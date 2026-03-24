@@ -202,6 +202,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "florence_chat": {
+        "description": "Florence household chat with Hermes core and no direct tool surface",
+        "tools": [],
+        "includes": []
+    },
+
 
     # Scenario-specific toolsets
     

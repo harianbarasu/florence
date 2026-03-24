@@ -2,16 +2,23 @@ from datetime import datetime, timezone
 
 from florence.contracts import (
     CandidateState,
+    Channel,
+    ChannelType,
     GoogleConnection,
     GoogleSourceKind,
     Household,
     HouseholdContext,
+    HouseholdNudgeTargetKind,
     HouseholdProfileKind,
+    HouseholdRoutineStatus,
+    Member,
+    MemberRole,
 )
 from florence.google import FlorenceGoogleSyncBatch, GmailSyncItem, ParentCalendarSyncItem
 from florence.runtime import (
     FlorenceCandidateReviewService,
     FlorenceGoogleSyncPersistenceService,
+    FlorenceHouseholdManagerService,
     FlorenceOnboardingSessionService,
 )
 from florence.state import FlorenceStateDB
@@ -398,4 +405,206 @@ def test_onboarding_sync_merges_grounding_hints_into_profile_metadata(tmp_path):
     assert school.metadata["contacts"] == ["Ms. Kim"]
     assert activity.metadata["locations"] == ["North Field"]
     assert activity.metadata["contacts"] == ["Coach Ben"]
+    store.close()
+
+
+def test_onboarding_sync_persists_manager_profile_preferences(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    onboarding_service = FlorenceOnboardingSessionService(store)
+
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="thread_dm_123",
+        display_name="Maya",
+    )
+    onboarding_service.record_child_names(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="thread_dm_123",
+        child_names=["Ava"],
+    )
+    onboarding_service.record_school_basics(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="thread_dm_123",
+        school_labels=["Roosevelt Elementary"],
+    )
+    onboarding_service.record_activity_basics(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="thread_dm_123",
+        activity_labels=["Soccer"],
+    )
+    onboarding_service.record_household_operations(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="thread_dm_123",
+        household_operations=["school forms", "pickup planning"],
+    )
+    onboarding_service.record_google_connected(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="thread_dm_123",
+    )
+    onboarding_service.record_nudge_preferences(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="thread_dm_123",
+        nudge_preferences="Day before and morning of for school things.",
+    )
+    onboarding_service.record_operating_preferences(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="thread_dm_123",
+        operating_preferences="Weekday morning brief at 6:45 and no messages after 9pm.",
+    )
+
+    household = store.get_household("hh_123")
+    assert household is not None
+    manager_profile = household.settings["manager_profile"]
+    assert manager_profile["household_operations"] == ["school forms", "pickup planning"]
+    assert manager_profile["nudge_preferences"] == "Day before and morning of for school things."
+    assert manager_profile["operating_preferences"] == "Weekday morning brief at 6:45 and no messages after 9pm."
+    store.close()
+
+
+def test_household_manager_service_schedules_due_nudge_with_default_dm_context(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    onboarding_service = FlorenceOnboardingSessionService(store)
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        display_name="Maya",
+    )
+
+    manager = FlorenceHouseholdManagerService(store)
+    nudge = manager.schedule_nudge(
+        household_id="hh_123",
+        message="Remember to order groceries for taco night.",
+        scheduled_for="2026-03-24T12:00:00+00:00",
+        target_kind=HouseholdNudgeTargetKind.GENERAL,
+    )
+
+    due = manager.list_due_nudges(
+        household_id="hh_123",
+        now=datetime(2026, 3, 24, 12, 30, tzinfo=timezone.utc),
+    )
+    assert due == [nudge]
+    assert nudge.recipient_member_id == "mem_123"
+    assert nudge.channel_id == "chan_dm_123"
+
+    sent = manager.mark_nudge_sent(
+        nudge_id=nudge.id,
+        sent_at=datetime(2026, 3, 24, 12, 31, tzinfo=timezone.utc),
+    )
+    assert sent is not None
+    assert sent.sent_at == "2026-03-24T12:31:00+00:00"
+    store.close()
+
+
+def test_household_manager_service_briefing_routines_due_and_advance(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(
+        Household(
+            id="hh_123",
+            name="Maya's household",
+            timezone="America/Los_Angeles",
+            settings={
+                "manager_profile": {
+                    "operating_preferences": "Weekday morning brief at 6:45 and evening check-in on school nights at 8:30pm.",
+                }
+            },
+        )
+    )
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    onboarding_service = FlorenceOnboardingSessionService(store)
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        display_name="Maya",
+    )
+
+    manager = FlorenceHouseholdManagerService(store)
+    routines = manager.ensure_briefing_routines(
+        household_id="hh_123",
+        now=datetime(2026, 3, 24, 12, 0, tzinfo=timezone.utc),
+    )
+    assert len(routines) == 2
+    assert all(routine.status == HouseholdRoutineStatus.ACTIVE for routine in routines)
+
+    morning = next(routine for routine in routines if routine.metadata.get("brief_kind") == "morning")
+    due = manager.list_due_briefing_routines(
+        household_id="hh_123",
+        now=datetime(2026, 3, 24, 14, 0, tzinfo=timezone.utc),
+    )
+    assert morning in due
+
+    updated = manager.mark_briefing_routine_sent(
+        routine_id=morning.id,
+        sent_at=datetime(2026, 3, 24, 14, 1, tzinfo=timezone.utc),
+    )
+    assert updated is not None
+    assert updated.last_completed_at == "2026-03-24T14:01:00+00:00"
+    assert updated.next_due_at is not None
+    assert updated.next_due_at > "2026-03-24T14:01:00+00:00"
+    store.close()
+
+
+def test_household_manager_service_records_reminder_feedback_and_event(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    manager = FlorenceHouseholdManagerService(store)
+    profile = manager.record_reminder_feedback(
+        household_id="hh_123",
+        feedback_text="Too many reminders too early. Morning-of is enough for practice.",
+        member_id="mem_123",
+        channel_id="chan_dm_123",
+        now=datetime(2026, 3, 24, 18, 30, tzinfo=timezone.utc),
+    )
+
+    assert profile["nudge_preferences_override"] == "Too many reminders too early. Morning-of is enough for practice."
+    assert profile["reminder_feedback"][-1]["member_id"] == "mem_123"
+    events = store.list_pilot_events(household_id="hh_123", event_type="reminder_feedback_received")
+    assert len(events) == 1
+    assert events[0].metadata["text"] == "Too many reminders too early. Morning-of is enough for practice."
     store.close()

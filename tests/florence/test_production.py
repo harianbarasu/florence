@@ -1,5 +1,6 @@
 import json
 import time
+from dataclasses import replace
 from urllib.parse import parse_qs, urlparse
 
 from florence.config import (
@@ -9,8 +10,9 @@ from florence.config import (
     FlorenceServerRuntimeConfig,
     FlorenceSettings,
 )
-from florence.contracts import Channel, ChannelType, Household
+from florence.contracts import Channel, ChannelType, Household, HouseholdRoutine, HouseholdRoutineStatus, Member, MemberRole
 from florence.google import GoogleCalendarMetadata, GoogleTokenResponse
+from florence.onboarding import OnboardingVariant
 from florence.runtime import FlorenceEntrypointResult, FlorenceProductionService
 from florence.state import FlorenceStateDB
 
@@ -24,6 +26,22 @@ class _FakeLinqClient:
 
     def send_text(self, *, chat_id, message):
         self.sent.append({"chat_id": chat_id, "message": message})
+
+
+class _FakeBriefingChatService:
+    def __init__(self):
+        self.calls = []
+
+    def compose_brief(self, *, household_id, channel_id, actor_member_id, brief_kind):
+        self.calls.append(
+            {
+                "household_id": household_id,
+                "channel_id": channel_id,
+                "actor_member_id": actor_member_id,
+                "brief_kind": brief_kind.value,
+            }
+        )
+        return "Morning brief: soccer bag, lunch order, and pickup timing are all on deck."
 
 
 def _build_settings(tmp_path):
@@ -120,6 +138,7 @@ def test_production_service_google_callback_sends_dm_follow_up(tmp_path, monkeyp
     settings = _build_settings(tmp_path)
     store = FlorenceStateDB(settings.server.db_path)
     service = FlorenceProductionService(settings, store=store)
+    service.entrypoints.onboarding_service.variant_selector = lambda _household_id, _member_id: OnboardingVariant.HYBRID
     service.linq = _FakeLinqClient()
     store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
     store.upsert_channel(
@@ -132,10 +151,35 @@ def test_production_service_google_callback_sends_dm_follow_up(tmp_path, monkeyp
             title="Maya",
         )
     )
-    service.entrypoints.onboarding_service.get_or_create_session(
+    service.entrypoints.onboarding_service.record_parent_name(
         household_id="hh_123",
         member_id="mem_123",
         thread_id="dm-thread-123",
+        display_name="Maya",
+    )
+    service.entrypoints.onboarding_service.record_child_names(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        child_names=["Ava"],
+    )
+    service.entrypoints.onboarding_service.record_school_basics(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        school_labels=["Roosevelt Elementary"],
+    )
+    service.entrypoints.onboarding_service.record_activity_basics(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        activity_labels=["Soccer"],
+    )
+    service.entrypoints.onboarding_service.record_household_operations(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        household_operations=["school forms", "pickup planning"],
     )
 
     link = service.entrypoints.google_account_link_service.build_connect_link(
@@ -174,7 +218,7 @@ def test_production_service_google_callback_sends_dm_follow_up(tmp_path, monkeyp
     assert "Google connected" in result.body
     assert service.linq.sent
     assert service.linq.sent[0]["chat_id"] == "dm-thread-123"
-    assert "children" in service.linq.sent[0]["message"].lower()
+    assert "reminders and nudges" in service.linq.sent[0]["message"].lower()
     store.close()
 
 
@@ -182,6 +226,7 @@ def test_production_service_first_dm_sends_onboarding_sequence_as_separate_messa
     settings = _build_settings(tmp_path)
     store = FlorenceStateDB(settings.server.db_path)
     service = FlorenceProductionService(settings, store=store)
+    service.entrypoints.onboarding_service.variant_selector = lambda _household_id, _member_id: OnboardingVariant.HYBRID
     service.linq = _FakeLinqClient()
 
     payload = {
@@ -206,14 +251,11 @@ def test_production_service_first_dm_sends_onboarding_sequence_as_separate_messa
     )
 
     assert result.status_code == 200
-    assert [item["message"] for item in service.linq.sent[:5]] == [
+    assert [item["message"] for item in service.linq.sent] == [
         "Hi, I'm Florence.",
-        "I help keep your household organized by keeping up with school emails, calendar invites, and schedule changes.",
-        "First step: connect your Google account so I can start syncing Gmail and Calendar.",
-        service.linq.sent[3]["message"],
-        "When you're done, reply done here and I'll keep going.",
+        "I help run the household with you by learning the family map first, then keeping up with reminders, logistics, school noise, and schedule changes.",
+        "Start with the kids I should know about: first name plus grade or age if helpful. One per line or comma-separated is fine.",
     ]
-    assert service.linq.sent[3]["message"].startswith("https://accounts.google.com/")
     store.close()
 
 
@@ -292,4 +334,120 @@ def test_production_service_ignores_duplicate_linq_message_ids(tmp_path):
     assert first.status_code == 200
     assert second.status_code == 200
     assert len(service.linq.sent) == sent_count_after_first
+    store.close()
+
+
+def test_production_service_run_sync_pass_sends_due_household_nudges_without_google_activity(tmp_path):
+    settings = _build_settings(tmp_path)
+    store = FlorenceStateDB(settings.server.db_path)
+    service = FlorenceProductionService(settings, store=store)
+    service.linq = _FakeLinqClient()
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    service.entrypoints.onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        display_name="Maya",
+    )
+    nudge = service.household_manager_service.schedule_nudge(
+        household_id="hh_123",
+        message="Taco night is tomorrow. Make sure groceries are in.",
+        scheduled_for="2026-03-24T12:00:00+00:00",
+    )
+
+    result = service.run_sync_pass()
+
+    assert result["nudges_sent"] == 1
+    assert result["nudges"] == 1
+    assert result["briefings_sent"] == 0
+    assert service.linq.sent == [
+        {"chat_id": "dm-thread-123", "message": "Taco night is tomorrow. Make sure groceries are in."}
+    ]
+    stored_nudge = store.get_household_nudge(nudge.id)
+    assert stored_nudge is not None
+    assert stored_nudge.status.value == "sent"
+    assert stored_nudge.sent_at is not None
+    store.close()
+
+
+def test_production_service_run_sync_pass_sends_due_household_briefing(tmp_path):
+    settings = _build_settings(tmp_path)
+    store = FlorenceStateDB(settings.server.db_path)
+    service = FlorenceProductionService(settings, store=store)
+    service.linq = _FakeLinqClient()
+    service.entrypoints.household_chat_service = _FakeBriefingChatService()
+    store.upsert_household(
+        Household(
+            id="hh_123",
+            name="Maya's household",
+            timezone="America/Los_Angeles",
+            settings={"manager_profile": {"operating_preferences": "Weekday morning brief at 6:45."}},
+        )
+    )
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    service.entrypoints.onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        display_name="Maya",
+    )
+    routines = service.household_manager_service.ensure_briefing_routines(household_id="hh_123")
+    morning = next(routine for routine in routines if routine.metadata.get("brief_kind") == "morning")
+    store.upsert_household_routine(
+        replace(
+            morning,
+            status=HouseholdRoutineStatus.ACTIVE,
+            next_due_at="2026-03-24T00:00:00+00:00",
+        )
+    )
+
+    result = service.run_sync_pass()
+
+    assert result["briefings_sent"] == 1
+    assert service.linq.sent == [
+        {
+            "chat_id": "dm-thread-123",
+            "message": "Morning brief: soccer bag, lunch order, and pickup timing are all on deck.",
+        }
+    ]
+    updated = store.get_household_routine(morning.id)
+    assert updated is not None
+    assert updated.last_completed_at is not None
+    events = store.list_pilot_events(household_id="hh_123", event_type="briefing_sent")
+    assert len(events) == 1
     store.close()

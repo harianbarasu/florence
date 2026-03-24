@@ -1,6 +1,7 @@
 from urllib.parse import parse_qs, urlparse
 
 from florence.google import GoogleCalendarMetadata, GoogleTokenResponse
+from florence.onboarding import OnboardingVariant
 from florence.runtime import FlorenceEntrypointService, FlorenceGoogleOauthConfig
 from florence.state import FlorenceStateDB
 
@@ -47,7 +48,7 @@ def test_entrypoints_group_without_resolved_household_returns_dm_first_message(t
     store.close()
 
 
-def test_entrypoints_dm_connect_stage_returns_google_link(tmp_path):
+def test_entrypoints_hybrid_onboarding_reaches_google_link_after_household_ops(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     service = FlorenceEntrypointService(
         store,
@@ -58,8 +59,9 @@ def test_entrypoints_dm_connect_stage_returns_google_link(tmp_path):
             state_secret="state-secret",
         ),
     )
+    service.onboarding_service.variant_selector = lambda _household_id, _member_id: OnboardingVariant.HYBRID
 
-    result = service.handle_linq_payload(
+    first = service.handle_linq_payload(
         _linq_payload(
             message_id="msg_1",
             text="Maya",
@@ -68,13 +70,46 @@ def test_entrypoints_dm_connect_stage_returns_google_link(tmp_path):
             is_group=False,
         )
     )
+    service.onboarding_service.record_child_names(
+        household_id=first.household_id or "",
+        member_id=first.member_id or "",
+        thread_id="dm-thread-123",
+        child_names=["Ava"],
+    )
+    service.onboarding_service.record_school_basics(
+        household_id=first.household_id or "",
+        member_id=first.member_id or "",
+        thread_id="dm-thread-123",
+        school_labels=["Roosevelt Elementary"],
+    )
+    service.onboarding_service.record_activity_basics(
+        household_id=first.household_id or "",
+        member_id=first.member_id or "",
+        thread_id="dm-thread-123",
+        activity_labels=["Soccer"],
+    )
+    service.onboarding_service.record_household_operations(
+        household_id=first.household_id or "",
+        member_id=first.member_id or "",
+        thread_id="dm-thread-123",
+        household_operations=["school forms", "pickup planning"],
+    )
+
+    result = service.handle_linq_payload(
+        _linq_payload(
+            message_id="msg_2",
+            text="what next?",
+            chat_id="dm-thread-123",
+            sender="+15555550123",
+            is_group=False,
+        )
+    )
 
     assert result.consumed is True
     assert result.reply_text is not None
-    assert result.reply_text == "Hi, I'm Florence."
-    assert len(result.reply_messages) == 5
-    assert result.reply_messages[2] == "First step: connect your Google account so I can start syncing Gmail and Calendar."
-    assert result.reply_messages[3].startswith("https://accounts.google.com/")
+    assert len(result.reply_messages) == 3
+    assert result.reply_messages[0] == "Next step: connect your Google account so I can compare Gmail and Calendar against the household context you just gave me."
+    assert result.reply_messages[1].startswith("https://accounts.google.com/")
     store.close()
 
 
@@ -89,7 +124,9 @@ def test_entrypoints_google_callback_returns_next_prompt(tmp_path, monkeypatch):
             state_secret="state-secret",
         ),
     )
-    dm_result = service.handle_linq_payload(
+    service.onboarding_service.variant_selector = lambda _household_id, _member_id: OnboardingVariant.HYBRID
+
+    first = service.handle_linq_payload(
         _linq_payload(
             message_id="msg_1",
             text="Maya",
@@ -98,7 +135,38 @@ def test_entrypoints_google_callback_returns_next_prompt(tmp_path, monkeypatch):
             is_group=False,
         )
     )
-    raw_state = parse_qs(urlparse(dm_result.reply_messages[3]).query)["state"][0]
+    household_id = first.household_id or ""
+    member_id = first.member_id or ""
+    service.onboarding_service.record_child_names(
+        household_id=household_id,
+        member_id=member_id,
+        thread_id="dm-thread-123",
+        child_names=["Ava"],
+    )
+    service.onboarding_service.record_school_basics(
+        household_id=household_id,
+        member_id=member_id,
+        thread_id="dm-thread-123",
+        school_labels=["Roosevelt Elementary"],
+    )
+    service.onboarding_service.record_activity_basics(
+        household_id=household_id,
+        member_id=member_id,
+        thread_id="dm-thread-123",
+        activity_labels=["Soccer"],
+    )
+    service.onboarding_service.record_household_operations(
+        household_id=household_id,
+        member_id=member_id,
+        thread_id="dm-thread-123",
+        household_operations=["school forms", "pickup planning"],
+    )
+    link = service.google_account_link_service.build_connect_link(
+        household_id=household_id,
+        member_id=member_id,
+        thread_id="dm-thread-123",
+    )
+    raw_state = parse_qs(urlparse(link.url).query)["state"][0]
 
     monkeypatch.setattr(
         "florence.runtime.services.exchange_google_code_for_tokens",
@@ -123,7 +191,7 @@ def test_entrypoints_google_callback_returns_next_prompt(tmp_path, monkeypatch):
 
     assert result.consumed is True
     assert result.reply_text is not None
-    assert "children" in result.reply_text.lower()
+    assert "reminders and nudges" in result.reply_text.lower()
     store.close()
 
 

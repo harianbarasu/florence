@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -31,6 +32,19 @@ def _log_runtime_configuration(settings: FlorenceSettings) -> None:
         logger.info("Florence Google OAuth is configured")
     else:
         logger.warning("Florence Google OAuth is not configured")
+    hermes_base_url = (
+        os.getenv("OPENAI_BASE_URL", "").strip()
+        or os.getenv("OPENROUTER_BASE_URL", "").strip()
+        or "(provider default)"
+    )
+    logger.info(
+        "Florence Hermes runtime: provider=%s model=%s base_url=%s",
+        settings.hermes.provider,
+        settings.hermes.model,
+        hermes_base_url,
+    )
+
+
 class _FlorenceRequestHandler(BaseHTTPRequestHandler):
     service: FlorenceProductionService | None = None
 

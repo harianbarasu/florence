@@ -1,6 +1,10 @@
 """Deterministic DM-first onboarding state and flows for Florence."""
 
 from florence.onboarding.flow import (
+    apply_household_members,
+    apply_household_operations,
+    apply_nudge_preferences,
+    apply_operating_preferences,
     OnboardingPrompt,
     OnboardingTransition,
     apply_activity_basics,
@@ -14,15 +18,20 @@ from florence.onboarding.flow import (
     mark_group_activated,
     sync_onboarding_stage,
 )
-from florence.onboarding.state import OnboardingStage, OnboardingState
+from florence.onboarding.state import OnboardingStage, OnboardingState, OnboardingVariant
 
 __all__ = [
     "OnboardingPrompt",
     "OnboardingStage",
     "OnboardingState",
+    "OnboardingVariant",
     "OnboardingTransition",
     "apply_activity_basics",
     "apply_child_names",
+    "apply_household_members",
+    "apply_household_operations",
+    "apply_nudge_preferences",
+    "apply_operating_preferences",
     "apply_parent_name",
     "apply_school_basics",
     "build_google_connect_message",

@@ -19,6 +19,7 @@ _EXPORTS = {
     "FlorenceGoogleSyncWorkerService": ("florence.runtime.services", "FlorenceGoogleSyncWorkerService"),
     "FlorenceHouseholdChatReply": ("florence.runtime.chat", "FlorenceHouseholdChatReply"),
     "FlorenceHouseholdChatService": ("florence.runtime.chat", "FlorenceHouseholdChatService"),
+    "FlorenceHouseholdManagerService": ("florence.runtime.services", "FlorenceHouseholdManagerService"),
     "FlorenceHouseholdQueryService": ("florence.runtime.services", "FlorenceHouseholdQueryService"),
     "FlorenceHTTPResult": ("florence.runtime.production", "FlorenceHTTPResult"),
     "FlorenceIdentityResolver": ("florence.runtime.resolver", "FlorenceIdentityResolver"),

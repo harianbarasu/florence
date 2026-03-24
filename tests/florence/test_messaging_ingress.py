@@ -3,6 +3,8 @@ from florence.messaging import (
     FlorenceMessagingIngressService,
     FlorenceResolvedInboundMessage,
 )
+from florence.contracts import Household
+from florence.onboarding import OnboardingVariant
 from florence.runtime import (
     FlorenceCandidateReviewService,
     FlorenceHouseholdQueryService,
@@ -49,13 +51,68 @@ class _StubHouseholdChatService:
         return _Reply()
 
 
+def _build_hybrid_onboarding_service(store, review_service):
+    return FlorenceOnboardingSessionService(
+        store,
+        candidate_review_service=review_service,
+        variant_selector=lambda _household_id, _member_id: OnboardingVariant.HYBRID,
+    )
+
+
+def _complete_hybrid_onboarding(onboarding_service):
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+        display_name="Maya",
+    )
+    onboarding_service.record_child_names(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+        child_names=["Ava"],
+    )
+    onboarding_service.record_school_basics(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+        school_labels=["Roosevelt Elementary"],
+    )
+    onboarding_service.record_activity_basics(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+        activity_labels=["Soccer"],
+    )
+    onboarding_service.record_household_operations(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+        household_operations=["school forms", "pickup planning"],
+    )
+    onboarding_service.record_google_connected(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+    )
+    onboarding_service.record_nudge_preferences(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+        nudge_preferences="Day before and morning of, and follow up until I reply for anything school-related.",
+    )
+    onboarding_service.record_operating_preferences(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+        operating_preferences="Weekday morning brief at 6:45, no texts after 9pm, ask before spending money.",
+    )
+
+
 def test_dm_parent_name_reply_includes_friendly_google_link(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)
-    onboarding_service = FlorenceOnboardingSessionService(
-        store,
-        candidate_review_service=review_service,
-    )
+    onboarding_service = _build_hybrid_onboarding_service(store, review_service)
     ingress = FlorenceMessagingIngressService(
         store,
         onboarding_service,
@@ -86,10 +143,8 @@ def test_dm_parent_name_reply_includes_friendly_google_link(tmp_path):
     assert result.reply_text == "Hi, I'm Florence."
     assert result.reply_messages == (
         "Hi, I'm Florence.",
-        "I help keep your household organized by keeping up with school emails, calendar invites, and schedule changes.",
-        "First step: connect your Google account so I can start syncing Gmail and Calendar.",
-        "https://example.com/google/connect",
-        "When you're done, reply done here and I'll keep going.",
+        "I help run the household with you by learning the family map first, then keeping up with reminders, logistics, school noise, and schedule changes.",
+        "Start with the kids I should know about: first name plus grade or age if helpful. One per line or comma-separated is fine.",
     )
     store.close()
 
@@ -97,10 +152,7 @@ def test_dm_parent_name_reply_includes_friendly_google_link(tmp_path):
 def test_complete_dm_routes_freeform_chat_through_household_chat_service(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)
-    onboarding_service = FlorenceOnboardingSessionService(
-        store,
-        candidate_review_service=review_service,
-    )
+    onboarding_service = _build_hybrid_onboarding_service(store, review_service)
     chat_service = _StubHouseholdChatService("I can keep planning with you here.")
     ingress = FlorenceMessagingIngressService(
         store,
@@ -110,35 +162,7 @@ def test_complete_dm_routes_freeform_chat_through_household_chat_service(tmp_pat
         household_chat_service=chat_service,
     )
 
-    onboarding_service.record_parent_name(
-        household_id="hh_123",
-        member_id="mem_123",
-        thread_id="dm_thread_123",
-        display_name="Maya",
-    )
-    onboarding_service.record_google_connected(
-        household_id="hh_123",
-        member_id="mem_123",
-        thread_id="dm_thread_123",
-    )
-    onboarding_service.record_child_names(
-        household_id="hh_123",
-        member_id="mem_123",
-        thread_id="dm_thread_123",
-        child_names=["Ava"],
-    )
-    onboarding_service.record_school_basics(
-        household_id="hh_123",
-        member_id="mem_123",
-        thread_id="dm_thread_123",
-        school_labels=["Roosevelt Elementary"],
-    )
-    onboarding_service.record_activity_basics(
-        household_id="hh_123",
-        member_id="mem_123",
-        thread_id="dm_thread_123",
-        activity_labels=["Soccer"],
-    )
+    _complete_hybrid_onboarding(onboarding_service)
 
     result = ingress.handle_message(
         FlorenceResolvedInboundMessage(
@@ -164,13 +188,10 @@ def test_complete_dm_routes_freeform_chat_through_household_chat_service(tmp_pat
     store.close()
 
 
-def test_activity_basics_completion_unlocks_agent_without_requiring_group(tmp_path):
+def test_activity_basics_advances_to_household_operations_before_unlocking_agent(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)
-    onboarding_service = FlorenceOnboardingSessionService(
-        store,
-        candidate_review_service=review_service,
-    )
+    onboarding_service = _build_hybrid_onboarding_service(store, review_service)
     ingress = FlorenceMessagingIngressService(
         store,
         onboarding_service,
@@ -183,11 +204,6 @@ def test_activity_basics_completion_unlocks_agent_without_requiring_group(tmp_pa
         member_id="mem_123",
         thread_id="dm_thread_123",
         display_name="Maya",
-    )
-    onboarding_service.record_google_connected(
-        household_id="hh_123",
-        member_id="mem_123",
-        thread_id="dm_thread_123",
     )
     onboarding_service.record_child_names(
         household_id="hh_123",
@@ -226,21 +242,18 @@ def test_activity_basics_completion_unlocks_agent_without_requiring_group(tmp_pa
     )
     assert result.consumed is True
     assert result.reply_messages == (
-        "Perfect. I have enough household context to help now.",
-        "You can keep asking me here, and you can add me to the family group later if you want shared help there too.",
+        "What recurring logistics or reminders should I help manage first? A short list is fine: lunches, forms, returns, bills, sports, appointments, birthdays, and so on.",
     )
-    assert session.is_complete is True
+    assert session.is_complete is False
+    assert session.stage == "collect_household_operations"
     assert session.group_channel_id is None
     store.close()
 
 
-def test_first_group_message_after_context_collection_records_group_channel(tmp_path):
+def test_nudge_preferences_advance_to_operating_policy_step(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)
-    onboarding_service = FlorenceOnboardingSessionService(
-        store,
-        candidate_review_service=review_service,
-    )
+    onboarding_service = _build_hybrid_onboarding_service(store, review_service)
     ingress = FlorenceMessagingIngressService(
         store,
         onboarding_service,
@@ -253,11 +266,6 @@ def test_first_group_message_after_context_collection_records_group_channel(tmp_
         member_id="mem_123",
         thread_id="dm_thread_123",
         display_name="Maya",
-    )
-    onboarding_service.record_google_connected(
-        household_id="hh_123",
-        member_id="mem_123",
-        thread_id="dm_thread_123",
     )
     onboarding_service.record_child_names(
         household_id="hh_123",
@@ -277,6 +285,146 @@ def test_first_group_message_after_context_collection_records_group_channel(tmp_
         thread_id="dm_thread_123",
         activity_labels=["Soccer"],
     )
+    onboarding_service.record_household_operations(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+        household_operations=["school forms", "returns"],
+    )
+    onboarding_service.record_google_connected(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+    )
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_203",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="Day before and morning of, and keep nudging if it is school-related.",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    session = onboarding_service.get_or_create_session(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+    )
+    assert result.consumed is True
+    assert result.reply_text is not None
+    assert "house rules" in result.reply_text.lower()
+    assert session.is_complete is False
+    assert session.stage == "collect_operating_preferences"
+    assert session.group_channel_id is None
+    store.close()
+
+
+def test_operating_preferences_completion_unlocks_agent_without_requiring_group(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_hybrid_onboarding_service(store, review_service)
+    ingress = FlorenceMessagingIngressService(
+        store,
+        onboarding_service,
+        review_service,
+        FlorenceHouseholdQueryService(store),
+    )
+
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+        display_name="Maya",
+    )
+    onboarding_service.record_child_names(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+        child_names=["Ava"],
+    )
+    onboarding_service.record_school_basics(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+        school_labels=["Roosevelt Elementary"],
+    )
+    onboarding_service.record_activity_basics(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+        activity_labels=["Soccer"],
+    )
+    onboarding_service.record_household_operations(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+        household_operations=["school forms", "returns"],
+    )
+    onboarding_service.record_google_connected(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+    )
+    onboarding_service.record_nudge_preferences(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+        nudge_preferences="Day before and morning of, and keep nudging if it is school-related.",
+    )
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_204",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="Weekday morning brief at 6:45, no texts after 9pm, ask before spending money.",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    session = onboarding_service.get_or_create_session(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+    )
+    assert result.consumed is True
+    assert result.reply_messages == (
+        "Perfect. I have enough context to start acting like your household manager.",
+        "You can ask me to plan, remind, research, coordinate, and stay on top of the family's logistics here.",
+    )
+    assert session.is_complete is True
+    assert session.group_channel_id is None
+    store.close()
+
+
+def test_first_group_message_after_context_collection_records_group_channel(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_hybrid_onboarding_service(store, review_service)
+    ingress = FlorenceMessagingIngressService(
+        store,
+        onboarding_service,
+        review_service,
+        FlorenceHouseholdQueryService(store),
+    )
+
+    _complete_hybrid_onboarding(onboarding_service)
 
     result = ingress.handle_message(
         FlorenceResolvedInboundMessage(
@@ -304,4 +452,82 @@ def test_first_group_message_after_context_collection_records_group_channel(tmp_
     assert result.reply_text is not None
     assert "I’m in." in result.reply_text
     assert session.group_channel_id == "group_thread_123"
+    store.close()
+
+
+def test_complete_dm_can_answer_tracking_visibility_request(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_hybrid_onboarding_service(store, review_service)
+    ingress = FlorenceMessagingIngressService(
+        store,
+        onboarding_service,
+        review_service,
+        FlorenceHouseholdQueryService(store),
+    )
+    _complete_hybrid_onboarding(onboarding_service)
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_205",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="What are you tracking for us right now?",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert result.consumed is True
+    assert result.reply_text is not None
+    assert "actively tracking" in result.reply_text.lower()
+    store.close()
+
+
+def test_complete_dm_reminder_feedback_updates_manager_profile_and_logs_event(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_hybrid_onboarding_service(store, review_service)
+    ingress = FlorenceMessagingIngressService(
+        store,
+        onboarding_service,
+        review_service,
+        FlorenceHouseholdQueryService(store),
+    )
+    _complete_hybrid_onboarding(onboarding_service)
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_206",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="Too many reminders too early. Morning-of is better for practices.",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert result.consumed is True
+    assert result.reply_text is not None
+    assert "updated your reminder style" in result.reply_text.lower()
+
+    household = store.get_household("hh_123")
+    assert household is not None
+    manager_profile = household.settings["manager_profile"]
+    assert manager_profile["nudge_preferences_override"] == "Too many reminders too early. Morning-of is better for practices."
+    events = store.list_pilot_events(household_id="hh_123", event_type="reminder_feedback_received")
+    assert len(events) == 1
     store.close()

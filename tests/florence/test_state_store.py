@@ -3,11 +3,23 @@ from florence.contracts import (
     ChildProfile,
     GoogleConnection,
     GoogleSourceKind,
+    HouseholdMeal,
+    HouseholdMealStatus,
+    HouseholdNudge,
+    HouseholdNudgeStatus,
+    HouseholdNudgeTargetKind,
     HouseholdProfileItem,
     HouseholdProfileKind,
+    HouseholdRoutine,
+    HouseholdRoutineStatus,
+    HouseholdShoppingItem,
+    HouseholdShoppingItemStatus,
+    HouseholdWorkItem,
+    HouseholdWorkItemStatus,
     ImportedCandidate,
+    PilotEvent,
 )
-from florence.onboarding import OnboardingStage, OnboardingState
+from florence.onboarding import OnboardingStage, OnboardingState, OnboardingVariant
 from florence.state import FlorenceStateDB
 
 
@@ -26,6 +38,11 @@ def test_state_db_round_trips_onboarding_google_and_candidates(tmp_path):
         activity_labels=["Soccer"],
         school_basics_collected=True,
         activity_basics_collected=True,
+        metadata={
+            "variant": OnboardingVariant.HYBRID.value,
+            "household_operations": ["school forms", "returns"],
+            "nudge_preferences": "Day before and morning of",
+        },
     )
     connection = GoogleConnection(
         id="gconn_123",
@@ -142,5 +159,101 @@ def test_state_db_updates_candidate_state(tmp_path):
 
     assert updated is not None
     assert updated.state == CandidateState.PENDING_REVIEW
+
+    store.close()
+
+
+def test_state_db_round_trips_house_manager_objects(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    work_item = HouseholdWorkItem(
+        id="work_123",
+        household_id="hh_123",
+        title="Order school lunches for next week",
+        description="Submit lunches before Friday cutoff.",
+        status=HouseholdWorkItemStatus.IN_PROGRESS,
+        owner_member_id="mem_123",
+        due_at="2026-03-27T18:00:00+00:00",
+        metadata={"category": "school_admin"},
+    )
+    routine = HouseholdRoutine(
+        id="routine_123",
+        household_id="hh_123",
+        title="Friday lunch-order check",
+        cadence="weekly on Friday at 9am",
+        status=HouseholdRoutineStatus.ACTIVE,
+        owner_member_id="mem_123",
+        next_due_at="2026-03-27T16:00:00+00:00",
+        metadata={"category": "school_admin"},
+    )
+    nudge = HouseholdNudge(
+        id="nudge_123",
+        household_id="hh_123",
+        target_kind=HouseholdNudgeTargetKind.WORK_ITEM,
+        target_id="work_123",
+        message="Lunch order cutoff is today at 10am.",
+        status=HouseholdNudgeStatus.SCHEDULED,
+        recipient_member_id="mem_123",
+        channel_id="chan_dm_123",
+        scheduled_for="2026-03-27T15:00:00+00:00",
+        metadata={"follow_up_policy": "until_acknowledged"},
+    )
+    meal = HouseholdMeal(
+        id="meal_123",
+        household_id="hh_123",
+        title="Taco night",
+        meal_type="dinner",
+        scheduled_for="2026-03-27T18:00:00+00:00",
+        description="Easy Friday dinner after soccer.",
+        status=HouseholdMealStatus.PLANNED,
+        metadata={"serves": 4},
+    )
+    shopping_item = HouseholdShoppingItem(
+        id="shop_123",
+        household_id="hh_123",
+        title="ground turkey",
+        list_name="groceries",
+        status=HouseholdShoppingItemStatus.NEEDED,
+        quantity="2",
+        unit="lb",
+        meal_id="meal_123",
+        needed_by="2026-03-27T16:00:00+00:00",
+        metadata={"store_section": "meat"},
+    )
+
+    store.upsert_household_work_item(work_item)
+    store.upsert_household_routine(routine)
+    store.upsert_household_nudge(nudge)
+    store.upsert_household_meal(meal)
+    store.upsert_household_shopping_item(shopping_item)
+
+    assert store.get_household_work_item("work_123") == work_item
+    assert store.get_household_routine("routine_123") == routine
+    assert store.get_household_nudge("nudge_123") == nudge
+    assert store.get_household_meal("meal_123") == meal
+    assert store.get_household_shopping_item("shop_123") == shopping_item
+    assert store.list_household_work_items(household_id="hh_123") == [work_item]
+    assert store.list_household_routines(household_id="hh_123") == [routine]
+    assert store.list_household_nudges(household_id="hh_123") == [nudge]
+    assert store.list_household_meals(household_id="hh_123") == [meal]
+    assert store.list_household_shopping_items(household_id="hh_123", list_name="groceries") == [shopping_item]
+
+    store.close()
+
+
+def test_state_db_round_trips_pilot_events(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    event = PilotEvent(
+        id="pilot_123",
+        household_id="hh_123",
+        event_type="briefing_sent",
+        member_id="mem_123",
+        channel_id="chan_dm_123",
+        metadata={"brief_kind": "morning"},
+        created_at=1711300000.0,
+    )
+    store.upsert_pilot_event(event)
+
+    assert store.list_pilot_events(household_id="hh_123") == [event]
+    assert store.list_pilot_events(household_id="hh_123", event_type="briefing_sent") == [event]
 
     store.close()

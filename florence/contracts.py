@@ -57,6 +57,10 @@ class HouseholdEventStatus(StrEnum):
 class HouseholdProfileKind(StrEnum):
     SCHOOL = "school"
     ACTIVITY = "activity"
+    CONTACT = "contact"
+    PLACE = "place"
+    PROVIDER = "provider"
+    ASSET = "asset"
     PREFERENCE = "preference"
 
 
@@ -64,6 +68,52 @@ class ChannelMessageRole(StrEnum):
     USER = "user"
     ASSISTANT = "assistant"
     SYSTEM = "system"
+
+
+class HouseholdWorkItemStatus(StrEnum):
+    OPEN = "open"
+    IN_PROGRESS = "in_progress"
+    BLOCKED = "blocked"
+    DONE = "done"
+    CANCELLED = "cancelled"
+
+
+class HouseholdRoutineStatus(StrEnum):
+    ACTIVE = "active"
+    PAUSED = "paused"
+    ARCHIVED = "archived"
+
+
+class HouseholdNudgeStatus(StrEnum):
+    SCHEDULED = "scheduled"
+    SENT = "sent"
+    ACKNOWLEDGED = "acknowledged"
+    CANCELLED = "cancelled"
+
+
+class HouseholdNudgeTargetKind(StrEnum):
+    EVENT = "event"
+    WORK_ITEM = "work_item"
+    ROUTINE = "routine"
+    GENERAL = "general"
+
+
+class HouseholdMealStatus(StrEnum):
+    PLANNED = "planned"
+    DONE = "done"
+    SKIPPED = "skipped"
+
+
+class HouseholdShoppingItemStatus(StrEnum):
+    NEEDED = "needed"
+    ORDERED = "ordered"
+    PURCHASED = "purchased"
+    SKIPPED = "skipped"
+
+
+class HouseholdBriefingKind(StrEnum):
+    MORNING = "morning"
+    EVENING = "evening"
 
 
 @dataclass(slots=True)
@@ -191,6 +241,79 @@ class HouseholdEvent:
 
 
 @dataclass(slots=True)
+class HouseholdWorkItem:
+    id: str
+    household_id: str
+    title: str
+    description: str | None = None
+    status: HouseholdWorkItemStatus = HouseholdWorkItemStatus.OPEN
+    owner_member_id: str | None = None
+    child_id: str | None = None
+    due_at: str | None = None
+    starts_at: str | None = None
+    completed_at: str | None = None
+    metadata: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class HouseholdRoutine:
+    id: str
+    household_id: str
+    title: str
+    cadence: str
+    description: str | None = None
+    status: HouseholdRoutineStatus = HouseholdRoutineStatus.ACTIVE
+    owner_member_id: str | None = None
+    child_id: str | None = None
+    next_due_at: str | None = None
+    last_completed_at: str | None = None
+    metadata: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class HouseholdNudge:
+    id: str
+    household_id: str
+    target_kind: HouseholdNudgeTargetKind
+    target_id: str | None = None
+    message: str = ""
+    status: HouseholdNudgeStatus = HouseholdNudgeStatus.SCHEDULED
+    recipient_member_id: str | None = None
+    channel_id: str | None = None
+    scheduled_for: str | None = None
+    sent_at: str | None = None
+    acknowledged_at: str | None = None
+    metadata: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class HouseholdMeal:
+    id: str
+    household_id: str
+    title: str
+    meal_type: str
+    scheduled_for: str
+    description: str | None = None
+    status: HouseholdMealStatus = HouseholdMealStatus.PLANNED
+    metadata: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class HouseholdShoppingItem:
+    id: str
+    household_id: str
+    title: str
+    list_name: str = "groceries"
+    status: HouseholdShoppingItemStatus = HouseholdShoppingItemStatus.NEEDED
+    quantity: str | None = None
+    unit: str | None = None
+    notes: str | None = None
+    meal_id: str | None = None
+    needed_by: str | None = None
+    metadata: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
 class ChannelMessage:
     id: str
     household_id: str
@@ -200,3 +323,14 @@ class ChannelMessage:
     sender_member_id: str | None = None
     created_at: float = 0.0
     metadata: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class PilotEvent:
+    id: str
+    household_id: str
+    event_type: str
+    member_id: str | None = None
+    channel_id: str | None = None
+    metadata: dict[str, object] = field(default_factory=dict)
+    created_at: float = 0.0

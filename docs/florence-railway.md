@@ -46,11 +46,12 @@ LINQ_WEBHOOK_SECRET=choose-a-long-random-secret
 
 # Florence runtime
 FLORENCE_SYNC_INTERVAL_SECONDS=300
-FLORENCE_HERMES_MODEL=anthropic/claude-opus-4.6
+FLORENCE_HERMES_PROVIDER=custom
+FLORENCE_HERMES_MODEL=gpt-5.4
 
-# Hermes model provider credentials
-OPENROUTER_API_KEY=...
-# Or set the equivalent key for whichever Hermes-supported provider you use.
+# Hermes model provider credentials for direct OpenAI
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_API_KEY=...
 ```
 
 Notes:
@@ -59,6 +60,10 @@ Notes:
 - If you use the Railway public domain, Florence now derives its public base URL
   automatically from `RAILWAY_PUBLIC_DOMAIN`.
 - If you use a custom domain, set `FLORENCE_PUBLIC_BASE_URL` explicitly.
+- If you want Claude instead, set `FLORENCE_HERMES_PROVIDER=anthropic`,
+  `FLORENCE_HERMES_MODEL=anthropic/claude-opus-4.6`, and `ANTHROPIC_API_KEY`.
+- If you want OpenRouter instead, set `FLORENCE_HERMES_PROVIDER=openrouter`,
+  use an OpenRouter model slug, and provide `OPENROUTER_API_KEY`.
 
 ## Google OAuth
 

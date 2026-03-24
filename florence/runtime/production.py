@@ -11,11 +11,12 @@ from typing import Any
 
 from florence.config import FlorenceSettings
 from florence.linq import FlorenceLinqClient
-from florence.contracts import CandidateState, ChannelType
+from florence.contracts import CandidateState, ChannelType, HouseholdBriefingKind
 from florence.google import decode_google_oauth_state
 from florence.runtime.entrypoints import FlorenceEntrypointService, FlorenceGoogleOauthConfig
 from florence.runtime.services import (
     FlorenceCandidateReviewService,
+    FlorenceHouseholdManagerService,
     FlorenceGoogleSyncPersistenceService,
     FlorenceGoogleSyncWorkerService,
 )
@@ -63,6 +64,7 @@ class FlorenceProductionService:
         )
         self.linq = FlorenceLinqClient(settings.linq)
         self.candidate_review_service = FlorenceCandidateReviewService(self.store)
+        self.household_manager_service = FlorenceHouseholdManagerService(self.store)
         self.sync_worker = FlorenceGoogleSyncWorkerService(
             self.store,
             FlorenceGoogleSyncPersistenceService(self.store),
@@ -196,16 +198,23 @@ class FlorenceProductionService:
 
     def run_sync_pass(self) -> dict[str, int]:
         households = self.store.list_households()
-        counters = {"households": 0, "connections": 0, "candidates": 0, "nudges": 0}
+        counters = {
+            "households": 0,
+            "connections": 0,
+            "candidates": 0,
+            "review_nudges": 0,
+            "nudges_sent": 0,
+            "briefings_sent": 0,
+            "nudges": 0,
+        }
         for household in households:
+            self.household_manager_service.ensure_briefing_routines(household_id=household.id)
             results = self.sync_worker.sync_household(
                 household_id=household.id,
                 client_id=self.settings.google.client_id,
                 client_secret=self.settings.google.client_secret,
             )
-            if not results:
-                continue
-            counters["households"] += 1
+            household_touched = bool(results)
             counters["connections"] += len(results)
             for result in results:
                 counters["candidates"] += len(result.sync_result.candidates)
@@ -214,7 +223,20 @@ class FlorenceProductionService:
                     member_id=result.connection.member_id,
                     candidates=result.sync_result.candidates,
                 ):
+                    counters["review_nudges"] += 1
                     counters["nudges"] += 1
+                    household_touched = True
+            sent_nudges = self._dispatch_due_household_nudges(household_id=household.id)
+            counters["nudges_sent"] += sent_nudges
+            counters["nudges"] += sent_nudges
+            if sent_nudges:
+                household_touched = True
+            sent_briefings = self._dispatch_due_household_briefings(household_id=household.id)
+            counters["briefings_sent"] += sent_briefings
+            if sent_briefings:
+                household_touched = True
+            if household_touched:
+                counters["households"] += 1
         return counters
 
     def _nudge_for_new_pending_candidates(
@@ -270,6 +292,87 @@ class FlorenceProductionService:
                 if channel.provider_channel_id == provider_channel_id:
                     return channel
         return None
+
+    def _dispatch_due_household_nudges(self, *, household_id: str) -> int:
+        sent = 0
+        for nudge in self.household_manager_service.list_due_nudges(household_id=household_id):
+            channel = self.store.get_channel(nudge.channel_id) if nudge.channel_id else None
+            if channel is None and nudge.recipient_member_id:
+                fallback_channel_id = self.household_manager_service.default_dm_channel_id(
+                    household_id=household_id,
+                    member_id=nudge.recipient_member_id,
+                )
+                if fallback_channel_id:
+                    channel = self.store.get_channel(fallback_channel_id)
+            if channel is None or not nudge.message.strip():
+                continue
+            if self._safe_send_channel_message(channel=channel, message=nudge.message):
+                self.household_manager_service.mark_nudge_sent(nudge_id=nudge.id)
+                self.household_manager_service.record_pilot_event(
+                    household_id=household_id,
+                    event_type="nudge_sent",
+                    member_id=nudge.recipient_member_id,
+                    channel_id=channel.id,
+                    metadata={
+                        "nudge_id": nudge.id,
+                        "target_kind": nudge.target_kind.value,
+                    },
+                )
+                sent += 1
+        return sent
+
+    def _dispatch_due_household_briefings(self, *, household_id: str) -> int:
+        chat_service = self.entrypoints.household_chat_service
+        if chat_service is None:
+            return 0
+        sent = 0
+        for routine in self.household_manager_service.list_due_briefing_routines(household_id=household_id):
+            metadata = dict(routine.metadata)
+            kind_raw = str(metadata.get("brief_kind") or HouseholdBriefingKind.MORNING.value).strip().lower()
+            try:
+                brief_kind = HouseholdBriefingKind(kind_raw)
+            except ValueError:
+                brief_kind = HouseholdBriefingKind.MORNING
+            recipient_member_id = routine.owner_member_id or self.household_manager_service.default_recipient_member_id(household_id)
+            channel_id = str(metadata.get("channel_id") or "").strip()
+            if not channel_id:
+                channel_id = self.household_manager_service.default_dm_channel_id(
+                    household_id=household_id,
+                    member_id=recipient_member_id,
+                ) or ""
+            channel = self.store.get_channel(channel_id) if channel_id else None
+            if channel is None:
+                continue
+            try:
+                brief_message = chat_service.compose_brief(
+                    household_id=household_id,
+                    channel_id=channel.id,
+                    actor_member_id=recipient_member_id,
+                    brief_kind=brief_kind,
+                )
+            except Exception:
+                logger.exception(
+                    "Florence briefing compose failed household_id=%s routine_id=%s",
+                    household_id,
+                    routine.id,
+                )
+                continue
+            if not brief_message or not brief_message.strip():
+                continue
+            if self._safe_send_channel_message(channel=channel, message=brief_message):
+                self.household_manager_service.mark_briefing_routine_sent(routine_id=routine.id)
+                self.household_manager_service.record_pilot_event(
+                    household_id=household_id,
+                    event_type="briefing_sent",
+                    member_id=recipient_member_id,
+                    channel_id=channel.id,
+                    metadata={
+                        "routine_id": routine.id,
+                        "brief_kind": brief_kind.value,
+                    },
+                )
+                sent += 1
+        return sent
 
     def _safe_send_channel_message(self, *, channel: Any, message: str, record_message: bool = True) -> bool:
         try:

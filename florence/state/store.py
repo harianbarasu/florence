@@ -18,21 +18,33 @@ from florence.contracts import (
     GoogleSourceKind,
     HouseholdEvent,
     HouseholdEventStatus,
+    HouseholdMeal,
+    HouseholdMealStatus,
+    HouseholdNudge,
+    HouseholdNudgeStatus,
+    HouseholdNudgeTargetKind,
     Household,
     HouseholdProfileItem,
     HouseholdProfileKind,
+    HouseholdRoutine,
+    HouseholdRoutineStatus,
+    HouseholdShoppingItem,
+    HouseholdShoppingItemStatus,
     HouseholdStatus,
+    HouseholdWorkItem,
+    HouseholdWorkItemStatus,
     IdentityKind,
     ImportedCandidate,
     Member,
     MemberIdentity,
     MemberRole,
+    PilotEvent,
 )
 from florence.onboarding import OnboardingStage, OnboardingState
 from florence.state.db import RowLike, connect_florence_db
 
 FLORENCE_DB_PATH = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes")) / "florence.db"
-FLORENCE_SCHEMA_VERSION = 4
+FLORENCE_SCHEMA_VERSION = 8
 
 FLORENCE_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS florence_schema_version (
@@ -53,6 +65,7 @@ CREATE TABLE IF NOT EXISTS onboarding_sessions (
     school_basics_collected INTEGER NOT NULL DEFAULT 0,
     activity_basics_collected INTEGER NOT NULL DEFAULT 0,
     group_channel_id TEXT,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -221,6 +234,112 @@ CREATE TABLE IF NOT EXISTS household_events (
 
 CREATE INDEX IF NOT EXISTS idx_household_events_household_time
 ON household_events(household_id, starts_at, status);
+
+CREATE TABLE IF NOT EXISTS household_work_items (
+    id TEXT PRIMARY KEY,
+    household_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT,
+    status TEXT NOT NULL,
+    owner_member_id TEXT,
+    child_id TEXT,
+    due_at TEXT,
+    starts_at TEXT,
+    completed_at TEXT,
+    metadata_json TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_household_work_items_household_status
+ON household_work_items(household_id, status, due_at, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS household_routines (
+    id TEXT PRIMARY KEY,
+    household_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    cadence TEXT NOT NULL,
+    description TEXT,
+    status TEXT NOT NULL,
+    owner_member_id TEXT,
+    child_id TEXT,
+    next_due_at TEXT,
+    last_completed_at TEXT,
+    metadata_json TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_household_routines_household_status
+ON household_routines(household_id, status, next_due_at, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS household_nudges (
+    id TEXT PRIMARY KEY,
+    household_id TEXT NOT NULL,
+    target_kind TEXT NOT NULL,
+    target_id TEXT,
+    message TEXT NOT NULL,
+    status TEXT NOT NULL,
+    recipient_member_id TEXT,
+    channel_id TEXT,
+    scheduled_for TEXT,
+    sent_at TEXT,
+    acknowledged_at TEXT,
+    metadata_json TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_household_nudges_household_status
+ON household_nudges(household_id, status, scheduled_for, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS household_meals (
+    id TEXT PRIMARY KEY,
+    household_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    meal_type TEXT NOT NULL,
+    scheduled_for TEXT NOT NULL,
+    description TEXT,
+    status TEXT NOT NULL,
+    metadata_json TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_household_meals_household_time
+ON household_meals(household_id, scheduled_for, status);
+
+CREATE TABLE IF NOT EXISTS household_shopping_items (
+    id TEXT PRIMARY KEY,
+    household_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    list_name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    quantity TEXT,
+    unit TEXT,
+    notes TEXT,
+    meal_id TEXT,
+    needed_by TEXT,
+    metadata_json TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_household_shopping_items_household_status
+ON household_shopping_items(household_id, list_name, status, needed_by, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS pilot_events (
+    id TEXT PRIMARY KEY,
+    household_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    member_id TEXT,
+    channel_id TEXT,
+    metadata_json TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_pilot_events_household_created
+ON pilot_events(household_id, created_at DESC);
 """
 
 
@@ -250,6 +369,7 @@ class FlorenceStateDB:
     def _init_schema(self) -> None:
         cursor = self._conn.cursor()
         cursor.executescript(FLORENCE_SCHEMA_SQL)
+        self._ensure_onboarding_session_columns()
         cursor.execute("SELECT version FROM florence_schema_version LIMIT 1")
         row = cursor.fetchone()
         if row is None:
@@ -257,6 +377,26 @@ class FlorenceStateDB:
         elif int(row["version"]) != FLORENCE_SCHEMA_VERSION:
             cursor.execute("UPDATE florence_schema_version SET version = ?", (FLORENCE_SCHEMA_VERSION,))
         self._conn.commit()
+
+    def _ensure_onboarding_session_columns(self) -> None:
+        columns = self._table_columns("onboarding_sessions")
+        if "metadata_json" not in columns:
+            self._conn.execute("ALTER TABLE onboarding_sessions ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'")
+
+    def _table_columns(self, table_name: str) -> set[str]:
+        database_str = str(self.database).strip().lower()
+        if database_str.startswith(("postgres://", "postgresql://")):
+            rows = self._conn.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_name = ? AND table_schema = current_schema()
+                """,
+                (table_name,),
+            ).fetchall()
+            return {str(row["column_name"]) for row in rows}
+        rows = self._conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        return {str(row["name"]) for row in rows}
 
     def close(self) -> None:
         if self._conn:
@@ -305,9 +445,10 @@ class FlorenceStateDB:
                 school_basics_collected,
                 activity_basics_collected,
                 group_channel_id,
+                metadata_json,
                 created_at,
                 updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(session_key) DO UPDATE SET
                 stage = excluded.stage,
                 parent_display_name = excluded.parent_display_name,
@@ -318,6 +459,7 @@ class FlorenceStateDB:
                 school_basics_collected = excluded.school_basics_collected,
                 activity_basics_collected = excluded.activity_basics_collected,
                 group_channel_id = excluded.group_channel_id,
+                metadata_json = excluded.metadata_json,
                 updated_at = excluded.updated_at
             """,
             (
@@ -334,6 +476,7 @@ class FlorenceStateDB:
                 1 if state.school_basics_collected else 0,
                 1 if state.activity_basics_collected else 0,
                 state.group_channel_id,
+                _json_dumps(state.metadata),
                 created_at,
                 now,
             ),
@@ -992,8 +1135,462 @@ class FlorenceStateDB:
         rows = self._conn.execute(query, tuple(params)).fetchall()
         return [self._row_to_household_event(row) for row in rows]
 
+    def get_household_work_item(self, work_item_id: str) -> HouseholdWorkItem | None:
+        row = self._conn.execute(
+            "SELECT * FROM household_work_items WHERE id = ?",
+            (work_item_id,),
+        ).fetchone()
+        return self._row_to_household_work_item(row) if row else None
+
+    def upsert_household_work_item(self, work_item: HouseholdWorkItem) -> HouseholdWorkItem:
+        now = time.time()
+        existing = self._conn.execute(
+            "SELECT created_at FROM household_work_items WHERE id = ?",
+            (work_item.id,),
+        ).fetchone()
+        created_at = float(existing["created_at"]) if existing else now
+        self._conn.execute(
+            """
+            INSERT INTO household_work_items (
+                id,
+                household_id,
+                title,
+                description,
+                status,
+                owner_member_id,
+                child_id,
+                due_at,
+                starts_at,
+                completed_at,
+                metadata_json,
+                created_at,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                household_id = excluded.household_id,
+                title = excluded.title,
+                description = excluded.description,
+                status = excluded.status,
+                owner_member_id = excluded.owner_member_id,
+                child_id = excluded.child_id,
+                due_at = excluded.due_at,
+                starts_at = excluded.starts_at,
+                completed_at = excluded.completed_at,
+                metadata_json = excluded.metadata_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                work_item.id,
+                work_item.household_id,
+                work_item.title,
+                work_item.description,
+                work_item.status.value,
+                work_item.owner_member_id,
+                work_item.child_id,
+                work_item.due_at,
+                work_item.starts_at,
+                work_item.completed_at,
+                _json_dumps(work_item.metadata),
+                created_at,
+                now,
+            ),
+        )
+        self._conn.commit()
+        return work_item
+
+    def list_household_work_items(
+        self,
+        *,
+        household_id: str,
+        status: HouseholdWorkItemStatus | None = None,
+        owner_member_id: str | None = None,
+    ) -> list[HouseholdWorkItem]:
+        params: list[object] = [household_id]
+        query = "SELECT * FROM household_work_items WHERE household_id = ?"
+        if status is not None:
+            query += " AND status = ?"
+            params.append(status.value)
+        if owner_member_id is not None:
+            query += " AND owner_member_id = ?"
+            params.append(owner_member_id)
+        query += " ORDER BY COALESCE(due_at, '') ASC, updated_at DESC, title ASC"
+        rows = self._conn.execute(query, tuple(params)).fetchall()
+        return [self._row_to_household_work_item(row) for row in rows]
+
+    def get_household_routine(self, routine_id: str) -> HouseholdRoutine | None:
+        row = self._conn.execute(
+            "SELECT * FROM household_routines WHERE id = ?",
+            (routine_id,),
+        ).fetchone()
+        return self._row_to_household_routine(row) if row else None
+
+    def upsert_household_routine(self, routine: HouseholdRoutine) -> HouseholdRoutine:
+        now = time.time()
+        existing = self._conn.execute(
+            "SELECT created_at FROM household_routines WHERE id = ?",
+            (routine.id,),
+        ).fetchone()
+        created_at = float(existing["created_at"]) if existing else now
+        self._conn.execute(
+            """
+            INSERT INTO household_routines (
+                id,
+                household_id,
+                title,
+                cadence,
+                description,
+                status,
+                owner_member_id,
+                child_id,
+                next_due_at,
+                last_completed_at,
+                metadata_json,
+                created_at,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                household_id = excluded.household_id,
+                title = excluded.title,
+                cadence = excluded.cadence,
+                description = excluded.description,
+                status = excluded.status,
+                owner_member_id = excluded.owner_member_id,
+                child_id = excluded.child_id,
+                next_due_at = excluded.next_due_at,
+                last_completed_at = excluded.last_completed_at,
+                metadata_json = excluded.metadata_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                routine.id,
+                routine.household_id,
+                routine.title,
+                routine.cadence,
+                routine.description,
+                routine.status.value,
+                routine.owner_member_id,
+                routine.child_id,
+                routine.next_due_at,
+                routine.last_completed_at,
+                _json_dumps(routine.metadata),
+                created_at,
+                now,
+            ),
+        )
+        self._conn.commit()
+        return routine
+
+    def list_household_routines(
+        self,
+        *,
+        household_id: str,
+        status: HouseholdRoutineStatus | None = None,
+        owner_member_id: str | None = None,
+    ) -> list[HouseholdRoutine]:
+        params: list[object] = [household_id]
+        query = "SELECT * FROM household_routines WHERE household_id = ?"
+        if status is not None:
+            query += " AND status = ?"
+            params.append(status.value)
+        if owner_member_id is not None:
+            query += " AND owner_member_id = ?"
+            params.append(owner_member_id)
+        query += " ORDER BY COALESCE(next_due_at, '') ASC, updated_at DESC, title ASC"
+        rows = self._conn.execute(query, tuple(params)).fetchall()
+        return [self._row_to_household_routine(row) for row in rows]
+
+    def get_household_nudge(self, nudge_id: str) -> HouseholdNudge | None:
+        row = self._conn.execute(
+            "SELECT * FROM household_nudges WHERE id = ?",
+            (nudge_id,),
+        ).fetchone()
+        return self._row_to_household_nudge(row) if row else None
+
+    def upsert_household_nudge(self, nudge: HouseholdNudge) -> HouseholdNudge:
+        now = time.time()
+        existing = self._conn.execute(
+            "SELECT created_at FROM household_nudges WHERE id = ?",
+            (nudge.id,),
+        ).fetchone()
+        created_at = float(existing["created_at"]) if existing else now
+        self._conn.execute(
+            """
+            INSERT INTO household_nudges (
+                id,
+                household_id,
+                target_kind,
+                target_id,
+                message,
+                status,
+                recipient_member_id,
+                channel_id,
+                scheduled_for,
+                sent_at,
+                acknowledged_at,
+                metadata_json,
+                created_at,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                household_id = excluded.household_id,
+                target_kind = excluded.target_kind,
+                target_id = excluded.target_id,
+                message = excluded.message,
+                status = excluded.status,
+                recipient_member_id = excluded.recipient_member_id,
+                channel_id = excluded.channel_id,
+                scheduled_for = excluded.scheduled_for,
+                sent_at = excluded.sent_at,
+                acknowledged_at = excluded.acknowledged_at,
+                metadata_json = excluded.metadata_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                nudge.id,
+                nudge.household_id,
+                nudge.target_kind.value,
+                nudge.target_id,
+                nudge.message,
+                nudge.status.value,
+                nudge.recipient_member_id,
+                nudge.channel_id,
+                nudge.scheduled_for,
+                nudge.sent_at,
+                nudge.acknowledged_at,
+                _json_dumps(nudge.metadata),
+                created_at,
+                now,
+            ),
+        )
+        self._conn.commit()
+        return nudge
+
+    def list_household_nudges(
+        self,
+        *,
+        household_id: str,
+        status: HouseholdNudgeStatus | None = None,
+        recipient_member_id: str | None = None,
+    ) -> list[HouseholdNudge]:
+        params: list[object] = [household_id]
+        query = "SELECT * FROM household_nudges WHERE household_id = ?"
+        if status is not None:
+            query += " AND status = ?"
+            params.append(status.value)
+        if recipient_member_id is not None:
+            query += " AND recipient_member_id = ?"
+            params.append(recipient_member_id)
+        query += " ORDER BY COALESCE(scheduled_for, '') ASC, updated_at DESC"
+        rows = self._conn.execute(query, tuple(params)).fetchall()
+        return [self._row_to_household_nudge(row) for row in rows]
+
+    def get_household_meal(self, meal_id: str) -> HouseholdMeal | None:
+        row = self._conn.execute(
+            "SELECT * FROM household_meals WHERE id = ?",
+            (meal_id,),
+        ).fetchone()
+        return self._row_to_household_meal(row) if row else None
+
+    def upsert_household_meal(self, meal: HouseholdMeal) -> HouseholdMeal:
+        now = time.time()
+        existing = self._conn.execute(
+            "SELECT created_at FROM household_meals WHERE id = ?",
+            (meal.id,),
+        ).fetchone()
+        created_at = float(existing["created_at"]) if existing else now
+        self._conn.execute(
+            """
+            INSERT INTO household_meals (
+                id,
+                household_id,
+                title,
+                meal_type,
+                scheduled_for,
+                description,
+                status,
+                metadata_json,
+                created_at,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                household_id = excluded.household_id,
+                title = excluded.title,
+                meal_type = excluded.meal_type,
+                scheduled_for = excluded.scheduled_for,
+                description = excluded.description,
+                status = excluded.status,
+                metadata_json = excluded.metadata_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                meal.id,
+                meal.household_id,
+                meal.title,
+                meal.meal_type,
+                meal.scheduled_for,
+                meal.description,
+                meal.status.value,
+                _json_dumps(meal.metadata),
+                created_at,
+                now,
+            ),
+        )
+        self._conn.commit()
+        return meal
+
+    def list_household_meals(
+        self,
+        *,
+        household_id: str,
+        status: HouseholdMealStatus | None = None,
+    ) -> list[HouseholdMeal]:
+        params: list[object] = [household_id]
+        query = "SELECT * FROM household_meals WHERE household_id = ?"
+        if status is not None:
+            query += " AND status = ?"
+            params.append(status.value)
+        query += " ORDER BY scheduled_for ASC, updated_at DESC"
+        rows = self._conn.execute(query, tuple(params)).fetchall()
+        return [self._row_to_household_meal(row) for row in rows]
+
+    def get_household_shopping_item(self, item_id: str) -> HouseholdShoppingItem | None:
+        row = self._conn.execute(
+            "SELECT * FROM household_shopping_items WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+        return self._row_to_household_shopping_item(row) if row else None
+
+    def upsert_household_shopping_item(self, item: HouseholdShoppingItem) -> HouseholdShoppingItem:
+        now = time.time()
+        existing = self._conn.execute(
+            "SELECT created_at FROM household_shopping_items WHERE id = ?",
+            (item.id,),
+        ).fetchone()
+        created_at = float(existing["created_at"]) if existing else now
+        self._conn.execute(
+            """
+            INSERT INTO household_shopping_items (
+                id,
+                household_id,
+                title,
+                list_name,
+                status,
+                quantity,
+                unit,
+                notes,
+                meal_id,
+                needed_by,
+                metadata_json,
+                created_at,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                household_id = excluded.household_id,
+                title = excluded.title,
+                list_name = excluded.list_name,
+                status = excluded.status,
+                quantity = excluded.quantity,
+                unit = excluded.unit,
+                notes = excluded.notes,
+                meal_id = excluded.meal_id,
+                needed_by = excluded.needed_by,
+                metadata_json = excluded.metadata_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                item.id,
+                item.household_id,
+                item.title,
+                item.list_name,
+                item.status.value,
+                item.quantity,
+                item.unit,
+                item.notes,
+                item.meal_id,
+                item.needed_by,
+                _json_dumps(item.metadata),
+                created_at,
+                now,
+            ),
+        )
+        self._conn.commit()
+        return item
+
+    def list_household_shopping_items(
+        self,
+        *,
+        household_id: str,
+        list_name: str | None = None,
+        status: HouseholdShoppingItemStatus | None = None,
+    ) -> list[HouseholdShoppingItem]:
+        params: list[object] = [household_id]
+        query = "SELECT * FROM household_shopping_items WHERE household_id = ?"
+        if list_name is not None:
+            query += " AND list_name = ?"
+            params.append(list_name)
+        if status is not None:
+            query += " AND status = ?"
+            params.append(status.value)
+        query += " ORDER BY COALESCE(needed_by, '') ASC, updated_at DESC, title ASC"
+        rows = self._conn.execute(query, tuple(params)).fetchall()
+        return [self._row_to_household_shopping_item(row) for row in rows]
+
+    def upsert_pilot_event(self, event: PilotEvent) -> PilotEvent:
+        self._conn.execute(
+            """
+            INSERT INTO pilot_events (
+                id,
+                household_id,
+                event_type,
+                member_id,
+                channel_id,
+                metadata_json,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                household_id = excluded.household_id,
+                event_type = excluded.event_type,
+                member_id = excluded.member_id,
+                channel_id = excluded.channel_id,
+                metadata_json = excluded.metadata_json,
+                created_at = excluded.created_at
+            """,
+            (
+                event.id,
+                event.household_id,
+                event.event_type,
+                event.member_id,
+                event.channel_id,
+                _json_dumps(event.metadata),
+                event.created_at,
+            ),
+        )
+        self._conn.commit()
+        return event
+
+    def list_pilot_events(
+        self,
+        *,
+        household_id: str,
+        event_type: str | None = None,
+        limit: int = 50,
+    ) -> list[PilotEvent]:
+        params: list[object] = [household_id]
+        query = "SELECT * FROM pilot_events WHERE household_id = ?"
+        if event_type is not None:
+            query += " AND event_type = ?"
+            params.append(event_type)
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(max(1, limit))
+        rows = self._conn.execute(query, tuple(params)).fetchall()
+        return [self._row_to_pilot_event(row) for row in rows]
+
     @staticmethod
     def _row_to_onboarding_state(row: RowLike) -> OnboardingState:
+        try:
+            metadata_raw = row["metadata_json"]
+        except (KeyError, IndexError, TypeError):
+            metadata_raw = None
         return OnboardingState(
             household_id=str(row["household_id"]),
             member_id=str(row["member_id"]),
@@ -1007,6 +1604,7 @@ class FlorenceStateDB:
             school_basics_collected=bool(row["school_basics_collected"]),
             activity_basics_collected=bool(row["activity_basics_collected"]),
             group_channel_id=str(row["group_channel_id"]) if row["group_channel_id"] is not None else None,
+            metadata=dict(_json_loads(metadata_raw, default={})),
         )
 
     @staticmethod
@@ -1138,4 +1736,94 @@ class FlorenceStateDB:
             source_candidate_id=str(row["source_candidate_id"]) if row["source_candidate_id"] is not None else None,
             status=HouseholdEventStatus(str(row["status"])),
             metadata=dict(_json_loads(row["metadata_json"], default={})),
+        )
+
+    @staticmethod
+    def _row_to_household_work_item(row: RowLike) -> HouseholdWorkItem:
+        return HouseholdWorkItem(
+            id=str(row["id"]),
+            household_id=str(row["household_id"]),
+            title=str(row["title"]),
+            description=str(row["description"]) if row["description"] is not None else None,
+            status=HouseholdWorkItemStatus(str(row["status"])),
+            owner_member_id=str(row["owner_member_id"]) if row["owner_member_id"] is not None else None,
+            child_id=str(row["child_id"]) if row["child_id"] is not None else None,
+            due_at=str(row["due_at"]) if row["due_at"] is not None else None,
+            starts_at=str(row["starts_at"]) if row["starts_at"] is not None else None,
+            completed_at=str(row["completed_at"]) if row["completed_at"] is not None else None,
+            metadata=dict(_json_loads(row["metadata_json"], default={})),
+        )
+
+    @staticmethod
+    def _row_to_household_routine(row: RowLike) -> HouseholdRoutine:
+        return HouseholdRoutine(
+            id=str(row["id"]),
+            household_id=str(row["household_id"]),
+            title=str(row["title"]),
+            cadence=str(row["cadence"]),
+            description=str(row["description"]) if row["description"] is not None else None,
+            status=HouseholdRoutineStatus(str(row["status"])),
+            owner_member_id=str(row["owner_member_id"]) if row["owner_member_id"] is not None else None,
+            child_id=str(row["child_id"]) if row["child_id"] is not None else None,
+            next_due_at=str(row["next_due_at"]) if row["next_due_at"] is not None else None,
+            last_completed_at=str(row["last_completed_at"]) if row["last_completed_at"] is not None else None,
+            metadata=dict(_json_loads(row["metadata_json"], default={})),
+        )
+
+    @staticmethod
+    def _row_to_household_nudge(row: RowLike) -> HouseholdNudge:
+        return HouseholdNudge(
+            id=str(row["id"]),
+            household_id=str(row["household_id"]),
+            target_kind=HouseholdNudgeTargetKind(str(row["target_kind"])),
+            target_id=str(row["target_id"]) if row["target_id"] is not None else None,
+            message=str(row["message"]),
+            status=HouseholdNudgeStatus(str(row["status"])),
+            recipient_member_id=str(row["recipient_member_id"]) if row["recipient_member_id"] is not None else None,
+            channel_id=str(row["channel_id"]) if row["channel_id"] is not None else None,
+            scheduled_for=str(row["scheduled_for"]) if row["scheduled_for"] is not None else None,
+            sent_at=str(row["sent_at"]) if row["sent_at"] is not None else None,
+            acknowledged_at=str(row["acknowledged_at"]) if row["acknowledged_at"] is not None else None,
+            metadata=dict(_json_loads(row["metadata_json"], default={})),
+        )
+
+    @staticmethod
+    def _row_to_household_meal(row: RowLike) -> HouseholdMeal:
+        return HouseholdMeal(
+            id=str(row["id"]),
+            household_id=str(row["household_id"]),
+            title=str(row["title"]),
+            meal_type=str(row["meal_type"]),
+            scheduled_for=str(row["scheduled_for"]),
+            description=str(row["description"]) if row["description"] is not None else None,
+            status=HouseholdMealStatus(str(row["status"])),
+            metadata=dict(_json_loads(row["metadata_json"], default={})),
+        )
+
+    @staticmethod
+    def _row_to_household_shopping_item(row: RowLike) -> HouseholdShoppingItem:
+        return HouseholdShoppingItem(
+            id=str(row["id"]),
+            household_id=str(row["household_id"]),
+            title=str(row["title"]),
+            list_name=str(row["list_name"]),
+            status=HouseholdShoppingItemStatus(str(row["status"])),
+            quantity=str(row["quantity"]) if row["quantity"] is not None else None,
+            unit=str(row["unit"]) if row["unit"] is not None else None,
+            notes=str(row["notes"]) if row["notes"] is not None else None,
+            meal_id=str(row["meal_id"]) if row["meal_id"] is not None else None,
+            needed_by=str(row["needed_by"]) if row["needed_by"] is not None else None,
+            metadata=dict(_json_loads(row["metadata_json"], default={})),
+        )
+
+    @staticmethod
+    def _row_to_pilot_event(row: RowLike) -> PilotEvent:
+        return PilotEvent(
+            id=str(row["id"]),
+            household_id=str(row["household_id"]),
+            event_type=str(row["event_type"]),
+            member_id=str(row["member_id"]) if row["member_id"] is not None else None,
+            channel_id=str(row["channel_id"]) if row["channel_id"] is not None else None,
+            metadata=dict(_json_loads(row["metadata_json"], default={})),
+            created_at=float(row["created_at"]),
         )

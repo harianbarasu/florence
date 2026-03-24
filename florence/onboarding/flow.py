@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-from florence.onboarding.state import OnboardingStage, OnboardingState
+from florence.onboarding.state import OnboardingStage, OnboardingState, OnboardingVariant
 
 
 @dataclass(slots=True)
@@ -25,16 +25,26 @@ def sync_onboarding_stage(state: OnboardingState) -> OnboardingState:
     """Return a copy of the state with the canonical next stage applied."""
     if state.group_channel_id:
         return replace(state, stage=OnboardingStage.COMPLETE)
-    if state.activity_basics_collected:
+    if state.is_complete:
         return replace(state, stage=OnboardingStage.COMPLETE)
+    if state.variant == OnboardingVariant.CONCIERGE and not state.household_members:
+        return replace(state, stage=OnboardingStage.COLLECT_HOUSEHOLD_MEMBERS)
+    if state.household_operations and not state.google_connected:
+        return replace(state, stage=OnboardingStage.CONNECT_GOOGLE)
+    if state.operating_preferences:
+        return replace(state, stage=OnboardingStage.COMPLETE)
+    if state.nudge_preferences:
+        return replace(state, stage=OnboardingStage.COLLECT_OPERATING_PREFERENCES)
+    if state.household_operations:
+        return replace(state, stage=OnboardingStage.COLLECT_NUDGE_PREFERENCES)
     if state.school_basics_collected:
+        if state.activity_basics_collected:
+            return replace(state, stage=OnboardingStage.COLLECT_HOUSEHOLD_OPERATIONS)
         return replace(state, stage=OnboardingStage.COLLECT_ACTIVITY_BASICS)
     if state.child_names:
         return replace(state, stage=OnboardingStage.COLLECT_SCHOOL_BASICS)
-    if state.google_connected:
-        return replace(state, stage=OnboardingStage.COLLECT_CHILD_NAMES)
     if state.parent_display_name:
-        return replace(state, stage=OnboardingStage.CONNECT_GOOGLE)
+        return replace(state, stage=OnboardingStage.COLLECT_CHILD_NAMES)
     return replace(state, stage=OnboardingStage.COLLECT_PARENT_NAME)
 
 
@@ -54,14 +64,28 @@ def build_google_connect_message_sequence(
         messages.extend(
             [
                 "Hi, I'm Florence.",
-                "I help keep your household organized by keeping up with school emails, calendar invites, and schedule changes.",
+                "I help run the household with you by tracking logistics, surfacing reminders, and staying on top of school and calendar noise.",
             ]
         )
-    messages.append("First step: connect your Google account so I can start syncing Gmail and Calendar.")
+    messages.append("Next step: connect your Google account so I can compare Gmail and Calendar against the household context you just gave me.")
     if link_url:
         messages.append(link_url)
     messages.append("When you're done, reply done here and I'll keep going.")
     return tuple(messages)
+
+
+def _replace_metadata_list(state: OnboardingState, key: str, values: list[str]) -> OnboardingState:
+    metadata = dict(state.metadata)
+    cleaned = [value for value in (" ".join(raw.split()).strip() for raw in values) if value]
+    metadata[key] = cleaned
+    return replace(state, metadata=metadata)
+
+
+def _replace_metadata_text(state: OnboardingState, key: str, value: str) -> OnboardingState:
+    metadata = dict(state.metadata)
+    cleaned = " ".join(value.split()).strip()
+    metadata[key] = cleaned
+    return replace(state, metadata=metadata)
 
 
 def build_onboarding_prompt(state: OnboardingState) -> OnboardingPrompt | None:
@@ -73,6 +97,15 @@ def build_onboarding_prompt(state: OnboardingState) -> OnboardingPrompt | None:
             text="What should I call you?",
         )
 
+    if current.stage == OnboardingStage.COLLECT_HOUSEHOLD_MEMBERS:
+        return OnboardingPrompt(
+            stage=current.stage,
+            text=(
+                "Let's build the household map first. Who is in your family unit? "
+                "Reply one per line or comma-separated, like Maya - mom, Ben - dad, Ava - daughter."
+            ),
+        )
+
     if current.stage == OnboardingStage.CONNECT_GOOGLE:
         return OnboardingPrompt(
             stage=current.stage,
@@ -81,26 +114,84 @@ def build_onboarding_prompt(state: OnboardingState) -> OnboardingPrompt | None:
         )
 
     if current.stage == OnboardingStage.COLLECT_CHILD_NAMES:
+        if current.variant == OnboardingVariant.CONCIERGE:
+            text = (
+                "Tell me about each child I should track: first name plus nickname, grade, or age if helpful. "
+                "One per line works well, like Ava - goes by Aves - 3rd grade."
+            )
+        else:
+            text = (
+                "Start with the kids I should know about: first name plus grade or age if helpful. "
+                "One per line or comma-separated is fine."
+            )
         return OnboardingPrompt(
             stage=current.stage,
-            text="What are your children's first names?",
+            text=text,
         )
 
     if current.stage == OnboardingStage.COLLECT_SCHOOL_BASICS:
         child_list = ", ".join(current.child_names)
-        if len(current.child_names) == 1:
-            prompt = f"Which school, daycare, or preschool does {child_list} attend?"
+        if current.variant == OnboardingVariant.CONCIERGE:
+            if len(current.child_names) == 1:
+                prompt = f"Which school, daycare, preschool, or camp should I know for {child_list}? Include who it belongs to if there is any ambiguity."
+            else:
+                prompt = f"Which schools, daycares, preschools, or camps should I know for {child_list}? Include which child goes with which place."
         else:
-            prompt = f"Which schools, daycares, or preschools should I know for {child_list}?"
+            if len(current.child_names) == 1:
+                prompt = f"Which school, daycare, or preschool does {child_list} attend?"
+            else:
+                prompt = f"Which schools, daycares, or preschools should I know for {child_list}?"
         return OnboardingPrompt(stage=current.stage, text=prompt)
 
     if current.stage == OnboardingStage.COLLECT_ACTIVITY_BASICS:
         child_list = ", ".join(current.child_names)
-        if len(current.child_names) == 1:
-            prompt = f"What recurring activities should I know about for {child_list}? If none yet, say none."
+        if current.variant == OnboardingVariant.CONCIERGE:
+            prompt = (
+                f"What recurring activities, teams, lessons, or clubs should I know for {child_list}? "
+                "If helpful, include the child, like Ava soccer or Noah piano. If none yet, say none."
+            )
         else:
             prompt = f"What recurring activities should I know about for {child_list}? If none yet, say none."
         return OnboardingPrompt(stage=current.stage, text=prompt)
+
+    if current.stage == OnboardingStage.COLLECT_HOUSEHOLD_OPERATIONS:
+        if current.variant == OnboardingVariant.CONCIERGE:
+            text = (
+                "What recurring household logistics do you want me to help manage like a house manager? "
+                "Think lunches, school forms, practice logistics, birthday gifts, bills, returns, camps, appointments, or anything else you mentally track."
+            )
+        else:
+            text = (
+                "What recurring logistics or reminders should I help manage first? "
+                "A short list is fine: lunches, forms, returns, bills, sports, appointments, birthdays, and so on."
+            )
+        return OnboardingPrompt(stage=current.stage, text=text)
+
+    if current.stage == OnboardingStage.COLLECT_NUDGE_PREFERENCES:
+        if current.variant == OnboardingVariant.CONCIERGE:
+            text = (
+                "How proactive should I be with reminders and nudges? "
+                "Tell me what deserves nudges, how early I should remind you, and whether I should keep following up until you reply."
+            )
+        else:
+            text = (
+                "How proactive should I be with reminders and nudges? "
+                "For example: day before and morning of, same-day only, or keep nudging until acknowledged."
+            )
+        return OnboardingPrompt(stage=current.stage, text=text)
+
+    if current.stage == OnboardingStage.COLLECT_OPERATING_PREFERENCES:
+        if current.variant == OnboardingVariant.CONCIERGE:
+            text = (
+                "Any house rules for how I should operate as your house manager? "
+                "Think quiet hours, morning brief or evening check-in preferences, who should get what, when I should ask before acting, and how proactive is too proactive."
+            )
+        else:
+            text = (
+                "Any house rules for how I should operate? "
+                "For example: weekday morning brief at 6:45, evening check-in only on school nights, don't text after 9pm, and always ask before spending money or messaging other adults."
+            )
+        return OnboardingPrompt(stage=current.stage, text=text)
 
     return None
 
@@ -124,13 +215,21 @@ def mark_google_connected(state: OnboardingState) -> OnboardingTransition:
     )
 
 
-def apply_child_names(state: OnboardingState, child_names: list[str]) -> OnboardingTransition:
+def apply_child_names(
+    state: OnboardingState,
+    child_names: list[str],
+    *,
+    child_details: list[str] | None = None,
+) -> OnboardingTransition:
     cleaned = [name for name in (" ".join(raw.split()).strip() for raw in child_names) if name]
-    next_state = sync_onboarding_stage(replace(state, child_names=cleaned))
+    next_state = replace(state, child_names=cleaned)
+    if child_details is not None:
+        next_state = _replace_metadata_list(next_state, "child_details", child_details)
+    next_state = sync_onboarding_stage(next_state)
     return OnboardingTransition(
         state=next_state,
         prompt=build_onboarding_prompt(next_state),
-        changed=cleaned != state.child_names,
+        changed=cleaned != state.child_names or (child_details is not None and next_state.child_details != state.child_details),
     )
 
 
@@ -163,6 +262,42 @@ def apply_activity_basics(state: OnboardingState, activity_labels: list[str]) ->
         state=next_state,
         prompt=build_onboarding_prompt(next_state),
         changed=cleaned != state.activity_labels or not state.activity_basics_collected,
+    )
+
+
+def apply_household_members(state: OnboardingState, household_members: list[str]) -> OnboardingTransition:
+    next_state = sync_onboarding_stage(_replace_metadata_list(state, "household_members", household_members))
+    return OnboardingTransition(
+        state=next_state,
+        prompt=build_onboarding_prompt(next_state),
+        changed=next_state.household_members != state.household_members,
+    )
+
+
+def apply_household_operations(state: OnboardingState, household_operations: list[str]) -> OnboardingTransition:
+    next_state = sync_onboarding_stage(_replace_metadata_list(state, "household_operations", household_operations))
+    return OnboardingTransition(
+        state=next_state,
+        prompt=build_onboarding_prompt(next_state),
+        changed=next_state.household_operations != state.household_operations,
+    )
+
+
+def apply_nudge_preferences(state: OnboardingState, nudge_preferences: str) -> OnboardingTransition:
+    next_state = sync_onboarding_stage(_replace_metadata_text(state, "nudge_preferences", nudge_preferences))
+    return OnboardingTransition(
+        state=next_state,
+        prompt=build_onboarding_prompt(next_state),
+        changed=next_state.nudge_preferences != state.nudge_preferences,
+    )
+
+
+def apply_operating_preferences(state: OnboardingState, operating_preferences: str) -> OnboardingTransition:
+    next_state = sync_onboarding_stage(_replace_metadata_text(state, "operating_preferences", operating_preferences))
+    return OnboardingTransition(
+        state=next_state,
+        prompt=build_onboarding_prompt(next_state),
+        changed=next_state.operating_preferences != state.operating_preferences,
     )
 
 

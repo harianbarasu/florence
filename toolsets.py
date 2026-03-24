@@ -79,6 +79,16 @@ _FLORENCE_HOUSEHOLD_TOOLS = [
     "todo", "clarify",
     "schedule_cronjob", "list_cronjobs", "remove_cronjob",
     "send_message",
+    "household_search_state",
+    "household_upsert_work_item",
+    "household_upsert_routine",
+    "household_schedule_nudge",
+    "household_upsert_meal",
+    "household_upsert_shopping_item",
+]
+
+_FLORENCE_BRIEFING_TOOLS = [
+    "household_search_state",
 ]
 
 
@@ -220,6 +230,12 @@ TOOLSETS = {
     "florence_chat": {
         "description": "Florence household-general Hermes profile without coding or admin tools",
         "tools": _FLORENCE_HOUSEHOLD_TOOLS,
+        "includes": []
+    },
+
+    "florence_briefing": {
+        "description": "Florence briefing profile (read-only household state lookup)",
+        "tools": _FLORENCE_BRIEFING_TOOLS,
         "includes": []
     },
 

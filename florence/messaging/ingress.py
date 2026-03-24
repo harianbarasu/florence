@@ -19,6 +19,7 @@ from florence.runtime.chat import FlorenceHouseholdChatService
 from florence.runtime.services import (
     FlorenceCandidateReviewService,
     FlorenceGoogleAccountLinkService,
+    FlorenceHouseholdManagerService,
     FlorenceHouseholdQueryService,
     FlorenceOnboardingSessionService,
 )
@@ -72,10 +73,40 @@ def _looks_like_schedule_question(text: str) -> bool:
     return bool(re.search(r"\b(today|this week|coming up|schedule|happening)\b", text, re.IGNORECASE))
 
 
+def _looks_like_tracking_request(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:what\s+are\s+you\s+tracking|what\s+are\s+you\s+managing|show\s+tracking|what\s+do\s+you\s+have)\b",
+            text,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _looks_like_reminder_list_request(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:show|list|what\s+are)\s+(?:my\s+)?(?:reminders|nudges|follow[- ]?ups)\b",
+            text,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _looks_like_reminder_feedback(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:too many reminders|fewer reminders|less proactive|more proactive|more reminders|too early|too late|nudge me less|nudge me more|stop pinging so much)\b",
+            text,
+            re.IGNORECASE,
+        )
+    )
+
+
 def _onboarding_ready_messages() -> tuple[str, ...]:
     return (
-        "Perfect. I have enough household context to help now.",
-        "You can keep asking me here, and you can add me to the family group later if you want shared help there too.",
+        "Perfect. I have enough context to start acting like your household manager.",
+        "You can ask me to plan, remind, research, coordinate, and stay on top of the family's logistics here.",
     )
 
 
@@ -84,10 +115,28 @@ def _split_names(text: str) -> list[str]:
     return [part.strip(" .,!?:;") for part in normalized.split(",") if part.strip(" .,!?:;")]
 
 
+def _split_entries(text: str) -> list[str]:
+    if "\n" in text:
+        return [part.strip(" .,!?:;") for part in text.splitlines() if part.strip(" .,!?:;")]
+    if ";" in text:
+        return [part.strip(" .,!?:;") for part in text.split(";") if part.strip(" .,!?:;")]
+    return _split_names(text)
+
+
 def _split_labels(text: str) -> list[str]:
     if re.search(r"^\s*none\b", text, re.IGNORECASE):
         return []
     return _split_names(text)
+
+
+def _extract_child_names(entries: list[str]) -> list[str]:
+    child_names: list[str] = []
+    for entry in entries:
+        head = re.split(r"\s*(?:-|:|\(|,)\s*", entry, maxsplit=1)[0]
+        cleaned = " ".join(head.split()).strip(" .,!?:;")
+        if cleaned:
+            child_names.append(cleaned)
+    return child_names
 
 
 def _require_member_id(member_id: str | None) -> str:
@@ -118,6 +167,7 @@ class FlorenceMessagingIngressService:
         *,
         google_account_link_service: FlorenceGoogleAccountLinkService | None = None,
         household_chat_service: FlorenceHouseholdChatService | None = None,
+        household_manager_service: FlorenceHouseholdManagerService | None = None,
     ):
         self.store = store
         self.onboarding_service = onboarding_service
@@ -125,6 +175,7 @@ class FlorenceMessagingIngressService:
         self.query_service = query_service
         self.google_account_link_service = google_account_link_service
         self.household_chat_service = household_chat_service
+        self.household_manager_service = household_manager_service or FlorenceHouseholdManagerService(store)
 
     def handle_message(self, resolved: FlorenceResolvedInboundMessage) -> FlorenceMessagingIngressResult:
         if resolved.message.is_from_me:
@@ -193,16 +244,24 @@ class FlorenceMessagingIngressService:
     ) -> tuple[str, ...]:
         if prompt is None:
             return ()
+        intro: tuple[str, ...] = (
+            (
+                "Hi, I'm Florence.",
+                "I help run the household with you by learning the family map first, then keeping up with reminders, logistics, school noise, and schedule changes.",
+            )
+            if include_intro
+            else ()
+        )
         if prompt.stage == OnboardingStage.CONNECT_GOOGLE and self.google_account_link_service is not None:
             link = self.google_account_link_service.build_connect_link(
                 household_id=household_id,
                 member_id=member_id,
                 thread_id=thread_id,
             )
-            return build_google_connect_message_sequence(link.url, include_intro=include_intro)
+            return intro + build_google_connect_message_sequence(link.url)
         if prompt.stage == OnboardingStage.CONNECT_GOOGLE:
-            return build_google_connect_message_sequence(include_intro=include_intro)
-        return (prompt.text,)
+            return intro + build_google_connect_message_sequence()
+        return intro + (prompt.text,)
 
     @staticmethod
     def _result_with_messages(
@@ -299,6 +358,33 @@ class FlorenceMessagingIngressService:
                 consumed=True,
             )
 
+        if _looks_like_tracking_request(text):
+            return FlorenceMessagingIngressResult(
+                reply_text=self.query_service.summarize_tracking_state(household_id=resolved.household_id),
+                consumed=True,
+            )
+
+        if _looks_like_reminder_list_request(text):
+            return FlorenceMessagingIngressResult(
+                reply_text=self.query_service.summarize_pending_nudges(household_id=resolved.household_id),
+                consumed=True,
+            )
+
+        if _looks_like_reminder_feedback(text):
+            self.household_manager_service.record_reminder_feedback(
+                household_id=resolved.household_id,
+                feedback_text=text,
+                member_id=member_id,
+                channel_id=resolved.channel_id,
+            )
+            return FlorenceMessagingIngressResult(
+                reply_text=(
+                    "Understood. I updated your reminder style and will adjust future nudges accordingly. "
+                    "You can ask me to show reminders anytime."
+                ),
+                consumed=True,
+            )
+
         if self.household_chat_service is not None:
             history = self.store.list_channel_messages(channel_id=resolved.channel_id, limit=24)
             reply = self.household_chat_service.respond(
@@ -345,6 +431,22 @@ class FlorenceMessagingIngressService:
                 )
             )
 
+        if stage == OnboardingStage.COLLECT_HOUSEHOLD_MEMBERS:
+            transition = self.onboarding_service.record_household_members(
+                household_id=resolved.household_id,
+                member_id=member_id,
+                thread_id=resolved.thread_id,
+                household_members=_split_entries(text),
+            )
+            return self._result_with_messages(
+                self._render_onboarding_prompt_messages(
+                    household_id=resolved.household_id,
+                    member_id=member_id,
+                    thread_id=resolved.thread_id,
+                    prompt=transition.prompt,
+                )
+            )
+
         if stage == OnboardingStage.CONNECT_GOOGLE:
             if _looks_like_google_connected(text):
                 transition = self.onboarding_service.record_google_connected(
@@ -375,11 +477,13 @@ class FlorenceMessagingIngressService:
             )
 
         if stage == OnboardingStage.COLLECT_CHILD_NAMES:
+            entries = _split_entries(text)
             transition = self.onboarding_service.record_child_names(
                 household_id=resolved.household_id,
                 member_id=member_id,
                 thread_id=resolved.thread_id,
-                child_names=_split_names(text),
+                child_names=_extract_child_names(entries),
+                child_details=entries,
             )
             return self._result_with_messages(
                 self._render_onboarding_prompt_messages(
@@ -414,6 +518,68 @@ class FlorenceMessagingIngressService:
                 activity_labels=_split_labels(text),
             )
             if transition.state.is_complete:
+                return self._result_with_messages(_onboarding_ready_messages())
+            return self._result_with_messages(
+                self._render_onboarding_prompt_messages(
+                    household_id=resolved.household_id,
+                    member_id=member_id,
+                    thread_id=resolved.thread_id,
+                    prompt=transition.prompt,
+                )
+            )
+
+        if stage == OnboardingStage.COLLECT_HOUSEHOLD_OPERATIONS:
+            transition = self.onboarding_service.record_household_operations(
+                household_id=resolved.household_id,
+                member_id=member_id,
+                thread_id=resolved.thread_id,
+                household_operations=_split_entries(text),
+            )
+            return self._result_with_messages(
+                self._render_onboarding_prompt_messages(
+                    household_id=resolved.household_id,
+                    member_id=member_id,
+                    thread_id=resolved.thread_id,
+                    prompt=transition.prompt,
+                )
+            )
+
+        if stage == OnboardingStage.COLLECT_NUDGE_PREFERENCES:
+            transition = self.onboarding_service.record_nudge_preferences(
+                household_id=resolved.household_id,
+                member_id=member_id,
+                thread_id=resolved.thread_id,
+                nudge_preferences=text,
+            )
+            if transition.state.is_complete:
+                self._record_onboarding_completion(
+                    household_id=resolved.household_id,
+                    member_id=member_id,
+                    channel_id=resolved.channel_id,
+                )
+                return self._result_with_messages(_onboarding_ready_messages())
+            return self._result_with_messages(
+                self._render_onboarding_prompt_messages(
+                    household_id=resolved.household_id,
+                    member_id=member_id,
+                    thread_id=resolved.thread_id,
+                    prompt=transition.prompt,
+                )
+            )
+
+        if stage == OnboardingStage.COLLECT_OPERATING_PREFERENCES:
+            transition = self.onboarding_service.record_operating_preferences(
+                household_id=resolved.household_id,
+                member_id=member_id,
+                thread_id=resolved.thread_id,
+                operating_preferences=text,
+            )
+            if transition.state.is_complete:
+                self._record_onboarding_completion(
+                    household_id=resolved.household_id,
+                    member_id=member_id,
+                    channel_id=resolved.channel_id,
+                )
                 return self._result_with_messages(_onboarding_ready_messages())
             return self._result_with_messages(
                 self._render_onboarding_prompt_messages(
@@ -490,3 +656,15 @@ class FlorenceMessagingIngressService:
                 return FlorenceMessagingIngressResult(reply_text=reply.text, consumed=True)
 
         return FlorenceMessagingIngressResult(consumed=False)
+
+    def _record_onboarding_completion(self, *, household_id: str, member_id: str, channel_id: str) -> None:
+        try:
+            self.household_manager_service.ensure_briefing_routines(household_id=household_id)
+            self.household_manager_service.record_pilot_event(
+                household_id=household_id,
+                event_type="onboarding_complete",
+                member_id=member_id,
+                channel_id=channel_id,
+            )
+        except Exception:
+            logger.exception("Failed to finalize onboarding completion hooks for household_id=%s", household_id)

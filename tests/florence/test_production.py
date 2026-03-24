@@ -1,4 +1,5 @@
 import json
+import threading
 import time
 from dataclasses import replace
 from urllib.parse import parse_qs, urlparse
@@ -10,7 +11,18 @@ from florence.config import (
     FlorenceServerRuntimeConfig,
     FlorenceSettings,
 )
-from florence.contracts import Channel, ChannelType, Household, HouseholdRoutine, HouseholdRoutineStatus, Member, MemberRole
+from florence.contracts import (
+    CandidateState,
+    Channel,
+    ChannelType,
+    GoogleSourceKind,
+    Household,
+    HouseholdRoutine,
+    HouseholdRoutineStatus,
+    ImportedCandidate,
+    Member,
+    MemberRole,
+)
 from florence.google import GoogleCalendarMetadata, GoogleTokenResponse
 from florence.onboarding import OnboardingVariant
 from florence.runtime import FlorenceEntrypointResult, FlorenceProductionService
@@ -222,6 +234,107 @@ def test_production_service_google_callback_sends_dm_follow_up(tmp_path, monkeyp
     store.close()
 
 
+def test_production_service_google_callback_keeps_onboarding_prompt_separate_from_review(tmp_path, monkeypatch):
+    settings = _build_settings(tmp_path)
+    store = FlorenceStateDB(settings.server.db_path)
+    service = FlorenceProductionService(settings, store=store)
+    service.entrypoints.onboarding_service.variant_selector = lambda _household_id, _member_id: OnboardingVariant.HYBRID
+    service.linq = _FakeLinqClient()
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    service.entrypoints.onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        display_name="Maya",
+    )
+    service.entrypoints.onboarding_service.record_child_names(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        child_names=["Ava"],
+    )
+    service.entrypoints.onboarding_service.record_school_basics(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        school_labels=["Roosevelt Elementary"],
+    )
+    service.entrypoints.onboarding_service.record_activity_basics(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        activity_labels=["Soccer"],
+    )
+    service.entrypoints.onboarding_service.record_household_operations(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        household_operations=["school forms", "pickup planning"],
+    )
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_123",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail_123",
+            title="Pending review candidate",
+            summary="Needs confirmation.",
+            state=CandidateState.PENDING_REVIEW,
+            requires_confirmation=True,
+            metadata={"confirmation_question": "Should I add this?"},
+        )
+    )
+
+    link = service.entrypoints.google_account_link_service.build_connect_link(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        now_ms=int(time.time() * 1000),
+        nonce="nonce-123",
+    )
+    raw_state = parse_qs(urlparse(link.url).query)["state"][0]
+
+    monkeypatch.setattr(
+        "florence.runtime.services.exchange_google_code_for_tokens",
+        lambda **_: GoogleTokenResponse(
+            access_token="access-token",
+            refresh_token="refresh-token",
+            expires_in=3600,
+        ),
+    )
+    monkeypatch.setattr("florence.runtime.services.fetch_google_user_email", lambda **_: "parent@example.com")
+    monkeypatch.setattr(
+        "florence.runtime.services.fetch_primary_google_calendar",
+        lambda **_: GoogleCalendarMetadata(
+            id="primary",
+            summary="Family",
+            timezone="America/Los_Angeles",
+            access_role="owner",
+        ),
+    )
+    monkeypatch.setattr("florence.runtime.services.list_recent_gmail_sync_items", lambda **_: [])
+    monkeypatch.setattr("florence.runtime.services.list_recent_parent_calendar_sync_items", lambda **_: [])
+
+    result = service.handle_google_callback(code="auth-code", state=raw_state)
+
+    assert result.status_code == 200
+    assert len(service.linq.sent) == 1
+    assert "How proactive should I be with reminders and nudges?" in service.linq.sent[0]["message"]
+    assert "Imported item:" not in service.linq.sent[0]["message"]
+    store.close()
+
+
 def test_production_service_first_dm_sends_onboarding_sequence_as_separate_messages(tmp_path):
     settings = _build_settings(tmp_path)
     store = FlorenceStateDB(settings.server.db_path)
@@ -334,6 +447,91 @@ def test_production_service_ignores_duplicate_linq_message_ids(tmp_path):
     assert first.status_code == 200
     assert second.status_code == 200
     assert len(service.linq.sent) == sent_count_after_first
+    store.close()
+
+
+def test_production_service_serializes_webhook_processing_per_chat(tmp_path, monkeypatch):
+    settings = _build_settings(tmp_path)
+    store = FlorenceStateDB(settings.server.db_path)
+    service = FlorenceProductionService(settings, store=store)
+    service.linq = _FakeLinqClient()
+
+    counter_lock = threading.Lock()
+    state = {"calls": 0, "active": 0, "max_active": 0}
+    second_entered = threading.Event()
+
+    def fake_handle(_payload):
+        with counter_lock:
+            state["calls"] += 1
+            call_number = state["calls"]
+            state["active"] += 1
+            state["max_active"] = max(state["max_active"], state["active"])
+        # If calls can overlap for the same chat, this first call waits and the
+        # second call will enter and set the event. With per-chat locking that
+        # second call cannot enter until the first exits.
+        if call_number == 1:
+            second_entered.wait(timeout=0.2)
+        else:
+            second_entered.set()
+        time.sleep(0.03)
+        with counter_lock:
+            state["active"] -= 1
+        return FlorenceEntrypointResult(consumed=True)
+
+    monkeypatch.setattr(service.entrypoints, "handle_linq_payload", fake_handle)
+
+    payload_one = {
+        "webhook_version": "2026-02-03",
+        "event_type": "message.received",
+        "data": {
+            "chat": {"id": "dm-thread-serial-1", "is_group": False},
+            "id": "msg_serial_1",
+            "direction": "inbound",
+            "sender_handle": {"handle": "+15555550123", "is_me": False},
+            "parts": [{"type": "text", "value": "first"}],
+            "service": "iMessage",
+        },
+    }
+    payload_two = {
+        "webhook_version": "2026-02-03",
+        "event_type": "message.received",
+        "data": {
+            "chat": {"id": "dm-thread-serial-1", "is_group": False},
+            "id": "msg_serial_2",
+            "direction": "inbound",
+            "sender_handle": {"handle": "+15555550123", "is_me": False},
+            "parts": [{"type": "text", "value": "second"}],
+            "service": "iMessage",
+        },
+    }
+    raw_one = json.dumps(payload_one).encode("utf-8")
+    raw_two = json.dumps(payload_two).encode("utf-8")
+
+    start = threading.Event()
+    results = []
+
+    def run(payload, raw_body):
+        start.wait(timeout=1)
+        results.append(
+            service.handle_linq_webhook(
+                payload=payload,
+                raw_body=raw_body,
+                webhook_signature="sig",
+                webhook_timestamp=str(int(time.time())),
+            )
+        )
+
+    t1 = threading.Thread(target=run, args=(payload_one, raw_one))
+    t2 = threading.Thread(target=run, args=(payload_two, raw_two))
+    t1.start()
+    t2.start()
+    start.set()
+    t1.join(timeout=2)
+    t2.join(timeout=2)
+
+    assert len(results) == 2
+    assert all(result.status_code == 200 for result in results)
+    assert state["max_active"] == 1
     store.close()
 
 

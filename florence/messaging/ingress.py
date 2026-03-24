@@ -33,6 +33,7 @@ from florence.runtime.services import (
 from florence.state import FlorenceStateDB
 
 logger = logging.getLogger(__name__)
+_REVIEW_CONFIRMATION_SUFFIX = "Reply yes to confirm it, no if it is wrong, or skip for later."
 
 
 @dataclass(slots=True)
@@ -70,6 +71,11 @@ def _looks_like_skip(text: str) -> bool:
 
 def _looks_like_review_request(text: str) -> bool:
     return bool(re.search(r"\b(review|imports?|gmail|calendar|candidates?)\b", text, re.IGNORECASE))
+
+
+def _looks_like_candidate_review_prompt(text: str) -> bool:
+    normalized = text.strip()
+    return "Imported item:" in normalized and _REVIEW_CONFIRMATION_SUFFIX in normalized
 
 
 def _looks_like_google_connected(text: str) -> bool:
@@ -427,6 +433,26 @@ class FlorenceMessagingIngressService:
             )
         )
 
+    def _is_candidate_review_reply_armed(self, *, channel_id: str, review_prompt_text: str) -> bool:
+        history = self.store.list_channel_messages(channel_id=channel_id, limit=8)
+        latest_assistant = next(
+            (
+                message
+                for message in reversed(history)
+                if message.sender_role == ChannelMessageRole.ASSISTANT
+            ),
+            None,
+        )
+        if latest_assistant is None:
+            return False
+
+        latest_body = latest_assistant.body.strip()
+        if not latest_body:
+            return False
+        if latest_body == review_prompt_text.strip():
+            return True
+        return _looks_like_candidate_review_prompt(latest_body)
+
     def _handle_dm_message(self, resolved: FlorenceResolvedInboundMessage) -> FlorenceMessagingIngressResult:
         text = resolved.message.body.strip()
         member_id = _require_member_id(resolved.member_id)
@@ -443,17 +469,21 @@ class FlorenceMessagingIngressService:
                 member_id=member_id,
             )
             if review_prompt is not None:
-                if _looks_like_yes(text):
+                review_reply_armed = self._is_candidate_review_reply_armed(
+                    channel_id=resolved.channel_id,
+                    review_prompt_text=review_prompt.text,
+                )
+                if review_reply_armed and _looks_like_yes(text):
                     result = self.candidate_review_service.confirm_candidate(candidate_id=review_prompt.candidate.id)
                     return FlorenceMessagingIngressResult(
                         reply_text=f"Confirmed. I added {result.event.title} to the family plan." if result.event else "Confirmed.",
                         group_announcement=result.group_announcement,
                         consumed=True,
                     )
-                if _looks_like_no(text):
+                if review_reply_armed and _looks_like_no(text):
                     self.candidate_review_service.reject_candidate(candidate_id=review_prompt.candidate.id)
                     return FlorenceMessagingIngressResult(reply_text="Rejected. I will leave it out.", consumed=True)
-                if _looks_like_skip(text):
+                if review_reply_armed and _looks_like_skip(text):
                     return FlorenceMessagingIngressResult(reply_text="Okay. I will leave it in your review queue for later.", consumed=True)
                 if _looks_like_review_request(text):
                     return FlorenceMessagingIngressResult(reply_text=review_prompt.text, consumed=True)
@@ -462,17 +492,21 @@ class FlorenceMessagingIngressService:
             return self._handle_onboarding_message(resolved, session.stage, text)
 
         if review_prompt is not None:
-            if _looks_like_yes(text):
+            review_reply_armed = self._is_candidate_review_reply_armed(
+                channel_id=resolved.channel_id,
+                review_prompt_text=review_prompt.text,
+            )
+            if review_reply_armed and _looks_like_yes(text):
                 result = self.candidate_review_service.confirm_candidate(candidate_id=review_prompt.candidate.id)
                 return FlorenceMessagingIngressResult(
                     reply_text=f"Confirmed. I added {result.event.title} to the family plan." if result.event else "Confirmed.",
                     group_announcement=result.group_announcement,
                     consumed=True,
                 )
-            if _looks_like_no(text):
+            if review_reply_armed and _looks_like_no(text):
                 self.candidate_review_service.reject_candidate(candidate_id=review_prompt.candidate.id)
                 return FlorenceMessagingIngressResult(reply_text="Rejected. I will leave it out.", consumed=True)
-            if _looks_like_skip(text):
+            if review_reply_armed and _looks_like_skip(text):
                 return FlorenceMessagingIngressResult(reply_text="Okay. I will leave it in your review queue for later.", consumed=True)
             if _looks_like_review_request(text):
                 return FlorenceMessagingIngressResult(reply_text=review_prompt.text, consumed=True)

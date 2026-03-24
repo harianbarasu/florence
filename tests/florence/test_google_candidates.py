@@ -185,3 +185,67 @@ def test_parent_calendar_candidate_uses_known_location_context():
 
     assert decision.kind == CandidateDecisionKind.CANDIDATE
     assert decision.raw_metadata["known_location_hits"] == 1
+
+
+def test_gmail_candidate_skips_newsletter_with_schedule_words_when_no_household_anchor():
+    item = GmailSyncItem(
+        gmail_message_id="gmail_128",
+        thread_id="thread_128",
+        from_address="pod@mail.scalablepod.com",
+        subject="Scalable: Creators Want Their Red Carpet Moment Too",
+        snippet="The schedule looks conditional. Which date or time applies?",
+        body_text="Kaya & Jasmine plus little news. Episode drops Friday at 4pm.",
+        attachment_text=None,
+        attachment_count=0,
+        received_at=datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc),
+    )
+    context = HouseholdContext(
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_123",
+        visible_child_names=["Theo", "Violet"],
+        school_labels=["Wish Community School", "Young Minds Preschool"],
+        activity_labels=["Baseball", "Dance", "Music"],
+    )
+
+    decision = build_gmail_candidate_decision(
+        item,
+        "America/Los_Angeles",
+        context=context,
+        now=datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc),
+    )
+
+    assert decision.kind == CandidateDecisionKind.SKIP
+    assert decision.reason == "not_school_logistics"
+
+
+def test_gmail_candidate_accepts_non_school_sender_when_child_and_activity_match_context():
+    item = GmailSyncItem(
+        gmail_message_id="gmail_129",
+        thread_id="thread_129",
+        from_address="coach.jen@gmail.com",
+        subject="Theo baseball practice moved",
+        snippet="Practice is Thursday 5pm instead of Wednesday.",
+        body_text="Theo baseball practice is on September 18 at 5pm.",
+        attachment_text=None,
+        attachment_count=0,
+        received_at=datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc),
+    )
+    context = HouseholdContext(
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_123",
+        visible_child_names=["Theo", "Violet"],
+        activity_labels=["Baseball", "Dance"],
+    )
+
+    decision = build_gmail_candidate_decision(
+        item,
+        "America/Los_Angeles",
+        context=context,
+        now=datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc),
+    )
+
+    assert decision.kind == CandidateDecisionKind.CANDIDATE
+    assert decision.raw_metadata["known_child_hits"] >= 1
+    assert decision.raw_metadata["known_activity_hits"] >= 1

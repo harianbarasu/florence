@@ -5,12 +5,14 @@ from __future__ import annotations
 import html
 import logging
 import json
+import threading
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any
 
 from florence.config import FlorenceSettings
 from florence.linq import FlorenceLinqClient
+from florence.linq.media import enrich_linq_payload_with_media_text
 from florence.contracts import CandidateState, ChannelType, HouseholdBriefingKind
 from florence.google import decode_google_oauth_state
 from florence.runtime.entrypoints import FlorenceEntrypointService, FlorenceGoogleOauthConfig
@@ -69,6 +71,10 @@ class FlorenceProductionService:
             self.store,
             FlorenceGoogleSyncPersistenceService(self.store),
         )
+        # Threaded webhook handling can race onboarding stage updates when
+        # parents send multiple messages quickly. Serialize by Linq chat.
+        self._linq_chat_locks_guard = threading.Lock()
+        self._linq_chat_locks: dict[str, threading.Lock] = {}
 
     def close(self) -> None:
         self.store.close()
@@ -88,33 +94,39 @@ class FlorenceProductionService:
         ):
             return self._json_result(403, {"ok": False, "error": "invalid_linq_webhook_signature"})
         try:
-            result = self.entrypoints.handle_linq_payload(payload)
-            reply_messages = result.reply_messages or ((result.reply_text,) if result.reply_text else ())
-            if reply_messages and result.channel_id:
-                channel = self.store.get_channel(result.channel_id)
-                if channel is not None:
-                    for message in reply_messages:
-                        self._safe_send_channel_message(channel=channel, message=message, record_message=False)
-
-            if result.group_announcement and result.household_id:
-                group_channel = self._find_group_channel(result.household_id, provider="linq")
-                if group_channel is not None:
-                    self._safe_send_channel_message(channel=group_channel, message=result.group_announcement)
-
-            return self._json_result(
-                200,
-                {
-                    "ok": True,
-                    "consumed": result.consumed,
-                    "householdId": result.household_id,
-                    "memberId": result.member_id,
-                    "channelId": result.channel_id,
-                    "error": result.error,
-                },
-            )
+            enrich_linq_payload_with_media_text(payload, linq_api_key=self.settings.linq.api_key)
         except Exception:
-            logger.exception("Florence Linq webhook failed")
-            return self._json_result(500, {"ok": False, "error": "internal_linq_webhook_error"})
+            logger.exception("Failed to enrich Linq payload with media text")
+        chat_lock = self._lock_for_linq_chat(self._linq_chat_id(payload))
+        with chat_lock:
+            try:
+                result = self.entrypoints.handle_linq_payload(payload)
+                reply_messages = result.reply_messages or ((result.reply_text,) if result.reply_text else ())
+                if reply_messages and result.channel_id:
+                    channel = self.store.get_channel(result.channel_id)
+                    if channel is not None:
+                        for message in reply_messages:
+                            self._safe_send_channel_message(channel=channel, message=message, record_message=False)
+
+                if result.group_announcement and result.household_id:
+                    group_channel = self._find_group_channel(result.household_id, provider="linq")
+                    if group_channel is not None:
+                        self._safe_send_channel_message(channel=group_channel, message=result.group_announcement)
+
+                return self._json_result(
+                    200,
+                    {
+                        "ok": True,
+                        "consumed": result.consumed,
+                        "householdId": result.household_id,
+                        "memberId": result.member_id,
+                        "channelId": result.channel_id,
+                        "error": result.error,
+                    },
+                )
+            except Exception:
+                logger.exception("Florence Linq webhook failed")
+                return self._json_result(500, {"ok": False, "error": "internal_linq_webhook_error"})
 
     def handle_google_callback(
         self,
@@ -158,21 +170,29 @@ class FlorenceProductionService:
             )
 
             dm_message = callback.onboarding_transition.prompt.text if callback.onboarding_transition.prompt else "Google connected."
-            review_prompt = self.candidate_review_service.build_next_review_prompt(
-                household_id=callback.connection.household_id,
-                member_id=callback.connection.member_id,
-            )
-            if review_prompt is not None:
-                dm_message = f"{dm_message}\n\n{review_prompt.text}" if dm_message else review_prompt.text
+            review_message: str | None = None
+            if callback.onboarding_transition.state.is_complete:
+                review_prompt = self.candidate_review_service.build_next_review_prompt(
+                    household_id=callback.connection.household_id,
+                    member_id=callback.connection.member_id,
+                )
+                if review_prompt is not None:
+                    review_message = review_prompt.text
 
-            if oauth_state.thread_id and dm_message:
+            if oauth_state.thread_id and (dm_message or review_message):
                 channel = self.store.get_channel(oauth_state.thread_id)
                 if channel is not None:
-                    self._safe_send_channel_message(channel=channel, message=dm_message)
+                    if dm_message:
+                        self._safe_send_channel_message(channel=channel, message=dm_message)
+                    if review_message:
+                        self._safe_send_channel_message(channel=channel, message=review_message)
                 else:
                     fallback_channel = self._find_channel_by_provider_id(oauth_state.thread_id)
                     if fallback_channel is not None:
-                        self._safe_send_channel_message(channel=fallback_channel, message=dm_message)
+                        if dm_message:
+                            self._safe_send_channel_message(channel=fallback_channel, message=dm_message)
+                        if review_message:
+                            self._safe_send_channel_message(channel=fallback_channel, message=review_message)
 
             summary = (
                 f"Florence is now connected to {callback.connection.email}. "
@@ -292,6 +312,26 @@ class FlorenceProductionService:
                 if channel.provider_channel_id == provider_channel_id:
                     return channel
         return None
+
+    @staticmethod
+    def _linq_chat_id(payload: dict[str, Any]) -> str:
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            return "__unknown_chat__"
+        chat = data.get("chat")
+        if not isinstance(chat, dict):
+            return "__unknown_chat__"
+        chat_id = str(chat.get("id") or "").strip()
+        return chat_id or "__unknown_chat__"
+
+    def _lock_for_linq_chat(self, chat_id: str) -> threading.Lock:
+        key = chat_id or "__unknown_chat__"
+        with self._linq_chat_locks_guard:
+            lock = self._linq_chat_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._linq_chat_locks[key] = lock
+            return lock
 
     def _dispatch_due_household_nudges(self, *, household_id: str) -> int:
         sent = 0

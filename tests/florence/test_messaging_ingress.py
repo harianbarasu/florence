@@ -6,10 +6,13 @@ from florence.messaging import (
 from datetime import datetime, timedelta, timezone
 
 from florence.contracts import (
+    CandidateState,
+    GoogleSourceKind,
     Household,
     HouseholdNudge,
     HouseholdNudgeStatus,
     HouseholdNudgeTargetKind,
+    ImportedCandidate,
     HouseholdWorkItem,
     HouseholdWorkItemStatus,
 )
@@ -194,6 +197,144 @@ def test_complete_dm_routes_freeform_chat_through_household_chat_service(tmp_pat
     assert result.reply_text == "I can keep planning with you here."
     assert chat_service.calls[0]["channel_id"] == "chan_dm_123"
     assert chat_service.calls[0]["actor_member_id"] == "mem_123"
+    store.close()
+
+
+def test_pending_candidate_does_not_hijack_generic_yes_without_review_prompt_context(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_hybrid_onboarding_service(store, review_service)
+    chat_service = _StubHouseholdChatService("I can pull exact Giants and A's dates now.")
+    ingress = FlorenceMessagingIngressService(
+        store,
+        onboarding_service,
+        review_service,
+        FlorenceHouseholdQueryService(store),
+        household_chat_service=chat_service,
+    )
+    _complete_hybrid_onboarding(onboarding_service)
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_123",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:haircuts",
+            title="Fireflies Haircuts for Kids accepted your appointment",
+            summary="Haircut appointment for Friday at 3:30 PM.",
+            state=CandidateState.PENDING_REVIEW,
+        )
+    )
+
+    first = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_301",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="Can you pull the baseball dates for next week?",
+                is_group_chat=False,
+            ),
+        )
+    )
+    assert first.reply_text == "I can pull exact Giants and A's dates now."
+
+    second = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_302",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="yes please",
+                is_group_chat=False,
+            ),
+        )
+    )
+    assert second.reply_text == "I can pull exact Giants and A's dates now."
+    candidate = store.get_imported_candidate("cand_123")
+    assert candidate is not None
+    assert candidate.state == CandidateState.PENDING_REVIEW
+    assert store.list_household_events(household_id="hh_123") == []
+    store.close()
+
+
+def test_review_prompt_then_yes_confirms_pending_candidate(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_hybrid_onboarding_service(store, review_service)
+    ingress = FlorenceMessagingIngressService(
+        store,
+        onboarding_service,
+        review_service,
+        FlorenceHouseholdQueryService(store),
+    )
+    _complete_hybrid_onboarding(onboarding_service)
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_124",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:fireflies-2",
+            title="Fireflies Haircuts for Kids accepted your appointment",
+            summary="Haircut appointment for Friday at 3:30 PM.",
+            state=CandidateState.PENDING_REVIEW,
+        )
+    )
+
+    review = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_303",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="review imports",
+                is_group_chat=False,
+            ),
+        )
+    )
+    assert review.reply_text is not None
+    assert "Imported item:" in review.reply_text
+
+    confirmation = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_304",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="yes",
+                is_group_chat=False,
+            ),
+        )
+    )
+    assert confirmation.reply_text is not None
+    assert confirmation.reply_text.startswith("Confirmed.")
+    candidate = store.get_imported_candidate("cand_124")
+    assert candidate is not None
+    assert candidate.state == CandidateState.CONFIRMED
+    events = store.list_household_events(household_id="hh_123")
+    assert len(events) == 1
+    assert "Fireflies Haircuts for Kids" in events[0].title
     store.close()
 
 

@@ -158,18 +158,19 @@ def build_gmail_candidate_decision(
         + known_location_hits
     )
 
-    looks_relevant = (
-        (logistics_hits > 0 or has_scheduling_evidence)
-        if sender_looks_school
-        else (logistics_hits > 0 and has_scheduling_evidence)
-    )
-    if not looks_relevant and context_signal_hits > 0:
+    has_household_anchor = context_signal_hits > 0
+    if sender_looks_school:
+        looks_relevant = bool(logistics_hits > 0 or has_scheduling_evidence or has_household_anchor)
+    else:
+        # Non-school/newsletter senders must tie back to known household
+        # context to avoid pulling random inbox noise into review.
         looks_relevant = bool(
-            has_scheduling_evidence
-            or logistics_hits > 0
-            or (known_activity_hits > 0 and known_child_hits > 0)
-            or school_domain_hits > 0
-            or platform_hits > 0
+            has_household_anchor
+            and (
+                (logistics_hits > 0 and has_scheduling_evidence)
+                or (logistics_hits > 0 and (known_child_hits > 0 or known_activity_hits > 0 or known_school_hits > 0))
+                or (known_activity_hits > 0 and known_child_hits > 0)
+            )
         )
     if not looks_relevant:
         return CandidateDecision(kind=CandidateDecisionKind.SKIP, reason="not_school_logistics")
@@ -280,6 +281,7 @@ def build_gmail_candidate_decision(
             "known_child_hits": known_child_hits,
             "known_contact_hits": known_contact_hits,
             "known_location_hits": known_location_hits,
+            "context_signal_hits": context_signal_hits,
             "logistics_hits": logistics_hits,
             "ambiguity_hits": ambiguity_hits,
             "attachment_count": item.attachment_count,

@@ -69,6 +69,13 @@ def _looks_like_schedule_question(text: str) -> bool:
     return bool(re.search(r"\b(today|this week|coming up|schedule|happening)\b", text, re.IGNORECASE))
 
 
+def _onboarding_ready_messages() -> tuple[str, ...]:
+    return (
+        "Perfect. I have enough household context to help now.",
+        "You can keep asking me here, and you can add me to the family group later if you want shared help there too.",
+    )
+
+
 def _split_names(text: str) -> list[str]:
     normalized = re.sub(r"\b(?:and|&)\b", ",", text, flags=re.IGNORECASE)
     return [part.strip(" .,!?:;") for part in normalized.split(",") if part.strip(" .,!?:;")]
@@ -279,8 +286,20 @@ class FlorenceMessagingIngressService:
                 consumed=True,
             )
 
+        if self.household_chat_service is not None:
+            history = self.store.list_channel_messages(channel_id=resolved.channel_id, limit=24)
+            reply = self.household_chat_service.respond(
+                household_id=resolved.household_id,
+                channel_id=resolved.channel_id,
+                actor_member_id=resolved.member_id,
+                message_text=resolved.message.body,
+                conversation_history=history[:-1] if history else None,
+            )
+            if reply is not None and reply.text.strip():
+                return FlorenceMessagingIngressResult(reply_text=reply.text, consumed=True)
+
         return FlorenceMessagingIngressResult(
-            reply_text="I’m set up. Ask me to review imports here, or ask in the family group what is happening this week.",
+            reply_text="I’m set up. You can ask me to plan, research, draft, review imports, or help with household logistics here or in the family group.",
             consumed=True,
         )
 
@@ -376,6 +395,8 @@ class FlorenceMessagingIngressService:
                 thread_id=resolved.thread_id,
                 activity_labels=_split_labels(text),
             )
+            if transition.state.is_complete:
+                return self._result_with_messages(_onboarding_ready_messages())
             return self._result_with_messages(
                 self._render_onboarding_prompt_messages(
                     household_id=resolved.household_id,
@@ -386,10 +407,7 @@ class FlorenceMessagingIngressService:
             )
 
         if stage == OnboardingStage.ACTIVATE_GROUP:
-            return FlorenceMessagingIngressResult(
-                reply_text="Add me to the family group and send a message there. I will use that first group thread as the household chat.",
-                consumed=True,
-            )
+            return self._result_with_messages(_onboarding_ready_messages())
 
         prompt = self.onboarding_service.get_prompt(
             household_id=resolved.household_id,
@@ -419,7 +437,7 @@ class FlorenceMessagingIngressService:
             member_id=resolved.member_id,
         )
         latest = onboarding_sessions[0] if onboarding_sessions else None
-        if latest is not None and latest.stage == OnboardingStage.ACTIVATE_GROUP and not latest.group_channel_id:
+        if latest is not None and latest.is_complete and not latest.group_channel_id:
             transition = self.onboarding_service.record_group_activated(
                 household_id=resolved.household_id,
                 member_id=resolved.member_id,
@@ -428,7 +446,7 @@ class FlorenceMessagingIngressService:
             )
             return FlorenceMessagingIngressResult(
                 reply_text=(
-                    "I’m in. Ask me what is happening this week, or I can start reviewing imported school and calendar items in DM."
+                    "I’m in. Ask me to plan, research, summarize, or help with household logistics here, and I can still review imported school and calendar items in DM."
                     if transition.state.is_complete
                     else None
                 ),

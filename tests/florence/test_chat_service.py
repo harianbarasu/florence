@@ -1,4 +1,14 @@
-from florence.contracts import ChildProfile, Household, HouseholdEvent, HouseholdProfileItem, HouseholdProfileKind, Member, MemberRole
+from florence.contracts import (
+    Channel,
+    ChannelType,
+    ChildProfile,
+    Household,
+    HouseholdEvent,
+    HouseholdProfileItem,
+    HouseholdProfileKind,
+    Member,
+    MemberRole,
+)
 from florence.runtime.chat import FlorenceHouseholdChatService
 from florence.state import FlorenceStateDB
 
@@ -35,6 +45,16 @@ def test_household_chat_service_uses_hermes_agent_with_confirmed_state(tmp_path)
             household_id="hh_123",
             display_name="Maya",
             role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm_thread_123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
         )
     )
     store.replace_child_profiles(
@@ -75,7 +95,7 @@ def test_household_chat_service_uses_hermes_agent_with_confirmed_state(tmp_path)
 
     reply = service.respond(
         household_id="hh_123",
-        channel_id="group_thread_123",
+        channel_id="chan_dm_123",
         actor_member_id="mem_123",
         message_text="What is happening this week?",
     )
@@ -83,6 +103,9 @@ def test_household_chat_service_uses_hermes_agent_with_confirmed_state(tmp_path)
     assert reply is not None
     assert "soccer" in reply.text.lower()
     assert _FakeAgent.created[0]["enabled_toolsets"] == ["florence_chat"]
+    assert _FakeAgent.created[0]["disabled_toolsets"] is None
     assert "Confirmed household events" in _FakeAgent.last_run["system_message"]
     assert "Ava soccer practice" in _FakeAgent.last_run["system_message"]
+    assert "general household agent" in _FakeAgent.last_run["system_message"]
+    assert "private parent DM" in _FakeAgent.last_run["system_message"]
     store.close()

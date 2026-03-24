@@ -41,3 +41,18 @@ def test_florence_settings_prefers_database_url_when_present(tmp_path, monkeypat
 
     assert settings.server.database_url == "postgresql://postgres:secret@db.example.com:5432/florence"
     assert settings.server.db_path is None
+
+
+def test_florence_settings_default_and_override_household_toolsets(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    default_settings = FlorenceSettings.from_env()
+    assert default_settings.hermes.enabled_toolsets == ("florence_chat",)
+    assert default_settings.hermes.disabled_toolsets == ()
+
+    monkeypatch.setenv("FLORENCE_HERMES_ENABLED_TOOLSETS", "web,browser,clarify")
+    monkeypatch.setenv("FLORENCE_HERMES_DISABLED_TOOLSETS", "memory,session_search")
+
+    overridden_settings = FlorenceSettings.from_env()
+    assert overridden_settings.hermes.enabled_toolsets == ("web", "browser", "clarify")
+    assert overridden_settings.hermes.disabled_toolsets == ("memory", "session_search")

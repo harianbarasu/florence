@@ -1,7 +1,14 @@
 from datetime import datetime, timezone
 
-from florence.contracts import CandidateState, GoogleConnection, GoogleSourceKind, HouseholdContext, HouseholdProfileKind
-from florence.google import FlorenceGoogleSyncBatch, GmailSyncItem
+from florence.contracts import (
+    CandidateState,
+    GoogleConnection,
+    GoogleSourceKind,
+    Household,
+    HouseholdContext,
+    HouseholdProfileKind,
+)
+from florence.google import FlorenceGoogleSyncBatch, GmailSyncItem, ParentCalendarSyncItem
 from florence.runtime import (
     FlorenceCandidateReviewService,
     FlorenceGoogleSyncPersistenceService,
@@ -13,6 +20,7 @@ from florence.state import FlorenceStateDB
 def test_google_sync_persistence_service_stores_connection_and_candidates(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     google_service = FlorenceGoogleSyncPersistenceService(store)
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
     connection = GoogleConnection(
         id="gconn_123",
         household_id="hh_123",
@@ -38,22 +46,46 @@ def test_google_sync_persistence_service_stores_connection_and_candidates(tmp_pa
                 GmailSyncItem(
                     gmail_message_id="gmail_123",
                     thread_id="thread_123",
-                    from_address="teacher@school.edu",
-                    subject="Soccer practice update",
-                    snippet="Practice moves to Thursday 4pm to 5pm",
+                    from_address="Ms. Kim <teacher@roosevelt.k12.ca.us>",
+                    subject="Roosevelt Elementary soccer practice update",
+                    snippet="ParentSquare reminder",
                     body_text="Ava soccer practice is on September 18 from 4pm to 5pm.",
                     attachment_text=None,
                     attachment_count=0,
                     received_at=datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc),
                 )
             ],
+            calendar_items=[
+                ParentCalendarSyncItem(
+                    google_event_id="event_123",
+                    title="Soccer practice",
+                    description="Weekly team practice on the north field",
+                    location="North Field",
+                    html_link=None,
+                    starts_at=datetime(2026, 9, 18, 23, 0, tzinfo=timezone.utc),
+                    ends_at=datetime(2026, 9, 19, 0, 0, tzinfo=timezone.utc),
+                    timezone="America/Los_Angeles",
+                    all_day=False,
+                    updated_at=None,
+                    calendar_summary="Family calendar",
+                    family_member_names=["Ava"],
+                )
+            ],
         )
     )
 
     assert store.get_google_connection("gconn_123") == connection
-    assert len(result.candidates) == 1
+    assert len(result.candidates) == 2
     assert result.candidates[0].state == CandidateState.QUARANTINED
-    assert len(store.list_imported_candidates(household_id="hh_123", member_id="mem_123")) == 1
+    assert len(store.list_imported_candidates(household_id="hh_123", member_id="mem_123")) == 2
+    household = store.get_household("hh_123")
+    assert household is not None
+    grounding_hints = household.settings["grounding_hints"]
+    assert grounding_hints["schools"][0]["label"] == "Roosevelt Elementary"
+    assert grounding_hints["schools"][0]["domains"] == ["roosevelt.k12.ca.us"]
+    assert grounding_hints["schools"][0]["platforms"] == ["ParentSquare"]
+    assert grounding_hints["activities"][0]["label"] == "Soccer"
+    assert grounding_hints["activities"][0]["locations"] == ["North Field"]
 
     store.close()
 
@@ -208,4 +240,162 @@ def test_second_parent_early_onboarding_does_not_clear_existing_household_ground
             kind=HouseholdProfileKind.SCHOOL,
         )
     ] == ["Roosevelt Elementary"]
+    store.close()
+
+
+def test_onboarding_prompt_surfaces_google_grounding_suggestions(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(
+        Household(
+            id="hh_123",
+            name="Maya's household",
+            timezone="America/Los_Angeles",
+            settings={
+                "grounding_hints": {
+                    "schools": [
+                        {
+                            "label": "Roosevelt Elementary",
+                            "domains": ["roosevelt.k12.ca.us"],
+                            "platforms": ["ParentSquare"],
+                            "contacts": ["Ms. Kim"],
+                        }
+                    ],
+                    "activities": [
+                        {
+                            "label": "Soccer",
+                            "locations": ["North Field"],
+                            "contacts": ["Coach Ben"],
+                        }
+                    ],
+                    "contacts": ["Ms. Kim", "Coach Ben"],
+                    "locations": ["North Field"],
+                }
+            },
+        )
+    )
+    onboarding_service = FlorenceOnboardingSessionService(store)
+
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="thread_dm_123",
+        display_name="Maya",
+    )
+    onboarding_service.record_google_connected(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="thread_dm_123",
+    )
+    onboarding_service.record_child_names(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="thread_dm_123",
+        child_names=["Ava"],
+    )
+    school_prompt = onboarding_service.get_prompt(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="thread_dm_123",
+    )
+
+    assert school_prompt is not None
+    assert "Google already surfaced a few likely school signals:" in school_prompt.text
+    assert "Roosevelt Elementary" in school_prompt.text
+    assert "ParentSquare" in school_prompt.text
+
+    onboarding_service.record_school_basics(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="thread_dm_123",
+        school_labels=["Roosevelt Elementary"],
+    )
+    activity_prompt = onboarding_service.get_prompt(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="thread_dm_123",
+    )
+
+    assert activity_prompt is not None
+    assert "Google also found likely activity signals:" in activity_prompt.text
+    assert "Soccer" in activity_prompt.text
+    assert "North Field" in activity_prompt.text
+    store.close()
+
+
+def test_onboarding_sync_merges_grounding_hints_into_profile_metadata(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(
+        Household(
+            id="hh_123",
+            name="Maya's household",
+            timezone="America/Los_Angeles",
+            settings={
+                "grounding_hints": {
+                    "schools": [
+                        {
+                            "label": "Roosevelt Elementary",
+                            "domains": ["roosevelt.k12.ca.us"],
+                            "platforms": ["ParentSquare"],
+                            "contacts": ["Ms. Kim"],
+                        }
+                    ],
+                    "activities": [
+                        {
+                            "label": "Soccer",
+                            "locations": ["North Field"],
+                            "contacts": ["Coach Ben"],
+                        }
+                    ],
+                }
+            },
+        )
+    )
+    onboarding_service = FlorenceOnboardingSessionService(store)
+
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="thread_dm_123",
+        display_name="Maya",
+    )
+    onboarding_service.record_google_connected(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="thread_dm_123",
+    )
+    onboarding_service.record_child_names(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="thread_dm_123",
+        child_names=["Ava Johnson"],
+    )
+    onboarding_service.record_school_basics(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="thread_dm_123",
+        school_labels=["Roosevelt Elementary"],
+    )
+    onboarding_service.record_activity_basics(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="thread_dm_123",
+        activity_labels=["Soccer"],
+    )
+
+    child = store.list_child_profiles(household_id="hh_123")[0]
+    school = store.list_household_profile_items(
+        household_id="hh_123",
+        kind=HouseholdProfileKind.SCHOOL,
+    )[0]
+    activity = store.list_household_profile_items(
+        household_id="hh_123",
+        kind=HouseholdProfileKind.ACTIVITY,
+    )[0]
+
+    assert child.metadata["aliases"] == ["Ava"]
+    assert school.metadata["domains"] == ["roosevelt.k12.ca.us"]
+    assert school.metadata["platforms"] == ["ParentSquare"]
+    assert school.metadata["contacts"] == ["Ms. Kim"]
+    assert activity.metadata["locations"] == ["North Field"]
+    assert activity.metadata["contacts"] == ["Coach Ben"]
     store.close()

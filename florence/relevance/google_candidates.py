@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from email.utils import parseaddr
 from enum import StrEnum
 
+from florence.contracts import HouseholdContext
 from florence.google.types import GmailSyncItem, ParentCalendarSyncItem
 from florence.relevance.common import (
     ALL_DAY_HINTS,
@@ -72,10 +75,41 @@ def _cleanup_gmail_title(raw: str) -> str:
     return title.strip(" ,.;:-")
 
 
+def _normalized_values(values: list[str]) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        cleaned = " ".join(value.split()).strip().lower()
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        normalized.append(cleaned)
+    return normalized
+
+
+def _count_known_hits(source: str, values: list[str]) -> int:
+    hits = 0
+    lowered = source.lower()
+    for value in _normalized_values(values):
+        pattern = re.escape(value)
+        if re.fullmatch(r"[a-z0-9]+", value):
+            pattern = rf"\b{pattern}\b"
+        if re.search(pattern, lowered):
+            hits += 1
+    return hits
+
+
+def _sender_domain(from_address: str) -> str:
+    _, email = parseaddr(from_address)
+    lowered = email.strip().lower()
+    return lowered.split("@", 1)[1] if "@" in lowered else ""
+
+
 def build_gmail_candidate_decision(
     item: GmailSyncItem,
     time_zone: str,
     *,
+    context: HouseholdContext | None = None,
     now: datetime | None = None,
 ) -> CandidateDecision:
     subject = _cleanup_gmail_title(item.subject) or "Untitled Gmail candidate"
@@ -85,8 +119,28 @@ def build_gmail_candidate_decision(
     text = "\n".join(part for part in (subject, snippet, body_text, attachment_text) if part).strip()
     lowered = text.lower()
     sender_lower = item.from_address.lower()
+    sender_domain = _sender_domain(item.from_address)
+
+    child_terms = list(context.visible_child_names) + list(context.child_aliases) if context is not None else []
+    school_terms = list(context.school_labels) if context is not None else []
+    activity_terms = list(context.activity_labels) if context is not None else []
+    contact_terms = list(context.contact_names) if context is not None else []
+    platform_terms = list(context.school_platforms) if context is not None else []
+    location_terms = list(context.location_labels) if context is not None else []
+    school_domain_hits = (
+        1
+        if context is not None and sender_domain and sender_domain.lower() in {domain.lower() for domain in context.school_domains}
+        else 0
+    )
+    platform_hits = _count_known_hits(f"{item.from_address}\n{text}", platform_terms)
+    known_school_hits = _count_known_hits(text, school_terms)
+    known_activity_hits = _count_known_hits(text, activity_terms)
+    known_child_hits = _count_known_hits(text, child_terms)
+    known_contact_hits = _count_known_hits(f"{item.from_address}\n{text}", contact_terms)
+    known_location_hits = _count_known_hits(text, location_terms)
 
     sender_looks_school = any(hint in sender_lower for hint in SCHOOL_SENDER_HINTS)
+    sender_looks_school = sender_looks_school or school_domain_hits > 0 or platform_hits > 0 or known_school_hits > 0
     logistics_hits = count_hint_hits(lowered, LOGISTICS_HINTS)
     ambiguity_hits = count_hint_hits(lowered, AMBIGUITY_HINTS)
     all_day_hits = count_hint_hits(lowered, ALL_DAY_HINTS)
@@ -94,12 +148,29 @@ def build_gmail_candidate_decision(
     time_range = parse_time_range(text)
     single_time = None if time_range else parse_single_time(text)
     has_scheduling_evidence = bool(date_match or time_range or single_time)
+    context_signal_hits = (
+        school_domain_hits
+        + platform_hits
+        + known_school_hits
+        + known_activity_hits
+        + known_child_hits
+        + known_contact_hits
+        + known_location_hits
+    )
 
     looks_relevant = (
         (logistics_hits > 0 or has_scheduling_evidence)
         if sender_looks_school
         else (logistics_hits > 0 and has_scheduling_evidence)
     )
+    if not looks_relevant and context_signal_hits > 0:
+        looks_relevant = bool(
+            has_scheduling_evidence
+            or logistics_hits > 0
+            or (known_activity_hits > 0 and known_child_hits > 0)
+            or school_domain_hits > 0
+            or platform_hits > 0
+        )
     if not looks_relevant:
         return CandidateDecision(kind=CandidateDecisionKind.SKIP, reason="not_school_logistics")
 
@@ -107,6 +178,20 @@ def build_gmail_candidate_decision(
     reasons: list[str] = []
     if sender_looks_school:
         reasons.append("school_sender")
+    if school_domain_hits > 0:
+        reasons.append("known_school_domain")
+    if platform_hits > 0:
+        reasons.append("known_school_platform")
+    if known_school_hits > 0:
+        reasons.append("known_school_label")
+    if known_activity_hits > 0:
+        reasons.append("known_activity")
+    if known_child_hits > 0:
+        reasons.append("known_child")
+    if known_contact_hits > 0:
+        reasons.append("known_contact")
+    if known_location_hits > 0:
+        reasons.append("known_location")
     if logistics_hits > 0:
         reasons.append("logistics_keywords")
     if date_match:
@@ -121,6 +206,13 @@ def build_gmail_candidate_decision(
     confidence_bps += min(logistics_hits, 2) * 1_000
     confidence_bps += 1_000 if date_match else 0
     confidence_bps += 1_000 if time_range else 700 if single_time else 0
+    confidence_bps += school_domain_hits * 1_200
+    confidence_bps += platform_hits * 600
+    confidence_bps += min(known_school_hits, 1) * 900
+    confidence_bps += min(known_activity_hits, 2) * 700
+    confidence_bps += min(known_child_hits, 2) * 600
+    confidence_bps += min(known_contact_hits, 1) * 500
+    confidence_bps += min(known_location_hits, 1) * 300
 
     requires_confirmation = False
     confirmation_question: str | None = None
@@ -181,14 +273,26 @@ def build_gmail_candidate_decision(
             "classifier": "gmail_heuristics_v1",
             "classification_reasons": reasons,
             "sender_looks_school": sender_looks_school,
+            "school_domain_hits": school_domain_hits,
+            "platform_hits": platform_hits,
+            "known_school_hits": known_school_hits,
+            "known_activity_hits": known_activity_hits,
+            "known_child_hits": known_child_hits,
+            "known_contact_hits": known_contact_hits,
+            "known_location_hits": known_location_hits,
             "logistics_hits": logistics_hits,
             "ambiguity_hits": ambiguity_hits,
             "attachment_count": item.attachment_count,
+            "sender_domain": sender_domain or None,
         },
     )
 
 
-def build_parent_calendar_candidate_decision(item: ParentCalendarSyncItem) -> CandidateDecision:
+def build_parent_calendar_candidate_decision(
+    item: ParentCalendarSyncItem,
+    *,
+    context: HouseholdContext | None = None,
+) -> CandidateDecision:
     title = _cleanup_gmail_title(item.title) or "Untitled calendar event"
     description = (item.description or "").strip()
     location = (item.location or "").strip()
@@ -198,12 +302,27 @@ def build_parent_calendar_candidate_decision(item: ParentCalendarSyncItem) -> Ca
     activity_hits = count_hint_hits(lowered, CHILD_ACTIVITY_HINTS)
     personal_hits = count_hint_hits(lowered, PERSONAL_CALENDAR_HINTS)
     child_name_hits = sum(1 for name in item.family_member_names if name.strip() and name.strip().lower() in lowered)
-    likely_child_logistics = logistics_hits > 0 or activity_hits > 0 or child_name_hits > 0
+    child_terms = list(context.visible_child_names) + list(context.child_aliases) if context is not None else []
+    known_activity_hits = _count_known_hits(lowered, list(context.activity_labels) if context is not None else [])
+    known_child_hits = _count_known_hits(lowered, child_terms)
+    known_school_hits = _count_known_hits(lowered, list(context.school_labels) if context is not None else [])
+    known_location_hits = _count_known_hits(lowered, list(context.location_labels) if context is not None else [])
+    known_contact_hits = _count_known_hits(lowered, list(context.contact_names) if context is not None else [])
+    family_signal_hits = (
+        child_name_hits
+        + activity_hits
+        + known_activity_hits
+        + known_child_hits
+        + known_school_hits
+        + known_location_hits
+        + known_contact_hits
+    )
+    likely_child_logistics = logistics_hits > 0 or family_signal_hits > 0
 
     if not likely_child_logistics:
         return CandidateDecision(kind=CandidateDecisionKind.SKIP, reason="not_child_or_family_logistics")
 
-    if personal_hits > logistics_hits and child_name_hits == 0:
+    if personal_hits > (logistics_hits + family_signal_hits) and family_signal_hits == 0:
         return CandidateDecision(kind=CandidateDecisionKind.SKIP, reason="looks_personal_not_family")
 
     summary_bits = [
@@ -212,7 +331,18 @@ def build_parent_calendar_candidate_decision(item: ParentCalendarSyncItem) -> Ca
         description or None,
     ]
     summary = compact_text(" · ".join(bit for bit in summary_bits if bit), 300)
-    confidence_bps = min(8_900, 5_600 + logistics_hits * 500 + activity_hits * 450 + child_name_hits * 700)
+    confidence_bps = min(
+        9_200,
+        5_600
+        + logistics_hits * 500
+        + activity_hits * 450
+        + child_name_hits * 700
+        + known_activity_hits * 550
+        + known_child_hits * 500
+        + known_school_hits * 350
+        + known_location_hits * 450
+        + known_contact_hits * 300,
+    )
 
     return CandidateDecision(
         kind=CandidateDecisionKind.CANDIDATE,
@@ -235,6 +365,11 @@ def build_parent_calendar_candidate_decision(item: ParentCalendarSyncItem) -> Ca
             "activity_hits": activity_hits,
             "personal_hits": personal_hits,
             "child_name_hits": child_name_hits,
+            "known_activity_hits": known_activity_hits,
+            "known_child_hits": known_child_hits,
+            "known_school_hits": known_school_hits,
+            "known_location_hits": known_location_hits,
+            "known_contact_hits": known_contact_hits,
             "calendar_event_id": item.google_event_id,
             "calendar_summary": item.calendar_summary,
             "html_link": item.html_link,

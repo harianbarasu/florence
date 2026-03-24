@@ -26,7 +26,7 @@ def sync_onboarding_stage(state: OnboardingState) -> OnboardingState:
     if state.group_channel_id:
         return replace(state, stage=OnboardingStage.COMPLETE)
     if state.activity_basics_collected:
-        return replace(state, stage=OnboardingStage.ACTIVATE_GROUP)
+        return replace(state, stage=OnboardingStage.COMPLETE)
     if state.school_basics_collected:
         return replace(state, stage=OnboardingStage.COLLECT_ACTIVITY_BASICS)
     if state.child_names:
@@ -101,13 +101,6 @@ def build_onboarding_prompt(state: OnboardingState) -> OnboardingPrompt | None:
         else:
             prompt = f"What recurring activities should I know about for {child_list}? If none yet, say none."
         return OnboardingPrompt(stage=current.stage, text=prompt)
-
-    if current.stage == OnboardingStage.ACTIVATE_GROUP:
-        return OnboardingPrompt(
-            stage=current.stage,
-            text="Add me to your family iMessage group, then tell me here once I'm in.",
-            requires_external_action=True,
-        )
 
     return None
 

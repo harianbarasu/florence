@@ -20,6 +20,8 @@ from florence.google.sync import (
     FlorenceGoogleSyncBatch,
     FlorenceGoogleSyncResult,
     build_google_import_candidates,
+    build_google_grounding_hints,
+    merge_google_grounding_hints,
 )
 from florence.google.types import (
     FlorenceGoogleOauthState,
@@ -40,7 +42,9 @@ __all__ = [
     "ParentCalendarSyncItem",
     "build_gmail_sync_item",
     "build_google_import_candidates",
+    "build_google_grounding_hints",
     "build_google_oauth_connect_url",
+    "merge_google_grounding_hints",
     "build_parent_calendar_sync_item",
     "decode_google_oauth_state",
     "encode_google_oauth_state",

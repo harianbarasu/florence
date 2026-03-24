@@ -40,4 +40,9 @@ class OnboardingState:
 
     @property
     def is_complete(self) -> bool:
-        return self.stage == OnboardingStage.COMPLETE
+        return bool(
+            self.google_connected
+            and self.child_names
+            and self.school_basics_collected
+            and self.activity_basics_collected
+        )

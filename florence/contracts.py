@@ -131,8 +131,13 @@ class HouseholdContext:
     actor_member_id: str | None
     channel_id: str
     visible_child_names: list[str] = field(default_factory=list)
+    child_aliases: list[str] = field(default_factory=list)
     school_labels: list[str] = field(default_factory=list)
+    school_domains: list[str] = field(default_factory=list)
+    school_platforms: list[str] = field(default_factory=list)
     activity_labels: list[str] = field(default_factory=list)
+    contact_names: list[str] = field(default_factory=list)
+    location_labels: list[str] = field(default_factory=list)
 
     @property
     def is_grounded_for_google_matching(self) -> bool:

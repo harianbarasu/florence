@@ -57,6 +57,8 @@ class FlorenceProductionService:
             google_oauth=google_oauth,
             household_chat_model=settings.hermes.model,
             household_chat_max_iterations=settings.hermes.max_iterations,
+            household_chat_enabled_toolsets=settings.hermes.enabled_toolsets,
+            household_chat_disabled_toolsets=settings.hermes.disabled_toolsets,
         )
         self.linq = FlorenceLinqClient(settings.linq)
         self.candidate_review_service = FlorenceCandidateReviewService(self.store)

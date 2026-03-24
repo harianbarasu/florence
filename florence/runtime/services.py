@@ -27,6 +27,7 @@ from florence.google import (
     FlorenceGoogleSyncResult,
     GoogleTokenResponse,
     build_google_import_candidates,
+    build_google_grounding_hints,
     build_google_oauth_connect_url,
     decode_google_oauth_state,
     exchange_google_code_for_tokens,
@@ -34,6 +35,7 @@ from florence.google import (
     fetch_primary_google_calendar,
     list_recent_gmail_sync_items,
     list_recent_parent_calendar_sync_items,
+    merge_google_grounding_hints,
     refresh_google_access_token,
 )
 from florence.onboarding import (
@@ -82,6 +84,147 @@ def _stable_id(prefix: str, *parts: str) -> str:
     return f"{prefix}_{digest}"
 
 
+def _clean_label(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = " ".join(str(value).split()).strip(" ,.;:-")
+    return normalized or None
+
+
+def _sorted_unique(values: set[str]) -> list[str]:
+    return sorted(value for value in values if value)
+
+
+def _metadata_list(metadata: dict[str, object], key: str) -> list[str]:
+    raw = metadata.get(key)
+    if not isinstance(raw, list):
+        return []
+    values: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        cleaned = _clean_label(str(item))
+        if cleaned is None:
+            continue
+        lowered = cleaned.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        values.append(cleaned)
+    return values
+
+
+def _merge_metadata_list(metadata: dict[str, object], key: str, values: list[str]) -> None:
+    merged = _metadata_list(metadata, key)
+    seen = {value.lower() for value in merged}
+    for raw in values:
+        cleaned = _clean_label(raw)
+        if cleaned is None:
+            continue
+        lowered = cleaned.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        merged.append(cleaned)
+    if merged:
+        metadata[key] = merged
+
+
+def _grounding_hints_from_settings(settings: dict[str, object] | None) -> dict[str, object]:
+    if settings is None:
+        return {}
+    raw = settings.get("grounding_hints")
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def _index_hint_entries(
+    hints: dict[str, object],
+    *,
+    key: str,
+    detail_fields: tuple[str, ...],
+) -> dict[str, dict[str, list[str]]]:
+    indexed: dict[str, dict[str, list[str]]] = {}
+    raw_entries = hints.get(key)
+    if not isinstance(raw_entries, list):
+        return indexed
+
+    for entry in raw_entries:
+        if not isinstance(entry, dict):
+            continue
+        label = _clean_label(str(entry.get("label") or ""))
+        if label is None:
+            continue
+        bucket = indexed.setdefault(label.lower(), {"label": label})
+        for field in detail_fields:
+            values = entry.get(field)
+            if isinstance(values, list):
+                bucket[field] = _sorted_unique(
+                    {
+                        *_metadata_list(bucket, field),
+                        *(
+                            cleaned
+                            for value in values
+                            if (cleaned := _clean_label(str(value))) is not None
+                        ),
+                    }
+                )
+    return indexed
+
+
+def _format_grounding_hint_line(label: str, *, primary: list[str], secondary: list[str]) -> str:
+    details: list[str] = []
+    if primary:
+        details.append(", ".join(primary[:2]))
+    if secondary:
+        details.append(", ".join(secondary[:2]))
+    if not details:
+        return f"- {label}"
+    return f"- {label} ({'; '.join(details)})"
+
+
+def _augment_onboarding_prompt(
+    prompt: OnboardingPrompt | None,
+    *,
+    settings: dict[str, object] | None,
+) -> OnboardingPrompt | None:
+    if prompt is None:
+        return None
+
+    hints = _grounding_hints_from_settings(settings)
+    if prompt.stage == OnboardingStage.COLLECT_SCHOOL_BASICS:
+        school_hints = list(_index_hint_entries(hints, key="schools", detail_fields=("domains", "platforms", "contacts")).values())
+        if not school_hints:
+            return prompt
+        lines = [prompt.text, "Google already surfaced a few likely school signals:"]
+        for entry in school_hints[:3]:
+            lines.append(
+                _format_grounding_hint_line(
+                    str(entry["label"]),
+                    primary=list(entry.get("platforms", [])),
+                    secondary=list(entry.get("contacts", [])) or list(entry.get("domains", [])),
+                )
+            )
+        lines.append("Reply with the school or daycare names I should use, even if they match the suggestions.")
+        return replace(prompt, text="\n".join(lines))
+
+    if prompt.stage == OnboardingStage.COLLECT_ACTIVITY_BASICS:
+        activity_hints = list(_index_hint_entries(hints, key="activities", detail_fields=("locations", "contacts")).values())
+        if not activity_hints:
+            return prompt
+        lines = [prompt.text, "Google also found likely activity signals:"]
+        for entry in activity_hints[:4]:
+            lines.append(
+                _format_grounding_hint_line(
+                    str(entry["label"]),
+                    primary=list(entry.get("locations", [])),
+                    secondary=list(entry.get("contacts", [])),
+                )
+            )
+        lines.append("Reply with the activity names I should use. If helpful, include the child, like Ava soccer.")
+        return replace(prompt, text="\n".join(lines))
+
+    return prompt
+
+
 def _build_household_context(
     store: FlorenceStateDB,
     *,
@@ -92,13 +235,77 @@ def _build_household_context(
     children = store.list_child_profiles(household_id=household_id)
     schools = store.list_household_profile_items(household_id=household_id, kind=HouseholdProfileKind.SCHOOL)
     activities = store.list_household_profile_items(household_id=household_id, kind=HouseholdProfileKind.ACTIVITY)
+    household = store.get_household(household_id)
+    grounding_hints = _grounding_hints_from_settings(household.settings if household is not None else None)
+    school_hint_entries = _index_hint_entries(
+        grounding_hints,
+        key="schools",
+        detail_fields=("domains", "platforms", "contacts"),
+    )
+    activity_hint_entries = _index_hint_entries(
+        grounding_hints,
+        key="activities",
+        detail_fields=("locations", "contacts"),
+    )
+    child_aliases: set[str] = set()
+    school_domains: set[str] = set()
+    school_platforms: set[str] = set()
+    contact_names: set[str] = set()
+    location_labels: set[str] = set()
+
+    for child in children:
+        child_aliases.update(_metadata_list(child.metadata, "aliases"))
+        first_name = _clean_label(child.full_name.split()[0] if child.full_name.strip() else None)
+        cleaned_name = _clean_label(child.full_name)
+        if first_name is not None and cleaned_name is not None and first_name.lower() != cleaned_name.lower():
+            child_aliases.add(first_name)
+
+    for school in schools:
+        school_domains.update(_metadata_list(school.metadata, "domains"))
+        school_platforms.update(_metadata_list(school.metadata, "platforms"))
+        contact_names.update(_metadata_list(school.metadata, "contacts"))
+
+    for activity in activities:
+        contact_names.update(_metadata_list(activity.metadata, "contacts"))
+        location_labels.update(_metadata_list(activity.metadata, "locations"))
+
+    for entry in school_hint_entries.values():
+        school_domains.update(str(value) for value in entry.get("domains", []))
+        school_platforms.update(str(value) for value in entry.get("platforms", []))
+        contact_names.update(str(value) for value in entry.get("contacts", []))
+
+    for entry in activity_hint_entries.values():
+        contact_names.update(str(value) for value in entry.get("contacts", []))
+        location_labels.update(str(value) for value in entry.get("locations", []))
+
+    raw_contacts = grounding_hints.get("contacts")
+    if isinstance(raw_contacts, list):
+        contact_names.update(
+            cleaned
+            for value in raw_contacts
+            if (cleaned := _clean_label(str(value))) is not None
+        )
+
+    raw_locations = grounding_hints.get("locations")
+    if isinstance(raw_locations, list):
+        location_labels.update(
+            cleaned
+            for value in raw_locations
+            if (cleaned := _clean_label(str(value))) is not None
+        )
+
     return HouseholdContext(
         household_id=household_id,
         actor_member_id=actor_member_id,
         channel_id=channel_id,
         visible_child_names=[child.full_name for child in children],
+        child_aliases=_sorted_unique(child_aliases),
         school_labels=[item.label for item in schools],
+        school_domains=_sorted_unique(school_domains),
+        school_platforms=_sorted_unique(school_platforms),
         activity_labels=[item.label for item in activities],
+        contact_names=_sorted_unique(contact_names),
+        location_labels=_sorted_unique(location_labels),
     )
 
 
@@ -279,7 +486,11 @@ class FlorenceOnboardingSessionService:
             member_id=member_id,
             thread_id=thread_id,
         )
-        return build_onboarding_prompt(state)
+        household = self.store.get_household(household_id)
+        return _augment_onboarding_prompt(
+            build_onboarding_prompt(state),
+            settings=household.settings if household is not None else None,
+        )
 
     def record_parent_name(
         self,
@@ -352,34 +563,70 @@ class FlorenceOnboardingSessionService:
     def _persist_transition(self, transition: OnboardingTransition) -> OnboardingTransition:
         self.store.upsert_onboarding_session(transition.state)
         self._sync_household_grounding(transition.state)
+        household = self.store.get_household(transition.state.household_id)
+        prompt = _augment_onboarding_prompt(
+            transition.prompt,
+            settings=household.settings if household is not None else None,
+        )
         if transition.state.is_grounded_for_google_matching and self.candidate_review_service is not None:
             self.candidate_review_service.release_quarantined_candidates(
                 household_id=transition.state.household_id,
                 member_id=transition.state.member_id,
             )
-        return transition
+        return replace(transition, prompt=prompt)
 
     def _sync_household_grounding(self, state: OnboardingState) -> None:
+        household = self.store.get_household(state.household_id)
+        grounding_hints = _grounding_hints_from_settings(household.settings if household is not None else None)
+        school_hints = _index_hint_entries(
+            grounding_hints,
+            key="schools",
+            detail_fields=("domains", "platforms", "contacts"),
+        )
+        activity_hints = _index_hint_entries(
+            grounding_hints,
+            key="activities",
+            detail_fields=("locations", "contacts"),
+        )
         if state.child_names or state.stage not in {OnboardingStage.COLLECT_PARENT_NAME, OnboardingStage.CONNECT_GOOGLE, OnboardingStage.COLLECT_CHILD_NAMES}:
-            children = [
-                ChildProfile(
-                    id=_stable_id("child", state.household_id, child_name.strip().lower()),
-                    household_id=state.household_id,
-                    full_name=child_name.strip(),
+            existing_children = {
+                child.full_name.strip().lower(): child
+                for child in self.store.list_child_profiles(household_id=state.household_id)
+            }
+            children: list[ChildProfile] = []
+            for child_name in state.child_names:
+                cleaned_name = child_name.strip()
+                if not cleaned_name:
+                    continue
+                existing_child = existing_children.get(cleaned_name.lower())
+                metadata = dict(existing_child.metadata) if existing_child is not None else {}
+                first_name = _clean_label(cleaned_name.split()[0] if cleaned_name else None)
+                if first_name is not None and first_name.lower() != cleaned_name.lower():
+                    _merge_metadata_list(metadata, "aliases", [first_name])
+                children.append(
+                    ChildProfile(
+                        id=_stable_id("child", state.household_id, cleaned_name.lower()),
+                        household_id=state.household_id,
+                        full_name=cleaned_name,
+                        metadata=metadata,
+                    )
                 )
-                for child_name in state.child_names
-                if child_name.strip()
-            ]
             self.store.replace_child_profiles(household_id=state.household_id, children=children)
 
         if state.school_basics_collected:
-            schools = [
-                HouseholdProfileItem(
-                    id=_stable_id("school", state.household_id, label.strip().lower()),
+            existing_schools = {
+                item.label.strip().lower(): item
+                for item in self.store.list_household_profile_items(
                     household_id=state.household_id,
                     kind=HouseholdProfileKind.SCHOOL,
+                )
+            }
+            schools = [
+                self._build_school_profile_item(
+                    state=state,
                     label=label.strip(),
-                    member_id=state.member_id,
+                    existing=existing_schools.get(label.strip().lower()),
+                    hint=school_hints.get(label.strip().lower()),
                 )
                 for label in state.school_labels
                 if label.strip()
@@ -391,13 +638,19 @@ class FlorenceOnboardingSessionService:
             )
 
         if state.activity_basics_collected:
-            activities = [
-                HouseholdProfileItem(
-                    id=_stable_id("activity", state.household_id, label.strip().lower()),
+            existing_activities = {
+                item.label.strip().lower(): item
+                for item in self.store.list_household_profile_items(
                     household_id=state.household_id,
                     kind=HouseholdProfileKind.ACTIVITY,
+                )
+            }
+            activities = [
+                self._build_activity_profile_item(
+                    state=state,
                     label=label.strip(),
-                    member_id=state.member_id,
+                    existing=existing_activities.get(label.strip().lower()),
+                    hint=activity_hints.get(label.strip().lower()),
                 )
                 for label in state.activity_labels
                 if label.strip()
@@ -407,6 +660,51 @@ class FlorenceOnboardingSessionService:
                 kind=HouseholdProfileKind.ACTIVITY,
                 items=activities,
             )
+
+    def _build_school_profile_item(
+        self,
+        *,
+        state: OnboardingState,
+        label: str,
+        existing: HouseholdProfileItem | None,
+        hint: dict[str, list[str]] | None,
+    ) -> HouseholdProfileItem:
+        metadata = dict(existing.metadata) if existing is not None else {}
+        if hint is not None:
+            _merge_metadata_list(metadata, "domains", list(hint.get("domains", [])))
+            _merge_metadata_list(metadata, "platforms", list(hint.get("platforms", [])))
+            _merge_metadata_list(metadata, "contacts", list(hint.get("contacts", [])))
+        return HouseholdProfileItem(
+            id=_stable_id("school", state.household_id, label.lower()),
+            household_id=state.household_id,
+            kind=HouseholdProfileKind.SCHOOL,
+            label=label,
+            member_id=state.member_id,
+            child_id=existing.child_id if existing is not None else None,
+            metadata=metadata,
+        )
+
+    def _build_activity_profile_item(
+        self,
+        *,
+        state: OnboardingState,
+        label: str,
+        existing: HouseholdProfileItem | None,
+        hint: dict[str, list[str]] | None,
+    ) -> HouseholdProfileItem:
+        metadata = dict(existing.metadata) if existing is not None else {}
+        if hint is not None:
+            _merge_metadata_list(metadata, "locations", list(hint.get("locations", [])))
+            _merge_metadata_list(metadata, "contacts", list(hint.get("contacts", [])))
+        return HouseholdProfileItem(
+            id=_stable_id("activity", state.household_id, label.lower()),
+            household_id=state.household_id,
+            kind=HouseholdProfileKind.ACTIVITY,
+            label=label,
+            member_id=state.member_id,
+            child_id=existing.child_id if existing is not None else None,
+            metadata=metadata,
+        )
 
 
 class FlorenceGoogleSyncPersistenceService:
@@ -421,6 +719,14 @@ class FlorenceGoogleSyncPersistenceService:
     def persist_sync_batch(self, batch: FlorenceGoogleSyncBatch) -> FlorenceGoogleSyncResult:
         result = build_google_import_candidates(batch)
         persisted = [self.store.upsert_imported_candidate(candidate) for candidate in result.candidates]
+        household = self.store.get_household(batch.connection.household_id)
+        if household is not None:
+            settings = dict(household.settings)
+            settings["grounding_hints"] = merge_google_grounding_hints(
+                _grounding_hints_from_settings(settings),
+                build_google_grounding_hints(batch),
+            )
+            self.store.upsert_household(replace(household, settings=settings))
         return FlorenceGoogleSyncResult(candidates=persisted, skipped_count=result.skipped_count)
 
 

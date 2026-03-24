@@ -66,6 +66,21 @@ _HERMES_CORE_TOOLS = [
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
 ]
 
+_FLORENCE_HOUSEHOLD_TOOLS = [
+    # Research + browsing
+    "web_search", "web_extract",
+    "browser_navigate", "browser_snapshot", "browser_click",
+    "browser_type", "browser_scroll", "browser_back",
+    "browser_press", "browser_close", "browser_get_images",
+    "browser_vision",
+    # Media + lightweight planning support
+    "vision_analyze", "image_generate", "text_to_speech",
+    # Household operations
+    "todo", "clarify",
+    "schedule_cronjob", "list_cronjobs", "remove_cronjob",
+    "send_message",
+]
+
 
 # Core toolset definitions
 # These can include individual tools or reference other toolsets
@@ -203,8 +218,8 @@ TOOLSETS = {
     },
 
     "florence_chat": {
-        "description": "Florence household chat with Hermes core and no direct tool surface",
-        "tools": [],
+        "description": "Florence household-general Hermes profile without coding or admin tools",
+        "tools": _FLORENCE_HOUSEHOLD_TOOLS,
         "includes": []
     },
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from florence.contracts import ChannelMessage, ChannelMessageRole, HouseholdProfileKind
+from florence.contracts import ChannelMessage, ChannelMessageRole, ChannelType, HouseholdProfileKind
 from florence.state import FlorenceStateDB
 
 
@@ -15,7 +15,7 @@ class FlorenceHouseholdChatReply:
 
 
 class FlorenceHouseholdChatService:
-    """Wrap Hermes core for household group chat after Florence onboarding."""
+    """Wrap Hermes core for Florence household chat after onboarding."""
 
     def __init__(
         self,
@@ -23,11 +23,15 @@ class FlorenceHouseholdChatService:
         *,
         model: str,
         max_iterations: int = 6,
+        enabled_toolsets: list[str] | tuple[str, ...] | None = None,
+        disabled_toolsets: list[str] | tuple[str, ...] | None = None,
         agent_factory: Callable[..., Any] | None = None,
     ):
         self.store = store
         self.model = model
         self.max_iterations = max_iterations
+        self.enabled_toolsets = list(enabled_toolsets) if enabled_toolsets is not None else ["florence_chat"]
+        self.disabled_toolsets = list(disabled_toolsets or [])
         self.agent_factory = agent_factory
 
     def respond(
@@ -56,7 +60,8 @@ class FlorenceHouseholdChatService:
         agent = agent_factory(
             model=self.model,
             max_iterations=self.max_iterations,
-            enabled_toolsets=["florence_chat"],
+            enabled_toolsets=self.enabled_toolsets,
+            disabled_toolsets=self.disabled_toolsets or None,
             quiet_mode=True,
             skip_memory=True,
             platform="florence",
@@ -92,6 +97,7 @@ class FlorenceHouseholdChatService:
         household = self.store.get_household(household_id)
         if household is None:
             return ""
+        channel = self.store.get_channel(channel_id)
 
         actor_name = None
         if actor_member_id:
@@ -118,15 +124,22 @@ class FlorenceHouseholdChatService:
         ]
 
         lines = [
-            "You are Florence, a household chief-of-staff assistant for a family group chat.",
+            "You are Florence, the Hermes-powered household agent for this iMessage thread.",
             "You are running on Hermes core, but the backend household state is the source of truth.",
+            "You are a general household agent: help with planning, research, logistics, shopping, writing, reminders, and coordination when useful.",
+            "You have Hermes non-coding tools available for research, browsing websites, messaging, reminders, and media tasks.",
             "Never claim an imported Gmail or Google Calendar item is confirmed unless it is already present in confirmed household state below.",
+            "Before taking an external action that spends money, commits the household, sends a message outside this thread, or changes reminders/plans, get a clear confirmation from the requester.",
             "If household information is missing or ambiguous, ask a short follow-up question.",
             "Keep replies concise and practical. Do not mention internal policy or hidden review queues unless asked directly.",
             f"Household: {household.name}",
             f"Timezone: {household.timezone}",
             f"Channel ID: {channel_id}",
         ]
+        if channel is not None and channel.channel_type == ChannelType.PARENT_DM:
+            lines.append("Channel context: this is a private parent DM, so one-on-one planning is fine.")
+        elif channel is not None and channel.channel_type == ChannelType.HOUSEHOLD_GROUP:
+            lines.append("Channel context: this is the shared household group chat, so reply for the whole family.")
         if actor_name:
             lines.append(f"Current speaker: {actor_name}")
         if members:
@@ -154,7 +167,5 @@ class FlorenceHouseholdChatService:
         else:
             lines.append("Confirmed household events: none yet.")
 
-        lines.append(
-            "You may answer questions about the household plan, summarize what is happening, and help with household coordination."
-        )
+        lines.append("Use the household state below as authoritative context, then use Hermes tools when they help.")
         return "\n".join(lines)

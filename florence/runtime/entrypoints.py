@@ -64,6 +64,8 @@ class FlorenceEntrypointService:
         google_oauth: FlorenceGoogleOauthConfig | None = None,
         household_chat_model: str | None = None,
         household_chat_max_iterations: int = 6,
+        household_chat_enabled_toolsets: list[str] | tuple[str, ...] | None = None,
+        household_chat_disabled_toolsets: list[str] | tuple[str, ...] | None = None,
     ):
         self.store = store
         self.candidate_review_service = FlorenceCandidateReviewService(store)
@@ -80,6 +82,8 @@ class FlorenceEntrypointService:
                 store,
                 model=household_chat_model,
                 max_iterations=household_chat_max_iterations,
+                enabled_toolsets=household_chat_enabled_toolsets,
+                disabled_toolsets=household_chat_disabled_toolsets,
             )
             if household_chat_model
             else None

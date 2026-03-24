@@ -71,6 +71,17 @@ def _as_float(value: Any, default: float) -> float:
         return default
 
 
+def _as_str_list(value: Any, default: tuple[str, ...] = ()) -> tuple[str, ...]:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return tuple(part.strip() for part in value.split(",") if part.strip())
+    if isinstance(value, (list, tuple, set)):
+        normalized = [str(part).strip() for part in value if str(part).strip()]
+        return tuple(normalized)
+    return default
+
+
 def _normalize_public_base_url(value: Any) -> str | None:
     if value is None:
         return None
@@ -109,6 +120,8 @@ class FlorenceLinqRuntimeConfig:
 class FlorenceHermesRuntimeConfig:
     model: str
     max_iterations: int
+    enabled_toolsets: tuple[str, ...] = ("florence_chat",)
+    disabled_toolsets: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -252,6 +265,26 @@ class FlorenceSettings:
                         default=6,
                     ),
                     6,
+                ),
+                enabled_toolsets=_as_str_list(
+                    _env_or_config(
+                        ("FLORENCE_HERMES_ENABLED_TOOLSETS",),
+                        florence_cfg,
+                        "hermes",
+                        "enabled_toolsets",
+                        default=("florence_chat",),
+                    ),
+                    ("florence_chat",),
+                ),
+                disabled_toolsets=_as_str_list(
+                    _env_or_config(
+                        ("FLORENCE_HERMES_DISABLED_TOOLSETS",),
+                        florence_cfg,
+                        "hermes",
+                        "disabled_toolsets",
+                        default=(),
+                    ),
+                    (),
                 ),
             ),
         )

@@ -45,7 +45,9 @@ def test_onboarding_flow_advances_through_required_v1_steps():
 
     transition = apply_activity_basics(transition.state, ["Soccer", "Piano"])
     assert transition.state.activity_basics_collected is True
-    assert transition.state.stage == OnboardingStage.ACTIVATE_GROUP
+    assert transition.state.stage == OnboardingStage.COMPLETE
+    assert transition.state.is_complete is True
+    assert transition.prompt is None
 
     transition = mark_group_activated(transition.state, "bb_thread_group_123")
     assert transition.state.group_channel_id == "bb_thread_group_123"
@@ -71,6 +73,6 @@ def test_onboarding_allows_empty_activity_list_once_answer_is_collected():
 
     assert transition.state.activity_labels == []
     assert transition.state.activity_basics_collected is True
-    assert transition.state.stage == OnboardingStage.ACTIVATE_GROUP
-    assert transition.prompt is not None
-    assert transition.prompt.requires_external_action is True
+    assert transition.state.stage == OnboardingStage.COMPLETE
+    assert transition.state.is_complete is True
+    assert transition.prompt is None

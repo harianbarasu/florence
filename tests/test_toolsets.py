@@ -141,3 +141,15 @@ class TestToolsetConsistency:
         # All platform toolsets should be identical
         for ts in tool_sets[1:]:
             assert ts == tool_sets[0]
+
+    def test_florence_chat_uses_general_non_coding_household_tools(self):
+        tools = set(resolve_toolset("florence_chat"))
+        assert "web_search" in tools
+        assert "browser_navigate" in tools
+        assert "schedule_cronjob" in tools
+        assert "send_message" in tools
+        assert "terminal" not in tools
+        assert "execute_code" not in tools
+        assert "delegate_task" not in tools
+        assert "memory" not in tools
+        assert "session_search" not in tools

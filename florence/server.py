@@ -7,12 +7,84 @@ import json
 import logging
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
 from florence.config import FlorenceSettings
 from florence.runtime.production import FlorenceHTTPResult, FlorenceProductionService
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_preflight_mode() -> str:
+    raw = os.getenv("FLORENCE_HERMES_PREFLIGHT", "strict").strip().lower()
+    if raw in {"off", "false", "0", "disabled", "no"}:
+        return "off"
+    if raw in {"warn", "warning"}:
+        return "warn"
+    return "strict"
+
+
+def _preflight_error_hint(exc: Exception) -> str:
+    detail = str(exc).lower()
+    if "unknown parameter: 'reasoning'" in detail or 'unknown parameter: "reasoning"' in detail:
+        return (
+            "Your model/provider pair does not accept Hermes reasoning fields. "
+            "Use a compatible provider/model pair or disable reasoning for that backend."
+        )
+    if "no cookie auth credentials found" in detail:
+        return (
+            "The configured endpoint expects Codex cookie/OAuth auth. "
+            "Use Codex OAuth credentials, or point Florence to an API-key endpoint."
+        )
+    if "401" in detail or "authentication" in detail:
+        return "Authentication failed. Check provider credentials and endpoint configuration."
+    return "Check FLORENCE_HERMES_PROVIDER, FLORENCE_HERMES_MODEL, and provider API credentials."
+
+
+def _default_preflight_agent_factory(**kwargs):
+    from run_agent import AIAgent
+
+    return AIAgent(**kwargs)
+
+
+def _run_hermes_preflight(
+    settings: FlorenceSettings,
+    *,
+    agent_factory: Callable[..., Any] | None = None,
+) -> None:
+    mode = _resolve_preflight_mode()
+    if mode == "off":
+        logger.info("Florence Hermes preflight skipped (FLORENCE_HERMES_PREFLIGHT=off)")
+        return
+
+    factory = agent_factory or _default_preflight_agent_factory
+    try:
+        agent = factory(
+            model=settings.hermes.model,
+            max_iterations=1,
+            provider=settings.hermes.provider,
+            enabled_toolsets=[],
+            disabled_toolsets=[],
+            quiet_mode=True,
+            skip_memory=True,
+            platform="florence-preflight",
+        )
+        result = agent.run_conversation(
+            user_message="Reply with exactly: preflight_ok",
+            system_message="Return exactly preflight_ok. No punctuation.",
+        )
+        final_response = str(result.get("final_response") or "").strip()
+        if not final_response:
+            raise RuntimeError("empty_final_response")
+    except Exception as exc:  # pragma: no cover - exercised via monkeypatched tests
+        message = f"Florence Hermes preflight failed: {exc}. {_preflight_error_hint(exc)}"
+        if mode == "warn":
+            logger.warning(message)
+            return
+        raise RuntimeError(message) from exc
+
+    logger.info("Florence Hermes preflight passed")
 
 
 def _log_runtime_configuration(settings: FlorenceSettings) -> None:
@@ -161,6 +233,8 @@ def main() -> None:
     _log_runtime_configuration(settings)
     host = args.host or settings.server.host
     port = args.port or settings.server.port
+
+    _run_hermes_preflight(settings)
 
     service = FlorenceProductionService(settings)
     server = build_http_server(service, host=host, port=port)

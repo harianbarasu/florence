@@ -6,9 +6,16 @@ import hashlib
 import logging
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta, timezone
 
-from florence.contracts import ChannelMessage, ChannelMessageRole
+from florence.contracts import (
+    ChannelMessage,
+    ChannelMessageRole,
+    HouseholdNudgeStatus,
+    HouseholdNudgeTargetKind,
+    HouseholdWorkItemStatus,
+)
 from florence.messaging.types import FlorenceInboundMessage
 from florence.onboarding import (
     OnboardingPrompt,
@@ -101,6 +108,60 @@ def _looks_like_reminder_feedback(text: str) -> bool:
             re.IGNORECASE,
         )
     )
+
+
+def _looks_like_done_for_reminder(text: str) -> bool:
+    return bool(
+        re.search(
+            r"^(?:done|handled|completed|finished|got it|took care of it)\b",
+            text.strip(),
+            re.IGNORECASE,
+        )
+    )
+
+
+def _looks_like_snooze_request(text: str) -> bool:
+    lowered = text.lower()
+    return "snooze" in lowered or "remind me later" in lowered or "later" == lowered.strip()
+
+
+def _parse_snooze_deadline(text: str, *, now: datetime | None = None) -> datetime:
+    base = now or datetime.now(timezone.utc)
+    match = re.search(r"\b(\d+)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)\b", text, re.IGNORECASE)
+    if match:
+        quantity = max(1, int(match.group(1)))
+        unit = match.group(2).lower()
+        if unit.startswith("m"):
+            return base + timedelta(minutes=quantity)
+        if unit.startswith("h"):
+            return base + timedelta(hours=quantity)
+        return base + timedelta(days=quantity)
+    lowered = text.lower()
+    if "tomorrow morning" in lowered:
+        target = (base + timedelta(days=1)).astimezone(timezone.utc)
+        return datetime(target.year, target.month, target.day, 14, 0, tzinfo=timezone.utc)
+    if "tomorrow" in lowered:
+        return base + timedelta(days=1)
+    if "tonight" in lowered:
+        return base + timedelta(hours=4)
+    return base + timedelta(hours=2)
+
+
+def _parse_optional_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    if raw.endswith("Z"):
+        raw = f"{raw[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _onboarding_ready_messages() -> tuple[str, ...]:
@@ -382,6 +443,104 @@ class FlorenceMessagingIngressService:
                     "Understood. I updated your reminder style and will adjust future nudges accordingly. "
                     "You can ask me to show reminders anytime."
                 ),
+                consumed=True,
+            )
+
+        pending_nudges = self.household_manager_service.list_pending_nudges(
+            household_id=resolved.household_id,
+            recipient_member_id=member_id,
+            channel_id=resolved.channel_id,
+        )
+        sent_nudges = [nudge for nudge in pending_nudges if nudge.status == HouseholdNudgeStatus.SENT]
+        if sent_nudges:
+            min_dt = datetime.min.replace(tzinfo=timezone.utc)
+            actionable_nudge = max(
+                sent_nudges,
+                key=lambda nudge: _parse_optional_iso(nudge.sent_at) or _parse_optional_iso(nudge.scheduled_for) or min_dt,
+            )
+        else:
+            actionable_nudge = pending_nudges[0] if pending_nudges else None
+
+        if _looks_like_done_for_reminder(text):
+            if actionable_nudge is None:
+                return FlorenceMessagingIngressResult(
+                    reply_text="I don’t see an active reminder to mark done right now.",
+                    consumed=True,
+                )
+            now = datetime.now(timezone.utc)
+            self.household_manager_service.acknowledge_nudge(
+                nudge_id=actionable_nudge.id,
+                acknowledged_at=now,
+            )
+            completed_work_item_title: str | None = None
+            if (
+                actionable_nudge.target_kind == HouseholdNudgeTargetKind.WORK_ITEM
+                and actionable_nudge.target_id
+            ):
+                work_item = self.store.get_household_work_item(actionable_nudge.target_id)
+                if work_item is not None and work_item.status not in {
+                    HouseholdWorkItemStatus.DONE,
+                    HouseholdWorkItemStatus.CANCELLED,
+                }:
+                    updated_work_item = replace(
+                        work_item,
+                        status=HouseholdWorkItemStatus.DONE,
+                        completed_at=now.isoformat(),
+                    )
+                    self.household_manager_service.upsert_work_item(updated_work_item)
+                    completed_work_item_title = updated_work_item.title
+            self.household_manager_service.record_pilot_event(
+                household_id=resolved.household_id,
+                event_type="reminder_done",
+                member_id=member_id,
+                channel_id=resolved.channel_id,
+                metadata={
+                    "nudge_id": actionable_nudge.id,
+                    "target_kind": actionable_nudge.target_kind.value,
+                    "target_id": actionable_nudge.target_id,
+                    "marked_work_item_done": bool(completed_work_item_title),
+                },
+                created_at=now,
+            )
+            if completed_work_item_title:
+                return FlorenceMessagingIngressResult(
+                    reply_text=f'Done. I marked "{completed_work_item_title}" complete and stopped that reminder.',
+                    consumed=True,
+                )
+            return FlorenceMessagingIngressResult(
+                reply_text="Done. I marked that reminder complete.",
+                consumed=True,
+            )
+
+        if _looks_like_snooze_request(text):
+            if actionable_nudge is None:
+                return FlorenceMessagingIngressResult(
+                    reply_text="I don’t see an active reminder to snooze right now.",
+                    consumed=True,
+                )
+            now = datetime.now(timezone.utc)
+            snooze_until = _parse_snooze_deadline(text, now=now).astimezone(timezone.utc)
+            updated_nudge = self.household_manager_service.snooze_nudge(
+                nudge_id=actionable_nudge.id,
+                scheduled_for=snooze_until,
+                snoozed_at=now,
+            )
+            self.household_manager_service.record_pilot_event(
+                household_id=resolved.household_id,
+                event_type="reminder_snoozed",
+                member_id=member_id,
+                channel_id=resolved.channel_id,
+                metadata={
+                    "nudge_id": actionable_nudge.id,
+                    "target_kind": actionable_nudge.target_kind.value,
+                    "target_id": actionable_nudge.target_id,
+                    "snoozed_until": (updated_nudge.scheduled_for if updated_nudge else snooze_until.isoformat()),
+                },
+                created_at=now,
+            )
+            until_text = (updated_nudge.scheduled_for if updated_nudge else snooze_until.isoformat()).replace("T", " ").replace("+00:00", "Z")
+            return FlorenceMessagingIngressResult(
+                reply_text=f"Okay, snoozed. I’ll remind you again around {until_text}.",
                 consumed=True,
             )
 

@@ -3,7 +3,16 @@ from florence.messaging import (
     FlorenceMessagingIngressService,
     FlorenceResolvedInboundMessage,
 )
-from florence.contracts import Household
+from datetime import datetime, timedelta, timezone
+
+from florence.contracts import (
+    Household,
+    HouseholdNudge,
+    HouseholdNudgeStatus,
+    HouseholdNudgeTargetKind,
+    HouseholdWorkItem,
+    HouseholdWorkItemStatus,
+)
 from florence.onboarding import OnboardingVariant
 from florence.runtime import (
     FlorenceCandidateReviewService,
@@ -530,4 +539,140 @@ def test_complete_dm_reminder_feedback_updates_manager_profile_and_logs_event(tm
     assert manager_profile["nudge_preferences_override"] == "Too many reminders too early. Morning-of is better for practices."
     events = store.list_pilot_events(household_id="hh_123", event_type="reminder_feedback_received")
     assert len(events) == 1
+    store.close()
+
+
+def test_complete_dm_done_acknowledges_sent_nudge_and_marks_work_item_done(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_hybrid_onboarding_service(store, review_service)
+    ingress = FlorenceMessagingIngressService(
+        store,
+        onboarding_service,
+        review_service,
+        FlorenceHouseholdQueryService(store),
+    )
+    _complete_hybrid_onboarding(onboarding_service)
+
+    now = datetime.now(timezone.utc)
+    work_item = HouseholdWorkItem(
+        id="work_123",
+        household_id="hh_123",
+        title="Upload field trip form",
+        status=HouseholdWorkItemStatus.OPEN,
+    )
+    store.upsert_household_work_item(work_item)
+    nudge = HouseholdNudge(
+        id="nudge_123",
+        household_id="hh_123",
+        target_kind=HouseholdNudgeTargetKind.WORK_ITEM,
+        target_id=work_item.id,
+        message="Reminder: upload the field trip form tonight.",
+        status=HouseholdNudgeStatus.SENT,
+        recipient_member_id="mem_123",
+        channel_id="chan_dm_123",
+        scheduled_for=(now - timedelta(minutes=20)).isoformat(),
+        sent_at=(now - timedelta(minutes=15)).isoformat(),
+    )
+    store.upsert_household_nudge(nudge)
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_207",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="done",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert result.consumed is True
+    assert result.reply_text is not None
+    assert "marked" in result.reply_text.lower()
+
+    updated_nudge = store.get_household_nudge("nudge_123")
+    assert updated_nudge is not None
+    assert updated_nudge.status == HouseholdNudgeStatus.ACKNOWLEDGED
+    assert updated_nudge.acknowledged_at is not None
+
+    updated_work_item = store.get_household_work_item("work_123")
+    assert updated_work_item is not None
+    assert updated_work_item.status == HouseholdWorkItemStatus.DONE
+    assert updated_work_item.completed_at is not None
+
+    events = store.list_pilot_events(household_id="hh_123", event_type="reminder_done")
+    assert len(events) == 1
+    assert events[0].metadata["nudge_id"] == "nudge_123"
+    assert events[0].metadata["marked_work_item_done"] is True
+    store.close()
+
+
+def test_complete_dm_snooze_reschedules_sent_nudge_and_logs_event(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_hybrid_onboarding_service(store, review_service)
+    ingress = FlorenceMessagingIngressService(
+        store,
+        onboarding_service,
+        review_service,
+        FlorenceHouseholdQueryService(store),
+    )
+    _complete_hybrid_onboarding(onboarding_service)
+
+    now = datetime.now(timezone.utc)
+    nudge = HouseholdNudge(
+        id="nudge_124",
+        household_id="hh_123",
+        target_kind=HouseholdNudgeTargetKind.GENERAL,
+        message="Reminder: pack baseball gear.",
+        status=HouseholdNudgeStatus.SENT,
+        recipient_member_id="mem_123",
+        channel_id="chan_dm_123",
+        scheduled_for=(now - timedelta(minutes=10)).isoformat(),
+        sent_at=(now - timedelta(minutes=8)).isoformat(),
+    )
+    store.upsert_household_nudge(nudge)
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_208",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="snooze 3h",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert result.consumed is True
+    assert result.reply_text is not None
+    assert "snoozed" in result.reply_text.lower()
+
+    updated_nudge = store.get_household_nudge("nudge_124")
+    assert updated_nudge is not None
+    assert updated_nudge.status == HouseholdNudgeStatus.SCHEDULED
+    assert updated_nudge.sent_at is None
+    assert updated_nudge.acknowledged_at is None
+    assert updated_nudge.scheduled_for is not None
+    scheduled_for = datetime.fromisoformat(updated_nudge.scheduled_for.replace("Z", "+00:00"))
+    assert scheduled_for > now + timedelta(hours=2)
+
+    events = store.list_pilot_events(household_id="hh_123", event_type="reminder_snoozed")
+    assert len(events) == 1
+    assert events[0].metadata["nudge_id"] == "nudge_124"
     store.close()

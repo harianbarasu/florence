@@ -1442,6 +1442,34 @@ class FlorenceHouseholdManagerService:
                 due.append(nudge)
         return due
 
+    def list_pending_nudges(
+        self,
+        *,
+        household_id: str,
+        recipient_member_id: str | None = None,
+        channel_id: str | None = None,
+    ) -> list[HouseholdNudge]:
+        candidates = [
+            nudge
+            for nudge in self.store.list_household_nudges(household_id=household_id)
+            if nudge.status in {HouseholdNudgeStatus.SCHEDULED, HouseholdNudgeStatus.SENT}
+        ]
+        if recipient_member_id:
+            scoped = [nudge for nudge in candidates if nudge.recipient_member_id == recipient_member_id]
+            if scoped:
+                candidates = scoped
+        if channel_id:
+            scoped = [nudge for nudge in candidates if nudge.channel_id == channel_id]
+            if scoped:
+                candidates = scoped
+
+        def sort_key(nudge: HouseholdNudge) -> tuple[int, datetime]:
+            priority = 0 if nudge.status == HouseholdNudgeStatus.SENT else 1
+            scheduled = _parse_iso_datetime(nudge.scheduled_for) or datetime.max.replace(tzinfo=timezone.utc)
+            return (priority, scheduled)
+
+        return sorted(candidates, key=sort_key)
+
     def mark_nudge_sent(
         self,
         *,
@@ -1471,6 +1499,29 @@ class FlorenceHouseholdManagerService:
             nudge,
             status=HouseholdNudgeStatus.ACKNOWLEDGED,
             acknowledged_at=(acknowledged_at or _utc_now()).isoformat(),
+        )
+        return self.store.upsert_household_nudge(updated)
+
+    def snooze_nudge(
+        self,
+        *,
+        nudge_id: str,
+        scheduled_for: datetime,
+        snoozed_at: datetime | None = None,
+    ) -> HouseholdNudge | None:
+        nudge = self.store.get_household_nudge(nudge_id)
+        if nudge is None:
+            return None
+        metadata = dict(nudge.metadata)
+        metadata["snoozed_count"] = int(metadata.get("snoozed_count", 0) or 0) + 1
+        metadata["last_snoozed_at"] = (snoozed_at or _utc_now()).isoformat()
+        updated = replace(
+            nudge,
+            status=HouseholdNudgeStatus.SCHEDULED,
+            scheduled_for=scheduled_for.isoformat(),
+            sent_at=None,
+            acknowledged_at=None,
+            metadata=metadata,
         )
         return self.store.upsert_household_nudge(updated)
 

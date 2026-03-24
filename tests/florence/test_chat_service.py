@@ -90,6 +90,7 @@ def test_household_chat_service_uses_hermes_agent_with_confirmed_state(tmp_path)
         store,
         model="anthropic/claude-opus-4.6",
         max_iterations=4,
+        provider="anthropic",
         agent_factory=_FakeAgent,
     )
 
@@ -102,6 +103,7 @@ def test_household_chat_service_uses_hermes_agent_with_confirmed_state(tmp_path)
 
     assert reply is not None
     assert "soccer" in reply.text.lower()
+    assert _FakeAgent.created[0]["provider"] == "anthropic"
     assert _FakeAgent.created[0]["enabled_toolsets"] == ["florence_chat"]
     assert _FakeAgent.created[0]["disabled_toolsets"] is None
     assert "Confirmed household events" in _FakeAgent.last_run["system_message"]

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Callable
 
 from florence.contracts import ChannelMessage, ChannelMessageRole, ChannelType, HouseholdProfileKind
 from florence.state import FlorenceStateDB
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -23,6 +26,7 @@ class FlorenceHouseholdChatService:
         *,
         model: str,
         max_iterations: int = 6,
+        provider: str = "auto",
         enabled_toolsets: list[str] | tuple[str, ...] | None = None,
         disabled_toolsets: list[str] | tuple[str, ...] | None = None,
         agent_factory: Callable[..., Any] | None = None,
@@ -30,6 +34,7 @@ class FlorenceHouseholdChatService:
         self.store = store
         self.model = model
         self.max_iterations = max_iterations
+        self.provider = provider.strip() if isinstance(provider, str) and provider.strip() else "auto"
         self.enabled_toolsets = list(enabled_toolsets) if enabled_toolsets is not None else ["florence_chat"]
         self.disabled_toolsets = list(disabled_toolsets or [])
         self.agent_factory = agent_factory
@@ -60,6 +65,7 @@ class FlorenceHouseholdChatService:
         agent = agent_factory(
             model=self.model,
             max_iterations=self.max_iterations,
+            provider=self.provider,
             enabled_toolsets=self.enabled_toolsets,
             disabled_toolsets=self.disabled_toolsets or None,
             quiet_mode=True,
@@ -73,7 +79,14 @@ class FlorenceHouseholdChatService:
             conversation_history=history,
         )
         final_response = str(result.get("final_response") or "").strip()
-        return FlorenceHouseholdChatReply(text=final_response) if final_response else None
+        if not final_response:
+            logger.warning(
+                "Florence household chat produced an empty final_response for household_id=%s channel_id=%s",
+                household_id,
+                channel_id,
+            )
+            return None
+        return FlorenceHouseholdChatReply(text=final_response)
 
     @staticmethod
     def _build_conversation_history(messages: list[ChannelMessage]) -> list[dict[str, str]]:

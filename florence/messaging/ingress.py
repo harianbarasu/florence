@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 import time
 from dataclasses import dataclass, field
@@ -22,6 +23,8 @@ from florence.runtime.services import (
     FlorenceOnboardingSessionService,
 )
 from florence.state import FlorenceStateDB
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -126,6 +129,16 @@ class FlorenceMessagingIngressService:
     def handle_message(self, resolved: FlorenceResolvedInboundMessage) -> FlorenceMessagingIngressResult:
         if resolved.message.is_from_me:
             return FlorenceMessagingIngressResult(consumed=False)
+
+        inbound_message_id = _stable_transport_message_id(resolved.message.provider, resolved.message.message_id)
+        if self.store.get_channel_message(inbound_message_id) is not None:
+            logger.info(
+                "Ignoring duplicate inbound message provider=%s message_id=%s channel_id=%s",
+                resolved.message.provider,
+                resolved.message.message_id,
+                resolved.channel_id,
+            )
+            return FlorenceMessagingIngressResult(consumed=True)
 
         self._append_inbound_message(resolved)
 
@@ -297,6 +310,11 @@ class FlorenceMessagingIngressService:
             )
             if reply is not None and reply.text.strip():
                 return FlorenceMessagingIngressResult(reply_text=reply.text, consumed=True)
+            logger.warning(
+                "Household chat returned no reply for household_id=%s channel_id=%s",
+                resolved.household_id,
+                resolved.channel_id,
+            )
 
         return FlorenceMessagingIngressResult(
             reply_text="I’m set up. You can ask me to plan, research, draft, review imports, or help with household logistics here or in the family group.",

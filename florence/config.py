@@ -120,6 +120,7 @@ class FlorenceLinqRuntimeConfig:
 class FlorenceHermesRuntimeConfig:
     model: str
     max_iterations: int
+    provider: str = "auto"
     enabled_toolsets: tuple[str, ...] = ("florence_chat",)
     disabled_toolsets: tuple[str, ...] = ()
 
@@ -266,6 +267,16 @@ class FlorenceSettings:
                     ),
                     6,
                 ),
+                provider=str(
+                    _env_or_config(
+                        ("FLORENCE_HERMES_PROVIDER", "HERMES_PROVIDER"),
+                        florence_cfg,
+                        "hermes",
+                        "provider",
+                        default="auto",
+                    )
+                ).strip()
+                or "auto",
                 enabled_toolsets=_as_str_list(
                     _env_or_config(
                         ("FLORENCE_HERMES_ENABLED_TOOLSETS",),

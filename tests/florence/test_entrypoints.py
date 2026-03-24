@@ -127,6 +127,19 @@ def test_entrypoints_google_callback_returns_next_prompt(tmp_path, monkeypatch):
     store.close()
 
 
+def test_entrypoints_threads_household_chat_provider(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    service = FlorenceEntrypointService(
+        store,
+        household_chat_model="openai/gpt-5.4",
+        household_chat_provider="custom",
+    )
+
+    assert service.household_chat_service is not None
+    assert service.household_chat_service.provider == "custom"
+    store.close()
+
+
 def test_entrypoints_ignores_linq_delivery_events(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     service = FlorenceEntrypointService(store)

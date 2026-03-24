@@ -253,3 +253,43 @@ def test_production_service_returns_500_when_linq_webhook_processing_fails(tmp_p
     assert json.loads(result.body) == {"ok": False, "error": "internal_linq_webhook_error"}
     assert service.linq.sent == []
     store.close()
+
+
+def test_production_service_ignores_duplicate_linq_message_ids(tmp_path):
+    settings = _build_settings(tmp_path)
+    store = FlorenceStateDB(settings.server.db_path)
+    service = FlorenceProductionService(settings, store=store)
+    service.linq = _FakeLinqClient()
+
+    payload = {
+        "webhook_version": "2026-02-03",
+        "event_type": "message.received",
+        "data": {
+            "chat": {"id": "dm-thread-123", "is_group": False},
+            "id": "msg_dup_123",
+            "direction": "inbound",
+            "sender_handle": {"handle": "+15555550123", "is_me": False},
+            "parts": [{"type": "text", "value": "Maya"}],
+            "service": "iMessage",
+        },
+    }
+    raw_body = json.dumps(payload).encode("utf-8")
+
+    first = service.handle_linq_webhook(
+        payload=payload,
+        raw_body=raw_body,
+        webhook_signature="sig",
+        webhook_timestamp=str(int(time.time())),
+    )
+    sent_count_after_first = len(service.linq.sent)
+    second = service.handle_linq_webhook(
+        payload=payload,
+        raw_body=raw_body,
+        webhook_signature="sig",
+        webhook_timestamp=str(int(time.time())),
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert len(service.linq.sent) == sent_count_after_first
+    store.close()

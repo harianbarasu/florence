@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from florence.contracts import CandidateState, GoogleConnection, GoogleSourceKind, HouseholdContext
+from florence.contracts import CandidateState, GoogleConnection, GoogleSourceKind, HouseholdContext, HouseholdProfileKind
 from florence.google import FlorenceGoogleSyncBatch, GmailSyncItem
 from florence.runtime import (
     FlorenceCandidateReviewService,
@@ -146,5 +146,66 @@ def test_onboarding_service_releases_quarantined_candidates_once_grounded(tmp_pa
     )
     assert len(pending) == 1
     assert pending[0].source_identifier == "gmail:gmail_123"
+    assert [child.full_name for child in store.list_child_profiles(household_id="hh_123")] == ["Ava"]
+    assert [
+        item.label
+        for item in store.list_household_profile_items(
+            household_id="hh_123",
+            kind=HouseholdProfileKind.SCHOOL,
+        )
+    ] == ["Roosevelt Elementary"]
+    assert [
+        item.label
+        for item in store.list_household_profile_items(
+            household_id="hh_123",
+            kind=HouseholdProfileKind.ACTIVITY,
+        )
+    ] == ["Soccer"]
 
+    store.close()
+
+
+def test_second_parent_early_onboarding_does_not_clear_existing_household_grounding(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    onboarding_service = FlorenceOnboardingSessionService(store)
+
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_primary",
+        thread_id="dm_primary",
+        display_name="Maya",
+    )
+    onboarding_service.record_google_connected(
+        household_id="hh_123",
+        member_id="mem_primary",
+        thread_id="dm_primary",
+    )
+    onboarding_service.record_child_names(
+        household_id="hh_123",
+        member_id="mem_primary",
+        thread_id="dm_primary",
+        child_names=["Ava"],
+    )
+    onboarding_service.record_school_basics(
+        household_id="hh_123",
+        member_id="mem_primary",
+        thread_id="dm_primary",
+        school_labels=["Roosevelt Elementary"],
+    )
+
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_second",
+        thread_id="dm_second",
+        display_name="Chris",
+    )
+
+    assert [child.full_name for child in store.list_child_profiles(household_id="hh_123")] == ["Ava"]
+    assert [
+        item.label
+        for item in store.list_household_profile_items(
+            household_id="hh_123",
+            kind=HouseholdProfileKind.SCHOOL,
+        )
+    ] == ["Roosevelt Elementary"]
     store.close()

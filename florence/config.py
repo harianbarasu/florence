@@ -95,17 +95,6 @@ class FlorenceGoogleRuntimeConfig:
 
 
 @dataclass(slots=True)
-class FlorenceBlueBubblesRuntimeConfig:
-    base_url: str | None
-    password: str | None
-    webhook_secret: str | None = None
-
-    @property
-    def configured(self) -> bool:
-        return bool(self.base_url and self.password)
-
-
-@dataclass(slots=True)
 class FlorenceLinqRuntimeConfig:
     api_key: str | None
     webhook_secret: str | None
@@ -136,7 +125,6 @@ class FlorenceServerRuntimeConfig:
 class FlorenceSettings:
     server: FlorenceServerRuntimeConfig
     google: FlorenceGoogleRuntimeConfig
-    bluebubbles: FlorenceBlueBubblesRuntimeConfig
     linq: FlorenceLinqRuntimeConfig
     hermes: FlorenceHermesRuntimeConfig
 
@@ -217,29 +205,6 @@ class FlorenceSettings:
                     florence_cfg,
                     "google",
                     "state_secret",
-                    default=None,
-                ),
-            ),
-            bluebubbles=FlorenceBlueBubblesRuntimeConfig(
-                base_url=_env_or_config(
-                    ("FLORENCE_BLUEBUBBLES_BASE_URL", "BLUEBUBBLES_BASE_URL"),
-                    florence_cfg,
-                    "bluebubbles",
-                    "base_url",
-                    default=None,
-                ),
-                password=_env_or_config(
-                    ("FLORENCE_BLUEBUBBLES_PASSWORD", "BLUEBUBBLES_PASSWORD"),
-                    florence_cfg,
-                    "bluebubbles",
-                    "password",
-                    default=None,
-                ),
-                webhook_secret=_env_or_config(
-                    ("FLORENCE_BLUEBUBBLES_WEBHOOK_SECRET", "BLUEBUBBLES_WEBHOOK_SECRET"),
-                    florence_cfg,
-                    "bluebubbles",
-                    "webhook_secret",
                     default=None,
                 ),
             ),

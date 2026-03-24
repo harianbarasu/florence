@@ -7,11 +7,9 @@ Linq, and shared state.
 """
 
 from florence.contracts import (
-    AppChatMessage,
-    AppChatMessageRole,
-    AppChatScope,
-    AppChatThread,
     CandidateState,
+    ChannelMessage,
+    ChannelMessageRole,
     Channel,
     ChannelType,
     ChildProfile,
@@ -21,6 +19,8 @@ from florence.contracts import (
     HouseholdContext,
     HouseholdEvent,
     HouseholdEventStatus,
+    HouseholdProfileItem,
+    HouseholdProfileKind,
     HouseholdStatus,
     IdentityKind,
     ImportedCandidate,
@@ -30,11 +30,9 @@ from florence.contracts import (
 )
 
 __all__ = [
-    "AppChatMessage",
-    "AppChatMessageRole",
-    "AppChatScope",
-    "AppChatThread",
     "CandidateState",
+    "ChannelMessage",
+    "ChannelMessageRole",
     "Channel",
     "ChannelType",
     "ChildProfile",
@@ -44,6 +42,8 @@ __all__ = [
     "HouseholdContext",
     "HouseholdEvent",
     "HouseholdEventStatus",
+    "HouseholdProfileItem",
+    "HouseholdProfileKind",
     "HouseholdStatus",
     "IdentityKind",
     "ImportedCandidate",

@@ -1,4 +1,12 @@
-from florence.contracts import CandidateState, GoogleConnection, GoogleSourceKind, ImportedCandidate
+from florence.contracts import (
+    CandidateState,
+    ChildProfile,
+    GoogleConnection,
+    GoogleSourceKind,
+    HouseholdProfileItem,
+    HouseholdProfileKind,
+    ImportedCandidate,
+)
 from florence.onboarding import OnboardingStage, OnboardingState
 from florence.state import FlorenceStateDB
 
@@ -63,6 +71,50 @@ def test_state_db_round_trips_onboarding_google_and_candidates(tmp_path):
     assert loaded_onboarding == onboarding
     assert loaded_connection == connection
     assert loaded_candidate == candidate
+
+    store.close()
+
+
+def test_state_db_round_trips_household_profiles(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    children = [
+        ChildProfile(id="child_ava", household_id="hh_123", full_name="Ava"),
+        ChildProfile(id="child_noah", household_id="hh_123", full_name="Noah"),
+    ]
+    schools = [
+        HouseholdProfileItem(
+            id="school_roosevelt",
+            household_id="hh_123",
+            kind=HouseholdProfileKind.SCHOOL,
+            label="Roosevelt Elementary",
+            member_id="mem_123",
+        )
+    ]
+    activities = [
+        HouseholdProfileItem(
+            id="activity_soccer",
+            household_id="hh_123",
+            kind=HouseholdProfileKind.ACTIVITY,
+            label="Soccer",
+            member_id="mem_123",
+        )
+    ]
+
+    store.replace_child_profiles(household_id="hh_123", children=children)
+    store.replace_household_profile_items(
+        household_id="hh_123",
+        kind=HouseholdProfileKind.SCHOOL,
+        items=schools,
+    )
+    store.replace_household_profile_items(
+        household_id="hh_123",
+        kind=HouseholdProfileKind.ACTIVITY,
+        items=activities,
+    )
+
+    assert store.list_child_profiles(household_id="hh_123") == children
+    assert store.list_household_profile_items(household_id="hh_123", kind=HouseholdProfileKind.SCHOOL) == schools
+    assert store.list_household_profile_items(household_id="hh_123", kind=HouseholdProfileKind.ACTIVITY) == activities
 
     store.close()
 

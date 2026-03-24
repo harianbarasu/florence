@@ -5,14 +5,11 @@ from __future__ import annotations
 from importlib import import_module
 
 _EXPORTS = {
-    "FlorenceAppBootstrapResult": ("florence.runtime.app_chat", "FlorenceAppBootstrapResult"),
-    "FlorenceAppChatService": ("florence.runtime.app_chat", "FlorenceAppChatService"),
-    "FlorenceAppChatTurnResult": ("florence.runtime.app_chat", "FlorenceAppChatTurnResult"),
     "CandidateReviewPrompt": ("florence.runtime.services", "CandidateReviewPrompt"),
     "CandidateReviewResult": ("florence.runtime.services", "CandidateReviewResult"),
-    "FlorenceAppService": ("florence.runtime.entrypoints", "FlorenceAppService"),
     "FlorenceCandidateReviewService": ("florence.runtime.services", "FlorenceCandidateReviewService"),
     "FlorenceEntrypointResult": ("florence.runtime.entrypoints", "FlorenceEntrypointResult"),
+    "FlorenceEntrypointService": ("florence.runtime.entrypoints", "FlorenceEntrypointService"),
     "FlorenceGoogleAccountLinkService": ("florence.runtime.services", "FlorenceGoogleAccountLinkService"),
     "FlorenceGoogleCallbackResult": ("florence.runtime.services", "FlorenceGoogleCallbackResult"),
     "FlorenceGoogleConnectLink": ("florence.runtime.services", "FlorenceGoogleConnectLink"),

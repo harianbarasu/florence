@@ -8,16 +8,19 @@ import time
 from pathlib import Path
 
 from florence.contracts import (
-    AppChatMessage,
-    AppChatMessageRole,
     CandidateState,
+    ChannelMessage,
+    ChannelMessageRole,
     Channel,
     ChannelType,
+    ChildProfile,
     GoogleConnection,
     GoogleSourceKind,
     HouseholdEvent,
     HouseholdEventStatus,
     Household,
+    HouseholdProfileItem,
+    HouseholdProfileKind,
     HouseholdStatus,
     IdentityKind,
     ImportedCandidate,
@@ -29,7 +32,7 @@ from florence.onboarding import OnboardingStage, OnboardingState
 from florence.state.db import RowLike, connect_florence_db
 
 FLORENCE_DB_PATH = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes")) / "florence.db"
-FLORENCE_SCHEMA_VERSION = 2
+FLORENCE_SCHEMA_VERSION = 4
 
 FLORENCE_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS florence_schema_version (
@@ -114,7 +117,35 @@ ON channels(household_id, provider, provider_channel_id);
 CREATE INDEX IF NOT EXISTS idx_channels_household_type
 ON channels(household_id, channel_type);
 
-CREATE TABLE IF NOT EXISTS app_chat_messages (
+CREATE TABLE IF NOT EXISTS child_profiles (
+    id TEXT PRIMARY KEY,
+    household_id TEXT NOT NULL,
+    full_name TEXT NOT NULL,
+    birthdate TEXT,
+    metadata_json TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_child_profiles_household
+ON child_profiles(household_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS household_profile_items (
+    id TEXT PRIMARY KEY,
+    household_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    label TEXT NOT NULL,
+    member_id TEXT,
+    child_id TEXT,
+    metadata_json TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_household_profile_items_household_kind
+ON household_profile_items(household_id, kind, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS channel_messages (
     id TEXT PRIMARY KEY,
     household_id TEXT NOT NULL,
     channel_id TEXT NOT NULL,
@@ -125,11 +156,11 @@ CREATE TABLE IF NOT EXISTS app_chat_messages (
     created_at REAL NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_app_chat_messages_channel
-ON app_chat_messages(channel_id, created_at ASC);
+CREATE INDEX IF NOT EXISTS idx_channel_messages_channel
+ON channel_messages(channel_id, created_at ASC);
 
-CREATE INDEX IF NOT EXISTS idx_app_chat_messages_household
-ON app_chat_messages(household_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_channel_messages_household
+ON channel_messages(household_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS google_connections (
     id TEXT PRIMARY KEY,
@@ -557,10 +588,103 @@ class FlorenceStateDB:
         rows = self._conn.execute(query, tuple(params)).fetchall()
         return [self._row_to_channel(row) for row in rows]
 
-    def append_app_chat_message(self, message: AppChatMessage) -> AppChatMessage:
+    def replace_child_profiles(self, *, household_id: str, children: list[ChildProfile]) -> list[ChildProfile]:
+        self._conn.execute("DELETE FROM child_profiles WHERE household_id = ?", (household_id,))
+        now = time.time()
+        for child in children:
+            self._conn.execute(
+                """
+                INSERT INTO child_profiles (
+                    id, household_id, full_name, birthdate, metadata_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    child.id,
+                    child.household_id,
+                    child.full_name,
+                    child.birthdate,
+                    _json_dumps(child.metadata),
+                    now,
+                    now,
+                ),
+            )
+        self._conn.commit()
+        return children
+
+    def list_child_profiles(self, *, household_id: str) -> list[ChildProfile]:
+        rows = self._conn.execute(
+            "SELECT * FROM child_profiles WHERE household_id = ? ORDER BY updated_at DESC, full_name ASC",
+            (household_id,),
+        ).fetchall()
+        return [self._row_to_child_profile(row) for row in rows]
+
+    def replace_household_profile_items(
+        self,
+        *,
+        household_id: str,
+        kind: HouseholdProfileKind,
+        items: list[HouseholdProfileItem],
+        member_id: str | None = None,
+    ) -> list[HouseholdProfileItem]:
+        if member_id is None:
+            self._conn.execute(
+                "DELETE FROM household_profile_items WHERE household_id = ? AND kind = ?",
+                (household_id, kind.value),
+            )
+        else:
+            self._conn.execute(
+                """
+                DELETE FROM household_profile_items
+                WHERE household_id = ? AND kind = ? AND member_id = ?
+                """,
+                (household_id, kind.value, member_id),
+            )
+        now = time.time()
+        for item in items:
+            self._conn.execute(
+                """
+                INSERT INTO household_profile_items (
+                    id, household_id, kind, label, member_id, child_id, metadata_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    item.id,
+                    item.household_id,
+                    item.kind.value,
+                    item.label,
+                    item.member_id,
+                    item.child_id,
+                    _json_dumps(item.metadata),
+                    now,
+                    now,
+                ),
+            )
+        self._conn.commit()
+        return items
+
+    def list_household_profile_items(
+        self,
+        *,
+        household_id: str,
+        kind: HouseholdProfileKind | None = None,
+        member_id: str | None = None,
+    ) -> list[HouseholdProfileItem]:
+        params: list[object] = [household_id]
+        query = "SELECT * FROM household_profile_items WHERE household_id = ?"
+        if kind is not None:
+            query += " AND kind = ?"
+            params.append(kind.value)
+        if member_id is not None:
+            query += " AND member_id = ?"
+            params.append(member_id)
+        query += " ORDER BY updated_at DESC, label ASC"
+        rows = self._conn.execute(query, tuple(params)).fetchall()
+        return [self._row_to_household_profile_item(row) for row in rows]
+
+    def append_channel_message(self, message: ChannelMessage) -> ChannelMessage:
         self._conn.execute(
             """
-            INSERT INTO app_chat_messages (
+            INSERT INTO channel_messages (
                 id, household_id, channel_id, sender_role, sender_member_id, body, metadata_json, created_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
@@ -586,29 +710,29 @@ class FlorenceStateDB:
         self._conn.commit()
         return message
 
-    def list_app_chat_messages(
+    def list_channel_messages(
         self,
         *,
         channel_id: str,
         limit: int = 50,
-    ) -> list[AppChatMessage]:
+    ) -> list[ChannelMessage]:
         rows = self._conn.execute(
             """
-            SELECT * FROM app_chat_messages
+            SELECT * FROM channel_messages
             WHERE channel_id = ?
             ORDER BY created_at DESC
             LIMIT ?
             """,
             (channel_id, max(1, limit)),
         ).fetchall()
-        return [self._row_to_app_chat_message(row) for row in reversed(rows)]
+        return [self._row_to_channel_message(row) for row in reversed(rows)]
 
-    def get_app_chat_message(self, message_id: str) -> AppChatMessage | None:
+    def get_channel_message(self, message_id: str) -> ChannelMessage | None:
         row = self._conn.execute(
-            "SELECT * FROM app_chat_messages WHERE id = ?",
+            "SELECT * FROM channel_messages WHERE id = ?",
             (message_id,),
         ).fetchone()
-        return self._row_to_app_chat_message(row) if row else None
+        return self._row_to_channel_message(row) if row else None
 
     def get_google_connection(self, connection_id: str) -> GoogleConnection | None:
         row = self._conn.execute(
@@ -930,12 +1054,34 @@ class FlorenceStateDB:
         )
 
     @staticmethod
-    def _row_to_app_chat_message(row: RowLike) -> AppChatMessage:
-        return AppChatMessage(
+    def _row_to_child_profile(row: RowLike) -> ChildProfile:
+        return ChildProfile(
+            id=str(row["id"]),
+            household_id=str(row["household_id"]),
+            full_name=str(row["full_name"]),
+            birthdate=str(row["birthdate"]) if row["birthdate"] is not None else None,
+            metadata=dict(_json_loads(row["metadata_json"], default={})),
+        )
+
+    @staticmethod
+    def _row_to_household_profile_item(row: RowLike) -> HouseholdProfileItem:
+        return HouseholdProfileItem(
+            id=str(row["id"]),
+            household_id=str(row["household_id"]),
+            kind=HouseholdProfileKind(str(row["kind"])),
+            label=str(row["label"]),
+            member_id=str(row["member_id"]) if row["member_id"] is not None else None,
+            child_id=str(row["child_id"]) if row["child_id"] is not None else None,
+            metadata=dict(_json_loads(row["metadata_json"], default={})),
+        )
+
+    @staticmethod
+    def _row_to_channel_message(row: RowLike) -> ChannelMessage:
+        return ChannelMessage(
             id=str(row["id"]),
             household_id=str(row["household_id"]),
             channel_id=str(row["channel_id"]),
-            sender_role=AppChatMessageRole(str(row["sender_role"])),
+            sender_role=ChannelMessageRole(str(row["sender_role"])),
             sender_member_id=str(row["sender_member_id"]) if row["sender_member_id"] is not None else None,
             body=str(row["body"]),
             created_at=float(row["created_at"]),

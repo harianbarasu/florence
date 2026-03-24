@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from florence.contracts import CandidateState, GoogleConnection, GoogleSourceKind
+from florence.contracts import CandidateState, ChildProfile, GoogleConnection, GoogleSourceKind, HouseholdProfileItem, HouseholdProfileKind
 from florence.google import GmailSyncItem, ParentCalendarSyncItem
 from florence.onboarding import OnboardingState
 from florence.runtime import FlorenceGoogleSyncPersistenceService, FlorenceGoogleSyncWorkerService
@@ -36,6 +36,36 @@ def test_google_sync_worker_fetches_and_persists_candidates(tmp_path, monkeypatc
             school_basics_collected=True,
             activity_basics_collected=True,
         )
+    )
+    store.replace_child_profiles(
+        household_id="hh_123",
+        children=[ChildProfile(id="child_ava", household_id="hh_123", full_name="Ava")],
+    )
+    store.replace_household_profile_items(
+        household_id="hh_123",
+        kind=HouseholdProfileKind.SCHOOL,
+        items=[
+            HouseholdProfileItem(
+                id="school_roosevelt",
+                household_id="hh_123",
+                kind=HouseholdProfileKind.SCHOOL,
+                label="Roosevelt Elementary",
+                member_id="mem_123",
+            )
+        ],
+    )
+    store.replace_household_profile_items(
+        household_id="hh_123",
+        kind=HouseholdProfileKind.ACTIVITY,
+        items=[
+            HouseholdProfileItem(
+                id="activity_soccer",
+                household_id="hh_123",
+                kind=HouseholdProfileKind.ACTIVITY,
+                label="Soccer",
+                member_id="mem_123",
+            )
+        ],
     )
 
     monkeypatch.setattr(

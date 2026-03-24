@@ -1,17 +1,15 @@
-"""Florence app-layer entrypoints for transport webhooks and OAuth callbacks."""
+"""Florence transport and OAuth entrypoints."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from florence.contracts import AppChatScope
 from florence.linq import parse_linq_payload
 from florence.messaging import (
     FlorenceInboundMessage,
     FlorenceMessagingIngressService,
     FlorenceResolvedInboundMessage,
 )
-from florence.runtime.app_chat import FlorenceAppBootstrapResult, FlorenceAppChatService, FlorenceAppChatTurnResult
 from florence.runtime.chat import FlorenceHouseholdChatService
 from florence.runtime.resolver import FlorenceIdentityResolver
 from florence.runtime.services import (
@@ -22,22 +20,11 @@ from florence.runtime.services import (
 )
 from florence.state import FlorenceStateDB
 
-IGNORED_BLUEBUBBLES_EVENT_TYPES = {
-    "chat-read-status-changed",
-    "typing-indicator",
-}
-
 IGNORED_LINQ_EVENT_TYPES = {
     "message.sent",
     "message.delivered",
     "message.read",
     "message.failed",
-}
-
-IGNORABLE_BLUEBUBBLES_PARSE_ERRORS = {
-    "bluebubbles_chat_guid_required",
-    "bluebubbles_message_id_required",
-    "bluebubbles_sender_handle_required",
 }
 
 IGNORABLE_LINQ_PARSE_ERRORS = {
@@ -66,8 +53,8 @@ class FlorenceEntrypointResult:
     error: str | None = None
 
 
-class FlorenceAppService:
-    """Composable Florence entrypoints around the persisted product services."""
+class FlorenceEntrypointService:
+    """Composable Florence entrypoints around persisted Florence services."""
 
     def __init__(
         self,
@@ -85,7 +72,6 @@ class FlorenceAppService:
         )
         self.query_service = FlorenceHouseholdQueryService(store)
         self.identity_resolvers = {
-            "bluebubbles": FlorenceIdentityResolver(store, provider="bluebubbles"),
             "linq": FlorenceIdentityResolver(store, provider="linq"),
         }
         self.household_chat_service = (
@@ -116,46 +102,6 @@ class FlorenceAppService:
             self.query_service,
             google_account_link_service=self.google_account_link_service,
             household_chat_service=self.household_chat_service,
-        )
-        self.app_chat_service = FlorenceAppChatService(
-            store,
-            onboarding_service=self.onboarding_service,
-            candidate_review_service=self.candidate_review_service,
-            query_service=self.query_service,
-            google_account_link_service=self.google_account_link_service,
-            household_chat_service=self.household_chat_service,
-        )
-
-    def handle_bluebubbles_payload(self, payload: dict[str, object]) -> FlorenceEntrypointResult:
-        from florence.bluebubbles import parse_bluebubbles_payload
-
-        try:
-            parsed = parse_bluebubbles_payload(payload)
-        except ValueError as exc:
-            if str(exc) in IGNORABLE_BLUEBUBBLES_PARSE_ERRORS:
-                return FlorenceEntrypointResult(consumed=False, error=str(exc))
-            raise
-        if parsed.event_type and parsed.event_type.strip().lower() in IGNORED_BLUEBUBBLES_EVENT_TYPES:
-            return FlorenceEntrypointResult(consumed=False)
-        inbound = FlorenceInboundMessage(
-            provider="bluebubbles",
-            message_id=parsed.source_message_id,
-            thread_id=parsed.chat_guid,
-            sender_handle=parsed.sender_handle,
-            body=parsed.body,
-            is_group_chat=parsed.is_group_chat,
-            is_from_me=parsed.is_from_me,
-            event_type=parsed.event_type,
-            participant_handles=tuple(parsed.participants),
-            metadata={"raw_payload": parsed.raw_payload},
-        )
-        return self._handle_transport_message(
-            provider="bluebubbles",
-            thread_id=inbound.thread_id,
-            sender_handle=inbound.sender_handle,
-            is_group_chat=inbound.is_group_chat,
-            participant_handles=list(inbound.participant_handles),
-            inbound_message=inbound,
         )
 
     def handle_linq_payload(self, payload: dict[str, object]) -> FlorenceEntrypointResult:
@@ -246,38 +192,4 @@ class FlorenceAppService:
             consumed=True,
             household_id=callback.connection.household_id,
             member_id=callback.connection.member_id,
-        )
-
-    def bootstrap_app_parent(
-        self,
-        *,
-        parent_name: str,
-        household_name: str | None = None,
-        timezone: str = "America/Los_Angeles",
-    ) -> FlorenceAppBootstrapResult:
-        return self.app_chat_service.bootstrap_parent(
-            parent_name=parent_name,
-            household_name=household_name,
-            timezone=timezone,
-        )
-
-    def list_app_threads(self, *, household_id: str, member_id: str):
-        return self.app_chat_service.list_threads(household_id=household_id, member_id=member_id)
-
-    def list_app_messages(self, *, channel_id: str, limit: int = 50):
-        return self.app_chat_service.list_messages(channel_id=channel_id, limit=limit)
-
-    def send_app_message(
-        self,
-        *,
-        household_id: str,
-        member_id: str,
-        scope: AppChatScope,
-        text: str,
-    ) -> FlorenceAppChatTurnResult:
-        return self.app_chat_service.send_message(
-            household_id=household_id,
-            member_id=member_id,
-            scope=scope,
-            text=text,
         )

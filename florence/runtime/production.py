@@ -1,4 +1,4 @@
-"""Production orchestration for Florence HTTP, delivery, and background sync."""
+"""Production orchestration for Florence HTTP, delivery, and sync notifications."""
 
 from __future__ import annotations
 
@@ -9,12 +9,11 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any
 
-from florence.bluebubbles.client import FlorenceBlueBubblesClient
 from florence.config import FlorenceSettings
 from florence.linq import FlorenceLinqClient
-from florence.contracts import AppChatMessage, AppChatScope, AppChatThread, CandidateState, ChannelType
+from florence.contracts import CandidateState, ChannelType
 from florence.google import decode_google_oauth_state
-from florence.runtime.entrypoints import FlorenceAppService, FlorenceGoogleOauthConfig
+from florence.runtime.entrypoints import FlorenceEntrypointService, FlorenceGoogleOauthConfig
 from florence.runtime.services import (
     FlorenceCandidateReviewService,
     FlorenceGoogleSyncPersistenceService,
@@ -53,13 +52,12 @@ class FlorenceProductionService:
             if settings.google.configured
             else None
         )
-        self.app = FlorenceAppService(
+        self.entrypoints = FlorenceEntrypointService(
             self.store,
             google_oauth=google_oauth,
             household_chat_model=settings.hermes.model,
             household_chat_max_iterations=settings.hermes.max_iterations,
         )
-        self.bluebubbles = FlorenceBlueBubblesClient(settings.bluebubbles)
         self.linq = FlorenceLinqClient(settings.linq)
         self.candidate_review_service = FlorenceCandidateReviewService(self.store)
         self.sync_worker = FlorenceGoogleSyncWorkerService(
@@ -69,118 +67,6 @@ class FlorenceProductionService:
 
     def close(self) -> None:
         self.store.close()
-
-    def handle_app_bootstrap(
-        self,
-        *,
-        parent_name: str | None,
-        household_name: str | None = None,
-        timezone: str | None = None,
-    ) -> FlorenceHTTPResult:
-        if not parent_name or not parent_name.strip():
-            return self._json_result(400, {"ok": False, "error": "parent_name_required"})
-        result = self.app.bootstrap_app_parent(
-            parent_name=parent_name,
-            household_name=household_name,
-            timezone=timezone or "America/Los_Angeles",
-        )
-        return self._json_result(
-            200,
-            {
-                "ok": True,
-                "household": self._serialize_household(result.household),
-                "member": self._serialize_member(result.member),
-                "threads": [
-                    self._serialize_thread(result.shared_thread),
-                    self._serialize_thread(result.private_thread),
-                ],
-                "assistantMessage": self._serialize_message(result.assistant_message) if result.assistant_message else None,
-            },
-        )
-
-    def handle_app_threads(
-        self,
-        *,
-        household_id: str | None,
-        member_id: str | None,
-    ) -> FlorenceHTTPResult:
-        if not household_id or not member_id:
-            return self._json_result(400, {"ok": False, "error": "household_id_and_member_id_required"})
-        threads = self.app.list_app_threads(household_id=household_id, member_id=member_id)
-        return self._json_result(200, {"ok": True, "threads": [self._serialize_thread(thread) for thread in threads]})
-
-    def handle_app_messages(
-        self,
-        *,
-        channel_id: str | None,
-        limit: int = 50,
-    ) -> FlorenceHTTPResult:
-        if not channel_id:
-            return self._json_result(400, {"ok": False, "error": "channel_id_required"})
-        messages = self.app.list_app_messages(channel_id=channel_id, limit=limit)
-        return self._json_result(200, {"ok": True, "messages": [self._serialize_message(message) for message in messages]})
-
-    def handle_app_send_message(
-        self,
-        *,
-        household_id: str | None,
-        member_id: str | None,
-        scope: str | None,
-        text: str | None,
-    ) -> FlorenceHTTPResult:
-        if not household_id or not member_id or not text or not text.strip():
-            return self._json_result(400, {"ok": False, "error": "household_id_member_id_and_text_required"})
-        try:
-            chat_scope = AppChatScope(str(scope or AppChatScope.SHARED.value))
-        except ValueError:
-            return self._json_result(400, {"ok": False, "error": "invalid_scope"})
-        result = self.app.send_app_message(
-            household_id=household_id,
-            member_id=member_id,
-            scope=chat_scope,
-            text=text,
-        )
-        return self._json_result(
-            200,
-            {
-                "ok": True,
-                "thread": self._serialize_thread(result.thread),
-                "userMessage": self._serialize_message(result.user_message),
-                "assistantMessage": self._serialize_message(result.assistant_message) if result.assistant_message else None,
-            },
-        )
-
-    def handle_bluebubbles_webhook(
-        self,
-        *,
-        payload: dict[str, Any],
-        webhook_secret: str | None,
-    ) -> FlorenceHTTPResult:
-        if not self.bluebubbles.verify_webhook_secret(webhook_secret):
-            return self._json_result(403, {"ok": False, "error": "invalid_bluebubbles_webhook_secret"})
-
-        result = self.app.handle_bluebubbles_payload(payload)
-        if result.reply_text and self.bluebubbles.is_configured() and result.channel_id:
-            channel = self.store.get_channel(result.channel_id)
-            if channel is not None:
-                self._safe_send_channel_message(channel=channel, message=result.reply_text, record_message=False)
-
-        if result.group_announcement and result.household_id:
-            group_channel = self._find_group_channel(result.household_id, provider="bluebubbles")
-            if group_channel is not None:
-                self._safe_send_channel_message(channel=group_channel, message=result.group_announcement)
-
-        return self._json_result(
-            200,
-            {
-                "ok": True,
-                "consumed": result.consumed,
-                "householdId": result.household_id,
-                "memberId": result.member_id,
-                "channelId": result.channel_id,
-                "error": result.error,
-            },
-        )
 
     def handle_linq_webhook(
         self,
@@ -197,7 +83,7 @@ class FlorenceProductionService:
         ):
             return self._json_result(403, {"ok": False, "error": "invalid_linq_webhook_signature"})
 
-        result = self.app.handle_linq_payload(payload)
+        result = self.entrypoints.handle_linq_payload(payload)
         if result.reply_text and result.channel_id:
             channel = self.store.get_channel(result.channel_id)
             if channel is not None:
@@ -254,7 +140,7 @@ class FlorenceProductionService:
 
         try:
             oauth_state = decode_google_oauth_state(state, self.settings.google.state_secret or "")
-            callback = self.app.google_account_link_service.handle_callback(code=code, raw_state=state)
+            callback = self.entrypoints.google_account_link_service.handle_callback(code=code, raw_state=state)
             sync_result = self.sync_worker.sync_connection(
                 callback.connection.id,
                 client_id=self.settings.google.client_id,
@@ -271,13 +157,7 @@ class FlorenceProductionService:
 
             if oauth_state.thread_id and dm_message:
                 channel = self.store.get_channel(oauth_state.thread_id)
-                if channel is not None and channel.provider == "florence_app":
-                    self.app.app_chat_service.append_assistant_message(
-                        household_id=callback.connection.household_id,
-                        channel_id=oauth_state.thread_id,
-                        body=dm_message,
-                    )
-                elif channel is not None:
+                if channel is not None:
                     self._safe_send_channel_message(channel=channel, message=dm_message)
                 else:
                     fallback_channel = self._find_channel_by_provider_id(oauth_state.thread_id)
@@ -387,12 +267,10 @@ class FlorenceProductionService:
         try:
             if channel.provider == "linq":
                 self.linq.send_text(chat_id=channel.provider_channel_id, message=message)
-            elif channel.provider == "bluebubbles":
-                self.bluebubbles.send_text(chat_guid=channel.provider_channel_id, message=message)
             else:
                 return False
-            if record_message and channel.provider != "florence_app":
-                self.app.ingress.append_assistant_message(
+            if record_message:
+                self.entrypoints.ingress.append_assistant_message(
                     household_id=channel.household_id,
                     channel_id=channel.id,
                     body=message,
@@ -459,28 +337,4 @@ class FlorenceProductionService:
             "displayName": member.display_name,
             "role": member.role.value,
             "status": member.status,
-        }
-
-    @staticmethod
-    def _serialize_thread(thread: AppChatThread) -> dict[str, Any]:
-        return {
-            "id": thread.channel.id,
-            "householdId": thread.channel.household_id,
-            "scope": thread.scope.value,
-            "memberId": thread.member_id,
-            "title": thread.channel.title,
-            "metadata": thread.channel.metadata,
-        }
-
-    @staticmethod
-    def _serialize_message(message: AppChatMessage) -> dict[str, Any]:
-        return {
-            "id": message.id,
-            "householdId": message.household_id,
-            "channelId": message.channel_id,
-            "senderRole": message.sender_role.value,
-            "senderMemberId": message.sender_member_id,
-            "body": message.body,
-            "createdAt": message.created_at,
-            "metadata": message.metadata,
         }

@@ -1,4 +1,4 @@
-from florence.contracts import Household, HouseholdEvent, Member, MemberRole
+from florence.contracts import ChildProfile, Household, HouseholdEvent, HouseholdProfileItem, HouseholdProfileKind, Member, MemberRole
 from florence.runtime.chat import FlorenceHouseholdChatService
 from florence.state import FlorenceStateDB
 
@@ -36,6 +36,23 @@ def test_household_chat_service_uses_hermes_agent_with_confirmed_state(tmp_path)
             display_name="Maya",
             role=MemberRole.ADMIN,
         )
+    )
+    store.replace_child_profiles(
+        household_id="hh_123",
+        children=[ChildProfile(id="child_ava", household_id="hh_123", full_name="Ava")],
+    )
+    store.replace_household_profile_items(
+        household_id="hh_123",
+        kind=HouseholdProfileKind.ACTIVITY,
+        items=[
+            HouseholdProfileItem(
+                id="activity_soccer",
+                household_id="hh_123",
+                kind=HouseholdProfileKind.ACTIVITY,
+                label="Soccer",
+                member_id="mem_123",
+            )
+        ],
     )
     store.upsert_household_event(
         HouseholdEvent(

@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from florence.contracts import AppChatMessage, AppChatMessageRole
+from florence.contracts import ChannelMessage, ChannelMessageRole, HouseholdProfileKind
 from florence.state import FlorenceStateDB
 
 
@@ -37,7 +37,7 @@ class FlorenceHouseholdChatService:
         channel_id: str,
         actor_member_id: str | None,
         message_text: str,
-        conversation_history: list[AppChatMessage] | None = None,
+        conversation_history: list[ChannelMessage] | None = None,
     ) -> FlorenceHouseholdChatReply | None:
         system_message = self._build_system_message(
             household_id=household_id,
@@ -71,14 +71,14 @@ class FlorenceHouseholdChatService:
         return FlorenceHouseholdChatReply(text=final_response) if final_response else None
 
     @staticmethod
-    def _build_conversation_history(messages: list[AppChatMessage]) -> list[dict[str, str]]:
+    def _build_conversation_history(messages: list[ChannelMessage]) -> list[dict[str, str]]:
         history: list[dict[str, str]] = []
         for message in messages:
             if not message.body.strip():
                 continue
-            if message.sender_role == AppChatMessageRole.USER:
+            if message.sender_role == ChannelMessageRole.USER:
                 history.append({"role": "user", "content": message.body})
-            elif message.sender_role == AppChatMessageRole.ASSISTANT:
+            elif message.sender_role == ChannelMessageRole.ASSISTANT:
                 history.append({"role": "assistant", "content": message.body})
         return history
 
@@ -100,31 +100,22 @@ class FlorenceHouseholdChatService:
                 actor_name = member.display_name
 
         members = self.store.list_members(household_id)
-        onboarding_sessions = self.store.list_onboarding_sessions(household_id)
         events = self.store.list_household_events(household_id=household_id)
-
-        child_names: list[str] = []
-        school_labels: list[str] = []
-        activity_labels: list[str] = []
-        seen_children: set[str] = set()
-        seen_schools: set[str] = set()
-        seen_activities: set[str] = set()
-        for session in onboarding_sessions:
-            for child_name in session.child_names:
-                normalized = child_name.strip()
-                if normalized and normalized not in seen_children:
-                    seen_children.add(normalized)
-                    child_names.append(normalized)
-            for school in session.school_labels:
-                normalized = school.strip()
-                if normalized and normalized not in seen_schools:
-                    seen_schools.add(normalized)
-                    school_labels.append(normalized)
-            for activity in session.activity_labels:
-                normalized = activity.strip()
-                if normalized and normalized not in seen_activities:
-                    seen_activities.add(normalized)
-                    activity_labels.append(normalized)
+        child_names = [child.full_name for child in self.store.list_child_profiles(household_id=household_id)]
+        school_labels = [
+            item.label
+            for item in self.store.list_household_profile_items(
+                household_id=household_id,
+                kind=HouseholdProfileKind.SCHOOL,
+            )
+        ]
+        activity_labels = [
+            item.label
+            for item in self.store.list_household_profile_items(
+                household_id=household_id,
+                kind=HouseholdProfileKind.ACTIVITY,
+            )
+        ]
 
         lines = [
             "You are Florence, a household chief-of-staff assistant for a family group chat.",

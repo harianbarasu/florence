@@ -16,7 +16,6 @@ from florence.contracts import (
     MemberIdentity,
     MemberRole,
 )
-from florence.onboarding import OnboardingStage
 from florence.state import FlorenceStateDB
 
 
@@ -73,7 +72,7 @@ class FlorenceResolvedTransportContext:
 class FlorenceIdentityResolver:
     """Creates and resolves Florence households, members, identities, and channels."""
 
-    def __init__(self, store: FlorenceStateDB, *, provider: str = "bluebubbles"):
+    def __init__(self, store: FlorenceStateDB, *, provider: str = "linq"):
         self.store = store
         self.provider = provider
 
@@ -144,7 +143,7 @@ class FlorenceIdentityResolver:
 
         sender_member = self._find_member_in_household_by_handle(household_id, sender_handle)
         if sender_member is None:
-            sender_member = self._find_pending_group_activation_member(household_id)
+            return None
 
         title_handles = [
             display_name_from_handle(handle)
@@ -211,14 +210,3 @@ class FlorenceIdentityResolver:
         if member is None or member.household_id != household_id:
             return None
         return member
-
-    def _find_pending_group_activation_member(self, household_id: str) -> Member | None:
-        for session in self.store.list_onboarding_sessions(household_id):
-            if session.group_channel_id:
-                continue
-            if session.stage != OnboardingStage.ACTIVATE_GROUP:
-                continue
-            member = self.store.get_member(session.member_id)
-            if member is not None:
-                return member
-        return None

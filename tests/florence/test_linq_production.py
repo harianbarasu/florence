@@ -4,7 +4,6 @@ import json
 import time
 
 from florence.config import (
-    FlorenceBlueBubblesRuntimeConfig,
     FlorenceGoogleRuntimeConfig,
     FlorenceHermesRuntimeConfig,
     FlorenceLinqRuntimeConfig,
@@ -42,11 +41,6 @@ def _build_settings(tmp_path):
             redirect_uri=None,
             state_secret=None,
         ),
-        bluebubbles=FlorenceBlueBubblesRuntimeConfig(
-            base_url=None,
-            password=None,
-            webhook_secret=None,
-        ),
         linq=FlorenceLinqRuntimeConfig(
             api_key="linq-api-key",
             webhook_secret="linq-webhook-secret",
@@ -75,7 +69,7 @@ def test_production_service_handles_linq_webhook(tmp_path, monkeypatch):
     service = FlorenceProductionService(settings, store=store)
     service.linq = _FakeLinqClient()
     monkeypatch.setattr(
-        service.app,
+        service.entrypoints,
         "handle_linq_payload",
         lambda payload: FlorenceEntrypointResult(
             reply_text="Hi from Florence",

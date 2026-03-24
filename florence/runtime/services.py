@@ -10,11 +10,14 @@ from typing import Any
 
 from florence.contracts import (
     CandidateState,
+    ChildProfile,
     GoogleConnection,
     GoogleSourceKind,
     HouseholdContext,
     HouseholdEvent,
     HouseholdEventStatus,
+    HouseholdProfileItem,
+    HouseholdProfileKind,
     ImportedCandidate,
 )
 from florence.google import (
@@ -35,6 +38,7 @@ from florence.google import (
 )
 from florence.onboarding import (
     OnboardingPrompt,
+    OnboardingStage,
     OnboardingState,
     OnboardingTransition,
     apply_activity_basics,
@@ -76,6 +80,26 @@ def _stable_id(prefix: str, *parts: str) -> str:
     raw = ":".join(parts).encode("utf-8")
     digest = hashlib.sha256(raw).hexdigest()[:20]
     return f"{prefix}_{digest}"
+
+
+def _build_household_context(
+    store: FlorenceStateDB,
+    *,
+    household_id: str,
+    actor_member_id: str,
+    channel_id: str,
+) -> HouseholdContext:
+    children = store.list_child_profiles(household_id=household_id)
+    schools = store.list_household_profile_items(household_id=household_id, kind=HouseholdProfileKind.SCHOOL)
+    activities = store.list_household_profile_items(household_id=household_id, kind=HouseholdProfileKind.ACTIVITY)
+    return HouseholdContext(
+        household_id=household_id,
+        actor_member_id=actor_member_id,
+        channel_id=channel_id,
+        visible_child_names=[child.full_name for child in children],
+        school_labels=[item.label for item in schools],
+        activity_labels=[item.label for item in activities],
+    )
 
 
 @dataclass(slots=True)
@@ -266,6 +290,9 @@ class FlorenceOnboardingSessionService:
         display_name: str,
     ) -> OnboardingTransition:
         state = self.get_or_create_session(household_id=household_id, member_id=member_id, thread_id=thread_id)
+        member = self.store.get_member(member_id)
+        if member is not None:
+            self.store.upsert_member(replace(member, display_name=display_name.strip() or member.display_name))
         return self._persist_transition(apply_parent_name(state, display_name))
 
     def record_google_connected(
@@ -324,12 +351,62 @@ class FlorenceOnboardingSessionService:
 
     def _persist_transition(self, transition: OnboardingTransition) -> OnboardingTransition:
         self.store.upsert_onboarding_session(transition.state)
+        self._sync_household_grounding(transition.state)
         if transition.state.is_grounded_for_google_matching and self.candidate_review_service is not None:
             self.candidate_review_service.release_quarantined_candidates(
                 household_id=transition.state.household_id,
                 member_id=transition.state.member_id,
             )
         return transition
+
+    def _sync_household_grounding(self, state: OnboardingState) -> None:
+        if state.child_names or state.stage not in {OnboardingStage.COLLECT_PARENT_NAME, OnboardingStage.CONNECT_GOOGLE, OnboardingStage.COLLECT_CHILD_NAMES}:
+            children = [
+                ChildProfile(
+                    id=_stable_id("child", state.household_id, child_name.strip().lower()),
+                    household_id=state.household_id,
+                    full_name=child_name.strip(),
+                )
+                for child_name in state.child_names
+                if child_name.strip()
+            ]
+            self.store.replace_child_profiles(household_id=state.household_id, children=children)
+
+        if state.school_basics_collected:
+            schools = [
+                HouseholdProfileItem(
+                    id=_stable_id("school", state.household_id, label.strip().lower()),
+                    household_id=state.household_id,
+                    kind=HouseholdProfileKind.SCHOOL,
+                    label=label.strip(),
+                    member_id=state.member_id,
+                )
+                for label in state.school_labels
+                if label.strip()
+            ]
+            self.store.replace_household_profile_items(
+                household_id=state.household_id,
+                kind=HouseholdProfileKind.SCHOOL,
+                items=schools,
+            )
+
+        if state.activity_basics_collected:
+            activities = [
+                HouseholdProfileItem(
+                    id=_stable_id("activity", state.household_id, label.strip().lower()),
+                    household_id=state.household_id,
+                    kind=HouseholdProfileKind.ACTIVITY,
+                    label=label.strip(),
+                    member_id=state.member_id,
+                )
+                for label in state.activity_labels
+                if label.strip()
+            ]
+            self.store.replace_household_profile_items(
+                household_id=state.household_id,
+                kind=HouseholdProfileKind.ACTIVITY,
+                items=activities,
+            )
 
 
 class FlorenceGoogleSyncPersistenceService:
@@ -464,13 +541,11 @@ class FlorenceGoogleSyncWorkerService:
             member_id=hydrated_connection.member_id,
         )
         latest_onboarding = onboarding_sessions[0] if onboarding_sessions else None
-        context = HouseholdContext(
+        context = _build_household_context(
+            self.store,
             household_id=hydrated_connection.household_id,
             actor_member_id=hydrated_connection.member_id,
             channel_id=latest_onboarding.thread_id if latest_onboarding is not None else "dm",
-            visible_child_names=list(latest_onboarding.child_names) if latest_onboarding is not None else [],
-            school_labels=list(latest_onboarding.school_labels) if latest_onboarding is not None else [],
-            activity_labels=list(latest_onboarding.activity_labels) if latest_onboarding is not None else [],
         )
         family_member_names = list(context.visible_child_names)
         calendar_timezone = str(hydrated_connection.metadata.get("primary_calendar_timezone") or "America/Los_Angeles")

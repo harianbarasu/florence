@@ -1,8 +1,8 @@
+import json
 import time
 from urllib.parse import parse_qs, urlparse
 
 from florence.config import (
-    FlorenceBlueBubblesRuntimeConfig,
     FlorenceGoogleRuntimeConfig,
     FlorenceHermesRuntimeConfig,
     FlorenceLinqRuntimeConfig,
@@ -15,24 +15,15 @@ from florence.runtime import FlorenceEntrypointResult, FlorenceProductionService
 from florence.state import FlorenceStateDB
 
 
-class _FakeBlueBubblesClient:
+class _FakeLinqClient:
     def __init__(self):
         self.sent = []
 
-    def is_configured(self):
+    def verify_webhook_signature(self, *, raw_body, timestamp, signature):
         return True
 
-    def verify_webhook_secret(self, value):
-        return value == "webhook-secret"
-
-    def send_text(self, *, chat_guid, message, reply_to_guid=None):
-        self.sent.append(
-            {
-                "chat_guid": chat_guid,
-                "message": message,
-                "reply_to_guid": reply_to_guid,
-            }
-        )
+    def send_text(self, *, chat_id, message):
+        self.sent.append({"chat_id": chat_id, "message": message})
 
 
 def _build_settings(tmp_path):
@@ -50,14 +41,9 @@ def _build_settings(tmp_path):
             redirect_uri="https://florence.example.com/v1/florence/google/callback",
             state_secret="state-secret",
         ),
-        bluebubbles=FlorenceBlueBubblesRuntimeConfig(
-            base_url="https://bb.example.com",
-            password="bb-password",
-            webhook_secret="webhook-secret",
-        ),
         linq=FlorenceLinqRuntimeConfig(
-            api_key=None,
-            webhook_secret=None,
+            api_key="linq-api-key",
+            webhook_secret="linq-webhook-secret",
         ),
         hermes=FlorenceHermesRuntimeConfig(
             model="anthropic/claude-opus-4.6",
@@ -69,18 +55,12 @@ def _build_settings(tmp_path):
 def test_production_service_delivers_dm_reply_and_group_announcement(tmp_path, monkeypatch):
     settings = _build_settings(tmp_path)
     store = FlorenceStateDB(settings.server.db_path)
-    store.upsert_household(
-        Household(
-            id="hh_123",
-            name="Maya's household",
-            timezone="America/Los_Angeles",
-        )
-    )
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
     store.upsert_channel(
         Channel(
             id="chan_dm_123",
             household_id="hh_123",
-            provider="bluebubbles",
+            provider="linq",
             provider_channel_id="dm-thread-123",
             channel_type=ChannelType.PARENT_DM,
             title="Maya",
@@ -90,17 +70,17 @@ def test_production_service_delivers_dm_reply_and_group_announcement(tmp_path, m
         Channel(
             id="chan_group_123",
             household_id="hh_123",
-            provider="bluebubbles",
+            provider="linq",
             provider_channel_id="group-thread-123",
             channel_type=ChannelType.HOUSEHOLD_GROUP,
             title="Family group",
         )
     )
     service = FlorenceProductionService(settings, store=store)
-    service.bluebubbles = _FakeBlueBubblesClient()
+    service.linq = _FakeLinqClient()
     monkeypatch.setattr(
-        service.app,
-        "handle_bluebubbles_payload",
+        service.entrypoints,
+        "handle_linq_payload",
         lambda payload: FlorenceEntrypointResult(
             reply_text="Hi from Florence",
             group_announcement="Added to the family plan: Ava soccer practice",
@@ -110,25 +90,29 @@ def test_production_service_delivers_dm_reply_and_group_announcement(tmp_path, m
         ),
     )
 
-    result = service.handle_bluebubbles_webhook(
-        payload={
-            "type": "new-message",
-            "data": {
-                "message": {
-                    "guid": "msg_123",
-                    "text": "hello",
-                    "isFromMe": False,
-                },
-                "chat": {"chatGuid": "dm-thread-123", "isGroup": False},
-                "sender": {"address": "+15555550123"},
-            },
+    payload = {
+        "webhook_version": "2026-02-03",
+        "event_type": "message.received",
+        "data": {
+            "chat": {"id": "dm-thread-123", "is_group": False},
+            "id": "msg_123",
+            "direction": "inbound",
+            "sender_handle": {"handle": "+15555550123", "is_me": False},
+            "parts": [{"type": "text", "value": "hello"}],
+            "service": "iMessage",
         },
-        webhook_secret="webhook-secret",
+    }
+    raw_body = json.dumps(payload).encode("utf-8")
+    result = service.handle_linq_webhook(
+        payload=payload,
+        raw_body=raw_body,
+        webhook_signature="sig",
+        webhook_timestamp=str(int(time.time())),
     )
 
     assert result.status_code == 200
-    assert service.bluebubbles.sent[0]["chat_guid"] == "dm-thread-123"
-    assert service.bluebubbles.sent[1]["chat_guid"] == "group-thread-123"
+    assert service.linq.sent[0]["chat_id"] == "dm-thread-123"
+    assert service.linq.sent[1]["chat_id"] == "group-thread-123"
     store.close()
 
 
@@ -136,31 +120,25 @@ def test_production_service_google_callback_sends_dm_follow_up(tmp_path, monkeyp
     settings = _build_settings(tmp_path)
     store = FlorenceStateDB(settings.server.db_path)
     service = FlorenceProductionService(settings, store=store)
-    service.bluebubbles = _FakeBlueBubblesClient()
-    store.upsert_household(
-        Household(
-            id="hh_123",
-            name="Maya's household",
-            timezone="America/Los_Angeles",
-        )
-    )
+    service.linq = _FakeLinqClient()
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
     store.upsert_channel(
         Channel(
             id="chan_dm_123",
             household_id="hh_123",
-            provider="bluebubbles",
+            provider="linq",
             provider_channel_id="dm-thread-123",
             channel_type=ChannelType.PARENT_DM,
             title="Maya",
         )
     )
-    service.app.onboarding_service.get_or_create_session(
+    service.entrypoints.onboarding_service.get_or_create_session(
         household_id="hh_123",
         member_id="mem_123",
         thread_id="dm-thread-123",
     )
 
-    link = service.app.google_account_link_service.build_connect_link(
+    link = service.entrypoints.google_account_link_service.build_connect_link(
         household_id="hh_123",
         member_id="mem_123",
         thread_id="dm-thread-123",
@@ -194,7 +172,7 @@ def test_production_service_google_callback_sends_dm_follow_up(tmp_path, monkeyp
 
     assert result.status_code == 200
     assert "Google connected" in result.body
-    assert service.bluebubbles.sent
-    assert service.bluebubbles.sent[0]["chat_guid"] == "dm-thread-123"
-    assert "children" in service.bluebubbles.sent[0]["message"].lower()
+    assert service.linq.sent
+    assert service.linq.sent[0]["chat_id"] == "dm-thread-123"
+    assert "children" in service.linq.sent[0]["message"].lower()
     store.close()

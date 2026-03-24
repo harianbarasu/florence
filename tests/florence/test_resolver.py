@@ -1,5 +1,4 @@
 from florence.contracts import ChannelType, IdentityKind
-from florence.onboarding import OnboardingStage, OnboardingState
 from florence.runtime import FlorenceIdentityResolver
 from florence.state import FlorenceStateDB
 
@@ -41,20 +40,12 @@ def test_identity_resolver_group_message_links_back_to_existing_household(tmp_pa
     store.close()
 
 
-def test_identity_resolver_existing_group_does_not_attribute_unknown_sender_to_anchor(tmp_path):
+def test_identity_resolver_requires_known_sender_for_new_group_activation(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     resolver = FlorenceIdentityResolver(store)
-    direct = resolver.resolve_direct_message(
+    resolver.resolve_direct_message(
         sender_handle="+15555550123",
         thread_external_id="dm_thread_123",
-    )
-    store.upsert_onboarding_session(
-        OnboardingState(
-            household_id=direct.household.id,
-            member_id=direct.member.id,
-            thread_id="dm_thread_123",
-            stage=OnboardingStage.ACTIVATE_GROUP,
-        )
     )
 
     first_group = resolver.resolve_group_message(
@@ -62,8 +53,15 @@ def test_identity_resolver_existing_group_does_not_attribute_unknown_sender_to_a
         participant_handles=["+15555550123", "+15555550124"],
         thread_external_id="group_thread_123",
     )
-    assert first_group is not None
-    assert first_group.member is not None
+    assert first_group is None
+
+    activated_group = resolver.resolve_group_message(
+        sender_handle="+15555550123",
+        participant_handles=["+15555550123", "+15555550124"],
+        thread_external_id="group_thread_123",
+    )
+    assert activated_group is not None
+    assert activated_group.member is not None
 
     repeated_group = resolver.resolve_group_message(
         sender_handle="+15555550999",
@@ -72,6 +70,6 @@ def test_identity_resolver_existing_group_does_not_attribute_unknown_sender_to_a
     )
 
     assert repeated_group is not None
-    assert repeated_group.household.id == direct.household.id
+    assert repeated_group.household.id == activated_group.household.id
     assert repeated_group.member is None
     store.close()

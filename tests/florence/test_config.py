@@ -7,8 +7,6 @@ def test_florence_settings_reads_env_and_derives_google_redirect_uri(tmp_path, m
     monkeypatch.setenv("GOOGLE_CLIENT_ID", "google-client")
     monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "google-secret")
     monkeypatch.setenv("GOOGLE_OAUTH_STATE_SECRET", "state-secret")
-    monkeypatch.setenv("BLUEBUBBLES_BASE_URL", "https://bb.example.com")
-    monkeypatch.setenv("BLUEBUBBLES_PASSWORD", "bb-password")
     monkeypatch.setenv("LINQ_API_KEY", "linq-api-key")
     monkeypatch.setenv("FLORENCE_HTTP_PORT", "9090")
 
@@ -18,7 +16,6 @@ def test_florence_settings_reads_env_and_derives_google_redirect_uri(tmp_path, m
     assert settings.server.public_base_url == "https://florence.example.com"
     assert settings.google.redirect_uri == "https://florence.example.com/v1/florence/google/callback"
     assert settings.google.configured is True
-    assert settings.bluebubbles.configured is True
     assert settings.linq.configured is True
 
 

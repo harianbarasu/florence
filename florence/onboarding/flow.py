@@ -38,6 +38,22 @@ def sync_onboarding_stage(state: OnboardingState) -> OnboardingState:
     return replace(state, stage=OnboardingStage.COLLECT_PARENT_NAME)
 
 
+def build_google_connect_message(link_url: str | None = None) -> str:
+    """Return the friendly Google-connect step copy, with an optional OAuth link."""
+    intro = (
+        "First step: connect your Google account so I can keep Gmail and Calendar in sync "
+        "for school emails, calendar invites, and household schedule changes. After that, "
+        "I’ll ask a couple quick questions about your family."
+    )
+    if link_url:
+        return (
+            f"{intro}\n\n"
+            f"Use this secure Google link:\n{link_url}\n\n"
+            "When you're done, reply done here and I’ll keep going."
+        )
+    return f"{intro}\n\nWhen you're done, reply done here and I’ll keep going."
+
+
 def build_onboarding_prompt(state: OnboardingState) -> OnboardingPrompt | None:
     """Return the next deterministic prompt for the current onboarding stage."""
     current = sync_onboarding_stage(state)
@@ -50,7 +66,7 @@ def build_onboarding_prompt(state: OnboardingState) -> OnboardingPrompt | None:
     if current.stage == OnboardingStage.CONNECT_GOOGLE:
         return OnboardingPrompt(
             stage=current.stage,
-            text="Connect your personal Google account so I can keep syncing Gmail and Calendar for household logistics.",
+            text=build_google_connect_message(),
             requires_external_action=True,
         )
 

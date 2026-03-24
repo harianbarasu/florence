@@ -10,7 +10,6 @@ from urllib.parse import parse_qs, urlparse
 
 from florence.config import FlorenceSettings
 from florence.runtime.production import FlorenceHTTPResult, FlorenceProductionService
-from florence.runtime.scheduler import FlorenceSyncScheduler
 
 logger = logging.getLogger(__name__)
 
@@ -32,16 +31,6 @@ def _log_runtime_configuration(settings: FlorenceSettings) -> None:
         logger.info("Florence Google OAuth is configured")
     else:
         logger.warning("Florence Google OAuth is not configured")
-
-
-def _read_str(payload: dict[str, object], *keys: str) -> str | None:
-    for key in keys:
-        value = payload.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return None
-
-
 class _FlorenceRequestHandler(BaseHTTPRequestHandler):
     service: FlorenceProductionService | None = None
 
@@ -65,90 +54,10 @@ class _FlorenceRequestHandler(BaseHTTPRequestHandler):
             )
             self._write_response(result)
             return
-        if parsed.path in {"/florence/app/chats", "/v1/app/chats"}:
-            query = parse_qs(parsed.query)
-            result = self._service().handle_app_threads(
-                household_id=self._query_value(query, "householdId") or self._query_value(query, "household_id"),
-                member_id=self._query_value(query, "memberId") or self._query_value(query, "member_id"),
-            )
-            self._write_response(result)
-            return
-        if parsed.path in {"/florence/app/chats/messages", "/v1/app/chats/messages"}:
-            query = parse_qs(parsed.query)
-            limit_raw = self._query_value(query, "limit")
-            result = self._service().handle_app_messages(
-                channel_id=self._query_value(query, "channelId") or self._query_value(query, "channel_id"),
-                limit=int(limit_raw) if limit_raw and limit_raw.isdigit() else 50,
-            )
-            self._write_response(result)
-            return
         self.send_error(404, "not_found")
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
-        if parsed.path in {"/florence/app/bootstrap", "/v1/app/bootstrap"}:
-            try:
-                payload = self._read_json_body()
-            except ValueError as exc:
-                self._write_response(
-                    FlorenceHTTPResult(
-                        status_code=400,
-                        content_type="application/json; charset=utf-8",
-                        body=json.dumps({"ok": False, "error": str(exc)}),
-                    )
-                )
-                return
-            result = self._service().handle_app_bootstrap(
-                parent_name=_read_str(payload, "parentName", "parent_name"),
-                household_name=_read_str(payload, "householdName", "household_name"),
-                timezone=_read_str(payload, "timezone"),
-            )
-            self._write_response(result)
-            return
-        if parsed.path in {"/florence/app/chats/send", "/v1/app/chats/send"}:
-            try:
-                payload = self._read_json_body()
-            except ValueError as exc:
-                self._write_response(
-                    FlorenceHTTPResult(
-                        status_code=400,
-                        content_type="application/json; charset=utf-8",
-                        body=json.dumps({"ok": False, "error": str(exc)}),
-                    )
-                )
-                return
-            result = self._service().handle_app_send_message(
-                household_id=_read_str(payload, "householdId", "household_id"),
-                member_id=_read_str(payload, "memberId", "member_id"),
-                scope=_read_str(payload, "scope"),
-                text=_read_str(payload, "text"),
-            )
-            self._write_response(result)
-            return
-        if parsed.path in {"/florence/bluebubbles/webhook", "/v1/channels/bluebubbles/webhook"}:
-            try:
-                raw = self._read_raw_body()
-                payload = self._parse_json_body(raw)
-            except ValueError as exc:
-                self._write_response(
-                    FlorenceHTTPResult(
-                        status_code=400,
-                        content_type="application/json; charset=utf-8",
-                        body=json.dumps({"ok": False, "error": str(exc)}),
-                    )
-                )
-                return
-            query = parse_qs(parsed.query)
-            result = self._service().handle_bluebubbles_webhook(
-                payload=payload,
-                webhook_secret=(
-                    self.headers.get("x-florence-bluebubbles-secret")
-                    or self._query_value(query, "secret")
-                    or self._query_value(query, "webhookSecret")
-                ),
-            )
-            self._write_response(result)
-            return
         if parsed.path in {"/florence/linq/webhook", "/v1/channels/linq/webhook"}:
             try:
                 raw = self._read_raw_body()
@@ -240,11 +149,6 @@ def main() -> None:
     port = args.port or settings.server.port
 
     service = FlorenceProductionService(settings)
-    scheduler = FlorenceSyncScheduler(
-        service,
-        interval_seconds=settings.server.sync_interval_seconds,
-    )
-    scheduler.start()
     server = build_http_server(service, host=host, port=port)
 
     logger.info("Florence HTTP server listening on %s:%s", host, port)
@@ -254,7 +158,6 @@ def main() -> None:
         logger.info("Shutting down Florence server")
     finally:
         server.shutdown()
-        scheduler.stop()
         service.close()
 
 

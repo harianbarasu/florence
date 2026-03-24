@@ -27,6 +27,8 @@ def test_onboarding_flow_advances_through_required_v1_steps():
     assert transition.state.stage == OnboardingStage.CONNECT_GOOGLE
     assert transition.prompt is not None
     assert transition.prompt.requires_external_action is True
+    assert "First step:" in transition.prompt.text
+    assert "reply done here" in transition.prompt.text.lower()
 
     transition = mark_google_connected(transition.state)
     assert transition.state.stage == OnboardingStage.COLLECT_CHILD_NAMES

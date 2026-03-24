@@ -28,7 +28,6 @@ class MemberRole(StrEnum):
 class ChannelType(StrEnum):
     HOUSEHOLD_GROUP = "household_group"
     PARENT_DM = "parent_dm"
-    APP_CHAT = "app_chat"
     SYSTEM_NOTIFICATIONS = "system_notifications"
 
 
@@ -55,12 +54,13 @@ class HouseholdEventStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
-class AppChatScope(StrEnum):
-    SHARED = "shared"
-    PRIVATE = "private"
+class HouseholdProfileKind(StrEnum):
+    SCHOOL = "school"
+    ACTIVITY = "activity"
+    PREFERENCE = "preference"
 
 
-class AppChatMessageRole(StrEnum):
+class ChannelMessageRole(StrEnum):
     USER = "user"
     ASSISTANT = "assistant"
     SYSTEM = "system"
@@ -91,6 +91,17 @@ class ChildProfile:
     household_id: str
     full_name: str
     birthdate: str | None = None
+    metadata: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class HouseholdProfileItem:
+    id: str
+    household_id: str
+    kind: HouseholdProfileKind
+    label: str
+    member_id: str | None = None
+    child_id: str | None = None
     metadata: dict[str, object] = field(default_factory=dict)
 
 
@@ -175,18 +186,11 @@ class HouseholdEvent:
 
 
 @dataclass(slots=True)
-class AppChatThread:
-    channel: Channel
-    scope: AppChatScope
-    member_id: str | None = None
-
-
-@dataclass(slots=True)
-class AppChatMessage:
+class ChannelMessage:
     id: str
     household_id: str
     channel_id: str
-    sender_role: AppChatMessageRole
+    sender_role: ChannelMessageRole
     body: str
     sender_member_id: str | None = None
     created_at: float = 0.0

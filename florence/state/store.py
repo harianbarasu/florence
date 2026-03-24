@@ -1,13 +1,11 @@
-"""SQLite-backed Florence product state store."""
+"""Database-backed Florence product state store."""
 
 from __future__ import annotations
 
 import json
 import os
-import sqlite3
 import time
 from pathlib import Path
-from typing import Any
 
 from florence.contracts import (
     AppChatMessage,
@@ -28,16 +26,10 @@ from florence.contracts import (
     MemberRole,
 )
 from florence.onboarding import OnboardingStage, OnboardingState
+from florence.state.db import RowLike, connect_florence_db
 
 FLORENCE_DB_PATH = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes")) / "florence.db"
 FLORENCE_SCHEMA_VERSION = 2
-
-try:  # pragma: no cover - optional until Postgres is configured
-    import psycopg
-    from psycopg.rows import dict_row
-except Exception:  # pragma: no cover - optional dependency path
-    psycopg = None
-    dict_row = None
 
 FLORENCE_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS florence_schema_version (
@@ -212,7 +204,7 @@ def _json_loads(raw: str | None, *, default: object) -> object:
 
 
 class FlorenceStateDB:
-    """SQLite persistence for Florence onboarding, Google, and candidate state."""
+    """Florence persistence backed by SQLite or Postgres."""
 
     def __init__(self, db_path: Path | str | None = None):
         self.database = db_path or os.getenv("FLORENCE_DATABASE_URL") or os.getenv("DATABASE_URL") or FLORENCE_DB_PATH
@@ -222,27 +214,7 @@ class FlorenceStateDB:
 
     @staticmethod
     def _connect(database: Path | str):
-        if isinstance(database, Path):
-            database.parent.mkdir(parents=True, exist_ok=True)
-            conn = sqlite3.connect(str(database), check_same_thread=False, timeout=10.0)
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA foreign_keys=ON")
-            return conn
-
-        database_str = str(database).strip()
-        if database_str.startswith(("postgres://", "postgresql://")):
-            if psycopg is None:
-                raise RuntimeError("psycopg_required_for_postgres")
-            return _PostgresCompatConnection(database_str)
-
-        path = Path(database_str).expanduser()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(path), check_same_thread=False, timeout=10.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA foreign_keys=ON")
-        return conn
+        return connect_florence_db(database)
 
     def _init_schema(self) -> None:
         cursor = self._conn.cursor()
@@ -897,7 +869,7 @@ class FlorenceStateDB:
         return [self._row_to_household_event(row) for row in rows]
 
     @staticmethod
-    def _row_to_onboarding_state(row: sqlite3.Row) -> OnboardingState:
+    def _row_to_onboarding_state(row: RowLike) -> OnboardingState:
         return OnboardingState(
             household_id=str(row["household_id"]),
             member_id=str(row["member_id"]),
@@ -914,7 +886,7 @@ class FlorenceStateDB:
         )
 
     @staticmethod
-    def _row_to_household(row: sqlite3.Row) -> Household:
+    def _row_to_household(row: RowLike) -> Household:
         return Household(
             id=str(row["id"]),
             name=str(row["name"]),
@@ -923,7 +895,7 @@ class FlorenceStateDB:
             settings=dict(_json_loads(row["settings_json"], default={})),
         )
 
-    def _row_to_member(self, row: sqlite3.Row) -> Member:
+    def _row_to_member(self, row: RowLike) -> Member:
         member_id = str(row["id"])
         identities = self.list_member_identities(member_id)
         return Member(
@@ -936,7 +908,7 @@ class FlorenceStateDB:
         )
 
     @staticmethod
-    def _row_to_member_identity(row: sqlite3.Row) -> MemberIdentity:
+    def _row_to_member_identity(row: RowLike) -> MemberIdentity:
         return MemberIdentity(
             id=str(row["id"]),
             member_id=str(row["member_id"]),
@@ -946,7 +918,7 @@ class FlorenceStateDB:
         )
 
     @staticmethod
-    def _row_to_channel(row: sqlite3.Row) -> Channel:
+    def _row_to_channel(row: RowLike) -> Channel:
         return Channel(
             id=str(row["id"]),
             household_id=str(row["household_id"]),
@@ -958,7 +930,7 @@ class FlorenceStateDB:
         )
 
     @staticmethod
-    def _row_to_app_chat_message(row: sqlite3.Row) -> AppChatMessage:
+    def _row_to_app_chat_message(row: RowLike) -> AppChatMessage:
         return AppChatMessage(
             id=str(row["id"]),
             household_id=str(row["household_id"]),
@@ -971,7 +943,7 @@ class FlorenceStateDB:
         )
 
     @staticmethod
-    def _row_to_google_connection(row: sqlite3.Row) -> GoogleConnection:
+    def _row_to_google_connection(row: RowLike) -> GoogleConnection:
         scopes_raw = _json_loads(row["connected_scopes_json"], default=[])
         scopes = tuple(GoogleSourceKind(str(scope)) for scope in scopes_raw)
         return GoogleConnection(
@@ -990,7 +962,7 @@ class FlorenceStateDB:
         )
 
     @staticmethod
-    def _row_to_imported_candidate(row: sqlite3.Row) -> ImportedCandidate:
+    def _row_to_imported_candidate(row: RowLike) -> ImportedCandidate:
         return ImportedCandidate(
             id=str(row["id"]),
             household_id=str(row["household_id"]),
@@ -1006,7 +978,7 @@ class FlorenceStateDB:
         )
 
     @staticmethod
-    def _row_to_household_event(row: sqlite3.Row) -> HouseholdEvent:
+    def _row_to_household_event(row: RowLike) -> HouseholdEvent:
         return HouseholdEvent(
             id=str(row["id"]),
             household_id=str(row["household_id"]),
@@ -1021,35 +993,3 @@ class FlorenceStateDB:
             status=HouseholdEventStatus(str(row["status"])),
             metadata=dict(_json_loads(row["metadata_json"], default={})),
         )
-
-
-class _PostgresCompatConnection:
-    """Minimal sqlite-like wrapper over psycopg for FlorenceStateDB."""
-
-    def __init__(self, dsn: str):
-        assert psycopg is not None
-        assert dict_row is not None
-        self._conn = psycopg.connect(dsn, row_factory=dict_row)
-
-    def execute(self, query: str, params: tuple[Any, ...] = ()):
-        cursor = self._conn.cursor()
-        cursor.execute(self._rewrite_query(query), params)
-        return cursor
-
-    def executescript(self, script: str) -> None:
-        cursor = self._conn.cursor()
-        for statement in script.split(";"):
-            sql = statement.strip()
-            if not sql:
-                continue
-            cursor.execute(sql)
-
-    def commit(self) -> None:
-        self._conn.commit()
-
-    def close(self) -> None:
-        self._conn.close()
-
-    @staticmethod
-    def _rewrite_query(query: str) -> str:
-        return query.replace("?", "%s")

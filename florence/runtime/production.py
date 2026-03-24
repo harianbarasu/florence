@@ -84,31 +84,34 @@ class FlorenceProductionService:
             signature=webhook_signature,
         ):
             return self._json_result(403, {"ok": False, "error": "invalid_linq_webhook_signature"})
+        try:
+            result = self.entrypoints.handle_linq_payload(payload)
+            reply_messages = result.reply_messages or ((result.reply_text,) if result.reply_text else ())
+            if reply_messages and result.channel_id:
+                channel = self.store.get_channel(result.channel_id)
+                if channel is not None:
+                    for message in reply_messages:
+                        self._safe_send_channel_message(channel=channel, message=message, record_message=False)
 
-        result = self.entrypoints.handle_linq_payload(payload)
-        reply_messages = result.reply_messages or ((result.reply_text,) if result.reply_text else ())
-        if reply_messages and result.channel_id:
-            channel = self.store.get_channel(result.channel_id)
-            if channel is not None:
-                for message in reply_messages:
-                    self._safe_send_channel_message(channel=channel, message=message, record_message=False)
+            if result.group_announcement and result.household_id:
+                group_channel = self._find_group_channel(result.household_id, provider="linq")
+                if group_channel is not None:
+                    self._safe_send_channel_message(channel=group_channel, message=result.group_announcement)
 
-        if result.group_announcement and result.household_id:
-            group_channel = self._find_group_channel(result.household_id, provider="linq")
-            if group_channel is not None:
-                self._safe_send_channel_message(channel=group_channel, message=result.group_announcement)
-
-        return self._json_result(
-            200,
-            {
-                "ok": True,
-                "consumed": result.consumed,
-                "householdId": result.household_id,
-                "memberId": result.member_id,
-                "channelId": result.channel_id,
-                "error": result.error,
-            },
-        )
+            return self._json_result(
+                200,
+                {
+                    "ok": True,
+                    "consumed": result.consumed,
+                    "householdId": result.household_id,
+                    "memberId": result.member_id,
+                    "channelId": result.channel_id,
+                    "error": result.error,
+                },
+            )
+        except Exception:
+            logger.exception("Florence Linq webhook failed")
+            return self._json_result(500, {"ok": False, "error": "internal_linq_webhook_error"})
 
     def handle_google_callback(
         self,

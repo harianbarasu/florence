@@ -215,3 +215,41 @@ def test_production_service_first_dm_sends_onboarding_sequence_as_separate_messa
     ]
     assert service.linq.sent[3]["message"].startswith("https://accounts.google.com/")
     store.close()
+
+
+def test_production_service_returns_500_when_linq_webhook_processing_fails(tmp_path, monkeypatch):
+    settings = _build_settings(tmp_path)
+    store = FlorenceStateDB(settings.server.db_path)
+    service = FlorenceProductionService(settings, store=store)
+    service.linq = _FakeLinqClient()
+    monkeypatch.setattr(
+        service.entrypoints,
+        "handle_linq_payload",
+        lambda payload: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    payload = {
+        "webhook_version": "2026-02-03",
+        "event_type": "message.received",
+        "data": {
+            "chat": {"id": "dm-thread-123", "is_group": False},
+            "id": "msg_err",
+            "direction": "inbound",
+            "sender_handle": {"handle": "+15555550123", "is_me": False},
+            "parts": [{"type": "text", "value": "hello"}],
+            "service": "iMessage",
+        },
+    }
+    raw_body = json.dumps(payload).encode("utf-8")
+
+    result = service.handle_linq_webhook(
+        payload=payload,
+        raw_body=raw_body,
+        webhook_signature="sig",
+        webhook_timestamp=str(int(time.time())),
+    )
+
+    assert result.status_code == 500
+    assert json.loads(result.body) == {"ok": False, "error": "internal_linq_webhook_error"}
+    assert service.linq.sent == []
+    store.close()

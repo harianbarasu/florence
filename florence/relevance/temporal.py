@@ -73,6 +73,13 @@ def zoned_datetime_to_utc(value: date, hours: int, minutes: int, time_zone: str)
     return local.astimezone(timezone.utc)
 
 
+def _safe_date(year: int, month: int, day: int) -> date | None:
+    try:
+        return date(year, month, day)
+    except ValueError:
+        return None
+
+
 def parse_explicit_date(source: str, time_zone: str, now: datetime | None = None) -> ParsedExplicitDate | None:
     current = now.astimezone(ZoneInfo(time_zone)) if now else datetime.now(ZoneInfo(time_zone))
     today = current.date()
@@ -95,27 +102,27 @@ def parse_explicit_date(source: str, time_zone: str, now: datetime | None = None
 
     iso = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", source)
     if iso:
-        return ParsedExplicitDate(
-            iso.group(0),
-            date(int(iso.group(1)), int(iso.group(2)), int(iso.group(3))),
-        )
+        parsed = _safe_date(int(iso.group(1)), int(iso.group(2)), int(iso.group(3)))
+        if parsed is not None:
+            return ParsedExplicitDate(iso.group(0), parsed)
 
     slash = re.search(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b", source)
     if slash:
         year = int(slash.group(3)) if slash.group(3) else today.year
         if year < 100:
             year += 2000
-        return ParsedExplicitDate(
-            slash.group(0),
-            date(year, int(slash.group(1)), int(slash.group(2))),
-        )
+        parsed = _safe_date(year, int(slash.group(1)), int(slash.group(2)))
+        if parsed is not None:
+            return ParsedExplicitDate(slash.group(0), parsed)
 
     month_name = re.search(r"\b([A-Za-z]+)\s+(\d{1,2})(?:,\s*(\d{4}))?\b", source)
     if month_name:
         month = MONTHS.get(month_name.group(1).lower())
         if month:
             year = int(month_name.group(3)) if month_name.group(3) else today.year
-            return ParsedExplicitDate(month_name.group(0), date(year, month, int(month_name.group(2))))
+            parsed = _safe_date(year, month, int(month_name.group(2)))
+            if parsed is not None:
+                return ParsedExplicitDate(month_name.group(0), parsed)
 
     return None
 

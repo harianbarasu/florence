@@ -133,6 +133,30 @@ def test_gmail_candidate_uses_household_platform_and_child_alias_context():
     assert decision.raw_metadata["known_activity_hits"] == 1
 
 
+def test_gmail_candidate_ignores_invalid_slash_dates_instead_of_crashing():
+    item = GmailSyncItem(
+        gmail_message_id="gmail_127",
+        thread_id="thread_127",
+        from_address="teacher@school.edu",
+        subject="Soccer practice update",
+        snippet="Schedule change",
+        body_text="Ava soccer practice is 13/24 at 4pm.",
+        attachment_text=None,
+        attachment_count=0,
+        received_at=datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc),
+    )
+
+    decision = build_gmail_candidate_decision(
+        item,
+        "America/Los_Angeles",
+        now=datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc),
+    )
+
+    assert decision.kind == CandidateDecisionKind.CANDIDATE
+    assert decision.requires_confirmation is True
+    assert decision.confirmation_question is not None
+
+
 def test_parent_calendar_candidate_uses_known_location_context():
     item = ParentCalendarSyncItem(
         google_event_id="event_126",

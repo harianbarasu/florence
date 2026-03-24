@@ -225,16 +225,28 @@ def _signal_handler(signum, frame):
     sys.exit(128 + signum)
 
 
+def _should_register_signal_handlers() -> bool:
+    """Return True only when import-time signal registration is safe."""
+    if threading.current_thread() is not threading.main_thread():
+        return False
+    try:
+        return os.getpid() == os.getpgrp()
+    except (OSError, AttributeError):
+        return False
+
+
 # Register cleanup handlers
 atexit.register(_emergency_cleanup_all_sessions)
 
-# Only register signal handlers in main process (not in multiprocessing workers)
+# Only register signal handlers in the main thread of the main process.
+# Florence imports Hermes from a threaded HTTP server, and Python forbids
+# signal.signal(...) outside the main interpreter thread.
 try:
-    if os.getpid() == os.getpgrp():  # Main process check
+    if _should_register_signal_handlers():
         signal.signal(signal.SIGINT, _signal_handler)
         signal.signal(signal.SIGTERM, _signal_handler)
-except (OSError, AttributeError):
-    pass  # Signal handling not available (e.g., Windows or worker process)
+except (OSError, AttributeError, ValueError):
+    pass  # Signal handling not available or not permitted in this runtime
 
 
 # =============================================================================

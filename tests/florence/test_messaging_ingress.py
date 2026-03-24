@@ -259,6 +259,55 @@ def test_activity_basics_advances_to_household_operations_before_unlocking_agent
     store.close()
 
 
+def test_child_name_parsing_from_freeform_sentence_keeps_only_names(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_hybrid_onboarding_service(store, review_service)
+    ingress = FlorenceMessagingIngressService(
+        store,
+        onboarding_service,
+        review_service,
+        FlorenceHouseholdQueryService(store),
+    )
+
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+        display_name="Maya",
+    )
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_child_parse_1",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body=(
+                    "Theo is 7 he's in first grade, Violet is about to turn 4 in May, "
+                    "she's in her last year of pre school before starting TK in the fall"
+                ),
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    session = onboarding_service.get_or_create_session(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+    )
+    assert session.child_names == ["Theo", "Violet"]
+    assert result.reply_text is not None
+    assert "Theo, Violet" in result.reply_text
+    store.close()
+
+
 def test_nudge_preferences_advance_to_operating_policy_step(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)

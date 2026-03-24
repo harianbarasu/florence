@@ -351,6 +351,14 @@ class TestVisionRequirements:
         result = check_vision_requirements()
         assert isinstance(result, bool)
 
+    def test_check_requirements_uses_auto_vision_client(self):
+        with patch("agent.auxiliary_client.get_vision_auxiliary_client", return_value=(object(), "gpt-4.1")):
+            assert check_vision_requirements() is True
+
+    def test_check_requirements_returns_false_when_no_vision_client_available(self):
+        with patch("agent.auxiliary_client.get_vision_auxiliary_client", return_value=(None, None)):
+            assert check_vision_requirements() is False
+
     def test_debug_session_info_returns_dict(self):
         info = get_debug_session_info()
         assert isinstance(info, dict)

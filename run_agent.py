@@ -487,10 +487,15 @@ class AIAgent:
                 _routed_client, _ = resolve_provider_client(
                     self.provider or "auto", model=self.model, raw_codex=True)
                 if _routed_client is not None:
+                    routed_base_url = str(_routed_client.base_url).rstrip("/")
                     client_kwargs = {
                         "api_key": _routed_client.api_key,
-                        "base_url": str(_routed_client.base_url),
+                        "base_url": routed_base_url,
                     }
+                    # Adopt the routed endpoint so downstream request shaping
+                    # (reasoning, max token param, prompt caching) matches the
+                    # actual backend instead of the default OpenRouter URL.
+                    self.base_url = routed_base_url
                     # Preserve any default_headers the router set
                     if hasattr(_routed_client, '_default_headers') and _routed_client._default_headers:
                         client_kwargs["default_headers"] = dict(_routed_client._default_headers)

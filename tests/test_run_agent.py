@@ -560,6 +560,33 @@ class TestBuildApiKwargs:
         kwargs = agent._build_api_kwargs(messages)
         assert kwargs["max_tokens"] == 4096
 
+    def test_custom_openai_endpoint_does_not_inject_openrouter_reasoning(self, monkeypatch):
+        class _RoutedClient:
+            api_key = "sk-test"
+            base_url = "https://api.openai.com/v1"
+            _default_headers = {}
+
+        with (
+            patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch("agent.auxiliary_client.resolve_provider_client", return_value=(_RoutedClient(), "gpt-5.4")),
+        ):
+            agent = AIAgent(
+                provider="custom",
+                model="gpt-5.4",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+        agent.max_tokens = 4096
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+
+        assert agent.base_url == "https://api.openai.com/v1"
+        assert kwargs["max_completion_tokens"] == 4096
+        assert "extra_body" not in kwargs or "reasoning" not in kwargs["extra_body"]
+
 
 class TestBuildAssistantMessage:
     def test_basic_message(self, agent):

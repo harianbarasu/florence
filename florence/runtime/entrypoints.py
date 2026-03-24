@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from florence.linq import parse_linq_payload
 from florence.messaging import (
@@ -45,6 +45,7 @@ class FlorenceGoogleOauthConfig:
 @dataclass(slots=True)
 class FlorenceEntrypointResult:
     reply_text: str | None = None
+    reply_messages: tuple[str, ...] = field(default_factory=tuple)
     group_announcement: str | None = None
     consumed: bool = False
     household_id: str | None = None
@@ -167,6 +168,7 @@ class FlorenceEntrypointService:
         )
         return FlorenceEntrypointResult(
             reply_text=result.reply_text,
+            reply_messages=result.reply_messages,
             group_announcement=result.group_announcement,
             consumed=result.consumed,
             household_id=resolved.household.id,

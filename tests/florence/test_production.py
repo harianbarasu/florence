@@ -176,3 +176,42 @@ def test_production_service_google_callback_sends_dm_follow_up(tmp_path, monkeyp
     assert service.linq.sent[0]["chat_id"] == "dm-thread-123"
     assert "children" in service.linq.sent[0]["message"].lower()
     store.close()
+
+
+def test_production_service_first_dm_sends_onboarding_sequence_as_separate_messages(tmp_path):
+    settings = _build_settings(tmp_path)
+    store = FlorenceStateDB(settings.server.db_path)
+    service = FlorenceProductionService(settings, store=store)
+    service.linq = _FakeLinqClient()
+
+    payload = {
+        "webhook_version": "2026-02-03",
+        "event_type": "message.received",
+        "data": {
+            "chat": {"id": "dm-thread-123", "is_group": False},
+            "id": "msg_hello",
+            "direction": "inbound",
+            "sender_handle": {"handle": "+15555550123", "is_me": False},
+            "parts": [{"type": "text", "value": "Maya"}],
+            "service": "iMessage",
+        },
+    }
+    raw_body = json.dumps(payload).encode("utf-8")
+
+    result = service.handle_linq_webhook(
+        payload=payload,
+        raw_body=raw_body,
+        webhook_signature="sig",
+        webhook_timestamp=str(int(time.time())),
+    )
+
+    assert result.status_code == 200
+    assert [item["message"] for item in service.linq.sent[:5]] == [
+        "Hi, I'm Florence.",
+        "I help keep your household organized by keeping up with school emails, calendar invites, and schedule changes.",
+        "First step: connect your Google account so I can start syncing Gmail and Calendar.",
+        service.linq.sent[3]["message"],
+        "When you're done, reply done here and I'll keep going.",
+    ]
+    assert "accounts.google.com" in service.linq.sent[3]["message"]
+    store.close()

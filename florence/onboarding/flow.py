@@ -40,18 +40,28 @@ def sync_onboarding_stage(state: OnboardingState) -> OnboardingState:
 
 def build_google_connect_message(link_url: str | None = None) -> str:
     """Return the friendly Google-connect step copy, with an optional OAuth link."""
-    intro = (
-        "First step: connect your Google account so I can keep Gmail and Calendar in sync "
-        "for school emails, calendar invites, and household schedule changes. After that, "
-        "I’ll ask a couple quick questions about your family."
-    )
-    if link_url:
-        return (
-            f"{intro}\n\n"
-            f"Use this secure Google link:\n{link_url}\n\n"
-            "When you're done, reply done here and I’ll keep going."
+    return "\n\n".join(build_google_connect_message_sequence(link_url))
+
+
+def build_google_connect_message_sequence(
+    link_url: str | None = None,
+    *,
+    include_intro: bool = False,
+) -> tuple[str, ...]:
+    """Return the Google-connect step as short separate agent-style messages."""
+    messages: list[str] = []
+    if include_intro:
+        messages.extend(
+            [
+                "Hi, I'm Florence.",
+                "I help keep your household organized by keeping up with school emails, calendar invites, and schedule changes.",
+            ]
         )
-    return f"{intro}\n\nWhen you're done, reply done here and I’ll keep going."
+    messages.append("First step: connect your Google account so I can start syncing Gmail and Calendar.")
+    if link_url:
+        messages.append(f"Use this secure Google link:\n{link_url}")
+    messages.append("When you're done, reply done here and I'll keep going.")
+    return tuple(messages)
 
 
 def build_onboarding_prompt(state: OnboardingState) -> OnboardingPrompt | None:

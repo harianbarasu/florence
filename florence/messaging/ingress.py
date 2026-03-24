@@ -5,11 +5,15 @@ from __future__ import annotations
 import hashlib
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from florence.contracts import ChannelMessage, ChannelMessageRole
 from florence.messaging.types import FlorenceInboundMessage
-from florence.onboarding import OnboardingPrompt, OnboardingStage, build_google_connect_message
+from florence.onboarding import (
+    OnboardingPrompt,
+    OnboardingStage,
+    build_google_connect_message_sequence,
+)
 from florence.runtime.chat import FlorenceHouseholdChatService
 from florence.runtime.services import (
     FlorenceCandidateReviewService,
@@ -36,6 +40,7 @@ class FlorenceResolvedInboundMessage:
 @dataclass(slots=True)
 class FlorenceMessagingIngressResult:
     reply_text: str | None = None
+    reply_messages: tuple[str, ...] = field(default_factory=tuple)
     group_announcement: str | None = None
     consumed: bool = False
 
@@ -122,11 +127,12 @@ class FlorenceMessagingIngressService:
         else:
             result = self._handle_dm_message(resolved)
 
-        if result.reply_text:
+        reply_messages = result.reply_messages or ((result.reply_text,) if result.reply_text else ())
+        for body in reply_messages:
             self.append_assistant_message(
                 household_id=resolved.household_id,
                 channel_id=resolved.channel_id,
-                body=result.reply_text,
+                body=body,
                 metadata={
                     "provider": resolved.message.provider,
                     "transport_thread_id": resolved.thread_id,
@@ -156,24 +162,41 @@ class FlorenceMessagingIngressService:
             )
         )
 
-    def _render_onboarding_prompt(
+    def _render_onboarding_prompt_messages(
         self,
         *,
         household_id: str,
         member_id: str,
         thread_id: str,
         prompt: OnboardingPrompt | None,
-    ) -> str | None:
+        include_intro: bool = False,
+    ) -> tuple[str, ...]:
         if prompt is None:
-            return None
+            return ()
         if prompt.stage == OnboardingStage.CONNECT_GOOGLE and self.google_account_link_service is not None:
             link = self.google_account_link_service.build_connect_link(
                 household_id=household_id,
                 member_id=member_id,
                 thread_id=thread_id,
             )
-            return build_google_connect_message(link.url)
-        return prompt.text
+            return build_google_connect_message_sequence(link.url, include_intro=include_intro)
+        if prompt.stage == OnboardingStage.CONNECT_GOOGLE:
+            return build_google_connect_message_sequence(include_intro=include_intro)
+        return (prompt.text,)
+
+    @staticmethod
+    def _result_with_messages(
+        messages: tuple[str, ...],
+        *,
+        group_announcement: str | None = None,
+        consumed: bool = True,
+    ) -> FlorenceMessagingIngressResult:
+        return FlorenceMessagingIngressResult(
+            reply_text=messages[0] if messages else None,
+            reply_messages=messages,
+            group_announcement=group_announcement,
+            consumed=consumed,
+        )
 
     def _append_inbound_message(self, resolved: FlorenceResolvedInboundMessage) -> None:
         body = resolved.message.body.strip()
@@ -275,14 +298,14 @@ class FlorenceMessagingIngressService:
                 thread_id=resolved.thread_id,
                 display_name=text,
             )
-            return FlorenceMessagingIngressResult(
-                reply_text=self._render_onboarding_prompt(
+            return self._result_with_messages(
+                self._render_onboarding_prompt_messages(
                     household_id=resolved.household_id,
                     member_id=member_id,
                     thread_id=resolved.thread_id,
                     prompt=transition.prompt,
-                ),
-                consumed=True,
+                    include_intro=True,
+                )
             )
 
         if stage == OnboardingStage.CONNECT_GOOGLE:
@@ -292,28 +315,26 @@ class FlorenceMessagingIngressService:
                     member_id=member_id,
                     thread_id=resolved.thread_id,
                 )
-                return FlorenceMessagingIngressResult(
-                    reply_text=self._render_onboarding_prompt(
+                return self._result_with_messages(
+                    self._render_onboarding_prompt_messages(
                         household_id=resolved.household_id,
                         member_id=member_id,
                         thread_id=resolved.thread_id,
                         prompt=transition.prompt,
-                    ),
-                    consumed=True,
+                    )
                 )
             prompt = self.onboarding_service.get_prompt(
                 household_id=resolved.household_id,
                 member_id=member_id,
                 thread_id=resolved.thread_id,
             )
-            return FlorenceMessagingIngressResult(
-                reply_text=self._render_onboarding_prompt(
+            return self._result_with_messages(
+                self._render_onboarding_prompt_messages(
                     household_id=resolved.household_id,
                     member_id=member_id,
                     thread_id=resolved.thread_id,
                     prompt=prompt,
-                ),
-                consumed=True,
+                )
             )
 
         if stage == OnboardingStage.COLLECT_CHILD_NAMES:
@@ -323,14 +344,13 @@ class FlorenceMessagingIngressService:
                 thread_id=resolved.thread_id,
                 child_names=_split_names(text),
             )
-            return FlorenceMessagingIngressResult(
-                reply_text=self._render_onboarding_prompt(
+            return self._result_with_messages(
+                self._render_onboarding_prompt_messages(
                     household_id=resolved.household_id,
                     member_id=member_id,
                     thread_id=resolved.thread_id,
                     prompt=transition.prompt,
-                ),
-                consumed=True,
+                )
             )
 
         if stage == OnboardingStage.COLLECT_SCHOOL_BASICS:
@@ -340,14 +360,13 @@ class FlorenceMessagingIngressService:
                 thread_id=resolved.thread_id,
                 school_labels=_split_labels(text),
             )
-            return FlorenceMessagingIngressResult(
-                reply_text=self._render_onboarding_prompt(
+            return self._result_with_messages(
+                self._render_onboarding_prompt_messages(
                     household_id=resolved.household_id,
                     member_id=member_id,
                     thread_id=resolved.thread_id,
                     prompt=transition.prompt,
-                ),
-                consumed=True,
+                )
             )
 
         if stage == OnboardingStage.COLLECT_ACTIVITY_BASICS:
@@ -357,14 +376,13 @@ class FlorenceMessagingIngressService:
                 thread_id=resolved.thread_id,
                 activity_labels=_split_labels(text),
             )
-            return FlorenceMessagingIngressResult(
-                reply_text=self._render_onboarding_prompt(
+            return self._result_with_messages(
+                self._render_onboarding_prompt_messages(
                     household_id=resolved.household_id,
                     member_id=member_id,
                     thread_id=resolved.thread_id,
                     prompt=transition.prompt,
-                ),
-                consumed=True,
+                )
             )
 
         if stage == OnboardingStage.ACTIVATE_GROUP:
@@ -378,14 +396,13 @@ class FlorenceMessagingIngressService:
             member_id=member_id,
             thread_id=resolved.thread_id,
         )
-        return FlorenceMessagingIngressResult(
-            reply_text=self._render_onboarding_prompt(
+        return self._result_with_messages(
+            self._render_onboarding_prompt_messages(
                 household_id=resolved.household_id,
                 member_id=member_id,
                 thread_id=resolved.thread_id,
                 prompt=prompt,
-            ),
-            consumed=True,
+            )
         )
 
     def _handle_group_message(self, resolved: FlorenceResolvedInboundMessage) -> FlorenceMessagingIngressResult:

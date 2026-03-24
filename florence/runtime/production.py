@@ -84,10 +84,12 @@ class FlorenceProductionService:
             return self._json_result(403, {"ok": False, "error": "invalid_linq_webhook_signature"})
 
         result = self.entrypoints.handle_linq_payload(payload)
-        if result.reply_text and result.channel_id:
+        reply_messages = result.reply_messages or ((result.reply_text,) if result.reply_text else ())
+        if reply_messages and result.channel_id:
             channel = self.store.get_channel(result.channel_id)
             if channel is not None:
-                self._safe_send_channel_message(channel=channel, message=result.reply_text, record_message=False)
+                for message in reply_messages:
+                    self._safe_send_channel_message(channel=channel, message=message, record_message=False)
 
         if result.group_announcement and result.household_id:
             group_channel = self._find_group_channel(result.household_id, provider="linq")

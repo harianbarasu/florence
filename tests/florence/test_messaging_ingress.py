@@ -53,7 +53,12 @@ def test_dm_parent_name_reply_includes_friendly_google_link(tmp_path):
 
     assert result.consumed is True
     assert result.reply_text is not None
-    assert "First step:" in result.reply_text
-    assert "https://example.com/google/connect" in result.reply_text
-    assert "reply done here" in result.reply_text.lower()
+    assert result.reply_text == "Hi, I'm Florence."
+    assert result.reply_messages == (
+        "Hi, I'm Florence.",
+        "I help keep your household organized by keeping up with school emails, calendar invites, and schedule changes.",
+        "First step: connect your Google account so I can start syncing Gmail and Calendar.",
+        "Use this secure Google link:\nhttps://example.com/google/connect",
+        "When you're done, reply done here and I'll keep going.",
+    )
     store.close()

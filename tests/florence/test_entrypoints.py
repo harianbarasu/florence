@@ -71,8 +71,10 @@ def test_entrypoints_dm_connect_stage_returns_google_link(tmp_path):
 
     assert result.consumed is True
     assert result.reply_text is not None
-    assert "First step:" in result.reply_text
-    assert "accounts.google.com" in result.reply_text
+    assert result.reply_text == "Hi, I'm Florence."
+    assert len(result.reply_messages) == 5
+    assert result.reply_messages[2] == "First step: connect your Google account so I can start syncing Gmail and Calendar."
+    assert "accounts.google.com" in result.reply_messages[3]
     store.close()
 
 
@@ -96,7 +98,7 @@ def test_entrypoints_google_callback_returns_next_prompt(tmp_path, monkeypatch):
             is_group=False,
         )
     )
-    raw_state = parse_qs(urlparse(dm_result.reply_text.splitlines()[3]).query)["state"][0]
+    raw_state = parse_qs(urlparse(dm_result.reply_messages[3].splitlines()[1]).query)["state"][0]
 
     monkeypatch.setattr(
         "florence.runtime.services.exchange_google_code_for_tokens",

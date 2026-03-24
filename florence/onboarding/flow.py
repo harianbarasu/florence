@@ -59,7 +59,7 @@ def build_google_connect_message_sequence(
         )
     messages.append("First step: connect your Google account so I can start syncing Gmail and Calendar.")
     if link_url:
-        messages.append(f"Use this secure Google link:\n{link_url}")
+        messages.append(link_url)
     messages.append("When you're done, reply done here and I'll keep going.")
     return tuple(messages)
 

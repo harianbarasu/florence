@@ -213,5 +213,5 @@ def test_production_service_first_dm_sends_onboarding_sequence_as_separate_messa
         service.linq.sent[3]["message"],
         "When you're done, reply done here and I'll keep going.",
     ]
-    assert "accounts.google.com" in service.linq.sent[3]["message"]
+    assert service.linq.sent[3]["message"].startswith("https://accounts.google.com/")
     store.close()

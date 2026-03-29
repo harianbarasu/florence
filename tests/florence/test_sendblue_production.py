@@ -1,0 +1,109 @@
+import json
+
+from florence.config import (
+    FlorenceGoogleRuntimeConfig,
+    FlorenceHermesRuntimeConfig,
+    FlorenceLinqRuntimeConfig,
+    FlorenceRedisRuntimeConfig,
+    FlorenceSendblueRuntimeConfig,
+    FlorenceServerRuntimeConfig,
+    FlorenceSettings,
+)
+from florence.contracts import Channel, ChannelType, Household
+from florence.runtime import FlorenceEntrypointResult, FlorenceProductionService
+from florence.state import FlorenceStateDB
+
+
+class _FakeSendblueClient:
+    def __init__(self):
+        self.sent = []
+
+    def verify_webhook_signature(self, *, secret_header):
+        return True
+
+    def send_text(self, *, thread_id, message):
+        self.sent.append({"thread_id": thread_id, "message": message})
+
+
+def _build_settings(tmp_path):
+    return FlorenceSettings(
+        server=FlorenceServerRuntimeConfig(
+            host="127.0.0.1",
+            port=8081,
+            public_base_url="https://florence.example.com",
+            onboarding_state_secret="state-secret",
+            sync_interval_seconds=300.0,
+            db_path=tmp_path / "florence.db",
+        ),
+        google=FlorenceGoogleRuntimeConfig(
+            client_id=None,
+            client_secret=None,
+            redirect_uri=None,
+            state_secret=None,
+        ),
+        linq=FlorenceLinqRuntimeConfig(
+            api_key="linq-api-key",
+            webhook_secret="linq-webhook-secret",
+        ),
+        sendblue=FlorenceSendblueRuntimeConfig(
+            api_key_id="sb-key-id",
+            api_secret_key="sb-secret",
+            from_number="+15122164639",
+            webhook_secret="sb-webhook-secret",
+        ),
+        hermes=FlorenceHermesRuntimeConfig(
+            model="anthropic/claude-opus-4.6",
+            max_iterations=4,
+        ),
+        redis=FlorenceRedisRuntimeConfig(url=None),
+    )
+
+
+def test_production_service_handles_sendblue_webhook(tmp_path, monkeypatch):
+    settings = _build_settings(tmp_path)
+    store = FlorenceStateDB(settings.server.db_path)
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="sendblue",
+            provider_channel_id="+15122164639|+15555550123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    service = FlorenceProductionService(settings, store=store)
+    service.sendblue = _FakeSendblueClient()
+    monkeypatch.setattr(
+        service.entrypoints,
+        "handle_sendblue_payload",
+        lambda payload: FlorenceEntrypointResult(
+            reply_text="Hi from Florence",
+            consumed=True,
+            household_id="hh_123",
+            channel_id="chan_dm_123",
+        ),
+    )
+
+    payload = {
+        "content": "hello",
+        "is_outbound": False,
+        "status": "RECEIVED",
+        "message_handle": "msg_123",
+        "from_number": "+15555550123",
+        "number": "+15555550123",
+        "to_number": "+15122164639",
+        "sendblue_number": "+15122164639",
+        "service": "iMessage",
+    }
+    result = service.handle_sendblue_webhook(
+        payload=payload,
+        webhook_secret="sb-webhook-secret",
+    )
+
+    assert result.status_code == 200
+    assert json.loads(result.body)["ok"] is True
+    assert service.sendblue.sent[0]["thread_id"] == "+15122164639|+15555550123"
+    assert service.sendblue.sent[0]["message"] == "Hi from Florence"
+    store.close()

@@ -99,6 +99,10 @@ def _log_runtime_configuration(settings: FlorenceSettings) -> None:
         logger.info("Florence Linq transport is configured")
     else:
         logger.warning("Florence Linq transport is not configured")
+    if settings.sendblue.configured:
+        logger.info("Florence Sendblue transport is configured")
+    else:
+        logger.warning("Florence Sendblue transport is not configured")
 
     if settings.google.configured:
         logger.info("Florence Google OAuth is configured")
@@ -206,6 +210,30 @@ class _FlorenceRequestHandler(BaseHTTPRequestHandler):
                 raw_body=raw,
                 webhook_signature=self.headers.get("x-webhook-signature"),
                 webhook_timestamp=self.headers.get("x-webhook-timestamp"),
+            )
+            self._write_response(result)
+            return
+        if parsed.path in {"/florence/sendblue/webhook", "/v1/channels/sendblue/webhook"}:
+            try:
+                raw = self._read_raw_body()
+                payload = self._parse_json_body(raw)
+            except ValueError as exc:
+                self._write_response(
+                    FlorenceHTTPResult(
+                        status_code=400,
+                        content_type="application/json; charset=utf-8",
+                        body=json.dumps({"ok": False, "error": str(exc)}),
+                    )
+                )
+                return
+            result = self._service().handle_sendblue_webhook(
+                payload=payload,
+                webhook_secret=(
+                    self.headers.get("x-sendblue-secret")
+                    or self.headers.get("sendblue-secret")
+                    or self.headers.get("x-webhook-secret")
+                    or self.headers.get("webhook-secret")
+                ),
             )
             self._write_response(result)
             return

@@ -14,6 +14,7 @@ from florence.onboarding import build_onboarding_ready_message_sequence
 from florence.runtime.chat import FlorenceHouseholdChatService
 from florence.runtime.onboarding_links import FlorenceOnboardingLinkService
 from florence.runtime.resolver import FlorenceIdentityResolver
+from florence.sendblue import parse_sendblue_payload
 from florence.runtime.services import (
     FlorenceCandidateReviewService,
     FlorenceGoogleAccountLinkService,
@@ -33,6 +34,12 @@ IGNORABLE_LINQ_PARSE_ERRORS = {
     "linq_chat_id_required",
     "linq_message_id_required",
     "linq_sender_handle_required",
+}
+
+IGNORABLE_SENDBLUE_PARSE_ERRORS = {
+    "sendblue_thread_id_required",
+    "sendblue_message_id_required",
+    "sendblue_sender_handle_required",
 }
 
 
@@ -91,6 +98,7 @@ class FlorenceEntrypointService:
         )
         self.identity_resolvers = {
             "linq": FlorenceIdentityResolver(store, provider="linq"),
+            "sendblue": FlorenceIdentityResolver(store, provider="sendblue"),
         }
         self.household_chat_service = (
             FlorenceHouseholdChatService(
@@ -139,6 +147,24 @@ class FlorenceEntrypointService:
             return FlorenceEntrypointResult(consumed=False, error="linq_non_imessage_ignored")
         return self._handle_transport_message(
             provider="linq",
+            thread_id=inbound.thread_id,
+            sender_handle=inbound.sender_handle,
+            is_group_chat=inbound.is_group_chat,
+            participant_handles=list(inbound.participant_handles),
+            inbound_message=inbound,
+        )
+
+    def handle_sendblue_payload(self, payload: dict[str, object]) -> FlorenceEntrypointResult:
+        try:
+            inbound = parse_sendblue_payload(payload)
+        except ValueError as exc:
+            if str(exc) in IGNORABLE_SENDBLUE_PARSE_ERRORS:
+                return FlorenceEntrypointResult(consumed=False, error=str(exc))
+            raise
+        if inbound.is_from_me:
+            return FlorenceEntrypointResult(consumed=False)
+        return self._handle_transport_message(
+            provider="sendblue",
             thread_id=inbound.thread_id,
             sender_handle=inbound.sender_handle,
             is_group_chat=inbound.is_group_chat,

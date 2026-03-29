@@ -41,6 +41,7 @@ from florence.runtime.services import (
     FlorenceGoogleSyncPersistenceService,
     FlorenceGoogleSyncWorkerService,
 )
+from florence.sendblue import FlorenceSendblueClient
 from florence.state import FlorenceStateDB
 
 logger = logging.getLogger(__name__)
@@ -90,6 +91,7 @@ class FlorenceProductionService:
         )
         self.onboarding_link_service = self.entrypoints.onboarding_link_service
         self.linq = FlorenceLinqClient(settings.linq)
+        self.sendblue = FlorenceSendblueClient(settings.sendblue)
         self.candidate_review_service = FlorenceCandidateReviewService(self.store)
         self.household_manager_service = FlorenceHouseholdManagerService(self.store)
         self.sync_worker = FlorenceGoogleSyncWorkerService(
@@ -155,6 +157,43 @@ class FlorenceProductionService:
             except Exception:
                 logger.exception("Florence Linq webhook failed")
                 return self._json_result(500, {"ok": False, "error": "internal_linq_webhook_error"})
+
+    def handle_sendblue_webhook(
+        self,
+        *,
+        payload: dict[str, Any],
+        webhook_secret: str | None,
+    ) -> FlorenceHTTPResult:
+        if not self.sendblue.verify_webhook_signature(secret_header=webhook_secret):
+            return self._json_result(403, {"ok": False, "error": "invalid_sendblue_webhook_signature"})
+        try:
+            result = self.entrypoints.handle_sendblue_payload(payload)
+            reply_messages = result.reply_messages or ((result.reply_text,) if result.reply_text else ())
+            if reply_messages and result.channel_id:
+                channel = self.store.get_channel(result.channel_id)
+                if channel is not None:
+                    for message in reply_messages:
+                        self._safe_send_channel_message(channel=channel, message=message, record_message=False)
+
+            if result.group_announcement and result.household_id:
+                group_channel = self._find_group_channel(result.household_id, provider="sendblue")
+                if group_channel is not None:
+                    self._safe_send_channel_message(channel=group_channel, message=result.group_announcement)
+
+            return self._json_result(
+                200,
+                {
+                    "ok": True,
+                    "consumed": result.consumed,
+                    "householdId": result.household_id,
+                    "memberId": result.member_id,
+                    "channelId": result.channel_id,
+                    "error": result.error,
+                },
+            )
+        except Exception:
+            logger.exception("Florence Sendblue webhook failed")
+            return self._json_result(500, {"ok": False, "error": "internal_sendblue_webhook_error"})
 
     def handle_onboarding_page(
         self,
@@ -1412,6 +1451,8 @@ class FlorenceProductionService:
             target_store = store or self.store
             if channel.provider == "linq":
                 self.linq.send_text(chat_id=channel.provider_channel_id, message=message)
+            elif channel.provider == "sendblue":
+                self.sendblue.send_text(thread_id=channel.provider_channel_id, message=message)
             else:
                 return False
             if record_message:

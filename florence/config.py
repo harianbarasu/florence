@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -117,6 +117,19 @@ class FlorenceLinqRuntimeConfig:
 
 
 @dataclass(slots=True)
+class FlorenceSendblueRuntimeConfig:
+    api_key_id: str | None = None
+    api_secret_key: str | None = None
+    from_number: str | None = None
+    webhook_secret: str | None = None
+    base_url: str = "https://api.sendblue.co/api"
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.api_key_id and self.api_secret_key and self.from_number)
+
+
+@dataclass(slots=True)
 class FlorenceHermesRuntimeConfig:
     model: str
     max_iterations: int
@@ -158,6 +171,7 @@ class FlorenceSettings:
     linq: FlorenceLinqRuntimeConfig
     hermes: FlorenceHermesRuntimeConfig
     redis: FlorenceRedisRuntimeConfig
+    sendblue: FlorenceSendblueRuntimeConfig = field(default_factory=FlorenceSendblueRuntimeConfig)
 
     @classmethod
     def from_env(cls) -> "FlorenceSettings":
@@ -281,6 +295,45 @@ class FlorenceSettings:
                         "linq",
                         "base_url",
                         default="https://api.linqapp.com/api/partner/v3",
+                    )
+                ).rstrip("/"),
+            ),
+            sendblue=FlorenceSendblueRuntimeConfig(
+                api_key_id=_env_or_config(
+                    ("FLORENCE_SENDBLUE_API_KEY_ID", "SENDBLUE_API_KEY_ID", "SENDBLUE_API_KEY"),
+                    florence_cfg,
+                    "sendblue",
+                    "api_key_id",
+                    default=None,
+                ),
+                api_secret_key=_env_or_config(
+                    ("FLORENCE_SENDBLUE_API_SECRET_KEY", "SENDBLUE_API_SECRET_KEY", "SENDBLUE_API_SECRET"),
+                    florence_cfg,
+                    "sendblue",
+                    "api_secret_key",
+                    default=None,
+                ),
+                from_number=_env_or_config(
+                    ("FLORENCE_SENDBLUE_FROM_NUMBER", "SENDBLUE_FROM_NUMBER"),
+                    florence_cfg,
+                    "sendblue",
+                    "from_number",
+                    default=None,
+                ),
+                webhook_secret=_env_or_config(
+                    ("FLORENCE_SENDBLUE_WEBHOOK_SECRET", "SENDBLUE_WEBHOOK_SECRET"),
+                    florence_cfg,
+                    "sendblue",
+                    "webhook_secret",
+                    default=None,
+                ),
+                base_url=str(
+                    _env_or_config(
+                        ("FLORENCE_SENDBLUE_BASE_URL", "SENDBLUE_BASE_URL"),
+                        florence_cfg,
+                        "sendblue",
+                        "base_url",
+                        default="https://api.sendblue.co/api",
                     )
                 ).rstrip("/"),
             ),

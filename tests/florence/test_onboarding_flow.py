@@ -6,8 +6,6 @@ from florence.onboarding import (
     apply_child_names,
     apply_household_members,
     apply_household_operations,
-    apply_nudge_preferences,
-    apply_operating_preferences,
     apply_parent_name,
     apply_school_basics,
     build_onboarding_prompt,
@@ -57,19 +55,6 @@ def test_onboarding_flow_advances_through_required_v1_steps():
     assert transition.prompt.requires_external_action is True
 
     transition = mark_google_connected(transition.state)
-    assert transition.state.stage == OnboardingStage.COLLECT_NUDGE_PREFERENCES
-
-    transition = apply_nudge_preferences(
-        transition.state,
-        "Day before and morning of for anything time-sensitive. Keep nudging until I reply for school forms.",
-    )
-    assert transition.state.stage == OnboardingStage.COLLECT_OPERATING_PREFERENCES
-    assert transition.prompt is not None
-
-    transition = apply_operating_preferences(
-        transition.state,
-        "Weekday morning brief at 6:45, evening check-in on school nights, no texts after 9pm, always ask before spending money.",
-    )
     assert transition.state.stage == OnboardingStage.COMPLETE
     assert transition.state.is_complete is True
     assert transition.prompt is None

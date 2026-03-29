@@ -80,6 +80,8 @@ _FLORENCE_HOUSEHOLD_TOOLS = [
     "schedule_cronjob", "list_cronjobs", "remove_cronjob",
     "send_message",
     "household_search_state",
+    "household_search_google_inbox",
+    "household_upsert_event",
     "household_upsert_work_item",
     "household_upsert_routine",
     "household_schedule_nudge",

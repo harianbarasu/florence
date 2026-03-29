@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import json
+import logging
+import os
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from email.utils import parseaddr
 from enum import StrEnum
+from typing import Any
 
 from florence.contracts import HouseholdContext
 from florence.google.types import GmailSyncItem, ParentCalendarSyncItem
@@ -16,6 +20,7 @@ from florence.relevance.common import (
     CHILD_ACTIVITY_HINTS,
     LOGISTICS_HINTS,
     PERSONAL_CALENDAR_HINTS,
+    PROMOTIONAL_HINTS,
     SCHOOL_SENDER_HINTS,
     count_hint_hits,
 )
@@ -26,6 +31,9 @@ from florence.relevance.temporal import (
     parse_time_range,
     zoned_datetime_to_utc,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 class CandidateDecisionKind(StrEnum):
@@ -105,7 +113,335 @@ def _sender_domain(from_address: str) -> str:
     return lowered.split("@", 1)[1] if "@" in lowered else ""
 
 
-def build_gmail_candidate_decision(
+def _response_output_text(response: Any) -> str:
+    output_text = getattr(response, "output_text", None)
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text.strip()
+    if isinstance(response, dict):
+        candidate = response.get("output_text")
+        if isinstance(candidate, str):
+            return candidate.strip()
+    return ""
+
+
+def _gmail_relevance_model() -> str:
+    return os.getenv("FLORENCE_GMAIL_RELEVANCE_MODEL", "gpt-5.4").strip() or "gpt-5.4"
+
+
+def _gmail_relevance_fast_model() -> str:
+    return os.getenv("FLORENCE_GMAIL_RELEVANCE_FAST_MODEL", "gpt-5.4-mini").strip() or "gpt-5.4-mini"
+
+
+def _gmail_relevance_client():
+    if os.getenv("FLORENCE_GMAIL_RELEVANCE_DISABLE", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return None
+    api_key = (
+        os.getenv("FLORENCE_GMAIL_RELEVANCE_OPENAI_API_KEY", "").strip()
+        or os.getenv("OPENAI_API_KEY", "").strip()
+    )
+    if not api_key:
+        return None
+    base_url = os.getenv("FLORENCE_GMAIL_RELEVANCE_OPENAI_BASE_URL", "https://api.openai.com/v1").strip()
+    from openai import OpenAI
+
+    return OpenAI(api_key=api_key, base_url=base_url)
+
+
+def _json_load_object(raw: str) -> dict[str, Any] | None:
+    normalized = raw.strip()
+    if normalized.startswith("```"):
+        normalized = re.sub(r"^```(?:json)?\s*", "", normalized)
+        normalized = re.sub(r"\s*```$", "", normalized)
+    try:
+        payload = json.loads(normalized)
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _normalize_llm_datetime(value: Any) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    candidate = raw.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
+def _normalize_llm_proposed_fields(value: Any, *, default_title: str) -> dict[str, object]:
+    normalized: dict[str, object] = {"title": default_title}
+    if not isinstance(value, dict):
+        return normalized
+
+    candidate_title = _cleanup_gmail_title(str(value.get("title") or "").strip()) or default_title
+    normalized["title"] = candidate_title
+
+    starts_at = _normalize_llm_datetime(value.get("starts_at"))
+    if starts_at:
+        normalized["starts_at"] = starts_at
+    ends_at = _normalize_llm_datetime(value.get("ends_at"))
+    if ends_at:
+        normalized["ends_at"] = ends_at
+
+    timezone_value = str(value.get("timezone") or "").strip()
+    if timezone_value:
+        normalized["timezone"] = timezone_value
+
+    if "all_day" in value:
+        normalized["all_day"] = bool(value.get("all_day"))
+
+    location = str(value.get("location") or "").strip()
+    if location:
+        normalized["location"] = location
+
+    description = compact_text(str(value.get("description") or "").strip(), max_length=800)
+    if description:
+        normalized["description"] = description
+
+    return normalized
+
+
+def _coerce_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _gmail_relevance_prompt() -> str:
+    return (
+        "You classify Gmail messages for Florence, a family house manager. "
+        "Decide whether this email is relevant household logistics that Florence should surface for parent review. "
+        "Be strict about skipping promotions, newsletters, podcasts, shopping, marketing, and generic news unless they are clearly tied to the family's known context. "
+        "Known children, schools, activities, contacts, platforms, and locations are strong evidence. "
+        "If the email is relevant but the date or time is ambiguous or incomplete, still return candidate=true with requires_confirmation=true. "
+        "Return JSON only with keys: kind, reason, title, summary, confidence_bps, requires_confirmation, confirmation_question, signals, proposed_fields. "
+        "kind must be candidate or skip. reason must be a short snake_case label. "
+        "signals must be a short array of evidence tags like known_contact, school_domain, schedule_change, no_class, family_day, promotion. "
+        "proposed_fields must be an object or null. Allowed proposed field keys are title, starts_at, ends_at, timezone, all_day, location, description. "
+        "If you emit starts_at or ends_at, use ISO 8601 with timezone; UTC is preferred. Do not invent facts."
+    )
+
+
+def _gmail_relevance_payload(
+    item: GmailSyncItem,
+    *,
+    time_zone: str,
+    context: HouseholdContext | None,
+    now: datetime | None,
+) -> dict[str, object]:
+    subject = _cleanup_gmail_title(item.subject) or "Untitled Gmail candidate"
+    return {
+        "time_zone": time_zone,
+        "now_utc": (now or item.received_at).isoformat() if (now or item.received_at) is not None else None,
+        "household_context": {
+            "children": list(context.visible_child_names) if context is not None else [],
+            "child_aliases": list(context.child_aliases) if context is not None else [],
+            "schools": list(context.school_labels) if context is not None else [],
+            "school_domains": list(context.school_domains) if context is not None else [],
+            "school_platforms": list(context.school_platforms) if context is not None else [],
+            "activities": list(context.activity_labels) if context is not None else [],
+            "contacts": list(context.contact_names) if context is not None else [],
+            "locations": list(context.location_labels) if context is not None else [],
+        },
+        "email": {
+            "from_address": item.from_address,
+            "subject": subject,
+            "snippet": compact_text(item.snippet or "", max_length=500),
+            "body_text": compact_text(item.body_text or "", max_length=3_000),
+            "attachment_text": compact_text(item.attachment_text or "", max_length=2_500),
+            "attachment_count": item.attachment_count,
+            "received_at": item.received_at.isoformat() if item.received_at is not None else None,
+        },
+    }
+
+
+def _decision_from_llm_payload(
+    *,
+    parsed: dict[str, Any],
+    subject: str,
+    time_zone: str,
+    classifier: str,
+    model: str,
+) -> CandidateDecision | None:
+    kind_raw = str(parsed.get("kind") or "").strip().lower()
+    if kind_raw not in {CandidateDecisionKind.CANDIDATE.value, CandidateDecisionKind.SKIP.value}:
+        return None
+
+    reason = str(parsed.get("reason") or "").strip() or ("llm_candidate" if kind_raw == "candidate" else "llm_skip")
+    confidence_value = _coerce_int(parsed.get("confidence_bps"))
+    confidence_bps = clamp_confidence_bps(confidence_value, minimum=1_000) if confidence_value is not None else None
+    signals = parsed.get("signals")
+    signal_list = [str(signal).strip() for signal in signals if str(signal).strip()] if isinstance(signals, list) else []
+
+    if kind_raw == CandidateDecisionKind.SKIP.value:
+        return CandidateDecision(
+            kind=CandidateDecisionKind.SKIP,
+            reason=reason,
+            confidence_bps=confidence_bps,
+            raw_metadata={
+                "classifier": classifier,
+                "model": model,
+                "signals": signal_list,
+            },
+        )
+
+    title = _cleanup_gmail_title(str(parsed.get("title") or "").strip()) or subject
+    summary = compact_text(str(parsed.get("summary") or "").strip(), max_length=300) or None
+    requires_confirmation = bool(parsed.get("requires_confirmation"))
+    confirmation_question = compact_text(str(parsed.get("confirmation_question") or "").strip(), max_length=220) or None
+    proposed_fields = _normalize_llm_proposed_fields(parsed.get("proposed_fields"), default_title=title)
+    if "timezone" not in proposed_fields and (proposed_fields.get("starts_at") or proposed_fields.get("ends_at")):
+        proposed_fields["timezone"] = time_zone
+    if requires_confirmation and not confirmation_question:
+        confirmation_question = f"Should I add {title} to your household plan?"
+
+    return CandidateDecision(
+        kind=CandidateDecisionKind.CANDIDATE,
+        title=title,
+        summary=summary,
+        proposed_fields=proposed_fields,
+        confidence_bps=clamp_confidence_bps(confidence_bps or 7_000, minimum=5_000),
+        requires_confirmation=requires_confirmation,
+        confirmation_question=confirmation_question,
+        should_auto_handoff=(confidence_bps or 7_000) >= 6_500,
+        reason=reason,
+        raw_metadata={
+            "classifier": classifier,
+            "model": model,
+            "signals": signal_list,
+        },
+    )
+
+
+def _run_gmail_candidate_decision_llm(
+    item: GmailSyncItem,
+    *,
+    model: str,
+    classifier: str,
+    context: HouseholdContext | None = None,
+    time_zone: str,
+    now: datetime | None = None,
+) -> CandidateDecision | None:
+    client = _gmail_relevance_client()
+    if client is None:
+        return None
+
+    subject = _cleanup_gmail_title(item.subject) or "Untitled Gmail candidate"
+    payload = _gmail_relevance_payload(item, time_zone=time_zone, context=context, now=now)
+
+    try:
+        response = client.responses.create(
+            model=model,
+            input=[
+                {
+                    "role": "system",
+                    "content": [{"type": "input_text", "text": _gmail_relevance_prompt()}],
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": json.dumps(payload, ensure_ascii=True)}],
+                },
+            ],
+            max_output_tokens=900,
+        )
+    except Exception:
+        logger.exception("Gmail relevance LLM call failed for %s using %s", item.gmail_message_id, model)
+        return None
+
+    parsed = _json_load_object(_response_output_text(response))
+    if parsed is None:
+        logger.warning("Gmail relevance LLM returned non-JSON for %s using %s", item.gmail_message_id, model)
+        return None
+    decision = _decision_from_llm_payload(
+        parsed=parsed,
+        subject=subject,
+        time_zone=time_zone,
+        classifier=classifier,
+        model=model,
+    )
+    if decision is None:
+        logger.warning("Gmail relevance LLM returned invalid payload for %s using %s", item.gmail_message_id, model)
+    return decision
+
+
+def _should_escalate_gmail_llm_decision(decision: CandidateDecision) -> bool:
+    if decision.kind == CandidateDecisionKind.CANDIDATE:
+        return True
+    if decision.requires_confirmation:
+        return True
+    confidence = decision.confidence_bps or 0
+    signals = [
+        str(signal).strip().lower()
+        for signal in decision.raw_metadata.get("signals", [])
+        if str(signal).strip()
+    ]
+    if confidence < 6_500:
+        return True
+    if confidence >= 8_500:
+        return False
+    interesting_signal_tokens = (
+        "known_",
+        "school",
+        "activity",
+        "camp",
+        "class",
+        "schedule",
+        "pickup",
+        "dropoff",
+        "family_day",
+        "no_class",
+        "cancel",
+    )
+    return any(any(token in signal for token in interesting_signal_tokens) for signal in signals)
+
+
+def _build_gmail_candidate_decision_llm(
+    item: GmailSyncItem,
+    time_zone: str,
+    *,
+    context: HouseholdContext | None = None,
+    now: datetime | None = None,
+) -> CandidateDecision | None:
+    fast_model = _gmail_relevance_fast_model()
+    fast_decision = _run_gmail_candidate_decision_llm(
+        item,
+        model=fast_model,
+        classifier="gmail_llm_fast_v1",
+        context=context,
+        time_zone=time_zone,
+        now=now,
+    )
+    if fast_decision is None:
+        return None
+
+    deep_model = _gmail_relevance_model()
+    if deep_model == fast_model or not _should_escalate_gmail_llm_decision(fast_decision):
+        return fast_decision
+
+    deep_decision = _run_gmail_candidate_decision_llm(
+        item,
+        model=deep_model,
+        classifier="gmail_llm_deep_v1",
+        context=context,
+        time_zone=time_zone,
+        now=now,
+    )
+    if deep_decision is None:
+        return fast_decision
+    deep_decision.raw_metadata["triage_model"] = fast_model
+    deep_decision.raw_metadata["triage_classifier"] = fast_decision.raw_metadata.get("classifier")
+    deep_decision.raw_metadata["triage_reason"] = fast_decision.reason
+    deep_decision.raw_metadata["triage_confidence_bps"] = fast_decision.confidence_bps
+    return deep_decision
+
+
+def _build_gmail_candidate_decision_heuristic(
     item: GmailSyncItem,
     time_zone: str,
     *,
@@ -117,7 +453,9 @@ def build_gmail_candidate_decision(
     body_text = (item.body_text or "").strip()
     attachment_text = (item.attachment_text or "").strip()
     text = "\n".join(part for part in (subject, snippet, body_text, attachment_text) if part).strip()
+    source_text = "\n".join(part for part in (item.from_address, subject, snippet, body_text, attachment_text) if part).strip()
     lowered = text.lower()
+    lowered_source = source_text.lower()
     sender_lower = item.from_address.lower()
     sender_domain = _sender_domain(item.from_address)
 
@@ -132,18 +470,19 @@ def build_gmail_candidate_decision(
         if context is not None and sender_domain and sender_domain.lower() in {domain.lower() for domain in context.school_domains}
         else 0
     )
-    platform_hits = _count_known_hits(f"{item.from_address}\n{text}", platform_terms)
-    known_school_hits = _count_known_hits(text, school_terms)
-    known_activity_hits = _count_known_hits(text, activity_terms)
-    known_child_hits = _count_known_hits(text, child_terms)
-    known_contact_hits = _count_known_hits(f"{item.from_address}\n{text}", contact_terms)
-    known_location_hits = _count_known_hits(text, location_terms)
+    platform_hits = _count_known_hits(source_text, platform_terms)
+    known_school_hits = _count_known_hits(source_text, school_terms)
+    known_activity_hits = _count_known_hits(source_text, activity_terms)
+    known_child_hits = _count_known_hits(source_text, child_terms)
+    known_contact_hits = _count_known_hits(source_text, contact_terms)
+    known_location_hits = _count_known_hits(source_text, location_terms)
 
     sender_looks_school = any(hint in sender_lower for hint in SCHOOL_SENDER_HINTS)
     sender_looks_school = sender_looks_school or school_domain_hits > 0 or platform_hits > 0 or known_school_hits > 0
     logistics_hits = count_hint_hits(lowered, LOGISTICS_HINTS)
     ambiguity_hits = count_hint_hits(lowered, AMBIGUITY_HINTS)
     all_day_hits = count_hint_hits(lowered, ALL_DAY_HINTS)
+    promotional_hits = count_hint_hits(lowered_source, PROMOTIONAL_HINTS)
     date_match = parse_explicit_date(text, time_zone, now=now or item.received_at)
     time_range = parse_time_range(text)
     single_time = None if time_range else parse_single_time(text)
@@ -157,19 +496,36 @@ def build_gmail_candidate_decision(
         + known_contact_hits
         + known_location_hits
     )
+    strong_household_anchor_hits = (
+        school_domain_hits
+        + platform_hits
+        + known_school_hits
+        + known_activity_hits
+        + known_child_hits
+        + known_contact_hits
+        + known_location_hits
+    )
 
     has_household_anchor = context_signal_hits > 0
+    if promotional_hits > 0 and strong_household_anchor_hits == 0:
+        return CandidateDecision(kind=CandidateDecisionKind.SKIP, reason="promotional_noise")
     if sender_looks_school:
-        looks_relevant = bool(logistics_hits > 0 or has_scheduling_evidence or has_household_anchor)
+        looks_relevant = bool(
+            has_scheduling_evidence
+            or (logistics_hits > 0 and strong_household_anchor_hits > 0)
+            or strong_household_anchor_hits >= 2
+            or (known_contact_hits > 0 and (logistics_hits > 0 or has_scheduling_evidence))
+        )
     else:
-        # Non-school/newsletter senders must tie back to known household
-        # context to avoid pulling random inbox noise into review.
         looks_relevant = bool(
             has_household_anchor
             and (
-                (logistics_hits > 0 and has_scheduling_evidence)
-                or (logistics_hits > 0 and (known_child_hits > 0 or known_activity_hits > 0 or known_school_hits > 0))
-                or (known_activity_hits > 0 and known_child_hits > 0)
+                has_scheduling_evidence
+                or logistics_hits > 0
+                or (
+                    known_contact_hits > 0
+                    and (known_child_hits > 0 or known_activity_hits > 0 or known_school_hits > 0)
+                )
             )
         )
     if not looks_relevant:
@@ -214,6 +570,7 @@ def build_gmail_candidate_decision(
     confidence_bps += min(known_child_hits, 2) * 600
     confidence_bps += min(known_contact_hits, 1) * 500
     confidence_bps += min(known_location_hits, 1) * 300
+    confidence_bps -= min(promotional_hits, 2) * 600
 
     requires_confirmation = False
     confirmation_question: str | None = None
@@ -286,7 +643,31 @@ def build_gmail_candidate_decision(
             "ambiguity_hits": ambiguity_hits,
             "attachment_count": item.attachment_count,
             "sender_domain": sender_domain or None,
+            "promotional_hits": promotional_hits,
         },
+    )
+
+
+def build_gmail_candidate_decision(
+    item: GmailSyncItem,
+    time_zone: str,
+    *,
+    context: HouseholdContext | None = None,
+    now: datetime | None = None,
+) -> CandidateDecision:
+    llm_decision = _build_gmail_candidate_decision_llm(
+        item,
+        time_zone,
+        context=context,
+        now=now,
+    )
+    if llm_decision is not None:
+        return llm_decision
+    return _build_gmail_candidate_decision_heuristic(
+        item,
+        time_zone,
+        context=context,
+        now=now,
     )
 
 

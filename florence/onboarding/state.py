@@ -106,8 +106,6 @@ class OnboardingState:
         )
         if not basics_ready:
             return False
-        if not self.household_operations or not self.nudge_preferences or not self.operating_preferences:
-            return False
         if self.variant == OnboardingVariant.CONCIERGE and not self.household_members:
             return False
         return True

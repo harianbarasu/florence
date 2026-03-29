@@ -8,6 +8,7 @@ from florence.config import (
     FlorenceGoogleRuntimeConfig,
     FlorenceHermesRuntimeConfig,
     FlorenceLinqRuntimeConfig,
+    FlorenceRedisRuntimeConfig,
     FlorenceServerRuntimeConfig,
     FlorenceSettings,
 )
@@ -15,6 +16,7 @@ from florence.contracts import (
     CandidateState,
     Channel,
     ChannelType,
+    GoogleConnection,
     GoogleSourceKind,
     Household,
     HouseholdRoutine,
@@ -62,6 +64,7 @@ def _build_settings(tmp_path):
             host="127.0.0.1",
             port=8081,
             public_base_url="https://florence.example.com",
+            onboarding_state_secret="state-secret",
             sync_interval_seconds=300.0,
             db_path=tmp_path / "florence.db",
         ),
@@ -79,6 +82,7 @@ def _build_settings(tmp_path):
             model="anthropic/claude-opus-4.6",
             max_iterations=4,
         ),
+        redis=FlorenceRedisRuntimeConfig(url=None),
     )
 
 
@@ -223,15 +227,41 @@ def test_production_service_google_callback_sends_dm_follow_up(tmp_path, monkeyp
     )
     monkeypatch.setattr("florence.runtime.services.list_recent_gmail_sync_items", lambda **_: [])
     monkeypatch.setattr("florence.runtime.services.list_recent_parent_calendar_sync_items", lambda **_: [])
+    launched: list[dict[str, object]] = []
+    monkeypatch.setattr(service, "_launch_google_sync_job", lambda **kwargs: launched.append(kwargs))
 
     result = service.handle_google_callback(code="auth-code", state=raw_state)
 
     assert result.status_code == 200
-    assert "Google connected" in result.body
+    assert "Continue Florence setup" in result.body
     assert service.linq.sent
     assert service.linq.sent[0]["chat_id"] == "dm-thread-123"
-    assert "reminders and nudges" in service.linq.sent[0]["message"].lower()
+    assert service.linq.sent[0]["message"] == "You're ready. Florence is set up as your house manager now."
+    assert service.linq.sent[1]["message"].startswith("Start with a real task like:")
+    assert "syncing your recent email and calendar in the background" in service.linq.sent[2]["message"]
+    assert len(launched) == 1
+    assert str(launched[0]["connection_id"]).startswith("gconn_")
+    assert launched[0]["thread_id"] == "dm-thread-123"
+    assert launched[0]["notify_when_finished"] is True
     store.close()
+
+
+def test_production_service_uses_web_base_url_for_onboarding_links(tmp_path):
+    settings = _build_settings(tmp_path)
+    settings = replace(
+        settings,
+        server=replace(settings.server, web_base_url="https://app.florence.example.com"),
+    )
+    service = FlorenceProductionService(settings)
+
+    link = service.onboarding_link_service.build_link(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+    )
+
+    assert link.url.startswith("https://app.florence.example.com/setup?token=")
+    service.close()
 
 
 def test_production_service_google_callback_keeps_onboarding_prompt_separate_from_review(tmp_path, monkeypatch):
@@ -325,13 +355,17 @@ def test_production_service_google_callback_keeps_onboarding_prompt_separate_fro
     )
     monkeypatch.setattr("florence.runtime.services.list_recent_gmail_sync_items", lambda **_: [])
     monkeypatch.setattr("florence.runtime.services.list_recent_parent_calendar_sync_items", lambda **_: [])
+    launched: list[dict[str, object]] = []
+    monkeypatch.setattr(service, "_launch_google_sync_job", lambda **kwargs: launched.append(kwargs))
 
     result = service.handle_google_callback(code="auth-code", state=raw_state)
 
     assert result.status_code == 200
-    assert len(service.linq.sent) == 1
-    assert "How proactive should I be with reminders and nudges?" in service.linq.sent[0]["message"]
+    assert len(service.linq.sent) == 3
+    assert service.linq.sent[0]["message"] == "You're ready. Florence is set up as your house manager now."
     assert "Imported item:" not in service.linq.sent[0]["message"]
+    assert "syncing your recent email and calendar in the background" in service.linq.sent[2]["message"]
+    assert launched[0]["notify_when_finished"] is True
     store.close()
 
 
@@ -364,11 +398,292 @@ def test_production_service_first_dm_sends_onboarding_sequence_as_separate_messa
     )
 
     assert result.status_code == 200
-    assert [item["message"] for item in service.linq.sent] == [
-        "Hi, I'm Florence.",
-        "I help run the household with you by learning the family map first, then keeping up with reminders, logistics, school noise, and schedule changes.",
-        "Start with the kids I should know about: first name plus grade or age if helpful. One per line or comma-separated is fine.",
+    assert len(service.linq.sent) == 4
+    assert service.linq.sent[0]["message"] == "Hi, I'm Florence."
+    assert service.linq.sent[1]["message"] == (
+        "I’m easiest to set up on a computer. Finish setup there so I can learn your household, connect Google, and start acting like your house manager."
+    )
+    assert service.linq.sent[2]["message"].startswith("https://florence.example.com/v1/florence/onboarding?token=")
+    assert service.linq.sent[3]["message"] == (
+        "Once setup is done, I’ll text you here when I’m ready and when the first Gmail and Calendar pass finishes."
+    )
+    store.close()
+
+
+def test_production_service_web_onboarding_submission_completes_setup_and_texts_ready(tmp_path):
+    settings = _build_settings(tmp_path)
+    store = FlorenceStateDB(settings.server.db_path)
+    service = FlorenceProductionService(settings, store=store)
+    service.linq = _FakeLinqClient()
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    service.entrypoints.onboarding_service.record_google_connected(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+    )
+    link = service.onboarding_link_service.build_link(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+    )
+    token = parse_qs(urlparse(link.url).query)["token"][0]
+
+    result = service.handle_onboarding_submission(
+        token=token,
+        form_data={
+            "parent_display_name": "Maya",
+            "household_members": "Maya - mom\nBen - dad",
+            "child_details": "Theo - 1st grade\nViolet - preschool",
+            "school_labels": "Wish Community School\nYoung Minds Preschool",
+            "activity_labels": "Theo baseball\nViolet dance",
+            "household_operations": "Meal planning\nSchool forms\nGroceries",
+            "nudge_preferences": "Day before + morning of for big things.",
+            "operating_preferences": "Morning brief at 6:45, no texts after 9pm.",
+        },
+    )
+
+    assert result.status_code == 200
+    assert "Florence is ready" in result.body
+    session = service.entrypoints.onboarding_service.get_or_create_session(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+    )
+    assert session.is_complete is True
+    assert service.linq.sent == [
+        {"chat_id": "dm-thread-123", "message": "You're ready. Florence is set up as your house manager now."},
+        {
+            "chat_id": "dm-thread-123",
+            "message": (
+                "Start with a real task like: what's on the kids' schedule next week, check my email for a school or camp update, "
+                "remind me about picture day, or plan dinners and groceries for next week."
+            ),
+        },
     ]
+    store.close()
+
+
+def test_production_service_web_setup_returns_sync_state_and_suggestions(tmp_path):
+    settings = _build_settings(tmp_path)
+    store = FlorenceStateDB(settings.server.db_path)
+    service = FlorenceProductionService(settings, store=store)
+    household = Household(
+        id="hh_123",
+        name="Maya's household",
+        timezone="America/Los_Angeles",
+        settings={
+            "grounding_hints": {
+                "schools": [
+                    {
+                        "label": "Roosevelt Elementary",
+                        "platforms": ["ParentSquare"],
+                        "contacts": ["Linda"],
+                    }
+                ],
+                "activities": [
+                    {
+                        "label": "Soccer",
+                        "locations": ["Community Field"],
+                        "contacts": ["Coach Ben"],
+                    }
+                ],
+            }
+        },
+    )
+    store.upsert_household(household)
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    service.entrypoints.onboarding_service.record_google_connected(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+    )
+    store.upsert_google_connection(
+        GoogleConnection(
+            id="gconn_123",
+            household_id="hh_123",
+            member_id="mem_123",
+            email="parent@example.com",
+            connected_scopes=(GoogleSourceKind.GMAIL, GoogleSourceKind.GOOGLE_CALENDAR),
+            metadata={
+                "web_primary": True,
+                "initial_sync_state": "ready",
+                "initial_sync_completed_at": "2026-03-29T18:00:00+00:00",
+                "sync_phase": "ready",
+                "last_sync_status": "ok",
+            },
+        )
+    )
+    link = service.onboarding_link_service.build_link(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+    )
+    token = parse_qs(urlparse(link.url).query)["token"][0]
+
+    result = service.handle_web_setup(token=token)
+
+    assert result.status_code == 200
+    payload = json.loads(result.body)
+    assert payload["ok"] is True
+    assert payload["setup"]["phase"] == "collect_household_profile"
+    assert payload["sync"]["primary"]["initialSyncState"] == "ready"
+    assert payload["suggestions"]["schools"][0]["label"] == "Roosevelt Elementary"
+    assert payload["suggestions"]["activities"][0]["label"] == "Soccer"
+    store.close()
+
+
+def test_production_service_web_setup_profile_completes_and_texts_parent(tmp_path):
+    settings = _build_settings(tmp_path)
+    store = FlorenceStateDB(settings.server.db_path)
+    service = FlorenceProductionService(settings, store=store)
+    service.linq = _FakeLinqClient()
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    service.entrypoints.onboarding_service.record_google_connected(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+    )
+    store.upsert_google_connection(
+        GoogleConnection(
+            id="gconn_123",
+            household_id="hh_123",
+            member_id="mem_123",
+            email="parent@example.com",
+            connected_scopes=(GoogleSourceKind.GMAIL, GoogleSourceKind.GOOGLE_CALENDAR),
+            metadata={
+                "web_primary": True,
+                "initial_sync_state": "ready",
+                "initial_sync_completed_at": "2026-03-29T18:00:00+00:00",
+                "sync_phase": "ready",
+                "last_sync_status": "ok",
+            },
+        )
+    )
+    link = service.onboarding_link_service.build_link(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+    )
+    token = parse_qs(urlparse(link.url).query)["token"][0]
+
+    result = service.handle_web_setup_profile(
+        token=token,
+        payload={
+            "parentDisplayName": "Maya",
+            "children": [{"name": "Theo", "details": "1st grade"}, {"name": "Violet", "details": "preschool"}],
+            "schools": ["Wish Community School", "Young Minds Preschool"],
+            "activities": ["Theo baseball", "Violet dance"],
+        },
+    )
+
+    assert result.status_code == 200
+    payload = json.loads(result.body)
+    assert payload["setup"]["readyForChat"] is True
+    assert len(store.list_child_profiles(household_id="hh_123")) == 2
+    assert len(service.linq.sent) == 2
+    assert service.linq.sent[0]["message"] == "You're ready. Florence is set up as your house manager now."
+    store.close()
+
+
+def test_production_service_web_session_resolves_by_google_email(tmp_path):
+    settings = _build_settings(tmp_path)
+    store = FlorenceStateDB(settings.server.db_path)
+    service = FlorenceProductionService(settings, store=store)
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    service.entrypoints.onboarding_service.record_google_connected(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+    )
+    store.upsert_google_connection(
+        GoogleConnection(
+            id="gconn_123",
+            household_id="hh_123",
+            member_id="mem_123",
+            email="parent@example.com",
+            connected_scopes=(GoogleSourceKind.GMAIL, GoogleSourceKind.GOOGLE_CALENDAR),
+            metadata={"web_primary": True},
+        )
+    )
+
+    result = service.handle_web_session(auth_email="parent@example.com")
+
+    assert result.status_code == 200
+    payload = json.loads(result.body)
+    assert payload["resolvedVia"] == "google_email"
+    assert payload["member"]["id"] == "mem_123"
+    assert payload["household"]["id"] == "hh_123"
     store.close()
 
 

@@ -212,3 +212,34 @@ def test_extract_pdf_attachment_text_with_gpt_uses_gpt_5_4_by_default(monkeypatc
     assert calls["base_url"] == "https://api.openai.com/v1"
     assert isinstance(calls["kwargs"], dict)
     assert calls["kwargs"]["model"] == "gpt-5.4"
+
+
+def test_list_recent_gmail_sync_items_accepts_custom_query(monkeypatch):
+    seen_queries: list[str] = []
+
+    class _FakeResponse:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+        def raise_for_status(self):
+            return None
+
+    def _fake_get(url, *, params=None, headers=None, timeout=None):  # noqa: ARG001
+        if url.endswith("/messages"):
+            seen_queries.append(str((params or {}).get("q") or ""))
+            return _FakeResponse({"messages": []})
+        raise AssertionError(f"Unexpected URL: {url}")
+
+    monkeypatch.setattr(google_fetch.httpx, "get", _fake_get)
+
+    items = list_recent_gmail_sync_items(
+        access_token="token",
+        max_results=5,
+        gmail_query='from:"Linda" subject:"spring break"',
+    )
+
+    assert items == []
+    assert seen_queries == ['from:"Linda" subject:"spring break" -in:trash -in:spam']

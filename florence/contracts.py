@@ -41,6 +41,18 @@ class GoogleSourceKind(StrEnum):
     GOOGLE_CALENDAR = "google_calendar"
 
 
+class HouseholdSourceVisibility(StrEnum):
+    SHARED = "shared"
+    PRIVATE = "private"
+
+
+class HouseholdSourceMatcherKind(StrEnum):
+    GMAIL_FROM_ADDRESS = "gmail_from_address"
+    GMAIL_FROM_DOMAIN = "gmail_from_domain"
+    GMAIL_SENDER_NAME = "gmail_sender_name"
+    GOOGLE_CALENDAR_SUMMARY = "google_calendar_summary"
+
+
 class CandidateState(StrEnum):
     QUARANTINED = "quarantined"
     PENDING_REVIEW = "pending_review"
@@ -206,6 +218,19 @@ class GoogleConnection:
     access_token: str | None = None
     refresh_token: str | None = None
     access_token_expires_at: str | None = None
+    metadata: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class HouseholdSourceRule:
+    id: str
+    household_id: str
+    source_kind: GoogleSourceKind
+    matcher_kind: HouseholdSourceMatcherKind
+    matcher_value: str
+    visibility: HouseholdSourceVisibility
+    label: str | None = None
+    created_by_member_id: str | None = None
     metadata: dict[str, object] = field(default_factory=dict)
 
 

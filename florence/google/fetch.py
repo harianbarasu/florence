@@ -373,6 +373,7 @@ def list_recent_gmail_sync_items(
     *,
     access_token: str,
     max_results: int | None = None,
+    gmail_query: str | None = None,
     timeout_seconds: float = 30.0,
 ) -> list[GmailSyncItem]:
     message_refs: list[dict[str, Any]] = []
@@ -381,9 +382,19 @@ def list_recent_gmail_sync_items(
 
     while True:
         list_url = "https://gmail.googleapis.com/gmail/v1/users/me/messages"
+        normalized_query = " ".join(str(gmail_query or "").split()).strip()
+        if normalized_query:
+            query = normalized_query
+            lowered_query = normalized_query.lower()
+            if "-in:trash" not in lowered_query:
+                query = f"{query} -in:trash"
+            if "-in:spam" not in lowered_query:
+                query = f"{query} -in:spam"
+        else:
+            query = "newer_than:90d -in:trash -in:spam"
         params = {
             "maxResults": str(page_size),
-            "q": "newer_than:90d -in:trash -in:spam",
+            "q": query,
         }
         if page_token:
             params["pageToken"] = page_token

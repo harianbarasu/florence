@@ -5,11 +5,17 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import re
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from florence.contracts import (
+    GoogleSourceKind,
+    HouseholdEvent,
+    HouseholdEventStatus,
     HouseholdMeal,
     HouseholdMealStatus,
     HouseholdNudgeTargetKind,
@@ -18,10 +24,14 @@ from florence.contracts import (
     HouseholdRoutineStatus,
     HouseholdShoppingItem,
     HouseholdShoppingItemStatus,
+    HouseholdSourceVisibility,
     HouseholdWorkItem,
     HouseholdWorkItemStatus,
 )
+from florence.google.fetch import list_recent_gmail_sync_items
+from florence.google.oauth import refresh_google_access_token
 from florence.runtime.services import FlorenceHouseholdManagerService
+from florence.source_rules import request_matches_shared_gmail_rule
 from florence.state import FlorenceStateDB
 from tools.registry import registry
 
@@ -336,6 +346,71 @@ SEARCH_STATE_SCHEMA = {
 }
 
 
+SEARCH_GOOGLE_INBOX_SCHEMA = {
+    "name": "household_search_google_inbox",
+    "description": (
+        "Search the connected Gmail inbox when the user explicitly asks Florence to check email from a sender, "
+        "school, camp, teacher, coach, or keyword. Use this instead of asking the user to forward the email when "
+        "Google is already connected."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Optional free-text search such as 'spring break musical beginnings' or a Gmail query fragment.",
+            },
+            "sender": {
+                "type": "string",
+                "description": "Optional sender name or email fragment, such as 'Linda' or 'school@district.org'.",
+            },
+            "subject": {
+                "type": "string",
+                "description": "Optional subject phrase to prioritize.",
+            },
+            "newer_than_days": {
+                "type": "integer",
+                "description": "How far back to search. Default 120 days.",
+            },
+            "max_results": {
+                "type": "integer",
+                "description": "Maximum number of matching messages to return. Default 5.",
+            },
+        },
+        "required": [],
+    },
+}
+
+
+UPSERT_EVENT_SCHEMA = {
+    "name": "household_upsert_event",
+    "description": (
+        "Create or update a household event Florence should remember across threads, such as camps, school days, "
+        "sports practices, trips, appointments, and deadlines."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string", "description": "Existing event id to update. Omit to upsert by title + start time."},
+            "title": {"type": "string", "description": "Event title."},
+            "starts_at": {"type": "string", "description": "Optional ISO timestamp when the event starts."},
+            "ends_at": {"type": "string", "description": "Optional ISO timestamp when the event ends."},
+            "timezone": {"type": "string", "description": "Optional timezone id."},
+            "all_day": {"type": "boolean", "description": "Whether this is an all-day event."},
+            "location": {"type": "string", "description": "Optional location."},
+            "description": {"type": "string", "description": "Optional details or notes."},
+            "status": {
+                "type": "string",
+                "enum": [status.value for status in HouseholdEventStatus],
+                "description": "Event status. Use tentative when plans are not locked.",
+            },
+            "metadata": {"type": "object", "description": "Optional structured metadata."},
+        },
+        "required": ["title"],
+    },
+}
+
+
 UPSERT_WORK_ITEM_SCHEMA = {
     "name": "household_upsert_work_item",
     "description": (
@@ -598,6 +673,215 @@ def _handle_search_state(args: dict, *, task_id: str | None = None, **_: Any) ->
     )
 
 
+def _parse_optional_iso_datetime(value: str | None) -> datetime | None:
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    if raw.endswith("Z"):
+        raw = f"{raw[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _google_client_credentials() -> tuple[str | None, str | None]:
+    client_id = os.getenv("FLORENCE_GOOGLE_CLIENT_ID") or os.getenv("GOOGLE_CLIENT_ID")
+    client_secret = os.getenv("FLORENCE_GOOGLE_CLIENT_SECRET") or os.getenv("GOOGLE_CLIENT_SECRET")
+    return (str(client_id).strip() if client_id else None, str(client_secret).strip() if client_secret else None)
+
+
+def _ensure_connection_access_token(
+    context: FlorenceHouseholdToolContext,
+    connection,
+) -> Any:
+    expiry = _parse_optional_iso_datetime(connection.access_token_expires_at)
+    refresh_needed = connection.access_token is None or (
+        expiry is not None and expiry <= datetime.now(timezone.utc) + timedelta(minutes=5)
+    )
+    if not refresh_needed:
+        return connection
+    client_id, client_secret = _google_client_credentials()
+    if not connection.refresh_token or not client_id or not client_secret:
+        return connection
+    refreshed = refresh_google_access_token(
+        refresh_token=connection.refresh_token,
+        client_id=client_id,
+        client_secret=client_secret,
+    )
+    expires_at = None
+    if refreshed.expires_in:
+        expires_at = (datetime.now(timezone.utc) + timedelta(seconds=int(refreshed.expires_in))).isoformat()
+    updated = replace(
+        connection,
+        access_token=refreshed.access_token or connection.access_token,
+        refresh_token=refreshed.refresh_token or connection.refresh_token,
+        access_token_expires_at=expires_at or connection.access_token_expires_at,
+    )
+    context.store.upsert_google_connection(updated)
+    return updated
+
+
+def _gmail_query_token(value: str) -> str:
+    escaped = value.replace('"', "").strip()
+    if not escaped:
+        return ""
+    return f"\"{escaped}\"" if re.search(r"\s", escaped) else escaped
+
+
+def _build_google_inbox_query(
+    *,
+    query: str | None,
+    sender: str | None,
+    subject: str | None,
+    newer_than_days: int,
+) -> str:
+    parts = [f"newer_than:{newer_than_days}d"]
+    if sender:
+        token = _gmail_query_token(sender)
+        if token:
+            parts.append(f"from:{token}")
+    if subject:
+        token = _gmail_query_token(subject)
+        if token:
+            parts.append(f"subject:{token}")
+    if query:
+        parts.append(query)
+    return " ".join(part for part in parts if part)
+
+
+def _gmail_item_matches(
+    item,
+    *,
+    query: str | None,
+    sender: str | None,
+    subject: str | None,
+) -> bool:
+    sender_filter = _normalize_optional_text(sender)
+    if sender_filter and sender_filter.lower() not in item.from_address.lower():
+        return False
+    subject_filter = _normalize_optional_text(subject)
+    if subject_filter and subject_filter.lower() not in item.subject.lower():
+        return False
+    query_filter = _normalize_optional_text(query)
+    if not query_filter:
+        return True
+    return _matches_query(
+        [
+            item.from_address,
+            item.subject,
+            item.snippet,
+            item.body_text,
+            item.attachment_text,
+        ],
+        query_filter,
+    )
+
+
+def _serialize_gmail_item(item, *, connection_email: str) -> dict[str, Any]:
+    return {
+        "connection_email": connection_email,
+        "gmail_message_id": item.gmail_message_id,
+        "thread_id": item.thread_id,
+        "from_address": item.from_address,
+        "subject": item.subject,
+        "snippet": item.snippet,
+        "body_text": item.body_text,
+        "attachment_text": item.attachment_text,
+        "attachment_count": item.attachment_count,
+        "received_at": item.received_at.isoformat() if item.received_at is not None else None,
+    }
+
+
+def _handle_search_google_inbox(args: dict, *, task_id: str | None = None, **_: Any) -> str:
+    context = _require_context(task_id)
+    query = _normalize_optional_text(args.get("query"))
+    sender = _normalize_optional_text(args.get("sender"))
+    subject = _normalize_optional_text(args.get("subject"))
+    newer_than_days = max(1, min(int(args.get("newer_than_days", 120) or 120), 365))
+    max_results = max(1, min(int(args.get("max_results", 5) or 5), 10))
+
+    household_connections = [
+        connection
+        for connection in context.store.list_google_connections(household_id=context.household_id)
+        if GoogleSourceKind.GMAIL in connection.connected_scopes
+    ]
+    shared_rules = context.store.list_household_source_rules(
+        household_id=context.household_id,
+        source_kind=GoogleSourceKind.GMAIL,
+        visibility=HouseholdSourceVisibility.SHARED,
+    )
+    search_shared_household = request_matches_shared_gmail_rule(
+        shared_rules,
+        sender=sender,
+        query=query,
+        subject=subject,
+    )
+
+    connections = []
+    if context.actor_member_id:
+        connections = [
+            connection
+            for connection in context.store.list_google_connections(
+                household_id=context.household_id,
+                member_id=context.actor_member_id,
+            )
+            if GoogleSourceKind.GMAIL in connection.connected_scopes
+        ]
+    if search_shared_household:
+        connections = household_connections
+    elif not connections and (context.actor_member_id is None or len(household_connections) == 1):
+        connections = household_connections
+
+    if not connections:
+        return json.dumps(
+            {
+                "error": "No active Google inbox is connected for this household member.",
+                "results": [],
+            }
+        )
+
+    gmail_query = _build_google_inbox_query(
+        query=query,
+        sender=sender,
+        subject=subject,
+        newer_than_days=newer_than_days,
+    )
+    results: list[dict[str, Any]] = []
+    searched_connection_emails: list[str] = []
+    for connection in connections:
+        hydrated = _ensure_connection_access_token(context, connection)
+        if not hydrated.access_token:
+            continue
+        searched_connection_emails.append(hydrated.email)
+        items = list_recent_gmail_sync_items(
+            access_token=hydrated.access_token,
+            max_results=max_results,
+            gmail_query=gmail_query,
+        )
+        for item in items:
+            if not _gmail_item_matches(item, query=query, sender=sender, subject=subject):
+                continue
+            results.append(_serialize_gmail_item(item, connection_email=hydrated.email))
+            if len(results) >= max_results:
+                break
+        if len(results) >= max_results:
+            break
+
+    return json.dumps(
+        {
+            "gmail_query": gmail_query,
+            "searched_connection_emails": searched_connection_emails,
+            "results": results[:max_results],
+        }
+    )
+
+
 def _handle_upsert_work_item(args: dict, *, task_id: str | None = None, **_: Any) -> str:
     context = _require_context(task_id)
     manager = FlorenceHouseholdManagerService(context.store)
@@ -625,6 +909,35 @@ def _handle_upsert_work_item(args: dict, *, task_id: str | None = None, **_: Any
         )
     )
     return json.dumps({"result": _serialize_work_item(item)})
+
+
+def _handle_upsert_event(args: dict, *, task_id: str | None = None, **_: Any) -> str:
+    context = _require_context(task_id)
+    title = _normalize_text(args.get("title"))
+    if not title:
+        return json.dumps({"error": "Missing required parameter: title"})
+    starts_at = _normalize_optional_text(args.get("starts_at"))
+    event = context.store.upsert_household_event(
+        HouseholdEvent(
+            id=_normalize_optional_text(args.get("id"))
+            or _stable_id("evt", context.household_id, starts_at or "unscheduled", title.lower()),
+            household_id=context.household_id,
+            title=title,
+            starts_at=starts_at,
+            ends_at=_normalize_optional_text(args.get("ends_at")),
+            timezone=_normalize_optional_text(args.get("timezone")),
+            all_day=bool(args.get("all_day")),
+            location=_normalize_optional_text(args.get("location")),
+            description=_normalize_optional_text(args.get("description")),
+            status=_enum_value(
+                HouseholdEventStatus,
+                args.get("status"),
+                HouseholdEventStatus.CONFIRMED if starts_at else HouseholdEventStatus.TENTATIVE,
+            ),
+            metadata=_normalize_metadata(args.get("metadata")),
+        )
+    )
+    return json.dumps({"result": _serialize_event(event)})
 
 
 def _handle_upsert_routine(args: dict, *, task_id: str | None = None, **_: Any) -> str:
@@ -754,6 +1067,20 @@ registry.register(
     toolset="florence_household",
     schema=SEARCH_STATE_SCHEMA,
     handler=_handle_search_state,
+    check_fn=_check_household_tool_requirements,
+)
+registry.register(
+    name="household_search_google_inbox",
+    toolset="florence_household",
+    schema=SEARCH_GOOGLE_INBOX_SCHEMA,
+    handler=_handle_search_google_inbox,
+    check_fn=_check_household_tool_requirements,
+)
+registry.register(
+    name="household_upsert_event",
+    toolset="florence_household",
+    schema=UPSERT_EVENT_SCHEMA,
+    handler=_handle_upsert_event,
     check_fn=_check_household_tool_requirements,
 )
 registry.register(

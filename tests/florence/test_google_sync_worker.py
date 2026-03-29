@@ -115,3 +115,79 @@ def test_google_sync_worker_fetches_and_persists_candidates(tmp_path, monkeypatc
     )
     assert len(pending) == 2
     store.close()
+
+
+def test_google_sync_worker_uses_deep_bootstrap_scan_on_first_sync(tmp_path, monkeypatch):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_google_connection(
+        GoogleConnection(
+            id="gconn_bootstrap",
+            household_id="hh_123",
+            member_id="mem_123",
+            email="parent@example.com",
+            connected_scopes=(GoogleSourceKind.GMAIL,),
+            access_token="access-token",
+            metadata={
+                "primary_calendar_id": "family",
+                "primary_calendar_summary": "Family calendar",
+                "primary_calendar_timezone": "America/Los_Angeles",
+            },
+        )
+    )
+    observed: dict[str, object] = {}
+
+    def _fake_gmail(**kwargs):
+        observed.update(kwargs)
+        return []
+
+    monkeypatch.setenv("FLORENCE_GMAIL_BOOTSTRAP_MAX_RESULTS", "321")
+    monkeypatch.setattr("florence.runtime.services.list_recent_gmail_sync_items", _fake_gmail)
+    monkeypatch.setattr("florence.runtime.services.list_recent_parent_calendar_sync_items", lambda **_: [])
+
+    worker = FlorenceGoogleSyncWorkerService(store, FlorenceGoogleSyncPersistenceService(store))
+    result = worker.sync_connection("gconn_bootstrap", now=datetime(2026, 3, 25, 18, 0, tzinfo=timezone.utc))
+
+    assert observed["max_results"] == 321
+    assert observed["gmail_query"] == "newer_than:90d"
+    assert result.connection.metadata["gmail_bootstrap_completed_at"] == "2026-03-25T18:00:00+00:00"
+    assert result.connection.metadata["gmail_last_query"] == "newer_than:90d"
+    store.close()
+
+
+def test_google_sync_worker_uses_incremental_window_after_bootstrap(tmp_path, monkeypatch):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_google_connection(
+        GoogleConnection(
+            id="gconn_incremental",
+            household_id="hh_123",
+            member_id="mem_123",
+            email="parent@example.com",
+            connected_scopes=(GoogleSourceKind.GMAIL,),
+            access_token="access-token",
+            metadata={
+                "primary_calendar_id": "family",
+                "primary_calendar_summary": "Family calendar",
+                "primary_calendar_timezone": "America/Los_Angeles",
+                "gmail_bootstrap_completed_at": "2026-03-20T18:00:00+00:00",
+                "gmail_last_synced_at": "2026-03-22T18:00:00+00:00",
+            },
+        )
+    )
+    observed: dict[str, object] = {}
+
+    def _fake_gmail(**kwargs):
+        observed.update(kwargs)
+        return []
+
+    monkeypatch.setenv("FLORENCE_GMAIL_INCREMENTAL_MAX_RESULTS", "111")
+    monkeypatch.setattr("florence.runtime.services.list_recent_gmail_sync_items", _fake_gmail)
+    monkeypatch.setattr("florence.runtime.services.list_recent_parent_calendar_sync_items", lambda **_: [])
+
+    worker = FlorenceGoogleSyncWorkerService(store, FlorenceGoogleSyncPersistenceService(store))
+    result = worker.sync_connection("gconn_incremental", now=datetime(2026, 3, 25, 18, 0, tzinfo=timezone.utc))
+
+    assert observed["max_results"] == 111
+    assert observed["gmail_query"] == "newer_than:5d"
+    assert result.connection.metadata["gmail_last_synced_at"] == "2026-03-25T18:00:00+00:00"
+    assert result.connection.metadata["gmail_last_max_results"] == 111
+    store.close()

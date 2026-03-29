@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from florence.contracts import (
     ChannelMessage,
     ChannelMessageRole,
+    HouseholdSourceVisibility,
     HouseholdNudgeStatus,
     HouseholdNudgeTargetKind,
     HouseholdWorkItemStatus,
@@ -20,9 +21,15 @@ from florence.messaging.types import FlorenceInboundMessage
 from florence.onboarding import (
     OnboardingPrompt,
     OnboardingStage,
+    build_onboarding_ready_message_sequence,
     build_google_connect_message_sequence,
+    build_web_onboarding_handoff_sequence,
+    extract_child_names,
+    split_entries,
+    split_labels,
 )
 from florence.runtime.chat import FlorenceHouseholdChatService
+from florence.runtime.onboarding_links import FlorenceOnboardingLinkService
 from florence.runtime.services import (
     FlorenceCandidateReviewService,
     FlorenceGoogleAccountLinkService,
@@ -69,6 +76,14 @@ def _looks_like_skip(text: str) -> bool:
     return bool(re.search(r"^(?:skip|later|not now)\b", text.strip(), re.IGNORECASE))
 
 
+def _looks_like_share_source(text: str) -> bool:
+    return bool(re.search(r"\b(?:share|shared|always share|future share)\b", text.strip(), re.IGNORECASE))
+
+
+def _looks_like_private_source(text: str) -> bool:
+    return bool(re.search(r"\b(?:private|keep private|don't share|do not share)\b", text.strip(), re.IGNORECASE))
+
+
 def _looks_like_review_request(text: str) -> bool:
     return bool(re.search(r"\b(review|imports?|gmail|calendar|candidates?)\b", text, re.IGNORECASE))
 
@@ -82,8 +97,38 @@ def _looks_like_google_connected(text: str) -> bool:
     return bool(re.search(r"\b(done|connected|finished|complete|i connected)\b", text, re.IGNORECASE))
 
 
+def _looks_like_google_done_prompt(text: str) -> bool:
+    lowered = " ".join(text.split()).lower()
+    return "reply done" in lowered and any(
+        token in lowered
+        for token in (
+            "google",
+            "connect",
+            "connected",
+            "link",
+            "gmail",
+            "calendar",
+            "email",
+        )
+    )
+
+
 def _looks_like_schedule_question(text: str) -> bool:
-    return bool(re.search(r"\b(today|this week|coming up|schedule|happening)\b", text, re.IGNORECASE))
+    normalized = " ".join(text.split()).lower()
+    if not normalized:
+        return False
+    if re.search(
+        r"\b(hours?|open|close|best time|tickets?|parking|weather|cost|price|directions?)\b",
+        normalized,
+    ):
+        return False
+    if re.search(r"\b(family|kids?|household|calendar|schedule|plan|coming up|happening)\b", normalized):
+        return True
+    if re.search(r"\bwhat(?:'s| is| do)\s+(?:on|happening|coming up|scheduled)\b", normalized):
+        return True
+    if re.search(r"\b(today|tomorrow|this week|next week)\b", normalized) and re.search(r"\b(we|our)\b", normalized):
+        return True
+    return False
 
 
 def _looks_like_tracking_request(text: str) -> bool:
@@ -170,106 +215,6 @@ def _parse_optional_iso(value: str | None) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def _onboarding_ready_messages() -> tuple[str, ...]:
-    return (
-        "Perfect. I have enough context to start acting like your household manager.",
-        "You can ask me to plan, remind, research, coordinate, and stay on top of the family's logistics here.",
-    )
-
-
-def _split_names(text: str) -> list[str]:
-    normalized = re.sub(r"\b(?:and|&)\b", ",", text, flags=re.IGNORECASE)
-    return [part.strip(" .,!?:;") for part in normalized.split(",") if part.strip(" .,!?:;")]
-
-
-def _split_entries(text: str) -> list[str]:
-    if "\n" in text:
-        return [part.strip(" .,!?:;") for part in text.splitlines() if part.strip(" .,!?:;")]
-    if ";" in text:
-        return [part.strip(" .,!?:;") for part in text.split(";") if part.strip(" .,!?:;")]
-    return _split_names(text)
-
-
-def _split_labels(text: str) -> list[str]:
-    if re.search(r"^\s*none\b", text, re.IGNORECASE):
-        return []
-    return _split_names(text)
-
-
-def _extract_child_names(entries: list[str]) -> list[str]:
-    child_names: list[str] = []
-    seen: set[str] = set()
-    stopwords = {
-        "he",
-        "she",
-        "they",
-        "we",
-        "i",
-        "it",
-        "my",
-        "our",
-        "his",
-        "her",
-        "their",
-        "kid",
-        "kids",
-        "child",
-        "children",
-        "son",
-        "daughter",
-    }
-    # Match "<name> is/turns/goes/attends/starts/starting ..."
-    # Supports one or two tokens for common child-name formats.
-    name_pattern = re.compile(
-        r"\b([A-Z][A-Za-z'’-]*(?:\s+[A-Z][A-Za-z'’-]*)?)\s+(?:is|turns|goes|attends|starts|starting)\b",
-    )
-
-    def normalize(candidate: str) -> str | None:
-        cleaned = " ".join(candidate.split()).strip(" .,!?:;\"'")
-        if not cleaned:
-            return None
-        lowered = cleaned.lower()
-        if lowered in stopwords:
-            return None
-        # Handle "Theo's" style possessives.
-        if lowered.endswith("'s") or lowered.endswith("’s"):
-            cleaned = cleaned[:-2].strip()
-            lowered = cleaned.lower()
-        if not cleaned or lowered in stopwords:
-            return None
-        if cleaned.islower():
-            cleaned = " ".join(part.capitalize() for part in cleaned.split())
-        return cleaned
-
-    def add_name(candidate: str) -> None:
-        normalized = normalize(candidate)
-        if normalized is None:
-            return
-        key = normalized.lower()
-        if key in seen:
-            return
-        seen.add(key)
-        child_names.append(normalized)
-
-    for entry in entries:
-        matched_names = [match.group(1) for match in name_pattern.finditer(entry)]
-        if matched_names:
-            for candidate in matched_names:
-                add_name(candidate)
-            continue
-
-        head = re.split(r"\s*(?:-|:|\(|,)\s*", entry, maxsplit=1)[0]
-        first_token_match = re.match(r"\s*([A-Za-z][A-Za-z'’-]*)", head)
-        if first_token_match:
-            add_name(first_token_match.group(1))
-            continue
-
-        cleaned = " ".join(head.split()).strip(" .,!?:;")
-        add_name(cleaned)
-
-    return child_names
-
-
 def _require_member_id(member_id: str | None) -> str:
     if member_id is None or not member_id.strip():
         raise ValueError("member_id_required_for_dm")
@@ -297,6 +242,7 @@ class FlorenceMessagingIngressService:
         query_service: FlorenceHouseholdQueryService,
         *,
         google_account_link_service: FlorenceGoogleAccountLinkService | None = None,
+        onboarding_link_service: FlorenceOnboardingLinkService | None = None,
         household_chat_service: FlorenceHouseholdChatService | None = None,
         household_manager_service: FlorenceHouseholdManagerService | None = None,
     ):
@@ -305,6 +251,7 @@ class FlorenceMessagingIngressService:
         self.candidate_review_service = candidate_review_service
         self.query_service = query_service
         self.google_account_link_service = google_account_link_service
+        self.onboarding_link_service = onboarding_link_service
         self.household_chat_service = household_chat_service
         self.household_manager_service = household_manager_service or FlorenceHouseholdManagerService(store)
 
@@ -394,6 +341,29 @@ class FlorenceMessagingIngressService:
             return intro + build_google_connect_message_sequence()
         return intro + (prompt.text,)
 
+    def _render_web_onboarding_messages(
+        self,
+        *,
+        household_id: str,
+        member_id: str,
+        thread_id: str,
+        include_intro: bool,
+    ) -> tuple[str, ...]:
+        if self.onboarding_link_service is None:
+            return ()
+        link = self.onboarding_link_service.build_link(
+            household_id=household_id,
+            member_id=member_id,
+            thread_id=thread_id,
+        )
+        return build_web_onboarding_handoff_sequence(link.url, include_intro=include_intro)
+
+    def _channel_has_assistant_history(self, *, channel_id: str) -> bool:
+        return any(
+            message.sender_role == ChannelMessageRole.ASSISTANT and message.body.strip()
+            for message in self.store.list_channel_messages(channel_id=channel_id, limit=8)
+        )
+
     @staticmethod
     def _result_with_messages(
         messages: tuple[str, ...],
@@ -453,6 +423,18 @@ class FlorenceMessagingIngressService:
             return True
         return _looks_like_candidate_review_prompt(latest_body)
 
+    def _latest_assistant_message_body(self, *, channel_id: str) -> str | None:
+        history = self.store.list_channel_messages(channel_id=channel_id, limit=8)
+        latest_assistant = next(
+            (
+                message
+                for message in reversed(history)
+                if message.sender_role == ChannelMessageRole.ASSISTANT and message.body.strip()
+            ),
+            None,
+        )
+        return latest_assistant.body.strip() if latest_assistant is not None else None
+
     def _handle_dm_message(self, resolved: FlorenceResolvedInboundMessage) -> FlorenceMessagingIngressResult:
         text = resolved.message.body.strip()
         member_id = _require_member_id(resolved.member_id)
@@ -473,6 +455,49 @@ class FlorenceMessagingIngressService:
                     channel_id=resolved.channel_id,
                     review_prompt_text=review_prompt.text,
                 )
+                if review_reply_armed and (_looks_like_share_source(text) or _looks_like_private_source(text)):
+                    visibility = (
+                        HouseholdSourceVisibility.PRIVATE
+                        if _looks_like_private_source(text)
+                        else HouseholdSourceVisibility.SHARED
+                    )
+                    updated_candidate = self.candidate_review_service.set_candidate_source_visibility(
+                        candidate_id=review_prompt.candidate.id,
+                        visibility=visibility,
+                        created_by_member_id=member_id,
+                    )
+                    source_label = str(
+                        updated_candidate.metadata.get("source_rule_label")
+                        or updated_candidate.metadata.get("source_visibility_label")
+                        or "this source"
+                    )
+                    prefix = (
+                        f"Understood. I’ll keep future items from {source_label} private to your review queue."
+                        if visibility == HouseholdSourceVisibility.PRIVATE
+                        else f"Understood. I’ll treat future items from {source_label} as shared household context."
+                    )
+                    if _looks_like_yes(text):
+                        result = self.candidate_review_service.confirm_candidate(candidate_id=review_prompt.candidate.id)
+                        suffix = (
+                            f" Confirmed. I added {result.event.title} to the family plan."
+                            if result.event
+                            else " Confirmed."
+                        )
+                        return FlorenceMessagingIngressResult(
+                            reply_text=f"{prefix}{suffix}",
+                            group_announcement=result.group_announcement,
+                            consumed=True,
+                        )
+                    if _looks_like_no(text):
+                        self.candidate_review_service.reject_candidate(candidate_id=review_prompt.candidate.id)
+                        return FlorenceMessagingIngressResult(
+                            reply_text=f"{prefix} I left this item out.",
+                            consumed=True,
+                        )
+                    return FlorenceMessagingIngressResult(
+                        reply_text=f"{prefix} Reply yes if you want me to add this item too.",
+                        consumed=True,
+                    )
                 if review_reply_armed and _looks_like_yes(text):
                     result = self.candidate_review_service.confirm_candidate(candidate_id=review_prompt.candidate.id)
                     return FlorenceMessagingIngressResult(
@@ -489,6 +514,15 @@ class FlorenceMessagingIngressService:
                     return FlorenceMessagingIngressResult(reply_text=review_prompt.text, consumed=True)
 
         if not session.is_complete:
+            if self.onboarding_link_service is not None:
+                return self._result_with_messages(
+                    self._render_web_onboarding_messages(
+                        household_id=resolved.household_id,
+                        member_id=member_id,
+                        thread_id=resolved.thread_id,
+                        include_intro=not self._channel_has_assistant_history(channel_id=resolved.channel_id),
+                    )
+                )
             return self._handle_onboarding_message(resolved, session.stage, text)
 
         if review_prompt is not None:
@@ -496,6 +530,49 @@ class FlorenceMessagingIngressService:
                 channel_id=resolved.channel_id,
                 review_prompt_text=review_prompt.text,
             )
+            if review_reply_armed and (_looks_like_share_source(text) or _looks_like_private_source(text)):
+                visibility = (
+                    HouseholdSourceVisibility.PRIVATE
+                    if _looks_like_private_source(text)
+                    else HouseholdSourceVisibility.SHARED
+                )
+                updated_candidate = self.candidate_review_service.set_candidate_source_visibility(
+                    candidate_id=review_prompt.candidate.id,
+                    visibility=visibility,
+                    created_by_member_id=member_id,
+                )
+                source_label = str(
+                    updated_candidate.metadata.get("source_rule_label")
+                    or updated_candidate.metadata.get("source_visibility_label")
+                    or "this source"
+                )
+                prefix = (
+                    f"Understood. I’ll keep future items from {source_label} private to your review queue."
+                    if visibility == HouseholdSourceVisibility.PRIVATE
+                    else f"Understood. I’ll treat future items from {source_label} as shared household context."
+                )
+                if _looks_like_yes(text):
+                    result = self.candidate_review_service.confirm_candidate(candidate_id=review_prompt.candidate.id)
+                    suffix = (
+                        f" Confirmed. I added {result.event.title} to the family plan."
+                        if result.event
+                        else " Confirmed."
+                    )
+                    return FlorenceMessagingIngressResult(
+                        reply_text=f"{prefix}{suffix}",
+                        group_announcement=result.group_announcement,
+                        consumed=True,
+                    )
+                if _looks_like_no(text):
+                    self.candidate_review_service.reject_candidate(candidate_id=review_prompt.candidate.id)
+                    return FlorenceMessagingIngressResult(
+                        reply_text=f"{prefix} I left this item out.",
+                        consumed=True,
+                    )
+                return FlorenceMessagingIngressResult(
+                    reply_text=f"{prefix} Reply yes if you want me to add this item too.",
+                    consumed=True,
+                )
             if review_reply_armed and _looks_like_yes(text):
                 result = self.candidate_review_service.confirm_candidate(candidate_id=review_prompt.candidate.id)
                 return FlorenceMessagingIngressResult(
@@ -510,24 +587,6 @@ class FlorenceMessagingIngressService:
                 return FlorenceMessagingIngressResult(reply_text="Okay. I will leave it in your review queue for later.", consumed=True)
             if _looks_like_review_request(text):
                 return FlorenceMessagingIngressResult(reply_text=review_prompt.text, consumed=True)
-
-        if _looks_like_schedule_question(text):
-            return FlorenceMessagingIngressResult(
-                reply_text=self.query_service.summarize_upcoming_events(household_id=resolved.household_id),
-                consumed=True,
-            )
-
-        if _looks_like_tracking_request(text):
-            return FlorenceMessagingIngressResult(
-                reply_text=self.query_service.summarize_tracking_state(household_id=resolved.household_id),
-                consumed=True,
-            )
-
-        if _looks_like_reminder_list_request(text):
-            return FlorenceMessagingIngressResult(
-                reply_text=self.query_service.summarize_pending_nudges(household_id=resolved.household_id),
-                consumed=True,
-            )
 
         if _looks_like_reminder_feedback(text):
             self.household_manager_service.record_reminder_feedback(
@@ -558,6 +617,48 @@ class FlorenceMessagingIngressService:
             )
         else:
             actionable_nudge = pending_nudges[0] if pending_nudges else None
+
+        latest_assistant_body = self._latest_assistant_message_body(channel_id=resolved.channel_id)
+        if (
+            _looks_like_done_for_reminder(text)
+            and latest_assistant_body is not None
+            and _looks_like_google_done_prompt(latest_assistant_body)
+        ):
+            member_connections = self.store.list_google_connections(
+                household_id=resolved.household_id,
+                member_id=member_id,
+            )
+            if member_connections:
+                if self.household_chat_service is not None:
+                    history = self.store.list_channel_messages(channel_id=resolved.channel_id, limit=24)
+                    reply = self.household_chat_service.respond(
+                        household_id=resolved.household_id,
+                        channel_id=resolved.channel_id,
+                        actor_member_id=resolved.member_id,
+                        message_text="My Google account is connected now. Continue with the inbox or calendar lookup you just offered.",
+                        conversation_history=history[:-1] if history else None,
+                    )
+                    if reply is not None and reply.text.strip():
+                        return FlorenceMessagingIngressResult(reply_text=reply.text, consumed=True)
+                return self._result_with_messages(build_onboarding_ready_message_sequence())
+
+            if self.google_account_link_service is not None:
+                link = self.google_account_link_service.build_connect_link(
+                    household_id=resolved.household_id,
+                    member_id=member_id,
+                    thread_id=resolved.thread_id,
+                )
+                return self._result_with_messages(
+                    (
+                        "I still don’t see your Google account connected yet.",
+                        link.url,
+                        "Once Google says you're connected, come back here and text done.",
+                    )
+                )
+            return FlorenceMessagingIngressResult(
+                reply_text="I still don’t see your Google account connected yet.",
+                consumed=True,
+            )
 
         if _looks_like_done_for_reminder(text):
             if actionable_nudge is None:
@@ -659,10 +760,25 @@ class FlorenceMessagingIngressService:
                 resolved.channel_id,
             )
 
-        return FlorenceMessagingIngressResult(
-            reply_text="I’m set up. You can ask me to plan, research, draft, review imports, or help with household logistics here or in the family group.",
-            consumed=True,
-        )
+        if _looks_like_schedule_question(text):
+            return FlorenceMessagingIngressResult(
+                reply_text=self.query_service.summarize_upcoming_events(household_id=resolved.household_id),
+                consumed=True,
+            )
+
+        if _looks_like_tracking_request(text):
+            return FlorenceMessagingIngressResult(
+                reply_text=self.query_service.summarize_tracking_state(household_id=resolved.household_id),
+                consumed=True,
+            )
+
+        if _looks_like_reminder_list_request(text):
+            return FlorenceMessagingIngressResult(
+                reply_text=self.query_service.summarize_pending_nudges(household_id=resolved.household_id),
+                consumed=True,
+            )
+
+        return self._result_with_messages(build_onboarding_ready_message_sequence())
 
     def _handle_onboarding_message(
         self,
@@ -693,7 +809,7 @@ class FlorenceMessagingIngressService:
                 household_id=resolved.household_id,
                 member_id=member_id,
                 thread_id=resolved.thread_id,
-                household_members=_split_entries(text),
+                household_members=split_entries(text),
             )
             return self._result_with_messages(
                 self._render_onboarding_prompt_messages(
@@ -734,12 +850,12 @@ class FlorenceMessagingIngressService:
             )
 
         if stage == OnboardingStage.COLLECT_CHILD_NAMES:
-            entries = _split_entries(text)
+            entries = split_entries(text)
             transition = self.onboarding_service.record_child_names(
                 household_id=resolved.household_id,
                 member_id=member_id,
                 thread_id=resolved.thread_id,
-                child_names=_extract_child_names(entries),
+                child_names=extract_child_names(entries),
                 child_details=entries,
             )
             return self._result_with_messages(
@@ -756,7 +872,7 @@ class FlorenceMessagingIngressService:
                 household_id=resolved.household_id,
                 member_id=member_id,
                 thread_id=resolved.thread_id,
-                school_labels=_split_labels(text),
+                school_labels=split_labels(text),
             )
             return self._result_with_messages(
                 self._render_onboarding_prompt_messages(
@@ -772,10 +888,10 @@ class FlorenceMessagingIngressService:
                 household_id=resolved.household_id,
                 member_id=member_id,
                 thread_id=resolved.thread_id,
-                activity_labels=_split_labels(text),
+                activity_labels=split_labels(text),
             )
             if transition.state.is_complete:
-                return self._result_with_messages(_onboarding_ready_messages())
+                return self._result_with_messages(build_onboarding_ready_message_sequence())
             return self._result_with_messages(
                 self._render_onboarding_prompt_messages(
                     household_id=resolved.household_id,
@@ -790,7 +906,7 @@ class FlorenceMessagingIngressService:
                 household_id=resolved.household_id,
                 member_id=member_id,
                 thread_id=resolved.thread_id,
-                household_operations=_split_entries(text),
+                household_operations=split_entries(text),
             )
             return self._result_with_messages(
                 self._render_onboarding_prompt_messages(
@@ -814,7 +930,7 @@ class FlorenceMessagingIngressService:
                     member_id=member_id,
                     channel_id=resolved.channel_id,
                 )
-                return self._result_with_messages(_onboarding_ready_messages())
+                return self._result_with_messages(build_onboarding_ready_message_sequence())
             return self._result_with_messages(
                 self._render_onboarding_prompt_messages(
                     household_id=resolved.household_id,
@@ -837,7 +953,7 @@ class FlorenceMessagingIngressService:
                     member_id=member_id,
                     channel_id=resolved.channel_id,
                 )
-                return self._result_with_messages(_onboarding_ready_messages())
+                return self._result_with_messages(build_onboarding_ready_message_sequence())
             return self._result_with_messages(
                 self._render_onboarding_prompt_messages(
                     household_id=resolved.household_id,
@@ -848,7 +964,7 @@ class FlorenceMessagingIngressService:
             )
 
         if stage == OnboardingStage.ACTIVATE_GROUP:
-            return self._result_with_messages(_onboarding_ready_messages())
+            return self._result_with_messages(build_onboarding_ready_message_sequence())
 
         prompt = self.onboarding_service.get_prompt(
             household_id=resolved.household_id,
@@ -887,16 +1003,10 @@ class FlorenceMessagingIngressService:
             )
             return FlorenceMessagingIngressResult(
                 reply_text=(
-                    "I’m in. Ask me to plan, research, summarize, or help with household logistics here, and I can still review imported school and calendar items in DM."
+                    "I’m in. Ask me things like what’s on the kids’ schedule next week, check connected email for school or camp updates, or plan dinners and groceries."
                     if transition.state.is_complete
                     else None
                 ),
-                consumed=True,
-            )
-
-        if _looks_like_schedule_question(resolved.message.body):
-            return FlorenceMessagingIngressResult(
-                reply_text=self.query_service.summarize_upcoming_events(household_id=resolved.household_id),
                 consumed=True,
             )
 
@@ -911,6 +1021,12 @@ class FlorenceMessagingIngressService:
             )
             if reply is not None and reply.text.strip():
                 return FlorenceMessagingIngressResult(reply_text=reply.text, consumed=True)
+
+        if _looks_like_schedule_question(resolved.message.body):
+            return FlorenceMessagingIngressResult(
+                reply_text=self.query_service.summarize_upcoming_events(household_id=resolved.household_id),
+                consumed=True,
+            )
 
         return FlorenceMessagingIngressResult(consumed=False)
 

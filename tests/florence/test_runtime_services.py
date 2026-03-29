@@ -10,7 +10,9 @@ from florence.contracts import (
     HouseholdContext,
     HouseholdNudgeTargetKind,
     HouseholdProfileKind,
+    HouseholdSourceVisibility,
     HouseholdRoutineStatus,
+    ImportedCandidate,
     Member,
     MemberRole,
 )
@@ -84,7 +86,14 @@ def test_google_sync_persistence_service_stores_connection_and_candidates(tmp_pa
     assert store.get_google_connection("gconn_123") == connection
     assert len(result.candidates) == 2
     assert result.candidates[0].state == CandidateState.QUARANTINED
+    assert result.candidates[0].metadata["source_visibility"] == HouseholdSourceVisibility.SHARED.value
     assert len(store.list_imported_candidates(household_id="hh_123", member_id="mem_123")) == 2
+    source_rules = store.list_household_source_rules(
+        household_id="hh_123",
+        source_kind=GoogleSourceKind.GMAIL,
+        visibility=HouseholdSourceVisibility.SHARED,
+    )
+    assert any(rule.matcher_value == "roosevelt.k12.ca.us" for rule in source_rules)
     household = store.get_household("hh_123")
     assert household is not None
     grounding_hints = household.settings["grounding_hints"]
@@ -94,6 +103,33 @@ def test_google_sync_persistence_service_stores_connection_and_candidates(tmp_pa
     assert grounding_hints["activities"][0]["label"] == "Soccer"
     assert grounding_hints["activities"][0]["locations"] == ["North Field"]
 
+    store.close()
+
+
+def test_candidate_review_prompt_asks_once_for_unknown_source_classification(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_123",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:gmail_123",
+            title="Weekend class info",
+            summary="Linda <linda@musicalbeginnings.com> - Musical Beginnings schedule update.",
+            state=CandidateState.PENDING_REVIEW,
+            metadata={
+                "from_address": "Linda <linda@musicalbeginnings.com>",
+                "confirmation_question": "Should I add Weekend class info to your household plan?",
+            },
+        )
+    )
+
+    prompt = review_service.build_next_review_prompt(household_id="hh_123", member_id="mem_123")
+
+    assert prompt is not None
+    assert "Reply share to treat future items from this source as household-shared" in prompt.text
     store.close()
 
 

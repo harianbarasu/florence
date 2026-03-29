@@ -14,6 +14,7 @@ def test_florence_settings_reads_env_and_derives_google_redirect_uri(tmp_path, m
 
     assert settings.server.port == 9090
     assert settings.server.public_base_url == "https://florence.example.com"
+    assert settings.server.web_base_url is None
     assert settings.google.redirect_uri == "https://florence.example.com/v1/florence/google/callback"
     assert settings.google.configured is True
     assert settings.linq.configured is True
@@ -31,6 +32,17 @@ def test_florence_settings_supports_railway_public_domain_and_port(tmp_path, mon
     assert settings.server.port == 8080
     assert settings.server.public_base_url == "https://florence-production.up.railway.app"
     assert settings.google.redirect_uri == "https://florence-production.up.railway.app/v1/florence/google/callback"
+
+
+def test_florence_settings_reads_web_base_url_when_configured(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("FLORENCE_PUBLIC_BASE_URL", "https://api.florence.example.com")
+    monkeypatch.setenv("FLORENCE_WEB_BASE_URL", "https://app.florence.example.com")
+
+    settings = FlorenceSettings.from_env()
+
+    assert settings.server.public_base_url == "https://api.florence.example.com"
+    assert settings.server.web_base_url == "https://app.florence.example.com"
 
 
 def test_florence_settings_prefers_database_url_when_present(tmp_path, monkeypatch):

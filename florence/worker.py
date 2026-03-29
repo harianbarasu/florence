@@ -35,8 +35,15 @@ def main() -> None:
         scheduler.start()
         logger.info("Florence worker started with interval %ss", settings.server.sync_interval_seconds)
         try:
-            while True:
-                time.sleep(3600)
+            if service.google_sync_queue.configured:
+                requeued = service.google_sync_queue.requeue_inflight_jobs()
+                if requeued:
+                    logger.info("Florence requeued %s inflight Google sync job(s) on startup", requeued)
+                while True:
+                    service.run_google_sync_queue_once()
+            else:
+                while True:
+                    time.sleep(3600)
         except KeyboardInterrupt:
             logger.info("Shutting down Florence worker")
         finally:

@@ -7,8 +7,10 @@ from datetime import datetime, timedelta, timezone
 
 from florence.contracts import (
     CandidateState,
+    GoogleConnection,
     GoogleSourceKind,
     Household,
+    HouseholdSourceVisibility,
     HouseholdNudge,
     HouseholdNudgeStatus,
     HouseholdNudgeTargetKind,
@@ -20,6 +22,7 @@ from florence.onboarding import OnboardingVariant
 from florence.runtime import (
     FlorenceCandidateReviewService,
     FlorenceHouseholdQueryService,
+    FlorenceIdentityResolver,
     FlorenceOnboardingSessionService,
 )
 from florence.state import FlorenceStateDB
@@ -29,6 +32,14 @@ class _StubGoogleAccountLinkService:
     def build_connect_link(self, *, household_id: str, member_id: str, thread_id: str):
         class _Link:
             url = "https://example.com/google/connect"
+
+        return _Link()
+
+
+class _StubOnboardingLinkService:
+    def build_link(self, *, household_id: str, member_id: str, thread_id: str):
+        class _Link:
+            url = "https://florence.example.com/v1/florence/onboarding?token=test-token"
 
         return _Link()
 
@@ -158,6 +169,52 @@ def test_dm_parent_name_reply_includes_friendly_google_link(tmp_path):
         "I help run the household with you by learning the family map first, then keeping up with reminders, logistics, school noise, and schedule changes.",
         "Start with the kids I should know about: first name plus grade or age if helpful. One per line or comma-separated is fine.",
     )
+    store.close()
+
+
+def test_dm_onboarding_prefers_web_handoff_when_link_service_is_available(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_hybrid_onboarding_service(store, review_service)
+    ingress = FlorenceMessagingIngressService(
+        store,
+        onboarding_service,
+        review_service,
+        FlorenceHouseholdQueryService(store),
+        google_account_link_service=_StubGoogleAccountLinkService(),
+        onboarding_link_service=_StubOnboardingLinkService(),
+    )
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_web_123",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="Maya",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    session = onboarding_service.get_or_create_session(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+    )
+    assert result.reply_messages == (
+        "Hi, I'm Florence.",
+        "I’m easiest to set up on a computer. Finish setup there so I can learn your household, connect Google, and start acting like your house manager.",
+        "https://florence.example.com/v1/florence/onboarding?token=test-token",
+        "Once setup is done, I’ll text you here when I’m ready and when the first Gmail and Calendar pass finishes.",
+    )
+    assert session.parent_display_name is None
+    assert session.stage == "collect_parent_name"
     store.close()
 
 
@@ -335,6 +392,81 @@ def test_review_prompt_then_yes_confirms_pending_candidate(tmp_path):
     events = store.list_household_events(household_id="hh_123")
     assert len(events) == 1
     assert "Fireflies Haircuts for Kids" in events[0].title
+    store.close()
+
+
+def test_review_prompt_then_share_persists_source_rule_for_future_items(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_hybrid_onboarding_service(store, review_service)
+    ingress = FlorenceMessagingIngressService(
+        store,
+        onboarding_service,
+        review_service,
+        FlorenceHouseholdQueryService(store),
+    )
+    _complete_hybrid_onboarding(onboarding_service)
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_125",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:linda-1",
+            title="Violet music class update",
+            summary="Linda <linda@musicalbeginnings.com> - no class April 8.",
+            state=CandidateState.PENDING_REVIEW,
+            metadata={
+                "from_address": "Linda <linda@musicalbeginnings.com>",
+                "confirmation_question": "Should I add Violet music class update to your household plan?",
+            },
+        )
+    )
+
+    review = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_305",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="review imports",
+                is_group_chat=False,
+            ),
+        )
+    )
+    assert review.reply_text is not None
+    assert "Reply share to treat future items from this source as household-shared" in review.reply_text
+
+    classification = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_306",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="share",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert classification.reply_text is not None
+    assert "shared household context" in classification.reply_text
+    rules = store.list_household_source_rules(
+        household_id="hh_123",
+        source_kind=GoogleSourceKind.GMAIL,
+        visibility=HouseholdSourceVisibility.SHARED,
+    )
+    assert any(rule.matcher_value == "musicalbeginnings.com" for rule in rules)
     store.close()
 
 
@@ -520,9 +652,9 @@ def test_nudge_preferences_advance_to_operating_policy_step(tmp_path):
     )
     assert result.consumed is True
     assert result.reply_text is not None
-    assert "house rules" in result.reply_text.lower()
-    assert session.is_complete is False
-    assert session.stage == "collect_operating_preferences"
+    assert "you're ready" in result.reply_text.lower()
+    assert session.is_complete is True
+    assert session.stage == "complete"
     assert session.group_channel_id is None
     store.close()
 
@@ -604,8 +736,8 @@ def test_operating_preferences_completion_unlocks_agent_without_requiring_group(
     )
     assert result.consumed is True
     assert result.reply_messages == (
-        "Perfect. I have enough context to start acting like your household manager.",
-        "You can ask me to plan, remind, research, coordinate, and stay on top of the family's logistics here.",
+        "You're ready. Florence is set up as your house manager now.",
+        "Start with a real task like: what's on the kids' schedule next week, check my email for a school or camp update, remind me about picture day, or plan dinners and groceries for next week.",
     )
     assert session.is_complete is True
     assert session.group_channel_id is None
@@ -651,6 +783,93 @@ def test_first_group_message_after_context_collection_records_group_channel(tmp_
     assert result.reply_text is not None
     assert "I’m in." in result.reply_text
     assert session.group_channel_id == "group_thread_123"
+    store.close()
+
+
+def test_complete_dm_schedule_question_routes_through_household_chat_service_before_state_shortcuts(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_hybrid_onboarding_service(store, review_service)
+    chat_service = _StubHouseholdChatService("I can check Musical Beginnings and pull the spring break dates.")
+    ingress = FlorenceMessagingIngressService(
+        store,
+        onboarding_service,
+        review_service,
+        FlorenceHouseholdQueryService(store),
+        household_chat_service=chat_service,
+    )
+    _complete_hybrid_onboarding(onboarding_service)
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_schedule_1",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="Do you know the spring break schedule for the kids music class?",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert result.reply_text == "I can check Musical Beginnings and pull the spring break dates."
+    assert chat_service.calls[0]["message_text"] == "Do you know the spring break schedule for the kids music class?"
+    store.close()
+
+
+def test_done_after_google_connect_prompt_routes_back_to_agent_not_reminder_ack(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_hybrid_onboarding_service(store, review_service)
+    chat_service = _StubHouseholdChatService("I found the Musical Beginnings spring break email and pulled the dates.")
+    ingress = FlorenceMessagingIngressService(
+        store,
+        onboarding_service,
+        review_service,
+        FlorenceHouseholdQueryService(store),
+        household_chat_service=chat_service,
+    )
+    _complete_hybrid_onboarding(onboarding_service)
+    store.upsert_google_connection(
+        GoogleConnection(
+            id="gconn_123",
+            household_id="hh_123",
+            member_id="mem_123",
+            email="maya@example.com",
+            connected_scopes=(GoogleSourceKind.GMAIL,),
+            access_token="access-token",
+        )
+    )
+    ingress.append_assistant_message(
+        household_id="hh_123",
+        channel_id="chan_dm_123",
+        body="If you already finished the link I sent you earlier, reply done and I'll look for emails from Linda at Musical Beginnings.",
+    )
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_done_google_1",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="done",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert result.reply_text == "I found the Musical Beginnings spring break email and pulled the dates."
+    assert chat_service.calls[0]["message_text"] == "My Google account is connected now. Continue with the inbox or calendar lookup you just offered."
     store.close()
 
 
@@ -865,4 +1084,49 @@ def test_complete_dm_snooze_reschedules_sent_nudge_and_logs_event(tmp_path):
     events = store.list_pilot_events(household_id="hh_123", event_type="reminder_snoozed")
     assert len(events) == 1
     assert events[0].metadata["nudge_id"] == "nudge_124"
+    store.close()
+
+
+def test_group_non_household_question_does_not_fall_back_to_schedule_summary(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_hybrid_onboarding_service(store, review_service)
+    resolver = FlorenceIdentityResolver(store, provider="linq")
+    direct = resolver.resolve_direct_message(
+        sender_handle="+15555550123",
+        thread_external_id="dm_thread_123",
+    )
+    group = resolver.resolve_group_message(
+        sender_handle="+15555550123",
+        participant_handles=["+15555550123", "+15555550124"],
+        thread_external_id="group_thread_123",
+    )
+    assert group is not None
+
+    ingress = FlorenceMessagingIngressService(
+        store,
+        onboarding_service,
+        review_service,
+        FlorenceHouseholdQueryService(store),
+    )
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id=direct.household.id,
+            member_id=direct.member.id,
+            channel_id=group.channel.id,
+            thread_id="group_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_aquarium_123",
+                thread_id="group_thread_123",
+                sender_handle="+15555550123",
+                body="What are the Monterey Bay Aquarium hours today and when is the best time to go?",
+                is_group_chat=True,
+            ),
+        )
+    )
+
+    assert result.consumed is False
+    assert result.reply_text is None
     store.close()

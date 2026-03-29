@@ -126,11 +126,27 @@ class FlorenceHermesRuntimeConfig:
 
 
 @dataclass(slots=True)
+class FlorenceRedisRuntimeConfig:
+    url: str | None
+    google_sync_queue_name: str = "florence-google-sync"
+    google_sync_queue_processing_name: str = "florence-google-sync-processing"
+    google_sync_queue_block_seconds: int = 5
+    google_sync_job_dedupe_ttl_seconds: int = 1800
+    google_sync_max_attempts: int = 3
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.url)
+
+
+@dataclass(slots=True)
 class FlorenceServerRuntimeConfig:
     host: str
     port: int
     public_base_url: str | None
+    onboarding_state_secret: str | None
     sync_interval_seconds: float
+    web_base_url: str | None = None
     db_path: Path | None = None
     database_url: str | None = None
 
@@ -141,6 +157,7 @@ class FlorenceSettings:
     google: FlorenceGoogleRuntimeConfig
     linq: FlorenceLinqRuntimeConfig
     hermes: FlorenceHermesRuntimeConfig
+    redis: FlorenceRedisRuntimeConfig
 
     @classmethod
     def from_env(cls) -> "FlorenceSettings":
@@ -153,6 +170,14 @@ class FlorenceSettings:
                 ("FLORENCE_PUBLIC_BASE_URL", "PUBLIC_API_BASE_URL", "RAILWAY_PUBLIC_DOMAIN"),
                 florence_cfg,
                 "public_base_url",
+                default=None,
+            )
+        )
+        web_base_url = _normalize_public_base_url(
+            _env_or_config(
+                ("FLORENCE_WEB_BASE_URL", "PUBLIC_WEB_BASE_URL"),
+                florence_cfg,
+                "web_base_url",
                 default=None,
             )
         )
@@ -186,6 +211,18 @@ class FlorenceSettings:
                 host=str(_env_or_config(("FLORENCE_HTTP_HOST",), florence_cfg, "http_host", default="0.0.0.0")),
                 port=_as_int(_env_or_config(("FLORENCE_HTTP_PORT", "PORT"), florence_cfg, "http_port", default=8081), 8081),
                 public_base_url=public_base_url,
+                web_base_url=web_base_url,
+                onboarding_state_secret=_env_or_config(
+                    (
+                        "FLORENCE_ONBOARDING_STATE_SECRET",
+                        "FLORENCE_GOOGLE_OAUTH_STATE_SECRET",
+                        "GOOGLE_OAUTH_STATE_SECRET",
+                    ),
+                    florence_cfg,
+                    "onboarding",
+                    "state_secret",
+                    default=None,
+                ),
                 sync_interval_seconds=_as_float(
                     _env_or_config(
                         ("FLORENCE_SYNC_INTERVAL_SECONDS",),
@@ -296,6 +333,65 @@ class FlorenceSettings:
                         default=(),
                     ),
                     (),
+                ),
+            ),
+            redis=FlorenceRedisRuntimeConfig(
+                url=_env_or_config(
+                    ("FLORENCE_REDIS_URL", "REDIS_URL"),
+                    florence_cfg,
+                    "redis",
+                    "url",
+                    default=None,
+                ),
+                google_sync_queue_name=str(
+                    _env_or_config(
+                        ("FLORENCE_GOOGLE_SYNC_QUEUE_NAME",),
+                        florence_cfg,
+                        "redis",
+                        "google_sync_queue_name",
+                        default="florence-google-sync",
+                    )
+                ).strip()
+                or "florence-google-sync",
+                google_sync_queue_processing_name=str(
+                    _env_or_config(
+                        ("FLORENCE_GOOGLE_SYNC_QUEUE_PROCESSING_NAME",),
+                        florence_cfg,
+                        "redis",
+                        "google_sync_queue_processing_name",
+                        default="florence-google-sync-processing",
+                    )
+                ).strip()
+                or "florence-google-sync-processing",
+                google_sync_queue_block_seconds=_as_int(
+                    _env_or_config(
+                        ("FLORENCE_GOOGLE_SYNC_QUEUE_BLOCK_SECONDS",),
+                        florence_cfg,
+                        "redis",
+                        "google_sync_queue_block_seconds",
+                        default=5,
+                    ),
+                    5,
+                ),
+                google_sync_job_dedupe_ttl_seconds=_as_int(
+                    _env_or_config(
+                        ("FLORENCE_GOOGLE_SYNC_JOB_DEDUPE_TTL_SECONDS",),
+                        florence_cfg,
+                        "redis",
+                        "google_sync_job_dedupe_ttl_seconds",
+                        default=1800,
+                    ),
+                    1800,
+                ),
+                google_sync_max_attempts=_as_int(
+                    _env_or_config(
+                        ("FLORENCE_GOOGLE_SYNC_MAX_ATTEMPTS",),
+                        florence_cfg,
+                        "redis",
+                        "google_sync_max_attempts",
+                        default=3,
+                    ),
+                    3,
                 ),
             ),
         )

@@ -143,6 +143,90 @@ def test_google_sync_skips_unrelated_items():
     assert result.candidates == []
 
 
+def test_google_sync_keeps_known_contact_schedule_email_even_without_school_sender_keywords():
+    connection = GoogleConnection(
+        id="gconn_123",
+        household_id="hh_123",
+        member_id="mem_123",
+        email="parent@example.com",
+        connected_scopes=(GoogleSourceKind.GMAIL,),
+        metadata={"primary_calendar_timezone": "America/Los_Angeles"},
+    )
+    context = HouseholdContext(
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_dm_123",
+        visible_child_names=["Violet"],
+        school_labels=["Young Minds Preschool"],
+        activity_labels=["Musical Beginnings"],
+        contact_names=["Linda"],
+    )
+    gmail_item = GmailSyncItem(
+        gmail_message_id="gmail_126",
+        thread_id="thread_126",
+        from_address="Linda <linda@musicalbeginnings.com>",
+        subject="Spring break and Family Day dates",
+        snippet="No class April 1 and April 8.",
+        body_text="For Violet's class: no class April 1 and April 8. Family Day May 6. Classes end July 1.",
+        attachment_text=None,
+        attachment_count=0,
+        received_at=datetime(2026, 3, 24, 12, 0, tzinfo=timezone.utc),
+    )
+
+    result = build_google_import_candidates(
+        FlorenceGoogleSyncBatch(
+            connection=connection,
+            context=context,
+            gmail_items=[gmail_item],
+        )
+    )
+
+    assert result.skipped_count == 0
+    assert result.pending_review_count == 1
+    assert result.candidates[0].title == "Spring break and Family Day dates"
+
+
+def test_google_sync_skips_promotional_email_with_dates_and_schedule_words():
+    connection = GoogleConnection(
+        id="gconn_123",
+        household_id="hh_123",
+        member_id="mem_123",
+        email="parent@example.com",
+        connected_scopes=(GoogleSourceKind.GMAIL,),
+        metadata={"primary_calendar_timezone": "America/Los_Angeles"},
+    )
+    context = HouseholdContext(
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_dm_123",
+        visible_child_names=["Theo", "Violet"],
+        school_labels=["Wish Community School"],
+        activity_labels=["Baseball", "Musical Beginnings"],
+    )
+    gmail_item = GmailSyncItem(
+        gmail_message_id="gmail_127",
+        thread_id="thread_127",
+        from_address="Kaya & Jasmine <pod@mail.scalablepod.com>",
+        subject="Scalable: Creators Want Their Red Carpet Moment Too",
+        snippet="The schedule for Scalable looks conditional. Which date or time applies?",
+        body_text="Listen to the latest podcast episode and catch up on creator news, new brands, and NewFronts coverage.",
+        attachment_text=None,
+        attachment_count=0,
+        received_at=datetime(2026, 3, 24, 12, 0, tzinfo=timezone.utc),
+    )
+
+    result = build_google_import_candidates(
+        FlorenceGoogleSyncBatch(
+            connection=connection,
+            context=context,
+            gmail_items=[gmail_item],
+        )
+    )
+
+    assert result.skipped_count == 1
+    assert result.candidates == []
+
+
 def test_google_sync_extracts_grounding_hints_from_google_sources():
     connection = GoogleConnection(
         id="gconn_123",

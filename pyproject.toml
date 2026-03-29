@@ -17,6 +17,7 @@ dependencies = [
   "python-dotenv",
   "fire",
   "httpx",
+  "redis>=5.0.0",
   "psycopg[binary]>=3.2",
   "rich",
   "tenacity",

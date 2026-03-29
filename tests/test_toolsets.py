@@ -149,6 +149,8 @@ class TestToolsetConsistency:
         assert "schedule_cronjob" in tools
         assert "send_message" in tools
         assert "household_search_state" in tools
+        assert "household_search_google_inbox" in tools
+        assert "household_upsert_event" in tools
         assert "household_upsert_meal" in tools
         assert "household_schedule_nudge" in tools
         assert "terminal" not in tools

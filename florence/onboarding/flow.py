@@ -64,13 +64,46 @@ def build_google_connect_message_sequence(
         messages.extend(
             [
                 "Hi, I'm Florence.",
-                "I help run the household with you by tracking logistics, surfacing reminders, and staying on top of school and calendar noise.",
+                "I help run the household with you by keeping logistics organized, surfacing reminders, and staying on top of school and calendar noise.",
             ]
         )
-    messages.append("Next step: connect your Google account so I can compare Gmail and Calendar against the household context you just gave me.")
+    messages.append("You're almost ready. Connect your Google account so I can compare Gmail and Calendar against the household context you just gave me.")
     if link_url:
         messages.append(link_url)
-    messages.append("When you're done, reply done here and I'll keep going.")
+    messages.append("Once Google says you're connected, come back here and text done.")
+    return tuple(messages)
+
+
+def build_onboarding_ready_message_sequence() -> tuple[str, ...]:
+    """Return the activation copy once Florence is ready for real use."""
+    return (
+        "You're ready. Florence is set up as your house manager now.",
+        (
+            "Start with a real task like: what's on the kids' schedule next week, check my email for a school or camp update, "
+            "remind me about picture day, or plan dinners and groceries for next week."
+        ),
+    )
+
+
+def build_web_onboarding_handoff_sequence(
+    link_url: str | None,
+    *,
+    include_intro: bool = False,
+) -> tuple[str, ...]:
+    """Return the web-first onboarding handoff copy."""
+    messages: list[str] = []
+    if include_intro:
+        messages.extend(
+            [
+                "Hi, I'm Florence.",
+                "I’m easiest to set up on a computer. Finish setup there so I can learn your household, connect Google, and start acting like your house manager.",
+            ]
+        )
+    else:
+        messages.append("Finish setup on your computer here when you're ready.")
+    if link_url:
+        messages.append(link_url)
+    messages.append("Once setup is done, I’ll text you here when I’m ready and when the first Gmail and Calendar pass finishes.")
     return tuple(messages)
 
 
@@ -116,7 +149,7 @@ def build_onboarding_prompt(state: OnboardingState) -> OnboardingPrompt | None:
     if current.stage == OnboardingStage.COLLECT_CHILD_NAMES:
         if current.variant == OnboardingVariant.CONCIERGE:
             text = (
-                "Tell me about each child I should track: first name plus nickname, grade, or age if helpful. "
+                "Tell me about each child I should know about: first name plus nickname, grade, or age if helpful. "
                 "One per line works well, like Ava - goes by Aves - 3rd grade."
             )
         else:
@@ -158,7 +191,7 @@ def build_onboarding_prompt(state: OnboardingState) -> OnboardingPrompt | None:
         if current.variant == OnboardingVariant.CONCIERGE:
             text = (
                 "What recurring household logistics do you want me to help manage like a house manager? "
-                "Think lunches, school forms, practice logistics, birthday gifts, bills, returns, camps, appointments, or anything else you mentally track."
+                "Think lunches, school forms, practice logistics, birthday gifts, bills, returns, camps, appointments, or anything else you keep in your head today."
             )
         else:
             text = (
@@ -170,13 +203,13 @@ def build_onboarding_prompt(state: OnboardingState) -> OnboardingPrompt | None:
     if current.stage == OnboardingStage.COLLECT_NUDGE_PREFERENCES:
         if current.variant == OnboardingVariant.CONCIERGE:
             text = (
-                "How proactive should I be with reminders and nudges? "
-                "Tell me what deserves nudges, how early I should remind you, and whether I should keep following up until you reply."
+                "Reminder style: I default to day before + morning of for important family logistics. "
+                "If you want a different default, say same-day only or keep nudging until you acknowledge."
             )
         else:
             text = (
-                "How proactive should I be with reminders and nudges? "
-                "For example: day before and morning of, same-day only, or keep nudging until acknowledged."
+                "Reminder style: I default to day before + morning of for important family logistics. "
+                "If you want a different default, say same-day only or keep nudging until acknowledged."
             )
         return OnboardingPrompt(stage=current.stage, text=text)
 
@@ -184,12 +217,12 @@ def build_onboarding_prompt(state: OnboardingState) -> OnboardingPrompt | None:
         if current.variant == OnboardingVariant.CONCIERGE:
             text = (
                 "Any house rules for how I should operate as your house manager? "
-                "Think quiet hours, morning brief or evening check-in preferences, who should get what, when I should ask before acting, and how proactive is too proactive."
+                "Share your defaults in one line, like quiet hours, brief timing, and when I should ask before taking action."
             )
         else:
             text = (
                 "Any house rules for how I should operate? "
-                "For example: weekday morning brief at 6:45, evening check-in only on school nights, don't text after 9pm, and always ask before spending money or messaging other adults."
+                "A short one-liner is enough, like no texts after 9pm, morning brief time, and ask before spending money."
             )
         return OnboardingPrompt(stage=current.stage, text=text)
 

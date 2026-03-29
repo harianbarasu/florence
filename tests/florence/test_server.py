@@ -6,6 +6,7 @@ from florence.config import (
     FlorenceGoogleRuntimeConfig,
     FlorenceHermesRuntimeConfig,
     FlorenceLinqRuntimeConfig,
+    FlorenceRedisRuntimeConfig,
     FlorenceServerRuntimeConfig,
     FlorenceSettings,
 )
@@ -18,6 +19,7 @@ def _build_settings(tmp_path):
             host="127.0.0.1",
             port=8081,
             public_base_url="https://florence.example.com",
+            onboarding_state_secret="state-secret",
             sync_interval_seconds=300.0,
             db_path=tmp_path / "florence.db",
         ),
@@ -36,6 +38,7 @@ def _build_settings(tmp_path):
             max_iterations=2,
             provider="custom",
         ),
+        redis=FlorenceRedisRuntimeConfig(url=None),
     )
 
 

@@ -14,6 +14,9 @@ from florence.contracts import (
     HouseholdRoutineStatus,
     HouseholdShoppingItem,
     HouseholdShoppingItemStatus,
+    HouseholdSourceMatcherKind,
+    HouseholdSourceRule,
+    HouseholdSourceVisibility,
     HouseholdWorkItem,
     HouseholdWorkItemStatus,
     ImportedCandidate,
@@ -160,6 +163,32 @@ def test_state_db_updates_candidate_state(tmp_path):
     assert updated is not None
     assert updated.state == CandidateState.PENDING_REVIEW
 
+    store.close()
+
+
+def test_state_db_round_trips_household_source_rules(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    rule = HouseholdSourceRule(
+        id="srcrule_123",
+        household_id="hh_123",
+        source_kind=GoogleSourceKind.GMAIL,
+        matcher_kind=HouseholdSourceMatcherKind.GMAIL_FROM_DOMAIN,
+        matcher_value="musicalbeginnings.com",
+        visibility=HouseholdSourceVisibility.SHARED,
+        label="Musical Beginnings",
+        created_by_member_id="mem_123",
+        metadata={"source_label": "Linda / musicalbeginnings.com"},
+    )
+
+    store.upsert_household_source_rule(rule)
+
+    loaded = store.list_household_source_rules(
+        household_id="hh_123",
+        source_kind=GoogleSourceKind.GMAIL,
+        visibility=HouseholdSourceVisibility.SHARED,
+    )
+
+    assert loaded == [rule]
     store.close()
 
 

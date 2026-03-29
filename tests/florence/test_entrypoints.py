@@ -108,7 +108,7 @@ def test_entrypoints_hybrid_onboarding_reaches_google_link_after_household_ops(t
     assert result.consumed is True
     assert result.reply_text is not None
     assert len(result.reply_messages) == 3
-    assert result.reply_messages[0] == "Next step: connect your Google account so I can compare Gmail and Calendar against the household context you just gave me."
+    assert result.reply_messages[0] == "You're almost ready. Connect your Google account so I can compare Gmail and Calendar against the household context you just gave me."
     assert result.reply_messages[1].startswith("https://accounts.google.com/")
     store.close()
 
@@ -191,7 +191,7 @@ def test_entrypoints_google_callback_returns_next_prompt(tmp_path, monkeypatch):
 
     assert result.consumed is True
     assert result.reply_text is not None
-    assert "reminders and nudges" in result.reply_text.lower()
+    assert "you're ready" in result.reply_text.lower()
     store.close()
 
 

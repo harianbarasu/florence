@@ -3,6 +3,13 @@
 from __future__ import annotations
 
 LOGISTICS_HINTS = (
+    "no class",
+    "class canceled",
+    "class cancelled",
+    "canceled",
+    "cancelled",
+    "closed",
+    "family day",
     "picture day",
     "picture retake",
     "photo retake",
@@ -57,6 +64,25 @@ LOGISTICS_HINTS = (
     "dentist",
     "doctor",
     "pediatric",
+)
+
+PROMOTIONAL_HINTS = (
+    "unsubscribe",
+    "sale",
+    "discount",
+    "offer",
+    "shop now",
+    "buy now",
+    "podcast",
+    "episode",
+    "newsletter",
+    "digest",
+    "sponsored",
+    "listen now",
+    "watch now",
+    "new brand",
+    "creator",
+    "red carpet",
 )
 
 CHILD_ACTIVITY_HINTS = (

@@ -24,8 +24,11 @@ from florence.contracts import (
     HouseholdNudgeStatus,
     HouseholdNudgeTargetKind,
     Household,
+    HouseholdSourceMatcherKind,
     HouseholdProfileItem,
     HouseholdProfileKind,
+    HouseholdSourceRule,
+    HouseholdSourceVisibility,
     HouseholdRoutine,
     HouseholdRoutineStatus,
     HouseholdShoppingItem,
@@ -44,7 +47,7 @@ from florence.onboarding import OnboardingStage, OnboardingState
 from florence.state.db import RowLike, connect_florence_db
 
 FLORENCE_DB_PATH = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes")) / "florence.db"
-FLORENCE_SCHEMA_VERSION = 8
+FLORENCE_SCHEMA_VERSION = 9
 
 FLORENCE_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS florence_schema_version (
@@ -192,6 +195,26 @@ CREATE TABLE IF NOT EXISTS google_connections (
 
 CREATE INDEX IF NOT EXISTS idx_google_connections_household
 ON google_connections(household_id, member_id, active);
+
+CREATE TABLE IF NOT EXISTS household_source_rules (
+    id TEXT PRIMARY KEY,
+    household_id TEXT NOT NULL,
+    source_kind TEXT NOT NULL,
+    matcher_kind TEXT NOT NULL,
+    matcher_value TEXT NOT NULL,
+    visibility TEXT NOT NULL,
+    label TEXT,
+    created_by_member_id TEXT,
+    metadata_json TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_household_source_rules_unique
+ON household_source_rules(household_id, source_kind, matcher_kind, matcher_value);
+
+CREATE INDEX IF NOT EXISTS idx_household_source_rules_visibility
+ON household_source_rules(household_id, visibility, source_kind, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS imported_candidates (
     id TEXT PRIMARY KEY,
@@ -955,6 +978,96 @@ class FlorenceStateDB:
         rows = self._conn.execute(query, tuple(params)).fetchall()
         return [self._row_to_google_connection(row) for row in rows]
 
+    def find_google_connection_by_email(
+        self,
+        *,
+        email: str,
+        active_only: bool = True,
+    ) -> GoogleConnection | None:
+        normalized = " ".join(email.split()).strip().lower()
+        if not normalized:
+            return None
+        params: list[object] = [normalized]
+        query = "SELECT * FROM google_connections WHERE LOWER(email) = ?"
+        if active_only:
+            query += " AND active = 1"
+        query += " ORDER BY updated_at DESC LIMIT 1"
+        row = self._conn.execute(query, tuple(params)).fetchone()
+        return self._row_to_google_connection(row) if row else None
+
+    def upsert_household_source_rule(self, rule: HouseholdSourceRule) -> HouseholdSourceRule:
+        now = time.time()
+        existing = self._conn.execute(
+            """
+            SELECT created_at FROM household_source_rules
+            WHERE household_id = ? AND source_kind = ? AND matcher_kind = ? AND matcher_value = ?
+            """,
+            (
+                rule.household_id,
+                rule.source_kind.value,
+                rule.matcher_kind.value,
+                rule.matcher_value,
+            ),
+        ).fetchone()
+        created_at = float(existing["created_at"]) if existing else now
+        self._conn.execute(
+            """
+            INSERT INTO household_source_rules (
+                id,
+                household_id,
+                source_kind,
+                matcher_kind,
+                matcher_value,
+                visibility,
+                label,
+                created_by_member_id,
+                metadata_json,
+                created_at,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(household_id, source_kind, matcher_kind, matcher_value) DO UPDATE SET
+                visibility = excluded.visibility,
+                label = excluded.label,
+                created_by_member_id = excluded.created_by_member_id,
+                metadata_json = excluded.metadata_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                rule.id,
+                rule.household_id,
+                rule.source_kind.value,
+                rule.matcher_kind.value,
+                rule.matcher_value,
+                rule.visibility.value,
+                rule.label,
+                rule.created_by_member_id,
+                _json_dumps(rule.metadata),
+                created_at,
+                now,
+            ),
+        )
+        self._conn.commit()
+        return rule
+
+    def list_household_source_rules(
+        self,
+        *,
+        household_id: str,
+        source_kind: GoogleSourceKind | None = None,
+        visibility: HouseholdSourceVisibility | None = None,
+    ) -> list[HouseholdSourceRule]:
+        params: list[object] = [household_id]
+        query = "SELECT * FROM household_source_rules WHERE household_id = ?"
+        if source_kind is not None:
+            query += " AND source_kind = ?"
+            params.append(source_kind.value)
+        if visibility is not None:
+            query += " AND visibility = ?"
+            params.append(visibility.value)
+        query += " ORDER BY updated_at DESC, matcher_value ASC"
+        rows = self._conn.execute(query, tuple(params)).fetchall()
+        return [self._row_to_household_source_rule(row) for row in rows]
+
     def get_imported_candidate_by_source(
         self,
         *,
@@ -1702,6 +1815,20 @@ class FlorenceStateDB:
             access_token_expires_at=(
                 str(row["access_token_expires_at"]) if row["access_token_expires_at"] is not None else None
             ),
+            metadata=dict(_json_loads(row["metadata_json"], default={})),
+        )
+
+    @staticmethod
+    def _row_to_household_source_rule(row: RowLike) -> HouseholdSourceRule:
+        return HouseholdSourceRule(
+            id=str(row["id"]),
+            household_id=str(row["household_id"]),
+            source_kind=GoogleSourceKind(str(row["source_kind"])),
+            matcher_kind=HouseholdSourceMatcherKind(str(row["matcher_kind"])),
+            matcher_value=str(row["matcher_value"]),
+            visibility=HouseholdSourceVisibility(str(row["visibility"])),
+            label=str(row["label"]) if row["label"] is not None else None,
+            created_by_member_id=str(row["created_by_member_id"]) if row["created_by_member_id"] is not None else None,
             metadata=dict(_json_loads(row["metadata_json"], default={})),
         )
 

@@ -10,7 +10,9 @@ from florence.messaging import (
     FlorenceMessagingIngressService,
     FlorenceResolvedInboundMessage,
 )
+from florence.onboarding import build_onboarding_ready_message_sequence
 from florence.runtime.chat import FlorenceHouseholdChatService
+from florence.runtime.onboarding_links import FlorenceOnboardingLinkService
 from florence.runtime.resolver import FlorenceIdentityResolver
 from florence.runtime.services import (
     FlorenceCandidateReviewService,
@@ -62,6 +64,9 @@ class FlorenceEntrypointService:
         store: FlorenceStateDB,
         *,
         google_oauth: FlorenceGoogleOauthConfig | None = None,
+        public_base_url: str | None = None,
+        onboarding_link_path: str = "/v1/florence/onboarding",
+        onboarding_state_secret: str | None = None,
         household_chat_model: str | None = None,
         household_chat_max_iterations: int = 6,
         household_chat_provider: str = "auto",
@@ -75,6 +80,15 @@ class FlorenceEntrypointService:
             candidate_review_service=self.candidate_review_service,
         )
         self.query_service = FlorenceHouseholdQueryService(store)
+        self.onboarding_link_service = (
+            FlorenceOnboardingLinkService(
+                public_base_url=public_base_url,
+                state_secret=onboarding_state_secret,
+                path=onboarding_link_path,
+            )
+            if public_base_url and onboarding_state_secret
+            else None
+        )
         self.identity_resolvers = {
             "linq": FlorenceIdentityResolver(store, provider="linq"),
         }
@@ -108,6 +122,7 @@ class FlorenceEntrypointService:
             self.candidate_review_service,
             self.query_service,
             google_account_link_service=self.google_account_link_service,
+            onboarding_link_service=self.onboarding_link_service,
             household_chat_service=self.household_chat_service,
         )
 
@@ -191,7 +206,10 @@ class FlorenceEntrypointService:
             household_id=callback.connection.household_id,
             member_id=callback.connection.member_id,
         )
-        reply = callback.onboarding_transition.prompt.text if callback.onboarding_transition.prompt else "Google connected."
+        if callback.onboarding_transition.state.is_complete:
+            reply = "\n\n".join(build_onboarding_ready_message_sequence())
+        else:
+            reply = callback.onboarding_transition.prompt.text if callback.onboarding_transition.prompt else "Google connected."
         if review_prompt is not None:
             reply = f"{reply}\n\n{review_prompt.text}" if reply else review_prompt.text
 

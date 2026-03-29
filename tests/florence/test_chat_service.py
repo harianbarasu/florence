@@ -190,6 +190,8 @@ def test_household_chat_service_uses_hermes_agent_with_confirmed_state(tmp_path)
     assert "general household agent" in _FakeAgent.last_run["system_message"]
     assert "private parent DM" in _FakeAgent.last_run["system_message"]
     assert "Florence household-state tools" in _FakeAgent.last_run["system_message"]
+    assert "household_search_google_inbox" in _FakeAgent.last_run["system_message"]
+    assert "Do not ask the user to forward or paste an email" in _FakeAgent.last_run["system_message"]
     assert "Household operating policy:" in _FakeAgent.last_run["system_message"]
     assert _FakeAgent.last_run["task_id"].startswith("florence-household-")
     store.close()

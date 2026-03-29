@@ -1,0 +1,1 @@
+self.__NEXT_FONT_MANIFEST='{"pages":{},"app":{"/Users/harianbarasu/Projects/florence/web/src/app/layout":["static/media/27834908180db20f-s.p.woff2","static/media/78fec81b34c4a365.p.woff2"]},"appUsingSizeAdjust":true,"pagesUsingSizeAdjust":false}';

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import time
 from dataclasses import dataclass, replace
@@ -27,6 +28,8 @@ from florence.contracts import (
     HouseholdNudgeTargetKind,
     HouseholdProfileItem,
     HouseholdProfileKind,
+    HouseholdSourceRule,
+    HouseholdSourceVisibility,
     HouseholdRoutine,
     HouseholdRoutineStatus,
     HouseholdShoppingItem,
@@ -73,6 +76,12 @@ from florence.onboarding import (
     mark_group_activated,
     OnboardingVariant,
 )
+from florence.source_rules import (
+    build_candidate_source_profile,
+    build_rules_for_candidate,
+    build_source_rule_prompt,
+    candidate_matches_source_rule,
+)
 from florence.state import FlorenceStateDB
 
 
@@ -87,6 +96,43 @@ def _parse_iso_datetime(value: str | None) -> datetime | None:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def _int_env(name: str, default: int, *, minimum: int = 1) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(minimum, value)
+
+
+def _gmail_bootstrap_max_results() -> int:
+    return _int_env("FLORENCE_GMAIL_BOOTSTRAP_MAX_RESULTS", 500)
+
+
+def _gmail_incremental_max_results() -> int:
+    return _int_env("FLORENCE_GMAIL_INCREMENTAL_MAX_RESULTS", 150)
+
+
+def _gmail_bootstrap_window_days() -> int:
+    return _int_env("FLORENCE_GMAIL_BOOTSTRAP_WINDOW_DAYS", 90)
+
+
+def _gmail_incremental_query(
+    *,
+    last_synced_at: datetime | None,
+    current_time: datetime,
+) -> str:
+    if last_synced_at is None:
+        return f"newer_than:{_gmail_bootstrap_window_days()}d"
+    elapsed_seconds = max(0.0, (current_time - last_synced_at).total_seconds())
+    elapsed_days = int((elapsed_seconds + 86_399) // 86_400)
+    overlap_days = 2
+    query_days = max(3, min(_gmail_bootstrap_window_days(), elapsed_days + overlap_days))
+    return f"newer_than:{query_days}d"
 
 
 def _parse_local_time_spec(value: str | None) -> tuple[int, int] | None:
@@ -435,6 +481,85 @@ class FlorenceGoogleSyncCycleResult:
     sync_result: FlorenceGoogleSyncResult
 
 
+def build_google_connection_sync_status(connection: GoogleConnection) -> dict[str, object]:
+    metadata = dict(connection.metadata)
+    initial_sync_completed_at = str(
+        metadata.get("initial_sync_completed_at")
+        or metadata.get("gmail_bootstrap_completed_at")
+        or ""
+    ).strip() or None
+    initial_sync_state = str(metadata.get("initial_sync_state") or "").strip().lower()
+    if not initial_sync_state:
+        initial_sync_state = "ready" if initial_sync_completed_at else "pending"
+    sync_phase = str(metadata.get("sync_phase") or "").strip().lower()
+    if not sync_phase:
+        sync_phase = "ready" if initial_sync_completed_at else "connect_google"
+    last_sync_completed_at = str(
+        metadata.get("last_sync_completed_at")
+        or metadata.get("gmail_last_synced_at")
+        or ""
+    ).strip() or None
+    calendar_last_synced_at = str(metadata.get("calendar_last_synced_at") or "").strip() or None
+    gmail_last_synced_at = str(metadata.get("gmail_last_synced_at") or "").strip() or None
+    last_sync_status = str(metadata.get("last_sync_status") or "").strip().lower() or None
+    last_sync_error = str(metadata.get("last_sync_error") or "").strip() or None
+    return {
+        "initialSyncState": initial_sync_state,
+        "initialSyncCompletedAt": initial_sync_completed_at,
+        "queuedAt": str(metadata.get("initial_sync_queued_at") or "").strip() or None,
+        "startedAt": str(metadata.get("initial_sync_started_at") or "").strip() or None,
+        "phase": sync_phase,
+        "lastSyncStatus": last_sync_status,
+        "lastSyncCompletedAt": last_sync_completed_at,
+        "lastSyncError": last_sync_error,
+        "gmailLastSyncedAt": gmail_last_synced_at,
+        "calendarLastSyncedAt": calendar_last_synced_at,
+        "gmailItemCount": int(metadata.get("last_gmail_item_count") or 0),
+        "calendarItemCount": int(metadata.get("last_calendar_item_count") or 0),
+        "candidateCount": int(metadata.get("last_candidate_count") or 0),
+    }
+
+
+def build_grounding_suggestions(settings: dict[str, object] | None) -> dict[str, list[dict[str, object]]]:
+    hints = _grounding_hints_from_settings(settings)
+    school_entries = list(_index_hint_entries(hints, key="schools", detail_fields=("domains", "platforms", "contacts")).values())
+    activity_entries = list(_index_hint_entries(hints, key="activities", detail_fields=("locations", "contacts")).values())
+
+    contacts: list[dict[str, object]] = []
+    seen_contacts: set[str] = set()
+    for entry in [*school_entries, *activity_entries]:
+        for contact in entry.get("contacts", []):
+            cleaned = _clean_label(str(contact))
+            if cleaned is None:
+                continue
+            lowered = cleaned.lower()
+            if lowered in seen_contacts:
+                continue
+            seen_contacts.add(lowered)
+            contacts.append({"label": cleaned})
+
+    return {
+        "schools": [
+            {
+                "label": str(entry["label"]),
+                "domains": list(entry.get("domains", [])),
+                "platforms": list(entry.get("platforms", [])),
+                "contacts": list(entry.get("contacts", [])),
+            }
+            for entry in school_entries
+        ],
+        "activities": [
+            {
+                "label": str(entry["label"]),
+                "locations": list(entry.get("locations", [])),
+                "contacts": list(entry.get("contacts", [])),
+            }
+            for entry in activity_entries
+        ],
+        "contacts": contacts,
+    }
+
+
 @dataclass(slots=True)
 class CandidateReviewPrompt:
     candidate: ImportedCandidate
@@ -448,11 +573,136 @@ class CandidateReviewResult:
     group_announcement: str | None = None
 
 
-class FlorenceCandidateReviewService:
-    """Manages the review state lifecycle for imported Google candidates."""
+class FlorenceSourceRuleService:
+    """Matches and persists reusable Gmail/Calendar sharing rules."""
 
     def __init__(self, store: FlorenceStateDB):
         self.store = store
+
+    def list_rules(
+        self,
+        *,
+        household_id: str,
+        source_kind: GoogleSourceKind | None = None,
+        visibility: HouseholdSourceVisibility | None = None,
+    ) -> list[HouseholdSourceRule]:
+        return self.store.list_household_source_rules(
+            household_id=household_id,
+            source_kind=source_kind,
+            visibility=visibility,
+        )
+
+    def apply_candidate_policy(self, candidate: ImportedCandidate) -> ImportedCandidate:
+        metadata = dict(candidate.metadata)
+        matched_rule = self._match_rule(candidate)
+        if matched_rule is not None:
+            metadata["source_visibility"] = matched_rule.visibility.value
+            metadata["source_rule_id"] = matched_rule.id
+            metadata["source_rule_label"] = matched_rule.label or matched_rule.matcher_value
+            metadata.pop("source_rule_prompt", None)
+            return replace(candidate, metadata=metadata)
+
+        profile = build_candidate_source_profile(candidate)
+        if profile is None:
+            return candidate
+
+        if profile.default_shared:
+            rules = self._persist_rules(
+                candidate,
+                visibility=HouseholdSourceVisibility.SHARED,
+                created_by_member_id=candidate.member_id,
+            )
+            if rules:
+                metadata["source_visibility"] = HouseholdSourceVisibility.SHARED.value
+                metadata["source_rule_id"] = rules[0].id
+                metadata["source_rule_label"] = profile.label
+                metadata["source_rule_auto"] = True
+                metadata.pop("source_rule_prompt", None)
+                return replace(candidate, metadata=metadata)
+
+        metadata["source_visibility"] = "needs_classification"
+        metadata["source_rule_label"] = profile.label
+        metadata["source_rule_prompt"] = build_source_rule_prompt(candidate)
+        return replace(candidate, metadata=metadata)
+
+    def set_candidate_visibility(
+        self,
+        *,
+        candidate_id: str,
+        visibility: HouseholdSourceVisibility,
+        created_by_member_id: str | None = None,
+    ) -> ImportedCandidate:
+        candidate = self.store.get_imported_candidate(candidate_id)
+        if candidate is None:
+            raise ValueError("unknown_candidate")
+
+        rules = self._persist_rules(candidate, visibility=visibility, created_by_member_id=created_by_member_id)
+        metadata = dict(candidate.metadata)
+        metadata["source_visibility"] = visibility.value
+        metadata["source_rule_ids"] = [rule.id for rule in rules]
+        metadata["source_rule_label"] = self.describe_candidate_source(candidate) or metadata.get("source_rule_label")
+        metadata.pop("source_rule_prompt", None)
+        updated = replace(candidate, metadata=metadata)
+        self.store.upsert_imported_candidate(updated)
+        return updated
+
+    def describe_candidate_source(self, candidate: ImportedCandidate) -> str | None:
+        profile = build_candidate_source_profile(candidate)
+        return profile.label if profile is not None else None
+
+    def build_candidate_source_prompt(self, candidate: ImportedCandidate) -> str | None:
+        if candidate.metadata.get("source_visibility") in {
+            HouseholdSourceVisibility.SHARED.value,
+            HouseholdSourceVisibility.PRIVATE.value,
+        }:
+            return None
+        if self._match_rule(candidate) is not None:
+            return None
+        profile = build_candidate_source_profile(candidate)
+        if profile is not None and profile.default_shared:
+            return None
+        prompt = candidate.metadata.get("source_rule_prompt")
+        if isinstance(prompt, str) and prompt.strip():
+            return prompt.strip()
+        return build_source_rule_prompt(candidate)
+
+    def _match_rule(self, candidate: ImportedCandidate) -> HouseholdSourceRule | None:
+        for rule in self.store.list_household_source_rules(
+            household_id=candidate.household_id,
+            source_kind=candidate.source_kind,
+        ):
+            if candidate_matches_source_rule(candidate, rule):
+                return rule
+        return None
+
+    def _persist_rules(
+        self,
+        candidate: ImportedCandidate,
+        *,
+        visibility: HouseholdSourceVisibility,
+        created_by_member_id: str | None = None,
+    ) -> list[HouseholdSourceRule]:
+        created: list[HouseholdSourceRule] = []
+        for rule in build_rules_for_candidate(
+            candidate,
+            visibility=visibility,
+            created_by_member_id=created_by_member_id,
+        ):
+            created.append(self.store.upsert_household_source_rule(rule))
+        return created
+
+
+class FlorenceCandidateReviewService:
+    """Manages the review state lifecycle for imported Google candidates."""
+
+    def __init__(
+        self,
+        store: FlorenceStateDB,
+        *,
+        source_rule_service: FlorenceSourceRuleService | None = None,
+    ):
+        self.store = store
+        self.source_rule_service = source_rule_service or FlorenceSourceRuleService(store)
 
     def release_quarantined_candidates(self, *, household_id: str, member_id: str) -> list[ImportedCandidate]:
         candidates = self.store.list_imported_candidates(
@@ -484,9 +734,29 @@ class FlorenceCandidateReviewService:
             f"Imported item: {candidate.title}",
             candidate.summary,
             question,
-            "Reply yes to confirm it, no if it is wrong, or skip for later.",
         ]
+        source_prompt = self.source_rule_service.build_candidate_source_prompt(candidate)
+        if source_prompt:
+            lines.append(source_prompt)
+        lines.extend(
+            [
+            "Reply yes to confirm it, no if it is wrong, or skip for later.",
+            ]
+        )
         return CandidateReviewPrompt(candidate=candidate, text="\n".join(line for line in lines if line))
+
+    def set_candidate_source_visibility(
+        self,
+        *,
+        candidate_id: str,
+        visibility: HouseholdSourceVisibility,
+        created_by_member_id: str | None = None,
+    ) -> ImportedCandidate:
+        return self.source_rule_service.set_candidate_visibility(
+            candidate_id=candidate_id,
+            visibility=visibility,
+            created_by_member_id=created_by_member_id,
+        )
 
     def confirm_candidate(
         self,
@@ -888,15 +1158,24 @@ class FlorenceOnboardingSessionService:
 class FlorenceGoogleSyncPersistenceService:
     """Persists Google connections and sync-derived review candidates."""
 
-    def __init__(self, store: FlorenceStateDB):
+    def __init__(
+        self,
+        store: FlorenceStateDB,
+        *,
+        source_rule_service: FlorenceSourceRuleService | None = None,
+    ):
         self.store = store
+        self.source_rule_service = source_rule_service or FlorenceSourceRuleService(store)
 
     def save_google_connection(self, connection: GoogleConnection) -> GoogleConnection:
         return self.store.upsert_google_connection(connection)
 
     def persist_sync_batch(self, batch: FlorenceGoogleSyncBatch) -> FlorenceGoogleSyncResult:
         result = build_google_import_candidates(batch)
-        persisted = [self.store.upsert_imported_candidate(candidate) for candidate in result.candidates]
+        persisted = [
+            self.store.upsert_imported_candidate(self.source_rule_service.apply_candidate_policy(candidate))
+            for candidate in result.candidates
+        ]
         household = self.store.get_household(batch.connection.household_id)
         if household is not None:
             settings = dict(household.settings)
@@ -963,8 +1242,16 @@ class FlorenceGoogleAccountLinkService:
         )
         email = fetch_google_user_email(access_token=tokens.access_token)
         primary_calendar = fetch_primary_google_calendar(access_token=tokens.access_token)
+        connection_id = _stable_id("gconn", payload.household_id, payload.member_id, email)
+        existing = self.store.get_google_connection(connection_id)
+        existing_metadata = dict(existing.metadata) if existing is not None else {}
+        existing_connections = self.store.list_google_connections(
+            household_id=payload.household_id,
+            member_id=payload.member_id,
+        )
+        is_primary_web_account = bool(existing_metadata.get("web_primary")) or not existing_connections
         connection = GoogleConnection(
-            id=_stable_id("gconn", payload.household_id, payload.member_id, email),
+            id=connection_id,
             household_id=payload.household_id,
             member_id=payload.member_id,
             email=email,
@@ -973,10 +1260,12 @@ class FlorenceGoogleAccountLinkService:
             refresh_token=tokens.refresh_token,
             access_token_expires_at=_google_token_expiry_iso(tokens),
             metadata={
+                **existing_metadata,
                 "primary_calendar_id": primary_calendar.id,
                 "primary_calendar_summary": primary_calendar.summary,
                 "primary_calendar_timezone": primary_calendar.timezone,
                 "primary_calendar_access_role": primary_calendar.access_role,
+                "web_primary": is_primary_web_account,
             },
         )
         self.store.upsert_google_connection(connection)
@@ -999,7 +1288,7 @@ class FlorenceGoogleSyncWorkerService:
         self,
         connection_id: str,
         *,
-        max_gmail_results: int = 20,
+        max_gmail_results: int | None = None,
         max_calendar_results: int = 20,
         window_days: int = 30,
         now: datetime | None = None,
@@ -1019,6 +1308,7 @@ class FlorenceGoogleSyncWorkerService:
         access_token = hydrated_connection.access_token
         if not access_token:
             raise ValueError("google_access_token_missing")
+        current_time = now or _utc_now()
 
         onboarding_sessions = self.store.list_member_onboarding_sessions(
             household_id=hydrated_connection.household_id,
@@ -1035,11 +1325,37 @@ class FlorenceGoogleSyncWorkerService:
         calendar_timezone = str(hydrated_connection.metadata.get("primary_calendar_timezone") or "America/Los_Angeles")
         calendar_id = str(hydrated_connection.metadata.get("primary_calendar_id") or "primary")
         calendar_summary = str(hydrated_connection.metadata.get("primary_calendar_summary") or "Primary calendar")
+        metadata = dict(hydrated_connection.metadata)
+        bootstrap_complete = bool(metadata.get("gmail_bootstrap_completed_at"))
+        if not metadata.get("initial_sync_started_at"):
+            metadata["initial_sync_started_at"] = current_time.isoformat()
+        if not metadata.get("initial_sync_completed_at"):
+            metadata["initial_sync_state"] = "running"
+        metadata["sync_phase"] = "syncing_inbox"
+        metadata["last_sync_status"] = "running"
+        metadata.pop("last_sync_error", None)
+        hydrated_connection = self.store.upsert_google_connection(replace(hydrated_connection, metadata=metadata))
+        metadata = dict(hydrated_connection.metadata)
+        last_gmail_sync_at = _parse_iso_datetime(str(metadata.get("gmail_last_synced_at") or ""))
+        gmail_query = (
+            _gmail_incremental_query(last_synced_at=last_gmail_sync_at, current_time=current_time)
+            if bootstrap_complete
+            else f"newer_than:{_gmail_bootstrap_window_days()}d"
+        )
+        resolved_max_gmail_results = (
+            max_gmail_results
+            if max_gmail_results is not None
+            else (_gmail_incremental_max_results() if bootstrap_complete else _gmail_bootstrap_max_results())
+        )
 
         gmail_items = list_recent_gmail_sync_items(
             access_token=access_token,
-            max_results=max_gmail_results,
+            max_results=resolved_max_gmail_results,
+            gmail_query=gmail_query,
         )
+        metadata["sync_phase"] = "syncing_calendar"
+        hydrated_connection = self.store.upsert_google_connection(replace(hydrated_connection, metadata=metadata))
+        metadata = dict(hydrated_connection.metadata)
         calendar_items = list_recent_parent_calendar_sync_items(
             access_token=access_token,
             calendar=(
@@ -1066,6 +1382,9 @@ class FlorenceGoogleSyncWorkerService:
             window_days=window_days,
             now=now,
         )
+        metadata["sync_phase"] = "finding_family_sources"
+        hydrated_connection = self.store.upsert_google_connection(replace(hydrated_connection, metadata=metadata))
+        metadata = dict(hydrated_connection.metadata)
         batch = FlorenceGoogleSyncBatch(
             connection=hydrated_connection,
             context=context,
@@ -1073,7 +1392,23 @@ class FlorenceGoogleSyncWorkerService:
             calendar_items=calendar_items,
         )
         sync_result = self.google_sync_service.persist_sync_batch(batch)
-        return FlorenceGoogleSyncCycleResult(connection=hydrated_connection, sync_result=sync_result)
+        metadata["gmail_last_synced_at"] = current_time.isoformat()
+        metadata["calendar_last_synced_at"] = current_time.isoformat()
+        metadata["gmail_last_query"] = gmail_query
+        metadata["gmail_last_max_results"] = resolved_max_gmail_results
+        metadata["last_gmail_item_count"] = len(gmail_items)
+        metadata["last_calendar_item_count"] = len(calendar_items)
+        metadata["last_candidate_count"] = len(sync_result.candidates)
+        metadata["last_sync_completed_at"] = current_time.isoformat()
+        metadata["last_sync_status"] = "ok"
+        metadata["sync_phase"] = "ready"
+        if not bootstrap_complete:
+            metadata["gmail_bootstrap_completed_at"] = current_time.isoformat()
+        if not metadata.get("initial_sync_completed_at"):
+            metadata["initial_sync_completed_at"] = current_time.isoformat()
+        metadata["initial_sync_state"] = "ready"
+        synced_connection = self.store.upsert_google_connection(replace(hydrated_connection, metadata=metadata))
+        return FlorenceGoogleSyncCycleResult(connection=synced_connection, sync_result=sync_result)
 
     def sync_household(
         self,
@@ -1571,14 +1906,16 @@ class FlorenceHouseholdQueryService:
             events.append(event)
 
         if not events:
-            return "Nothing confirmed is on the family plan for the next week yet."
+            return "I do not have anything on the family plan for the next week yet."
 
         lines = ["Here is the family plan for the next week:"]
         for event in events[:10]:
             if event.starts_at:
-                lines.append(f"- {event.title} ({event.starts_at})")
+                suffix = " (tentative)" if event.status == HouseholdEventStatus.TENTATIVE else ""
+                lines.append(f"- {event.title} ({event.starts_at}){suffix}")
             else:
-                lines.append(f"- {event.title}")
+                suffix = " (tentative)" if event.status == HouseholdEventStatus.TENTATIVE else ""
+                lines.append(f"- {event.title}{suffix}")
         return "\n".join(lines)
 
     def summarize_tracking_state(self, *, household_id: str, now: datetime | None = None) -> str:

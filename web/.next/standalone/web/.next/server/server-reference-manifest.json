@@ -1,1 +1,71 @@
-{"node":{"00d5dfea6676b039c178dba2ac80c6d94672dd3d91":{"workers":{"app/accounts/page":{"moduleId":"8613","async":false},"app/settings/page":{"moduleId":"8613","async":false},"app/setup/page":{"moduleId":"8613","async":false}},"layer":{"app/accounts/page":"rsc","app/settings/page":"rsc","app/setup/page":"rsc"},"filename":"components/app-shell.tsx","exportedName":"$$RSC_SERVER_ACTION_0"},"405c2b14e9e09f46c57d5cb98fe9cc2b5f8f0c0673":{"workers":{"app/accounts/page":{"moduleId":"8613","async":false},"app/login/page":{"moduleId":"2130","async":false},"app/settings/page":{"moduleId":"8613","async":false},"app/setup/page":{"moduleId":"8613","async":false}},"layer":{"app/accounts/page":"rsc","app/login/page":"rsc","app/settings/page":"rsc","app/setup/page":"rsc"},"filename":"components/auth/google-sign-in-card.tsx","exportedName":"$$RSC_SERVER_ACTION_0"}},"edge":{},"encryptionKey":"2yJMp4/WdNOCiMbCGwWQ7ZqfzMOxDI3OtxC38uUZZ3A="}
+{
+  "node": {
+    "00bc4298c7ce36e1b10d2ab46c82aa496e10274751": {
+      "workers": {
+        "app/accounts/page": {
+          "moduleId": 35433,
+          "async": false,
+          "exportedName": "$$RSC_SERVER_ACTION_0",
+          "filename": "web/src/components/app-shell.tsx"
+        },
+        "app/settings/page": {
+          "moduleId": 33299,
+          "async": false,
+          "exportedName": "$$RSC_SERVER_ACTION_0",
+          "filename": "web/src/components/app-shell.tsx"
+        },
+        "app/setup/page": {
+          "moduleId": 4162,
+          "async": false,
+          "exportedName": "$$RSC_SERVER_ACTION_0",
+          "filename": "web/src/components/app-shell.tsx"
+        }
+      },
+      "layer": {
+        "app/accounts/page": "rsc",
+        "app/settings/page": "rsc",
+        "app/setup/page": "rsc"
+      },
+      "filename": "web/src/components/app-shell.tsx",
+      "exportedName": "$$RSC_SERVER_ACTION_0"
+    },
+    "4012fad878edf77613ebc86d385218093a19cb4b5b": {
+      "workers": {
+        "app/accounts/page": {
+          "moduleId": 35433,
+          "async": false,
+          "exportedName": "$$RSC_SERVER_ACTION_0",
+          "filename": "web/src/components/auth/google-sign-in-card.tsx"
+        },
+        "app/login/page": {
+          "moduleId": 75886,
+          "async": false,
+          "exportedName": "$$RSC_SERVER_ACTION_0",
+          "filename": "web/src/components/auth/google-sign-in-card.tsx"
+        },
+        "app/settings/page": {
+          "moduleId": 33299,
+          "async": false,
+          "exportedName": "$$RSC_SERVER_ACTION_0",
+          "filename": "web/src/components/auth/google-sign-in-card.tsx"
+        },
+        "app/setup/page": {
+          "moduleId": 4162,
+          "async": false,
+          "exportedName": "$$RSC_SERVER_ACTION_0",
+          "filename": "web/src/components/auth/google-sign-in-card.tsx"
+        }
+      },
+      "layer": {
+        "app/accounts/page": "rsc",
+        "app/login/page": "rsc",
+        "app/settings/page": "rsc",
+        "app/setup/page": "rsc"
+      },
+      "filename": "web/src/components/auth/google-sign-in-card.tsx",
+      "exportedName": "$$RSC_SERVER_ACTION_0"
+    }
+  },
+  "edge": {},
+  "encryptionKey": "2yJMp4/WdNOCiMbCGwWQ7ZqfzMOxDI3OtxC38uUZZ3A="
+}

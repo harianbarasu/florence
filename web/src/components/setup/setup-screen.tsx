@@ -296,15 +296,12 @@ export function SetupScreen({ token }: { token?: string }) {
   return (
     <div className="grid gap-6">
       <div className="grid gap-6 xl:grid-cols-[minmax(0,1.28fr)_minmax(320px,0.72fr)]">
-        <Card className="overflow-hidden">
-          <CardHeader className="gap-5 border-b border-border/70 bg-[linear-gradient(160deg,rgba(28,91,122,0.12),rgba(255,255,255,0.42)_42%,rgba(176,106,51,0.06))]">
+        <Card>
+          <CardHeader>
             <div className="flex flex-wrap items-start justify-between gap-4">
-              <div className="max-w-3xl">
-                <div className="mb-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
-                  Setup overview
-                </div>
-                <CardTitle className="text-2xl sm:text-3xl">{syncHeadline(data)}</CardTitle>
-                <CardDescription className="mt-3 max-w-2xl text-sm leading-7 sm:text-base">
+              <div>
+                <CardTitle>{syncHeadline(data)}</CardTitle>
+                <CardDescription className="mt-1.5 max-w-2xl">
                   {syncBody(data)}
                 </CardDescription>
               </div>
@@ -313,9 +310,9 @@ export function SetupScreen({ token }: { token?: string }) {
               </Badge>
             </div>
           </CardHeader>
-          <CardContent className="grid gap-5 pt-6">
-            <div className="rounded-[1.5rem] border border-border/70 bg-white/75 p-4">
-              <div className="mb-3 flex items-center justify-between gap-3 text-sm">
+          <CardContent className="grid gap-5">
+            <div>
+              <div className="mb-2 flex items-center justify-between gap-3 text-sm">
                 <div className="font-medium">Onboarding progress</div>
                 <div className="text-muted-foreground">{progressValue}%</div>
               </div>
@@ -326,10 +323,10 @@ export function SetupScreen({ token }: { token?: string }) {
               {readinessItems.map((item) => (
                 <div
                   key={item.title}
-                  className="rounded-[1.5rem] border border-border/70 bg-white/70 p-4 shadow-sm"
+                  className="rounded-lg border p-4"
                 >
-                  <div className="mb-2 flex items-center justify-between gap-3">
-                    <div className="text-sm font-semibold">{item.title}</div>
+                  <div className="mb-1 flex items-center justify-between gap-3">
+                    <div className="text-sm font-medium">{item.title}</div>
                     <Badge
                       variant={
                         item.complete
@@ -346,7 +343,7 @@ export function SetupScreen({ token }: { token?: string }) {
                           : "In progress"}
                     </Badge>
                   </div>
-                  <p className="text-sm leading-6 text-muted-foreground">{item.description}</p>
+                  <p className="text-sm text-muted-foreground">{item.description}</p>
                 </div>
               ))}
             </div>
@@ -425,17 +422,17 @@ export function SetupScreen({ token }: { token?: string }) {
       </div>
 
       {!data.setup.googleConnected ? (
-        <Card className="overflow-hidden border-primary/20">
-          <CardHeader className="border-b border-border/70 bg-[linear-gradient(180deg,rgba(28,91,122,0.08),rgba(28,91,122,0.02))]">
+        <Card>
+          <CardHeader>
             <div className="flex flex-wrap items-start justify-between gap-4">
               <div>
-                <CardTitle className="flex items-center gap-2 text-xl">
+                <CardTitle className="flex items-center gap-2">
                   <LoaderCircle className="h-5 w-5 animate-spin text-primary" />
                   Continuing to Google
                 </CardTitle>
-                <CardDescription className="mt-2 max-w-2xl text-sm leading-7">
-                  The second manual Florence step is gone. This page now hands off directly into the Gmail and Calendar
-                  consent flow. If the browser blocks that redirect, use the fallback link below.
+                <CardDescription className="mt-1.5 max-w-2xl">
+                  This page hands off directly into the Gmail and Calendar consent flow.
+                  If the browser blocks the redirect, use the fallback link below.
                 </CardDescription>
               </div>
               <Badge variant={autoConnectFailed ? "warning" : "secondary"}>
@@ -443,7 +440,7 @@ export function SetupScreen({ token }: { token?: string }) {
               </Badge>
             </div>
           </CardHeader>
-          <CardContent className="flex flex-wrap items-center gap-3 pt-6">
+          <CardContent className="flex flex-wrap items-center gap-3">
             {data.googleConnectUrl ? (
               <Button asChild>
                 <a href={data.googleConnectUrl}>
@@ -532,7 +529,7 @@ export function SetupScreen({ token }: { token?: string }) {
               </div>
               <div className="grid gap-3">
                 {children.map((child, index) => (
-                  <div key={`${index}-${child.name}`} className="rounded-[1.25rem] border border-border/70 bg-white/70 p-4">
+                  <div key={`${index}-${child.name}`} className="rounded-lg border p-4">
                     <div className="grid gap-3 sm:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
                       <div className="grid gap-2">
                         <Label>Child name</Label>
@@ -653,7 +650,7 @@ export function SetupScreen({ token }: { token?: string }) {
             <CardContent className="grid gap-3">
               {data.preview.candidates.length ? (
                 data.preview.candidates.map((candidate) => (
-                  <div key={candidate.id} className="rounded-[1.25rem] border border-border/70 bg-white/70 p-4">
+                  <div key={candidate.id} className="rounded-lg border p-4">
                     <div className="mb-1 flex items-center justify-between gap-3">
                       <div className="font-medium">{candidate.title}</div>
                       <Badge variant={candidate.state === "pending_review" ? "warning" : "outline"}>

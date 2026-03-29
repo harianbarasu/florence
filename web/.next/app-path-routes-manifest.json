@@ -1,9 +1,9 @@
 {
   "/_global-error/page": "/_global-error",
   "/_not-found/page": "/_not-found",
+  "/accounts/page": "/accounts",
   "/api/auth/[...nextauth]/route": "/api/auth/[...nextauth]",
   "/api/florence/[...path]/route": "/api/florence/[...path]",
-  "/accounts/page": "/accounts",
   "/login/page": "/login",
   "/page": "/",
   "/settings/page": "/settings",

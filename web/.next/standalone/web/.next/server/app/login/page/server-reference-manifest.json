@@ -1,0 +1,20 @@
+{
+  "node": {
+    "4012fad878edf77613ebc86d385218093a19cb4b5b": {
+      "workers": {
+        "app/login/page": {
+          "moduleId": 75886,
+          "async": false,
+          "exportedName": "$$RSC_SERVER_ACTION_0",
+          "filename": "web/src/components/auth/google-sign-in-card.tsx"
+        }
+      },
+      "layer": {
+        "app/login/page": "rsc"
+      },
+      "exportedName": "$$RSC_SERVER_ACTION_0",
+      "filename": "web/src/components/auth/google-sign-in-card.tsx"
+    }
+  },
+  "edge": {}
+}

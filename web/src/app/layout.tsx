@@ -20,7 +20,7 @@ export default async function RootLayout({
 
   return (
     <html lang="en" className={`${GeistSans.variable} ${GeistMono.variable}`}>
-      <body className="min-h-screen font-sans">
+      <body className="min-h-screen font-sans antialiased overflow-x-hidden">
         <Providers>{children}</Providers>
       </body>
     </html>

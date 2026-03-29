@@ -134,19 +134,19 @@ export function AccountsScreen({ token }: { token?: string }) {
                 </Button>
               </CardHeader>
               <CardContent className="grid gap-3 text-sm text-muted-foreground sm:grid-cols-2 xl:grid-cols-4">
-                <div className="rounded-2xl border border-border/70 bg-white/70 p-4">
+                <div className="rounded-lg border p-4">
                   <div className="mb-2 font-medium text-foreground">Inbox</div>
                   <div>{connection.sync.gmailItemCount} items in first pass</div>
                 </div>
-                <div className="rounded-2xl border border-border/70 bg-white/70 p-4">
+                <div className="rounded-lg border p-4">
                   <div className="mb-2 font-medium text-foreground">Calendar</div>
                   <div>{connection.sync.calendarItemCount} events in first pass</div>
                 </div>
-                <div className="rounded-2xl border border-border/70 bg-white/70 p-4">
+                <div className="rounded-lg border p-4">
                   <div className="mb-2 font-medium text-foreground">Candidates</div>
                   <div>{connection.sync.candidateCount} surfaced</div>
                 </div>
-                <div className="rounded-2xl border border-border/70 bg-white/70 p-4">
+                <div className="rounded-lg border p-4">
                   <div className="mb-2 font-medium text-foreground">Status</div>
                   <div className="flex items-center gap-2">
                     {connection.sync.initialSyncState === "ready" ? (

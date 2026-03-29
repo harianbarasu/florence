@@ -28,8 +28,11 @@ Florence can now run on Postgres. On Railway, Postgres is the preferred setup.
 7. Set `REDIS_URL` or `FLORENCE_REDIS_URL` on both Florence services from Redis.
 8. Expose the generated Railway domain or attach your own custom domain on the web service.
 
-`railway.json` already tells Railway to use the Dockerfile and health check
-`/health`.
+`railway.json` already tells Railway to use the Dockerfile. Set service-specific
+healthchecks in Railway itself:
+
+- `florence-api`: `/health`
+- `florence-worker`: no healthcheck path
 
 ## Required Environment
 
@@ -119,11 +122,13 @@ messages directly to the Linq API over HTTPS using `LINQ_API_KEY`.
 
 After the first deploy:
 
-1. Open `https://<your-domain>/health` and confirm `{"ok": true}`.
-2. Send a Linq test webhook.
-3. Start a Florence DM onboarding thread and confirm Florence replies with the desktop onboarding URL.
-4. Open the onboarding URL, complete setup, and confirm Google connect returns back into the onboarding page.
-5. Confirm both the web service and worker can read and write Postgres and Redis.
+1. Set the `florence-api` service healthcheck path to `/health`.
+2. Leave the `florence-worker` service with no healthcheck path because it is a long-running background process, not an HTTP server.
+3. Open `https://<your-api-domain>/health` and confirm `{"ok": true}`.
+4. Send a Linq test webhook.
+5. Start a Florence DM onboarding thread and confirm Florence replies with the desktop onboarding URL.
+6. Open the onboarding URL, complete setup, and confirm Google connect returns back into the onboarding page.
+7. Confirm both the web service and worker can read and write Postgres and Redis.
 
 ## Operational Notes
 

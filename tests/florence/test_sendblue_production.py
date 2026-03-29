@@ -11,6 +11,7 @@ from florence.config import (
 )
 from florence.contracts import Channel, ChannelType, Household
 from florence.runtime import FlorenceEntrypointResult, FlorenceProductionService
+from florence.server import _extract_sendblue_webhook_secret
 from florence.state import FlorenceStateDB
 
 
@@ -107,3 +108,9 @@ def test_production_service_handles_sendblue_webhook(tmp_path, monkeypatch):
     assert service.sendblue.sent[0]["thread_id"] == "+15122164639|+15555550123"
     assert service.sendblue.sent[0]["message"] == "Hi from Florence"
     store.close()
+
+
+def test_server_accepts_sendblue_documented_secret_header():
+    headers = {"sb-signing-secret": "sb-webhook-secret"}
+
+    assert _extract_sendblue_webhook_secret(headers) == "sb-webhook-secret"

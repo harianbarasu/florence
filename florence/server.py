@@ -125,6 +125,16 @@ def _log_runtime_configuration(settings: FlorenceSettings) -> None:
     )
 
 
+def _extract_sendblue_webhook_secret(headers: Any) -> str | None:
+    return (
+        headers.get("sb-signing-secret")
+        or headers.get("x-sendblue-secret")
+        or headers.get("sendblue-secret")
+        or headers.get("x-webhook-secret")
+        or headers.get("webhook-secret")
+    )
+
+
 class _FlorenceRequestHandler(BaseHTTPRequestHandler):
     service: FlorenceProductionService | None = None
 
@@ -228,12 +238,7 @@ class _FlorenceRequestHandler(BaseHTTPRequestHandler):
                 return
             result = self._service().handle_sendblue_webhook(
                 payload=payload,
-                webhook_secret=(
-                    self.headers.get("x-sendblue-secret")
-                    or self.headers.get("sendblue-secret")
-                    or self.headers.get("x-webhook-secret")
-                    or self.headers.get("webhook-secret")
-                ),
+                webhook_secret=_extract_sendblue_webhook_secret(self.headers),
             )
             self._write_response(result)
             return

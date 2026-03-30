@@ -25,7 +25,9 @@ from florence.contracts import (
 )
 from florence.google import decode_google_oauth_state
 from florence.onboarding import (
+    build_google_connected_syncing_message_sequence,
     build_onboarding_ready_message_sequence,
+    build_sync_complete_finish_profile_message_sequence,
     extract_child_names,
     split_entries,
     split_labels,
@@ -389,30 +391,30 @@ class FlorenceProductionService:
             dm_messages = (
                 build_onboarding_ready_message_sequence()
                 if callback.onboarding_transition.state.is_complete
-                else (
-                    (
-                        "Google connected.",
-                        "Finish the rest of setup on your computer here:",
-                        onboarding_link.url,
-                    )
-                    if onboarding_link is not None
-                    else ("Google connected.",)
+                else build_google_connected_syncing_message_sequence(
+                    onboarding_link.url if onboarding_link is not None else None
                 )
             )
-            sync_notice = "I’m syncing your recent email and calendar in the background now. I’ll text you when the first pass is ready."
+            sync_notice = (
+                "I’m syncing your recent email and calendar in the background now. I’ll text you when the first pass is ready."
+                if callback.onboarding_transition.state.is_complete
+                else None
+            )
 
             if oauth_state.thread_id and (dm_messages or sync_notice):
                 channel = self.store.get_channel(oauth_state.thread_id)
                 if channel is not None:
                     for message in dm_messages:
                         self._safe_send_channel_message(channel=channel, message=message)
-                    self._safe_send_channel_message(channel=channel, message=sync_notice)
+                    if sync_notice:
+                        self._safe_send_channel_message(channel=channel, message=sync_notice)
                 else:
                     fallback_channel = self._find_channel_by_provider_id(oauth_state.thread_id)
                     if fallback_channel is not None:
                         for message in dm_messages:
                             self._safe_send_channel_message(channel=fallback_channel, message=message)
-                        self._safe_send_channel_message(channel=fallback_channel, message=sync_notice)
+                        if sync_notice:
+                            self._safe_send_channel_message(channel=fallback_channel, message=sync_notice)
 
             if became_complete:
                 self._record_onboarding_completion(
@@ -426,11 +428,11 @@ class FlorenceProductionService:
             self._launch_google_sync_job(
                 connection_id=callback.connection.id,
                 thread_id=oauth_state.thread_id or None,
-                notify_when_finished=callback.onboarding_transition.state.is_complete,
+                notify_when_finished=True,
             )
             if onboarding_link is not None:
                 redirect_message = (
-                    "Google connected. Taking you back to Florence setup now."
+                    "Google connected. Taking you back to Florence so you can track sync progress."
                     if not callback.onboarding_transition.state.is_complete
                     else "Google connected. Florence is ready and your first sync is running now."
                 )
@@ -774,9 +776,14 @@ class FlorenceProductionService:
             if channel is None:
                 return
 
-            review_prompt = candidate_review_service.build_next_review_prompt(
-                household_id=result.connection.household_id,
-                member_id=result.connection.member_id,
+            setup_payload = self._serialize_web_setup(
+                self._build_web_context(
+                    household_id=result.connection.household_id,
+                    member_id=result.connection.member_id,
+                    thread_id=thread_id or channel.provider_channel_id,
+                    resolved_via="sync",
+                    auth_email=None,
+                )
             )
             ready_sequence_sent = False
             if self._is_web_setup_ready(
@@ -796,15 +803,31 @@ class FlorenceProductionService:
                 )
             if notify_when_finished:
                 if not ready_sequence_sent:
-                    summary_message = (
-                        f"First sync complete. I found {len(result.sync_result.candidates)} item"
-                        f"{'' if len(result.sync_result.candidates) == 1 else 's'} to review."
-                        if result.sync_result.candidates
-                        else "First sync complete. I’m connected and didn’t pull out anything obvious yet."
-                    )
-                    self._safe_send_channel_message(channel=channel, message=summary_message, store=store)
-            if review_prompt is not None:
-                self._safe_send_channel_message(channel=channel, message=review_prompt.text, store=store)
+                    if setup_payload["setup"]["phase"] == "collect_household_profile":
+                        onboarding_link = (
+                            self.onboarding_link_service.build_link(
+                                household_id=result.connection.household_id,
+                                member_id=result.connection.member_id,
+                                thread_id=thread_id or channel.provider_channel_id,
+                            ).url
+                            if self.onboarding_link_service is not None
+                            else None
+                        )
+                        for message in build_sync_complete_finish_profile_message_sequence(onboarding_link):
+                            self._safe_send_channel_message(channel=channel, message=message, store=store)
+                    else:
+                        summary_message = (
+                            f"First sync complete. I found {len(result.sync_result.candidates)} item"
+                            f"{'' if len(result.sync_result.candidates) == 1 else 's'} to review."
+                            if result.sync_result.candidates
+                            else "First sync complete. I’m connected and didn’t pull out anything obvious yet."
+                        )
+                        self._safe_send_channel_message(channel=channel, message=summary_message, store=store)
+            self._nudge_for_new_pending_candidates(
+                household_id=result.connection.household_id,
+                member_id=result.connection.member_id,
+                candidates=result.sync_result.candidates,
+            )
         except Exception:
             logger.exception("Florence background Google sync failed connection_id=%s", connection_id)
             self._mark_connection_sync_error(

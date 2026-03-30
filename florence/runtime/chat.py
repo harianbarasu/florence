@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable
 
 from florence.contracts import (
@@ -42,6 +42,7 @@ class FlorenceHouseholdChatService:
         enabled_toolsets: list[str] | tuple[str, ...] | None = None,
         disabled_toolsets: list[str] | tuple[str, ...] | None = None,
         agent_factory: Callable[..., Any] | None = None,
+        session_db: Any | None = None,
     ):
         self.store = store
         self.model = model
@@ -50,6 +51,7 @@ class FlorenceHouseholdChatService:
         self.enabled_toolsets = list(enabled_toolsets) if enabled_toolsets is not None else ["florence_chat"]
         self.disabled_toolsets = list(disabled_toolsets or [])
         self.agent_factory = agent_factory
+        self.session_db = session_db or self._build_session_db()
 
     def respond(
         self,
@@ -67,7 +69,10 @@ class FlorenceHouseholdChatService:
         )
         if not system_message:
             return None
-        history = self._build_conversation_history(conversation_history or [])
+        history, session_id = self._load_conversation_history(
+            channel_id=channel_id,
+            fallback_messages=conversation_history or [],
+        )
         result = self._run_agent_conversation(
             household_id=household_id,
             channel_id=channel_id,
@@ -75,6 +80,7 @@ class FlorenceHouseholdChatService:
             user_message=message_text,
             system_message=system_message,
             conversation_history=history,
+            session_id=session_id,
         )
         final_response = str(result.get("final_response") or "").strip()
         if not final_response:
@@ -138,6 +144,7 @@ class FlorenceHouseholdChatService:
         user_message: str,
         system_message: str,
         conversation_history: list[dict[str, str]] | None,
+        session_id: str | None = None,
         enabled_toolsets: list[str] | None = None,
         disabled_toolsets: list[str] | None = None,
     ) -> dict[str, Any]:
@@ -173,15 +180,71 @@ class FlorenceHouseholdChatService:
                 quiet_mode=True,
                 skip_memory=True,
                 platform="florence",
+                session_id=session_id,
+                session_db=self.session_db,
             )
-            return agent.run_conversation(
+            result = agent.run_conversation(
                 user_message=user_message,
                 system_message=system_message,
                 conversation_history=conversation_history,
                 task_id=task_id,
             )
+            self._persist_channel_session_id(
+                channel_id=channel_id,
+                session_id=str(getattr(agent, "session_id", "") or "").strip(),
+            )
+            return result
         finally:
             clear_household_tool_context(task_id)
+
+    @staticmethod
+    def _build_session_db() -> Any | None:
+        try:
+            from hermes_state import SessionDB
+
+            return SessionDB()
+        except Exception:
+            return None
+
+    def _default_session_id(self, channel_id: str) -> str:
+        return f"florence-channel-{channel_id}"
+
+    def _current_channel_session_id(self, channel_id: str) -> str:
+        channel = self.store.get_channel(channel_id)
+        if channel is None:
+            return self._default_session_id(channel_id)
+        metadata = dict(channel.metadata) if isinstance(channel.metadata, dict) else {}
+        stored = str(metadata.get("hermes_session_id") or "").strip()
+        return stored or self._default_session_id(channel_id)
+
+    def _persist_channel_session_id(self, *, channel_id: str, session_id: str | None) -> None:
+        cleaned = str(session_id or "").strip()
+        if not cleaned:
+            return
+        channel = self.store.get_channel(channel_id)
+        if channel is None:
+            return
+        metadata = dict(channel.metadata) if isinstance(channel.metadata, dict) else {}
+        if str(metadata.get("hermes_session_id") or "").strip() == cleaned:
+            return
+        metadata["hermes_session_id"] = cleaned
+        self.store.upsert_channel(replace(channel, metadata=metadata))
+
+    def _load_conversation_history(
+        self,
+        *,
+        channel_id: str,
+        fallback_messages: list[ChannelMessage],
+    ) -> tuple[list[dict[str, str]], str]:
+        session_id = self._current_channel_session_id(channel_id)
+        if self.session_db is not None:
+            try:
+                transcript = self.session_db.get_messages_as_conversation(session_id)
+                if transcript:
+                    return transcript, session_id
+            except Exception:
+                logger.debug("Florence SessionDB load failed for channel_id=%s", channel_id, exc_info=True)
+        return self._build_conversation_history(fallback_messages), session_id
 
     @staticmethod
     def _build_conversation_history(messages: list[ChannelMessage]) -> list[dict[str, str]]:

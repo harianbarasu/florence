@@ -1170,10 +1170,33 @@ class FlorenceGoogleSyncPersistenceService:
     def save_google_connection(self, connection: GoogleConnection) -> GoogleConnection:
         return self.store.upsert_google_connection(connection)
 
+    @staticmethod
+    def _merged_candidate_state(*, existing: ImportedCandidate, incoming: ImportedCandidate) -> CandidateState:
+        if existing.state in {CandidateState.CONFIRMED, CandidateState.REJECTED}:
+            return existing.state
+        if existing.state == CandidateState.PENDING_REVIEW or incoming.state == CandidateState.PENDING_REVIEW:
+            return CandidateState.PENDING_REVIEW
+        return incoming.state
+
+    def _merge_with_existing_candidate(self, candidate: ImportedCandidate) -> ImportedCandidate:
+        existing = self.store.get_imported_candidate(candidate.id)
+        if existing is None:
+            return candidate
+        merged_metadata = dict(existing.metadata)
+        merged_metadata.update(candidate.metadata)
+        return replace(
+            candidate,
+            state=self._merged_candidate_state(existing=existing, incoming=candidate),
+            confidence_bps=candidate.confidence_bps if candidate.confidence_bps is not None else existing.confidence_bps,
+            metadata=merged_metadata,
+        )
+
     def persist_sync_batch(self, batch: FlorenceGoogleSyncBatch) -> FlorenceGoogleSyncResult:
         result = build_google_import_candidates(batch)
         persisted = [
-            self.store.upsert_imported_candidate(self.source_rule_service.apply_candidate_policy(candidate))
+            self.store.upsert_imported_candidate(
+                self._merge_with_existing_candidate(self.source_rule_service.apply_candidate_policy(candidate))
+            )
             for candidate in result.candidates
         ]
         household = self.store.get_household(batch.connection.household_id)

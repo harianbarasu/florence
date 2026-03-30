@@ -218,6 +218,174 @@ def test_dm_onboarding_prefers_web_handoff_when_link_service_is_available(tmp_pa
     store.close()
 
 
+def test_dm_status_question_after_google_connect_returns_sync_progress_sequence(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_hybrid_onboarding_service(store, review_service)
+    ingress = FlorenceMessagingIngressService(
+        store,
+        onboarding_service,
+        review_service,
+        FlorenceHouseholdQueryService(store),
+        google_account_link_service=_StubGoogleAccountLinkService(),
+        onboarding_link_service=_StubOnboardingLinkService(),
+    )
+
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+        display_name="Maya",
+    )
+    onboarding_service.record_household_operations(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+        household_operations=["school forms", "pickup planning"],
+    )
+    onboarding_service.record_google_connected(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+    )
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_sync_progress",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="What's the sync status?",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert result.reply_messages == (
+        "Google connected.",
+        "I’m syncing your recent email and calendar in the background now.",
+        "If you want to track setup progress on your computer, use this link:",
+        "https://florence.example.com/v1/florence/onboarding?token=test-token",
+        "I’ll text you here when the first pass is ready.",
+    )
+    store.close()
+
+
+def test_dm_acknowledgement_during_sync_does_not_loop_setup_messages(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_hybrid_onboarding_service(store, review_service)
+    ingress = FlorenceMessagingIngressService(
+        store,
+        onboarding_service,
+        review_service,
+        FlorenceHouseholdQueryService(store),
+        google_account_link_service=_StubGoogleAccountLinkService(),
+        onboarding_link_service=_StubOnboardingLinkService(),
+    )
+
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+        display_name="Maya",
+    )
+    onboarding_service.record_household_operations(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+        household_operations=["school forms", "pickup planning"],
+    )
+    onboarding_service.record_google_connected(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+    )
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_sync_ack",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="Sounds good",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert result.consumed is True
+    assert result.reply_text is None
+    assert result.reply_messages == ()
+    store.close()
+
+
+def test_dm_substantive_message_during_sync_uses_household_chat_service(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_hybrid_onboarding_service(store, review_service)
+    chat_service = _StubHouseholdChatService("I can help you think through Friday pickup while the sync finishes.")
+    ingress = FlorenceMessagingIngressService(
+        store,
+        onboarding_service,
+        review_service,
+        FlorenceHouseholdQueryService(store),
+        google_account_link_service=_StubGoogleAccountLinkService(),
+        onboarding_link_service=_StubOnboardingLinkService(),
+        household_chat_service=chat_service,
+    )
+
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+        display_name="Maya",
+    )
+    onboarding_service.record_household_operations(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+        household_operations=["school forms", "pickup planning"],
+    )
+    onboarding_service.record_google_connected(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+    )
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_sync_substantive",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="Can you help me think through Friday pickup while this is syncing?",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert result.consumed is True
+    assert result.reply_text == "I can help you think through Friday pickup while the sync finishes."
+    assert "first Gmail and Calendar sync is still running" in chat_service.calls[0]["message_text"]
+    store.close()
+
+
 def test_complete_dm_routes_freeform_chat_through_household_chat_service(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)

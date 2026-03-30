@@ -85,6 +85,35 @@ def build_onboarding_ready_message_sequence() -> tuple[str, ...]:
     )
 
 
+def build_google_connected_syncing_message_sequence(link_url: str | None = None) -> tuple[str, ...]:
+    """Return the post-OAuth copy while the first sync is still running."""
+    messages = [
+        "Google connected.",
+        "I’m syncing your recent email and calendar in the background now.",
+    ]
+    if link_url:
+        messages.extend(
+            [
+                "If you want to track setup progress on your computer, use this link:",
+                link_url,
+            ]
+        )
+    messages.append("I’ll text you here when the first pass is ready.")
+    return tuple(messages)
+
+
+def build_sync_complete_finish_profile_message_sequence(link_url: str | None = None) -> tuple[str, ...]:
+    """Return the post-sync handoff when profile grounding is still incomplete."""
+    messages = [
+        "First sync complete.",
+        "Go back to Florence setup on your computer to add kids, schools, and activities so I can finish onboarding.",
+    ]
+    if link_url:
+        messages.append(link_url)
+    messages.append("Once that is done, I’ll switch into normal chat mode here.")
+    return tuple(messages)
+
+
 def build_web_onboarding_handoff_sequence(
     link_url: str | None,
     *,

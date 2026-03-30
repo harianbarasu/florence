@@ -133,6 +133,80 @@ def test_candidate_review_prompt_asks_once_for_unknown_source_classification(tmp
     store.close()
 
 
+def test_google_sync_persistence_service_preserves_review_metadata_and_terminal_state(tmp_path, monkeypatch):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    google_service = FlorenceGoogleSyncPersistenceService(store)
+    connection = GoogleConnection(
+        id="gconn_123",
+        household_id="hh_123",
+        member_id="mem_123",
+        email="parent@example.com",
+        connected_scopes=(GoogleSourceKind.GMAIL,),
+        metadata={"primary_calendar_timezone": "America/Los_Angeles"},
+    )
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_123",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:gmail_123",
+            title="Young Minds invoice",
+            summary="Existing candidate already reviewed.",
+            state=CandidateState.CONFIRMED,
+            metadata={
+                "review_nudged_at": "2026-03-30T03:30:00Z",
+                "confirmed_event_id": "evt_123",
+            },
+        )
+    )
+
+    monkeypatch.setattr(
+        "florence.runtime.services.build_google_import_candidates",
+        lambda _batch: type(
+            "_FakeSyncResult",
+            (),
+            {
+                "candidates": [
+                    ImportedCandidate(
+                        id="cand_123",
+                        household_id="hh_123",
+                        member_id="mem_123",
+                        source_kind=GoogleSourceKind.GMAIL,
+                        source_identifier="gmail:gmail_123",
+                        title="Young Minds invoice",
+                        summary="Re-imported from Gmail.",
+                        state=CandidateState.PENDING_REVIEW,
+                        metadata={"confirmation_question": "Should I add this invoice to your household plan?"},
+                    )
+                ],
+                "skipped_count": 0,
+            },
+        )(),
+    )
+
+    result = google_service.persist_sync_batch(
+        FlorenceGoogleSyncBatch(
+            connection=connection,
+            context=HouseholdContext(
+                household_id="hh_123",
+                actor_member_id="mem_123",
+                channel_id="chan_dm_123",
+            ),
+        )
+    )
+
+    persisted = result.candidates[0]
+    stored = store.get_imported_candidate("cand_123")
+
+    assert persisted.state == CandidateState.CONFIRMED
+    assert persisted.metadata["review_nudged_at"] == "2026-03-30T03:30:00Z"
+    assert persisted.metadata["confirmed_event_id"] == "evt_123"
+    assert persisted.metadata["confirmation_question"] == "Should I add this invoice to your household plan?"
+    assert stored == persisted
+    store.close()
+
+
 def test_onboarding_service_releases_quarantined_candidates_once_grounded(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)

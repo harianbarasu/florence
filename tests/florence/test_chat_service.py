@@ -18,6 +18,7 @@ from florence.contracts import (
 )
 from florence.runtime.chat import FlorenceHouseholdChatService
 from florence.state import FlorenceStateDB
+from hermes_state import SessionDB
 
 
 class _FakeAgent:
@@ -26,6 +27,7 @@ class _FakeAgent:
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
+        self.session_id = kwargs.get("session_id")
         _FakeAgent.created.append(kwargs)
 
     def run_conversation(self, user_message, system_message, conversation_history=None, task_id=None):
@@ -36,6 +38,18 @@ class _FakeAgent:
             "task_id": task_id,
         }
         return {"final_response": "Use the confirmed plan: Ava has soccer on Thursday."}
+
+
+class _RotatingSessionAgent(_FakeAgent):
+    def run_conversation(self, user_message, system_message, conversation_history=None, task_id=None):
+        result = super().run_conversation(
+            user_message,
+            system_message,
+            conversation_history=conversation_history,
+            task_id=task_id,
+        )
+        self.session_id = "florence-channel-chan_dm_123-next"
+        return result
 
 
 def test_household_chat_service_uses_hermes_agent_with_confirmed_state(tmp_path):
@@ -175,6 +189,8 @@ def test_household_chat_service_uses_hermes_agent_with_confirmed_state(tmp_path)
     assert _FakeAgent.created[0]["provider"] == "anthropic"
     assert _FakeAgent.created[0]["enabled_toolsets"] == ["florence_chat"]
     assert _FakeAgent.created[0]["disabled_toolsets"] is None
+    assert _FakeAgent.created[0]["session_id"] == "florence-channel-chan_dm_123"
+    assert _FakeAgent.created[0]["session_db"] is not None
     assert "Confirmed household events" in _FakeAgent.last_run["system_message"]
     assert "Ava soccer practice" in _FakeAgent.last_run["system_message"]
     assert "Open household work items" in _FakeAgent.last_run["system_message"]
@@ -194,6 +210,135 @@ def test_household_chat_service_uses_hermes_agent_with_confirmed_state(tmp_path)
     assert "Do not ask the user to forward or paste an email" in _FakeAgent.last_run["system_message"]
     assert "Household operating policy:" in _FakeAgent.last_run["system_message"]
     assert _FakeAgent.last_run["task_id"].startswith("florence-household-")
+    store.close()
+
+
+def test_household_chat_service_prefers_session_db_transcript_for_channel(tmp_path):
+    _FakeAgent.created.clear()
+    _FakeAgent.last_run = None
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    session_db = SessionDB(tmp_path / "hermes-state.db")
+    store.upsert_household(
+        Household(
+            id="hh_123",
+            name="Maya's household",
+            timezone="America/Los_Angeles",
+        )
+    )
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm_thread_123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+            metadata={"hermes_session_id": "florence-channel-chan_dm_123-next"},
+        )
+    )
+    session_db.create_session(
+        session_id="florence-channel-chan_dm_123-next",
+        source="florence",
+        model="anthropic/claude-opus-4.6",
+    )
+    session_db.append_message(
+        session_id="florence-channel-chan_dm_123-next",
+        role="user",
+        content="Earlier question from Hermes transcript",
+    )
+    session_db.append_message(
+        session_id="florence-channel-chan_dm_123-next",
+        role="assistant",
+        content="Earlier Hermes reply",
+    )
+
+    service = FlorenceHouseholdChatService(
+        store,
+        model="anthropic/claude-opus-4.6",
+        max_iterations=4,
+        provider="anthropic",
+        agent_factory=_FakeAgent,
+        session_db=session_db,
+    )
+
+    reply = service.respond(
+        household_id="hh_123",
+        channel_id="chan_dm_123",
+        actor_member_id="mem_123",
+        message_text="What were we talking about?",
+        conversation_history=[],
+    )
+
+    assert reply is not None
+    assert _FakeAgent.created[0]["session_id"] == "florence-channel-chan_dm_123-next"
+    assert _FakeAgent.last_run["conversation_history"] == [
+        {"role": "user", "content": "Earlier question from Hermes transcript"},
+        {"role": "assistant", "content": "Earlier Hermes reply"},
+    ]
+    session_db.close()
+    store.close()
+
+
+def test_household_chat_service_persists_rotated_session_id_to_channel(tmp_path):
+    _FakeAgent.created.clear()
+    _FakeAgent.last_run = None
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    session_db = SessionDB(tmp_path / "hermes-state.db")
+    store.upsert_household(
+        Household(
+            id="hh_123",
+            name="Maya's household",
+            timezone="America/Los_Angeles",
+        )
+    )
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm_thread_123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+
+    service = FlorenceHouseholdChatService(
+        store,
+        model="anthropic/claude-opus-4.6",
+        max_iterations=4,
+        provider="anthropic",
+        agent_factory=_RotatingSessionAgent,
+        session_db=session_db,
+    )
+
+    reply = service.respond(
+        household_id="hh_123",
+        channel_id="chan_dm_123",
+        actor_member_id="mem_123",
+        message_text="Keep going",
+    )
+
+    assert reply is not None
+    updated = store.get_channel("chan_dm_123")
+    assert updated is not None
+    assert updated.metadata["hermes_session_id"] == "florence-channel-chan_dm_123-next"
+    session_db.close()
     store.close()
 
 

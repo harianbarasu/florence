@@ -21,6 +21,7 @@ from florence.messaging.types import FlorenceInboundMessage
 from florence.onboarding import (
     OnboardingPrompt,
     OnboardingStage,
+    build_google_connected_syncing_message_sequence,
     build_onboarding_ready_message_sequence,
     build_google_connect_message_sequence,
     build_web_onboarding_handoff_sequence,
@@ -113,6 +114,16 @@ def _looks_like_google_done_prompt(text: str) -> bool:
     )
 
 
+def _looks_like_acknowledgement(text: str) -> bool:
+    return bool(
+        re.search(
+            r"^(?:ok|okay|sounds good|sgtm|got it|cool|nice|great|perfect|thanks|thank you|awesome|works for me|understood|roger|👍|🙏)\b",
+            text.strip(),
+            re.IGNORECASE,
+        )
+    )
+
+
 def _looks_like_schedule_question(text: str) -> bool:
     normalized = " ".join(text.split()).lower()
     if not normalized:
@@ -129,6 +140,16 @@ def _looks_like_schedule_question(text: str) -> bool:
     if re.search(r"\b(today|tomorrow|this week|next week)\b", normalized) and re.search(r"\b(we|our)\b", normalized):
         return True
     return False
+
+
+def _looks_like_sync_status_request(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:sync|status|progress|processing|still working|still syncing|when.*ready|how long|setup status|first pass|gmail|calendar)\b",
+            text,
+            re.IGNORECASE,
+        )
+    )
 
 
 def _looks_like_tracking_request(text: str) -> bool:
@@ -437,6 +458,8 @@ class FlorenceMessagingIngressService:
 
     def _handle_dm_message(self, resolved: FlorenceResolvedInboundMessage) -> FlorenceMessagingIngressResult:
         text = resolved.message.body.strip()
+        if not text:
+            return FlorenceMessagingIngressResult(consumed=True)
         member_id = _require_member_id(resolved.member_id)
         session = self.onboarding_service.get_or_create_session(
             household_id=resolved.household_id,
@@ -515,6 +538,52 @@ class FlorenceMessagingIngressService:
 
         if not session.is_complete:
             if self.onboarding_link_service is not None:
+                if session.google_connected:
+                    link = self.onboarding_link_service.build_link(
+                        household_id=resolved.household_id,
+                        member_id=member_id,
+                        thread_id=resolved.thread_id,
+                    )
+                    if _looks_like_acknowledgement(text):
+                        return FlorenceMessagingIngressResult(consumed=True)
+                    if (
+                        _looks_like_sync_status_request(text)
+                        or _looks_like_tracking_request(text)
+                        or _looks_like_review_request(text)
+                    ):
+                        return self._result_with_messages(
+                            build_google_connected_syncing_message_sequence(link.url)
+                        )
+                    if _looks_like_schedule_question(text):
+                        return FlorenceMessagingIngressResult(
+                            reply_text=(
+                                "I’m still syncing your recent email and calendar, so I’m not ready to answer from that data yet. "
+                                "I’ll text you when the first pass is ready. If you want, I can still help you think through plans manually in the meantime."
+                            ),
+                            consumed=True,
+                        )
+                    if self.household_chat_service is not None:
+                        history = self.store.list_channel_messages(channel_id=resolved.channel_id, limit=24)
+                        reply = self.household_chat_service.respond(
+                            household_id=resolved.household_id,
+                            channel_id=resolved.channel_id,
+                            actor_member_id=resolved.member_id,
+                            message_text=(
+                                "Context for this turn: the first Gmail and Calendar sync is still running. "
+                                "If the user asks for information that depends on synced inbox or calendar data, say that it is still syncing. "
+                                "For everything else, help normally.\n\n"
+                                f"User message: {resolved.message.body}"
+                            ),
+                            conversation_history=history[:-1] if history else None,
+                        )
+                        if reply is not None and reply.text.strip():
+                            return FlorenceMessagingIngressResult(reply_text=reply.text, consumed=True)
+                    return self._result_with_messages(
+                        (
+                            "I’m still syncing your recent email and calendar in the background.",
+                            "I’ll text you when the first pass is ready.",
+                        )
+                    )
                 return self._result_with_messages(
                     self._render_web_onboarding_messages(
                         household_id=resolved.household_id,

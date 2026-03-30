@@ -157,3 +157,118 @@ class TestParseResultContract:
                 assert tc.id is not None
                 assert isinstance(tc.function.name, str)
                 assert isinstance(tc.function.arguments, str)
+
+
+# ─── DeepSeek V3 parser tests ───────────────────────────────────────────
+
+class TestDeepSeekV3Parser:
+    @pytest.fixture
+    def parser(self):
+        return get_parser("deepseek_v3")
+
+    def test_no_tool_call(self, parser):
+        text = "Hello, how can I help you?"
+        content, tool_calls = parser.parse(text)
+        assert content == text
+        assert tool_calls is None
+
+    def test_single_tool_call(self, parser):
+        text = (
+            '<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n'
+            '```json\n{"city": "London"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>'
+        )
+        content, tool_calls = parser.parse(text)
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "get_weather"
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args["city"] == "London"
+
+    def test_multiple_tool_calls(self, parser):
+        text = (
+            '<｜tool▁calls▁begin｜>'
+            '<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n'
+            '```json\n{"city": "London"}\n```<｜tool▁call▁end｜>'
+            '<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_time\n'
+            '```json\n{"timezone": "UTC"}\n```<｜tool▁call▁end｜>'
+            '<｜tool▁calls▁end｜>'
+        )
+        content, tool_calls = parser.parse(text)
+        assert tool_calls is not None
+        assert len(tool_calls) == 2, f"Expected 2 tool calls, got {len(tool_calls)}"
+        names = [tc.function.name for tc in tool_calls]
+        assert "get_weather" in names
+        assert "get_time" in names
+
+    def test_tool_call_with_preceding_text(self, parser):
+        text = (
+            'Let me check that for you.\n'
+            '<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>terminal\n'
+            '```json\n{"command": "ls"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>'
+        )
+        content, tool_calls = parser.parse(text)
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+
+
+# ─── Mistral parser tests ───────────────────────────────────────────────
+
+class TestMistralParser:
+    @pytest.fixture
+    def parser(self):
+        return get_parser("mistral")
+
+    def test_no_tool_call(self, parser):
+        text = "Hello, how can I help you?"
+        content, tool_calls = parser.parse(text)
+        assert content == text
+        assert tool_calls is None
+
+    def test_pre_v11_single_tool_call(self, parser):
+        text = '[TOOL_CALLS] [{"name": "func", "arguments": {"key": "val"}}]'
+        content, tool_calls = parser.parse(text)
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "func"
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args["key"] == "val"
+
+    def test_pre_v11_nested_json(self, parser):
+        text = '[TOOL_CALLS] [{"name": "func", "arguments": {"nested": {"deep": true}}}]'
+        content, tool_calls = parser.parse(text)
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "func"
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args["nested"]["deep"] is True
+
+    def test_v11_single_tool_call(self, parser):
+        text = '[TOOL_CALLS]get_weather{"city": "London"}'
+        content, tool_calls = parser.parse(text)
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "get_weather"
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args["city"] == "London"
+
+    def test_v11_multiple_tool_calls(self, parser):
+        text = '[TOOL_CALLS]func1{"a": 1}[TOOL_CALLS]func2{"b": 2}'
+        content, tool_calls = parser.parse(text)
+        assert tool_calls is not None
+        assert len(tool_calls) == 2
+        names = [tc.function.name for tc in tool_calls]
+        assert "func1" in names
+        assert "func2" in names
+
+    def test_preceding_text_preserved(self, parser):
+        text = 'Hello[TOOL_CALLS]func{"a": 1}'
+        content, tool_calls = parser.parse(text)
+        assert content == "Hello"
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "func"
+
+    def test_malformed_json_fallback(self, parser):
+        text = "[TOOL_CALLS] not valid json"
+        content, tool_calls = parser.parse(text)
+        assert tool_calls is None

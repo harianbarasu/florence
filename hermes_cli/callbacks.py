@@ -12,6 +12,7 @@ import getpass
 
 from hermes_cli.banner import cprint, _DIM, _RST
 from hermes_cli.config import save_env_value_secure
+from hermes_constants import display_hermes_home
 
 
 def clarify_callback(cli, question, choices):
@@ -131,7 +132,8 @@ def prompt_for_secret(cli, var_name: str, prompt: str, metadata=None) -> dict:
             }
 
         stored = save_env_value_secure(var_name, value)
-        cprint(f"\n{_DIM}  ✓ Stored secret in ~/.hermes/.env as {var_name}{_RST}")
+        _dhh = display_hermes_home()
+        cprint(f"\n{_DIM}  ✓ Stored secret in {_dhh}/.env as {var_name}{_RST}")
         return {
             **stored,
             "skipped": False,
@@ -183,7 +185,8 @@ def prompt_for_secret(cli, var_name: str, prompt: str, metadata=None) -> dict:
                 }
 
             stored = save_env_value_secure(var_name, value)
-            cprint(f"\n{_DIM}  ✓ Stored secret in ~/.hermes/.env as {var_name}{_RST}")
+            _dhh = display_hermes_home()
+            cprint(f"\n{_DIM}  ✓ Stored secret in {_dhh}/.env as {var_name}{_RST}")
             return {
                 **stored,
                 "skipped": False,
@@ -227,43 +230,53 @@ def approval_callback(cli, command: str, description: str) -> str:
     Shows a selection UI with choices: once / session / always / deny.
     When the command is longer than 70 characters, a "view" option is
     included so the user can reveal the full text before deciding.
+
+    Uses cli._approval_lock to serialize concurrent requests (e.g. from
+    parallel delegation subtasks) so each prompt gets its own turn.
     """
-    timeout = 60
-    response_queue = queue.Queue()
-    choices = ["once", "session", "always", "deny"]
-    if len(command) > 70:
-        choices.append("view")
+    lock = getattr(cli, "_approval_lock", None)
+    if lock is None:
+        import threading
+        cli._approval_lock = threading.Lock()
+        lock = cli._approval_lock
 
-    cli._approval_state = {
-        "command": command,
-        "description": description,
-        "choices": choices,
-        "selected": 0,
-        "response_queue": response_queue,
-    }
-    cli._approval_deadline = _time.monotonic() + timeout
+    with lock:
+        timeout = 60
+        response_queue = queue.Queue()
+        choices = ["once", "session", "always", "deny"]
+        if len(command) > 70:
+            choices.append("view")
 
-    if hasattr(cli, "_app") and cli._app:
-        cli._app.invalidate()
+        cli._approval_state = {
+            "command": command,
+            "description": description,
+            "choices": choices,
+            "selected": 0,
+            "response_queue": response_queue,
+        }
+        cli._approval_deadline = _time.monotonic() + timeout
 
-    while True:
-        try:
-            result = response_queue.get(timeout=1)
-            cli._approval_state = None
-            cli._approval_deadline = 0
-            if hasattr(cli, "_app") and cli._app:
-                cli._app.invalidate()
-            return result
-        except queue.Empty:
-            remaining = cli._approval_deadline - _time.monotonic()
-            if remaining <= 0:
-                break
-            if hasattr(cli, "_app") and cli._app:
-                cli._app.invalidate()
+        if hasattr(cli, "_app") and cli._app:
+            cli._app.invalidate()
 
-    cli._approval_state = None
-    cli._approval_deadline = 0
-    if hasattr(cli, "_app") and cli._app:
-        cli._app.invalidate()
-    cprint(f"\n{_DIM}  ⏱ Timeout — denying command{_RST}")
-    return "deny"
+        while True:
+            try:
+                result = response_queue.get(timeout=1)
+                cli._approval_state = None
+                cli._approval_deadline = 0
+                if hasattr(cli, "_app") and cli._app:
+                    cli._app.invalidate()
+                return result
+            except queue.Empty:
+                remaining = cli._approval_deadline - _time.monotonic()
+                if remaining <= 0:
+                    break
+                if hasattr(cli, "_app") and cli._app:
+                    cli._app.invalidate()
+
+        cli._approval_state = None
+        cli._approval_deadline = 0
+        if hasattr(cli, "_app") and cli._app:
+            cli._app.invalidate()
+        cprint(f"\n{_DIM}  ⏱ Timeout — denying command{_RST}")
+        return "deny"

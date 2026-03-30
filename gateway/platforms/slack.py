@@ -12,7 +12,7 @@ import asyncio
 import logging
 import os
 import re
-from typing import Dict, List, Optional, Any
+from typing import Dict, Optional, Any
 
 try:
     from slack_bolt.async_app import AsyncApp
@@ -37,8 +37,6 @@ from gateway.platforms.base import (
     SendResult,
     SUPPORTED_DOCUMENT_TYPES,
     cache_document_from_bytes,
-    cache_image_from_url,
-    cache_audio_from_url,
 )
 
 
@@ -74,6 +72,7 @@ class SlackAdapter(BasePlatformAdapter):
         self._handler: Optional[AsyncSocketModeHandler] = None
         self._bot_user_id: Optional[str] = None
         self._user_name_cache: Dict[str, str] = {}  # user_id → display name
+        self._socket_mode_task: Optional[asyncio.Task] = None
 
     async def connect(self) -> bool:
         """Connect to Slack via Socket Mode."""
@@ -94,6 +93,17 @@ class SlackAdapter(BasePlatformAdapter):
             return False
 
         try:
+            # Acquire scoped lock to prevent duplicate app token usage
+            from gateway.status import acquire_scoped_lock
+            self._token_lock_identity = app_token
+            acquired, existing = acquire_scoped_lock('slack-app-token', app_token, metadata={'platform': 'slack'})
+            if not acquired:
+                owner_pid = existing.get('pid') if isinstance(existing, dict) else None
+                message = f'Slack app token already in use' + (f' (PID {owner_pid})' if owner_pid else '') + '. Stop the other gateway first.'
+                logger.error('[%s] %s', self.name, message)
+                self._set_fatal_error('slack_token_lock', message, retryable=False)
+                return False
+
             self._app = AsyncApp(token=bot_token)
 
             # Get our own bot user ID for mention detection
@@ -121,7 +131,7 @@ class SlackAdapter(BasePlatformAdapter):
 
             # Start Socket Mode handler in background
             self._handler = AsyncSocketModeHandler(self._app, app_token)
-            asyncio.create_task(self._handler.start_async())
+            self._socket_mode_task = asyncio.create_task(self._handler.start_async())
 
             self._running = True
             logger.info("[Slack] Connected as @%s (Socket Mode)", bot_name)
@@ -139,6 +149,16 @@ class SlackAdapter(BasePlatformAdapter):
             except Exception as e:  # pragma: no cover - defensive logging
                 logger.warning("[Slack] Error while closing Socket Mode handler: %s", e, exc_info=True)
         self._running = False
+
+        # Release the token lock (use stored identity, not re-read env)
+        try:
+            from gateway.status import release_scoped_lock
+            if getattr(self, '_token_lock_identity', None):
+                release_scoped_lock('slack-app-token', self._token_lock_identity)
+                self._token_lock_identity = None
+        except Exception:
+            pass
+
         logger.info("[Slack] Disconnected")
 
     async def send(
@@ -259,6 +279,30 @@ class SlackAdapter(BasePlatformAdapter):
             if metadata.get("thread_ts"):
                 return metadata["thread_ts"]
         return reply_to
+
+    async def _upload_file(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Upload a local file to Slack."""
+        if not self._app:
+            return SendResult(success=False, error="Not connected")
+
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"File not found: {file_path}")
+
+        result = await self._app.client.files_upload_v2(
+            channel=chat_id,
+            file=file_path,
+            filename=os.path.basename(file_path),
+            initial_comment=caption or "",
+            thread_ts=self._resolve_thread_ts(reply_to, metadata),
+        )
+        return SendResult(success=True, raw_response=result)
 
     # ----- Markdown → mrkdwn conversion -----
 
@@ -417,23 +461,10 @@ class SlackAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send a local image file to Slack by uploading it."""
-        if not self._app:
-            return SendResult(success=False, error="Not connected")
-
         try:
-            import os
-            if not os.path.exists(image_path):
-                return SendResult(success=False, error=f"Image file not found: {image_path}")
-
-            result = await self._app.client.files_upload_v2(
-                channel=chat_id,
-                file=image_path,
-                filename=os.path.basename(image_path),
-                initial_comment=caption or "",
-                thread_ts=self._resolve_thread_ts(reply_to, metadata),
-            )
-            return SendResult(success=True, raw_response=result)
-
+            return await self._upload_file(chat_id, image_path, caption, reply_to, metadata)
+        except FileNotFoundError:
+            return SendResult(success=False, error=f"Image file not found: {image_path}")
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error(
                 "[%s] Failed to send local Slack image %s: %s",
@@ -495,21 +526,13 @@ class SlackAdapter(BasePlatformAdapter):
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
     ) -> SendResult:
         """Send an audio file to Slack."""
-        if not self._app:
-            return SendResult(success=False, error="Not connected")
-
         try:
-            result = await self._app.client.files_upload_v2(
-                channel=chat_id,
-                file=audio_path,
-                filename=os.path.basename(audio_path),
-                initial_comment=caption or "",
-                thread_ts=self._resolve_thread_ts(reply_to, metadata),
-            )
-            return SendResult(success=True, raw_response=result)
-
+            return await self._upload_file(chat_id, audio_path, caption, reply_to, metadata)
+        except FileNotFoundError:
+            return SendResult(success=False, error=f"Audio file not found: {audio_path}")
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error(
                 "[Slack] Failed to send audio file %s: %s",
@@ -786,23 +809,11 @@ class SlackAdapter(BasePlatformAdapter):
         user_id = command.get("user_id", "")
         channel_id = command.get("channel_id", "")
 
-        # Map subcommands to gateway commands
-        subcommand_map = {
-            "new": "/reset", "reset": "/reset",
-            "status": "/status", "stop": "/stop",
-            "help": "/help",
-            "model": "/model", "personality": "/personality",
-            "retry": "/retry", "undo": "/undo",
-            "compact": "/compress", "compress": "/compress",
-            "resume": "/resume",
-            "background": "/background",
-            "usage": "/usage",
-            "insights": "/insights",
-            "title": "/title",
-            "reasoning": "/reasoning",
-            "provider": "/provider",
-            "rollback": "/rollback",
-        }
+        # Map subcommands to gateway commands — derived from central registry.
+        # Also keep "compact" as a Slack-specific alias for /compress.
+        from hermes_cli.commands import slack_subcommand_map
+        subcommand_map = slack_subcommand_map()
+        subcommand_map["compact"] = "/compress"
         first_word = text.split()[0] if text else ""
         if first_word in subcommand_map:
             # Preserve arguments after the subcommand
@@ -829,33 +840,65 @@ class SlackAdapter(BasePlatformAdapter):
         await self.handle_message(event)
 
     async def _download_slack_file(self, url: str, ext: str, audio: bool = False) -> str:
-        """Download a Slack file using the bot token for auth."""
+        """Download a Slack file using the bot token for auth, with retry."""
+        import asyncio
         import httpx
 
         bot_token = self.config.token
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-            response = await client.get(
-                url,
-                headers={"Authorization": f"Bearer {bot_token}"},
-            )
-            response.raise_for_status()
+        last_exc = None
 
-        if audio:
-            from gateway.platforms.base import cache_audio_from_bytes
-            return cache_audio_from_bytes(response.content, ext)
-        else:
-            from gateway.platforms.base import cache_image_from_bytes
-            return cache_image_from_bytes(response.content, ext)
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            for attempt in range(3):
+                try:
+                    response = await client.get(
+                        url,
+                        headers={"Authorization": f"Bearer {bot_token}"},
+                    )
+                    response.raise_for_status()
+
+                    if audio:
+                        from gateway.platforms.base import cache_audio_from_bytes
+                        return cache_audio_from_bytes(response.content, ext)
+                    else:
+                        from gateway.platforms.base import cache_image_from_bytes
+                        return cache_image_from_bytes(response.content, ext)
+                except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
+                    last_exc = exc
+                    if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 429:
+                        raise
+                    if attempt < 2:
+                        logger.debug("Slack file download retry %d/2 for %s: %s",
+                                     attempt + 1, url[:80], exc)
+                        await asyncio.sleep(1.5 * (attempt + 1))
+                        continue
+                    raise
+        raise last_exc
 
     async def _download_slack_file_bytes(self, url: str) -> bytes:
-        """Download a Slack file and return raw bytes."""
+        """Download a Slack file and return raw bytes, with retry."""
+        import asyncio
         import httpx
 
         bot_token = self.config.token
+        last_exc = None
+
         async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-            response = await client.get(
-                url,
-                headers={"Authorization": f"Bearer {bot_token}"},
-            )
-            response.raise_for_status()
-        return response.content
+            for attempt in range(3):
+                try:
+                    response = await client.get(
+                        url,
+                        headers={"Authorization": f"Bearer {bot_token}"},
+                    )
+                    response.raise_for_status()
+                    return response.content
+                except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
+                    last_exc = exc
+                    if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 429:
+                        raise
+                    if attempt < 2:
+                        logger.debug("Slack file download retry %d/2 for %s: %s",
+                                     attempt + 1, url[:80], exc)
+                        await asyncio.sleep(1.5 * (attempt + 1))
+                        continue
+                    raise
+        raise last_exc

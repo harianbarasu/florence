@@ -1,15 +1,54 @@
 #!/usr/bin/env python3
 """File Tools Module - LLM agent file manipulation tools."""
 
+import errno
 import json
 import logging
 import os
 import threading
-from typing import Optional
+from pathlib import Path
 from tools.file_operations import ShellFileOperations
 from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
+
+
+_EXPECTED_WRITE_ERRNOS = {errno.EACCES, errno.EPERM, errno.EROFS}
+
+# Paths that file tools should refuse to write to without going through the
+# terminal tool's approval system.  These match prefixes after os.path.realpath.
+_SENSITIVE_PATH_PREFIXES = ("/etc/", "/boot/", "/usr/lib/systemd/")
+_SENSITIVE_EXACT_PATHS = {"/var/run/docker.sock", "/run/docker.sock"}
+
+
+def _check_sensitive_path(filepath: str) -> str | None:
+    """Return an error message if the path targets a sensitive system location."""
+    try:
+        resolved = os.path.realpath(os.path.expanduser(filepath))
+    except (OSError, ValueError):
+        resolved = filepath
+    for prefix in _SENSITIVE_PATH_PREFIXES:
+        if resolved.startswith(prefix):
+            return (
+                f"Refusing to write to sensitive system path: {filepath}\n"
+                "Use the terminal tool with sudo if you need to modify system files."
+            )
+    if resolved in _SENSITIVE_EXACT_PATHS:
+        return (
+            f"Refusing to write to sensitive system path: {filepath}\n"
+            "Use the terminal tool with sudo if you need to modify system files."
+        )
+    return None
+
+
+def _is_expected_write_exception(exc: Exception) -> bool:
+    """Return True for expected write denials that should not hit error logs."""
+    if isinstance(exc, PermissionError):
+        return True
+    if isinstance(exc, OSError) and exc.errno in _EXPECTED_WRITE_ERRNOS:
+        return True
+    return False
+
 
 _file_ops_lock = threading.Lock()
 _file_ops_cache: dict = {}
@@ -36,8 +75,8 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
     from tools.terminal_tool import (
         _active_environments, _env_lock, _create_environment,
         _get_env_config, _last_activity, _start_cleanup_thread,
-        _check_disk_usage_warning,
-        _creation_locks, _creation_locks_lock,
+        _creation_locks,
+        _creation_locks_lock,
     )
     import time
 
@@ -101,13 +140,33 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                     "container_persistent": config.get("container_persistent", True),
                     "docker_volumes": config.get("docker_volumes", []),
                 }
+
+            ssh_config = None
+            if env_type == "ssh":
+                ssh_config = {
+                    "host": config.get("ssh_host", ""),
+                    "user": config.get("ssh_user", ""),
+                    "port": config.get("ssh_port", 22),
+                    "key": config.get("ssh_key", ""),
+                    "persistent": config.get("ssh_persistent", False),
+                }
+
+            local_config = None
+            if env_type == "local":
+                local_config = {
+                    "persistent": config.get("local_persistent", False),
+                }
+
             terminal_env = _create_environment(
                 env_type=env_type,
                 image=image,
                 cwd=cwd,
                 timeout=config["timeout"],
+                ssh_config=ssh_config,
                 container_config=container_config,
+                local_config=local_config,
                 task_id=task_id,
+                host_cwd=config.get("host_cwd"),
             )
 
             with _env_lock:
@@ -136,6 +195,28 @@ def clear_file_ops_cache(task_id: str = None):
 def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = "default") -> str:
     """Read a file with pagination and line numbers."""
     try:
+        # Security: block direct reads of internal Hermes cache/index files
+        # to prevent prompt injection via catalog or hub metadata files.
+        import pathlib as _pathlib
+        from hermes_constants import get_hermes_home as _get_hh
+        _resolved = _pathlib.Path(path).expanduser().resolve()
+        _hermes_home = _get_hh().resolve()
+        _blocked_dirs = [
+            _hermes_home / "skills" / ".hub" / "index-cache",
+            _hermes_home / "skills" / ".hub",
+        ]
+        for _blocked in _blocked_dirs:
+            try:
+                _resolved.relative_to(_blocked)
+                return json.dumps({
+                    "error": (
+                        f"Access denied: {path} is an internal Hermes cache file "
+                        "and cannot be read directly to prevent prompt injection. "
+                        "Use the skills_list or skill_view tools instead."
+                    )
+                })
+            except ValueError:
+                pass
         file_ops = _get_file_ops(task_id)
         result = file_ops.read_file(path, offset, limit)
         if result.content:
@@ -233,12 +314,18 @@ def notify_other_tool_call(task_id: str = "default"):
 
 def write_file_tool(path: str, content: str, task_id: str = "default") -> str:
     """Write content to a file."""
+    sensitive_err = _check_sensitive_path(path)
+    if sensitive_err:
+        return json.dumps({"error": sensitive_err}, ensure_ascii=False)
     try:
         file_ops = _get_file_ops(task_id)
         result = file_ops.write_file(path, content)
         return json.dumps(result.to_dict(), ensure_ascii=False)
     except Exception as e:
-        logger.error("write_file error: %s: %s", type(e).__name__, e)
+        if _is_expected_write_exception(e):
+            logger.debug("write_file expected denial: %s: %s", type(e).__name__, e)
+        else:
+            logger.error("write_file error: %s: %s", type(e).__name__, e, exc_info=True)
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
 
@@ -246,6 +333,18 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                new_string: str = None, replace_all: bool = False, patch: str = None,
                task_id: str = "default") -> str:
     """Patch a file using replace mode or V4A patch format."""
+    # Check sensitive paths for both replace (explicit path) and V4A patch (extract paths)
+    _paths_to_check = []
+    if path:
+        _paths_to_check.append(path)
+    if mode == "patch" and patch:
+        import re as _re
+        for _m in _re.finditer(r'^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$', patch, _re.MULTILINE):
+            _paths_to_check.append(_m.group(1).strip())
+    for _p in _paths_to_check:
+        sensitive_err = _check_sensitive_path(_p)
+        if sensitive_err:
+            return json.dumps({"error": sensitive_err}, ensure_ascii=False)
     try:
         file_ops = _get_file_ops(task_id)
         
@@ -280,7 +379,17 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
     """Search for content or files."""
     try:
         # Track searches to detect *consecutive* repeated search loops.
-        search_key = ("search", pattern, target, str(path), file_glob or "")
+        # Include pagination args so users can page through truncated
+        # results without tripping the repeated-search guard.
+        search_key = (
+            "search",
+            pattern,
+            target,
+            str(path),
+            file_glob or "",
+            limit,
+            offset,
+        )
         with _read_tracker_lock:
             task_data = _read_tracker.setdefault(task_id, {
                 "last_key": None, "consecutive": 0, "read_history": set(),
@@ -448,7 +557,7 @@ def _handle_search_files(args, **kw):
         output_mode=args.get("output_mode", "content"), context=args.get("context", 0), task_id=tid)
 
 
-registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, handler=_handle_read_file, check_fn=_check_file_reqs)
-registry.register(name="write_file", toolset="file", schema=WRITE_FILE_SCHEMA, handler=_handle_write_file, check_fn=_check_file_reqs)
-registry.register(name="patch", toolset="file", schema=PATCH_SCHEMA, handler=_handle_patch, check_fn=_check_file_reqs)
-registry.register(name="search_files", toolset="file", schema=SEARCH_FILES_SCHEMA, handler=_handle_search_files, check_fn=_check_file_reqs)
+registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, handler=_handle_read_file, check_fn=_check_file_reqs, emoji="📖")
+registry.register(name="write_file", toolset="file", schema=WRITE_FILE_SCHEMA, handler=_handle_write_file, check_fn=_check_file_reqs, emoji="✍️")
+registry.register(name="patch", toolset="file", schema=PATCH_SCHEMA, handler=_handle_patch, check_fn=_check_file_reqs, emoji="🔧")
+registry.register(name="search_files", toolset="file", schema=SEARCH_FILES_SCHEMA, handler=_handle_search_files, check_fn=_check_file_reqs, emoji="🔎")

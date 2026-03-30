@@ -18,10 +18,8 @@ from hermes_cli.setup import (
     print_header,
     print_info,
     print_success,
-    print_warning,
     print_error,
     prompt_yes_no,
-    prompt_choice,
 )
 
 logger = logging.getLogger(__name__)
@@ -90,7 +88,19 @@ def claw_command(args):
 
 def _cmd_migrate(args):
     """Run the OpenClaw → Hermes migration."""
-    source_dir = Path(getattr(args, "source", None) or Path.home() / ".openclaw")
+    # Check current and legacy OpenClaw directories
+    explicit_source = getattr(args, "source", None)
+    if explicit_source:
+        source_dir = Path(explicit_source)
+    else:
+        source_dir = Path.home() / ".openclaw"
+        if not source_dir.is_dir():
+            # Try legacy directory names
+            for legacy in (".clawdbot", ".moldbot"):
+                candidate = Path.home() / legacy
+                if candidate.is_dir():
+                    source_dir = candidate
+                    break
     dry_run = getattr(args, "dry_run", False)
     preset = getattr(args, "preset", "full")
     overwrite = getattr(args, "overwrite", False)
@@ -127,7 +137,7 @@ def _cmd_migrate(args):
         print()
         print_error(f"OpenClaw directory not found: {source_dir}")
         print_info("Make sure your OpenClaw installation is at the expected path.")
-        print_info(f"You can specify a custom path: hermes claw migrate --source /path/to/.openclaw")
+        print_info("You can specify a custom path: hermes claw migrate --source /path/to/.openclaw")
         return
 
     # Find the migration script
@@ -208,7 +218,6 @@ def _print_migration_report(report: dict, dry_run: bool):
     skipped = summary.get("skipped", 0)
     conflicts = summary.get("conflict", 0)
     errors = summary.get("error", 0)
-    total = migrated + skipped + conflicts + errors
 
     print()
     if dry_run:
@@ -242,7 +251,7 @@ def _print_migration_report(report: dict, dry_run: bool):
             print()
 
         if conflict_items:
-            print(color(f"  ⚠ Conflicts (skipped — use --overwrite to force):", Colors.YELLOW))
+            print(color("  ⚠ Conflicts (skipped — use --overwrite to force):", Colors.YELLOW))
             for item in conflict_items:
                 kind = item.get("kind", "unknown")
                 reason = item.get("reason", "already exists")
@@ -250,7 +259,7 @@ def _print_migration_report(report: dict, dry_run: bool):
             print()
 
         if skipped_items:
-            print(color(f"  ─ Skipped:", Colors.DIM))
+            print(color("  ─ Skipped:", Colors.DIM))
             for item in skipped_items:
                 kind = item.get("kind", "unknown")
                 reason = item.get("reason", "")
@@ -258,7 +267,7 @@ def _print_migration_report(report: dict, dry_run: bool):
             print()
 
         if error_items:
-            print(color(f"  ✗ Errors:", Colors.RED))
+            print(color("  ✗ Errors:", Colors.RED))
             for item in error_items:
                 kind = item.get("kind", "unknown")
                 reason = item.get("reason", "unknown error")
@@ -294,3 +303,18 @@ def _print_migration_report(report: dict, dry_run: bool):
     elif migrated:
         print()
         print_success("Migration complete!")
+        # Warn if API keys were skipped (migrate_secrets not enabled)
+        skipped_keys = [
+            i for i in report.get("items", [])
+            if i.get("kind") == "provider-keys" and i.get("status") == "skipped"
+        ]
+        if skipped_keys:
+            print()
+            print(color("  ⚠ API keys were NOT migrated (secrets migration is disabled by default).", Colors.YELLOW))
+            print(color("  Your OPENROUTER_API_KEY and other provider keys must be added manually.", Colors.YELLOW))
+            print()
+            print_info("To migrate API keys, re-run with:")
+            print_info("  hermes claw migrate --migrate-secrets")
+            print()
+            print_info("Or add your key manually:")
+            print_info("  hermes config set OPENROUTER_API_KEY sk-or-v1-...")

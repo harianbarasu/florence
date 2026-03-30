@@ -1,19 +1,20 @@
-FROM python:3.11-slim
+FROM debian:13.4
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    HERMES_HOME=/data/hermes-home \
-    FLORENCE_HTTP_HOST=0.0.0.0
+RUN apt-get update
+RUN apt-get install -y nodejs npm python3 python3-pip ripgrep ffmpeg gcc python3-dev libffi-dev
 
-WORKDIR /app
+COPY . /opt/hermes
+WORKDIR /opt/hermes
 
-RUN mkdir -p /data/hermes-home
+RUN pip install -e ".[all]" --break-system-packages
+RUN npm install
+RUN npx playwright install --with-deps chromium
+WORKDIR /opt/hermes/scripts/whatsapp-bridge
+RUN npm install
 
-COPY . /app
+WORKDIR /opt/hermes
+RUN chmod +x /opt/hermes/docker/entrypoint.sh
 
-RUN pip install --upgrade pip && pip install .
-
-EXPOSE 8080
-
-CMD ["florence-server"]
+ENV HERMES_HOME=/opt/data
+VOLUME [ "/opt/data" ]
+ENTRYPOINT [ "/opt/hermes/docker/entrypoint.sh" ]

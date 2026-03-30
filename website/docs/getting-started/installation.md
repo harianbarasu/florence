@@ -59,6 +59,10 @@ The only prerequisite is **Git**. The installer automatically handles everything
 You do **not** need to install Python, Node.js, ripgrep, or ffmpeg manually. The installer detects what's missing and installs it for you. Just make sure `git` is available (`git --version`).
 :::
 
+:::tip Nix users
+If you use Nix (on NixOS, macOS, or Linux), there's a dedicated setup path with a Nix flake, declarative NixOS module, and optional container mode. See the **[Nix & NixOS Setup](./nix-setup.md)** guide.
+:::
+
 ---
 
 ## Manual Installation
@@ -119,10 +123,12 @@ uv pip install -e "."
 | `cli` | Terminal menu UI for setup wizard | `uv pip install -e ".[cli]"` |
 | `modal` | Modal cloud execution backend | `uv pip install -e ".[modal]"` |
 | `tts-premium` | ElevenLabs premium voices | `uv pip install -e ".[tts-premium]"` |
+| `voice` | CLI microphone input + audio playback | `uv pip install -e ".[voice]"` |
 | `pty` | PTY terminal support | `uv pip install -e ".[pty]"` |
 | `honcho` | AI-native memory (Honcho integration) | `uv pip install -e ".[honcho]"` |
 | `mcp` | Model Context Protocol support | `uv pip install -e ".[mcp]"` |
 | `homeassistant` | Home Assistant integration | `uv pip install -e ".[homeassistant]"` |
+| `acp` | ACP editor integration support | `uv pip install -e ".[acp]"` |
 | `slack` | Slack messaging | `uv pip install -e ".[slack]"` |
 | `dev` | pytest & test utilities | `uv pip install -e ".[dev]"` |
 
@@ -130,13 +136,10 @@ You can combine extras: `uv pip install -e ".[messaging,cron]"`
 
 </details>
 
-### Step 4: Install Submodule Packages
+### Step 4: Install Optional Submodules (if needed)
 
 ```bash
-# Terminal tool backend (required for terminal/command-execution)
-uv pip install -e "./mini-swe-agent"
-
-# RL training backend
+# RL training backend (optional)
 uv pip install -e "./tinker-atropos"
 ```
 
@@ -236,7 +239,6 @@ export VIRTUAL_ENV="$(pwd)/venv"
 
 # Install everything
 uv pip install -e ".[all]"
-uv pip install -e "./mini-swe-agent"
 uv pip install -e "./tinker-atropos"
 npm install  # optional, for browser tools and WhatsApp
 

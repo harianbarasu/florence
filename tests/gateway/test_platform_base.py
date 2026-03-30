@@ -62,6 +62,18 @@ class TestMessageEventGetCommand:
         event = MessageEvent(text="/")
         assert event.get_command() == ""
 
+    def test_command_with_at_botname(self):
+        event = MessageEvent(text="/new@TigerNanoBot")
+        assert event.get_command() == "new"
+
+    def test_command_with_at_botname_and_args(self):
+        event = MessageEvent(text="/compress@TigerNanoBot")
+        assert event.get_command() == "compress"
+
+    def test_command_mixed_case_with_at_botname(self):
+        event = MessageEvent(text="/RESET@TigerNanoBot")
+        assert event.get_command() == "reset"
+
 
 class TestMessageEventGetCommandArgs:
     def test_command_with_args(self):
@@ -257,6 +269,29 @@ class TestExtractMedia:
         content = "Before\n\nMEDIA:/audio.ogg\n\n\n\nAfter"
         _, cleaned = BasePlatformAdapter.extract_media(content)
         assert "\n\n\n" not in cleaned
+
+    def test_media_tag_allows_optional_whitespace_after_colon(self):
+        content = "MEDIA: /path/to/audio.ogg"
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert media == [("/path/to/audio.ogg", False)]
+        assert cleaned == ""
+
+    def test_media_tag_strips_wrapping_quotes_and_backticks(self):
+        content = "MEDIA: `/path/to/file.png`\nMEDIA:\"/path/to/file2.png\"\nMEDIA:'/path/to/file3.png'"
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert media == [
+            ("/path/to/file.png", False),
+            ("/path/to/file2.png", False),
+            ("/path/to/file3.png", False),
+        ]
+        assert cleaned == ""
+
+    def test_media_tag_supports_quoted_paths_with_spaces(self):
+        content = "Here\nMEDIA: '/tmp/my image.png'\nAfter"
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert media == [("/tmp/my image.png", False)]
+        assert "Here" in cleaned
+        assert "After" in cleaned
 
 
 # ---------------------------------------------------------------------------

@@ -10,7 +10,9 @@ Run with:  python -m pytest tests/test_delegate.py -v
 """
 
 import json
+import os
 import sys
+import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -21,6 +23,7 @@ from tools.delegate_tool import (
     MAX_DEPTH,
     check_delegate_requirements,
     delegate_task,
+    _build_child_agent,
     _build_child_system_prompt,
     _strip_blocked_tools,
     _resolve_delegation_credentials,
@@ -43,6 +46,7 @@ def _make_mock_parent(depth=0):
     parent._session_db = None
     parent._delegate_depth = depth
     parent._active_children = []
+    parent._active_children_lock = threading.Lock()
     return parent
 
 
@@ -244,6 +248,101 @@ class TestDelegateTask(unittest.TestCase):
             self.assertEqual(kwargs["api_key"], parent.api_key)
             self.assertEqual(kwargs["provider"], parent.provider)
             self.assertEqual(kwargs["api_mode"], parent.api_mode)
+
+
+class TestToolNamePreservation(unittest.TestCase):
+    """Verify _last_resolved_tool_names is restored after subagent runs."""
+
+    def test_global_tool_names_restored_after_delegation(self):
+        """The process-global _last_resolved_tool_names must be restored
+        after a subagent completes so the parent's execute_code sandbox
+        generates correct imports."""
+        import model_tools
+
+        parent = _make_mock_parent(depth=0)
+        original_tools = ["terminal", "read_file", "web_search", "execute_code", "delegate_task"]
+        model_tools._last_resolved_tool_names = list(original_tools)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done", "completed": True, "api_calls": 1,
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(goal="Test tool preservation", parent_agent=parent)
+
+        self.assertEqual(model_tools._last_resolved_tool_names, original_tools)
+
+    def test_global_tool_names_restored_after_child_failure(self):
+        """Even when the child agent raises, the global must be restored."""
+        import model_tools
+
+        parent = _make_mock_parent(depth=0)
+        original_tools = ["terminal", "read_file", "web_search"]
+        model_tools._last_resolved_tool_names = list(original_tools)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.side_effect = RuntimeError("boom")
+            MockAgent.return_value = mock_child
+
+            result = json.loads(delegate_task(goal="Crash test", parent_agent=parent))
+            self.assertEqual(result["results"][0]["status"], "error")
+
+        self.assertEqual(model_tools._last_resolved_tool_names, original_tools)
+
+    def test_build_child_agent_does_not_raise_name_error(self):
+        """Regression: _build_child_agent must not reference _saved_tool_names.
+
+        The bug introduced by the e7844e9c merge conflict: line 235 inside
+        _build_child_agent read `list(_saved_tool_names)` where that variable
+        is only defined later in _run_single_child.  Calling _build_child_agent
+        standalone (without _run_single_child's scope) must never raise NameError.
+        """
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent"):
+            try:
+                _build_child_agent(
+                    task_index=0,
+                    goal="regression check",
+                    context=None,
+                    toolsets=None,
+                    model=None,
+                    max_iterations=10,
+                    parent_agent=parent,
+                )
+            except NameError as exc:
+                self.fail(
+                    f"_build_child_agent raised NameError — "
+                    f"_saved_tool_names leaked back into wrong scope: {exc}"
+                )
+
+    def test_saved_tool_names_set_on_child_before_run(self):
+        """_run_single_child must set _delegate_saved_tool_names on the child
+        from model_tools._last_resolved_tool_names before run_conversation."""
+        import model_tools
+
+        parent = _make_mock_parent(depth=0)
+        expected_tools = ["read_file", "web_search", "execute_code"]
+        model_tools._last_resolved_tool_names = list(expected_tools)
+
+        captured = {}
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+
+            def capture_and_return(user_message):
+                captured["saved"] = list(mock_child._delegate_saved_tool_names)
+                return {"final_response": "ok", "completed": True, "api_calls": 1}
+
+            mock_child.run_conversation.side_effect = capture_and_return
+            MockAgent.return_value = mock_child
+
+            delegate_task(goal="capture test", parent_agent=parent)
+
+        self.assertEqual(captured["saved"], expected_tools)
 
 
 class TestDelegateObservability(unittest.TestCase):
@@ -462,6 +561,43 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         self.assertEqual(creds["api_mode"], "chat_completions")
         mock_resolve.assert_called_once_with(requested="openrouter")
 
+    def test_direct_endpoint_uses_configured_base_url_and_api_key(self):
+        parent = _make_mock_parent(depth=0)
+        cfg = {
+            "model": "qwen2.5-coder",
+            "provider": "openrouter",
+            "base_url": "http://localhost:1234/v1",
+            "api_key": "local-key",
+        }
+        creds = _resolve_delegation_credentials(cfg, parent)
+        self.assertEqual(creds["model"], "qwen2.5-coder")
+        self.assertEqual(creds["provider"], "custom")
+        self.assertEqual(creds["base_url"], "http://localhost:1234/v1")
+        self.assertEqual(creds["api_key"], "local-key")
+        self.assertEqual(creds["api_mode"], "chat_completions")
+
+    def test_direct_endpoint_falls_back_to_openai_api_key_env(self):
+        parent = _make_mock_parent(depth=0)
+        cfg = {
+            "model": "qwen2.5-coder",
+            "base_url": "http://localhost:1234/v1",
+        }
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "env-openai-key"}, clear=False):
+            creds = _resolve_delegation_credentials(cfg, parent)
+        self.assertEqual(creds["api_key"], "env-openai-key")
+        self.assertEqual(creds["provider"], "custom")
+
+    def test_direct_endpoint_does_not_fall_back_to_openrouter_api_key_env(self):
+        parent = _make_mock_parent(depth=0)
+        cfg = {
+            "model": "qwen2.5-coder",
+            "base_url": "http://localhost:1234/v1",
+        }
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "env-openrouter-key"}, clear=False):
+            with self.assertRaises(ValueError) as ctx:
+                _resolve_delegation_credentials(cfg, parent)
+        self.assertIn("OPENAI_API_KEY", str(ctx.exception))
+
     @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
     def test_nous_provider_resolves_nous_credentials(self, mock_resolve):
         """Nous provider resolves Nous Portal base_url and api_key."""
@@ -591,6 +727,40 @@ class TestDelegationProviderIntegration(unittest.TestCase):
 
     @patch("tools.delegate_tool._load_config")
     @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_direct_endpoint_credentials_reach_child_agent(self, mock_creds, mock_cfg):
+        mock_cfg.return_value = {
+            "max_iterations": 45,
+            "model": "qwen2.5-coder",
+            "base_url": "http://localhost:1234/v1",
+            "api_key": "local-key",
+        }
+        mock_creds.return_value = {
+            "model": "qwen2.5-coder",
+            "provider": "custom",
+            "base_url": "http://localhost:1234/v1",
+            "api_key": "local-key",
+            "api_mode": "chat_completions",
+        }
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done", "completed": True, "api_calls": 1
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(goal="Direct endpoint test", parent_agent=parent)
+
+            _, kwargs = MockAgent.call_args
+            self.assertEqual(kwargs["model"], "qwen2.5-coder")
+            self.assertEqual(kwargs["provider"], "custom")
+            self.assertEqual(kwargs["base_url"], "http://localhost:1234/v1")
+            self.assertEqual(kwargs["api_key"], "local-key")
+            self.assertEqual(kwargs["api_mode"], "chat_completions")
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
     def test_empty_config_inherits_parent(self, mock_creds, mock_cfg):
         """When delegation config is empty, child inherits parent credentials."""
         mock_cfg.return_value = {"max_iterations": 45, "model": "", "provider": ""}
@@ -650,7 +820,12 @@ class TestDelegationProviderIntegration(unittest.TestCase):
         }
         parent = _make_mock_parent(depth=0)
 
-        with patch("tools.delegate_tool._run_single_child") as mock_run:
+        # Patch _build_child_agent since credentials are now passed there
+        # (agents are built in the main thread before being handed to workers)
+        with patch("tools.delegate_tool._build_child_agent") as mock_build, \
+             patch("tools.delegate_tool._run_single_child") as mock_run:
+            mock_child = MagicMock()
+            mock_build.return_value = mock_child
             mock_run.return_value = {
                 "task_index": 0, "status": "completed",
                 "summary": "Done", "api_calls": 1, "duration_seconds": 1.0
@@ -659,7 +834,8 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             tasks = [{"goal": "Task A"}, {"goal": "Task B"}]
             delegate_task(tasks=tasks, parent_agent=parent)
 
-            for call in mock_run.call_args_list:
+            self.assertEqual(mock_build.call_count, 2)
+            for call in mock_build.call_args_list:
                 self.assertEqual(call.kwargs.get("model"), "meta-llama/llama-4-scout")
                 self.assertEqual(call.kwargs.get("override_provider"), "openrouter")
                 self.assertEqual(call.kwargs.get("override_base_url"), "https://openrouter.ai/api/v1")

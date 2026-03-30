@@ -1,14 +1,25 @@
+# Git
 .git
+.gitignore
+.gitmodules
 .github
-.plans
+
+# Environment files
+.env
+.env.*
+
+# Python
 .pytest_cache
 .venv
-.env
 __pycache__
 *.pyc
 *.pyo
 *.pyd
 
+# Dependencies
+node_modules
+
+# Large docs / optional assets not needed in the base image
 tests
 website
 landingpage
@@ -16,10 +27,10 @@ docs
 plans
 optional-skills
 skills
-node_modules
 tinker-atropos
 mini-swe-agent
 
+# Lockfiles / local plans
 package-lock.json
 uv.lock
 PLAN-*.md

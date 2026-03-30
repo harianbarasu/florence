@@ -9,12 +9,13 @@ action="list" and for resolving human-friendly channel names to numeric IDs.
 import json
 import logging
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from hermes_cli.config import get_hermes_home
 
 logger = logging.getLogger(__name__)
 
-DIRECTORY_PATH = Path.home() / ".hermes" / "channel_directory.json"
+DIRECTORY_PATH = get_hermes_home() / "channel_directory.json"
 
 
 def _session_entry_id(origin: Dict[str, Any]) -> Optional[str]:
@@ -61,7 +62,7 @@ def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
             logger.warning("Channel directory: failed to build %s: %s", platform.value, e)
 
     # Telegram, WhatsApp & Signal can't enumerate chats -- pull from session history
-    for plat_name in ("telegram", "whatsapp", "signal", "email"):
+    for plat_name in ("telegram", "whatsapp", "signal", "email", "sms"):
         if plat_name not in platforms:
             platforms[plat_name] = _build_from_sessions(plat_name)
 
@@ -88,7 +89,7 @@ def _build_discord(adapter) -> List[Dict[str, str]]:
         return channels
 
     try:
-        import discord as _discord
+        import discord as _discord  # noqa: F401 — SDK presence check
     except ImportError:
         return channels
 
@@ -117,7 +118,6 @@ def _build_slack(adapter) -> List[Dict[str, str]]:
         return _build_from_sessions("slack")
 
     try:
-        import asyncio
         from tools.send_message_tool import _send_slack  # noqa: F401
         # Use the Slack Web API directly if available
     except Exception:
@@ -129,7 +129,7 @@ def _build_slack(adapter) -> List[Dict[str, str]]:
 
 def _build_from_sessions(platform_name: str) -> List[Dict[str, str]]:
     """Pull known channels/contacts from sessions.json origin data."""
-    sessions_path = Path.home() / ".hermes" / "sessions" / "sessions.json"
+    sessions_path = get_hermes_home() / "sessions" / "sessions.json"
     if not sessions_path.exists():
         return []
 

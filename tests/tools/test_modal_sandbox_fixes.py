@@ -1,13 +1,12 @@
 """Tests for Modal sandbox infrastructure fixes (TBLite baseline).
 
-Covers the 9 bugs discovered while setting up TBLite evaluation:
-1. Tool resolution — terminal + file tools load with minisweagent
+Covers the bugs discovered while setting up TBLite evaluation:
+1. Tool resolution — terminal + file tools load correctly
 2. CWD fix — host paths get replaced with /root for container backends
 3. ephemeral_disk version check
-4. Tilde ~ replaced with /root for container backends
-5. ensurepip fix in patches.py for Modal image builder
-6. install_pipx stays True for swerex-remote
-7. /home/ added to host prefix check
+4. ensurepip fix in Modal image builder
+5. No swe-rex dependency — uses native Modal SDK
+6. /home/ added to host prefix check
 """
 
 import os
@@ -36,17 +35,8 @@ except ImportError:
 class TestToolResolution:
     """Verify get_tool_definitions returns all expected tools for eval."""
 
-    def _has_minisweagent(self):
-        try:
-            import minisweagent  # noqa: F401
-            return True
-        except ImportError:
-            return False
-
     def test_terminal_and_file_toolsets_resolve_all_tools(self):
         """enabled_toolsets=['terminal', 'file'] should produce 6 tools."""
-        if not self._has_minisweagent():
-            pytest.skip("minisweagent not installed (git submodule update --init)")
         from model_tools import get_tool_definitions
         tools = get_tool_definitions(
             enabled_toolsets=["terminal", "file"],
@@ -58,18 +48,13 @@ class TestToolResolution:
 
     def test_terminal_tool_present(self):
         """The terminal tool must be present (not silently dropped)."""
-        if not self._has_minisweagent():
-            pytest.skip("minisweagent not installed (git submodule update --init)")
         from model_tools import get_tool_definitions
         tools = get_tool_definitions(
             enabled_toolsets=["terminal", "file"],
             quiet_mode=True,
         )
         names = [t["function"]["name"] for t in tools]
-        assert "terminal" in names, (
-            f"terminal tool missing! Only got: {names}. "
-            "Check that minisweagent is installed (git submodule update --init)."
-        )
+        assert "terminal" in names, f"terminal tool missing! Only got: {names}."
 
 
 # =========================================================================
@@ -91,8 +76,8 @@ class TestCwdHandling:
                 "/home/ paths should be replaced for modal backend."
             )
 
-    def test_users_path_replaced_for_docker(self):
-        """TERMINAL_CWD=/Users/... should be replaced with /root for docker."""
+    def test_users_path_replaced_for_docker_by_default(self):
+        """Docker should keep host paths out of the sandbox unless explicitly enabled."""
         with patch.dict(os.environ, {
             "TERMINAL_ENV": "docker",
             "TERMINAL_CWD": "/Users/someone/projects",
@@ -100,8 +85,22 @@ class TestCwdHandling:
             config = _tt_mod._get_env_config()
             assert config["cwd"] == "/root", (
                 f"Expected /root, got {config['cwd']}. "
-                "/Users/ paths should be replaced for docker backend."
+                "Host paths should be discarded for docker backend by default."
             )
+            assert config["host_cwd"] is None
+            assert config["docker_mount_cwd_to_workspace"] is False
+
+    def test_users_path_maps_to_workspace_for_docker_when_enabled(self):
+        """Docker should map the host cwd into /workspace only when explicitly enabled."""
+        with patch.dict(os.environ, {
+            "TERMINAL_ENV": "docker",
+            "TERMINAL_CWD": "/Users/someone/projects",
+            "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE": "true",
+        }):
+            config = _tt_mod._get_env_config()
+            assert config["cwd"] == "/workspace"
+            assert config["host_cwd"] == "/Users/someone/projects"
+            assert config["docker_mount_cwd_to_workspace"] is True
 
     def test_windows_path_replaced_for_modal(self):
         """TERMINAL_CWD=C:\\Users\\... should be replaced for modal."""
@@ -119,11 +118,26 @@ class TestCwdHandling:
                 # Remove TERMINAL_CWD so it uses default
                 env = os.environ.copy()
                 env.pop("TERMINAL_CWD", None)
+                env.pop("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", None)
                 with patch.dict(os.environ, env, clear=True):
                     config = _tt_mod._get_env_config()
                     assert config["cwd"] == "/root", (
                         f"Backend {backend}: expected /root default, got {config['cwd']}"
                     )
+
+    def test_docker_default_cwd_maps_current_directory_when_enabled(self):
+        """Docker should use /workspace when cwd mounting is explicitly enabled."""
+        with patch("tools.terminal_tool.os.getcwd", return_value="/home/user/project"):
+            with patch.dict(os.environ, {
+                "TERMINAL_ENV": "docker",
+                "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE": "true",
+            }, clear=False):
+                env = os.environ.copy()
+                env.pop("TERMINAL_CWD", None)
+                with patch.dict(os.environ, env, clear=True):
+                    config = _tt_mod._get_env_config()
+                    assert config["cwd"] == "/workspace"
+                    assert config["host_cwd"] == "/home/user/project"
 
     def test_local_backend_uses_getcwd(self):
         """Local backend should use os.getcwd(), not /root."""
@@ -133,6 +147,31 @@ class TestCwdHandling:
             with patch.dict(os.environ, env, clear=True):
                 config = _tt_mod._get_env_config()
                 assert config["cwd"] == os.getcwd()
+
+    def test_create_environment_passes_docker_host_cwd_and_flag(self, monkeypatch):
+        """Docker host cwd and mount flag should reach DockerEnvironment."""
+        captured = {}
+        sentinel = object()
+
+        def _fake_docker_environment(**kwargs):
+            captured.update(kwargs)
+            return sentinel
+
+        monkeypatch.setattr(_tt_mod, "_DockerEnvironment", _fake_docker_environment)
+
+        env = _tt_mod._create_environment(
+            env_type="docker",
+            image="python:3.11",
+            cwd="/workspace",
+            timeout=60,
+            container_config={"docker_mount_cwd_to_workspace": True},
+            host_cwd="/home/user/project",
+        )
+
+        assert env is sentinel
+        assert captured["cwd"] == "/workspace"
+        assert captured["host_cwd"] == "/home/user/project"
+        assert captured["auto_mount_cwd"] is True
 
     def test_ssh_preserves_home_paths(self):
         """SSH backend should NOT replace /home/ paths (they're valid remotely)."""
@@ -211,42 +250,48 @@ class TestModalEnvironmentDefaults:
 
 
 # =========================================================================
-# Test 7: ensurepip fix in patches.py
+# Test 7: ensurepip fix in ModalEnvironment
 # =========================================================================
 
 class TestEnsurepipFix:
-    """Verify the pip fix is applied in the patched Modal init."""
+    """Verify the pip fix is applied in the ModalEnvironment init."""
 
-    def test_patched_init_creates_image_with_setup_commands(self):
-        """The patched __init__ should create a modal.Image with pip fix."""
+    def test_modal_environment_creates_image_with_setup_commands(self):
+        """ModalEnvironment.__init__ should create a modal.Image with pip fix."""
         try:
-            from environments.patches import _patch_swerex_modal
+            from tools.environments.modal import ModalEnvironment
         except ImportError:
-            pytest.skip("environments.patches not importable")
+            pytest.skip("tools.environments.modal not importable")
 
-        # Check that the patch code references ensurepip
         import inspect
-        source = inspect.getsource(_patch_swerex_modal)
+        source = inspect.getsource(ModalEnvironment.__init__)
         assert "ensurepip" in source, (
-            "patches._patch_swerex_modal should include ensurepip fix "
+            "ModalEnvironment should include ensurepip fix "
             "for Modal's legacy image builder"
         )
         assert "setup_dockerfile_commands" in source, (
-            "patches._patch_swerex_modal should use setup_dockerfile_commands "
+            "ModalEnvironment should use setup_dockerfile_commands "
             "to fix pip before Modal's bootstrap"
         )
 
-    def test_patched_init_uses_install_pipx_from_config(self):
-        """The patched init should respect install_pipx from config."""
+    def test_modal_environment_uses_native_sdk(self):
+        """ModalEnvironment should use Modal SDK directly, not swe-rex."""
         try:
-            from environments.patches import _patch_swerex_modal
+            from tools.environments.modal import ModalEnvironment
         except ImportError:
-            pytest.skip("environments.patches not importable")
+            pytest.skip("tools.environments.modal not importable")
 
         import inspect
-        source = inspect.getsource(_patch_swerex_modal)
-        assert "install_pipx" in source, (
-            "patches._patch_swerex_modal should pass install_pipx to ModalDeployment"
+        source = inspect.getsource(ModalEnvironment)
+        assert "swerex" not in source.lower(), (
+            "ModalEnvironment should not depend on swe-rex; "
+            "use Modal SDK directly via Sandbox.create() + exec()"
+        )
+        assert "Sandbox.create.aio" in source, (
+            "ModalEnvironment should use async Modal Sandbox.create.aio()"
+        )
+        assert "exec.aio" in source, (
+            "ModalEnvironment should use Sandbox.exec.aio() for command execution"
         )
 
 

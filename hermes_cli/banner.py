@@ -6,10 +6,13 @@ Pure display functions with no HermesCLI state dependency.
 import json
 import logging
 import os
+import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
-from typing import Dict, List, Any, Optional
+from hermes_constants import get_hermes_home
+from typing import Dict, List, Optional
 
 from rich.console import Console
 from rich.panel import Panel
@@ -25,7 +28,7 @@ logger = logging.getLogger(__name__)
 # ANSI building blocks for conversation display
 # =========================================================================
 
-_GOLD = "\033[1;33m"
+_GOLD = "\033[1;38;2;255;215;0m"  # True-color #FFD700 bold
 _BOLD = "\033[1m"
 _DIM = "\033[2m"
 _RST = "\033[0m"
@@ -100,27 +103,22 @@ COMPACT_BANNER = """
 # =========================================================================
 
 def get_available_skills() -> Dict[str, List[str]]:
-    """Scan ~/.hermes/skills/ and return skills grouped by category."""
-    import os
+    """Return skills grouped by category, filtered by platform and disabled state.
 
-    hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
-    skills_dir = hermes_home / "skills"
-    skills_by_category = {}
+    Delegates to ``_find_all_skills()`` from ``tools/skills_tool`` which already
+    handles platform gating (``platforms:`` frontmatter) and respects the
+    user's ``skills.disabled`` config list.
+    """
+    try:
+        from tools.skills_tool import _find_all_skills
+        all_skills = _find_all_skills()  # already filtered
+    except Exception:
+        return {}
 
-    if not skills_dir.exists():
-        return skills_by_category
-
-    for skill_file in skills_dir.rglob("SKILL.md"):
-        rel_path = skill_file.relative_to(skills_dir)
-        parts = rel_path.parts
-        if len(parts) >= 2:
-            category = parts[0]
-            skill_name = parts[-2]
-        else:
-            category = "general"
-            skill_name = skill_file.parent.name
-        skills_by_category.setdefault(category, []).append(skill_name)
-
+    skills_by_category: Dict[str, List[str]] = {}
+    for skill in all_skills:
+        category = skill.get("category") or "general"
+        skills_by_category.setdefault(category, []).append(skill["name"])
     return skills_by_category
 
 
@@ -139,11 +137,13 @@ def check_for_updates() -> Optional[int]:
     ``~/.hermes/.update_check``).  Returns the number of commits behind,
     or ``None`` if the check fails or isn't applicable.
     """
-    hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+    hermes_home = get_hermes_home()
     repo_dir = hermes_home / "hermes-agent"
     cache_file = hermes_home / ".update_check"
 
-    # Must be a git repo
+    # Must be a git repo — fall back to project root for dev installs
+    if not (repo_dir / ".git").exists():
+        repo_dir = Path(__file__).parent.parent.resolve()
     if not (repo_dir / ".git").exists():
         return None
 
@@ -191,6 +191,30 @@ def check_for_updates() -> Optional[int]:
 
 
 # =========================================================================
+# Non-blocking update check
+# =========================================================================
+
+_update_result: Optional[int] = None
+_update_check_done = threading.Event()
+
+
+def prefetch_update_check():
+    """Kick off update check in a background daemon thread."""
+    def _run():
+        global _update_result
+        _update_result = check_for_updates()
+        _update_check_done.set()
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+
+
+def get_update_result(timeout: float = 0.5) -> Optional[int]:
+    """Get result of prefetched check. Returns None if not ready."""
+    _update_check_done.wait(timeout=timeout)
+    return _update_result
+
+
+# =========================================================================
 # Welcome banner
 # =========================================================================
 
@@ -203,6 +227,17 @@ def _format_context_length(tokens: int) -> str:
         val = tokens / 1_000
         return f"{val:g}K"
     return str(tokens)
+
+
+def _display_toolset_name(toolset_name: str) -> str:
+    """Normalize internal/legacy toolset identifiers for banner display."""
+    if not toolset_name:
+        return "unknown"
+    return (
+        toolset_name[:-6]
+        if toolset_name.endswith("_tools")
+        else toolset_name
+    )
 
 
 def build_welcome_banner(console: Console, model: str, cwd: str,
@@ -232,8 +267,18 @@ def build_welcome_banner(console: Console, model: str, cwd: str,
 
     _, unavailable_toolsets = check_tool_availability(quiet=True)
     disabled_tools = set()
+    # Tools whose toolset has a check_fn are lazy-initialized (e.g. honcho,
+    # homeassistant) — they show as unavailable at banner time because the
+    # check hasn't run yet, but they aren't misconfigured.
+    lazy_tools = set()
     for item in unavailable_toolsets:
-        disabled_tools.update(item.get("tools", []))
+        toolset_name = item.get("name", "")
+        ts_req = TOOLSET_REQUIREMENTS.get(toolset_name, {})
+        tools_in_ts = item.get("tools", [])
+        if ts_req.get("check_fn"):
+            lazy_tools.update(tools_in_ts)
+        else:
+            disabled_tools.update(tools_in_ts)
 
     layout_table = Table.grid(padding=(0, 2))
     layout_table.add_column("left", justify="center")
@@ -245,8 +290,18 @@ def build_welcome_banner(console: Console, model: str, cwd: str,
     text = _skin_color("banner_text", "#FFF8DC")
     session_color = _skin_color("session_border", "#8B8682")
 
-    left_lines = ["", HERMES_CADUCEUS, ""]
+    # Use skin's custom caduceus art if provided
+    try:
+        from hermes_cli.skin_engine import get_active_skin
+        _bskin = get_active_skin()
+        _hero = _bskin.banner_hero if hasattr(_bskin, 'banner_hero') and _bskin.banner_hero else HERMES_CADUCEUS
+    except Exception:
+        _bskin = None
+        _hero = HERMES_CADUCEUS
+    left_lines = ["", _hero, ""]
     model_short = model.split("/")[-1] if "/" in model else model
+    if model_short.endswith(".gguf"):
+        model_short = model_short[:-5]
     if len(model_short) > 28:
         model_short = model_short[:25] + "..."
     ctx_str = f" [dim {dim}]·[/] [dim {dim}]{_format_context_length(context_length)} context[/]" if context_length else ""
@@ -261,12 +316,12 @@ def build_welcome_banner(console: Console, model: str, cwd: str,
 
     for tool in tools:
         tool_name = tool["function"]["name"]
-        toolset = get_toolset_for_tool(tool_name) or "other"
+        toolset = _display_toolset_name(get_toolset_for_tool(tool_name) or "other")
         toolsets_dict.setdefault(toolset, []).append(tool_name)
 
     for item in unavailable_toolsets:
         toolset_id = item.get("id", item.get("name", "unknown"))
-        display_name = f"{toolset_id}_tools" if not toolset_id.endswith("_tools") else toolset_id
+        display_name = _display_toolset_name(toolset_id)
         if display_name not in toolsets_dict:
             toolsets_dict[display_name] = []
         for tool_name in item.get("tools", []):
@@ -283,6 +338,8 @@ def build_welcome_banner(console: Console, model: str, cwd: str,
         for name in sorted(tool_names):
             if name in disabled_tools:
                 colored_names.append(f"[red]{name}[/]")
+            elif name in lazy_tools:
+                colored_names.append(f"[yellow]{name}[/]")
             else:
                 colored_names.append(f"[{text}]{name}[/]")
 
@@ -302,14 +359,16 @@ def build_welcome_banner(console: Console, model: str, cwd: str,
                     colored_names.append("[dim]...[/]")
                 elif name in disabled_tools:
                     colored_names.append(f"[red]{name}[/]")
+                elif name in lazy_tools:
+                    colored_names.append(f"[yellow]{name}[/]")
                 else:
                     colored_names.append(f"[{text}]{name}[/]")
             tools_str = ", ".join(colored_names)
 
-        right_lines.append(f"[dim #B8860B]{toolset}:[/] {tools_str}")
+        right_lines.append(f"[dim {dim}]{toolset}:[/] {tools_str}")
 
     if remaining_toolsets > 0:
-        right_lines.append(f"[dim #B8860B](and {remaining_toolsets} more toolsets...)[/]")
+        right_lines.append(f"[dim {dim}](and {remaining_toolsets} more toolsets...)[/]")
 
     # MCP Servers section (only if configured)
     try:
@@ -320,12 +379,12 @@ def build_welcome_banner(console: Console, model: str, cwd: str,
 
     if mcp_status:
         right_lines.append("")
-        right_lines.append("[bold #FFBF00]MCP Servers[/]")
+        right_lines.append(f"[bold {accent}]MCP Servers[/]")
         for srv in mcp_status:
             if srv["connected"]:
                 right_lines.append(
-                    f"[dim #B8860B]{srv['name']}[/] [#FFF8DC]({srv['transport']})[/] "
-                    f"[dim #B8860B]—[/] [#FFF8DC]{srv['tools']} tool(s)[/]"
+                    f"[dim {dim}]{srv['name']}[/] [{text}]({srv['transport']})[/] "
+                    f"[dim {dim}]—[/] [{text}]{srv['tools']} tool(s)[/]"
                 )
             else:
                 right_lines.append(
@@ -358,11 +417,20 @@ def build_welcome_banner(console: Console, model: str, cwd: str,
     if mcp_connected:
         summary_parts.append(f"{mcp_connected} MCP servers")
     summary_parts.append("/help for commands")
+    # Show active profile name when not 'default'
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        _profile_name = get_active_profile_name()
+        if _profile_name and _profile_name != "default":
+            right_lines.append(f"[bold {accent}]Profile:[/] [{text}]{_profile_name}[/]")
+    except Exception:
+        pass  # Never break the banner over a profiles.py bug
+
     right_lines.append(f"[dim {dim}]{' · '.join(summary_parts)}[/]")
 
-    # Update check — show if behind origin/main
+    # Update check — use prefetched result if available
     try:
-        behind = check_for_updates()
+        behind = get_update_result(timeout=0.5)
         if behind and behind > 0:
             commits_word = "commit" if behind == 1 else "commits"
             right_lines.append(
@@ -386,6 +454,9 @@ def build_welcome_banner(console: Console, model: str, cwd: str,
     )
 
     console.print()
-    console.print(HERMES_AGENT_LOGO)
-    console.print()
+    term_width = shutil.get_terminal_size().columns
+    if term_width >= 95:
+        _logo = _bskin.banner_logo if _bskin and hasattr(_bskin, 'banner_logo') and _bskin.banner_logo else HERMES_AGENT_LOGO
+        console.print(_logo)
+        console.print()
     console.print(outer_panel)

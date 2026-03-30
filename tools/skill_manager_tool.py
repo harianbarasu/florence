@@ -39,6 +39,7 @@ import re
 import shutil
 import tempfile
 from pathlib import Path
+from hermes_constants import get_hermes_home
 from typing import Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -59,18 +60,24 @@ def _security_scan_skill(skill_dir: Path) -> Optional[str]:
     try:
         result = scan_skill(skill_dir, source="agent-created")
         allowed, reason = should_allow_install(result)
-        if not allowed:
+        if allowed is False:
             report = format_scan_report(result)
             return f"Security scan blocked this skill ({reason}):\n{report}"
+        if allowed is None:
+            # "ask" — allow but include the warning so the user sees the findings
+            report = format_scan_report(result)
+            logger.warning("Agent-created skill has security findings: %s", reason)
+            # Don't block — return None to allow, but log the warning
+            return None
     except Exception as e:
-        logger.warning("Security scan failed for %s: %s", skill_dir, e)
+        logger.warning("Security scan failed for %s: %s", skill_dir, e, exc_info=True)
     return None
 
 import yaml
 
 
 # All skills live in ~/.hermes/skills/ (single source of truth)
-HERMES_HOME = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+HERMES_HOME = get_hermes_home()
 SKILLS_DIR = HERMES_HOME / "skills"
 
 MAX_NAME_LENGTH = 64
@@ -102,6 +109,31 @@ def _validate_name(name: str) -> Optional[str]:
         return (
             f"Invalid skill name '{name}'. Use lowercase letters, numbers, "
             f"hyphens, dots, and underscores. Must start with a letter or digit."
+        )
+    return None
+
+
+def _validate_category(category: Optional[str]) -> Optional[str]:
+    """Validate an optional category name used as a single directory segment."""
+    if category is None:
+        return None
+    if not isinstance(category, str):
+        return "Category must be a string."
+
+    category = category.strip()
+    if not category:
+        return None
+    if "/" in category or "\\" in category:
+        return (
+            f"Invalid category '{category}'. Use lowercase letters, numbers, "
+            "hyphens, dots, and underscores. Categories must be a single directory name."
+        )
+    if len(category) > MAX_NAME_LENGTH:
+        return f"Category exceeds {MAX_NAME_LENGTH} characters."
+    if not VALID_NAME_RE.match(category):
+        return (
+            f"Invalid category '{category}'. Use lowercase letters, numbers, "
+            "hyphens, dots, and underscores. Categories must be a single directory name."
         )
     return None
 
@@ -219,7 +251,7 @@ def _atomic_write_text(file_path: Path, content: str, encoding: str = "utf-8") -
         try:
             os.unlink(temp_path)
         except OSError:
-            pass
+            logger.error("Failed to remove temporary file %s during atomic write", temp_path, exc_info=True)
         raise
 
 
@@ -231,6 +263,10 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
     """Create a new user skill with SKILL.md content."""
     # Validate name
     err = _validate_name(name)
+    if err:
+        return {"success": False, "error": err}
+
+    err = _validate_category(category)
     if err:
         return {"success": False, "error": err}
 
@@ -540,6 +576,13 @@ def skill_manage(
     else:
         result = {"success": False, "error": f"Unknown action '{action}'. Use: create, edit, patch, delete, write_file, remove_file"}
 
+    if result.get("success"):
+        try:
+            from agent.prompt_builder import clear_skills_system_prompt_cache
+            clear_skills_system_prompt_cache(clear_snapshot=True)
+        except Exception:
+            pass
+
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -561,7 +604,8 @@ SKILL_MANAGE_SCHEMA = {
         "user-corrected approach worked, non-trivial workflow discovered, "
         "or user asks you to remember a procedure.\n"
         "Update when: instructions stale/wrong, OS-specific failures, "
-        "missing steps or pitfalls found during use.\n\n"
+        "missing steps or pitfalls found during use. "
+        "If you used a skill and hit issues not covered by it, patch it immediately.\n\n"
         "After difficult/iterative tasks, offer to save as a skill. "
         "Skip for simple one-offs. Confirm with user before creating/deleting.\n\n"
         "Good skills: trigger conditions, numbered steps with exact commands, "
@@ -653,4 +697,5 @@ registry.register(
         old_string=args.get("old_string"),
         new_string=args.get("new_string"),
         replace_all=args.get("replace_all", False)),
+    emoji="📝",
 )

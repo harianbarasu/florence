@@ -295,7 +295,7 @@ export function SetupScreen({ token }: { token?: string }) {
 
   return (
     <div className="grid gap-6">
-      <div className="grid gap-6 xl:grid-cols-[minmax(0,1.28fr)_minmax(320px,0.72fr)]">
+      <div className="grid gap-6 lg:grid-cols-[minmax(0,1.28fr)_minmax(280px,0.72fr)]">
         <Card>
           <CardHeader>
             <div className="flex flex-wrap items-start justify-between gap-4">
@@ -493,7 +493,7 @@ export function SetupScreen({ token }: { token?: string }) {
         </Alert>
       ) : null}
 
-      <div className="grid gap-6 xl:grid-cols-[minmax(0,1.12fr)_minmax(320px,0.88fr)]">
+      <div className="grid gap-6 lg:grid-cols-[minmax(0,1.12fr)_minmax(280px,0.88fr)]">
         <Card>
           <CardHeader>
             <CardTitle>Household profile</CardTitle>
@@ -508,7 +508,7 @@ export function SetupScreen({ token }: { token?: string }) {
                 id="parent-name"
                 value={parentDisplayName}
                 onChange={(event) => setParentDisplayName(event.target.value)}
-                placeholder="Maya"
+                placeholder="e.g. Sarah"
               />
             </div>
 
@@ -542,7 +542,7 @@ export function SetupScreen({ token }: { token?: string }) {
                               ),
                             )
                           }
-                          placeholder="Theo"
+                          placeholder="e.g. Alex"
                         />
                       </div>
                       <div className="grid gap-2">
@@ -556,7 +556,7 @@ export function SetupScreen({ token }: { token?: string }) {
                               ),
                             )
                           }
-                          placeholder="1st grade, baseball, nickname Theo"
+                          placeholder="e.g. 2nd grade, soccer"
                         />
                       </div>
                     </div>
@@ -571,7 +571,7 @@ export function SetupScreen({ token }: { token?: string }) {
                 id="schools"
                 value={schoolsText}
                 onChange={(event) => setSchoolsText(event.target.value)}
-                placeholder={"Wish Community School\nYoung Minds Preschool"}
+                placeholder={"e.g. Westlake Elementary\nSunrise Preschool"}
               />
               {data.suggestions.schools.length ? (
                 <div className="flex flex-wrap gap-2">
@@ -600,7 +600,7 @@ export function SetupScreen({ token }: { token?: string }) {
                 id="activities"
                 value={activitiesText}
                 onChange={(event) => setActivitiesText(event.target.value)}
-                placeholder={"Theo baseball\nViolet dance\nBoth - Musical Beginnings"}
+                placeholder={"e.g. Soccer practice\nPiano lessons"}
               />
               {data.suggestions.activities.length ? (
                 <div className="flex flex-wrap gap-2">

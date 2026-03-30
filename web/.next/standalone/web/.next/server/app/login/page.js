@@ -15,6 +15,6 @@ R.c("server/chunks/ssr/33490_next_dist_client_components_9610ddc8._.js")
 R.c("server/chunks/ssr/33490_next_dist_client_components_builtin_forbidden_7c431319.js")
 R.c("server/chunks/ssr/33490_next_dist_client_components_builtin_unauthorized_c5c0f3ea.js")
 R.c("server/chunks/ssr/[root-of-the-server]__03e94664._.js")
-R.c("server/chunks/ssr/web_51388b36._.js")
+R.c("server/chunks/ssr/web_8a667a41._.js")
 R.m(86259)
 module.exports=R.m(86259).exports

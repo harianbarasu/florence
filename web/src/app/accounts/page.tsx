@@ -15,7 +15,7 @@ export default async function AccountsPage({
   const session = await auth();
 
   if (!session?.user?.email) {
-    return <GoogleSignInCard redirectTo="/accounts" title="Sign in to manage Florence accounts" />;
+    return <GoogleSignInCard redirectTo="/accounts" />;
   }
 
   return (

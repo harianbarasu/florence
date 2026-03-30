@@ -15,7 +15,7 @@ export default async function SettingsPage({
   const session = await auth();
 
   if (!session?.user?.email) {
-    return <GoogleSignInCard redirectTo="/settings" title="Sign in to manage Florence settings" />;
+    return <GoogleSignInCard redirectTo="/settings" />;
   }
 
   return (

@@ -9,5 +9,5 @@ export default async function LoginPage({
 }) {
   const resolved = (await searchParams) || {};
   const next = typeof resolved.next === "string" ? resolved.next : "/setup";
-  return <GoogleSignInCard redirectTo={next} title="Sign in to Florence web" />;
+  return <GoogleSignInCard redirectTo={next} />;
 }

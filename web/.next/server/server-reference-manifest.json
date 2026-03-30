@@ -13,18 +13,11 @@
           "async": false,
           "exportedName": "$$RSC_SERVER_ACTION_0",
           "filename": "web/src/components/app-shell.tsx"
-        },
-        "app/setup/page": {
-          "moduleId": 4162,
-          "async": false,
-          "exportedName": "$$RSC_SERVER_ACTION_0",
-          "filename": "web/src/components/app-shell.tsx"
         }
       },
       "layer": {
         "app/accounts/page": "rsc",
-        "app/settings/page": "rsc",
-        "app/setup/page": "rsc"
+        "app/settings/page": "rsc"
       },
       "filename": "web/src/components/app-shell.tsx",
       "exportedName": "$$RSC_SERVER_ACTION_0"
@@ -50,7 +43,7 @@
           "filename": "web/src/components/auth/google-sign-in-card.tsx"
         },
         "app/setup/page": {
-          "moduleId": 4162,
+          "moduleId": 81980,
           "async": false,
           "exportedName": "$$RSC_SERVER_ACTION_0",
           "filename": "web/src/components/auth/google-sign-in-card.tsx"

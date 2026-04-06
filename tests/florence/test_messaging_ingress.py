@@ -232,7 +232,7 @@ def test_dm_parent_name_reply_includes_friendly_google_link(tmp_path):
     store.close()
 
 
-def test_dm_onboarding_prefers_web_handoff_when_link_service_is_available(tmp_path):
+def test_dm_onboarding_stays_in_messages_even_when_link_service_is_available(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)
     onboarding_service = _build_hybrid_onboarding_service(store, review_service)
@@ -269,12 +269,11 @@ def test_dm_onboarding_prefers_web_handoff_when_link_service_is_available(tmp_pa
     )
     assert result.reply_messages == (
         "Hi, I'm Florence.",
-        "I’m easiest to set up on a computer. Finish setup there so I can learn your household, connect Google, and start acting like your house manager.",
-        "https://florence.example.com/v1/florence/onboarding?token=test-token",
-        "Once setup is done, I’ll text you here when I’m ready and when the first Gmail and Calendar pass finishes.",
+        "I help run the household with you by learning the family map first, then keeping up with reminders, logistics, school noise, and schedule changes.",
+        "Start with the kids I should know about: first name plus grade or age if helpful. One per line or comma-separated is fine.",
     )
-    assert session.parent_display_name is None
-    assert session.stage == "collect_parent_name"
+    assert session.parent_display_name == "Maya"
+    assert session.stage == "collect_child_names"
     store.close()
 
 
@@ -329,8 +328,6 @@ def test_dm_status_question_after_google_connect_returns_sync_progress_sequence(
     assert result.reply_messages == (
         "Google connected.",
         "I’m syncing your recent email and calendar in the background now.",
-        "If you want to track setup progress on your computer, use this link:",
-        "https://florence.example.com/v1/florence/onboarding?token=test-token",
         "I’ll text you here when the first pass is ready.",
     )
     store.close()
@@ -1275,6 +1272,76 @@ def test_operating_preferences_completion_unlocks_agent_without_requiring_group(
     )
     assert session.is_complete is True
     assert session.group_channel_id is None
+    store.close()
+
+
+def test_activity_completion_after_google_records_onboarding_completion(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_hybrid_onboarding_service(store, review_service)
+    ingress = FlorenceMessagingIngressService(
+        store,
+        onboarding_service,
+        review_service,
+        FlorenceHouseholdQueryService(store),
+    )
+
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+        display_name="Maya",
+    )
+    onboarding_service.record_child_names(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+        child_names=["Ava"],
+    )
+    onboarding_service.record_school_basics(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+        school_labels=["Roosevelt Elementary"],
+    )
+    onboarding_service.record_google_connected(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+    )
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_205",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="Soccer",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    session = onboarding_service.get_or_create_session(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+    )
+    events = store.list_pilot_events(household_id="hh_123", event_type="onboarding_complete")
+    assert result.consumed is True
+    assert result.reply_messages == (
+        "You're ready. Florence is set up as your house manager now.",
+        "Start with a real task like: what's on the kids' schedule next week, check my email for a school or camp update, remind me about picture day, or plan dinners and groceries for next week.",
+    )
+    assert session.is_complete is True
+    assert session.stage == "complete"
+    assert len(events) == 1
+    assert events[0].channel_id == "chan_dm_123"
     store.close()
 
 

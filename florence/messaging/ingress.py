@@ -25,7 +25,6 @@ from florence.onboarding import (
     build_google_connected_syncing_message_sequence,
     build_onboarding_ready_message_sequence,
     build_google_connect_message_sequence,
-    build_web_onboarding_handoff_sequence,
     extract_child_names,
     split_entries,
     split_labels,
@@ -144,6 +143,21 @@ def _looks_like_acknowledgement(text: str) -> bool:
         re.search(
             r"^(?:ok|okay|sounds good|sgtm|got it|cool|nice|great|perfect|thanks|thank you|awesome|works for me|understood|roger|👍|🙏)\b",
             text.strip(),
+            re.IGNORECASE,
+        )
+    )
+
+
+def _looks_like_general_chat_request(text: str) -> bool:
+    normalized = " ".join(text.split()).strip()
+    if not normalized:
+        return False
+    if "?" in normalized:
+        return True
+    return bool(
+        re.search(
+            r"^(?:can|could|would|what|when|where|who|why|how|show|check|find|plan|help|remind|review|list|share|send|post)\b",
+            normalized,
             re.IGNORECASE,
         )
     )
@@ -386,23 +400,6 @@ class FlorenceMessagingIngressService:
         if prompt.stage == OnboardingStage.CONNECT_GOOGLE:
             return intro + build_google_connect_message_sequence()
         return intro + (prompt.text,)
-
-    def _render_web_onboarding_messages(
-        self,
-        *,
-        household_id: str,
-        member_id: str,
-        thread_id: str,
-        include_intro: bool,
-    ) -> tuple[str, ...]:
-        if self.onboarding_link_service is None:
-            return ()
-        link = self.onboarding_link_service.build_link(
-            household_id=household_id,
-            member_id=member_id,
-            thread_id=thread_id,
-        )
-        return build_web_onboarding_handoff_sequence(link.url, include_intro=include_intro)
 
     def _channel_has_assistant_history(self, *, channel_id: str) -> bool:
         return any(
@@ -706,72 +703,54 @@ class FlorenceMessagingIngressService:
                     return FlorenceMessagingIngressResult(reply_text=review_prompt.text, consumed=True)
 
         if not session.is_complete:
-            if self.onboarding_link_service is not None:
-                if session.google_connected:
-                    link = self.onboarding_link_service.build_link(
-                        household_id=resolved.household_id,
-                        member_id=member_id,
-                        thread_id=resolved.thread_id,
+            if session.google_connected:
+                if _looks_like_acknowledgement(text):
+                    return FlorenceMessagingIngressResult(consumed=True)
+                if (
+                    _looks_like_sync_status_request(text)
+                    or _looks_like_tracking_request(text)
+                    or _looks_like_review_request(text)
+                ):
+                    return self._result_with_messages(build_google_connected_syncing_message_sequence())
+                if _looks_like_schedule_question(text):
+                    return FlorenceMessagingIngressResult(
+                        reply_text=(
+                            "I’m still syncing your recent email and calendar, so I’m not ready to answer from that data yet. "
+                            "I’ll text you when the first pass is ready. If you want, I can still help you think through plans manually in the meantime."
+                        ),
+                        consumed=True,
                     )
-                    if _looks_like_acknowledgement(text):
-                        return FlorenceMessagingIngressResult(consumed=True)
-                    if (
-                        _looks_like_sync_status_request(text)
-                        or _looks_like_tracking_request(text)
-                        or _looks_like_review_request(text)
-                    ):
-                        return self._result_with_messages(
-                            build_google_connected_syncing_message_sequence(link.url)
-                        )
-                    if _looks_like_schedule_question(text):
-                        return FlorenceMessagingIngressResult(
-                            reply_text=(
-                                "I’m still syncing your recent email and calendar, so I’m not ready to answer from that data yet. "
-                                "I’ll text you when the first pass is ready. If you want, I can still help you think through plans manually in the meantime."
-                            ),
-                            consumed=True,
-                        )
-                    if self.household_chat_service is not None:
-                        history = self.store.list_channel_messages(channel_id=resolved.channel_id, limit=24)
-                        contextual_message = (
-                            "Context for this turn: the first Gmail and Calendar sync is still running. "
-                            "If the user asks for information that depends on synced inbox or calendar data, say that it is still syncing. "
-                            "For everything else, help normally.\n\n"
-                            f"User message: {resolved.message.body}"
-                        )
-                        if capture_kind is not None:
-                            reply = self.household_chat_service.handle_capture_request(
-                                household_id=resolved.household_id,
-                                channel_id=resolved.channel_id,
-                                actor_member_id=resolved.member_id,
-                                message_text=contextual_message,
-                                capture_kind=capture_kind,
-                                conversation_history=history[:-1] if history else None,
-                            )
-                        else:
-                            reply = self.household_chat_service.respond(
-                                household_id=resolved.household_id,
-                                channel_id=resolved.channel_id,
-                                actor_member_id=resolved.member_id,
-                                message_text=contextual_message,
-                                conversation_history=history[:-1] if history else None,
-                            )
-                        if reply is not None and reply.text.strip():
-                            return FlorenceMessagingIngressResult(reply_text=reply.text, consumed=True)
-                    return self._result_with_messages(
-                        (
-                            "I’m still syncing your recent email and calendar in the background.",
-                            "I’ll text you when the first pass is ready.",
-                        )
+                if session.stage != OnboardingStage.CONNECT_GOOGLE and not _looks_like_general_chat_request(text):
+                    return self._handle_onboarding_message(resolved, session.stage, text)
+                if self.household_chat_service is not None:
+                    history = self.store.list_channel_messages(channel_id=resolved.channel_id, limit=24)
+                    contextual_message = (
+                        "Context for this turn: the first Gmail and Calendar sync is still running. "
+                        "If the user asks for information that depends on synced inbox or calendar data, say that it is still syncing. "
+                        "If the user seems to be continuing onboarding, keep the answer concise so they can finish setup in this thread. "
+                        "For everything else, help normally.\n\n"
+                        f"User message: {resolved.message.body}"
                     )
-                return self._result_with_messages(
-                    self._render_web_onboarding_messages(
-                        household_id=resolved.household_id,
-                        member_id=member_id,
-                        thread_id=resolved.thread_id,
-                        include_intro=not self._channel_has_assistant_history(channel_id=resolved.channel_id),
-                    )
-                )
+                    if capture_kind is not None:
+                        reply = self.household_chat_service.handle_capture_request(
+                            household_id=resolved.household_id,
+                            channel_id=resolved.channel_id,
+                            actor_member_id=resolved.member_id,
+                            message_text=contextual_message,
+                            capture_kind=capture_kind,
+                            conversation_history=history[:-1] if history else None,
+                        )
+                    else:
+                        reply = self.household_chat_service.respond(
+                            household_id=resolved.household_id,
+                            channel_id=resolved.channel_id,
+                            actor_member_id=resolved.member_id,
+                            message_text=contextual_message,
+                            conversation_history=history[:-1] if history else None,
+                        )
+                    if reply is not None and reply.text.strip():
+                        return FlorenceMessagingIngressResult(reply_text=reply.text, consumed=True)
+                return self._result_with_messages(build_google_connected_syncing_message_sequence())
             return self._handle_onboarding_message(resolved, session.stage, text)
 
         if review_prompt is not None:
@@ -1140,6 +1119,11 @@ class FlorenceMessagingIngressService:
                 activity_labels=split_labels(text),
             )
             if transition.state.is_complete:
+                self._record_onboarding_completion(
+                    household_id=resolved.household_id,
+                    member_id=member_id,
+                    channel_id=resolved.channel_id,
+                )
                 return self._result_with_messages(build_onboarding_ready_message_sequence())
             return self._result_with_messages(
                 self._render_onboarding_prompt_messages(

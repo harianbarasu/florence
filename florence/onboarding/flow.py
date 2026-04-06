@@ -66,11 +66,11 @@ def build_google_connect_message_sequence(
                 "Hi, I'm Florence.",
                 "I help run the household with you by keeping logistics organized, surfacing reminders, and staying on top of school and calendar noise.",
             ]
-        )
+    )
     messages.append("You're almost ready. Connect your Google account so I can compare Gmail and Calendar against the household context you just gave me.")
     if link_url:
         messages.append(link_url)
-    messages.append("Once Google says you're connected, come back here and text done.")
+    messages.append("Once Google says you're connected, come back here. I’ll pick up from there.")
     return tuple(messages)
 
 
@@ -99,40 +99,6 @@ def build_google_connected_syncing_message_sequence(link_url: str | None = None)
             ]
         )
     messages.append("I’ll text you here when the first pass is ready.")
-    return tuple(messages)
-
-
-def build_sync_complete_finish_profile_message_sequence(link_url: str | None = None) -> tuple[str, ...]:
-    """Return the post-sync handoff when profile grounding is still incomplete."""
-    messages = [
-        "First sync complete.",
-        "Go back to Florence setup on your computer to add kids, schools, and activities so I can finish onboarding.",
-    ]
-    if link_url:
-        messages.append(link_url)
-    messages.append("Once that is done, I’ll switch into normal chat mode here.")
-    return tuple(messages)
-
-
-def build_web_onboarding_handoff_sequence(
-    link_url: str | None,
-    *,
-    include_intro: bool = False,
-) -> tuple[str, ...]:
-    """Return the web-first onboarding handoff copy."""
-    messages: list[str] = []
-    if include_intro:
-        messages.extend(
-            [
-                "Hi, I'm Florence.",
-                "I’m easiest to set up on a computer. Finish setup there so I can learn your household, connect Google, and start acting like your house manager.",
-            ]
-        )
-    else:
-        messages.append("Finish setup on your computer here when you're ready.")
-    if link_url:
-        messages.append(link_url)
-    messages.append("Once setup is done, I’ll text you here when I’m ready and when the first Gmail and Calendar pass finishes.")
     return tuple(messages)
 
 

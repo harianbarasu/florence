@@ -248,17 +248,16 @@ def test_production_service_google_callback_sends_dm_follow_up(tmp_path, monkeyp
     result = service.handle_google_callback(code="auth-code", state=raw_state)
 
     assert result.status_code == 200
-    assert "Continue Florence setup" in result.body
+    assert "Go back to your Messages conversation" in result.body
     assert service.linq.sent
     assert service.linq.sent[0]["chat_id"] == "dm-thread-123"
     assert [message["message"] for message in service.linq.sent] == [
         "Google connected.",
         "I\u2019m syncing your recent email and calendar in the background now.",
-        "If you want to track setup progress on your computer, use this link:",
-        service.linq.sent[3]["message"],
         "I\u2019ll text you here when the first pass is ready.",
     ]
-    assert service.linq.sent[3]["message"].startswith("https://florence.example.com/v1/florence/onboarding?token=")
+    onboarding_events = store.list_pilot_events(household_id="hh_123", event_type="onboarding_complete")
+    assert len(onboarding_events) == 1
     assert len(launched) == 1
     assert str(launched[0]["connection_id"]).startswith("gconn_")
     assert launched[0]["thread_id"] == "dm-thread-123"
@@ -342,15 +341,13 @@ def test_production_service_google_callback_sends_progress_link_until_setup_read
     result = service.handle_google_callback(code="auth-code", state=raw_state)
 
     assert result.status_code == 200
-    assert "track sync progress" in result.body
+    assert "Messages conversation" in result.body
     assert [message["message"] for message in service.linq.sent] == [
         "Google connected.",
         "I\u2019m syncing your recent email and calendar in the background now.",
-        "If you want to track setup progress on your computer, use this link:",
-        service.linq.sent[3]["message"],
         "I\u2019ll text you here when the first pass is ready.",
+        "Reminder style: I default to day before + morning of for important family logistics. If you want a different default, say same-day only or keep nudging until acknowledged.",
     ]
-    assert service.linq.sent[3]["message"].startswith("https://florence.example.com/v1/florence/onboarding?token=")
     assert launched[0]["notify_when_finished"] is True
     store.close()
 
@@ -481,7 +478,7 @@ def test_production_service_google_callback_keeps_onboarding_prompt_separate_fro
     result = service.handle_google_callback(code="auth-code", state=raw_state)
 
     assert result.status_code == 200
-    assert len(service.linq.sent) == 5
+    assert len(service.linq.sent) == 3
     assert service.linq.sent[0]["message"] == "Google connected."
     assert all("Imported item:" not in message["message"] for message in service.linq.sent)
     assert "syncing your recent email and calendar in the background" in service.linq.sent[1]["message"]
@@ -787,14 +784,13 @@ def test_production_service_first_dm_sends_onboarding_sequence_as_separate_messa
     )
 
     assert result.status_code == 200
-    assert len(service.linq.sent) == 4
+    assert len(service.linq.sent) == 3
     assert service.linq.sent[0]["message"] == "Hi, I'm Florence."
     assert service.linq.sent[1]["message"] == (
-        "I’m easiest to set up on a computer. Finish setup there so I can learn your household, connect Google, and start acting like your house manager."
+        "I help run the household with you by learning the family map first, then keeping up with reminders, logistics, school noise, and schedule changes."
     )
-    assert service.linq.sent[2]["message"].startswith("https://florence.example.com/v1/florence/onboarding?token=")
-    assert service.linq.sent[3]["message"] == (
-        "Once setup is done, I’ll text you here when I’m ready and when the first Gmail and Calendar pass finishes."
+    assert service.linq.sent[2]["message"] == (
+        "Start with the kids I should know about: first name plus grade or age if helpful. One per line or comma-separated is fine."
     )
     store.close()
 

@@ -396,15 +396,6 @@ class FlorenceProductionService:
                 thread_id=oauth_state.thread_id or "",
             )
             callback = self.entrypoints.google_account_link_service.handle_callback(code=code, raw_state=state)
-            onboarding_link = (
-                self.onboarding_link_service.build_link(
-                    household_id=oauth_state.household_id,
-                    member_id=oauth_state.member_id,
-                    thread_id=oauth_state.thread_id or "",
-                )
-                if self.onboarding_link_service is not None
-                else None
-            )
             updated_context = self._build_web_context(
                 household_id=oauth_state.household_id,
                 member_id=oauth_state.member_id,
@@ -414,17 +405,21 @@ class FlorenceProductionService:
             )
             web_setup_payload = self._serialize_web_setup(updated_context)
             web_setup_ready = bool(web_setup_payload["setup"]["readyForChat"])
-            became_complete = web_setup_ready and not self._has_onboarding_completion_event(
+            dm_onboarding_complete = bool(callback.onboarding_transition.state.is_complete)
+            became_complete = (web_setup_ready or dm_onboarding_complete) and not self._has_onboarding_completion_event(
                 household_id=oauth_state.household_id,
                 member_id=oauth_state.member_id,
             )
-            dm_messages = (
-                build_onboarding_ready_message_sequence()
-                if web_setup_ready
-                else build_google_connected_syncing_message_sequence(
-                    onboarding_link.url if onboarding_link is not None else None
+            if web_setup_ready:
+                dm_messages = build_onboarding_ready_message_sequence()
+            else:
+                next_prompt_state = self.entrypoints.onboarding_service.get_prompt(
+                    household_id=oauth_state.household_id,
+                    member_id=oauth_state.member_id,
+                    thread_id=oauth_state.thread_id or "",
                 )
-            )
+                next_prompt = next_prompt_state.text if next_prompt_state is not None else None
+                dm_messages = build_google_connected_syncing_message_sequence() + ((next_prompt,) if next_prompt else ())
             sync_notice = None
 
             if oauth_state.thread_id and (dm_messages or sync_notice):
@@ -456,26 +451,12 @@ class FlorenceProductionService:
                 thread_id=oauth_state.thread_id or None,
                 notify_when_finished=True,
             )
-            if onboarding_link is not None:
-                redirect_message = (
-                    "Google connected. Taking you back to Florence so you can track sync progress."
-                    if not web_setup_ready
-                    else "Google connected. Florence is ready."
-                )
-                return self._html_result(
-                    200,
-                    self._render_redirect_page(
-                        title="Google connected",
-                        message=redirect_message,
-                        href=f"{onboarding_link.url}&google=connected",
-                    ),
-                )
             summary = f"Florence is now connected to {callback.connection.email}. Your recent email and calendar are syncing in the background."
             return self._html_result(
                 200,
                 self._render_google_callback_page(
                     title="Google connected",
-                    message=f"{summary} You can go back to your conversation now.",
+                    message=f"{summary} Go back to your Messages conversation to keep onboarding there.",
                 ),
             )
         except Exception as exc:
@@ -955,16 +936,6 @@ class FlorenceProductionService:
                 )
             freshest_connection = store.get_google_connection(result.connection.id) or result.connection
             if notify_when_finished and not self._sync_activation_brief_already_sent(connection=freshest_connection):
-                onboarding_link = (
-                    self.onboarding_link_service.build_link(
-                        household_id=result.connection.household_id,
-                        member_id=result.connection.member_id,
-                        thread_id=thread_id or channel.provider_channel_id,
-                    ).url
-                    if self.onboarding_link_service is not None
-                    and str(setup_payload.get("setup", {}).get("phase") or "") == "collect_household_profile"
-                    else None
-                )
                 group_channel = self._find_group_channel(
                     result.connection.household_id,
                     provider=channel.provider,
@@ -973,7 +944,7 @@ class FlorenceProductionService:
                     connection=freshest_connection,
                     candidates=result.sync_result.candidates,
                     group_available=group_channel is not None,
-                    onboarding_link=onboarding_link,
+                    onboarding_link=None,
                     ready_sequence_sent=ready_sequence_sent,
                 )
                 sent_activation = self._safe_send_channel_message(
@@ -1373,7 +1344,7 @@ class FlorenceProductionService:
             "@media (max-width:900px){.shell{grid-template-columns:1fr;}.fields{grid-template-columns:1fr;}h1{font-size:34px;}}"
             "</style></head><body><div class='page'><div class='hero'><div class='eyebrow'>Florence setup</div>"
             f"<h1>Set up Florence for {html.escape(household_name)}</h1>"
-            "<p class='lede'>This is the detailed desktop setup. Give Florence the household context once, connect Google, and she can start acting like a real house manager instead of a blank chat window.</p>"
+            "<p class='lede'>Florence setup now happens in Messages first. This page is just a backup place to inspect or edit household context and reconnect Google if you need a bigger screen.</p>"
             "</div><div class='shell'><div class='card'>"
             + notice_html
             + f"<div class='notice {'success' if session.is_complete else 'info'}'>{readiness_copy}</div>"
@@ -1441,36 +1412,13 @@ class FlorenceProductionService:
             + google_status
             + "<small>Florence uses Gmail and Calendar to find household-relevant items and keep the family plan current.</small></div>"
             + "</div><div class='actions'><button class='save-button' type='submit'>Save setup</button>"
-            + "<div class='helper'>Florence will text the main thread when setup is complete and when the first inbox scan finishes.</div></div></form></div>"
+            + "<div class='helper'>Florence will keep the real onboarding flow in Messages and text the main thread when Google is connected, when the first inbox scan finishes, and when setup is complete.</div></div></form></div>"
             + "<div class='sidebar'><div class='card'><h2>What Florence should be able to do next</h2><ul>"
             + "<li>Check your inbox for school, camp, and activity updates</li>"
             + "<li>Answer schedule questions from shared household state</li>"
             + "<li>Plan meals, groceries, logistics, and reminders across the family</li>"
             + "<li>Send useful morning briefs and well-timed nudges</li>"
             + "</ul></div><div class='card'><div class='section-title'>Examples</div><div class='helper'>Try texts like “What’s on the kids’ schedule next week?”, “Check my email for anything from Musical Beginnings”, “Plan dinners and groceries for next week”, or “Remind me about picture day the morning of.”</div></div></div></div></div></body></html>"
-        )
-
-    @staticmethod
-    def _render_redirect_page(*, title: str, message: str, href: str) -> str:
-        safe_title = html.escape(title)
-        safe_message = html.escape(message)
-        safe_href = html.escape(href, quote=True)
-        return (
-            "<!doctype html><html><head><meta charset='utf-8'><meta http-equiv='refresh' content='0;url="
-            + safe_href
-            + "'><title>"
-            + safe_title
-            + "</title><style>"
-            "body{font-family:ui-sans-serif,system-ui,sans-serif;background:#f7f3eb;color:#1f1f1f;padding:48px;line-height:1.5;}"
-            ".card{max-width:720px;margin:0 auto;background:#fffdf8;border:1px solid #d9ceb7;border-radius:16px;padding:32px;box-shadow:0 12px 32px rgba(0,0,0,0.08);}"
-            "a{color:#9b4d2a;font-weight:700;}"
-            "</style></head><body><div class='card'><h1>"
-            + safe_title
-            + "</h1><p>"
-            + safe_message
-            + "</p><p><a href='"
-            + safe_href
-            + "'>Continue Florence setup</a></p></div></body></html>"
         )
 
     def _nudge_for_new_pending_candidates(

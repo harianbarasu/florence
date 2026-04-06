@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 from florence.contracts import (
     Channel,
     ChannelType,
@@ -700,6 +702,121 @@ def test_household_chat_service_compose_group_promotion_uses_group_safe_prompt(t
     store.close()
 
 
+def test_household_chat_service_compose_review_prompt_uses_agentic_review_prompt(tmp_path):
+    _FakeAgent.created.clear()
+    _FakeAgent.last_run = None
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(
+        Household(
+            id="hh_123",
+            name="Maya's household",
+            timezone="America/Los_Angeles",
+        )
+    )
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm_thread_123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    service = FlorenceHouseholdChatService(
+        store,
+        model="anthropic/claude-opus-4.6",
+        max_iterations=4,
+        provider="anthropic",
+        agent_factory=_FakeAgent,
+    )
+
+    candidate = SimpleNamespace(
+        id="cand_like",
+        title="Science fair reminder",
+        summary="Science fair is Friday at school.",
+        state="pending_review",
+        metadata={"confirmation_question": "Should I add science fair to the household plan?"},
+    )
+
+    prompt = service.compose_review_prompt(
+        household_id="hh_123",
+        channel_id="chan_dm_123",
+        actor_member_id="mem_123",
+        candidate=candidate,
+        source_prompt="Reply share to treat future items from this source as household-shared.",
+    )
+
+    assert prompt is not None
+    assert _FakeAgent.created[0]["enabled_toolsets"] == ["florence_briefing"]
+    assert "short Florence review prompt for one possible household item" in _FakeAgent.last_run["system_message"]
+    assert "Do not say 'Imported item', 'candidate', 'queue'" in _FakeAgent.last_run["system_message"]
+    assert "End exactly with: Reply yes if I should add it, no if it's wrong, or skip for later." in _FakeAgent.last_run["system_message"]
+    assert "\"task\": \"compose_review_prompt\"" in _FakeAgent.last_run["user_message"]
+    store.close()
+
+
+def test_household_chat_service_compose_sync_waiting_reply_uses_agentic_prompt(tmp_path):
+    _FakeAgent.created.clear()
+    _FakeAgent.last_run = None
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(
+        Household(
+            id="hh_123",
+            name="Maya's household",
+            timezone="America/Los_Angeles",
+        )
+    )
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm_thread_123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    service = FlorenceHouseholdChatService(
+        store,
+        model="anthropic/claude-opus-4.6",
+        max_iterations=4,
+        provider="anthropic",
+        agent_factory=_FakeAgent,
+    )
+
+    reply = service.compose_sync_waiting_reply(
+        household_id="hh_123",
+        channel_id="chan_dm_123",
+        actor_member_id="mem_123",
+        user_message="What's the sync status?",
+        data_dependent=False,
+    )
+
+    assert reply is not None
+    assert _FakeAgent.created[0]["enabled_toolsets"] == ["florence_briefing"]
+    assert "first Gmail and Calendar sync is still running" in _FakeAgent.last_run["system_message"]
+    assert "Do not replay the active onboarding question" in _FakeAgent.last_run["system_message"]
+    assert "\"task\": \"compose_sync_waiting_reply\"" in _FakeAgent.last_run["user_message"]
+    store.close()
+
+
 def test_household_chat_service_compose_weekly_brief_uses_weekly_prompt(tmp_path):
     _FakeAgent.created.clear()
     _FakeAgent.last_run = None
@@ -747,4 +864,60 @@ def test_household_chat_service_compose_weekly_brief_uses_weekly_prompt(tmp_path
     assert brief is not None
     assert "weekly household preview" in _FakeAgent.last_run["user_message"].lower()
     assert "meal planning" in _FakeAgent.last_run["user_message"].lower()
+    store.close()
+
+
+def test_household_chat_service_compose_activation_brief_uses_agentic_prompt(tmp_path):
+    _FakeAgent.created.clear()
+    _FakeAgent.last_run = None
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(
+        Household(
+            id="hh_123",
+            name="Maya's household",
+            timezone="America/Los_Angeles",
+        )
+    )
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm_thread_123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    service = FlorenceHouseholdChatService(
+        store,
+        model="anthropic/claude-opus-4.6",
+        max_iterations=4,
+        provider="anthropic",
+        agent_factory=_FakeAgent,
+    )
+
+    brief = service.compose_activation_brief(
+        household_id="hh_123",
+        channel_id="chan_dm_123",
+        actor_member_id="mem_123",
+        gmail_count=500,
+        calendar_count=14,
+        candidates=[],
+        group_available=False,
+    )
+
+    assert brief is not None
+    assert _FakeAgent.created[0]["enabled_toolsets"] == ["florence_briefing"]
+    assert "first activation brief after the initial Google sync finishes" in _FakeAgent.last_run["system_message"]
+    assert "Do not say 'items need review', 'candidate queue', 'I scanned X emails'" in _FakeAgent.last_run["system_message"]
+    assert "Collapse duplicate raw artifacts into one underlying household fact" in _FakeAgent.last_run["system_message"]
+    assert "\"task\": \"compose_initial_sync_activation_brief\"" in _FakeAgent.last_run["user_message"]
     store.close()

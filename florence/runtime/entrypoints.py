@@ -261,9 +261,48 @@ class FlorenceEntrypointService:
         if callback.onboarding_transition.state.is_complete:
             reply = "\n\n".join(build_onboarding_ready_message_sequence())
         else:
-            reply = callback.onboarding_transition.prompt.text if callback.onboarding_transition.prompt else "Google connected."
+            reply = None
+            if self.household_chat_service is not None:
+                channel = self.store.get_channel(callback.onboarding_transition.state.thread_id)
+                if channel is not None:
+                    try:
+                        rendered = self.household_chat_service.compose_sync_waiting_reply(
+                            household_id=callback.connection.household_id,
+                            channel_id=channel.id,
+                            actor_member_id=callback.connection.member_id,
+                            just_connected=True,
+                        )
+                        if rendered is not None and rendered.strip():
+                            reply = rendered.strip()
+                    except Exception:
+                        reply = None
+            if not reply:
+                reply = (
+                    callback.onboarding_transition.prompt.text
+                    if callback.onboarding_transition.prompt
+                    else "Google connected."
+                )
         if review_prompt is not None:
-            reply = f"{reply}\n\n{review_prompt.text}" if reply else review_prompt.text
+            review_prompt_text = review_prompt.text
+            if self.household_chat_service is not None:
+                channel = self.store.get_channel(callback.onboarding_transition.state.thread_id)
+                if channel is not None:
+                    try:
+                        source_prompt = self.candidate_review_service.source_rule_service.build_candidate_source_prompt(
+                            review_prompt.candidate
+                        )
+                        rendered = self.household_chat_service.compose_review_prompt(
+                            household_id=callback.connection.household_id,
+                            channel_id=channel.id,
+                            actor_member_id=callback.connection.member_id,
+                            candidate=review_prompt.candidate,
+                            source_prompt=source_prompt,
+                        )
+                        if rendered is not None and rendered.strip():
+                            review_prompt_text = rendered.strip()
+                    except Exception:
+                        review_prompt_text = review_prompt.text
+            reply = f"{reply}\n\n{review_prompt_text}" if reply else review_prompt_text
 
         return FlorenceEntrypointResult(
             reply_text=reply,

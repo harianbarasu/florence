@@ -839,17 +839,20 @@ class FlorenceCandidateReviewService:
             return None
         candidate = candidates[0]
         question = str(candidate.metadata.get("confirmation_question") or "Should I add this?")
+        title = " ".join(str(candidate.title or "").split()).strip()
+        summary = " ".join(str(candidate.summary or "").split()).strip()
         lines = [
-            f"Imported item: {candidate.title}",
-            candidate.summary,
-            question,
+            title or summary,
         ]
+        if summary and summary != title:
+            lines.append(summary)
+        lines.append(question)
         source_prompt = self.source_rule_service.build_candidate_source_prompt(candidate)
         if source_prompt:
             lines.append(source_prompt)
         lines.extend(
             [
-            "Reply yes to confirm it, no if it is wrong, or skip for later.",
+                "Reply yes if I should add it, no if it's wrong, or skip for later.",
             ]
         )
         return CandidateReviewPrompt(candidate=candidate, text="\n".join(line for line in lines if line))

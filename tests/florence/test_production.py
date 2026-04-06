@@ -48,6 +48,9 @@ class _FakeLinqClient:
 class _FakeBriefingChatService:
     def __init__(self):
         self.calls = []
+        self.sync_waiting_text = (
+            "Google is connected. I’m pulling in the first pass in the background and I’ll text you here when it’s ready."
+        )
 
     def compose_brief(self, *, household_id, channel_id, actor_member_id, brief_kind):
         self.calls.append(
@@ -61,6 +64,76 @@ class _FakeBriefingChatService:
         if brief_kind.value == "weekly":
             return "Weekly preview: science fair, pickup swap, and dinner coverage need attention."
         return "Morning brief: soccer bag, lunch order, and pickup timing are all on deck."
+
+    def compose_activation_brief(
+        self,
+        *,
+        household_id,
+        channel_id,
+        actor_member_id,
+        gmail_count,
+        calendar_count,
+        candidates,
+        group_available,
+    ):
+        self.calls.append(
+            {
+                "household_id": household_id,
+                "channel_id": channel_id,
+                "actor_member_id": actor_member_id,
+                "gmail_count": gmail_count,
+                "calendar_count": calendar_count,
+                "candidate_count": len(candidates),
+                "group_available": group_available,
+            }
+        )
+        return SimpleNamespace(
+            text="A few things look important from your recent email and calendar, including Science fair reminder. I can dig into any of them if you want.",
+            group_text="Household update: Science fair reminder looks important from recent email and calendar.",
+        )
+
+    def compose_review_prompt(
+        self,
+        *,
+        household_id,
+        channel_id,
+        actor_member_id,
+        candidate,
+        source_prompt=None,
+    ):
+        self.calls.append(
+            {
+                "household_id": household_id,
+                "channel_id": channel_id,
+                "actor_member_id": actor_member_id,
+                "candidate_id": getattr(candidate, "id", None),
+                "source_prompt": source_prompt,
+            }
+        )
+        return "This looks like a household item to double-check. Reply yes if I should add it, no if it's wrong, or skip for later."
+
+    def compose_sync_waiting_reply(
+        self,
+        *,
+        household_id,
+        channel_id,
+        actor_member_id,
+        user_message=None,
+        conversation_history=None,
+        data_dependent=False,
+        just_connected=False,
+    ):
+        self.calls.append(
+            {
+                "household_id": household_id,
+                "channel_id": channel_id,
+                "actor_member_id": actor_member_id,
+                "user_message": user_message,
+                "data_dependent": data_dependent,
+                "just_connected": just_connected,
+            }
+        )
+        return self.sync_waiting_text
 
 
 class _FakeTimer:
@@ -276,6 +349,7 @@ def test_production_service_google_callback_sends_dm_follow_up(tmp_path, monkeyp
     store = FlorenceStateDB(settings.server.db_path)
     service = FlorenceProductionService(settings, store=store)
     service.entrypoints.onboarding_service.variant_selector = lambda _household_id, _member_id: OnboardingVariant.HYBRID
+    service.entrypoints.household_chat_service = _FakeBriefingChatService()
     service.linq = _FakeLinqClient()
     store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
     store.upsert_member(
@@ -357,7 +431,7 @@ def test_production_service_google_callback_sends_dm_follow_up(tmp_path, monkeyp
     assert service.linq.sent
     assert service.linq.sent[0]["chat_id"] == "dm-thread-123"
     assert [message["message"] for message in service.linq.sent] == [
-        "Google is connected. I\u2019m syncing the last 30 days of your email and calendar in the background now, and I\u2019ll text you here when the first pass is ready.",
+        "Google is connected. I’m pulling in the first pass in the background and I’ll text you here when it’s ready.",
     ]
     onboarding_events = store.list_pilot_events(household_id="hh_123", event_type="onboarding_complete")
     assert len(onboarding_events) == 1
@@ -373,6 +447,7 @@ def test_production_service_google_callback_sends_progress_link_until_setup_read
     store = FlorenceStateDB(settings.server.db_path)
     service = FlorenceProductionService(settings, store=store)
     service.entrypoints.onboarding_service.variant_selector = lambda _household_id, _member_id: OnboardingVariant.HYBRID
+    service.entrypoints.household_chat_service = _FakeBriefingChatService()
     service.linq = _FakeLinqClient()
     store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
     store.upsert_member(
@@ -446,7 +521,7 @@ def test_production_service_google_callback_sends_progress_link_until_setup_read
     assert result.status_code == 200
     assert "Messages conversation" in result.body
     assert [message["message"] for message in service.linq.sent] == [
-        "Google is connected. I\u2019m syncing the last 30 days of your email and calendar in the background now, and I\u2019ll text you here when the first pass is ready.",
+        "Google is connected. I’m pulling in the first pass in the background and I’ll text you here when it’s ready.",
     ]
     assert launched[0]["notify_when_finished"] is True
     store.close()
@@ -475,6 +550,7 @@ def test_production_service_google_callback_keeps_onboarding_prompt_separate_fro
     store = FlorenceStateDB(settings.server.db_path)
     service = FlorenceProductionService(settings, store=store)
     service.entrypoints.onboarding_service.variant_selector = lambda _household_id, _member_id: OnboardingVariant.HYBRID
+    service.entrypoints.household_chat_service = _FakeBriefingChatService()
     service.linq = _FakeLinqClient()
     store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
     store.upsert_member(
@@ -562,7 +638,7 @@ def test_production_service_google_callback_keeps_onboarding_prompt_separate_fro
     assert result.status_code == 200
     assert len(service.linq.sent) == 1
     assert service.linq.sent[0]["message"] == (
-        "Google is connected. I’m syncing the last 30 days of your email and calendar in the background now, and I’ll text you here when the first pass is ready."
+        "Google is connected. I’m pulling in the first pass in the background and I’ll text you here when it’s ready."
     )
     assert all("Imported item:" not in message["message"] for message in service.linq.sent)
     assert launched[0]["notify_when_finished"] is True
@@ -665,6 +741,7 @@ def test_process_google_sync_job_sends_operational_brief_with_group_promotion_me
     store = FlorenceStateDB(settings.server.db_path)
     service = FlorenceProductionService(settings, store=store)
     service.linq = _FakeLinqClient()
+    service.entrypoints.household_chat_service = _FakeBriefingChatService()
     store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
     store.upsert_member(
         Member(
@@ -749,9 +826,8 @@ def test_process_google_sync_job_sends_operational_brief_with_group_promotion_me
     )
 
     assert len(service.linq.sent) == 1
-    assert "I went through your recent email and calendar activity." in service.linq.sent[0]["message"]
+    assert "A few things look important from your recent email and calendar" in service.linq.sent[0]["message"]
     assert "Science fair reminder" in service.linq.sent[0]["message"]
-    assert "Reply 'share' and I will post a short version to the parent group." in service.linq.sent[0]["message"]
     stored_messages = store.list_channel_messages(channel_id="chan_dm_123")
     assert len(stored_messages) == 1
     assert stored_messages[0].metadata["promotion_kind"] == "sync_activation_brief"

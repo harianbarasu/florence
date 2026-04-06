@@ -38,7 +38,7 @@ from florence.runtime.services import (
 from florence.state import FlorenceStateDB
 
 logger = logging.getLogger(__name__)
-_REVIEW_CONFIRMATION_SUFFIX = "Reply yes to confirm it, no if it is wrong, or skip for later."
+_REVIEW_CONFIRMATION_SUFFIX = "Reply yes if I should add it, no if it's wrong, or skip for later."
 
 
 @dataclass(slots=True)
@@ -114,7 +114,7 @@ def _looks_like_review_request(text: str) -> bool:
 
 def _looks_like_candidate_review_prompt(text: str) -> bool:
     normalized = text.strip()
-    return "Imported item:" in normalized and _REVIEW_CONFIRMATION_SUFFIX in normalized
+    return _REVIEW_CONFIRMATION_SUFFIX in normalized
 
 
 def _looks_like_google_connected(text: str) -> bool:
@@ -412,6 +412,60 @@ class FlorenceMessagingIngressService:
         if prompt.stage == OnboardingStage.CONNECT_GOOGLE:
             return intro + google_sequence
         return intro + google_sequence + (prompt.text,)
+
+    def _render_review_prompt_text(
+        self,
+        *,
+        household_id: str,
+        channel_id: str,
+        actor_member_id: str | None,
+        prompt,
+    ) -> str:
+        if self.household_chat_service is None:
+            return prompt.text
+        try:
+            source_prompt = self.candidate_review_service.source_rule_service.build_candidate_source_prompt(prompt.candidate)
+            rendered = self.household_chat_service.compose_review_prompt(
+                household_id=household_id,
+                channel_id=channel_id,
+                actor_member_id=actor_member_id,
+                candidate=prompt.candidate,
+                source_prompt=source_prompt,
+            )
+            if rendered is not None and rendered.strip():
+                return rendered.strip()
+        except Exception:
+            logger.exception(
+                "Florence review prompt composition failed household_id=%s channel_id=%s candidate_id=%s",
+                household_id,
+                channel_id,
+                getattr(prompt.candidate, "id", ""),
+            )
+        return prompt.text
+
+    def _compose_sync_waiting_reply(
+        self,
+        *,
+        household_id: str,
+        channel_id: str,
+        actor_member_id: str | None,
+        user_message: str,
+        conversation_history: list[ChannelMessage] | None = None,
+        data_dependent: bool = False,
+    ) -> str | None:
+        if self.household_chat_service is None:
+            return None
+        reply = self.household_chat_service.compose_sync_waiting_reply(
+            household_id=household_id,
+            channel_id=channel_id,
+            actor_member_id=actor_member_id,
+            user_message=user_message,
+            conversation_history=conversation_history,
+            data_dependent=data_dependent,
+        )
+        if reply is not None and reply.strip():
+            return reply.strip()
+        return None
 
     def _channel_has_assistant_history(self, *, channel_id: str) -> bool:
         return any(
@@ -836,15 +890,22 @@ class FlorenceMessagingIngressService:
                 return FlorenceMessagingIngressResult(reply_text=reply.text, consumed=True)
 
         review_prompt = None
+        review_prompt_text: str | None = None
         if session.is_grounded_for_google_matching:
             review_prompt = self.candidate_review_service.build_next_review_prompt(
                 household_id=resolved.household_id,
                 member_id=member_id,
             )
             if review_prompt is not None:
+                review_prompt_text = self._render_review_prompt_text(
+                    household_id=resolved.household_id,
+                    channel_id=resolved.channel_id,
+                    actor_member_id=resolved.member_id,
+                    prompt=review_prompt,
+                )
                 review_reply_armed = self._is_candidate_review_reply_armed(
                     channel_id=resolved.channel_id,
-                    review_prompt_text=review_prompt.text,
+                    review_prompt_text=review_prompt_text,
                 )
                 if review_reply_armed and (_looks_like_share_source(text) or _looks_like_private_source(text)):
                     visibility = (
@@ -902,7 +963,7 @@ class FlorenceMessagingIngressService:
                 if review_reply_armed and _looks_like_skip(text):
                     return FlorenceMessagingIngressResult(reply_text="Okay. I will leave it in your review queue for later.", consumed=True)
                 if _looks_like_review_request(text):
-                    return FlorenceMessagingIngressResult(reply_text=review_prompt.text, consumed=True)
+                    return FlorenceMessagingIngressResult(reply_text=review_prompt_text, consumed=True)
 
         if not session.is_complete:
             if self._should_defer_onboarding_reply(
@@ -919,8 +980,29 @@ class FlorenceMessagingIngressService:
                     or _looks_like_tracking_request(text)
                     or _looks_like_review_request(text)
                 ):
+                    history = self.store.list_channel_messages(channel_id=resolved.channel_id, limit=24)
+                    waiting_reply = self._compose_sync_waiting_reply(
+                        household_id=resolved.household_id,
+                        channel_id=resolved.channel_id,
+                        actor_member_id=resolved.member_id,
+                        user_message=resolved.message.body,
+                        conversation_history=history[:-1] if history else None,
+                    )
+                    if waiting_reply is not None:
+                        return FlorenceMessagingIngressResult(reply_text=waiting_reply, consumed=True)
                     return self._result_with_messages(build_google_connected_syncing_message_sequence())
                 if _looks_like_schedule_question(text):
+                    history = self.store.list_channel_messages(channel_id=resolved.channel_id, limit=24)
+                    waiting_reply = self._compose_sync_waiting_reply(
+                        household_id=resolved.household_id,
+                        channel_id=resolved.channel_id,
+                        actor_member_id=resolved.member_id,
+                        user_message=resolved.message.body,
+                        conversation_history=history[:-1] if history else None,
+                        data_dependent=True,
+                    )
+                    if waiting_reply is not None:
+                        return FlorenceMessagingIngressResult(reply_text=waiting_reply, consumed=True)
                     return FlorenceMessagingIngressResult(
                         reply_text=(
                             "I’m still syncing your recent email and calendar, so I’m not ready to answer from that data yet. "
@@ -962,9 +1044,15 @@ class FlorenceMessagingIngressService:
             return self._handle_onboarding_message(resolved, session.stage, text)
 
         if review_prompt is not None:
+            review_prompt_text = review_prompt_text or self._render_review_prompt_text(
+                household_id=resolved.household_id,
+                channel_id=resolved.channel_id,
+                actor_member_id=resolved.member_id,
+                prompt=review_prompt,
+            )
             review_reply_armed = self._is_candidate_review_reply_armed(
                 channel_id=resolved.channel_id,
-                review_prompt_text=review_prompt.text,
+                review_prompt_text=review_prompt_text,
             )
             if review_reply_armed and (_looks_like_share_source(text) or _looks_like_private_source(text)):
                 visibility = (
@@ -1022,7 +1110,7 @@ class FlorenceMessagingIngressService:
             if review_reply_armed and _looks_like_skip(text):
                 return FlorenceMessagingIngressResult(reply_text="Okay. I will leave it in your review queue for later.", consumed=True)
             if _looks_like_review_request(text):
-                return FlorenceMessagingIngressResult(reply_text=review_prompt.text, consumed=True)
+                return FlorenceMessagingIngressResult(reply_text=review_prompt_text, consumed=True)
 
         if _looks_like_reminder_feedback(text):
             self.household_manager_service.record_reminder_feedback(

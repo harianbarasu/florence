@@ -59,13 +59,21 @@ class _StubHouseholdChatService:
         *,
         promotion_text: str | None = None,
         capture_reply_text: str | None = None,
+        review_prompt_text: str | None = None,
+        sync_waiting_text: str | None = None,
     ):
         self.reply_text = reply_text
         self.promotion_text = promotion_text
         self.capture_reply_text = capture_reply_text or reply_text
+        self.review_prompt_text = review_prompt_text or (
+            "This looks worth double-checking. Reply yes if I should add it, no if it's wrong, or skip for later."
+        )
+        self.sync_waiting_text = sync_waiting_text or reply_text
         self.calls = []
         self.promotion_calls = []
         self.capture_calls = []
+        self.review_prompt_calls = []
+        self.sync_waiting_calls = []
 
     def respond(
         self,
@@ -134,6 +142,50 @@ class _StubHouseholdChatService:
             text = self.capture_reply_text
 
         return _Reply()
+
+    def compose_review_prompt(
+        self,
+        *,
+        household_id: str,
+        channel_id: str,
+        actor_member_id: str | None,
+        candidate,
+        source_prompt: str | None = None,
+    ) -> str | None:
+        self.review_prompt_calls.append(
+            {
+                "household_id": household_id,
+                "channel_id": channel_id,
+                "actor_member_id": actor_member_id,
+                "candidate_id": getattr(candidate, "id", None),
+                "source_prompt": source_prompt,
+            }
+        )
+        return self.review_prompt_text
+
+    def compose_sync_waiting_reply(
+        self,
+        *,
+        household_id: str,
+        channel_id: str,
+        actor_member_id: str | None,
+        user_message: str | None = None,
+        conversation_history=None,
+        data_dependent: bool = False,
+        just_connected: bool = False,
+    ) -> str | None:
+        self.sync_waiting_calls.append(
+            {
+                "household_id": household_id,
+                "channel_id": channel_id,
+                "actor_member_id": actor_member_id,
+                "user_message": user_message,
+                "conversation_history": conversation_history or [],
+                "data_dependent": data_dependent,
+                "just_connected": just_connected,
+            }
+        )
+        return self.sync_waiting_text
 
 
 def _build_hybrid_onboarding_service(store, review_service):
@@ -579,6 +631,57 @@ def test_dm_status_question_after_google_connect_returns_sync_progress_sequence(
     assert result.reply_messages == (
         "Google is connected. I’m syncing the last 30 days of your email and calendar in the background now, and I’ll text you here when the first pass is ready.",
     )
+    store.close()
+
+
+def test_dm_status_question_after_google_connect_prefers_household_chat(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_hybrid_onboarding_service(store, review_service)
+    chat_service = _StubHouseholdChatService(
+        "I’m still syncing in the background, but I’ll text you here when the first pass is ready."
+    )
+    ingress = FlorenceMessagingIngressService(
+        store,
+        onboarding_service,
+        review_service,
+        FlorenceHouseholdQueryService(store),
+        household_chat_service=chat_service,
+    )
+
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+        display_name="Maya",
+    )
+    onboarding_service.record_google_connected(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+    )
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_sync_progress_chat",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="What's the sync status?",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert result.reply_text == "I’m still syncing in the background, but I’ll text you here when the first pass is ready."
+    assert chat_service.sync_waiting_calls
+    assert chat_service.sync_waiting_calls[0]["user_message"] == "What's the sync status?"
+    assert chat_service.sync_waiting_calls[0]["data_dependent"] is False
     store.close()
 
 
@@ -1134,7 +1237,8 @@ def test_review_prompt_then_yes_confirms_pending_candidate(tmp_path):
         )
     )
     assert review.reply_text is not None
-    assert "Imported item:" in review.reply_text
+    assert "Fireflies Haircuts for Kids" in review.reply_text
+    assert "Reply yes if I should add it, no if it's wrong, or skip for later." in review.reply_text
 
     confirmation = ingress.handle_message(
         FlorenceResolvedInboundMessage(

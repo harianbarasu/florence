@@ -406,37 +406,53 @@ class FlorenceProductionService:
                 household_id=oauth_state.household_id,
                 member_id=oauth_state.member_id,
             )
+            resolved_channel = None
+            if oauth_state.thread_id:
+                resolved_channel = self.store.get_channel(oauth_state.thread_id)
+                if resolved_channel is None:
+                    resolved_channel = self._find_channel_by_provider_id(oauth_state.thread_id)
+
             if web_setup_ready:
                 dm_messages = build_onboarding_ready_message_sequence()
             else:
-                # Keep Google connect as a quiet background status update.
-                # The active onboarding question already exists in-thread, so
-                # replaying it here makes the conversation feel chaotic.
-                dm_messages = build_google_connected_syncing_message_sequence()
+                dm_messages = ()
+                chat_service = self.entrypoints.household_chat_service
+                if chat_service is not None and resolved_channel is not None:
+                    try:
+                        sync_waiting = chat_service.compose_sync_waiting_reply(
+                            household_id=oauth_state.household_id,
+                            channel_id=resolved_channel.id,
+                            actor_member_id=oauth_state.member_id,
+                            just_connected=True,
+                        )
+                        if sync_waiting is not None and sync_waiting.strip():
+                            dm_messages = (sync_waiting.strip(),)
+                    except Exception:
+                        logger.exception(
+                            "Florence Google callback sync-status composition failed household_id=%s member_id=%s",
+                            oauth_state.household_id,
+                            oauth_state.member_id,
+                        )
+                if not dm_messages:
+                    # Keep Google connect as a quiet background status update.
+                    # The active onboarding question already exists in-thread, so
+                    # replaying it here makes the conversation feel chaotic.
+                    dm_messages = build_google_connected_syncing_message_sequence()
             sync_notice = None
 
             if oauth_state.thread_id and (dm_messages or sync_notice):
-                channel = self.store.get_channel(oauth_state.thread_id)
+                channel = resolved_channel
                 if channel is not None:
                     for message in dm_messages:
                         self._safe_send_channel_message(channel=channel, message=message)
                     if sync_notice:
                         self._safe_send_channel_message(channel=channel, message=sync_notice)
-                else:
-                    fallback_channel = self._find_channel_by_provider_id(oauth_state.thread_id)
-                    if fallback_channel is not None:
-                        for message in dm_messages:
-                            self._safe_send_channel_message(channel=fallback_channel, message=message)
-                        if sync_notice:
-                            self._safe_send_channel_message(channel=fallback_channel, message=sync_notice)
 
             if became_complete:
                 self._record_onboarding_completion(
                     household_id=callback.connection.household_id,
                     member_id=callback.connection.member_id,
-                    channel_id=self._find_channel_by_provider_id(oauth_state.thread_id or "").id
-                    if oauth_state.thread_id and self._find_channel_by_provider_id(oauth_state.thread_id) is not None
-                    else "google_callback",
+                    channel_id=resolved_channel.id if resolved_channel is not None else "google_callback",
                 )
 
             self._launch_google_sync_job(
@@ -933,13 +949,38 @@ class FlorenceProductionService:
                     result.connection.household_id,
                     provider=channel.provider,
                 )
-                activation_message, group_message = self._build_sync_activation_brief_messages(
-                    connection=freshest_connection,
-                    candidates=result.sync_result.candidates,
-                    group_available=group_channel is not None,
-                    onboarding_link=None,
-                    ready_sequence_sent=ready_sequence_sent,
-                )
+                activation_message: str | None = None
+                group_message: str | None = None
+                chat_service = self.entrypoints.household_chat_service
+                if chat_service is not None:
+                    try:
+                        activation_brief = chat_service.compose_activation_brief(
+                            household_id=result.connection.household_id,
+                            channel_id=channel.id,
+                            actor_member_id=result.connection.member_id,
+                            gmail_count=int(freshest_connection.metadata.get("last_gmail_item_count") or 0),
+                            calendar_count=int(freshest_connection.metadata.get("last_calendar_item_count") or 0),
+                            candidates=list(result.sync_result.candidates),
+                            group_available=group_channel is not None,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Florence activation brief compose failed household_id=%s connection_id=%s",
+                            result.connection.household_id,
+                            connection_id,
+                        )
+                        activation_brief = None
+                    if activation_brief is not None:
+                        activation_message = activation_brief.text
+                        group_message = activation_brief.group_text
+                if not activation_message:
+                    activation_message, group_message = self._build_sync_activation_brief_messages(
+                        connection=freshest_connection,
+                        candidates=result.sync_result.candidates,
+                        group_available=group_channel is not None,
+                        onboarding_link=None,
+                        ready_sequence_sent=ready_sequence_sent,
+                    )
                 sent_activation = self._safe_send_channel_message(
                     channel=channel,
                     message=activation_message,
@@ -1547,7 +1588,28 @@ class FlorenceProductionService:
 
         channel = self._find_channel_by_provider_id(dm_thread_id)
         if channel is not None:
-            self._safe_send_channel_message(channel=channel, message=prompt.text)
+            prompt_text = prompt.text
+            chat_service = self.entrypoints.household_chat_service
+            if chat_service is not None:
+                try:
+                    source_prompt = self.candidate_review_service.source_rule_service.build_candidate_source_prompt(prompt.candidate)
+                    rendered = chat_service.compose_review_prompt(
+                        household_id=household_id,
+                        channel_id=channel.id,
+                        actor_member_id=member_id,
+                        candidate=prompt.candidate,
+                        source_prompt=source_prompt,
+                    )
+                    if rendered is not None and rendered.strip():
+                        prompt_text = rendered.strip()
+                except Exception:
+                    logger.exception(
+                        "Florence review nudge compose failed household_id=%s member_id=%s candidate_id=%s",
+                        household_id,
+                        member_id,
+                        prompt.candidate.id,
+                    )
+            self._safe_send_channel_message(channel=channel, message=prompt_text)
 
         nudged_at = datetime.utcnow().isoformat() + "Z"
         for candidate in newly_pending:
@@ -1588,28 +1650,21 @@ class FlorenceProductionService:
         titles, remaining = self._activation_candidate_titles(candidates)
 
         lines = [
-            "I went through your recent email and calendar activity. Here is what matters right now:",
+            "I pulled together a first pass from your recent email and calendar activity.",
         ]
         if titles:
             title_summary = "; ".join(titles)
             if remaining:
                 title_summary += f"; plus {remaining} more"
-            noun = "item" if len(candidates) == 1 else "items"
-            lines.append(f"- {len(candidates)} {noun} need review: {title_summary}.")
+            lines.append(f"The main things worth a closer look are {title_summary}.")
         else:
-            lines.append("- Nothing urgent jumped out from the first pass yet.")
-
-        if gmail_count or calendar_count:
-            lines.append(
-                f"- I scanned {gmail_count} recent email{'s' if gmail_count != 1 else ''} and "
-                f"{calendar_count} calendar item{'s' if calendar_count != 1 else ''}."
-            )
+            lines.append("Nothing urgent jumped out from the first pass yet, but I’m still keeping an eye on it.")
         if onboarding_link:
-            lines.append(f"- To sharpen future plans, finish adding kids, schools, and activities here: {onboarding_link}")
+            lines.append(f"To sharpen future plans, finish adding kids, schools, and activities here: {onboarding_link}")
         if group_available and titles:
-            lines.append("Reply 'share' and I will post a short version to the parent group.")
+            lines.append("If you want, reply share and I’ll post a short version to the parent group.")
         elif not ready_sequence_sent:
-            lines.append("Reply 'review' if you want the full queue, or text me anything else you want me to handle.")
+            lines.append("Text me anything you want me to handle next.")
         else:
             lines.append("Text me anything else you want me to handle.")
 

@@ -426,6 +426,10 @@ class FlorenceStateDB:
             self._conn.close()
             self._conn = None
 
+    def rollback(self) -> None:
+        if self._conn:
+            self._conn.rollback()
+
     @staticmethod
     def build_onboarding_session_key(household_id: str, member_id: str, thread_id: str) -> str:
         return f"{household_id}:{member_id}:{thread_id}"

@@ -34,6 +34,8 @@ class FlorenceConnection(Protocol):
 
     def commit(self) -> None: ...
 
+    def rollback(self) -> None: ...
+
     def close(self) -> None: ...
 
 
@@ -73,21 +75,33 @@ class SQLiteConnectionAdapter:
     def commit(self) -> None:
         self._conn.commit()
 
+    def rollback(self) -> None:
+        self._conn.rollback()
+
     def close(self) -> None:
         self._conn.close()
 
 
 class PostgresCursorAdapter:
-    def __init__(self, cursor: Any):
+    def __init__(self, cursor: Any, connection: Any):
         self._cursor = cursor
+        self._connection = connection
 
     def execute(self, query: str, params: tuple[Any, ...] = ()) -> "PostgresCursorAdapter":
-        self._cursor.execute(_rewrite_placeholders(query), params)
+        try:
+            self._cursor.execute(_rewrite_placeholders(query), params)
+        except Exception:
+            self._connection.rollback()
+            raise
         return self
 
     def executescript(self, script: str) -> None:
-        for statement in _split_sql_script(script):
-            self._cursor.execute(statement)
+        try:
+            for statement in _split_sql_script(script):
+                self._cursor.execute(statement)
+        except Exception:
+            self._connection.rollback()
+            raise
 
     def fetchone(self) -> RowLike | None:
         return self._cursor.fetchone()
@@ -108,10 +122,13 @@ class PostgresConnectionAdapter:
         return cursor
 
     def cursor(self) -> PostgresCursorAdapter:
-        return PostgresCursorAdapter(self._conn.cursor())
+        return PostgresCursorAdapter(self._conn.cursor(), self._conn)
 
     def commit(self) -> None:
         self._conn.commit()
+
+    def rollback(self) -> None:
+        self._conn.rollback()
 
     def close(self) -> None:
         self._conn.close()

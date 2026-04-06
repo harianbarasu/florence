@@ -47,5 +47,11 @@ class FlorenceSyncScheduler:
                 result = self.run_once()
                 logger.info("Florence sync pass complete: %s", result)
             except Exception:
+                try:
+                    rollback = getattr(getattr(self.service, "store", None), "rollback", None)
+                    if callable(rollback):
+                        rollback()
+                except Exception:
+                    logger.exception("Florence sync pass rollback failed")
                 logger.exception("Florence sync pass failed")
             self._stop_event.wait(self.interval_seconds)

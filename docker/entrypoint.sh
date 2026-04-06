@@ -35,4 +35,8 @@ if [ -d "$INSTALL_DIR/skills" ]; then
     python3 "$INSTALL_DIR/tools/skills_sync.py"
 fi
 
-exec hermes "$@"
+if [ "$#" -gt 0 ]; then
+    exec "$@"
+fi
+
+exec python3 -m florence.server

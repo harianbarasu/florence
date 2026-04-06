@@ -304,7 +304,8 @@ class FlorenceMessagingIngressService:
         onboarding_link_service: FlorenceOnboardingLinkService | None = None,
         household_chat_service: FlorenceHouseholdChatService | None = None,
         household_manager_service: FlorenceHouseholdManagerService | None = None,
-        onboarding_reply_debounce_seconds: float = 8.0,
+        onboarding_reply_debounce_seconds: float = 4.0,
+        onboarding_reply_max_wait_seconds: float | None = 8.0,
     ):
         self.store = store
         self.onboarding_service = onboarding_service
@@ -315,6 +316,11 @@ class FlorenceMessagingIngressService:
         self.household_chat_service = household_chat_service
         self.household_manager_service = household_manager_service or FlorenceHouseholdManagerService(store)
         self.onboarding_reply_debounce_seconds = max(0.0, float(onboarding_reply_debounce_seconds))
+        self.onboarding_reply_max_wait_seconds = (
+            None
+            if onboarding_reply_max_wait_seconds is None
+            else max(self.onboarding_reply_debounce_seconds, float(onboarding_reply_max_wait_seconds))
+        )
 
     def handle_message(self, resolved: FlorenceResolvedInboundMessage) -> FlorenceMessagingIngressResult:
         if resolved.message.is_from_me:
@@ -427,11 +433,24 @@ class FlorenceMessagingIngressService:
             consumed=consumed,
         )
 
-    def _deferred_result(self) -> FlorenceMessagingIngressResult:
+    def _deferred_delay_seconds(self, *, channel_id: str) -> float:
+        delay = self.onboarding_reply_debounce_seconds
+        if delay <= 0:
+            return 0.0
+        pending = self._pending_user_turn_messages(channel_id=channel_id)
+        if not pending:
+            return delay
+        if self.onboarding_reply_max_wait_seconds is None:
+            return delay
+        elapsed_total = max(0.0, time.time() - pending[0].created_at)
+        remaining_total = max(0.0, self.onboarding_reply_max_wait_seconds - elapsed_total)
+        return min(delay, remaining_total)
+
+    def _deferred_result(self, *, channel_id: str) -> FlorenceMessagingIngressResult:
         return FlorenceMessagingIngressResult(
             consumed=True,
             defer_reply=True,
-            defer_seconds=self.onboarding_reply_debounce_seconds,
+            defer_seconds=self._deferred_delay_seconds(channel_id=channel_id),
         )
 
     def _append_inbound_message(self, resolved: FlorenceResolvedInboundMessage) -> None:
@@ -514,12 +533,10 @@ class FlorenceMessagingIngressService:
 
     @staticmethod
     def _is_onboarding_bundled_stage(stage: OnboardingStage) -> bool:
-        return stage in {
-            OnboardingStage.COLLECT_CHILD_NAMES,
-            OnboardingStage.COLLECT_CHILD_AGE,
-            OnboardingStage.COLLECT_CHILD_SCHOOL,
-            OnboardingStage.COLLECT_CHILD_ACTIVITIES,
-        }
+        # Only the child-name collection step really benefits from bundling.
+        # Per-child detail questions should advance immediately so the thread
+        # does not feel stalled after simple replies like "she's 7".
+        return stage == OnboardingStage.COLLECT_CHILD_NAMES
 
     def _should_defer_onboarding_reply(
         self,
@@ -629,7 +646,23 @@ class FlorenceMessagingIngressService:
         pending = self._pending_user_turn_messages(channel_id=channel_id)
         if not pending:
             return FlorenceMessagingIngressResult(consumed=False)
+        first_pending = pending[0]
         latest_pending = pending[-1]
+        if (
+            self.onboarding_reply_max_wait_seconds is not None
+            and (time.time() - first_pending.created_at) >= self.onboarding_reply_max_wait_seconds - 0.25
+        ):
+            combined_text = self._pending_user_turn_text(channel_id=channel_id)
+            if combined_text is None:
+                return FlorenceMessagingIngressResult(consumed=False)
+            return self._record_onboarding_reply(
+                household_id=household_id,
+                member_id=member_id,
+                channel_id=channel_id,
+                thread_id=thread_id,
+                stage=session.stage,
+                text=combined_text,
+            )
         if (
             self.onboarding_reply_debounce_seconds > 0
             and (time.time() - latest_pending.created_at) < self.onboarding_reply_debounce_seconds - 0.25
@@ -877,7 +910,7 @@ class FlorenceMessagingIngressService:
                 stage=session.stage,
                 text=text,
             ):
-                return self._deferred_result()
+                return self._deferred_result(channel_id=resolved.channel_id)
             if session.google_connected:
                 if _looks_like_acknowledgement(text):
                     return FlorenceMessagingIngressResult(consumed=True)

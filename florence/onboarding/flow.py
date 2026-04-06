@@ -215,8 +215,7 @@ def build_onboarding_ready_message_sequence() -> tuple[str, ...]:
 
 def build_google_connected_syncing_message_sequence(link_url: str | None = None) -> tuple[str, ...]:
     messages = [
-        "Google connected.",
-        "I’m syncing the last 30 days of your email and calendar in the background now.",
+        "Google is connected. I’m syncing the last 30 days of your email and calendar in the background now, and I’ll text you here when the first pass is ready.",
     ]
     if link_url:
         messages.extend(
@@ -225,7 +224,6 @@ def build_google_connected_syncing_message_sequence(link_url: str | None = None)
                 link_url,
             ]
         )
-    messages.append("I’ll text you here when the first pass is ready.")
     return tuple(messages)
 
 

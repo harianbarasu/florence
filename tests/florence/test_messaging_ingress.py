@@ -376,6 +376,116 @@ def test_dm_onboarding_flush_handles_single_fragment_after_debounce(tmp_path, mo
     store.close()
 
 
+def test_dm_onboarding_child_names_debounce_resets_but_hard_caps_total_wait(tmp_path, monkeypatch):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_hybrid_onboarding_service(store, review_service)
+    ingress = FlorenceMessagingIngressService(
+        store,
+        onboarding_service,
+        review_service,
+        FlorenceHouseholdQueryService(store),
+        google_account_link_service=_StubGoogleAccountLinkService(),
+        onboarding_reply_debounce_seconds=4.0,
+        onboarding_reply_max_wait_seconds=8.0,
+    )
+
+    base_time = time.time()
+    monkeypatch.setattr("florence.messaging.ingress.time.time", lambda: base_time)
+    ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_name_multi_0",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="Maya",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    first = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_name_multi_1",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="Ava",
+                is_group_chat=False,
+            ),
+        )
+    )
+    assert first.defer_reply is True
+    assert first.defer_seconds == 4.0
+
+    monkeypatch.setattr("florence.messaging.ingress.time.time", lambda: base_time + 3.0)
+    second = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_name_multi_2",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="Ben",
+                is_group_chat=False,
+            ),
+        )
+    )
+    assert second.defer_reply is True
+    assert second.defer_seconds == 4.0
+
+    monkeypatch.setattr("florence.messaging.ingress.time.time", lambda: base_time + 6.2)
+    third = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_name_multi_3",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="Cara",
+                is_group_chat=False,
+            ),
+        )
+    )
+    assert third.defer_reply is True
+    assert 1.5 <= float(third.defer_seconds or 0.0) <= 2.0
+
+    monkeypatch.setattr("florence.messaging.ingress.time.time", lambda: base_time + 8.2)
+    flushed = ingress.flush_deferred_onboarding_reply(
+        household_id="hh_123",
+        member_id="mem_123",
+        channel_id="chan_dm_123",
+        thread_id="dm_thread_123",
+    )
+
+    session = onboarding_service.get_or_create_session(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+    )
+    assert flushed.reply_text == "Great, let's learn more about each kid one at a time. How old is Ava?"
+    assert session.child_names == ["Ava", "Ben", "Cara"]
+    store.close()
+
+
 def test_dm_onboarding_stays_in_messages_even_when_link_service_is_available(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)
@@ -467,9 +577,7 @@ def test_dm_status_question_after_google_connect_returns_sync_progress_sequence(
     )
 
     assert result.reply_messages == (
-        "Google connected.",
-        "I’m syncing the last 30 days of your email and calendar in the background now.",
-        "I’ll text you here when the first pass is ready.",
+        "Google is connected. I’m syncing the last 30 days of your email and calendar in the background now, and I’ll text you here when the first pass is ready.",
     )
     store.close()
 
@@ -1382,6 +1490,58 @@ def test_google_callback_copy_does_not_require_group_to_unlock_agent(tmp_path):
     assert result.reply_messages == ("What activities does Ava do? If none right now, say none.",)
     assert session.is_complete is False
     assert session.group_channel_id is None
+    store.close()
+
+
+def test_child_age_reply_advances_immediately_after_google_connect(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_hybrid_onboarding_service(store, review_service)
+    ingress = FlorenceMessagingIngressService(
+        store,
+        onboarding_service,
+        review_service,
+        FlorenceHouseholdQueryService(store),
+        onboarding_reply_debounce_seconds=8.0,
+    )
+
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+        display_name="Maya",
+    )
+    onboarding_service.record_child_names(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+        child_names=["Lexie"],
+    )
+    onboarding_service.record_google_connected(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+    )
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_lexie_age",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="she's 7",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert result.defer_reply is False
+    assert result.reply_messages == ("What school does Lexie go to? If not in school yet, say not yet.",)
     store.close()
 
 

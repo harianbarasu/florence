@@ -357,9 +357,7 @@ def test_production_service_google_callback_sends_dm_follow_up(tmp_path, monkeyp
     assert service.linq.sent
     assert service.linq.sent[0]["chat_id"] == "dm-thread-123"
     assert [message["message"] for message in service.linq.sent] == [
-        "Google connected.",
-        "I\u2019m syncing the last 30 days of your email and calendar in the background now.",
-        "I\u2019ll text you here when the first pass is ready.",
+        "Google is connected. I\u2019m syncing the last 30 days of your email and calendar in the background now, and I\u2019ll text you here when the first pass is ready.",
     ]
     onboarding_events = store.list_pilot_events(household_id="hh_123", event_type="onboarding_complete")
     assert len(onboarding_events) == 1
@@ -448,10 +446,7 @@ def test_production_service_google_callback_sends_progress_link_until_setup_read
     assert result.status_code == 200
     assert "Messages conversation" in result.body
     assert [message["message"] for message in service.linq.sent] == [
-        "Google connected.",
-        "I\u2019m syncing the last 30 days of your email and calendar in the background now.",
-        "I\u2019ll text you here when the first pass is ready.",
-        "Great, let's learn more about each kid one at a time. How old is Ava?",
+        "Google is connected. I\u2019m syncing the last 30 days of your email and calendar in the background now, and I\u2019ll text you here when the first pass is ready.",
     ]
     assert launched[0]["notify_when_finished"] is True
     store.close()
@@ -565,11 +560,11 @@ def test_production_service_google_callback_keeps_onboarding_prompt_separate_fro
     result = service.handle_google_callback(code="auth-code", state=raw_state)
 
     assert result.status_code == 200
-    assert len(service.linq.sent) == 4
-    assert service.linq.sent[0]["message"] == "Google connected."
+    assert len(service.linq.sent) == 1
+    assert service.linq.sent[0]["message"] == (
+        "Google is connected. I’m syncing the last 30 days of your email and calendar in the background now, and I’ll text you here when the first pass is ready."
+    )
     assert all("Imported item:" not in message["message"] for message in service.linq.sent)
-    assert "syncing the last 30 days of your email and calendar in the background" in service.linq.sent[1]["message"]
-    assert "How old is Ava?" in service.linq.sent[-1]["message"]
     assert launched[0]["notify_when_finished"] is True
     store.close()
 

@@ -24,6 +24,8 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         stream=sys.stdout,
     )
+    for noisy_logger in ("httpx", "httpcore", "openai", "openai._base_client"):
+        logging.getLogger(noisy_logger).setLevel(logging.WARNING)
     settings = FlorenceSettings.from_env()
     service = FlorenceProductionService(settings)
 

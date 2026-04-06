@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import re
 import time
@@ -87,6 +88,9 @@ from florence.source_rules import (
     candidate_matches_source_rule,
 )
 from florence.state import FlorenceStateDB
+
+
+logger = logging.getLogger(__name__)
 
 
 def _utc_now() -> datetime:
@@ -1491,6 +1495,7 @@ class FlorenceGoogleSyncWorkerService:
         connection = self.store.get_google_connection(connection_id)
         if connection is None:
             raise ValueError("unknown_google_connection")
+        logger.info("Florence Google sync started connection_id=%s", connection_id)
 
         hydrated_connection = self._ensure_fresh_access_token(
             connection,
@@ -1543,6 +1548,12 @@ class FlorenceGoogleSyncWorkerService:
             max_results=resolved_max_gmail_results,
             gmail_query=gmail_query,
         )
+        logger.info(
+            "Florence Google sync fetched Gmail items connection_id=%s count=%s query=%s",
+            connection_id,
+            len(gmail_items),
+            gmail_query,
+        )
         metadata["sync_phase"] = "syncing_calendar"
         hydrated_connection = self.store.upsert_google_connection(replace(hydrated_connection, metadata=metadata))
         metadata = dict(hydrated_connection.metadata)
@@ -1566,6 +1577,11 @@ class FlorenceGoogleSyncWorkerService:
                         detail_visibility=target.detail_visibility,
                     )
                 )
+        logger.info(
+            "Florence Google sync fetched calendar items connection_id=%s count=%s",
+            connection_id,
+            fetched_calendar_item_count,
+        )
         metadata["sync_phase"] = "finding_family_sources"
         hydrated_connection = self.store.upsert_google_connection(replace(hydrated_connection, metadata=metadata))
         metadata = dict(hydrated_connection.metadata)
@@ -1574,6 +1590,12 @@ class FlorenceGoogleSyncWorkerService:
             context=context,
             gmail_items=gmail_items,
             calendar_items=calendar_items,
+        )
+        logger.info(
+            "Florence Google sync classifying household-relevant sources connection_id=%s gmail_items=%s calendar_items=%s",
+            connection_id,
+            len(gmail_items),
+            len(calendar_items),
         )
         sync_result = self.google_sync_service.persist_sync_batch(batch)
         metadata["gmail_last_synced_at"] = current_time.isoformat()
@@ -1592,6 +1614,12 @@ class FlorenceGoogleSyncWorkerService:
             metadata["initial_sync_completed_at"] = current_time.isoformat()
         metadata["initial_sync_state"] = "ready"
         synced_connection = self.store.upsert_google_connection(replace(hydrated_connection, metadata=metadata))
+        logger.info(
+            "Florence Google sync complete connection_id=%s candidates=%s skipped=%s",
+            connection_id,
+            len(sync_result.candidates),
+            sync_result.skipped_count,
+        )
         return FlorenceGoogleSyncCycleResult(connection=synced_connection, sync_result=sync_result)
 
     def sync_household(

@@ -49,6 +49,45 @@ from florence.state.db import RowLike, connect_florence_db
 FLORENCE_DB_PATH = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes")) / "florence.db"
 FLORENCE_SCHEMA_VERSION = 9
 
+_RESET_ALL_TABLES = (
+    "channel_messages",
+    "channels",
+    "child_profiles",
+    "google_connections",
+    "household_events",
+    "household_meals",
+    "household_nudges",
+    "household_profile_items",
+    "household_routines",
+    "household_shopping_items",
+    "household_source_rules",
+    "household_work_items",
+    "households",
+    "imported_candidates",
+    "member_identities",
+    "members",
+    "onboarding_sessions",
+    "pilot_events",
+)
+
+_RESET_HOUSEHOLD_TABLES = (
+    "channel_messages",
+    "channels",
+    "child_profiles",
+    "google_connections",
+    "household_events",
+    "household_meals",
+    "household_nudges",
+    "household_profile_items",
+    "household_routines",
+    "household_shopping_items",
+    "household_source_rules",
+    "household_work_items",
+    "imported_candidates",
+    "onboarding_sessions",
+    "pilot_events",
+)
+
 FLORENCE_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS florence_schema_version (
     version INTEGER NOT NULL
@@ -429,6 +468,77 @@ class FlorenceStateDB:
     def rollback(self) -> None:
         if self._conn:
             self._conn.rollback()
+
+    def count_all_state_rows(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for table in _RESET_ALL_TABLES:
+            row = self._conn.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()
+            counts[table] = int(row["count"]) if row is not None else 0
+        return counts
+
+    def count_household_state_rows(self, household_id: str) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for table in _RESET_HOUSEHOLD_TABLES:
+            row = self._conn.execute(
+                f"SELECT COUNT(*) AS count FROM {table} WHERE household_id = ?",
+                (household_id,),
+            ).fetchone()
+            counts[table] = int(row["count"]) if row is not None else 0
+
+        member_row = self._conn.execute(
+            "SELECT COUNT(*) AS count FROM members WHERE household_id = ?",
+            (household_id,),
+        ).fetchone()
+        counts["members"] = int(member_row["count"]) if member_row is not None else 0
+
+        identity_row = self._conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM member_identities
+            WHERE member_id IN (
+                SELECT id FROM members WHERE household_id = ?
+            )
+            """,
+            (household_id,),
+        ).fetchone()
+        counts["member_identities"] = int(identity_row["count"]) if identity_row is not None else 0
+
+        household_row = self._conn.execute(
+            "SELECT COUNT(*) AS count FROM households WHERE id = ?",
+            (household_id,),
+        ).fetchone()
+        counts["households"] = int(household_row["count"]) if household_row is not None else 0
+        return counts
+
+    def wipe_all_state(self) -> dict[str, int]:
+        deleted_counts = self.count_all_state_rows()
+        database_str = str(self.database).strip().lower()
+        if database_str.startswith(("postgres://", "postgresql://")):
+            self._conn.execute(
+                "TRUNCATE TABLE " + ", ".join(_RESET_ALL_TABLES) + " RESTART IDENTITY CASCADE"
+            )
+        else:
+            for table in _RESET_ALL_TABLES:
+                self._conn.execute(f"DELETE FROM {table}")
+        self._conn.commit()
+        return deleted_counts
+
+    def delete_household_state(self, household_id: str) -> dict[str, int]:
+        deleted_counts = self.count_household_state_rows(household_id)
+        member_rows = self._conn.execute(
+            "SELECT id FROM members WHERE household_id = ?",
+            (household_id,),
+        ).fetchall()
+        member_ids = [str(row["id"]) for row in member_rows]
+
+        for table in _RESET_HOUSEHOLD_TABLES:
+            self._conn.execute(f"DELETE FROM {table} WHERE household_id = ?", (household_id,))
+        for member_id in member_ids:
+            self._conn.execute("DELETE FROM member_identities WHERE member_id = ?", (member_id,))
+        self._conn.execute("DELETE FROM members WHERE household_id = ?", (household_id,))
+        self._conn.execute("DELETE FROM households WHERE id = ?", (household_id,))
+        self._conn.commit()
+        return deleted_counts
 
     @staticmethod
     def build_onboarding_session_key(household_id: str, member_id: str, thread_id: str) -> str:

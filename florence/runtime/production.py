@@ -409,13 +409,10 @@ class FlorenceProductionService:
             if web_setup_ready:
                 dm_messages = build_onboarding_ready_message_sequence()
             else:
-                next_prompt_state = self.entrypoints.onboarding_service.get_prompt(
-                    household_id=oauth_state.household_id,
-                    member_id=oauth_state.member_id,
-                    thread_id=oauth_state.thread_id or "",
-                )
-                next_prompt = next_prompt_state.text if next_prompt_state is not None else None
-                dm_messages = build_google_connected_syncing_message_sequence() + ((next_prompt,) if next_prompt else ())
+                # Keep Google connect as a quiet background status update.
+                # The active onboarding question already exists in-thread, so
+                # replaying it here makes the conversation feel chaotic.
+                dm_messages = build_google_connected_syncing_message_sequence()
             sync_notice = None
 
             if oauth_state.thread_id and (dm_messages or sync_notice):

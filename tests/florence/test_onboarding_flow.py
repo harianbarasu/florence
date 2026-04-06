@@ -4,6 +4,7 @@ from florence.onboarding import (
     OnboardingVariant,
     apply_activity_basics,
     apply_child_names,
+    apply_child_profile_updates,
     apply_household_members,
     apply_household_operations,
     apply_parent_name,
@@ -33,22 +34,31 @@ def test_onboarding_flow_advances_through_required_v1_steps():
     assert "kids" in transition.prompt.text.lower() or "child" in transition.prompt.text.lower()
 
     transition = apply_child_names(transition.state, ["Ava", "Noah"])
-    assert transition.state.stage == OnboardingStage.COLLECT_SCHOOL_BASICS
+    assert transition.state.stage == OnboardingStage.COLLECT_CHILD_AGE
 
-    transition = apply_school_basics(
+    transition = apply_child_profile_updates(
         transition.state,
-        ["Roosevelt Elementary", "Little Oaks Preschool"],
+        [{"name": "Ava", "age": "7"}],
     )
-    assert transition.state.school_basics_collected is True
-    assert transition.state.stage == OnboardingStage.COLLECT_ACTIVITY_BASICS
+    assert transition.state.stage == OnboardingStage.COLLECT_CHILD_SCHOOL
 
-    transition = apply_activity_basics(transition.state, ["Soccer", "Piano"])
-    assert transition.state.activity_basics_collected is True
-    assert transition.state.stage == OnboardingStage.COLLECT_HOUSEHOLD_OPERATIONS
-
-    transition = apply_household_operations(
+    transition = apply_child_profile_updates(
         transition.state,
-        ["school forms", "returns", "soccer logistics"],
+        [{"name": "Ava", "school": "Roosevelt Elementary"}],
+    )
+    assert transition.state.school_basics_collected is False
+    assert transition.state.stage == OnboardingStage.COLLECT_CHILD_ACTIVITIES
+
+    transition = apply_child_profile_updates(
+        transition.state,
+        [{"name": "Ava", "activities": ["Soccer"]}],
+    )
+    assert transition.state.activity_basics_collected is False
+    assert transition.state.stage == OnboardingStage.COLLECT_CHILD_AGE
+
+    transition = apply_child_profile_updates(
+        transition.state,
+        [{"name": "Noah", "age": "4", "school": "Little Oaks Preschool", "activities": ["Piano"]}],
     )
     assert transition.state.stage == OnboardingStage.CONNECT_GOOGLE
     assert transition.prompt is not None
@@ -72,23 +82,24 @@ def test_onboarding_allows_empty_activity_list_once_answer_is_collected():
         member_id="mem_123",
         thread_id="thread_dm_123",
         parent_display_name="Maya",
-        child_names=["Ava"],
-        school_labels=["Roosevelt Elementary"],
-        school_basics_collected=True,
-        stage=OnboardingStage.COLLECT_ACTIVITY_BASICS,
-        metadata={"variant": OnboardingVariant.HYBRID.value},
+        stage=OnboardingStage.COLLECT_CHILD_ACTIVITIES,
+        metadata={
+            "variant": OnboardingVariant.HYBRID.value,
+            "child_profiles": [{"name": "Ava", "age": "7", "school": "Roosevelt Elementary"}],
+            "current_child_index": 0,
+        },
     )
 
     transition = apply_activity_basics(state, [])
 
     assert transition.state.activity_labels == []
     assert transition.state.activity_basics_collected is True
-    assert transition.state.stage == OnboardingStage.COLLECT_HOUSEHOLD_OPERATIONS
+    assert transition.state.stage == OnboardingStage.CONNECT_GOOGLE
     assert transition.state.is_complete is False
     assert transition.prompt is not None
 
 
-def test_concierge_variant_collects_family_unit_before_child_details():
+def test_concierge_variant_now_starts_with_kids_before_any_family_map_prompt():
     state = OnboardingState(
         household_id="hh_123",
         member_id="mem_456",
@@ -98,9 +109,9 @@ def test_concierge_variant_collects_family_unit_before_child_details():
 
     transition = apply_parent_name(state, "Maya")
 
-    assert transition.state.stage == OnboardingStage.COLLECT_HOUSEHOLD_MEMBERS
+    assert transition.state.stage == OnboardingStage.COLLECT_CHILD_NAMES
     assert transition.prompt is not None
-    assert "family unit" in transition.prompt.text.lower()
+    assert "kids" in transition.prompt.text.lower()
 
     transition = apply_household_members(
         transition.state,

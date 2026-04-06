@@ -66,6 +66,7 @@ from florence.onboarding import (
     OnboardingTransition,
     apply_activity_basics,
     apply_child_names,
+    apply_child_profile_updates,
     apply_household_members,
     apply_household_operations,
     apply_nudge_preferences,
@@ -76,7 +77,9 @@ from florence.onboarding import (
     mark_google_connected,
     mark_group_activated,
     OnboardingVariant,
+    sync_onboarding_stage,
 )
+from florence.onboarding.intake import FlorenceOnboardingIntakeService
 from florence.source_rules import (
     build_candidate_source_profile,
     build_rules_for_candidate,
@@ -119,7 +122,7 @@ def _gmail_incremental_max_results() -> int:
 
 
 def _gmail_bootstrap_window_days() -> int:
-    return _int_env("FLORENCE_GMAIL_BOOTSTRAP_WINDOW_DAYS", 90)
+    return _int_env("FLORENCE_GMAIL_BOOTSTRAP_WINDOW_DAYS", 30)
 
 
 def _gmail_incremental_query(
@@ -446,7 +449,7 @@ def _augment_onboarding_prompt(
         return None
 
     hints = _grounding_hints_from_settings(settings)
-    if prompt.stage == OnboardingStage.COLLECT_SCHOOL_BASICS:
+    if prompt.stage in {OnboardingStage.COLLECT_SCHOOL_BASICS, OnboardingStage.COLLECT_CHILD_SCHOOL}:
         school_hints = list(_index_hint_entries(hints, key="schools", detail_fields=("domains", "platforms", "contacts")).values())
         if not school_hints:
             return prompt
@@ -462,7 +465,7 @@ def _augment_onboarding_prompt(
         lines.append("Reply with the school or daycare names I should use, even if they match the suggestions.")
         return replace(prompt, text="\n".join(lines))
 
-    if prompt.stage == OnboardingStage.COLLECT_ACTIVITY_BASICS:
+    if prompt.stage in {OnboardingStage.COLLECT_ACTIVITY_BASICS, OnboardingStage.COLLECT_CHILD_ACTIVITIES}:
         activity_hints = list(_index_hint_entries(hints, key="activities", detail_fields=("locations", "contacts")).values())
         if not activity_hints:
             return prompt
@@ -940,10 +943,12 @@ class FlorenceOnboardingSessionService:
         *,
         candidate_review_service: FlorenceCandidateReviewService | None = None,
         variant_selector: Callable[[str, str], OnboardingVariant] | None = None,
+        intake_service: FlorenceOnboardingIntakeService | None = None,
     ):
         self.store = store
         self.candidate_review_service = candidate_review_service
         self.variant_selector = variant_selector or self._select_variant
+        self.intake_service = intake_service or FlorenceOnboardingIntakeService()
 
     def get_or_create_session(self, *, household_id: str, member_id: str, thread_id: str) -> OnboardingState:
         existing = self.store.get_onboarding_session(
@@ -993,6 +998,43 @@ class FlorenceOnboardingSessionService:
         if member is not None:
             self.store.upsert_member(replace(member, display_name=display_name.strip() or member.display_name))
         return self._persist_transition(apply_parent_name(state, display_name))
+
+    def record_user_reply(
+        self,
+        *,
+        household_id: str,
+        member_id: str,
+        thread_id: str,
+        text: str,
+    ) -> OnboardingTransition:
+        state = self.get_or_create_session(household_id=household_id, member_id=member_id, thread_id=thread_id)
+        intake = self.intake_service.parse(state=state, text=text)
+        next_state = state
+
+        if intake.parent_name and not next_state.parent_display_name:
+            next_state = apply_parent_name(next_state, intake.parent_name).state
+            member = self.store.get_member(member_id)
+            if member is not None:
+                self.store.upsert_member(replace(member, display_name=intake.parent_name))
+
+        if intake.child_names:
+            next_state = apply_child_names(next_state, intake.child_names, child_details=intake.child_names).state
+
+        if intake.child_updates:
+            next_state = apply_child_profile_updates(next_state, intake.child_updates).state
+
+        if intake.google_connected and not next_state.google_connected:
+            next_state = mark_google_connected(next_state).state
+
+        next_state = sync_onboarding_stage(next_state)
+        changed = next_state != state
+        return self._persist_transition(
+            OnboardingTransition(
+                state=next_state,
+                prompt=build_onboarding_prompt(next_state),
+                changed=changed and not intake.ignore_message,
+            )
+        )
 
     def record_google_connected(
         self,
@@ -1127,6 +1169,11 @@ class FlorenceOnboardingSessionService:
             OnboardingStage.CONNECT_GOOGLE,
             OnboardingStage.COLLECT_CHILD_NAMES,
         }:
+            child_profile_map = {
+                str(profile.get("name")).strip().lower(): profile
+                for profile in state.child_profiles
+                if isinstance(profile, dict) and str(profile.get("name") or "").strip()
+            }
             existing_children = {
                 child.full_name.strip().lower(): child
                 for child in self.store.list_child_profiles(household_id=state.household_id)
@@ -1141,6 +1188,10 @@ class FlorenceOnboardingSessionService:
                 first_name = _clean_label(cleaned_name.split()[0] if cleaned_name else None)
                 if first_name is not None and first_name.lower() != cleaned_name.lower():
                     _merge_metadata_list(metadata, "aliases", [first_name])
+                parsed_profile = child_profile_map.get(cleaned_name.lower())
+                parsed_age = _clean_label(parsed_profile.get("age")) if isinstance(parsed_profile, dict) else None
+                if parsed_age is not None:
+                    metadata["age"] = parsed_age
                 children.append(
                     ChildProfile(
                         id=_stable_id("child", state.household_id, cleaned_name.lower()),
@@ -1204,6 +1255,7 @@ class FlorenceOnboardingSessionService:
             settings["manager_profile"] = {
                 "onboarding_variant": state.variant.value,
                 "household_members": state.household_members,
+                "child_profiles": state.child_profiles,
                 "child_details": state.child_details,
                 "household_operations": state.household_operations,
                 "nudge_preferences": state.nudge_preferences,

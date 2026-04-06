@@ -25,9 +25,6 @@ from florence.onboarding import (
     build_google_connected_syncing_message_sequence,
     build_onboarding_ready_message_sequence,
     build_google_connect_message_sequence,
-    extract_child_names,
-    split_entries,
-    split_labels,
 )
 from florence.runtime.chat import FlorenceHouseholdChatService
 from florence.runtime.onboarding_links import FlorenceOnboardingLinkService
@@ -63,6 +60,8 @@ class FlorenceMessagingIngressResult:
     reply_messages: tuple[str, ...] = field(default_factory=tuple)
     group_announcement: str | None = None
     consumed: bool = False
+    defer_reply: bool = False
+    defer_seconds: float | None = None
 
 
 def _looks_like_yes(text: str) -> bool:
@@ -305,6 +304,7 @@ class FlorenceMessagingIngressService:
         onboarding_link_service: FlorenceOnboardingLinkService | None = None,
         household_chat_service: FlorenceHouseholdChatService | None = None,
         household_manager_service: FlorenceHouseholdManagerService | None = None,
+        onboarding_reply_debounce_seconds: float = 8.0,
     ):
         self.store = store
         self.onboarding_service = onboarding_service
@@ -314,6 +314,7 @@ class FlorenceMessagingIngressService:
         self.onboarding_link_service = onboarding_link_service
         self.household_chat_service = household_chat_service
         self.household_manager_service = household_manager_service or FlorenceHouseholdManagerService(store)
+        self.onboarding_reply_debounce_seconds = max(0.0, float(onboarding_reply_debounce_seconds))
 
     def handle_message(self, resolved: FlorenceResolvedInboundMessage) -> FlorenceMessagingIngressResult:
         if resolved.message.is_from_me:
@@ -379,27 +380,32 @@ class FlorenceMessagingIngressService:
         thread_id: str,
         prompt: OnboardingPrompt | None,
         include_intro: bool = False,
+        include_google_connect: bool = False,
     ) -> tuple[str, ...]:
-        if prompt is None:
-            return ()
         intro: tuple[str, ...] = (
             (
                 "Hi, I'm Florence.",
-                "I help run the household with you by learning the family map first, then keeping up with reminders, logistics, school noise, and schedule changes.",
+                "I help run the household with you by keeping logistics organized, surfacing reminders, and staying on top of school and calendar noise.",
             )
             if include_intro
             else ()
         )
-        if prompt.stage == OnboardingStage.CONNECT_GOOGLE and self.google_account_link_service is not None:
-            link = self.google_account_link_service.build_connect_link(
-                household_id=household_id,
-                member_id=member_id,
-                thread_id=thread_id,
-            )
-            return intro + build_google_connect_message_sequence(link.url)
+        google_sequence: tuple[str, ...] = ()
+        if (prompt is not None and prompt.stage == OnboardingStage.CONNECT_GOOGLE) or include_google_connect:
+            if self.google_account_link_service is not None:
+                link = self.google_account_link_service.build_connect_link(
+                    household_id=household_id,
+                    member_id=member_id,
+                    thread_id=thread_id,
+                )
+                google_sequence = build_google_connect_message_sequence(link.url)
+            else:
+                google_sequence = build_google_connect_message_sequence()
+        if prompt is None:
+            return intro + google_sequence
         if prompt.stage == OnboardingStage.CONNECT_GOOGLE:
-            return intro + build_google_connect_message_sequence()
-        return intro + (prompt.text,)
+            return intro + google_sequence
+        return intro + google_sequence + (prompt.text,)
 
     def _channel_has_assistant_history(self, *, channel_id: str) -> bool:
         return any(
@@ -419,6 +425,13 @@ class FlorenceMessagingIngressService:
             reply_messages=messages,
             group_announcement=group_announcement,
             consumed=consumed,
+        )
+
+    def _deferred_result(self) -> FlorenceMessagingIngressResult:
+        return FlorenceMessagingIngressResult(
+            consumed=True,
+            defer_reply=True,
+            defer_seconds=self.onboarding_reply_debounce_seconds,
         )
 
     def _append_inbound_message(self, resolved: FlorenceResolvedInboundMessage) -> None:
@@ -477,6 +490,162 @@ class FlorenceMessagingIngressService:
             None,
         )
         return latest_assistant.body.strip() if latest_assistant is not None else None
+
+    def _pending_user_turn_messages(self, *, channel_id: str) -> list[ChannelMessage]:
+        history = self.store.list_channel_messages(channel_id=channel_id, limit=24)
+        last_assistant_index = max(
+            (index for index, message in enumerate(history) if message.sender_role == ChannelMessageRole.ASSISTANT),
+            default=-1,
+        )
+        pending = [
+            message
+            for message in history[last_assistant_index + 1 :]
+            if message.sender_role == ChannelMessageRole.USER and message.body.strip()
+        ]
+        return pending
+
+    def _pending_user_turn_text(self, *, channel_id: str) -> str | None:
+        pending = self._pending_user_turn_messages(channel_id=channel_id)
+        if not pending:
+            return None
+        combined = "\n".join(message.body.strip() for message in pending if message.body.strip())
+        normalized = " ".join(combined.split()).strip()
+        return combined if normalized else None
+
+    @staticmethod
+    def _is_onboarding_bundled_stage(stage: OnboardingStage) -> bool:
+        return stage in {
+            OnboardingStage.COLLECT_CHILD_NAMES,
+            OnboardingStage.COLLECT_CHILD_AGE,
+            OnboardingStage.COLLECT_CHILD_SCHOOL,
+            OnboardingStage.COLLECT_CHILD_ACTIVITIES,
+        }
+
+    def _should_defer_onboarding_reply(
+        self,
+        *,
+        channel_id: str,
+        stage: OnboardingStage,
+        text: str,
+    ) -> bool:
+        if self.onboarding_reply_debounce_seconds <= 0:
+            return False
+        if not self._is_onboarding_bundled_stage(stage):
+            return False
+        normalized = " ".join(text.split()).strip()
+        if not normalized:
+            return False
+        if _looks_like_acknowledgement(normalized):
+            return False
+        if _looks_like_google_connected(normalized):
+            return False
+        if _looks_like_group_share_request(normalized):
+            return False
+        if _looks_like_general_chat_request(normalized):
+            return False
+        if _looks_like_schedule_question(normalized):
+            return False
+        if _looks_like_sync_status_request(normalized):
+            return False
+        if _looks_like_review_request(normalized):
+            return False
+        latest_assistant = self._latest_assistant_message_body(channel_id=channel_id)
+        if latest_assistant is None:
+            return False
+        if _looks_like_candidate_review_prompt(latest_assistant):
+            return False
+        if _looks_like_google_done_prompt(latest_assistant):
+            return False
+        return True
+
+    def _record_onboarding_reply(
+        self,
+        *,
+        household_id: str,
+        member_id: str,
+        channel_id: str,
+        thread_id: str,
+        stage: OnboardingStage,
+        text: str,
+    ) -> FlorenceMessagingIngressResult:
+        if stage == OnboardingStage.CONNECT_GOOGLE and not _looks_like_google_connected(text):
+            prompt = self.onboarding_service.get_prompt(
+                household_id=household_id,
+                member_id=member_id,
+                thread_id=thread_id,
+            )
+            return self._result_with_messages(
+                self._render_onboarding_prompt_messages(
+                    household_id=household_id,
+                    member_id=member_id,
+                    thread_id=thread_id,
+                    prompt=prompt,
+                )
+            )
+
+        transition = self.onboarding_service.record_user_reply(
+            household_id=household_id,
+            member_id=member_id,
+            thread_id=thread_id,
+            text=text,
+        )
+        if transition.state.is_complete:
+            self._record_onboarding_completion(
+                household_id=household_id,
+                member_id=member_id,
+                channel_id=channel_id,
+            )
+            return self._result_with_messages(build_onboarding_ready_message_sequence())
+
+        include_google_connect = (
+            stage == OnboardingStage.COLLECT_PARENT_NAME and not transition.state.google_connected
+        )
+        return self._result_with_messages(
+            self._render_onboarding_prompt_messages(
+                household_id=household_id,
+                member_id=member_id,
+                thread_id=thread_id,
+                prompt=transition.prompt,
+                include_intro=(stage == OnboardingStage.COLLECT_PARENT_NAME),
+                include_google_connect=include_google_connect,
+            )
+        )
+
+    def flush_deferred_onboarding_reply(
+        self,
+        *,
+        household_id: str,
+        member_id: str,
+        channel_id: str,
+        thread_id: str,
+    ) -> FlorenceMessagingIngressResult:
+        session = self.onboarding_service.get_or_create_session(
+            household_id=household_id,
+            member_id=member_id,
+            thread_id=thread_id,
+        )
+        if session.is_complete:
+            return FlorenceMessagingIngressResult(consumed=False)
+        pending = self._pending_user_turn_messages(channel_id=channel_id)
+        if not pending:
+            return FlorenceMessagingIngressResult(consumed=False)
+        latest_pending = pending[-1]
+        if (
+            self.onboarding_reply_debounce_seconds > 0
+            and (time.time() - latest_pending.created_at) < self.onboarding_reply_debounce_seconds - 0.25
+        ):
+            return FlorenceMessagingIngressResult(consumed=False)
+        combined_text = self._pending_user_turn_text(channel_id=channel_id)
+        if combined_text is None:
+            return FlorenceMessagingIngressResult(consumed=False)
+        return self._record_onboarding_reply(
+            household_id=household_id,
+            member_id=member_id,
+            channel_id=channel_id,
+            thread_id=thread_id,
+            stage=session.stage,
+            text=combined_text,
+        )
 
     def _latest_promotable_group_message(self, *, channel_id: str) -> ChannelMessage | None:
         history = self.store.list_channel_messages(channel_id=channel_id, limit=12)
@@ -703,6 +872,12 @@ class FlorenceMessagingIngressService:
                     return FlorenceMessagingIngressResult(reply_text=review_prompt.text, consumed=True)
 
         if not session.is_complete:
+            if self._should_defer_onboarding_reply(
+                channel_id=resolved.channel_id,
+                stage=session.stage,
+                text=text,
+            ):
+                return self._deferred_result()
             if session.google_connected:
                 if _looks_like_acknowledgement(text):
                     return FlorenceMessagingIngressResult(consumed=True)
@@ -1015,202 +1190,14 @@ class FlorenceMessagingIngressService:
         text: str,
     ) -> FlorenceMessagingIngressResult:
         member_id = _require_member_id(resolved.member_id)
-        if stage == OnboardingStage.COLLECT_PARENT_NAME and text:
-            transition = self.onboarding_service.record_parent_name(
-                household_id=resolved.household_id,
-                member_id=member_id,
-                thread_id=resolved.thread_id,
-                display_name=text,
-            )
-            return self._result_with_messages(
-                self._render_onboarding_prompt_messages(
-                    household_id=resolved.household_id,
-                    member_id=member_id,
-                    thread_id=resolved.thread_id,
-                    prompt=transition.prompt,
-                    include_intro=True,
-                )
-            )
-
-        if stage == OnboardingStage.COLLECT_HOUSEHOLD_MEMBERS:
-            transition = self.onboarding_service.record_household_members(
-                household_id=resolved.household_id,
-                member_id=member_id,
-                thread_id=resolved.thread_id,
-                household_members=split_entries(text),
-            )
-            return self._result_with_messages(
-                self._render_onboarding_prompt_messages(
-                    household_id=resolved.household_id,
-                    member_id=member_id,
-                    thread_id=resolved.thread_id,
-                    prompt=transition.prompt,
-                )
-            )
-
-        if stage == OnboardingStage.CONNECT_GOOGLE:
-            if _looks_like_google_connected(text):
-                transition = self.onboarding_service.record_google_connected(
-                    household_id=resolved.household_id,
-                    member_id=member_id,
-                    thread_id=resolved.thread_id,
-                )
-                return self._result_with_messages(
-                    self._render_onboarding_prompt_messages(
-                        household_id=resolved.household_id,
-                        member_id=member_id,
-                        thread_id=resolved.thread_id,
-                        prompt=transition.prompt,
-                    )
-                )
-            prompt = self.onboarding_service.get_prompt(
-                household_id=resolved.household_id,
-                member_id=member_id,
-                thread_id=resolved.thread_id,
-            )
-            return self._result_with_messages(
-                self._render_onboarding_prompt_messages(
-                    household_id=resolved.household_id,
-                    member_id=member_id,
-                    thread_id=resolved.thread_id,
-                    prompt=prompt,
-                )
-            )
-
-        if stage == OnboardingStage.COLLECT_CHILD_NAMES:
-            entries = split_entries(text)
-            transition = self.onboarding_service.record_child_names(
-                household_id=resolved.household_id,
-                member_id=member_id,
-                thread_id=resolved.thread_id,
-                child_names=extract_child_names(entries),
-                child_details=entries,
-            )
-            return self._result_with_messages(
-                self._render_onboarding_prompt_messages(
-                    household_id=resolved.household_id,
-                    member_id=member_id,
-                    thread_id=resolved.thread_id,
-                    prompt=transition.prompt,
-                )
-            )
-
-        if stage == OnboardingStage.COLLECT_SCHOOL_BASICS:
-            transition = self.onboarding_service.record_school_basics(
-                household_id=resolved.household_id,
-                member_id=member_id,
-                thread_id=resolved.thread_id,
-                school_labels=split_labels(text),
-            )
-            return self._result_with_messages(
-                self._render_onboarding_prompt_messages(
-                    household_id=resolved.household_id,
-                    member_id=member_id,
-                    thread_id=resolved.thread_id,
-                    prompt=transition.prompt,
-                )
-            )
-
-        if stage == OnboardingStage.COLLECT_ACTIVITY_BASICS:
-            transition = self.onboarding_service.record_activity_basics(
-                household_id=resolved.household_id,
-                member_id=member_id,
-                thread_id=resolved.thread_id,
-                activity_labels=split_labels(text),
-            )
-            if transition.state.is_complete:
-                self._record_onboarding_completion(
-                    household_id=resolved.household_id,
-                    member_id=member_id,
-                    channel_id=resolved.channel_id,
-                )
-                return self._result_with_messages(build_onboarding_ready_message_sequence())
-            return self._result_with_messages(
-                self._render_onboarding_prompt_messages(
-                    household_id=resolved.household_id,
-                    member_id=member_id,
-                    thread_id=resolved.thread_id,
-                    prompt=transition.prompt,
-                )
-            )
-
-        if stage == OnboardingStage.COLLECT_HOUSEHOLD_OPERATIONS:
-            transition = self.onboarding_service.record_household_operations(
-                household_id=resolved.household_id,
-                member_id=member_id,
-                thread_id=resolved.thread_id,
-                household_operations=split_entries(text),
-            )
-            return self._result_with_messages(
-                self._render_onboarding_prompt_messages(
-                    household_id=resolved.household_id,
-                    member_id=member_id,
-                    thread_id=resolved.thread_id,
-                    prompt=transition.prompt,
-                )
-            )
-
-        if stage == OnboardingStage.COLLECT_NUDGE_PREFERENCES:
-            transition = self.onboarding_service.record_nudge_preferences(
-                household_id=resolved.household_id,
-                member_id=member_id,
-                thread_id=resolved.thread_id,
-                nudge_preferences=text,
-            )
-            if transition.state.is_complete:
-                self._record_onboarding_completion(
-                    household_id=resolved.household_id,
-                    member_id=member_id,
-                    channel_id=resolved.channel_id,
-                )
-                return self._result_with_messages(build_onboarding_ready_message_sequence())
-            return self._result_with_messages(
-                self._render_onboarding_prompt_messages(
-                    household_id=resolved.household_id,
-                    member_id=member_id,
-                    thread_id=resolved.thread_id,
-                    prompt=transition.prompt,
-                )
-            )
-
-        if stage == OnboardingStage.COLLECT_OPERATING_PREFERENCES:
-            transition = self.onboarding_service.record_operating_preferences(
-                household_id=resolved.household_id,
-                member_id=member_id,
-                thread_id=resolved.thread_id,
-                operating_preferences=text,
-            )
-            if transition.state.is_complete:
-                self._record_onboarding_completion(
-                    household_id=resolved.household_id,
-                    member_id=member_id,
-                    channel_id=resolved.channel_id,
-                )
-                return self._result_with_messages(build_onboarding_ready_message_sequence())
-            return self._result_with_messages(
-                self._render_onboarding_prompt_messages(
-                    household_id=resolved.household_id,
-                    member_id=member_id,
-                    thread_id=resolved.thread_id,
-                    prompt=transition.prompt,
-                )
-            )
-
-        if stage == OnboardingStage.ACTIVATE_GROUP:
-            return self._result_with_messages(build_onboarding_ready_message_sequence())
-
-        prompt = self.onboarding_service.get_prompt(
+        bundled_text = self._pending_user_turn_text(channel_id=resolved.channel_id) or text
+        return self._record_onboarding_reply(
             household_id=resolved.household_id,
             member_id=member_id,
+            channel_id=resolved.channel_id,
             thread_id=resolved.thread_id,
-        )
-        return self._result_with_messages(
-            self._render_onboarding_prompt_messages(
-                household_id=resolved.household_id,
-                member_id=member_id,
-                thread_id=resolved.thread_id,
-                prompt=prompt,
-            )
+            stage=stage,
+            text=bundled_text,
         )
 
     def _handle_group_message(self, resolved: FlorenceResolvedInboundMessage) -> FlorenceMessagingIngressResult:

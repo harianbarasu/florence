@@ -28,6 +28,7 @@ from florence.contracts import (
     MemberRole,
 )
 from florence.google import GoogleCalendarMetadata, GoogleTokenResponse
+from florence.messaging import FlorenceMessagingIngressResult
 from florence.onboarding import OnboardingVariant
 from florence.runtime import FlorenceEntrypointResult, FlorenceProductionService
 from florence.state import FlorenceStateDB
@@ -62,6 +63,26 @@ class _FakeBriefingChatService:
         return "Morning brief: soccer bag, lunch order, and pickup timing are all on deck."
 
 
+class _FakeTimer:
+    instances = []
+
+    def __init__(self, interval, function, args=None, kwargs=None):
+        self.interval = interval
+        self.function = function
+        self.args = args or ()
+        self.kwargs = kwargs or {}
+        self.daemon = False
+        self.started = False
+        self.cancelled = False
+        _FakeTimer.instances.append(self)
+
+    def start(self):
+        self.started = True
+
+    def cancel(self):
+        self.cancelled = True
+
+
 def _build_settings(tmp_path):
     return FlorenceSettings(
         server=FlorenceServerRuntimeConfig(
@@ -87,6 +108,27 @@ def _build_settings(tmp_path):
             max_iterations=4,
         ),
         redis=FlorenceRedisRuntimeConfig(url=None),
+    )
+
+
+def _complete_child_profile(onboarding_service, *, household_id: str, member_id: str, thread_id: str, age: str = "7", school: str = "Roosevelt Elementary", activities: str = "Soccer"):
+    onboarding_service.record_user_reply(
+        household_id=household_id,
+        member_id=member_id,
+        thread_id=thread_id,
+        text=age,
+    )
+    onboarding_service.record_user_reply(
+        household_id=household_id,
+        member_id=member_id,
+        thread_id=thread_id,
+        text=school,
+    )
+    onboarding_service.record_user_reply(
+        household_id=household_id,
+        member_id=member_id,
+        thread_id=thread_id,
+        text=activities,
     )
 
 
@@ -154,6 +196,81 @@ def test_production_service_delivers_dm_reply_and_group_announcement(tmp_path, m
     store.close()
 
 
+def test_production_service_defers_onboarding_reply_and_flushes_later(tmp_path, monkeypatch):
+    settings = _build_settings(tmp_path)
+    store = FlorenceStateDB(settings.server.db_path)
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    service = FlorenceProductionService(settings, store=store)
+    service.linq = _FakeLinqClient()
+    _FakeTimer.instances = []
+    monkeypatch.setattr("florence.runtime.production.threading.Timer", _FakeTimer)
+    monkeypatch.setattr(
+        service.entrypoints,
+        "handle_linq_payload",
+        lambda payload: FlorenceEntrypointResult(
+            consumed=True,
+            defer_reply=True,
+            defer_seconds=6.0,
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+        ),
+    )
+    monkeypatch.setattr(
+        service.entrypoints.ingress,
+        "flush_deferred_onboarding_reply",
+        lambda **kwargs: FlorenceMessagingIngressResult(
+            reply_text="Great, let's learn more about each kid one at a time. How old is Ava?",
+            reply_messages=("Great, let's learn more about each kid one at a time. How old is Ava?",),
+            consumed=True,
+        ),
+    )
+
+    payload = {
+        "webhook_version": "2026-02-03",
+        "event_type": "message.received",
+        "data": {
+            "chat": {"id": "dm-thread-123", "is_group": False},
+            "id": "msg_123",
+            "direction": "inbound",
+            "sender_handle": {"handle": "+15555550123", "is_me": False},
+            "parts": [{"type": "text", "value": "Ava"}],
+            "service": "iMessage",
+        },
+    }
+    raw_body = json.dumps(payload).encode("utf-8")
+    result = service.handle_linq_webhook(
+        payload=payload,
+        raw_body=raw_body,
+        webhook_signature="sig",
+        webhook_timestamp=str(int(time.time())),
+    )
+
+    assert result.status_code == 200
+    assert json.loads(result.body)["deferred"] is True
+    assert service.linq.sent == []
+    assert len(_FakeTimer.instances) == 1
+    assert _FakeTimer.instances[0].started is True
+    _FakeTimer.instances[0].function(*_FakeTimer.instances[0].args, **_FakeTimer.instances[0].kwargs)
+    assert service.linq.sent == [
+        {
+            "chat_id": "dm-thread-123",
+            "message": "Great, let's learn more about each kid one at a time. How old is Ava?",
+        }
+    ]
+    store.close()
+
+
 def test_production_service_google_callback_sends_dm_follow_up(tmp_path, monkeypatch):
     settings = _build_settings(tmp_path)
     store = FlorenceStateDB(settings.server.db_path)
@@ -191,23 +308,11 @@ def test_production_service_google_callback_sends_dm_follow_up(tmp_path, monkeyp
         thread_id="dm-thread-123",
         child_names=["Ava"],
     )
-    service.entrypoints.onboarding_service.record_school_basics(
+    _complete_child_profile(
+        service.entrypoints.onboarding_service,
         household_id="hh_123",
         member_id="mem_123",
         thread_id="dm-thread-123",
-        school_labels=["Roosevelt Elementary"],
-    )
-    service.entrypoints.onboarding_service.record_activity_basics(
-        household_id="hh_123",
-        member_id="mem_123",
-        thread_id="dm-thread-123",
-        activity_labels=["Soccer"],
-    )
-    service.entrypoints.onboarding_service.record_household_operations(
-        household_id="hh_123",
-        member_id="mem_123",
-        thread_id="dm-thread-123",
-        household_operations=["school forms", "pickup planning"],
     )
 
     link = service.entrypoints.google_account_link_service.build_connect_link(
@@ -253,7 +358,7 @@ def test_production_service_google_callback_sends_dm_follow_up(tmp_path, monkeyp
     assert service.linq.sent[0]["chat_id"] == "dm-thread-123"
     assert [message["message"] for message in service.linq.sent] == [
         "Google connected.",
-        "I\u2019m syncing your recent email and calendar in the background now.",
+        "I\u2019m syncing the last 30 days of your email and calendar in the background now.",
         "I\u2019ll text you here when the first pass is ready.",
     ]
     onboarding_events = store.list_pilot_events(household_id="hh_123", event_type="onboarding_complete")
@@ -296,11 +401,11 @@ def test_production_service_google_callback_sends_progress_link_until_setup_read
         thread_id="dm-thread-123",
         display_name="Maya",
     )
-    service.entrypoints.onboarding_service.record_household_operations(
+    service.entrypoints.onboarding_service.record_child_names(
         household_id="hh_123",
         member_id="mem_123",
         thread_id="dm-thread-123",
-        household_operations=["school forms", "pickup planning"],
+        child_names=["Ava"],
     )
 
     link = service.entrypoints.google_account_link_service.build_connect_link(
@@ -344,9 +449,9 @@ def test_production_service_google_callback_sends_progress_link_until_setup_read
     assert "Messages conversation" in result.body
     assert [message["message"] for message in service.linq.sent] == [
         "Google connected.",
-        "I\u2019m syncing your recent email and calendar in the background now.",
+        "I\u2019m syncing the last 30 days of your email and calendar in the background now.",
         "I\u2019ll text you here when the first pass is ready.",
-        "Reminder style: I default to day before + morning of for important family logistics. If you want a different default, say same-day only or keep nudging until acknowledged.",
+        "Great, let's learn more about each kid one at a time. How old is Ava?",
     ]
     assert launched[0]["notify_when_finished"] is True
     store.close()
@@ -407,24 +512,6 @@ def test_production_service_google_callback_keeps_onboarding_prompt_separate_fro
         thread_id="dm-thread-123",
         child_names=["Ava"],
     )
-    service.entrypoints.onboarding_service.record_school_basics(
-        household_id="hh_123",
-        member_id="mem_123",
-        thread_id="dm-thread-123",
-        school_labels=["Roosevelt Elementary"],
-    )
-    service.entrypoints.onboarding_service.record_activity_basics(
-        household_id="hh_123",
-        member_id="mem_123",
-        thread_id="dm-thread-123",
-        activity_labels=["Soccer"],
-    )
-    service.entrypoints.onboarding_service.record_household_operations(
-        household_id="hh_123",
-        member_id="mem_123",
-        thread_id="dm-thread-123",
-        household_operations=["school forms", "pickup planning"],
-    )
     store.upsert_imported_candidate(
         ImportedCandidate(
             id="cand_123",
@@ -478,10 +565,11 @@ def test_production_service_google_callback_keeps_onboarding_prompt_separate_fro
     result = service.handle_google_callback(code="auth-code", state=raw_state)
 
     assert result.status_code == 200
-    assert len(service.linq.sent) == 3
+    assert len(service.linq.sent) == 4
     assert service.linq.sent[0]["message"] == "Google connected."
     assert all("Imported item:" not in message["message"] for message in service.linq.sent)
-    assert "syncing your recent email and calendar in the background" in service.linq.sent[1]["message"]
+    assert "syncing the last 30 days of your email and calendar in the background" in service.linq.sent[1]["message"]
+    assert "How old is Ava?" in service.linq.sent[-1]["message"]
     assert launched[0]["notify_when_finished"] is True
     store.close()
 
@@ -784,14 +872,15 @@ def test_production_service_first_dm_sends_onboarding_sequence_as_separate_messa
     )
 
     assert result.status_code == 200
-    assert len(service.linq.sent) == 3
+    assert len(service.linq.sent) == 6
     assert service.linq.sent[0]["message"] == "Hi, I'm Florence."
     assert service.linq.sent[1]["message"] == (
-        "I help run the household with you by learning the family map first, then keeping up with reminders, logistics, school noise, and schedule changes."
+        "I help run the household with you by keeping logistics organized, surfacing reminders, and staying on top of school and calendar noise."
     )
-    assert service.linq.sent[2]["message"] == (
-        "Start with the kids I should know about: first name plus grade or age if helpful. One per line or comma-separated is fine."
-    )
+    assert service.linq.sent[2]["message"] == "Connect your Google account so I can pull the last 30 days of family email and calendar in the background while we keep going here."
+    assert service.linq.sent[3]["message"].startswith("https://accounts.google.com/")
+    assert service.linq.sent[4]["message"] == "Once Google says you're connected, come right back here. You can also keep answering my questions while it runs."
+    assert service.linq.sent[5]["message"] == "What are your kids' names? One per line or comma-separated is fine."
     store.close()
 
 
@@ -846,23 +935,14 @@ def test_production_service_web_onboarding_submission_completes_setup_and_texts_
     )
 
     assert result.status_code == 200
-    assert "Florence is ready" in result.body
+    assert "Saved. Finish any missing sections and Florence will be ready." in result.body
     session = service.entrypoints.onboarding_service.get_or_create_session(
         household_id="hh_123",
         member_id="mem_123",
         thread_id="dm-thread-123",
     )
-    assert session.is_complete is True
-    assert service.linq.sent == [
-        {"chat_id": "dm-thread-123", "message": "You're ready. Florence is set up as your house manager now."},
-        {
-            "chat_id": "dm-thread-123",
-            "message": (
-                "Start with a real task like: what's on the kids' schedule next week, check my email for a school or camp update, "
-                "remind me about picture day, or plan dinners and groceries for next week."
-            ),
-        },
-    ]
+    assert session.is_complete is False
+    assert service.linq.sent == []
     store.close()
 
 
@@ -1057,11 +1137,10 @@ def test_production_service_web_setup_profile_completes_and_texts_parent(tmp_pat
 
     assert result.status_code == 200
     payload = json.loads(result.body)
-    assert payload["setup"]["readyForChat"] is True
+    assert payload["setup"]["readyForChat"] is False
     assert payload["setup"]["requiredFields"]["calendarClassification"] is True
     assert len(store.list_child_profiles(household_id="hh_123")) == 2
-    assert len(service.linq.sent) == 2
-    assert service.linq.sent[0]["message"] == "You're ready. Florence is set up as your house manager now."
+    assert service.linq.sent == []
     assert payload["preferences"]["trustDefaults"]["allowGoogleDataProcessing"] is True
     store.close()
 

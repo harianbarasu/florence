@@ -409,6 +409,12 @@ def test_onboarding_prompt_surfaces_google_grounding_suggestions(tmp_path):
         thread_id="thread_dm_123",
         child_names=["Ava"],
     )
+    onboarding_service.record_user_reply(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="thread_dm_123",
+        text="7",
+    )
     school_prompt = onboarding_service.get_prompt(
         household_id="hh_123",
         member_id="mem_123",

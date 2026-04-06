@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Any
 
 
 class OnboardingVariant(StrEnum):
@@ -14,8 +15,11 @@ class OnboardingVariant(StrEnum):
 class OnboardingStage(StrEnum):
     COLLECT_PARENT_NAME = "collect_parent_name"
     COLLECT_HOUSEHOLD_MEMBERS = "collect_household_members"
-    CONNECT_GOOGLE = "connect_google"
     COLLECT_CHILD_NAMES = "collect_child_names"
+    COLLECT_CHILD_AGE = "collect_child_age"
+    COLLECT_CHILD_SCHOOL = "collect_child_school"
+    COLLECT_CHILD_ACTIVITIES = "collect_child_activities"
+    CONNECT_GOOGLE = "connect_google"
     COLLECT_SCHOOL_BASICS = "collect_school_basics"
     COLLECT_ACTIVITY_BASICS = "collect_activity_basics"
     COLLECT_HOUSEHOLD_OPERATIONS = "collect_household_operations"
@@ -43,6 +47,61 @@ def _metadata_text(metadata: dict[str, object], key: str) -> str | None:
         return None
     cleaned = " ".join(str(raw).split()).strip()
     return cleaned or None
+
+
+def _metadata_int(metadata: dict[str, object], key: str) -> int | None:
+    raw = metadata.get(key)
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except Exception:
+        return None
+
+
+def _clean_text(value: object) -> str | None:
+    if value is None:
+        return None
+    cleaned = " ".join(str(value).split()).strip()
+    return cleaned or None
+
+
+def _clean_text_list(value: object) -> list[str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        return None
+    values: list[str] = []
+    for item in value:
+        cleaned = _clean_text(item)
+        if cleaned:
+            values.append(cleaned)
+    return values
+
+
+def _metadata_child_profiles(metadata: dict[str, object]) -> list[dict[str, Any]]:
+    raw = metadata.get("child_profiles")
+    if not isinstance(raw, list):
+        return []
+    profiles: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name = _clean_text(item.get("name"))
+        if not name:
+            continue
+        profile: dict[str, Any] = {"name": name}
+        age = _clean_text(item.get("age"))
+        school = _clean_text(item.get("school"))
+        activities = _clean_text_list(item.get("activities"))
+        if age is not None:
+            profile["age"] = age
+        if school is not None:
+            profile["school"] = school
+        if activities is not None:
+            profile["activities"] = activities
+        profiles.append(profile)
+    return profiles
 
 
 @dataclass(slots=True)
@@ -77,7 +136,50 @@ class OnboardingState:
 
     @property
     def child_details(self) -> list[str]:
-        return _metadata_list(self.metadata, "child_details")
+        explicit = _metadata_list(self.metadata, "child_details")
+        if explicit:
+            return explicit
+        details: list[str] = []
+        for profile in self.child_profiles:
+            parts = [str(profile["name"])]
+            age = _clean_text(profile.get("age"))
+            school = _clean_text(profile.get("school"))
+            activities = _clean_text_list(profile.get("activities"))
+            if age:
+                parts.append(f"age {age}")
+            if school:
+                parts.append(school)
+            if activities is not None and activities:
+                parts.append(", ".join(activities))
+            details.append(" - ".join(parts))
+        return details
+
+    @property
+    def child_profiles(self) -> list[dict[str, Any]]:
+        return _metadata_child_profiles(self.metadata)
+
+    @property
+    def current_child_index(self) -> int:
+        index = _metadata_int(self.metadata, "current_child_index")
+        if index is None or index < 0:
+            return 0
+        if not self.child_profiles:
+            return 0
+        return min(index, max(0, len(self.child_profiles) - 1))
+
+    @property
+    def current_child_profile(self) -> dict[str, Any] | None:
+        profiles = self.child_profiles
+        if not profiles:
+            return None
+        return profiles[self.current_child_index]
+
+    @property
+    def current_child_name(self) -> str | None:
+        profile = self.current_child_profile
+        if profile is None:
+            return None
+        return _clean_text(profile.get("name"))
 
     @property
     def household_operations(self) -> list[str]:
@@ -98,14 +200,14 @@ class OnboardingState:
 
     @property
     def is_complete(self) -> bool:
-        basics_ready = bool(
-            self.google_connected
-            and self.child_names
-            and self.school_basics_collected
-            and self.activity_basics_collected
-        )
-        if not basics_ready:
+        profiles = self.child_profiles
+        if not self.google_connected or not profiles:
             return False
-        if self.variant == OnboardingVariant.CONCIERGE and not self.household_members:
-            return False
+        for profile in profiles:
+            if not _clean_text(profile.get("age")):
+                return False
+            if not _clean_text(profile.get("school")):
+                return False
+            if not isinstance(profile.get("activities"), list):
+                return False
         return True

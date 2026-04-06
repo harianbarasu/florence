@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sys
 import time
 
 from florence.config import FlorenceSettings
@@ -18,7 +19,11 @@ def main() -> None:
     parser.add_argument("--once", action="store_true", help="Run a single sync pass and exit")
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stdout,
+    )
     settings = FlorenceSettings.from_env()
     service = FlorenceProductionService(settings)
 

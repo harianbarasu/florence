@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from typing import Any
 
-from florence.onboarding.state import OnboardingStage, OnboardingState, OnboardingVariant
+from florence.onboarding.state import OnboardingStage, OnboardingState
 
 
 @dataclass(slots=True)
@@ -21,35 +22,164 @@ class OnboardingTransition:
     changed: bool = False
 
 
+def _clean_text(value: object) -> str | None:
+    if value is None:
+        return None
+    cleaned = " ".join(str(value).split()).strip()
+    return cleaned or None
+
+
+def _clean_list(values: list[str]) -> list[str]:
+    return [item for item in (_clean_text(value) for value in values) if item]
+
+
+def _dedupe(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in values:
+        key = value.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(value)
+    return ordered
+
+
+def _normalize_child_profiles(profiles: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in profiles:
+        if not isinstance(item, dict):
+            continue
+        name = _clean_text(item.get("name"))
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        profile: dict[str, Any] = {"name": name}
+        age = _clean_text(item.get("age"))
+        school = _clean_text(item.get("school"))
+        activities_raw = item.get("activities")
+        activities = _clean_list(activities_raw) if isinstance(activities_raw, list) else None
+        if age is not None:
+            profile["age"] = age
+        if school is not None:
+            profile["school"] = school
+        if activities is not None:
+            profile["activities"] = activities
+        normalized.append(profile)
+    return normalized
+
+
+def _seed_child_profiles(state: OnboardingState) -> list[dict[str, Any]]:
+    if state.child_profiles:
+        return [dict(profile) for profile in state.child_profiles]
+    return [{"name": name} for name in _clean_list(state.child_names)]
+
+
+def _child_detail_lines(profiles: list[dict[str, Any]]) -> list[str]:
+    details: list[str] = []
+    for profile in profiles:
+        parts = [str(profile["name"])]
+        age = _clean_text(profile.get("age"))
+        school = _clean_text(profile.get("school"))
+        activities = profile.get("activities")
+        if age:
+            parts.append(f"age {age}")
+        if school:
+            parts.append(school)
+        if isinstance(activities, list) and activities:
+            parts.append(", ".join(_clean_list(activities)))
+        details.append(" - ".join(parts))
+    return details
+
+
+def _refresh_child_state(state: OnboardingState, profiles: list[dict[str, Any]]) -> OnboardingState:
+    normalized = _normalize_child_profiles(profiles)
+    metadata = dict(state.metadata)
+    metadata["child_profiles"] = normalized
+    metadata["child_details"] = _child_detail_lines(normalized)
+    names = [str(profile["name"]) for profile in normalized]
+    school_labels = _dedupe(
+        [
+            school
+            for school in (_clean_text(profile.get("school")) for profile in normalized)
+            if school and school.lower() not in {"none yet", "not yet", "unknown"}
+        ]
+    )
+    activity_labels = _dedupe(
+        [
+            label
+            for profile in normalized
+            for label in (_clean_list(profile.get("activities")) if isinstance(profile.get("activities"), list) else [])
+        ]
+    )
+    school_collected = bool(normalized) and all(_clean_text(profile.get("school")) is not None for profile in normalized)
+    activity_collected = bool(normalized) and all(isinstance(profile.get("activities"), list) for profile in normalized)
+    return replace(
+        state,
+        metadata=metadata,
+        child_names=names,
+        school_labels=school_labels,
+        activity_labels=activity_labels,
+        school_basics_collected=school_collected,
+        activity_basics_collected=activity_collected,
+    )
+
+
+def _set_current_child_index(state: OnboardingState, index: int) -> OnboardingState:
+    metadata = dict(state.metadata)
+    metadata["current_child_index"] = max(0, index)
+    return replace(state, metadata=metadata)
+
+
+def _replace_metadata_list(state: OnboardingState, key: str, values: list[str]) -> OnboardingState:
+    metadata = dict(state.metadata)
+    metadata[key] = _clean_list(values)
+    return replace(state, metadata=metadata)
+
+
+def _replace_metadata_text(state: OnboardingState, key: str, value: str) -> OnboardingState:
+    metadata = dict(state.metadata)
+    metadata[key] = _clean_text(value)
+    return replace(state, metadata=metadata)
+
+
+def _next_missing_child_field(state: OnboardingState) -> tuple[int | None, OnboardingStage | None]:
+    profiles = state.child_profiles
+    for index, profile in enumerate(profiles):
+        if _clean_text(profile.get("age")) is None:
+            return index, OnboardingStage.COLLECT_CHILD_AGE
+        if _clean_text(profile.get("school")) is None:
+            return index, OnboardingStage.COLLECT_CHILD_SCHOOL
+        if not isinstance(profile.get("activities"), list):
+            return index, OnboardingStage.COLLECT_CHILD_ACTIVITIES
+    return None, None
+
+
 def sync_onboarding_stage(state: OnboardingState) -> OnboardingState:
     """Return a copy of the state with the canonical next stage applied."""
-    if state.group_channel_id:
-        return replace(state, stage=OnboardingStage.COMPLETE)
-    if state.is_complete:
-        return replace(state, stage=OnboardingStage.COMPLETE)
-    if state.variant == OnboardingVariant.CONCIERGE and not state.household_members:
-        return replace(state, stage=OnboardingStage.COLLECT_HOUSEHOLD_MEMBERS)
-    if state.household_operations and not state.google_connected:
-        return replace(state, stage=OnboardingStage.CONNECT_GOOGLE)
-    if state.operating_preferences:
-        return replace(state, stage=OnboardingStage.COMPLETE)
-    if state.nudge_preferences:
-        return replace(state, stage=OnboardingStage.COLLECT_OPERATING_PREFERENCES)
-    if state.household_operations:
-        return replace(state, stage=OnboardingStage.COLLECT_NUDGE_PREFERENCES)
-    if state.school_basics_collected:
-        if state.activity_basics_collected:
-            return replace(state, stage=OnboardingStage.COLLECT_HOUSEHOLD_OPERATIONS)
-        return replace(state, stage=OnboardingStage.COLLECT_ACTIVITY_BASICS)
-    if state.child_names:
-        return replace(state, stage=OnboardingStage.COLLECT_SCHOOL_BASICS)
-    if state.parent_display_name:
-        return replace(state, stage=OnboardingStage.COLLECT_CHILD_NAMES)
-    return replace(state, stage=OnboardingStage.COLLECT_PARENT_NAME)
+    current = state
+    if current.group_channel_id:
+        return replace(current, stage=OnboardingStage.COMPLETE)
+    if current.is_complete:
+        return replace(current, stage=OnboardingStage.COMPLETE)
+    if not current.parent_display_name:
+        return replace(current, stage=OnboardingStage.COLLECT_PARENT_NAME)
+    if not current.child_profiles:
+        return replace(current, stage=OnboardingStage.COLLECT_CHILD_NAMES)
+    child_index, child_stage = _next_missing_child_field(current)
+    if child_stage is not None and child_index is not None:
+        current = _set_current_child_index(current, child_index)
+        return replace(current, stage=child_stage)
+    if not current.google_connected:
+        return replace(current, stage=OnboardingStage.CONNECT_GOOGLE)
+    return replace(current, stage=OnboardingStage.COMPLETE)
 
 
 def build_google_connect_message(link_url: str | None = None) -> str:
-    """Return the friendly Google-connect step copy, with an optional OAuth link."""
     return "\n\n".join(build_google_connect_message_sequence(link_url))
 
 
@@ -58,7 +188,6 @@ def build_google_connect_message_sequence(
     *,
     include_intro: bool = False,
 ) -> tuple[str, ...]:
-    """Return the Google-connect step as short separate agent-style messages."""
     messages: list[str] = []
     if include_intro:
         messages.extend(
@@ -66,16 +195,15 @@ def build_google_connect_message_sequence(
                 "Hi, I'm Florence.",
                 "I help run the household with you by keeping logistics organized, surfacing reminders, and staying on top of school and calendar noise.",
             ]
-    )
-    messages.append("You're almost ready. Connect your Google account so I can compare Gmail and Calendar against the household context you just gave me.")
+        )
+    messages.append("Connect your Google account so I can pull the last 30 days of family email and calendar in the background while we keep going here.")
     if link_url:
         messages.append(link_url)
-    messages.append("Once Google says you're connected, come back here. I’ll pick up from there.")
+    messages.append("Once Google says you're connected, come right back here. You can also keep answering my questions while it runs.")
     return tuple(messages)
 
 
 def build_onboarding_ready_message_sequence() -> tuple[str, ...]:
-    """Return the activation copy once Florence is ready for real use."""
     return (
         "You're ready. Florence is set up as your house manager now.",
         (
@@ -86,10 +214,9 @@ def build_onboarding_ready_message_sequence() -> tuple[str, ...]:
 
 
 def build_google_connected_syncing_message_sequence(link_url: str | None = None) -> tuple[str, ...]:
-    """Return the post-OAuth copy while the first sync is still running."""
     messages = [
         "Google connected.",
-        "I’m syncing your recent email and calendar in the background now.",
+        "I’m syncing the last 30 days of your email and calendar in the background now.",
     ]
     if link_url:
         messages.extend(
@@ -102,36 +229,37 @@ def build_google_connected_syncing_message_sequence(link_url: str | None = None)
     return tuple(messages)
 
 
-def _replace_metadata_list(state: OnboardingState, key: str, values: list[str]) -> OnboardingState:
-    metadata = dict(state.metadata)
-    cleaned = [value for value in (" ".join(raw.split()).strip() for raw in values) if value]
-    metadata[key] = cleaned
-    return replace(state, metadata=metadata)
-
-
-def _replace_metadata_text(state: OnboardingState, key: str, value: str) -> OnboardingState:
-    metadata = dict(state.metadata)
-    cleaned = " ".join(value.split()).strip()
-    metadata[key] = cleaned
-    return replace(state, metadata=metadata)
-
-
 def build_onboarding_prompt(state: OnboardingState) -> OnboardingPrompt | None:
-    """Return the next deterministic prompt for the current onboarding stage."""
     current = sync_onboarding_stage(state)
     if current.stage == OnboardingStage.COLLECT_PARENT_NAME:
+        return OnboardingPrompt(stage=current.stage, text="What's your name?")
+
+    if current.stage == OnboardingStage.COLLECT_CHILD_NAMES:
         return OnboardingPrompt(
             stage=current.stage,
-            text="What should I call you?",
+            text="What are your kids' names? One per line or comma-separated is fine.",
         )
 
-    if current.stage == OnboardingStage.COLLECT_HOUSEHOLD_MEMBERS:
+    child_name = current.current_child_name or "your child"
+    if current.stage == OnboardingStage.COLLECT_CHILD_AGE:
+        intro = "Great, let's learn more about each kid one at a time."
+        if current.current_child_index > 0:
+            intro = "Okay, next one."
         return OnboardingPrompt(
             stage=current.stage,
-            text=(
-                "Let's build the household map first. Who is in your family unit? "
-                "Reply one per line or comma-separated, like Maya - mom, Ben - dad, Ava - daughter."
-            ),
+            text=f"{intro} How old is {child_name}?",
+        )
+
+    if current.stage == OnboardingStage.COLLECT_CHILD_SCHOOL:
+        return OnboardingPrompt(
+            stage=current.stage,
+            text=f"What school does {child_name} go to? If not in school yet, say not yet.",
+        )
+
+    if current.stage == OnboardingStage.COLLECT_CHILD_ACTIVITIES:
+        return OnboardingPrompt(
+            stage=current.stage,
+            text=f"What activities does {child_name} do? If none right now, say none.",
         )
 
     if current.stage == OnboardingStage.CONNECT_GOOGLE:
@@ -141,96 +269,22 @@ def build_onboarding_prompt(state: OnboardingState) -> OnboardingPrompt | None:
             requires_external_action=True,
         )
 
-    if current.stage == OnboardingStage.COLLECT_CHILD_NAMES:
-        if current.variant == OnboardingVariant.CONCIERGE:
-            text = (
-                "Tell me about each child I should know about: first name plus nickname, grade, or age if helpful. "
-                "One per line works well, like Ava - goes by Aves - 3rd grade."
-            )
-        else:
-            text = (
-                "Start with the kids I should know about: first name plus grade or age if helpful. "
-                "One per line or comma-separated is fine."
-            )
-        return OnboardingPrompt(
-            stage=current.stage,
-            text=text,
-        )
+    if current.stage == OnboardingStage.COMPLETE:
+        return None
 
-    if current.stage == OnboardingStage.COLLECT_SCHOOL_BASICS:
-        child_list = ", ".join(current.child_names)
-        if current.variant == OnboardingVariant.CONCIERGE:
-            if len(current.child_names) == 1:
-                prompt = f"Which school, daycare, preschool, or camp should I know for {child_list}? Include who it belongs to if there is any ambiguity."
-            else:
-                prompt = f"Which schools, daycares, preschools, or camps should I know for {child_list}? Include which child goes with which place."
-        else:
-            if len(current.child_names) == 1:
-                prompt = f"Which school, daycare, or preschool does {child_list} attend?"
-            else:
-                prompt = f"Which schools, daycares, or preschools should I know for {child_list}?"
-        return OnboardingPrompt(stage=current.stage, text=prompt)
-
-    if current.stage == OnboardingStage.COLLECT_ACTIVITY_BASICS:
-        child_list = ", ".join(current.child_names)
-        if current.variant == OnboardingVariant.CONCIERGE:
-            prompt = (
-                f"What recurring activities, teams, lessons, or clubs should I know for {child_list}? "
-                "If helpful, include the child, like Ava soccer or Noah piano. If none yet, say none."
-            )
-        else:
-            prompt = f"What recurring activities should I know about for {child_list}? If none yet, say none."
-        return OnboardingPrompt(stage=current.stage, text=prompt)
-
-    if current.stage == OnboardingStage.COLLECT_HOUSEHOLD_OPERATIONS:
-        if current.variant == OnboardingVariant.CONCIERGE:
-            text = (
-                "What recurring household logistics do you want me to help manage like a house manager? "
-                "Think lunches, school forms, practice logistics, birthday gifts, bills, returns, camps, appointments, or anything else you keep in your head today."
-            )
-        else:
-            text = (
-                "What recurring logistics or reminders should I help manage first? "
-                "A short list is fine: lunches, forms, returns, bills, sports, appointments, birthdays, and so on."
-            )
-        return OnboardingPrompt(stage=current.stage, text=text)
-
-    if current.stage == OnboardingStage.COLLECT_NUDGE_PREFERENCES:
-        if current.variant == OnboardingVariant.CONCIERGE:
-            text = (
-                "Reminder style: I default to day before + morning of for important family logistics. "
-                "If you want a different default, say same-day only or keep nudging until you acknowledge."
-            )
-        else:
-            text = (
-                "Reminder style: I default to day before + morning of for important family logistics. "
-                "If you want a different default, say same-day only or keep nudging until acknowledged."
-            )
-        return OnboardingPrompt(stage=current.stage, text=text)
-
-    if current.stage == OnboardingStage.COLLECT_OPERATING_PREFERENCES:
-        if current.variant == OnboardingVariant.CONCIERGE:
-            text = (
-                "Any house rules for how I should operate as your house manager? "
-                "Share your defaults in one line, like quiet hours, brief timing, and when I should ask before taking action."
-            )
-        else:
-            text = (
-                "Any house rules for how I should operate? "
-                "A short one-liner is enough, like no texts after 9pm, morning brief time, and ask before spending money."
-            )
-        return OnboardingPrompt(stage=current.stage, text=text)
-
-    return None
+    return OnboardingPrompt(
+        stage=current.stage,
+        text="Tell me what I should know next.",
+    )
 
 
 def apply_parent_name(state: OnboardingState, display_name: str) -> OnboardingTransition:
-    cleaned = " ".join(display_name.split()).strip()
-    next_state = sync_onboarding_stage(replace(state, parent_display_name=cleaned or None))
+    cleaned = _clean_text(display_name)
+    next_state = sync_onboarding_stage(replace(state, parent_display_name=cleaned))
     return OnboardingTransition(
         state=next_state,
         prompt=build_onboarding_prompt(next_state),
-        changed=cleaned != (state.parent_display_name or ""),
+        changed=cleaned != (state.parent_display_name or None),
     )
 
 
@@ -249,47 +303,86 @@ def apply_child_names(
     *,
     child_details: list[str] | None = None,
 ) -> OnboardingTransition:
-    cleaned = [name for name in (" ".join(raw.split()).strip() for raw in child_names) if name]
-    next_state = replace(state, child_names=cleaned)
+    existing = {str(profile["name"]).lower(): dict(profile) for profile in state.child_profiles}
+    ordered: list[dict[str, Any]] = list(state.child_profiles)
+    for name in _clean_list(child_names):
+        key = name.lower()
+        if key in existing:
+            continue
+        profile = {"name": name}
+        ordered.append(profile)
+        existing[key] = profile
+    next_state = _refresh_child_state(state, ordered)
     if child_details is not None:
         next_state = _replace_metadata_list(next_state, "child_details", child_details)
     next_state = sync_onboarding_stage(next_state)
     return OnboardingTransition(
         state=next_state,
         prompt=build_onboarding_prompt(next_state),
-        changed=cleaned != state.child_names or (child_details is not None and next_state.child_details != state.child_details),
+        changed=next_state.child_profiles != state.child_profiles,
+    )
+
+
+def apply_child_profile_updates(state: OnboardingState, child_updates: list[dict[str, Any]]) -> OnboardingTransition:
+    profiles = _seed_child_profiles(state)
+    index_by_name = {str(profile["name"]).lower(): idx for idx, profile in enumerate(profiles)}
+    changed = False
+    for raw in child_updates:
+        if not isinstance(raw, dict):
+            continue
+        name = _clean_text(raw.get("name")) or state.current_child_name
+        if not name:
+            continue
+        key = name.lower()
+        if key not in index_by_name:
+            profiles.append({"name": name})
+            index_by_name[key] = len(profiles) - 1
+            changed = True
+        profile = dict(profiles[index_by_name[key]])
+        age = _clean_text(raw.get("age"))
+        school = _clean_text(raw.get("school"))
+        activities_raw = raw.get("activities")
+        activities = _clean_list(activities_raw) if isinstance(activities_raw, list) else activities_raw
+        if age is not None and age != profile.get("age"):
+            profile["age"] = age
+            changed = True
+        if school is not None and school != profile.get("school"):
+            profile["school"] = school
+            changed = True
+        if isinstance(activities, list) and activities != profile.get("activities"):
+            profile["activities"] = activities
+            changed = True
+        profiles[index_by_name[key]] = profile
+    next_state = _refresh_child_state(state, profiles)
+    next_state = sync_onboarding_stage(next_state)
+    return OnboardingTransition(
+        state=next_state,
+        prompt=build_onboarding_prompt(next_state),
+        changed=changed,
     )
 
 
 def apply_school_basics(state: OnboardingState, school_labels: list[str]) -> OnboardingTransition:
-    cleaned = [label for label in (" ".join(raw.split()).strip() for raw in school_labels) if label]
-    next_state = sync_onboarding_stage(
-        replace(
-            state,
-            school_labels=cleaned,
-            school_basics_collected=True,
-        )
-    )
-    return OnboardingTransition(
-        state=next_state,
-        prompt=build_onboarding_prompt(next_state),
-        changed=cleaned != state.school_labels or not state.school_basics_collected,
+    profiles = _seed_child_profiles(state)
+    labels = _clean_list(school_labels)
+    unresolved = [idx for idx, profile in enumerate(profiles) if _clean_text(profile.get("school")) is None]
+    for idx, label in zip(unresolved, labels):
+        profiles[idx]["school"] = label
+    return apply_child_profile_updates(
+        _refresh_child_state(state, profiles),
+        [],
     )
 
 
 def apply_activity_basics(state: OnboardingState, activity_labels: list[str]) -> OnboardingTransition:
-    cleaned = [label for label in (" ".join(raw.split()).strip() for raw in activity_labels) if label]
-    next_state = sync_onboarding_stage(
-        replace(
-            state,
-            activity_labels=cleaned,
-            activity_basics_collected=True,
-        )
-    )
-    return OnboardingTransition(
-        state=next_state,
-        prompt=build_onboarding_prompt(next_state),
-        changed=cleaned != state.activity_labels or not state.activity_basics_collected,
+    profiles = _seed_child_profiles(state)
+    unresolved = [idx for idx, profile in enumerate(profiles) if not isinstance(profile.get("activities"), list)]
+    if unresolved:
+        target_index = unresolved[0]
+        profiles[target_index]["activities"] = _clean_list(activity_labels)
+    return apply_child_profile_updates(
+        _refresh_child_state(state, profiles),
+        [],
     )
 
 
@@ -330,10 +423,10 @@ def apply_operating_preferences(state: OnboardingState, operating_preferences: s
 
 
 def mark_group_activated(state: OnboardingState, group_channel_id: str) -> OnboardingTransition:
-    cleaned = group_channel_id.strip()
-    next_state = sync_onboarding_stage(replace(state, group_channel_id=cleaned or None))
+    cleaned = _clean_text(group_channel_id)
+    next_state = sync_onboarding_stage(replace(state, group_channel_id=cleaned))
     return OnboardingTransition(
         state=next_state,
         prompt=build_onboarding_prompt(next_state),
-        changed=cleaned != (state.group_channel_id or ""),
+        changed=cleaned != (state.group_channel_id or None),
     )

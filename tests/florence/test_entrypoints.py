@@ -50,7 +50,7 @@ def test_entrypoints_group_without_resolved_household_returns_dm_first_message(t
     store.close()
 
 
-def test_entrypoints_hybrid_onboarding_reaches_google_link_after_household_ops(tmp_path):
+def test_entrypoints_hybrid_onboarding_offers_google_link_immediately_after_name(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     service = FlorenceEntrypointService(
         store,
@@ -72,46 +72,14 @@ def test_entrypoints_hybrid_onboarding_reaches_google_link_after_household_ops(t
             is_group=False,
         )
     )
-    service.onboarding_service.record_child_names(
-        household_id=first.household_id or "",
-        member_id=first.member_id or "",
-        thread_id="dm-thread-123",
-        child_names=["Ava"],
+    assert first.consumed is True
+    assert first.reply_text is not None
+    assert first.reply_messages[0] == "Hi, I'm Florence."
+    assert first.reply_messages[2] == (
+        "Connect your Google account so I can pull the last 30 days of family email and calendar in the background while we keep going here."
     )
-    service.onboarding_service.record_school_basics(
-        household_id=first.household_id or "",
-        member_id=first.member_id or "",
-        thread_id="dm-thread-123",
-        school_labels=["Roosevelt Elementary"],
-    )
-    service.onboarding_service.record_activity_basics(
-        household_id=first.household_id or "",
-        member_id=first.member_id or "",
-        thread_id="dm-thread-123",
-        activity_labels=["Soccer"],
-    )
-    service.onboarding_service.record_household_operations(
-        household_id=first.household_id or "",
-        member_id=first.member_id or "",
-        thread_id="dm-thread-123",
-        household_operations=["school forms", "pickup planning"],
-    )
-
-    result = service.handle_linq_payload(
-        _linq_payload(
-            message_id="msg_2",
-            text="what next?",
-            chat_id="dm-thread-123",
-            sender="+15555550123",
-            is_group=False,
-        )
-    )
-
-    assert result.consumed is True
-    assert result.reply_text is not None
-    assert len(result.reply_messages) == 3
-    assert result.reply_messages[0] == "You're almost ready. Connect your Google account so I can compare Gmail and Calendar against the household context you just gave me."
-    assert result.reply_messages[1].startswith("https://accounts.google.com/")
+    assert first.reply_messages[3].startswith("https://accounts.google.com/")
+    assert first.reply_messages[-1] == "What are your kids' names? One per line or comma-separated is fine."
     store.close()
 
 
@@ -144,24 +112,6 @@ def test_entrypoints_google_callback_returns_next_prompt(tmp_path, monkeypatch):
         member_id=member_id,
         thread_id="dm-thread-123",
         child_names=["Ava"],
-    )
-    service.onboarding_service.record_school_basics(
-        household_id=household_id,
-        member_id=member_id,
-        thread_id="dm-thread-123",
-        school_labels=["Roosevelt Elementary"],
-    )
-    service.onboarding_service.record_activity_basics(
-        household_id=household_id,
-        member_id=member_id,
-        thread_id="dm-thread-123",
-        activity_labels=["Soccer"],
-    )
-    service.onboarding_service.record_household_operations(
-        household_id=household_id,
-        member_id=member_id,
-        thread_id="dm-thread-123",
-        household_operations=["school forms", "pickup planning"],
     )
     link = service.google_account_link_service.build_connect_link(
         household_id=household_id,
@@ -196,7 +146,7 @@ def test_entrypoints_google_callback_returns_next_prompt(tmp_path, monkeypatch):
 
     assert result.consumed is True
     assert result.reply_text is not None
-    assert "you're ready" in result.reply_text.lower()
+    assert "how old is ava" in result.reply_text.lower()
     store.close()
 
 

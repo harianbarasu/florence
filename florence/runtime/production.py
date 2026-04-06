@@ -34,7 +34,11 @@ from florence.onboarding import (
 )
 from florence.runtime.onboarding_links import FlorenceOnboardingLinkService
 from florence.runtime.queue import FlorenceGoogleSyncJob, FlorenceRedisGoogleSyncQueue
-from florence.runtime.entrypoints import FlorenceEntrypointService, FlorenceGoogleOauthConfig
+from florence.runtime.entrypoints import (
+    FlorenceEntrypointResult,
+    FlorenceEntrypointService,
+    FlorenceGoogleOauthConfig,
+)
 from florence.runtime.services import (
     FlorenceCandidateReviewService,
     build_google_connection_sync_status,
@@ -125,8 +129,18 @@ class FlorenceProductionService:
         self._linq_chat_locks: dict[str, threading.Lock] = {}
         self._google_sync_jobs_guard = threading.Lock()
         self._google_sync_jobs: set[str] = set()
+        self._deferred_ingress_guard = threading.Lock()
+        self._deferred_ingress_timers: dict[str, tuple[int, threading.Timer]] = {}
 
     def close(self) -> None:
+        with self._deferred_ingress_guard:
+            timers = list(self._deferred_ingress_timers.values())
+            self._deferred_ingress_timers.clear()
+        for _token, timer in timers:
+            try:
+                timer.cancel()
+            except Exception:
+                logger.exception("Failed to cancel deferred ingress timer")
         self.store.close()
 
     def handle_linq_webhook(
@@ -151,23 +165,14 @@ class FlorenceProductionService:
         with chat_lock:
             try:
                 result = self.entrypoints.handle_linq_payload(payload)
-                reply_messages = result.reply_messages or ((result.reply_text,) if result.reply_text else ())
-                if reply_messages and result.channel_id:
-                    channel = self.store.get_channel(result.channel_id)
-                    if channel is not None:
-                        for message in reply_messages:
-                            self._safe_send_channel_message(channel=channel, message=message, record_message=False)
-
-                if result.group_announcement and result.household_id:
-                    group_channel = self._find_group_channel(result.household_id, provider="linq")
-                    if group_channel is not None:
-                        self._safe_send_channel_message(channel=group_channel, message=result.group_announcement)
+                self._deliver_or_defer_ingress_result(result=result, provider="linq")
 
                 return self._json_result(
                     200,
                     {
                         "ok": True,
                         "consumed": result.consumed,
+                        "deferred": result.defer_reply,
                         "householdId": result.household_id,
                         "memberId": result.member_id,
                         "channelId": result.channel_id,
@@ -188,23 +193,14 @@ class FlorenceProductionService:
             return self._json_result(403, {"ok": False, "error": "invalid_sendblue_webhook_signature"})
         try:
             result = self.entrypoints.handle_sendblue_payload(payload)
-            reply_messages = result.reply_messages or ((result.reply_text,) if result.reply_text else ())
-            if reply_messages and result.channel_id:
-                channel = self.store.get_channel(result.channel_id)
-                if channel is not None:
-                    for message in reply_messages:
-                        self._safe_send_channel_message(channel=channel, message=message, record_message=False)
-
-            if result.group_announcement and result.household_id:
-                group_channel = self._find_group_channel(result.household_id, provider="sendblue")
-                if group_channel is not None:
-                    self._safe_send_channel_message(channel=group_channel, message=result.group_announcement)
+            self._deliver_or_defer_ingress_result(result=result, provider="sendblue")
 
             return self._json_result(
                 200,
                 {
                     "ok": True,
                     "consumed": result.consumed,
+                    "deferred": result.defer_reply,
                     "householdId": result.household_id,
                     "memberId": result.member_id,
                     "channelId": result.channel_id,
@@ -1062,6 +1058,108 @@ class FlorenceProductionService:
             if household_touched:
                 counters["households"] += 1
         return counters
+
+    def _deliver_or_defer_ingress_result(
+        self,
+        *,
+        result: FlorenceEntrypointResult,
+        provider: str,
+    ) -> None:
+        if result.defer_reply:
+            if result.household_id and result.member_id and result.channel_id:
+                self._schedule_deferred_ingress_flush(
+                    household_id=result.household_id,
+                    member_id=result.member_id,
+                    channel_id=result.channel_id,
+                    delay_seconds=float(result.defer_seconds or 0.0),
+                )
+            return
+
+        reply_messages = result.reply_messages or ((result.reply_text,) if result.reply_text else ())
+        if reply_messages and result.channel_id:
+            channel = self.store.get_channel(result.channel_id)
+            if channel is not None:
+                for message in reply_messages:
+                    self._safe_send_channel_message(channel=channel, message=message, record_message=False)
+
+        if result.group_announcement and result.household_id:
+            group_channel = self._find_group_channel(result.household_id, provider=provider)
+            if group_channel is not None:
+                self._safe_send_channel_message(channel=group_channel, message=result.group_announcement)
+
+    def _schedule_deferred_ingress_flush(
+        self,
+        *,
+        household_id: str,
+        member_id: str,
+        channel_id: str,
+        delay_seconds: float,
+    ) -> None:
+        channel = self.store.get_channel(channel_id)
+        if channel is None:
+            return
+        delay = max(0.5, delay_seconds or self.entrypoints.ingress.onboarding_reply_debounce_seconds)
+        token = time.time_ns()
+        timer = threading.Timer(
+            delay,
+            self._flush_deferred_ingress_reply,
+            kwargs={
+                "token": token,
+                "household_id": household_id,
+                "member_id": member_id,
+                "channel_id": channel_id,
+                "thread_id": channel.provider_channel_id,
+            },
+        )
+        timer.daemon = True
+        with self._deferred_ingress_guard:
+            existing = self._deferred_ingress_timers.pop(channel_id, None)
+            self._deferred_ingress_timers[channel_id] = (token, timer)
+        if existing is not None:
+            try:
+                existing[1].cancel()
+            except Exception:
+                logger.exception("Failed to cancel deferred ingress timer for channel %s", channel_id)
+        timer.start()
+
+    def _flush_deferred_ingress_reply(
+        self,
+        *,
+        token: int,
+        household_id: str,
+        member_id: str,
+        channel_id: str,
+        thread_id: str,
+    ) -> None:
+        try:
+            result = self.entrypoints.ingress.flush_deferred_onboarding_reply(
+                household_id=household_id,
+                member_id=member_id,
+                channel_id=channel_id,
+                thread_id=thread_id,
+            )
+            if not result.consumed:
+                return
+            reply_messages = result.reply_messages or ((result.reply_text,) if result.reply_text else ())
+            if not reply_messages:
+                return
+            channel = self.store.get_channel(channel_id)
+            if channel is None:
+                return
+            for message in reply_messages:
+                self._safe_send_channel_message(channel=channel, message=message)
+        except Exception:
+            logger.exception(
+                "Florence deferred ingress flush failed household_id=%s member_id=%s channel_id=%s",
+                household_id,
+                member_id,
+                channel_id,
+            )
+        finally:
+            with self._deferred_ingress_guard:
+                current = self._deferred_ingress_timers.get(channel_id)
+                if current is not None and current[0] == token:
+                    self._deferred_ingress_timers.pop(channel_id, None)
 
     def _load_web_context(
         self,

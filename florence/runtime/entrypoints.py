@@ -57,6 +57,8 @@ class FlorenceEntrypointResult:
     reply_messages: tuple[str, ...] = field(default_factory=tuple)
     group_announcement: str | None = None
     consumed: bool = False
+    defer_reply: bool = False
+    defer_seconds: float | None = None
     household_id: str | None = None
     member_id: str | None = None
     channel_id: str | None = None
@@ -240,6 +242,8 @@ class FlorenceEntrypointService:
             reply_messages=result.reply_messages,
             group_announcement=result.group_announcement,
             consumed=result.consumed,
+            defer_reply=result.defer_reply,
+            defer_seconds=result.defer_seconds,
             household_id=resolved.household.id,
             member_id=member_id,
             channel_id=resolved.channel.id,

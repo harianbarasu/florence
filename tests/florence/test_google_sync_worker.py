@@ -148,9 +148,9 @@ def test_google_sync_worker_uses_deep_bootstrap_scan_on_first_sync(tmp_path, mon
     result = worker.sync_connection("gconn_bootstrap", now=datetime(2026, 3, 25, 18, 0, tzinfo=timezone.utc))
 
     assert observed["max_results"] == 321
-    assert observed["gmail_query"] == "newer_than:90d"
+    assert observed["gmail_query"] == "newer_than:30d"
     assert result.connection.metadata["gmail_bootstrap_completed_at"] == "2026-03-25T18:00:00+00:00"
-    assert result.connection.metadata["gmail_last_query"] == "newer_than:90d"
+    assert result.connection.metadata["gmail_last_query"] == "newer_than:30d"
     store.close()
 
 

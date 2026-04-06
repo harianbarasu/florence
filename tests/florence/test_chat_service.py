@@ -103,6 +103,20 @@ def test_household_chat_service_uses_hermes_agent_with_confirmed_state(tmp_path)
             )
         ],
     )
+    store.replace_household_profile_items(
+        household_id="hh_123",
+        kind=HouseholdProfileKind.PREFERENCE,
+        items=[
+            HouseholdProfileItem(
+                id="pref_123",
+                household_id="hh_123",
+                kind=HouseholdProfileKind.PREFERENCE,
+                label="Kid spice preference",
+                child_id="child_ava",
+                metadata={"value": "Ava will not eat spicy food."},
+            )
+        ],
+    )
     store.upsert_household_event(
         HouseholdEvent(
             id="evt_123",
@@ -189,6 +203,14 @@ def test_household_chat_service_uses_hermes_agent_with_confirmed_state(tmp_path)
     assert _FakeAgent.created[0]["provider"] == "anthropic"
     assert _FakeAgent.created[0]["enabled_toolsets"] == ["florence_chat"]
     assert _FakeAgent.created[0]["disabled_toolsets"] is None
+    assert _FakeAgent.created[0]["skip_memory"] is False
+    assert _FakeAgent.created[0]["skip_local_memory"] is True
+    assert _FakeAgent.created[0]["tool_use_enforcement"] == "auto"
+    assert _FakeAgent.created[0]["honcho_session_key"] == "florence:member:hh_123:mem_123"
+    assert _FakeAgent.created[0]["session_search_kwargs"] == {
+        "source_filter": ["florence"],
+        "allowed_session_ids": ["florence-channel-chan_dm_123"],
+    }
     assert _FakeAgent.created[0]["session_id"] == "florence-channel-chan_dm_123"
     assert _FakeAgent.created[0]["session_db"] is not None
     assert "Confirmed household events" in _FakeAgent.last_run["system_message"]
@@ -204,7 +226,21 @@ def test_household_chat_service_uses_hermes_agent_with_confirmed_state(tmp_path)
     assert "Open grocery list" in _FakeAgent.last_run["system_message"]
     assert "tortillas" in _FakeAgent.last_run["system_message"]
     assert "general household agent" in _FakeAgent.last_run["system_message"]
+    assert "inbox -> plan, capture -> handled, and briefs -> stay ahead" in _FakeAgent.last_run["system_message"]
+    assert "school email, screenshots, flyers, photos, mental dumps, meals, groceries" in _FakeAgent.last_run["system_message"]
+    assert "Your memory stack is: authoritative Florence household state, Florence session history, and Florence-scoped Honcho memory." in _FakeAgent.last_run["system_message"]
+    assert "When a user tells Florence a stable preference, constraint, rule, or working style that should affect future behavior, save it with household_record_preference." in _FakeAgent.last_run["system_message"]
+    assert "Use household_search_state when you need the latest tracked household picture" in _FakeAgent.last_run["system_message"]
+    assert "ground the answer in household_search_state and session_search first" in _FakeAgent.last_run["system_message"]
+    assert "Use session_search and Honcho memory to recover earlier commitments, preferences, and threads of work" in _FakeAgent.last_run["system_message"]
+    assert "Remembered household preferences:" in _FakeAgent.last_run["system_message"]
+    assert "Ava | Kid spice preference: Ava will not eat spicy food." in _FakeAgent.last_run["system_message"]
+    assert "When the user asks what matters, what changed, or what they are forgetting" in _FakeAgent.last_run["system_message"]
+    assert "household_upsert_meal and household_upsert_shopping_item" in _FakeAgent.last_run["system_message"]
     assert "private parent DM" in _FakeAgent.last_run["system_message"]
+    assert "raw mental-load dumps, emotional support, and individually scoped reasoning stay private by default" in _FakeAgent.last_run["system_message"]
+    assert "Memory policy: use private member-scoped memory and recall freely here" in _FakeAgent.last_run["system_message"]
+    assert "offer a concise group-safe summary instead of echoing the raw message" in _FakeAgent.last_run["system_message"]
     assert "Florence household-state tools" in _FakeAgent.last_run["system_message"]
     assert "household_search_google_inbox" in _FakeAgent.last_run["system_message"]
     assert "Do not ask the user to forward or paste an email" in _FakeAgent.last_run["system_message"]
@@ -342,6 +378,165 @@ def test_household_chat_service_persists_rotated_session_id_to_channel(tmp_path)
     store.close()
 
 
+def test_household_chat_service_group_prompt_emphasizes_shared_coordination(tmp_path):
+    _FakeAgent.created.clear()
+    _FakeAgent.last_run = None
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(
+        Household(
+            id="hh_123",
+            name="Maya's household",
+            timezone="America/Los_Angeles",
+        )
+    )
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_group_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="group_thread_123",
+            channel_type=ChannelType.HOUSEHOLD_GROUP,
+            title="Parent group",
+        )
+    )
+
+    service = FlorenceHouseholdChatService(
+        store,
+        model="anthropic/claude-opus-4.6",
+        max_iterations=4,
+        provider="anthropic",
+        agent_factory=_FakeAgent,
+    )
+
+    reply = service.respond(
+        household_id="hh_123",
+        channel_id="chan_group_123",
+        actor_member_id="mem_123",
+        message_text="What matters this week?",
+    )
+
+    assert reply is not None
+    assert "shared household group chat" in _FakeAgent.last_run["system_message"]
+    assert "optimize for shared visibility, coordination, ownership, schedule changes, reminders, meals, grocery planning" in _FakeAgent.last_run["system_message"]
+    assert "Memory policy: treat this thread as shared household memory." in _FakeAgent.last_run["system_message"]
+    assert _FakeAgent.created[0]["honcho_session_key"] == "florence:household:hh_123"
+    store.close()
+
+
+def test_household_chat_service_passes_household_scoped_runtime_overrides(tmp_path):
+    _FakeAgent.created.clear()
+    _FakeAgent.last_run = None
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    session_db = SessionDB(tmp_path / "hermes-state.db")
+    store.upsert_household(
+        Household(
+            id="hh_123",
+            name="Maya's household",
+            timezone="America/Los_Angeles",
+        )
+    )
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm_thread_123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+            metadata={"hermes_session_id": "florence-channel-chan_dm_123-next"},
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_group_123",
+            household_id="hh_123",
+            provider="sendblue",
+            provider_channel_id="group_thread_123",
+            channel_type=ChannelType.HOUSEHOLD_GROUP,
+            title="Family",
+            metadata={"hermes_session_id": "florence-channel-chan_group_123-next"},
+        )
+    )
+    session_db.create_session(
+        session_id="florence-channel-chan_dm_123-root",
+        source="florence",
+        model="anthropic/claude-opus-4.6",
+    )
+    session_db.create_session(
+        session_id="florence-channel-chan_dm_123-next",
+        source="florence",
+        model="anthropic/claude-opus-4.6",
+        parent_session_id="florence-channel-chan_dm_123-root",
+    )
+    session_db.create_session(
+        session_id="florence-channel-chan_group_123-root",
+        source="florence",
+        model="anthropic/claude-opus-4.6",
+    )
+    session_db.create_session(
+        session_id="florence-channel-chan_group_123-next",
+        source="florence",
+        model="anthropic/claude-opus-4.6",
+        parent_session_id="florence-channel-chan_group_123-root",
+    )
+
+    service = FlorenceHouseholdChatService(
+        store,
+        model="anthropic/claude-opus-4.6",
+        max_iterations=4,
+        provider="anthropic",
+        fallback_model=(
+            {"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
+        ),
+        tool_use_enforcement=("codex", "gpt"),
+        enable_honcho=False,
+        honcho_scope="channel",
+        agent_factory=_FakeAgent,
+        session_db=session_db,
+    )
+
+    reply = service.respond(
+        household_id="hh_123",
+        channel_id="chan_dm_123",
+        actor_member_id="mem_123",
+        message_text="What changed?",
+    )
+
+    assert reply is not None
+    assert _FakeAgent.created[0]["skip_memory"] is True
+    assert _FakeAgent.created[0]["skip_local_memory"] is True
+    assert _FakeAgent.created[0]["honcho_session_key"] is None
+    assert _FakeAgent.created[0]["fallback_model"] == [
+        {"provider": "openrouter", "model": "anthropic/claude-sonnet-4"}
+    ]
+    assert _FakeAgent.created[0]["tool_use_enforcement"] == ["codex", "gpt"]
+    assert _FakeAgent.created[0]["session_search_kwargs"] == {
+        "source_filter": ["florence"],
+        "allowed_session_ids": [
+            "florence-channel-chan_dm_123-root",
+            "florence-channel-chan_group_123-root",
+        ],
+    }
+    session_db.close()
+    store.close()
+
+
 def test_household_chat_service_compose_brief_uses_briefing_toolset(tmp_path):
     _FakeAgent.created.clear()
     _FakeAgent.last_run = None
@@ -390,5 +585,166 @@ def test_household_chat_service_compose_brief_uses_briefing_toolset(tmp_path):
     assert _FakeAgent.created[0]["enabled_toolsets"] == ["florence_briefing"]
     assert _FakeAgent.created[0]["disabled_toolsets"] == []
     assert "automatic household briefing" in _FakeAgent.last_run["system_message"]
+    assert "surface what matters, what might slip, and the clearest next step" in _FakeAgent.last_run["system_message"]
+    assert "use household_search_state to refresh the tracked household picture" in _FakeAgent.last_run["system_message"]
+    assert "Use session_search and Honcho recall when recent commitments, context, or follow-through might matter for the brief." in _FakeAgent.last_run["system_message"]
+    assert "use household_search_google_inbox" in _FakeAgent.last_run["system_message"]
+    assert "Do not present uncertain Gmail or calendar imports as confirmed household facts." in _FakeAgent.last_run["system_message"]
     assert "morning brief" in _FakeAgent.last_run["user_message"].lower()
+    store.close()
+
+
+def test_household_chat_service_capture_prompt_emphasizes_stateful_recall(tmp_path):
+    _FakeAgent.created.clear()
+    _FakeAgent.last_run = None
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(
+        Household(
+            id="hh_123",
+            name="Maya's household",
+            timezone="America/Los_Angeles",
+        )
+    )
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm_thread_123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+
+    service = FlorenceHouseholdChatService(
+        store,
+        model="anthropic/claude-opus-4.6",
+        max_iterations=4,
+        provider="anthropic",
+        agent_factory=_FakeAgent,
+    )
+
+    reply = service.handle_capture_request(
+        household_id="hh_123",
+        channel_id="chan_dm_123",
+        actor_member_id="mem_123",
+        message_text="Can you make dinner from what is in the fridge and build a grocery list for tomorrow?",
+        capture_kind="fridge photo",
+    )
+
+    assert reply is not None
+    assert "Before creating duplicates, look at household state, prior Florence context, and connected inbox context when they help." in _FakeAgent.last_run["system_message"]
+    assert "For meal and grocery requests, prefer creating or updating household meals and shopping items instead of leaving the plan only in chat." in _FakeAgent.last_run["system_message"]
+    assert _FakeAgent.last_run["user_message"].startswith("Handle this fridge photo request.")
+    store.close()
+
+
+def test_household_chat_service_compose_group_promotion_uses_group_safe_prompt(tmp_path):
+    _FakeAgent.created.clear()
+    _FakeAgent.last_run = None
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(
+        Household(
+            id="hh_123",
+            name="Maya's household",
+            timezone="America/Los_Angeles",
+        )
+    )
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm_thread_123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    service = FlorenceHouseholdChatService(
+        store,
+        model="anthropic/claude-opus-4.6",
+        max_iterations=4,
+        provider="anthropic",
+        agent_factory=_FakeAgent,
+    )
+
+    summary = service.compose_group_promotion(
+        household_id="hh_123",
+        channel_id="chan_dm_123",
+        actor_member_id="mem_123",
+        source_text="Parent: Science fair is Friday.\nFlorence: I can remind you and keep dinner simple.",
+    )
+
+    assert summary is not None
+    assert _FakeAgent.created[0]["enabled_toolsets"] == ["florence_briefing"]
+    assert _FakeAgent.created[0]["disabled_toolsets"] == []
+    assert "group-safe household update from a private parent DM" in _FakeAgent.last_run["system_message"]
+    assert "Do not include raw feelings, therapy-like language, health-sensitive details" in _FakeAgent.last_run["system_message"]
+    assert "Turn this recent private DM exchange into a short parent-group update if appropriate" in _FakeAgent.last_run["user_message"]
+    store.close()
+
+
+def test_household_chat_service_compose_weekly_brief_uses_weekly_prompt(tmp_path):
+    _FakeAgent.created.clear()
+    _FakeAgent.last_run = None
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(
+        Household(
+            id="hh_123",
+            name="Maya's household",
+            timezone="America/Los_Angeles",
+        )
+    )
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm_thread_123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    service = FlorenceHouseholdChatService(
+        store,
+        model="anthropic/claude-opus-4.6",
+        max_iterations=4,
+        provider="anthropic",
+        agent_factory=_FakeAgent,
+    )
+
+    brief = service.compose_brief(
+        household_id="hh_123",
+        channel_id="chan_dm_123",
+        actor_member_id="mem_123",
+        brief_kind=HouseholdBriefingKind.WEEKLY,
+    )
+
+    assert brief is not None
+    assert "weekly household preview" in _FakeAgent.last_run["user_message"].lower()
+    assert "meal planning" in _FakeAgent.last_run["user_message"].lower()
     store.close()

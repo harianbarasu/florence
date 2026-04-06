@@ -23,6 +23,14 @@ def build_sendblue_thread_id(*, sendblue_number: str, contact_number: str) -> st
     return f"{line}|{contact}"
 
 
+def build_sendblue_group_thread_id(*, sendblue_number: str, group_id: str) -> str:
+    line = _read_string(sendblue_number)
+    group = _read_string(group_id)
+    if not line or not group:
+        raise ValueError("sendblue_thread_id_required")
+    return f"{line}|group:{group}"
+
+
 def parse_sendblue_payload(payload: dict[str, Any]) -> FlorenceInboundMessage:
     message_id = _read_string(payload.get("message_handle"))
     if not message_id:
@@ -49,10 +57,16 @@ def parse_sendblue_payload(payload: dict[str, Any]) -> FlorenceInboundMessage:
         for participant in (_read_string(value) for value in (_read_array(payload.get("participants")) or []))
         if participant
     )
+    thread_id = (
+        build_sendblue_group_thread_id(sendblue_number=line_handle, group_id=group_id)
+        if group_id
+        else build_sendblue_thread_id(sendblue_number=line_handle, contact_number=contact_handle)
+    )
+
     return FlorenceInboundMessage(
         provider="sendblue",
         message_id=message_id,
-        thread_id=build_sendblue_thread_id(sendblue_number=line_handle, contact_number=contact_handle),
+        thread_id=thread_id,
         sender_handle=sender_handle,
         body=_read_string(payload.get("content")) or "",
         is_group_chat=bool(group_id),

@@ -742,6 +742,60 @@ class TestToolUseEnforcementConfig:
             prompt = a._build_system_prompt()
             assert TOOL_USE_ENFORCEMENT_GUIDANCE not in prompt
 
+    def test_explicit_argument_overrides_config(self):
+        from agent.prompt_builder import TOOL_USE_ENFORCEMENT_GUIDANCE
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs("terminal", "web_search"),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"agent": {"tool_use_enforcement": False}},
+            ),
+        ):
+            agent = AIAgent(
+                model="anthropic/claude-sonnet-4",
+                api_key="test-key-1234567890",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                tool_use_enforcement=True,
+            )
+
+        prompt = agent._build_system_prompt()
+        assert TOOL_USE_ENFORCEMENT_GUIDANCE in prompt
+
+
+class TestMemoryModeOverrides:
+    def test_skip_local_memory_preserves_honcho_only_mode(self):
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={
+                    "memory": {
+                        "memory_enabled": True,
+                        "user_profile_enabled": True,
+                    }
+                },
+            ),
+            patch("tools.memory_tool.MemoryStore") as mock_memory_store,
+        ):
+            AIAgent(
+                api_key="test-key-1234567890",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=False,
+                skip_local_memory=True,
+            )
+
+        mock_memory_store.assert_not_called()
+
 
 class TestInvalidateSystemPrompt:
     def test_clears_cache(self, agent):

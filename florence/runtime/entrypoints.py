@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from florence.linq import parse_linq_payload
 from florence.messaging import (
@@ -79,6 +79,10 @@ class FlorenceEntrypointService:
         household_chat_provider: str = "auto",
         household_chat_enabled_toolsets: list[str] | tuple[str, ...] | None = None,
         household_chat_disabled_toolsets: list[str] | tuple[str, ...] | None = None,
+        household_chat_fallback_model: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
+        household_chat_tool_use_enforcement: str | bool | list[str] | tuple[str, ...] = "auto",
+        household_chat_enable_honcho: bool = True,
+        household_chat_honcho_scope: str = "member",
     ):
         self.store = store
         self.candidate_review_service = FlorenceCandidateReviewService(store)
@@ -108,6 +112,10 @@ class FlorenceEntrypointService:
                 provider=household_chat_provider,
                 enabled_toolsets=household_chat_enabled_toolsets,
                 disabled_toolsets=household_chat_disabled_toolsets,
+                fallback_model=household_chat_fallback_model,
+                tool_use_enforcement=household_chat_tool_use_enforcement,
+                enable_honcho=household_chat_enable_honcho,
+                honcho_scope=household_chat_honcho_scope,
             )
             if household_chat_model
             else None
@@ -196,6 +204,20 @@ class FlorenceEntrypointService:
                     ),
                     consumed=True,
                     error="unresolved_group_household",
+                )
+            if provider == "sendblue":
+                metadata = dict(resolved.channel.metadata)
+                group_id = str(inbound_message.metadata.get("group_id") or "").strip()
+                sendblue_number = str(inbound_message.metadata.get("sendblue_number") or "").strip()
+                if group_id:
+                    metadata["group_id"] = group_id
+                if sendblue_number:
+                    metadata["sendblue_number"] = sendblue_number
+                if participant_handles:
+                    metadata["participant_handles"] = list(dict.fromkeys(handle for handle in participant_handles if handle))
+                resolved = replace(
+                    resolved,
+                    channel=self.store.upsert_channel(replace(resolved.channel, metadata=metadata)),
                 )
         else:
             resolved = resolver.resolve_direct_message(

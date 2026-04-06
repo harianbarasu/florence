@@ -368,6 +368,12 @@ def _calendar_candidate_summary(item: ParentCalendarSyncItem, decision: Candidat
     return " - ".join(bit for bit in bits if bit)
 
 
+def _calendar_source_identifier(item: ParentCalendarSyncItem) -> str:
+    if item.calendar_primary or not item.calendar_id:
+        return f"google_calendar:{item.google_event_id}"
+    return f"google_calendar:{item.calendar_id}:{item.google_event_id}"
+
+
 def _build_imported_candidate(
     *,
     connection: GoogleConnection,
@@ -438,12 +444,18 @@ def build_google_import_candidates(batch: FlorenceGoogleSyncBatch) -> FlorenceGo
         )
 
     for item in batch.calendar_items:
+        if item.usage_mode is not None and item.usage_mode != "planning_and_conflicts":
+            result.skipped_count += 1
+            continue
+        if item.detail_visibility is not None and item.detail_visibility != "full_details":
+            result.skipped_count += 1
+            continue
         decision = build_parent_calendar_candidate_decision(item, context=batch.context)
         if decision.kind != CandidateDecisionKind.CANDIDATE:
             result.skipped_count += 1
             continue
 
-        source_identifier = f"google_calendar:{item.google_event_id}"
+        source_identifier = _calendar_source_identifier(item)
         result.candidates.append(
             _build_imported_candidate(
                 connection=batch.connection,
@@ -455,7 +467,11 @@ def build_google_import_candidates(batch: FlorenceGoogleSyncBatch) -> FlorenceGo
                 decision=decision,
                 source_metadata={
                     "google_event_id": item.google_event_id,
+                    "calendar_id": item.calendar_id,
+                    "calendar_primary": item.calendar_primary,
                     "calendar_summary": item.calendar_summary,
+                    "usage_mode": item.usage_mode,
+                    "detail_visibility": item.detail_visibility,
                     "html_link": item.html_link,
                     "starts_at": item.starts_at.isoformat(),
                     "ends_at": item.ends_at.isoformat(),

@@ -1,11 +1,14 @@
 {
-  "/_global-error/page": "/_global-error",
   "/_not-found/page": "/_not-found",
-  "/accounts/page": "/accounts",
+  "/_global-error/page": "/_global-error",
   "/api/auth/[...nextauth]/route": "/api/auth/[...nextauth]",
-  "/api/florence/[...path]/route": "/api/florence/[...path]",
-  "/login/page": "/login",
+  "/accounts/page": "/accounts",
+  "/calendar/page": "/calendar",
+  "/connections/page": "/connections",
   "/page": "/",
+  "/login/page": "/login",
+  "/review/page": "/review",
   "/settings/page": "/settings",
-  "/setup/page": "/setup"
+  "/setup/page": "/setup",
+  "/api/florence/[...path]/route": "/api/florence/[...path]"
 }

@@ -20,6 +20,7 @@ from florence.contracts import (
     GoogleConnection,
     GoogleSourceKind,
     Household,
+    HouseholdEvent,
     HouseholdRoutine,
     HouseholdRoutineStatus,
     ImportedCandidate,
@@ -56,6 +57,8 @@ class _FakeBriefingChatService:
                 "brief_kind": brief_kind.value,
             }
         )
+        if brief_kind.value == "weekly":
+            return "Weekly preview: science fair, pickup swap, and dinner coverage need attention."
         return "Morning brief: soccer bag, lunch order, and pickup timing are all on deck."
 
 
@@ -158,6 +161,14 @@ def test_production_service_google_callback_sends_dm_follow_up(tmp_path, monkeyp
     service.entrypoints.onboarding_service.variant_selector = lambda _household_id, _member_id: OnboardingVariant.HYBRID
     service.linq = _FakeLinqClient()
     store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
     store.upsert_channel(
         Channel(
             id="chan_dm_123",
@@ -218,13 +229,16 @@ def test_production_service_google_callback_sends_dm_follow_up(tmp_path, monkeyp
     )
     monkeypatch.setattr("florence.runtime.services.fetch_google_user_email", lambda **_: "parent@example.com")
     monkeypatch.setattr(
-        "florence.runtime.services.fetch_primary_google_calendar",
-        lambda **_: GoogleCalendarMetadata(
-            id="primary",
-            summary="Family",
-            timezone="America/Los_Angeles",
-            access_role="owner",
-        ),
+        "florence.runtime.services.list_google_calendars",
+        lambda **_: [
+            GoogleCalendarMetadata(
+                id="primary",
+                summary="Family",
+                timezone="America/Los_Angeles",
+                access_role="owner",
+                primary=True,
+            )
+        ],
     )
     monkeypatch.setattr("florence.runtime.services.list_recent_gmail_sync_items", lambda **_: [])
     monkeypatch.setattr("florence.runtime.services.list_recent_parent_calendar_sync_items", lambda **_: [])
@@ -237,9 +251,14 @@ def test_production_service_google_callback_sends_dm_follow_up(tmp_path, monkeyp
     assert "Continue Florence setup" in result.body
     assert service.linq.sent
     assert service.linq.sent[0]["chat_id"] == "dm-thread-123"
-    assert service.linq.sent[0]["message"] == "You're ready. Florence is set up as your house manager now."
-    assert service.linq.sent[1]["message"].startswith("Start with a real task like:")
-    assert "syncing your recent email and calendar in the background" in service.linq.sent[2]["message"]
+    assert [message["message"] for message in service.linq.sent] == [
+        "Google connected.",
+        "I\u2019m syncing your recent email and calendar in the background now.",
+        "If you want to track setup progress on your computer, use this link:",
+        service.linq.sent[3]["message"],
+        "I\u2019ll text you here when the first pass is ready.",
+    ]
+    assert service.linq.sent[3]["message"].startswith("https://florence.example.com/v1/florence/onboarding?token=")
     assert len(launched) == 1
     assert str(launched[0]["connection_id"]).startswith("gconn_")
     assert launched[0]["thread_id"] == "dm-thread-123"
@@ -254,6 +273,14 @@ def test_production_service_google_callback_sends_progress_link_until_setup_read
     service.entrypoints.onboarding_service.variant_selector = lambda _household_id, _member_id: OnboardingVariant.HYBRID
     service.linq = _FakeLinqClient()
     store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
     store.upsert_channel(
         Channel(
             id="chan_dm_123",
@@ -296,13 +323,16 @@ def test_production_service_google_callback_sends_progress_link_until_setup_read
     )
     monkeypatch.setattr("florence.runtime.services.fetch_google_user_email", lambda **_: "parent@example.com")
     monkeypatch.setattr(
-        "florence.runtime.services.fetch_primary_google_calendar",
-        lambda **_: GoogleCalendarMetadata(
-            id="primary",
-            summary="Family",
-            timezone="America/Los_Angeles",
-            access_role="owner",
-        ),
+        "florence.runtime.services.list_google_calendars",
+        lambda **_: [
+            GoogleCalendarMetadata(
+                id="primary",
+                summary="Family",
+                timezone="America/Los_Angeles",
+                access_role="owner",
+                primary=True,
+            )
+        ],
     )
     monkeypatch.setattr("florence.runtime.services.list_recent_gmail_sync_items", lambda **_: [])
     monkeypatch.setattr("florence.runtime.services.list_recent_parent_calendar_sync_items", lambda **_: [])
@@ -350,6 +380,14 @@ def test_production_service_google_callback_keeps_onboarding_prompt_separate_fro
     service.entrypoints.onboarding_service.variant_selector = lambda _household_id, _member_id: OnboardingVariant.HYBRID
     service.linq = _FakeLinqClient()
     store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
     store.upsert_channel(
         Channel(
             id="chan_dm_123",
@@ -424,13 +462,16 @@ def test_production_service_google_callback_keeps_onboarding_prompt_separate_fro
     )
     monkeypatch.setattr("florence.runtime.services.fetch_google_user_email", lambda **_: "parent@example.com")
     monkeypatch.setattr(
-        "florence.runtime.services.fetch_primary_google_calendar",
-        lambda **_: GoogleCalendarMetadata(
-            id="primary",
-            summary="Family",
-            timezone="America/Los_Angeles",
-            access_role="owner",
-        ),
+        "florence.runtime.services.list_google_calendars",
+        lambda **_: [
+            GoogleCalendarMetadata(
+                id="primary",
+                summary="Family",
+                timezone="America/Los_Angeles",
+                access_role="owner",
+                primary=True,
+            )
+        ],
     )
     monkeypatch.setattr("florence.runtime.services.list_recent_gmail_sync_items", lambda **_: [])
     monkeypatch.setattr("florence.runtime.services.list_recent_parent_calendar_sync_items", lambda **_: [])
@@ -440,10 +481,10 @@ def test_production_service_google_callback_keeps_onboarding_prompt_separate_fro
     result = service.handle_google_callback(code="auth-code", state=raw_state)
 
     assert result.status_code == 200
-    assert len(service.linq.sent) == 3
-    assert service.linq.sent[0]["message"] == "You're ready. Florence is set up as your house manager now."
-    assert "Imported item:" not in service.linq.sent[0]["message"]
-    assert "syncing your recent email and calendar in the background" in service.linq.sent[2]["message"]
+    assert len(service.linq.sent) == 5
+    assert service.linq.sent[0]["message"] == "Google connected."
+    assert all("Imported item:" not in message["message"] for message in service.linq.sent)
+    assert "syncing your recent email and calendar in the background" in service.linq.sent[1]["message"]
     assert launched[0]["notify_when_finished"] is True
     store.close()
 
@@ -536,6 +577,184 @@ def test_process_google_sync_job_skips_already_nudged_review_candidates(tmp_path
     )
 
     assert service.linq.sent == []
+    store.close()
+
+
+def test_process_google_sync_job_sends_operational_brief_with_group_promotion_metadata(tmp_path, monkeypatch):
+    settings = _build_settings(tmp_path)
+    store = FlorenceStateDB(settings.server.db_path)
+    service = FlorenceProductionService(settings, store=store)
+    service.linq = _FakeLinqClient()
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_group_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="group-thread-123",
+            channel_type=ChannelType.HOUSEHOLD_GROUP,
+            title="Parent group",
+        )
+    )
+    service.entrypoints.onboarding_service.record_google_connected(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+    )
+    connection = store.upsert_google_connection(
+        GoogleConnection(
+            id="gconn_123",
+            household_id="hh_123",
+            member_id="mem_123",
+            email="parent@example.com",
+            connected_scopes=(GoogleSourceKind.GMAIL, GoogleSourceKind.GOOGLE_CALENDAR),
+            access_token="access-token",
+            metadata={
+                "last_gmail_item_count": 9,
+                "last_calendar_item_count": 3,
+                "primary_calendar_id": "primary",
+                "primary_calendar_summary": "Family",
+                "primary_calendar_timezone": "America/Los_Angeles",
+            },
+        )
+    )
+    candidate = ImportedCandidate(
+        id="cand_123",
+        household_id="hh_123",
+        member_id="mem_123",
+        source_kind=GoogleSourceKind.GMAIL,
+        source_identifier="gmail:gmail_123",
+        title="Science fair reminder",
+        summary="Science fair is Friday.",
+        state=CandidateState.PENDING_REVIEW,
+    )
+
+    class _FakeSyncWorkerService:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def sync_connection(self, connection_id, **_kwargs):
+            assert connection_id == "gconn_123"
+            return SimpleNamespace(
+                connection=connection,
+                sync_result=SimpleNamespace(candidates=[candidate]),
+            )
+
+    monkeypatch.setattr("florence.runtime.production.FlorenceGoogleSyncWorkerService", _FakeSyncWorkerService)
+    monkeypatch.setattr(service, "_nudge_for_new_pending_candidates", lambda **_kwargs: False)
+
+    service.process_google_sync_job(
+        connection_id="gconn_123",
+        thread_id="dm-thread-123",
+        notify_when_finished=True,
+        raise_on_error=True,
+    )
+
+    assert len(service.linq.sent) == 1
+    assert "I went through your recent email and calendar activity." in service.linq.sent[0]["message"]
+    assert "Science fair reminder" in service.linq.sent[0]["message"]
+    assert "Reply 'share' and I will post a short version to the parent group." in service.linq.sent[0]["message"]
+    stored_messages = store.list_channel_messages(channel_id="chan_dm_123")
+    assert len(stored_messages) == 1
+    assert stored_messages[0].metadata["promotion_kind"] == "sync_activation_brief"
+    assert "Science fair reminder" in stored_messages[0].metadata["promotable_group_message"]
+    updated_connection = store.get_google_connection("gconn_123")
+    assert updated_connection is not None
+    assert updated_connection.metadata["initial_sync_activation_brief_sent_at"]
+    store.close()
+
+
+def test_production_service_process_google_sync_job_does_not_repeat_activation_brief(tmp_path, monkeypatch):
+    settings = _build_settings(tmp_path)
+    store = FlorenceStateDB(settings.server.db_path)
+    service = FlorenceProductionService(settings, store=store)
+    service.linq = _FakeLinqClient()
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(Member(id="mem_123", household_id="hh_123", display_name="Maya", role=MemberRole.ADMIN))
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    initial_connection = store.upsert_google_connection(
+        GoogleConnection(
+            id="gconn_123",
+            household_id="hh_123",
+            member_id="mem_123",
+            email="parent@example.com",
+            connected_scopes=(GoogleSourceKind.GMAIL, GoogleSourceKind.GOOGLE_CALENDAR),
+            access_token="access-token",
+            metadata={
+                "last_gmail_item_count": 9,
+                "last_calendar_item_count": 3,
+                "primary_calendar_id": "primary",
+                "primary_calendar_summary": "Family",
+                "primary_calendar_timezone": "America/Los_Angeles",
+            },
+        )
+    )
+    candidate = ImportedCandidate(
+        id="cand_123",
+        household_id="hh_123",
+        member_id="mem_123",
+        source_kind=GoogleSourceKind.GMAIL,
+        source_identifier="gmail:gmail_123",
+        title="Science fair reminder",
+        summary="Science fair is Friday.",
+        state=CandidateState.PENDING_REVIEW,
+    )
+
+    class _FakeSyncWorkerService:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def sync_connection(self, connection_id, **_kwargs):
+            assert connection_id == "gconn_123"
+            return SimpleNamespace(
+                connection=store.get_google_connection(connection_id) or initial_connection,
+                sync_result=SimpleNamespace(candidates=[candidate]),
+            )
+
+    monkeypatch.setattr("florence.runtime.production.FlorenceGoogleSyncWorkerService", _FakeSyncWorkerService)
+    monkeypatch.setattr(service, "_nudge_for_new_pending_candidates", lambda **_kwargs: False)
+
+    service.process_google_sync_job(
+        connection_id="gconn_123",
+        thread_id="dm-thread-123",
+        notify_when_finished=True,
+        raise_on_error=True,
+    )
+    service.process_google_sync_job(
+        connection_id="gconn_123",
+        thread_id="dm-thread-123",
+        notify_when_finished=True,
+        raise_on_error=True,
+    )
+
+    assert len(service.linq.sent) == 1
     store.close()
 
 
@@ -715,6 +934,18 @@ def test_production_service_web_setup_returns_sync_state_and_suggestions(tmp_pat
                 "initial_sync_completed_at": "2026-03-29T18:00:00+00:00",
                 "sync_phase": "ready",
                 "last_sync_status": "ok",
+                "primary_calendar_id": "primary",
+                "primary_calendar_summary": "Family",
+                "primary_calendar_timezone": "America/Los_Angeles",
+                "available_calendars": [
+                    {
+                        "id": "primary",
+                        "summary": "Family",
+                        "timezone": "America/Los_Angeles",
+                        "access_role": "owner",
+                        "primary": True,
+                    }
+                ],
             },
         )
     )
@@ -730,7 +961,7 @@ def test_production_service_web_setup_returns_sync_state_and_suggestions(tmp_pat
     assert result.status_code == 200
     payload = json.loads(result.body)
     assert payload["ok"] is True
-    assert payload["setup"]["phase"] == "collect_household_profile"
+    assert payload["setup"]["phase"] == "web_consent"
     assert payload["sync"]["primary"]["initialSyncState"] == "ready"
     assert payload["suggestions"]["schools"][0]["label"] == "Roosevelt Elementary"
     assert payload["suggestions"]["activities"][0]["label"] == "Soccer"
@@ -779,6 +1010,18 @@ def test_production_service_web_setup_profile_completes_and_texts_parent(tmp_pat
                 "initial_sync_completed_at": "2026-03-29T18:00:00+00:00",
                 "sync_phase": "ready",
                 "last_sync_status": "ok",
+                "primary_calendar_id": "primary",
+                "primary_calendar_summary": "Family",
+                "primary_calendar_timezone": "America/Los_Angeles",
+                "available_calendars": [
+                    {
+                        "id": "primary",
+                        "summary": "Family",
+                        "timezone": "America/Los_Angeles",
+                        "access_role": "owner",
+                        "primary": True,
+                    }
+                ],
             },
         )
     )
@@ -796,15 +1039,34 @@ def test_production_service_web_setup_profile_completes_and_texts_parent(tmp_pat
             "children": [{"name": "Theo", "details": "1st grade"}, {"name": "Violet", "details": "preschool"}],
             "schools": ["Wish Community School", "Young Minds Preschool"],
             "activities": ["Theo baseball", "Violet dance"],
+            "consent": {"acceptTerms": True, "acceptPrivacy": True},
+            "calendarSelections": [
+                {
+                    "connectionId": "gconn_123",
+                    "calendarId": "primary",
+                    "usageMode": "planning_and_conflicts",
+                    "detailVisibility": "full_details",
+                }
+            ],
+            "topPriorities": ["school schedule changes", "pickups and dropoffs"],
+            "painPoints": ["too much important info is buried in email"],
+            "trustDefaults": {
+                "allowGoogleDataProcessing": True,
+                "allowHouseholdLogisticsSharing": True,
+                "privateCalendarHandling": "conflicts_only",
+                "askBeforeSensitiveShare": True,
+            },
         },
     )
 
     assert result.status_code == 200
     payload = json.loads(result.body)
     assert payload["setup"]["readyForChat"] is True
+    assert payload["setup"]["requiredFields"]["calendarClassification"] is True
     assert len(store.list_child_profiles(household_id="hh_123")) == 2
     assert len(service.linq.sent) == 2
     assert service.linq.sent[0]["message"] == "You're ready. Florence is set up as your house manager now."
+    assert payload["preferences"]["trustDefaults"]["allowGoogleDataProcessing"] is True
     store.close()
 
 
@@ -854,6 +1116,143 @@ def test_production_service_web_session_resolves_by_google_email(tmp_path):
     assert payload["resolvedVia"] == "google_email"
     assert payload["member"]["id"] == "mem_123"
     assert payload["household"]["id"] == "hh_123"
+    store.close()
+
+
+def test_production_service_web_review_confirm_updates_candidate_and_event(tmp_path):
+    settings = _build_settings(tmp_path)
+    store = FlorenceStateDB(settings.server.db_path)
+    service = FlorenceProductionService(settings, store=store)
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    service.entrypoints.onboarding_service.record_google_connected(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+    )
+    store.upsert_google_connection(
+        GoogleConnection(
+            id="gconn_123",
+            household_id="hh_123",
+            member_id="mem_123",
+            email="parent@example.com",
+            connected_scopes=(GoogleSourceKind.GMAIL, GoogleSourceKind.GOOGLE_CALENDAR),
+            metadata={
+                "web_primary": True,
+                "available_calendars": [
+                    {"id": "primary", "summary": "Family", "timezone": "America/Los_Angeles", "primary": True}
+                ],
+                "calendar_preferences": {
+                    "primary": {
+                        "usage_mode": "planning_and_conflicts",
+                        "detail_visibility": "full_details",
+                    }
+                },
+            },
+        )
+    )
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_123",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail_123",
+            title="Baseball game Saturday",
+            summary="Saturday at 9am.",
+            state=CandidateState.PENDING_REVIEW,
+            metadata={
+                "proposed_fields": {
+                    "title": "Baseball game Saturday",
+                    "starts_at": "2026-04-02T16:00:00+00:00",
+                    "ends_at": "2026-04-02T17:00:00+00:00",
+                    "timezone": "America/Los_Angeles",
+                }
+            },
+        )
+    )
+
+    result = service.handle_web_review_action(
+        auth_email="parent@example.com",
+        payload={"candidateId": "cand_123", "decision": "confirm"},
+    )
+
+    assert result.status_code == 200
+    payload = json.loads(result.body)
+    assert payload["counts"]["confirmed"] == 1
+    assert payload["counts"]["pending"] == 0
+    events = store.list_household_events(household_id="hh_123")
+    assert len(events) == 1
+    assert events[0].source_candidate_id == "cand_123"
+    store.close()
+
+
+def test_production_service_web_calendar_filters_events_by_range(tmp_path):
+    settings = _build_settings(tmp_path)
+    store = FlorenceStateDB(settings.server.db_path)
+    service = FlorenceProductionService(settings, store=store)
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    service.entrypoints.onboarding_service.record_google_connected(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+    )
+    store.upsert_google_connection(
+        GoogleConnection(
+            id="gconn_123",
+            household_id="hh_123",
+            member_id="mem_123",
+            email="parent@example.com",
+            connected_scopes=(GoogleSourceKind.GMAIL, GoogleSourceKind.GOOGLE_CALENDAR),
+            metadata={"web_primary": True},
+        )
+    )
+    store.upsert_household_event(
+        HouseholdEvent(
+            id="evt_in",
+            household_id="hh_123",
+            title="Soccer practice",
+            starts_at="2026-04-05T16:00:00+00:00",
+            ends_at="2026-04-05T17:00:00+00:00",
+            timezone="America/Los_Angeles",
+        )
+    )
+    store.upsert_household_event(
+        HouseholdEvent(
+            id="evt_out",
+            household_id="hh_123",
+            title="Summer camp",
+            starts_at="2026-07-05T16:00:00+00:00",
+            ends_at="2026-07-05T17:00:00+00:00",
+            timezone="America/Los_Angeles",
+        )
+    )
+
+    result = service.handle_web_calendar(
+        auth_email="parent@example.com",
+        start="2026-04-01T00:00:00+00:00",
+        end="2026-04-30T23:59:59+00:00",
+    )
+
+    assert result.status_code == 200
+    payload = json.loads(result.body)
+    assert payload["counts"]["total"] == 1
+    assert payload["events"][0]["id"] == "evt_in"
     store.close()
 
 
@@ -1133,4 +1532,76 @@ def test_production_service_run_sync_pass_sends_due_household_briefing(tmp_path)
     assert updated.last_completed_at is not None
     events = store.list_pilot_events(household_id="hh_123", event_type="briefing_sent")
     assert len(events) == 1
+    store.close()
+
+
+def test_production_service_run_sync_pass_prefers_household_group_for_briefing(tmp_path):
+    settings = _build_settings(tmp_path)
+    store = FlorenceStateDB(settings.server.db_path)
+    service = FlorenceProductionService(settings, store=store)
+    service.linq = _FakeLinqClient()
+    fake_chat = _FakeBriefingChatService()
+    service.entrypoints.household_chat_service = fake_chat
+    store.upsert_household(
+        Household(
+            id="hh_123",
+            name="Maya's household",
+            timezone="America/Los_Angeles",
+            settings={"manager_profile": {"operating_preferences": "Weekday morning brief at 6:45."}},
+        )
+    )
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_group_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="group-thread-123",
+            channel_type=ChannelType.HOUSEHOLD_GROUP,
+            title="Parent group",
+        )
+    )
+    service.entrypoints.onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        display_name="Maya",
+    )
+    routines = service.household_manager_service.ensure_briefing_routines(household_id="hh_123")
+    morning = next(routine for routine in routines if routine.metadata.get("brief_kind") == "morning")
+    store.upsert_household_routine(
+        replace(
+            morning,
+            status=HouseholdRoutineStatus.ACTIVE,
+            next_due_at="2026-03-24T00:00:00+00:00",
+        )
+    )
+
+    result = service.run_sync_pass()
+
+    assert result["briefings_sent"] == 1
+    assert service.linq.sent == [
+        {
+            "chat_id": "group-thread-123",
+            "message": "Morning brief: soccer bag, lunch order, and pickup timing are all on deck.",
+        }
+    ]
+    assert fake_chat.calls[0]["channel_id"] == "chan_group_123"
     store.close()

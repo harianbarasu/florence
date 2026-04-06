@@ -499,12 +499,15 @@ class AIAgent:
         platform: str = None,
         skip_context_files: bool = False,
         skip_memory: bool = False,
+        skip_local_memory: bool = False,
         session_db=None,
         honcho_session_key: str = None,
         honcho_manager=None,
         honcho_config=None,
         iteration_budget: "IterationBudget" = None,
         fallback_model: Dict[str, Any] = None,
+        tool_use_enforcement: Any = None,
+        session_search_kwargs: Dict[str, Any] = None,
         checkpoints_enabled: bool = False,
         checkpoint_max_snapshots: int = 50,
         pass_session_id: bool = False,
@@ -547,6 +550,8 @@ class AIAgent:
             skip_context_files (bool): If True, skip auto-injection of SOUL.md, AGENTS.md, and .cursorrules
                 into the system prompt. Use this for batch processing and data generation to avoid
                 polluting trajectories with user-specific persona or project instructions.
+            skip_local_memory (bool): If True, disable file-backed MEMORY.md / USER.md while still allowing
+                Honcho cross-session memory when skip_memory is False.
             honcho_session_key (str): Session key for Honcho integration (e.g., "telegram:123456" or CLI session_id).
                 When provided and Honcho is enabled in config, enables persistent cross-session user modeling.
             honcho_manager: Optional shared HonchoSessionManager owned by the caller.
@@ -573,6 +578,7 @@ class AIAgent:
         self.background_review_callback = None  # Optional sync callback for gateway delivery
         self.skip_context_files = skip_context_files
         self.pass_session_id = pass_session_id
+        self._session_search_kwargs = dict(session_search_kwargs or {})
         self.log_prefix_chars = log_prefix_chars
         self.log_prefix = f"{log_prefix} " if log_prefix else ""
         # Store effective base URL for feature detection (prompt caching, reasoning, etc.)
@@ -1046,7 +1052,7 @@ class AIAgent:
         self._memory_flush_min_turns = 6
         self._turns_since_memory = 0
         self._iters_since_skill = 0
-        if not skip_memory:
+        if not skip_memory and not skip_local_memory:
             try:
                 mem_config = _agent_cfg.get("memory", {})
                 self._memory_enabled = mem_config.get("memory_enabled", False)
@@ -1146,7 +1152,11 @@ class AIAgent:
         _agent_section = _agent_cfg.get("agent", {})
         if not isinstance(_agent_section, dict):
             _agent_section = {}
-        self._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
+        self._tool_use_enforcement = (
+            tool_use_enforcement
+            if tool_use_enforcement is not None
+            else _agent_section.get("tool_use_enforcement", "auto")
+        )
 
         # Initialize context compressor for automatic context management
         # Compresses conversation when approaching model's context limit
@@ -5270,6 +5280,7 @@ class AIAgent:
                 limit=function_args.get("limit", 3),
                 db=self._session_db,
                 current_session_id=self.session_id,
+                **self._session_search_kwargs,
             )
         elif function_name == "memory":
             target = function_args.get("target", "memory")
@@ -5598,6 +5609,7 @@ class AIAgent:
                         limit=function_args.get("limit", 3),
                         db=self._session_db,
                         current_session_id=self.session_id,
+                        **self._session_search_kwargs,
                     )
                 tool_duration = time.time() - tool_start_time
                 if self.quiet_mode:

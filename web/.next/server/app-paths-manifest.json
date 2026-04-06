@@ -1,11 +1,14 @@
 {
-  "/_global-error/page": "app/_global-error/page.js",
   "/_not-found/page": "app/_not-found/page.js",
-  "/accounts/page": "app/accounts/page.js",
+  "/_global-error/page": "app/_global-error/page.js",
   "/api/auth/[...nextauth]/route": "app/api/auth/[...nextauth]/route.js",
-  "/api/florence/[...path]/route": "app/api/florence/[...path]/route.js",
-  "/login/page": "app/login/page.js",
+  "/accounts/page": "app/accounts/page.js",
+  "/calendar/page": "app/calendar/page.js",
+  "/connections/page": "app/connections/page.js",
   "/page": "app/page.js",
+  "/login/page": "app/login/page.js",
+  "/review/page": "app/review/page.js",
   "/settings/page": "app/settings/page.js",
-  "/setup/page": "app/setup/page.js"
+  "/setup/page": "app/setup/page.js",
+  "/api/florence/[...path]/route": "app/api/florence/[...path]/route.js"
 }

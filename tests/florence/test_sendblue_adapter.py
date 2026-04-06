@@ -1,4 +1,8 @@
-from florence.sendblue import build_sendblue_thread_id, parse_sendblue_payload
+from florence.sendblue import (
+    build_sendblue_group_thread_id,
+    build_sendblue_thread_id,
+    parse_sendblue_payload,
+)
 
 
 def test_sendblue_adapter_parses_inbound_message_payload():
@@ -31,3 +35,28 @@ def test_sendblue_adapter_parses_inbound_message_payload():
     assert inbound.is_group_chat is False
     assert inbound.is_from_me is False
     assert inbound.event_type == "RECEIVED"
+
+
+def test_sendblue_adapter_uses_group_id_for_group_threads():
+    inbound = parse_sendblue_payload(
+        {
+            "content": "Hi group",
+            "is_outbound": False,
+            "status": "RECEIVED",
+            "message_handle": "msg_group_123",
+            "from_number": "+15555550123",
+            "number": "+15555550123",
+            "to_number": "+15122164639",
+            "sendblue_number": "+15122164639",
+            "group_id": "group_123456",
+            "participants": ["+15555550123", "+15555550124", "+15122164639"],
+            "service": "iMessage",
+            "message_type": "message",
+        }
+    )
+
+    assert inbound.thread_id == build_sendblue_group_thread_id(
+        sendblue_number="+15122164639",
+        group_id="group_123456",
+    )
+    assert inbound.is_group_chat is True

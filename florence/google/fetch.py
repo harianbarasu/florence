@@ -517,6 +517,8 @@ def build_parent_calendar_sync_item(
         updated_at=updated_at,
         calendar_summary=calendar.summary,
         family_member_names=[name for name in family_member_names if name.strip()],
+        calendar_id=calendar.id,
+        calendar_primary=calendar.primary,
     )
 
 

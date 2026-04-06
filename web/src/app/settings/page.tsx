@@ -2,6 +2,7 @@ import { auth } from "@/auth";
 import { AppShell } from "@/components/app-shell";
 import { GoogleSignInCard } from "@/components/auth/google-sign-in-card";
 import { SettingsScreen } from "@/components/settings/settings-screen";
+import { withToken } from "@/lib/routes";
 
 type SearchParams = Record<string, string | string[] | undefined>;
 
@@ -15,7 +16,7 @@ export default async function SettingsPage({
   const session = await auth();
 
   if (!session?.user?.email) {
-    return <GoogleSignInCard redirectTo="/settings" />;
+    return <GoogleSignInCard redirectTo={withToken("/settings", token)} />;
   }
 
   return (
@@ -23,6 +24,7 @@ export default async function SettingsPage({
       currentPath="/settings"
       userName={session.user.name || session.user.email}
       userEmail={session.user.email}
+      token={token}
     >
       <SettingsScreen token={token} />
     </AppShell>

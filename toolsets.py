@@ -76,9 +76,10 @@ _FLORENCE_HOUSEHOLD_TOOLS = [
     # Media + lightweight planning support
     "vision_analyze", "image_generate", "text_to_speech",
     # Household operations
-    "todo", "clarify",
+    "todo", "session_search", "clarify",
     "schedule_cronjob", "list_cronjobs", "remove_cronjob",
     "send_message",
+    "honcho_context", "honcho_profile", "honcho_search", "honcho_conclude",
     "household_search_state",
     "household_search_google_inbox",
     "household_upsert_event",
@@ -87,10 +88,15 @@ _FLORENCE_HOUSEHOLD_TOOLS = [
     "household_schedule_nudge",
     "household_upsert_meal",
     "household_upsert_shopping_item",
+    "household_record_preference",
 ]
 
 _FLORENCE_BRIEFING_TOOLS = [
     "household_search_state",
+    "household_search_google_inbox",
+    "session_search",
+    "honcho_context",
+    "honcho_search",
 ]
 
 

@@ -8,7 +8,7 @@ import json
 import threading
 import time
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlencode
 
@@ -21,13 +21,13 @@ from florence.contracts import (
     ChannelMessageRole,
     ChannelType,
     HouseholdBriefingKind,
+    HouseholdEventStatus,
     HouseholdProfileKind,
 )
 from florence.google import decode_google_oauth_state
 from florence.onboarding import (
     build_google_connected_syncing_message_sequence,
     build_onboarding_ready_message_sequence,
-    build_sync_complete_finish_profile_message_sequence,
     extract_child_names,
     split_entries,
     split_labels,
@@ -47,6 +47,20 @@ from florence.sendblue import FlorenceSendblueClient
 from florence.state import FlorenceStateDB
 
 logger = logging.getLogger(__name__)
+
+WEB_SETUP_CALENDAR_USAGE_MODES = {
+    "planning_and_conflicts",
+    "conflicts_only",
+    "ignore",
+}
+WEB_SETUP_CALENDAR_DETAIL_VISIBILITY = {
+    "full_details",
+    "busy_only",
+}
+WEB_SETUP_PRIVATE_CALENDAR_HANDLING = {
+    "conflicts_only",
+    "full_details",
+}
 
 
 @dataclass(slots=True)
@@ -90,6 +104,10 @@ class FlorenceProductionService:
             household_chat_provider=settings.hermes.provider,
             household_chat_enabled_toolsets=settings.hermes.enabled_toolsets,
             household_chat_disabled_toolsets=settings.hermes.disabled_toolsets,
+            household_chat_fallback_model=settings.hermes.fallback_model,
+            household_chat_tool_use_enforcement=settings.hermes.tool_use_enforcement,
+            household_chat_enable_honcho=settings.hermes.enable_honcho,
+            household_chat_honcho_scope=settings.hermes.honcho_scope,
         )
         self.onboarding_link_service = self.entrypoints.onboarding_link_service
         self.linq = FlorenceLinqClient(settings.linq)
@@ -387,19 +405,27 @@ class FlorenceProductionService:
                 if self.onboarding_link_service is not None
                 else None
             )
-            became_complete = callback.onboarding_transition.state.is_complete and not existing_session.is_complete
+            updated_context = self._build_web_context(
+                household_id=oauth_state.household_id,
+                member_id=oauth_state.member_id,
+                thread_id=oauth_state.thread_id or "",
+                resolved_via="google_callback",
+                auth_email=callback.connection.email,
+            )
+            web_setup_payload = self._serialize_web_setup(updated_context)
+            web_setup_ready = bool(web_setup_payload["setup"]["readyForChat"])
+            became_complete = web_setup_ready and not self._has_onboarding_completion_event(
+                household_id=oauth_state.household_id,
+                member_id=oauth_state.member_id,
+            )
             dm_messages = (
                 build_onboarding_ready_message_sequence()
-                if callback.onboarding_transition.state.is_complete
+                if web_setup_ready
                 else build_google_connected_syncing_message_sequence(
                     onboarding_link.url if onboarding_link is not None else None
                 )
             )
-            sync_notice = (
-                "I’m syncing your recent email and calendar in the background now. I’ll text you when the first pass is ready."
-                if callback.onboarding_transition.state.is_complete
-                else None
-            )
+            sync_notice = None
 
             if oauth_state.thread_id and (dm_messages or sync_notice):
                 channel = self.store.get_channel(oauth_state.thread_id)
@@ -433,8 +459,8 @@ class FlorenceProductionService:
             if onboarding_link is not None:
                 redirect_message = (
                     "Google connected. Taking you back to Florence so you can track sync progress."
-                    if not callback.onboarding_transition.state.is_complete
-                    else "Google connected. Florence is ready and your first sync is running now."
+                    if not web_setup_ready
+                    else "Google connected. Florence is ready."
                 )
                 return self._html_result(
                     200,
@@ -547,6 +573,51 @@ class FlorenceProductionService:
                 member_id=member_id,
                 thread_id=thread_id,
                 activity_labels=self._coerce_label_list(payload.get("activities", payload.get("activityLabels"))),
+            )
+
+        manager_updates: dict[str, object] = {}
+        current_manager_profile = self.household_manager_service.get_manager_profile(household_id)
+
+        if "consent" in payload:
+            manager_updates["web_consent"] = self._merge_web_consent(
+                current=current_manager_profile.get("web_consent"),
+                incoming=payload.get("consent"),
+            )
+
+        if any(
+            key in payload
+            for key in ("topPriorities", "topPriorityOther", "painPoints", "painPointOther", "priorities")
+        ):
+            manager_updates.update(
+                self._merge_priority_preferences(
+                    current=current_manager_profile,
+                    payload=payload,
+                )
+            )
+
+        if "trustDefaults" in payload:
+            manager_updates["trust_defaults"] = self._merge_trust_defaults(
+                current=current_manager_profile.get("trust_defaults"),
+                incoming=payload.get("trustDefaults"),
+            )
+
+        activation_action = str(payload.get("activationReviewAction") or "").strip().lower()
+        if activation_action:
+            manager_updates["activation_review"] = self._merge_activation_state(
+                current=current_manager_profile.get("activation_review"),
+                action=activation_action,
+            )
+
+        if manager_updates:
+            self.household_manager_service.update_manager_profile(
+                household_id=household_id,
+                updates=manager_updates,
+            )
+
+        if "calendarSelections" in payload or "calendarClassifications" in payload:
+            self._persist_web_calendar_selections(
+                context=context,
+                raw=payload.get("calendarSelections", payload.get("calendarClassifications")),
             )
 
         updated_context = self._build_web_context(
@@ -709,6 +780,87 @@ class FlorenceProductionService:
         )
         return self._json_result(200, {"ok": True, **self._serialize_web_settings(updated_context)})
 
+    def handle_web_review(
+        self,
+        *,
+        token: str | None = None,
+        auth_email: str | None = None,
+    ) -> FlorenceHTTPResult:
+        try:
+            context = self._load_web_context(token=token, auth_email=auth_email)
+        except Exception as exc:
+            return self._web_error_result(exc)
+        return self._json_result(200, {"ok": True, **self._serialize_web_review(context)})
+
+    def handle_web_review_action(
+        self,
+        *,
+        payload: dict[str, Any],
+        token: str | None = None,
+        auth_email: str | None = None,
+    ) -> FlorenceHTTPResult:
+        try:
+            context = self._load_web_context(token=token, auth_email=auth_email)
+        except Exception as exc:
+            return self._web_error_result(exc)
+
+        decision = str(payload.get("decision") or "").strip().lower()
+        candidate_id = str(payload.get("candidateId") or "").strip()
+        household_id = context["household"].id
+        member_id = context["member"].id
+
+        if decision == "skip_activation":
+            profile = self.household_manager_service.get_manager_profile(household_id)
+            activation = self._merge_activation_state(
+                current=profile.get("activation_review"),
+                action="skip",
+            )
+            self.household_manager_service.update_manager_profile(
+                household_id=household_id,
+                updates={"activation_review": activation},
+            )
+        else:
+            if not candidate_id:
+                return self._json_result(400, {"ok": False, "error": "candidate_id_required"})
+            candidate = self.store.get_imported_candidate(candidate_id)
+            if candidate is None or candidate.household_id != household_id or candidate.member_id != member_id:
+                return self._json_result(404, {"ok": False, "error": "unknown_candidate"})
+            if decision == "confirm":
+                self.candidate_review_service.confirm_candidate(
+                    candidate_id=candidate_id,
+                    overrides=payload.get("overrides") if isinstance(payload.get("overrides"), dict) else None,
+                )
+            elif decision == "reject":
+                self.candidate_review_service.reject_candidate(candidate_id=candidate_id)
+            else:
+                return self._json_result(400, {"ok": False, "error": "invalid_review_decision"})
+
+        updated_context = self._build_web_context(
+            household_id=household_id,
+            member_id=member_id,
+            thread_id=context["session"].thread_id,
+            resolved_via=context["resolved_via"],
+            auth_email=context["auth_email"],
+        )
+        return self._json_result(200, {"ok": True, **self._serialize_web_review(updated_context)})
+
+    def handle_web_calendar(
+        self,
+        *,
+        token: str | None = None,
+        auth_email: str | None = None,
+        start: str | None = None,
+        end: str | None = None,
+    ) -> FlorenceHTTPResult:
+        try:
+            context = self._load_web_context(token=token, auth_email=auth_email)
+        except Exception as exc:
+            return self._web_error_result(exc)
+        return self._json_result(
+            200,
+            {"ok": True, **self._serialize_web_calendar(context, start=start, end=end)},
+        )
+
     def _launch_google_sync_job(
         self,
         *,
@@ -801,28 +953,48 @@ class FlorenceProductionService:
                     thread_id=thread_id,
                     store=store,
                 )
-            if notify_when_finished:
-                if not ready_sequence_sent:
-                    if setup_payload["setup"]["phase"] == "collect_household_profile":
-                        onboarding_link = (
-                            self.onboarding_link_service.build_link(
-                                household_id=result.connection.household_id,
-                                member_id=result.connection.member_id,
-                                thread_id=thread_id or channel.provider_channel_id,
-                            ).url
-                            if self.onboarding_link_service is not None
-                            else None
-                        )
-                        for message in build_sync_complete_finish_profile_message_sequence(onboarding_link):
-                            self._safe_send_channel_message(channel=channel, message=message, store=store)
-                    else:
-                        summary_message = (
-                            f"First sync complete. I found {len(result.sync_result.candidates)} item"
-                            f"{'' if len(result.sync_result.candidates) == 1 else 's'} to review."
-                            if result.sync_result.candidates
-                            else "First sync complete. I’m connected and didn’t pull out anything obvious yet."
-                        )
-                        self._safe_send_channel_message(channel=channel, message=summary_message, store=store)
+            freshest_connection = store.get_google_connection(result.connection.id) or result.connection
+            if notify_when_finished and not self._sync_activation_brief_already_sent(connection=freshest_connection):
+                onboarding_link = (
+                    self.onboarding_link_service.build_link(
+                        household_id=result.connection.household_id,
+                        member_id=result.connection.member_id,
+                        thread_id=thread_id or channel.provider_channel_id,
+                    ).url
+                    if self.onboarding_link_service is not None
+                    and str(setup_payload.get("setup", {}).get("phase") or "") == "collect_household_profile"
+                    else None
+                )
+                group_channel = self._find_group_channel(
+                    result.connection.household_id,
+                    provider=channel.provider,
+                )
+                activation_message, group_message = self._build_sync_activation_brief_messages(
+                    connection=freshest_connection,
+                    candidates=result.sync_result.candidates,
+                    group_available=group_channel is not None,
+                    onboarding_link=onboarding_link,
+                    ready_sequence_sent=ready_sequence_sent,
+                )
+                sent_activation = self._safe_send_channel_message(
+                    channel=channel,
+                    message=activation_message,
+                    store=store,
+                    message_metadata=(
+                        {
+                            "promotion_kind": "sync_activation_brief",
+                            "promotable_group_message": group_message,
+                        }
+                        if group_message
+                        else None
+                    ),
+                )
+                if sent_activation:
+                    self._mark_sync_activation_brief_sent(
+                        connection=freshest_connection,
+                        store=store,
+                        channel_id=channel.id,
+                    )
             self._nudge_for_new_pending_candidates(
                 household_id=result.connection.household_id,
                 member_id=result.connection.member_id,
@@ -1348,6 +1520,86 @@ class FlorenceProductionService:
                 return channel
         return None
 
+    @staticmethod
+    def _activation_candidate_titles(candidates: list[Any], *, limit: int = 3) -> tuple[list[str], int]:
+        titles: list[str] = []
+        for candidate in candidates[:limit]:
+            title = " ".join(str(candidate.title or "").split()).strip()
+            if title:
+                titles.append(title)
+        remaining = max(0, len(candidates) - len(titles))
+        return titles, remaining
+
+    def _build_sync_activation_brief_messages(
+        self,
+        *,
+        connection: Any,
+        candidates: list[Any],
+        group_available: bool,
+        onboarding_link: str | None,
+        ready_sequence_sent: bool,
+    ) -> tuple[str, str | None]:
+        metadata = dict(getattr(connection, "metadata", {}) or {})
+        gmail_count = int(metadata.get("last_gmail_item_count") or 0)
+        calendar_count = int(metadata.get("last_calendar_item_count") or 0)
+        titles, remaining = self._activation_candidate_titles(candidates)
+
+        lines = [
+            "I went through your recent email and calendar activity. Here is what matters right now:",
+        ]
+        if titles:
+            title_summary = "; ".join(titles)
+            if remaining:
+                title_summary += f"; plus {remaining} more"
+            noun = "item" if len(candidates) == 1 else "items"
+            lines.append(f"- {len(candidates)} {noun} need review: {title_summary}.")
+        else:
+            lines.append("- Nothing urgent jumped out from the first pass yet.")
+
+        if gmail_count or calendar_count:
+            lines.append(
+                f"- I scanned {gmail_count} recent email{'s' if gmail_count != 1 else ''} and "
+                f"{calendar_count} calendar item{'s' if calendar_count != 1 else ''}."
+            )
+        if onboarding_link:
+            lines.append(f"- To sharpen future plans, finish adding kids, schools, and activities here: {onboarding_link}")
+        if group_available and titles:
+            lines.append("Reply 'share' and I will post a short version to the parent group.")
+        elif not ready_sequence_sent:
+            lines.append("Reply 'review' if you want the full queue, or text me anything else you want me to handle.")
+        else:
+            lines.append("Text me anything else you want me to handle.")
+
+        group_message: str | None = None
+        if group_available and titles:
+            group_lines = [
+                "Florence pulled together a quick household update from recent email and calendar activity:",
+                *(f"- {title}" for title in titles),
+            ]
+            if remaining:
+                group_lines.append(f"- Plus {remaining} more item{'s' if remaining != 1 else ''} to walk through.")
+            group_lines.append("Reply here if you want reminders or more detail on any of these.")
+            group_message = "\n".join(group_lines)
+
+        return "\n".join(lines), group_message
+
+    @staticmethod
+    def _sync_activation_brief_already_sent(*, connection: Any) -> bool:
+        metadata = dict(getattr(connection, "metadata", {}) or {})
+        return bool(str(metadata.get("initial_sync_activation_brief_sent_at") or "").strip())
+
+    @staticmethod
+    def _mark_sync_activation_brief_sent(
+        *,
+        connection: Any,
+        store: FlorenceStateDB,
+        channel_id: str,
+    ) -> None:
+        metadata = dict(getattr(connection, "metadata", {}) or {})
+        metadata["initial_sync_activation_brief_sent_at"] = datetime.now(timezone.utc).isoformat()
+        metadata["initial_sync_activation_brief_channel_id"] = channel_id
+        store.upsert_google_connection(replace(connection, metadata=metadata))
+
     def _find_channel_by_provider_id(
         self,
         provider_channel_id: str,
@@ -1431,6 +1683,9 @@ class FlorenceProductionService:
             channel = self.store.get_channel(channel_id) if channel_id else None
             if channel is None:
                 continue
+            preferred_group_channel = self._find_group_channel(household_id, provider=channel.provider)
+            if preferred_group_channel is not None:
+                channel = preferred_group_channel
             try:
                 brief_message = chat_service.compose_brief(
                     household_id=household_id,
@@ -1469,13 +1724,34 @@ class FlorenceProductionService:
         message: str,
         record_message: bool = True,
         store: FlorenceStateDB | None = None,
+        message_metadata: dict[str, Any] | None = None,
     ) -> bool:
         try:
             target_store = store or self.store
             if channel.provider == "linq":
                 self.linq.send_text(chat_id=channel.provider_channel_id, message=message)
             elif channel.provider == "sendblue":
-                self.sendblue.send_text(thread_id=channel.provider_channel_id, message=message)
+                metadata = dict(getattr(channel, "metadata", {}) or {})
+                group_id = str(metadata.get("group_id") or "").strip() or None
+                numbers = None
+                if group_id is None and channel.channel_type == ChannelType.HOUSEHOLD_GROUP:
+                    participant_handles = metadata.get("participant_handles")
+                    sendblue_number = str(metadata.get("sendblue_number") or "").strip()
+                    if isinstance(participant_handles, list):
+                        numbers = [
+                            str(handle).strip()
+                            for handle in participant_handles
+                            if isinstance(handle, str)
+                            and str(handle).strip()
+                            and str(handle).strip() != sendblue_number
+                        ]
+                        numbers = list(dict.fromkeys(numbers)) or None
+                self.sendblue.send_text(
+                    thread_id=channel.provider_channel_id,
+                    message=message,
+                    group_id=group_id,
+                    numbers=numbers,
+                )
             else:
                 return False
             if record_message:
@@ -1489,6 +1765,7 @@ class FlorenceProductionService:
                         metadata={
                             "provider": channel.provider,
                             "transport_thread_id": channel.provider_channel_id,
+                            **(message_metadata or {}),
                         },
                         created_at=time.time(),
                     )
@@ -1634,6 +1911,261 @@ class FlorenceProductionService:
             deduped_details = list(deduped_names)
         return deduped_names, deduped_details
 
+    @staticmethod
+    def _utc_now_iso() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    @staticmethod
+    def _coerce_bool(raw: Any) -> bool | None:
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, (int, float)) and raw in {0, 1}:
+            return bool(raw)
+        if isinstance(raw, str):
+            lowered = raw.strip().lower()
+            if lowered in {"true", "1", "yes", "on"}:
+                return True
+            if lowered in {"false", "0", "no", "off"}:
+                return False
+        return None
+
+    @staticmethod
+    def _clean_text(raw: Any) -> str | None:
+        if raw is None:
+            return None
+        cleaned = " ".join(str(raw).split()).strip()
+        return cleaned or None
+
+    @classmethod
+    def _merge_web_consent(cls, *, current: Any, incoming: Any) -> dict[str, Any]:
+        consent = dict(current) if isinstance(current, dict) else {}
+        if not isinstance(incoming, dict):
+            return consent
+        now = cls._utc_now_iso()
+        if cls._coerce_bool(incoming.get("acceptTerms")) is True and not consent.get("termsAcceptedAt"):
+            consent["termsAcceptedAt"] = now
+        if cls._coerce_bool(incoming.get("acceptPrivacy")) is True and not consent.get("privacyAcceptedAt"):
+            consent["privacyAcceptedAt"] = now
+        terms_accepted_at = cls._clean_text(incoming.get("termsAcceptedAt"))
+        privacy_accepted_at = cls._clean_text(incoming.get("privacyAcceptedAt"))
+        if terms_accepted_at is not None:
+            consent["termsAcceptedAt"] = terms_accepted_at
+        if privacy_accepted_at is not None:
+            consent["privacyAcceptedAt"] = privacy_accepted_at
+        return consent
+
+    @classmethod
+    def _merge_priority_preferences(
+        cls,
+        *,
+        current: dict[str, object],
+        payload: dict[str, Any],
+    ) -> dict[str, object]:
+        updates: dict[str, object] = {}
+        nested = payload.get("priorities") if isinstance(payload.get("priorities"), dict) else {}
+
+        if "topPriorities" in payload or "topPriorities" in nested:
+            updates["top_priorities"] = cls._coerce_label_list(
+                payload.get("topPriorities", nested.get("topPriorities"))
+            )[:3]
+        if "topPriorityOther" in payload or "topPriorityOther" in nested:
+            updates["top_priority_other"] = cls._clean_text(
+                payload.get("topPriorityOther", nested.get("topPriorityOther"))
+            )
+        if "painPoints" in payload or "painPoints" in nested:
+            updates["pain_points"] = cls._coerce_label_list(
+                payload.get("painPoints", nested.get("painPoints"))
+            )[:2]
+        if "painPointOther" in payload or "painPointOther" in nested:
+            updates["pain_point_other"] = cls._clean_text(
+                payload.get("painPointOther", nested.get("painPointOther"))
+            )
+
+        if updates:
+            updates["priorities_updated_at"] = cls._utc_now_iso()
+        return updates
+
+    @classmethod
+    def _merge_trust_defaults(cls, *, current: Any, incoming: Any) -> dict[str, Any]:
+        trust_defaults = dict(current) if isinstance(current, dict) else {}
+        if not isinstance(incoming, dict):
+            return trust_defaults
+        for key in ("allowGoogleDataProcessing", "allowHouseholdLogisticsSharing", "askBeforeSensitiveShare"):
+            coerced = cls._coerce_bool(incoming.get(key))
+            if coerced is not None:
+                trust_defaults[key] = coerced
+        private_calendar_handling = cls._clean_text(incoming.get("privateCalendarHandling"))
+        if private_calendar_handling in WEB_SETUP_PRIVATE_CALENDAR_HANDLING:
+            trust_defaults["privateCalendarHandling"] = private_calendar_handling
+        if trust_defaults:
+            trust_defaults["updatedAt"] = cls._utc_now_iso()
+        return trust_defaults
+
+    @classmethod
+    def _merge_activation_state(cls, *, current: Any, action: str) -> dict[str, Any]:
+        activation = dict(current) if isinstance(current, dict) else {}
+        normalized_action = action.strip().lower()
+        if normalized_action in {"skip", "skip_activation"}:
+            activation["action"] = "skip"
+            activation["completedAt"] = cls._utc_now_iso()
+        elif normalized_action in {"complete", "reviewed"}:
+            activation["action"] = "reviewed"
+            activation["completedAt"] = cls._utc_now_iso()
+        return activation
+
+    @classmethod
+    def _serialize_google_calendar_definition(
+        cls,
+        *,
+        raw_calendar: dict[str, Any],
+        preference: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        usage_mode = cls._clean_text((preference or {}).get("usage_mode"))
+        if usage_mode not in WEB_SETUP_CALENDAR_USAGE_MODES:
+            usage_mode = None
+        detail_visibility = cls._clean_text((preference or {}).get("detail_visibility"))
+        if detail_visibility not in WEB_SETUP_CALENDAR_DETAIL_VISIBILITY:
+            detail_visibility = None
+        return {
+            "id": str(raw_calendar.get("id") or ""),
+            "summary": str(raw_calendar.get("summary") or "Calendar"),
+            "timezone": str(raw_calendar.get("timezone") or "America/Los_Angeles"),
+            "accessRole": cls._clean_text(raw_calendar.get("access_role") or raw_calendar.get("accessRole")),
+            "primary": bool(raw_calendar.get("primary")),
+            "selected": not bool(raw_calendar.get("selected") is False),
+            "hidden": bool(raw_calendar.get("hidden")),
+            "usageMode": usage_mode,
+            "detailVisibility": detail_visibility,
+            "configured": usage_mode is not None
+            and (usage_mode == "ignore" or detail_visibility in WEB_SETUP_CALENDAR_DETAIL_VISIBILITY),
+        }
+
+    @classmethod
+    def _calendar_catalog_for_connection(cls, connection) -> list[dict[str, Any]]:
+        metadata = dict(connection.metadata)
+        raw_catalog = metadata.get("available_calendars")
+        raw_preferences = metadata.get("calendar_preferences")
+        preferences = dict(raw_preferences) if isinstance(raw_preferences, dict) else {}
+
+        calendars: list[dict[str, Any]] = []
+        if isinstance(raw_catalog, list):
+            for raw_item in raw_catalog:
+                if not isinstance(raw_item, dict):
+                    continue
+                calendar_id = cls._clean_text(raw_item.get("id"))
+                if calendar_id is None:
+                    continue
+                calendars.append(
+                    cls._serialize_google_calendar_definition(
+                        raw_calendar={**raw_item, "id": calendar_id},
+                        preference=preferences.get(calendar_id) if isinstance(preferences.get(calendar_id), dict) else None,
+                    )
+                )
+
+        if not calendars and metadata.get("primary_calendar_id"):
+            primary_id = str(metadata.get("primary_calendar_id"))
+            calendars.append(
+                cls._serialize_google_calendar_definition(
+                    raw_calendar={
+                        "id": primary_id,
+                        "summary": metadata.get("primary_calendar_summary") or "Primary calendar",
+                        "timezone": metadata.get("primary_calendar_timezone") or "America/Los_Angeles",
+                        "access_role": metadata.get("primary_calendar_access_role"),
+                        "primary": True,
+                    },
+                    preference=preferences.get(primary_id) if isinstance(preferences.get(primary_id), dict) else None,
+                )
+            )
+
+        calendars.sort(
+            key=lambda calendar: (
+                0 if calendar["primary"] else 1,
+                0 if calendar["selected"] else 1,
+                str(calendar["summary"]).lower(),
+            )
+        )
+        return calendars
+
+    @classmethod
+    def _calendar_classification_complete_for_connection(cls, connection) -> bool:
+        calendars = cls._calendar_catalog_for_connection(connection)
+        if not calendars:
+            return False
+        for calendar in calendars:
+            usage_mode = calendar.get("usageMode")
+            if usage_mode not in WEB_SETUP_CALENDAR_USAGE_MODES:
+                return False
+            if usage_mode != "ignore" and calendar.get("detailVisibility") not in WEB_SETUP_CALENDAR_DETAIL_VISIBILITY:
+                return False
+        return True
+
+    @classmethod
+    def _serialize_setup_preferences(cls, manager_profile: dict[str, object]) -> dict[str, Any]:
+        consent_raw = manager_profile.get("web_consent")
+        consent = dict(consent_raw) if isinstance(consent_raw, dict) else {}
+        trust_raw = manager_profile.get("trust_defaults")
+        trust = dict(trust_raw) if isinstance(trust_raw, dict) else {}
+        activation_raw = manager_profile.get("activation_review")
+        activation = dict(activation_raw) if isinstance(activation_raw, dict) else {}
+        return {
+            "consent": {
+                "termsAcceptedAt": cls._clean_text(consent.get("termsAcceptedAt")),
+                "privacyAcceptedAt": cls._clean_text(consent.get("privacyAcceptedAt")),
+            },
+            "priorities": {
+                "topPriorities": cls._coerce_label_list(manager_profile.get("top_priorities")),
+                "topPriorityOther": cls._clean_text(manager_profile.get("top_priority_other")),
+                "painPoints": cls._coerce_label_list(manager_profile.get("pain_points")),
+                "painPointOther": cls._clean_text(manager_profile.get("pain_point_other")),
+                "updatedAt": cls._clean_text(manager_profile.get("priorities_updated_at")),
+            },
+            "trustDefaults": {
+                "allowGoogleDataProcessing": cls._coerce_bool(trust.get("allowGoogleDataProcessing")),
+                "allowHouseholdLogisticsSharing": cls._coerce_bool(trust.get("allowHouseholdLogisticsSharing")),
+                "privateCalendarHandling": cls._clean_text(trust.get("privateCalendarHandling")),
+                "askBeforeSensitiveShare": cls._coerce_bool(trust.get("askBeforeSensitiveShare")),
+                "updatedAt": cls._clean_text(trust.get("updatedAt")),
+            },
+            "activation": {
+                "action": cls._clean_text(activation.get("action")),
+                "completedAt": cls._clean_text(activation.get("completedAt")),
+            },
+        }
+
+    def _persist_web_calendar_selections(self, *, context: dict[str, Any], raw: Any) -> None:
+        if not isinstance(raw, list):
+            return
+        connections = {connection.id: connection for connection in context["connections"]}
+        default_connection = self._primary_google_connection(list(context["connections"]))
+        updates_by_connection: dict[str, dict[str, dict[str, str]]] = {}
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            connection_id = self._clean_text(item.get("connectionId"))
+            if connection_id is None and default_connection is not None:
+                connection_id = default_connection.id
+            if connection_id is None or connection_id not in connections:
+                continue
+            calendar_id = self._clean_text(item.get("calendarId"))
+            usage_mode = self._clean_text(item.get("usageMode"))
+            if calendar_id is None or usage_mode not in WEB_SETUP_CALENDAR_USAGE_MODES:
+                continue
+            detail_visibility = self._clean_text(item.get("detailVisibility"))
+            next_preference: dict[str, str] = {"usage_mode": usage_mode}
+            if usage_mode != "ignore" and detail_visibility in WEB_SETUP_CALENDAR_DETAIL_VISIBILITY:
+                next_preference["detail_visibility"] = detail_visibility
+            updates_by_connection.setdefault(connection_id, {})[calendar_id] = next_preference
+
+        for connection_id, connection_updates in updates_by_connection.items():
+            connection = connections[connection_id]
+            metadata = dict(connection.metadata)
+            preferences = dict(metadata.get("calendar_preferences")) if isinstance(metadata.get("calendar_preferences"), dict) else {}
+            for calendar_id, next_preference in connection_updates.items():
+                preferences[calendar_id] = next_preference
+            metadata["calendar_preferences"] = preferences
+            metadata["calendar_preferences_updated_at"] = self._utc_now_iso()
+            self.store.upsert_google_connection(replace(connection, metadata=metadata))
+
     @classmethod
     def _serialize_google_connection(cls, connection) -> dict[str, Any]:
         return {
@@ -1644,6 +2176,8 @@ class FlorenceProductionService:
             "connectedScopes": [scope.value for scope in connection.connected_scopes],
             "active": connection.active,
             "primaryWebAccount": bool(connection.metadata.get("web_primary")),
+            "calendarClassificationComplete": cls._calendar_classification_complete_for_connection(connection),
+            "availableCalendars": cls._calendar_catalog_for_connection(connection),
             "metadata": dict(connection.metadata),
             "sync": build_google_connection_sync_status(connection),
         }
@@ -1682,6 +2216,22 @@ class FlorenceProductionService:
             "metadata": dict(item.metadata),
         }
 
+    @staticmethod
+    def _serialize_household_event(event) -> dict[str, Any]:
+        return {
+            "id": event.id,
+            "title": event.title,
+            "startsAt": event.starts_at,
+            "endsAt": event.ends_at,
+            "timezone": event.timezone,
+            "allDay": event.all_day,
+            "location": event.location,
+            "description": event.description,
+            "sourceCandidateId": event.source_candidate_id,
+            "status": event.status.value,
+            "metadata": dict(event.metadata),
+        }
+
     def _primary_google_connection(self, connections: list[Any]) -> Any | None:
         if not connections:
             return None
@@ -1709,6 +2259,9 @@ class FlorenceProductionService:
             if primary_connection is not None
             else None
         )
+        manager_service = self.household_manager_service if store is None else FlorenceHouseholdManagerService(target_store)
+        manager_profile = manager_service.get_manager_profile(household_id)
+        setup_preferences = self._serialize_setup_preferences(manager_profile)
         has_children = bool(target_store.list_child_profiles(household_id=household_id))
         has_schools = bool(
             target_store.list_household_profile_items(
@@ -1722,13 +2275,49 @@ class FlorenceProductionService:
                 kind=HouseholdProfileKind.ACTIVITY,
             )
         )
+        calendar_classification_complete = bool(
+            resolved_connections
+            and all(self._calendar_classification_complete_for_connection(connection) for connection in resolved_connections)
+        )
+        priorities_complete = bool(
+            setup_preferences["priorities"]["topPriorities"]
+            and (
+                setup_preferences["priorities"]["painPoints"]
+                or setup_preferences["priorities"]["painPointOther"]
+            )
+        )
+        trust_defaults = setup_preferences["trustDefaults"]
+        trust_defaults_complete = bool(
+            trust_defaults["allowGoogleDataProcessing"] is True
+            and trust_defaults["allowHouseholdLogisticsSharing"] is True
+            and trust_defaults["privateCalendarHandling"] in WEB_SETUP_PRIVATE_CALENDAR_HANDLING
+            and isinstance(trust_defaults["askBeforeSensitiveShare"], bool)
+        )
+        consent_complete = bool(
+            setup_preferences["consent"]["termsAcceptedAt"]
+            and setup_preferences["consent"]["privacyAcceptedAt"]
+        )
+        reviewed_candidates = target_store.list_imported_candidates(
+            household_id=household_id,
+            member_id=member_id,
+        )
+        activation_complete = bool(
+            setup_preferences["activation"]["completedAt"]
+            or any(candidate.state in {CandidateState.CONFIRMED, CandidateState.REJECTED} for candidate in reviewed_candidates)
+            or not reviewed_candidates
+        )
         return bool(
-            primary_connection is not None
+            consent_complete
+            and primary_connection is not None
             and primary_sync is not None
+            and calendar_classification_complete
             and primary_sync["initialSyncCompletedAt"]
             and has_children
             and has_schools
             and has_activities
+            and priorities_complete
+            and trust_defaults_complete
+            and activation_complete
         )
 
     def _serialize_web_setup(self, context: dict[str, Any]) -> dict[str, Any]:
@@ -1736,6 +2325,7 @@ class FlorenceProductionService:
         member = context["member"]
         session = context["session"]
         connections = list(context["connections"])
+        adults = self.store.list_members(household.id)
         children = self.store.list_child_profiles(household_id=household.id)
         schools = self.store.list_household_profile_items(
             household_id=household.id,
@@ -1780,31 +2370,85 @@ class FlorenceProductionService:
                 member_id=member.id,
             )[:5]
         ]
+        all_candidates = self.store.list_imported_candidates(
+            household_id=household.id,
+            member_id=member.id,
+        )
+        manager_profile = self.household_manager_service.get_manager_profile(household.id)
+        setup_preferences = self._serialize_setup_preferences(manager_profile)
+        consent_complete = bool(
+            setup_preferences["consent"]["termsAcceptedAt"]
+            and setup_preferences["consent"]["privacyAcceptedAt"]
+        )
+        calendar_classification_complete = bool(
+            connections
+            and all(self._calendar_classification_complete_for_connection(connection) for connection in connections)
+        )
         has_children = bool(children)
         has_schools = bool(schools)
         has_activities = bool(activities)
+        required_profile_complete = bool(has_children and has_schools and has_activities)
+        priorities_complete = bool(
+            setup_preferences["priorities"]["topPriorities"]
+            and (
+                setup_preferences["priorities"]["painPoints"]
+                or setup_preferences["priorities"]["painPointOther"]
+            )
+        )
+        trust_defaults_complete = bool(
+            setup_preferences["trustDefaults"]["allowGoogleDataProcessing"] is True
+            and setup_preferences["trustDefaults"]["allowHouseholdLogisticsSharing"] is True
+            and setup_preferences["trustDefaults"]["privateCalendarHandling"] in WEB_SETUP_PRIVATE_CALENDAR_HANDLING
+            and isinstance(setup_preferences["trustDefaults"]["askBeforeSensitiveShare"], bool)
+        )
         initial_sync_complete = bool(primary_sync["initialSyncCompletedAt"])
-        if not connections:
+        activation_complete = bool(
+            setup_preferences["activation"]["completedAt"]
+            or any(candidate.state in {CandidateState.CONFIRMED, CandidateState.REJECTED} for candidate in all_candidates)
+            or not all_candidates
+        )
+
+        if not consent_complete:
+            phase = "web_consent"
+        elif not connections:
             phase = "connect_google"
         elif primary_sync["initialSyncState"] == "attention_needed":
             phase = "attention_needed"
+        elif not calendar_classification_complete:
+            phase = "classify_calendars"
+        elif not required_profile_complete:
+            phase = "collect_household_profile"
+        elif not priorities_complete:
+            phase = "collect_top_priorities"
+        elif not trust_defaults_complete:
+            phase = "collect_trust_defaults"
         elif not initial_sync_complete:
             phase = "initial_sync_running"
-        elif not (has_children and has_schools and has_activities):
-            phase = "collect_household_profile"
+        elif not activation_complete:
+            phase = "activation_review"
         else:
             phase = "ready"
         missing: list[str] = []
+        if not consent_complete:
+            missing.append("consent")
         if not connections:
             missing.append("google_account")
-        if connections and not initial_sync_complete:
-            missing.append("initial_sync")
+        if connections and not calendar_classification_complete:
+            missing.append("calendar_classification")
         if not has_children:
             missing.append("kids")
         if not has_schools:
             missing.append("schools")
         if not has_activities:
             missing.append("activities")
+        if not priorities_complete:
+            missing.append("top_priorities")
+        if not trust_defaults_complete:
+            missing.append("trust_defaults")
+        if connections and not initial_sync_complete:
+            missing.append("initial_sync")
+        if not activation_complete:
+            missing.append("activation_review")
 
         return {
             "household": self._serialize_household(household),
@@ -1823,12 +2467,23 @@ class FlorenceProductionService:
                 "missing": missing,
                 "googleConnected": bool(connections),
                 "initialSyncComplete": initial_sync_complete,
-                "requiredProfileComplete": bool(has_children and has_schools and has_activities),
+                "requiredProfileComplete": required_profile_complete,
+                "calendarClassificationComplete": calendar_classification_complete,
+                "topPrioritiesComplete": priorities_complete,
+                "trustDefaultsComplete": trust_defaults_complete,
+                "activationComplete": activation_complete,
                 "readyForChat": phase == "ready",
                 "requiredFields": {
+                    "consent": consent_complete,
+                    "googleAccount": bool(connections),
+                    "calendarClassification": calendar_classification_complete,
                     "kids": has_children,
                     "schools": has_schools,
                     "activities": has_activities,
+                    "topPriorities": priorities_complete,
+                    "trustDefaults": trust_defaults_complete,
+                    "initialSync": initial_sync_complete,
+                    "activationReview": activation_complete,
                 },
             },
             "sync": {
@@ -1837,21 +2492,120 @@ class FlorenceProductionService:
                 "connections": [self._serialize_google_connection(connection) for connection in connections],
             },
             "profile": {
+                "adults": [self._serialize_member(adult) for adult in adults],
                 "children": [self._serialize_child(child) for child in children],
                 "schools": [self._serialize_profile_item(item) for item in schools],
                 "activities": [self._serialize_profile_item(item) for item in activities],
             },
+            "preferences": setup_preferences,
             "suggestions": suggestions,
             "preview": {
                 "candidates": preview_candidates,
-                "candidateCount": len(
-                    self.store.list_imported_candidates(
-                        household_id=household.id,
-                        member_id=member.id,
-                    )
-                ),
+                "candidateCount": len(all_candidates),
             },
             "googleConnectUrl": context["google_connect_url"],
+        }
+
+    def _serialize_web_review(self, context: dict[str, Any]) -> dict[str, Any]:
+        household = context["household"]
+        member = context["member"]
+        setup_payload = self._serialize_web_setup(context)
+        candidates = self.store.list_imported_candidates(
+            household_id=household.id,
+            member_id=member.id,
+        )
+        counts = {
+            "total": len(candidates),
+            "pending": 0,
+            "confirmed": 0,
+            "rejected": 0,
+            "quarantined": 0,
+        }
+        for candidate in candidates:
+            if candidate.state == CandidateState.PENDING_REVIEW:
+                counts["pending"] += 1
+            elif candidate.state == CandidateState.CONFIRMED:
+                counts["confirmed"] += 1
+            elif candidate.state == CandidateState.REJECTED:
+                counts["rejected"] += 1
+            elif candidate.state == CandidateState.QUARANTINED:
+                counts["quarantined"] += 1
+        next_prompt = self.candidate_review_service.build_next_review_prompt(
+            household_id=household.id,
+            member_id=member.id,
+        )
+        return {
+            "household": self._serialize_household(household),
+            "member": self._serialize_member(member),
+            "setup": setup_payload["setup"],
+            "counts": counts,
+            "nextPrompt": {
+                "candidateId": next_prompt.candidate.id,
+                "text": next_prompt.text,
+            }
+            if next_prompt is not None
+            else None,
+            "candidates": [self._serialize_candidate_preview(candidate) for candidate in candidates],
+        }
+
+    def _serialize_web_calendar(
+        self,
+        context: dict[str, Any],
+        *,
+        start: str | None,
+        end: str | None,
+    ) -> dict[str, Any]:
+        household = context["household"]
+        member = context["member"]
+        setup_payload = self._serialize_web_setup(context)
+        range_start = None
+        range_end = None
+        try:
+            range_start = datetime.fromisoformat(start) if start else None
+        except ValueError:
+            range_start = None
+        try:
+            range_end = datetime.fromisoformat(end) if end else None
+        except ValueError:
+            range_end = None
+        if range_end is None:
+            range_end = datetime.now(timezone.utc) + timedelta(days=90)
+        events = self.store.list_household_events(household_id=household.id)
+        filtered_events = []
+        for event in events:
+            event_start = None
+            event_end = None
+            try:
+                event_start = datetime.fromisoformat(event.starts_at) if event.starts_at else None
+            except ValueError:
+                event_start = None
+            try:
+                event_end = datetime.fromisoformat(event.ends_at) if event.ends_at else None
+            except ValueError:
+                event_end = None
+            effective_start = event_start or event_end
+            effective_end = event_end or event_start
+            if range_start is not None and effective_end is not None and effective_end < range_start:
+                continue
+            if range_end is not None and effective_start is not None and effective_start > range_end:
+                continue
+            filtered_events.append(event)
+        counts = {
+            "total": len(filtered_events),
+            "confirmed": sum(1 for event in filtered_events if event.status == HouseholdEventStatus.CONFIRMED),
+            "tentative": sum(1 for event in filtered_events if event.status == HouseholdEventStatus.TENTATIVE),
+            "cancelled": sum(1 for event in filtered_events if event.status == HouseholdEventStatus.CANCELLED),
+        }
+        return {
+            "household": self._serialize_household(household),
+            "member": self._serialize_member(member),
+            "setup": setup_payload["setup"],
+            "range": {
+                "start": start,
+                "end": range_end.isoformat() if range_end is not None else end,
+            },
+            "counts": counts,
+            "events": [self._serialize_household_event(event) for event in filtered_events],
         }
 
     def _serialize_web_settings(self, context: dict[str, Any]) -> dict[str, Any]:

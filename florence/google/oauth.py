@@ -189,6 +189,22 @@ def fetch_primary_google_calendar(
     fallback_timezone: str = "America/Los_Angeles",
     timeout_seconds: float = 30.0,
 ) -> GoogleCalendarMetadata:
+    calendars = list_google_calendars(
+        access_token=access_token,
+        fallback_timezone=fallback_timezone,
+        timeout_seconds=timeout_seconds,
+    )
+    if not calendars:
+        raise ValueError("google_primary_calendar_missing")
+    return next((calendar for calendar in calendars if calendar.primary), calendars[0])
+
+
+def list_google_calendars(
+    *,
+    access_token: str,
+    fallback_timezone: str = "America/Los_Angeles",
+    timeout_seconds: float = 30.0,
+) -> list[GoogleCalendarMetadata]:
     response = httpx.get(
         "https://www.googleapis.com/calendar/v3/users/me/calendarList",
         headers={"authorization": f"Bearer {access_token}"},
@@ -197,12 +213,26 @@ def fetch_primary_google_calendar(
     payload = response.json()
     response.raise_for_status()
     items = payload.get("items") or []
-    primary = next((item for item in items if item.get("primary")), None) or (items[0] if items else None)
-    if not isinstance(primary, dict) or not primary.get("id"):
-        raise ValueError("google_primary_calendar_missing")
-    return GoogleCalendarMetadata(
-        id=str(primary["id"]),
-        summary=str(primary.get("summary") or "Primary calendar"),
-        timezone=str(primary.get("timeZone") or fallback_timezone),
-        access_role=str(primary.get("accessRole")) if primary.get("accessRole") is not None else None,
+    calendars: list[GoogleCalendarMetadata] = []
+    for raw_item in items:
+        if not isinstance(raw_item, dict) or not raw_item.get("id"):
+            continue
+        calendars.append(
+            GoogleCalendarMetadata(
+                id=str(raw_item["id"]),
+                summary=str(raw_item.get("summary") or "Calendar"),
+                timezone=str(raw_item.get("timeZone") or fallback_timezone),
+                access_role=str(raw_item.get("accessRole")) if raw_item.get("accessRole") is not None else None,
+                primary=bool(raw_item.get("primary")),
+                selected=not bool(raw_item.get("selected") is False),
+                hidden=bool(raw_item.get("hidden")),
+            )
+        )
+    calendars.sort(
+        key=lambda calendar: (
+            0 if calendar.primary else 1,
+            0 if calendar.selected else 1,
+            calendar.summary.lower(),
+        )
     )
+    return calendars

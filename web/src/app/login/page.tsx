@@ -8,6 +8,6 @@ export default async function LoginPage({
   searchParams?: Promise<SearchParams>;
 }) {
   const resolved = (await searchParams) || {};
-  const next = typeof resolved.next === "string" ? resolved.next : "/setup";
+  const next = typeof resolved.next === "string" ? resolved.next : "/calendar";
   return <GoogleSignInCard redirectTo={next} />;
 }

@@ -103,6 +103,53 @@ def test_google_sync_moves_candidates_to_pending_review_once_grounded():
     assert candidate.metadata["google_event_id"] == "event_123"
 
 
+def test_google_sync_skips_calendar_candidates_for_conflicts_only_or_busy_only_modes():
+    connection = GoogleConnection(
+        id="gconn_123",
+        household_id="hh_123",
+        member_id="mem_123",
+        email="parent@example.com",
+        connected_scopes=(GoogleSourceKind.GOOGLE_CALENDAR,),
+    )
+    context = HouseholdContext(
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_dm_123",
+        visible_child_names=["Ava"],
+        school_labels=["Roosevelt Elementary"],
+        activity_labels=["Soccer"],
+    )
+    result = build_google_import_candidates(
+        FlorenceGoogleSyncBatch(
+            connection=connection,
+            context=context,
+            calendar_items=[
+                ParentCalendarSyncItem(
+                    google_event_id="event_conflict",
+                    title="Busy block",
+                    description="Private appointment",
+                    location=None,
+                    html_link=None,
+                    starts_at=datetime(2026, 9, 18, 23, 0, tzinfo=timezone.utc),
+                    ends_at=datetime(2026, 9, 19, 0, 0, tzinfo=timezone.utc),
+                    timezone="America/Los_Angeles",
+                    all_day=False,
+                    updated_at=None,
+                    calendar_summary="Work calendar",
+                    family_member_names=["Ava"],
+                    calendar_id="work",
+                    usage_mode="conflicts_only",
+                    detail_visibility="busy_only",
+                )
+            ],
+        )
+    )
+
+    assert result.pending_review_count == 0
+    assert result.quarantined_count == 0
+    assert result.skipped_count == 1
+
+
 def test_google_sync_skips_unrelated_items():
     connection = GoogleConnection(
         id="gconn_123",

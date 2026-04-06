@@ -1,11 +1,16 @@
 export type FlorenceSyncPhase =
+  | "web_consent"
   | "connect_google"
   | "account_connected"
   | "syncing_inbox"
   | "syncing_calendar"
   | "finding_family_sources"
-  | "initial_sync_running"
+  | "classify_calendars"
   | "collect_household_profile"
+  | "collect_top_priorities"
+  | "collect_trust_defaults"
+  | "initial_sync_running"
+  | "activation_review"
   | "ready"
   | "attention_needed";
 
@@ -33,8 +38,23 @@ export type FlorenceGoogleConnection = {
   connectedScopes: string[];
   active: boolean;
   primaryWebAccount: boolean;
+  calendarClassificationComplete: boolean;
+  availableCalendars: FlorenceGoogleCalendar[];
   metadata: Record<string, unknown>;
   sync: FlorenceConnectionSync;
+};
+
+export type FlorenceGoogleCalendar = {
+  id: string;
+  summary: string;
+  timezone: string;
+  accessRole: string | null;
+  primary: boolean;
+  selected: boolean;
+  hidden: boolean;
+  usageMode: "planning_and_conflicts" | "conflicts_only" | "ignore" | null;
+  detailVisibility: "full_details" | "busy_only" | null;
+  configured: boolean;
 };
 
 export type FlorenceChild = {
@@ -51,6 +71,14 @@ export type FlorenceProfileItem = {
   memberId: string | null;
   childId: string | null;
   metadata: Record<string, unknown>;
+};
+
+export type FlorenceHouseholdAdult = {
+  id: string;
+  householdId: string;
+  displayName: string;
+  role: string;
+  status: string;
 };
 
 export type FlorenceSuggestion = {
@@ -70,6 +98,31 @@ export type FlorenceCandidatePreview = {
   confidenceBps: number;
   requiresConfirmation: boolean;
   metadata: Record<string, unknown>;
+};
+
+export type FlorenceSetupPreferences = {
+  consent: {
+    termsAcceptedAt: string | null;
+    privacyAcceptedAt: string | null;
+  };
+  priorities: {
+    topPriorities: string[];
+    topPriorityOther: string | null;
+    painPoints: string[];
+    painPointOther: string | null;
+    updatedAt: string | null;
+  };
+  trustDefaults: {
+    allowGoogleDataProcessing: boolean | null;
+    allowHouseholdLogisticsSharing: boolean | null;
+    privateCalendarHandling: "conflicts_only" | "full_details" | null;
+    askBeforeSensitiveShare: boolean | null;
+    updatedAt: string | null;
+  };
+  activation: {
+    action: string | null;
+    completedAt: string | null;
+  };
 };
 
 export type FlorenceSetupResponse = {
@@ -102,11 +155,22 @@ export type FlorenceSetupResponse = {
     googleConnected: boolean;
     initialSyncComplete: boolean;
     requiredProfileComplete: boolean;
+    calendarClassificationComplete: boolean;
+    topPrioritiesComplete: boolean;
+    trustDefaultsComplete: boolean;
+    activationComplete: boolean;
     readyForChat: boolean;
     requiredFields: {
+      consent: boolean;
+      googleAccount: boolean;
+      calendarClassification: boolean;
       kids: boolean;
       schools: boolean;
       activities: boolean;
+      topPriorities: boolean;
+      trustDefaults: boolean;
+      initialSync: boolean;
+      activationReview: boolean;
     };
   };
   sync: {
@@ -115,10 +179,12 @@ export type FlorenceSetupResponse = {
     connections: FlorenceGoogleConnection[];
   };
   profile: {
+    adults: FlorenceHouseholdAdult[];
     children: FlorenceChild[];
     schools: FlorenceProfileItem[];
     activities: FlorenceProfileItem[];
   };
+  preferences: FlorenceSetupPreferences;
   suggestions: {
     schools: FlorenceSuggestion[];
     activities: FlorenceSuggestion[];
@@ -155,4 +221,55 @@ export type FlorenceSettingsResponse = {
 export type FlorenceConnectUrlResponse = {
   ok: true;
   connectUrl: string;
+};
+
+export type FlorenceReviewResponse = {
+  ok: true;
+  household: FlorenceSetupResponse["household"];
+  member: FlorenceSetupResponse["member"];
+  setup: FlorenceSetupResponse["setup"];
+  counts: {
+    total: number;
+    pending: number;
+    confirmed: number;
+    rejected: number;
+    quarantined: number;
+  };
+  nextPrompt: {
+    candidateId: string;
+    text: string;
+  } | null;
+  candidates: FlorenceCandidatePreview[];
+};
+
+export type FlorenceCalendarEvent = {
+  id: string;
+  title: string;
+  startsAt: string | null;
+  endsAt: string | null;
+  timezone: string | null;
+  allDay: boolean;
+  location: string | null;
+  description: string | null;
+  sourceCandidateId: string | null;
+  status: string;
+  metadata: Record<string, unknown>;
+};
+
+export type FlorenceCalendarResponse = {
+  ok: true;
+  household: FlorenceSetupResponse["household"];
+  member: FlorenceSetupResponse["member"];
+  setup: FlorenceSetupResponse["setup"];
+  range: {
+    start: string | null;
+    end: string | null;
+  };
+  counts: {
+    total: number;
+    confirmed: number;
+    tentative: number;
+    cancelled: number;
+  };
+  events: FlorenceCalendarEvent[];
 };

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -71,6 +72,19 @@ def _as_float(value: Any, default: float) -> float:
         return default
 
 
+def _as_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
 def _as_str_list(value: Any, default: tuple[str, ...] = ()) -> tuple[str, ...]:
     if value is None:
         return default
@@ -91,6 +105,85 @@ def _normalize_public_base_url(value: Any) -> str | None:
     if "://" not in normalized:
         normalized = f"https://{normalized}"
     return normalized
+
+
+def _normalize_fallback_entry(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    provider = str(value.get("provider") or "").strip()
+    model = str(value.get("model") or "").strip()
+    if not provider or not model:
+        return None
+    normalized: dict[str, Any] = {
+        "provider": provider,
+        "model": model,
+    }
+    for optional_key in ("base_url", "api_key_env"):
+        optional_value = value.get(optional_key)
+        if optional_value is not None and str(optional_value).strip():
+            normalized[optional_key] = str(optional_value).strip()
+    return normalized
+
+
+def _as_fallback_model_chain(value: Any) -> tuple[dict[str, Any], ...]:
+    if value is None:
+        return ()
+    parsed = value
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return ()
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return ()
+    if isinstance(parsed, dict):
+        entry = _normalize_fallback_entry(parsed)
+        return (entry,) if entry else ()
+    if isinstance(parsed, (list, tuple)):
+        normalized = []
+        for item in parsed:
+            entry = _normalize_fallback_entry(item)
+            if entry is not None:
+                normalized.append(entry)
+        return tuple(normalized)
+    return ()
+
+
+def _as_tool_use_enforcement(value: Any, default: Any = "auto") -> Any:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (list, tuple, set)):
+        normalized = [str(item).strip() for item in value if str(item).strip()]
+        return tuple(normalized) if normalized else default
+    normalized = str(value).strip()
+    if not normalized:
+        return default
+    try:
+        parsed = json.loads(normalized)
+    except Exception:
+        parsed = None
+    if isinstance(parsed, bool):
+        return parsed
+    if isinstance(parsed, list):
+        items = [str(item).strip() for item in parsed if str(item).strip()]
+        return tuple(items) if items else default
+    if "," in normalized:
+        items = [part.strip() for part in normalized.split(",") if part.strip()]
+        return tuple(items) if items else default
+    lowered = normalized.lower()
+    if lowered in {"true", "false"}:
+        return lowered == "true"
+    return normalized
+
+
+def _normalize_honcho_scope(value: Any, default: str = "member") -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"member", "channel", "household"}:
+        return normalized
+    return default
 
 
 @dataclass(slots=True)
@@ -136,6 +229,10 @@ class FlorenceHermesRuntimeConfig:
     provider: str = "auto"
     enabled_toolsets: tuple[str, ...] = ("florence_chat",)
     disabled_toolsets: tuple[str, ...] = ()
+    fallback_model: tuple[dict[str, Any], ...] = ()
+    tool_use_enforcement: str | bool | tuple[str, ...] = "auto"
+    enable_honcho: bool = True
+    honcho_scope: str = "member"
 
 
 @dataclass(slots=True)
@@ -386,6 +483,45 @@ class FlorenceSettings:
                         default=(),
                     ),
                     (),
+                ),
+                fallback_model=_as_fallback_model_chain(
+                    _env_or_config(
+                        ("FLORENCE_HERMES_FALLBACK_MODEL",),
+                        florence_cfg,
+                        "hermes",
+                        "fallback_model",
+                        default=(),
+                    )
+                ),
+                tool_use_enforcement=_as_tool_use_enforcement(
+                    _env_or_config(
+                        ("FLORENCE_HERMES_TOOL_USE_ENFORCEMENT",),
+                        florence_cfg,
+                        "hermes",
+                        "tool_use_enforcement",
+                        default="auto",
+                    ),
+                    "auto",
+                ),
+                enable_honcho=_as_bool(
+                    _env_or_config(
+                        ("FLORENCE_HERMES_ENABLE_HONCHO",),
+                        florence_cfg,
+                        "hermes",
+                        "enable_honcho",
+                        default=True,
+                    ),
+                    True,
+                ),
+                honcho_scope=_normalize_honcho_scope(
+                    _env_or_config(
+                        ("FLORENCE_HERMES_HONCHO_SCOPE",),
+                        florence_cfg,
+                        "hermes",
+                        "honcho_scope",
+                        default="member",
+                    ),
+                    "member",
                 ),
             ),
             redis=FlorenceRedisRuntimeConfig(

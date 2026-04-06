@@ -83,10 +83,28 @@
       "namedRegex": "^/accounts(?:/)?$"
     },
     {
+      "page": "/calendar",
+      "regex": "^/calendar(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/calendar(?:/)?$"
+    },
+    {
+      "page": "/connections",
+      "regex": "^/connections(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/connections(?:/)?$"
+    },
+    {
       "page": "/login",
       "regex": "^/login(?:/)?$",
       "routeKeys": {},
       "namedRegex": "^/login(?:/)?$"
+    },
+    {
+      "page": "/review",
+      "regex": "^/review(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/review(?:/)?$"
     },
     {
       "page": "/settings",

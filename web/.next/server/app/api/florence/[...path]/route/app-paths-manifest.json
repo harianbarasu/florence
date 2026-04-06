@@ -1,3 +1,0 @@
-{
-  "/api/florence/[...path]/route": "app/api/florence/[...path]/route.js"
-}

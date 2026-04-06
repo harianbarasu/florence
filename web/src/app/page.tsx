@@ -1,5 +1,10 @@
-import { redirect } from "next/navigation";
+import { auth } from "@/auth";
+import { ExplorePage } from "@/components/marketing/explore-page";
 
-export default function HomePage() {
-  redirect("/setup");
+export default async function HomePage() {
+  const session = await auth();
+  if (session?.user?.email) {
+    return <ExplorePage />;
+  }
+  return <ExplorePage />;
 }

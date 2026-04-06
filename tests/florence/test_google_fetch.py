@@ -91,6 +91,8 @@ def test_build_parent_calendar_sync_item_maps_event_fields():
 
     assert item is not None
     assert item.google_event_id == "event_123"
+    assert item.calendar_id == "primary"
+    assert item.calendar_primary is False
     assert item.title == "Ava soccer practice"
     assert item.calendar_summary == "Family calendar"
     assert item.family_member_names == ["Ava", "Noah"]

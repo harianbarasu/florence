@@ -175,6 +175,42 @@ def _resolve_meal_id(
     raise ValueError("unknown_household_meal_title")
 
 
+def _resolve_child_id(
+    context: FlorenceHouseholdToolContext,
+    *,
+    child_id: str | None = None,
+    child_name: str | None = None,
+) -> str | None:
+    if child_id:
+        matches = [
+            child
+            for child in context.store.list_child_profiles(household_id=context.household_id)
+            if child.id == child_id
+        ]
+        if not matches:
+            raise ValueError("unknown_household_child_id")
+        return matches[0].id
+    normalized_name = _normalize_text(child_name).lower()
+    if not normalized_name:
+        return None
+    matches = []
+    for child in context.store.list_child_profiles(household_id=context.household_id):
+        display = _normalize_text(child.full_name).lower()
+        first = display.split()[0] if display else ""
+        aliases = {
+            _normalize_text(alias).lower()
+            for alias in child.metadata.get("aliases", [])
+            if _normalize_text(alias)
+        } if isinstance(child.metadata, dict) else set()
+        if normalized_name in {display, first, *aliases}:
+            matches.append(child)
+    if len(matches) == 1:
+        return matches[0].id
+    if len(matches) > 1:
+        raise ValueError("ambiguous_household_child_name")
+    raise ValueError("unknown_household_child_name")
+
+
 def _serialize_work_item(item: HouseholdWorkItem) -> dict[str, Any]:
     return {
         "id": item.id,
@@ -302,8 +338,8 @@ SEARCH_STATE_SCHEMA = {
     "name": "household_search_state",
     "description": (
         "Search Florence household state when you need to pull the latest tracked work, routines, nudges, meals, "
-        "shopping items, confirmed events, children, or profile items. Use this before updating existing state "
-        "if the current household picture is unclear."
+        "shopping items, confirmed events, children, profile items, reminder preferences, or operating preferences. "
+        "Use this before updating existing state if the current household picture is unclear."
     ),
     "parameters": {
         "type": "object",
@@ -344,6 +380,30 @@ SEARCH_STATE_SCHEMA = {
         "required": [],
     },
 }
+
+
+def _serialize_manager_profile_entry(key: str, value: Any) -> dict[str, Any]:
+    label = key.replace("_", " ")
+    if isinstance(value, str):
+        summary = value
+    elif isinstance(value, list):
+        summary = " | ".join(str(item) for item in value[:8])
+    elif isinstance(value, dict):
+        summary = json.dumps(value, sort_keys=True)
+    else:
+        summary = str(value)
+    return {
+        "id": f"manager_profile:{key}",
+        "kind": "manager_profile",
+        "label": label,
+        "member_id": None,
+        "child_id": None,
+        "metadata": {
+            "profile_key": key,
+            "value": value,
+            "summary": summary,
+        },
+    }
 
 
 SEARCH_GOOGLE_INBOX_SCHEMA = {
@@ -549,6 +609,40 @@ UPSERT_SHOPPING_ITEM_SCHEMA = {
 }
 
 
+RECORD_PREFERENCE_SCHEMA = {
+    "name": "household_record_preference",
+    "description": (
+        "Persist a durable household preference or rule Florence should remember across threads, such as reminder style, "
+        "quiet hours, meal constraints, sharing defaults, kid food preferences, or other operating preferences."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "label": {"type": "string", "description": "Short preference label, e.g. 'Reminder style' or 'Kid spice preference'."},
+            "value": {"type": "string", "description": "The actual preference Florence should remember."},
+            "category": {
+                "type": "string",
+                "enum": [
+                    "general",
+                    "reminder_style",
+                    "operating_rule",
+                    "meal_preference",
+                    "sharing_preference",
+                    "child_preference",
+                ],
+                "description": "Preference category. Use reminder_style and operating_rule when it should directly shape Florence behavior.",
+            },
+            "member_id": {"type": "string", "description": "Optional member the preference applies to."},
+            "member_name": {"type": "string", "description": "Optional member name such as 'Maya' or 'me'."},
+            "child_id": {"type": "string", "description": "Optional child id the preference applies to."},
+            "child_name": {"type": "string", "description": "Optional child name such as 'Ava'."},
+            "metadata": {"type": "object", "description": "Optional structured metadata."},
+        },
+        "required": ["label", "value"],
+    },
+}
+
+
 def _handle_search_state(args: dict, *, task_id: str | None = None, **_: Any) -> str:
     context = _require_context(task_id)
     query = _normalize_text(args.get("query")).lower()
@@ -663,6 +757,23 @@ def _handle_search_state(args: dict, *, task_id: str | None = None, **_: Any) ->
             for item in items
             if _matches_query([item.label, item.kind.value, item.metadata], query)
         ]
+        if entity_type == "preferences":
+            household = context.store.get_household(context.household_id)
+            raw_manager_profile = household.settings.get("manager_profile") if household and isinstance(household.settings, dict) else None
+            manager_profile = dict(raw_manager_profile) if isinstance(raw_manager_profile, dict) else {}
+            for profile_key, profile_value in manager_profile.items():
+                serialized = _serialize_manager_profile_entry(profile_key, profile_value)
+                if not _matches_query(
+                    [
+                        profile_key,
+                        serialized["label"],
+                        serialized["metadata"].get("summary"),
+                        serialized["metadata"].get("value"),
+                    ],
+                    query,
+                ):
+                    continue
+                matches.append(serialized)
         results[entity_type] = matches[:limit]
 
     return json.dumps(
@@ -1062,6 +1173,44 @@ def _handle_upsert_shopping_item(args: dict, *, task_id: str | None = None, **_:
     return json.dumps({"result": _serialize_shopping_item(item)})
 
 
+def _handle_record_preference(args: dict, *, task_id: str | None = None, **_: Any) -> str:
+    context = _require_context(task_id)
+    manager = FlorenceHouseholdManagerService(context.store)
+    label = _normalize_text(args.get("label"))
+    value = _normalize_text(args.get("value"))
+    if not label:
+        return json.dumps({"error": "Missing required parameter: label"})
+    if not value:
+        return json.dumps({"error": "Missing required parameter: value"})
+    subject_member_id = _resolve_member_id(
+        context,
+        member_id=_normalize_optional_text(args.get("member_id")),
+        member_name=_normalize_optional_text(args.get("member_name")),
+    )
+    subject_child_id = _resolve_child_id(
+        context,
+        child_id=_normalize_optional_text(args.get("child_id")),
+        child_name=_normalize_optional_text(args.get("child_name")),
+    )
+    preference_item, profile = manager.record_preference(
+        household_id=context.household_id,
+        label=label,
+        value=value,
+        category=_normalize_optional_text(args.get("category")) or "general",
+        member_id=subject_member_id,
+        child_id=subject_child_id,
+        recorded_by_member_id=context.actor_member_id,
+        channel_id=context.channel_id,
+        metadata=_normalize_metadata(args.get("metadata")),
+    )
+    return json.dumps(
+        {
+            "result": _serialize_profile_item(preference_item),
+            "manager_profile": profile,
+        }
+    )
+
+
 registry.register(
     name="household_search_state",
     toolset="florence_household",
@@ -1116,5 +1265,12 @@ registry.register(
     toolset="florence_household",
     schema=UPSERT_SHOPPING_ITEM_SCHEMA,
     handler=_handle_upsert_shopping_item,
+    check_fn=_check_household_tool_requirements,
+)
+registry.register(
+    name="household_record_preference",
+    toolset="florence_household",
+    schema=RECORD_PREFERENCE_SCHEMA,
+    handler=_handle_record_preference,
     check_fn=_check_household_tool_requirements,
 )

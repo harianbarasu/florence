@@ -1,6 +1,8 @@
 import { auth } from "@/auth";
 import { GoogleSignInCard } from "@/components/auth/google-sign-in-card";
-import { OnboardingWizard } from "@/components/setup/onboarding-wizard";
+import { AppShell } from "@/components/app-shell";
+import { SetupScreen } from "@/components/setup/setup-screen";
+import { withToken } from "@/lib/routes";
 
 type SearchParams = Record<string, string | string[] | undefined>;
 
@@ -14,14 +16,18 @@ export default async function SetupPage({
   const session = await auth();
 
   if (!session?.user?.email) {
-    const redirectTo = token ? `/setup?token=${encodeURIComponent(token)}` : "/setup";
+    const redirectTo = withToken("/setup", token);
     return <GoogleSignInCard redirectTo={redirectTo} />;
   }
 
   return (
-    <OnboardingWizard
+    <AppShell
+      currentPath="/setup"
+      userName={session.user.name || session.user.email}
+      userEmail={session.user.email}
       token={token}
-      userName={session.user.name || undefined}
-    />
+    >
+      <SetupScreen token={token} />
+    </AppShell>
   );
 }

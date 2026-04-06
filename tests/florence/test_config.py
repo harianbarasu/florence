@@ -62,12 +62,29 @@ def test_florence_settings_default_and_override_household_toolsets(tmp_path, mon
     assert default_settings.hermes.provider == "auto"
     assert default_settings.hermes.enabled_toolsets == ("florence_chat",)
     assert default_settings.hermes.disabled_toolsets == ()
+    assert default_settings.hermes.fallback_model == ()
+    assert default_settings.hermes.tool_use_enforcement == "auto"
+    assert default_settings.hermes.enable_honcho is True
+    assert default_settings.hermes.honcho_scope == "member"
 
     monkeypatch.setenv("FLORENCE_HERMES_PROVIDER", "custom")
     monkeypatch.setenv("FLORENCE_HERMES_ENABLED_TOOLSETS", "web,browser,clarify")
     monkeypatch.setenv("FLORENCE_HERMES_DISABLED_TOOLSETS", "memory,session_search")
+    monkeypatch.setenv(
+        "FLORENCE_HERMES_FALLBACK_MODEL",
+        '[{"provider":"openrouter","model":"anthropic/claude-sonnet-4"}]',
+    )
+    monkeypatch.setenv("FLORENCE_HERMES_TOOL_USE_ENFORCEMENT", "deepseek,gemini")
+    monkeypatch.setenv("FLORENCE_HERMES_ENABLE_HONCHO", "false")
+    monkeypatch.setenv("FLORENCE_HERMES_HONCHO_SCOPE", "channel")
 
     overridden_settings = FlorenceSettings.from_env()
     assert overridden_settings.hermes.provider == "custom"
     assert overridden_settings.hermes.enabled_toolsets == ("web", "browser", "clarify")
     assert overridden_settings.hermes.disabled_toolsets == ("memory", "session_search")
+    assert overridden_settings.hermes.fallback_model == (
+        {"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
+    )
+    assert overridden_settings.hermes.tool_use_enforcement == ("deepseek", "gemini")
+    assert overridden_settings.hermes.enable_honcho is False
+    assert overridden_settings.hermes.honcho_scope == "channel"

@@ -153,12 +153,19 @@ class TestToolsetConsistency:
         assert "household_upsert_event" in tools
         assert "household_upsert_meal" in tools
         assert "household_schedule_nudge" in tools
+        assert "household_record_preference" in tools
         assert "terminal" not in tools
         assert "execute_code" not in tools
         assert "delegate_task" not in tools
         assert "memory" not in tools
-        assert "session_search" not in tools
+        assert "session_search" in tools
 
     def test_florence_briefing_is_read_only_household_lookup(self):
         tools = set(resolve_toolset("florence_briefing"))
-        assert tools == {"household_search_state"}
+        assert tools == {
+            "household_search_state",
+            "household_search_google_inbox",
+            "session_search",
+            "honcho_context",
+            "honcho_search",
+        }

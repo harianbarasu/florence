@@ -44,13 +44,16 @@ def test_google_account_link_callback_persists_connection_and_marks_onboarding_c
     )
     monkeypatch.setattr("florence.runtime.services.fetch_google_user_email", lambda **_: "parent@example.com")
     monkeypatch.setattr(
-        "florence.runtime.services.fetch_primary_google_calendar",
-        lambda **_: GoogleCalendarMetadata(
-            id="primary",
-            summary="Family",
-            timezone="America/Los_Angeles",
-            access_role="owner",
-        ),
+        "florence.runtime.services.list_google_calendars",
+        lambda **_: [
+            GoogleCalendarMetadata(
+                id="primary",
+                summary="Family",
+                timezone="America/Los_Angeles",
+                access_role="owner",
+                primary=True,
+            )
+        ],
     )
 
     raw_state = parse_qs(urlparse(link.url).query)["state"][0]
@@ -61,4 +64,5 @@ def test_google_account_link_callback_persists_connection_and_marks_onboarding_c
     assert result.onboarding_transition.state.google_connected is True
     saved = store.list_google_connections(household_id="hh_123", member_id="mem_123")
     assert len(saved) == 1
+    assert saved[0].metadata["available_calendars"][0]["id"] == "primary"
     store.close()

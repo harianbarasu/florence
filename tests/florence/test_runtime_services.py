@@ -679,10 +679,14 @@ def test_household_manager_service_briefing_routines_due_and_advance(tmp_path):
         household_id="hh_123",
         now=datetime(2026, 3, 24, 12, 0, tzinfo=timezone.utc),
     )
-    assert len(routines) == 2
+    assert len(routines) == 3
     assert all(routine.status == HouseholdRoutineStatus.ACTIVE for routine in routines)
 
     morning = next(routine for routine in routines if routine.metadata.get("brief_kind") == "morning")
+    weekly = next(routine for routine in routines if routine.metadata.get("brief_kind") == "weekly")
+    assert weekly.title == "Weekly preview"
+    assert weekly.metadata["days"] == [6]
+    assert weekly.metadata["local_time"] == "17:30"
     due = manager.list_due_briefing_routines(
         household_id="hh_123",
         now=datetime(2026, 3, 24, 14, 0, tzinfo=timezone.utc),

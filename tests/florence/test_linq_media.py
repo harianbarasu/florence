@@ -86,3 +86,58 @@ def test_enrich_linq_payload_with_media_text_no_media_parts_returns_false():
     assert changed is False
     inbound = parse_linq_payload(payload)
     assert inbound.body == "Hello Florence"
+
+
+def test_enrich_linq_payload_with_media_text_handles_fridge_style_images(monkeypatch):
+    payload = {
+        "api_version": "v3",
+        "webhook_version": "2026-02-03",
+        "event_type": "message.received",
+        "data": {
+            "chat": {"id": "chat_123", "is_group": False},
+            "id": "msg_456",
+            "direction": "inbound",
+            "sender_handle": {"handle": "+15555550123", "is_me": False},
+            "parts": [
+                {"type": "text", "value": "What can we make from this?"},
+                {"type": "image", "url": "https://example.com/fridge.png", "filename": "fridge.png"},
+            ],
+            "service": "iMessage",
+        },
+    }
+
+    class _FakeResponse:
+        def __init__(self, *, content: bytes, content_type: str):
+            self.content = content
+            self.headers = {"content-type": content_type}
+            self.status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+    def _fake_get(url, *, headers=None, timeout=None):  # noqa: ARG001
+        if url.endswith("fridge.png"):
+            return _FakeResponse(content=b"\x89PNGfake", content_type="image/png")
+        raise AssertionError(f"Unexpected URL: {url}")
+
+    monkeypatch.setattr(linq_media.httpx, "get", _fake_get)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+
+    class _FakeResponses:
+        def create(self, **kwargs):
+            prompt_text = kwargs["input"][0]["content"][0]["text"]
+            assert "pantry, fridge, grocery, meal, or food photo" in prompt_text
+            assert "permission slips, uniforms, materials to bring, follow-up actions" in prompt_text
+            return types.SimpleNamespace(output_text="Visible items: eggs, spinach, tortillas, salsa.")
+
+    class _FakeOpenAI:
+        def __init__(self, **kwargs):  # noqa: ARG002
+            self.responses = _FakeResponses()
+
+    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=_FakeOpenAI))
+
+    changed = linq_media.enrich_linq_payload_with_media_text(payload, linq_api_key=None)
+    assert changed is True
+
+    inbound = parse_linq_payload(payload)
+    assert "fridge.png: Visible items: eggs, spinach, tortillas, salsa." in inbound.body

@@ -191,3 +191,119 @@ def test_google_sync_worker_uses_incremental_window_after_bootstrap(tmp_path, mo
     assert result.connection.metadata["gmail_last_synced_at"] == "2026-03-25T18:00:00+00:00"
     assert result.connection.metadata["gmail_last_max_results"] == 111
     store.close()
+
+
+def test_google_sync_worker_honors_calendar_preferences_and_keeps_non_primary_ids_distinct(tmp_path, monkeypatch):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_google_connection(
+        GoogleConnection(
+            id="gconn_multi",
+            household_id="hh_123",
+            member_id="mem_123",
+            email="parent@example.com",
+            connected_scopes=(GoogleSourceKind.GOOGLE_CALENDAR,),
+            access_token="access-token",
+            metadata={
+                "primary_calendar_id": "family",
+                "primary_calendar_summary": "Family calendar",
+                "primary_calendar_timezone": "America/Los_Angeles",
+                "available_calendars": [
+                    {
+                        "id": "family",
+                        "summary": "Family calendar",
+                        "timezone": "America/Los_Angeles",
+                        "primary": True,
+                    },
+                    {
+                        "id": "work",
+                        "summary": "Work calendar",
+                        "timezone": "America/Los_Angeles",
+                    },
+                    {
+                        "id": "shared_secondary",
+                        "summary": "Shared secondary calendar",
+                        "timezone": "America/Los_Angeles",
+                    },
+                    {
+                        "id": "ignored",
+                        "summary": "Ignored calendar",
+                        "timezone": "America/Los_Angeles",
+                    },
+                ],
+                "calendar_preferences": {
+                    "family": {
+                        "usage_mode": "planning_and_conflicts",
+                        "detail_visibility": "full_details",
+                    },
+                    "work": {
+                        "usage_mode": "conflicts_only",
+                        "detail_visibility": "busy_only",
+                    },
+                    "shared_secondary": {
+                        "usage_mode": "planning_and_conflicts",
+                        "detail_visibility": "full_details",
+                    },
+                    "ignored": {
+                        "usage_mode": "ignore",
+                    },
+                },
+            },
+        )
+    )
+    store.upsert_onboarding_session(
+        OnboardingState(
+            household_id="hh_123",
+            member_id="mem_123",
+            thread_id="dm_thread_123",
+            google_connected=True,
+            child_names=["Ava"],
+            school_labels=["Roosevelt Elementary"],
+            activity_labels=["Soccer"],
+            school_basics_collected=True,
+            activity_basics_collected=True,
+        )
+    )
+    store.replace_child_profiles(
+        household_id="hh_123",
+        children=[ChildProfile(id="child_ava", household_id="hh_123", full_name="Ava")],
+    )
+    observed_calendar_ids: list[str] = []
+
+    monkeypatch.setattr("florence.runtime.services.list_recent_gmail_sync_items", lambda **_: [])
+
+    def _fake_calendar_fetch(*, calendar, **kwargs):
+        observed_calendar_ids.append(calendar.id)
+        return [
+            ParentCalendarSyncItem(
+                google_event_id="event_shared",
+                title="Ava soccer practice",
+                description="Weekly team practice",
+                location="North field",
+                html_link=None,
+                starts_at=datetime(2026, 9, 18, 23, 0, tzinfo=timezone.utc),
+                ends_at=datetime(2026, 9, 19, 0, 0, tzinfo=timezone.utc),
+                timezone="America/Los_Angeles",
+                all_day=False,
+                updated_at=None,
+                calendar_summary=calendar.summary,
+                family_member_names=["Ava"],
+                calendar_id=calendar.id,
+                calendar_primary=calendar.primary,
+            )
+        ]
+
+    monkeypatch.setattr("florence.runtime.services.list_recent_parent_calendar_sync_items", _fake_calendar_fetch)
+
+    worker = FlorenceGoogleSyncWorkerService(store, FlorenceGoogleSyncPersistenceService(store))
+    result = worker.sync_connection("gconn_multi")
+
+    assert observed_calendar_ids == ["family", "work", "shared_secondary"]
+    candidates = store.list_imported_candidates(household_id="hh_123", member_id="mem_123")
+    assert len(candidates) == 2
+    assert {candidate.source_identifier for candidate in candidates} == {
+        "google_calendar:event_shared",
+        "google_calendar:shared_secondary:event_shared",
+    }
+    assert {candidate.metadata["calendar_id"] for candidate in candidates} == {"family", "shared_secondary"}
+    assert result.connection.metadata["last_calendar_item_count"] == 3
+    store.close()

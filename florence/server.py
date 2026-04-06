@@ -190,6 +190,24 @@ class _FlorenceRequestHandler(BaseHTTPRequestHandler):
             )
             self._write_response(result)
             return
+        if parsed.path == "/v1/web/review":
+            query = parse_qs(parsed.query)
+            result = self._service().handle_web_review(
+                token=self._query_value(query, "token"),
+                auth_email=self._query_value(query, "email") or self.headers.get("x-florence-auth-email"),
+            )
+            self._write_response(result)
+            return
+        if parsed.path == "/v1/web/calendar":
+            query = parse_qs(parsed.query)
+            result = self._service().handle_web_calendar(
+                token=self._query_value(query, "token"),
+                auth_email=self._query_value(query, "email") or self.headers.get("x-florence-auth-email"),
+                start=self._query_value(query, "start"),
+                end=self._query_value(query, "end"),
+            )
+            self._write_response(result)
+            return
         if parsed.path == "/v1/web/settings":
             query = parse_qs(parsed.query)
             result = self._service().handle_web_settings(
@@ -289,6 +307,15 @@ class _FlorenceRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/v1/web/settings":
             self._handle_json_post(
                 lambda payload: self._service().handle_web_settings_update(
+                    payload=payload,
+                    token=str(payload.get("token") or "") or None,
+                    auth_email=str(payload.get("authEmail") or self.headers.get("x-florence-auth-email") or "") or None,
+                )
+            )
+            return
+        if parsed.path == "/v1/web/review":
+            self._handle_json_post(
+                lambda payload: self._service().handle_web_review_action(
                     payload=payload,
                     token=str(payload.get("token") or "") or None,
                     auth_email=str(payload.get("authEmail") or self.headers.get("x-florence-auth-email") or "") or None,

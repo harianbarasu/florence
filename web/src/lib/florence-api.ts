@@ -1,8 +1,10 @@
 "use client";
 
 import type {
+  FlorenceCalendarResponse,
   FlorenceConnectUrlResponse,
   FlorenceConnectionsResponse,
+  FlorenceReviewResponse,
   FlorenceSessionResponse,
   FlorenceSettingsResponse,
   FlorenceSetupResponse,
@@ -130,4 +132,42 @@ export async function saveSettings(payload: Record<string, unknown>) {
     body: JSON.stringify(payload),
   });
   return parseResponse<FlorenceSettingsResponse>(response);
+}
+
+export async function getReview(token?: string): Promise<FlorenceReviewResponse> {
+  const response = await fetch(withQuery("/api/florence/review", { token }), {
+    method: "GET",
+    cache: "no-store",
+  });
+  return parseResponse<FlorenceReviewResponse>(response);
+}
+
+export async function saveReviewDecision(payload: Record<string, unknown>) {
+  const response = await fetch("/api/florence/review", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  return parseResponse<FlorenceReviewResponse>(response);
+}
+
+export async function getCalendar(params?: {
+  token?: string;
+  start?: string;
+  end?: string;
+}): Promise<FlorenceCalendarResponse> {
+  const response = await fetch(
+    withQuery("/api/florence/calendar", {
+      token: params?.token,
+      start: params?.start,
+      end: params?.end,
+    }),
+    {
+      method: "GET",
+      cache: "no-store",
+    },
+  );
+  return parseResponse<FlorenceCalendarResponse>(response);
 }

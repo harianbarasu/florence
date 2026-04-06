@@ -4,9 +4,11 @@ from datetime import datetime, timezone
 from florence.contracts import (
     Channel,
     ChannelType,
+    ChildProfile,
     GoogleConnection,
     GoogleSourceKind,
     Household,
+    HouseholdProfileKind,
     HouseholdSourceMatcherKind,
     HouseholdSourceRule,
     HouseholdSourceVisibility,
@@ -271,6 +273,164 @@ def test_household_google_inbox_search_uses_shared_source_rules_across_connected
 
         assert set(inbox_result["searched_connection_emails"]) == {"maya@example.com", "kendall@example.com"}
         assert inbox_result["results"][0]["from_address"] == "Linda <linda@musicalbeginnings.com>"
+    finally:
+        clear_household_tool_context(task_id)
+        store.close()
+
+
+def test_household_search_state_includes_manager_profile_preferences(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(
+        Household(
+            id="hh_123",
+            name="Maya's household",
+            timezone="America/Los_Angeles",
+            settings={
+                "manager_profile": {
+                    "operating_preferences": "Weekday morning brief at 6:45 and no texts after 9pm.",
+                    "nudge_preferences": "Morning-of is enough for practice reminders.",
+                    "household_operations": ["school forms", "pickup planning"],
+                }
+            },
+        )
+    )
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    task_id = "task-household-preferences"
+    set_household_tool_context(
+        task_id,
+        store=store,
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_dm_123",
+    )
+    try:
+        result = json.loads(
+            handle_function_call(
+                "household_search_state",
+                {
+                    "query": "morning brief",
+                    "entity_types": ["preferences"],
+                },
+                task_id=task_id,
+            )
+        )
+
+        preferences = result["results"]["preferences"]
+        assert any(item["kind"] == "manager_profile" for item in preferences)
+        assert any(item["metadata"]["profile_key"] == "operating_preferences" for item in preferences)
+        assert any("morning brief" in item["metadata"]["summary"].lower() for item in preferences)
+    finally:
+        clear_household_tool_context(task_id)
+        store.close()
+
+
+def test_household_record_preference_persists_preference_and_updates_manager_profile(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(
+        Household(
+            id="hh_123",
+            name="Maya's household",
+            timezone="America/Los_Angeles",
+            settings={"manager_profile": {"operating_preferences": "Weekday morning brief at 6:45."}},
+        )
+    )
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.replace_child_profiles(
+        household_id="hh_123",
+        children=[
+            ChildProfile(
+                id="child_ava",
+                household_id="hh_123",
+                full_name="Ava",
+                metadata={"aliases": ["Avs"]},
+            )
+        ],
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    task_id = "task-household-record-preference"
+    set_household_tool_context(
+        task_id,
+        store=store,
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_dm_123",
+    )
+    try:
+        reminder_result = json.loads(
+            handle_function_call(
+                "household_record_preference",
+                {
+                    "label": "Reminder style",
+                    "value": "Morning-of is enough for practice reminders.",
+                    "category": "reminder_style",
+                },
+                task_id=task_id,
+            )
+        )
+        child_result = json.loads(
+            handle_function_call(
+                "household_record_preference",
+                {
+                    "label": "Kid spice preference",
+                    "value": "Ava will not eat spicy food.",
+                    "category": "child_preference",
+                    "child_name": "Avs",
+                },
+                task_id=task_id,
+            )
+        )
+
+        assert reminder_result["result"]["label"] == "Reminder style"
+        assert reminder_result["result"]["metadata"]["category"] == "reminder_style"
+        assert reminder_result["manager_profile"]["nudge_preferences_override"] == (
+            "Reminder style: Morning-of is enough for practice reminders."
+        )
+        assert child_result["result"]["child_id"] == "child_ava"
+        assert child_result["result"]["metadata"]["value"] == "Ava will not eat spicy food."
+
+        household = store.get_household("hh_123")
+        assert household is not None
+        manager_profile = household.settings["manager_profile"]
+        assert manager_profile["nudge_preferences"] == "Reminder style: Morning-of is enough for practice reminders."
+        preferences = store.list_household_profile_items(
+            household_id="hh_123",
+            kind=HouseholdProfileKind.PREFERENCE,
+        )
+        assert len(preferences) == 2
+        assert any(item.label == "Kid spice preference" and item.child_id == "child_ava" for item in preferences)
     finally:
         clear_household_tool_context(task_id)
         store.close()

@@ -7,6 +7,10 @@ from datetime import datetime, timedelta, timezone
 
 from florence.contracts import (
     CandidateState,
+    Channel,
+    ChannelMessage,
+    ChannelMessageRole,
+    ChannelType,
     GoogleConnection,
     GoogleSourceKind,
     Household,
@@ -15,6 +19,8 @@ from florence.contracts import (
     HouseholdNudgeStatus,
     HouseholdNudgeTargetKind,
     ImportedCandidate,
+    Member,
+    MemberRole,
     HouseholdWorkItem,
     HouseholdWorkItemStatus,
 )
@@ -45,9 +51,19 @@ class _StubOnboardingLinkService:
 
 
 class _StubHouseholdChatService:
-    def __init__(self, reply_text: str):
+    def __init__(
+        self,
+        reply_text: str,
+        *,
+        promotion_text: str | None = None,
+        capture_reply_text: str | None = None,
+    ):
         self.reply_text = reply_text
+        self.promotion_text = promotion_text
+        self.capture_reply_text = capture_reply_text or reply_text
         self.calls = []
+        self.promotion_calls = []
+        self.capture_calls = []
 
     def respond(
         self,
@@ -70,6 +86,50 @@ class _StubHouseholdChatService:
 
         class _Reply:
             text = self.reply_text
+
+        return _Reply()
+
+    def compose_group_promotion(
+        self,
+        *,
+        household_id: str,
+        channel_id: str,
+        actor_member_id: str | None,
+        source_text: str,
+    ) -> str | None:
+        self.promotion_calls.append(
+            {
+                "household_id": household_id,
+                "channel_id": channel_id,
+                "actor_member_id": actor_member_id,
+                "source_text": source_text,
+            }
+        )
+        return self.promotion_text
+
+    def handle_capture_request(
+        self,
+        *,
+        household_id: str,
+        channel_id: str,
+        actor_member_id: str | None,
+        message_text: str,
+        capture_kind: str,
+        conversation_history=None,
+    ):
+        self.capture_calls.append(
+            {
+                "household_id": household_id,
+                "channel_id": channel_id,
+                "actor_member_id": actor_member_id,
+                "message_text": message_text,
+                "capture_kind": capture_kind,
+                "conversation_history": conversation_history or [],
+            }
+        )
+
+        class _Reply:
+            text = self.capture_reply_text
 
         return _Reply()
 
@@ -273,6 +333,312 @@ def test_dm_status_question_after_google_connect_returns_sync_progress_sequence(
         "https://florence.example.com/v1/florence/onboarding?token=test-token",
         "I’ll text you here when the first pass is ready.",
     )
+    store.close()
+
+
+def test_dm_share_reply_promotes_latest_brief_to_group(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_hybrid_onboarding_service(store, review_service)
+    ingress = FlorenceMessagingIngressService(
+        store,
+        onboarding_service,
+        review_service,
+        FlorenceHouseholdQueryService(store),
+    )
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm_thread_123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_group_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="group_thread_123",
+            channel_type=ChannelType.HOUSEHOLD_GROUP,
+            title="Parent group",
+        )
+    )
+    store.append_channel_message(
+        ChannelMessage(
+            id="msg_asst_shareable",
+            household_id="hh_123",
+            channel_id="chan_dm_123",
+            sender_role=ChannelMessageRole.ASSISTANT,
+            body="I went through your recent email and calendar activity.",
+            metadata={
+                "promotable_group_message": "Florence pulled together a quick household update:\n- Science fair Friday\n- Soccer photos Monday",
+            },
+            created_at=datetime.now(tz=timezone.utc).timestamp(),
+        )
+    )
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_share_brief",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="share that with the group",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert result.consumed is True
+    assert result.reply_text == "Shared a short version with the parent group."
+    assert result.group_announcement == (
+        "Florence pulled together a quick household update:\n- Science fair Friday\n- Soccer photos Monday"
+    )
+    updated = store.get_channel_message("msg_asst_shareable")
+    assert updated is not None
+    assert updated.metadata["promoted_group_channel_id"] == "chan_group_123"
+    assert updated.metadata["promoted_to_group_at"]
+    store.close()
+
+
+def test_dm_share_reply_can_compose_group_safe_summary_from_recent_dm(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_hybrid_onboarding_service(store, review_service)
+    chat_service = _StubHouseholdChatService(
+        "I can keep planning with you here.",
+        promotion_text="Household update: science fair is Friday and dinner is covered tonight.",
+    )
+    ingress = FlorenceMessagingIngressService(
+        store,
+        onboarding_service,
+        review_service,
+        FlorenceHouseholdQueryService(store),
+        household_chat_service=chat_service,
+    )
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm_thread_123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_group_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="group_thread_123",
+            channel_type=ChannelType.HOUSEHOLD_GROUP,
+            title="Parent group",
+        )
+    )
+    store.append_channel_message(
+        ChannelMessage(
+            id="msg_user_prev",
+            household_id="hh_123",
+            channel_id="chan_dm_123",
+            sender_role=ChannelMessageRole.USER,
+            sender_member_id="mem_123",
+            body="Science fair is Friday and I already planned tacos for dinner.",
+            created_at=datetime.now(tz=timezone.utc).timestamp() - 10,
+        )
+    )
+    store.append_channel_message(
+        ChannelMessage(
+            id="msg_asst_prev",
+            household_id="hh_123",
+            channel_id="chan_dm_123",
+            sender_role=ChannelMessageRole.ASSISTANT,
+            body="I can remind you about the science fair and keep taco night in the plan.",
+            created_at=datetime.now(tz=timezone.utc).timestamp() - 5,
+        )
+    )
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_share_generic",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="share that with the group",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert result.consumed is True
+    assert result.reply_text == "Shared a short version with the parent group."
+    assert result.group_announcement == "Household update: science fair is Friday and dinner is covered tonight."
+    assert len(chat_service.promotion_calls) == 1
+    assert "Science fair is Friday" in chat_service.promotion_calls[0]["source_text"]
+    assert "share that with the group" not in chat_service.promotion_calls[0]["source_text"]
+    store.close()
+
+
+def test_completed_dm_meal_request_uses_capture_handler(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_hybrid_onboarding_service(store, review_service)
+    _complete_hybrid_onboarding(onboarding_service)
+    chat_service = _StubHouseholdChatService(
+        "I can keep planning with you here.",
+        capture_reply_text="Handled: I planned three dinners and started the grocery list.",
+    )
+    ingress = FlorenceMessagingIngressService(
+        store,
+        onboarding_service,
+        review_service,
+        FlorenceHouseholdQueryService(store),
+        household_chat_service=chat_service,
+    )
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm_thread_123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_meal_capture",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="Can you plan dinners for this week and make the grocery list too?",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert result.consumed is True
+    assert result.reply_text == "Handled: I planned three dinners and started the grocery list."
+    assert len(chat_service.capture_calls) == 1
+    assert chat_service.capture_calls[0]["capture_kind"] == "meal and grocery"
+    assert chat_service.calls == []
+    store.close()
+
+
+def test_completed_group_media_message_uses_capture_handler(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_hybrid_onboarding_service(store, review_service)
+    _complete_hybrid_onboarding(onboarding_service)
+    onboarding_service.record_group_activated(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+        group_channel_id="group_thread_123",
+    )
+    chat_service = _StubHouseholdChatService(
+        "I can keep planning with you here.",
+        capture_reply_text="Handled: I pulled two school events from the flyer and saved the follow-up items.",
+    )
+    ingress = FlorenceMessagingIngressService(
+        store,
+        onboarding_service,
+        review_service,
+        FlorenceHouseholdQueryService(store),
+        household_chat_service=chat_service,
+    )
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_group_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="group_thread_123",
+            channel_type=ChannelType.HOUSEHOLD_GROUP,
+            title="Parent group",
+        )
+    )
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_group_123",
+            thread_id="group_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_group_media",
+                thread_id="group_thread_123",
+                sender_handle="+15555550123",
+                body=(
+                    "Can you add this please?\n\n"
+                    "Media context extracted from attachments:\n"
+                    "- school-flyer.png: Science fair is Friday at 6 PM. Wear blue. PTA meeting Monday at 7 PM."
+                ),
+                is_group_chat=True,
+            ),
+        )
+    )
+
+    assert result.consumed is True
+    assert result.reply_text == "Handled: I pulled two school events from the flyer and saved the follow-up items."
+    assert len(chat_service.capture_calls) == 1
+    assert chat_service.capture_calls[0]["capture_kind"] == "media logistics"
+    assert chat_service.calls == []
     store.close()
 
 

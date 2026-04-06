@@ -53,6 +53,7 @@ from florence.google import (
     exchange_google_code_for_tokens,
     fetch_google_user_email,
     fetch_primary_google_calendar,
+    list_google_calendars,
     list_recent_gmail_sync_items,
     list_recent_parent_calendar_sync_items,
     merge_google_grounding_hints,
@@ -176,6 +177,14 @@ def _extract_local_time_from_preferences(
 
 def _local_schedule_days(*, text: str | None, kind: HouseholdBriefingKind) -> list[int]:
     lowered = (text or "").lower()
+    if kind == HouseholdBriefingKind.WEEKLY:
+        if "friday" in lowered:
+            return [4]
+        if "saturday" in lowered:
+            return [5]
+        if "monday" in lowered:
+            return [0]
+        return [6]
     if "daily" in lowered or "every day" in lowered:
         return [0, 1, 2, 3, 4, 5, 6]
     if kind == HouseholdBriefingKind.EVENING and "school night" in lowered:
@@ -267,6 +276,18 @@ def _metadata_list(metadata: dict[str, object], key: str) -> list[str]:
     return values
 
 
+_CALENDAR_USAGE_MODES_WITH_EVENT_IMPORT = {"planning_and_conflicts"}
+_CALENDAR_USAGE_MODES_WITH_FETCH = {"planning_and_conflicts", "conflicts_only"}
+_CALENDAR_DETAIL_VISIBILITY_WITH_DETAILS = {"full_details"}
+
+
+@dataclass(slots=True)
+class _GoogleCalendarSyncTarget:
+    calendar: GoogleCalendarMetadata
+    usage_mode: str
+    detail_visibility: str
+
+
 def _merge_metadata_list(metadata: dict[str, object], key: str, values: list[str]) -> None:
     merged = _metadata_list(metadata, key)
     seen = {value.lower() for value in merged}
@@ -322,6 +343,87 @@ def _index_hint_entries(
                     }
                 )
     return indexed
+
+
+def _calendar_sync_targets(metadata: dict[str, object]) -> list[_GoogleCalendarSyncTarget]:
+    raw_catalog = metadata.get("available_calendars")
+    raw_preferences = metadata.get("calendar_preferences")
+    preferences = dict(raw_preferences) if isinstance(raw_preferences, dict) else {}
+    calendars: list[GoogleCalendarMetadata] = []
+    if isinstance(raw_catalog, list):
+        for raw_item in raw_catalog:
+            if not isinstance(raw_item, dict):
+                continue
+            calendar_id = _clean_label(str(raw_item.get("id") or ""))
+            if calendar_id is None:
+                continue
+            calendars.append(
+                GoogleCalendarMetadata(
+                    id=calendar_id,
+                    summary=str(raw_item.get("summary") or "Calendar"),
+                    timezone=str(raw_item.get("timezone") or "America/Los_Angeles"),
+                    access_role=(
+                        str(raw_item.get("access_role"))
+                        if raw_item.get("access_role") is not None
+                        else (
+                            str(raw_item.get("accessRole"))
+                            if raw_item.get("accessRole") is not None
+                            else None
+                        )
+                    ),
+                    primary=bool(raw_item.get("primary")),
+                    selected=not bool(raw_item.get("selected") is False),
+                    hidden=bool(raw_item.get("hidden")),
+                )
+            )
+    if not calendars and metadata.get("primary_calendar_id") is not None:
+        calendars.append(
+            GoogleCalendarMetadata(
+                id=str(metadata.get("primary_calendar_id") or "primary"),
+                summary=str(metadata.get("primary_calendar_summary") or "Primary calendar"),
+                timezone=str(metadata.get("primary_calendar_timezone") or "America/Los_Angeles"),
+                access_role=(
+                    str(metadata.get("primary_calendar_access_role"))
+                    if metadata.get("primary_calendar_access_role") is not None
+                    else None
+                ),
+                primary=True,
+            )
+        )
+
+    targets: list[_GoogleCalendarSyncTarget] = []
+    if not preferences:
+        primary = next((calendar for calendar in calendars if calendar.primary), None) or (calendars[0] if calendars else None)
+        if primary is None:
+            return []
+        return [
+            _GoogleCalendarSyncTarget(
+                calendar=primary,
+                usage_mode="planning_and_conflicts",
+                detail_visibility="full_details",
+            )
+        ]
+
+    for calendar in calendars:
+        preference = preferences.get(calendar.id)
+        if not isinstance(preference, dict):
+            continue
+        usage_mode = _clean_label(str(preference.get("usage_mode") or ""))
+        detail_visibility = _clean_label(str(preference.get("detail_visibility") or ""))
+        if usage_mode not in _CALENDAR_USAGE_MODES_WITH_FETCH:
+            continue
+        if usage_mode in _CALENDAR_USAGE_MODES_WITH_EVENT_IMPORT and detail_visibility not in _CALENDAR_DETAIL_VISIBILITY_WITH_DETAILS:
+            detail_visibility = "busy_only"
+        elif detail_visibility is None:
+            detail_visibility = "full_details"
+        targets.append(
+            _GoogleCalendarSyncTarget(
+                calendar=calendar,
+                usage_mode=usage_mode,
+                detail_visibility=detail_visibility,
+            )
+        )
+    return targets
 
 
 def _format_grounding_hint_line(label: str, *, primary: list[str], secondary: list[str]) -> str:
@@ -1264,7 +1366,11 @@ class FlorenceGoogleAccountLinkService:
             redirect_uri=self.redirect_uri,
         )
         email = fetch_google_user_email(access_token=tokens.access_token)
-        primary_calendar = fetch_primary_google_calendar(access_token=tokens.access_token)
+        calendars = list_google_calendars(access_token=tokens.access_token)
+        primary_calendar = next((calendar for calendar in calendars if calendar.primary), None)
+        if primary_calendar is None:
+            primary_calendar = fetch_primary_google_calendar(access_token=tokens.access_token)
+            calendars = [primary_calendar]
         connection_id = _stable_id("gconn", payload.household_id, payload.member_id, email)
         existing = self.store.get_google_connection(connection_id)
         existing_metadata = dict(existing.metadata) if existing is not None else {}
@@ -1288,6 +1394,18 @@ class FlorenceGoogleAccountLinkService:
                 "primary_calendar_summary": primary_calendar.summary,
                 "primary_calendar_timezone": primary_calendar.timezone,
                 "primary_calendar_access_role": primary_calendar.access_role,
+                "available_calendars": [
+                    {
+                        "id": calendar.id,
+                        "summary": calendar.summary,
+                        "timezone": calendar.timezone,
+                        "access_role": calendar.access_role,
+                        "primary": calendar.primary,
+                        "selected": calendar.selected,
+                        "hidden": calendar.hidden,
+                    }
+                    for calendar in calendars
+                ],
                 "web_primary": is_primary_web_account,
             },
         )
@@ -1345,9 +1463,6 @@ class FlorenceGoogleSyncWorkerService:
             channel_id=latest_onboarding.thread_id if latest_onboarding is not None else "dm",
         )
         family_member_names = list(context.visible_child_names)
-        calendar_timezone = str(hydrated_connection.metadata.get("primary_calendar_timezone") or "America/Los_Angeles")
-        calendar_id = str(hydrated_connection.metadata.get("primary_calendar_id") or "primary")
-        calendar_summary = str(hydrated_connection.metadata.get("primary_calendar_summary") or "Primary calendar")
         metadata = dict(hydrated_connection.metadata)
         bootstrap_complete = bool(metadata.get("gmail_bootstrap_completed_at"))
         if not metadata.get("initial_sync_started_at"):
@@ -1379,32 +1494,26 @@ class FlorenceGoogleSyncWorkerService:
         metadata["sync_phase"] = "syncing_calendar"
         hydrated_connection = self.store.upsert_google_connection(replace(hydrated_connection, metadata=metadata))
         metadata = dict(hydrated_connection.metadata)
-        calendar_items = list_recent_parent_calendar_sync_items(
-            access_token=access_token,
-            calendar=(
-                replace(
-                    fetch_primary_google_calendar(access_token=access_token, fallback_timezone=calendar_timezone),
-                    id=calendar_id,
-                    summary=calendar_summary,
-                    timezone=calendar_timezone,
+        calendar_items: list[Any] = []
+        fetched_calendar_item_count = 0
+        for target in _calendar_sync_targets(hydrated_connection.metadata):
+            fetched_items = list_recent_parent_calendar_sync_items(
+                access_token=access_token,
+                calendar=target.calendar,
+                family_member_names=family_member_names,
+                max_results=max_calendar_results,
+                window_days=window_days,
+                now=now,
+            )
+            fetched_calendar_item_count += len(fetched_items)
+            for item in fetched_items:
+                calendar_items.append(
+                    replace(
+                        item,
+                        usage_mode=target.usage_mode,
+                        detail_visibility=target.detail_visibility,
+                    )
                 )
-                if calendar_id == "primary" and "primary_calendar_id" not in hydrated_connection.metadata
-                else GoogleCalendarMetadata(
-                    id=calendar_id,
-                    summary=calendar_summary,
-                    timezone=calendar_timezone,
-                    access_role=(
-                        str(hydrated_connection.metadata.get("primary_calendar_access_role"))
-                        if hydrated_connection.metadata.get("primary_calendar_access_role") is not None
-                        else None
-                    ),
-                )
-            ),
-            family_member_names=family_member_names,
-            max_results=max_calendar_results,
-            window_days=window_days,
-            now=now,
-        )
         metadata["sync_phase"] = "finding_family_sources"
         hydrated_connection = self.store.upsert_google_connection(replace(hydrated_connection, metadata=metadata))
         metadata = dict(hydrated_connection.metadata)
@@ -1420,7 +1529,7 @@ class FlorenceGoogleSyncWorkerService:
         metadata["gmail_last_query"] = gmail_query
         metadata["gmail_last_max_results"] = resolved_max_gmail_results
         metadata["last_gmail_item_count"] = len(gmail_items)
-        metadata["last_calendar_item_count"] = len(calendar_items)
+        metadata["last_calendar_item_count"] = fetched_calendar_item_count
         metadata["last_candidate_count"] = len(sync_result.candidates)
         metadata["last_sync_completed_at"] = current_time.isoformat()
         metadata["last_sync_status"] = "ok"
@@ -1522,6 +1631,109 @@ class FlorenceHouseholdManagerService:
         self.store.upsert_household(replace(household, settings=settings))
         return profile
 
+    def record_preference(
+        self,
+        *,
+        household_id: str,
+        label: str,
+        value: str,
+        category: str = "general",
+        member_id: str | None = None,
+        child_id: str | None = None,
+        recorded_by_member_id: str | None = None,
+        channel_id: str | None = None,
+        metadata: dict[str, object] | None = None,
+        now: datetime | None = None,
+    ) -> tuple[HouseholdProfileItem, dict[str, object]]:
+        cleaned_label = _clean_label(label)
+        cleaned_value = " ".join(str(value).split()).strip()
+        if cleaned_label is None:
+            raise ValueError("missing_preference_label")
+        if not cleaned_value:
+            raise ValueError("missing_preference_value")
+
+        normalized_category = _clean_label(category) or "general"
+        lowered_category = normalized_category.lower().replace(" ", "_")
+        captured_at = (now or _utc_now()).isoformat()
+        existing_items = self.store.list_household_profile_items(
+            household_id=household_id,
+            kind=HouseholdProfileKind.PREFERENCE,
+        )
+        preference_id = _stable_id(
+            "pref",
+            household_id,
+            member_id or "",
+            child_id or "",
+            cleaned_label.lower(),
+        )
+        existing_item = next((item for item in existing_items if item.id == preference_id), None)
+        item_metadata = dict(existing_item.metadata) if existing_item is not None else {}
+        item_metadata.update(dict(metadata or {}))
+        item_metadata.update(
+            {
+                "category": lowered_category,
+                "value": cleaned_value,
+                "captured_at": captured_at,
+                "recorded_by_member_id": recorded_by_member_id,
+                "channel_id": channel_id,
+            }
+        )
+        preference_item = HouseholdProfileItem(
+            id=preference_id,
+            household_id=household_id,
+            kind=HouseholdProfileKind.PREFERENCE,
+            label=cleaned_label,
+            member_id=member_id,
+            child_id=child_id,
+            metadata=item_metadata,
+        )
+        updated_items = [item for item in existing_items if item.id != preference_id]
+        updated_items.append(preference_item)
+        self.store.replace_household_profile_items(
+            household_id=household_id,
+            kind=HouseholdProfileKind.PREFERENCE,
+            items=updated_items,
+        )
+
+        preference_statement = (
+            cleaned_value
+            if cleaned_label.lower() in cleaned_value.lower()
+            else f"{cleaned_label}: {cleaned_value}"
+        )
+        profile_updates: dict[str, object] = {}
+        profile = self.get_manager_profile(household_id)
+        if lowered_category in {"reminder_style", "nudge_style", "reminder_preferences"}:
+            profile_updates = {
+                "nudge_preferences": preference_statement,
+                "nudge_preferences_override": preference_statement,
+                "nudge_preferences_last_updated_at": captured_at,
+            }
+        elif lowered_category in {"operating_rule", "operating_preference"}:
+            existing = str(profile.get("operating_preferences") or "").strip()
+            existing_parts = [part.strip() for part in existing.split("|") if part.strip()]
+            if preference_statement not in existing_parts:
+                existing_parts.append(preference_statement)
+            profile_updates = {
+                "operating_preferences": " | ".join(existing_parts),
+            }
+
+        updated_profile = self.update_manager_profile(household_id=household_id, updates=profile_updates) if profile_updates else profile
+        self.record_pilot_event(
+            household_id=household_id,
+            event_type="preference_recorded",
+            member_id=recorded_by_member_id,
+            channel_id=channel_id,
+            metadata={
+                "label": cleaned_label,
+                "value": cleaned_value,
+                "category": lowered_category,
+                "subject_member_id": member_id,
+                "subject_child_id": child_id,
+            },
+            created_at=now,
+        )
+        return preference_item, updated_profile
+
     def record_pilot_event(
         self,
         *,
@@ -1605,6 +1817,7 @@ class FlorenceHouseholdManagerService:
 
         disable_morning = bool(re.search(r"\b(?:no|skip|disable)\s+morning\s+brief\b", operating_preferences, re.IGNORECASE))
         disable_evening = bool(re.search(r"\b(?:no|skip|disable)\s+evening\s+(?:check[- ]?in|brief)\b", operating_preferences, re.IGNORECASE))
+        disable_weekly = bool(re.search(r"\b(?:no|skip|disable)\s+(?:weekly\s+brief|weekend\s+preview)\b", operating_preferences, re.IGNORECASE))
 
         morning_hour, morning_minute = _extract_local_time_from_preferences(
             operating_preferences,
@@ -1617,6 +1830,12 @@ class FlorenceHouseholdManagerService:
             keywords=("evening check-in", "evening check in", "evening brief", "evening"),
             default_hour=20,
             default_minute=15,
+        )
+        weekly_hour, weekly_minute = _extract_local_time_from_preferences(
+            operating_preferences,
+            keywords=("weekly brief", "weekend preview", "weekly", "weekend"),
+            default_hour=17,
+            default_minute=30,
         )
 
         routine_specs = [
@@ -1635,6 +1854,14 @@ class FlorenceHouseholdManagerService:
                 "minute": evening_minute,
                 "days": _local_schedule_days(text=operating_preferences, kind=HouseholdBriefingKind.EVENING),
                 "disabled": disable_evening,
+            },
+            {
+                "kind": HouseholdBriefingKind.WEEKLY,
+                "title": "Weekly preview",
+                "hour": weekly_hour,
+                "minute": weekly_minute,
+                "days": _local_schedule_days(text=operating_preferences, kind=HouseholdBriefingKind.WEEKLY),
+                "disabled": disable_weekly,
             },
         ]
 

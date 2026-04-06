@@ -284,3 +284,103 @@ class TestSessionSearch:
         assert result["count"] == 0
         assert result["results"] == []
         assert result["sessions_searched"] == 0
+
+    def test_allowed_session_ids_filters_results(self):
+        from unittest.mock import AsyncMock, MagicMock, patch as _patch
+        from tools.session_search_tool import session_search
+
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = [
+            {"session_id": "allowed-child", "content": "match 1", "source": "florence",
+             "session_started": 1709500000, "model": "test"},
+            {"session_id": "blocked-child", "content": "match 2", "source": "florence",
+             "session_started": 1709400000, "model": "test"},
+        ]
+
+        def _get_session(session_id):
+            if session_id == "allowed-child":
+                return {"parent_session_id": "allowed-root"}
+            if session_id == "allowed-root":
+                return {"parent_session_id": None}
+            if session_id == "blocked-child":
+                return {"parent_session_id": "blocked-root"}
+            if session_id == "blocked-root":
+                return {"parent_session_id": None}
+            return None
+
+        mock_db.get_session.side_effect = _get_session
+        mock_db.get_messages_as_conversation.return_value = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi there"},
+        ]
+
+        with _patch(
+            "tools.session_search_tool.async_call_llm",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("no provider"),
+        ):
+            result = json.loads(
+                session_search(
+                    query="test",
+                    db=mock_db,
+                    source_filter=["florence"],
+                    allowed_session_ids={"allowed-root"},
+                )
+            )
+
+        assert result["success"] is True
+        assert result["sessions_searched"] == 1
+        assert result["count"] == 1
+        assert result["results"][0]["session_id"] == "allowed-root"
+
+    def test_recent_sessions_respects_source_filter_and_allowlist(self):
+        from unittest.mock import MagicMock
+        from tools.session_search_tool import session_search
+
+        mock_db = MagicMock()
+        mock_db.list_sessions_rich.return_value = [
+            {
+                "id": "allowed-root",
+                "source": "florence",
+                "parent_session_id": None,
+                "started_at": 1709500000,
+                "last_active": 1709500100,
+                "message_count": 4,
+                "preview": "allowed preview",
+                "title": "Allowed session",
+            },
+            {
+                "id": "other-source",
+                "source": "cli",
+                "parent_session_id": None,
+                "started_at": 1709400000,
+                "last_active": 1709400100,
+                "message_count": 2,
+                "preview": "cli preview",
+                "title": "CLI session",
+            },
+            {
+                "id": "blocked-root",
+                "source": "florence",
+                "parent_session_id": None,
+                "started_at": 1709300000,
+                "last_active": 1709300100,
+                "message_count": 3,
+                "preview": "blocked preview",
+                "title": "Blocked session",
+            },
+        ]
+        mock_db.get_session.return_value = {"parent_session_id": None}
+
+        result = json.loads(
+            session_search(
+                query="",
+                db=mock_db,
+                source_filter=["florence"],
+                allowed_session_ids={"allowed-root"},
+            )
+        )
+
+        assert result["success"] is True
+        assert result["count"] == 1
+        assert result["results"][0]["session_id"] == "allowed-root"

@@ -22,8 +22,15 @@ class _FakeSendblueClient:
     def verify_webhook_signature(self, *, secret_header):
         return True
 
-    def send_text(self, *, thread_id, message):
-        self.sent.append({"thread_id": thread_id, "message": message})
+    def send_text(self, *, thread_id, message, group_id=None, numbers=None):
+        self.sent.append(
+            {
+                "thread_id": thread_id,
+                "message": message,
+                "group_id": group_id,
+                "numbers": numbers,
+            }
+        )
 
 
 def _build_settings(tmp_path):
@@ -114,3 +121,62 @@ def test_server_accepts_sendblue_documented_secret_header():
     headers = {"sb-signing-secret": "sb-webhook-secret"}
 
     assert _extract_sendblue_webhook_secret(headers) == "sb-webhook-secret"
+
+
+def test_production_service_sends_group_message_through_sendblue_group_endpoint(tmp_path, monkeypatch):
+    settings = _build_settings(tmp_path)
+    store = FlorenceStateDB(settings.server.db_path)
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_channel(
+        Channel(
+            id="chan_group_123",
+            household_id="hh_123",
+            provider="sendblue",
+            provider_channel_id="+15122164639|group:group_123456",
+            channel_type=ChannelType.HOUSEHOLD_GROUP,
+            title="Parent group",
+            metadata={
+                "group_id": "group_123456",
+                "participant_handles": ["+15555550123", "+15555550124"],
+                "sendblue_number": "+15122164639",
+            },
+        )
+    )
+    service = FlorenceProductionService(settings, store=store)
+    service.sendblue = _FakeSendblueClient()
+    monkeypatch.setattr(
+        service.entrypoints,
+        "handle_sendblue_payload",
+        lambda payload: FlorenceEntrypointResult(
+            reply_text="Hi from Florence",
+            consumed=True,
+            household_id="hh_123",
+            channel_id="chan_group_123",
+        ),
+    )
+
+    payload = {
+        "content": "hello group",
+        "is_outbound": False,
+        "status": "RECEIVED",
+        "message_handle": "msg_group_123",
+        "from_number": "+15555550123",
+        "number": "+15555550123",
+        "to_number": "+15122164639",
+        "sendblue_number": "+15122164639",
+        "group_id": "group_123456",
+        "participants": ["+15555550123", "+15555550124", "+15122164639"],
+        "service": "iMessage",
+    }
+    result = service.handle_sendblue_webhook(
+        payload=payload,
+        webhook_secret="sb-webhook-secret",
+    )
+
+    assert result.status_code == 200
+    assert json.loads(result.body)["ok"] is True
+    assert service.sendblue.sent[0]["thread_id"] == "+15122164639|group:group_123456"
+    assert service.sendblue.sent[0]["group_id"] == "group_123456"
+    assert service.sendblue.sent[0]["numbers"] is None
+    assert service.sendblue.sent[0]["message"] == "Hi from Florence"
+    store.close()

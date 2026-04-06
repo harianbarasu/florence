@@ -10,6 +10,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 
 from florence.contracts import (
+    ChannelType,
     ChannelMessage,
     ChannelMessageRole,
     HouseholdSourceVisibility,
@@ -83,6 +84,30 @@ def _looks_like_share_source(text: str) -> bool:
 
 def _looks_like_private_source(text: str) -> bool:
     return bool(re.search(r"\b(?:private|keep private|don't share|do not share)\b", text.strip(), re.IGNORECASE))
+
+
+def _looks_like_group_share_request(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:share|send|post)\b.*\b(?:group|family|parent group|everyone)\b|^(?:share|send it|post it)\b",
+            text.strip(),
+            re.IGNORECASE,
+        )
+    )
+
+
+def _has_media_capture_context(text: str) -> bool:
+    return "media context extracted from attachments:" in text.lower()
+
+
+def _looks_like_meal_or_grocery_request(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:meal plan|plan dinners?|plan meals?|what(?:'s| can) (?:for )?dinner|grocery list|groceries|shopping list|pantry|fridge|recipe)\b",
+            text,
+            re.IGNORECASE,
+        )
+    )
 
 
 def _looks_like_review_request(text: str) -> bool:
@@ -456,16 +481,160 @@ class FlorenceMessagingIngressService:
         )
         return latest_assistant.body.strip() if latest_assistant is not None else None
 
+    def _latest_promotable_group_message(self, *, channel_id: str) -> ChannelMessage | None:
+        history = self.store.list_channel_messages(channel_id=channel_id, limit=12)
+        for message in reversed(history):
+            if message.sender_role != ChannelMessageRole.ASSISTANT:
+                continue
+            promotable = " ".join(str(message.metadata.get("promotable_group_message") or "").split()).strip()
+            return message if promotable else None
+        return None
+
+    @staticmethod
+    def _capture_kind_for_message(text: str) -> str | None:
+        if _has_media_capture_context(text):
+            return "media logistics"
+        if _looks_like_meal_or_grocery_request(text):
+            return "meal and grocery"
+        return None
+
+    def _recent_exchange_for_group_promotion(
+        self,
+        *,
+        channel_id: str,
+        current_provider: str,
+        current_message_id: str,
+    ) -> str | None:
+        current_inbound_id = _stable_transport_message_id(current_provider, current_message_id)
+        history = [
+            message
+            for message in self.store.list_channel_messages(channel_id=channel_id, limit=8)
+            if message.id != current_inbound_id
+        ]
+        if not history:
+            return None
+        recent = history[-4:]
+        rendered: list[str] = []
+        for message in recent:
+            speaker = "Florence" if message.sender_role == ChannelMessageRole.ASSISTANT else "Parent"
+            body = " ".join(message.body.split()).strip()
+            if body:
+                rendered.append(f"{speaker}: {body}")
+        if not rendered:
+            return None
+        return "\n".join(rendered)
+
     def _handle_dm_message(self, resolved: FlorenceResolvedInboundMessage) -> FlorenceMessagingIngressResult:
         text = resolved.message.body.strip()
         if not text:
             return FlorenceMessagingIngressResult(consumed=True)
         member_id = _require_member_id(resolved.member_id)
+        capture_kind = self._capture_kind_for_message(text)
         session = self.onboarding_service.get_or_create_session(
             household_id=resolved.household_id,
             member_id=member_id,
             thread_id=resolved.thread_id,
         )
+
+        promotable_message = self._latest_promotable_group_message(channel_id=resolved.channel_id)
+        if promotable_message is not None and _looks_like_group_share_request(text):
+            promotable_group_message = str(promotable_message.metadata.get("promotable_group_message") or "").strip()
+            current_channel = self.store.get_channel(resolved.channel_id)
+            provider = current_channel.provider if current_channel is not None else resolved.message.provider
+            group_channel = next(
+                (
+                    channel
+                    for channel in self.store.list_channels(
+                        household_id=resolved.household_id,
+                        channel_type=ChannelType.HOUSEHOLD_GROUP,
+                    )
+                    if channel.provider == provider
+                ),
+                None,
+            )
+            if group_channel is None:
+                return FlorenceMessagingIngressResult(
+                    reply_text="I can share that once the parent group is active.",
+                    consumed=True,
+                )
+            if promotable_message.metadata.get("promoted_to_group_at"):
+                return FlorenceMessagingIngressResult(
+                    reply_text="I already shared that with the parent group.",
+                    consumed=True,
+                )
+            self.store.append_channel_message(
+                replace(
+                    promotable_message,
+                    metadata={
+                        **dict(promotable_message.metadata),
+                        "promoted_to_group_at": datetime.now(timezone.utc).isoformat(),
+                        "promoted_group_channel_id": group_channel.id,
+                    },
+                )
+            )
+            return FlorenceMessagingIngressResult(
+                reply_text="Shared a short version with the parent group.",
+                group_announcement=promotable_group_message,
+                consumed=True,
+            )
+        if promotable_message is None and _looks_like_group_share_request(text) and self.household_chat_service is not None:
+            current_channel = self.store.get_channel(resolved.channel_id)
+            provider = current_channel.provider if current_channel is not None else resolved.message.provider
+            group_channel = next(
+                (
+                    channel
+                    for channel in self.store.list_channels(
+                        household_id=resolved.household_id,
+                        channel_type=ChannelType.HOUSEHOLD_GROUP,
+                    )
+                    if channel.provider == provider
+                ),
+                None,
+            )
+            if group_channel is None:
+                return FlorenceMessagingIngressResult(
+                    reply_text="I can share that once the parent group is active.",
+                    consumed=True,
+                )
+            source_text = self._recent_exchange_for_group_promotion(
+                channel_id=resolved.channel_id,
+                current_provider=resolved.message.provider,
+                current_message_id=resolved.message.message_id,
+            )
+            if source_text is None:
+                return FlorenceMessagingIngressResult(
+                    reply_text="There is not a clean update to share from that DM yet.",
+                    consumed=True,
+                )
+            shared_summary = self.household_chat_service.compose_group_promotion(
+                household_id=resolved.household_id,
+                channel_id=resolved.channel_id,
+                actor_member_id=resolved.member_id,
+                source_text=source_text,
+            )
+            if not shared_summary or not shared_summary.strip():
+                return FlorenceMessagingIngressResult(
+                    reply_text="There is not a clean update to share from that DM yet.",
+                    consumed=True,
+                )
+            return FlorenceMessagingIngressResult(
+                reply_text="Shared a short version with the parent group.",
+                group_announcement=shared_summary.strip(),
+                consumed=True,
+            )
+
+        if capture_kind is not None and self.household_chat_service is not None:
+            history = self.store.list_channel_messages(channel_id=resolved.channel_id, limit=24)
+            reply = self.household_chat_service.handle_capture_request(
+                household_id=resolved.household_id,
+                channel_id=resolved.channel_id,
+                actor_member_id=resolved.member_id,
+                message_text=resolved.message.body,
+                capture_kind=capture_kind,
+                conversation_history=history[:-1] if history else None,
+            )
+            if reply is not None and reply.text.strip():
+                return FlorenceMessagingIngressResult(reply_text=reply.text, consumed=True)
 
         review_prompt = None
         if session.is_grounded_for_google_matching:
@@ -564,18 +733,29 @@ class FlorenceMessagingIngressService:
                         )
                     if self.household_chat_service is not None:
                         history = self.store.list_channel_messages(channel_id=resolved.channel_id, limit=24)
-                        reply = self.household_chat_service.respond(
-                            household_id=resolved.household_id,
-                            channel_id=resolved.channel_id,
-                            actor_member_id=resolved.member_id,
-                            message_text=(
-                                "Context for this turn: the first Gmail and Calendar sync is still running. "
-                                "If the user asks for information that depends on synced inbox or calendar data, say that it is still syncing. "
-                                "For everything else, help normally.\n\n"
-                                f"User message: {resolved.message.body}"
-                            ),
-                            conversation_history=history[:-1] if history else None,
+                        contextual_message = (
+                            "Context for this turn: the first Gmail and Calendar sync is still running. "
+                            "If the user asks for information that depends on synced inbox or calendar data, say that it is still syncing. "
+                            "For everything else, help normally.\n\n"
+                            f"User message: {resolved.message.body}"
                         )
+                        if capture_kind is not None:
+                            reply = self.household_chat_service.handle_capture_request(
+                                household_id=resolved.household_id,
+                                channel_id=resolved.channel_id,
+                                actor_member_id=resolved.member_id,
+                                message_text=contextual_message,
+                                capture_kind=capture_kind,
+                                conversation_history=history[:-1] if history else None,
+                            )
+                        else:
+                            reply = self.household_chat_service.respond(
+                                household_id=resolved.household_id,
+                                channel_id=resolved.channel_id,
+                                actor_member_id=resolved.member_id,
+                                message_text=contextual_message,
+                                conversation_history=history[:-1] if history else None,
+                            )
                         if reply is not None and reply.text.strip():
                             return FlorenceMessagingIngressResult(reply_text=reply.text, consumed=True)
                     return self._result_with_messages(
@@ -1079,15 +1259,26 @@ class FlorenceMessagingIngressService:
                 consumed=True,
             )
 
+        capture_kind = self._capture_kind_for_message(resolved.message.body)
         if self.household_chat_service is not None:
             history = self.store.list_channel_messages(channel_id=resolved.channel_id, limit=24)
-            reply = self.household_chat_service.respond(
-                household_id=resolved.household_id,
-                channel_id=resolved.channel_id,
-                actor_member_id=resolved.member_id,
-                message_text=resolved.message.body,
-                conversation_history=history[:-1] if history else None,
-            )
+            if capture_kind is not None:
+                reply = self.household_chat_service.handle_capture_request(
+                    household_id=resolved.household_id,
+                    channel_id=resolved.channel_id,
+                    actor_member_id=resolved.member_id,
+                    message_text=resolved.message.body,
+                    capture_kind=capture_kind,
+                    conversation_history=history[:-1] if history else None,
+                )
+            else:
+                reply = self.household_chat_service.respond(
+                    household_id=resolved.household_id,
+                    channel_id=resolved.channel_id,
+                    actor_member_id=resolved.member_id,
+                    message_text=resolved.message.body,
+                    conversation_history=history[:-1] if history else None,
+                )
             if reply is not None and reply.text.strip():
                 return FlorenceMessagingIngressResult(reply_text=reply.text, consumed=True)
 

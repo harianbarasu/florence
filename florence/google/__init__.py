@@ -7,6 +7,7 @@ from florence.google.oauth import (
     encode_google_oauth_state,
     exchange_google_code_for_tokens,
     fetch_google_user_email,
+    list_google_calendars,
     fetch_primary_google_calendar,
     refresh_google_access_token,
 )
@@ -50,6 +51,7 @@ __all__ = [
     "encode_google_oauth_state",
     "exchange_google_code_for_tokens",
     "fetch_google_user_email",
+    "list_google_calendars",
     "fetch_primary_google_calendar",
     "list_recent_gmail_sync_items",
     "list_recent_parent_calendar_sync_items",

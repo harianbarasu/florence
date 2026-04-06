@@ -25,8 +25,7 @@ export function GoogleSignInCard({
           <div>
             <h1 className="text-xl font-semibold">Sign in to get started</h1>
             <p className="mt-2 text-sm leading-relaxed text-muted-foreground">
-              Florence needs your Google account to connect Gmail and Calendar
-              for your household.
+              Florence is your household manager over text. Start with Google so it can learn from Gmail and Calendar, then help with the family schedule, school noise, reminders, planning, and the invisible work that keeps the house running.
             </p>
           </div>
           <form action={startGoogleSignIn} className="w-full">

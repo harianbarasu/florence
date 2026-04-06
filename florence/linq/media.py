@@ -137,8 +137,11 @@ def _extract_image_text_with_gpt(*, image_bytes: bytes, mime_type: str, filename
                         {
                             "type": "input_text",
                             "text": (
-                                "Extract useful logistics text from this screenshot/image. Focus on names, dates, times, "
-                                "locations, tasks, and deadlines. Keep it concise."
+                                "Extract useful household context from this screenshot or image. "
+                                "If it contains text, focus on names, dates, times, locations, tasks, deadlines, and required items. "
+                                "For school flyers, forms, or logistics screenshots, also call out permission slips, uniforms, materials to bring, follow-up actions, and who the update is from when visible. "
+                                "If it is a pantry, fridge, grocery, meal, or food photo, list the visible ingredients, groceries, or meal-relevant items. "
+                                "Return concise plain text that helps Florence handle logistics or meal and grocery planning."
                             ),
                         }
                     ],
@@ -340,4 +343,3 @@ def enrich_linq_payload_with_media_text(
         }
     )
     return True
-

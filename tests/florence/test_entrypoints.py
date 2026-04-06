@@ -1,6 +1,8 @@
 from urllib.parse import parse_qs, urlparse
 
+from florence.contracts import ChannelType
 from florence.google import GoogleCalendarMetadata, GoogleTokenResponse
+from florence.messaging import FlorenceMessagingIngressResult
 from florence.onboarding import OnboardingVariant
 from florence.runtime import FlorenceEntrypointService, FlorenceGoogleOauthConfig
 from florence.state import FlorenceStateDB
@@ -178,13 +180,16 @@ def test_entrypoints_google_callback_returns_next_prompt(tmp_path, monkeypatch):
     )
     monkeypatch.setattr("florence.runtime.services.fetch_google_user_email", lambda **_: "parent@example.com")
     monkeypatch.setattr(
-        "florence.runtime.services.fetch_primary_google_calendar",
-        lambda **_: GoogleCalendarMetadata(
-            id="primary",
-            summary="Family",
-            timezone="America/Los_Angeles",
-            access_role="owner",
-        ),
+        "florence.runtime.services.list_google_calendars",
+        lambda **_: [
+            GoogleCalendarMetadata(
+                id="primary",
+                summary="Family",
+                timezone="America/Los_Angeles",
+                access_role="owner",
+                primary=True,
+            )
+        ],
     )
 
     result = service.handle_google_oauth_callback(code="auth-code", state=raw_state)
@@ -255,4 +260,53 @@ def test_entrypoints_ignores_partial_linq_payloads(tmp_path):
 
     assert result.consumed is False
     assert result.error == "linq_message_id_required"
+    store.close()
+
+
+def test_entrypoints_sendblue_group_persists_group_id_on_channel(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    service = FlorenceEntrypointService(store)
+
+    first = service.handle_sendblue_payload(
+        {
+            "content": "Maya",
+            "is_outbound": False,
+            "status": "RECEIVED",
+            "message_handle": "msg_dm_123",
+            "from_number": "+15555550123",
+            "number": "+15555550123",
+            "to_number": "+15122164639",
+            "sendblue_number": "+15122164639",
+            "service": "iMessage",
+        }
+    )
+    assert first.household_id is not None
+
+    service.ingress.handle_message = lambda _resolved: FlorenceMessagingIngressResult(reply_text="Hi group", consumed=True)  # type: ignore[method-assign]
+
+    result = service.handle_sendblue_payload(
+        {
+            "content": "hey Florence",
+            "is_outbound": False,
+            "status": "RECEIVED",
+            "message_handle": "msg_group_123",
+            "from_number": "+15555550123",
+            "number": "+15555550123",
+            "to_number": "+15122164639",
+            "sendblue_number": "+15122164639",
+            "group_id": "group_123456",
+            "participants": ["+15555550123", "+15555550124", "+15122164639"],
+            "service": "iMessage",
+        }
+    )
+
+    assert result.consumed is True
+    channel = store.get_channel_by_provider_id(
+        provider="sendblue",
+        provider_channel_id="+15122164639|group:group_123456",
+    )
+    assert channel is not None
+    assert channel.channel_type == ChannelType.HOUSEHOLD_GROUP
+    assert channel.metadata["group_id"] == "group_123456"
+    assert channel.metadata["sendblue_number"] == "+15122164639"
     store.close()

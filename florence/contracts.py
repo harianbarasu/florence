@@ -126,6 +126,7 @@ class HouseholdShoppingItemStatus(StrEnum):
 class HouseholdBriefingKind(StrEnum):
     MORNING = "morning"
     EVENING = "evening"
+    WEEKLY = "weekly"
 
 
 @dataclass(slots=True)

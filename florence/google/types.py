@@ -30,6 +30,9 @@ class GoogleCalendarMetadata:
     summary: str
     timezone: str
     access_role: str | None = None
+    primary: bool = False
+    selected: bool = True
+    hidden: bool = False
 
 
 @dataclass(slots=True)
@@ -59,3 +62,7 @@ class ParentCalendarSyncItem:
     updated_at: datetime | None
     calendar_summary: str | None
     family_member_names: list[str]
+    calendar_id: str | None = None
+    calendar_primary: bool = False
+    usage_mode: str | None = None
+    detail_visibility: str | None = None

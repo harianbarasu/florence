@@ -33,18 +33,20 @@ def test_state_db_round_trips_onboarding_google_and_candidates(tmp_path):
         household_id="hh_123",
         member_id="mem_123",
         thread_id="thread_dm_123",
-        stage=OnboardingStage.COLLECT_ACTIVITY_BASICS,
+        stage=OnboardingStage.COLLECT_CHILD_ACTIVITIES,
         parent_display_name="Maya",
         google_connected=True,
         child_names=["Ava"],
-        school_labels=["Roosevelt Elementary"],
-        activity_labels=["Soccer"],
-        school_basics_collected=True,
-        activity_basics_collected=True,
         metadata={
             "variant": OnboardingVariant.HYBRID.value,
-            "household_operations": ["school forms", "returns"],
-            "nudge_preferences": "Day before and morning of",
+            "child_profiles": [
+                {
+                    "name": "Ava",
+                    "age": "7",
+                    "school": "Roosevelt Elementary",
+                    "activities": ["Soccer"],
+                }
+            ],
         },
     )
     connection = GoogleConnection(

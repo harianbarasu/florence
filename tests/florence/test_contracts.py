@@ -42,11 +42,13 @@ def test_onboarding_state_is_not_grounded_without_school_or_activity_basics():
         household_id="hh_123",
         member_id="mem_123",
         thread_id="thread_123",
-        stage=OnboardingStage.COLLECT_SCHOOL_BASICS,
+        stage=OnboardingStage.COLLECT_CHILD_SCHOOL,
         google_connected=True,
         child_names=["Noah"],
     )
     assert state.is_grounded_for_google_matching is False
 
-    state.activity_labels.append("Soccer")
+    state.metadata["child_profiles"] = [
+        {"name": "Noah", "activities": ["Soccer"]},
+    ]
     assert state.is_grounded_for_google_matching is True

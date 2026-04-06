@@ -8,7 +8,7 @@ import logging
 import os
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Callable
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from florence.config import FlorenceSettings
@@ -159,64 +159,6 @@ class _FlorenceRequestHandler(BaseHTTPRequestHandler):
             )
             self._write_response(result)
             return
-        if parsed.path in {"/florence/onboarding", "/v1/florence/onboarding"}:
-            query = parse_qs(parsed.query)
-            result = self._service().handle_onboarding_page(
-                token=self._query_value(query, "token"),
-                status_message=self._query_value(query, "status"),
-            )
-            self._write_response(result)
-            return
-        if parsed.path == "/v1/web/session":
-            query = parse_qs(parsed.query)
-            result = self._service().handle_web_session(
-                token=self._query_value(query, "token"),
-                auth_email=self._query_value(query, "email") or self.headers.get("x-florence-auth-email"),
-            )
-            self._write_response(result)
-            return
-        if parsed.path == "/v1/web/setup":
-            query = parse_qs(parsed.query)
-            result = self._service().handle_web_setup(
-                token=self._query_value(query, "token"),
-                auth_email=self._query_value(query, "email") or self.headers.get("x-florence-auth-email"),
-            )
-            self._write_response(result)
-            return
-        if parsed.path == "/v1/web/google/connections":
-            query = parse_qs(parsed.query)
-            result = self._service().handle_web_google_connections(
-                token=self._query_value(query, "token"),
-                auth_email=self._query_value(query, "email") or self.headers.get("x-florence-auth-email"),
-            )
-            self._write_response(result)
-            return
-        if parsed.path == "/v1/web/review":
-            query = parse_qs(parsed.query)
-            result = self._service().handle_web_review(
-                token=self._query_value(query, "token"),
-                auth_email=self._query_value(query, "email") or self.headers.get("x-florence-auth-email"),
-            )
-            self._write_response(result)
-            return
-        if parsed.path == "/v1/web/calendar":
-            query = parse_qs(parsed.query)
-            result = self._service().handle_web_calendar(
-                token=self._query_value(query, "token"),
-                auth_email=self._query_value(query, "email") or self.headers.get("x-florence-auth-email"),
-                start=self._query_value(query, "start"),
-                end=self._query_value(query, "end"),
-            )
-            self._write_response(result)
-            return
-        if parsed.path == "/v1/web/settings":
-            query = parse_qs(parsed.query)
-            result = self._service().handle_web_settings(
-                token=self._query_value(query, "token"),
-                auth_email=self._query_value(query, "email") or self.headers.get("x-florence-auth-email"),
-            )
-            self._write_response(result)
-            return
         self.send_error(404, "not_found")
 
     def do_POST(self) -> None:  # noqa: N802
@@ -261,68 +203,6 @@ class _FlorenceRequestHandler(BaseHTTPRequestHandler):
             )
             self._write_response(result)
             return
-        if parsed.path in {"/florence/onboarding", "/v1/florence/onboarding"}:
-            form = self._parse_form_body(self._read_raw_body())
-            result = self._service().handle_onboarding_submission(
-                token=form.get("token"),
-                form_data=form,
-            )
-            self._write_response(result)
-            return
-        if parsed.path == "/v1/web/setup/profile":
-            self._handle_json_post(
-                lambda payload: self._service().handle_web_setup_profile(
-                    payload=payload,
-                    token=str(payload.get("token") or "") or None,
-                    auth_email=str(payload.get("authEmail") or self.headers.get("x-florence-auth-email") or "") or None,
-                )
-            )
-            return
-        if parsed.path == "/v1/web/google/start":
-            self._handle_json_post(
-                lambda payload: self._service().handle_web_google_start(
-                    token=str(payload.get("token") or "") or None,
-                    auth_email=str(payload.get("authEmail") or self.headers.get("x-florence-auth-email") or "") or None,
-                ),
-                allow_empty=True,
-            )
-            return
-        if parsed.path == "/v1/web/google/add-account":
-            self._handle_json_post(
-                lambda payload: self._service().handle_web_google_add_account(
-                    token=str(payload.get("token") or "") or None,
-                    auth_email=str(payload.get("authEmail") or self.headers.get("x-florence-auth-email") or "") or None,
-                ),
-                allow_empty=True,
-            )
-            return
-        if parsed.path == "/v1/web/google/disconnect":
-            self._handle_json_post(
-                lambda payload: self._service().handle_web_google_disconnect(
-                    payload=payload,
-                    token=str(payload.get("token") or "") or None,
-                    auth_email=str(payload.get("authEmail") or self.headers.get("x-florence-auth-email") or "") or None,
-                )
-            )
-            return
-        if parsed.path == "/v1/web/settings":
-            self._handle_json_post(
-                lambda payload: self._service().handle_web_settings_update(
-                    payload=payload,
-                    token=str(payload.get("token") or "") or None,
-                    auth_email=str(payload.get("authEmail") or self.headers.get("x-florence-auth-email") or "") or None,
-                )
-            )
-            return
-        if parsed.path == "/v1/web/review":
-            self._handle_json_post(
-                lambda payload: self._service().handle_web_review_action(
-                    payload=payload,
-                    token=str(payload.get("token") or "") or None,
-                    auth_email=str(payload.get("authEmail") or self.headers.get("x-florence-auth-email") or "") or None,
-                )
-            )
-            return
         self.send_error(404, "not_found")
 
     def log_message(self, format: str, *args) -> None:  # noqa: A003
@@ -331,28 +211,6 @@ class _FlorenceRequestHandler(BaseHTTPRequestHandler):
     def _read_raw_body(self) -> bytes:
         content_length = int(self.headers.get("content-length") or "0")
         return self.rfile.read(content_length) if content_length > 0 else b"{}"
-
-    def _read_json_body(self) -> dict:
-        return self._parse_json_body(self._read_raw_body())
-
-    def _handle_json_post(
-        self,
-        handler: Callable[[dict], FlorenceHTTPResult],
-        *,
-        allow_empty: bool = False,
-    ) -> None:
-        try:
-            payload = self._read_json_body() if not allow_empty else self._parse_optional_json_body(self._read_raw_body())
-        except ValueError as exc:
-            self._write_response(
-                FlorenceHTTPResult(
-                    status_code=400,
-                    content_type="application/json; charset=utf-8",
-                    body=json.dumps({"ok": False, "error": str(exc)}),
-                )
-            )
-            return
-        self._write_response(handler(payload))
 
     @staticmethod
     def _parse_json_body(raw: bytes) -> dict:
@@ -363,20 +221,6 @@ class _FlorenceRequestHandler(BaseHTTPRequestHandler):
         if not isinstance(parsed, dict):
             raise ValueError("json_body_must_be_object")
         return parsed
-
-    @staticmethod
-    def _parse_optional_json_body(raw: bytes) -> dict:
-        if not raw.strip():
-            return {}
-        return _FlorenceRequestHandler._parse_json_body(raw)
-
-    @staticmethod
-    def _parse_form_body(raw: bytes) -> dict[str, str]:
-        parsed = parse_qs(raw.decode("utf-8"), keep_blank_values=True)
-        return {
-            key: values[0] if values else ""
-            for key, values in parsed.items()
-        }
 
     def _write_response(self, result: FlorenceHTTPResult) -> None:
         body_bytes = result.body.encode("utf-8")

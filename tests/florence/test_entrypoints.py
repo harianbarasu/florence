@@ -1,10 +1,9 @@
-from urllib.parse import parse_qs, urlparse
-
+from florence.config import FlorenceGoogleRuntimeConfig
 from florence.contracts import ChannelType
-from florence.google import GoogleCalendarMetadata, GoogleTokenResponse
 from florence.messaging import FlorenceMessagingIngressResult
 from florence.onboarding import OnboardingVariant
-from florence.runtime import FlorenceEntrypointService, FlorenceGoogleOauthConfig
+from florence.runtime.chat import FlorenceHouseholdChatService
+from florence.runtime import FlorenceEntrypointService
 from florence.state import FlorenceStateDB
 
 
@@ -30,9 +29,21 @@ def _linq_payload(*, message_id: str, text: str, chat_id: str, sender: str, is_g
     }
 
 
+def _build_entrypoints(store: FlorenceStateDB, **kwargs) -> FlorenceEntrypointService:
+    kwargs.setdefault(
+        "household_chat_service",
+        FlorenceHouseholdChatService(
+            store,
+            model="openai/gpt-5.4",
+            provider="custom",
+        ),
+    )
+    return FlorenceEntrypointService(store, **kwargs)
+
+
 def test_entrypoints_group_without_resolved_household_returns_dm_first_message(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
-    service = FlorenceEntrypointService(store)
+    service = _build_entrypoints(store)
 
     result = service.handle_linq_payload(
         _linq_payload(
@@ -52,9 +63,9 @@ def test_entrypoints_group_without_resolved_household_returns_dm_first_message(t
 
 def test_entrypoints_hybrid_onboarding_offers_google_link_immediately_after_name(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
-    service = FlorenceEntrypointService(
+    service = _build_entrypoints(
         store,
-        google_oauth=FlorenceGoogleOauthConfig(
+        google_oauth=FlorenceGoogleRuntimeConfig(
             client_id="client-id",
             client_secret="client-secret",
             redirect_uri="https://example.com/callback",
@@ -79,93 +90,30 @@ def test_entrypoints_hybrid_onboarding_offers_google_link_immediately_after_name
         "Connect your Google account so I can pull the last 30 days of family email and calendar in the background while we keep going here."
     )
     assert first.reply_messages[3].startswith("https://accounts.google.com/")
-    assert first.reply_messages[-1] == "What are your kids' names? One per line or comma-separated is fine."
+    assert first.reply_messages[-1] == "What are your kids' names? Send all of them in one message, one per line or comma-separated."
     store.close()
 
 
-def test_entrypoints_google_callback_returns_next_prompt(tmp_path, monkeypatch):
+def test_entrypoints_uses_injected_household_chat_service(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
+    household_chat_service = FlorenceHouseholdChatService(
+        store,
+        model="openai/gpt-5.4",
+        provider="custom",
+    )
     service = FlorenceEntrypointService(
         store,
-        google_oauth=FlorenceGoogleOauthConfig(
-            client_id="client-id",
-            client_secret="client-secret",
-            redirect_uri="https://example.com/callback",
-            state_secret="state-secret",
-        ),
-    )
-    service.onboarding_service.variant_selector = lambda _household_id, _member_id: OnboardingVariant.HYBRID
-
-    first = service.handle_linq_payload(
-        _linq_payload(
-            message_id="msg_1",
-            text="Maya",
-            chat_id="dm-thread-123",
-            sender="+15555550123",
-            is_group=False,
-        )
-    )
-    household_id = first.household_id or ""
-    member_id = first.member_id or ""
-    service.onboarding_service.record_child_names(
-        household_id=household_id,
-        member_id=member_id,
-        thread_id="dm-thread-123",
-        child_names=["Ava"],
-    )
-    link = service.google_account_link_service.build_connect_link(
-        household_id=household_id,
-        member_id=member_id,
-        thread_id="dm-thread-123",
-    )
-    raw_state = parse_qs(urlparse(link.url).query)["state"][0]
-
-    monkeypatch.setattr(
-        "florence.runtime.services.exchange_google_code_for_tokens",
-        lambda **_: GoogleTokenResponse(
-            access_token="access-token",
-            refresh_token="refresh-token",
-            expires_in=3600,
-        ),
-    )
-    monkeypatch.setattr("florence.runtime.services.fetch_google_user_email", lambda **_: "parent@example.com")
-    monkeypatch.setattr(
-        "florence.runtime.services.list_google_calendars",
-        lambda **_: [
-            GoogleCalendarMetadata(
-                id="primary",
-                summary="Family",
-                timezone="America/Los_Angeles",
-                access_role="owner",
-                primary=True,
-            )
-        ],
+        household_chat_service=household_chat_service,
     )
 
-    result = service.handle_google_oauth_callback(code="auth-code", state=raw_state)
-
-    assert result.consumed is True
-    assert result.reply_text is not None
-    assert "how old is ava" in result.reply_text.lower()
-    store.close()
-
-
-def test_entrypoints_threads_household_chat_provider(tmp_path):
-    store = FlorenceStateDB(tmp_path / "florence.db")
-    service = FlorenceEntrypointService(
-        store,
-        household_chat_model="openai/gpt-5.4",
-        household_chat_provider="custom",
-    )
-
-    assert service.household_chat_service is not None
+    assert service.household_chat_service is household_chat_service
     assert service.household_chat_service.provider == "custom"
     store.close()
 
 
 def test_entrypoints_ignores_linq_delivery_events(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
-    service = FlorenceEntrypointService(store)
+    service = _build_entrypoints(store)
 
     result = service.handle_linq_payload(
         {
@@ -190,7 +138,7 @@ def test_entrypoints_ignores_linq_delivery_events(tmp_path):
 
 def test_entrypoints_ignores_partial_linq_payloads(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
-    service = FlorenceEntrypointService(store)
+    service = _build_entrypoints(store)
 
     result = service.handle_linq_payload(
         {
@@ -215,7 +163,7 @@ def test_entrypoints_ignores_partial_linq_payloads(tmp_path):
 
 def test_entrypoints_sendblue_group_persists_group_id_on_channel(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
-    service = FlorenceEntrypointService(store)
+    service = _build_entrypoints(store)
 
     first = service.handle_sendblue_payload(
         {

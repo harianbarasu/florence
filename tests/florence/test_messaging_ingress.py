@@ -1,11 +1,10 @@
 from florence.messaging import (
     FlorenceInboundMessage,
     FlorenceMessagingIngressService,
-    FlorenceMessagingIngressResult,
     FlorenceResolvedInboundMessage,
 )
+from florence.messaging.protocol_types import CANDIDATE_REVIEW_PROMPT_KIND
 from datetime import datetime, timedelta, timezone
-import time
 
 from florence.contracts import (
     CandidateState,
@@ -29,7 +28,6 @@ from florence.contracts import (
 from florence.onboarding import OnboardingVariant
 from florence.runtime import (
     FlorenceCandidateReviewService,
-    FlorenceHouseholdQueryService,
     FlorenceIdentityResolver,
     FlorenceOnboardingSessionService,
 )
@@ -44,34 +42,23 @@ class _StubGoogleAccountLinkService:
         return _Link()
 
 
-class _StubOnboardingLinkService:
-    def build_link(self, *, household_id: str, member_id: str, thread_id: str):
-        class _Link:
-            url = "https://florence.example.com/v1/florence/onboarding?token=test-token"
-
-        return _Link()
-
-
 class _StubHouseholdChatService:
     def __init__(
         self,
         reply_text: str,
         *,
         promotion_text: str | None = None,
-        capture_reply_text: str | None = None,
         review_prompt_text: str | None = None,
         sync_waiting_text: str | None = None,
     ):
         self.reply_text = reply_text
         self.promotion_text = promotion_text
-        self.capture_reply_text = capture_reply_text or reply_text
-        self.review_prompt_text = review_prompt_text or (
-            "This looks worth double-checking. Reply yes if I should add it, no if it's wrong, or skip for later."
+        self.review_prompt_text = review_prompt_text
+        self.sync_waiting_text = sync_waiting_text or (
+            "Google is connected. I’m syncing the last 30 days of your email and calendar in the background now, and I’ll text you here when the first pass is ready."
         )
-        self.sync_waiting_text = sync_waiting_text or reply_text
         self.calls = []
         self.promotion_calls = []
-        self.capture_calls = []
         self.review_prompt_calls = []
         self.sync_waiting_calls = []
 
@@ -117,32 +104,6 @@ class _StubHouseholdChatService:
         )
         return self.promotion_text
 
-    def handle_capture_request(
-        self,
-        *,
-        household_id: str,
-        channel_id: str,
-        actor_member_id: str | None,
-        message_text: str,
-        capture_kind: str,
-        conversation_history=None,
-    ):
-        self.capture_calls.append(
-            {
-                "household_id": household_id,
-                "channel_id": channel_id,
-                "actor_member_id": actor_member_id,
-                "message_text": message_text,
-                "capture_kind": capture_kind,
-                "conversation_history": conversation_history or [],
-            }
-        )
-
-        class _Reply:
-            text = self.capture_reply_text
-
-        return _Reply()
-
     def compose_review_prompt(
         self,
         *,
@@ -158,10 +119,18 @@ class _StubHouseholdChatService:
                 "channel_id": channel_id,
                 "actor_member_id": actor_member_id,
                 "candidate_id": getattr(candidate, "id", None),
+                "candidate_title": getattr(candidate, "title", None),
                 "source_prompt": source_prompt,
             }
         )
-        return self.review_prompt_text
+        if self.review_prompt_text is not None:
+            return self.review_prompt_text
+        title = " ".join(str(getattr(candidate, "title", "") or "").split()).strip()
+        lines = [title or "This looks worth double-checking."]
+        if source_prompt:
+            lines.append(source_prompt.strip())
+        lines.append("Reply yes if I should add it, no if it's wrong, or skip for later.")
+        return " ".join(line for line in lines if line)
 
     def compose_sync_waiting_reply(
         self,
@@ -193,6 +162,34 @@ def _build_hybrid_onboarding_service(store, review_service):
         store,
         candidate_review_service=review_service,
         variant_selector=lambda _household_id, _member_id: OnboardingVariant.HYBRID,
+    )
+
+
+def _build_ingress(
+    store,
+    onboarding_service,
+    review_service,
+    **kwargs,
+):
+    google_account_link_service = kwargs.pop("google_account_link_service", None)
+    onboarding_service.set_link_url_builder(
+        None
+        if google_account_link_service is None
+        else lambda household_id, member_id, thread_id: google_account_link_service.build_connect_link(
+            household_id=household_id,
+            member_id=member_id,
+            thread_id=thread_id,
+        ).url
+    )
+    kwargs.setdefault(
+        "household_chat_service",
+        _StubHouseholdChatService("I can keep planning with you here."),
+    )
+    return FlorenceMessagingIngressService(
+        store,
+        onboarding_service,
+        review_service,
+        **kwargs,
     )
 
 
@@ -238,11 +235,10 @@ def test_dm_parent_name_reply_includes_friendly_google_link(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)
     onboarding_service = _build_hybrid_onboarding_service(store, review_service)
-    ingress = FlorenceMessagingIngressService(
+    ingress = _build_ingress(
         store,
         onboarding_service,
         review_service,
-        FlorenceHouseholdQueryService(store),
         google_account_link_service=_StubGoogleAccountLinkService(),
     )
 
@@ -272,22 +268,20 @@ def test_dm_parent_name_reply_includes_friendly_google_link(tmp_path):
         "Connect your Google account so I can pull the last 30 days of family email and calendar in the background while we keep going here.",
         "https://example.com/google/connect",
         "Once Google says you're connected, come right back here. You can also keep answering my questions while it runs.",
-        "What are your kids' names? One per line or comma-separated is fine.",
+        "What are your kids' names? Send all of them in one message, one per line or comma-separated.",
     )
     store.close()
 
 
-def test_dm_onboarding_debounces_successive_child_name_messages(tmp_path, monkeypatch):
+def test_dm_onboarding_replies_immediately_to_child_name_message(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)
     onboarding_service = _build_hybrid_onboarding_service(store, review_service)
-    ingress = FlorenceMessagingIngressService(
+    ingress = _build_ingress(
         store,
         onboarding_service,
         review_service,
-        FlorenceHouseholdQueryService(store),
         google_account_link_service=_StubGoogleAccountLinkService(),
-        onboarding_reply_debounce_seconds=8.0,
     )
 
     ingress.handle_message(
@@ -307,7 +301,7 @@ def test_dm_onboarding_debounces_successive_child_name_messages(tmp_path, monkey
         )
     )
 
-    first = ingress.handle_message(
+    result = ingress.handle_message(
         FlorenceResolvedInboundMessage(
             household_id="hh_123",
             member_id="mem_123",
@@ -323,62 +317,26 @@ def test_dm_onboarding_debounces_successive_child_name_messages(tmp_path, monkey
             ),
         )
     )
-    second = ingress.handle_message(
-        FlorenceResolvedInboundMessage(
-            household_id="hh_123",
-            member_id="mem_123",
-            channel_id="chan_dm_123",
-            thread_id="dm_thread_123",
-            message=FlorenceInboundMessage(
-                provider="linq",
-                message_id="msg_child_2",
-                thread_id="dm_thread_123",
-                sender_handle="+15555550123",
-                body="Ben",
-                is_group_chat=False,
-            ),
-        )
-    )
-
-    assert first.defer_reply is True
-    assert second.defer_reply is True
-    assert first.reply_messages == ()
-    assert second.reply_messages == ()
-
-    real_time = time.time
-    monkeypatch.setattr("florence.messaging.ingress.time.time", lambda: real_time() + 20)
-    flushed = ingress.flush_deferred_onboarding_reply(
-        household_id="hh_123",
-        member_id="mem_123",
-        channel_id="chan_dm_123",
-        thread_id="dm_thread_123",
-    )
 
     session = onboarding_service.get_or_create_session(
         household_id="hh_123",
         member_id="mem_123",
         thread_id="dm_thread_123",
     )
-    assert flushed == FlorenceMessagingIngressResult(
-        reply_text="Great, let's learn more about each kid one at a time. How old is Ava?",
-        reply_messages=("Great, let's learn more about each kid one at a time. How old is Ava?",),
-        consumed=True,
-    )
-    assert session.child_names == ["Ava", "Ben"]
+    assert result.reply_messages == ("Great, let's learn more about each kid one at a time. How old is Ava?",)
+    assert session.child_names == ["Ava"]
     store.close()
 
 
-def test_dm_onboarding_flush_handles_single_fragment_after_debounce(tmp_path, monkeypatch):
+def test_dm_onboarding_absorbs_fragmented_second_child_name_during_child_detail_collection(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)
     onboarding_service = _build_hybrid_onboarding_service(store, review_service)
-    ingress = FlorenceMessagingIngressService(
+    ingress = _build_ingress(
         store,
         onboarding_service,
         review_service,
-        FlorenceHouseholdQueryService(store),
         google_account_link_service=_StubGoogleAccountLinkService(),
-        onboarding_reply_debounce_seconds=8.0,
     )
 
     ingress.handle_message(
@@ -397,7 +355,7 @@ def test_dm_onboarding_flush_handles_single_fragment_after_debounce(tmp_path, mo
             ),
         )
     )
-    deferred = ingress.handle_message(
+    first = ingress.handle_message(
         FlorenceResolvedInboundMessage(
             household_id="hh_123",
             member_id="mem_123",
@@ -413,74 +371,6 @@ def test_dm_onboarding_flush_handles_single_fragment_after_debounce(tmp_path, mo
             ),
         )
     )
-
-    assert deferred.defer_reply is True
-    real_time = time.time
-    monkeypatch.setattr("florence.messaging.ingress.time.time", lambda: real_time() + 20)
-    flushed = ingress.flush_deferred_onboarding_reply(
-        household_id="hh_123",
-        member_id="mem_123",
-        channel_id="chan_dm_123",
-        thread_id="dm_thread_123",
-    )
-
-    assert flushed.reply_text == "Great, let's learn more about each kid one at a time. How old is Ava?"
-    store.close()
-
-
-def test_dm_onboarding_child_names_debounce_resets_but_hard_caps_total_wait(tmp_path, monkeypatch):
-    store = FlorenceStateDB(tmp_path / "florence.db")
-    review_service = FlorenceCandidateReviewService(store)
-    onboarding_service = _build_hybrid_onboarding_service(store, review_service)
-    ingress = FlorenceMessagingIngressService(
-        store,
-        onboarding_service,
-        review_service,
-        FlorenceHouseholdQueryService(store),
-        google_account_link_service=_StubGoogleAccountLinkService(),
-        onboarding_reply_debounce_seconds=4.0,
-        onboarding_reply_max_wait_seconds=8.0,
-    )
-
-    base_time = time.time()
-    monkeypatch.setattr("florence.messaging.ingress.time.time", lambda: base_time)
-    ingress.handle_message(
-        FlorenceResolvedInboundMessage(
-            household_id="hh_123",
-            member_id="mem_123",
-            channel_id="chan_dm_123",
-            thread_id="dm_thread_123",
-            message=FlorenceInboundMessage(
-                provider="linq",
-                message_id="msg_name_multi_0",
-                thread_id="dm_thread_123",
-                sender_handle="+15555550123",
-                body="Maya",
-                is_group_chat=False,
-            ),
-        )
-    )
-
-    first = ingress.handle_message(
-        FlorenceResolvedInboundMessage(
-            household_id="hh_123",
-            member_id="mem_123",
-            channel_id="chan_dm_123",
-            thread_id="dm_thread_123",
-            message=FlorenceInboundMessage(
-                provider="linq",
-                message_id="msg_name_multi_1",
-                thread_id="dm_thread_123",
-                sender_handle="+15555550123",
-                body="Ava",
-                is_group_chat=False,
-            ),
-        )
-    )
-    assert first.defer_reply is True
-    assert first.defer_seconds == 4.0
-
-    monkeypatch.setattr("florence.messaging.ingress.time.time", lambda: base_time + 3.0)
     second = ingress.handle_message(
         FlorenceResolvedInboundMessage(
             household_id="hh_123",
@@ -489,7 +379,7 @@ def test_dm_onboarding_child_names_debounce_resets_but_hard_caps_total_wait(tmp_
             thread_id="dm_thread_123",
             message=FlorenceInboundMessage(
                 provider="linq",
-                message_id="msg_name_multi_2",
+                message_id="msg_child_fragmented",
                 thread_id="dm_thread_123",
                 sender_handle="+15555550123",
                 body="Ben",
@@ -497,44 +387,15 @@ def test_dm_onboarding_child_names_debounce_resets_but_hard_caps_total_wait(tmp_
             ),
         )
     )
-    assert second.defer_reply is True
-    assert second.defer_seconds == 4.0
-
-    monkeypatch.setattr("florence.messaging.ingress.time.time", lambda: base_time + 6.2)
-    third = ingress.handle_message(
-        FlorenceResolvedInboundMessage(
-            household_id="hh_123",
-            member_id="mem_123",
-            channel_id="chan_dm_123",
-            thread_id="dm_thread_123",
-            message=FlorenceInboundMessage(
-                provider="linq",
-                message_id="msg_name_multi_3",
-                thread_id="dm_thread_123",
-                sender_handle="+15555550123",
-                body="Cara",
-                is_group_chat=False,
-            ),
-        )
-    )
-    assert third.defer_reply is True
-    assert 1.5 <= float(third.defer_seconds or 0.0) <= 2.0
-
-    monkeypatch.setattr("florence.messaging.ingress.time.time", lambda: base_time + 8.2)
-    flushed = ingress.flush_deferred_onboarding_reply(
-        household_id="hh_123",
-        member_id="mem_123",
-        channel_id="chan_dm_123",
-        thread_id="dm_thread_123",
-    )
 
     session = onboarding_service.get_or_create_session(
         household_id="hh_123",
         member_id="mem_123",
         thread_id="dm_thread_123",
     )
-    assert flushed.reply_text == "Great, let's learn more about each kid one at a time. How old is Ava?"
-    assert session.child_names == ["Ava", "Ben", "Cara"]
+    assert first.reply_messages == ("Great, let's learn more about each kid one at a time. How old is Ava?",)
+    assert second.reply_messages == ("Great, let's learn more about each kid one at a time. How old is Ava?",)
+    assert session.child_names == ["Ava", "Ben"]
     store.close()
 
 
@@ -542,13 +403,11 @@ def test_dm_onboarding_stays_in_messages_even_when_link_service_is_available(tmp
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)
     onboarding_service = _build_hybrid_onboarding_service(store, review_service)
-    ingress = FlorenceMessagingIngressService(
+    ingress = _build_ingress(
         store,
         onboarding_service,
         review_service,
-        FlorenceHouseholdQueryService(store),
         google_account_link_service=_StubGoogleAccountLinkService(),
-        onboarding_link_service=_StubOnboardingLinkService(),
     )
 
     result = ingress.handle_message(
@@ -579,24 +438,27 @@ def test_dm_onboarding_stays_in_messages_even_when_link_service_is_available(tmp
         "Connect your Google account so I can pull the last 30 days of family email and calendar in the background while we keep going here.",
         "https://example.com/google/connect",
         "Once Google says you're connected, come right back here. You can also keep answering my questions while it runs.",
-        "What are your kids' names? One per line or comma-separated is fine.",
+        "What are your kids' names? Send all of them in one message, one per line or comma-separated.",
     )
     assert session.parent_display_name == "Maya"
     assert session.stage == "collect_child_names"
     store.close()
 
 
-def test_dm_status_question_after_google_connect_returns_sync_progress_sequence(tmp_path):
+def test_dm_status_question_after_google_connect_falls_back_to_stock_sync_update_when_chat_is_empty(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)
     onboarding_service = _build_hybrid_onboarding_service(store, review_service)
-    ingress = FlorenceMessagingIngressService(
+    chat_service = _StubHouseholdChatService(
+        "",
+        sync_waiting_text="I’m still syncing in the background, but I’ll text you here when the first pass is ready.",
+    )
+    ingress = _build_ingress(
         store,
         onboarding_service,
         review_service,
-        FlorenceHouseholdQueryService(store),
+        household_chat_service=chat_service,
         google_account_link_service=_StubGoogleAccountLinkService(),
-        onboarding_link_service=_StubOnboardingLinkService(),
     )
 
     onboarding_service.record_parent_name(
@@ -628,24 +490,26 @@ def test_dm_status_question_after_google_connect_returns_sync_progress_sequence(
         )
     )
 
-    assert result.reply_messages == (
-        "Google is connected. I’m syncing the last 30 days of your email and calendar in the background now, and I’ll text you here when the first pass is ready.",
+    assert result.reply_text == (
+        "Google is connected. I’m syncing the last 30 days of your email and calendar in the background now, and I’ll text you here when the first pass is ready."
     )
+    assert chat_service.calls
+    assert chat_service.sync_waiting_calls == []
     store.close()
 
 
-def test_dm_status_question_after_google_connect_prefers_household_chat(tmp_path):
+def test_dm_status_question_after_google_connect_uses_household_chat_context(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)
     onboarding_service = _build_hybrid_onboarding_service(store, review_service)
     chat_service = _StubHouseholdChatService(
-        "I’m still syncing in the background, but I’ll text you here when the first pass is ready."
+        "I’m still syncing in the background, but I’ll text you here when the first pass is ready.",
+        sync_waiting_text="I’m still syncing in the background, but I’ll text you here when the first pass is ready.",
     )
-    ingress = FlorenceMessagingIngressService(
+    ingress = _build_ingress(
         store,
         onboarding_service,
         review_service,
-        FlorenceHouseholdQueryService(store),
         household_chat_service=chat_service,
     )
 
@@ -679,9 +543,61 @@ def test_dm_status_question_after_google_connect_prefers_household_chat(tmp_path
     )
 
     assert result.reply_text == "I’m still syncing in the background, but I’ll text you here when the first pass is ready."
+    assert chat_service.calls
+    assert "first Gmail and Calendar sync is still running" in chat_service.calls[0]["message_text"]
+    assert "What's the sync status?" in chat_service.calls[0]["message_text"]
+    assert chat_service.sync_waiting_calls == []
+    store.close()
+
+
+def test_dm_data_dependent_question_during_initial_sync_sets_data_dependent_flag(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_hybrid_onboarding_service(store, review_service)
+    chat_service = _StubHouseholdChatService(
+        "I’m still syncing, so I can’t answer from your calendar confidently yet.",
+        sync_waiting_text="I’m still syncing, so I can’t answer from your calendar confidently yet.",
+    )
+    ingress = _build_ingress(
+        store,
+        onboarding_service,
+        review_service,
+        household_chat_service=chat_service,
+    )
+
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+        display_name="Maya",
+    )
+    onboarding_service.record_google_connected(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+    )
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_sync_calendar_question",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="Can you check tomorrow's calendar?",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert result.reply_text == "I’m still syncing, so I can’t answer from your calendar confidently yet."
     assert chat_service.sync_waiting_calls
-    assert chat_service.sync_waiting_calls[0]["user_message"] == "What's the sync status?"
-    assert chat_service.sync_waiting_calls[0]["data_dependent"] is False
+    assert chat_service.sync_waiting_calls[0]["user_message"] == "Can you check tomorrow's calendar?"
+    assert chat_service.sync_waiting_calls[0]["data_dependent"] is True
     store.close()
 
 
@@ -689,11 +605,10 @@ def test_dm_share_reply_promotes_latest_brief_to_group(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)
     onboarding_service = _build_hybrid_onboarding_service(store, review_service)
-    ingress = FlorenceMessagingIngressService(
+    ingress = _build_ingress(
         store,
         onboarding_service,
         review_service,
-        FlorenceHouseholdQueryService(store),
     )
     store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
     store.upsert_member(
@@ -775,11 +690,10 @@ def test_dm_share_reply_can_compose_group_safe_summary_from_recent_dm(tmp_path):
         "I can keep planning with you here.",
         promotion_text="Household update: science fair is Friday and dinner is covered tonight.",
     )
-    ingress = FlorenceMessagingIngressService(
+    ingress = _build_ingress(
         store,
         onboarding_service,
         review_service,
-        FlorenceHouseholdQueryService(store),
         household_chat_service=chat_service,
     )
     store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
@@ -859,20 +773,18 @@ def test_dm_share_reply_can_compose_group_safe_summary_from_recent_dm(tmp_path):
     store.close()
 
 
-def test_completed_dm_meal_request_uses_capture_handler(tmp_path):
+def test_completed_dm_meal_request_routes_through_household_chat(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)
     onboarding_service = _build_hybrid_onboarding_service(store, review_service)
     _complete_hybrid_onboarding(onboarding_service)
     chat_service = _StubHouseholdChatService(
         "I can keep planning with you here.",
-        capture_reply_text="Handled: I planned three dinners and started the grocery list.",
     )
-    ingress = FlorenceMessagingIngressService(
+    ingress = _build_ingress(
         store,
         onboarding_service,
         review_service,
-        FlorenceHouseholdQueryService(store),
         household_chat_service=chat_service,
     )
     store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
@@ -913,33 +825,23 @@ def test_completed_dm_meal_request_uses_capture_handler(tmp_path):
     )
 
     assert result.consumed is True
-    assert result.reply_text == "Handled: I planned three dinners and started the grocery list."
-    assert len(chat_service.capture_calls) == 1
-    assert chat_service.capture_calls[0]["capture_kind"] == "meal and grocery"
-    assert chat_service.calls == []
+    assert result.reply_text == "I can keep planning with you here."
+    assert chat_service.calls[0]["message_text"] == "Can you plan dinners for this week and make the grocery list too?"
     store.close()
 
 
-def test_completed_group_media_message_uses_capture_handler(tmp_path):
+def test_completed_group_media_message_routes_through_household_chat(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)
     onboarding_service = _build_hybrid_onboarding_service(store, review_service)
     _complete_hybrid_onboarding(onboarding_service)
-    onboarding_service.record_group_activated(
-        household_id="hh_123",
-        member_id="mem_123",
-        thread_id="dm_thread_123",
-        group_channel_id="group_thread_123",
-    )
     chat_service = _StubHouseholdChatService(
         "I can keep planning with you here.",
-        capture_reply_text="Handled: I pulled two school events from the flyer and saved the follow-up items.",
     )
-    ingress = FlorenceMessagingIngressService(
+    ingress = _build_ingress(
         store,
         onboarding_service,
         review_service,
-        FlorenceHouseholdQueryService(store),
         household_chat_service=chat_service,
     )
     store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
@@ -984,10 +886,8 @@ def test_completed_group_media_message_uses_capture_handler(tmp_path):
     )
 
     assert result.consumed is True
-    assert result.reply_text == "Handled: I pulled two school events from the flyer and saved the follow-up items."
-    assert len(chat_service.capture_calls) == 1
-    assert chat_service.capture_calls[0]["capture_kind"] == "media logistics"
-    assert chat_service.calls == []
+    assert result.reply_text == "I can keep planning with you here."
+    assert "Media context extracted from attachments" in chat_service.calls[0]["message_text"]
     store.close()
 
 
@@ -995,13 +895,11 @@ def test_dm_acknowledgement_during_sync_does_not_loop_setup_messages(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)
     onboarding_service = _build_hybrid_onboarding_service(store, review_service)
-    ingress = FlorenceMessagingIngressService(
+    ingress = _build_ingress(
         store,
         onboarding_service,
         review_service,
-        FlorenceHouseholdQueryService(store),
         google_account_link_service=_StubGoogleAccountLinkService(),
-        onboarding_link_service=_StubOnboardingLinkService(),
     )
 
     onboarding_service.record_parent_name(
@@ -1044,13 +942,11 @@ def test_dm_substantive_message_during_sync_uses_household_chat_service(tmp_path
     review_service = FlorenceCandidateReviewService(store)
     onboarding_service = _build_hybrid_onboarding_service(store, review_service)
     chat_service = _StubHouseholdChatService("I can help you think through Friday pickup while the sync finishes.")
-    ingress = FlorenceMessagingIngressService(
+    ingress = _build_ingress(
         store,
         onboarding_service,
         review_service,
-        FlorenceHouseholdQueryService(store),
         google_account_link_service=_StubGoogleAccountLinkService(),
-        onboarding_link_service=_StubOnboardingLinkService(),
         household_chat_service=chat_service,
     )
 
@@ -1089,16 +985,63 @@ def test_dm_substantive_message_during_sync_uses_household_chat_service(tmp_path
     store.close()
 
 
+def test_dm_statement_during_sync_without_question_marker_still_falls_through_to_household_chat(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_hybrid_onboarding_service(store, review_service)
+    chat_service = _StubHouseholdChatService("I can help you sort out Friday pickup while the sync finishes.")
+    ingress = _build_ingress(
+        store,
+        onboarding_service,
+        review_service,
+        google_account_link_service=_StubGoogleAccountLinkService(),
+        household_chat_service=chat_service,
+    )
+
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+        display_name="Maya",
+    )
+    onboarding_service.record_google_connected(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+    )
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_sync_statement",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="I need help figuring out Friday pickup while this is syncing",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert result.consumed is True
+    assert result.reply_text == "I can help you sort out Friday pickup while the sync finishes."
+    assert "first Gmail and Calendar sync is still running" in chat_service.calls[0]["message_text"]
+    store.close()
+
+
 def test_complete_dm_routes_freeform_chat_through_household_chat_service(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)
     onboarding_service = _build_hybrid_onboarding_service(store, review_service)
     chat_service = _StubHouseholdChatService("I can keep planning with you here.")
-    ingress = FlorenceMessagingIngressService(
+    ingress = _build_ingress(
         store,
         onboarding_service,
         review_service,
-        FlorenceHouseholdQueryService(store),
         household_chat_service=chat_service,
     )
 
@@ -1133,11 +1076,10 @@ def test_pending_candidate_does_not_hijack_generic_yes_without_review_prompt_con
     review_service = FlorenceCandidateReviewService(store)
     onboarding_service = _build_hybrid_onboarding_service(store, review_service)
     chat_service = _StubHouseholdChatService("I can pull exact Giants and A's dates now.")
-    ingress = FlorenceMessagingIngressService(
+    ingress = _build_ingress(
         store,
         onboarding_service,
         review_service,
-        FlorenceHouseholdQueryService(store),
         household_chat_service=chat_service,
     )
     _complete_hybrid_onboarding(onboarding_service)
@@ -1196,15 +1138,64 @@ def test_pending_candidate_does_not_hijack_generic_yes_without_review_prompt_con
     store.close()
 
 
+def test_pending_candidate_does_not_hijack_calendar_question_without_explicit_review_request(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_hybrid_onboarding_service(store, review_service)
+    chat_service = _StubHouseholdChatService("I can check the Roosevelt calendar for Friday now.")
+    ingress = _build_ingress(
+        store,
+        onboarding_service,
+        review_service,
+        household_chat_service=chat_service,
+    )
+    _complete_hybrid_onboarding(onboarding_service)
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_123b",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:school-updates",
+            title="Roosevelt Friday schedule update",
+            summary="Friday dismissal is 12:30 PM.",
+            state=CandidateState.PENDING_REVIEW,
+        )
+    )
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_302b",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="Can you check the Roosevelt calendar for Friday?",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert result.reply_text == "I can check the Roosevelt calendar for Friday now."
+    assert chat_service.calls[0]["message_text"] == "Can you check the Roosevelt calendar for Friday?"
+    candidate = store.get_imported_candidate("cand_123b")
+    assert candidate is not None
+    assert candidate.state == CandidateState.PENDING_REVIEW
+    store.close()
+
+
 def test_review_prompt_then_yes_confirms_pending_candidate(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)
     onboarding_service = _build_hybrid_onboarding_service(store, review_service)
-    ingress = FlorenceMessagingIngressService(
+    ingress = _build_ingress(
         store,
         onboarding_service,
         review_service,
-        FlorenceHouseholdQueryService(store),
     )
     _complete_hybrid_onboarding(onboarding_service)
     store.upsert_imported_candidate(
@@ -1239,6 +1230,13 @@ def test_review_prompt_then_yes_confirms_pending_candidate(tmp_path):
     assert review.reply_text is not None
     assert "Fireflies Haircuts for Kids" in review.reply_text
     assert "Reply yes if I should add it, no if it's wrong, or skip for later." in review.reply_text
+    review_messages = store.list_channel_messages(channel_id="chan_dm_123", limit=8)
+    latest_review_message = next(
+        message
+        for message in reversed(review_messages)
+        if message.sender_role == ChannelMessageRole.ASSISTANT
+    )
+    assert latest_review_message.metadata["protocol_kind"] == CANDIDATE_REVIEW_PROMPT_KIND
 
     confirmation = ingress.handle_message(
         FlorenceResolvedInboundMessage(
@@ -1271,11 +1269,10 @@ def test_review_prompt_then_share_persists_source_rule_for_future_items(tmp_path
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)
     onboarding_service = _build_hybrid_onboarding_service(store, review_service)
-    ingress = FlorenceMessagingIngressService(
+    ingress = _build_ingress(
         store,
         onboarding_service,
         review_service,
-        FlorenceHouseholdQueryService(store),
     )
     _complete_hybrid_onboarding(onboarding_service)
     store.upsert_imported_candidate(
@@ -1346,11 +1343,10 @@ def test_child_activity_answer_advances_to_google_connect_before_unlocking_agent
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)
     onboarding_service = _build_hybrid_onboarding_service(store, review_service)
-    ingress = FlorenceMessagingIngressService(
+    ingress = _build_ingress(
         store,
         onboarding_service,
         review_service,
-        FlorenceHouseholdQueryService(store),
     )
 
     onboarding_service.record_parent_name(
@@ -1407,7 +1403,6 @@ def test_child_activity_answer_advances_to_google_connect_before_unlocking_agent
     )
     assert session.is_complete is False
     assert session.stage == "connect_google"
-    assert session.group_channel_id is None
     store.close()
 
 
@@ -1415,11 +1410,10 @@ def test_child_name_parsing_from_freeform_sentence_keeps_only_names(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)
     onboarding_service = _build_hybrid_onboarding_service(store, review_service)
-    ingress = FlorenceMessagingIngressService(
+    ingress = _build_ingress(
         store,
         onboarding_service,
         review_service,
-        FlorenceHouseholdQueryService(store),
     )
 
     onboarding_service.record_parent_name(
@@ -1464,11 +1458,10 @@ def test_google_done_after_child_details_completes_onboarding(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)
     onboarding_service = _build_hybrid_onboarding_service(store, review_service)
-    ingress = FlorenceMessagingIngressService(
+    ingress = _build_ingress(
         store,
         onboarding_service,
         review_service,
-        FlorenceHouseholdQueryService(store),
     )
 
     onboarding_service.record_parent_name(
@@ -1529,7 +1522,6 @@ def test_google_done_after_child_details_completes_onboarding(tmp_path):
     assert "you're ready" in result.reply_text.lower()
     assert session.is_complete is True
     assert session.stage == "complete"
-    assert session.group_channel_id is None
     store.close()
 
 
@@ -1537,11 +1529,10 @@ def test_google_callback_copy_does_not_require_group_to_unlock_agent(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)
     onboarding_service = _build_hybrid_onboarding_service(store, review_service)
-    ingress = FlorenceMessagingIngressService(
+    ingress = _build_ingress(
         store,
         onboarding_service,
         review_service,
-        FlorenceHouseholdQueryService(store),
     )
 
     onboarding_service.record_parent_name(
@@ -1593,7 +1584,6 @@ def test_google_callback_copy_does_not_require_group_to_unlock_agent(tmp_path):
     assert result.consumed is True
     assert result.reply_messages == ("What activities does Ava do? If none right now, say none.",)
     assert session.is_complete is False
-    assert session.group_channel_id is None
     store.close()
 
 
@@ -1601,12 +1591,10 @@ def test_child_age_reply_advances_immediately_after_google_connect(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)
     onboarding_service = _build_hybrid_onboarding_service(store, review_service)
-    ingress = FlorenceMessagingIngressService(
+    ingress = _build_ingress(
         store,
         onboarding_service,
         review_service,
-        FlorenceHouseholdQueryService(store),
-        onboarding_reply_debounce_seconds=8.0,
     )
 
     onboarding_service.record_parent_name(
@@ -1644,7 +1632,6 @@ def test_child_age_reply_advances_immediately_after_google_connect(tmp_path):
         )
     )
 
-    assert result.defer_reply is False
     assert result.reply_messages == ("What school does Lexie go to? If not in school yet, say not yet.",)
     store.close()
 
@@ -1653,11 +1640,10 @@ def test_activity_completion_after_google_records_onboarding_completion(tmp_path
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)
     onboarding_service = _build_hybrid_onboarding_service(store, review_service)
-    ingress = FlorenceMessagingIngressService(
+    ingress = _build_ingress(
         store,
         onboarding_service,
         review_service,
-        FlorenceHouseholdQueryService(store),
     )
 
     onboarding_service.record_parent_name(
@@ -1713,11 +1699,10 @@ def test_first_group_message_after_context_collection_records_group_channel(tmp_
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)
     onboarding_service = _build_hybrid_onboarding_service(store, review_service)
-    ingress = FlorenceMessagingIngressService(
+    ingress = _build_ingress(
         store,
         onboarding_service,
         review_service,
-        FlorenceHouseholdQueryService(store),
     )
 
     _complete_hybrid_onboarding(onboarding_service)
@@ -1747,7 +1732,8 @@ def test_first_group_message_after_context_collection_records_group_channel(tmp_
     assert result.consumed is True
     assert result.reply_text is not None
     assert "I’m in." in result.reply_text
-    assert session.group_channel_id == "group_thread_123"
+    assert "main household thread" in result.reply_text
+    assert "Use DM when something should stay private." in result.reply_text
     store.close()
 
 
@@ -1756,11 +1742,10 @@ def test_complete_dm_schedule_question_routes_through_household_chat_service_bef
     review_service = FlorenceCandidateReviewService(store)
     onboarding_service = _build_hybrid_onboarding_service(store, review_service)
     chat_service = _StubHouseholdChatService("I can check Musical Beginnings and pull the spring break dates.")
-    ingress = FlorenceMessagingIngressService(
+    ingress = _build_ingress(
         store,
         onboarding_service,
         review_service,
-        FlorenceHouseholdQueryService(store),
         household_chat_service=chat_service,
     )
     _complete_hybrid_onboarding(onboarding_service)
@@ -1792,11 +1777,10 @@ def test_done_after_google_connect_prompt_routes_back_to_agent_not_reminder_ack(
     review_service = FlorenceCandidateReviewService(store)
     onboarding_service = _build_hybrid_onboarding_service(store, review_service)
     chat_service = _StubHouseholdChatService("I found the Musical Beginnings spring break email and pulled the dates.")
-    ingress = FlorenceMessagingIngressService(
+    ingress = _build_ingress(
         store,
         onboarding_service,
         review_service,
-        FlorenceHouseholdQueryService(store),
         household_chat_service=chat_service,
     )
     _complete_hybrid_onboarding(onboarding_service)
@@ -1842,11 +1826,14 @@ def test_complete_dm_can_answer_tracking_visibility_request(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)
     onboarding_service = _build_hybrid_onboarding_service(store, review_service)
-    ingress = FlorenceMessagingIngressService(
+    chat_service = _StubHouseholdChatService(
+        "Here’s what I’m tracking right now: school reminders, upcoming events, and groceries that still need a plan."
+    )
+    ingress = _build_ingress(
         store,
         onboarding_service,
         review_service,
-        FlorenceHouseholdQueryService(store),
+        household_chat_service=chat_service,
     )
     _complete_hybrid_onboarding(onboarding_service)
 
@@ -1869,7 +1856,8 @@ def test_complete_dm_can_answer_tracking_visibility_request(tmp_path):
 
     assert result.consumed is True
     assert result.reply_text is not None
-    assert "actively tracking" in result.reply_text.lower()
+    assert "tracking right now" in result.reply_text.lower()
+    assert chat_service.calls[0]["message_text"] == "What are you tracking for us right now?"
     store.close()
 
 
@@ -1878,11 +1866,10 @@ def test_complete_dm_reminder_feedback_updates_manager_profile_and_logs_event(tm
     store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
     review_service = FlorenceCandidateReviewService(store)
     onboarding_service = _build_hybrid_onboarding_service(store, review_service)
-    ingress = FlorenceMessagingIngressService(
+    ingress = _build_ingress(
         store,
         onboarding_service,
         review_service,
-        FlorenceHouseholdQueryService(store),
     )
     _complete_hybrid_onboarding(onboarding_service)
 
@@ -1916,16 +1903,51 @@ def test_complete_dm_reminder_feedback_updates_manager_profile_and_logs_event(tm
     store.close()
 
 
+def test_complete_dm_done_without_active_reminder_falls_through_to_household_chat(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_hybrid_onboarding_service(store, review_service)
+    chat_service = _StubHouseholdChatService("Tell me which reminder or task you want to update.")
+    ingress = _build_ingress(
+        store,
+        onboarding_service,
+        review_service,
+        household_chat_service=chat_service,
+    )
+    _complete_hybrid_onboarding(onboarding_service)
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_206b",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="done",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert result.consumed is True
+    assert result.reply_text == "Tell me which reminder or task you want to update."
+    assert chat_service.calls[0]["message_text"] == "done"
+    store.close()
+
+
 def test_complete_dm_done_acknowledges_sent_nudge_and_marks_work_item_done(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
     review_service = FlorenceCandidateReviewService(store)
     onboarding_service = _build_hybrid_onboarding_service(store, review_service)
-    ingress = FlorenceMessagingIngressService(
+    ingress = _build_ingress(
         store,
         onboarding_service,
         review_service,
-        FlorenceHouseholdQueryService(store),
     )
     _complete_hybrid_onboarding(onboarding_service)
 
@@ -1994,11 +2016,10 @@ def test_complete_dm_snooze_reschedules_sent_nudge_and_logs_event(tmp_path):
     store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
     review_service = FlorenceCandidateReviewService(store)
     onboarding_service = _build_hybrid_onboarding_service(store, review_service)
-    ingress = FlorenceMessagingIngressService(
+    ingress = _build_ingress(
         store,
         onboarding_service,
         review_service,
-        FlorenceHouseholdQueryService(store),
     )
     _complete_hybrid_onboarding(onboarding_service)
 
@@ -2068,11 +2089,10 @@ def test_group_non_household_question_does_not_fall_back_to_schedule_summary(tmp
     )
     assert group is not None
 
-    ingress = FlorenceMessagingIngressService(
+    ingress = _build_ingress(
         store,
         onboarding_service,
         review_service,
-        FlorenceHouseholdQueryService(store),
     )
 
     result = ingress.handle_message(
@@ -2092,6 +2112,6 @@ def test_group_non_household_question_does_not_fall_back_to_schedule_summary(tmp
         )
     )
 
-    assert result.consumed is False
-    assert result.reply_text is None
+    assert result.consumed is True
+    assert result.reply_text == "I can keep planning with you here."
     store.close()

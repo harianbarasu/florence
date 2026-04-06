@@ -102,48 +102,16 @@ def _refresh_child_state(state: OnboardingState, profiles: list[dict[str, Any]])
     metadata["child_profiles"] = normalized
     metadata["child_details"] = _child_detail_lines(normalized)
     names = [str(profile["name"]) for profile in normalized]
-    school_labels = _dedupe(
-        [
-            school
-            for school in (_clean_text(profile.get("school")) for profile in normalized)
-            if school and school.lower() not in {"none yet", "not yet", "unknown"}
-        ]
-    )
-    activity_labels = _dedupe(
-        [
-            label
-            for profile in normalized
-            for label in (_clean_list(profile.get("activities")) if isinstance(profile.get("activities"), list) else [])
-        ]
-    )
-    school_collected = bool(normalized) and all(_clean_text(profile.get("school")) is not None for profile in normalized)
-    activity_collected = bool(normalized) and all(isinstance(profile.get("activities"), list) for profile in normalized)
     return replace(
         state,
         metadata=metadata,
         child_names=names,
-        school_labels=school_labels,
-        activity_labels=activity_labels,
-        school_basics_collected=school_collected,
-        activity_basics_collected=activity_collected,
     )
 
 
 def _set_current_child_index(state: OnboardingState, index: int) -> OnboardingState:
     metadata = dict(state.metadata)
     metadata["current_child_index"] = max(0, index)
-    return replace(state, metadata=metadata)
-
-
-def _replace_metadata_list(state: OnboardingState, key: str, values: list[str]) -> OnboardingState:
-    metadata = dict(state.metadata)
-    metadata[key] = _clean_list(values)
-    return replace(state, metadata=metadata)
-
-
-def _replace_metadata_text(state: OnboardingState, key: str, value: str) -> OnboardingState:
-    metadata = dict(state.metadata)
-    metadata[key] = _clean_text(value)
     return replace(state, metadata=metadata)
 
 
@@ -162,8 +130,6 @@ def _next_missing_child_field(state: OnboardingState) -> tuple[int | None, Onboa
 def sync_onboarding_stage(state: OnboardingState) -> OnboardingState:
     """Return a copy of the state with the canonical next stage applied."""
     current = state
-    if current.group_channel_id:
-        return replace(current, stage=OnboardingStage.COMPLETE)
     if current.is_complete:
         return replace(current, stage=OnboardingStage.COMPLETE)
     if not current.parent_display_name:
@@ -203,6 +169,50 @@ def build_google_connect_message_sequence(
     return tuple(messages)
 
 
+def build_onboarding_prompt_message_sequence(
+    prompt: OnboardingPrompt | None,
+    *,
+    link_url: str | None = None,
+    include_intro: bool = False,
+    include_google_connect: bool = False,
+) -> tuple[str, ...]:
+    intro: tuple[str, ...] = ()
+    if include_intro:
+        intro = (
+            "Hi, I'm Florence.",
+            "I help run the household with you by keeping logistics organized, surfacing reminders, and staying on top of school and calendar noise.",
+        )
+
+    google_sequence: tuple[str, ...] = ()
+    if (prompt is not None and prompt.stage == OnboardingStage.CONNECT_GOOGLE) or include_google_connect:
+        google_sequence = build_google_connect_message_sequence(link_url)
+
+    if prompt is None:
+        return intro + google_sequence
+    if prompt.stage == OnboardingStage.CONNECT_GOOGLE:
+        return intro + google_sequence
+    return intro + google_sequence + (prompt.text,)
+
+
+def build_onboarding_transition_message_sequence(
+    transition: OnboardingTransition,
+    *,
+    previous_stage: OnboardingStage,
+    link_url: str | None = None,
+) -> tuple[str, ...]:
+    if transition.state.is_complete:
+        return build_onboarding_ready_message_sequence()
+    return build_onboarding_prompt_message_sequence(
+        transition.prompt,
+        link_url=link_url,
+        include_intro=(previous_stage == OnboardingStage.COLLECT_PARENT_NAME),
+        include_google_connect=(
+            previous_stage == OnboardingStage.COLLECT_PARENT_NAME
+            and not transition.state.google_connected
+        ),
+    )
+
+
 def build_onboarding_ready_message_sequence() -> tuple[str, ...]:
     return (
         "You're ready. Florence is set up as your house manager now.",
@@ -214,17 +224,10 @@ def build_onboarding_ready_message_sequence() -> tuple[str, ...]:
 
 
 def build_google_connected_syncing_message_sequence(link_url: str | None = None) -> tuple[str, ...]:
-    messages = [
+    _ = link_url
+    return (
         "Google is connected. I’m syncing the last 30 days of your email and calendar in the background now, and I’ll text you here when the first pass is ready.",
-    ]
-    if link_url:
-        messages.extend(
-            [
-                "If you want to track setup progress on your computer, use this link:",
-                link_url,
-            ]
-        )
-    return tuple(messages)
+    )
 
 
 def build_onboarding_prompt(state: OnboardingState) -> OnboardingPrompt | None:
@@ -235,7 +238,7 @@ def build_onboarding_prompt(state: OnboardingState) -> OnboardingPrompt | None:
     if current.stage == OnboardingStage.COLLECT_CHILD_NAMES:
         return OnboardingPrompt(
             stage=current.stage,
-            text="What are your kids' names? One per line or comma-separated is fine.",
+            text="What are your kids' names? Send all of them in one message, one per line or comma-separated.",
         )
 
     child_name = current.current_child_name or "your child"
@@ -311,8 +314,6 @@ def apply_child_names(
         ordered.append(profile)
         existing[key] = profile
     next_state = _refresh_child_state(state, ordered)
-    if child_details is not None:
-        next_state = _replace_metadata_list(next_state, "child_details", child_details)
     next_state = sync_onboarding_stage(next_state)
     return OnboardingTransition(
         state=next_state,
@@ -357,74 +358,4 @@ def apply_child_profile_updates(state: OnboardingState, child_updates: list[dict
         state=next_state,
         prompt=build_onboarding_prompt(next_state),
         changed=changed,
-    )
-
-
-def apply_school_basics(state: OnboardingState, school_labels: list[str]) -> OnboardingTransition:
-    profiles = _seed_child_profiles(state)
-    labels = _clean_list(school_labels)
-    unresolved = [idx for idx, profile in enumerate(profiles) if _clean_text(profile.get("school")) is None]
-    for idx, label in zip(unresolved, labels):
-        profiles[idx]["school"] = label
-    return apply_child_profile_updates(
-        _refresh_child_state(state, profiles),
-        [],
-    )
-
-
-def apply_activity_basics(state: OnboardingState, activity_labels: list[str]) -> OnboardingTransition:
-    profiles = _seed_child_profiles(state)
-    unresolved = [idx for idx, profile in enumerate(profiles) if not isinstance(profile.get("activities"), list)]
-    if unresolved:
-        target_index = unresolved[0]
-        profiles[target_index]["activities"] = _clean_list(activity_labels)
-    return apply_child_profile_updates(
-        _refresh_child_state(state, profiles),
-        [],
-    )
-
-
-def apply_household_members(state: OnboardingState, household_members: list[str]) -> OnboardingTransition:
-    next_state = sync_onboarding_stage(_replace_metadata_list(state, "household_members", household_members))
-    return OnboardingTransition(
-        state=next_state,
-        prompt=build_onboarding_prompt(next_state),
-        changed=next_state.household_members != state.household_members,
-    )
-
-
-def apply_household_operations(state: OnboardingState, household_operations: list[str]) -> OnboardingTransition:
-    next_state = sync_onboarding_stage(_replace_metadata_list(state, "household_operations", household_operations))
-    return OnboardingTransition(
-        state=next_state,
-        prompt=build_onboarding_prompt(next_state),
-        changed=next_state.household_operations != state.household_operations,
-    )
-
-
-def apply_nudge_preferences(state: OnboardingState, nudge_preferences: str) -> OnboardingTransition:
-    next_state = sync_onboarding_stage(_replace_metadata_text(state, "nudge_preferences", nudge_preferences))
-    return OnboardingTransition(
-        state=next_state,
-        prompt=build_onboarding_prompt(next_state),
-        changed=next_state.nudge_preferences != state.nudge_preferences,
-    )
-
-
-def apply_operating_preferences(state: OnboardingState, operating_preferences: str) -> OnboardingTransition:
-    next_state = sync_onboarding_stage(_replace_metadata_text(state, "operating_preferences", operating_preferences))
-    return OnboardingTransition(
-        state=next_state,
-        prompt=build_onboarding_prompt(next_state),
-        changed=next_state.operating_preferences != state.operating_preferences,
-    )
-
-
-def mark_group_activated(state: OnboardingState, group_channel_id: str) -> OnboardingTransition:
-    cleaned = _clean_text(group_channel_id)
-    next_state = sync_onboarding_stage(replace(state, group_channel_id=cleaned))
-    return OnboardingTransition(
-        state=next_state,
-        prompt=build_onboarding_prompt(next_state),
-        changed=cleaned != (state.group_channel_id or None),
     )

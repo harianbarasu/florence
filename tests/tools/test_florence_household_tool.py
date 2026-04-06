@@ -2,16 +2,20 @@ import json
 from datetime import datetime, timezone
 
 from florence.contracts import (
+    CandidateState,
     Channel,
     ChannelType,
     ChildProfile,
     GoogleConnection,
     GoogleSourceKind,
     Household,
+    HouseholdEvent,
+    HouseholdEventStatus,
     HouseholdProfileKind,
     HouseholdSourceMatcherKind,
     HouseholdSourceRule,
     HouseholdSourceVisibility,
+    ImportedCandidate,
     Member,
     MemberRole,
 )
@@ -162,6 +166,8 @@ def test_household_tools_can_create_event_meal_shopping_item_and_nudge(tmp_path,
                 task_id=task_id,
             )
         )
+        assert inbox_result["search_scope"] == "private_parent"
+        assert inbox_result["scope_reason"] == "current_parent_dm"
         assert inbox_result["searched_connection_emails"] == ["maya@example.com"]
         assert inbox_result["results"][0]["from_address"] == "Linda <linda@musicalbeginnings.com>"
         assert "April 1 and April 8" in inbox_result["results"][0]["body_text"]
@@ -271,8 +277,89 @@ def test_household_google_inbox_search_uses_shared_source_rules_across_connected
             )
         )
 
+        assert inbox_result["search_scope"] == "shared_household"
+        assert inbox_result["scope_reason"] == "matched_shared_source_rule"
         assert set(inbox_result["searched_connection_emails"]) == {"maya@example.com", "kendall@example.com"}
         assert inbox_result["results"][0]["from_address"] == "Linda <linda@musicalbeginnings.com>"
+    finally:
+        clear_household_tool_context(task_id)
+        store.close()
+
+
+def test_household_google_inbox_search_from_group_requires_shared_scope(tmp_path, monkeypatch):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_group_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="group-thread-123",
+            channel_type=ChannelType.HOUSEHOLD_GROUP,
+            title="Parent group",
+        )
+    )
+    store.upsert_google_connection(
+        GoogleConnection(
+            id="gconn_123",
+            household_id="hh_123",
+            member_id="mem_123",
+            email="maya@example.com",
+            connected_scopes=(GoogleSourceKind.GMAIL,),
+            access_token="access-token-maya",
+        )
+    )
+    task_id = "task-group-inbox-search"
+    set_household_tool_context(
+        task_id,
+        store=store,
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_group_123",
+    )
+    try:
+        monkeypatch.setattr(
+            household_tool,
+            "list_recent_gmail_sync_items",
+            lambda **_: [
+                GmailSyncItem(
+                    gmail_message_id="gmail_789",
+                    thread_id="thread_789",
+                    from_address="Linda <linda@musicalbeginnings.com>",
+                    subject="Private note",
+                    snippet="Private note",
+                    body_text="Private note",
+                    attachment_text=None,
+                    attachment_count=0,
+                    received_at=datetime(2026, 3, 24, 12, 0, tzinfo=timezone.utc),
+                )
+            ],
+        )
+
+        inbox_result = json.loads(
+            handle_function_call(
+                "household_search_google_inbox",
+                {
+                    "sender": "Linda",
+                    "query": "private note",
+                },
+                task_id=task_id,
+            )
+        )
+
+        assert inbox_result["search_scope"] == "group_requires_shared_scope"
+        assert inbox_result["scope_reason"] == "group_chat_disallows_private_inbox_search"
+        assert inbox_result["searched_connection_emails"] == []
+        assert inbox_result["results"] == []
+        assert "family group only uses shared household scope" in inbox_result["error"]
     finally:
         clear_household_tool_context(task_id)
         store.close()
@@ -336,6 +423,83 @@ def test_household_search_state_includes_manager_profile_preferences(tmp_path):
         assert any(item["kind"] == "manager_profile" for item in preferences)
         assert any(item["metadata"]["profile_key"] == "operating_preferences" for item in preferences)
         assert any("morning brief" in item["metadata"]["summary"].lower() for item in preferences)
+    finally:
+        clear_household_tool_context(task_id)
+        store.close()
+
+
+def test_household_search_state_surfaces_scope_tentative_and_private_review_state(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    store.upsert_household_event(
+        HouseholdEvent(
+            id="evt_123",
+            household_id="hh_123",
+            title="Possible camp carpool",
+            starts_at="2026-04-02T16:00:00+00:00",
+            ends_at="2026-04-02T17:00:00+00:00",
+            status=HouseholdEventStatus.TENTATIVE,
+        )
+    )
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_123",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:camp-1",
+            title="Summer camp invoice",
+            summary="Invoice from billing@camp-example.com.",
+            state=CandidateState.PENDING_REVIEW,
+            metadata={"source_visibility": "needs_classification", "review_lane": "steady_state"},
+        )
+    )
+    task_id = "task-household-visibility"
+    set_household_tool_context(
+        task_id,
+        store=store,
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_dm_123",
+    )
+    try:
+        result = json.loads(
+            handle_function_call(
+                "household_search_state",
+                {
+                    "query": "",
+                    "entity_types": ["events"],
+                },
+                task_id=task_id,
+            )
+        )
+
+        visibility = result["visibility"]
+        assert visibility["current_scope"]["scope"] == "private_parent_dm"
+        assert visibility["current_scope"]["private_review_available"] is True
+        assert visibility["tentative_state"]["event_count"] == 1
+        assert visibility["tentative_state"]["events"][0]["title"] == "Possible camp carpool"
+        assert visibility["private_review_state"]["pending_candidate_count"] == 1
+        assert visibility["private_review_state"]["pending_candidates"][0]["title"] == "Summer camp invoice"
+        assert visibility["private_review_state"]["pending_candidates"][0]["source_visibility"] == "needs_classification"
     finally:
         clear_household_tool_context(task_id)
         store.close()

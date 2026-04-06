@@ -14,7 +14,6 @@ def test_florence_settings_reads_env_and_derives_google_redirect_uri(tmp_path, m
 
     assert settings.server.port == 9090
     assert settings.server.public_base_url == "https://florence.example.com"
-    assert settings.server.web_base_url is None
     assert settings.google.redirect_uri == "https://florence.example.com/v1/florence/google/callback"
     assert settings.google.configured is True
     assert settings.linq.configured is True
@@ -33,18 +32,6 @@ def test_florence_settings_supports_railway_public_domain_and_port(tmp_path, mon
     assert settings.server.public_base_url == "https://florence-production.up.railway.app"
     assert settings.google.redirect_uri == "https://florence-production.up.railway.app/v1/florence/google/callback"
 
-
-def test_florence_settings_reads_web_base_url_when_configured(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("FLORENCE_PUBLIC_BASE_URL", "https://api.florence.example.com")
-    monkeypatch.setenv("FLORENCE_WEB_BASE_URL", "https://app.florence.example.com")
-
-    settings = FlorenceSettings.from_env()
-
-    assert settings.server.public_base_url == "https://api.florence.example.com"
-    assert settings.server.web_base_url == "https://app.florence.example.com"
-
-
 def test_florence_settings_prefers_database_url_when_present(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("DATABASE_URL", "postgresql://postgres:secret@db.example.com:5432/florence")
@@ -59,32 +46,15 @@ def test_florence_settings_default_and_override_household_toolsets(tmp_path, mon
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
     default_settings = FlorenceSettings.from_env()
+    assert default_settings.hermes.model == "anthropic/claude-opus-4.6"
+    assert default_settings.hermes.max_iterations == 6
     assert default_settings.hermes.provider == "auto"
-    assert default_settings.hermes.enabled_toolsets == ("florence_chat",)
-    assert default_settings.hermes.disabled_toolsets == ()
-    assert default_settings.hermes.fallback_model == ()
-    assert default_settings.hermes.tool_use_enforcement == "auto"
-    assert default_settings.hermes.enable_honcho is True
-    assert default_settings.hermes.honcho_scope == "member"
 
     monkeypatch.setenv("FLORENCE_HERMES_PROVIDER", "custom")
-    monkeypatch.setenv("FLORENCE_HERMES_ENABLED_TOOLSETS", "web,browser,clarify")
-    monkeypatch.setenv("FLORENCE_HERMES_DISABLED_TOOLSETS", "memory,session_search")
-    monkeypatch.setenv(
-        "FLORENCE_HERMES_FALLBACK_MODEL",
-        '[{"provider":"openrouter","model":"anthropic/claude-sonnet-4"}]',
-    )
-    monkeypatch.setenv("FLORENCE_HERMES_TOOL_USE_ENFORCEMENT", "deepseek,gemini")
-    monkeypatch.setenv("FLORENCE_HERMES_ENABLE_HONCHO", "false")
-    monkeypatch.setenv("FLORENCE_HERMES_HONCHO_SCOPE", "channel")
+    monkeypatch.setenv("FLORENCE_HERMES_MODEL", "openai/gpt-5.4")
+    monkeypatch.setenv("FLORENCE_HERMES_MAX_ITERATIONS", "9")
 
     overridden_settings = FlorenceSettings.from_env()
+    assert overridden_settings.hermes.model == "openai/gpt-5.4"
+    assert overridden_settings.hermes.max_iterations == 9
     assert overridden_settings.hermes.provider == "custom"
-    assert overridden_settings.hermes.enabled_toolsets == ("web", "browser", "clarify")
-    assert overridden_settings.hermes.disabled_toolsets == ("memory", "session_search")
-    assert overridden_settings.hermes.fallback_model == (
-        {"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
-    )
-    assert overridden_settings.hermes.tool_use_enforcement == ("deepseek", "gemini")
-    assert overridden_settings.hermes.enable_honcho is False
-    assert overridden_settings.hermes.honcho_scope == "channel"

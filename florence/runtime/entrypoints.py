@@ -3,24 +3,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from typing import Any
 
+from florence.config import FlorenceGoogleRuntimeConfig
 from florence.linq import parse_linq_payload
 from florence.messaging import (
     FlorenceInboundMessage,
     FlorenceMessagingIngressService,
     FlorenceResolvedInboundMessage,
 )
-from florence.onboarding import build_onboarding_ready_message_sequence
 from florence.runtime.chat import FlorenceHouseholdChatService
-from florence.runtime.onboarding_links import FlorenceOnboardingLinkService
+from florence.runtime.candidate_review import FlorenceCandidateReviewService
+from florence.runtime.google_services import FlorenceGoogleAccountLinkService
+from florence.runtime.onboarding_service import FlorenceOnboardingSessionService
 from florence.runtime.resolver import FlorenceIdentityResolver
 from florence.sendblue import parse_sendblue_payload
-from florence.runtime.services import (
-    FlorenceCandidateReviewService,
-    FlorenceGoogleAccountLinkService,
-    FlorenceHouseholdQueryService,
-    FlorenceOnboardingSessionService,
-)
 from florence.state import FlorenceStateDB
 
 IGNORED_LINQ_EVENT_TYPES = {
@@ -42,23 +39,12 @@ IGNORABLE_SENDBLUE_PARSE_ERRORS = {
     "sendblue_sender_handle_required",
 }
 
-
-@dataclass(slots=True)
-class FlorenceGoogleOauthConfig:
-    client_id: str
-    client_secret: str
-    redirect_uri: str
-    state_secret: str
-
-
 @dataclass(slots=True)
 class FlorenceEntrypointResult:
     reply_text: str | None = None
     reply_messages: tuple[str, ...] = field(default_factory=tuple)
     group_announcement: str | None = None
     consumed: bool = False
-    defer_reply: bool = False
-    defer_seconds: float | None = None
     household_id: str | None = None
     member_id: str | None = None
     channel_id: str | None = None
@@ -72,19 +58,8 @@ class FlorenceEntrypointService:
         self,
         store: FlorenceStateDB,
         *,
-        google_oauth: FlorenceGoogleOauthConfig | None = None,
-        public_base_url: str | None = None,
-        onboarding_link_path: str = "/v1/florence/onboarding",
-        onboarding_state_secret: str | None = None,
-        household_chat_model: str | None = None,
-        household_chat_max_iterations: int = 6,
-        household_chat_provider: str = "auto",
-        household_chat_enabled_toolsets: list[str] | tuple[str, ...] | None = None,
-        household_chat_disabled_toolsets: list[str] | tuple[str, ...] | None = None,
-        household_chat_fallback_model: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
-        household_chat_tool_use_enforcement: str | bool | list[str] | tuple[str, ...] = "auto",
-        household_chat_enable_honcho: bool = True,
-        household_chat_honcho_scope: str = "member",
+        google_oauth: FlorenceGoogleRuntimeConfig | None = None,
+        household_chat_service: FlorenceHouseholdChatService,
     ):
         self.store = store
         self.candidate_review_service = FlorenceCandidateReviewService(store)
@@ -92,36 +67,11 @@ class FlorenceEntrypointService:
             store,
             candidate_review_service=self.candidate_review_service,
         )
-        self.query_service = FlorenceHouseholdQueryService(store)
-        self.onboarding_link_service = (
-            FlorenceOnboardingLinkService(
-                public_base_url=public_base_url,
-                state_secret=onboarding_state_secret,
-                path=onboarding_link_path,
-            )
-            if public_base_url and onboarding_state_secret
-            else None
-        )
         self.identity_resolvers = {
             "linq": FlorenceIdentityResolver(store, provider="linq"),
             "sendblue": FlorenceIdentityResolver(store, provider="sendblue"),
         }
-        self.household_chat_service = (
-            FlorenceHouseholdChatService(
-                store,
-                model=household_chat_model,
-                max_iterations=household_chat_max_iterations,
-                provider=household_chat_provider,
-                enabled_toolsets=household_chat_enabled_toolsets,
-                disabled_toolsets=household_chat_disabled_toolsets,
-                fallback_model=household_chat_fallback_model,
-                tool_use_enforcement=household_chat_tool_use_enforcement,
-                enable_honcho=household_chat_enable_honcho,
-                honcho_scope=household_chat_honcho_scope,
-            )
-            if household_chat_model
-            else None
-        )
+        self.household_chat_service = household_chat_service
         self.google_account_link_service = (
             FlorenceGoogleAccountLinkService(
                 store,
@@ -134,13 +84,19 @@ class FlorenceEntrypointService:
             if google_oauth is not None
             else None
         )
+        self.onboarding_service.set_link_url_builder(
+            None
+            if self.google_account_link_service is None
+            else lambda household_id, member_id, thread_id: self.google_account_link_service.build_connect_link(
+                household_id=household_id,
+                member_id=member_id,
+                thread_id=thread_id,
+            ).url
+        )
         self.ingress = FlorenceMessagingIngressService(
             store,
             self.onboarding_service,
             self.candidate_review_service,
-            self.query_service,
-            google_account_link_service=self.google_account_link_service,
-            onboarding_link_service=self.onboarding_link_service,
             household_chat_service=self.household_chat_service,
         )
 
@@ -242,71 +198,7 @@ class FlorenceEntrypointService:
             reply_messages=result.reply_messages,
             group_announcement=result.group_announcement,
             consumed=result.consumed,
-            defer_reply=result.defer_reply,
-            defer_seconds=result.defer_seconds,
             household_id=resolved.household.id,
             member_id=member_id,
             channel_id=resolved.channel.id,
-        )
-
-    def handle_google_oauth_callback(self, *, code: str, state: str) -> FlorenceEntrypointResult:
-        if self.google_account_link_service is None:
-            return FlorenceEntrypointResult(error="google_oauth_not_configured")
-
-        callback = self.google_account_link_service.handle_callback(code=code, raw_state=state)
-        review_prompt = self.candidate_review_service.build_next_review_prompt(
-            household_id=callback.connection.household_id,
-            member_id=callback.connection.member_id,
-        )
-        if callback.onboarding_transition.state.is_complete:
-            reply = "\n\n".join(build_onboarding_ready_message_sequence())
-        else:
-            reply = None
-            if self.household_chat_service is not None:
-                channel = self.store.get_channel(callback.onboarding_transition.state.thread_id)
-                if channel is not None:
-                    try:
-                        rendered = self.household_chat_service.compose_sync_waiting_reply(
-                            household_id=callback.connection.household_id,
-                            channel_id=channel.id,
-                            actor_member_id=callback.connection.member_id,
-                            just_connected=True,
-                        )
-                        if rendered is not None and rendered.strip():
-                            reply = rendered.strip()
-                    except Exception:
-                        reply = None
-            if not reply:
-                reply = (
-                    callback.onboarding_transition.prompt.text
-                    if callback.onboarding_transition.prompt
-                    else "Google connected."
-                )
-        if review_prompt is not None:
-            review_prompt_text = review_prompt.text
-            if self.household_chat_service is not None:
-                channel = self.store.get_channel(callback.onboarding_transition.state.thread_id)
-                if channel is not None:
-                    try:
-                        source_prompt = self.candidate_review_service.source_rule_service.build_candidate_source_prompt(
-                            review_prompt.candidate
-                        )
-                        rendered = self.household_chat_service.compose_review_prompt(
-                            household_id=callback.connection.household_id,
-                            channel_id=channel.id,
-                            actor_member_id=callback.connection.member_id,
-                            candidate=review_prompt.candidate,
-                            source_prompt=source_prompt,
-                        )
-                        if rendered is not None and rendered.strip():
-                            review_prompt_text = rendered.strip()
-                    except Exception:
-                        review_prompt_text = review_prompt.text
-            reply = f"{reply}\n\n{review_prompt_text}" if reply else review_prompt_text
-
-        return FlorenceEntrypointResult(
-            reply_text=reply,
-            consumed=True,
-            household_id=callback.connection.household_id,
-            member_id=callback.connection.member_id,
         )

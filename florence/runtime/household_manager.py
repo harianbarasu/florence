@@ -1,0 +1,716 @@
+"""Household operating-state helpers for Florence."""
+
+from __future__ import annotations
+
+import re
+import time
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
+
+from florence.contracts import (
+    ChannelType,
+    HouseholdBriefingKind,
+    HouseholdMeal,
+    HouseholdNudge,
+    HouseholdNudgeStatus,
+    HouseholdNudgeTargetKind,
+    HouseholdProfileItem,
+    HouseholdProfileKind,
+    HouseholdRoutine,
+    HouseholdRoutineStatus,
+    HouseholdShoppingItem,
+    HouseholdWorkItem,
+    HouseholdWorkItemStatus,
+    MemberRole,
+    PilotEvent,
+)
+from florence.runtime.services import (
+    _clean_label,
+    _extract_local_time_from_preferences,
+    _local_schedule_days,
+    _next_due_local_schedule_iso,
+    _parse_iso_datetime,
+    _parse_local_time_spec,
+    _stable_id,
+    _utc_now,
+)
+from florence.state import FlorenceStateDB
+
+
+@dataclass(slots=True)
+class _ReminderActionResult:
+    reply_text: str
+
+
+class FlorenceHouseholdManagerService:
+    """Generic Florence operating-state service for the household agent."""
+
+    def __init__(self, store: FlorenceStateDB):
+        self.store = store
+
+    def upsert_work_item(self, work_item: HouseholdWorkItem) -> HouseholdWorkItem:
+        return self.store.upsert_household_work_item(work_item)
+
+    def upsert_routine(self, routine: HouseholdRoutine) -> HouseholdRoutine:
+        return self.store.upsert_household_routine(routine)
+
+    def upsert_meal(self, meal: HouseholdMeal) -> HouseholdMeal:
+        return self.store.upsert_household_meal(meal)
+
+    def upsert_shopping_item(self, item: HouseholdShoppingItem) -> HouseholdShoppingItem:
+        return self.store.upsert_household_shopping_item(item)
+
+    def get_manager_profile(self, household_id: str) -> dict[str, object]:
+        household = self.store.get_household(household_id)
+        if household is None:
+            return {}
+        raw = household.settings.get("manager_profile") if isinstance(household.settings, dict) else None
+        return dict(raw) if isinstance(raw, dict) else {}
+
+    def update_manager_profile(self, *, household_id: str, updates: dict[str, object]) -> dict[str, object]:
+        household = self.store.get_household(household_id)
+        if household is None:
+            return {}
+        settings = dict(household.settings) if isinstance(household.settings, dict) else {}
+        profile = dict(settings.get("manager_profile")) if isinstance(settings.get("manager_profile"), dict) else {}
+        profile.update(updates)
+        settings["manager_profile"] = profile
+        self.store.upsert_household(replace(household, settings=settings))
+        return profile
+
+    def record_preference(
+        self,
+        *,
+        household_id: str,
+        label: str,
+        value: str,
+        category: str = "general",
+        member_id: str | None = None,
+        child_id: str | None = None,
+        recorded_by_member_id: str | None = None,
+        channel_id: str | None = None,
+        metadata: dict[str, object] | None = None,
+        now: datetime | None = None,
+    ) -> tuple[HouseholdProfileItem, dict[str, object]]:
+        cleaned_label = _clean_label(label)
+        cleaned_value = " ".join(str(value).split()).strip()
+        if cleaned_label is None:
+            raise ValueError("missing_preference_label")
+        if not cleaned_value:
+            raise ValueError("missing_preference_value")
+
+        normalized_category = _clean_label(category) or "general"
+        lowered_category = normalized_category.lower().replace(" ", "_")
+        captured_at = (now or _utc_now()).isoformat()
+        existing_items = self.store.list_household_profile_items(
+            household_id=household_id,
+            kind=HouseholdProfileKind.PREFERENCE,
+        )
+        preference_id = _stable_id(
+            "pref",
+            household_id,
+            member_id or "",
+            child_id or "",
+            cleaned_label.lower(),
+        )
+        existing_item = next((item for item in existing_items if item.id == preference_id), None)
+        item_metadata = dict(existing_item.metadata) if existing_item is not None else {}
+        item_metadata.update(dict(metadata or {}))
+        item_metadata.update(
+            {
+                "category": lowered_category,
+                "value": cleaned_value,
+                "captured_at": captured_at,
+                "recorded_by_member_id": recorded_by_member_id,
+                "channel_id": channel_id,
+            }
+        )
+        preference_item = HouseholdProfileItem(
+            id=preference_id,
+            household_id=household_id,
+            kind=HouseholdProfileKind.PREFERENCE,
+            label=cleaned_label,
+            member_id=member_id,
+            child_id=child_id,
+            metadata=item_metadata,
+        )
+        updated_items = [item for item in existing_items if item.id != preference_id]
+        updated_items.append(preference_item)
+        self.store.replace_household_profile_items(
+            household_id=household_id,
+            kind=HouseholdProfileKind.PREFERENCE,
+            items=updated_items,
+        )
+
+        preference_statement = (
+            cleaned_value
+            if cleaned_label.lower() in cleaned_value.lower()
+            else f"{cleaned_label}: {cleaned_value}"
+        )
+        profile_updates: dict[str, object] = {}
+        profile = self.get_manager_profile(household_id)
+        if lowered_category in {"reminder_style", "nudge_style", "reminder_preferences"}:
+            profile_updates = {
+                "nudge_preferences": preference_statement,
+                "nudge_preferences_override": preference_statement,
+                "nudge_preferences_last_updated_at": captured_at,
+            }
+        elif lowered_category in {"operating_rule", "operating_preference"}:
+            existing = str(profile.get("operating_preferences") or "").strip()
+            existing_parts = [part.strip() for part in existing.split("|") if part.strip()]
+            if preference_statement not in existing_parts:
+                existing_parts.append(preference_statement)
+            profile_updates = {
+                "operating_preferences": " | ".join(existing_parts),
+            }
+
+        updated_profile = (
+            self.update_manager_profile(household_id=household_id, updates=profile_updates)
+            if profile_updates
+            else profile
+        )
+        self.record_pilot_event(
+            household_id=household_id,
+            event_type="preference_recorded",
+            member_id=recorded_by_member_id,
+            channel_id=channel_id,
+            metadata={
+                "label": cleaned_label,
+                "value": cleaned_value,
+                "category": lowered_category,
+                "subject_member_id": member_id,
+                "subject_child_id": child_id,
+            },
+            created_at=now,
+        )
+        return preference_item, updated_profile
+
+    def record_pilot_event(
+        self,
+        *,
+        household_id: str,
+        event_type: str,
+        member_id: str | None = None,
+        channel_id: str | None = None,
+        metadata: dict[str, object] | None = None,
+        created_at: datetime | None = None,
+    ) -> PilotEvent:
+        created = created_at or _utc_now()
+        event = PilotEvent(
+            id=_stable_id("pilot", household_id, event_type, str(time.time_ns())),
+            household_id=household_id,
+            event_type=event_type,
+            member_id=member_id,
+            channel_id=channel_id,
+            metadata=dict(metadata or {}),
+            created_at=created.timestamp(),
+        )
+        return self.store.upsert_pilot_event(event)
+
+    def finalize_onboarding_completion(
+        self,
+        *,
+        household_id: str,
+        member_id: str,
+        channel_id: str,
+    ) -> None:
+        self.ensure_briefing_routines(household_id=household_id)
+        self.record_pilot_event(
+            household_id=household_id,
+            event_type="onboarding_complete",
+            member_id=member_id,
+            channel_id=channel_id,
+        )
+
+    def record_reminder_feedback(
+        self,
+        *,
+        household_id: str,
+        feedback_text: str,
+        member_id: str | None = None,
+        channel_id: str | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, object]:
+        cleaned = " ".join(feedback_text.split()).strip()
+        if not cleaned:
+            return self.get_manager_profile(household_id)
+        current = self.get_manager_profile(household_id)
+        feedback_items_raw = current.get("reminder_feedback")
+        feedback_items = list(feedback_items_raw) if isinstance(feedback_items_raw, list) else []
+        captured_at = (now or _utc_now()).isoformat()
+        feedback_items.append(
+            {
+                "text": cleaned,
+                "captured_at": captured_at,
+                "member_id": member_id,
+                "channel_id": channel_id,
+            }
+        )
+        updates: dict[str, object] = {
+            "nudge_preferences": cleaned,
+            "nudge_preferences_override": cleaned,
+            "nudge_preferences_last_updated_at": captured_at,
+            "reminder_feedback": feedback_items[-80:],
+        }
+        profile = self.update_manager_profile(household_id=household_id, updates=updates)
+        self.record_pilot_event(
+            household_id=household_id,
+            event_type="reminder_feedback_received",
+            member_id=member_id,
+            channel_id=channel_id,
+            metadata={"text": cleaned},
+            created_at=now,
+        )
+        return profile
+
+    def ensure_briefing_routines(
+        self,
+        *,
+        household_id: str,
+        now: datetime | None = None,
+    ) -> list[HouseholdRoutine]:
+        household = self.store.get_household(household_id)
+        if household is None:
+            return []
+        current = now or _utc_now()
+        timezone_name = household.timezone or "America/Los_Angeles"
+        profile = self.get_manager_profile(household_id)
+        operating_preferences = str(profile.get("operating_preferences") or "")
+        default_owner = self.default_recipient_member_id(household_id)
+        default_channel = self.default_dm_channel_id(household_id=household_id, member_id=default_owner)
+        if default_owner is None:
+            return []
+
+        disable_morning = bool(re.search(r"\b(?:no|skip|disable)\s+morning\s+brief\b", operating_preferences, re.IGNORECASE))
+        disable_evening = bool(re.search(r"\b(?:no|skip|disable)\s+evening\s+(?:check[- ]?in|brief)\b", operating_preferences, re.IGNORECASE))
+        disable_weekly = bool(re.search(r"\b(?:no|skip|disable)\s+(?:weekly\s+brief|weekend\s+preview)\b", operating_preferences, re.IGNORECASE))
+
+        morning_hour, morning_minute = _extract_local_time_from_preferences(
+            operating_preferences,
+            keywords=("morning brief", "morning"),
+            default_hour=6,
+            default_minute=45,
+        )
+        evening_hour, evening_minute = _extract_local_time_from_preferences(
+            operating_preferences,
+            keywords=("evening check-in", "evening check in", "evening brief", "evening"),
+            default_hour=20,
+            default_minute=15,
+        )
+        weekly_hour, weekly_minute = _extract_local_time_from_preferences(
+            operating_preferences,
+            keywords=("weekly brief", "weekend preview", "weekly", "weekend"),
+            default_hour=17,
+            default_minute=30,
+        )
+
+        routine_specs = [
+            {
+                "kind": HouseholdBriefingKind.MORNING,
+                "title": "Morning brief",
+                "hour": morning_hour,
+                "minute": morning_minute,
+                "days": _local_schedule_days(text=operating_preferences, kind=HouseholdBriefingKind.MORNING),
+                "disabled": disable_morning,
+            },
+            {
+                "kind": HouseholdBriefingKind.EVENING,
+                "title": "Evening check-in",
+                "hour": evening_hour,
+                "minute": evening_minute,
+                "days": _local_schedule_days(text=operating_preferences, kind=HouseholdBriefingKind.EVENING),
+                "disabled": disable_evening,
+            },
+            {
+                "kind": HouseholdBriefingKind.WEEKLY,
+                "title": "Weekly preview",
+                "hour": weekly_hour,
+                "minute": weekly_minute,
+                "days": _local_schedule_days(text=operating_preferences, kind=HouseholdBriefingKind.WEEKLY),
+                "disabled": disable_weekly,
+            },
+        ]
+
+        upserted: list[HouseholdRoutine] = []
+        for spec in routine_specs:
+            routine_id = _stable_id("routine", household_id, "briefing", spec["kind"].value)
+            existing = self.store.get_household_routine(routine_id)
+            metadata = {
+                "automation_kind": "briefing",
+                "brief_kind": spec["kind"].value,
+                "local_time": f"{spec['hour']:02d}:{spec['minute']:02d}",
+                "days": list(spec["days"]),
+                "channel_id": default_channel,
+            }
+            cadence = (
+                f"briefing on weekdays at {spec['hour']:02d}:{spec['minute']:02d} local"
+                if spec["days"] == [0, 1, 2, 3, 4]
+                else f"briefing at {spec['hour']:02d}:{spec['minute']:02d} local on days {','.join(str(day) for day in spec['days'])}"
+            )
+            if spec["disabled"]:
+                if existing is None:
+                    continue
+                paused = replace(
+                    existing,
+                    title=spec["title"],
+                    cadence=cadence,
+                    status=HouseholdRoutineStatus.PAUSED,
+                    owner_member_id=existing.owner_member_id or default_owner,
+                    next_due_at=None,
+                    metadata=metadata,
+                )
+                upserted.append(self.store.upsert_household_routine(paused))
+                continue
+
+            next_due = _next_due_local_schedule_iso(
+                household_timezone=timezone_name,
+                hour=int(spec["hour"]),
+                minute=int(spec["minute"]),
+                days=list(spec["days"]),
+                now=current,
+            )
+            routine = HouseholdRoutine(
+                id=routine_id,
+                household_id=household_id,
+                title=spec["title"],
+                cadence=cadence,
+                description="Automatic Florence household briefing routine",
+                status=HouseholdRoutineStatus.ACTIVE,
+                owner_member_id=(existing.owner_member_id if existing is not None and existing.owner_member_id else default_owner),
+                next_due_at=next_due if existing is None or existing.status != HouseholdRoutineStatus.ACTIVE else (existing.next_due_at or next_due),
+                last_completed_at=existing.last_completed_at if existing is not None else None,
+                metadata=metadata,
+            )
+            upserted.append(self.store.upsert_household_routine(routine))
+        return upserted
+
+    def list_due_briefing_routines(
+        self,
+        *,
+        household_id: str,
+        now: datetime | None = None,
+    ) -> list[HouseholdRoutine]:
+        current = now or _utc_now()
+        due: list[HouseholdRoutine] = []
+        for routine in self.store.list_household_routines(
+            household_id=household_id,
+            status=HouseholdRoutineStatus.ACTIVE,
+        ):
+            if str(routine.metadata.get("automation_kind") or "") != "briefing":
+                continue
+            scheduled_at = _parse_iso_datetime(routine.next_due_at)
+            if scheduled_at is None or scheduled_at <= current:
+                due.append(routine)
+        return due
+
+    def mark_briefing_routine_sent(
+        self,
+        *,
+        routine_id: str,
+        sent_at: datetime | None = None,
+    ) -> HouseholdRoutine | None:
+        routine = self.store.get_household_routine(routine_id)
+        if routine is None:
+            return None
+        household = self.store.get_household(routine.household_id)
+        if household is None:
+            return None
+        metadata = dict(routine.metadata)
+        local_time = str(metadata.get("local_time") or "06:45")
+        parsed_time = _parse_local_time_spec(local_time) or (6, 45)
+        raw_days = metadata.get("days")
+        days = [int(item) for item in raw_days if isinstance(item, int) and 0 <= int(item) <= 6] if isinstance(raw_days, list) else [0, 1, 2, 3, 4]
+        now_value = sent_at or _utc_now()
+        next_due_at = _next_due_local_schedule_iso(
+            household_timezone=household.timezone,
+            hour=parsed_time[0],
+            minute=parsed_time[1],
+            days=days or [0, 1, 2, 3, 4],
+            now=now_value,
+        )
+        updated = replace(
+            routine,
+            last_completed_at=now_value.isoformat(),
+            next_due_at=next_due_at,
+        )
+        return self.store.upsert_household_routine(updated)
+
+    def schedule_nudge(
+        self,
+        *,
+        household_id: str,
+        message: str,
+        scheduled_for: str,
+        target_kind: HouseholdNudgeTargetKind = HouseholdNudgeTargetKind.GENERAL,
+        target_id: str | None = None,
+        recipient_member_id: str | None = None,
+        channel_id: str | None = None,
+        metadata: dict[str, object] | None = None,
+    ) -> HouseholdNudge:
+        resolved_member_id = recipient_member_id or self.default_recipient_member_id(household_id)
+        resolved_channel_id = channel_id or self.default_dm_channel_id(
+            household_id=household_id,
+            member_id=resolved_member_id,
+        )
+        normalized_message = " ".join(message.split()).strip()
+        normalized_scheduled_for = str(scheduled_for).strip()
+        nudge_id = _stable_id(
+            "nudge",
+            household_id,
+            target_kind.value,
+            target_id or "general",
+            normalized_message,
+            normalized_scheduled_for,
+        )
+        return self.store.upsert_household_nudge(
+            HouseholdNudge(
+                id=nudge_id,
+                household_id=household_id,
+                target_kind=target_kind,
+                target_id=target_id,
+                message=normalized_message,
+                recipient_member_id=resolved_member_id,
+                channel_id=resolved_channel_id,
+                scheduled_for=normalized_scheduled_for,
+                metadata=dict(metadata or {}),
+            )
+        )
+
+    def list_due_nudges(
+        self,
+        *,
+        household_id: str,
+        now: datetime | None = None,
+    ) -> list[HouseholdNudge]:
+        current = now or _utc_now()
+        due: list[HouseholdNudge] = []
+        for nudge in self.store.list_household_nudges(
+            household_id=household_id,
+            status=HouseholdNudgeStatus.SCHEDULED,
+        ):
+            scheduled_at = _parse_iso_datetime(nudge.scheduled_for)
+            if scheduled_at is None or scheduled_at <= current:
+                due.append(nudge)
+        return due
+
+    def list_pending_nudges(
+        self,
+        *,
+        household_id: str,
+        recipient_member_id: str | None = None,
+        channel_id: str | None = None,
+    ) -> list[HouseholdNudge]:
+        candidates = [
+            nudge
+            for nudge in self.store.list_household_nudges(household_id=household_id)
+            if nudge.status in {HouseholdNudgeStatus.SCHEDULED, HouseholdNudgeStatus.SENT}
+        ]
+        if recipient_member_id:
+            scoped = [nudge for nudge in candidates if nudge.recipient_member_id == recipient_member_id]
+            if scoped:
+                candidates = scoped
+        if channel_id:
+            scoped = [nudge for nudge in candidates if nudge.channel_id == channel_id]
+            if scoped:
+                candidates = scoped
+
+        def sort_key(nudge: HouseholdNudge) -> tuple[int, datetime]:
+            priority = 0 if nudge.status == HouseholdNudgeStatus.SENT else 1
+            scheduled = _parse_iso_datetime(nudge.scheduled_for) or datetime.max.replace(tzinfo=timezone.utc)
+            return (priority, scheduled)
+
+        return sorted(candidates, key=sort_key)
+
+    def complete_actionable_nudge(
+        self,
+        *,
+        household_id: str,
+        member_id: str,
+        channel_id: str,
+        now: datetime | None = None,
+    ) -> _ReminderActionResult | None:
+        actionable_nudge = self._actionable_nudge(
+            household_id=household_id,
+            member_id=member_id,
+            channel_id=channel_id,
+        )
+        if actionable_nudge is None:
+            return None
+
+        current = now or _utc_now()
+        self.acknowledge_nudge(
+            nudge_id=actionable_nudge.id,
+            acknowledged_at=current,
+        )
+        completed_work_item_title: str | None = None
+        if actionable_nudge.target_kind == HouseholdNudgeTargetKind.WORK_ITEM and actionable_nudge.target_id:
+            work_item = self.store.get_household_work_item(actionable_nudge.target_id)
+            if work_item is not None and work_item.status not in {
+                HouseholdWorkItemStatus.DONE,
+                HouseholdWorkItemStatus.CANCELLED,
+            }:
+                updated_work_item = replace(
+                    work_item,
+                    status=HouseholdWorkItemStatus.DONE,
+                    completed_at=current.isoformat(),
+                )
+                self.upsert_work_item(updated_work_item)
+                completed_work_item_title = updated_work_item.title
+
+        self.record_pilot_event(
+            household_id=household_id,
+            event_type="reminder_done",
+            member_id=member_id,
+            channel_id=channel_id,
+            metadata={
+                "nudge_id": actionable_nudge.id,
+                "target_kind": actionable_nudge.target_kind.value,
+                "target_id": actionable_nudge.target_id,
+                "marked_work_item_done": bool(completed_work_item_title),
+            },
+            created_at=current,
+        )
+        if completed_work_item_title:
+            return _ReminderActionResult(
+                reply_text=f'Done. I marked "{completed_work_item_title}" complete and stopped that reminder.'
+            )
+        return _ReminderActionResult(reply_text="Done. I marked that reminder complete.")
+
+    def snooze_actionable_nudge(
+        self,
+        *,
+        household_id: str,
+        member_id: str,
+        channel_id: str,
+        scheduled_for: datetime,
+        now: datetime | None = None,
+    ) -> _ReminderActionResult | None:
+        actionable_nudge = self._actionable_nudge(
+            household_id=household_id,
+            member_id=member_id,
+            channel_id=channel_id,
+        )
+        if actionable_nudge is None:
+            return None
+
+        current = now or _utc_now()
+        updated_nudge = self.snooze_nudge(
+            nudge_id=actionable_nudge.id,
+            scheduled_for=scheduled_for,
+            snoozed_at=current,
+        )
+        self.record_pilot_event(
+            household_id=household_id,
+            event_type="reminder_snoozed",
+            member_id=member_id,
+            channel_id=channel_id,
+            metadata={
+                "nudge_id": actionable_nudge.id,
+                "target_kind": actionable_nudge.target_kind.value,
+                "target_id": actionable_nudge.target_id,
+                "snoozed_until": (updated_nudge.scheduled_for if updated_nudge else scheduled_for.isoformat()),
+            },
+            created_at=current,
+        )
+        until_text = (updated_nudge.scheduled_for if updated_nudge else scheduled_for.isoformat()).replace("T", " ").replace("+00:00", "Z")
+        return _ReminderActionResult(reply_text=f"Okay, snoozed. I’ll remind you again around {until_text}.")
+
+    def mark_nudge_sent(
+        self,
+        *,
+        nudge_id: str,
+        sent_at: datetime | None = None,
+    ) -> HouseholdNudge | None:
+        nudge = self.store.get_household_nudge(nudge_id)
+        if nudge is None:
+            return None
+        updated = replace(
+            nudge,
+            status=HouseholdNudgeStatus.SENT,
+            sent_at=(sent_at or _utc_now()).isoformat(),
+        )
+        return self.store.upsert_household_nudge(updated)
+
+    def acknowledge_nudge(
+        self,
+        *,
+        nudge_id: str,
+        acknowledged_at: datetime | None = None,
+    ) -> HouseholdNudge | None:
+        nudge = self.store.get_household_nudge(nudge_id)
+        if nudge is None:
+            return None
+        updated = replace(
+            nudge,
+            status=HouseholdNudgeStatus.ACKNOWLEDGED,
+            acknowledged_at=(acknowledged_at or _utc_now()).isoformat(),
+        )
+        return self.store.upsert_household_nudge(updated)
+
+    def snooze_nudge(
+        self,
+        *,
+        nudge_id: str,
+        scheduled_for: datetime,
+        snoozed_at: datetime | None = None,
+    ) -> HouseholdNudge | None:
+        nudge = self.store.get_household_nudge(nudge_id)
+        if nudge is None:
+            return None
+        metadata = dict(nudge.metadata)
+        metadata["snoozed_count"] = int(metadata.get("snoozed_count", 0) or 0) + 1
+        metadata["last_snoozed_at"] = (snoozed_at or _utc_now()).isoformat()
+        updated = replace(
+            nudge,
+            status=HouseholdNudgeStatus.SCHEDULED,
+            scheduled_for=scheduled_for.isoformat(),
+            sent_at=None,
+            acknowledged_at=None,
+            metadata=metadata,
+        )
+        return self.store.upsert_household_nudge(updated)
+
+    def default_recipient_member_id(self, household_id: str) -> str | None:
+        members = self.store.list_members(household_id)
+        if not members:
+            return None
+        priority = {
+            MemberRole.ADMIN: 0,
+            MemberRole.PARENT: 1,
+            MemberRole.CAREGIVER: 2,
+            MemberRole.GRANDPARENT: 3,
+            MemberRole.CHILD_LIMITED: 4,
+        }
+        ranked = sorted(members, key=lambda member: (priority.get(member.role, 99), member.display_name.lower()))
+        return ranked[0].id if ranked else None
+
+    def default_dm_channel_id(self, *, household_id: str, member_id: str | None = None) -> str | None:
+        channels = self.store.list_channels(household_id=household_id, channel_type=ChannelType.PARENT_DM)
+        if member_id:
+            sessions = self.store.list_member_onboarding_sessions(household_id=household_id, member_id=member_id)
+            for session in sessions:
+                for channel in channels:
+                    if channel.provider_channel_id == session.thread_id:
+                        return channel.id
+        return channels[0].id if channels else None
+
+    def _actionable_nudge(
+        self,
+        *,
+        household_id: str,
+        member_id: str,
+        channel_id: str,
+    ) -> HouseholdNudge | None:
+        pending_nudges = self.list_pending_nudges(
+            household_id=household_id,
+            recipient_member_id=member_id,
+            channel_id=channel_id,
+        )
+        sent_nudges = [nudge for nudge in pending_nudges if nudge.status == HouseholdNudgeStatus.SENT]
+        if not sent_nudges:
+            return pending_nudges[0] if pending_nudges else None
+        min_dt = datetime.min.replace(tzinfo=timezone.utc)
+        return max(
+            sent_nudges,
+            key=lambda nudge: _parse_iso_datetime(nudge.sent_at) or _parse_iso_datetime(nudge.scheduled_for) or min_dt,
+        )

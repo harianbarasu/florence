@@ -35,16 +35,16 @@ def test_google_account_link_callback_persists_connection_and_marks_onboarding_c
     )
 
     monkeypatch.setattr(
-        "florence.runtime.services.exchange_google_code_for_tokens",
+        "florence.runtime.google_services.exchange_google_code_for_tokens",
         lambda **_: GoogleTokenResponse(
             access_token="access-token",
             refresh_token="refresh-token",
             expires_in=3600,
         ),
     )
-    monkeypatch.setattr("florence.runtime.services.fetch_google_user_email", lambda **_: "parent@example.com")
+    monkeypatch.setattr("florence.runtime.google_services.fetch_google_user_email", lambda **_: "parent@example.com")
     monkeypatch.setattr(
-        "florence.runtime.services.list_google_calendars",
+        "florence.runtime.google_services.list_google_calendars",
         lambda **_: [
             GoogleCalendarMetadata(
                 id="primary",

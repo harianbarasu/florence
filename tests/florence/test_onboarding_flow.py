@@ -2,20 +2,16 @@ from florence.onboarding import (
     OnboardingStage,
     OnboardingState,
     OnboardingVariant,
-    apply_activity_basics,
     apply_child_names,
     apply_child_profile_updates,
-    apply_household_members,
-    apply_household_operations,
     apply_parent_name,
-    apply_school_basics,
     build_onboarding_prompt,
+    build_onboarding_transition_message_sequence,
     mark_google_connected,
-    mark_group_activated,
 )
 
 
-def test_onboarding_flow_advances_through_required_v1_steps():
+def test_onboarding_flow_advances_through_minimal_imessage_steps():
     state = OnboardingState(
         household_id="hh_123",
         member_id="mem_123",
@@ -30,35 +26,19 @@ def test_onboarding_flow_advances_through_required_v1_steps():
     transition = apply_parent_name(state, "  Maya   ")
     assert transition.state.parent_display_name == "Maya"
     assert transition.state.stage == OnboardingStage.COLLECT_CHILD_NAMES
-    assert transition.prompt is not None
-    assert "kids" in transition.prompt.text.lower() or "child" in transition.prompt.text.lower()
 
     transition = apply_child_names(transition.state, ["Ava", "Noah"])
     assert transition.state.stage == OnboardingStage.COLLECT_CHILD_AGE
 
     transition = apply_child_profile_updates(
         transition.state,
-        [{"name": "Ava", "age": "7"}],
+        [{"name": "Ava", "age": "7", "school": "Roosevelt Elementary", "activities": ["Soccer"]}],
     )
-    assert transition.state.stage == OnboardingStage.COLLECT_CHILD_SCHOOL
-
-    transition = apply_child_profile_updates(
-        transition.state,
-        [{"name": "Ava", "school": "Roosevelt Elementary"}],
-    )
-    assert transition.state.school_basics_collected is False
-    assert transition.state.stage == OnboardingStage.COLLECT_CHILD_ACTIVITIES
-
-    transition = apply_child_profile_updates(
-        transition.state,
-        [{"name": "Ava", "activities": ["Soccer"]}],
-    )
-    assert transition.state.activity_basics_collected is False
     assert transition.state.stage == OnboardingStage.COLLECT_CHILD_AGE
 
     transition = apply_child_profile_updates(
         transition.state,
-        [{"name": "Noah", "age": "4", "school": "Little Oaks Preschool", "activities": ["Piano"]}],
+        [{"name": "Noah", "age": "4", "school": "Little Oaks Preschool", "activities": []}],
     )
     assert transition.state.stage == OnboardingStage.CONNECT_GOOGLE
     assert transition.prompt is not None
@@ -69,14 +49,8 @@ def test_onboarding_flow_advances_through_required_v1_steps():
     assert transition.state.is_complete is True
     assert transition.prompt is None
 
-    transition = mark_group_activated(transition.state, "bb_thread_group_123")
-    assert transition.state.group_channel_id == "bb_thread_group_123"
-    assert transition.state.stage == OnboardingStage.COMPLETE
-    assert transition.state.is_complete is True
-    assert transition.prompt is None
 
-
-def test_onboarding_allows_empty_activity_list_once_answer_is_collected():
+def test_activity_answer_can_be_empty_and_still_complete_child_profile():
     state = OnboardingState(
         household_id="hh_123",
         member_id="mem_123",
@@ -90,16 +64,18 @@ def test_onboarding_allows_empty_activity_list_once_answer_is_collected():
         },
     )
 
-    transition = apply_activity_basics(state, [])
+    transition = apply_child_profile_updates(
+        state,
+        [{"name": "Ava", "activities": []}],
+    )
 
     assert transition.state.activity_labels == []
-    assert transition.state.activity_basics_collected is True
     assert transition.state.stage == OnboardingStage.CONNECT_GOOGLE
     assert transition.state.is_complete is False
     assert transition.prompt is not None
 
 
-def test_concierge_variant_now_starts_with_kids_before_any_family_map_prompt():
+def test_concierge_variant_still_goes_straight_to_kids_after_parent_name():
     state = OnboardingState(
         household_id="hh_123",
         member_id="mem_456",
@@ -113,9 +89,27 @@ def test_concierge_variant_now_starts_with_kids_before_any_family_map_prompt():
     assert transition.prompt is not None
     assert "kids" in transition.prompt.text.lower()
 
-    transition = apply_household_members(
-        transition.state,
-        ["Maya - mom", "Ben - dad", "Ava - daughter"],
+
+def test_transition_messages_after_parent_name_include_intro_and_google_connect():
+    state = OnboardingState(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="thread_dm_123",
+        metadata={"variant": OnboardingVariant.HYBRID.value},
     )
 
-    assert transition.state.stage == OnboardingStage.COLLECT_CHILD_NAMES
+    transition = apply_parent_name(state, "Maya")
+    messages = build_onboarding_transition_message_sequence(
+        transition,
+        previous_stage=OnboardingStage.COLLECT_PARENT_NAME,
+        link_url="https://example.com/google/connect",
+    )
+
+    assert messages == (
+        "Hi, I'm Florence.",
+        "I help run the household with you by keeping logistics organized, surfacing reminders, and staying on top of school and calendar noise.",
+        "Connect your Google account so I can pull the last 30 days of family email and calendar in the background while we keep going here.",
+        "https://example.com/google/connect",
+        "Once Google says you're connected, come right back here. You can also keep answering my questions while it runs.",
+        "What are your kids' names? Send all of them in one message, one per line or comma-separated.",
+    )

@@ -21,6 +21,7 @@ from florence.contracts import (
     HouseholdWorkItemStatus,
 )
 from florence.state import FlorenceStateDB
+from florence.runtime.visibility import build_scope_model_lines, resolve_conversation_scope
 
 logger = logging.getLogger(__name__)
 
@@ -46,12 +47,6 @@ class FlorenceHouseholdChatService:
         model: str,
         max_iterations: int = 6,
         provider: str = "auto",
-        enabled_toolsets: list[str] | tuple[str, ...] | None = None,
-        disabled_toolsets: list[str] | tuple[str, ...] | None = None,
-        fallback_model: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
-        tool_use_enforcement: str | bool | list[str] | tuple[str, ...] = "auto",
-        enable_honcho: bool = True,
-        honcho_scope: str = "member",
         agent_factory: Callable[..., Any] | None = None,
         session_db: Any | None = None,
     ):
@@ -59,12 +54,6 @@ class FlorenceHouseholdChatService:
         self.model = model
         self.max_iterations = max_iterations
         self.provider = provider.strip() if isinstance(provider, str) and provider.strip() else "auto"
-        self.enabled_toolsets = list(enabled_toolsets) if enabled_toolsets is not None else ["florence_chat"]
-        self.disabled_toolsets = list(disabled_toolsets or [])
-        self.fallback_model = [dict(item) for item in (fallback_model or ()) if isinstance(item, dict)]
-        self.tool_use_enforcement = list(tool_use_enforcement) if isinstance(tool_use_enforcement, tuple) else tool_use_enforcement
-        self.enable_honcho = bool(enable_honcho)
-        self.honcho_scope = str(honcho_scope or "member").strip().lower() or "member"
         self.agent_factory = agent_factory
         self.session_db = session_db or self._build_session_db()
 
@@ -96,6 +85,7 @@ class FlorenceHouseholdChatService:
             system_message=system_message,
             conversation_history=history,
             session_id=session_id,
+            enabled_toolsets=["florence_chat"],
         )
         final_response = str(result.get("final_response") or "").strip()
         if not final_response:
@@ -103,64 +93,6 @@ class FlorenceHouseholdChatService:
                 "Florence household chat produced an empty final_response for household_id=%s channel_id=%s",
                 household_id,
                 channel_id,
-            )
-            return None
-        return FlorenceHouseholdChatReply(text=final_response)
-
-    def handle_capture_request(
-        self,
-        *,
-        household_id: str,
-        channel_id: str,
-        actor_member_id: str | None,
-        message_text: str,
-        capture_kind: str,
-        conversation_history: list[ChannelMessage] | None = None,
-    ) -> FlorenceHouseholdChatReply | None:
-        system_message = self._build_system_message(
-            household_id=household_id,
-            channel_id=channel_id,
-            actor_member_id=actor_member_id,
-        )
-        if not system_message:
-            return None
-        capture_label = " ".join(str(capture_kind or "capture").split()).strip().lower() or "capture"
-        system_message = "\n".join(
-            [
-                system_message,
-                "You are handling a capture -> handled request.",
-                "Before creating duplicates, look at household state, prior Florence context, and connected inbox context when they help.",
-                "Default to turning the input into durable household state when the user is asking Florence to remember, plan, track, or manage something.",
-                "For meal and grocery requests, prefer creating or updating household meals and shopping items instead of leaving the plan only in chat.",
-                "For screenshots, flyers, photos, or extracted media text, pull out dates, times, locations, reminders, deadlines, and required items, then persist the structured result.",
-                "If the input is incomplete or ambiguous, ask one short follow-up question instead of guessing.",
-                "Reply with a concise handled summary of what Florence captured, planned, saved, or still needs.",
-            ]
-        )
-        history, session_id = self._load_conversation_history(
-            channel_id=channel_id,
-            fallback_messages=conversation_history or [],
-        )
-        result = self._run_agent_conversation(
-            household_id=household_id,
-            channel_id=channel_id,
-            actor_member_id=actor_member_id,
-            user_message=(
-                f"Handle this {capture_label} request.\n\n"
-                "Convert it into structured household state when appropriate, then reply with the short handled result.\n\n"
-                f"User message:\n{message_text}"
-            ),
-            system_message=system_message,
-            conversation_history=history,
-            session_id=session_id,
-        )
-        final_response = str(result.get("final_response") or "").strip()
-        if not final_response:
-            logger.warning(
-                "Florence capture handler produced an empty final_response for household_id=%s channel_id=%s kind=%s",
-                household_id,
-                channel_id,
-                capture_kind,
             )
             return None
         return FlorenceHouseholdChatReply(text=final_response)
@@ -216,7 +148,6 @@ class FlorenceHouseholdChatService:
             system_message=system_message,
             conversation_history=None,
             enabled_toolsets=["florence_briefing"],
-            disabled_toolsets=[],
         )
         final_response = str(result.get("final_response") or "").strip()
         return final_response or None
@@ -280,7 +211,6 @@ class FlorenceHouseholdChatService:
             system_message=system_message,
             conversation_history=None,
             enabled_toolsets=["florence_briefing"],
-            disabled_toolsets=[],
         )
         final_response = str(result.get("final_response") or "").strip()
         if not final_response:
@@ -344,7 +274,6 @@ class FlorenceHouseholdChatService:
             system_message=system_message,
             conversation_history=None,
             enabled_toolsets=["florence_briefing"],
-            disabled_toolsets=[],
         )
         final_response = str(result.get("final_response") or "").strip()
         return final_response or None
@@ -413,7 +342,6 @@ class FlorenceHouseholdChatService:
                 else None
             ),
             enabled_toolsets=["florence_briefing"],
-            disabled_toolsets=[],
         )
         final_response = str(result.get("final_response") or "").strip()
         return final_response or None
@@ -454,7 +382,6 @@ class FlorenceHouseholdChatService:
             system_message=system_message,
             conversation_history=None,
             enabled_toolsets=["florence_briefing"],
-            disabled_toolsets=[],
         )
         final_response = str(result.get("final_response") or "").strip()
         if not final_response or final_response == "NO_GROUP_SHARE":
@@ -471,8 +398,7 @@ class FlorenceHouseholdChatService:
         system_message: str,
         conversation_history: list[dict[str, str]] | None,
         session_id: str | None = None,
-        enabled_toolsets: list[str] | None = None,
-        disabled_toolsets: list[str] | None = None,
+        enabled_toolsets: list[str],
     ) -> dict[str, Any]:
         task_id = f"florence-household-{uuid.uuid4()}"
 
@@ -497,29 +423,18 @@ class FlorenceHouseholdChatService:
                 model=self.model,
                 max_iterations=self.max_iterations,
                 provider=self.provider,
-                enabled_toolsets=enabled_toolsets if enabled_toolsets is not None else self.enabled_toolsets,
-                disabled_toolsets=(
-                    disabled_toolsets
-                    if disabled_toolsets is not None
-                    else (self.disabled_toolsets or None)
-                ),
+                enabled_toolsets=enabled_toolsets,
                 quiet_mode=True,
-                skip_memory=not self.enable_honcho,
+                skip_memory=False,
                 skip_local_memory=True,
                 platform="florence",
                 session_id=session_id,
                 session_db=self.session_db,
-                honcho_session_key=(
-                    self._build_honcho_session_key(
-                        household_id=household_id,
-                        channel_id=channel_id,
-                        actor_member_id=actor_member_id,
-                    )
-                    if self.enable_honcho
-                    else None
+                honcho_session_key=self._build_honcho_session_key(
+                    household_id=household_id,
+                    channel_id=channel_id,
+                    actor_member_id=actor_member_id,
                 ),
-                fallback_model=self.fallback_model or None,
-                tool_use_enforcement=self.tool_use_enforcement,
                 session_search_kwargs=self._build_session_search_kwargs(
                     household_id=household_id,
                     channel_id=channel_id,
@@ -607,12 +522,12 @@ class FlorenceHouseholdChatService:
         actor_member_id: str | None,
     ) -> str:
         channel = self.store.get_channel(channel_id)
-        channel_type = channel.channel_type if channel is not None else None
-        scope = self.honcho_scope
-        if scope == "household":
-            return f"florence:household:{household_id}"
-        if scope == "channel":
-            return f"florence:channel:{household_id}:{channel_id}"
+        scope = resolve_conversation_scope(
+            self.store,
+            channel_id=channel_id,
+            actor_member_id=actor_member_id,
+        )
+        channel_type = scope.channel_type
         if channel_type == ChannelType.HOUSEHOLD_GROUP:
             return f"florence:household:{household_id}"
         if actor_member_id:
@@ -739,28 +654,40 @@ class FlorenceHouseholdChatService:
                 kind=HouseholdProfileKind.ACTIVITY,
             )
         ]
+        scope = resolve_conversation_scope(
+            self.store,
+            channel_id=channel_id,
+            actor_member_id=actor_member_id,
+        )
+        channel_type = scope.channel_type
 
         lines = [
-            "You are Florence, the Hermes-powered household agent for this iMessage thread.",
+            "You are Florence, the Hermes-powered household agent for this household conversation.",
             "You are running on Hermes core, but the backend household state is the source of truth.",
+            "The family group chat is the primary operating surface for shared household work. Parent DMs are the private side channel.",
             "You are a general household agent: help with planning, research, logistics, shopping, writing, reminders, and coordination when useful.",
             "Your core product loops are inbox -> plan, capture -> handled, and briefs -> stay ahead.",
             "Treat almost any household input as something you can structure and handle: school email, screenshots, flyers, photos, mental dumps, meals, groceries, reminders, and schedule questions.",
             "You have Hermes non-coding tools available for research, browsing websites, messaging, reminders, and media tasks.",
             "Your memory stack is: authoritative Florence household state, Florence session history, and Florence-scoped Honcho memory.",
             "You also have Florence household-state tools. Use them to persist durable household state when the user wants Florence to remember or manage something over time.",
+            "Before creating duplicate tasks, events, meals, grocery items, or reminders, check household state, recent Florence context, and connected inbox context when they help.",
+            "When the user is asking Florence to capture, track, plan, or manage something, prefer updating durable household state and reply with a concise handled summary of what Florence saved, planned, or still needs.",
+            "For meal and grocery requests, prefer creating or updating household meals and shopping items instead of leaving the plan only in chat.",
             "When a user tells Florence a stable preference, constraint, rule, or working style that should affect future behavior, save it with household_record_preference.",
             "Use household_search_state when you need the latest tracked household picture before answering or updating state.",
+            "household_search_state now returns scope context too: current visibility scope, tentative tracked state, and any private review state available in the current channel.",
             "When the user asks what Florence said before, refers to an earlier conversation, or wants prior household context, use session_search to recall earlier Florence threads for this household.",
             "When the user asks what they are forgetting, what changed, what matters this week, what still needs handling, or asks for a plan, ground the answer in household_search_state and session_search first, then check Gmail when relevant.",
             "Use session_search and Honcho memory to recover earlier commitments, preferences, and threads of work instead of making the user repeat themselves.",
             "When the user explicitly asks you to check email, search Gmail, or find a message from a school, camp, teacher, coach, or sender, use household_search_google_inbox.",
+            "household_search_google_inbox respects scope: in a parent DM it defaults to that parent's inbox, while in the family group it only uses shared-household inbox scope.",
             "Do not ask the user to forward or paste an email if a connected Google inbox is available and household_search_google_inbox can answer it.",
             "When a user gives concrete dates/times they want remembered (camp, school, sports, appointments, trips), save them with household_upsert_event instead of leaving them only in chat.",
             "When plans are tentative, still save them as tentative events and update later.",
             "When the user asks what matters, what changed, or what they are forgetting, synthesize a short operational plan instead of dumping raw notes.",
             "When the user asks for meal planning, pantry or fridge help, or grocery support, use household_upsert_meal and household_upsert_shopping_item when they want Florence to keep tracking it.",
-            "When a user shares a screenshot, flyer, photo, or document with dates, deadlines, or logistics, extract the structured details and persist them.",
+            "When a user shares a screenshot, flyer, photo, document, or extracted media text with dates, deadlines, or logistics, extract the structured details and persist them.",
             "Never claim an imported Gmail or Google Calendar item is confirmed unless it is already present in confirmed household state below.",
             "Before taking an external action that spends money, commits the household, sends a message outside this thread, or changes reminders/plans, get a clear confirmation from the requester.",
             "If household information is missing or ambiguous, ask a short follow-up question.",
@@ -769,8 +696,9 @@ class FlorenceHouseholdChatService:
             f"Timezone: {household.timezone}",
             f"Channel ID: {channel_id}",
         ]
-        if channel is not None and channel.channel_type == ChannelType.PARENT_DM:
-            lines.append("Channel context: this is a private parent DM, so one-on-one planning is fine.")
+        lines.extend(build_scope_model_lines(scope=scope))
+        if scope.is_private_parent_dm:
+            lines.append("Channel context: this is a private parent DM, which acts as Florence's private side channel.")
             lines.append(
                 "Private DM policy: raw mental-load dumps, emotional support, and individually scoped reasoning stay private by default."
             )
@@ -780,8 +708,8 @@ class FlorenceHouseholdChatService:
             lines.append(
                 "If something from this DM should become shared household state, create the structured event, task, meal, grocery item, or reminder first, then offer a concise group-safe summary instead of echoing the raw message."
             )
-        elif channel is not None and channel.channel_type == ChannelType.HOUSEHOLD_GROUP:
-            lines.append("Channel context: this is the shared household group chat, so reply for the whole family.")
+        elif scope.is_shared_household_group:
+            lines.append("Channel context: this is the shared household group chat, which is Florence's primary operating surface for the family.")
             lines.append(
                 "Group-chat policy: optimize for shared visibility, coordination, ownership, schedule changes, reminders, meals, grocery planning, and household logistics."
             )
@@ -825,21 +753,7 @@ class FlorenceHouseholdChatService:
         if isinstance(operating_preferences, str) and operating_preferences.strip():
             lines.append(f"Household operating policy: {operating_preferences.strip()}")
 
-        if events:
-            lines.append("Confirmed household events:")
-            for event in events[:20]:
-                label = event.title
-                if event.starts_at:
-                    label = f"{label} | starts {event.starts_at}"
-                if event.ends_at:
-                    label = f"{label} | ends {event.ends_at}"
-                if event.location:
-                    label = f"{label} | location {event.location}"
-                if event.status.value != "confirmed":
-                    label = f"{label} | status {event.status.value}"
-                lines.append(f"- {label}")
-        else:
-            lines.append("Confirmed household events: none yet.")
+        lines.extend(self._build_event_snapshot_lines(events))
 
         if work_items:
             lines.append("Open household work items:")
@@ -889,3 +803,36 @@ class FlorenceHouseholdChatService:
 
         lines.append("Use the household state below as authoritative context, then use Hermes tools when they help.")
         return "\n".join(lines)
+
+    @staticmethod
+    def _build_event_snapshot_lines(events: list[Any]) -> list[str]:
+        confirmed_events = [event for event in events if event.status.value == "confirmed"]
+        tentative_events = [event for event in events if event.status.value != "confirmed"]
+        lines: list[str] = []
+
+        if confirmed_events:
+            lines.append("Confirmed household events:")
+            for event in confirmed_events[:20]:
+                lines.append(f"- {FlorenceHouseholdChatService._format_event_snapshot_line(event)}")
+        else:
+            lines.append("Confirmed household events: none yet.")
+
+        if tentative_events:
+            lines.append("Tentative tracked events:")
+            for event in tentative_events[:12]:
+                lines.append(f"- {FlorenceHouseholdChatService._format_event_snapshot_line(event, include_status=True)}")
+
+        return lines
+
+    @staticmethod
+    def _format_event_snapshot_line(event: Any, *, include_status: bool = False) -> str:
+        label = event.title
+        if event.starts_at:
+            label = f"{label} | starts {event.starts_at}"
+        if event.ends_at:
+            label = f"{label} | ends {event.ends_at}"
+        if event.location:
+            label = f"{label} | location {event.location}"
+        if include_status:
+            label = f"{label} | status {event.status.value}"
+        return label

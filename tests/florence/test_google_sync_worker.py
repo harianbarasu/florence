@@ -31,10 +31,15 @@ def test_google_sync_worker_fetches_and_persists_candidates(tmp_path, monkeypatc
             thread_id="dm_thread_123",
             google_connected=True,
             child_names=["Ava"],
-            school_labels=["Roosevelt Elementary"],
-            activity_labels=["Soccer"],
-            school_basics_collected=True,
-            activity_basics_collected=True,
+            metadata={
+                "child_profiles": [
+                    {
+                        "name": "Ava",
+                        "school": "Roosevelt Elementary",
+                        "activities": ["Soccer"],
+                    }
+                ]
+            },
         )
     )
     store.replace_child_profiles(
@@ -69,7 +74,7 @@ def test_google_sync_worker_fetches_and_persists_candidates(tmp_path, monkeypatc
     )
 
     monkeypatch.setattr(
-        "florence.runtime.services.list_recent_gmail_sync_items",
+        "florence.runtime.google_services.list_recent_gmail_sync_items",
         lambda **_: [
             GmailSyncItem(
                 gmail_message_id="gmail_123",
@@ -85,7 +90,7 @@ def test_google_sync_worker_fetches_and_persists_candidates(tmp_path, monkeypatc
         ],
     )
     monkeypatch.setattr(
-        "florence.runtime.services.list_recent_parent_calendar_sync_items",
+        "florence.runtime.google_services.list_recent_parent_calendar_sync_items",
         lambda **_: [
             ParentCalendarSyncItem(
                 google_event_id="event_123",
@@ -141,8 +146,8 @@ def test_google_sync_worker_uses_deep_bootstrap_scan_on_first_sync(tmp_path, mon
         return []
 
     monkeypatch.setenv("FLORENCE_GMAIL_BOOTSTRAP_MAX_RESULTS", "321")
-    monkeypatch.setattr("florence.runtime.services.list_recent_gmail_sync_items", _fake_gmail)
-    monkeypatch.setattr("florence.runtime.services.list_recent_parent_calendar_sync_items", lambda **_: [])
+    monkeypatch.setattr("florence.runtime.google_services.list_recent_gmail_sync_items", _fake_gmail)
+    monkeypatch.setattr("florence.runtime.google_services.list_recent_parent_calendar_sync_items", lambda **_: [])
 
     worker = FlorenceGoogleSyncWorkerService(store, FlorenceGoogleSyncPersistenceService(store))
     result = worker.sync_connection("gconn_bootstrap", now=datetime(2026, 3, 25, 18, 0, tzinfo=timezone.utc))
@@ -180,8 +185,8 @@ def test_google_sync_worker_uses_incremental_window_after_bootstrap(tmp_path, mo
         return []
 
     monkeypatch.setenv("FLORENCE_GMAIL_INCREMENTAL_MAX_RESULTS", "111")
-    monkeypatch.setattr("florence.runtime.services.list_recent_gmail_sync_items", _fake_gmail)
-    monkeypatch.setattr("florence.runtime.services.list_recent_parent_calendar_sync_items", lambda **_: [])
+    monkeypatch.setattr("florence.runtime.google_services.list_recent_gmail_sync_items", _fake_gmail)
+    monkeypatch.setattr("florence.runtime.google_services.list_recent_parent_calendar_sync_items", lambda **_: [])
 
     worker = FlorenceGoogleSyncWorkerService(store, FlorenceGoogleSyncPersistenceService(store))
     result = worker.sync_connection("gconn_incremental", now=datetime(2026, 3, 25, 18, 0, tzinfo=timezone.utc))
@@ -257,10 +262,15 @@ def test_google_sync_worker_honors_calendar_preferences_and_keeps_non_primary_id
             thread_id="dm_thread_123",
             google_connected=True,
             child_names=["Ava"],
-            school_labels=["Roosevelt Elementary"],
-            activity_labels=["Soccer"],
-            school_basics_collected=True,
-            activity_basics_collected=True,
+            metadata={
+                "child_profiles": [
+                    {
+                        "name": "Ava",
+                        "school": "Roosevelt Elementary",
+                        "activities": ["Soccer"],
+                    }
+                ]
+            },
         )
     )
     store.replace_child_profiles(
@@ -269,7 +279,7 @@ def test_google_sync_worker_honors_calendar_preferences_and_keeps_non_primary_id
     )
     observed_calendar_ids: list[str] = []
 
-    monkeypatch.setattr("florence.runtime.services.list_recent_gmail_sync_items", lambda **_: [])
+    monkeypatch.setattr("florence.runtime.google_services.list_recent_gmail_sync_items", lambda **_: [])
 
     def _fake_calendar_fetch(*, calendar, **kwargs):
         observed_calendar_ids.append(calendar.id)
@@ -292,7 +302,7 @@ def test_google_sync_worker_honors_calendar_preferences_and_keeps_non_primary_id
             )
         ]
 
-    monkeypatch.setattr("florence.runtime.services.list_recent_parent_calendar_sync_items", _fake_calendar_fetch)
+    monkeypatch.setattr("florence.runtime.google_services.list_recent_parent_calendar_sync_items", _fake_calendar_fetch)
 
     worker = FlorenceGoogleSyncWorkerService(store, FlorenceGoogleSyncPersistenceService(store))
     result = worker.sync_connection("gconn_multi")

@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from florence.contracts import (
+    CandidateState,
     GoogleSourceKind,
     HouseholdEvent,
     HouseholdEventStatus,
@@ -24,14 +25,14 @@ from florence.contracts import (
     HouseholdRoutineStatus,
     HouseholdShoppingItem,
     HouseholdShoppingItemStatus,
-    HouseholdSourceVisibility,
     HouseholdWorkItem,
     HouseholdWorkItemStatus,
+    ImportedCandidate,
 )
 from florence.google.fetch import list_recent_gmail_sync_items
 from florence.google.oauth import refresh_google_access_token
-from florence.runtime.services import FlorenceHouseholdManagerService
-from florence.source_rules import request_matches_shared_gmail_rule
+from florence.runtime.household_manager import FlorenceHouseholdManagerService
+from florence.runtime.visibility import resolve_conversation_scope, resolve_google_inbox_scope
 from florence.state import FlorenceStateDB
 from tools.registry import registry
 
@@ -338,8 +339,10 @@ SEARCH_STATE_SCHEMA = {
     "name": "household_search_state",
     "description": (
         "Search Florence household state when you need to pull the latest tracked work, routines, nudges, meals, "
-        "shopping items, confirmed events, children, profile items, reminder preferences, or operating preferences. "
-        "Use this before updating existing state if the current household picture is unclear."
+        "shopping items, events, children, profile items, reminder preferences, or operating preferences. "
+        "The result also includes structured scope context showing the current channel scope, tentative tracked state, "
+        "and any private review state available in the current DM. Use this before updating existing state if the "
+        "current household picture is unclear."
     ),
     "parameters": {
         "type": "object",
@@ -382,6 +385,93 @@ SEARCH_STATE_SCHEMA = {
 }
 
 
+def _serialize_review_candidate(candidate: ImportedCandidate) -> dict[str, Any]:
+    metadata = candidate.metadata if isinstance(candidate.metadata, dict) else {}
+    return {
+        "id": candidate.id,
+        "title": candidate.title,
+        "summary": candidate.summary,
+        "state": candidate.state.value,
+        "source_kind": candidate.source_kind.value,
+        "review_lane": str(metadata.get("review_lane") or "").strip() or None,
+        "source_visibility": str(metadata.get("source_visibility") or "").strip() or None,
+        "source_rule_label": str(metadata.get("source_rule_label") or "").strip() or None,
+        "requires_confirmation": candidate.requires_confirmation,
+    }
+
+
+def _build_visibility_summary(
+    context: FlorenceHouseholdToolContext,
+    *,
+    query: str,
+    limit: int,
+) -> dict[str, Any]:
+    scope = resolve_conversation_scope(
+        context.store,
+        channel_id=context.channel_id,
+        actor_member_id=context.actor_member_id,
+    )
+    tentative_events = [
+        _serialize_event(event)
+        for event in context.store.list_household_events(household_id=context.household_id)
+        if event.status != HouseholdEventStatus.CONFIRMED
+        and _matches_query([event.title, event.description, event.location, event.status.value, event.metadata], query)
+    ]
+    confirmed_event_count = sum(
+        1
+        for event in context.store.list_household_events(household_id=context.household_id)
+        if event.status == HouseholdEventStatus.CONFIRMED
+    )
+    visibility: dict[str, Any] = {
+        "current_scope": {
+            "channel_type": scope.channel_type.value if scope.channel_type is not None else None,
+            "scope": scope.scope,
+            "actor_member_id": context.actor_member_id,
+            "private_review_available": scope.private_review_available,
+        },
+        "shared_household_state": {
+            "confirmed_event_count": confirmed_event_count,
+        },
+        "tentative_state": {
+            "event_count": len(tentative_events),
+            "events": tentative_events[:limit],
+        },
+    }
+
+    if scope.private_review_available:
+        pending_candidates = [
+            _serialize_review_candidate(candidate)
+            for candidate in context.store.list_imported_candidates(
+                household_id=context.household_id,
+                member_id=context.actor_member_id,
+                state=CandidateState.PENDING_REVIEW,
+            )
+            if _matches_query(
+                [
+                    candidate.title,
+                    candidate.summary,
+                    candidate.state.value,
+                    candidate.source_kind.value,
+                    candidate.metadata,
+                ],
+                query,
+            )
+        ]
+        visibility["private_review_state"] = {
+            "available_in_current_scope": True,
+            "pending_candidate_count": len(pending_candidates),
+            "pending_candidates": pending_candidates[:limit],
+        }
+    else:
+        visibility["private_review_state"] = {
+            "available_in_current_scope": False,
+            "pending_candidate_count": 0,
+            "pending_candidates": [],
+        }
+
+    return visibility
+
+
 def _serialize_manager_profile_entry(key: str, value: Any) -> dict[str, Any]:
     label = key.replace("_", " ")
     if isinstance(value, str):
@@ -411,7 +501,8 @@ SEARCH_GOOGLE_INBOX_SCHEMA = {
     "description": (
         "Search the connected Gmail inbox when the user explicitly asks Florence to check email from a sender, "
         "school, camp, teacher, coach, or keyword. Use this instead of asking the user to forward the email when "
-        "Google is already connected."
+        "Google is already connected. In a parent DM, this defaults to that parent's inbox unless the request clearly "
+        "matches shared household source rules. In the family group, only shared-household inbox scope is allowed."
     ),
     "parameters": {
         "type": "object",
@@ -779,6 +870,11 @@ def _handle_search_state(args: dict, *, task_id: str | None = None, **_: Any) ->
     return json.dumps(
         {
             "household_id": context.household_id,
+            "visibility": _build_visibility_summary(
+                context,
+                query=query,
+                limit=limit,
+            ),
             "results": results,
         }
     )
@@ -917,42 +1013,36 @@ def _handle_search_google_inbox(args: dict, *, task_id: str | None = None, **_: 
     newer_than_days = max(1, min(int(args.get("newer_than_days", 120) or 120), 365))
     max_results = max(1, min(int(args.get("max_results", 5) or 5), 10))
 
-    household_connections = [
-        connection
-        for connection in context.store.list_google_connections(household_id=context.household_id)
-        if GoogleSourceKind.GMAIL in connection.connected_scopes
-    ]
-    shared_rules = context.store.list_household_source_rules(
+    google_scope = resolve_google_inbox_scope(
+        context.store,
         household_id=context.household_id,
-        source_kind=GoogleSourceKind.GMAIL,
-        visibility=HouseholdSourceVisibility.SHARED,
-    )
-    search_shared_household = request_matches_shared_gmail_rule(
-        shared_rules,
-        sender=sender,
+        channel_id=context.channel_id,
+        actor_member_id=context.actor_member_id,
         query=query,
+        sender=sender,
         subject=subject,
     )
+    if google_scope.error:
+        return json.dumps(
+            {
+                "error": google_scope.error,
+                "search_scope": google_scope.search_scope,
+                "scope_reason": google_scope.scope_reason,
+                "searched_connection_emails": [],
+                "results": [],
+            }
+        )
 
-    connections = []
-    if context.actor_member_id:
-        connections = [
-            connection
-            for connection in context.store.list_google_connections(
-                household_id=context.household_id,
-                member_id=context.actor_member_id,
-            )
-            if GoogleSourceKind.GMAIL in connection.connected_scopes
-        ]
-    if search_shared_household:
-        connections = household_connections
-    elif not connections and (context.actor_member_id is None or len(household_connections) == 1):
-        connections = household_connections
+    connections = google_scope.connections
+    search_scope = google_scope.search_scope
+    scope_reason = google_scope.scope_reason
 
     if not connections:
         return json.dumps(
             {
                 "error": "No active Google inbox is connected for this household member.",
+                "search_scope": search_scope,
+                "scope_reason": scope_reason,
                 "results": [],
             }
         )
@@ -987,6 +1077,8 @@ def _handle_search_google_inbox(args: dict, *, task_id: str | None = None, **_: 
     return json.dumps(
         {
             "gmail_query": gmail_query,
+            "search_scope": search_scope,
+            "scope_reason": scope_reason,
             "searched_connection_emails": searched_connection_emails,
             "results": results[:max_results],
         }

@@ -14,18 +14,11 @@ class OnboardingVariant(StrEnum):
 
 class OnboardingStage(StrEnum):
     COLLECT_PARENT_NAME = "collect_parent_name"
-    COLLECT_HOUSEHOLD_MEMBERS = "collect_household_members"
     COLLECT_CHILD_NAMES = "collect_child_names"
     COLLECT_CHILD_AGE = "collect_child_age"
     COLLECT_CHILD_SCHOOL = "collect_child_school"
     COLLECT_CHILD_ACTIVITIES = "collect_child_activities"
     CONNECT_GOOGLE = "connect_google"
-    COLLECT_SCHOOL_BASICS = "collect_school_basics"
-    COLLECT_ACTIVITY_BASICS = "collect_activity_basics"
-    COLLECT_HOUSEHOLD_OPERATIONS = "collect_household_operations"
-    COLLECT_NUDGE_PREFERENCES = "collect_nudge_preferences"
-    COLLECT_OPERATING_PREFERENCES = "collect_operating_preferences"
-    ACTIVATE_GROUP = "activate_group"
     COMPLETE = "complete"
 
 
@@ -115,11 +108,6 @@ class OnboardingState:
     parent_display_name: str | None = None
     google_connected: bool = False
     child_names: list[str] = field(default_factory=list)
-    school_labels: list[str] = field(default_factory=list)
-    activity_labels: list[str] = field(default_factory=list)
-    school_basics_collected: bool = False
-    activity_basics_collected: bool = False
-    group_channel_id: str | None = None
     metadata: dict[str, object] = field(default_factory=dict)
 
     @property
@@ -129,10 +117,6 @@ class OnboardingState:
             return OnboardingVariant(raw)
         except ValueError:
             return OnboardingVariant.HYBRID
-
-    @property
-    def household_members(self) -> list[str]:
-        return _metadata_list(self.metadata, "household_members")
 
     @property
     def child_details(self) -> list[str]:
@@ -182,16 +166,35 @@ class OnboardingState:
         return _clean_text(profile.get("name"))
 
     @property
-    def household_operations(self) -> list[str]:
-        return _metadata_list(self.metadata, "household_operations")
+    def school_labels(self) -> list[str]:
+        labels: list[str] = []
+        seen: set[str] = set()
+        for profile in self.child_profiles:
+            school = _clean_text(profile.get("school"))
+            if school is None or school.lower() in {"none yet", "not yet", "unknown"}:
+                continue
+            lowered = school.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            labels.append(school)
+        return labels
 
     @property
-    def nudge_preferences(self) -> str | None:
-        return _metadata_text(self.metadata, "nudge_preferences")
-
-    @property
-    def operating_preferences(self) -> str | None:
-        return _metadata_text(self.metadata, "operating_preferences")
+    def activity_labels(self) -> list[str]:
+        labels: list[str] = []
+        seen: set[str] = set()
+        for profile in self.child_profiles:
+            activities = _clean_text_list(profile.get("activities"))
+            if not activities:
+                continue
+            for activity in activities:
+                lowered = activity.lower()
+                if lowered in seen:
+                    continue
+                seen.add(lowered)
+                labels.append(activity)
+        return labels
 
     @property
     def is_grounded_for_google_matching(self) -> bool:

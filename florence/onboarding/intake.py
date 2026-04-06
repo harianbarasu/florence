@@ -49,6 +49,44 @@ def _looks_like_google_connected(text: str) -> bool:
     return bool(re.search(r"\b(done|connected|finished|complete|i connected)\b", text, re.IGNORECASE))
 
 
+def _looks_like_conversational_request(text: str) -> bool:
+    normalized = " ".join(text.split()).strip()
+    if not normalized:
+        return False
+    if "?" in normalized and len(normalized.split()) > 1:
+        return True
+    return bool(
+        re.search(
+            r"^(?:can|could|would|what|when|where|who|why|how|show|check|find|plan|help|remind|review|list|share|send|post)\b",
+            normalized,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _looks_like_child_detail_reply(stage: OnboardingStage, text: str) -> bool:
+    normalized = " ".join(text.split()).strip()
+    if not normalized or _looks_like_conversational_request(normalized):
+        return False
+    lowered = normalized.lower()
+    word_count = len(normalized.split())
+    if stage == OnboardingStage.COLLECT_CHILD_AGE:
+        if any(char.isdigit() for char in normalized):
+            return True
+        if any(marker in lowered for marker in ("year old", "years old", "turning", "turns", "month old", "months old")):
+            return True
+        return word_count <= 3
+    if stage == OnboardingStage.COLLECT_CHILD_SCHOOL:
+        if lowered in {"not yet", "n/a", "na"}:
+            return True
+        return word_count <= 8
+    if stage == OnboardingStage.COLLECT_CHILD_ACTIVITIES:
+        if lowered.startswith("none"):
+            return True
+        return word_count <= 12
+    return True
+
+
 def _configured_api_key() -> str | None:
     raw = (
         os.getenv("FLORENCE_ONBOARDING_OPENAI_API_KEY", "").strip()
@@ -172,9 +210,23 @@ class FlorenceOnboardingIntakeService:
         if state.stage == OnboardingStage.COLLECT_PARENT_NAME:
             return OnboardingIntakeResult(parent_name=cleaned)
         if state.stage == OnboardingStage.COLLECT_CHILD_NAMES:
+            if _looks_like_conversational_request(cleaned):
+                return OnboardingIntakeResult(
+                    google_connected=_looks_like_google_connected(cleaned),
+                    ignore_message=True,
+                )
             return OnboardingIntakeResult(
                 google_connected=_looks_like_google_connected(cleaned),
                 child_names=extract_child_names(split_entries(raw_text)),
+            )
+        if state.stage in {
+            OnboardingStage.COLLECT_CHILD_AGE,
+            OnboardingStage.COLLECT_CHILD_SCHOOL,
+            OnboardingStage.COLLECT_CHILD_ACTIVITIES,
+        } and not _looks_like_child_detail_reply(state.stage, cleaned):
+            return OnboardingIntakeResult(
+                google_connected=_looks_like_google_connected(cleaned),
+                ignore_message=True,
             )
         update: dict[str, Any] = {}
         if state.current_child_name:

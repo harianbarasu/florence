@@ -46,7 +46,9 @@ def test_enrich_linq_payload_with_media_text_appends_extracted_attachment_contex
     class _FakeResponses:
         def create(self, **kwargs):
             content = kwargs["input"][1]["content"]
-            if any(item.get("type") == "input_file" for item in content):
+            file_item = next((item for item in content if item.get("type") == "input_file"), None)
+            if file_item is not None:
+                assert file_item["file_data"].startswith("data:application/pdf;base64,")
                 return types.SimpleNamespace(output_text="Picture Day form due Thursday at 8am.")
             if any(item.get("type") == "input_image" for item in content):
                 return types.SimpleNamespace(output_text="Flyer says baseball practice Tuesday 4:30 PM.")

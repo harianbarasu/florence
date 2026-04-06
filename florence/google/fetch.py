@@ -69,6 +69,11 @@ def _compact_text(raw: str, max_length: int = 8_000) -> str:
     return f"{normalized[: max_length - 1].rstrip()}..."
 
 
+def _pdf_file_data_url(pdf_bytes: bytes) -> str:
+    encoded = base64.b64encode(pdf_bytes).decode("ascii")
+    return f"data:application/pdf;base64,{encoded}"
+
+
 def _read_gmail_header(headers: list[dict[str, Any]] | None, name: str) -> str:
     lowered_name = name.lower()
     for header in headers or []:
@@ -196,7 +201,7 @@ def _extract_pdf_attachment_text_with_gpt(
                         {
                             "type": "input_file",
                             "filename": filename or "attachment.pdf",
-                            "file_data": base64.b64encode(pdf_bytes).decode("ascii"),
+                            "file_data": _pdf_file_data_url(pdf_bytes),
                         },
                         {
                             "type": "input_text",

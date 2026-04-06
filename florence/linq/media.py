@@ -61,6 +61,11 @@ def _response_output_text(response: Any) -> str:
     return ""
 
 
+def _pdf_file_data_url(pdf_bytes: bytes) -> str:
+    encoded = base64.b64encode(pdf_bytes).decode("ascii")
+    return f"data:application/pdf;base64,{encoded}"
+
+
 def _media_model() -> str:
     return os.getenv("FLORENCE_CHAT_MEDIA_MODEL", "gpt-5.4").strip() or "gpt-5.4"
 
@@ -105,7 +110,7 @@ def _extract_pdf_text_with_gpt(*, pdf_bytes: bytes, filename: str | None) -> str
                         {
                             "type": "input_file",
                             "filename": filename or "attachment.pdf",
-                            "file_data": base64.b64encode(pdf_bytes).decode("ascii"),
+                            "file_data": _pdf_file_data_url(pdf_bytes),
                         },
                         {"type": "input_text", "text": "Return plain text only."},
                     ],

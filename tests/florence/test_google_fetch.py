@@ -214,6 +214,10 @@ def test_extract_pdf_attachment_text_with_gpt_uses_gpt_5_4_by_default(monkeypatc
     assert calls["base_url"] == "https://api.openai.com/v1"
     assert isinstance(calls["kwargs"], dict)
     assert calls["kwargs"]["model"] == "gpt-5.4"
+    file_input = calls["kwargs"]["input"][1]["content"][0]
+    assert file_input["type"] == "input_file"
+    assert file_input["filename"] == "forms.pdf"
+    assert file_input["file_data"].startswith("data:application/pdf;base64,")
 
 
 def test_list_recent_gmail_sync_items_accepts_custom_query(monkeypatch):

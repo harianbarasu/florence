@@ -6,7 +6,9 @@ import json
 import logging
 import uuid
 from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
 from florence.contracts import (
     ChannelMessage,
@@ -45,6 +47,7 @@ class FlorenceHouseholdChatService:
         briefing_emoji_mode: str = "none",
         agent_factory: Callable[..., Any] | None = None,
         session_db: Any | None = None,
+        now_getter: Callable[[], datetime] | None = None,
     ):
         self.store = store
         self.model = model
@@ -58,6 +61,7 @@ class FlorenceHouseholdChatService:
         )
         self.agent_factory = agent_factory
         self.session_db = session_db or self._build_session_db()
+        self.now_getter = now_getter or (lambda: datetime.now(timezone.utc))
 
     def respond(
         self,
@@ -531,7 +535,12 @@ class FlorenceHouseholdChatService:
                 actor_name = member.display_name
 
         members = self.store.list_members(household_id)
-        events = self.store.list_household_events(household_id=household_id)
+        now_utc = self._coerce_aware_datetime(self.now_getter())
+        local_now = self._household_local_now(now_utc=now_utc, timezone_name=household.timezone)
+        events = self._relevant_events_snapshot(
+            self.store.list_household_events(household_id=household_id),
+            now_utc=now_utc,
+        )
         work_items = [
             item
             for item in self.store.list_household_work_items(household_id=household_id)
@@ -629,6 +638,7 @@ class FlorenceHouseholdChatService:
             "Keep replies concise and practical. Do not mention internal policy or hidden review queues unless asked directly.",
             f"Household: {household.name}",
             f"Timezone: {household.timezone}",
+            f"Current household-local date/time: {local_now.isoformat()}",
             f"Channel ID: {channel_id}",
         ]
         lines.extend(build_scope_model_lines(scope=scope))
@@ -742,6 +752,64 @@ class FlorenceHouseholdChatService:
                 lines.append(f"- {FlorenceHouseholdChatService._format_event_snapshot_line(event, include_status=True)}")
 
         return lines
+
+    @staticmethod
+    def _coerce_aware_datetime(value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    @staticmethod
+    def _parse_event_datetime(raw: str | None) -> datetime | None:
+        if not raw:
+            return None
+        text = raw.strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = f"{text[:-1]}+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    @staticmethod
+    def _household_local_now(*, now_utc: datetime, timezone_name: str | None) -> datetime:
+        zone_name = timezone_name or "America/Los_Angeles"
+        try:
+            return now_utc.astimezone(ZoneInfo(zone_name))
+        except Exception:
+            return now_utc
+
+    @classmethod
+    def _event_is_relevant(cls, event: Any, *, now_utc: datetime) -> bool:
+        start = cls._parse_event_datetime(getattr(event, "starts_at", None))
+        end = cls._parse_event_datetime(getattr(event, "ends_at", None)) or start
+        lookback = timedelta(hours=12)
+
+        if start is None and end is None:
+            return event.status.value != "confirmed"
+        if end is not None:
+            return end >= now_utc - lookback
+        return False
+
+    @classmethod
+    def _event_sort_key(cls, event: Any, *, now_utc: datetime) -> tuple[int, datetime, str]:
+        start = cls._parse_event_datetime(getattr(event, "starts_at", None))
+        end = cls._parse_event_datetime(getattr(event, "ends_at", None)) or start
+        if start is None and end is None:
+            return (2, datetime.max.replace(tzinfo=timezone.utc), getattr(event, "title", ""))
+        if end is not None and end < now_utc:
+            return (1, end, getattr(event, "title", ""))
+        return (0, start or end or datetime.max.replace(tzinfo=timezone.utc), getattr(event, "title", ""))
+
+    @classmethod
+    def _relevant_events_snapshot(cls, events: list[Any], *, now_utc: datetime) -> list[Any]:
+        relevant = [event for event in events if cls._event_is_relevant(event, now_utc=now_utc)]
+        return sorted(relevant, key=lambda event: cls._event_sort_key(event, now_utc=now_utc))
 
     @staticmethod
     def _format_event_snapshot_line(event: Any, *, include_status: bool = False) -> str:

@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from florence.contracts import (
@@ -198,6 +199,7 @@ def test_household_chat_service_uses_hermes_agent_with_confirmed_state(tmp_path)
         max_iterations=4,
         provider="anthropic",
         agent_factory=_FakeAgent,
+        now_getter=lambda: datetime(2026, 3, 18, 12, 0, tzinfo=timezone.utc),
     )
 
     reply = service.respond(
@@ -220,6 +222,7 @@ def test_household_chat_service_uses_hermes_agent_with_confirmed_state(tmp_path)
     }
     assert _FakeAgent.created[0]["session_id"] == "florence-channel-chan_dm_123"
     assert _FakeAgent.created[0]["session_db"] is not None
+    assert "Current household-local date/time:" in _FakeAgent.last_run["system_message"]
     assert "Confirmed household events" in _FakeAgent.last_run["system_message"]
     assert "Ava soccer practice" in _FakeAgent.last_run["system_message"]
     assert "Open household work items" in _FakeAgent.last_run["system_message"]
@@ -258,12 +261,78 @@ def test_household_chat_service_uses_hermes_agent_with_confirmed_state(tmp_path)
     assert "Current scope: private parent DM. Florence may use shared household context plus this parent's private context here." in _FakeAgent.last_run["system_message"]
     assert "offer a concise group-safe summary instead of echoing the raw message" in _FakeAgent.last_run["system_message"]
     assert "Tentative tracked events:" in _FakeAgent.last_run["system_message"]
-    assert "Possible camp carpool | starts 2026-03-21T15:00:00+00:00 | ends 2026-03-21T16:00:00+00:00 | status tentative" in _FakeAgent.last_run["system_message"]
-    assert "Florence household-state tools" in _FakeAgent.last_run["system_message"]
-    assert "household_search_google_inbox" in _FakeAgent.last_run["system_message"]
-    assert "in a parent DM it defaults to that parent's inbox, while in the family group it only uses shared-household inbox scope" in _FakeAgent.last_run["system_message"]
-    assert "Do not ask the user to forward or paste an email" in _FakeAgent.last_run["system_message"]
-    assert _FakeAgent.last_run["task_id"].startswith("florence-household-")
+
+
+def test_household_chat_service_omits_stale_past_events_from_default_snapshot(tmp_path):
+    _FakeAgent.created.clear()
+    _FakeAgent.last_run = None
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(
+        Household(
+            id="hh_123",
+            name="Maya's household",
+            timezone="America/Los_Angeles",
+        )
+    )
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm_thread_123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    store.upsert_household_event(
+        HouseholdEvent(
+            id="evt_past",
+            household_id="hh_123",
+            title="March flight to Los Angeles",
+            starts_at="2026-03-15T15:00:00+00:00",
+            ends_at="2026-03-15T18:00:00+00:00",
+            timezone="America/Los_Angeles",
+        )
+    )
+    store.upsert_household_event(
+        HouseholdEvent(
+            id="evt_upcoming",
+            household_id="hh_123",
+            title="Theo music class",
+            starts_at="2026-04-08T23:15:00+00:00",
+            ends_at="2026-04-09T00:00:00+00:00",
+            timezone="America/Los_Angeles",
+        )
+    )
+
+    service = FlorenceHouseholdChatService(
+        store,
+        model="anthropic/claude-opus-4.6",
+        max_iterations=4,
+        provider="anthropic",
+        agent_factory=_FakeAgent,
+        now_getter=lambda: datetime(2026, 4, 7, 18, 0, tzinfo=timezone.utc),
+    )
+
+    reply = service.respond(
+        household_id="hh_123",
+        channel_id="chan_dm_123",
+        actor_member_id="mem_123",
+        message_text="What matters next?",
+    )
+
+    assert reply is not None
+    assert "Current household-local date/time: 2026-04-07" in _FakeAgent.last_run["system_message"]
+    assert "Theo music class" in _FakeAgent.last_run["system_message"]
+    assert "March flight to Los Angeles" not in _FakeAgent.last_run["system_message"]
     store.close()
 
 

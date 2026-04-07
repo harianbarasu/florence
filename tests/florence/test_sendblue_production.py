@@ -119,6 +119,55 @@ def test_production_service_handles_sendblue_webhook(tmp_path, monkeypatch):
     store.close()
 
 
+def test_production_service_strips_markdown_before_sending_sendblue_message(tmp_path, monkeypatch):
+    settings = _build_settings(tmp_path)
+    store = FlorenceStateDB(settings.server.db_path)
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="sendblue",
+            provider_channel_id="+15122164639|+15555550123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    service = FlorenceProductionService(settings, store=store)
+    service.sendblue = _FakeSendblueClient()
+    monkeypatch.setattr(
+        service.entrypoints,
+        "handle_sendblue_payload",
+        lambda payload: FlorenceEntrypointResult(
+            reply_text="**Private note**\n\nCheck [camp email](https://example.com) tonight.",
+            consumed=True,
+            household_id="hh_123",
+            channel_id="chan_dm_123",
+        ),
+    )
+
+    payload = {
+        "content": "hello",
+        "is_outbound": False,
+        "status": "RECEIVED",
+        "message_handle": "msg_123",
+        "from_number": "+15555550123",
+        "number": "+15555550123",
+        "to_number": "+15122164639",
+        "sendblue_number": "+15122164639",
+        "service": "iMessage",
+    }
+    result = service.handle_sendblue_webhook(
+        payload=payload,
+        webhook_secret="sb-webhook-secret",
+    )
+
+    assert result.status_code == 200
+    assert json.loads(result.body)["ok"] is True
+    assert service.sendblue.sent[0]["message"] == "Private note\n\nCheck camp email (https://example.com) tonight."
+    store.close()
+
+
 def test_server_accepts_sendblue_documented_secret_header():
     headers = {"sb-signing-secret": "sb-webhook-secret"}
 
@@ -266,4 +315,97 @@ def test_production_service_enriches_sendblue_media_payload_before_entrypoint(tm
     assert result.status_code == 200
     assert "Media context extracted from attachments" in str(captured_payload["content"])
     assert "form.pdf: Permission slip due Friday at pickup." in str(captured_payload["content"])
+    store.close()
+
+
+def test_production_service_enriches_sendblue_image_payload_before_entrypoint(tmp_path, monkeypatch):
+    settings = _build_settings(tmp_path)
+    store = FlorenceStateDB(settings.server.db_path)
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="sendblue",
+            provider_channel_id="+15122164639|+15555550123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    service = FlorenceProductionService(settings, store=store)
+    service.sendblue = _FakeSendblueClient()
+
+    class _FakeResponse:
+        def __init__(self, *, content: bytes, content_type: str):
+            self.content = content
+            self.headers = {"content-type": content_type}
+
+        def raise_for_status(self):
+            return None
+
+    def _fake_get(url, *, timeout=None):  # noqa: ARG001
+        if url.endswith("calendar.png"):
+            return _FakeResponse(content=b"\x89PNG-fake", content_type="image/png")
+        raise AssertionError(f"Unexpected URL: {url}")
+
+    monkeypatch.setattr(sendblue_media.httpx, "get", _fake_get)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+
+    class _FakeResponses:
+        def create(self, **kwargs):
+            content = kwargs["input"][1]["content"]
+            image_item = next((item for item in content if item.get("type") == "input_image"), None)
+            assert image_item is not None
+            assert image_item["image_url"].startswith("data:image/png;base64,")
+            system_text = kwargs["input"][0]["content"][0]["text"]
+            assert "faithful OCR-style extraction" in system_text
+            assert "row-by-row closures" in system_text
+            return types.SimpleNamespace(
+                output_text=(
+                    "Young Minds school calendar: Mar 30-Apr 3, 2026 Spring Break; "
+                    "May 25 Memorial Day; Jun 18 TK graduation."
+                )
+            )
+
+    class _FakeOpenAI:
+        def __init__(self, **kwargs):  # noqa: ARG002
+            self.responses = _FakeResponses()
+
+    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=_FakeOpenAI))
+    captured_payload: dict[str, object] = {}
+
+    def _handle(payload):
+        captured_payload.update(payload)
+        return FlorenceEntrypointResult(
+            reply_text="Hi from Florence",
+            consumed=True,
+            household_id="hh_123",
+            channel_id="chan_dm_123",
+        )
+
+    monkeypatch.setattr(service.entrypoints, "handle_sendblue_payload", _handle)
+
+    payload = {
+        "content": "Can you look at this calendar screenshot?",
+        "is_outbound": False,
+        "status": "RECEIVED",
+        "message_handle": "msg_media_img_123",
+        "from_number": "+15555550123",
+        "number": "+15555550123",
+        "to_number": "+15122164639",
+        "sendblue_number": "+15122164639",
+        "service": "iMessage",
+        "message_type": "file",
+        "media_url": "https://example.com/calendar.png",
+        "filename": "calendar.png",
+    }
+
+    result = service.handle_sendblue_webhook(
+        payload=payload,
+        webhook_secret="sb-webhook-secret",
+    )
+
+    assert result.status_code == 200
+    assert "Media context extracted from attachments" in str(captured_payload["content"])
+    assert "calendar.png: Young Minds school calendar:" in str(captured_payload["content"])
     store.close()

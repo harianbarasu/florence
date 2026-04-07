@@ -41,6 +41,8 @@ class FlorenceHouseholdChatService:
         model: str,
         max_iterations: int = 6,
         provider: str = "auto",
+        briefing_style: str = "plain",
+        briefing_emoji_mode: str = "none",
         agent_factory: Callable[..., Any] | None = None,
         session_db: Any | None = None,
     ):
@@ -48,6 +50,12 @@ class FlorenceHouseholdChatService:
         self.model = model
         self.max_iterations = max_iterations
         self.provider = provider.strip() if isinstance(provider, str) and provider.strip() else "auto"
+        self.briefing_style = briefing_style.strip().lower() if isinstance(briefing_style, str) and briefing_style.strip() else "plain"
+        self.briefing_emoji_mode = (
+            briefing_emoji_mode.strip().lower()
+            if isinstance(briefing_emoji_mode, str) and briefing_emoji_mode.strip()
+            else "none"
+        )
         self.agent_factory = agent_factory
         self.session_db = session_db or self._build_session_db()
 
@@ -114,6 +122,7 @@ class FlorenceHouseholdChatService:
                 "Use a short header and at most 6 bullets.",
                 "Write like Florence is the household operator: surface what matters, what might slip, and the clearest next step.",
                 "Prioritize shared logistics, reminders, deadlines, meal planning, grocery coordination, and pickup or schedule risks.",
+                *self._briefing_style_instructions(),
                 "Before drafting the brief, use household_search_state to refresh the tracked household picture.",
                 "Use session_search and Honcho recall when recent commitments, context, or follow-through might matter for the brief.",
                 "If a brief depends on recent school, camp, teacher, coach, or sender updates that may still be outside tracked state, use household_search_google_inbox.",
@@ -145,6 +154,30 @@ class FlorenceHouseholdChatService:
         )
         final_response = str(result.get("final_response") or "").strip()
         return final_response or None
+
+    def _briefing_style_instructions(self) -> list[str]:
+        lines = [
+            "Write for iMessage/SMS in plain text. Do not rely on markdown, bold markers, or other rich-text formatting.",
+            "Use everyday parent-facing language, not PM, admin, or ops jargon.",
+            "Avoid words like 'underspecified', 'surface', 'risk posture', 'optimize', or 'unresolved items'.",
+        ]
+        if self.briefing_style == "warm":
+            lines.append(
+                "Keep the tone warm, calm, and competent. Sound like a helpful co-parenting operator, not a dashboard or life coach."
+            )
+        elif self.briefing_style == "neutral":
+            lines.append(
+                "Keep the tone calm, neutral, and matter-of-fact without sounding stiff."
+            )
+        else:
+            lines.append(
+                "Keep the tone calm, direct, and natural. Prefer plainspoken text a parent would actually send."
+            )
+        if self.briefing_emoji_mode == "minimal":
+            lines.append("Use at most one emoji in the header if it genuinely helps. Do not use emojis in bullets.")
+        else:
+            lines.append("Do not use emojis.")
+        return lines
 
     def compose_operator_message(
         self,

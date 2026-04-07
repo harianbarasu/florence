@@ -105,3 +105,63 @@ def test_production_service_handles_linq_webhook(tmp_path, monkeypatch):
     assert service.linq.sent[0]["chat_id"] == "chat_123"
     assert service.linq.sent[0]["message"] == "Hi from Florence"
     store.close()
+
+
+def test_production_service_strips_markdown_before_sending_linq_message(tmp_path, monkeypatch):
+    settings = _build_settings(tmp_path)
+    store = FlorenceStateDB(settings.server.db_path)
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="chat_123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    service = FlorenceProductionService(settings, store=store)
+    service.linq = _FakeLinqClient()
+    monkeypatch.setattr(
+        service.entrypoints,
+        "handle_linq_payload",
+        lambda payload: FlorenceEntrypointResult(
+            reply_text=(
+                "**Evening check-in**\n\n"
+                "- **Tomorrow is light but underspecified:** no confirmed events.\n"
+                "- **Suggested prep item:** set out bags tonight."
+            ),
+            consumed=True,
+            household_id="hh_123",
+            channel_id="chan_dm_123",
+        ),
+    )
+
+    payload = {
+        "webhook_version": "2026-02-03",
+        "event_type": "message.received",
+        "data": {
+            "chat": {"id": "chat_123", "is_group": False},
+            "id": "msg_123",
+            "direction": "inbound",
+            "sender_handle": {"handle": "+15555550123", "is_me": False},
+            "parts": [{"type": "text", "value": "hello"}],
+            "service": "iMessage",
+        },
+    }
+    raw_body = json.dumps(payload).encode("utf-8")
+    result = service.handle_linq_webhook(
+        payload=payload,
+        raw_body=raw_body,
+        webhook_signature="sig",
+        webhook_timestamp=str(int(time.time())),
+    )
+
+    assert result.status_code == 200
+    assert service.linq.sent[0]["message"] == (
+        "Evening check-in\n\n"
+        "- Tomorrow is light but underspecified: no confirmed events.\n"
+        "- Suggested prep item: set out bags tonight."
+    )
+    store.close()

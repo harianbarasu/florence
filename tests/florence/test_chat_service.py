@@ -596,11 +596,66 @@ def test_household_chat_service_compose_brief_uses_briefing_toolset(tmp_path):
     assert _FakeAgent.created[0]["enabled_toolsets"] == ["florence_briefing"]
     assert "automatic household briefing" in _FakeAgent.last_run["system_message"]
     assert "surface what matters, what might slip, and the clearest next step" in _FakeAgent.last_run["system_message"]
+    assert "Write for iMessage/SMS in plain text." in _FakeAgent.last_run["system_message"]
+    assert "Avoid words like 'underspecified'" in _FakeAgent.last_run["system_message"]
+    assert "Do not use emojis." in _FakeAgent.last_run["system_message"]
     assert "use household_search_state to refresh the tracked household picture" in _FakeAgent.last_run["system_message"]
     assert "Use session_search and Honcho recall when recent commitments, context, or follow-through might matter for the brief." in _FakeAgent.last_run["system_message"]
     assert "use household_search_google_inbox" in _FakeAgent.last_run["system_message"]
     assert "Do not present uncertain Gmail or calendar imports as confirmed household facts." in _FakeAgent.last_run["system_message"]
     assert "morning brief" in _FakeAgent.last_run["user_message"].lower()
+    store.close()
+
+
+def test_household_chat_service_compose_brief_supports_warm_minimal_emoji_policy(tmp_path):
+    _FakeAgent.created.clear()
+    _FakeAgent.last_run = None
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(
+        Household(
+            id="hh_123",
+            name="Maya's household",
+            timezone="America/Los_Angeles",
+        )
+    )
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm_thread_123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    service = FlorenceHouseholdChatService(
+        store,
+        model="anthropic/claude-opus-4.6",
+        max_iterations=4,
+        provider="anthropic",
+        briefing_style="warm",
+        briefing_emoji_mode="minimal",
+        agent_factory=_FakeAgent,
+    )
+
+    brief = service.compose_brief(
+        household_id="hh_123",
+        channel_id="chan_dm_123",
+        actor_member_id="mem_123",
+        brief_kind=HouseholdBriefingKind.EVENING,
+    )
+
+    assert brief is not None
+    assert "Keep the tone warm, calm, and competent." in _FakeAgent.last_run["system_message"]
+    assert "Use at most one emoji in the header if it genuinely helps." in _FakeAgent.last_run["system_message"]
     store.close()
 
 

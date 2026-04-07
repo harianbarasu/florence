@@ -17,10 +17,13 @@ DEFAULT_PDF_EXTRACTION_PROMPT = (
 DEFAULT_IMAGE_EXTRACTION_PROMPT = (
     "Extract useful household context from this screenshot or image. "
     "If it contains text, focus on names, dates, times, locations, tasks, deadlines, and required items. "
+    "For screenshots, tables, calendars, schedules, forms, or dense text images, do faithful OCR-style extraction of all visible logistics-relevant text instead of only summarizing the top few items. "
+    "Preserve date ranges, row-by-row closures, holidays, dismissal notes, and other schedule details when visible. "
     "For school flyers, forms, or logistics screenshots, also call out permission slips, uniforms, materials to bring, "
     "follow-up actions, and who the update is from when visible. "
     "If it is a pantry, fridge, grocery, meal, or food photo, list the visible ingredients, groceries, or meal-relevant items. "
-    "Return concise plain text that helps Florence handle logistics or meal and grocery planning."
+    "If some text is unclear, say that briefly instead of inventing details. "
+    "Return plain text that helps Florence handle logistics or meal and grocery planning."
 )
 
 
@@ -135,8 +138,8 @@ def extract_image_text_with_openai(
     default_model: str = "gpt-5.4",
     default_base_url: str = "https://api.openai.com/v1",
     system_text: str = DEFAULT_IMAGE_EXTRACTION_PROMPT,
-    max_output_tokens: int = 1_200,
-    max_output_chars: int = 2_500,
+    max_output_tokens: int = 1_800,
+    max_output_chars: int = 5_000,
 ) -> str | None:
     client = _openai_client(
         api_key_env_names=api_key_env_names,

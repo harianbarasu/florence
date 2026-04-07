@@ -77,7 +77,7 @@ def _extract_image_text_with_gpt(*, image_bytes: bytes, mime_type: str, filename
         base_url_env_name="FLORENCE_CHAT_MEDIA_OPENAI_BASE_URL",
         model_env_name="FLORENCE_CHAT_MEDIA_MODEL",
         log_label="Linq image extraction",
-        max_output_chars=2_500,
+        max_output_chars=5_000,
     )
 
 

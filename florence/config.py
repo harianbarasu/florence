@@ -82,6 +82,11 @@ def _normalize_public_base_url(value: Any) -> str | None:
     return normalized
 
 
+def _normalize_choice(value: Any, *, allowed: set[str], default: str) -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in allowed else default
+
+
 @dataclass(slots=True)
 class FlorenceGoogleRuntimeConfig:
     client_id: str | None
@@ -126,6 +131,12 @@ class FlorenceHermesRuntimeConfig:
 
 
 @dataclass(slots=True)
+class FlorenceBriefingRuntimeConfig:
+    style: str = "plain"
+    emoji_mode: str = "none"
+
+
+@dataclass(slots=True)
 class FlorenceRedisRuntimeConfig:
     url: str | None
     google_sync_queue_name: str = "florence-google-sync"
@@ -157,6 +168,7 @@ class FlorenceSettings:
     hermes: FlorenceHermesRuntimeConfig
     redis: FlorenceRedisRuntimeConfig
     sendblue: FlorenceSendblueRuntimeConfig = field(default_factory=FlorenceSendblueRuntimeConfig)
+    briefing: FlorenceBriefingRuntimeConfig = field(default_factory=FlorenceBriefingRuntimeConfig)
 
     @classmethod
     def from_env(cls) -> "FlorenceSettings":
@@ -332,6 +344,30 @@ class FlorenceSettings:
                     )
                 ).strip()
                 or "auto",
+            ),
+            briefing=FlorenceBriefingRuntimeConfig(
+                style=_normalize_choice(
+                    _env_or_config(
+                        ("FLORENCE_BRIEFING_STYLE",),
+                        florence_cfg,
+                        "briefing",
+                        "style",
+                        default="plain",
+                    ),
+                    allowed={"plain", "neutral", "warm"},
+                    default="plain",
+                ),
+                emoji_mode=_normalize_choice(
+                    _env_or_config(
+                        ("FLORENCE_BRIEFING_EMOJI_MODE",),
+                        florence_cfg,
+                        "briefing",
+                        "emoji_mode",
+                        default="none",
+                    ),
+                    allowed={"none", "minimal"},
+                    default="none",
+                ),
             ),
             redis=FlorenceRedisRuntimeConfig(
                 url=_env_or_config(

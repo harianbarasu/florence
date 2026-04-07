@@ -62,6 +62,8 @@ class FlorenceProductionService:
             model=settings.hermes.model,
             max_iterations=settings.hermes.max_iterations,
             provider=settings.hermes.provider,
+            briefing_style=settings.briefing.style,
+            briefing_emoji_mode=settings.briefing.emoji_mode,
         )
         self.entrypoints = FlorenceEntrypointService(
             self.store,

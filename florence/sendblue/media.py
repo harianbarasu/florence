@@ -180,7 +180,7 @@ def _extract_media_text(ref: _SendblueMediaRef, *, content: bytes, content_type:
             base_url_env_name="FLORENCE_CHAT_MEDIA_OPENAI_BASE_URL",
             model_env_name="FLORENCE_CHAT_MEDIA_MODEL",
             log_label="Sendblue image extraction",
-            max_output_chars=2_500,
+            max_output_chars=5_000,
         )
     return None
 

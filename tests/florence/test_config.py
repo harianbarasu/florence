@@ -49,12 +49,18 @@ def test_florence_settings_default_and_override_household_toolsets(tmp_path, mon
     assert default_settings.hermes.model == "anthropic/claude-opus-4.6"
     assert default_settings.hermes.max_iterations == 6
     assert default_settings.hermes.provider == "auto"
+    assert default_settings.briefing.style == "plain"
+    assert default_settings.briefing.emoji_mode == "none"
 
     monkeypatch.setenv("FLORENCE_HERMES_PROVIDER", "custom")
     monkeypatch.setenv("FLORENCE_HERMES_MODEL", "openai/gpt-5.4")
     monkeypatch.setenv("FLORENCE_HERMES_MAX_ITERATIONS", "9")
+    monkeypatch.setenv("FLORENCE_BRIEFING_STYLE", "warm")
+    monkeypatch.setenv("FLORENCE_BRIEFING_EMOJI_MODE", "minimal")
 
     overridden_settings = FlorenceSettings.from_env()
     assert overridden_settings.hermes.model == "openai/gpt-5.4"
     assert overridden_settings.hermes.max_iterations == 9
     assert overridden_settings.hermes.provider == "custom"
+    assert overridden_settings.briefing.style == "warm"
+    assert overridden_settings.briefing.emoji_mode == "minimal"

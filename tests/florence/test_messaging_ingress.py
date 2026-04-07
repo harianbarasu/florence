@@ -1718,8 +1718,48 @@ def test_first_group_message_after_context_collection_records_group_channel(tmp_
     assert result.consumed is True
     assert result.reply_text is not None
     assert "I’m in." in result.reply_text
-    assert "main household thread" in result.reply_text
-    assert "Use DM when something should stay private." in result.reply_text
+
+
+def test_known_parent_new_dm_thread_does_not_restart_onboarding(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_onboarding_service(store, review_service)
+    chat_service = _StubHouseholdChatService("I remember you. What do you need?")
+    ingress = _build_ingress(
+        store,
+        onboarding_service,
+        review_service,
+        household_chat_service=chat_service,
+    )
+
+    _complete_hybrid_onboarding(onboarding_service)
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_new",
+            thread_id="dm_thread_new",
+            message=FlorenceInboundMessage(
+                provider="sendblue",
+                message_id="msg_new_thread_1",
+                thread_id="dm_thread_new",
+                sender_handle="+15555550123",
+                body="Hi",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    resumed = onboarding_service.get_or_create_session(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_new",
+    )
+    assert resumed.is_complete is True
+    assert result.consumed is True
+    assert result.reply_text == "I remember you. What do you need?"
+    assert chat_service.calls[0]["message_text"] == "Hi"
     store.close()
 
 

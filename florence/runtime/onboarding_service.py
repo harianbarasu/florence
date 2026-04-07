@@ -67,6 +67,15 @@ class FlorenceOnboardingSessionService:
         if existing is not None:
             return existing
 
+        previous_sessions = self.store.list_member_onboarding_sessions(
+            household_id=household_id,
+            member_id=member_id,
+        )
+        if previous_sessions:
+            resumed = replace(previous_sessions[0], thread_id=thread_id)
+            self.store.upsert_onboarding_session(resumed)
+            return resumed
+
         state = OnboardingState(
             household_id=household_id,
             member_id=member_id,

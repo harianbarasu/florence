@@ -527,6 +527,60 @@ def test_second_parent_early_onboarding_does_not_clear_existing_household_ground
     store.close()
 
 
+def test_onboarding_service_reuses_latest_member_state_for_new_thread(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    onboarding_service = FlorenceOnboardingSessionService(store)
+
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_old",
+        display_name="Jackson",
+    )
+    onboarding_service.record_google_connected(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_old",
+    )
+    onboarding_service.record_child_names(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_old",
+        child_names=["Lexie"],
+    )
+    onboarding_service.record_user_reply(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_old",
+        text="5",
+    )
+    onboarding_service.record_user_reply(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_old",
+        text="Bright Horizons",
+    )
+    onboarding_service.record_user_reply(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_old",
+        text="Swimming",
+    )
+
+    resumed = onboarding_service.get_or_create_session(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_new",
+    )
+
+    assert resumed.thread_id == "dm_new"
+    assert resumed.parent_display_name == "Jackson"
+    assert resumed.child_names == ["Lexie"]
+    assert resumed.google_connected is True
+    assert resumed.is_complete is True
+    store.close()
+
+
 def test_onboarding_service_ignores_generic_planning_message_during_child_detail_collection(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     onboarding_service = FlorenceOnboardingSessionService(store)

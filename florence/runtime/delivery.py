@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from typing import Any, Callable
 
@@ -11,6 +12,20 @@ from florence.runtime.entrypoints import FlorenceEntrypointResult
 from florence.state import FlorenceStateDB
 
 logger = logging.getLogger(__name__)
+
+
+def _plain_text_transport_message(message: str) -> str:
+    text = message
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", text)
+    text = re.sub(r"```(?:[a-zA-Z0-9_+-]+)?\n?", "", text)
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    text = re.sub(r"(?<!\*)\*\*([^\n*][\s\S]*?[^\n*])\*\*(?!\*)", r"\1", text)
+    text = re.sub(r"(?<!_)__([^\n_][\s\S]*?[^\n_])__(?!_)", r"\1", text)
+    text = re.sub(r"(?<!\S)\*([^\n*]+)\*(?!\S)", r"\1", text)
+    text = re.sub(r"(?<!\S)_([^\n_]+)_(?!\S)", r"\1", text)
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 class FlorenceChannelDeliveryService:
@@ -97,8 +112,9 @@ class FlorenceChannelDeliveryService:
     ) -> bool:
         try:
             target_store = store or self.store
+            outgoing_message = _plain_text_transport_message(message)
             if channel.provider == "linq":
-                self._linq_client_getter().send_text(chat_id=channel.provider_channel_id, message=message)
+                self._linq_client_getter().send_text(chat_id=channel.provider_channel_id, message=outgoing_message)
             elif channel.provider == "sendblue":
                 metadata = dict(getattr(channel, "metadata", {}) or {})
                 group_id = str(metadata.get("group_id") or "").strip() or None
@@ -117,7 +133,7 @@ class FlorenceChannelDeliveryService:
                         numbers = list(dict.fromkeys(numbers)) or None
                 self._sendblue_client_getter().send_text(
                     thread_id=channel.provider_channel_id,
-                    message=message,
+                    message=outgoing_message,
                     group_id=group_id,
                     numbers=numbers,
                 )
@@ -130,7 +146,7 @@ class FlorenceChannelDeliveryService:
                         household_id=channel.household_id,
                         channel_id=channel.id,
                         sender_role=ChannelMessageRole.ASSISTANT,
-                        body=message,
+                        body=outgoing_message,
                         metadata={
                             "provider": channel.provider,
                             "transport_thread_id": channel.provider_channel_id,

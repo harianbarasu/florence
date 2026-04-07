@@ -85,13 +85,16 @@ class FlorenceHouseholdChatBridge:
         user_message: str,
         data_dependent: bool,
     ) -> str | None:
-        reply = self.household_chat_service.compose_sync_waiting_reply(
+        reply = self.household_chat_service.compose_operator_message(
             household_id=household_id,
             channel_id=channel_id,
             actor_member_id=actor_member_id,
-            user_message=user_message,
+            kind="sync_waiting",
+            payload={
+                "user_message": user_message,
+                "data_dependent": data_dependent,
+            },
             conversation_history=self.channel_log.conversation_history(channel_id=channel_id),
-            data_dependent=data_dependent,
         )
         if reply is not None and reply.strip():
             return reply.strip()

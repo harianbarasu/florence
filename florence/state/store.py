@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from florence.contracts import (
@@ -45,15 +46,18 @@ from florence.contracts import (
 )
 from florence.onboarding import OnboardingStage, OnboardingState
 from florence.state.db import RowLike, connect_florence_db
+from florence.google.types import StoredCalendarSyncItem, StoredGmailSyncItem
 
 FLORENCE_DB_PATH = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes")) / "florence.db"
-FLORENCE_SCHEMA_VERSION = 9
+FLORENCE_SCHEMA_VERSION = 10
 
 _RESET_ALL_TABLES = (
     "channel_messages",
     "channels",
     "child_profiles",
     "google_connections",
+    "google_calendar_events",
+    "google_gmail_messages",
     "household_events",
     "household_meals",
     "household_nudges",
@@ -75,6 +79,8 @@ _RESET_HOUSEHOLD_TABLES = (
     "channels",
     "child_profiles",
     "google_connections",
+    "google_calendar_events",
+    "google_gmail_messages",
     "household_events",
     "household_meals",
     "household_nudges",
@@ -234,6 +240,67 @@ CREATE TABLE IF NOT EXISTS google_connections (
 
 CREATE INDEX IF NOT EXISTS idx_google_connections_household
 ON google_connections(household_id, member_id, active);
+
+CREATE TABLE IF NOT EXISTS google_gmail_messages (
+    id TEXT PRIMARY KEY,
+    connection_id TEXT NOT NULL,
+    household_id TEXT NOT NULL,
+    member_id TEXT NOT NULL,
+    gmail_message_id TEXT NOT NULL,
+    gmail_thread_id TEXT,
+    from_address TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    snippet TEXT,
+    body_text TEXT,
+    attachment_text TEXT,
+    attachment_count INTEGER NOT NULL DEFAULT 0,
+    received_at TEXT,
+    received_at_ts REAL,
+    metadata_json TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_google_gmail_messages_unique
+ON google_gmail_messages(connection_id, gmail_message_id);
+
+CREATE INDEX IF NOT EXISTS idx_google_gmail_messages_household_time
+ON google_gmail_messages(household_id, connection_id, received_at_ts DESC, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS google_calendar_events (
+    id TEXT PRIMARY KEY,
+    connection_id TEXT NOT NULL,
+    household_id TEXT NOT NULL,
+    member_id TEXT NOT NULL,
+    google_event_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT,
+    location TEXT,
+    html_link TEXT,
+    starts_at TEXT NOT NULL,
+    ends_at TEXT NOT NULL,
+    starts_at_ts REAL NOT NULL,
+    ends_at_ts REAL NOT NULL,
+    timezone TEXT NOT NULL,
+    all_day INTEGER NOT NULL DEFAULT 0,
+    updated_at_source TEXT,
+    updated_at_source_ts REAL,
+    calendar_summary TEXT,
+    family_member_names_json TEXT NOT NULL,
+    calendar_id TEXT,
+    calendar_primary INTEGER NOT NULL DEFAULT 0,
+    usage_mode TEXT,
+    detail_visibility TEXT,
+    metadata_json TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_google_calendar_events_unique
+ON google_calendar_events(connection_id, google_event_id);
+
+CREATE INDEX IF NOT EXISTS idx_google_calendar_events_household_time
+ON google_calendar_events(household_id, connection_id, starts_at_ts ASC, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS household_source_rules (
     id TEXT PRIMARY KEY,
@@ -413,6 +480,27 @@ def _json_loads(raw: str | None, *, default: object) -> object:
     if not raw:
         return default
     return json.loads(raw)
+
+
+def _isoformat_or_none(value: datetime | None) -> str | None:
+    return value.isoformat() if value is not None else None
+
+
+def _timestamp_or_none(value: datetime | None) -> float | None:
+    return value.timestamp() if value is not None else None
+
+
+def _parse_datetime(raw: str | None) -> datetime | None:
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _placeholders(count: int) -> str:
+    return ",".join("?" for _ in range(max(1, count)))
 
 
 class FlorenceStateDB:
@@ -1108,6 +1196,294 @@ class FlorenceStateDB:
         query += " ORDER BY updated_at DESC LIMIT 1"
         row = self._conn.execute(query, tuple(params)).fetchone()
         return self._row_to_google_connection(row) if row else None
+
+    def upsert_google_gmail_messages(
+        self,
+        *,
+        connection: GoogleConnection,
+        items: list,
+    ) -> list[StoredGmailSyncItem]:
+        if not items:
+            return []
+        now = time.time()
+        sql = """
+            INSERT INTO google_gmail_messages (
+                id,
+                connection_id,
+                household_id,
+                member_id,
+                gmail_message_id,
+                gmail_thread_id,
+                from_address,
+                subject,
+                snippet,
+                body_text,
+                attachment_text,
+                attachment_count,
+                received_at,
+                received_at_ts,
+                metadata_json,
+                created_at,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(connection_id, gmail_message_id) DO UPDATE SET
+                household_id = excluded.household_id,
+                member_id = excluded.member_id,
+                gmail_thread_id = excluded.gmail_thread_id,
+                from_address = excluded.from_address,
+                subject = excluded.subject,
+                snippet = excluded.snippet,
+                body_text = excluded.body_text,
+                attachment_text = excluded.attachment_text,
+                attachment_count = excluded.attachment_count,
+                received_at = excluded.received_at,
+                received_at_ts = excluded.received_at_ts,
+                metadata_json = excluded.metadata_json,
+                updated_at = excluded.updated_at
+            """
+        for item in items:
+            self._conn.execute(
+                sql,
+                (
+                    f"{connection.id}:{item.gmail_message_id}",
+                    connection.id,
+                    connection.household_id,
+                    connection.member_id,
+                    item.gmail_message_id,
+                    item.thread_id,
+                    item.from_address,
+                    item.subject,
+                    item.snippet,
+                    item.body_text,
+                    item.attachment_text,
+                    item.attachment_count,
+                    _isoformat_or_none(item.received_at),
+                    _timestamp_or_none(item.received_at),
+                    _json_dumps({}),
+                    now,
+                    now,
+                ),
+            )
+        self._conn.commit()
+        return [
+            StoredGmailSyncItem(
+                connection_id=connection.id,
+                connection_email=connection.email,
+                household_id=connection.household_id,
+                member_id=connection.member_id,
+                gmail_message_id=item.gmail_message_id,
+                thread_id=item.thread_id,
+                from_address=item.from_address,
+                subject=item.subject,
+                snippet=item.snippet,
+                body_text=item.body_text,
+                attachment_text=item.attachment_text,
+                attachment_count=item.attachment_count,
+                received_at=item.received_at,
+            )
+            for item in items
+        ]
+
+    def search_google_gmail_messages(
+        self,
+        *,
+        household_id: str,
+        connection_ids: list[str],
+        query: str | None = None,
+        sender: str | None = None,
+        subject: str | None = None,
+        newer_than_days: int = 365,
+        limit: int = 10,
+    ) -> list[StoredGmailSyncItem]:
+        if not connection_ids:
+            return []
+        params: list[object] = [household_id, *connection_ids]
+        sql = f"""
+            SELECT gm.*, gc.email AS connection_email
+            FROM google_gmail_messages gm
+            JOIN google_connections gc ON gc.id = gm.connection_id
+            WHERE gm.household_id = ?
+              AND gm.connection_id IN ({_placeholders(len(connection_ids))})
+        """
+        cutoff_days = max(1, newer_than_days)
+        cutoff_ts = time.time() - (cutoff_days * 86_400)
+        sql += " AND COALESCE(gm.received_at_ts, 0) >= ?"
+        params.append(cutoff_ts)
+
+        normalized_sender = " ".join(str(sender or "").split()).strip().lower()
+        if normalized_sender:
+            sql += " AND LOWER(COALESCE(gm.from_address, '')) LIKE ?"
+            params.append(f"%{normalized_sender}%")
+
+        normalized_subject = " ".join(str(subject or "").split()).strip().lower()
+        if normalized_subject:
+            sql += " AND LOWER(COALESCE(gm.subject, '')) LIKE ?"
+            params.append(f"%{normalized_subject}%")
+
+        normalized_query = " ".join(str(query or "").split()).strip().lower()
+        if normalized_query:
+            sql += """
+                AND LOWER(
+                    COALESCE(gm.from_address, '') || ' ' ||
+                    COALESCE(gm.subject, '') || ' ' ||
+                    COALESCE(gm.snippet, '') || ' ' ||
+                    COALESCE(gm.body_text, '') || ' ' ||
+                    COALESCE(gm.attachment_text, '')
+                ) LIKE ?
+            """
+            params.append(f"%{normalized_query}%")
+
+        sql += " ORDER BY COALESCE(gm.received_at_ts, 0) DESC, gm.updated_at DESC LIMIT ?"
+        params.append(max(1, limit))
+        rows = self._conn.execute(sql, tuple(params)).fetchall()
+        return [self._row_to_stored_gmail_sync_item(row) for row in rows]
+
+    def upsert_google_calendar_events(
+        self,
+        *,
+        connection: GoogleConnection,
+        items: list,
+    ) -> list[StoredCalendarSyncItem]:
+        if not items:
+            return []
+        now = time.time()
+        sql = """
+            INSERT INTO google_calendar_events (
+                id,
+                connection_id,
+                household_id,
+                member_id,
+                google_event_id,
+                title,
+                description,
+                location,
+                html_link,
+                starts_at,
+                ends_at,
+                starts_at_ts,
+                ends_at_ts,
+                timezone,
+                all_day,
+                updated_at_source,
+                updated_at_source_ts,
+                calendar_summary,
+                family_member_names_json,
+                calendar_id,
+                calendar_primary,
+                usage_mode,
+                detail_visibility,
+                metadata_json,
+                created_at,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(connection_id, google_event_id) DO UPDATE SET
+                household_id = excluded.household_id,
+                member_id = excluded.member_id,
+                title = excluded.title,
+                description = excluded.description,
+                location = excluded.location,
+                html_link = excluded.html_link,
+                starts_at = excluded.starts_at,
+                ends_at = excluded.ends_at,
+                starts_at_ts = excluded.starts_at_ts,
+                ends_at_ts = excluded.ends_at_ts,
+                timezone = excluded.timezone,
+                all_day = excluded.all_day,
+                updated_at_source = excluded.updated_at_source,
+                updated_at_source_ts = excluded.updated_at_source_ts,
+                calendar_summary = excluded.calendar_summary,
+                family_member_names_json = excluded.family_member_names_json,
+                calendar_id = excluded.calendar_id,
+                calendar_primary = excluded.calendar_primary,
+                usage_mode = excluded.usage_mode,
+                detail_visibility = excluded.detail_visibility,
+                metadata_json = excluded.metadata_json,
+                updated_at = excluded.updated_at
+            """
+        for item in items:
+            self._conn.execute(
+                sql,
+                (
+                    f"{connection.id}:{item.google_event_id}",
+                    connection.id,
+                    connection.household_id,
+                    connection.member_id,
+                    item.google_event_id,
+                    item.title,
+                    item.description,
+                    item.location,
+                    item.html_link,
+                    item.starts_at.isoformat(),
+                    item.ends_at.isoformat(),
+                    item.starts_at.timestamp(),
+                    item.ends_at.timestamp(),
+                    item.timezone,
+                    1 if item.all_day else 0,
+                    _isoformat_or_none(item.updated_at),
+                    _timestamp_or_none(item.updated_at),
+                    item.calendar_summary,
+                    _json_dumps(item.family_member_names),
+                    item.calendar_id,
+                    1 if item.calendar_primary else 0,
+                    item.usage_mode,
+                    item.detail_visibility,
+                    _json_dumps({}),
+                    now,
+                    now,
+                ),
+            )
+        self._conn.commit()
+        return [
+            StoredCalendarSyncItem(
+                connection_id=connection.id,
+                connection_email=connection.email,
+                household_id=connection.household_id,
+                member_id=connection.member_id,
+                google_event_id=item.google_event_id,
+                title=item.title,
+                description=item.description,
+                location=item.location,
+                html_link=item.html_link,
+                starts_at=item.starts_at,
+                ends_at=item.ends_at,
+                timezone=item.timezone,
+                all_day=item.all_day,
+                updated_at=item.updated_at,
+                calendar_summary=item.calendar_summary,
+                family_member_names=list(item.family_member_names),
+                calendar_id=item.calendar_id,
+                calendar_primary=item.calendar_primary,
+                usage_mode=item.usage_mode,
+                detail_visibility=item.detail_visibility,
+            )
+            for item in items
+        ]
+
+    def list_google_calendar_events(
+        self,
+        *,
+        household_id: str,
+        connection_ids: list[str] | None = None,
+        starts_after: datetime | None = None,
+        limit: int = 250,
+    ) -> list[StoredCalendarSyncItem]:
+        params: list[object] = [household_id]
+        sql = """
+            SELECT gce.*, gc.email AS connection_email
+            FROM google_calendar_events gce
+            JOIN google_connections gc ON gc.id = gce.connection_id
+            WHERE gce.household_id = ?
+        """
+        if connection_ids:
+            sql += f" AND gce.connection_id IN ({_placeholders(len(connection_ids))})"
+            params.extend(connection_ids)
+        if starts_after is not None:
+            sql += " AND gce.starts_at_ts >= ?"
+            params.append(starts_after.timestamp())
+        sql += " ORDER BY gce.starts_at_ts ASC, gce.updated_at DESC LIMIT ?"
+        params.append(max(1, limit))
+        rows = self._conn.execute(sql, tuple(params)).fetchall()
+        return [self._row_to_stored_calendar_sync_item(row) for row in rows]
 
     def upsert_household_source_rule(self, rule: HouseholdSourceRule) -> HouseholdSourceRule:
         now = time.time()
@@ -1925,6 +2301,49 @@ class FlorenceStateDB:
                 str(row["access_token_expires_at"]) if row["access_token_expires_at"] is not None else None
             ),
             metadata=dict(_json_loads(row["metadata_json"], default={})),
+        )
+
+    @staticmethod
+    def _row_to_stored_gmail_sync_item(row: RowLike) -> StoredGmailSyncItem:
+        return StoredGmailSyncItem(
+            connection_id=str(row["connection_id"]),
+            connection_email=str(row["connection_email"]),
+            household_id=str(row["household_id"]),
+            member_id=str(row["member_id"]),
+            gmail_message_id=str(row["gmail_message_id"]),
+            thread_id=str(row["gmail_thread_id"]) if row["gmail_thread_id"] is not None else None,
+            from_address=str(row["from_address"]),
+            subject=str(row["subject"]),
+            snippet=str(row["snippet"]) if row["snippet"] is not None else None,
+            body_text=str(row["body_text"]) if row["body_text"] is not None else None,
+            attachment_text=str(row["attachment_text"]) if row["attachment_text"] is not None else None,
+            attachment_count=int(row["attachment_count"]),
+            received_at=_parse_datetime(str(row["received_at"])) if row["received_at"] is not None else None,
+        )
+
+    @staticmethod
+    def _row_to_stored_calendar_sync_item(row: RowLike) -> StoredCalendarSyncItem:
+        return StoredCalendarSyncItem(
+            connection_id=str(row["connection_id"]),
+            connection_email=str(row["connection_email"]),
+            household_id=str(row["household_id"]),
+            member_id=str(row["member_id"]),
+            google_event_id=str(row["google_event_id"]),
+            title=str(row["title"]),
+            description=str(row["description"]) if row["description"] is not None else None,
+            location=str(row["location"]) if row["location"] is not None else None,
+            html_link=str(row["html_link"]) if row["html_link"] is not None else None,
+            starts_at=_parse_datetime(str(row["starts_at"])) or datetime.fromtimestamp(float(row["starts_at_ts"]), tz=timezone.utc),
+            ends_at=_parse_datetime(str(row["ends_at"])) or datetime.fromtimestamp(float(row["ends_at_ts"]), tz=timezone.utc),
+            timezone=str(row["timezone"]),
+            all_day=bool(row["all_day"]),
+            updated_at=_parse_datetime(str(row["updated_at_source"])) if row["updated_at_source"] is not None else None,
+            calendar_summary=str(row["calendar_summary"]) if row["calendar_summary"] is not None else None,
+            family_member_names=list(_json_loads(row["family_member_names_json"], default=[])),
+            calendar_id=str(row["calendar_id"]) if row["calendar_id"] is not None else None,
+            calendar_primary=bool(row["calendar_primary"]),
+            usage_mode=str(row["usage_mode"]) if row["usage_mode"] is not None else None,
+            detail_visibility=str(row["detail_visibility"]) if row["detail_visibility"] is not None else None,
         )
 
     @staticmethod

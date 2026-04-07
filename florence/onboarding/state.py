@@ -7,11 +7,6 @@ from enum import StrEnum
 from typing import Any
 
 
-class OnboardingVariant(StrEnum):
-    CONCIERGE = "concierge"
-    HYBRID = "hybrid"
-
-
 class OnboardingStage(StrEnum):
     COLLECT_PARENT_NAME = "collect_parent_name"
     COLLECT_CHILD_NAMES = "collect_child_names"
@@ -109,14 +104,6 @@ class OnboardingState:
     google_connected: bool = False
     child_names: list[str] = field(default_factory=list)
     metadata: dict[str, object] = field(default_factory=dict)
-
-    @property
-    def variant(self) -> OnboardingVariant:
-        raw = str(self.metadata.get("variant") or "").strip().lower()
-        try:
-            return OnboardingVariant(raw)
-        except ValueError:
-            return OnboardingVariant.HYBRID
 
     @property
     def child_details(self) -> list[str]:

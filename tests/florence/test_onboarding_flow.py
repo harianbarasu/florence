@@ -1,7 +1,6 @@
 from florence.onboarding import (
     OnboardingStage,
     OnboardingState,
-    OnboardingVariant,
     apply_child_names,
     apply_child_profile_updates,
     apply_parent_name,
@@ -16,7 +15,6 @@ def test_onboarding_flow_advances_through_minimal_imessage_steps():
         household_id="hh_123",
         member_id="mem_123",
         thread_id="thread_dm_123",
-        metadata={"variant": OnboardingVariant.HYBRID.value},
     )
 
     prompt = build_onboarding_prompt(state)
@@ -58,7 +56,6 @@ def test_activity_answer_can_be_empty_and_still_complete_child_profile():
         parent_display_name="Maya",
         stage=OnboardingStage.COLLECT_CHILD_ACTIVITIES,
         metadata={
-            "variant": OnboardingVariant.HYBRID.value,
             "child_profiles": [{"name": "Ava", "age": "7", "school": "Roosevelt Elementary"}],
             "current_child_index": 0,
         },
@@ -75,12 +72,11 @@ def test_activity_answer_can_be_empty_and_still_complete_child_profile():
     assert transition.prompt is not None
 
 
-def test_concierge_variant_still_goes_straight_to_kids_after_parent_name():
+def test_onboarding_goes_straight_to_kids_after_parent_name():
     state = OnboardingState(
         household_id="hh_123",
         member_id="mem_456",
         thread_id="thread_dm_456",
-        metadata={"variant": OnboardingVariant.CONCIERGE.value},
     )
 
     transition = apply_parent_name(state, "Maya")
@@ -95,7 +91,6 @@ def test_transition_messages_after_parent_name_include_intro_and_google_connect(
         household_id="hh_123",
         member_id="mem_123",
         thread_id="thread_dm_123",
-        metadata={"variant": OnboardingVariant.HYBRID.value},
     )
 
     transition = apply_parent_name(state, "Maya")
@@ -108,7 +103,7 @@ def test_transition_messages_after_parent_name_include_intro_and_google_connect(
     assert messages == (
         "Hi, I'm Florence.",
         "I help run the household with you by keeping logistics organized, surfacing reminders, and staying on top of school and calendar noise.",
-        "Connect your Google account so I can pull the last 30 days of family email and calendar in the background while we keep going here.",
+        "Connect your Google account so I can pull up to the last year of family email and calendar in the background while we keep going here.",
         "https://example.com/google/connect",
         "Once Google says you're connected, come right back here. You can also keep answering my questions while it runs.",
         "What are your kids' names? Send all of them in one message, one per line or comma-separated.",

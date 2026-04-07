@@ -73,3 +73,31 @@ def test_identity_resolver_requires_known_sender_for_new_group_activation(tmp_pa
     assert repeated_group.household.id == activated_group.household.id
     assert repeated_group.member is None
     store.close()
+
+
+def test_identity_resolver_direct_message_links_to_existing_household_group_participant(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    resolver = FlorenceIdentityResolver(store)
+    direct = resolver.resolve_direct_message(
+        sender_handle="+15555550123",
+        thread_external_id="dm_thread_123",
+    )
+    resolver.resolve_group_message(
+        sender_handle="+15555550123",
+        participant_handles=["+15555550123", "+15555550124"],
+        thread_external_id="group_thread_123",
+    )
+
+    linked = resolver.resolve_direct_message(
+        sender_handle="+15555550124",
+        thread_external_id="dm_thread_456",
+    )
+
+    assert linked.household.id == direct.household.id
+    assert linked.member is not None
+    assert linked.member.role.value == "parent"
+    assert linked.private_dm_link_intro == (
+        "You're linked to this household now. This 1:1 thread is private to you, and the family group is still the shared lane."
+    )
+    assert store.find_member_by_identity(kind=IdentityKind.PHONE, normalized_value="+15555550124") is not None
+    store.close()

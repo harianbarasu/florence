@@ -22,7 +22,7 @@ from florence.contracts import (
     ImportedCandidate,
     PilotEvent,
 )
-from florence.onboarding import OnboardingStage, OnboardingState, OnboardingVariant
+from florence.onboarding import OnboardingStage, OnboardingState
 from florence.state import FlorenceStateDB
 
 
@@ -38,7 +38,6 @@ def test_state_db_round_trips_onboarding_google_and_candidates(tmp_path):
         google_connected=True,
         child_names=["Ava"],
         metadata={
-            "variant": OnboardingVariant.HYBRID.value,
             "child_profiles": [
                 {
                     "name": "Ava",

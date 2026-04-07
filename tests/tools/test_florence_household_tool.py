@@ -11,6 +11,7 @@ from florence.contracts import (
     Household,
     HouseholdEvent,
     HouseholdEventStatus,
+    HouseholdProfileItem,
     HouseholdProfileKind,
     HouseholdSourceMatcherKind,
     HouseholdSourceRule,
@@ -22,14 +23,13 @@ from florence.contracts import (
 from florence.google.types import GmailSyncItem
 from florence.state import FlorenceStateDB
 from model_tools import handle_function_call
-import tools.florence_household_tool as household_tool
 from tools.florence_household_tool import (
     clear_household_tool_context,
     set_household_tool_context,
 )
 
 
-def test_household_tools_can_create_event_meal_shopping_item_and_nudge(tmp_path, monkeypatch):
+def test_household_tools_can_create_event_meal_shopping_item_and_nudge(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
     store.upsert_member(
@@ -50,15 +50,30 @@ def test_household_tools_can_create_event_meal_shopping_item_and_nudge(tmp_path,
             title="Maya",
         )
     )
-    store.upsert_google_connection(
-        GoogleConnection(
-            id="gconn_123",
-            household_id="hh_123",
-            member_id="mem_123",
-            email="maya@example.com",
-            connected_scopes=(GoogleSourceKind.GMAIL,),
-            access_token="access-token",
-        )
+    connection = GoogleConnection(
+        id="gconn_123",
+        household_id="hh_123",
+        member_id="mem_123",
+        email="maya@example.com",
+        connected_scopes=(GoogleSourceKind.GMAIL,),
+        access_token="access-token",
+    )
+    store.upsert_google_connection(connection)
+    store.upsert_google_gmail_messages(
+        connection=connection,
+        items=[
+            GmailSyncItem(
+                gmail_message_id="gmail_123",
+                thread_id="thread_123",
+                from_address="Linda <linda@musicalbeginnings.com>",
+                subject="Spring break and Family Day dates",
+                snippet="No class April 1 and April 8.",
+                body_text="For Violet's Musical Beginnings class: no class April 1 and April 8. Family Day May 6.",
+                attachment_text=None,
+                attachment_count=0,
+                received_at=datetime.now(timezone.utc),
+            )
+        ],
     )
     task_id = "task-household-tools"
     set_household_tool_context(
@@ -69,19 +84,6 @@ def test_household_tools_can_create_event_meal_shopping_item_and_nudge(tmp_path,
         channel_id="chan_dm_123",
     )
     try:
-        monkeypatch.setattr(household_tool, "list_recent_gmail_sync_items", lambda **_: [
-            GmailSyncItem(
-                gmail_message_id="gmail_123",
-                thread_id="thread_123",
-                from_address="Linda <linda@musicalbeginnings.com>",
-                subject="Spring break and Family Day dates",
-                snippet="No class April 1 and April 8.",
-                body_text="For Violet's Musical Beginnings class: no class April 1 and April 8. Family Day May 6.",
-                attachment_text=None,
-                attachment_count=0,
-                received_at=None,
-            )
-        ])
         event_result = json.loads(
             handle_function_call(
                 "household_upsert_event",
@@ -176,7 +178,7 @@ def test_household_tools_can_create_event_meal_shopping_item_and_nudge(tmp_path,
         store.close()
 
 
-def test_household_google_inbox_search_uses_shared_source_rules_across_connected_parents(tmp_path, monkeypatch):
+def test_household_google_inbox_search_uses_shared_source_rules_across_connected_parents(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
     store.upsert_member(
@@ -205,25 +207,39 @@ def test_household_google_inbox_search_uses_shared_source_rules_across_connected
             title="Maya",
         )
     )
-    store.upsert_google_connection(
-        GoogleConnection(
-            id="gconn_123",
-            household_id="hh_123",
-            member_id="mem_123",
-            email="maya@example.com",
-            connected_scopes=(GoogleSourceKind.GMAIL,),
-            access_token="access-token-maya",
-        )
+    maya_connection = GoogleConnection(
+        id="gconn_123",
+        household_id="hh_123",
+        member_id="mem_123",
+        email="maya@example.com",
+        connected_scopes=(GoogleSourceKind.GMAIL,),
+        access_token="access-token-maya",
     )
-    store.upsert_google_connection(
-        GoogleConnection(
-            id="gconn_456",
-            household_id="hh_123",
-            member_id="mem_456",
-            email="kendall@example.com",
-            connected_scopes=(GoogleSourceKind.GMAIL,),
-            access_token="access-token-kendall",
-        )
+    store.upsert_google_connection(maya_connection)
+    kendall_connection = GoogleConnection(
+        id="gconn_456",
+        household_id="hh_123",
+        member_id="mem_456",
+        email="kendall@example.com",
+        connected_scopes=(GoogleSourceKind.GMAIL,),
+        access_token="access-token-kendall",
+    )
+    store.upsert_google_connection(kendall_connection)
+    store.upsert_google_gmail_messages(
+        connection=kendall_connection,
+        items=[
+            GmailSyncItem(
+                gmail_message_id="gmail_789",
+                thread_id="thread_789",
+                from_address="Linda <linda@musicalbeginnings.com>",
+                subject="Spring break and Family Day dates",
+                snippet="No class April 1 and April 8.",
+                body_text="For Violet's Musical Beginnings class: no class April 1 and April 8. Family Day May 6.",
+                attachment_text=None,
+                attachment_count=0,
+                received_at=datetime.now(timezone.utc),
+            )
+        ],
     )
     store.upsert_household_source_rule(
         HouseholdSourceRule(
@@ -247,25 +263,6 @@ def test_household_google_inbox_search_uses_shared_source_rules_across_connected
         channel_id="chan_dm_123",
     )
     try:
-        def _fake_list_recent_gmail_sync_items(*, access_token, **_kwargs):
-            if access_token == "access-token-maya":
-                return []
-            return [
-                GmailSyncItem(
-                    gmail_message_id="gmail_789",
-                    thread_id="thread_789",
-                    from_address="Linda <linda@musicalbeginnings.com>",
-                    subject="Spring break and Family Day dates",
-                    snippet="No class April 1 and April 8.",
-                    body_text="For Violet's Musical Beginnings class: no class April 1 and April 8. Family Day May 6.",
-                    attachment_text=None,
-                    attachment_count=0,
-                    received_at=datetime(2026, 3, 24, 12, 0, tzinfo=timezone.utc),
-                )
-            ]
-
-        monkeypatch.setattr(household_tool, "list_recent_gmail_sync_items", _fake_list_recent_gmail_sync_items)
-
         inbox_result = json.loads(
             handle_function_call(
                 "household_search_google_inbox",
@@ -286,7 +283,7 @@ def test_household_google_inbox_search_uses_shared_source_rules_across_connected
         store.close()
 
 
-def test_household_google_inbox_search_from_group_requires_shared_scope(tmp_path, monkeypatch):
+def test_household_google_inbox_search_from_group_requires_shared_scope(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
     store.upsert_member(
@@ -326,24 +323,6 @@ def test_household_google_inbox_search_from_group_requires_shared_scope(tmp_path
         channel_id="chan_group_123",
     )
     try:
-        monkeypatch.setattr(
-            household_tool,
-            "list_recent_gmail_sync_items",
-            lambda **_: [
-                GmailSyncItem(
-                    gmail_message_id="gmail_789",
-                    thread_id="thread_789",
-                    from_address="Linda <linda@musicalbeginnings.com>",
-                    subject="Private note",
-                    snippet="Private note",
-                    body_text="Private note",
-                    attachment_text=None,
-                    attachment_count=0,
-                    received_at=datetime(2026, 3, 24, 12, 0, tzinfo=timezone.utc),
-                )
-            ],
-        )
-
         inbox_result = json.loads(
             handle_function_call(
                 "household_search_google_inbox",
@@ -365,21 +344,40 @@ def test_household_google_inbox_search_from_group_requires_shared_scope(tmp_path
         store.close()
 
 
-def test_household_search_state_includes_manager_profile_preferences(tmp_path):
+def test_household_search_state_includes_structured_preferences(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     store.upsert_household(
         Household(
             id="hh_123",
             name="Maya's household",
             timezone="America/Los_Angeles",
-            settings={
-                "manager_profile": {
-                    "operating_preferences": "Weekday morning brief at 6:45 and no texts after 9pm.",
-                    "nudge_preferences": "Morning-of is enough for practice reminders.",
-                    "household_operations": ["school forms", "pickup planning"],
-                }
-            },
         )
+    )
+    store.replace_household_profile_items(
+        household_id="hh_123",
+        kind=HouseholdProfileKind.PREFERENCE,
+        items=[
+            HouseholdProfileItem(
+                id="pref_operating_rule_123",
+                household_id="hh_123",
+                kind=HouseholdProfileKind.PREFERENCE,
+                label="Briefing cadence",
+                metadata={
+                    "category": "operating_rule",
+                    "value": "Weekday morning brief at 6:45 and no texts after 9pm.",
+                },
+            ),
+            HouseholdProfileItem(
+                id="pref_reminder_123",
+                household_id="hh_123",
+                kind=HouseholdProfileKind.PREFERENCE,
+                label="Reminder style",
+                metadata={
+                    "category": "reminder_style",
+                    "value": "Morning-of is enough for practice reminders.",
+                },
+            ),
+        ],
     )
     store.upsert_member(
         Member(
@@ -420,9 +418,9 @@ def test_household_search_state_includes_manager_profile_preferences(tmp_path):
         )
 
         preferences = result["results"]["preferences"]
-        assert any(item["kind"] == "manager_profile" for item in preferences)
-        assert any(item["metadata"]["profile_key"] == "operating_preferences" for item in preferences)
-        assert any("morning brief" in item["metadata"]["summary"].lower() for item in preferences)
+        assert any(item["kind"] == "preference" for item in preferences)
+        assert any(item["metadata"]["category"] == "operating_rule" for item in preferences)
+        assert any("morning brief" in str(item["metadata"]["value"]).lower() for item in preferences)
     finally:
         clear_household_tool_context(task_id)
         store.close()
@@ -469,7 +467,7 @@ def test_household_search_state_surfaces_scope_tentative_and_private_review_stat
             title="Summer camp invoice",
             summary="Invoice from billing@camp-example.com.",
             state=CandidateState.PENDING_REVIEW,
-            metadata={"source_visibility": "needs_classification", "review_lane": "steady_state"},
+            metadata={"source_visibility": "needs_classification"},
         )
     )
     task_id = "task-household-visibility"
@@ -505,14 +503,13 @@ def test_household_search_state_surfaces_scope_tentative_and_private_review_stat
         store.close()
 
 
-def test_household_record_preference_persists_preference_and_updates_manager_profile(tmp_path):
+def test_household_record_preference_persists_preference_items(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     store.upsert_household(
         Household(
             id="hh_123",
             name="Maya's household",
             timezone="America/Los_Angeles",
-            settings={"manager_profile": {"operating_preferences": "Weekday morning brief at 6:45."}},
         )
     )
     store.upsert_member(
@@ -579,21 +576,16 @@ def test_household_record_preference_persists_preference_and_updates_manager_pro
 
         assert reminder_result["result"]["label"] == "Reminder style"
         assert reminder_result["result"]["metadata"]["category"] == "reminder_style"
-        assert reminder_result["manager_profile"]["nudge_preferences_override"] == (
-            "Reminder style: Morning-of is enough for practice reminders."
-        )
+        assert reminder_result["result"]["metadata"]["value"] == "Morning-of is enough for practice reminders."
         assert child_result["result"]["child_id"] == "child_ava"
         assert child_result["result"]["metadata"]["value"] == "Ava will not eat spicy food."
 
-        household = store.get_household("hh_123")
-        assert household is not None
-        manager_profile = household.settings["manager_profile"]
-        assert manager_profile["nudge_preferences"] == "Reminder style: Morning-of is enough for practice reminders."
         preferences = store.list_household_profile_items(
             household_id="hh_123",
             kind=HouseholdProfileKind.PREFERENCE,
         )
         assert len(preferences) == 2
+        assert any(item.label == "Reminder style" and item.metadata["value"] == "Morning-of is enough for practice reminders." for item in preferences)
         assert any(item.label == "Kid spice preference" and item.child_id == "child_ava" for item in preferences)
     finally:
         clear_household_tool_context(task_id)

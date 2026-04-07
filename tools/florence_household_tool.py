@@ -4,12 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
-import os
 import re
 import threading
-from dataclasses import dataclass, replace
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
 from typing import Any
 
 from florence.contracts import (
@@ -29,14 +26,10 @@ from florence.contracts import (
     HouseholdWorkItemStatus,
     ImportedCandidate,
 )
-from florence.google.fetch import list_recent_gmail_sync_items
-from florence.google.oauth import refresh_google_access_token
 from florence.runtime.household_manager import FlorenceHouseholdManagerService
 from florence.runtime.visibility import resolve_conversation_scope, resolve_google_inbox_scope
 from florence.state import FlorenceStateDB
 from tools.registry import registry
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -339,7 +332,7 @@ SEARCH_STATE_SCHEMA = {
     "name": "household_search_state",
     "description": (
         "Search Florence household state when you need to pull the latest tracked work, routines, nudges, meals, "
-        "shopping items, events, children, profile items, reminder preferences, or operating preferences. "
+        "shopping items, events, children, or profile items including household preferences. "
         "The result also includes structured scope context showing the current channel scope, tentative tracked state, "
         "and any private review state available in the current DM. Use this before updating existing state if the "
         "current household picture is unclear."
@@ -393,7 +386,6 @@ def _serialize_review_candidate(candidate: ImportedCandidate) -> dict[str, Any]:
         "summary": candidate.summary,
         "state": candidate.state.value,
         "source_kind": candidate.source_kind.value,
-        "review_lane": str(metadata.get("review_lane") or "").strip() or None,
         "source_visibility": str(metadata.get("source_visibility") or "").strip() or None,
         "source_rule_label": str(metadata.get("source_rule_label") or "").strip() or None,
         "requires_confirmation": candidate.requires_confirmation,
@@ -470,36 +462,10 @@ def _build_visibility_summary(
         }
 
     return visibility
-
-
-def _serialize_manager_profile_entry(key: str, value: Any) -> dict[str, Any]:
-    label = key.replace("_", " ")
-    if isinstance(value, str):
-        summary = value
-    elif isinstance(value, list):
-        summary = " | ".join(str(item) for item in value[:8])
-    elif isinstance(value, dict):
-        summary = json.dumps(value, sort_keys=True)
-    else:
-        summary = str(value)
-    return {
-        "id": f"manager_profile:{key}",
-        "kind": "manager_profile",
-        "label": label,
-        "member_id": None,
-        "child_id": None,
-        "metadata": {
-            "profile_key": key,
-            "value": value,
-            "summary": summary,
-        },
-    }
-
-
 SEARCH_GOOGLE_INBOX_SCHEMA = {
     "name": "household_search_google_inbox",
     "description": (
-        "Search the connected Gmail inbox when the user explicitly asks Florence to check email from a sender, "
+        "Search Florence's mirrored Gmail inbox when the user explicitly asks Florence to check email from a sender, "
         "school, camp, teacher, coach, or keyword. Use this instead of asking the user to forward the email when "
         "Google is already connected. In a parent DM, this defaults to that parent's inbox unless the request clearly "
         "matches shared household source rules. In the family group, only shared-household inbox scope is allowed."
@@ -509,7 +475,7 @@ SEARCH_GOOGLE_INBOX_SCHEMA = {
         "properties": {
             "query": {
                 "type": "string",
-                "description": "Optional free-text search such as 'spring break musical beginnings' or a Gmail query fragment.",
+                "description": "Optional free-text search such as 'spring break musical beginnings'.",
             },
             "sender": {
                 "type": "string",
@@ -848,23 +814,6 @@ def _handle_search_state(args: dict, *, task_id: str | None = None, **_: Any) ->
             for item in items
             if _matches_query([item.label, item.kind.value, item.metadata], query)
         ]
-        if entity_type == "preferences":
-            household = context.store.get_household(context.household_id)
-            raw_manager_profile = household.settings.get("manager_profile") if household and isinstance(household.settings, dict) else None
-            manager_profile = dict(raw_manager_profile) if isinstance(raw_manager_profile, dict) else {}
-            for profile_key, profile_value in manager_profile.items():
-                serialized = _serialize_manager_profile_entry(profile_key, profile_value)
-                if not _matches_query(
-                    [
-                        profile_key,
-                        serialized["label"],
-                        serialized["metadata"].get("summary"),
-                        serialized["metadata"].get("value"),
-                    ],
-                    query,
-                ):
-                    continue
-                matches.append(serialized)
         results[entity_type] = matches[:limit]
 
     return json.dumps(
@@ -878,60 +827,6 @@ def _handle_search_state(args: dict, *, task_id: str | None = None, **_: Any) ->
             "results": results,
         }
     )
-
-
-def _parse_optional_iso_datetime(value: str | None) -> datetime | None:
-    if value is None:
-        return None
-    raw = str(value).strip()
-    if not raw:
-        return None
-    if raw.endswith("Z"):
-        raw = f"{raw[:-1]}+00:00"
-    try:
-        parsed = datetime.fromisoformat(raw)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
-
-
-def _google_client_credentials() -> tuple[str | None, str | None]:
-    client_id = os.getenv("FLORENCE_GOOGLE_CLIENT_ID") or os.getenv("GOOGLE_CLIENT_ID")
-    client_secret = os.getenv("FLORENCE_GOOGLE_CLIENT_SECRET") or os.getenv("GOOGLE_CLIENT_SECRET")
-    return (str(client_id).strip() if client_id else None, str(client_secret).strip() if client_secret else None)
-
-
-def _ensure_connection_access_token(
-    context: FlorenceHouseholdToolContext,
-    connection,
-) -> Any:
-    expiry = _parse_optional_iso_datetime(connection.access_token_expires_at)
-    refresh_needed = connection.access_token is None or (
-        expiry is not None and expiry <= datetime.now(timezone.utc) + timedelta(minutes=5)
-    )
-    if not refresh_needed:
-        return connection
-    client_id, client_secret = _google_client_credentials()
-    if not connection.refresh_token or not client_id or not client_secret:
-        return connection
-    refreshed = refresh_google_access_token(
-        refresh_token=connection.refresh_token,
-        client_id=client_id,
-        client_secret=client_secret,
-    )
-    expires_at = None
-    if refreshed.expires_in:
-        expires_at = (datetime.now(timezone.utc) + timedelta(seconds=int(refreshed.expires_in))).isoformat()
-    updated = replace(
-        connection,
-        access_token=refreshed.access_token or connection.access_token,
-        refresh_token=refreshed.refresh_token or connection.refresh_token,
-        access_token_expires_at=expires_at or connection.access_token_expires_at,
-    )
-    context.store.upsert_google_connection(updated)
-    return updated
 
 
 def _gmail_query_token(value: str) -> str:
@@ -960,34 +855,6 @@ def _build_google_inbox_query(
     if query:
         parts.append(query)
     return " ".join(part for part in parts if part)
-
-
-def _gmail_item_matches(
-    item,
-    *,
-    query: str | None,
-    sender: str | None,
-    subject: str | None,
-) -> bool:
-    sender_filter = _normalize_optional_text(sender)
-    if sender_filter and sender_filter.lower() not in item.from_address.lower():
-        return False
-    subject_filter = _normalize_optional_text(subject)
-    if subject_filter and subject_filter.lower() not in item.subject.lower():
-        return False
-    query_filter = _normalize_optional_text(query)
-    if not query_filter:
-        return True
-    return _matches_query(
-        [
-            item.from_address,
-            item.subject,
-            item.snippet,
-            item.body_text,
-            item.attachment_text,
-        ],
-        query_filter,
-    )
 
 
 def _serialize_gmail_item(item, *, connection_email: str) -> dict[str, Any]:
@@ -1053,30 +920,25 @@ def _handle_search_google_inbox(args: dict, *, task_id: str | None = None, **_: 
         subject=subject,
         newer_than_days=newer_than_days,
     )
-    results: list[dict[str, Any]] = []
-    searched_connection_emails: list[str] = []
-    for connection in connections:
-        hydrated = _ensure_connection_access_token(context, connection)
-        if not hydrated.access_token:
-            continue
-        searched_connection_emails.append(hydrated.email)
-        items = list_recent_gmail_sync_items(
-            access_token=hydrated.access_token,
-            max_results=max_results,
-            gmail_query=gmail_query,
-        )
-        for item in items:
-            if not _gmail_item_matches(item, query=query, sender=sender, subject=subject):
-                continue
-            results.append(_serialize_gmail_item(item, connection_email=hydrated.email))
-            if len(results) >= max_results:
-                break
-        if len(results) >= max_results:
-            break
+    searched_connection_emails = [connection.email for connection in connections]
+    mirror_results = context.store.search_google_gmail_messages(
+        household_id=context.household_id,
+        connection_ids=[connection.id for connection in connections],
+        query=query,
+        sender=sender,
+        subject=subject,
+        newer_than_days=newer_than_days,
+        limit=max_results,
+    )
+    results = [
+        _serialize_gmail_item(item, connection_email=item.connection_email)
+        for item in mirror_results
+    ]
 
     return json.dumps(
         {
             "gmail_query": gmail_query,
+            "search_backend": "local_mirror",
             "search_scope": search_scope,
             "scope_reason": scope_reason,
             "searched_connection_emails": searched_connection_emails,
@@ -1284,7 +1146,7 @@ def _handle_record_preference(args: dict, *, task_id: str | None = None, **_: An
         child_id=_normalize_optional_text(args.get("child_id")),
         child_name=_normalize_optional_text(args.get("child_name")),
     )
-    preference_item, profile = manager.record_preference(
+    preference_item = manager.record_preference(
         household_id=context.household_id,
         label=label,
         value=value,
@@ -1298,7 +1160,6 @@ def _handle_record_preference(args: dict, *, task_id: str | None = None, **_: An
     return json.dumps(
         {
             "result": _serialize_profile_item(preference_item),
-            "manager_profile": profile,
         }
     )
 

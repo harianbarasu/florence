@@ -30,6 +30,8 @@ from florence.google.types import (
     GoogleCalendarMetadata,
     GoogleTokenResponse,
     ParentCalendarSyncItem,
+    StoredCalendarSyncItem,
+    StoredGmailSyncItem,
 )
 
 __all__ = [
@@ -41,6 +43,8 @@ __all__ = [
     "GoogleCalendarMetadata",
     "GoogleTokenResponse",
     "ParentCalendarSyncItem",
+    "StoredCalendarSyncItem",
+    "StoredGmailSyncItem",
     "build_gmail_sync_item",
     "build_google_import_candidates",
     "build_google_grounding_hints",

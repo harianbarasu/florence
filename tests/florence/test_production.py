@@ -28,7 +28,7 @@ from florence.contracts import (
     MemberRole,
 )
 from florence.google import GoogleCalendarMetadata, GoogleTokenResponse
-from florence.onboarding import OnboardingVariant, build_onboarding_ready_message_sequence
+from florence.onboarding import build_onboarding_ready_message_sequence
 from florence.runtime import FlorenceEntrypointResult, FlorenceProductionService
 from florence.state import FlorenceStateDB
 
@@ -64,74 +64,32 @@ class _FakeBriefingChatService:
             return "Weekly preview: science fair, pickup swap, and dinner coverage need attention."
         return "Morning brief: soccer bag, lunch order, and pickup timing are all on deck."
 
-    def compose_activation_brief(
+    def compose_operator_message(
         self,
         *,
         household_id,
         channel_id,
         actor_member_id,
-        gmail_count,
-        calendar_count,
-        candidates,
-        group_available,
-    ):
-        self.calls.append(
-            {
-                "household_id": household_id,
-                "channel_id": channel_id,
-                "actor_member_id": actor_member_id,
-                "gmail_count": gmail_count,
-                "calendar_count": calendar_count,
-                "candidate_count": len(candidates),
-                "group_available": group_available,
-            }
-        )
-        return SimpleNamespace(
-            text="A few things look important from your recent email and calendar, including Science fair reminder. I can dig into any of them if you want.",
-            group_text="Household update: Science fair reminder looks important from recent email and calendar.",
-        )
-
-    def compose_review_prompt(
-        self,
-        *,
-        household_id,
-        channel_id,
-        actor_member_id,
-        candidate,
-        source_prompt=None,
-    ):
-        self.calls.append(
-            {
-                "household_id": household_id,
-                "channel_id": channel_id,
-                "actor_member_id": actor_member_id,
-                "candidate_id": getattr(candidate, "id", None),
-                "source_prompt": source_prompt,
-            }
-        )
-        return "This looks like a household item to double-check. Reply yes if I should add it, no if it's wrong, or skip for later."
-
-    def compose_sync_waiting_reply(
-        self,
-        *,
-        household_id,
-        channel_id,
-        actor_member_id,
-        user_message=None,
+        kind,
+        payload=None,
         conversation_history=None,
-        data_dependent=False,
-        just_connected=False,
     ):
+        payload = dict(payload or {})
         self.calls.append(
             {
                 "household_id": household_id,
                 "channel_id": channel_id,
                 "actor_member_id": actor_member_id,
-                "user_message": user_message,
-                "data_dependent": data_dependent,
-                "just_connected": just_connected,
+                "kind": kind,
+                "payload": payload,
             }
         )
+        if kind == "activation_brief":
+            return "A few things look important from your recent email and calendar, including Science fair reminder. I can dig into any of them if you want."
+        if kind == "group_promotion":
+            return "Household update: Science fair reminder looks important from recent email and calendar."
+        if kind == "review_prompt":
+            return "This looks like a household item to double-check. Reply yes if I should add it, no if it's wrong, or skip for later."
         return self.sync_waiting_text
 
 
@@ -251,7 +209,6 @@ def test_production_service_google_callback_sends_dm_follow_up(tmp_path, monkeyp
     settings = _build_settings(tmp_path)
     store = FlorenceStateDB(settings.server.db_path)
     service = FlorenceProductionService(settings, store=store)
-    service.entrypoints.onboarding_service.variant_selector = lambda _household_id, _member_id: OnboardingVariant.HYBRID
     service.household_chat_service = _FakeBriefingChatService()
     service.linq = _FakeLinqClient()
     store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
@@ -347,7 +304,6 @@ def test_production_service_google_callback_keeps_onboarding_prompt_separate_fro
     settings = _build_settings(tmp_path)
     store = FlorenceStateDB(settings.server.db_path)
     service = FlorenceProductionService(settings, store=store)
-    service.entrypoints.onboarding_service.variant_selector = lambda _household_id, _member_id: OnboardingVariant.HYBRID
     service.household_chat_service = _FakeBriefingChatService()
     service.linq = _FakeLinqClient()
     store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
@@ -719,7 +675,6 @@ def test_production_service_first_dm_sends_onboarding_sequence_as_separate_messa
     settings = _build_settings(tmp_path)
     store = FlorenceStateDB(settings.server.db_path)
     service = FlorenceProductionService(settings, store=store)
-    service.entrypoints.onboarding_service.variant_selector = lambda _household_id, _member_id: OnboardingVariant.HYBRID
     service.linq = _FakeLinqClient()
 
     payload = {
@@ -749,7 +704,7 @@ def test_production_service_first_dm_sends_onboarding_sequence_as_separate_messa
     assert service.linq.sent[1]["message"] == (
         "I help run the household with you by keeping logistics organized, surfacing reminders, and staying on top of school and calendar noise."
     )
-    assert service.linq.sent[2]["message"] == "Connect your Google account so I can pull the last 30 days of family email and calendar in the background while we keep going here."
+    assert service.linq.sent[2]["message"] == "Connect your Google account so I can pull up to the last year of family email and calendar in the background while we keep going here."
     assert service.linq.sent[3]["message"].startswith("https://accounts.google.com/")
     assert service.linq.sent[4]["message"] == "Once Google says you're connected, come right back here. You can also keep answering my questions while it runs."
     assert service.linq.sent[5]["message"] == "What are your kids' names? Send all of them in one message, one per line or comma-separated."
@@ -981,7 +936,6 @@ def test_production_service_run_sync_pass_sends_due_household_briefing(tmp_path)
             id="hh_123",
             name="Maya's household",
             timezone="America/Los_Angeles",
-            settings={"manager_profile": {"operating_preferences": "Weekday morning brief at 6:45."}},
         )
     )
     store.upsert_member(
@@ -1047,7 +1001,6 @@ def test_production_service_run_sync_pass_prefers_household_group_for_briefing(t
             id="hh_123",
             name="Maya's household",
             timezone="America/Los_Angeles",
-            settings={"manager_profile": {"operating_preferences": "Weekday morning brief at 6:45."}},
         )
     )
     store.upsert_member(

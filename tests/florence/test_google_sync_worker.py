@@ -113,6 +113,17 @@ def test_google_sync_worker_fetches_and_persists_candidates(tmp_path, monkeypatc
     result = worker.sync_connection("gconn_123")
 
     assert result.connection.id == "gconn_123"
+    mirrored_messages = store.search_google_gmail_messages(
+        household_id="hh_123",
+        connection_ids=["gconn_123"],
+        newer_than_days=400,
+        limit=5,
+    )
+    assert len(mirrored_messages) == 1
+    assert mirrored_messages[0].subject == "Soccer practice update"
+    mirrored_events = store.list_google_calendar_events(household_id="hh_123", limit=5)
+    assert len(mirrored_events) == 1
+    assert mirrored_events[0].title == "Ava soccer practice"
     pending = store.list_imported_candidates(
         household_id="hh_123",
         member_id="mem_123",
@@ -140,22 +151,32 @@ def test_google_sync_worker_uses_deep_bootstrap_scan_on_first_sync(tmp_path, mon
         )
     )
     observed: dict[str, object] = {}
+    observed_calendar: dict[str, object] = {}
 
     def _fake_gmail(**kwargs):
         observed.update(kwargs)
         return []
 
+    def _fake_calendar(**kwargs):
+        observed_calendar.update(kwargs)
+        return []
+
     monkeypatch.setenv("FLORENCE_GMAIL_BOOTSTRAP_MAX_RESULTS", "321")
+    monkeypatch.setenv("FLORENCE_CALENDAR_BOOTSTRAP_MAX_RESULTS", "654")
     monkeypatch.setattr("florence.runtime.google_services.list_recent_gmail_sync_items", _fake_gmail)
-    monkeypatch.setattr("florence.runtime.google_services.list_recent_parent_calendar_sync_items", lambda **_: [])
+    monkeypatch.setattr("florence.runtime.google_services.list_recent_parent_calendar_sync_items", _fake_calendar)
 
     worker = FlorenceGoogleSyncWorkerService(store, FlorenceGoogleSyncPersistenceService(store))
     result = worker.sync_connection("gconn_bootstrap", now=datetime(2026, 3, 25, 18, 0, tzinfo=timezone.utc))
 
     assert observed["max_results"] == 321
-    assert observed["gmail_query"] == "newer_than:30d"
+    assert observed["gmail_query"] == "newer_than:365d"
+    assert observed_calendar["max_results"] == 654
+    assert observed_calendar["past_window_days"] == 365
+    assert observed_calendar["future_window_days"] == 365
     assert result.connection.metadata["gmail_bootstrap_completed_at"] == "2026-03-25T18:00:00+00:00"
-    assert result.connection.metadata["gmail_last_query"] == "newer_than:30d"
+    assert result.connection.metadata["gmail_last_query"] == "newer_than:365d"
+    assert result.connection.metadata["calendar_bootstrap_completed_at"] == "2026-03-25T18:00:00+00:00"
     store.close()
 
 
@@ -175,26 +196,38 @@ def test_google_sync_worker_uses_incremental_window_after_bootstrap(tmp_path, mo
                 "primary_calendar_timezone": "America/Los_Angeles",
                 "gmail_bootstrap_completed_at": "2026-03-20T18:00:00+00:00",
                 "gmail_last_synced_at": "2026-03-22T18:00:00+00:00",
+                "calendar_bootstrap_completed_at": "2026-03-20T18:00:00+00:00",
+                "calendar_last_synced_at": "2026-03-22T18:00:00+00:00",
             },
         )
     )
     observed: dict[str, object] = {}
+    observed_calendar: dict[str, object] = {}
 
     def _fake_gmail(**kwargs):
         observed.update(kwargs)
         return []
 
+    def _fake_calendar(**kwargs):
+        observed_calendar.update(kwargs)
+        return []
+
     monkeypatch.setenv("FLORENCE_GMAIL_INCREMENTAL_MAX_RESULTS", "111")
+    monkeypatch.setenv("FLORENCE_CALENDAR_INCREMENTAL_MAX_RESULTS", "222")
     monkeypatch.setattr("florence.runtime.google_services.list_recent_gmail_sync_items", _fake_gmail)
-    monkeypatch.setattr("florence.runtime.google_services.list_recent_parent_calendar_sync_items", lambda **_: [])
+    monkeypatch.setattr("florence.runtime.google_services.list_recent_parent_calendar_sync_items", _fake_calendar)
 
     worker = FlorenceGoogleSyncWorkerService(store, FlorenceGoogleSyncPersistenceService(store))
     result = worker.sync_connection("gconn_incremental", now=datetime(2026, 3, 25, 18, 0, tzinfo=timezone.utc))
 
     assert observed["max_results"] == 111
     assert observed["gmail_query"] == "newer_than:5d"
+    assert observed_calendar["max_results"] == 222
+    assert observed_calendar["past_window_days"] == 30
+    assert observed_calendar["future_window_days"] == 120
     assert result.connection.metadata["gmail_last_synced_at"] == "2026-03-25T18:00:00+00:00"
     assert result.connection.metadata["gmail_last_max_results"] == 111
+    assert result.connection.metadata["calendar_last_max_results"] == 222
     store.close()
 
 

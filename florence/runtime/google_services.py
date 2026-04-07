@@ -32,8 +32,6 @@ from florence.google import (
 from florence.onboarding import OnboardingTransition
 from florence.runtime.candidate_review import (
     _SourceRuleService,
-    merged_review_lane,
-    with_review_lane,
 )
 from florence.runtime.onboarding_service import FlorenceOnboardingSessionService
 from florence.runtime.services import (
@@ -62,15 +60,39 @@ def _int_env(name: str, default: int, *, minimum: int = 1) -> int:
 
 
 def _gmail_bootstrap_max_results() -> int:
-    return _int_env("FLORENCE_GMAIL_BOOTSTRAP_MAX_RESULTS", 500)
+    return _int_env("FLORENCE_GMAIL_BOOTSTRAP_MAX_RESULTS", 2_000)
 
 
 def _gmail_incremental_max_results() -> int:
-    return _int_env("FLORENCE_GMAIL_INCREMENTAL_MAX_RESULTS", 150)
+    return _int_env("FLORENCE_GMAIL_INCREMENTAL_MAX_RESULTS", 250)
 
 
 def _gmail_bootstrap_window_days() -> int:
-    return _int_env("FLORENCE_GMAIL_BOOTSTRAP_WINDOW_DAYS", 30)
+    return _int_env("FLORENCE_GMAIL_BOOTSTRAP_WINDOW_DAYS", 365)
+
+
+def _calendar_bootstrap_max_results() -> int:
+    return _int_env("FLORENCE_CALENDAR_BOOTSTRAP_MAX_RESULTS", 1_000)
+
+
+def _calendar_incremental_max_results() -> int:
+    return _int_env("FLORENCE_CALENDAR_INCREMENTAL_MAX_RESULTS", 250)
+
+
+def _calendar_bootstrap_past_window_days() -> int:
+    return _int_env("FLORENCE_CALENDAR_BOOTSTRAP_PAST_WINDOW_DAYS", 365)
+
+
+def _calendar_bootstrap_future_window_days() -> int:
+    return _int_env("FLORENCE_CALENDAR_BOOTSTRAP_FUTURE_WINDOW_DAYS", 365)
+
+
+def _calendar_incremental_past_window_days() -> int:
+    return _int_env("FLORENCE_CALENDAR_INCREMENTAL_PAST_WINDOW_DAYS", 30)
+
+
+def _calendar_incremental_future_window_days() -> int:
+    return _int_env("FLORENCE_CALENDAR_INCREMENTAL_FUTURE_WINDOW_DAYS", 120)
 
 
 def _gmail_incremental_query(
@@ -232,10 +254,9 @@ class FlorenceGoogleSyncPersistenceService:
     def _merge_with_existing_candidate(self, candidate):
         existing = self.store.get_imported_candidate(candidate.id)
         if existing is None:
-            return with_review_lane(candidate)
+            return candidate
         merged_metadata = dict(existing.metadata)
         merged_metadata.update(candidate.metadata)
-        merged_metadata["review_lane"] = merged_review_lane(existing=existing, incoming=candidate)
         return replace(
             candidate,
             state=self._merged_candidate_state(existing=existing, incoming=candidate),
@@ -244,6 +265,14 @@ class FlorenceGoogleSyncPersistenceService:
         )
 
     def persist_sync_batch(self, batch: FlorenceGoogleSyncBatch) -> FlorenceGoogleSyncResult:
+        self.store.upsert_google_gmail_messages(
+            connection=batch.connection,
+            items=list(batch.gmail_items),
+        )
+        self.store.upsert_google_calendar_events(
+            connection=batch.connection,
+            items=list(batch.calendar_items),
+        )
         result = build_google_import_candidates(batch)
         persisted = [
             self.store.upsert_imported_candidate(
@@ -374,8 +403,8 @@ class FlorenceGoogleSyncWorkerService:
         connection_id: str,
         *,
         max_gmail_results: int | None = None,
-        max_calendar_results: int = 20,
-        window_days: int = 30,
+        max_calendar_results: int | None = None,
+        window_days: int | None = None,
         now: datetime | None = None,
         client_id: str | None = None,
         client_secret: str | None = None,
@@ -410,6 +439,7 @@ class FlorenceGoogleSyncWorkerService:
         family_member_names = list(context.visible_child_names)
         metadata = dict(hydrated_connection.metadata)
         bootstrap_complete = bool(metadata.get("gmail_bootstrap_completed_at"))
+        calendar_bootstrap_complete = bool(metadata.get("calendar_bootstrap_completed_at"))
         if not metadata.get("initial_sync_started_at"):
             metadata["initial_sync_started_at"] = current_time.isoformat()
         if not metadata.get("initial_sync_completed_at"):
@@ -447,13 +477,33 @@ class FlorenceGoogleSyncWorkerService:
         metadata = dict(hydrated_connection.metadata)
         calendar_items: list[Any] = []
         fetched_calendar_item_count = 0
+        resolved_max_calendar_results = (
+            max_calendar_results
+            if max_calendar_results is not None
+            else (_calendar_incremental_max_results() if calendar_bootstrap_complete else _calendar_bootstrap_max_results())
+        )
+        calendar_past_window_days = (
+            _calendar_incremental_past_window_days()
+            if calendar_bootstrap_complete
+            else _calendar_bootstrap_past_window_days()
+        )
+        calendar_future_window_days = (
+            window_days
+            if window_days is not None
+            else (
+                _calendar_incremental_future_window_days()
+                if calendar_bootstrap_complete
+                else _calendar_bootstrap_future_window_days()
+            )
+        )
         for target in _calendar_sync_targets(hydrated_connection.metadata):
             fetched_items = list_recent_parent_calendar_sync_items(
                 access_token=access_token,
                 calendar=target.calendar,
                 family_member_names=family_member_names,
-                max_results=max_calendar_results,
-                window_days=window_days,
+                max_results=resolved_max_calendar_results,
+                past_window_days=calendar_past_window_days,
+                future_window_days=calendar_future_window_days,
                 now=now,
             )
             fetched_calendar_item_count += len(fetched_items)
@@ -492,12 +542,17 @@ class FlorenceGoogleSyncWorkerService:
         metadata["gmail_last_max_results"] = resolved_max_gmail_results
         metadata["last_gmail_item_count"] = len(gmail_items)
         metadata["last_calendar_item_count"] = fetched_calendar_item_count
+        metadata["calendar_last_max_results"] = resolved_max_calendar_results
+        metadata["calendar_last_past_window_days"] = calendar_past_window_days
+        metadata["calendar_last_future_window_days"] = calendar_future_window_days
         metadata["last_candidate_count"] = len(sync_result.candidates)
         metadata["last_sync_completed_at"] = current_time.isoformat()
         metadata["last_sync_status"] = "ok"
         metadata["sync_phase"] = "ready"
         if not bootstrap_complete:
             metadata["gmail_bootstrap_completed_at"] = current_time.isoformat()
+        if not calendar_bootstrap_complete:
+            metadata["calendar_bootstrap_completed_at"] = current_time.isoformat()
         if not metadata.get("initial_sync_completed_at"):
             metadata["initial_sync_completed_at"] = current_time.isoformat()
         metadata["initial_sync_state"] = "ready"

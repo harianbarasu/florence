@@ -104,6 +104,7 @@ def test_list_recent_gmail_sync_items_extracts_text_html_and_pdf_attachments(mon
     html_attachment = "<html><body>Picture Day is Friday at 8am.</body></html>"
     inline_text_attachment = "Bring baseball glove and cleats."
     pdf_bytes = b"%PDF-1.7 fake"
+    image_bytes = b"\x89PNG-fake"
 
     def _to_b64url_bytes(raw: bytes) -> str:
         import base64
@@ -117,6 +118,11 @@ def test_list_recent_gmail_sync_items_extracts_text_html_and_pdf_attachments(mon
         google_fetch,
         "_extract_pdf_attachment_text_with_gpt",
         lambda **_: "Practice moved to Tuesday at 4:30 PM at North Field.",
+    )
+    monkeypatch.setattr(
+        google_fetch,
+        "_extract_image_attachment_text_with_gpt",
+        lambda **_: "Screenshot says uniform handoff is Friday at pickup.",
     )
 
     class _FakeResponse:
@@ -164,6 +170,11 @@ def test_list_recent_gmail_sync_items_extracts_text_html_and_pdf_attachments(mon
                                 "filename": "gear.txt",
                                 "body": {"data": _to_b64url_text(inline_text_attachment)},
                             },
+                            {
+                                "mimeType": "image/png",
+                                "filename": "pickup.png",
+                                "body": {"attachmentId": "att_img"},
+                            },
                         ],
                     },
                 }
@@ -172,6 +183,8 @@ def test_list_recent_gmail_sync_items_extracts_text_html_and_pdf_attachments(mon
             return _FakeResponse({"data": _to_b64url_text(html_attachment)})
         if url.endswith("/attachments/att_pdf"):
             return _FakeResponse({"data": _to_b64url_bytes(pdf_bytes)})
+        if url.endswith("/attachments/att_img"):
+            return _FakeResponse({"data": _to_b64url_bytes(image_bytes)})
         raise AssertionError(f"Unexpected URL: {url}")
 
     monkeypatch.setattr(google_fetch.httpx, "get", _fake_get)
@@ -179,11 +192,12 @@ def test_list_recent_gmail_sync_items_extracts_text_html_and_pdf_attachments(mon
     items = list_recent_gmail_sync_items(access_token="token", max_results=5)
     assert len(items) == 1
     item = items[0]
-    assert item.attachment_count == 3
+    assert item.attachment_count == 4
     assert item.attachment_text is not None
     assert "school.html: Picture Day is Friday at 8am." in item.attachment_text
     assert "practice.pdf: Practice moved to Tuesday at 4:30 PM at North Field." in item.attachment_text
     assert "gear.txt: Bring baseball glove and cleats." in item.attachment_text
+    assert "pickup.png: Screenshot says uniform handoff is Friday at pickup." in item.attachment_text
 
 
 def test_extract_pdf_attachment_text_with_gpt_uses_gpt_5_4_by_default(monkeypatch):

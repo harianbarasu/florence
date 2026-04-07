@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass, replace
 from typing import Callable
 
@@ -12,7 +11,6 @@ from florence.onboarding import (
     OnboardingStage,
     OnboardingState,
     OnboardingTransition,
-    OnboardingVariant,
     apply_child_names,
     apply_child_profile_updates,
     apply_parent_name,
@@ -52,13 +50,11 @@ class FlorenceOnboardingSessionService:
         store: FlorenceStateDB,
         *,
         candidate_review_service: FlorenceCandidateReviewService | None = None,
-        variant_selector: Callable[[str, str], OnboardingVariant] | None = None,
         intake_service: FlorenceOnboardingIntakeService | None = None,
         link_url_builder: Callable[[str, str, str], str | None] | None = None,
     ):
         self.store = store
         self.candidate_review_service = candidate_review_service
-        self.variant_selector = variant_selector or self._select_variant
         self.intake_service = intake_service or FlorenceOnboardingIntakeService()
         self.link_url_builder = link_url_builder
 
@@ -75,15 +71,9 @@ class FlorenceOnboardingSessionService:
             household_id=household_id,
             member_id=member_id,
             thread_id=thread_id,
-            metadata={"variant": self.variant_selector(household_id, member_id).value},
         )
         self.store.upsert_onboarding_session(state)
         return state
-
-    @staticmethod
-    def _select_variant(household_id: str, member_id: str) -> OnboardingVariant:
-        digest = hashlib.sha256(f"{household_id}:{member_id}".encode("utf-8")).hexdigest()
-        return OnboardingVariant.CONCIERGE if int(digest[-1], 16) % 2 == 0 else OnboardingVariant.HYBRID
 
     def get_prompt(self, *, household_id: str, member_id: str, thread_id: str) -> OnboardingPrompt | None:
         state = self.get_or_create_session(
@@ -454,16 +444,6 @@ class FlorenceOnboardingSessionService:
                 kind=HouseholdProfileKind.ACTIVITY,
                 items=activities,
             )
-
-        if household is not None:
-            settings = dict(household.settings)
-            settings["manager_profile"] = {
-                "onboarding_variant": state.variant.value,
-                "parent_display_name": state.parent_display_name,
-                "child_profiles": state.child_profiles,
-                "child_details": state.child_details,
-            }
-            self.store.upsert_household(replace(household, settings=settings))
 
     def _build_school_profile_item(
         self,

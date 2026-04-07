@@ -149,10 +149,19 @@ class FlorenceEntrypointService:
         inbound_message,
     ) -> FlorenceEntrypointResult:
         resolver = self.identity_resolvers[provider]
+        effective_participant_handles = list(participant_handles)
+        if provider == "sendblue":
+            sendblue_number = str(inbound_message.metadata.get("sendblue_number") or "").strip()
+            if sendblue_number:
+                effective_participant_handles = [
+                    handle
+                    for handle in effective_participant_handles
+                    if str(handle).strip() and str(handle).strip() != sendblue_number
+                ]
         if is_group_chat:
             resolved = resolver.resolve_group_message(
                 sender_handle=sender_handle,
-                participant_handles=participant_handles,
+                participant_handles=effective_participant_handles,
                 thread_external_id=thread_id,
             )
             if resolved is None:
@@ -171,17 +180,31 @@ class FlorenceEntrypointService:
                     metadata["group_id"] = group_id
                 if sendblue_number:
                     metadata["sendblue_number"] = sendblue_number
-                if participant_handles:
-                    metadata["participant_handles"] = list(dict.fromkeys(handle for handle in participant_handles if handle))
+                if effective_participant_handles:
+                    metadata["participant_handles"] = list(
+                        dict.fromkeys(handle for handle in effective_participant_handles if handle)
+                    )
                 resolved = replace(
                     resolved,
                     channel=self.store.upsert_channel(replace(resolved.channel, metadata=metadata)),
                 )
         else:
-            resolved = resolver.resolve_direct_message(
-                sender_handle=sender_handle,
-                thread_external_id=thread_id,
-            )
+            try:
+                resolved = resolver.resolve_direct_message(
+                    sender_handle=sender_handle,
+                    thread_external_id=thread_id,
+                )
+            except ValueError as exc:
+                if str(exc) == "ambiguous_existing_household_for_identity":
+                    return FlorenceEntrypointResult(
+                        reply_text=(
+                            "I found more than one possible household for this number, so I didn't create a new one. "
+                            "Message me in the right family group first or have the other parent invite me there so I can link this DM correctly."
+                        ),
+                        consumed=True,
+                        error=str(exc),
+                    )
+                raise
 
         member_id = resolved.member.id if resolved.member is not None else None
         result = self.ingress.handle_message(
@@ -193,11 +216,26 @@ class FlorenceEntrypointService:
                 message=inbound_message,
             )
         )
+        reply_text = result.reply_text
+        reply_messages = result.reply_messages
+        consumed = result.consumed
+        if resolved.private_dm_link_intro:
+            existing_messages = reply_messages or ((reply_text,) if reply_text else ())
+            reply_messages = (resolved.private_dm_link_intro, *existing_messages)
+            reply_text = None
+            consumed = True
+        group_announcement = result.group_announcement
+        if resolved.group_private_dm_hint:
+            group_announcement = (
+                f"{group_announcement}\n\n{resolved.group_private_dm_hint}"
+                if group_announcement
+                else resolved.group_private_dm_hint
+            )
         return FlorenceEntrypointResult(
-            reply_text=result.reply_text,
-            reply_messages=result.reply_messages,
-            group_announcement=result.group_announcement,
-            consumed=result.consumed,
+            reply_text=reply_text,
+            reply_messages=reply_messages,
+            group_announcement=group_announcement,
+            consumed=consumed or bool(group_announcement),
             household_id=resolved.household.id,
             member_id=member_id,
             channel_id=resolved.channel.id,

@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import base64
 import logging
-import os
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
 
 import httpx
+
+from florence.media.openai_extract import (
+    compact_text,
+    extract_image_text_with_openai,
+    extract_pdf_text_with_openai,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,10 +43,7 @@ def _read_array(value: Any) -> list[Any] | None:
 
 
 def _compact_text(raw: str, max_length: int = _MAX_MEDIA_TEXT_CHARS) -> str:
-    normalized = " ".join(raw.split())
-    if len(normalized) <= max_length:
-        return normalized
-    return f"{normalized[: max_length - 1].rstrip()}..."
+    return compact_text(raw, max_length=max_length)
 
 
 def _strip_html_tags(html: str) -> str:
@@ -50,122 +52,33 @@ def _strip_html_tags(html: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html)).strip()
 
 
-def _response_output_text(response: Any) -> str:
-    output_text = getattr(response, "output_text", None)
-    if isinstance(output_text, str) and output_text.strip():
-        return output_text.strip()
-    if isinstance(response, dict):
-        candidate = response.get("output_text")
-        if isinstance(candidate, str):
-            return candidate.strip()
-    return ""
-
-
-def _pdf_file_data_url(pdf_bytes: bytes) -> str:
-    encoded = base64.b64encode(pdf_bytes).decode("ascii")
-    return f"data:application/pdf;base64,{encoded}"
-
-
-def _media_model() -> str:
-    return os.getenv("FLORENCE_CHAT_MEDIA_MODEL", "gpt-5.4").strip() or "gpt-5.4"
-
-
-def _openai_client():
-    api_key = (
-        os.getenv("FLORENCE_CHAT_MEDIA_OPENAI_API_KEY", "").strip()
-        or os.getenv("OPENAI_API_KEY", "").strip()
-    )
-    if not api_key:
-        return None
-    base_url = os.getenv("FLORENCE_CHAT_MEDIA_OPENAI_BASE_URL", "https://api.openai.com/v1").strip()
-    from openai import OpenAI
-
-    return OpenAI(api_key=api_key, base_url=base_url)
-
-
 def _extract_pdf_text_with_gpt(*, pdf_bytes: bytes, filename: str | None) -> str | None:
-    client = _openai_client()
-    if client is None:
-        logger.warning("Skipping Linq PDF extraction: OPENAI_API_KEY not configured")
-        return None
-    try:
-        response = client.responses.create(
-            model=_media_model(),
-            input=[
-                {
-                    "role": "system",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": (
-                                "Extract plain text details from this PDF. Preserve dates, times, names, locations, "
-                                "deadlines, and required items when present."
-                            ),
-                        }
-                    ],
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_file",
-                            "filename": filename or "attachment.pdf",
-                            "file_data": _pdf_file_data_url(pdf_bytes),
-                        },
-                        {"type": "input_text", "text": "Return plain text only."},
-                    ],
-                },
-            ],
-            max_output_tokens=1_500,
-        )
-    except Exception:
-        logger.exception("Linq PDF extraction failed for %s", filename or "attachment.pdf")
-        return None
-    text = _response_output_text(response)
-    return _compact_text(text, max_length=4_500) if text else None
+    return extract_pdf_text_with_openai(
+        pdf_bytes=pdf_bytes,
+        filename=filename,
+        api_key_env_names=("FLORENCE_CHAT_MEDIA_OPENAI_API_KEY", "OPENAI_API_KEY"),
+        base_url_env_name="FLORENCE_CHAT_MEDIA_OPENAI_BASE_URL",
+        model_env_name="FLORENCE_CHAT_MEDIA_MODEL",
+        log_label="Linq PDF extraction",
+        system_text=(
+            "Extract plain text details from this PDF. Preserve dates, times, names, locations, "
+            "deadlines, and required items when present."
+        ),
+        max_output_chars=4_500,
+    )
 
 
 def _extract_image_text_with_gpt(*, image_bytes: bytes, mime_type: str, filename: str | None) -> str | None:
-    client = _openai_client()
-    if client is None:
-        logger.warning("Skipping Linq image extraction: OPENAI_API_KEY not configured")
-        return None
-
-    data_url = f"data:{mime_type};base64,{base64.b64encode(image_bytes).decode('ascii')}"
-    try:
-        response = client.responses.create(
-            model=_media_model(),
-            input=[
-                {
-                    "role": "system",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": (
-                                "Extract useful household context from this screenshot or image. "
-                                "If it contains text, focus on names, dates, times, locations, tasks, deadlines, and required items. "
-                                "For school flyers, forms, or logistics screenshots, also call out permission slips, uniforms, materials to bring, follow-up actions, and who the update is from when visible. "
-                                "If it is a pantry, fridge, grocery, meal, or food photo, list the visible ingredients, groceries, or meal-relevant items. "
-                                "Return concise plain text that helps Florence handle logistics or meal and grocery planning."
-                            ),
-                        }
-                    ],
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "input_image", "image_url": data_url},
-                        {"type": "input_text", "text": "Return plain text only."},
-                    ],
-                },
-            ],
-            max_output_tokens=1_200,
-        )
-    except Exception:
-        logger.exception("Linq image extraction failed for %s", filename or "image")
-        return None
-    text = _response_output_text(response)
-    return _compact_text(text, max_length=2_500) if text else None
+    return extract_image_text_with_openai(
+        image_bytes=image_bytes,
+        mime_type=mime_type,
+        filename=filename,
+        api_key_env_names=("FLORENCE_CHAT_MEDIA_OPENAI_API_KEY", "OPENAI_API_KEY"),
+        base_url_env_name="FLORENCE_CHAT_MEDIA_OPENAI_BASE_URL",
+        model_env_name="FLORENCE_CHAT_MEDIA_MODEL",
+        log_label="Linq image extraction",
+        max_output_chars=2_500,
+    )
 
 
 def _decode_data_url(raw_url: str) -> tuple[bytes, str | None]:

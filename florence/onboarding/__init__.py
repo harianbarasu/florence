@@ -17,13 +17,12 @@ from florence.onboarding.flow import (
     sync_onboarding_stage,
 )
 from florence.onboarding.parsing import extract_child_names, split_entries, split_labels, split_names
-from florence.onboarding.state import OnboardingStage, OnboardingState, OnboardingVariant
+from florence.onboarding.state import OnboardingStage, OnboardingState
 
 __all__ = [
     "OnboardingPrompt",
     "OnboardingStage",
     "OnboardingState",
-    "OnboardingVariant",
     "OnboardingTransition",
     "apply_child_names",
     "apply_child_profile_updates",

@@ -13,6 +13,7 @@ from florence.contracts import (
     HouseholdNudge,
     HouseholdNudgeStatus,
     HouseholdNudgeTargetKind,
+    HouseholdProfileItem,
     HouseholdProfileKind,
     HouseholdSourceVisibility,
     HouseholdRoutineStatus,
@@ -43,20 +44,24 @@ class _StubGroupShareChatService:
         self.promotion_text = promotion_text
         self.promotion_calls: list[dict[str, object]] = []
 
-    def compose_group_promotion(
+    def compose_operator_message(
         self,
         *,
         household_id: str,
         channel_id: str,
         actor_member_id: str | None,
-        source_text: str,
+        kind: str,
+        payload=None,
+        conversation_history=None,  # noqa: ARG002
     ) -> str | None:
+        assert kind == "group_promotion"
+        payload = dict(payload or {})
         self.promotion_calls.append(
             {
                 "household_id": household_id,
                 "channel_id": channel_id,
                 "actor_member_id": actor_member_id,
-                "source_text": source_text,
+                "source_text": payload.get("source_text"),
             }
         )
         return self.promotion_text
@@ -71,19 +76,24 @@ class _FakeLinqClient:
 
 
 class _StubReviewPromptChatService:
-    def compose_review_prompt(
+    def compose_operator_message(
         self,
         *,
         household_id: str,
         channel_id: str,
         actor_member_id: str | None,
-        candidate,
-        source_prompt: str | None = None,
+        kind: str,
+        payload=None,
+        conversation_history=None,  # noqa: ARG002
     ) -> str:
-        title = str(getattr(candidate, "title", "") or "").strip() or "This looks worth double-checking."
+        assert kind == "review_prompt"
+        payload = dict(payload or {})
+        candidate = dict(payload.get("candidate") or {})
+        source_prompt = payload.get("source_prompt")
+        title = str(candidate.get("title") or "").strip() or "This looks worth double-checking."
         lines = [title]
         if source_prompt:
-            lines.append(source_prompt.strip())
+            lines.append(str(source_prompt).strip())
         lines.append("Reply yes if I should add it, no if it's wrong, or skip for later.")
         return " ".join(lines)
 
@@ -148,15 +158,10 @@ def test_google_sync_persistence_service_stores_connection_and_candidates(tmp_pa
     assert store.get_google_connection("gconn_123") == connection
     assert len(result.candidates) == 2
     assert result.candidates[0].state == CandidateState.QUARANTINED
-    assert result.candidates[0].metadata["source_visibility"] == HouseholdSourceVisibility.SHARED.value
-    assert result.candidates[0].metadata["review_lane"] == "bootstrap"
+    assert result.candidates[0].metadata["source_visibility"] == "needs_classification"
     assert len(store.list_imported_candidates(household_id="hh_123", member_id="mem_123")) == 2
-    source_rules = store.list_household_source_rules(
-        household_id="hh_123",
-        source_kind=GoogleSourceKind.GMAIL,
-        visibility=HouseholdSourceVisibility.SHARED,
-    )
-    assert any(rule.matcher_value == "roosevelt.k12.ca.us" for rule in source_rules)
+    source_rules = store.list_household_source_rules(household_id="hh_123", source_kind=GoogleSourceKind.GMAIL)
+    assert source_rules == []
     household = store.get_household("hh_123")
     assert household is not None
     grounding_hints = household.settings["grounding_hints"]
@@ -196,7 +201,7 @@ def test_candidate_review_prompt_asks_once_for_unknown_source_classification(tmp
     store.close()
 
 
-def test_candidate_review_prefers_bootstrap_lane_before_steady_state(tmp_path):
+def test_candidate_review_prompt_returns_latest_pending_candidate(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)
     store.upsert_imported_candidate(
@@ -210,7 +215,6 @@ def test_candidate_review_prefers_bootstrap_lane_before_steady_state(tmp_path):
             summary="Should be reviewed later.",
             state=CandidateState.PENDING_REVIEW,
             metadata={
-                "review_lane": "steady_state",
                 "confirmation_question": "Should I add this later item to your household plan?",
             },
         )
@@ -226,7 +230,6 @@ def test_candidate_review_prefers_bootstrap_lane_before_steady_state(tmp_path):
             summary="Should be reviewed first.",
             state=CandidateState.PENDING_REVIEW,
             metadata={
-                "review_lane": "bootstrap",
                 "confirmation_question": "Should I add this first item to your household plan?",
             },
         )
@@ -281,7 +284,7 @@ def test_google_sync_persistence_service_marks_grounded_candidates_as_steady_sta
     )
 
     assert result.candidates[0].state == CandidateState.PENDING_REVIEW
-    assert result.candidates[0].metadata["review_lane"] == "steady_state"
+    assert result.candidates[0].metadata["source_visibility"] == "needs_classification"
     store.close()
 
 
@@ -678,7 +681,7 @@ def test_onboarding_service_renders_transition_and_repeat_messages(tmp_path):
     assert transition_messages == (
         "Hi, I'm Florence.",
         "I help run the household with you by keeping logistics organized, surfacing reminders, and staying on top of school and calendar noise.",
-        "Connect your Google account so I can pull the last 30 days of family email and calendar in the background while we keep going here.",
+        "Connect your Google account so I can pull up to the last year of family email and calendar in the background while we keep going here.",
         "https://example.com/google/connect",
         "Once Google says you're connected, come right back here. You can also keep answering my questions while it runs.",
         "What are your kids' names? Send all of them in one message, one per line or comma-separated.",
@@ -825,7 +828,7 @@ def test_onboarding_sync_merges_grounding_hints_into_profile_metadata(tmp_path):
     store.close()
 
 
-def test_onboarding_sync_persists_minimal_manager_profile(tmp_path):
+def test_onboarding_sync_persists_structured_household_profiles_without_manager_sidecar(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
     onboarding_service = FlorenceOnboardingSessionService(store)
@@ -868,16 +871,26 @@ def test_onboarding_sync_persists_minimal_manager_profile(tmp_path):
 
     household = store.get_household("hh_123")
     assert household is not None
-    manager_profile = household.settings["manager_profile"]
-    assert manager_profile["parent_display_name"] == "Maya"
-    assert manager_profile["child_profiles"] == [
-        {
-            "name": "Ava",
-            "age": "7",
-            "school": "Roosevelt Elementary",
-            "activities": ["Soccer"],
-        }
-    ]
+    assert "manager_profile" not in household.settings
+    session = store.get_onboarding_session(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="thread_dm_123",
+    )
+    assert session is not None
+    assert session.parent_display_name == "Maya"
+    child = store.list_child_profiles(household_id="hh_123")[0]
+    assert child.full_name == "Ava"
+    school = store.list_household_profile_items(
+        household_id="hh_123",
+        kind=HouseholdProfileKind.SCHOOL,
+    )[0]
+    assert school.label == "Roosevelt Elementary"
+    activity = store.list_household_profile_items(
+        household_id="hh_123",
+        kind=HouseholdProfileKind.ACTIVITY,
+    )[0]
+    assert activity.label == "Soccer"
     store.close()
 
 
@@ -1027,18 +1040,7 @@ def test_household_manager_service_snoozes_actionable_nudge(tmp_path):
 
 def test_household_manager_service_briefing_routines_due_and_advance(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
-    store.upsert_household(
-        Household(
-            id="hh_123",
-            name="Maya's household",
-            timezone="America/Los_Angeles",
-            settings={
-                "manager_profile": {
-                    "operating_preferences": "Weekday morning brief at 6:45 and evening check-in on school nights at 8:30pm.",
-                }
-            },
-        )
-    )
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
     store.upsert_member(
         Member(
             id="mem_123",
@@ -1063,6 +1065,22 @@ def test_household_manager_service_briefing_routines_due_and_advance(tmp_path):
         member_id="mem_123",
         thread_id="dm-thread-123",
         display_name="Maya",
+    )
+    store.replace_household_profile_items(
+        household_id="hh_123",
+        kind=HouseholdProfileKind.PREFERENCE,
+        items=[
+            HouseholdProfileItem(
+                id="pref_briefing_123",
+                household_id="hh_123",
+                kind=HouseholdProfileKind.PREFERENCE,
+                label="Briefing cadence",
+                metadata={
+                    "category": "operating_rule",
+                    "value": "Weekday morning brief at 6:45 and evening check-in on school nights at 8:30pm.",
+                },
+            )
+        ],
     )
 
     manager = FlorenceHouseholdManagerService(store)
@@ -1107,8 +1125,11 @@ def test_household_manager_service_records_reminder_feedback_and_event(tmp_path)
         now=datetime(2026, 3, 24, 18, 30, tzinfo=timezone.utc),
     )
 
-    assert profile["nudge_preferences_override"] == "Too many reminders too early. Morning-of is enough for practice."
-    assert profile["reminder_feedback"][-1]["member_id"] == "mem_123"
+    assert profile is not None
+    assert profile.label == "Reminder style"
+    assert profile.metadata["category"] == "reminder_style"
+    assert profile.metadata["value"] == "Too many reminders too early. Morning-of is enough for practice."
+    assert profile.metadata["recorded_by_member_id"] == "mem_123"
     events = store.list_pilot_events(household_id="hh_123", event_type="reminder_feedback_received")
     assert len(events) == 1
     assert events[0].metadata["text"] == "Too many reminders too early. Morning-of is enough for practice."

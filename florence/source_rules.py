@@ -28,31 +28,6 @@ _CONSUMER_EMAIL_DOMAINS = {
     "aol.com",
 }
 
-_KNOWN_FAMILY_SIGNAL_FIELDS = (
-    "school_domain_hits",
-    "platform_hits",
-    "known_school_hits",
-    "known_activity_hits",
-    "known_child_hits",
-    "known_contact_hits",
-    "known_location_hits",
-    "child_name_hits",
-)
-
-_KNOWN_FAMILY_SIGNAL_TOKENS = (
-    "known_school",
-    "known_activity",
-    "known_child",
-    "known_contact",
-    "known_location",
-    "school_domain",
-    "school_platform",
-    "school_sender",
-    "family_day",
-    "no_class",
-)
-
-
 @dataclass(slots=True)
 class SourceMatcherSpec:
     matcher_kind: HouseholdSourceMatcherKind
@@ -65,7 +40,6 @@ class CandidateSourceProfile:
     source_kind: GoogleSourceKind
     label: str
     matchers: tuple[SourceMatcherSpec, ...]
-    default_shared: bool
 
 
 def _clean_text(value: str | None) -> str | None:
@@ -90,7 +64,7 @@ def _match_term(text: str, term: str) -> bool:
     return normalized_term in normalized_text
 
 
-def _gmail_profile_from_address(from_address: str, *, default_shared: bool) -> CandidateSourceProfile | None:
+def _gmail_profile_from_address(from_address: str) -> CandidateSourceProfile | None:
     display_name, email = parseaddr(from_address)
     clean_name = _clean_text(display_name)
     clean_email = _normalize_match_value(email)
@@ -131,11 +105,10 @@ def _gmail_profile_from_address(from_address: str, *, default_shared: bool) -> C
         source_kind=GoogleSourceKind.GMAIL,
         label=label,
         matchers=tuple(matchers),
-        default_shared=default_shared,
     )
 
 
-def _calendar_profile(summary: str | None, *, default_shared: bool) -> CandidateSourceProfile | None:
+def _calendar_profile(summary: str | None) -> CandidateSourceProfile | None:
     clean_summary = _clean_text(summary)
     if clean_summary is None:
         return None
@@ -149,42 +122,14 @@ def _calendar_profile(summary: str | None, *, default_shared: bool) -> Candidate
                 label=clean_summary,
             ),
         ),
-        default_shared=default_shared,
     )
 
 
-def _candidate_has_known_family_signals(candidate: ImportedCandidate) -> bool:
-    raw_metadata = candidate.metadata.get("raw_metadata")
-    if isinstance(raw_metadata, dict):
-        for field in _KNOWN_FAMILY_SIGNAL_FIELDS:
-            value = raw_metadata.get(field)
-            if isinstance(value, int) and value > 0:
-                return True
-        for key in ("signals", "classification_reasons"):
-            signals = raw_metadata.get(key)
-            if isinstance(signals, list):
-                lowered = [str(signal).strip().lower() for signal in signals if str(signal).strip()]
-                if any(any(token in signal for token in _KNOWN_FAMILY_SIGNAL_TOKENS) for signal in lowered):
-                    return True
-    if candidate.source_kind == GoogleSourceKind.GOOGLE_CALENDAR:
-        summary = str(candidate.metadata.get("calendar_summary") or "").strip().lower()
-        if "family" in summary:
-            return True
-    return False
-
-
 def build_candidate_source_profile(candidate: ImportedCandidate) -> CandidateSourceProfile | None:
-    default_shared = _candidate_has_known_family_signals(candidate)
     if candidate.source_kind == GoogleSourceKind.GMAIL:
-        return _gmail_profile_from_address(
-            str(candidate.metadata.get("from_address") or ""),
-            default_shared=default_shared,
-        )
+        return _gmail_profile_from_address(str(candidate.metadata.get("from_address") or ""))
     if candidate.source_kind == GoogleSourceKind.GOOGLE_CALENDAR:
-        return _calendar_profile(
-            str(candidate.metadata.get("calendar_summary") or ""),
-            default_shared=default_shared,
-        )
+        return _calendar_profile(str(candidate.metadata.get("calendar_summary") or ""))
     return None
 
 

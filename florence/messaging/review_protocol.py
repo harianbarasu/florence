@@ -171,12 +171,20 @@ class FlorenceCandidateReviewProtocol:
         prompt,
     ) -> str:
         try:
-            rendered = self.household_chat_service.compose_review_prompt(
+            rendered = self.household_chat_service.compose_operator_message(
                 household_id=household_id,
                 channel_id=channel_id,
                 actor_member_id=actor_member_id,
-                candidate=prompt.candidate,
-                source_prompt=prompt.source_prompt,
+                kind="review_prompt",
+                payload={
+                    "candidate": {
+                        "title": str(getattr(prompt.candidate, "title", "") or "").strip(),
+                        "summary": str(getattr(prompt.candidate, "summary", "") or "").strip(),
+                        "state": str(getattr(prompt.candidate, "state", "") or "").strip(),
+                        "confirmation_question": str(getattr(prompt.candidate, "metadata", {}).get("confirmation_question") or "").strip(),
+                    },
+                    "source_prompt": prompt.source_prompt,
+                },
             )
             if rendered is not None and rendered.strip():
                 return rendered.strip()

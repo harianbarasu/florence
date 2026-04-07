@@ -162,7 +162,7 @@ def build_google_connect_message_sequence(
                 "I help run the household with you by keeping logistics organized, surfacing reminders, and staying on top of school and calendar noise.",
             ]
         )
-    messages.append("Connect your Google account so I can pull the last 30 days of family email and calendar in the background while we keep going here.")
+    messages.append("Connect your Google account so I can pull up to the last year of family email and calendar in the background while we keep going here.")
     if link_url:
         messages.append(link_url)
     messages.append("Once Google says you're connected, come right back here. You can also keep answering my questions while it runs.")
@@ -226,7 +226,7 @@ def build_onboarding_ready_message_sequence() -> tuple[str, ...]:
 def build_google_connected_syncing_message_sequence(link_url: str | None = None) -> tuple[str, ...]:
     _ = link_url
     return (
-        "Google is connected. I’m syncing the last 30 days of your email and calendar in the background now, and I’ll text you here when the first pass is ready.",
+        "Google is connected. I’m syncing up to the last year of your email and calendar in the background now, and I’ll text you here when the first pass is ready.",
     )
 
 

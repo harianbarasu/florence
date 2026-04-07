@@ -60,23 +60,42 @@ class FlorenceHouseholdManagerService:
     def upsert_shopping_item(self, item: HouseholdShoppingItem) -> HouseholdShoppingItem:
         return self.store.upsert_household_shopping_item(item)
 
-    def get_manager_profile(self, household_id: str) -> dict[str, object]:
-        household = self.store.get_household(household_id)
-        if household is None:
-            return {}
-        raw = household.settings.get("manager_profile") if isinstance(household.settings, dict) else None
-        return dict(raw) if isinstance(raw, dict) else {}
+    @staticmethod
+    def _preference_category(item: HouseholdProfileItem) -> str:
+        return (_clean_label(str(item.metadata.get("category") or "")) or "general").lower().replace(" ", "_")
 
-    def update_manager_profile(self, *, household_id: str, updates: dict[str, object]) -> dict[str, object]:
-        household = self.store.get_household(household_id)
-        if household is None:
-            return {}
-        settings = dict(household.settings) if isinstance(household.settings, dict) else {}
-        profile = dict(settings.get("manager_profile")) if isinstance(settings.get("manager_profile"), dict) else {}
-        profile.update(updates)
-        settings["manager_profile"] = profile
-        self.store.upsert_household(replace(household, settings=settings))
-        return profile
+    @staticmethod
+    def _preference_statement(item: HouseholdProfileItem) -> str:
+        value = str(item.metadata.get("value") or item.metadata.get("summary") or "").strip()
+        if not value:
+            return item.label
+        if item.label.lower() in value.lower():
+            return value
+        return f"{item.label}: {value}"
+
+    def preference_statements(
+        self,
+        *,
+        household_id: str,
+        categories: set[str] | None = None,
+    ) -> list[str]:
+        normalized_categories = {category.strip().lower() for category in (categories or set()) if category.strip()}
+        statements: list[str] = []
+        seen: set[str] = set()
+        for item in self.store.list_household_profile_items(
+            household_id=household_id,
+            kind=HouseholdProfileKind.PREFERENCE,
+        ):
+            category = self._preference_category(item)
+            if normalized_categories and category not in normalized_categories:
+                continue
+            statement = self._preference_statement(item)
+            key = statement.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            statements.append(statement)
+        return statements
 
     def record_preference(
         self,
@@ -91,7 +110,7 @@ class FlorenceHouseholdManagerService:
         channel_id: str | None = None,
         metadata: dict[str, object] | None = None,
         now: datetime | None = None,
-    ) -> tuple[HouseholdProfileItem, dict[str, object]]:
+    ) -> HouseholdProfileItem:
         cleaned_label = _clean_label(label)
         cleaned_value = " ".join(str(value).split()).strip()
         if cleaned_label is None:
@@ -141,34 +160,6 @@ class FlorenceHouseholdManagerService:
             kind=HouseholdProfileKind.PREFERENCE,
             items=updated_items,
         )
-
-        preference_statement = (
-            cleaned_value
-            if cleaned_label.lower() in cleaned_value.lower()
-            else f"{cleaned_label}: {cleaned_value}"
-        )
-        profile_updates: dict[str, object] = {}
-        profile = self.get_manager_profile(household_id)
-        if lowered_category in {"reminder_style", "nudge_style", "reminder_preferences"}:
-            profile_updates = {
-                "nudge_preferences": preference_statement,
-                "nudge_preferences_override": preference_statement,
-                "nudge_preferences_last_updated_at": captured_at,
-            }
-        elif lowered_category in {"operating_rule", "operating_preference"}:
-            existing = str(profile.get("operating_preferences") or "").strip()
-            existing_parts = [part.strip() for part in existing.split("|") if part.strip()]
-            if preference_statement not in existing_parts:
-                existing_parts.append(preference_statement)
-            profile_updates = {
-                "operating_preferences": " | ".join(existing_parts),
-            }
-
-        updated_profile = (
-            self.update_manager_profile(household_id=household_id, updates=profile_updates)
-            if profile_updates
-            else profile
-        )
         self.record_pilot_event(
             household_id=household_id,
             event_type="preference_recorded",
@@ -183,7 +174,7 @@ class FlorenceHouseholdManagerService:
             },
             created_at=now,
         )
-        return preference_item, updated_profile
+        return preference_item
 
     def record_pilot_event(
         self,
@@ -230,29 +221,22 @@ class FlorenceHouseholdManagerService:
         member_id: str | None = None,
         channel_id: str | None = None,
         now: datetime | None = None,
-    ) -> dict[str, object]:
+    ) -> HouseholdProfileItem | None:
         cleaned = " ".join(feedback_text.split()).strip()
         if not cleaned:
-            return self.get_manager_profile(household_id)
-        current = self.get_manager_profile(household_id)
-        feedback_items_raw = current.get("reminder_feedback")
-        feedback_items = list(feedback_items_raw) if isinstance(feedback_items_raw, list) else []
-        captured_at = (now or _utc_now()).isoformat()
-        feedback_items.append(
-            {
-                "text": cleaned,
-                "captured_at": captured_at,
-                "member_id": member_id,
-                "channel_id": channel_id,
-            }
+            return None
+        preference_item = self.record_preference(
+            household_id=household_id,
+            label="Reminder style",
+            value=cleaned,
+            category="reminder_style",
+            recorded_by_member_id=member_id,
+            channel_id=channel_id,
+            metadata={
+                "source": "reminder_feedback",
+            },
+            now=now,
         )
-        updates: dict[str, object] = {
-            "nudge_preferences": cleaned,
-            "nudge_preferences_override": cleaned,
-            "nudge_preferences_last_updated_at": captured_at,
-            "reminder_feedback": feedback_items[-80:],
-        }
-        profile = self.update_manager_profile(household_id=household_id, updates=updates)
         self.record_pilot_event(
             household_id=household_id,
             event_type="reminder_feedback_received",
@@ -261,7 +245,7 @@ class FlorenceHouseholdManagerService:
             metadata={"text": cleaned},
             created_at=now,
         )
-        return profile
+        return preference_item
 
     def ensure_briefing_routines(
         self,
@@ -274,8 +258,12 @@ class FlorenceHouseholdManagerService:
             return []
         current = now or _utc_now()
         timezone_name = household.timezone or "America/Los_Angeles"
-        profile = self.get_manager_profile(household_id)
-        operating_preferences = str(profile.get("operating_preferences") or "")
+        operating_preferences = " | ".join(
+            self.preference_statements(
+                household_id=household_id,
+                categories={"operating_rule", "operating_preference"},
+            )
+        )
         default_owner = self.default_recipient_member_id(household_id)
         default_channel = self.default_dm_channel_id(household_id=household_id, member_id=default_owner)
         if default_owner is None:

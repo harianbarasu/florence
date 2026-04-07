@@ -1,7 +1,6 @@
 from florence.config import FlorenceGoogleRuntimeConfig
 from florence.contracts import ChannelType
 from florence.messaging import FlorenceMessagingIngressResult
-from florence.onboarding import OnboardingVariant
 from florence.runtime.chat import FlorenceHouseholdChatService
 from florence.runtime import FlorenceEntrypointService
 from florence.state import FlorenceStateDB
@@ -72,7 +71,6 @@ def test_entrypoints_hybrid_onboarding_offers_google_link_immediately_after_name
             state_secret="state-secret",
         ),
     )
-    service.onboarding_service.variant_selector = lambda _household_id, _member_id: OnboardingVariant.HYBRID
 
     first = service.handle_linq_payload(
         _linq_payload(
@@ -87,7 +85,7 @@ def test_entrypoints_hybrid_onboarding_offers_google_link_immediately_after_name
     assert first.reply_text is not None
     assert first.reply_messages[0] == "Hi, I'm Florence."
     assert first.reply_messages[2] == (
-        "Connect your Google account so I can pull the last 30 days of family email and calendar in the background while we keep going here."
+        "Connect your Google account so I can pull up to the last year of family email and calendar in the background while we keep going here."
     )
     assert first.reply_messages[3].startswith("https://accounts.google.com/")
     assert first.reply_messages[-1] == "What are your kids' names? Send all of them in one message, one per line or comma-separated."
@@ -207,4 +205,108 @@ def test_entrypoints_sendblue_group_persists_group_id_on_channel(tmp_path):
     assert channel.channel_type == ChannelType.HOUSEHOLD_GROUP
     assert channel.metadata["group_id"] == "group_123456"
     assert channel.metadata["sendblue_number"] == "+15122164639"
+    store.close()
+
+
+def test_entrypoints_group_activation_adds_private_dm_hint_for_unlinked_parent(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    service = _build_entrypoints(store)
+
+    first = service.handle_sendblue_payload(
+        {
+            "content": "Maya",
+            "is_outbound": False,
+            "status": "RECEIVED",
+            "message_handle": "msg_dm_123",
+            "from_number": "+15555550123",
+            "number": "+15555550123",
+            "to_number": "+15122164639",
+            "sendblue_number": "+15122164639",
+            "service": "iMessage",
+        }
+    )
+    assert first.household_id is not None
+
+    service.ingress.handle_message = lambda _resolved: FlorenceMessagingIngressResult(reply_text="Hi group", consumed=True)  # type: ignore[method-assign]
+
+    result = service.handle_sendblue_payload(
+        {
+            "content": "hey Florence",
+            "is_outbound": False,
+            "status": "RECEIVED",
+            "message_handle": "msg_group_123",
+            "from_number": "+15555550123",
+            "number": "+15555550123",
+            "to_number": "+15122164639",
+            "sendblue_number": "+15122164639",
+            "group_id": "group_123456",
+            "participants": ["+15555550123", "+15555550124", "+15122164639"],
+            "service": "iMessage",
+        }
+    )
+
+    assert result.group_announcement == (
+        "If anyone else in this group wants a private 1:1 lane too, message me directly anytime. I'll keep that DM private and link it to this household."
+    )
+    store.close()
+
+
+def test_entrypoints_second_parent_dm_links_to_existing_household_after_group_activation(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    service = _build_entrypoints(store)
+
+    first = service.handle_sendblue_payload(
+        {
+            "content": "Maya",
+            "is_outbound": False,
+            "status": "RECEIVED",
+            "message_handle": "msg_dm_123",
+            "from_number": "+15555550123",
+            "number": "+15555550123",
+            "to_number": "+15122164639",
+            "sendblue_number": "+15122164639",
+            "service": "iMessage",
+        }
+    )
+    assert first.household_id is not None
+
+    service.ingress.handle_message = lambda _resolved: FlorenceMessagingIngressResult(reply_text="ok", consumed=True)  # type: ignore[method-assign]
+
+    group = service.handle_sendblue_payload(
+        {
+            "content": "hey Florence",
+            "is_outbound": False,
+            "status": "RECEIVED",
+            "message_handle": "msg_group_123",
+            "from_number": "+15555550123",
+            "number": "+15555550123",
+            "to_number": "+15122164639",
+            "sendblue_number": "+15122164639",
+            "group_id": "group_123456",
+            "participants": ["+15555550123", "+15555550124", "+15122164639"],
+            "service": "iMessage",
+        }
+    )
+    assert group.household_id == first.household_id
+
+    second_parent_dm = service.handle_sendblue_payload(
+        {
+            "content": "Hi Florence, this is Kendall",
+            "is_outbound": False,
+            "status": "RECEIVED",
+            "message_handle": "msg_dm_456",
+            "from_number": "+15555550124",
+            "number": "+15555550124",
+            "to_number": "+15122164639",
+            "sendblue_number": "+15122164639",
+            "service": "iMessage",
+        }
+    )
+
+    assert second_parent_dm.household_id == first.household_id
+    assert second_parent_dm.member_id is not None
+    assert second_parent_dm.reply_messages == (
+        "You're linked to this household now. This 1:1 thread is private to you, and the family group is still the shared lane.",
+        "ok",
+    )
     store.close()

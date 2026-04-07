@@ -64,11 +64,6 @@ def test_household_chat_service_uses_hermes_agent_with_confirmed_state(tmp_path)
             id="hh_123",
             name="Maya's household",
             timezone="America/Los_Angeles",
-            settings={
-                "manager_profile": {
-                    "operating_preferences": "Weekday morning brief at 6:45, no texts after 9pm, always ask before spending money.",
-                }
-            },
         )
     )
     store.upsert_member(
@@ -268,7 +263,6 @@ def test_household_chat_service_uses_hermes_agent_with_confirmed_state(tmp_path)
     assert "household_search_google_inbox" in _FakeAgent.last_run["system_message"]
     assert "in a parent DM it defaults to that parent's inbox, while in the family group it only uses shared-household inbox scope" in _FakeAgent.last_run["system_message"]
     assert "Do not ask the user to forward or paste an email" in _FakeAgent.last_run["system_message"]
-    assert "Household operating policy:" in _FakeAgent.last_run["system_message"]
     assert _FakeAgent.last_run["task_id"].startswith("florence-household-")
     store.close()
 
@@ -663,7 +657,7 @@ def test_household_chat_service_general_prompt_emphasizes_stateful_capture_and_r
     store.close()
 
 
-def test_household_chat_service_compose_group_promotion_uses_group_safe_prompt(tmp_path):
+def test_household_chat_service_compose_operator_message_group_promotion_uses_group_safe_prompt(tmp_path):
     _FakeAgent.created.clear()
     _FakeAgent.last_run = None
     store = FlorenceStateDB(tmp_path / "florence.db")
@@ -700,11 +694,12 @@ def test_household_chat_service_compose_group_promotion_uses_group_safe_prompt(t
         agent_factory=_FakeAgent,
     )
 
-    summary = service.compose_group_promotion(
+    summary = service.compose_operator_message(
         household_id="hh_123",
         channel_id="chan_dm_123",
         actor_member_id="mem_123",
-        source_text="Parent: Science fair is Friday.\nFlorence: I can remind you and keep dinner simple.",
+        kind="group_promotion",
+        payload={"source_text": "Parent: Science fair is Friday.\nFlorence: I can remind you and keep dinner simple."},
     )
 
     assert summary is not None
@@ -715,7 +710,7 @@ def test_household_chat_service_compose_group_promotion_uses_group_safe_prompt(t
     store.close()
 
 
-def test_household_chat_service_compose_review_prompt_uses_agentic_review_prompt(tmp_path):
+def test_household_chat_service_compose_operator_message_review_prompt_uses_agentic_review_prompt(tmp_path):
     _FakeAgent.created.clear()
     _FakeAgent.last_run = None
     store = FlorenceStateDB(tmp_path / "florence.db")
@@ -752,20 +747,20 @@ def test_household_chat_service_compose_review_prompt_uses_agentic_review_prompt
         agent_factory=_FakeAgent,
     )
 
-    candidate = SimpleNamespace(
-        id="cand_like",
-        title="Science fair reminder",
-        summary="Science fair is Friday at school.",
-        state="pending_review",
-        metadata={"confirmation_question": "Should I add science fair to the household plan?"},
-    )
-
-    prompt = service.compose_review_prompt(
+    prompt = service.compose_operator_message(
         household_id="hh_123",
         channel_id="chan_dm_123",
         actor_member_id="mem_123",
-        candidate=candidate,
-        source_prompt="Reply share to treat future items from this source as household-shared.",
+        kind="review_prompt",
+        payload={
+            "candidate": {
+                "title": "Science fair reminder",
+                "summary": "Science fair is Friday at school.",
+                "state": "pending_review",
+                "confirmation_question": "Should I add science fair to the household plan?",
+            },
+            "source_prompt": "Reply share to treat future items from this source as household-shared.",
+        },
     )
 
     assert prompt is not None
@@ -777,7 +772,7 @@ def test_household_chat_service_compose_review_prompt_uses_agentic_review_prompt
     store.close()
 
 
-def test_household_chat_service_compose_sync_waiting_reply_uses_agentic_prompt(tmp_path):
+def test_household_chat_service_compose_operator_message_sync_waiting_uses_agentic_prompt(tmp_path):
     _FakeAgent.created.clear()
     _FakeAgent.last_run = None
     store = FlorenceStateDB(tmp_path / "florence.db")
@@ -814,12 +809,12 @@ def test_household_chat_service_compose_sync_waiting_reply_uses_agentic_prompt(t
         agent_factory=_FakeAgent,
     )
 
-    reply = service.compose_sync_waiting_reply(
+    reply = service.compose_operator_message(
         household_id="hh_123",
         channel_id="chan_dm_123",
         actor_member_id="mem_123",
-        user_message="What's the sync status?",
-        data_dependent=False,
+        kind="sync_waiting",
+        payload={"user_message": "What's the sync status?", "data_dependent": False},
     )
 
     assert reply is not None
@@ -830,7 +825,7 @@ def test_household_chat_service_compose_sync_waiting_reply_uses_agentic_prompt(t
     store.close()
 
 
-def test_household_chat_service_compose_data_dependent_sync_waiting_reply_uses_data_guidance(tmp_path):
+def test_household_chat_service_compose_operator_message_data_dependent_sync_waiting_uses_data_guidance(tmp_path):
     _FakeAgent.created.clear()
     _FakeAgent.last_run = None
     store = FlorenceStateDB(tmp_path / "florence.db")
@@ -867,12 +862,12 @@ def test_household_chat_service_compose_data_dependent_sync_waiting_reply_uses_d
         agent_factory=_FakeAgent,
     )
 
-    reply = service.compose_sync_waiting_reply(
+    reply = service.compose_operator_message(
         household_id="hh_123",
         channel_id="chan_dm_123",
         actor_member_id="mem_123",
-        user_message="Can you check tomorrow's calendar?",
-        data_dependent=True,
+        kind="sync_waiting",
+        payload={"user_message": "Can you check tomorrow's calendar?", "data_dependent": True},
     )
 
     assert reply is not None
@@ -931,7 +926,7 @@ def test_household_chat_service_compose_weekly_brief_uses_weekly_prompt(tmp_path
     store.close()
 
 
-def test_household_chat_service_compose_activation_brief_uses_agentic_prompt(tmp_path):
+def test_household_chat_service_compose_operator_message_activation_brief_uses_agentic_prompt(tmp_path):
     _FakeAgent.created.clear()
     _FakeAgent.last_run = None
     store = FlorenceStateDB(tmp_path / "florence.db")
@@ -968,14 +963,16 @@ def test_household_chat_service_compose_activation_brief_uses_agentic_prompt(tmp
         agent_factory=_FakeAgent,
     )
 
-    brief = service.compose_activation_brief(
+    brief = service.compose_operator_message(
         household_id="hh_123",
         channel_id="chan_dm_123",
         actor_member_id="mem_123",
-        gmail_count=500,
-        calendar_count=14,
-        candidates=[],
-        group_available=False,
+        kind="activation_brief",
+        payload={
+            "gmail_count": 500,
+            "calendar_count": 14,
+            "candidates": [],
+        },
     )
 
     assert brief is not None

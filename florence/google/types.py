@@ -49,7 +49,48 @@ class GmailSyncItem:
 
 
 @dataclass(slots=True)
+class StoredGmailSyncItem:
+    connection_id: str
+    connection_email: str
+    household_id: str
+    member_id: str
+    gmail_message_id: str
+    thread_id: str | None
+    from_address: str
+    subject: str
+    snippet: str | None
+    body_text: str | None
+    attachment_text: str | None
+    attachment_count: int
+    received_at: datetime | None
+
+
+@dataclass(slots=True)
 class ParentCalendarSyncItem:
+    google_event_id: str
+    title: str
+    description: str | None
+    location: str | None
+    html_link: str | None
+    starts_at: datetime
+    ends_at: datetime
+    timezone: str
+    all_day: bool
+    updated_at: datetime | None
+    calendar_summary: str | None
+    family_member_names: list[str]
+    calendar_id: str | None = None
+    calendar_primary: bool = False
+    usage_mode: str | None = None
+    detail_visibility: str | None = None
+
+
+@dataclass(slots=True)
+class StoredCalendarSyncItem:
+    connection_id: str
+    connection_email: str
+    household_id: str
+    member_id: str
     google_event_id: str
     title: str
     description: str | None

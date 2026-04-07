@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import logging
-import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -13,6 +12,10 @@ from urllib.parse import quote
 
 import httpx
 
+from florence.media.openai_extract import (
+    extract_image_text_with_openai,
+    extract_pdf_text_with_openai,
+)
 from florence.google.types import GmailSyncItem, GoogleCalendarMetadata, ParentCalendarSyncItem
 
 logger = logging.getLogger(__name__)
@@ -20,7 +23,9 @@ logger = logging.getLogger(__name__)
 _GMAIL_ATTACHMENT_PARSE_LIMIT = 5
 _GMAIL_TEXT_ATTACHMENT_MAX_BYTES = 256_000
 _GMAIL_PDF_ATTACHMENT_MAX_BYTES = 8_000_000
+_GMAIL_IMAGE_ATTACHMENT_MAX_BYTES = 8_000_000
 _GMAIL_PDF_EXTRACTION_MAX_CHARS = 5_000
+_GMAIL_IMAGE_EXTRACTION_MAX_CHARS = 2_500
 _GMAIL_ATTACHMENT_TEXT_MAX_CHARS = 8_000
 
 
@@ -67,11 +72,6 @@ def _compact_text(raw: str, max_length: int = 8_000) -> str:
     if len(normalized) <= max_length:
         return normalized
     return f"{normalized[: max_length - 1].rstrip()}..."
-
-
-def _pdf_file_data_url(pdf_bytes: bytes) -> str:
-    encoded = base64.b64encode(pdf_bytes).decode("ascii")
-    return f"data:application/pdf;base64,{encoded}"
 
 
 def _read_gmail_header(headers: list[dict[str, Any]] | None, name: str) -> str:
@@ -146,84 +146,42 @@ def _collect_attachment_parts(
             _collect_attachment_parts(child, attachments=attachments)
 
 
-def _response_output_text(response: Any) -> str:
-    output_text = getattr(response, "output_text", None)
-    if isinstance(output_text, str) and output_text.strip():
-        return output_text.strip()
-    if isinstance(response, dict):
-        candidate = response.get("output_text")
-        if isinstance(candidate, str):
-            return candidate.strip()
-    return ""
-
-
 def _extract_pdf_attachment_text_with_gpt(
     *,
     pdf_bytes: bytes,
     filename: str | None,
 ) -> str | None:
-    api_key = (
-        os.getenv("FLORENCE_GMAIL_PDF_OPENAI_API_KEY", "").strip()
-        or os.getenv("OPENAI_API_KEY", "").strip()
+    return extract_pdf_text_with_openai(
+        pdf_bytes=pdf_bytes,
+        filename=filename,
+        api_key_env_names=("FLORENCE_GMAIL_PDF_OPENAI_API_KEY", "OPENAI_API_KEY"),
+        base_url_env_name="FLORENCE_GMAIL_PDF_OPENAI_BASE_URL",
+        model_env_name="FLORENCE_GMAIL_PDF_MODEL",
+        log_label="OpenAI Gmail PDF attachment extraction",
+        system_text=(
+            "Extract plain text details from this PDF attachment. Preserve dates, times, names, "
+            "locations, fees, deadlines, and required items when present. Keep it concise."
+        ),
+        max_output_chars=_GMAIL_PDF_EXTRACTION_MAX_CHARS,
     )
-    if not api_key:
-        logger.warning(
-            "Skipping Gmail PDF attachment extraction for %s: OPENAI_API_KEY is not configured",
-            filename or "attachment.pdf",
-        )
-        return None
 
-    base_url = os.getenv("FLORENCE_GMAIL_PDF_OPENAI_BASE_URL", "https://api.openai.com/v1").strip()
-    model = os.getenv("FLORENCE_GMAIL_PDF_MODEL", "gpt-5.4").strip() or "gpt-5.4"
 
-    try:
-        from openai import OpenAI
-
-        client = OpenAI(api_key=api_key, base_url=base_url)
-        response = client.responses.create(
-            model=model,
-            input=[
-                {
-                    "role": "system",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": (
-                                "Extract plain text details from this PDF attachment. Preserve dates, times, names, "
-                                "locations, fees, deadlines, and required items when present. Keep it concise."
-                            ),
-                        }
-                    ],
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_file",
-                            "filename": filename or "attachment.pdf",
-                            "file_data": _pdf_file_data_url(pdf_bytes),
-                        },
-                        {
-                            "type": "input_text",
-                            "text": "Return plain text only.",
-                        },
-                    ],
-                },
-            ],
-            max_output_tokens=1_500,
-        )
-    except Exception:
-        logger.exception(
-            "OpenAI PDF attachment extraction failed for %s (model=%s)",
-            filename or "attachment.pdf",
-            model,
-        )
-        return None
-
-    extracted = _response_output_text(response)
-    if not extracted:
-        return None
-    return _compact_text(extracted, max_length=_GMAIL_PDF_EXTRACTION_MAX_CHARS)
+def _extract_image_attachment_text_with_gpt(
+    *,
+    image_bytes: bytes,
+    mime_type: str,
+    filename: str | None,
+) -> str | None:
+    return extract_image_text_with_openai(
+        image_bytes=image_bytes,
+        mime_type=mime_type,
+        filename=filename,
+        api_key_env_names=("FLORENCE_GMAIL_PDF_OPENAI_API_KEY", "OPENAI_API_KEY"),
+        base_url_env_name="FLORENCE_GMAIL_PDF_OPENAI_BASE_URL",
+        model_env_name="FLORENCE_GMAIL_PDF_MODEL",
+        log_label="OpenAI Gmail image attachment extraction",
+        max_output_chars=_GMAIL_IMAGE_EXTRACTION_MAX_CHARS,
+    )
 
 
 def _download_gmail_attachment_bytes(
@@ -294,6 +252,21 @@ def _extract_attachment_part_text(part: _GmailAttachmentPart, *, content: bytes)
             )
             return None
         return _extract_pdf_attachment_text_with_gpt(pdf_bytes=content, filename=part.filename)
+
+    if mime_type.startswith("image/") or filename.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic", ".heif")):
+        if len(content) > _GMAIL_IMAGE_ATTACHMENT_MAX_BYTES:
+            logger.warning(
+                "Skipping oversized Gmail image attachment %s (%d bytes)",
+                part.filename or "image",
+                len(content),
+            )
+            return None
+        final_mime = mime_type if mime_type.startswith("image/") else "image/jpeg"
+        return _extract_image_attachment_text_with_gpt(
+            image_bytes=content,
+            mime_type=final_mime,
+            filename=part.filename,
+        )
 
     return None
 
@@ -533,38 +506,50 @@ def list_recent_parent_calendar_sync_items(
     calendar: GoogleCalendarMetadata,
     family_member_names: list[str],
     max_results: int = 20,
-    window_days: int = 30,
+    window_days: int | None = None,
+    past_window_days: int | None = None,
+    future_window_days: int | None = None,
     timeout_seconds: float = 30.0,
     now: datetime | None = None,
 ) -> list[ParentCalendarSyncItem]:
-    start_time = now or datetime.now(timezone.utc)
-    end_time = start_time + timedelta(days=window_days)
+    anchor_time = now or datetime.now(timezone.utc)
+    resolved_past_window_days = max(0, past_window_days or 0)
+    resolved_future_window_days = max(0, future_window_days if future_window_days is not None else (window_days or 30))
+    start_time = anchor_time - timedelta(days=resolved_past_window_days)
+    end_time = anchor_time + timedelta(days=resolved_future_window_days)
     events_url = f"https://www.googleapis.com/calendar/v3/calendars/{quote(calendar.id, safe='')}/events"
-    response = httpx.get(
-        events_url,
-        params={
-            "singleEvents": "true",
-            "orderBy": "startTime",
-            "maxResults": str(max_results),
-            "timeMin": start_time.isoformat(),
-            "timeMax": end_time.isoformat(),
-        },
-        headers={"authorization": f"Bearer {access_token}"},
-        timeout=timeout_seconds,
-    )
-    payload = response.json()
-    response.raise_for_status()
-
     results: list[ParentCalendarSyncItem] = []
-    for event in payload.get("items") or []:
-        if not isinstance(event, dict):
-            continue
-        sync_item = build_parent_calendar_sync_item(
-            event,
-            calendar=calendar,
-            family_member_names=family_member_names,
+    page_token: str | None = None
+    while len(results) < max_results:
+        response = httpx.get(
+            events_url,
+            params={
+                "singleEvents": "true",
+                "orderBy": "startTime",
+                "maxResults": str(min(250, max_results - len(results))),
+                "timeMin": start_time.isoformat(),
+                "timeMax": end_time.isoformat(),
+                **({"pageToken": page_token} if page_token else {}),
+            },
+            headers={"authorization": f"Bearer {access_token}"},
+            timeout=timeout_seconds,
         )
-        if sync_item is not None:
-            results.append(sync_item)
+        payload = response.json()
+        response.raise_for_status()
+        for event in payload.get("items") or []:
+            if not isinstance(event, dict):
+                continue
+            sync_item = build_parent_calendar_sync_item(
+                event,
+                calendar=calendar,
+                family_member_names=family_member_names,
+            )
+            if sync_item is not None:
+                results.append(sync_item)
+            if len(results) >= max_results:
+                break
+        page_token = payload.get("nextPageToken")
+        if not page_token:
+            break
 
     return results

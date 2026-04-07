@@ -1,4 +1,6 @@
 import json
+import sys
+import types
 
 from florence.config import (
     FlorenceGoogleRuntimeConfig,
@@ -11,6 +13,7 @@ from florence.config import (
 )
 from florence.contracts import Channel, ChannelType, Household
 from florence.runtime import FlorenceEntrypointResult, FlorenceProductionService
+import florence.sendblue.media as sendblue_media
 from florence.server import _extract_sendblue_webhook_secret
 from florence.state import FlorenceStateDB
 
@@ -178,4 +181,89 @@ def test_production_service_sends_group_message_through_sendblue_group_endpoint(
     assert service.sendblue.sent[0]["group_id"] == "group_123456"
     assert service.sendblue.sent[0]["numbers"] is None
     assert service.sendblue.sent[0]["message"] == "Hi from Florence"
+    store.close()
+
+
+def test_production_service_enriches_sendblue_media_payload_before_entrypoint(tmp_path, monkeypatch):
+    settings = _build_settings(tmp_path)
+    store = FlorenceStateDB(settings.server.db_path)
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="sendblue",
+            provider_channel_id="+15122164639|+15555550123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    service = FlorenceProductionService(settings, store=store)
+    service.sendblue = _FakeSendblueClient()
+
+    class _FakeResponse:
+        def __init__(self, *, content: bytes, content_type: str):
+            self.content = content
+            self.headers = {"content-type": content_type}
+
+        def raise_for_status(self):
+            return None
+
+    def _fake_get(url, *, timeout=None):  # noqa: ARG001
+        if url.endswith("form.pdf"):
+            return _FakeResponse(content=b"%PDF-fake", content_type="application/pdf")
+        raise AssertionError(f"Unexpected URL: {url}")
+
+    monkeypatch.setattr(sendblue_media.httpx, "get", _fake_get)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+
+    class _FakeResponses:
+        def create(self, **kwargs):
+            content = kwargs["input"][1]["content"]
+            file_item = next((item for item in content if item.get("type") == "input_file"), None)
+            assert file_item is not None
+            assert file_item["file_data"].startswith("data:application/pdf;base64,")
+            return types.SimpleNamespace(output_text="Permission slip due Friday at pickup.")
+
+    class _FakeOpenAI:
+        def __init__(self, **kwargs):  # noqa: ARG002
+            self.responses = _FakeResponses()
+
+    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=_FakeOpenAI))
+    captured_payload: dict[str, object] = {}
+
+    def _handle(payload):
+        captured_payload.update(payload)
+        return FlorenceEntrypointResult(
+            reply_text="Hi from Florence",
+            consumed=True,
+            household_id="hh_123",
+            channel_id="chan_dm_123",
+        )
+
+    monkeypatch.setattr(service.entrypoints, "handle_sendblue_payload", _handle)
+
+    payload = {
+        "content": "Can you check this form?",
+        "is_outbound": False,
+        "status": "RECEIVED",
+        "message_handle": "msg_media_123",
+        "from_number": "+15555550123",
+        "number": "+15555550123",
+        "to_number": "+15122164639",
+        "sendblue_number": "+15122164639",
+        "service": "iMessage",
+        "message_type": "file",
+        "media_url": "https://example.com/form.pdf",
+        "filename": "form.pdf",
+    }
+
+    result = service.handle_sendblue_webhook(
+        payload=payload,
+        webhook_secret="sb-webhook-secret",
+    )
+
+    assert result.status_code == 200
+    assert "Media context extracted from attachments" in str(captured_payload["content"])
+    assert "form.pdf: Permission slip due Friday at pickup." in str(captured_payload["content"])
     store.close()

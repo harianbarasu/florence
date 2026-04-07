@@ -50,7 +50,6 @@ class CandidateDecision:
     confidence_bps: int | None = None
     requires_confirmation: bool = False
     confirmation_question: str | None = None
-    should_auto_handoff: bool = False
     reason: str | None = None
     raw_metadata: dict[str, object] = field(default_factory=dict)
 
@@ -126,10 +125,6 @@ def _response_output_text(response: Any) -> str:
 
 def _gmail_relevance_model() -> str:
     return os.getenv("FLORENCE_GMAIL_RELEVANCE_MODEL", "gpt-5.4").strip() or "gpt-5.4"
-
-
-def _gmail_relevance_fast_model() -> str:
-    return os.getenv("FLORENCE_GMAIL_RELEVANCE_FAST_MODEL", "gpt-5.4-mini").strip() or "gpt-5.4-mini"
 
 
 def _gmail_relevance_client():
@@ -309,7 +304,6 @@ def _decision_from_llm_payload(
         confidence_bps=clamp_confidence_bps(confidence_bps or 7_000, minimum=5_000),
         requires_confirmation=requires_confirmation,
         confirmation_question=confirmation_question,
-        should_auto_handoff=(confidence_bps or 7_000) >= 6_500,
         reason=reason,
         raw_metadata={
             "classifier": classifier,
@@ -323,7 +317,6 @@ def _run_gmail_candidate_decision_llm(
     item: GmailSyncItem,
     *,
     model: str,
-    classifier: str,
     context: HouseholdContext | None = None,
     time_zone: str,
     now: datetime | None = None,
@@ -362,83 +355,12 @@ def _run_gmail_candidate_decision_llm(
         parsed=parsed,
         subject=subject,
         time_zone=time_zone,
-        classifier=classifier,
+        classifier="gmail_llm_v1",
         model=model,
     )
     if decision is None:
         logger.warning("Gmail relevance LLM returned invalid payload for %s using %s", item.gmail_message_id, model)
     return decision
-
-
-def _should_escalate_gmail_llm_decision(decision: CandidateDecision) -> bool:
-    if decision.kind == CandidateDecisionKind.CANDIDATE:
-        return True
-    if decision.requires_confirmation:
-        return True
-    confidence = decision.confidence_bps or 0
-    signals = [
-        str(signal).strip().lower()
-        for signal in decision.raw_metadata.get("signals", [])
-        if str(signal).strip()
-    ]
-    if confidence < 6_500:
-        return True
-    if confidence >= 8_500:
-        return False
-    interesting_signal_tokens = (
-        "known_",
-        "school",
-        "activity",
-        "camp",
-        "class",
-        "schedule",
-        "pickup",
-        "dropoff",
-        "family_day",
-        "no_class",
-        "cancel",
-    )
-    return any(any(token in signal for token in interesting_signal_tokens) for signal in signals)
-
-
-def _build_gmail_candidate_decision_llm(
-    item: GmailSyncItem,
-    time_zone: str,
-    *,
-    context: HouseholdContext | None = None,
-    now: datetime | None = None,
-) -> CandidateDecision | None:
-    fast_model = _gmail_relevance_fast_model()
-    fast_decision = _run_gmail_candidate_decision_llm(
-        item,
-        model=fast_model,
-        classifier="gmail_llm_fast_v1",
-        context=context,
-        time_zone=time_zone,
-        now=now,
-    )
-    if fast_decision is None:
-        return None
-
-    deep_model = _gmail_relevance_model()
-    if deep_model == fast_model or not _should_escalate_gmail_llm_decision(fast_decision):
-        return fast_decision
-
-    deep_decision = _run_gmail_candidate_decision_llm(
-        item,
-        model=deep_model,
-        classifier="gmail_llm_deep_v1",
-        context=context,
-        time_zone=time_zone,
-        now=now,
-    )
-    if deep_decision is None:
-        return fast_decision
-    deep_decision.raw_metadata["triage_model"] = fast_model
-    deep_decision.raw_metadata["triage_classifier"] = fast_decision.raw_metadata.get("classifier")
-    deep_decision.raw_metadata["triage_reason"] = fast_decision.reason
-    deep_decision.raw_metadata["triage_confidence_bps"] = fast_decision.confidence_bps
-    return deep_decision
 
 
 def _build_gmail_candidate_decision_heuristic(
@@ -476,60 +398,38 @@ def _build_gmail_candidate_decision_heuristic(
     known_child_hits = _count_known_hits(source_text, child_terms)
     known_contact_hits = _count_known_hits(source_text, contact_terms)
     known_location_hits = _count_known_hits(source_text, location_terms)
-
+    anchor_hits = (
+        school_domain_hits
+        + platform_hits
+        + known_school_hits
+        + known_activity_hits
+        + known_child_hits
+        + known_contact_hits
+        + known_location_hits
+    )
     sender_looks_school = any(hint in sender_lower for hint in SCHOOL_SENDER_HINTS)
     sender_looks_school = sender_looks_school or school_domain_hits > 0 or platform_hits > 0 or known_school_hits > 0
     logistics_hits = count_hint_hits(lowered, LOGISTICS_HINTS)
-    ambiguity_hits = count_hint_hits(lowered, AMBIGUITY_HINTS)
+    activity_hint_hits = count_hint_hits(lowered, CHILD_ACTIVITY_HINTS)
     all_day_hits = count_hint_hits(lowered, ALL_DAY_HINTS)
     promotional_hits = count_hint_hits(lowered_source, PROMOTIONAL_HINTS)
     date_match = parse_explicit_date(text, time_zone, now=now or item.received_at)
     time_range = parse_time_range(text)
     single_time = None if time_range else parse_single_time(text)
-    has_scheduling_evidence = bool(date_match or time_range or single_time)
-    context_signal_hits = (
-        school_domain_hits
-        + platform_hits
-        + known_school_hits
-        + known_activity_hits
-        + known_child_hits
-        + known_contact_hits
-        + known_location_hits
-    )
-    strong_household_anchor_hits = (
-        school_domain_hits
-        + platform_hits
-        + known_school_hits
-        + known_activity_hits
-        + known_child_hits
-        + known_contact_hits
-        + known_location_hits
-    )
-
-    has_household_anchor = context_signal_hits > 0
-    if promotional_hits > 0 and strong_household_anchor_hits == 0:
+    has_scheduling_evidence = bool(date_match or time_range or single_time or all_day_hits > 0)
+    if promotional_hits > 0 and anchor_hits == 0:
         return CandidateDecision(kind=CandidateDecisionKind.SKIP, reason="promotional_noise")
+
+    strong_anchor = (
+        anchor_hits >= 2
+        or (known_child_hits > 0 and (known_activity_hits > 0 or known_school_hits > 0 or known_contact_hits > 0))
+    )
     if sender_looks_school:
-        looks_relevant = bool(
-            has_scheduling_evidence
-            or (logistics_hits > 0 and strong_household_anchor_hits > 0)
-            or strong_household_anchor_hits >= 2
-            or (known_contact_hits > 0 and (logistics_hits > 0 or has_scheduling_evidence))
-        )
+        looks_relevant = strong_anchor or logistics_hits > 0 or has_scheduling_evidence or activity_hint_hits > 0
     else:
-        looks_relevant = bool(
-            has_household_anchor
-            and (
-                has_scheduling_evidence
-                or logistics_hits > 0
-                or (
-                    known_contact_hits > 0
-                    and (known_child_hits > 0 or known_activity_hits > 0 or known_school_hits > 0)
-                )
-            )
-        )
+        looks_relevant = anchor_hits > 0 and (logistics_hits > 0 or has_scheduling_evidence or activity_hint_hits > 0)
     if not looks_relevant:
-        return CandidateDecision(kind=CandidateDecisionKind.SKIP, reason="not_school_logistics")
+        return CandidateDecision(kind=CandidateDecisionKind.SKIP, reason="not_household_logistics")
 
     proposed_fields: dict[str, object] = {"title": subject}
     reasons: list[str] = []
@@ -551,6 +451,8 @@ def _build_gmail_candidate_decision_heuristic(
         reasons.append("known_location")
     if logistics_hits > 0:
         reasons.append("logistics_keywords")
+    if activity_hint_hits > 0:
+        reasons.append("activity_keywords")
     if date_match:
         reasons.append("date")
     if time_range or single_time:
@@ -558,24 +460,18 @@ def _build_gmail_candidate_decision_heuristic(
     if all_day_hits > 0:
         reasons.append("all_day_hint")
 
-    confidence_bps = 4_500
-    confidence_bps += 2_000 if sender_looks_school else 500
-    confidence_bps += min(logistics_hits, 2) * 1_000
-    confidence_bps += 1_000 if date_match else 0
-    confidence_bps += 1_000 if time_range else 700 if single_time else 0
-    confidence_bps += school_domain_hits * 1_200
-    confidence_bps += platform_hits * 600
-    confidence_bps += min(known_school_hits, 1) * 900
-    confidence_bps += min(known_activity_hits, 2) * 700
-    confidence_bps += min(known_child_hits, 2) * 600
-    confidence_bps += min(known_contact_hits, 1) * 500
-    confidence_bps += min(known_location_hits, 1) * 300
-    confidence_bps -= min(promotional_hits, 2) * 600
+    confidence_bps = 5_500
+    confidence_bps += 900 if sender_looks_school else 0
+    confidence_bps += min(anchor_hits, 3) * 500
+    confidence_bps += min(logistics_hits, 2) * 600
+    confidence_bps += 800 if date_match else 0
+    confidence_bps += 700 if time_range else 500 if single_time else 0
+    confidence_bps -= min(promotional_hits, 2) * 500
 
     requires_confirmation = False
     confirmation_question: str | None = None
 
-    if ambiguity_hits > 0:
+    if count_hint_hits(lowered, AMBIGUITY_HINTS) > 0:
         requires_confirmation = True
         confirmation_question = f"The schedule for {subject} looks conditional. Which date or time applies?"
         reasons.append("ambiguous_schedule")
@@ -626,24 +522,14 @@ def _build_gmail_candidate_decision_heuristic(
         confidence_bps=clamp_confidence_bps(confidence_bps, minimum=5_000),
         requires_confirmation=requires_confirmation,
         confirmation_question=confirmation_question,
-        should_auto_handoff=confidence_bps >= 6_500,
         raw_metadata={
             "classifier": "gmail_heuristics_v1",
             "classification_reasons": reasons,
-            "sender_looks_school": sender_looks_school,
-            "school_domain_hits": school_domain_hits,
             "platform_hits": platform_hits,
-            "known_school_hits": known_school_hits,
             "known_activity_hits": known_activity_hits,
             "known_child_hits": known_child_hits,
-            "known_contact_hits": known_contact_hits,
             "known_location_hits": known_location_hits,
-            "context_signal_hits": context_signal_hits,
-            "logistics_hits": logistics_hits,
-            "ambiguity_hits": ambiguity_hits,
-            "attachment_count": item.attachment_count,
-            "sender_domain": sender_domain or None,
-            "promotional_hits": promotional_hits,
+            "anchor_hits": anchor_hits,
         },
     )
 
@@ -655,10 +541,11 @@ def build_gmail_candidate_decision(
     context: HouseholdContext | None = None,
     now: datetime | None = None,
 ) -> CandidateDecision:
-    llm_decision = _build_gmail_candidate_decision_llm(
+    llm_decision = _run_gmail_candidate_decision_llm(
         item,
-        time_zone,
+        model=_gmail_relevance_model(),
         context=context,
+        time_zone=time_zone,
         now=now,
     )
     if llm_decision is not None:
@@ -741,20 +628,10 @@ def build_parent_calendar_candidate_decision(
             "all_day": item.all_day,
         },
         confidence_bps=confidence_bps,
-        should_auto_handoff=child_name_hits > 0 or activity_hits > 0 or logistics_hits >= 2,
         raw_metadata={
             "classifier": "parent_calendar_heuristics_v1",
-            "logistics_hits": logistics_hits,
-            "activity_hits": activity_hits,
-            "personal_hits": personal_hits,
-            "child_name_hits": child_name_hits,
             "known_activity_hits": known_activity_hits,
-            "known_child_hits": known_child_hits,
-            "known_school_hits": known_school_hits,
             "known_location_hits": known_location_hits,
-            "known_contact_hits": known_contact_hits,
-            "calendar_event_id": item.google_event_id,
-            "calendar_summary": item.calendar_summary,
-            "html_link": item.html_link,
+            "family_signal_hits": family_signal_hits,
         },
     )

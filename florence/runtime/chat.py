@@ -31,12 +31,6 @@ class FlorenceHouseholdChatReply:
     text: str
 
 
-@dataclass(slots=True)
-class FlorenceHouseholdActivationBrief:
-    text: str
-    group_text: str | None = None
-
-
 class FlorenceHouseholdChatService:
     """Wrap Hermes core for Florence household chat after onboarding."""
 
@@ -152,142 +146,15 @@ class FlorenceHouseholdChatService:
         final_response = str(result.get("final_response") or "").strip()
         return final_response or None
 
-    def compose_activation_brief(
+    def compose_operator_message(
         self,
         *,
         household_id: str,
         channel_id: str,
         actor_member_id: str | None,
-        gmail_count: int,
-        calendar_count: int,
-        candidates: list[Any],
-        group_available: bool,
-    ) -> FlorenceHouseholdActivationBrief | None:
-        base_system = self._build_system_message(
-            household_id=household_id,
-            channel_id=channel_id,
-            actor_member_id=actor_member_id,
-        )
-        if not base_system:
-            return None
-        system_message = "\n".join(
-            [
-                base_system,
-                "You are preparing Florence's first activation brief after the initial Google sync finishes.",
-                "Keep it calm, concise, and operator-like.",
-                "Write at most 5 short bullets or short paragraphs.",
-                "Lead with the 1-3 household facts or possible slips that matter most.",
-                "Collapse duplicate raw artifacts into one underlying household fact when they refer to the same appointment, event, reminder, or thread.",
-                "Do not say 'items need review', 'candidate queue', 'I scanned X emails', or other pipeline language unless it is truly essential.",
-                "Do not dump raw repeated titles.",
-                "If something looks important but still uncertain, phrase it as something Florence wants to double-check, not as a confirmed fact.",
-                "Do not mention tool internals, sync phases, or ingestion mechanics.",
-                "End with one short natural invitation for what the parent can ask next. Do not use command-style product UI language.",
-            ]
-        )
-        user_message = json.dumps(
-            {
-                "task": "compose_initial_sync_activation_brief",
-                "gmail_count": gmail_count,
-                "calendar_count": calendar_count,
-                "group_available": group_available,
-                "candidates": [
-                    {
-                        "title": str(getattr(candidate, "title", "") or "").strip(),
-                        "summary": str(getattr(candidate, "summary", "") or "").strip(),
-                        "state": str(getattr(candidate, "state", "") or "").strip(),
-                        "confirmation_question": str(getattr(candidate, "metadata", {}).get("confirmation_question") or "").strip(),
-                    }
-                    for candidate in candidates
-                ],
-            },
-            ensure_ascii=True,
-        )
-        result = self._run_agent_conversation(
-            household_id=household_id,
-            channel_id=channel_id,
-            actor_member_id=actor_member_id,
-            user_message=user_message,
-            system_message=system_message,
-            conversation_history=None,
-            enabled_toolsets=["florence_briefing"],
-        )
-        final_response = str(result.get("final_response") or "").strip()
-        if not final_response:
-            return None
-        group_text = None
-        if group_available:
-            group_text = self.compose_group_promotion(
-                household_id=household_id,
-                channel_id=channel_id,
-                actor_member_id=actor_member_id,
-                source_text=final_response,
-            )
-        return FlorenceHouseholdActivationBrief(text=final_response, group_text=group_text)
-
-    def compose_review_prompt(
-        self,
-        *,
-        household_id: str,
-        channel_id: str,
-        actor_member_id: str | None,
-        candidate: Any,
-        source_prompt: str | None = None,
-    ) -> str | None:
-        base_system = self._build_system_message(
-            household_id=household_id,
-            channel_id=channel_id,
-            actor_member_id=actor_member_id,
-        )
-        if not base_system:
-            return None
-        system_message = "\n".join(
-            [
-                base_system,
-                "You are preparing a short Florence review prompt for one possible household item.",
-                "Keep it calm, concise, and plainspoken.",
-                "Do not say 'Imported item', 'candidate', 'queue', or other pipeline language.",
-                "Summarize the underlying household fact or question in normal language.",
-                "If the item is uncertain, frame it as something Florence wants to double-check before adding.",
-                "If there is source-sharing guidance, include it naturally in one short line.",
-                "End exactly with: Reply yes if I should add it, no if it's wrong, or skip for later.",
-            ]
-        )
-        user_message = json.dumps(
-            {
-                "task": "compose_review_prompt",
-                "candidate": {
-                    "title": str(getattr(candidate, "title", "") or "").strip(),
-                    "summary": str(getattr(candidate, "summary", "") or "").strip(),
-                    "state": str(getattr(candidate, "state", "") or "").strip(),
-                    "confirmation_question": str(getattr(candidate, "metadata", {}).get("confirmation_question") or "").strip(),
-                },
-                "source_prompt": str(source_prompt or "").strip(),
-            },
-            ensure_ascii=True,
-        )
-        result = self._run_agent_conversation(
-            household_id=household_id,
-            channel_id=channel_id,
-            actor_member_id=actor_member_id,
-            user_message=user_message,
-            system_message=system_message,
-            conversation_history=None,
-            enabled_toolsets=["florence_briefing"],
-        )
-        final_response = str(result.get("final_response") or "").strip()
-        return final_response or None
-
-    def compose_sync_waiting_reply(
-        self,
-        *,
-        household_id: str,
-        channel_id: str,
-        actor_member_id: str | None,
-        user_message: str | None = None,
+        kind: str,
+        payload: dict[str, Any] | None = None,
         conversation_history: list[ChannelMessage] | None = None,
-        data_dependent: bool = False,
-        just_connected: bool = False,
     ) -> str | None:
         base_system = self._build_system_message(
             household_id=household_id,
@@ -296,95 +163,132 @@ class FlorenceHouseholdChatService:
         )
         if not base_system:
             return None
-        system_message = "\n".join(
-            [
-                base_system,
-                "You are writing a short Florence message while the first Gmail and Calendar sync is still running.",
-                "Keep it calm, concise, and reassuring.",
-                "Do not replay the active onboarding question unless the user explicitly asks for it.",
-                "Do not mention candidate queues, scan counts, pipeline phases, or tool internals.",
-                "Do not sound like a background job log or admin console.",
-                "Keep it to one short text-sized reply.",
-            ]
-        )
-        if just_connected:
+        payload = dict(payload or {})
+        conversation_context = None
+        if conversation_history is not None:
+            conversation_context = self._build_conversation_history(conversation_history)
+
+        if kind == "activation_brief":
             system_message = "\n".join(
                 [
-                    system_message,
+                    base_system,
+                    "You are preparing Florence's first activation brief after the initial Google sync finishes.",
+                    "Keep it calm, concise, and operator-like.",
+                    "Write at most 5 short bullets or short paragraphs.",
+                    "Lead with the 1-3 household facts or possible slips that matter most.",
+                    "Collapse duplicate raw artifacts into one underlying household fact when they refer to the same appointment, event, reminder, or thread.",
+                    "Do not say 'items need review', 'candidate queue', 'I scanned X emails', or other pipeline language unless it is truly essential.",
+                    "Do not dump raw repeated titles.",
+                    "If something looks important but still uncertain, phrase it as something Florence wants to double-check, not as a confirmed fact.",
+                    "Do not mention tool internals, sync phases, or ingestion mechanics.",
+                    "End with one short natural invitation for what the parent can ask next. Do not use command-style product UI language.",
+                ]
+            )
+            user_message = json.dumps(
+                {
+                    "task": "compose_initial_sync_activation_brief",
+                    "gmail_count": int(payload.get("gmail_count") or 0),
+                    "calendar_count": int(payload.get("calendar_count") or 0),
+                    "candidates": list(payload.get("candidates") or []),
+                },
+                ensure_ascii=True,
+            )
+        elif kind == "review_prompt":
+            system_message = "\n".join(
+                [
+                    base_system,
+                    "You are preparing a short Florence review prompt for one possible household item.",
+                    "Keep it calm, concise, and plainspoken.",
+                    "Do not say 'Imported item', 'candidate', 'queue', or other pipeline language.",
+                    "Summarize the underlying household fact or question in normal language.",
+                    "If the item is uncertain, frame it as something Florence wants to double-check before adding.",
+                    "If there is source-sharing guidance, include it naturally in one short line.",
+                    "End exactly with: Reply yes if I should add it, no if it's wrong, or skip for later.",
+                ]
+            )
+            user_message = json.dumps(
+                {
+                    "task": "compose_review_prompt",
+                    "candidate": dict(payload.get("candidate") or {}),
+                    "source_prompt": str(payload.get("source_prompt") or "").strip(),
+                },
+                ensure_ascii=True,
+            )
+        elif kind == "sync_waiting":
+            data_dependent = bool(payload.get("data_dependent"))
+            system_message = "\n".join(
+                [
+                    base_system,
+                    "You are writing a short Florence message while the first Gmail and Calendar sync is still running.",
+                    "Keep it calm, concise, and reassuring.",
+                    "Do not replay the active onboarding question unless the user explicitly asks for it.",
+                    "Do not mention candidate queues, scan counts, pipeline phases, or tool internals.",
+                    "Do not sound like a background job log or admin console.",
+                    "Keep it to one short text-sized reply.",
+                    (
+                        "The user is asking for inbox or calendar-dependent information, so explain that Florence is still syncing before it can answer confidently from that data."
+                        if data_dependent
+                        else "The user mainly wants sync status or wants to know what Florence can do while the sync runs."
+                    ),
+                ]
+            )
+            user_message = json.dumps(
+                {
+                    "task": "compose_sync_waiting_reply",
+                    "user_message": str(payload.get("user_message") or "").strip(),
+                    "data_dependent": data_dependent,
+                },
+                ensure_ascii=True,
+            )
+        elif kind == "sync_started":
+            system_message = "\n".join(
+                [
+                    base_system,
+                    "You are writing a short Florence message while the first Gmail and Calendar sync is still running.",
+                    "Keep it calm, concise, and reassuring.",
+                    "Do not replay the active onboarding question unless the user explicitly asks for it.",
+                    "Do not mention candidate queues, scan counts, pipeline phases, or tool internals.",
+                    "Do not sound like a background job log or admin console.",
+                    "Keep it to one short text-sized reply.",
                     "Google just connected successfully. Florence is sending a quiet background-status update into the DM thread.",
                     "Acknowledge that sync is running in the background and say Florence will text when the first pass is ready.",
                 ]
             )
-            prompt_payload: dict[str, Any] = {
-                "task": "compose_google_sync_started_update",
-            }
-        else:
-            guidance = (
-                "The user is asking for inbox or calendar-dependent information, so explain that Florence is still syncing before it can answer confidently from that data."
-                if data_dependent
-                else "The user mainly wants sync status or wants to know what Florence can do while the sync runs."
+            user_message = json.dumps(
+                {
+                    "task": "compose_google_sync_started_update",
+                },
+                ensure_ascii=True,
             )
-            system_message = "\n".join([system_message, guidance])
-            prompt_payload = {
-                "task": "compose_sync_waiting_reply",
-                "user_message": str(user_message or "").strip(),
-                "data_dependent": bool(data_dependent),
-            }
-        result = self._run_agent_conversation(
-            household_id=household_id,
-            channel_id=channel_id,
-            actor_member_id=actor_member_id,
-            user_message=json.dumps(prompt_payload, ensure_ascii=True),
-            system_message=system_message,
-            conversation_history=(
-                self._build_conversation_history(conversation_history or [])
-                if conversation_history is not None
-                else None
-            ),
-            enabled_toolsets=["florence_briefing"],
-        )
-        final_response = str(result.get("final_response") or "").strip()
-        return final_response or None
-
-    def compose_group_promotion(
-        self,
-        *,
-        household_id: str,
-        channel_id: str,
-        actor_member_id: str | None,
-        source_text: str,
-    ) -> str | None:
-        base_system = self._build_system_message(
-            household_id=household_id,
-            channel_id=channel_id,
-            actor_member_id=actor_member_id,
-        )
-        if not base_system:
-            return None
-        system_message = "\n".join(
-            [
-                base_system,
-                "You are preparing a short group-safe household update from a private parent DM.",
-                "Only include concrete shared logistics, tasks, reminders, meals, grocery items, calendar changes, or plans the other parent should know.",
-                "Do not include raw feelings, therapy-like language, health-sensitive details, vulnerable wording, or anything that belongs only in a private DM.",
-                "If there is nothing appropriate to share with the parent group, reply exactly NO_GROUP_SHARE.",
-                "Keep the result concise and ready to send as a standalone household update.",
-            ]
-        )
-        result = self._run_agent_conversation(
-            household_id=household_id,
-            channel_id=channel_id,
-            actor_member_id=actor_member_id,
-            user_message=(
+        elif kind == "group_promotion":
+            system_message = "\n".join(
+                [
+                    base_system,
+                    "You are preparing a short group-safe household update from a private parent DM.",
+                    "Only include concrete shared logistics, tasks, reminders, meals, grocery items, calendar changes, or plans the other parent should know.",
+                    "Do not include raw feelings, therapy-like language, health-sensitive details, vulnerable wording, or anything that belongs only in a private DM.",
+                    "If there is nothing appropriate to share with the parent group, reply exactly NO_GROUP_SHARE.",
+                    "Keep the result concise and ready to send as a standalone household update.",
+                ]
+            )
+            user_message = (
                 "Turn this recent private DM exchange into a short parent-group update if appropriate:\n\n"
-                f"{source_text}"
-            ),
+                f"{str(payload.get('source_text') or '').strip()}"
+            )
+        else:
+            raise ValueError(f"unsupported_operator_message_kind: {kind}")
+
+        result = self._run_agent_conversation(
+            household_id=household_id,
+            channel_id=channel_id,
+            actor_member_id=actor_member_id,
+            user_message=user_message,
             system_message=system_message,
-            conversation_history=None,
+            conversation_history=conversation_context,
             enabled_toolsets=["florence_briefing"],
         )
         final_response = str(result.get("final_response") or "").strip()
-        if not final_response or final_response == "NO_GROUP_SHARE":
+        if kind == "group_promotion" and final_response == "NO_GROUP_SHARE":
             return None
         return final_response
 
@@ -586,8 +490,6 @@ class FlorenceHouseholdChatService:
         if household is None:
             return ""
         channel = self.store.get_channel(channel_id)
-        manager_profile = household.settings.get("manager_profile") if isinstance(household.settings, dict) else None
-        manager_profile = dict(manager_profile) if isinstance(manager_profile, dict) else {}
 
         actor_name = None
         if actor_member_id:
@@ -737,22 +639,6 @@ class FlorenceHouseholdChatService:
                     label = f"{member_name_by_id[item.member_id]} | {label}"
                 rendered = f"{label}: {value}" if value else label
                 lines.append(f"- {rendered}")
-        household_members = manager_profile.get("household_members")
-        if isinstance(household_members, list) and household_members:
-            lines.append("Family unit details: " + " | ".join(str(item) for item in household_members[:6]))
-        child_details = manager_profile.get("child_details")
-        if isinstance(child_details, list) and child_details:
-            lines.append("Child notes: " + " | ".join(str(item) for item in child_details[:6]))
-        household_operations = manager_profile.get("household_operations")
-        if isinstance(household_operations, list) and household_operations:
-            lines.append("Household operations to help manage: " + ", ".join(str(item) for item in household_operations[:10]))
-        nudge_preferences = manager_profile.get("nudge_preferences_override") or manager_profile.get("nudge_preferences")
-        if isinstance(nudge_preferences, str) and nudge_preferences.strip():
-            lines.append(f"Reminder and nudge style: {nudge_preferences.strip()}")
-        operating_preferences = manager_profile.get("operating_preferences")
-        if isinstance(operating_preferences, str) and operating_preferences.strip():
-            lines.append(f"Household operating policy: {operating_preferences.strip()}")
-
         lines.extend(self._build_event_snapshot_lines(events))
 
         if work_items:

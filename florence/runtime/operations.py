@@ -105,12 +105,20 @@ class FlorenceHouseholdOperationsService:
             prompt_text = prompt.text
             try:
                 source_prompt = candidate_review_service.source_rule_service.build_candidate_source_prompt(prompt.candidate)
-                rendered = self._household_chat_service_getter().compose_review_prompt(
+                rendered = self._household_chat_service_getter().compose_operator_message(
                     household_id=household_id,
                     channel_id=channel.id,
                     actor_member_id=member_id,
-                    candidate=prompt.candidate,
-                    source_prompt=source_prompt,
+                    kind="review_prompt",
+                    payload={
+                        "candidate": {
+                            "title": str(getattr(prompt.candidate, "title", "") or "").strip(),
+                            "summary": str(getattr(prompt.candidate, "summary", "") or "").strip(),
+                            "state": str(getattr(prompt.candidate, "state", "") or "").strip(),
+                            "confirmation_question": str(getattr(prompt.candidate, "metadata", {}).get("confirmation_question") or "").strip(),
+                        },
+                        "source_prompt": source_prompt,
+                    },
                 )
                 if rendered is not None and rendered.strip():
                     prompt_text = rendered.strip()
@@ -257,14 +265,24 @@ class FlorenceHouseholdOperationsService:
         activation_message: str | None = None
         group_message: str | None = None
         try:
-            activation_brief = self._household_chat_service_getter().compose_activation_brief(
+            activation_message = self._household_chat_service_getter().compose_operator_message(
                 household_id=connection.household_id,
                 channel_id=primary_channel.id,
                 actor_member_id=connection.member_id,
-                gmail_count=int(connection.metadata.get("last_gmail_item_count") or 0),
-                calendar_count=int(connection.metadata.get("last_calendar_item_count") or 0),
-                candidates=candidates,
-                group_available=(group_channel is not None and not deliver_to_group),
+                kind="activation_brief",
+                payload={
+                    "gmail_count": int(connection.metadata.get("last_gmail_item_count") or 0),
+                    "calendar_count": int(connection.metadata.get("last_calendar_item_count") or 0),
+                    "candidates": [
+                        {
+                            "title": str(getattr(candidate, "title", "") or "").strip(),
+                            "summary": str(getattr(candidate, "summary", "") or "").strip(),
+                            "state": str(getattr(candidate, "state", "") or "").strip(),
+                            "confirmation_question": str(getattr(candidate, "metadata", {}).get("confirmation_question") or "").strip(),
+                        }
+                        for candidate in candidates
+                    ],
+                },
             )
         except Exception:
             logger.exception(
@@ -272,10 +290,22 @@ class FlorenceHouseholdOperationsService:
                 connection.household_id,
                 connection.id,
             )
-            activation_brief = None
-        if activation_brief is not None:
-            activation_message = activation_brief.text
-            group_message = activation_brief.group_text
+            activation_message = None
+        if activation_message and group_channel is not None and not deliver_to_group:
+            try:
+                group_message = self._household_chat_service_getter().compose_operator_message(
+                    household_id=connection.household_id,
+                    channel_id=primary_channel.id,
+                    actor_member_id=connection.member_id,
+                    kind="group_promotion",
+                    payload={"source_text": activation_message},
+                )
+            except Exception:
+                logger.exception(
+                    "Florence activation brief group-promotion compose failed household_id=%s connection_id=%s",
+                    connection.household_id,
+                    connection.id,
+                )
         if not activation_message:
             activation_message, group_message = self.fallback_sync_activation_brief_messages(
                 deliver_to_group=deliver_to_group,

@@ -84,11 +84,12 @@ class FlorenceGroupShareService:
             return FlorenceGroupShareResult(
                 reply_text="There is not a clean update to share from that DM yet.",
             )
-        shared_summary = self.household_chat_service.compose_group_promotion(
+        shared_summary = self.household_chat_service.compose_operator_message(
             household_id=household_id,
             channel_id=channel_id,
             actor_member_id=actor_member_id,
-            source_text=source_text,
+            kind="group_promotion",
+            payload={"source_text": source_text},
         )
         if not shared_summary or not shared_summary.strip():
             return FlorenceGroupShareResult(

@@ -56,13 +56,12 @@ def test_gmail_candidate_skips_unrelated_email():
     assert decision.reason == "promotional_noise"
 
 
-def test_gmail_candidate_uses_two_pass_llm_when_configured(monkeypatch):
+def test_gmail_candidate_uses_single_llm_pass_when_configured(monkeypatch):
     calls: list[dict[str, object]] = []
 
     class _FakeResponses:
         def create(self, **kwargs):
             calls.append(kwargs)
-            model = kwargs["model"]
             payload = {
                 "kind": "candidate",
                 "reason": "known_contact_schedule_email",
@@ -77,8 +76,6 @@ def test_gmail_candidate_uses_two_pass_llm_when_configured(monkeypatch):
                     "description": "No class April 1 and April 8. Family Day May 6.",
                 },
             }
-            if model == "gpt-5.4-mini":
-                payload["confidence_bps"] = 7300
             return types.SimpleNamespace(
                 output_text=json.dumps(payload)
             )
@@ -121,14 +118,13 @@ def test_gmail_candidate_uses_two_pass_llm_when_configured(monkeypatch):
 
     assert decision.kind == CandidateDecisionKind.CANDIDATE
     assert decision.title == "Spring break and Family Day dates"
-    assert decision.raw_metadata["classifier"] == "gmail_llm_deep_v1"
-    assert decision.raw_metadata["triage_model"] == "gpt-5.4-mini"
+    assert decision.raw_metadata["classifier"] == "gmail_llm_v1"
     assert decision.raw_metadata["signals"] == ["known_contact", "known_activity", "no_class", "family_day"]
     assert calls[0]["api_key"] == "sk-test"
-    assert [entry["model"] for entry in calls if "model" in entry] == ["gpt-5.4-mini", "gpt-5.4"]
+    assert [entry["model"] for entry in calls if "model" in entry] == ["gpt-5.4"]
 
 
-def test_gmail_candidate_escalates_low_confidence_skip_to_deep_pass(monkeypatch):
+def test_gmail_candidate_uses_single_llm_model_without_escalation(monkeypatch):
     calls: list[str] = []
 
     class _FakeResponses:
@@ -190,8 +186,8 @@ def test_gmail_candidate_escalates_low_confidence_skip_to_deep_pass(monkeypatch)
     decision = build_gmail_candidate_decision(item, "America/Los_Angeles", context=context)
 
     assert decision.kind == CandidateDecisionKind.CANDIDATE
-    assert decision.raw_metadata["classifier"] == "gmail_llm_deep_v1"
-    assert calls == ["gpt-5.4-mini", "gpt-5.4"]
+    assert decision.raw_metadata["classifier"] == "gmail_llm_v1"
+    assert calls == ["gpt-5.4"]
 
 
 def test_gmail_candidate_falls_back_to_heuristics_when_llm_output_is_invalid(monkeypatch):

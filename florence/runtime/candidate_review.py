@@ -22,10 +22,6 @@ from florence.source_rules import (
 )
 from florence.state import FlorenceStateDB
 
-BOOTSTRAP_REVIEW_LANE = "bootstrap"
-STEADY_STATE_REVIEW_LANE = "steady_state"
-_KNOWN_REVIEW_LANES = {BOOTSTRAP_REVIEW_LANE, STEADY_STATE_REVIEW_LANE}
-
 
 @dataclass(slots=True)
 class _CandidateReviewPrompt:
@@ -47,30 +43,6 @@ class _CandidateReviewReply:
     group_announcement: str | None = None
 
 
-def review_lane_for_candidate(candidate: ImportedCandidate) -> str:
-    raw = str(candidate.metadata.get("review_lane") or "").strip().lower()
-    if raw in _KNOWN_REVIEW_LANES:
-        return raw
-    if candidate.state == CandidateState.QUARANTINED:
-        return BOOTSTRAP_REVIEW_LANE
-    return STEADY_STATE_REVIEW_LANE
-
-
-def with_review_lane(candidate: ImportedCandidate, *, lane: str | None = None) -> ImportedCandidate:
-    resolved_lane = lane or review_lane_for_candidate(candidate)
-    metadata = dict(candidate.metadata)
-    metadata["review_lane"] = resolved_lane
-    return replace(candidate, metadata=metadata)
-
-
-def merged_review_lane(*, existing: ImportedCandidate, incoming: ImportedCandidate) -> str:
-    existing_lane = review_lane_for_candidate(existing)
-    incoming_lane = review_lane_for_candidate(incoming)
-    if existing.state == CandidateState.PENDING_REVIEW and existing_lane == BOOTSTRAP_REVIEW_LANE:
-        return BOOTSTRAP_REVIEW_LANE
-    return incoming_lane
-
-
 class _SourceRuleService:
     """Matches and persists reusable Gmail/Calendar sharing rules."""
 
@@ -85,30 +57,16 @@ class _SourceRuleService:
             metadata["source_rule_id"] = matched_rule.id
             metadata["source_rule_label"] = matched_rule.label or matched_rule.matcher_value
             metadata.pop("source_rule_prompt", None)
-            return with_review_lane(replace(candidate, metadata=metadata))
+            return replace(candidate, metadata=metadata)
 
         profile = build_candidate_source_profile(candidate)
         if profile is None:
-            return with_review_lane(candidate)
-
-        if profile.default_shared:
-            rules = self._persist_rules(
-                candidate,
-                visibility=HouseholdSourceVisibility.SHARED,
-                created_by_member_id=candidate.member_id,
-            )
-            if rules:
-                metadata["source_visibility"] = HouseholdSourceVisibility.SHARED.value
-                metadata["source_rule_id"] = rules[0].id
-                metadata["source_rule_label"] = profile.label
-                metadata["source_rule_auto"] = True
-                metadata.pop("source_rule_prompt", None)
-                return with_review_lane(replace(candidate, metadata=metadata))
+            return candidate
 
         metadata["source_visibility"] = "needs_classification"
         metadata["source_rule_label"] = profile.label
         metadata["source_rule_prompt"] = build_source_rule_prompt(candidate)
-        return with_review_lane(replace(candidate, metadata=metadata))
+        return replace(candidate, metadata=metadata)
 
     def set_candidate_visibility(
         self,
@@ -127,7 +85,7 @@ class _SourceRuleService:
         metadata["source_rule_ids"] = [rule.id for rule in rules]
         metadata["source_rule_label"] = self.describe_candidate_source(candidate) or metadata.get("source_rule_label")
         metadata.pop("source_rule_prompt", None)
-        updated = with_review_lane(replace(candidate, metadata=metadata))
+        updated = replace(candidate, metadata=metadata)
         self.store.upsert_imported_candidate(updated)
         return updated
 
@@ -142,9 +100,6 @@ class _SourceRuleService:
         }:
             return None
         if self._match_rule(candidate) is not None:
-            return None
-        profile = build_candidate_source_profile(candidate)
-        if profile is not None and profile.default_shared:
             return None
         prompt = candidate.metadata.get("source_rule_prompt")
         if isinstance(prompt, str) and prompt.strip():
@@ -197,39 +152,16 @@ class FlorenceCandidateReviewService:
         )
         released: list[ImportedCandidate] = []
         for candidate in candidates:
-            promoted = with_review_lane(
-                replace(candidate, state=CandidateState.PENDING_REVIEW),
-                lane=BOOTSTRAP_REVIEW_LANE,
-            )
+            promoted = replace(candidate, state=CandidateState.PENDING_REVIEW)
             self.store.upsert_imported_candidate(promoted)
             released.append(promoted)
         return released
 
-    def build_next_bootstrap_review_prompt(self, *, household_id: str, member_id: str) -> _CandidateReviewPrompt | None:
-        return self._build_review_prompt(
-            household_id=household_id,
-            member_id=member_id,
-            review_lane=BOOTSTRAP_REVIEW_LANE,
-        )
-
-    def build_next_steady_state_review_prompt(self, *, household_id: str, member_id: str) -> _CandidateReviewPrompt | None:
-        return self._build_review_prompt(
-            household_id=household_id,
-            member_id=member_id,
-            review_lane=STEADY_STATE_REVIEW_LANE,
-        )
-
     def build_next_dm_review_prompt(self, *, household_id: str, member_id: str) -> _CandidateReviewPrompt | None:
-        return self.build_next_bootstrap_review_prompt(
-            household_id=household_id,
-            member_id=member_id,
-        ) or self.build_next_steady_state_review_prompt(
-            household_id=household_id,
-            member_id=member_id,
-        )
+        return self.build_next_review_prompt(household_id=household_id, member_id=member_id)
 
     def build_next_review_prompt(self, *, household_id: str, member_id: str) -> _CandidateReviewPrompt | None:
-        return self.build_next_dm_review_prompt(household_id=household_id, member_id=member_id)
+        return self._build_review_prompt(household_id=household_id, member_id=member_id)
 
     def apply_review_response(
         self,
@@ -340,17 +272,13 @@ class FlorenceCandidateReviewService:
         *,
         household_id: str,
         member_id: str,
-        review_lane: str,
     ) -> _CandidateReviewPrompt | None:
         candidates = self.store.list_imported_candidates(
             household_id=household_id,
             member_id=member_id,
             state=CandidateState.PENDING_REVIEW,
         )
-        candidate = next(
-            (item for item in candidates if review_lane_for_candidate(item) == review_lane),
-            None,
-        )
+        candidate = candidates[0] if candidates else None
         if candidate is None:
             return None
         question = str(candidate.metadata.get("confirmation_question") or "Should I add this?")

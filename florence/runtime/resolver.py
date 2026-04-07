@@ -67,6 +67,8 @@ class FlorenceResolvedTransportContext:
     household: Household
     member: Member | None
     channel: Channel
+    group_private_dm_hint: str | None = None
+    private_dm_link_intro: str | None = None
 
 
 class FlorenceIdentityResolver:
@@ -80,8 +82,19 @@ class FlorenceIdentityResolver:
         kind = infer_identity_kind(sender_handle)
         normalized = normalize_identity_value(kind, sender_handle)
         member = self.store.find_member_by_identity(kind=kind, normalized_value=normalized)
+        linked_to_existing_household = False
         if member is None:
-            member = self._create_household_for_new_sender(sender_handle, normalized, kind)
+            linked_household = self._resolve_existing_group_household_for_handle(normalized)
+            if linked_household is not None:
+                member = self._create_linked_household_member(
+                    household_id=linked_household,
+                    sender_handle=sender_handle,
+                    normalized_handle=normalized,
+                    kind=kind,
+                )
+                linked_to_existing_household = True
+            else:
+                member = self._create_household_for_new_sender(sender_handle, normalized, kind)
 
         household = self.store.get_household(member.household_id)
         if household is None:
@@ -103,7 +116,16 @@ class FlorenceIdentityResolver:
                     metadata={"sender_handle": normalized},
                 )
             )
-        return FlorenceResolvedTransportContext(household=household, member=member, channel=channel)
+        return FlorenceResolvedTransportContext(
+            household=household,
+            member=member,
+            channel=channel,
+            private_dm_link_intro=(
+                self._build_private_dm_link_intro()
+                if linked_to_existing_household
+                else None
+            ),
+        )
 
     def resolve_group_message(
         self,
@@ -151,6 +173,17 @@ class FlorenceIdentityResolver:
             if handle.strip()
         ]
         title = ", ".join(dict.fromkeys(title_handles)) or "Family group"
+        normalized_participant_handles = [
+            normalize_identity_value(infer_identity_kind(handle), handle)
+            for handle in (participant_handles or [])
+            if handle.strip()
+        ]
+        unlinked_handles = [
+            handle
+            for handle in normalized_participant_handles
+            if handle != normalize_identity_value(infer_identity_kind(sender_handle), sender_handle)
+            and self._find_member_in_household_by_handle(household_id, handle) is None
+        ]
         channel = self.store.upsert_channel(
             Channel(
                 id=_stable_id("chan", household.id, self.provider, thread_external_id),
@@ -160,14 +193,20 @@ class FlorenceIdentityResolver:
                 channel_type=ChannelType.HOUSEHOLD_GROUP,
                 title=title,
                 metadata={
-                    "participant_handles": [
-                        normalize_identity_value(infer_identity_kind(handle), handle)
-                        for handle in (participant_handles or [])
-                    ],
+                    "participant_handles": normalized_participant_handles,
                 },
             )
         )
-        return FlorenceResolvedTransportContext(household=household, member=sender_member, channel=channel)
+        return FlorenceResolvedTransportContext(
+            household=household,
+            member=sender_member,
+            channel=channel,
+            group_private_dm_hint=(
+                "If anyone else in this group wants a private 1:1 lane too, message me directly anytime. I'll keep that DM private and link it to this household."
+                if unlinked_handles
+                else None
+            ),
+        )
 
     def _create_household_for_new_sender(
         self,
@@ -202,6 +241,60 @@ class FlorenceIdentityResolver:
             )
         )
         return self.store.get_member(member.id) or member
+
+    def _create_linked_household_member(
+        self,
+        *,
+        household_id: str,
+        sender_handle: str,
+        normalized_handle: str,
+        kind: IdentityKind,
+    ) -> Member:
+        display_name = display_name_from_handle(sender_handle)
+        member = self.store.upsert_member(
+            Member(
+                id=_stable_id("mem", household_id, normalized_handle),
+                household_id=household_id,
+                display_name=display_name,
+                role=MemberRole.PARENT,
+            )
+        )
+        self.store.upsert_member_identity(
+            MemberIdentity(
+                id=_stable_id("ident", kind.value, normalized_handle),
+                member_id=member.id,
+                kind=kind,
+                value=sender_handle.strip(),
+                normalized_value=normalized_handle,
+            )
+        )
+        return self.store.get_member(member.id) or member
+
+    def _resolve_existing_group_household_for_handle(self, normalized_handle: str) -> str | None:
+        candidate_households: set[str] = set()
+        for household in self.store.list_households():
+            for channel in self.store.list_channels(household_id=household.id, channel_type=ChannelType.HOUSEHOLD_GROUP):
+                participant_handles = channel.metadata.get("participant_handles")
+                if not isinstance(participant_handles, list):
+                    continue
+                normalized_participants = {
+                    normalize_identity_value(infer_identity_kind(str(handle)), str(handle))
+                    for handle in participant_handles
+                    if isinstance(handle, str) and str(handle).strip()
+                }
+                if normalized_handle in normalized_participants:
+                    candidate_households.add(household.id)
+        if len(candidate_households) == 1:
+            return next(iter(candidate_households))
+        if len(candidate_households) > 1:
+            raise ValueError("ambiguous_existing_household_for_identity")
+        return None
+
+    @staticmethod
+    def _build_private_dm_link_intro() -> str:
+        return (
+            "You're linked to this household now. This 1:1 thread is private to you, and the family group is still the shared lane."
+        )
 
     def _find_member_in_household_by_handle(self, household_id: str, handle: str) -> Member | None:
         kind = infer_identity_kind(handle)

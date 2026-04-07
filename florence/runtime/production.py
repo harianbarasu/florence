@@ -34,6 +34,7 @@ from florence.runtime.candidate_review import FlorenceCandidateReviewService
 from florence.runtime.household_manager import FlorenceHouseholdManagerService
 from florence.runtime.operations import FlorenceHouseholdOperationsService
 from florence.sendblue import FlorenceSendblueClient
+from florence.sendblue.media import enrich_sendblue_payload_with_media_text
 from florence.state import FlorenceStateDB
 
 logger = logging.getLogger(__name__)
@@ -145,6 +146,9 @@ class FlorenceProductionService:
         payload: dict[str, Any],
         webhook_secret: str | None,
     ) -> FlorenceHTTPResult:
+        def _enrich() -> None:
+            enrich_sendblue_payload_with_media_text(payload)
+
         return self._handle_webhook(
             provider="sendblue",
             payload=payload,
@@ -152,6 +156,8 @@ class FlorenceProductionService:
             invalid_error="invalid_sendblue_webhook_signature",
             internal_error="internal_sendblue_webhook_error",
             handler=self.entrypoints.handle_sendblue_payload,
+            enrich=_enrich,
+            enrich_error_log="Failed to enrich Sendblue payload with media text",
             failure_log="Florence Sendblue webhook failed",
         )
 
@@ -206,11 +212,11 @@ class FlorenceProductionService:
                 dm_messages = ()
                 if resolved_channel is not None:
                     try:
-                        sync_waiting = self.household_chat_service.compose_sync_waiting_reply(
+                        sync_waiting = self.household_chat_service.compose_operator_message(
                             household_id=oauth_state.household_id,
                             channel_id=resolved_channel.id,
                             actor_member_id=oauth_state.member_id,
-                            just_connected=True,
+                            kind="sync_started",
                         )
                         if sync_waiting is not None and sync_waiting.strip():
                             dm_messages = (sync_waiting.strip(),)

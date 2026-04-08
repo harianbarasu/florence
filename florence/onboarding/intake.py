@@ -49,6 +49,12 @@ def _looks_like_conversational_request(text: str) -> bool:
         return False
     if "?" in normalized and len(normalized.split()) > 1:
         return True
+    if re.search(
+        r"\b(?:help figuring out|help with|can you help|could you help|i need help|while this is syncing)\b",
+        normalized,
+        re.IGNORECASE,
+    ):
+        return True
     return bool(
         re.search(
             r"^(?:can|could|would|what|when|where|who|why|how|show|check|find|plan|help|remind|review|list|share|send|post)\b",
@@ -63,21 +69,16 @@ def _looks_like_child_detail_reply(stage: OnboardingStage, text: str) -> bool:
     if not normalized or _looks_like_conversational_request(normalized):
         return False
     lowered = normalized.lower()
-    word_count = len(normalized.split())
     if stage == OnboardingStage.COLLECT_CHILD_AGE:
         if any(char.isdigit() for char in normalized):
             return True
         if any(marker in lowered for marker in ("year old", "years old", "turning", "turns", "month old", "months old")):
             return True
-        return word_count <= 3
+        return True
     if stage == OnboardingStage.COLLECT_CHILD_SCHOOL:
-        if lowered in {"not yet", "n/a", "na"}:
-            return True
-        return word_count <= 8
+        return True
     if stage == OnboardingStage.COLLECT_CHILD_ACTIVITIES:
-        if lowered.startswith("none"):
-            return True
-        return word_count <= 12
+        return True
     return True
 
 

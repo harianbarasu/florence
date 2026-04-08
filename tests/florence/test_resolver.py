@@ -101,3 +101,35 @@ def test_identity_resolver_direct_message_links_to_existing_household_group_part
     )
     assert store.find_member_by_identity(kind=IdentityKind.PHONE, normalized_value="+15555550124") is not None
     store.close()
+
+
+def test_identity_resolver_group_message_merges_standalone_second_parent_household(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    resolver = FlorenceIdentityResolver(store)
+
+    first_parent = resolver.resolve_direct_message(
+        sender_handle="+15555550123",
+        thread_external_id="dm_thread_123",
+    )
+    second_parent = resolver.resolve_direct_message(
+        sender_handle="+15555550124",
+        thread_external_id="dm_thread_456",
+    )
+
+    resolved_group = resolver.resolve_group_message(
+        sender_handle="+15555550123",
+        participant_handles=["+15555550123", "+15555550124"],
+        thread_external_id="group_thread_123",
+    )
+
+    assert resolved_group is not None
+    assert resolved_group.household.id == first_parent.household.id
+    assert store.get_household(second_parent.household.id) is None
+    linked_second_parent = store.find_member_by_identity(
+        kind=IdentityKind.PHONE,
+        normalized_value="+15555550124",
+    )
+    assert linked_second_parent is not None
+    assert linked_second_parent.household_id == first_parent.household.id
+    assert len(store.list_households()) == 1
+    store.close()

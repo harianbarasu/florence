@@ -7,7 +7,7 @@ import re
 import time
 from typing import Any, Callable
 
-from florence.contracts import ChannelMessage, ChannelMessageRole, ChannelType
+from florence.contracts import ChannelMessage, ChannelMessageRole, ChannelType, PilotEvent
 from florence.runtime.entrypoints import FlorenceEntrypointResult
 from florence.state import FlorenceStateDB
 
@@ -110,27 +110,15 @@ class FlorenceChannelDeliveryService:
         store: FlorenceStateDB | None = None,
         message_metadata: dict[str, Any] | None = None,
     ) -> bool:
+        target_store = store or self.store
+        outgoing_message = _plain_text_transport_message(message)
+        transport_metadata = self._transport_metadata_for_channel(channel)
         try:
-            target_store = store or self.store
-            outgoing_message = _plain_text_transport_message(message)
             if channel.provider == "linq":
                 self._linq_client_getter().send_text(chat_id=channel.provider_channel_id, message=outgoing_message)
             elif channel.provider == "sendblue":
-                metadata = dict(getattr(channel, "metadata", {}) or {})
-                group_id = str(metadata.get("group_id") or "").strip() or None
-                numbers = None
-                if group_id is None and channel.channel_type == ChannelType.HOUSEHOLD_GROUP:
-                    participant_handles = metadata.get("participant_handles")
-                    sendblue_number = str(metadata.get("sendblue_number") or "").strip()
-                    if isinstance(participant_handles, list):
-                        numbers = [
-                            str(handle).strip()
-                            for handle in participant_handles
-                            if isinstance(handle, str)
-                            and str(handle).strip()
-                            and str(handle).strip() != sendblue_number
-                        ]
-                        numbers = list(dict.fromkeys(numbers)) or None
+                group_id = transport_metadata.get("group_id")
+                numbers = transport_metadata.get("numbers")
                 self._sendblue_client_getter().send_text(
                     thread_id=channel.provider_channel_id,
                     message=outgoing_message,
@@ -155,11 +143,90 @@ class FlorenceChannelDeliveryService:
                         created_at=time.time(),
                     )
                 )
+            self._record_outbound_audit_event(
+                store=target_store,
+                channel=channel,
+                outgoing_message=outgoing_message,
+                record_message=record_message,
+                message_metadata=message_metadata,
+                transport_metadata=transport_metadata,
+            )
             return True
         except Exception:
             logger.exception("Florence transport delivery failed for channel %s", channel.provider_channel_id)
+            self._record_outbound_audit_event(
+                store=target_store,
+                channel=channel,
+                outgoing_message=outgoing_message,
+                record_message=record_message,
+                message_metadata=message_metadata,
+                transport_metadata=transport_metadata,
+                failed=True,
+            )
             return False
 
     @staticmethod
     def _assistant_message_id(channel_id: str) -> str:
         return f"msg_asst_{channel_id}_{time.time_ns()}"
+
+    @staticmethod
+    def _transport_metadata_for_channel(channel: Any) -> dict[str, Any]:
+        metadata = dict(getattr(channel, "metadata", {}) or {})
+        group_id = str(metadata.get("group_id") or "").strip() or None
+        numbers = None
+        sendblue_number = str(metadata.get("sendblue_number") or "").strip()
+        if group_id is None and channel.channel_type == ChannelType.HOUSEHOLD_GROUP:
+            participant_handles = metadata.get("participant_handles")
+            if isinstance(participant_handles, list):
+                numbers = [
+                    str(handle).strip()
+                    for handle in participant_handles
+                    if isinstance(handle, str)
+                    and str(handle).strip()
+                    and str(handle).strip() != sendblue_number
+                ]
+                numbers = list(dict.fromkeys(numbers)) or None
+        return {
+            "group_id": group_id,
+            "numbers": numbers,
+            "sendblue_number": sendblue_number or None,
+        }
+
+    def _record_outbound_audit_event(
+        self,
+        *,
+        store: FlorenceStateDB,
+        channel: Any,
+        outgoing_message: str,
+        record_message: bool,
+        message_metadata: dict[str, Any] | None,
+        transport_metadata: dict[str, Any],
+        failed: bool = False,
+    ) -> None:
+        event_type = "outbound_message_failed" if failed else "outbound_message_sent"
+        metadata: dict[str, Any] = {
+            "provider": channel.provider,
+            "provider_channel_id": channel.provider_channel_id,
+            "channel_type": channel.channel_type.value if hasattr(channel.channel_type, "value") else str(channel.channel_type),
+            "channel_title": getattr(channel, "title", None),
+            "message": outgoing_message,
+            "record_message": record_message,
+            "message_metadata": dict(message_metadata or {}),
+            **transport_metadata,
+        }
+        try:
+            store.upsert_pilot_event(
+                PilotEvent(
+                    id=f"pilot_{event_type}_{channel.id}_{time.time_ns()}",
+                    household_id=channel.household_id,
+                    event_type=event_type,
+                    channel_id=channel.id,
+                    metadata=metadata,
+                    created_at=time.time(),
+                )
+            )
+        except Exception:
+            logger.exception(
+                "Florence outbound audit logging failed for channel %s",
+                channel.provider_channel_id,
+            )

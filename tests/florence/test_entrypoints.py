@@ -310,3 +310,75 @@ def test_entrypoints_second_parent_dm_links_to_existing_household_after_group_ac
         "ok",
     )
     store.close()
+
+
+def test_entrypoints_group_activation_merges_duplicate_parent_households(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    service = _build_entrypoints(store)
+
+    first = service.handle_sendblue_payload(
+        {
+            "content": "Jackson",
+            "is_outbound": False,
+            "status": "RECEIVED",
+            "message_handle": "msg_dm_123",
+            "from_number": "+15555550123",
+            "number": "+15555550123",
+            "to_number": "+15122164639",
+            "sendblue_number": "+15122164639",
+            "service": "iMessage",
+        }
+    )
+    second = service.handle_sendblue_payload(
+        {
+            "content": "Kendall",
+            "is_outbound": False,
+            "status": "RECEIVED",
+            "message_handle": "msg_dm_456",
+            "from_number": "+15555550124",
+            "number": "+15555550124",
+            "to_number": "+15122164639",
+            "sendblue_number": "+15122164639",
+            "service": "iMessage",
+        }
+    )
+    assert first.household_id is not None
+    assert second.household_id is not None
+    assert first.household_id != second.household_id
+
+    service.ingress.handle_message = lambda _resolved: FlorenceMessagingIngressResult(reply_text="ok", consumed=True)  # type: ignore[method-assign]
+    merged_group = service.handle_sendblue_payload(
+        {
+            "content": "hey Florence",
+            "is_outbound": False,
+            "status": "RECEIVED",
+            "message_handle": "msg_group_123",
+            "from_number": "+15555550123",
+            "number": "+15555550123",
+            "to_number": "+15122164639",
+            "sendblue_number": "+15122164639",
+            "group_id": "group_123456",
+            "participants": ["+15555550123", "+15555550124", "+15122164639"],
+            "service": "iMessage",
+        }
+    )
+
+    linked_second_parent = service.handle_sendblue_payload(
+        {
+            "content": "Hi Florence, this is Kendall",
+            "is_outbound": False,
+            "status": "RECEIVED",
+            "message_handle": "msg_dm_789",
+            "from_number": "+15555550124",
+            "number": "+15555550124",
+            "to_number": "+15122164639",
+            "sendblue_number": "+15122164639",
+            "service": "iMessage",
+        }
+    )
+
+    assert merged_group.household_id == first.household_id
+    assert store.get_household(second.household_id) is None
+    assert linked_second_parent.household_id == first.household_id
+    assert len(store.list_households()) == 1
+    store.close()

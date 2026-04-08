@@ -672,6 +672,22 @@ def add_google_calendar_to_calendar_list(
     return payload if isinstance(payload, dict) else {}
 
 
+def delete_google_calendar(
+    *,
+    access_token: str,
+    calendar_id: str,
+    timeout_seconds: float = 30.0,
+) -> None:
+    response = httpx.delete(
+        f"https://www.googleapis.com/calendar/v3/calendars/{quote(calendar_id, safe='')}",
+        headers={"authorization": f"Bearer {access_token}"},
+        timeout=timeout_seconds,
+    )
+    if response.status_code == 404:
+        return
+    response.raise_for_status()
+
+
 def _google_calendar_event_payload(event: HouseholdEvent) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "summary": event.title,

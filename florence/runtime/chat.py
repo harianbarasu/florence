@@ -628,6 +628,7 @@ class FlorenceHouseholdChatService:
             "household_search_google_inbox respects scope: in a parent DM it defaults to that parent's inbox, while in the family group it only uses shared-household inbox scope.",
             "When the user is replying to one currently surfaced imported-item review prompt, treat only that item as actionable. Use household_apply_candidate_review to confirm, reject, skip, set source_visibility, or confirm with corrected fields.",
             "When the user is replying to one currently surfaced reminder/nudge prompt, treat only that one nudge as actionable. Use household_apply_nudge_action for done or snooze changes.",
+            "When the user gives feedback about reminder style, timing, or Florence being too proactive or not proactive enough, save it with household_record_preference instead of treating it as a deterministic Florence protocol.",
             "When a parent DM is still in onboarding and the message context says onboarding is active, use household_apply_onboarding_update to store only the specific missing setup facts the user actually provided.",
             "For imported Gmail review items, use source_provenance as the primary evidence. Florence may preserve light proposed_fields, but do not trust Gmail-derived times or dates unless they are clearly supported by the raw source.",
             "Do not reach into unrelated hidden review items during ordinary household chat.",

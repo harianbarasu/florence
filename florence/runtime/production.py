@@ -28,6 +28,7 @@ from florence.runtime.household_calendar_projection import (
     HOUSEHOLD_CALENDAR_PROJECTION_SETTINGS_KEY,
     FlorenceHouseholdCalendarProjectionService,
 )
+from florence.runtime.household_merge import FlorenceHouseholdMergeService
 from florence.runtime.queue import FlorenceGoogleSyncJob, FlorenceRedisGoogleSyncQueue
 from florence.runtime.entrypoints import (
     FlorenceEntrypointResult,
@@ -71,21 +72,25 @@ class FlorenceProductionService:
             briefing_style=settings.briefing.style,
             briefing_emoji_mode=settings.briefing.emoji_mode,
         )
+        self.household_calendar_projection_service = FlorenceHouseholdCalendarProjectionService(
+            self.store,
+            client_id=settings.google.client_id,
+            client_secret=settings.google.client_secret,
+        )
         self.entrypoints = FlorenceEntrypointService(
             self.store,
             google_oauth=(settings.google if settings.google.configured else None),
             household_chat_service=household_chat_service,
+            household_merge_service=FlorenceHouseholdMergeService(
+                self.store,
+                household_calendar_projection_service=self.household_calendar_projection_service,
+            ),
         )
         self._household_chat_service = household_chat_service
         self.linq = FlorenceLinqClient(settings.linq)
         self.sendblue = FlorenceSendblueClient(settings.sendblue)
         self.candidate_review_service = FlorenceCandidateReviewService(self.store)
         self.household_manager_service = FlorenceHouseholdManagerService(self.store)
-        self.household_calendar_projection_service = FlorenceHouseholdCalendarProjectionService(
-            self.store,
-            client_id=settings.google.client_id,
-            client_secret=settings.google.client_secret,
-        )
         self.delivery_service = FlorenceChannelDeliveryService(
             self.store,
             linq_client_getter=lambda: self.linq,

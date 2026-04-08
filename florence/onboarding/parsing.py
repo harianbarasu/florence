@@ -21,7 +21,22 @@ def split_entries(text: str) -> list[str]:
 def split_labels(text: str) -> list[str]:
     if re.search(r"^\s*none\b", text, re.IGNORECASE):
         return []
-    return split_names(text)
+    normalized = " ".join(str(text).split()).strip()
+    if not normalized:
+        return []
+    if "\n" in text:
+        return [part.strip(" .,!?:;") for part in text.splitlines() if part.strip(" .,!?:;")]
+    if ";" in text:
+        return [part.strip(" .,!?:;") for part in text.split(";") if part.strip(" .,!?:;")]
+    if "," in text:
+        return [part.strip(" .,!?:;") for part in text.split(",") if part.strip(" .,!?:;")]
+    if re.search(
+        r"\b(?:he|she|they|does|do|plays|play|takes|take|with|through|at|on|class|classes|practice|practices|league)\b",
+        normalized,
+        re.IGNORECASE,
+    ):
+        return [normalized]
+    return split_names(normalized)
 
 
 def extract_child_names(entries: list[str]) -> list[str]:

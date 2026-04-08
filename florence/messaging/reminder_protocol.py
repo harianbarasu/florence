@@ -31,25 +31,9 @@ def _looks_like_google_done_prompt(text: str) -> bool:
     )
 
 
-def _looks_like_reminder_feedback(text: str) -> bool:
-    return bool(
-        re.search(
-            r"\b(?:too many reminders|fewer reminders|less proactive|more proactive|more reminders|too early|too late|nudge me less|nudge me more|stop pinging so much)\b",
-            text,
-            re.IGNORECASE,
-        )
-    )
-
-
 def _looks_like_done_for_reminder(text: str) -> bool:
     normalized = " ".join(text.strip().lower().split())
-    return normalized in {
-        "done",
-        "handled",
-        "completed",
-        "finished",
-        "took care of it",
-    }
+    return normalized == "done"
 
 
 def _looks_like_snooze_request(text: str) -> bool:
@@ -102,21 +86,6 @@ class FlorenceReminderProtocol:
         text: str,
         respond_with_household_chat: Callable[[str], FlorenceProtocolReply | None],
     ) -> FlorenceProtocolReply | None:
-        if _looks_like_reminder_feedback(text):
-            self.household_manager_service.record_reminder_feedback(
-                household_id=household_id,
-                feedback_text=text,
-                member_id=member_id,
-                channel_id=channel_id,
-            )
-            return FlorenceProtocolReply(
-                reply_text=(
-                    "Understood. I updated your reminder style and will adjust future nudges accordingly. "
-                    "You can ask me to show reminders anytime."
-                ),
-                consumed=True,
-            )
-
         google_done_result = self._handle_google_done_followup(
             household_id=household_id,
             member_id=member_id,

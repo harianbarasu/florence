@@ -9,13 +9,26 @@ from florence.messaging.protocol_types import FlorenceProtocolReply
 
 
 def _looks_like_acknowledgement(text: str) -> bool:
-    return bool(
-        re.search(
-            r"^(?:ok|okay|sounds good|sgtm|got it|cool|nice|great|perfect|thanks|thank you|awesome|works for me|understood|roger|👍|🙏)\b",
-            text.strip(),
-            re.IGNORECASE,
-        )
-    )
+    normalized = " ".join(text.strip().lower().split())
+    return normalized in {
+        "ok",
+        "okay",
+        "sounds good",
+        "sgtm",
+        "got it",
+        "cool",
+        "nice",
+        "great",
+        "perfect",
+        "thanks",
+        "thank you",
+        "awesome",
+        "works for me",
+        "understood",
+        "roger",
+        "👍",
+        "🙏",
+    }
 
 
 def _looks_like_synced_data_request(text: str) -> bool:

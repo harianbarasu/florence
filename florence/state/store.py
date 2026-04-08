@@ -628,6 +628,189 @@ class FlorenceStateDB:
         self._conn.commit()
         return deleted_counts
 
+    def merge_households(
+        self,
+        *,
+        target_household_id: str,
+        source_household_id: str,
+        merged_settings: dict[str, object] | None = None,
+    ) -> Household | None:
+        if target_household_id == source_household_id:
+            return self.get_household(target_household_id)
+
+        target = self.get_household(target_household_id)
+        source = self.get_household(source_household_id)
+        if target is None or source is None:
+            raise ValueError("household_missing_for_merge")
+
+        now = time.time()
+        target_has_active_admin = any(
+            member.role == MemberRole.ADMIN and member.status == "active"
+            for member in self.list_members(target_household_id)
+        )
+        source_members = self.list_members(source_household_id)
+        source_rules = self.list_household_source_rules(household_id=source_household_id)
+        source_channels = self.list_channels(household_id=source_household_id)
+        source_sessions = self.list_onboarding_sessions(source_household_id)
+
+        try:
+            for channel in source_channels:
+                existing = self._conn.execute(
+                    """
+                    SELECT id FROM channels
+                    WHERE household_id = ? AND provider = ? AND provider_channel_id = ?
+                    LIMIT 1
+                    """,
+                    (
+                        target_household_id,
+                        channel.provider,
+                        channel.provider_channel_id,
+                    ),
+                ).fetchone()
+                if existing is not None and str(existing["id"]) != channel.id:
+                    self._conn.execute(
+                        """
+                        UPDATE channel_messages
+                        SET household_id = ?, channel_id = ?
+                        WHERE channel_id = ?
+                        """,
+                        (target_household_id, str(existing["id"]), channel.id),
+                    )
+                    self._conn.execute("DELETE FROM channels WHERE id = ?", (channel.id,))
+                    continue
+                self._conn.execute(
+                    "UPDATE channels SET household_id = ? WHERE id = ?",
+                    (target_household_id, channel.id),
+                )
+
+            self._conn.execute(
+                "UPDATE channel_messages SET household_id = ? WHERE household_id = ?",
+                (target_household_id, source_household_id),
+            )
+
+            for table in (
+                "child_profiles",
+                "google_connections",
+                "google_calendar_events",
+                "google_gmail_messages",
+                "household_events",
+                "household_meals",
+                "household_nudges",
+                "household_profile_items",
+                "household_routines",
+                "household_shopping_items",
+                "household_work_items",
+                "imported_candidates",
+                "pilot_events",
+            ):
+                self._conn.execute(
+                    f"UPDATE {table} SET household_id = ? WHERE household_id = ?",
+                    (target_household_id, source_household_id),
+                )
+
+            for rule in source_rules:
+                existing = self._conn.execute(
+                    """
+                    SELECT id FROM household_source_rules
+                    WHERE household_id = ? AND source_kind = ? AND matcher_kind = ? AND matcher_value = ?
+                    LIMIT 1
+                    """,
+                    (
+                        target_household_id,
+                        rule.source_kind.value,
+                        rule.matcher_kind.value,
+                        rule.matcher_value,
+                    ),
+                ).fetchone()
+                if existing is not None and str(existing["id"]) != rule.id:
+                    self._conn.execute("DELETE FROM household_source_rules WHERE id = ?", (rule.id,))
+                    continue
+                self._conn.execute(
+                    "UPDATE household_source_rules SET household_id = ? WHERE id = ?",
+                    (target_household_id, rule.id),
+                )
+
+            for session in source_sessions:
+                new_session_key = self.build_onboarding_session_key(
+                    target_household_id,
+                    session.member_id,
+                    session.thread_id,
+                )
+                existing = self._conn.execute(
+                    "SELECT session_key FROM onboarding_sessions WHERE session_key = ? LIMIT 1",
+                    (new_session_key,),
+                ).fetchone()
+                if existing is not None and str(existing["session_key"]) != self.build_onboarding_session_key(
+                    source_household_id,
+                    session.member_id,
+                    session.thread_id,
+                ):
+                    self._conn.execute(
+                        "DELETE FROM onboarding_sessions WHERE session_key = ?",
+                        (
+                            self.build_onboarding_session_key(
+                                source_household_id,
+                                session.member_id,
+                                session.thread_id,
+                            ),
+                        ),
+                    )
+                    continue
+                self._conn.execute(
+                    """
+                    UPDATE onboarding_sessions
+                    SET session_key = ?, household_id = ?
+                    WHERE session_key = ?
+                    """,
+                    (
+                        new_session_key,
+                        target_household_id,
+                        self.build_onboarding_session_key(
+                            source_household_id,
+                            session.member_id,
+                            session.thread_id,
+                        ),
+                    ),
+                )
+
+            for member in source_members:
+                role = member.role
+                if target_has_active_admin and role == MemberRole.ADMIN:
+                    role = MemberRole.PARENT
+                self._conn.execute(
+                    """
+                    UPDATE members
+                    SET household_id = ?, role = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (target_household_id, role.value, now, member.id),
+                )
+                if role == MemberRole.ADMIN and member.status == "active":
+                    target_has_active_admin = True
+
+            self._conn.execute(
+                """
+                UPDATE households
+                SET name = ?, timezone = ?, status = ?, settings_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    target.name,
+                    target.timezone,
+                    target.status.value,
+                    _json_dumps(merged_settings if merged_settings is not None else target.settings),
+                    now,
+                    target_household_id,
+                ),
+            )
+            self._conn.execute("DELETE FROM households WHERE id = ?", (source_household_id,))
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+        return self.get_household(target_household_id)
+
     @staticmethod
     def build_onboarding_session_key(household_id: str, member_id: str, thread_id: str) -> str:
         return f"{household_id}:{member_id}:{thread_id}"

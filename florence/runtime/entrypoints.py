@@ -15,6 +15,7 @@ from florence.messaging import (
 from florence.runtime.chat import FlorenceHouseholdChatService
 from florence.runtime.candidate_review import FlorenceCandidateReviewService
 from florence.runtime.google_services import FlorenceGoogleAccountLinkService
+from florence.runtime.household_merge import FlorenceHouseholdMergeService
 from florence.runtime.onboarding_service import FlorenceOnboardingSessionService
 from florence.runtime.resolver import FlorenceIdentityResolver
 from florence.sendblue import parse_sendblue_payload
@@ -60,6 +61,7 @@ class FlorenceEntrypointService:
         *,
         google_oauth: FlorenceGoogleRuntimeConfig | None = None,
         household_chat_service: FlorenceHouseholdChatService,
+        household_merge_service: FlorenceHouseholdMergeService | None = None,
     ):
         self.store = store
         self.candidate_review_service = FlorenceCandidateReviewService(store)
@@ -67,9 +69,18 @@ class FlorenceEntrypointService:
             store,
             candidate_review_service=self.candidate_review_service,
         )
+        household_merge_service = household_merge_service or FlorenceHouseholdMergeService(store)
         self.identity_resolvers = {
-            "linq": FlorenceIdentityResolver(store, provider="linq"),
-            "sendblue": FlorenceIdentityResolver(store, provider="sendblue"),
+            "linq": FlorenceIdentityResolver(
+                store,
+                provider="linq",
+                household_merge_service=household_merge_service,
+            ),
+            "sendblue": FlorenceIdentityResolver(
+                store,
+                provider="sendblue",
+                household_merge_service=household_merge_service,
+            ),
         }
         self.household_chat_service = household_chat_service
         self.google_account_link_service = (

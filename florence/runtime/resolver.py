@@ -16,6 +16,7 @@ from florence.contracts import (
     MemberIdentity,
     MemberRole,
 )
+from florence.runtime.household_merge import FlorenceHouseholdMergeService
 from florence.state import FlorenceStateDB
 
 
@@ -74,9 +75,16 @@ class FlorenceResolvedTransportContext:
 class FlorenceIdentityResolver:
     """Creates and resolves Florence households, members, identities, and channels."""
 
-    def __init__(self, store: FlorenceStateDB, *, provider: str = "linq"):
+    def __init__(
+        self,
+        store: FlorenceStateDB,
+        *,
+        provider: str = "linq",
+        household_merge_service: FlorenceHouseholdMergeService | None = None,
+    ):
         self.store = store
         self.provider = provider
+        self.household_merge_service = household_merge_service or FlorenceHouseholdMergeService(store)
 
     def resolve_direct_message(self, *, sender_handle: str, thread_external_id: str) -> FlorenceResolvedTransportContext:
         kind = infer_identity_kind(sender_handle)
@@ -156,9 +164,18 @@ class FlorenceIdentityResolver:
             matching_households.setdefault(member.household_id, []).append(member)
 
         if len(matching_households) != 1:
-            return None
+            sender_member = self._find_member_by_handle(sender_handle)
+            if sender_member is None:
+                return None
+            household_id = self.household_merge_service.merge_group_households(
+                target_household_id=sender_member.household_id,
+                matching_households=matching_households,
+            )
+            if household_id is None:
+                return None
+        else:
+            household_id, _matched_members = next(iter(matching_households.items()))
 
-        household_id, matched_members = next(iter(matching_households.items()))
         household = self.store.get_household(household_id)
         if household is None:
             return None
@@ -303,3 +320,8 @@ class FlorenceIdentityResolver:
         if member is None or member.household_id != household_id:
             return None
         return member
+
+    def _find_member_by_handle(self, handle: str) -> Member | None:
+        kind = infer_identity_kind(handle)
+        normalized = normalize_identity_value(kind, handle)
+        return self.store.find_member_by_identity(kind=kind, normalized_value=normalized)

@@ -2017,6 +2017,61 @@ def test_done_after_google_connect_prompt_routes_back_to_agent_not_reminder_ack(
     store.close()
 
 
+def test_incomplete_setup_does_not_swallow_real_request_that_starts_with_great(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_onboarding_service(store, review_service)
+    chat_service = _StubHouseholdChatService(
+        "Still syncing, but I can keep helping once the first pass lands.",
+        sync_waiting_text="Still syncing, but I can keep helping once the first pass lands.",
+    )
+    ingress = _build_ingress(
+        store,
+        onboarding_service,
+        review_service,
+        household_chat_service=chat_service,
+    )
+
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+        display_name="Maya",
+    )
+    onboarding_service.record_child_names(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+        child_names=["Ava"],
+    )
+    onboarding_service.record_google_connected(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+    )
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_setup_sync_1",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="Great can you check email for school updates while that sync runs?",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert result.reply_text == "Still syncing, but I can keep helping once the first pass lands."
+    assert chat_service.sync_waiting_calls[0]["data_dependent"] is True
+    store.close()
+
+
 def test_complete_dm_can_answer_tracking_visibility_request(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)
@@ -2056,15 +2111,17 @@ def test_complete_dm_can_answer_tracking_visibility_request(tmp_path):
     store.close()
 
 
-def test_complete_dm_reminder_feedback_records_preference_and_logs_event(tmp_path):
+def test_complete_dm_reminder_feedback_routes_through_household_chat(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
     review_service = FlorenceCandidateReviewService(store)
     onboarding_service = _build_onboarding_service(store, review_service)
+    chat_service = _StubHouseholdChatService("I’ll remember that you want fewer reminders and less proactive nudging.")
     ingress = _build_ingress(
         store,
         onboarding_service,
         review_service,
+        household_chat_service=chat_service,
     )
     _complete_hybrid_onboarding(onboarding_service)
 
@@ -2086,19 +2143,15 @@ def test_complete_dm_reminder_feedback_records_preference_and_logs_event(tmp_pat
     )
 
     assert result.consumed is True
-    assert result.reply_text is not None
-    assert "updated your reminder style" in result.reply_text.lower()
-
+    assert result.reply_text == "I’ll remember that you want fewer reminders and less proactive nudging."
+    assert chat_service.calls[0]["message_text"] == "Too many reminders too early. Morning-of is better for practices."
     preferences = store.list_household_profile_items(
         household_id="hh_123",
         kind=HouseholdProfileKind.PREFERENCE,
     )
-    assert len(preferences) == 1
-    assert preferences[0].label == "Reminder style"
-    assert preferences[0].metadata["category"] == "reminder_style"
-    assert preferences[0].metadata["value"] == "Too many reminders too early. Morning-of is better for practices."
+    assert preferences == []
     events = store.list_pilot_events(household_id="hh_123", event_type="reminder_feedback_received")
-    assert len(events) == 1
+    assert events == []
     store.close()
 
 
@@ -2365,6 +2418,75 @@ def test_complete_dm_got_it_does_not_acknowledge_sent_nudge(tmp_path):
     assert result.consumed is True
     assert result.reply_text == "Tell me which reminder you want to update."
     updated_nudge = store.get_household_nudge("nudge_125")
+    assert updated_nudge is not None
+    assert updated_nudge.status == HouseholdNudgeStatus.SENT
+    assert store.list_pilot_events(household_id="hh_123", event_type="reminder_done") == []
+    store.close()
+
+
+def test_complete_dm_finished_does_not_acknowledge_sent_nudge(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_onboarding_service(store, review_service)
+    chat_service = _StubHouseholdChatService("Tell me which reminder you want to update.")
+    ingress = _build_ingress(
+        store,
+        onboarding_service,
+        review_service,
+        household_chat_service=chat_service,
+    )
+    _complete_hybrid_onboarding(onboarding_service)
+
+    now = datetime.now(timezone.utc)
+    nudge = HouseholdNudge(
+        id="nudge_126",
+        household_id="hh_123",
+        target_kind=HouseholdNudgeTargetKind.GENERAL,
+        message="Reminder: pack baseball gear.",
+        status=HouseholdNudgeStatus.SENT,
+        recipient_member_id="mem_123",
+        channel_id="chan_dm_123",
+        scheduled_for=(now - timedelta(minutes=10)).isoformat(),
+        sent_at=(now - timedelta(minutes=8)).isoformat(),
+    )
+    store.upsert_household_nudge(nudge)
+    store.append_channel_message(
+        ChannelMessage(
+            id="msg_nudge_prompt_126",
+            household_id="hh_123",
+            channel_id="chan_dm_123",
+            sender_role=ChannelMessageRole.ASSISTANT,
+            body="Reminder: pack baseball gear.",
+            metadata={
+                "pending_action_type": "household_nudge",
+                "pending_action_target_kind": "household_nudge",
+                "pending_action_target_id": "nudge_126",
+            },
+            created_at=datetime.now(timezone.utc).timestamp(),
+        )
+    )
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_210",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="finished",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert result.consumed is True
+    assert result.reply_text == "Tell me which reminder you want to update."
+    updated_nudge = store.get_household_nudge("nudge_126")
     assert updated_nudge is not None
     assert updated_nudge.status == HouseholdNudgeStatus.SENT
     assert store.list_pilot_events(household_id="hh_123", event_type="reminder_done") == []

@@ -14,6 +14,7 @@ from florence.runtime.household_calendar_projection import (
     HOUSEHOLD_CALENDAR_PROJECTION_SETTINGS_KEY,
     FlorenceHouseholdCalendarProjectionService,
 )
+from florence.runtime.household_merge import FlorenceHouseholdMergeService
 from florence.state import FlorenceStateDB
 
 
@@ -236,4 +237,198 @@ def test_household_calendar_projection_syncs_confirmed_events_and_removes_non_co
     assert confirmed.metadata[HOUSEHOLD_CALENDAR_PROJECTION_EVENT_ID_KEY] == "gcal_evt_confirmed_123"
     assert deleted == ["gcal_old_123"]
     assert HOUSEHOLD_CALENDAR_PROJECTION_EVENT_ID_KEY not in tentative.metadata
+    store.close()
+
+
+def test_household_merge_service_keeps_target_projection_and_retires_source_projection(monkeypatch, tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(
+        Household(
+            id="hh_primary",
+            name="Jackson household",
+            timezone="America/Los_Angeles",
+            settings={
+                HOUSEHOLD_CALENDAR_PROJECTION_SETTINGS_KEY: {
+                    "host_connection_id": "gconn_primary",
+                    "host_email": "jackson@example.com",
+                    "calendar_id": "cal_primary",
+                    "calendar_web_url": "https://calendar.google.com/calendar/u/0/r?cid=cal_primary",
+                    "status": "active",
+                }
+            },
+        )
+    )
+    store.upsert_household(
+        Household(
+            id="hh_secondary",
+            name="Kendall household",
+            timezone="America/Los_Angeles",
+            settings={
+                HOUSEHOLD_CALENDAR_PROJECTION_SETTINGS_KEY: {
+                    "host_connection_id": "gconn_secondary",
+                    "host_email": "kendall@example.com",
+                    "calendar_id": "cal_secondary",
+                    "calendar_web_url": "https://calendar.google.com/calendar/u/0/r?cid=cal_secondary",
+                    "status": "active",
+                }
+            },
+        )
+    )
+    primary_member = store.upsert_member(
+        Member(
+            id="mem_primary",
+            household_id="hh_primary",
+            display_name="Jackson",
+            role=MemberRole.ADMIN,
+        )
+    )
+    secondary_member = store.upsert_member(
+        Member(
+            id="mem_secondary",
+            household_id="hh_secondary",
+            display_name="Kendall",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_google_connection(
+        GoogleConnection(
+            id="gconn_primary",
+            household_id="hh_primary",
+            member_id="mem_primary",
+            email="jackson@example.com",
+            connected_scopes=(GoogleSourceKind.GMAIL, GoogleSourceKind.GOOGLE_CALENDAR),
+            access_token="primary-token",
+            metadata={"florence_projection_calendar_id": "cal_primary"},
+        )
+    )
+    store.upsert_google_connection(
+        GoogleConnection(
+            id="gconn_secondary",
+            household_id="hh_secondary",
+            member_id="mem_secondary",
+            email="kendall@example.com",
+            connected_scopes=(GoogleSourceKind.GMAIL, GoogleSourceKind.GOOGLE_CALENDAR),
+            access_token="secondary-token",
+            metadata={"florence_projection_calendar_id": "cal_secondary"},
+        )
+    )
+
+    projection_service = FlorenceHouseholdCalendarProjectionService(store)
+    ensured: list[tuple[str, str | None]] = []
+    deleted: list[str] = []
+    monkeypatch.setattr(
+        projection_service,
+        "ensure_projection",
+        lambda **kwargs: ensured.append((kwargs["household_id"], kwargs.get("preferred_connection_id"))) or kwargs,
+    )
+    monkeypatch.setattr(
+        "florence.runtime.household_merge.delete_google_calendar",
+        lambda **kwargs: deleted.append(kwargs["calendar_id"]),
+    )
+
+    service = FlorenceHouseholdMergeService(
+        store,
+        household_calendar_projection_service=projection_service,
+    )
+    merged_household_id = service.merge_group_households(
+        target_household_id="hh_primary",
+        matching_households={
+            "hh_primary": [primary_member],
+            "hh_secondary": [secondary_member],
+        },
+    )
+
+    merged_household = store.get_household("hh_primary")
+    moved_connection = store.get_google_connection("gconn_secondary")
+    assert merged_household_id == "hh_primary"
+    assert store.get_household("hh_secondary") is None
+    assert merged_household is not None
+    assert merged_household.settings[HOUSEHOLD_CALENDAR_PROJECTION_SETTINGS_KEY]["calendar_id"] == "cal_primary"
+    assert deleted == ["cal_secondary"]
+    assert ensured == [("hh_primary", "gconn_primary")]
+    assert moved_connection is not None
+    assert moved_connection.household_id == "hh_primary"
+    assert moved_connection.metadata[HOUSEHOLD_CALENDAR_MANAGED_IDS_METADATA_KEY] == ["cal_secondary"]
+    assert "florence_projection_calendar_id" not in moved_connection.metadata
+    store.close()
+
+
+def test_household_merge_service_moves_source_projection_when_target_has_none(monkeypatch, tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_primary", name="Jackson household", timezone="America/Los_Angeles"))
+    store.upsert_household(
+        Household(
+            id="hh_secondary",
+            name="Kendall household",
+            timezone="America/Los_Angeles",
+            settings={
+                HOUSEHOLD_CALENDAR_PROJECTION_SETTINGS_KEY: {
+                    "host_connection_id": "gconn_secondary",
+                    "host_email": "kendall@example.com",
+                    "calendar_id": "cal_secondary",
+                    "calendar_web_url": "https://calendar.google.com/calendar/u/0/r?cid=cal_secondary",
+                    "status": "active",
+                }
+            },
+        )
+    )
+    primary_member = store.upsert_member(
+        Member(
+            id="mem_primary",
+            household_id="hh_primary",
+            display_name="Jackson",
+            role=MemberRole.ADMIN,
+        )
+    )
+    secondary_member = store.upsert_member(
+        Member(
+            id="mem_secondary",
+            household_id="hh_secondary",
+            display_name="Kendall",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_google_connection(
+        GoogleConnection(
+            id="gconn_secondary",
+            household_id="hh_secondary",
+            member_id="mem_secondary",
+            email="kendall@example.com",
+            connected_scopes=(GoogleSourceKind.GMAIL, GoogleSourceKind.GOOGLE_CALENDAR),
+            access_token="secondary-token",
+            metadata={"florence_projection_calendar_id": "cal_secondary"},
+        )
+    )
+
+    projection_service = FlorenceHouseholdCalendarProjectionService(store)
+    ensured: list[tuple[str, str | None]] = []
+    deleted: list[str] = []
+    monkeypatch.setattr(
+        projection_service,
+        "ensure_projection",
+        lambda **kwargs: ensured.append((kwargs["household_id"], kwargs.get("preferred_connection_id"))) or kwargs,
+    )
+    monkeypatch.setattr(
+        "florence.runtime.household_merge.delete_google_calendar",
+        lambda **kwargs: deleted.append(kwargs["calendar_id"]),
+    )
+
+    service = FlorenceHouseholdMergeService(
+        store,
+        household_calendar_projection_service=projection_service,
+    )
+    merged_household_id = service.merge_group_households(
+        target_household_id="hh_primary",
+        matching_households={
+            "hh_primary": [primary_member],
+            "hh_secondary": [secondary_member],
+        },
+    )
+
+    merged_household = store.get_household("hh_primary")
+    assert merged_household_id == "hh_primary"
+    assert merged_household is not None
+    assert merged_household.settings[HOUSEHOLD_CALENDAR_PROJECTION_SETTINGS_KEY]["calendar_id"] == "cal_secondary"
+    assert ensured == [("hh_primary", "gconn_secondary")]
+    assert deleted == []
     store.close()

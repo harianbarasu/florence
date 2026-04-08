@@ -201,6 +201,44 @@ def test_candidate_review_prompt_asks_once_for_unknown_source_classification(tmp
     store.close()
 
 
+def test_delivery_service_records_outbound_audit_event(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    linq = _FakeLinqClient()
+    delivery = FlorenceChannelDeliveryService(
+        store,
+        linq_client_getter=lambda: linq,
+        sendblue_client_getter=lambda: None,
+    )
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    channel = store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+
+    sent = delivery.send_channel_message(
+        channel=channel,
+        message="**Hello** there",
+        message_metadata={"protocol_kind": "candidate_review_prompt"},
+    )
+
+    events = store.list_pilot_events(household_id="hh_123", event_type="outbound_message_sent")
+    assert sent is True
+    assert linq.sent == [{"chat_id": "dm-thread-123", "message": "Hello there"}]
+    assert len(events) == 1
+    assert events[0].channel_id == "chan_dm_123"
+    assert events[0].metadata["provider"] == "linq"
+    assert events[0].metadata["provider_channel_id"] == "dm-thread-123"
+    assert events[0].metadata["message"] == "Hello there"
+    assert events[0].metadata["message_metadata"]["protocol_kind"] == "candidate_review_prompt"
+    store.close()
+
+
 def test_candidate_review_prompt_returns_latest_pending_candidate(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)
@@ -743,6 +781,93 @@ def test_onboarding_service_renders_transition_and_repeat_messages(tmp_path):
     assert repeat_messages == (
         "What are your kids' names? Send all of them in one message, one per line or comma-separated.",
     )
+    store.close()
+
+
+def test_onboarding_service_accepts_long_school_reply_and_advances(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    onboarding_service = FlorenceOnboardingSessionService(store)
+
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="thread_dm_123",
+        display_name="Jackson",
+    )
+    onboarding_service.record_child_names(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="thread_dm_123",
+        child_names=["Violet"],
+    )
+    onboarding_service.record_user_reply(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="thread_dm_123",
+        text="She'll be 4 next month",
+    )
+
+    transition = onboarding_service.record_user_reply(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="thread_dm_123",
+        text="Young Minds Preschool. Last year before she starts TK at WISH next year.",
+    )
+
+    assert transition.changed is True
+    assert transition.state.stage == OnboardingStage.COLLECT_CHILD_ACTIVITIES
+    assert transition.prompt is not None
+    assert transition.prompt.text == "What activities does Violet do? If none right now, say none."
+    assert transition.state.child_profiles[0]["school"] == (
+        "Young Minds Preschool. Last year before she starts TK at WISH next year."
+    )
+    store.close()
+
+
+def test_onboarding_service_accepts_long_activities_reply_and_advances_to_next_child(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    onboarding_service = FlorenceOnboardingSessionService(store)
+
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="thread_dm_123",
+        display_name="Jackson",
+    )
+    onboarding_service.record_child_names(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="thread_dm_123",
+        child_names=["Theo", "Violet"],
+    )
+    onboarding_service.record_user_reply(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="thread_dm_123",
+        text="5",
+    )
+    onboarding_service.record_user_reply(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="thread_dm_123",
+        text="WISH charter",
+    )
+
+    transition = onboarding_service.record_user_reply(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="thread_dm_123",
+        text="He plays little league baseball with DRALL and does music class with Musical Beginnings.",
+    )
+
+    assert transition.changed is True
+    assert transition.state.stage == OnboardingStage.COLLECT_CHILD_AGE
+    assert transition.prompt is not None
+    assert transition.prompt.text == "Okay, next one. How old is Violet?"
+    assert transition.state.current_child_name == "Violet"
+    assert transition.state.child_profiles[0]["activities"] == [
+        "He plays little league baseball with DRALL and does music class with Musical Beginnings."
+    ]
     store.close()
 
 

@@ -136,6 +136,26 @@ async def test_web_extract_dispatches_to_openai_direct_fetch():
 
 
 @pytest.mark.asyncio
+async def test_web_extract_normalizes_webcal_links_before_fetch():
+    extracted = [{
+        "url": "https://api.team-manager.gc.com/schedule.ics",
+        "title": "Schedule",
+        "content": "BEGIN:VCALENDAR",
+        "raw_content": "BEGIN:VCALENDAR",
+        "metadata": {"sourceURL": "https://api.team-manager.gc.com/schedule.ics", "title": "Schedule"},
+    }]
+
+    with patch.object(web_tools, "_get_backend", return_value="openai"), \
+         patch.object(web_tools, "is_safe_url", return_value=True) as safe_url_mock, \
+         patch.object(web_tools, "_direct_http_extract", new=AsyncMock(return_value=extracted)) as extract_mock:
+        result = json.loads(await web_tools.web_extract_tool(["webcal://api.team-manager.gc.com/schedule.ics"], use_llm_processing=False))
+
+    assert result["results"][0]["title"] == "Schedule"
+    safe_url_mock.assert_called_once_with("https://api.team-manager.gc.com/schedule.ics")
+    extract_mock.assert_awaited_once_with(["https://api.team-manager.gc.com/schedule.ics"])
+
+
+@pytest.mark.asyncio
 async def test_anthropic_extract_falls_back_to_web_fetch_result_block():
     response = SimpleNamespace(content=[
         _anthropic_web_fetch_tool_result(

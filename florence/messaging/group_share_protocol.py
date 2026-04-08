@@ -2,8 +2,32 @@
 
 from __future__ import annotations
 
+import re
+
 from florence.messaging.protocol_types import FlorenceProtocolReply
 from florence.runtime.chat import _GROUP_SHARE_EXECUTE_SENTINEL
+
+
+_SCHEDULE_FEED_PATTERN = re.compile(r"(?:\bwebcal://|\bhttps?://\S+\.ics(?:\?|$)|\b\S+\.ics(?:\?|$))", re.IGNORECASE)
+
+
+def _looks_like_schedule_feed_link(text: str) -> bool:
+    normalized = " ".join(str(text or "").split()).strip()
+    if not normalized:
+        return False
+    return _SCHEDULE_FEED_PATTERN.search(normalized) is not None
+
+
+def _looks_like_explicit_group_share_request(text: str) -> bool:
+    normalized = " ".join(str(text or "").split()).strip().lower()
+    if not normalized:
+        return False
+    if normalized in {"share that", "share it", "send it", "post it"}:
+        return True
+    return (
+        re.search(r"\b(?:share|send|post)\b", normalized) is not None
+        and any(phrase in normalized for phrase in ("group", "parent group", "family", "everyone", "parents"))
+    )
 
 class FlorenceGroupShareProtocol:
     """DM-only explicit promotion from a private parent thread into the household group."""
@@ -25,6 +49,9 @@ class FlorenceGroupShareProtocol:
         current_message_id: str,
         text: str,
     ) -> FlorenceProtocolReply | None:
+        if _looks_like_schedule_feed_link(text) and not _looks_like_explicit_group_share_request(text):
+            return None
+
         latest_assistant = self.group_share_service.channel_log.latest_assistant_message(channel_id=channel_id)
         decision = self.group_share_service.household_chat_service.compose_operator_message(
             household_id=household_id,

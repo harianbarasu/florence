@@ -25,6 +25,7 @@ from florence.contracts import (
     HouseholdShoppingItemStatus,
     HouseholdWorkItemStatus,
 )
+from florence.messaging.types import FlorenceInboundAttachment
 from florence.state import FlorenceStateDB
 from florence.runtime.visibility import build_scope_model_lines, resolve_conversation_scope
 
@@ -98,6 +99,7 @@ class FlorenceHouseholdChatService:
         channel_id: str,
         actor_member_id: str | None,
         message_text: str,
+        message_attachments: tuple[FlorenceInboundAttachment, ...] = (),
         conversation_history: list[ChannelMessage] | None = None,
     ) -> FlorenceHouseholdChatReply | None:
         system_message = self._build_system_message(
@@ -115,7 +117,11 @@ class FlorenceHouseholdChatService:
             household_id=household_id,
             channel_id=channel_id,
             actor_member_id=actor_member_id,
-            user_message=message_text,
+            user_message=self._build_live_user_message(
+                message_text=message_text,
+                message_attachments=message_attachments,
+            ),
+            persist_user_message=message_text,
             system_message=system_message,
             conversation_history=history,
             session_id=session_id,
@@ -442,6 +448,8 @@ class FlorenceHouseholdChatService:
                     "You are deciding whether a private parent-DM message is an explicit request to share recent DM context into the household parent group.",
                     f"If the user is clearly asking Florence to share, send, or post the recent DM update to the parent group, reply exactly {_GROUP_SHARE_EXECUTE_SENTINEL}.",
                     f"Otherwise reply exactly {_GROUP_SHARE_NO_ACTION_SENTINEL}.",
+                    "Bare links, screenshots, attachments, schedule feeds, webcal:// links, and .ics calendar URLs are not group-share requests by themselves.",
+                    "Follow-ups like 'here is the calendar link', 'here is the schedule', or 'use this feed for Theo' are normal household-task turns unless they explicitly mention sharing to the group.",
                     "Do not confuse this with source-visibility choices inside a review-item prompt.",
                     "If the latest assistant protocol kind is candidate_review_prompt, plain replies like share/private usually belong to review handling, not group promotion.",
                 ]
@@ -710,7 +718,8 @@ class FlorenceHouseholdChatService:
         household_id: str,
         channel_id: str,
         actor_member_id: str | None,
-        user_message: str,
+        user_message: Any,
+        persist_user_message: str | None = None,
         system_message: str,
         conversation_history: list[dict[str, str]] | None,
         session_id: str | None = None,
@@ -775,12 +784,21 @@ class FlorenceHouseholdChatService:
                     actor_member_id=actor_member_id,
                 ),
             )
-            result = agent.run_conversation(
-                user_message=user_message,
-                system_message=system_message,
-                conversation_history=conversation_history,
-                task_id=task_id,
-            )
+            run_kwargs = {
+                "user_message": user_message,
+                "system_message": system_message,
+                "conversation_history": conversation_history,
+                "task_id": task_id,
+            }
+            if persist_user_message is not None:
+                run_kwargs["persist_user_message"] = persist_user_message
+            try:
+                result = agent.run_conversation(**run_kwargs)
+            except TypeError as exc:
+                if "persist_user_message" not in str(exc):
+                    raise
+                run_kwargs.pop("persist_user_message", None)
+                result = agent.run_conversation(**run_kwargs)
             if not internal_turn:
                 self._persist_channel_session_id(
                     channel_id=channel_id,
@@ -861,6 +879,30 @@ class FlorenceHouseholdChatService:
     def looks_like_protocol_sentinel(reply_text: str | None) -> bool:
         normalized = str(reply_text or "").strip()
         return normalized in _PROTOCOL_SENTINELS
+
+    @staticmethod
+    def _build_live_user_message(
+        *,
+        message_text: str,
+        message_attachments: tuple[FlorenceInboundAttachment, ...],
+    ) -> Any:
+        image_parts = []
+        for attachment in message_attachments:
+            source = str(attachment.data_url or attachment.url or "").strip()
+            mime_type = str(attachment.mime_type or "").strip().lower()
+            if not source:
+                continue
+            if attachment.kind != "image" and not mime_type.startswith("image/"):
+                continue
+            image_parts.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": source},
+                }
+            )
+        if not image_parts:
+            return message_text
+        return [{"type": "text", "text": message_text}, *image_parts]
 
     @staticmethod
     def _verbose_turn_logging_enabled() -> bool:
@@ -1240,6 +1282,10 @@ class FlorenceHouseholdChatService:
             "Your core product loops are inbox -> plan, capture -> handled, and briefs -> stay ahead.",
             "Treat almost any household input as something you can structure and handle: school email, screenshots, flyers, photos, mental dumps, meals, groceries, reminders, and schedule questions.",
             "You have Hermes non-coding tools available for research, browsing websites, messaging, reminders, and media tasks.",
+            "Talk like a capable household assistant, not an internal ops dashboard.",
+            "In ordinary parent-facing replies, do not mention backend wording like 'household state', 'calendar projection', 'tentative anchor', 'protocol', 'candidate', 'source classification', or similar internal mechanics unless the user is explicitly asking Florence to debug itself.",
+            "If something is missing, say the plain missing fact directly, for example: 'I don't have Theo's school hours saved yet.'",
+            "Do not explain storage layers, sync pipelines, projection mechanics, or visibility models in ordinary replies.",
             "Your memory stack is: authoritative Florence household state, Florence session history, and Florence-scoped Honcho memory.",
             "You also have Florence household-state tools. Use them to persist durable household state when the user wants Florence to remember or manage something over time.",
             "Before creating duplicate tasks, events, meals, grocery items, or reminders, check household state, recent Florence context, and connected inbox context when they help.",
@@ -1252,11 +1298,18 @@ class FlorenceHouseholdChatService:
             "When the user asks what they are forgetting, what changed, what matters this week, what still needs handling, or asks for a plan, ground the answer in household_search_state and session_search first, then check Gmail when relevant.",
             "Use session_search and Honcho memory to recover earlier commitments, preferences, and threads of work instead of making the user repeat themselves.",
             "Use household_search_google_inbox whenever connected inbox context is likely to be the fastest grounded way to answer or act on the request.",
+            "Use household_search_google_calendar whenever the user is asking about a class, practice, game, appointment, or schedule detail that may already be on their mirrored Google Calendar.",
             "In a private parent DM, be willing to search the connected inbox before asking the parent to restate details that likely already live in an email, invite, or forwarded message.",
+            "Treat webcal:// links and .ics URLs as calendar feeds or schedule exports. Convert webcal:// to https:// before fetching or extracting them.",
+            "If a parent pastes a schedule link or calendar feed into a private DM, assume they want Florence to inspect or ingest that schedule, not share it to the group.",
+            "When a parent pastes a shareable schedule feed they want Florence to remember, use household_import_calendar_feed instead of only summarizing the feed in chat.",
             "If the user points Florence toward their inbox as the source of truth, treat that as a strong cue to search the connected inbox instead of bouncing the question back.",
             "household_search_google_inbox respects scope: in a parent DM it defaults to that parent's inbox, while in the family group it only uses shared-household inbox scope.",
+            "household_search_google_calendar respects the same privacy boundary: in a parent DM it defaults to that parent's mirrored calendar, while in the family group it only uses shared-household calendar scope.",
             "If household_search_google_inbox returns no matches but reports mirror_sync_running=true, explain that Florence is still syncing that inbox instead of implying the email does not exist.",
+            "If household_search_google_calendar returns no matches but reports mirror_sync_running=true, explain that Florence is still syncing that calendar instead of implying the schedule is absent.",
             "If household_search_google_inbox returns no matches and the user is pointing to a very recent forwarded invite or message, ask for one or two grounding details rather than claiming certainty that nothing is there.",
+            "If the user thinks something was added twice or duplicated on the calendar, start with household_search_state for events. Use event_insights.likely_duplicate_groups when present, then fix the extra event by id instead of narrating internal uncertainty.",
             "When the user needs current information from the public web such as school calendars, camp policies, activity schedules, vendor details, or comparisons, use web_search and web_extract instead of guessing.",
             "When the task requires interacting with a website or portal, following multi-step navigation, checking dynamic page state, or inspecting console/browser output, use the browser tools instead of pretending you already know the result.",
             "If external research or website investigation branches into a bounded sidecar task, use delegate_task to gather evidence in parallel, then return to the main Florence turn to synthesize the result and make any final household-state updates yourself.",
@@ -1276,6 +1329,8 @@ class FlorenceHouseholdChatService:
             "Before taking an external action that spends money, commits the household, sends a message outside this thread, or changes reminders/plans, get a clear confirmation from the requester.",
             "If household information is missing or ambiguous, ask a short follow-up question.",
             "Keep replies concise and practical. Do not mention internal policy or hidden review queues unless asked directly.",
+            "When the user asks a direct operational question, answer that question plainly in the first sentence before any extra context.",
+            "When Florence saves or updates something, say it plainly. Prefer 'I added Violet's Wednesday music class' over internal phrases like 'grounded parts', 'baseline cleanup', 'durable fact', or 'private context'.",
             f"Household: {household.name}",
             f"Timezone: {household.timezone}",
             f"Current household-local date/time: {local_now.isoformat()}",

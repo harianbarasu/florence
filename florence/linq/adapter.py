@@ -5,6 +5,10 @@ from __future__ import annotations
 from typing import Any
 
 from florence.messaging import FlorenceInboundMessage
+from florence.messaging.types import (
+    FLORENCE_MEDIA_ATTACHMENTS_METADATA_KEY,
+    parse_inbound_attachments,
+)
 
 IGNORED_LINQ_EVENT_TYPES = {
     "message.sent",
@@ -80,6 +84,7 @@ def parse_linq_payload(payload: dict[str, Any]) -> FlorenceInboundMessage:
                 "event_id": _read_string(payload.get("event_id")),
                 "trace_id": _read_string(payload.get("trace_id")),
             },
+            attachments=parse_inbound_attachments(payload.get(FLORENCE_MEDIA_ATTACHMENTS_METADATA_KEY)),
         )
 
     message = _read_object(data.get("message")) or {}
@@ -112,4 +117,5 @@ def parse_linq_payload(payload: dict[str, Any]) -> FlorenceInboundMessage:
             "event_id": _read_string(payload.get("event_id")),
             "trace_id": _read_string(payload.get("trace_id")),
         },
+        attachments=parse_inbound_attachments(payload.get(FLORENCE_MEDIA_ATTACHMENTS_METADATA_KEY)),
     )

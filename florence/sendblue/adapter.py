@@ -5,6 +5,10 @@ from __future__ import annotations
 from typing import Any
 
 from florence.messaging import FlorenceInboundMessage
+from florence.messaging.types import (
+    FLORENCE_MEDIA_ATTACHMENTS_METADATA_KEY,
+    parse_inbound_attachments,
+)
 
 
 def _read_string(value: Any) -> str | None:
@@ -83,4 +87,5 @@ def parse_sendblue_payload(payload: dict[str, Any]) -> FlorenceInboundMessage:
             "group_id": group_id,
             "message_type": _read_string(payload.get("message_type")),
         },
+        attachments=parse_inbound_attachments(payload.get(FLORENCE_MEDIA_ATTACHMENTS_METADATA_KEY)),
     )

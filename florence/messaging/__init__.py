@@ -5,9 +5,10 @@ from florence.messaging.ingress_types import (
     FlorenceMessagingIngressResult,
     FlorenceResolvedInboundMessage,
 )
-from florence.messaging.types import FlorenceInboundMessage
+from florence.messaging.types import FlorenceInboundAttachment, FlorenceInboundMessage
 
 __all__ = [
+    "FlorenceInboundAttachment",
     "FlorenceInboundMessage",
     "FlorenceMessagingIngressResult",
     "FlorenceMessagingIngressService",

@@ -6,6 +6,7 @@ import logging
 
 from florence.messaging.channel_log import FlorenceChannelLog
 from florence.messaging.protocol_types import FlorenceProtocolReply
+from florence.messaging.types import FlorenceInboundAttachment
 from florence.onboarding import build_google_connected_syncing_message_sequence
 from florence.runtime.chat import (
     FlorenceHouseholdChatService,
@@ -46,6 +47,7 @@ class FlorenceHouseholdChatBridge:
         channel_id: str,
         actor_member_id: str | None,
         message_text: str,
+        message_attachments: tuple[FlorenceInboundAttachment, ...] = (),
         history_limit: int = 24,
     ) -> FlorenceProtocolReply | None:
         history = self.channel_log.conversation_history(channel_id=channel_id, limit=history_limit)
@@ -54,6 +56,7 @@ class FlorenceHouseholdChatBridge:
             channel_id=channel_id,
             actor_member_id=actor_member_id,
             message_text=message_text,
+            message_attachments=message_attachments,
             conversation_history=history,
         )
         if reply is None or not reply.text.strip():

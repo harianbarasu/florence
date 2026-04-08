@@ -10,10 +10,13 @@ from urllib.parse import urlparse
 
 import httpx
 
+from florence.messaging.types import FLORENCE_MEDIA_ATTACHMENTS_METADATA_KEY
 from florence.media.openai_extract import (
+    build_image_data_url,
     compact_text,
     extract_image_text_with_openai,
     extract_pdf_text_with_openai,
+    render_pdf_pages_to_images,
 )
 
 logger = logging.getLogger(__name__)
@@ -210,6 +213,69 @@ def _extract_media_text(ref: _LinqMediaRef, *, content: bytes, content_type: str
     return None
 
 
+def _pdf_page_attachment_filename(filename: str | None, page_number: int) -> str:
+    base = filename or "attachment.pdf"
+    return f"{base}#page-{page_number}.png"
+
+
+def _serialize_media_attachments(
+    ref: _LinqMediaRef,
+    *,
+    content: bytes,
+    content_type: str | None,
+    extracted_text: str | None,
+) -> list[dict[str, str]]:
+    mime_type = (ref.mime_type or content_type or "").split(";")[0].strip().lower()
+    filename = ref.filename
+    if mime_type.startswith("image/") or (filename or "").lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic", ".heif")):
+        final_mime = mime_type if mime_type.startswith("image/") else "image/jpeg"
+        return [
+            {
+                "kind": "image",
+                "mime_type": final_mime,
+                "filename": filename or "",
+                "url": ref.url,
+                "data_url": build_image_data_url(content, final_mime),
+                "extracted_text": extracted_text or "",
+            }
+        ]
+    if mime_type == "application/pdf" or (filename or "").lower().endswith(".pdf"):
+        attachments: list[dict[str, str]] = [
+            {
+                "kind": "pdf",
+                "mime_type": mime_type or "application/pdf",
+                "filename": filename or "",
+                "url": ref.url,
+                "extracted_text": extracted_text or "",
+            }
+        ]
+        for rendered_page in render_pdf_pages_to_images(
+            pdf_bytes=content,
+            filename=filename,
+            log_label="Linq PDF render",
+        ):
+            attachments.append(
+                {
+                    "kind": "image",
+                    "mime_type": rendered_page.mime_type,
+                    "filename": _pdf_page_attachment_filename(filename, rendered_page.page_number),
+                    "url": ref.url,
+                    "data_url": rendered_page.data_url,
+                    "extracted_text": "",
+                }
+            )
+        return attachments
+    return [
+        {
+            "kind": "file",
+            "mime_type": mime_type or "",
+            "filename": filename or "",
+            "url": ref.url,
+            "extracted_text": extracted_text or "",
+        }
+    ]
+
+
 def _message_parts(payload: dict[str, Any]) -> list[Any] | None:
     data = _read_object(payload.get("data")) or payload
     parts = _read_array(data.get("parts"))
@@ -234,6 +300,7 @@ def enrich_linq_payload_with_media_text(
         return False
 
     extracted_lines: list[str] = []
+    serialized_attachments: list[dict[str, str]] = []
     for ref in refs[:_MAX_MEDIA_PARTS]:
         try:
             content, content_type = _download_media_bytes(
@@ -246,10 +313,20 @@ def enrich_linq_payload_with_media_text(
             continue
 
         text = _extract_media_text(ref, content=content, content_type=content_type)
+        serialized = _serialize_media_attachments(
+            ref,
+            content=content,
+            content_type=content_type,
+            extracted_text=text,
+        )
+        serialized_attachments.extend(serialized)
         if not text:
             continue
         label = ref.filename or (ref.mime_type or content_type or "attachment").split(";")[0]
         extracted_lines.append(f"{label}: {text}")
+
+    if serialized_attachments:
+        payload[FLORENCE_MEDIA_ATTACHMENTS_METADATA_KEY] = serialized_attachments
 
     if not extracted_lines:
         return False

@@ -134,6 +134,54 @@ def _gmail_match_score(
         score += len(query_terms) * 2
     return score
 
+
+def _calendar_match_score(
+    item: StoredCalendarSyncItem,
+    *,
+    query: str | None,
+    query_terms: list[str],
+) -> int:
+    normalized_query = " ".join(str(query or "").split()).strip().lower()
+    title_text = str(item.title or "").lower()
+    description_text = str(item.description or "").lower()
+    location_text = str(item.location or "").lower()
+    calendar_text = str(item.calendar_summary or "").lower()
+    family_text = " ".join(str(name or "").lower() for name in item.family_member_names)
+
+    score = 0
+    if normalized_query:
+        if normalized_query in title_text:
+            score += 18
+        if normalized_query in calendar_text:
+            score += 15
+        if normalized_query in family_text:
+            score += 12
+        if normalized_query in description_text:
+            score += 10
+        if normalized_query in location_text:
+            score += 8
+
+    matched_terms = 0
+    for term in query_terms:
+        term_score = 0
+        if term in title_text:
+            term_score = max(term_score, 7)
+        if term in calendar_text:
+            term_score = max(term_score, 6)
+        if term in family_text:
+            term_score = max(term_score, 6)
+        if term in description_text:
+            term_score = max(term_score, 4)
+        if term in location_text:
+            term_score = max(term_score, 4)
+        if term_score:
+            matched_terms += 1
+            score += term_score
+
+    if query_terms and matched_terms == len(query_terms):
+        score += len(query_terms) * 2
+    return score
+
 _RESET_HOUSEHOLD_TABLES = (
     "channel_messages",
     "channels",
@@ -1729,6 +1777,55 @@ class FlorenceStateDB:
         rows = self._conn.execute(sql, tuple(params)).fetchall()
         return [self._row_to_stored_calendar_sync_item(row) for row in rows]
 
+    def search_google_calendar_events(
+        self,
+        *,
+        household_id: str,
+        connection_ids: list[str],
+        query: str | None = None,
+        calendar_summary: str | None = None,
+        newer_than_days: int = 365,
+        limit: int = 10,
+    ) -> list[StoredCalendarSyncItem]:
+        if not connection_ids:
+            return []
+        params: list[object] = [household_id, *connection_ids]
+        sql = f"""
+            SELECT gce.*, gc.email AS connection_email
+            FROM google_calendar_events gce
+            JOIN google_connections gc ON gc.id = gce.connection_id
+            WHERE gce.household_id = ?
+              AND gce.connection_id IN ({_placeholders(len(connection_ids))})
+        """
+        cutoff_days = max(1, newer_than_days)
+        cutoff_ts = time.time() - (cutoff_days * 86_400)
+        sql += " AND COALESCE(gce.ends_at_ts, gce.starts_at_ts, 0) >= ?"
+        params.append(cutoff_ts)
+
+        normalized_calendar_summary = " ".join(str(calendar_summary or "").split()).strip().lower()
+        if normalized_calendar_summary:
+            sql += " AND LOWER(COALESCE(gce.calendar_summary, '')) LIKE ?"
+            params.append(f"%{normalized_calendar_summary}%")
+
+        sql += " ORDER BY COALESCE(gce.starts_at_ts, 0) ASC, gce.updated_at DESC"
+        rows = self._conn.execute(sql, tuple(params)).fetchall()
+        items = [self._row_to_stored_calendar_sync_item(row) for row in rows]
+        query_terms = _normalized_search_terms(query)
+        if query_terms:
+            scored: list[tuple[int, StoredCalendarSyncItem]] = []
+            for item in items:
+                score = _calendar_match_score(item, query=query, query_terms=query_terms)
+                if score > 0:
+                    scored.append((score, item))
+            scored.sort(
+                key=lambda pair: (
+                    -pair[0],
+                    pair[1].starts_at.timestamp(),
+                )
+            )
+            return [item for _, item in scored[: max(1, limit)]]
+        return items[: max(1, limit)]
+
     def upsert_household_source_rule(self, rule: HouseholdSourceRule) -> HouseholdSourceRule:
         now = time.time()
         existing = self._conn.execute(
@@ -1966,6 +2063,13 @@ class FlorenceStateDB:
         )
         self._conn.commit()
         return event
+
+    def get_household_event(self, event_id: str) -> HouseholdEvent | None:
+        row = self._conn.execute(
+            "SELECT * FROM household_events WHERE id = ?",
+            (event_id,),
+        ).fetchone()
+        return self._row_to_household_event(row) if row else None
 
     def list_household_events(
         self,

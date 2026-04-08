@@ -202,6 +202,25 @@ def request_matches_shared_gmail_rule(
     return False
 
 
+def request_matches_shared_calendar_rule(
+    rules: list[HouseholdSourceRule],
+    *,
+    query: str | None,
+    calendar_summary: str | None,
+) -> bool:
+    haystack = " ".join(part for part in (calendar_summary, query) if part).strip().lower()
+    if not haystack:
+        return False
+    for rule in rules:
+        if rule.source_kind != GoogleSourceKind.GOOGLE_CALENDAR or rule.visibility != HouseholdSourceVisibility.SHARED:
+            continue
+        if _match_term(haystack, rule.matcher_value):
+            return True
+        if rule.label and _match_term(haystack, rule.label):
+            return True
+    return False
+
+
 def _source_rule_id(
     household_id: str,
     source_kind: GoogleSourceKind,

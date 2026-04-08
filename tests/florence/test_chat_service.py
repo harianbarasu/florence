@@ -22,6 +22,7 @@ from florence.contracts import (
     IdentityKind,
     HouseholdWorkItem,
 )
+from florence.messaging.types import FlorenceInboundAttachment
 from florence.runtime.chat import FlorenceHouseholdChatService
 from florence.state import FlorenceStateDB
 from hermes_state import SessionDB
@@ -36,35 +37,55 @@ class _FakeAgent:
         self.session_id = kwargs.get("session_id")
         _FakeAgent.created.append(kwargs)
 
-    def run_conversation(self, user_message, system_message, conversation_history=None, task_id=None):
+    def run_conversation(
+        self,
+        user_message,
+        system_message,
+        conversation_history=None,
+        task_id=None,
+        persist_user_message=None,
+        **_,
+    ):
         _FakeAgent.last_run = {
             "user_message": user_message,
             "system_message": system_message,
             "conversation_history": conversation_history or [],
             "task_id": task_id,
+            "persist_user_message": persist_user_message,
         }
         return {"final_response": "Use the confirmed plan: Ava has soccer on Thursday."}
 
 
 class _RotatingSessionAgent(_FakeAgent):
-    def run_conversation(self, user_message, system_message, conversation_history=None, task_id=None):
+    def run_conversation(self, user_message, system_message, conversation_history=None, task_id=None, persist_user_message=None, **kwargs):
         result = super().run_conversation(
             user_message,
             system_message,
             conversation_history=conversation_history,
             task_id=task_id,
+            persist_user_message=persist_user_message,
+            **kwargs,
         )
         self.session_id = "florence-channel-chan_dm_123-next"
         return result
 
 
 class _RoutinePlanAgent(_FakeAgent):
-    def run_conversation(self, user_message, system_message, conversation_history=None, task_id=None):
+    def run_conversation(
+        self,
+        user_message,
+        system_message,
+        conversation_history=None,
+        task_id=None,
+        persist_user_message=None,
+        **_,
+    ):
         _FakeAgent.last_run = {
             "user_message": user_message,
             "system_message": system_message,
             "conversation_history": conversation_history or [],
             "task_id": task_id,
+            "persist_user_message": persist_user_message,
         }
         return {
             "final_response": (
@@ -260,6 +281,13 @@ def test_household_chat_service_uses_hermes_agent_with_confirmed_state(tmp_path)
     assert "general household agent" in _FakeAgent.last_run["system_message"]
     assert "inbox -> plan, capture -> handled, and briefs -> stay ahead" in _FakeAgent.last_run["system_message"]
     assert "school email, screenshots, flyers, photos, mental dumps, meals, groceries" in _FakeAgent.last_run["system_message"]
+    assert "Talk like a capable household assistant, not an internal ops dashboard." in _FakeAgent.last_run["system_message"]
+    assert "do not mention backend wording like 'household state', 'calendar projection', 'tentative anchor'" in _FakeAgent.last_run["system_message"]
+    assert "I don't have Theo's school hours saved yet." in _FakeAgent.last_run["system_message"]
+    assert "Treat webcal:// links and .ics URLs as calendar feeds or schedule exports." in _FakeAgent.last_run["system_message"]
+    assert "If a parent pastes a schedule link or calendar feed into a private DM, assume they want Florence to inspect or ingest that schedule" in _FakeAgent.last_run["system_message"]
+    assert "use household_import_calendar_feed instead of only summarizing the feed in chat" in _FakeAgent.last_run["system_message"]
+    assert "Prefer 'I added Violet's Wednesday music class' over internal phrases like 'grounded parts', 'baseline cleanup', 'durable fact', or 'private context'." in _FakeAgent.last_run["system_message"]
     assert "Your memory stack is: authoritative Florence household state, Florence session history, and Florence-scoped Honcho memory." in _FakeAgent.last_run["system_message"]
     assert "Household scope model:" in _FakeAgent.last_run["system_message"]
     assert "Shared household scope: facts, plans, reminders, meals, grocery items, routines, and events" in _FakeAgent.last_run["system_message"]
@@ -271,8 +299,12 @@ def test_household_chat_service_uses_hermes_agent_with_confirmed_state(tmp_path)
     assert "household_search_state now returns scope context too: current visibility scope and tentative tracked state." in _FakeAgent.last_run["system_message"]
     assert "ground the answer in household_search_state and session_search first" in _FakeAgent.last_run["system_message"]
     assert "Use session_search and Honcho memory to recover earlier commitments, preferences, and threads of work" in _FakeAgent.last_run["system_message"]
+    assert "Use household_search_google_calendar whenever the user is asking about a class, practice, game, appointment, or schedule detail" in _FakeAgent.last_run["system_message"]
     assert "private parent dm, be willing to search the connected inbox" in _FakeAgent.last_run["system_message"].lower()
     assert "points florence toward their inbox as the source of truth" in _FakeAgent.last_run["system_message"].lower()
+    assert "household_search_google_calendar respects the same privacy boundary" in _FakeAgent.last_run["system_message"]
+    assert "If household_search_google_calendar returns no matches but reports mirror_sync_running=true" in _FakeAgent.last_run["system_message"]
+    assert "If the user thinks something was added twice or duplicated on the calendar, start with household_search_state for events." in _FakeAgent.last_run["system_message"]
     assert "use web_search and web_extract instead of guessing" in _FakeAgent.last_run["system_message"]
     assert "use the browser tools instead of pretending you already know the result" in _FakeAgent.last_run["system_message"]
     assert "use delegate_task to gather evidence in parallel" in _FakeAgent.last_run["system_message"]
@@ -281,6 +313,7 @@ def test_household_chat_service_uses_hermes_agent_with_confirmed_state(tmp_path)
     assert "use household_apply_onboarding_update to store only the specific missing setup facts" in _FakeAgent.last_run["system_message"]
     assert "For imported Gmail review items, use source_provenance as the primary evidence." in _FakeAgent.last_run["system_message"]
     assert "Do not reach into unrelated hidden review items during ordinary household chat." in _FakeAgent.last_run["system_message"]
+    assert "answer that question plainly in the first sentence" in _FakeAgent.last_run["system_message"]
     assert "Remembered household preferences:" in _FakeAgent.last_run["system_message"]
     assert "Ava | Kid spice preference: Ava will not eat spicy food." in _FakeAgent.last_run["system_message"]
     assert "When the user asks what matters, what changed, or what they are forgetting" in _FakeAgent.last_run["system_message"]
@@ -552,6 +585,68 @@ def test_household_chat_service_group_prompt_emphasizes_shared_coordination(tmp_
     assert "Current scope: shared household group. Florence may use shared household context here" in _FakeAgent.last_run["system_message"]
     assert "must not reveal private DM-only context unless it was explicitly promoted" in _FakeAgent.last_run["system_message"]
     assert _FakeAgent.created[0]["honcho_session_key"] == "florence:household:hh_123"
+    store.close()
+
+
+def test_household_chat_service_passes_image_attachments_into_current_turn(tmp_path):
+    _FakeAgent.created.clear()
+    _FakeAgent.last_run = None
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(
+        Household(
+            id="hh_123",
+            name="Maya's household",
+            timezone="America/Los_Angeles",
+        )
+    )
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm_thread_123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+
+    service = FlorenceHouseholdChatService(
+        store,
+        model="anthropic/claude-opus-4.6",
+        max_iterations=4,
+        provider="anthropic",
+        agent_factory=_FakeAgent,
+    )
+
+    reply = service.respond(
+        household_id="hh_123",
+        channel_id="chan_dm_123",
+        actor_member_id="mem_123",
+        message_text="Can you read the exact closure dates from this image?",
+        message_attachments=(
+            FlorenceInboundAttachment(
+                kind="image",
+                mime_type="image/png",
+                filename="studio-closures.png",
+                data_url="data:image/png;base64,QUFBQQ==",
+            ),
+        ),
+    )
+
+    assert reply is not None
+    assert _FakeAgent.last_run["persist_user_message"] == "Can you read the exact closure dates from this image?"
+    assert _FakeAgent.last_run["user_message"] == [
+        {"type": "text", "text": "Can you read the exact closure dates from this image?"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUFBQQ=="}},
+    ]
     store.close()
 
 
@@ -1186,6 +1281,7 @@ def test_household_chat_service_compose_operator_message_group_share_turn_uses_e
     assert decision is not None
     assert "reply exactly EXECUTE_GROUP_SHARE" in _FakeAgent.last_run["system_message"]
     assert "reply exactly NO_GROUP_SHARE_PROTOCOL_ACTION" in _FakeAgent.last_run["system_message"]
+    assert "Bare links, screenshots, attachments, schedule feeds, webcal:// links, and .ics calendar URLs are not group-share requests by themselves." in _FakeAgent.last_run["system_message"]
     assert "\"task\": \"group_share_turn_decision\"" in _FakeAgent.last_run["user_message"]
     assert _FakeAgent.created[0]["skip_memory"] is True
     assert _FakeAgent.created[0]["honcho_session_key"] is None

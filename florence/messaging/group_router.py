@@ -57,6 +57,7 @@ class FlorenceGroupRouter:
             channel_id=resolved.channel_id,
             actor_member_id=resolved.member_id,
             message_text=resolved.message.body,
+            message_attachments=resolved.message.attachments,
         )
         if chat_result is not None:
             return self._result_from_protocol_reply(chat_result)

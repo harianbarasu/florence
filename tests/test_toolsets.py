@@ -151,6 +151,8 @@ class TestToolsetConsistency:
         assert "send_message" in tools
         assert "household_search_state" in tools
         assert "household_search_google_inbox" in tools
+        assert "household_search_google_calendar" in tools
+        assert "household_import_calendar_feed" in tools
         assert "household_apply_candidate_review" in tools
         assert "household_apply_nudge_action" in tools
         assert "household_apply_onboarding_update" in tools
@@ -172,6 +174,7 @@ class TestToolsetConsistency:
         assert tools == {
             "household_search_state",
             "household_search_google_inbox",
+            "household_search_google_calendar",
             "session_search",
             "honcho_context",
             "honcho_search",

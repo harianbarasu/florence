@@ -83,6 +83,8 @@ _FLORENCE_HOUSEHOLD_TOOLS = [
     "honcho_context", "honcho_profile", "honcho_search", "honcho_conclude",
     "household_search_state",
     "household_search_google_inbox",
+    "household_search_google_calendar",
+    "household_import_calendar_feed",
     "household_apply_candidate_review",
     "household_apply_nudge_action",
     "household_apply_onboarding_update",
@@ -102,6 +104,7 @@ _FLORENCE_ONBOARDING_TOOLS = [
 _FLORENCE_BRIEFING_TOOLS = [
     "household_search_state",
     "household_search_google_inbox",
+    "household_search_google_calendar",
     "session_search",
     "honcho_context",
     "honcho_search",

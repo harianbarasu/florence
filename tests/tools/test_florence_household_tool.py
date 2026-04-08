@@ -25,7 +25,7 @@ from florence.contracts import (
     Member,
     MemberRole,
 )
-from florence.google.types import GmailSyncItem
+from florence.google.types import GmailSyncItem, ParentCalendarSyncItem
 from florence.state import FlorenceStateDB
 from model_tools import handle_function_call
 from tools.florence_household_tool import (
@@ -448,6 +448,240 @@ def test_household_google_inbox_search_from_group_requires_shared_scope(tmp_path
         store.close()
 
 
+def test_household_google_calendar_search_matches_human_query_terms_without_exact_phrase(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Jackson's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Jackson",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Jackson",
+        )
+    )
+    connection = GoogleConnection(
+        id="gconn_cal_123",
+        household_id="hh_123",
+        member_id="mem_123",
+        email="jackson@example.com",
+        connected_scopes=(GoogleSourceKind.GOOGLE_CALENDAR,),
+        access_token="access-token",
+        metadata={
+            "calendar_last_synced_at": "2026-04-08T10:00:00+00:00",
+            "last_calendar_item_count": 2,
+            "last_sync_status": "ok",
+        },
+    )
+    store.upsert_google_connection(connection)
+    store.upsert_google_calendar_events(
+        connection=connection,
+        items=[
+            ParentCalendarSyncItem(
+                google_event_id="gcal_drall_123",
+                title="Theo DRALL Baseball Practice",
+                description="Practice at North Field",
+                location="North Field",
+                html_link="https://calendar.google.com/event?eid=drall123",
+                starts_at=datetime(2026, 4, 12, 16, 0, tzinfo=timezone.utc),
+                ends_at=datetime(2026, 4, 12, 17, 30, tzinfo=timezone.utc),
+                timezone="America/Los_Angeles",
+                all_day=False,
+                updated_at=datetime(2026, 4, 8, 9, 0, tzinfo=timezone.utc),
+                calendar_summary="GameChanger - DRALL Baseball",
+                family_member_names=["Theo"],
+                calendar_id="cal_gamechanger",
+                calendar_primary=False,
+            )
+        ],
+    )
+    task_id = "task-calendar-query"
+    set_household_tool_context(
+        task_id,
+        store=store,
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_dm_123",
+    )
+    try:
+        result = json.loads(
+            handle_function_call(
+                "household_search_google_calendar",
+                {"query": "drall baseball Theo"},
+                task_id=task_id,
+            )
+        )
+
+        assert result["search_scope"] == "private_parent"
+        assert result["scope_reason"] == "current_parent_dm"
+        assert result["searched_connection_emails"] == ["jackson@example.com"]
+        assert result["results"][0]["google_event_id"] == "gcal_drall_123"
+        assert result["results"][0]["calendar_summary"] == "GameChanger - DRALL Baseball"
+        assert result["results"][0]["family_member_names"] == ["Theo"]
+    finally:
+        clear_household_tool_context(task_id)
+        store.close()
+
+
+def test_household_google_calendar_search_from_group_requires_shared_scope(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_group_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="group-thread-123",
+            channel_type=ChannelType.HOUSEHOLD_GROUP,
+            title="Parent group",
+        )
+    )
+    store.upsert_google_connection(
+        GoogleConnection(
+            id="gconn_123",
+            household_id="hh_123",
+            member_id="mem_123",
+            email="maya@example.com",
+            connected_scopes=(GoogleSourceKind.GOOGLE_CALENDAR,),
+            access_token="access-token-maya",
+        )
+    )
+    task_id = "task-group-calendar-search"
+    set_household_tool_context(
+        task_id,
+        store=store,
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_group_123",
+    )
+    try:
+        result = json.loads(
+            handle_function_call(
+                "household_search_google_calendar",
+                {"query": "Theo baseball"},
+                task_id=task_id,
+            )
+        )
+
+        assert result["search_scope"] == "group_requires_shared_scope"
+        assert result["scope_reason"] == "group_chat_disallows_private_calendar_search"
+        assert result["searched_connection_emails"] == []
+        assert result["results"] == []
+        assert "family group only uses shared household scope" in result["error"]
+    finally:
+        clear_household_tool_context(task_id)
+        store.close()
+
+
+def test_household_import_calendar_feed_ingests_webcal_schedule(monkeypatch, tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Jackson household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Jackson",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Jackson",
+        )
+    )
+    store.replace_child_profiles(
+        household_id="hh_123",
+        children=[ChildProfile(id="child_theo", household_id="hh_123", full_name="Theo")],
+    )
+
+    class _Response:
+        status_code = 200
+
+        def __init__(self, text: str) -> None:
+            self.text = text
+
+        def raise_for_status(self) -> None:
+            return None
+
+    monkeypatch.setattr("tools.florence_household_tool.is_safe_url", lambda _url: True)
+    monkeypatch.setattr("tools.florence_household_tool.check_website_access", lambda _url: None)
+    monkeypatch.setattr(
+        "tools.florence_household_tool.httpx.get",
+        lambda url, **_: _Response(
+            "\r\n".join(
+                [
+                    "BEGIN:VCALENDAR",
+                    "X-WR-CALNAME:GameChanger - DRALL Baseball",
+                    "BEGIN:VEVENT",
+                    "UID:evt-1",
+                    "SUMMARY:Practice",
+                    "DTSTART;TZID=America/Los_Angeles:20260415T153000",
+                    "DTEND;TZID=America/Los_Angeles:20260415T170000",
+                    "LOCATION:North Field",
+                    "DESCRIPTION:Bring glove",
+                    "END:VEVENT",
+                    "END:VCALENDAR",
+                ]
+            )
+        ),
+    )
+
+    task_id = "task-import-calendar-feed"
+    set_household_tool_context(
+        task_id,
+        store=store,
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_dm_123",
+    )
+    try:
+        result = json.loads(
+            handle_function_call(
+                "household_import_calendar_feed",
+                {
+                    "url": "webcal://api.team-manager.gc.com/ics-calendar-documents/user/example.ics",
+                    "child_name": "Theo",
+                    "title_prefix": "DRALL Baseball",
+                },
+                task_id=task_id,
+            )
+        )
+
+        assert result["feed_url"] == "https://api.team-manager.gc.com/ics-calendar-documents/user/example.ics"
+        assert result["calendar_summary"] == "GameChanger - DRALL Baseball"
+        assert result["imported_count"] == 1
+        saved_event = store.list_household_events(household_id="hh_123")[0]
+        assert saved_event.title == "Theo — DRALL Baseball — Practice"
+        assert saved_event.metadata["imported_from_calendar_feed"] is True
+        assert saved_event.metadata["calendar_feed_uid"] == "evt-1"
+        assert saved_event.metadata["child_name"] == "Theo"
+    finally:
+        clear_household_tool_context(task_id)
+        store.close()
+
+
 def test_household_search_state_includes_structured_preferences(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     store.upsert_household(
@@ -603,6 +837,82 @@ def test_household_search_state_surfaces_scope_tentative_and_private_review_stat
         assert visibility["private_review_state"]["included_in_response"] is False
         assert visibility["private_review_state"]["pending_candidate_count"] == 0
         assert visibility["private_review_state"]["pending_candidates"] == []
+    finally:
+        clear_household_tool_context(task_id)
+        store.close()
+
+
+def test_household_search_state_surfaces_likely_duplicate_events(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.replace_child_profiles(
+        household_id="hh_123",
+        children=[ChildProfile(id="child_violet", household_id="hh_123", full_name="Violet")],
+    )
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    store.upsert_household_event(
+        HouseholdEvent(
+            id="evt_music_canonical",
+            household_id="hh_123",
+            title="Violet — Musical Beginnings Preschool Tunes",
+            starts_at="2026-04-15T15:30:00-07:00",
+            ends_at="2026-04-15T16:15:00-07:00",
+            status=HouseholdEventStatus.CONFIRMED,
+            metadata={"shared_google_calendar_event_id": "gcal_123"},
+        )
+    )
+    store.upsert_household_event(
+        HouseholdEvent(
+            id="evt_music_dup",
+            household_id="hh_123",
+            title="Violet music class",
+            starts_at="2026-04-15T15:30:00-07:00",
+            ends_at="2026-04-15T16:15:00-07:00",
+            status=HouseholdEventStatus.CONFIRMED,
+        )
+    )
+    task_id = "task-household-duplicate-events"
+    set_household_tool_context(
+        task_id,
+        store=store,
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_dm_123",
+    )
+    try:
+        result = json.loads(
+            handle_function_call(
+                "household_search_state",
+                {
+                    "query": "violet music",
+                    "entity_types": ["events"],
+                },
+                task_id=task_id,
+            )
+        )
+
+        groups = result["event_insights"]["likely_duplicate_groups"]
+        assert len(groups) == 1
+        assert groups[0]["canonical_event_id"] == "evt_music_canonical"
+        assert groups[0]["duplicate_event_ids"] == ["evt_music_dup"]
+        assert {event["id"] for event in groups[0]["events"]} == {"evt_music_canonical", "evt_music_dup"}
     finally:
         clear_household_tool_context(task_id)
         store.close()
@@ -828,6 +1138,72 @@ def test_household_apply_candidate_review_confirms_with_corrected_fields(tmp_pat
         assert result["result"]["event"]["starts_at"] == "2026-06-10T15:30:00-07:00"
         assert result["result"]["event"]["ends_at"] == "2026-06-10T16:15:00-07:00"
         assert result["result"]["reply_text"].startswith("Confirmed.")
+    finally:
+        clear_household_tool_context(task_id)
+        store.close()
+
+
+def test_household_upsert_event_can_cancel_existing_event_by_id_without_losing_fields(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    store.upsert_household_event(
+        HouseholdEvent(
+            id="evt_123",
+            household_id="hh_123",
+            title="Violet music class",
+            starts_at="2026-04-15T15:30:00-07:00",
+            ends_at="2026-04-15T16:15:00-07:00",
+            timezone="America/Los_Angeles",
+            location="Main Studio",
+            description="Preschool Tunes",
+            status=HouseholdEventStatus.CONFIRMED,
+            metadata={"source": "manual"},
+        )
+    )
+    task_id = "task-upsert-event-by-id"
+    set_household_tool_context(
+        task_id,
+        store=store,
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_dm_123",
+    )
+    try:
+        result = json.loads(
+            handle_function_call(
+                "household_upsert_event",
+                {
+                    "id": "evt_123",
+                    "status": "cancelled",
+                },
+                task_id=task_id,
+            )
+        )
+
+        assert result["result"]["id"] == "evt_123"
+        assert result["result"]["status"] == "cancelled"
+        assert result["result"]["title"] == "Violet music class"
+        assert result["result"]["starts_at"] == "2026-04-15T15:30:00-07:00"
+        assert result["result"]["location"] == "Main Studio"
+        assert result["result"]["metadata"]["source"] == "manual"
     finally:
         clear_household_tool_context(task_id)
         store.close()

@@ -10,6 +10,8 @@ from datetime import datetime
 from dataclasses import dataclass
 from typing import Any
 
+import httpx
+from florence.calendar_feed import parse_calendar_feed
 from florence.contracts import (
     CandidateState,
     GoogleSourceKind,
@@ -36,12 +38,21 @@ from florence.messaging.protocol_types import (
 )
 from florence.onboarding import OnboardingStage
 from florence.runtime.candidate_review import FlorenceCandidateReviewService
-from florence.runtime.household_calendar_projection import FlorenceHouseholdCalendarProjectionService
+from florence.runtime.household_calendar_projection import (
+    HOUSEHOLD_CALENDAR_PROJECTION_EVENT_ID_KEY,
+    FlorenceHouseholdCalendarProjectionService,
+)
 from florence.runtime.household_manager import FlorenceHouseholdManagerService
 from florence.runtime.onboarding_service import FlorenceOnboardingSessionService
-from florence.runtime.visibility import resolve_conversation_scope, resolve_google_inbox_scope
+from florence.runtime.visibility import (
+    resolve_conversation_scope,
+    resolve_google_calendar_scope,
+    resolve_google_inbox_scope,
+)
 from florence.state import FlorenceStateDB
 from tools.registry import registry
+from tools.url_safety import is_safe_url
+from tools.website_policy import check_website_access
 
 
 @dataclass(slots=True)
@@ -371,13 +382,174 @@ def _matches_query(fields: list[Any], query: str) -> bool:
     return False
 
 
+_DUPLICATE_EVENT_STOPWORDS = {
+    "the",
+    "and",
+    "with",
+    "for",
+    "from",
+    "class",
+    "lesson",
+    "event",
+    "schedule",
+    "session",
+}
+
+
+def _event_tokens(event: HouseholdEvent, *, child_tokens: set[str]) -> set[str]:
+    fields = [event.title, event.description, event.location]
+    if isinstance(event.metadata, dict):
+        fields.extend(
+            [
+                event.metadata.get("child_name"),
+                event.metadata.get("activity_name"),
+                event.metadata.get("calendar_summary"),
+                event.metadata.get("source_label"),
+            ]
+        )
+    tokens = {
+        token
+        for token in re.findall(r"[a-z0-9]+", " ".join(str(field or "").lower() for field in fields))
+        if len(token) >= 3 and token not in _DUPLICATE_EVENT_STOPWORDS
+    }
+    root_tokens = {token[:5] for token in tokens if len(token) >= 5}
+    matched_children = {token for token in child_tokens if token in tokens}
+    return tokens | root_tokens | matched_children
+
+
+def _events_look_duplicate(
+    first: HouseholdEvent,
+    second: HouseholdEvent,
+    *,
+    child_tokens: set[str],
+) -> bool:
+    if first.id == second.id:
+        return False
+    if first.status == HouseholdEventStatus.CANCELLED or second.status == HouseholdEventStatus.CANCELLED:
+        return False
+    if not first.starts_at or not second.starts_at or first.starts_at != second.starts_at:
+        return False
+    if first.ends_at and second.ends_at and first.ends_at != second.ends_at:
+        return False
+    first_title = _normalize_text(first.title).lower()
+    second_title = _normalize_text(second.title).lower()
+    if first_title and first_title == second_title:
+        return True
+    shared_tokens = _event_tokens(first, child_tokens=child_tokens) & _event_tokens(second, child_tokens=child_tokens)
+    if len(shared_tokens) >= 2:
+        return True
+    child_overlap = shared_tokens & child_tokens
+    return bool(child_overlap) and bool(shared_tokens - child_tokens)
+
+
+def _event_duplicate_sort_key(event: HouseholdEvent) -> tuple[int, int, int, str]:
+    metadata = event.metadata if isinstance(event.metadata, dict) else {}
+    return (
+        0 if event.status == HouseholdEventStatus.CONFIRMED else 1,
+        0 if str(metadata.get(HOUSEHOLD_CALENDAR_PROJECTION_EVENT_ID_KEY) or "").strip() else 1,
+        0 if event.source_candidate_id else 1,
+        event.id,
+    )
+
+
+def _build_event_duplicate_groups(
+    context: FlorenceHouseholdToolContext,
+    *,
+    events: list[HouseholdEvent],
+    limit: int,
+) -> list[dict[str, Any]]:
+    child_tokens: set[str] = set()
+    for child in context.store.list_child_profiles(household_id=context.household_id):
+        full_name = _normalize_text(child.full_name).lower()
+        if full_name:
+            child_tokens.add(full_name)
+            first_name = full_name.split()[0]
+            if first_name:
+                child_tokens.add(first_name)
+        if isinstance(child.metadata, dict):
+            for alias in child.metadata.get("aliases", []):
+                normalized = _normalize_text(alias).lower()
+                if normalized:
+                    child_tokens.add(normalized)
+
+    adjacency: dict[str, set[str]] = {event.id: set() for event in events}
+    indexed = {event.id: event for event in events}
+    for index, first in enumerate(events):
+        for second in events[index + 1 :]:
+            if _events_look_duplicate(first, second, child_tokens=child_tokens):
+                adjacency[first.id].add(second.id)
+                adjacency[second.id].add(first.id)
+
+    groups: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for event in events:
+        if event.id in seen or not adjacency.get(event.id):
+            continue
+        stack = [event.id]
+        component_ids: list[str] = []
+        while stack:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            component_ids.append(current)
+            stack.extend(sorted(adjacency.get(current, set()) - seen))
+        component = sorted((indexed[event_id] for event_id in component_ids), key=_event_duplicate_sort_key)
+        if len(component) < 2:
+            continue
+        shared_tokens = set.intersection(*[_event_tokens(item, child_tokens=child_tokens) for item in component])
+        canonical = component[0]
+        groups.append(
+            {
+                "canonical_event_id": canonical.id,
+                "duplicate_event_ids": [item.id for item in component[1:]],
+                "shared_tokens": sorted(shared_tokens)[:6],
+                "events": [_serialize_event(item) for item in component],
+            }
+        )
+
+    groups.sort(key=lambda item: (str(item["events"][0].get("starts_at") or ""), item["canonical_event_id"]))
+    return groups[:limit]
+
+
+def _normalize_calendar_feed_url(url: str) -> str:
+    text = str(url or "").strip()
+    lowered = text.lower()
+    if lowered.startswith("webcal://"):
+        return "https://" + text.split("://", 1)[1]
+    return text
+
+
+def _fetch_calendar_feed_text(url: str) -> tuple[str, str]:
+    normalized_url = _normalize_calendar_feed_url(url)
+    if not normalized_url:
+        raise ValueError("Missing required parameter: url")
+    if not is_safe_url(normalized_url):
+        raise ValueError("Calendar feed URL is not allowed.")
+    blocked = check_website_access(normalized_url)
+    if blocked is not None:
+        raise ValueError(str(blocked.get("message") or "Calendar feed URL is blocked by website policy."))
+    response = httpx.get(
+        normalized_url,
+        headers={
+            "User-Agent": "Florence/1.0 (+https://hermes-agent.nousresearch.com)",
+            "Accept": "text/calendar,application/octet-stream,text/plain,*/*",
+        },
+        follow_redirects=True,
+        timeout=30.0,
+    )
+    response.raise_for_status()
+    return normalized_url, response.text
+
+
 SEARCH_STATE_SCHEMA = {
     "name": "household_search_state",
     "description": (
         "Search Florence household state when you need to pull the latest tracked work, routines, nudges, meals, "
         "shopping items, events, children, or profile items including household preferences. "
         "The result also includes structured scope context showing the current channel scope and tentative tracked "
-        "state. Private review details are hidden by default unless you explicitly request them. Use this before "
+        "state. Private review details are hidden by default unless you explicitly request them. Event searches also "
+        "surface likely duplicate-event groups when Florence sees overlapping schedule entries. Use this before "
         "updating existing state if the current household picture is unclear."
     ),
     "parameters": {
@@ -672,6 +844,72 @@ SEARCH_GOOGLE_INBOX_SCHEMA = {
     },
 }
 
+SEARCH_GOOGLE_CALENDAR_SCHEMA = {
+    "name": "household_search_google_calendar",
+    "description": (
+        "Search Florence's mirrored Google Calendar events for the schedule, class, practice, appointment, or calendar-derived detail that best answers the current request. "
+        "Use this when calendar context is likely to already contain the answer, instead of asking the user to restate schedule details that may already be on their calendar. "
+        "In a parent DM, this defaults to that parent's mirrored calendar unless the request clearly matches shared household source rules. "
+        "In the family group, only shared-household calendar scope is allowed."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Optional free-text search such as 'Theo DRALL baseball' or 'Violet music Thursdays'.",
+            },
+            "calendar_summary": {
+                "type": "string",
+                "description": "Optional calendar name or summary to prioritize, such as 'GameChanger' or 'Family'.",
+            },
+            "newer_than_days": {
+                "type": "integer",
+                "description": "How far back to include events that may still be relevant. Default 180 days.",
+            },
+            "max_results": {
+                "type": "integer",
+                "description": "Maximum number of matching events to return. Default 5.",
+            },
+        },
+        "required": [],
+    },
+}
+
+IMPORT_CALENDAR_FEED_SCHEMA = {
+    "name": "household_import_calendar_feed",
+    "description": (
+        "Fetch and ingest a shareable calendar feed such as a webcal:// or .ics schedule link into durable Florence household events. "
+        "Use this when a parent pastes a team, school, class, or activity calendar feed they want Florence to remember or keep on the calendar."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "url": {
+                "type": "string",
+                "description": "Required calendar-feed URL. Florence accepts webcal:// or https:// links to .ics feeds.",
+            },
+            "child_name": {
+                "type": "string",
+                "description": "Optional child the schedule belongs to, such as 'Theo'.",
+            },
+            "title_prefix": {
+                "type": "string",
+                "description": "Optional label to prefix imported event titles when the feed titles are too generic.",
+            },
+            "max_events": {
+                "type": "integer",
+                "description": "Maximum number of feed events to ingest from this fetch. Default 75.",
+            },
+            "metadata": {
+                "type": "object",
+                "description": "Optional structured metadata to store on every imported event.",
+            },
+        },
+        "required": ["url"],
+    },
+}
+
 
 UPSERT_EVENT_SCHEMA = {
     "name": "household_upsert_event",
@@ -683,7 +921,7 @@ UPSERT_EVENT_SCHEMA = {
         "type": "object",
         "properties": {
             "id": {"type": "string", "description": "Existing event id to update. Omit to upsert by title + start time."},
-            "title": {"type": "string", "description": "Event title."},
+            "title": {"type": "string", "description": "Event title. Required when creating a new event, optional when updating an existing id."},
             "starts_at": {"type": "string", "description": "Optional ISO timestamp when the event starts."},
             "ends_at": {"type": "string", "description": "Optional ISO timestamp when the event ends."},
             "timezone": {"type": "string", "description": "Optional timezone id."},
@@ -697,7 +935,7 @@ UPSERT_EVENT_SCHEMA = {
             },
             "metadata": {"type": "object", "description": "Optional structured metadata."},
         },
-        "required": ["title"],
+        "required": [],
     },
 }
 
@@ -901,6 +1139,8 @@ def _handle_search_state(args: dict, *, task_id: str | None = None, **_: Any) ->
         }
 
     results: dict[str, list[dict[str, Any]]] = {}
+    event_matches: list[HouseholdEvent] = []
+    duplicate_event_groups: list[dict[str, Any]] = []
 
     if "work_items" in entity_types:
         matches = [
@@ -951,12 +1191,32 @@ def _handle_search_state(args: dict, *, task_id: str | None = None, **_: Any) ->
         results["shopping_items"] = matches[:limit]
 
     if "events" in entity_types:
-        matches = [
-            _serialize_event(item)
-            for item in context.store.list_household_events(household_id=context.household_id)
+        all_events = context.store.list_household_events(household_id=context.household_id)
+        event_matches = [
+            item
+            for item in all_events
             if _matches_query([item.title, item.description, item.location, item.status.value, item.metadata], query)
         ]
-        results["events"] = matches[:limit]
+        results["events"] = [_serialize_event(item) for item in event_matches[:limit]]
+        duplicate_event_groups = _build_event_duplicate_groups(context, events=all_events, limit=max(limit, 25))
+        if query:
+            duplicate_event_groups = [
+                group
+                for group in duplicate_event_groups
+                if any(
+                    _matches_query(
+                        [
+                            event.get("title"),
+                            event.get("description"),
+                            event.get("location"),
+                            event.get("status"),
+                            event.get("metadata"),
+                        ],
+                        query,
+                    )
+                    for event in group["events"]
+                )
+            ]
 
     if "children" in entity_types:
         matches = [
@@ -1001,6 +1261,9 @@ def _handle_search_state(args: dict, *, task_id: str | None = None, **_: Any) ->
                 include_private_review_state=include_private_review_state,
             ),
             "results": results,
+            "event_insights": {
+                "likely_duplicate_groups": duplicate_event_groups[:limit],
+            },
         }
     )
 
@@ -1329,6 +1592,26 @@ def _serialize_gmail_item(item, *, connection_email: str) -> dict[str, Any]:
     }
 
 
+def _serialize_calendar_item(item, *, connection_email: str) -> dict[str, Any]:
+    return {
+        "connection_email": connection_email,
+        "google_event_id": item.google_event_id,
+        "title": item.title,
+        "description": item.description,
+        "location": item.location,
+        "html_link": item.html_link,
+        "starts_at": item.starts_at.isoformat() if item.starts_at is not None else None,
+        "ends_at": item.ends_at.isoformat() if item.ends_at is not None else None,
+        "timezone": item.timezone,
+        "all_day": bool(item.all_day),
+        "updated_at": item.updated_at.isoformat() if item.updated_at is not None else None,
+        "calendar_summary": item.calendar_summary,
+        "family_member_names": list(item.family_member_names),
+        "calendar_id": item.calendar_id,
+        "calendar_primary": bool(item.calendar_primary),
+    }
+
+
 def _handle_search_google_inbox(args: dict, *, task_id: str | None = None, **_: Any) -> str:
     context = _require_context(task_id)
     query = _normalize_optional_text(args.get("query"))
@@ -1424,6 +1707,188 @@ def _handle_search_google_inbox(args: dict, *, task_id: str | None = None, **_: 
     )
 
 
+def _handle_search_google_calendar(args: dict, *, task_id: str | None = None, **_: Any) -> str:
+    context = _require_context(task_id)
+    query = _normalize_optional_text(args.get("query"))
+    calendar_summary = _normalize_optional_text(args.get("calendar_summary"))
+    newer_than_days = max(1, min(int(args.get("newer_than_days", 180) or 180), 365))
+    max_results = max(1, min(int(args.get("max_results", 5) or 5), 10))
+
+    google_scope = resolve_google_calendar_scope(
+        context.store,
+        household_id=context.household_id,
+        channel_id=context.channel_id,
+        actor_member_id=context.actor_member_id,
+        query=query,
+        calendar_summary=calendar_summary,
+    )
+    if google_scope.error:
+        return json.dumps(
+            {
+                "error": google_scope.error,
+                "search_scope": google_scope.search_scope,
+                "scope_reason": google_scope.scope_reason,
+                "searched_connection_emails": [],
+                "results": [],
+            }
+        )
+
+    connections = google_scope.connections
+    search_scope = google_scope.search_scope
+    scope_reason = google_scope.scope_reason
+    connection_sync_statuses = [
+        {
+            "email": connection.email,
+            "initial_sync_state": (dict(connection.metadata).get("initial_sync_state") if isinstance(connection.metadata, dict) else None),
+            "last_sync_status": (dict(connection.metadata).get("last_sync_status") if isinstance(connection.metadata, dict) else None),
+            "last_sync_error": (dict(connection.metadata).get("last_sync_error") if isinstance(connection.metadata, dict) else None),
+            "sync_phase": (dict(connection.metadata).get("sync_phase") if isinstance(connection.metadata, dict) else None),
+            "calendar_last_synced_at": (dict(connection.metadata).get("calendar_last_synced_at") if isinstance(connection.metadata, dict) else None),
+            "last_calendar_item_count": (dict(connection.metadata).get("last_calendar_item_count") if isinstance(connection.metadata, dict) else None),
+        }
+        for connection in connections
+    ]
+    mirror_sync_running = any(
+        status.get("initial_sync_state") == "running" or status.get("last_sync_status") == "running"
+        for status in connection_sync_statuses
+    )
+
+    if not connections:
+        return json.dumps(
+            {
+                "error": "No active Google Calendar is connected for this household member.",
+                "search_scope": search_scope,
+                "scope_reason": scope_reason,
+                "mirror_sync_running": False,
+                "connection_sync_statuses": [],
+                "results": [],
+            }
+        )
+
+    searched_connection_emails = [connection.email for connection in connections]
+    mirror_results = context.store.search_google_calendar_events(
+        household_id=context.household_id,
+        connection_ids=[connection.id for connection in connections],
+        query=query,
+        calendar_summary=calendar_summary,
+        newer_than_days=newer_than_days,
+        limit=max_results,
+    )
+    results = [
+        _serialize_calendar_item(item, connection_email=item.connection_email)
+        for item in mirror_results
+    ]
+
+    return json.dumps(
+        {
+            "search_backend": "local_mirror",
+            "search_scope": search_scope,
+            "scope_reason": scope_reason,
+            "mirror_sync_running": mirror_sync_running,
+            "connection_sync_statuses": connection_sync_statuses,
+            "searched_connection_emails": searched_connection_emails,
+            "results": results[:max_results],
+        }
+    )
+
+
+def _handle_import_calendar_feed(args: dict, *, task_id: str | None = None, **_: Any) -> str:
+    context = _require_context(task_id)
+    raw_url = _normalize_text(args.get("url"))
+    if not raw_url:
+        return json.dumps({"error": "Missing required parameter: url"})
+    household = context.store.get_household(context.household_id)
+    default_timezone = household.timezone if household is not None else "UTC"
+    title_prefix = _normalize_optional_text(args.get("title_prefix"))
+    child_name = _normalize_optional_text(args.get("child_name"))
+    child_id = _resolve_child_id(context, child_name=child_name) if child_name else None
+    child_display_name = None
+    if child_id:
+        child = next(
+            (item for item in context.store.list_child_profiles(household_id=context.household_id) if item.id == child_id),
+            None,
+        )
+        child_display_name = child.full_name if child is not None else child_name
+    max_events = max(1, min(int(args.get("max_events", 75) or 75), 250))
+    base_metadata = _normalize_metadata(args.get("metadata"))
+
+    try:
+        normalized_url, feed_text = _fetch_calendar_feed_text(raw_url)
+    except ValueError as exc:
+        return json.dumps({"error": str(exc)})
+    except httpx.HTTPError as exc:
+        return json.dumps({"error": f"Failed to fetch calendar feed: {exc}"})
+
+    calendar_summary, parsed_events = parse_calendar_feed(feed_text, default_timezone=default_timezone)
+    imported_events: list[dict[str, Any]] = []
+    imported_count = 0
+    skipped_without_start = 0
+    for item in parsed_events[:max_events]:
+        if not item.starts_at:
+            skipped_without_start += 1
+            continue
+        title = _normalize_text(item.summary)
+        if title_prefix:
+            if title:
+                title = f"{title_prefix} — {title}"
+            else:
+                title = title_prefix
+        if child_display_name and child_display_name.lower() not in title.lower():
+            title = f"{child_display_name} — {title}" if title else child_display_name
+        title = title or "Calendar event"
+        metadata = {
+            "imported_from_calendar_feed": True,
+            "calendar_feed_url": normalized_url,
+            "calendar_feed_uid": item.uid,
+            "calendar_feed_recurrence_id": item.recurrence_id,
+            "calendar_summary": calendar_summary,
+        }
+        if child_id:
+            metadata["child_id"] = child_id
+        if child_display_name:
+            metadata["child_name"] = child_display_name
+        metadata.update(base_metadata)
+        event_id = _stable_id(
+            "evt_feed",
+            context.household_id,
+            normalized_url,
+            str(item.uid or title),
+            str(item.recurrence_id or item.starts_at or ""),
+        )
+        existing_event = context.store.get_household_event(event_id)
+        merged_metadata = dict(existing_event.metadata) if existing_event is not None and isinstance(existing_event.metadata, dict) else {}
+        merged_metadata.update(metadata)
+        event = context.store.upsert_household_event(
+            HouseholdEvent(
+                id=event_id,
+                household_id=context.household_id,
+                title=title,
+                starts_at=item.starts_at,
+                ends_at=item.ends_at or item.starts_at,
+                timezone=item.timezone or default_timezone,
+                all_day=item.all_day,
+                location=_normalize_optional_text(item.location),
+                description=_normalize_optional_text(item.description),
+                source_candidate_id=existing_event.source_candidate_id if existing_event is not None else None,
+                status=HouseholdEventStatus.CONFIRMED,
+                metadata=merged_metadata,
+            )
+        )
+        imported_events.append(_serialize_event(event))
+        imported_count += 1
+
+    _sync_household_calendar_projection(context)
+    return json.dumps(
+        {
+            "feed_url": normalized_url,
+            "calendar_summary": calendar_summary,
+            "imported_count": imported_count,
+            "skipped_without_start_count": skipped_without_start,
+            "results": imported_events,
+        }
+    )
+
+
 def _handle_upsert_work_item(args: dict, *, task_id: str | None = None, **_: Any) -> str:
     context = _require_context(task_id)
     manager = FlorenceHouseholdManagerService(context.store)
@@ -1455,28 +1920,43 @@ def _handle_upsert_work_item(args: dict, *, task_id: str | None = None, **_: Any
 
 def _handle_upsert_event(args: dict, *, task_id: str | None = None, **_: Any) -> str:
     context = _require_context(task_id)
-    title = _normalize_text(args.get("title"))
+    event_id = _normalize_optional_text(args.get("id"))
+    existing_event = context.store.get_household_event(event_id) if event_id else None
+    title = _normalize_text(args.get("title")) or (existing_event.title if existing_event is not None else "")
     if not title:
         return json.dumps({"error": "Missing required parameter: title"})
-    starts_at = _normalize_optional_text(args.get("starts_at"))
+    starts_at = _normalize_optional_text(args.get("starts_at")) or (existing_event.starts_at if existing_event is not None else None)
+    ends_at = _normalize_optional_text(args.get("ends_at")) or (existing_event.ends_at if existing_event is not None else None)
+    timezone_name = _normalize_optional_text(args.get("timezone")) or (existing_event.timezone if existing_event is not None else None)
+    location = _normalize_optional_text(args.get("location")) or (existing_event.location if existing_event is not None else None)
+    description = _normalize_optional_text(args.get("description")) or (existing_event.description if existing_event is not None else None)
+    if "all_day" in args:
+        all_day = bool(args.get("all_day"))
+    else:
+        all_day = existing_event.all_day if existing_event is not None else False
+    metadata = dict(existing_event.metadata) if existing_event is not None and isinstance(existing_event.metadata, dict) else {}
+    if "metadata" in args:
+        metadata.update(_normalize_metadata(args.get("metadata")))
     event = context.store.upsert_household_event(
         HouseholdEvent(
-            id=_normalize_optional_text(args.get("id"))
-            or _stable_id("evt", context.household_id, starts_at or "unscheduled", title.lower()),
+            id=event_id or _stable_id("evt", context.household_id, starts_at or "unscheduled", title.lower()),
             household_id=context.household_id,
             title=title,
             starts_at=starts_at,
-            ends_at=_normalize_optional_text(args.get("ends_at")),
-            timezone=_normalize_optional_text(args.get("timezone")),
-            all_day=bool(args.get("all_day")),
-            location=_normalize_optional_text(args.get("location")),
-            description=_normalize_optional_text(args.get("description")),
+            ends_at=ends_at,
+            timezone=timezone_name,
+            all_day=all_day,
+            location=location,
+            description=description,
+            source_candidate_id=existing_event.source_candidate_id if existing_event is not None else None,
             status=_enum_value(
                 HouseholdEventStatus,
                 args.get("status"),
-                HouseholdEventStatus.CONFIRMED if starts_at else HouseholdEventStatus.TENTATIVE,
+                existing_event.status
+                if existing_event is not None
+                else (HouseholdEventStatus.CONFIRMED if starts_at else HouseholdEventStatus.TENTATIVE),
             ),
-            metadata=_normalize_metadata(args.get("metadata")),
+            metadata=metadata,
         )
     )
     _sync_household_calendar_projection(context)
@@ -1670,6 +2150,20 @@ registry.register(
     toolset="florence_household",
     schema=SEARCH_GOOGLE_INBOX_SCHEMA,
     handler=_handle_search_google_inbox,
+    check_fn=_check_household_tool_requirements,
+)
+registry.register(
+    name="household_search_google_calendar",
+    toolset="florence_household",
+    schema=SEARCH_GOOGLE_CALENDAR_SCHEMA,
+    handler=_handle_search_google_calendar,
+    check_fn=_check_household_tool_requirements,
+)
+registry.register(
+    name="household_import_calendar_feed",
+    toolset="florence_household",
+    schema=IMPORT_CALENDAR_FEED_SCHEMA,
+    handler=_handle_import_calendar_feed,
     check_fn=_check_household_tool_requirements,
 )
 registry.register(

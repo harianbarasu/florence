@@ -771,6 +771,18 @@ def _derive_filename(url: str, content_disposition: str = "") -> str:
     return tail or "document"
 
 
+def _normalize_fetch_url(url: str) -> str:
+    text = str(url or "").strip()
+    if not text:
+        return text
+    lowered = text.lower()
+    if lowered.startswith("webcal://"):
+        return "https://" + text.split("://", 1)[1]
+    if not lowered.startswith(("http://", "https://")):
+        return f"https://{text}"
+    return text
+
+
 def _parse_model_json(text: Any) -> Optional[dict]:
     if not isinstance(text, str):
         return None
@@ -1011,6 +1023,7 @@ async def _direct_http_extract(urls: List[str]) -> List[Dict[str, Any]]:
         timeout=httpx.Timeout(timeout=60.0, connect=10.0),
     ) as client:
         for url in urls:
+            url = _normalize_fetch_url(url)
             if is_interrupted():
                 results.append({"url": url, "error": "Interrupted", "title": ""})
                 continue
@@ -1545,6 +1558,7 @@ async def web_extract_tool(
         safe_urls = []
         ssrf_blocked: List[Dict[str, Any]] = []
         for url in urls:
+            url = _normalize_fetch_url(url)
             if not is_safe_url(url):
                 ssrf_blocked.append({
                     "url": url, "title": "", "content": "",

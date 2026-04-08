@@ -10,7 +10,7 @@ from florence.contracts import (
     GoogleSourceKind,
     HouseholdSourceVisibility,
 )
-from florence.source_rules import request_matches_shared_gmail_rule
+from florence.source_rules import request_matches_shared_calendar_rule, request_matches_shared_gmail_rule
 from florence.state import FlorenceStateDB
 
 
@@ -35,6 +35,14 @@ class FlorenceConversationScope:
 
 @dataclass(slots=True)
 class FlorenceGoogleInboxScope:
+    search_scope: str
+    scope_reason: str
+    connections: list[Any]
+    error: str | None = None
+
+
+@dataclass(slots=True)
+class FlorenceGoogleCalendarScope:
     search_scope: str
     scope_reason: str
     connections: list[Any]
@@ -160,6 +168,82 @@ def resolve_google_inbox_scope(
             connections=household_connections,
         )
     return FlorenceGoogleInboxScope(
+        search_scope="private_parent",
+        scope_reason="current_parent_dm",
+        connections=member_connections,
+    )
+
+
+def resolve_google_calendar_scope(
+    store: FlorenceStateDB,
+    *,
+    household_id: str,
+    channel_id: str,
+    actor_member_id: str | None,
+    query: str | None,
+    calendar_summary: str | None,
+) -> FlorenceGoogleCalendarScope:
+    household_connections = [
+        connection
+        for connection in store.list_google_connections(household_id=household_id)
+        if GoogleSourceKind.GOOGLE_CALENDAR in connection.connected_scopes
+    ]
+    shared_rules = store.list_household_source_rules(
+        household_id=household_id,
+        source_kind=GoogleSourceKind.GOOGLE_CALENDAR,
+        visibility=HouseholdSourceVisibility.SHARED,
+    )
+    scope = resolve_conversation_scope(
+        store,
+        channel_id=channel_id,
+        actor_member_id=actor_member_id,
+    )
+    search_shared_household = request_matches_shared_calendar_rule(
+        shared_rules,
+        query=query,
+        calendar_summary=calendar_summary,
+    )
+
+    if scope.is_shared_household_group:
+        if not search_shared_household:
+            return FlorenceGoogleCalendarScope(
+                search_scope="group_requires_shared_scope",
+                scope_reason="group_chat_disallows_private_calendar_search",
+                connections=[],
+                error=(
+                    "Calendar search from the family group only uses shared household scope. "
+                    "Use a private DM for private calendar lookup, or ask here about a shared team, class, school, or calendar."
+                ),
+            )
+        return FlorenceGoogleCalendarScope(
+            search_scope="shared_household",
+            scope_reason="matched_shared_source_rule",
+            connections=household_connections,
+        )
+
+    member_connections: list[Any] = []
+    if actor_member_id:
+        member_connections = [
+            connection
+            for connection in store.list_google_connections(
+                household_id=household_id,
+                member_id=actor_member_id,
+            )
+            if GoogleSourceKind.GOOGLE_CALENDAR in connection.connected_scopes
+        ]
+    if search_shared_household:
+        return FlorenceGoogleCalendarScope(
+            search_scope="shared_household",
+            scope_reason="matched_shared_source_rule",
+            connections=household_connections,
+        )
+    if not member_connections and (actor_member_id is None or len(household_connections) == 1):
+        return FlorenceGoogleCalendarScope(
+            search_scope="available_connected_calendar",
+            scope_reason="single_connected_calendar_fallback",
+            connections=household_connections,
+        )
+    return FlorenceGoogleCalendarScope(
         search_scope="private_parent",
         scope_reason="current_parent_dm",
         connections=member_connections,

@@ -3,6 +3,8 @@ import types
 
 import florence.linq.media as linq_media
 from florence.linq import parse_linq_payload
+from florence.media.openai_extract import RenderedPdfPageImage
+from florence.messaging.types import FLORENCE_MEDIA_ATTACHMENTS_METADATA_KEY
 
 
 def test_enrich_linq_payload_with_media_text_appends_extracted_attachment_context(monkeypatch):
@@ -41,6 +43,18 @@ def test_enrich_linq_payload_with_media_text_appends_extracted_attachment_contex
         raise AssertionError(f"Unexpected URL: {url}")
 
     monkeypatch.setattr(linq_media.httpx, "get", _fake_get)
+    monkeypatch.setattr(
+        linq_media,
+        "render_pdf_pages_to_images",
+        lambda **kwargs: (
+            RenderedPdfPageImage(
+                page_number=1,
+                mime_type="image/png",
+                image_bytes=b"pdf-page",
+                data_url="data:image/png;base64,cGRmLXBhZ2U=",
+            ),
+        ),
+    )
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
 
     class _FakeResponses:
@@ -67,6 +81,15 @@ def test_enrich_linq_payload_with_media_text_appends_extracted_attachment_contex
     assert "Media context extracted from attachments" in inbound.body
     assert "screenshot.png: Flyer says baseball practice Tuesday 4:30 PM." in inbound.body
     assert "form.pdf: Picture Day form due Thursday at 8am." in inbound.body
+    assert len(inbound.attachments) == 3
+    assert inbound.attachments[0].kind == "image"
+    assert inbound.attachments[0].data_url.startswith("data:image/png;base64,")
+    assert inbound.attachments[1].kind == "pdf"
+    assert inbound.attachments[2].kind == "image"
+    assert inbound.attachments[2].filename == "form.pdf#page-1.png"
+    assert inbound.attachments[2].data_url == "data:image/png;base64,cGRmLXBhZ2U="
+    assert payload[FLORENCE_MEDIA_ATTACHMENTS_METADATA_KEY][1]["filename"] == "form.pdf"
+    assert payload[FLORENCE_MEDIA_ATTACHMENTS_METADATA_KEY][2]["filename"] == "form.pdf#page-1.png"
 
 
 def test_enrich_linq_payload_with_media_text_no_media_parts_returns_false():

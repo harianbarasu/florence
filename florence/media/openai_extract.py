@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import logging
 import os
+from dataclasses import dataclass
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -25,6 +26,14 @@ DEFAULT_IMAGE_EXTRACTION_PROMPT = (
     "If some text is unclear, say that briefly instead of inventing details. "
     "Return plain text that helps Florence handle logistics or meal and grocery planning."
 )
+
+
+@dataclass(frozen=True, slots=True)
+class RenderedPdfPageImage:
+    page_number: int
+    mime_type: str
+    image_bytes: bytes
+    data_url: str
 
 
 def compact_text(raw: str, *, max_length: int) -> str:
@@ -72,6 +81,68 @@ def build_pdf_data_url(pdf_bytes: bytes) -> str:
 def build_image_data_url(image_bytes: bytes, mime_type: str) -> str:
     encoded = base64.b64encode(image_bytes).decode("ascii")
     return f"data:{mime_type};base64,{encoded}"
+
+
+def render_pdf_pages_to_images(
+    *,
+    pdf_bytes: bytes,
+    filename: str | None,
+    log_label: str,
+    max_pages: int = 2,
+    zoom: float = 2.0,
+) -> tuple[RenderedPdfPageImage, ...]:
+    fitz = None
+    try:  # pragma: no branch
+        import fitz as imported_fitz  # type: ignore[import-not-found]
+
+        fitz = imported_fitz
+    except Exception:
+        try:
+            import pymupdf as imported_fitz  # type: ignore[import-not-found]
+
+            fitz = imported_fitz
+        except Exception:
+            fitz = None
+
+    if fitz is None:
+        logger.warning("%s skipped for %s: PyMuPDF not installed", log_label, filename or "attachment.pdf")
+        return ()
+
+    try:
+        document = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception:
+        logger.exception("%s failed to open %s", log_label, filename or "attachment.pdf")
+        return ()
+
+    try:
+        page_count = min(max(int(max_pages), 0), int(getattr(document, "page_count", len(document))))
+        if page_count <= 0:
+            return ()
+        matrix = fitz.Matrix(float(zoom), float(zoom))
+        rendered_pages: list[RenderedPdfPageImage] = []
+        for page_index in range(page_count):
+            page = document.load_page(page_index)
+            pixmap = page.get_pixmap(matrix=matrix, alpha=False)
+            image_bytes = pixmap.tobytes("png")
+            if not image_bytes:
+                continue
+            rendered_pages.append(
+                RenderedPdfPageImage(
+                    page_number=page_index + 1,
+                    mime_type="image/png",
+                    image_bytes=image_bytes,
+                    data_url=build_image_data_url(image_bytes, "image/png"),
+                )
+            )
+        return tuple(rendered_pages)
+    except Exception:
+        logger.exception("%s failed to render %s", log_label, filename or "attachment.pdf")
+        return ()
+    finally:
+        try:
+            document.close()
+        except Exception:
+            pass
 
 
 def _openai_client(

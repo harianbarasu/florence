@@ -1,6 +1,7 @@
 import json
 import re
 from florence.messaging import (
+    FlorenceInboundAttachment,
     FlorenceInboundMessage,
     FlorenceMessagingIngressService,
     FlorenceResolvedInboundMessage,
@@ -159,6 +160,7 @@ class _StubHouseholdChatService:
         channel_id: str,
         actor_member_id: str | None,
         message_text: str,
+        message_attachments=(),
         conversation_history=None,
     ):
         self.calls.append(
@@ -167,6 +169,7 @@ class _StubHouseholdChatService:
                 "channel_id": channel_id,
                 "actor_member_id": actor_member_id,
                 "message_text": message_text,
+                "message_attachments": message_attachments,
                 "conversation_history": conversation_history or [],
             }
         )
@@ -1340,6 +1343,52 @@ def test_completed_group_media_message_routes_through_household_chat(tmp_path):
     assert result.consumed is True
     assert result.reply_text == "I can keep planning with you here."
     assert "Media context extracted from attachments" in chat_service.calls[0]["message_text"]
+    assert chat_service.calls[0]["message_attachments"] == ()
+    store.close()
+
+
+def test_completed_dm_passes_image_attachments_into_household_chat(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_onboarding_service(store, review_service)
+    _complete_hybrid_onboarding(onboarding_service)
+    chat_service = _StubHouseholdChatService("I can read the attachment now.")
+    ingress = _build_ingress(
+        store,
+        onboarding_service,
+        review_service,
+        household_chat_service=chat_service,
+    )
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_media_live",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="Can you pull the exact closure dates from this image?",
+                is_group_chat=False,
+                attachments=(
+                    FlorenceInboundAttachment(
+                        kind="image",
+                        mime_type="image/png",
+                        filename="studio-closures.png",
+                        data_url="data:image/png;base64,QUFBQQ==",
+                    ),
+                ),
+            ),
+        )
+    )
+
+    assert result.consumed is True
+    assert result.reply_text == "I can read the attachment now."
+    assert len(chat_service.calls[0]["message_attachments"]) == 1
+    assert chat_service.calls[0]["message_attachments"][0].filename == "studio-closures.png"
     store.close()
 
 
@@ -1376,6 +1425,43 @@ def test_completed_dm_suppresses_protocol_sentinel_if_chat_model_leaks_one(tmp_p
     assert result.consumed is False
     assert result.reply_text is None
     assert chat_service.calls[0]["message_text"] == "You should see it in my email from today."
+    store.close()
+
+
+def test_completed_dm_webcal_link_bypasses_group_share_protocol_and_routes_to_chat(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_onboarding_service(store, review_service)
+    _complete_hybrid_onboarding(onboarding_service)
+    chat_service = _StubHouseholdChatService("I can inspect Theo's DRALL calendar feed.")
+    ingress = _build_ingress(
+        store,
+        onboarding_service,
+        review_service,
+        household_chat_service=chat_service,
+    )
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_webcal",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="webcal://api.team-manager.gc.com/ics-calendar-documents/user/example.ics?teamId=abc",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert result.consumed is True
+    assert result.reply_text == "I can inspect Theo's DRALL calendar feed."
+    assert chat_service.group_share_turn_calls == []
+    assert chat_service.calls[0]["message_text"] == "webcal://api.team-manager.gc.com/ics-calendar-documents/user/example.ics?teamId=abc"
     store.close()
 
 

@@ -12,6 +12,8 @@ from florence.config import (
     FlorenceSettings,
 )
 from florence.contracts import Channel, ChannelType, Household
+from florence.media.openai_extract import RenderedPdfPageImage
+from florence.messaging.types import FLORENCE_MEDIA_ATTACHMENTS_METADATA_KEY
 from florence.runtime import FlorenceEntrypointResult, FlorenceProductionService
 import florence.sendblue.media as sendblue_media
 from florence.server import _extract_sendblue_webhook_secret
@@ -264,6 +266,18 @@ def test_production_service_enriches_sendblue_media_payload_before_entrypoint(tm
         raise AssertionError(f"Unexpected URL: {url}")
 
     monkeypatch.setattr(sendblue_media.httpx, "get", _fake_get)
+    monkeypatch.setattr(
+        sendblue_media,
+        "render_pdf_pages_to_images",
+        lambda **kwargs: (
+            RenderedPdfPageImage(
+                page_number=1,
+                mime_type="image/png",
+                image_bytes=b"pdf-page",
+                data_url="data:image/png;base64,cGRmLXBhZ2U=",
+            ),
+        ),
+    )
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
 
     class _FakeResponses:
@@ -315,6 +329,11 @@ def test_production_service_enriches_sendblue_media_payload_before_entrypoint(tm
     assert result.status_code == 200
     assert "Media context extracted from attachments" in str(captured_payload["content"])
     assert "form.pdf: Permission slip due Friday at pickup." in str(captured_payload["content"])
+    serialized = captured_payload[FLORENCE_MEDIA_ATTACHMENTS_METADATA_KEY]
+    assert len(serialized) == 2
+    assert serialized[0]["kind"] == "pdf"
+    assert serialized[1]["kind"] == "image"
+    assert serialized[1]["filename"] == "form.pdf#page-1.png"
     store.close()
 
 
@@ -408,4 +427,6 @@ def test_production_service_enriches_sendblue_image_payload_before_entrypoint(tm
     assert result.status_code == 200
     assert "Media context extracted from attachments" in str(captured_payload["content"])
     assert "calendar.png: Young Minds school calendar:" in str(captured_payload["content"])
+    assert captured_payload[FLORENCE_MEDIA_ATTACHMENTS_METADATA_KEY][0]["kind"] == "image"
+    assert captured_payload[FLORENCE_MEDIA_ATTACHMENTS_METADATA_KEY][0]["data_url"].startswith("data:image/png;base64,")
     store.close()

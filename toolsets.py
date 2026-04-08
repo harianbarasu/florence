@@ -99,6 +99,8 @@ _FLORENCE_HOUSEHOLD_TOOLS = [
 
 _FLORENCE_ONBOARDING_TOOLS = [
     "household_apply_onboarding_update",
+    "household_search_google_inbox",
+    "household_search_google_calendar",
 ]
 
 _FLORENCE_BRIEFING_TOOLS = [

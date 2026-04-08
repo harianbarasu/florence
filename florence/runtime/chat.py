@@ -27,7 +27,12 @@ from florence.contracts import (
 )
 from florence.messaging.types import FlorenceInboundAttachment
 from florence.state import FlorenceStateDB
-from florence.runtime.visibility import build_scope_model_lines, resolve_conversation_scope
+from florence.runtime.visibility import (
+    build_scope_model_lines,
+    resolve_conversation_scope,
+    resolve_google_calendar_scope,
+    resolve_google_inbox_scope,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -118,8 +123,12 @@ class FlorenceHouseholdChatService:
             channel_id=channel_id,
             actor_member_id=actor_member_id,
             user_message=self._build_live_user_message(
+                household_id=household_id,
+                channel_id=channel_id,
+                actor_member_id=actor_member_id,
                 message_text=message_text,
                 message_attachments=message_attachments,
+                conversation_history=history,
             ),
             persist_user_message=message_text,
             system_message=system_message,
@@ -341,7 +350,7 @@ class FlorenceHouseholdChatService:
             )
         elif kind == "onboarding_turn":
             enabled_toolsets = ["florence_onboarding"]
-            max_iterations = min(self.max_iterations, 2)
+            max_iterations = self._onboarding_max_iterations(payload)
             system_message = self._build_onboarding_turn_system_message(
                 self._build_onboarding_system_message(
                     household_id=household_id,
@@ -349,7 +358,12 @@ class FlorenceHouseholdChatService:
                     actor_member_id=actor_member_id,
                 )
             )
-            user_message = self._build_onboarding_turn_user_message(payload)
+            user_message = self._build_onboarding_turn_user_message(
+                household_id=household_id,
+                channel_id=channel_id,
+                actor_member_id=actor_member_id,
+                payload=payload,
+            )
         elif kind == "review_prompt":
             system_message = "\n".join(
                 [
@@ -610,7 +624,12 @@ class FlorenceHouseholdChatService:
             conversation_context = self._build_conversation_history(conversation_history)
 
         system_message = self._build_onboarding_turn_system_message(base_system)
-        user_message = self._build_onboarding_turn_user_message(payload)
+        user_message = self._build_onboarding_turn_user_message(
+            household_id=household_id,
+            channel_id=channel_id,
+            actor_member_id=actor_member_id,
+            payload=payload,
+        )
         result = self._run_agent_conversation(
             household_id=household_id,
             channel_id=channel_id,
@@ -619,7 +638,7 @@ class FlorenceHouseholdChatService:
             system_message=system_message,
             conversation_history=conversation_context,
             enabled_toolsets=["florence_onboarding"],
-            max_iterations=min(self.max_iterations, 2),
+            max_iterations=self._onboarding_max_iterations(payload),
             turn_kind="onboarding_turn",
             internal_turn=True,
         )
@@ -641,6 +660,9 @@ class FlorenceHouseholdChatService:
                 "Use household_apply_onboarding_update to store only explicit setup facts the parent actually provided in this message.",
                 "Do not infer unstated names, ages, schools, activities, or Google connection status.",
                 "Do not use unrelated Florence write tools in this turn.",
+                "When Google is connected and the current onboarding question is about school or activities, you may use household_search_google_inbox or household_search_google_calendar to recover newly synced context for that exact missing field.",
+                "If recent_google_context already contains a likely answer, use it to ask a short confirmation or to continue the turn more intelligently instead of asking the user to restate everything from scratch.",
+                "If the parent says Florence should already have that answer from email or calendar, treat that as permission to check the connected Google context for the current onboarding question.",
                 (
                     f"If Google is already connected and the message is asking for inbox or calendar dependent information that still requires the first sync to finish, "
                     f"reply exactly {_ONBOARDING_SYNC_WAITING_SENTINEL}."
@@ -684,8 +706,9 @@ class FlorenceHouseholdChatService:
             "You are Florence, the Hermes-powered household onboarding agent for this private parent DM.",
             "This lane is only for setup. Florence household state is the source of truth.",
             "Keep this turn narrow: interpret the user's setup reply, store explicit facts, and move to the next onboarding step.",
-            "Do not browse, research, search Gmail, or use general household planning behavior in this lane.",
-            "Do not use any Florence tool except household_apply_onboarding_update.",
+            "Do not browse, research, or use general household planning behavior in this lane.",
+            "Use household_apply_onboarding_update for onboarding writes.",
+            "Only use household_search_google_inbox or household_search_google_calendar when Google is connected and they are directly helping with the one current missing onboarding field.",
             f"Household: {household.name}",
             f"Timezone: {household.timezone}",
         ]
@@ -695,8 +718,14 @@ class FlorenceHouseholdChatService:
             lines.append(f"Current speaker: {actor_name}")
         return "\n".join(lines)
 
-    @staticmethod
-    def _build_onboarding_turn_user_message(payload: dict[str, Any]) -> str:
+    def _build_onboarding_turn_user_message(
+        self,
+        *,
+        household_id: str,
+        channel_id: str,
+        actor_member_id: str | None,
+        payload: dict[str, Any],
+    ) -> str:
         return json.dumps(
             {
                 "task": "handle_onboarding_turn",
@@ -708,9 +737,120 @@ class FlorenceHouseholdChatService:
                 "child_profiles": list(payload.get("child_profiles") or []),
                 "current_child_name": payload.get("current_child_name"),
                 "next_prompt": payload.get("next_prompt"),
+                "recent_google_context": self._build_onboarding_recent_google_context(
+                    household_id=household_id,
+                    channel_id=channel_id,
+                    actor_member_id=actor_member_id,
+                    payload=payload,
+                ),
             },
             ensure_ascii=True,
         )
+
+    @staticmethod
+    def _onboarding_google_lookup_stage(payload: dict[str, Any]) -> bool:
+        stage = str(payload.get("stage") or "").strip()
+        return bool(payload.get("google_connected")) and stage in {"collect_child_school", "collect_child_activities"}
+
+    def _onboarding_max_iterations(self, payload: dict[str, Any]) -> int:
+        return min(self.max_iterations, 3 if self._onboarding_google_lookup_stage(payload) else 2)
+
+    def _build_onboarding_recent_google_context(
+        self,
+        *,
+        household_id: str,
+        channel_id: str,
+        actor_member_id: str | None,
+        payload: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if not self._onboarding_google_lookup_stage(payload):
+            return None
+        focus_child_name = str(payload.get("current_child_name") or "").strip()
+        if not focus_child_name:
+            child_names = [str(name).strip() for name in payload.get("child_names") or [] if str(name).strip()]
+            focus_child_name = child_names[0] if len(child_names) == 1 else ""
+        if not focus_child_name:
+            return None
+
+        inbox_scope = resolve_google_inbox_scope(
+            self.store,
+            household_id=household_id,
+            channel_id=channel_id,
+            actor_member_id=actor_member_id,
+            query=focus_child_name,
+            sender=None,
+            subject=None,
+        )
+        calendar_scope = resolve_google_calendar_scope(
+            self.store,
+            household_id=household_id,
+            channel_id=channel_id,
+            actor_member_id=actor_member_id,
+            query=focus_child_name,
+            calendar_summary=None,
+        )
+
+        gmail_matches: list[dict[str, Any]] = []
+        if not inbox_scope.error and inbox_scope.connections:
+            for item in self.store.search_google_gmail_messages(
+                household_id=household_id,
+                connection_ids=[connection.id for connection in inbox_scope.connections],
+                query=focus_child_name,
+                newer_than_days=365,
+                limit=3,
+            ):
+                gmail_matches.append(
+                    {
+                        "from_address": item.from_address,
+                        "subject": item.subject,
+                        "snippet": item.snippet,
+                        "received_at": item.received_at.isoformat() if item.received_at is not None else None,
+                    }
+                )
+
+        calendar_matches: list[dict[str, Any]] = []
+        if not calendar_scope.error and calendar_scope.connections:
+            for item in self.store.search_google_calendar_events(
+                household_id=household_id,
+                connection_ids=[connection.id for connection in calendar_scope.connections],
+                query=focus_child_name,
+                newer_than_days=365,
+                limit=3,
+            ):
+                calendar_matches.append(
+                    {
+                        "title": item.title,
+                        "calendar_summary": item.calendar_summary,
+                        "starts_at": item.starts_at.isoformat() if item.starts_at is not None else None,
+                        "ends_at": item.ends_at.isoformat() if item.ends_at is not None else None,
+                    }
+                )
+
+        connection_statuses = []
+        for connection in {connection.id: connection for connection in [*(inbox_scope.connections or []), *(calendar_scope.connections or [])]}.values():
+            metadata = dict(connection.metadata) if isinstance(connection.metadata, dict) else {}
+            connection_statuses.append(
+                {
+                    "email": connection.email,
+                    "initial_sync_state": metadata.get("initial_sync_state"),
+                    "last_sync_status": metadata.get("last_sync_status"),
+                    "sync_phase": metadata.get("sync_phase"),
+                }
+            )
+
+        mirror_sync_running = any(
+            status.get("initial_sync_state") == "running" or status.get("last_sync_status") == "running"
+            for status in connection_statuses
+        )
+        if not gmail_matches and not calendar_matches and not mirror_sync_running:
+            return None
+        return {
+            "focus_child_name": focus_child_name,
+            "gmail_matches": gmail_matches,
+            "calendar_matches": calendar_matches,
+            "mirror_sync_running": mirror_sync_running,
+            "connection_statuses": connection_statuses,
+        }
 
     def _run_agent_conversation(
         self,
@@ -880,12 +1020,23 @@ class FlorenceHouseholdChatService:
         normalized = str(reply_text or "").strip()
         return normalized in _PROTOCOL_SENTINELS
 
-    @staticmethod
     def _build_live_user_message(
+        self,
         *,
+        household_id: str,
+        channel_id: str,
+        actor_member_id: str | None,
         message_text: str,
         message_attachments: tuple[FlorenceInboundAttachment, ...],
+        conversation_history: list[dict[str, str]] | None,
     ) -> Any:
+        recent_google_context = self._build_recent_google_context(
+            household_id=household_id,
+            channel_id=channel_id,
+            actor_member_id=actor_member_id,
+            message_text=message_text,
+            conversation_history=conversation_history,
+        )
         image_parts = []
         for attachment in message_attachments:
             source = str(attachment.data_url or attachment.url or "").strip()
@@ -900,9 +1051,159 @@ class FlorenceHouseholdChatService:
                     "image_url": {"url": source},
                 }
             )
-        if not image_parts:
+        if not image_parts and recent_google_context is None:
             return message_text
-        return [{"type": "text", "text": message_text}, *image_parts]
+        if not image_parts:
+            return json.dumps(
+                {
+                    "task": "handle_live_household_turn",
+                    "user_message": message_text,
+                    "recent_google_context": recent_google_context,
+                },
+                ensure_ascii=True,
+            )
+        return [
+            {
+                "type": "text",
+                "text": json.dumps(
+                    {
+                        "task": "handle_live_household_turn",
+                        "user_message": message_text,
+                        "recent_google_context": recent_google_context,
+                    },
+                    ensure_ascii=True,
+                ),
+            },
+            *image_parts,
+        ]
+
+    def _build_recent_google_context(
+        self,
+        *,
+        household_id: str,
+        channel_id: str,
+        actor_member_id: str | None,
+        message_text: str,
+        conversation_history: list[dict[str, str]] | None,
+    ) -> dict[str, Any] | None:
+        scope = resolve_conversation_scope(
+            self.store,
+            channel_id=channel_id,
+            actor_member_id=actor_member_id,
+        )
+        if not scope.is_private_parent_dm:
+            return None
+        query = self._build_recent_google_query(message_text=message_text, conversation_history=conversation_history)
+        if not query:
+            return None
+
+        inbox_scope = resolve_google_inbox_scope(
+            self.store,
+            household_id=household_id,
+            channel_id=channel_id,
+            actor_member_id=actor_member_id,
+            query=query,
+            sender=None,
+            subject=None,
+        )
+        calendar_scope = resolve_google_calendar_scope(
+            self.store,
+            household_id=household_id,
+            channel_id=channel_id,
+            actor_member_id=actor_member_id,
+            query=query,
+            calendar_summary=None,
+        )
+
+        gmail_matches: list[dict[str, Any]] = []
+        if not inbox_scope.error and inbox_scope.connections:
+            for item in self.store.search_google_gmail_messages(
+                household_id=household_id,
+                connection_ids=[connection.id for connection in inbox_scope.connections],
+                query=query,
+                newer_than_days=365,
+                limit=3,
+            ):
+                gmail_matches.append(
+                    {
+                        "from_address": item.from_address,
+                        "subject": item.subject,
+                        "snippet": item.snippet,
+                        "received_at": item.received_at.isoformat() if item.received_at is not None else None,
+                    }
+                )
+
+        calendar_matches: list[dict[str, Any]] = []
+        if not calendar_scope.error and calendar_scope.connections:
+            for item in self.store.search_google_calendar_events(
+                household_id=household_id,
+                connection_ids=[connection.id for connection in calendar_scope.connections],
+                query=query,
+                newer_than_days=365,
+                limit=3,
+            ):
+                calendar_matches.append(
+                    {
+                        "title": item.title,
+                        "calendar_summary": item.calendar_summary,
+                        "starts_at": item.starts_at.isoformat() if item.starts_at is not None else None,
+                        "ends_at": item.ends_at.isoformat() if item.ends_at is not None else None,
+                    }
+                )
+
+        connection_statuses = []
+        combined_connections = {
+            connection.id: connection
+            for connection in [*(inbox_scope.connections or []), *(calendar_scope.connections or [])]
+        }
+        for connection in combined_connections.values():
+            metadata = dict(connection.metadata) if isinstance(connection.metadata, dict) else {}
+            connection_statuses.append(
+                {
+                    "email": connection.email,
+                    "initial_sync_state": metadata.get("initial_sync_state"),
+                    "last_sync_status": metadata.get("last_sync_status"),
+                    "sync_phase": metadata.get("sync_phase"),
+                }
+            )
+
+        mirror_sync_running = any(
+            status.get("initial_sync_state") == "running" or status.get("last_sync_status") == "running"
+            for status in connection_statuses
+        )
+        if not gmail_matches and not calendar_matches and not mirror_sync_running:
+            return None
+        return {
+            "query_basis": query,
+            "gmail_matches": gmail_matches,
+            "calendar_matches": calendar_matches,
+            "mirror_sync_running": mirror_sync_running,
+            "connection_statuses": connection_statuses,
+        }
+
+    @staticmethod
+    def _build_recent_google_query(
+        *,
+        message_text: str,
+        conversation_history: list[dict[str, str]] | None,
+    ) -> str:
+        parts: list[str] = []
+        current = " ".join(str(message_text or "").split()).strip()
+        if current:
+            parts.append(current)
+        if conversation_history:
+            recent = conversation_history[-4:]
+            for item in recent:
+                role = str(item.get("role") or "").strip().lower()
+                if role not in {"user", "assistant"}:
+                    continue
+                content = " ".join(str(item.get("content") or "").split()).strip()
+                if content:
+                    parts.append(content)
+        combined = " ".join(parts).strip()
+        if len(combined) > 500:
+            combined = combined[:500]
+        return combined
 
     @staticmethod
     def _verbose_turn_logging_enabled() -> bool:
@@ -1309,6 +1610,9 @@ class FlorenceHouseholdChatService:
             "If household_search_google_inbox returns no matches but reports mirror_sync_running=true, explain that Florence is still syncing that inbox instead of implying the email does not exist.",
             "If household_search_google_calendar returns no matches but reports mirror_sync_running=true, explain that Florence is still syncing that calendar instead of implying the schedule is absent.",
             "If household_search_google_inbox returns no matches and the user is pointing to a very recent forwarded invite or message, ask for one or two grounding details rather than claiming certainty that nothing is there.",
+            "If the live turn payload includes recent_google_context, treat it as fresh mirrored inbox or calendar evidence for this active DM thread.",
+            "Use recent_google_context proactively when it likely answers the parent's question or resolves a vague reference like that invite, that schedule, or those school emails.",
+            "Do not make the parent restate where something came from if recent_google_context already contains the relevant synced evidence.",
             "If the user thinks something was added twice or duplicated on the calendar, start with household_search_state for events. Use event_insights.likely_duplicate_groups when present, then fix the extra event by id instead of narrating internal uncertainty.",
             "When the user needs current information from the public web such as school calendars, camp policies, activity schedules, vendor details, or comparisons, use web_search and web_extract instead of guessing.",
             "When the task requires interacting with a website or portal, following multi-step navigation, checking dynamic page state, or inspecting console/browser output, use the browser tools instead of pretending you already know the result.",

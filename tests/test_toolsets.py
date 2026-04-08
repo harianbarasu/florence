@@ -179,3 +179,11 @@ class TestToolsetConsistency:
             "honcho_context",
             "honcho_search",
         }
+
+    def test_florence_onboarding_allows_narrow_google_lookup(self):
+        tools = set(resolve_toolset("florence_onboarding"))
+        assert tools == {
+            "household_apply_onboarding_update",
+            "household_search_google_inbox",
+            "household_search_google_calendar",
+        }

@@ -3,8 +3,12 @@ from types import SimpleNamespace
 
 from florence.contracts import (
     Channel,
+    ChannelMessage,
+    ChannelMessageRole,
     ChannelType,
     ChildProfile,
+    GoogleConnection,
+    GoogleSourceKind,
     Household,
     HouseholdBriefingKind,
     HouseholdEvent,
@@ -22,6 +26,7 @@ from florence.contracts import (
     IdentityKind,
     HouseholdWorkItem,
 )
+from florence.google.types import GmailSyncItem, ParentCalendarSyncItem
 from florence.messaging.types import FlorenceInboundAttachment
 from florence.runtime.chat import FlorenceHouseholdChatService
 from florence.state import FlorenceStateDB
@@ -305,6 +310,9 @@ def test_household_chat_service_uses_hermes_agent_with_confirmed_state(tmp_path)
     assert "household_search_google_calendar respects the same privacy boundary" in _FakeAgent.last_run["system_message"]
     assert "If household_search_google_calendar returns no matches but reports mirror_sync_running=true" in _FakeAgent.last_run["system_message"]
     assert "If the user thinks something was added twice or duplicated on the calendar, start with household_search_state for events." in _FakeAgent.last_run["system_message"]
+    assert "If the live turn payload includes recent_google_context, treat it as fresh mirrored inbox or calendar evidence for this active DM thread." in _FakeAgent.last_run["system_message"]
+    assert "Use recent_google_context proactively when it likely answers the parent's question or resolves a vague reference like that invite, that schedule, or those school emails." in _FakeAgent.last_run["system_message"]
+    assert "Do not make the parent restate where something came from if recent_google_context already contains the relevant synced evidence." in _FakeAgent.last_run["system_message"]
     assert "use web_search and web_extract instead of guessing" in _FakeAgent.last_run["system_message"]
     assert "use the browser tools instead of pretending you already know the result" in _FakeAgent.last_run["system_message"]
     assert "use delegate_task to gather evidence in parallel" in _FakeAgent.last_run["system_message"]
@@ -643,8 +651,10 @@ def test_household_chat_service_passes_image_attachments_into_current_turn(tmp_p
 
     assert reply is not None
     assert _FakeAgent.last_run["persist_user_message"] == "Can you read the exact closure dates from this image?"
-    assert _FakeAgent.last_run["user_message"] == [
-        {"type": "text", "text": "Can you read the exact closure dates from this image?"},
+    assert _FakeAgent.last_run["user_message"][0]["type"] == "text"
+    assert "\"task\": \"handle_live_household_turn\"" in _FakeAgent.last_run["user_message"][0]["text"]
+    assert "Can you read the exact closure dates from this image?" in _FakeAgent.last_run["user_message"][0]["text"]
+    assert _FakeAgent.last_run["user_message"][1:] == [
         {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUFBQQ=="}},
     ]
     store.close()
@@ -1635,6 +1645,286 @@ def test_household_chat_service_compose_onboarding_turn_includes_explicit_setup_
     assert _FakeAgent.created[0]["skip_memory"] is True
     assert _FakeAgent.created[0]["honcho_session_key"] is None
     assert _FakeAgent.created[0]["session_id"].startswith("florence-channel-chan_dm_123-internal-onboarding_turn-")
+    store.close()
+
+
+def test_household_chat_service_compose_onboarding_turn_uses_recent_google_context_for_school_stage(tmp_path):
+    _FakeAgent.created.clear()
+    _FakeAgent.last_run = None
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(
+        Household(
+            id="hh_123",
+            name="Maya's household",
+            timezone="America/Los_Angeles",
+        )
+    )
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm_thread_123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    connection = GoogleConnection(
+        id="gconn_123",
+        household_id="hh_123",
+        member_id="mem_123",
+        email="maya@example.com",
+        connected_scopes=(GoogleSourceKind.GMAIL, GoogleSourceKind.GOOGLE_CALENDAR),
+        access_token="access-token",
+        metadata={"last_sync_status": "ok"},
+    )
+    store.upsert_google_connection(connection)
+    store.upsert_google_gmail_messages(
+        connection=connection,
+        items=[
+            GmailSyncItem(
+                gmail_message_id="gmail_123",
+                thread_id="thread_123",
+                from_address="Roosevelt Elementary <office@roosevelt.edu>",
+                subject="Theo welcome to Roosevelt Elementary",
+                snippet="Theo starts at Roosevelt Elementary this fall.",
+                body_text="Theo starts at Roosevelt Elementary this fall. School office hours attached.",
+                attachment_text=None,
+                attachment_count=0,
+                received_at=datetime.now(timezone.utc),
+            )
+        ],
+    )
+    service = FlorenceHouseholdChatService(
+        store,
+        model="anthropic/claude-opus-4.6",
+        max_iterations=4,
+        provider="anthropic",
+        agent_factory=_FakeAgent,
+    )
+
+    reply_messages = service.compose_onboarding_turn(
+        household_id="hh_123",
+        channel_id="chan_dm_123",
+        actor_member_id="mem_123",
+        payload={
+            "user_message": "You should probably already have Theo's school from my email.",
+            "stage": "collect_child_school",
+            "google_connected": True,
+            "parent_display_name": "Maya",
+            "child_names": ["Theo"],
+            "child_profiles": [{"name": "Theo", "age": "7"}],
+            "current_child_name": "Theo",
+            "next_prompt": "What school does Theo go to?",
+        },
+    )
+
+    assert reply_messages is not None
+    assert _FakeAgent.created[0]["enabled_toolsets"] == ["florence_onboarding"]
+    assert _FakeAgent.created[0]["max_iterations"] == 3
+    assert "you may use household_search_google_inbox or household_search_google_calendar" in _FakeAgent.last_run["system_message"]
+    assert "\"recent_google_context\"" in _FakeAgent.last_run["user_message"]
+    assert "Roosevelt Elementary" in _FakeAgent.last_run["user_message"]
+    store.close()
+
+
+def test_household_chat_service_includes_recent_google_context_for_vague_private_dm_followup(tmp_path):
+    _FakeAgent.created.clear()
+    _FakeAgent.last_run = None
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(
+        Household(
+            id="hh_123",
+            name="Maya's household",
+            timezone="America/Los_Angeles",
+        )
+    )
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm_thread_123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    connection = GoogleConnection(
+        id="gconn_123",
+        household_id="hh_123",
+        member_id="mem_123",
+        email="maya@example.com",
+        connected_scopes=(GoogleSourceKind.GMAIL, GoogleSourceKind.GOOGLE_CALENDAR),
+        access_token="access-token",
+        metadata={"last_sync_status": "ok"},
+    )
+    store.upsert_google_connection(connection)
+    store.upsert_google_gmail_messages(
+        connection=connection,
+        items=[
+            GmailSyncItem(
+                gmail_message_id="gmail_123",
+                thread_id="thread_123",
+                from_address="Kendall <kendall@example.com>",
+                subject="Fwd: You are confirmed for RUMI'S 3RD BIRTHDAY PARTY!",
+                snippet="Birthday party next month at 2 PM.",
+                body_text="Rumi's 3rd birthday party is next month at 2 PM.",
+                attachment_text=None,
+                attachment_count=0,
+                received_at=datetime.now(timezone.utc),
+            )
+        ],
+    )
+    store.upsert_google_calendar_events(
+        connection=connection,
+        items=[
+            ParentCalendarSyncItem(
+                google_event_id="gcal_123",
+                title="Rumi's 3rd Birthday Party",
+                description="Birthday party next month at 2 PM.",
+                location="123 Main St",
+                html_link="https://calendar.google.com/event?eid=test",
+                starts_at=datetime(2026, 5, 14, 21, 0, tzinfo=timezone.utc),
+                ends_at=datetime(2026, 5, 14, 23, 0, tzinfo=timezone.utc),
+                timezone="America/Los_Angeles",
+                all_day=False,
+                updated_at=datetime.now(timezone.utc),
+                calendar_summary="Maya",
+                family_member_names=["Theo"],
+                calendar_id="primary",
+                calendar_primary=True,
+                usage_mode="default",
+                detail_visibility="default",
+            )
+        ],
+    )
+    service = FlorenceHouseholdChatService(
+        store,
+        model="anthropic/claude-opus-4.6",
+        max_iterations=4,
+        provider="anthropic",
+        agent_factory=_FakeAgent,
+    )
+
+    reply = service.respond(
+        household_id="hh_123",
+        channel_id="chan_dm_123",
+        actor_member_id="mem_123",
+        message_text="Can you add that to the calendar?",
+        conversation_history=[
+            ChannelMessage(
+                id="msg_1",
+                household_id="hh_123",
+                channel_id="chan_dm_123",
+                sender_role=ChannelMessageRole.USER,
+                body="Kendall just forwarded a birthday party invite for next month that we are going to.",
+            ),
+            ChannelMessage(
+                id="msg_2",
+                household_id="hh_123",
+                channel_id="chan_dm_123",
+                sender_role=ChannelMessageRole.ASSISTANT,
+                body="What's the date and time on the invite?",
+            ),
+        ],
+    )
+
+    assert reply is not None
+    assert "\"recent_google_context\"" in _FakeAgent.last_run["user_message"]
+    assert "RUMI'S 3RD BIRTHDAY PARTY" in _FakeAgent.last_run["user_message"]
+    assert "Rumi's 3rd Birthday Party" in _FakeAgent.last_run["user_message"]
+    assert "Kendall just forwarded a birthday party invite for next month" in _FakeAgent.last_run["user_message"]
+    store.close()
+
+
+def test_household_chat_service_includes_recent_google_context_when_sync_running(tmp_path):
+    _FakeAgent.created.clear()
+    _FakeAgent.last_run = None
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(
+        Household(
+            id="hh_123",
+            name="Maya's household",
+            timezone="America/Los_Angeles",
+        )
+    )
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm_thread_123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    store.upsert_google_connection(
+        GoogleConnection(
+            id="gconn_123",
+            household_id="hh_123",
+            member_id="mem_123",
+            email="maya@example.com",
+            connected_scopes=(GoogleSourceKind.GMAIL, GoogleSourceKind.GOOGLE_CALENDAR),
+            access_token="access-token",
+            metadata={
+                "initial_sync_state": "running",
+                "last_sync_status": "running",
+                "sync_phase": "syncing_inbox",
+            },
+        )
+    )
+    service = FlorenceHouseholdChatService(
+        store,
+        model="anthropic/claude-opus-4.6",
+        max_iterations=4,
+        provider="anthropic",
+        agent_factory=_FakeAgent,
+    )
+
+    reply = service.respond(
+        household_id="hh_123",
+        channel_id="chan_dm_123",
+        actor_member_id="mem_123",
+        message_text="Did you find that invite yet?",
+        conversation_history=[
+            ChannelMessage(
+                id="msg_1",
+                household_id="hh_123",
+                channel_id="chan_dm_123",
+                sender_role=ChannelMessageRole.USER,
+                body="Kendall forwarded a birthday invite this morning.",
+            )
+        ],
+    )
+
+    assert reply is not None
+    assert "\"recent_google_context\"" in _FakeAgent.last_run["user_message"]
+    assert "\"mirror_sync_running\": true" in _FakeAgent.last_run["user_message"]
+    assert "\"sync_phase\": \"syncing_inbox\"" in _FakeAgent.last_run["user_message"]
     store.close()
 
 

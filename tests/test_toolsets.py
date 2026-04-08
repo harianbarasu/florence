@@ -150,6 +150,9 @@ class TestToolsetConsistency:
         assert "send_message" in tools
         assert "household_search_state" in tools
         assert "household_search_google_inbox" in tools
+        assert "household_apply_candidate_review" in tools
+        assert "household_apply_nudge_action" in tools
+        assert "household_apply_onboarding_update" in tools
         assert "household_upsert_event" in tools
         assert "household_upsert_meal" in tools
         assert "household_schedule_nudge" in tools

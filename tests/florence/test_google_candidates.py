@@ -1,6 +1,3 @@
-import json
-import sys
-import types
 from datetime import datetime, timezone
 
 from florence.contracts import HouseholdContext
@@ -32,7 +29,7 @@ def test_gmail_candidate_detects_school_logistics_event():
     )
 
     assert decision.kind == CandidateDecisionKind.CANDIDATE
-    assert decision.requires_confirmation is False
+    assert decision.requires_confirmation is True
     assert decision.proposed_fields is not None
     assert decision.proposed_fields["title"] == "Soccer practice update"
 
@@ -54,185 +51,6 @@ def test_gmail_candidate_skips_unrelated_email():
 
     assert decision.kind == CandidateDecisionKind.SKIP
     assert decision.reason == "promotional_noise"
-
-
-def test_gmail_candidate_uses_single_llm_pass_when_configured(monkeypatch):
-    calls: list[dict[str, object]] = []
-
-    class _FakeResponses:
-        def create(self, **kwargs):
-            calls.append(kwargs)
-            payload = {
-                "kind": "candidate",
-                "reason": "known_contact_schedule_email",
-                "title": "Spring break and Family Day dates",
-                "summary": "Linda sent the spring break and Family Day dates for Violet's class.",
-                "confidence_bps": 9100,
-                "requires_confirmation": False,
-                "confirmation_question": None,
-                "signals": ["known_contact", "known_activity", "no_class", "family_day"],
-                "proposed_fields": {
-                    "title": "Spring break and Family Day dates",
-                    "description": "No class April 1 and April 8. Family Day May 6.",
-                },
-            }
-            return types.SimpleNamespace(
-                output_text=json.dumps(payload)
-            )
-
-    class _FakeOpenAI:
-        def __init__(self, *, api_key, base_url):
-            calls.append({"api_key": api_key, "base_url": base_url})
-            self.responses = _FakeResponses()
-
-    monkeypatch.delenv("FLORENCE_GMAIL_RELEVANCE_DISABLE", raising=False)
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
-    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=_FakeOpenAI))
-
-    item = GmailSyncItem(
-        gmail_message_id="gmail_125",
-        thread_id="thread_125",
-        from_address="Linda <linda@musicalbeginnings.com>",
-        subject="Spring break and Family Day dates",
-        snippet="No class April 1 and April 8.",
-        body_text="For Violet's class: no class April 1 and April 8. Family Day May 6.",
-        attachment_text=None,
-        attachment_count=0,
-        received_at=datetime(2026, 3, 24, 12, 0, tzinfo=timezone.utc),
-    )
-    context = HouseholdContext(
-        household_id="hh_123",
-        actor_member_id="mem_123",
-        channel_id="chan_123",
-        visible_child_names=["Violet"],
-        activity_labels=["Musical Beginnings"],
-        contact_names=["Linda"],
-    )
-
-    decision = build_gmail_candidate_decision(
-        item,
-        "America/Los_Angeles",
-        context=context,
-        now=datetime(2026, 3, 24, 12, 0, tzinfo=timezone.utc),
-    )
-
-    assert decision.kind == CandidateDecisionKind.CANDIDATE
-    assert decision.title == "Spring break and Family Day dates"
-    assert decision.raw_metadata["classifier"] == "gmail_llm_v1"
-    assert decision.raw_metadata["signals"] == ["known_contact", "known_activity", "no_class", "family_day"]
-    assert calls[0]["api_key"] == "sk-test"
-    assert [entry["model"] for entry in calls if "model" in entry] == ["gpt-5.4"]
-
-
-def test_gmail_candidate_uses_single_llm_model_without_escalation(monkeypatch):
-    calls: list[str] = []
-
-    class _FakeResponses:
-        def create(self, **kwargs):
-            calls.append(kwargs["model"])
-            if kwargs["model"] == "gpt-5.4-mini":
-                return types.SimpleNamespace(
-                    output_text=json.dumps(
-                        {
-                            "kind": "skip",
-                            "reason": "uncertain_schoolish_message",
-                            "confidence_bps": 6200,
-                            "signals": ["known_contact", "schedule_change"],
-                        }
-                    )
-                )
-            return types.SimpleNamespace(
-                output_text=json.dumps(
-                    {
-                        "kind": "candidate",
-                        "reason": "known_contact_schedule_email",
-                        "title": "Camp reminder",
-                        "summary": "Camp schedule update from a known contact.",
-                        "confidence_bps": 8900,
-                        "requires_confirmation": False,
-                        "signals": ["known_contact", "schedule_change"],
-                        "proposed_fields": {"title": "Camp reminder"},
-                    }
-                )
-            )
-
-    class _FakeOpenAI:
-        def __init__(self, *, api_key, base_url):  # noqa: ARG002
-            self.responses = _FakeResponses()
-
-    monkeypatch.delenv("FLORENCE_GMAIL_RELEVANCE_DISABLE", raising=False)
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
-    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=_FakeOpenAI))
-
-    item = GmailSyncItem(
-        gmail_message_id="gmail_125b",
-        thread_id="thread_125b",
-        from_address="director@farmcamp.com",
-        subject="Camp reminder",
-        snippet="Schedule update for Theo",
-        body_text="Theo's pickup moved to 3pm this Friday.",
-        attachment_text=None,
-        attachment_count=0,
-        received_at=datetime(2026, 3, 24, 12, 0, tzinfo=timezone.utc),
-    )
-    context = HouseholdContext(
-        household_id="hh_123",
-        actor_member_id="mem_123",
-        channel_id="chan_123",
-        visible_child_names=["Theo"],
-        contact_names=["Camp Director"],
-    )
-
-    decision = build_gmail_candidate_decision(item, "America/Los_Angeles", context=context)
-
-    assert decision.kind == CandidateDecisionKind.CANDIDATE
-    assert decision.raw_metadata["classifier"] == "gmail_llm_v1"
-    assert calls == ["gpt-5.4"]
-
-
-def test_gmail_candidate_falls_back_to_heuristics_when_llm_output_is_invalid(monkeypatch):
-    class _FakeResponses:
-        def create(self, **kwargs):  # noqa: ARG002
-            return types.SimpleNamespace(output_text="not-json")
-
-    class _FakeOpenAI:
-        def __init__(self, *, api_key, base_url):  # noqa: ARG002
-            self.responses = _FakeResponses()
-
-    monkeypatch.delenv("FLORENCE_GMAIL_RELEVANCE_DISABLE", raising=False)
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
-    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=_FakeOpenAI))
-
-    item = GmailSyncItem(
-        gmail_message_id="gmail_126-fallback",
-        thread_id="thread_126-fallback",
-        from_address="updates@parentsquare.com",
-        subject="Practice reminder",
-        snippet="Aves soccer is Thursday from 4pm to 5pm",
-        body_text="Please arrive early for soccer practice on September 18.",
-        attachment_text=None,
-        attachment_count=0,
-        received_at=datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc),
-    )
-    context = HouseholdContext(
-        household_id="hh_123",
-        actor_member_id="mem_123",
-        channel_id="chan_123",
-        visible_child_names=["Ava"],
-        child_aliases=["Aves"],
-        school_platforms=["ParentSquare"],
-        activity_labels=["Soccer"],
-    )
-
-    decision = build_gmail_candidate_decision(
-        item,
-        "America/Los_Angeles",
-        context=context,
-        now=datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc),
-    )
-
-    assert decision.kind == CandidateDecisionKind.CANDIDATE
-    assert decision.raw_metadata["classifier"] == "gmail_heuristics_v1"
 
 
 def test_parent_calendar_candidate_detects_child_activity():
@@ -310,9 +128,10 @@ def test_gmail_candidate_uses_household_platform_and_child_alias_context():
     )
 
     assert decision.kind == CandidateDecisionKind.CANDIDATE
-    assert decision.raw_metadata["platform_hits"] == 1
-    assert decision.raw_metadata["known_child_hits"] == 1
-    assert decision.raw_metadata["known_activity_hits"] == 1
+    assert decision.raw_metadata["classifier"] == "gmail_heuristics_v2"
+    assert decision.raw_metadata["anchor_hits"] >= 2
+    assert "household_anchor" in decision.raw_metadata["reason_tags"]
+    assert "schedule_signal" in decision.raw_metadata["reason_tags"]
 
 
 def test_gmail_candidate_ignores_invalid_slash_dates_instead_of_crashing():
@@ -337,6 +156,82 @@ def test_gmail_candidate_ignores_invalid_slash_dates_instead_of_crashing():
     assert decision.kind == CandidateDecisionKind.CANDIDATE
     assert decision.requires_confirmation is True
     assert decision.confirmation_question is not None
+
+
+def test_gmail_candidate_parses_shared_meridiem_time_range_correctly():
+    item = GmailSyncItem(
+        gmail_message_id="gmail_127b",
+        thread_id="thread_127b",
+        from_address="teacher@school.edu",
+        subject="Theo music class update",
+        snippet="June 10 class is 3:30-4:15 PM",
+        body_text="Theo music class is on June 10 from 3:30 to 4:15 PM.",
+        attachment_text=None,
+        attachment_count=0,
+        received_at=datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc),
+    )
+    context = HouseholdContext(
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_123",
+        visible_child_names=["Theo"],
+        activity_labels=["Music"],
+    )
+
+    decision = build_gmail_candidate_decision(
+        item,
+        "America/Los_Angeles",
+        context=context,
+        now=datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc),
+    )
+
+    assert decision.kind == CandidateDecisionKind.CANDIDATE
+    assert decision.requires_confirmation is True
+    assert decision.proposed_fields is not None
+    assert decision.proposed_fields == {"title": "Theo music class update"}
+    assert decision.raw_metadata["temporal_evidence"]["date_match"]["date"] == "2026-06-10"
+    assert decision.raw_metadata["temporal_evidence"]["time_range"] == {
+        "start": "15:30",
+        "end": "16:15",
+    }
+
+
+def test_gmail_candidate_parses_single_side_meridiem_with_dash_range():
+    item = GmailSyncItem(
+        gmail_message_id="gmail_127c",
+        thread_id="thread_127c",
+        from_address="coach@school.edu",
+        subject="Practice schedule",
+        snippet="Thursday 3:30-4:15pm",
+        body_text="Theo baseball practice is Thursday 3:30-4:15pm at North Field.",
+        attachment_text=None,
+        attachment_count=0,
+        received_at=datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc),
+    )
+    context = HouseholdContext(
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_123",
+        visible_child_names=["Theo"],
+        activity_labels=["Baseball"],
+        location_labels=["North Field"],
+    )
+
+    decision = build_gmail_candidate_decision(
+        item,
+        "America/Los_Angeles",
+        context=context,
+        now=datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc),
+    )
+
+    assert decision.kind == CandidateDecisionKind.CANDIDATE
+    assert decision.requires_confirmation is True
+    assert decision.proposed_fields == {"title": "Practice schedule"}
+    assert decision.raw_metadata["temporal_evidence"]["date_match"]["date"] == "2026-09-17"
+    assert decision.raw_metadata["temporal_evidence"]["time_range"] == {
+        "start": "15:30",
+        "end": "16:15",
+    }
 
 
 def test_parent_calendar_candidate_uses_known_location_context():
@@ -429,5 +324,5 @@ def test_gmail_candidate_accepts_non_school_sender_when_child_and_activity_match
     )
 
     assert decision.kind == CandidateDecisionKind.CANDIDATE
-    assert decision.raw_metadata["known_child_hits"] >= 1
-    assert decision.raw_metadata["known_activity_hits"] >= 1
+    assert decision.raw_metadata["anchor_hits"] >= 2
+    assert "household_anchor" in decision.raw_metadata["reason_tags"]

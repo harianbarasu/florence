@@ -132,9 +132,24 @@ class _GoogleCalendarSyncTarget:
     detail_visibility: str
 
 
+def _managed_projection_calendar_ids(metadata: dict[str, object]) -> set[str]:
+    ids: set[str] = set()
+    legacy_projection_id = _clean_label(str(metadata.get("florence_projection_calendar_id") or ""))
+    if legacy_projection_id is not None:
+        ids.add(legacy_projection_id)
+    raw_managed_ids = metadata.get("florence_managed_calendar_ids")
+    if isinstance(raw_managed_ids, list):
+        for raw_item in raw_managed_ids:
+            cleaned = _clean_label(str(raw_item or ""))
+            if cleaned is not None:
+                ids.add(cleaned)
+    return ids
+
+
 def _calendar_sync_targets(metadata: dict[str, object]) -> list[_GoogleCalendarSyncTarget]:
     raw_catalog = metadata.get("available_calendars")
     raw_preferences = metadata.get("calendar_preferences")
+    managed_projection_ids = _managed_projection_calendar_ids(metadata)
     preferences = dict(raw_preferences) if isinstance(raw_preferences, dict) else {}
     calendars: list[GoogleCalendarMetadata] = []
     if isinstance(raw_catalog, list):
@@ -180,7 +195,10 @@ def _calendar_sync_targets(metadata: dict[str, object]) -> list[_GoogleCalendarS
 
     targets: list[_GoogleCalendarSyncTarget] = []
     if not preferences:
-        primary = next((calendar for calendar in calendars if calendar.primary), None) or (calendars[0] if calendars else None)
+        primary = next(
+            (calendar for calendar in calendars if calendar.primary and calendar.id not in managed_projection_ids),
+            None,
+        ) or next((calendar for calendar in calendars if calendar.id not in managed_projection_ids), None)
         if primary is None:
             return []
         return [
@@ -192,6 +210,8 @@ def _calendar_sync_targets(metadata: dict[str, object]) -> list[_GoogleCalendarS
         ]
 
     for calendar in calendars:
+        if calendar.id in managed_projection_ids:
+            continue
         preference = preferences.get(calendar.id)
         if not isinstance(preference, dict):
             continue

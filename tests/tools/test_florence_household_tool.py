@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 from florence.contracts import (
     CandidateState,
     Channel,
+    ChannelMessage,
+    ChannelMessageRole,
     ChannelType,
     ChildProfile,
     GoogleConnection,
@@ -11,6 +13,9 @@ from florence.contracts import (
     Household,
     HouseholdEvent,
     HouseholdEventStatus,
+    HouseholdNudge,
+    HouseholdNudgeStatus,
+    HouseholdNudgeTargetKind,
     HouseholdProfileItem,
     HouseholdProfileKind,
     HouseholdSourceMatcherKind,
@@ -467,7 +472,7 @@ def test_household_search_state_surfaces_scope_tentative_and_private_review_stat
             title="Summer camp invoice",
             summary="Invoice from billing@camp-example.com.",
             state=CandidateState.PENDING_REVIEW,
-            metadata={"source_visibility": "needs_classification"},
+            metadata={},
         )
     )
     task_id = "task-household-visibility"
@@ -495,9 +500,465 @@ def test_household_search_state_surfaces_scope_tentative_and_private_review_stat
         assert visibility["current_scope"]["private_review_available"] is True
         assert visibility["tentative_state"]["event_count"] == 1
         assert visibility["tentative_state"]["events"][0]["title"] == "Possible camp carpool"
+        assert visibility["private_review_state"]["available_in_current_scope"] is True
+        assert visibility["private_review_state"]["included_in_response"] is False
+        assert visibility["private_review_state"]["pending_candidate_count"] == 0
+        assert visibility["private_review_state"]["pending_candidates"] == []
+    finally:
+        clear_household_tool_context(task_id)
+        store.close()
+
+
+def test_household_search_state_includes_shared_calendar_projection_link(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(
+        Household(
+            id="hh_123",
+            name="Maya's household",
+            timezone="America/Los_Angeles",
+            settings={
+                "shared_google_calendar_projection": {
+                    "calendar_id": "cal_shared_123",
+                    "calendar_summary": "Florence - Maya's household",
+                    "calendar_web_url": "https://calendar.google.com/calendar/u/0/r?cid=cal_shared_123",
+                    "host_email": "maya@example.com",
+                    "shared_with_emails": ["kendall@example.com"],
+                    "status": "active",
+                    "last_synced_at": "2026-04-07T18:00:00+00:00",
+                }
+            },
+        )
+    )
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    task_id = "task-household-calendar-link"
+    set_household_tool_context(
+        task_id,
+        store=store,
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_dm_123",
+    )
+    try:
+        result = json.loads(
+            handle_function_call(
+                "household_search_state",
+                {
+                    "query": "",
+                    "entity_types": ["events"],
+                },
+                task_id=task_id,
+            )
+        )
+
+        projection = result["visibility"]["shared_calendar_projection"]
+        assert projection["available"] is True
+        assert projection["calendar_id"] == "cal_shared_123"
+        assert projection["calendar_web_url"] == "https://calendar.google.com/calendar/u/0/r?cid=cal_shared_123"
+        assert projection["host_email"] == "maya@example.com"
+        assert projection["shared_with_emails"] == ["kendall@example.com"]
+    finally:
+        clear_household_tool_context(task_id)
+        store.close()
+
+
+def test_household_search_state_can_explicitly_include_private_review_state(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_124",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:camp-2",
+            title="Summer camp invoice",
+            summary="Invoice from billing@camp-example.com.",
+            state=CandidateState.PENDING_REVIEW,
+            metadata={},
+        )
+    )
+    task_id = "task-household-private-review"
+    set_household_tool_context(
+        task_id,
+        store=store,
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_dm_123",
+    )
+    try:
+        result = json.loads(
+            handle_function_call(
+                "household_search_state",
+                {
+                    "query": "",
+                    "entity_types": ["events"],
+                    "include_private_review_state": True,
+                },
+                task_id=task_id,
+            )
+        )
+
+        visibility = result["visibility"]
+        assert visibility["private_review_state"]["available_in_current_scope"] is True
+        assert visibility["private_review_state"]["included_in_response"] is True
         assert visibility["private_review_state"]["pending_candidate_count"] == 1
         assert visibility["private_review_state"]["pending_candidates"][0]["title"] == "Summer camp invoice"
-        assert visibility["private_review_state"]["pending_candidates"][0]["source_visibility"] == "needs_classification"
+        assert visibility["private_review_state"]["pending_candidates"][0]["source_visibility"] is None
+    finally:
+        clear_household_tool_context(task_id)
+        store.close()
+
+
+def test_household_apply_candidate_review_confirms_with_corrected_fields(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    store.append_channel_message(
+        ChannelMessage(
+            id="assistant_review_prompt_200",
+            household_id="hh_123",
+            channel_id="chan_dm_123",
+            sender_role=ChannelMessageRole.ASSISTANT,
+            body="Theo music class. Reply yes if I should add it, no if it's wrong, or skip for later.",
+            metadata={
+                "protocol_kind": "candidate_review_prompt",
+                "pending_action_type": "candidate_review",
+                "pending_action_target_kind": "imported_candidate",
+                "pending_action_target_id": "cand_200",
+            },
+            created_at=datetime.now(timezone.utc).timestamp(),
+        )
+    )
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_200",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:music-200",
+            title="Theo music class",
+            summary="Theo has a music class on June 10 at 4:15 PM.",
+            state=CandidateState.PENDING_REVIEW,
+            metadata={
+                "proposed_fields": {
+                    "title": "Theo music class",
+                    "starts_at": "2026-06-10T16:15:00-07:00",
+                    "ends_at": "2026-06-10T17:00:00-07:00",
+                    "timezone": "America/Los_Angeles",
+                }
+            },
+        )
+    )
+    task_id = "task-apply-candidate-review"
+    set_household_tool_context(
+        task_id,
+        store=store,
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_dm_123",
+    )
+    try:
+        result = json.loads(
+            handle_function_call(
+                "household_apply_candidate_review",
+                {
+                    "candidate_id": "cand_200",
+                    "resolution": "confirm",
+                    "starts_at": "2026-06-10T15:30:00-07:00",
+                    "ends_at": "2026-06-10T16:15:00-07:00",
+                },
+                task_id=task_id,
+            )
+        )
+
+        candidate = store.get_imported_candidate("cand_200")
+        assert candidate is not None
+        assert candidate.state == CandidateState.CONFIRMED
+        assert result["result"]["event"]["starts_at"] == "2026-06-10T15:30:00-07:00"
+        assert result["result"]["event"]["ends_at"] == "2026-06-10T16:15:00-07:00"
+        assert result["result"]["reply_text"].startswith("Confirmed.")
+    finally:
+        clear_household_tool_context(task_id)
+        store.close()
+
+
+def test_household_apply_candidate_review_rejects_non_active_candidate(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    store.append_channel_message(
+        ChannelMessage(
+            id="assistant_review_prompt_201",
+            household_id="hh_123",
+            channel_id="chan_dm_123",
+            sender_role=ChannelMessageRole.ASSISTANT,
+            body="Theo music class. Reply yes if I should add it, no if it's wrong, or skip for later.",
+            metadata={
+                "protocol_kind": "candidate_review_prompt",
+                "pending_action_type": "candidate_review",
+                "pending_action_target_kind": "imported_candidate",
+                "pending_action_target_id": "cand_201",
+            },
+            created_at=datetime.now(timezone.utc).timestamp(),
+        )
+    )
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_201",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:music-201",
+            title="Theo music class",
+            summary="Theo has a music class on June 10 at 4:15 PM.",
+            state=CandidateState.PENDING_REVIEW,
+        )
+    )
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_202",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:music-202",
+            title="Coaching session",
+            summary="Coaching session on April 15.",
+            state=CandidateState.PENDING_REVIEW,
+        )
+    )
+    task_id = "task-apply-candidate-review-mismatch"
+    set_household_tool_context(
+        task_id,
+        store=store,
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_dm_123",
+    )
+    try:
+        result = json.loads(
+            handle_function_call(
+                "household_apply_candidate_review",
+                {
+                    "candidate_id": "cand_202",
+                    "resolution": "confirm",
+                },
+                task_id=task_id,
+            )
+        )
+
+        assert result["error"] == "Candidate review is only allowed for the one currently surfaced review item in this DM."
+        assert result["active_candidate_id"] == "cand_201"
+        assert store.get_imported_candidate("cand_202").state == CandidateState.PENDING_REVIEW
+        assert store.list_household_events(household_id="hh_123") == []
+    finally:
+        clear_household_tool_context(task_id)
+        store.close()
+
+
+def test_household_apply_nudge_action_marks_active_nudge_done(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    store.upsert_household_nudge(
+        HouseholdNudge(
+            id="nudge_123",
+            household_id="hh_123",
+            target_kind=HouseholdNudgeTargetKind.GENERAL,
+            message="Reminder: pack baseball gear.",
+            status=HouseholdNudgeStatus.SENT,
+            recipient_member_id="mem_123",
+            channel_id="chan_dm_123",
+            scheduled_for="2026-04-07T15:00:00+00:00",
+            sent_at="2026-04-07T15:05:00+00:00",
+        )
+    )
+    store.append_channel_message(
+        ChannelMessage(
+            id="msg_nudge_123",
+            household_id="hh_123",
+            channel_id="chan_dm_123",
+            sender_role=ChannelMessageRole.ASSISTANT,
+            body="Reminder: pack baseball gear.",
+            metadata={
+                "protocol_kind": "household_nudge_prompt",
+                "pending_action_type": "household_nudge",
+                "pending_action_target_kind": "household_nudge",
+                "pending_action_target_id": "nudge_123",
+            },
+            created_at=datetime.now(timezone.utc).timestamp(),
+        )
+    )
+    task_id = "task-household-nudge"
+    set_household_tool_context(
+        task_id,
+        store=store,
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_dm_123",
+    )
+    try:
+        result = json.loads(
+            handle_function_call(
+                "household_apply_nudge_action",
+                {
+                    "nudge_id": "nudge_123",
+                    "action": "done",
+                },
+                task_id=task_id,
+            )
+        )
+
+        assert "result" in result
+        assert "done" in result["result"]["reply_text"].lower()
+        assert store.get_household_nudge("nudge_123").status == HouseholdNudgeStatus.ACKNOWLEDGED
+    finally:
+        clear_household_tool_context(task_id)
+        store.close()
+
+
+def test_household_apply_onboarding_update_records_explicit_child_detail(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    task_id = "task-household-onboarding"
+    set_household_tool_context(
+        task_id,
+        store=store,
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_dm_123",
+    )
+    try:
+        handle_function_call(
+            "household_apply_onboarding_update",
+            {
+                "parent_name": "Maya",
+                "child_names": ["Ava"],
+            },
+            task_id=task_id,
+        )
+        result = json.loads(
+            handle_function_call(
+                "household_apply_onboarding_update",
+                {
+                    "age": "7",
+                },
+                task_id=task_id,
+            )
+        )
+
+        session = store.get_onboarding_session(
+            household_id="hh_123",
+            member_id="mem_123",
+            thread_id="dm-thread-123",
+        )
+        assert session is not None
+        assert session.current_child_name == "Ava"
+        assert session.child_profiles[0]["age"] == "7"
+        assert result["result"]["stage"] == "collect_child_school"
     finally:
         clear_household_tool_context(task_id)
         store.close()

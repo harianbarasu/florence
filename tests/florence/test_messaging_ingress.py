@@ -1174,14 +1174,16 @@ def test_pending_candidate_does_not_hijack_calendar_question_without_explicit_re
     store.close()
 
 
-def test_review_prompt_then_yes_confirms_pending_candidate(tmp_path):
+def test_review_prompt_then_yes_routes_single_item_context_to_chat(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)
     onboarding_service = _build_onboarding_service(store, review_service)
+    chat_service = _StubHouseholdChatService("Confirmed. I’m adding that review item now.")
     ingress = _build_ingress(
         store,
         onboarding_service,
         review_service,
+        household_chat_service=chat_service,
     )
     _complete_hybrid_onboarding(onboarding_service)
     store.upsert_imported_candidate(
@@ -1223,6 +1225,9 @@ def test_review_prompt_then_yes_confirms_pending_candidate(tmp_path):
         if message.sender_role == ChannelMessageRole.ASSISTANT
     )
     assert latest_review_message.metadata["protocol_kind"] == CANDIDATE_REVIEW_PROMPT_KIND
+    assert latest_review_message.metadata["pending_action_type"] == "candidate_review"
+    assert latest_review_message.metadata["pending_action_target_kind"] == "imported_candidate"
+    assert latest_review_message.metadata["pending_action_target_id"] == "cand_124"
 
     confirmation = ingress.handle_message(
         FlorenceResolvedInboundMessage(
@@ -1241,24 +1246,183 @@ def test_review_prompt_then_yes_confirms_pending_candidate(tmp_path):
         )
     )
     assert confirmation.reply_text is not None
-    assert confirmation.reply_text.startswith("Confirmed.")
+    assert confirmation.reply_text == "Confirmed. I’m adding that review item now."
+    assert chat_service.calls
+    contextual_message = chat_service.calls[-1]["message_text"]
+    assert '"candidate_id": "cand_124"' in contextual_message
+    assert "Interpret the whole message yourself, including short yes/no/share/private replies" in contextual_message
+    assert "User reply: yes" in contextual_message
     candidate = store.get_imported_candidate("cand_124")
     assert candidate is not None
-    assert candidate.state == CandidateState.CONFIRMED
-    events = store.list_household_events(household_id="hh_123")
-    assert len(events) == 1
-    assert "Fireflies Haircuts for Kids" in events[0].title
+    assert candidate.state == CandidateState.PENDING_REVIEW
+    assert store.list_household_events(household_id="hh_123") == []
     store.close()
 
 
-def test_review_prompt_then_share_persists_source_rule_for_future_items(tmp_path):
+def test_review_prompt_then_corrective_yes_routes_single_item_context_to_chat(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)
     onboarding_service = _build_onboarding_service(store, review_service)
+    chat_service = _StubHouseholdChatService("Got it — I’ll fix the time before I add it.")
     ingress = _build_ingress(
         store,
         onboarding_service,
         review_service,
+        household_chat_service=chat_service,
+    )
+    _complete_hybrid_onboarding(onboarding_service)
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_124b",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:music-1",
+            title="Theo music class",
+            summary="Theo has a music class on June 10 at 4:15 PM.",
+            state=CandidateState.PENDING_REVIEW,
+            metadata={
+                "confirmation_question": "Should I add Theo music class to the household plan?",
+                "proposed_fields": {
+                    "title": "Theo music class",
+                    "starts_at": "2026-06-10T16:15:00-07:00",
+                    "ends_at": "2026-06-10T17:00:00-07:00",
+                    "timezone": "America/Los_Angeles",
+                },
+            },
+        )
+    )
+
+    review = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_304a",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="review imports",
+                is_group_chat=False,
+            ),
+        )
+    )
+    assert review.reply_text is not None
+
+    correction = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_304b",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="Yes, add it but the time is 3:30 PM to 4:15 PM.",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert correction.reply_text == "Got it — I’ll fix the time before I add it."
+    assert chat_service.calls
+    contextual_message = chat_service.calls[-1]["message_text"]
+    assert "household_apply_candidate_review" in contextual_message
+    assert '"candidate_id": "cand_124b"' in contextual_message
+    assert "Treat only this item as review-actionable right now." in contextual_message
+    assert "User reply: Yes, add it but the time is 3:30 PM to 4:15 PM." in contextual_message
+    candidate = store.get_imported_candidate("cand_124b")
+    assert candidate is not None
+    assert candidate.state == CandidateState.PENDING_REVIEW
+    assert store.list_household_events(household_id="hh_123") == []
+    store.close()
+
+
+def test_review_prompt_then_corrective_no_does_not_reject_candidate(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_onboarding_service(store, review_service)
+    chat_service = _StubHouseholdChatService("Got it — the event might be right, but the details need correction.")
+    ingress = _build_ingress(
+        store,
+        onboarding_service,
+        review_service,
+        household_chat_service=chat_service,
+    )
+    _complete_hybrid_onboarding(onboarding_service)
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_124c",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:music-2",
+            title="Theo music class",
+            summary="Theo has a music class on June 10 at 4:15 PM.",
+            state=CandidateState.PENDING_REVIEW,
+            metadata={
+                "confirmation_question": "Should I add Theo music class to the household plan?",
+            },
+        )
+    )
+
+    ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_304c",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="review imports",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    correction = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_304d",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="No, it is at 3:30 and lasts until 4:15.",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert correction.reply_text == "Got it — the event might be right, but the details need correction."
+    candidate = store.get_imported_candidate("cand_124c")
+    assert candidate is not None
+    assert candidate.state == CandidateState.PENDING_REVIEW
+    assert store.list_household_events(household_id="hh_123") == []
+    assert "Interpret the whole message yourself, including short yes/no/share/private replies" in chat_service.calls[-1]["message_text"]
+    store.close()
+
+
+def test_review_prompt_then_share_routes_to_chat_for_explicit_source_decision(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_onboarding_service(store, review_service)
+    chat_service = _StubHouseholdChatService("Got it — I’ll treat this source as shared household context.")
+    ingress = _build_ingress(
+        store,
+        onboarding_service,
+        review_service,
+        household_chat_service=chat_service,
     )
     _complete_hybrid_onboarding(onboarding_service)
     store.upsert_imported_candidate(
@@ -1295,7 +1459,7 @@ def test_review_prompt_then_share_persists_source_rule_for_future_items(tmp_path
         )
     )
     assert review.reply_text is not None
-    assert "Reply share to treat future items from this source as household-shared" in review.reply_text
+    assert "Reply yes if I should add it, no if it's wrong, or skip for later." in review.reply_text
 
     classification = ingress.handle_message(
         FlorenceResolvedInboundMessage(
@@ -1315,13 +1479,18 @@ def test_review_prompt_then_share_persists_source_rule_for_future_items(tmp_path
     )
 
     assert classification.reply_text is not None
-    assert "shared household context" in classification.reply_text
+    assert classification.reply_text == "Got it — I’ll treat this source as shared household context."
+    assert chat_service.calls
+    contextual_message = chat_service.calls[-1]["message_text"]
+    assert '"candidate_id": "cand_125"' in contextual_message
+    assert "set source_visibility" in contextual_message
+    assert "User reply: share" in contextual_message
     rules = store.list_household_source_rules(
         household_id="hh_123",
         source_kind=GoogleSourceKind.GMAIL,
         visibility=HouseholdSourceVisibility.SHARED,
     )
-    assert any(rule.matcher_value == "musicalbeginnings.com" for rule in rules)
+    assert rules == []
     store.close()
 
 
@@ -2002,6 +2171,21 @@ def test_complete_dm_done_acknowledges_sent_nudge_and_marks_work_item_done(tmp_p
         sent_at=(now - timedelta(minutes=15)).isoformat(),
     )
     store.upsert_household_nudge(nudge)
+    store.append_channel_message(
+        ChannelMessage(
+            id="msg_nudge_prompt_123",
+            household_id="hh_123",
+            channel_id="chan_dm_123",
+            sender_role=ChannelMessageRole.ASSISTANT,
+            body="Reminder: upload the field trip form tonight.",
+            metadata={
+                "pending_action_type": "household_nudge",
+                "pending_action_target_kind": "household_nudge",
+                "pending_action_target_id": "nudge_123",
+            },
+            created_at=datetime.now(timezone.utc).timestamp(),
+        )
+    )
 
     result = ingress.handle_message(
         FlorenceResolvedInboundMessage(
@@ -2066,6 +2250,21 @@ def test_complete_dm_snooze_reschedules_sent_nudge_and_logs_event(tmp_path):
         sent_at=(now - timedelta(minutes=8)).isoformat(),
     )
     store.upsert_household_nudge(nudge)
+    store.append_channel_message(
+        ChannelMessage(
+            id="msg_nudge_prompt_124",
+            household_id="hh_123",
+            channel_id="chan_dm_123",
+            sender_role=ChannelMessageRole.ASSISTANT,
+            body="Reminder: pack baseball gear.",
+            metadata={
+                "pending_action_type": "household_nudge",
+                "pending_action_target_kind": "household_nudge",
+                "pending_action_target_id": "nudge_124",
+            },
+            created_at=datetime.now(timezone.utc).timestamp(),
+        )
+    )
 
     result = ingress.handle_message(
         FlorenceResolvedInboundMessage(
@@ -2100,6 +2299,75 @@ def test_complete_dm_snooze_reschedules_sent_nudge_and_logs_event(tmp_path):
     events = store.list_pilot_events(household_id="hh_123", event_type="reminder_snoozed")
     assert len(events) == 1
     assert events[0].metadata["nudge_id"] == "nudge_124"
+    store.close()
+
+
+def test_complete_dm_got_it_does_not_acknowledge_sent_nudge(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_onboarding_service(store, review_service)
+    chat_service = _StubHouseholdChatService("Tell me which reminder you want to update.")
+    ingress = _build_ingress(
+        store,
+        onboarding_service,
+        review_service,
+        household_chat_service=chat_service,
+    )
+    _complete_hybrid_onboarding(onboarding_service)
+
+    now = datetime.now(timezone.utc)
+    nudge = HouseholdNudge(
+        id="nudge_125",
+        household_id="hh_123",
+        target_kind=HouseholdNudgeTargetKind.GENERAL,
+        message="Reminder: pack baseball gear.",
+        status=HouseholdNudgeStatus.SENT,
+        recipient_member_id="mem_123",
+        channel_id="chan_dm_123",
+        scheduled_for=(now - timedelta(minutes=10)).isoformat(),
+        sent_at=(now - timedelta(minutes=8)).isoformat(),
+    )
+    store.upsert_household_nudge(nudge)
+    store.append_channel_message(
+        ChannelMessage(
+            id="msg_nudge_prompt_125",
+            household_id="hh_123",
+            channel_id="chan_dm_123",
+            sender_role=ChannelMessageRole.ASSISTANT,
+            body="Reminder: pack baseball gear.",
+            metadata={
+                "pending_action_type": "household_nudge",
+                "pending_action_target_kind": "household_nudge",
+                "pending_action_target_id": "nudge_125",
+            },
+            created_at=datetime.now(timezone.utc).timestamp(),
+        )
+    )
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_209",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="got it",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert result.consumed is True
+    assert result.reply_text == "Tell me which reminder you want to update."
+    updated_nudge = store.get_household_nudge("nudge_125")
+    assert updated_nudge is not None
+    assert updated_nudge.status == HouseholdNudgeStatus.SENT
+    assert store.list_pilot_events(household_id="hh_123", event_type="reminder_done") == []
     store.close()
 
 

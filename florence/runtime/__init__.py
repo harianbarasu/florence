@@ -12,6 +12,7 @@ _EXPORTS = {
     "FlorenceGoogleSyncPersistenceService": ("florence.runtime.google_services", "FlorenceGoogleSyncPersistenceService"),
     "FlorenceGoogleSyncWorkerService": ("florence.runtime.google_services", "FlorenceGoogleSyncWorkerService"),
     "FlorenceGroupShareService": ("florence.runtime.group_share", "FlorenceGroupShareService"),
+    "FlorenceHouseholdCalendarProjectionService": ("florence.runtime.household_calendar_projection", "FlorenceHouseholdCalendarProjectionService"),
     "FlorenceHouseholdManagerService": ("florence.runtime.household_manager", "FlorenceHouseholdManagerService"),
     "FlorenceIdentityResolver": ("florence.runtime.resolver", "FlorenceIdentityResolver"),
     "FlorenceOnboardingSessionService": ("florence.runtime.onboarding_service", "FlorenceOnboardingSessionService"),

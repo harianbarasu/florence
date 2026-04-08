@@ -4,6 +4,7 @@ from florence.contracts import CandidateState, ChildProfile, GoogleConnection, G
 from florence.google import GmailSyncItem, ParentCalendarSyncItem
 from florence.onboarding import OnboardingState
 from florence.runtime import FlorenceGoogleSyncPersistenceService, FlorenceGoogleSyncWorkerService
+from florence.runtime.google_services import _calendar_sync_targets
 from florence.state import FlorenceStateDB
 
 
@@ -350,3 +351,36 @@ def test_google_sync_worker_honors_calendar_preferences_and_keeps_non_primary_id
     assert {candidate.metadata["calendar_id"] for candidate in candidates} == {"family", "shared_secondary"}
     assert result.connection.metadata["last_calendar_item_count"] == 3
     store.close()
+
+
+def test_google_sync_targets_skip_florence_managed_shared_calendars_from_any_connection():
+    targets = _calendar_sync_targets(
+        {
+            "available_calendars": [
+                {
+                    "id": "family",
+                    "summary": "Family calendar",
+                    "timezone": "America/Los_Angeles",
+                    "primary": True,
+                },
+                {
+                    "id": "florence_shared",
+                    "summary": "Florence shared household calendar",
+                    "timezone": "America/Los_Angeles",
+                },
+            ],
+            "calendar_preferences": {
+                "family": {
+                    "usage_mode": "planning_and_conflicts",
+                    "detail_visibility": "full_details",
+                },
+                "florence_shared": {
+                    "usage_mode": "planning_and_conflicts",
+                    "detail_visibility": "full_details",
+                },
+            },
+            "florence_managed_calendar_ids": ["florence_shared"],
+        }
+    )
+
+    assert [target.calendar.id for target in targets] == ["family"]

@@ -182,19 +182,6 @@ def build_rules_for_candidate(
             )
         )
     return tuple(rules)
-
-
-def build_source_rule_prompt(candidate: ImportedCandidate) -> str | None:
-    profile = build_candidate_source_profile(candidate)
-    if profile is None:
-        return None
-    return (
-        f"Future items from {profile.label} are not classified yet. "
-        "Reply share to treat future items from this source as household-shared, "
-        "or private to keep future items from this source private."
-    )
-
-
 def request_matches_shared_gmail_rule(
     rules: list[HouseholdSourceRule],
     *,

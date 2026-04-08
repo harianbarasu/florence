@@ -335,3 +335,49 @@ def test_google_sync_extracts_grounding_hints_from_google_sources():
     assert activity_hint["locations"] == ["North Field"]
     assert hints["contacts"] == ["Ms. Kim"]
     assert hints["locations"] == ["North Field"]
+
+
+def test_google_sync_preserves_source_provenance_and_temporal_evidence():
+    connection = GoogleConnection(
+        id="gconn_123",
+        household_id="hh_123",
+        member_id="mem_123",
+        email="parent@example.com",
+        connected_scopes=(GoogleSourceKind.GMAIL,),
+        metadata={"primary_calendar_timezone": "America/Los_Angeles"},
+    )
+    context = HouseholdContext(
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_dm_123",
+        visible_child_names=["Theo"],
+        activity_labels=["Music"],
+    )
+    gmail_item = GmailSyncItem(
+        gmail_message_id="gmail_provenance",
+        thread_id="thread_provenance",
+        from_address="coach@example.com",
+        subject="Theo music class",
+        snippet="June 10 update",
+        body_text="Theo music class\n\nJune 10 from 3:30 to 4:15 PM\nBring snack",
+        attachment_text="Visible schedule\n\nTue Jun 10 3:30-4:15 PM",
+        attachment_count=1,
+        received_at=datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc),
+    )
+
+    result = build_google_import_candidates(
+        FlorenceGoogleSyncBatch(
+            connection=connection,
+            context=context,
+            gmail_items=[gmail_item],
+        )
+    )
+
+    candidate = result.candidates[0]
+    assert candidate.metadata["source_provenance"]["body_text"] == "Theo music class\n\nJune 10 from 3:30 to 4:15 PM\nBring snack"
+    assert candidate.metadata["source_provenance"]["attachment_text"] == "Visible schedule\n\nTue Jun 10 3:30-4:15 PM"
+    assert candidate.metadata["raw_metadata"]["temporal_evidence"]["date_match"]["date"] == "2026-06-10"
+    assert candidate.metadata["raw_metadata"]["temporal_evidence"]["time_range"] == {
+        "start": "15:30",
+        "end": "16:15",
+    }

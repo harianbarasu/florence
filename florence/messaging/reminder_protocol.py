@@ -7,7 +7,12 @@ import re
 from typing import Callable
 
 from florence.messaging.channel_log import FlorenceChannelLog
-from florence.messaging.protocol_types import FlorenceProtocolReply
+from florence.messaging.protocol_types import (
+    HOUSEHOLD_NUDGE_PROMPT_KIND,
+    PENDING_ACTION_TARGET_ID_KEY,
+    PENDING_ACTION_TYPE_KEY,
+    FlorenceProtocolReply,
+)
 
 
 def _looks_like_google_done_prompt(text: str) -> bool:
@@ -37,18 +42,19 @@ def _looks_like_reminder_feedback(text: str) -> bool:
 
 
 def _looks_like_done_for_reminder(text: str) -> bool:
-    return bool(
-        re.search(
-            r"^(?:done|handled|completed|finished|got it|took care of it)\b",
-            text.strip(),
-            re.IGNORECASE,
-        )
-    )
+    normalized = " ".join(text.strip().lower().split())
+    return normalized in {
+        "done",
+        "handled",
+        "completed",
+        "finished",
+        "took care of it",
+    }
 
 
 def _looks_like_snooze_request(text: str) -> bool:
-    lowered = text.lower()
-    return "snooze" in lowered or "remind me later" in lowered or "later" == lowered.strip()
+    lowered = " ".join(text.lower().split())
+    return lowered.startswith("snooze") or lowered == "remind me later" or lowered == "later"
 
 
 def _parse_snooze_deadline(text: str, *, now: datetime | None = None) -> datetime:
@@ -122,11 +128,14 @@ class FlorenceReminderProtocol:
         if google_done_result is not None:
             return google_done_result
 
-        if _looks_like_done_for_reminder(text):
+        active_nudge_id = self._active_nudge_id(channel_id=channel_id)
+
+        if active_nudge_id and _looks_like_done_for_reminder(text):
             reminder_reply = self.household_manager_service.complete_actionable_nudge(
                 household_id=household_id,
                 member_id=member_id,
                 channel_id=channel_id,
+                nudge_id=active_nudge_id,
             )
             if reminder_reply is None:
                 return None
@@ -135,13 +144,14 @@ class FlorenceReminderProtocol:
                 consumed=True,
             )
 
-        if _looks_like_snooze_request(text):
+        if active_nudge_id and _looks_like_snooze_request(text):
             now = datetime.now(timezone.utc)
             snooze_until = _parse_snooze_deadline(text, now=now).astimezone(timezone.utc)
             reminder_reply = self.household_manager_service.snooze_actionable_nudge(
                 household_id=household_id,
                 member_id=member_id,
                 channel_id=channel_id,
+                nudge_id=active_nudge_id,
                 scheduled_for=snooze_until,
                 now=now,
             )
@@ -153,6 +163,34 @@ class FlorenceReminderProtocol:
             )
 
         return None
+
+    def is_reply_armed(self, *, channel_id: str) -> bool:
+        return self._active_nudge_id(channel_id=channel_id) is not None
+
+    def build_chat_followup_context(
+        self,
+        *,
+        household_id: str,
+        member_id: str,
+        channel_id: str,
+        text: str,
+    ) -> str | None:
+        active_nudge_id = self._active_nudge_id(channel_id=channel_id)
+        if active_nudge_id is None:
+            return None
+        nudge = self.household_manager_service.store.get_household_nudge(active_nudge_id)
+        if nudge is None or nudge.household_id != household_id:
+            return None
+        if nudge.recipient_member_id and nudge.recipient_member_id != member_id:
+            return None
+        return (
+            "Context for this turn: there is one currently surfaced reminder/nudge in this DM.\n"
+            "Only that reminder is actionable right now.\n"
+            "Use household_apply_nudge_action with the exact nudge_id if the user is completing, snoozing, or otherwise updating it.\n"
+            "Do not mutate reminder state for vague acknowledgements unless the user clearly means this exact reminder.\n"
+            f"Active nudge: {self._render_nudge_context(nudge)}\n"
+            f"User reply: {text}"
+        )
 
     def _handle_google_done_followup(
         self,
@@ -197,3 +235,27 @@ class FlorenceReminderProtocol:
             return None
         reply_messages = chat_result.reply_messages or ((chat_result.reply_text,) if chat_result.reply_text else ())
         return chat_result.reply_text, reply_messages
+
+    def _active_nudge_id(self, *, channel_id: str) -> str | None:
+        latest_assistant = self.channel_log.latest_assistant_message(channel_id=channel_id, limit=8)
+        if latest_assistant is None:
+            return None
+        protocol_kind = str(latest_assistant.metadata.get("protocol_kind") or "").strip()
+        if protocol_kind and protocol_kind != HOUSEHOLD_NUDGE_PROMPT_KIND:
+            return None
+        if latest_assistant.metadata.get(PENDING_ACTION_TYPE_KEY) != "household_nudge":
+            return None
+        nudge_id = str(latest_assistant.metadata.get(PENDING_ACTION_TARGET_ID_KEY) or "").strip()
+        return nudge_id or None
+
+    @staticmethod
+    def _render_nudge_context(nudge) -> str:
+        bits = [f'nudge_id="{nudge.id}"', f'status="{nudge.status.value}"']
+        if nudge.message:
+            bits.append(f'message="{nudge.message}"')
+        bits.append(f'target_kind="{nudge.target_kind.value}"')
+        if nudge.target_id:
+            bits.append(f'target_id="{nudge.target_id}"')
+        if nudge.scheduled_for:
+            bits.append(f'scheduled_for="{nudge.scheduled_for}"')
+        return "{ " + ", ".join(bits) + " }"

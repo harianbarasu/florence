@@ -58,7 +58,6 @@ class FlorenceMessagingIngressService:
             store,
             channel_log=self.channel_log,
             household_chat_service=self.household_chat_service,
-            review_confirmation_suffix=_REVIEW_CONFIRMATION_SUFFIX,
         )
         self.setup_protocol = FlorenceSetupProtocol(
             onboarding_service=self.onboarding_service,

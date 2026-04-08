@@ -136,6 +136,42 @@ def _normalize_hours(hours: int, meridiem: str | None) -> int:
     return hours
 
 
+def _time_total_minutes(hours: int, minutes: int) -> int:
+    return hours * 60 + minutes
+
+
+def _normalize_time_range_pair(
+    *,
+    start_hour: int,
+    start_minute: int,
+    start_meridiem: str | None,
+    end_hour: int,
+    end_minute: int,
+    end_meridiem: str | None,
+) -> ParsedTimeRange:
+    inferred_start = (start_meridiem or end_meridiem or "").lower() or None
+    inferred_end = (end_meridiem or start_meridiem or "").lower() or None
+    normalized_start = ParsedTime(_normalize_hours(start_hour, inferred_start), start_minute)
+    normalized_end = ParsedTime(_normalize_hours(end_hour, inferred_end), end_minute)
+
+    # When only one side carried am/pm and the naive propagation yields a backwards range,
+    # try flipping the missing side before giving up. This handles common strings like
+    # "11:30-1 pm" or "3:30 PM-4:15".
+    if _time_total_minutes(normalized_end.hours, normalized_end.minutes) <= _time_total_minutes(normalized_start.hours, normalized_start.minutes):
+        if start_meridiem and not end_meridiem:
+            alternate_end_meridiem = "am" if inferred_start == "pm" else "pm"
+            alternate_end = ParsedTime(_normalize_hours(end_hour, alternate_end_meridiem), end_minute)
+            if _time_total_minutes(alternate_end.hours, alternate_end.minutes) > _time_total_minutes(normalized_start.hours, normalized_start.minutes):
+                normalized_end = alternate_end
+        elif end_meridiem and not start_meridiem:
+            alternate_start_meridiem = "am" if inferred_end == "pm" else "pm"
+            alternate_start = ParsedTime(_normalize_hours(start_hour, alternate_start_meridiem), start_minute)
+            if _time_total_minutes(normalized_end.hours, normalized_end.minutes) > _time_total_minutes(alternate_start.hours, alternate_start.minutes):
+                normalized_start = alternate_start
+
+    return ParsedTimeRange(start=normalized_start, end=normalized_end)
+
+
 def parse_single_time(source: str) -> ParsedTime | None:
     match = re.search(
         r"\b(?:at|starts?\s+at|begins?\s+at|arrive(?:s|)\s+at)\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b",
@@ -153,14 +189,18 @@ def parse_single_time(source: str) -> ParsedTime | None:
 
 def parse_time_range(source: str) -> ParsedTimeRange | None:
     explicit = re.search(
-        r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*(?:-|to|until)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b",
+        r"\b(?:from\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:-|–|to|until)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b",
         source,
         flags=re.IGNORECASE,
     )
-    if explicit:
-        return ParsedTimeRange(
-            start=ParsedTime(_normalize_hours(int(explicit.group(1)), explicit.group(3)), int(explicit.group(2) or 0)),
-            end=ParsedTime(_normalize_hours(int(explicit.group(4)), explicit.group(6)), int(explicit.group(5) or 0)),
+    if explicit and (explicit.group(3) or explicit.group(6)):
+        return _normalize_time_range_pair(
+            start_hour=int(explicit.group(1)),
+            start_minute=int(explicit.group(2) or 0),
+            start_meridiem=explicit.group(3),
+            end_hour=int(explicit.group(4)),
+            end_minute=int(explicit.group(5) or 0),
+            end_meridiem=explicit.group(6),
         )
 
     starts_ends = re.search(

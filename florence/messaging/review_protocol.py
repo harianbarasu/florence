@@ -2,34 +2,19 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 
-from florence.contracts import HouseholdSourceVisibility
 from florence.messaging.channel_log import FlorenceChannelLog
-from florence.messaging.protocol_types import CANDIDATE_REVIEW_PROMPT_KIND, FlorenceProtocolReply
+from florence.messaging.protocol_types import (
+    CANDIDATE_REVIEW_PROMPT_KIND,
+    PENDING_ACTION_TARGET_ID_KEY,
+    build_candidate_review_prompt_metadata,
+    FlorenceProtocolReply,
+)
 
 logger = logging.getLogger(__name__)
-
-
-def _looks_like_yes(text: str) -> bool:
-    return bool(re.search(r"^(?:yes|yep|yeah|sure|confirm|add it|do it)\b", text.strip(), re.IGNORECASE))
-
-
-def _looks_like_no(text: str) -> bool:
-    return bool(re.search(r"^(?:no|nope|nah|reject|wrong)\b", text.strip(), re.IGNORECASE))
-
-
-def _looks_like_skip(text: str) -> bool:
-    return bool(re.search(r"^(?:skip|later|not now)\b", text.strip(), re.IGNORECASE))
-
-
-def _looks_like_share_source(text: str) -> bool:
-    return bool(re.search(r"\b(?:share|shared|always share|future share)\b", text.strip(), re.IGNORECASE))
-
-
-def _looks_like_private_source(text: str) -> bool:
-    return bool(re.search(r"\b(?:private|keep private|don't share|do not share)\b", text.strip(), re.IGNORECASE))
 
 
 def _looks_like_review_queue_request(text: str) -> bool:
@@ -107,60 +92,56 @@ class FlorenceCandidateReviewProtocol:
             actor_member_id=member_id,
             prompt=prompt,
         )
-        review_reply_armed = self._is_candidate_review_reply_armed(
-            channel_id=channel_id,
-            review_prompt_text=prompt_text,
-        )
-        if review_reply_armed and (_looks_like_share_source(text) or _looks_like_private_source(text)):
-            source_visibility = (
-                HouseholdSourceVisibility.PRIVATE
-                if _looks_like_private_source(text)
-                else HouseholdSourceVisibility.SHARED
-            )
-            resolution = "confirm" if _looks_like_yes(text) else "reject" if _looks_like_no(text) else None
-            review_reply = self.candidate_review_service.apply_review_response(
-                candidate_id=prompt.candidate.id,
-                member_id=member_id,
-                source_visibility=source_visibility,
-                resolution=resolution,
-            )
-            return FlorenceProtocolReply(
-                reply_text=review_reply.reply_text,
-                group_announcement=review_reply.group_announcement,
-                consumed=True,
-            )
-        if review_reply_armed and _looks_like_yes(text):
-            review_reply = self.candidate_review_service.apply_review_response(
-                candidate_id=prompt.candidate.id,
-                member_id=member_id,
-                resolution="confirm",
-            )
-            return FlorenceProtocolReply(
-                reply_text=review_reply.reply_text,
-                group_announcement=review_reply.group_announcement,
-                consumed=True,
-            )
-        if review_reply_armed and _looks_like_no(text):
-            review_reply = self.candidate_review_service.apply_review_response(
-                candidate_id=prompt.candidate.id,
-                member_id=member_id,
-                resolution="reject",
-            )
-            return FlorenceProtocolReply(reply_text=review_reply.reply_text, consumed=True)
-        if review_reply_armed and _looks_like_skip(text):
-            review_reply = self.candidate_review_service.apply_review_response(
-                candidate_id=prompt.candidate.id,
-                member_id=member_id,
-                resolution="skip",
-            )
-            return FlorenceProtocolReply(reply_text=review_reply.reply_text, consumed=True)
         if _looks_like_review_queue_request(text):
             return FlorenceProtocolReply(
                 reply_text=prompt_text,
-                reply_metadata={"protocol_kind": CANDIDATE_REVIEW_PROMPT_KIND},
+                reply_metadata=build_candidate_review_prompt_metadata(prompt.candidate.id),
                 consumed=True,
             )
         return None
+
+    def is_reply_armed(
+        self,
+        *,
+        channel_id: str,
+        review_prompt_text: str,
+    ) -> bool:
+        return self._is_candidate_review_reply_armed(
+            channel_id=channel_id,
+            review_prompt_text=review_prompt_text,
+        )
+
+    def build_chat_followup_context(
+        self,
+        *,
+        text: str,
+        prompt,
+    ) -> str:
+        candidate = prompt.candidate
+        metadata = dict(getattr(candidate, "metadata", {}) or {})
+        review_item = {
+            "candidate_id": getattr(candidate, "id", ""),
+            "title": getattr(candidate, "title", ""),
+            "summary": getattr(candidate, "summary", ""),
+            "confirmation_question": metadata.get("confirmation_question"),
+            "proposed_fields": metadata.get("proposed_fields"),
+            "source_provenance": metadata.get("source_provenance"),
+            "temporal_evidence": (metadata.get("raw_metadata") or {}).get("temporal_evidence"),
+            "source_visibility": metadata.get("source_visibility"),
+            "source_rule_label": metadata.get("source_rule_label"),
+        }
+        return (
+            "Context for this turn: there is one currently surfaced private review item in this DM.\n"
+            "Treat only this item as review-actionable right now. Do not act on any other hidden review items.\n"
+            "If the user's reply is clearly about this item, use household_apply_candidate_review with this exact "
+            "candidate_id to confirm, reject, skip, set source_visibility, or confirm with corrected fields.\n"
+            "For imported Gmail items, treat source_provenance as the primary evidence. Florence may preserve light proposed_fields, but do not trust Gmail-derived times/dates unless they are clearly supported by the raw source.\n"
+            "If the user is clarifying or correcting details, keep the same item in focus instead of treating it as a new request.\n"
+            "Interpret the whole message yourself, including short yes/no/share/private replies; Florence no longer resolves those deterministically here.\n"
+            "If the user's message is not actually about this review item, ignore the review item and just help normally.\n\n"
+            f"Active review item:\n{json.dumps(review_item, ensure_ascii=True)}\n\n"
+            f"User reply: {text.strip()}"
+        )
 
     def _render_review_prompt_text(
         self,
@@ -209,3 +190,12 @@ class FlorenceCandidateReviewProtocol:
         if latest_body == review_prompt_text.strip():
             return True
         return _looks_like_candidate_review_prompt(latest_body, confirmation_suffix=self.confirmation_suffix)
+
+    def active_candidate_id(self, *, channel_id: str) -> str | None:
+        latest_assistant = self.channel_log.latest_assistant_message(channel_id=channel_id, limit=8)
+        if latest_assistant is None:
+            return None
+        if latest_assistant.metadata.get("protocol_kind") != CANDIDATE_REVIEW_PROMPT_KIND:
+            return None
+        candidate_id = str(latest_assistant.metadata.get(PENDING_ACTION_TARGET_ID_KEY) or "").strip()
+        return candidate_id or None

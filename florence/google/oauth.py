@@ -27,7 +27,7 @@ from florence.google.types import (
 
 FLORENCE_GOOGLE_OAUTH_SCOPES = (
     "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/calendar.readonly",
+    "https://www.googleapis.com/auth/calendar",
     "https://www.googleapis.com/auth/userinfo.email",
 )
 

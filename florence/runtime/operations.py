@@ -7,14 +7,19 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from florence.contracts import CandidateState, ChannelType, HouseholdBriefingKind
-from florence.messaging.protocol_types import CANDIDATE_REVIEW_PROMPT_KIND
+from florence.contracts import CandidateState, ChannelMessageRole, ChannelType, HouseholdBriefingKind
+from florence.messaging.protocol_types import (
+    CANDIDATE_REVIEW_PROMPT_KIND,
+    build_candidate_review_prompt_metadata,
+    build_household_nudge_metadata,
+)
 from florence.runtime.candidate_review import FlorenceCandidateReviewService
 from florence.runtime.delivery import FlorenceChannelDeliveryService
 from florence.runtime.household_manager import FlorenceHouseholdManagerService
 from florence.state import FlorenceStateDB
 
 logger = logging.getLogger(__name__)
+_ACTIVE_REVIEW_NUDGE_WINDOW_SECONDS = 15 * 60
 
 
 class FlorenceHouseholdOperationsService:
@@ -100,8 +105,20 @@ class FlorenceHouseholdOperationsService:
         if prompt is None:
             return False
 
+        sent_prompt = False
         channel = self.delivery_service.find_channel_by_provider_id(dm_thread_id, store=target_store)
         if channel is not None:
+            if self._should_defer_review_nudge_for_active_conversation(
+                channel_id=channel.id,
+                store=target_store,
+            ):
+                logger.info(
+                    "Deferring review nudge during active conversation household_id=%s member_id=%s channel_id=%s",
+                    household_id,
+                    member_id,
+                    channel.id,
+                )
+                return False
             prompt_text = prompt.text
             try:
                 source_prompt = candidate_review_service.source_rule_service.build_candidate_source_prompt(prompt.candidate)
@@ -129,12 +146,35 @@ class FlorenceHouseholdOperationsService:
                     member_id,
                     prompt.candidate.id,
                 )
-            self.delivery_service.send_channel_message(
+            sent_prompt = self.delivery_service.send_channel_message(
                 channel=channel,
                 message=prompt_text,
                 store=target_store,
-                message_metadata={"protocol_kind": CANDIDATE_REVIEW_PROMPT_KIND},
+                message_metadata=build_candidate_review_prompt_metadata(prompt.candidate.id),
             )
+            if sent_prompt:
+                candidate_metadata = dict(prompt.candidate.metadata) if isinstance(prompt.candidate.metadata, dict) else {}
+                self._manager_service(store).record_pilot_event(
+                    household_id=household_id,
+                    event_type="review_prompt_sent",
+                    member_id=member_id,
+                    channel_id=channel.id,
+                    metadata={
+                        "candidate_id": prompt.candidate.id,
+                        "source_kind": prompt.candidate.source_kind.value,
+                        "source_identifier": prompt.candidate.source_identifier,
+                        "candidate_title": prompt.candidate.title,
+                        "candidate_summary": prompt.candidate.summary,
+                        "confirmation_question": str(candidate_metadata.get("confirmation_question") or "").strip() or None,
+                        "source_visibility": str(candidate_metadata.get("source_visibility") or "").strip() or None,
+                        "source_rule_label": str(candidate_metadata.get("source_rule_label") or "").strip() or None,
+                        "newly_pending_count": len(newly_pending),
+                        "trigger": "new_pending_candidate",
+                    },
+                )
+
+        if not sent_prompt:
+            return False
 
         nudged_at = datetime.now(timezone.utc).isoformat()
         for candidate in newly_pending:
@@ -163,7 +203,12 @@ class FlorenceHouseholdOperationsService:
                     channel = target_store.get_channel(fallback_channel_id)
             if channel is None or not nudge.message.strip():
                 continue
-            if self.delivery_service.send_channel_message(channel=channel, message=nudge.message, store=target_store):
+            if self.delivery_service.send_channel_message(
+                channel=channel,
+                message=nudge.message,
+                store=target_store,
+                message_metadata=build_household_nudge_metadata(nudge.id),
+            ):
                 manager_service.mark_nudge_sent(nudge_id=nudge.id)
                 manager_service.record_pilot_event(
                     household_id=household_id,
@@ -177,6 +222,26 @@ class FlorenceHouseholdOperationsService:
                 )
                 sent += 1
         return sent
+
+    def _should_defer_review_nudge_for_active_conversation(
+        self,
+        *,
+        channel_id: str,
+        store: FlorenceStateDB,
+    ) -> bool:
+        cutoff = datetime.now(timezone.utc).timestamp() - _ACTIVE_REVIEW_NUDGE_WINDOW_SECONDS
+        recent_messages = [
+            message
+            for message in store.list_channel_messages(channel_id=channel_id, limit=8)
+            if message.created_at >= cutoff
+        ]
+        if not recent_messages:
+            return False
+        return any(
+            message.sender_role != ChannelMessageRole.ASSISTANT
+            or message.metadata.get("protocol_kind") != CANDIDATE_REVIEW_PROMPT_KIND
+            for message in recent_messages
+        )
 
     def dispatch_due_household_briefings(
         self,

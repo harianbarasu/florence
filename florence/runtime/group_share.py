@@ -25,12 +25,10 @@ class FlorenceGroupShareService:
         *,
         channel_log: FlorenceChannelLog,
         household_chat_service,
-        review_confirmation_suffix: str,
     ) -> None:
         self.store = store
         self.channel_log = channel_log
         self.household_chat_service = household_chat_service
-        self.review_confirmation_suffix = review_confirmation_suffix
 
     def handle_explicit_share_request(
         self,
@@ -42,10 +40,7 @@ class FlorenceGroupShareService:
         current_message_id: str,
     ) -> FlorenceGroupShareResult | None:
         latest_assistant = self.channel_log.latest_assistant_message(channel_id=channel_id)
-        latest_body = latest_assistant.body.strip() if latest_assistant is not None else None
         if latest_assistant is not None and latest_assistant.metadata.get("protocol_kind") == CANDIDATE_REVIEW_PROMPT_KIND:
-            return None
-        if latest_body is not None and self.review_confirmation_suffix in latest_body:
             return None
 
         provider = self._provider_for_channel(

@@ -28,10 +28,29 @@ DEFAULT_IMAGE_EXTRACTION_PROMPT = (
 
 
 def compact_text(raw: str, *, max_length: int) -> str:
-    normalized = " ".join(raw.split())
+    normalized = _normalize_preserving_line_structure(raw)
     if len(normalized) <= max_length:
         return normalized
     return f"{normalized[: max_length - 1].rstrip()}..."
+
+
+def _normalize_preserving_line_structure(raw: str) -> str:
+    text = raw.replace("\r\n", "\n").replace("\r", "\n")
+    normalized_lines: list[str] = []
+    blank_pending = False
+    for line in text.split("\n"):
+        cleaned = " ".join(line.split())
+        if not cleaned:
+            if normalized_lines and not blank_pending:
+                normalized_lines.append("")
+            blank_pending = True
+            continue
+        blank_pending = False
+        normalized_lines.append(cleaned)
+
+    while normalized_lines and not normalized_lines[-1]:
+        normalized_lines.pop()
+    return "\n".join(normalized_lines).strip()
 
 
 def response_output_text(response: Any) -> str:

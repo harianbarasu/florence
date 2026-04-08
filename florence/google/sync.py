@@ -374,6 +374,49 @@ def _calendar_source_identifier(item: ParentCalendarSyncItem) -> str:
     return f"google_calendar:{item.calendar_id}:{item.google_event_id}"
 
 
+def _compact_source_text(raw: str | None, *, max_length: int) -> str | None:
+    if not raw:
+        return None
+    text = raw.replace("\r\n", "\n").replace("\r", "\n")
+    normalized_lines: list[str] = []
+    blank_pending = False
+    for line in text.split("\n"):
+        cleaned = " ".join(line.split())
+        if not cleaned:
+            if normalized_lines and not blank_pending:
+                normalized_lines.append("")
+            blank_pending = True
+            continue
+        blank_pending = False
+        normalized_lines.append(cleaned)
+
+    while normalized_lines and not normalized_lines[-1]:
+        normalized_lines.pop()
+    normalized = "\n".join(normalized_lines).strip()
+    if len(normalized) <= max_length:
+        return normalized or None
+    return f"{normalized[: max_length - 1].rstrip()}…"
+
+
+def _gmail_source_provenance(item: GmailSyncItem) -> dict[str, object]:
+    return {
+        "subject": item.subject,
+        "snippet": _compact_source_text(item.snippet, max_length=500),
+        "body_text": _compact_source_text(item.body_text, max_length=3_000),
+        "attachment_text": _compact_source_text(item.attachment_text, max_length=4_000),
+        "attachment_count": item.attachment_count,
+    }
+
+
+def _calendar_source_provenance(item: ParentCalendarSyncItem) -> dict[str, object]:
+    return {
+        "title": item.title,
+        "description": _compact_source_text(item.description, max_length=2_000),
+        "location": _compact_source_text(item.location, max_length=400),
+        "calendar_summary": _compact_source_text(item.calendar_summary, max_length=400),
+    }
+
+
 def _build_imported_candidate(
     *,
     connection: GoogleConnection,
@@ -439,6 +482,7 @@ def build_google_import_candidates(batch: FlorenceGoogleSyncBatch) -> FlorenceGo
                     "gmail_thread_id": item.thread_id,
                     "from_address": item.from_address,
                     "received_at": item.received_at.isoformat() if item.received_at is not None else None,
+                    "source_provenance": _gmail_source_provenance(item),
                 },
             )
         )
@@ -476,6 +520,7 @@ def build_google_import_candidates(batch: FlorenceGoogleSyncBatch) -> FlorenceGo
                     "starts_at": item.starts_at.isoformat(),
                     "ends_at": item.ends_at.isoformat(),
                     "all_day": item.all_day,
+                    "source_provenance": _calendar_source_provenance(item),
                 },
             )
         )

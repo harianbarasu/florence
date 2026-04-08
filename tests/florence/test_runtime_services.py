@@ -158,7 +158,7 @@ def test_google_sync_persistence_service_stores_connection_and_candidates(tmp_pa
     assert store.get_google_connection("gconn_123") == connection
     assert len(result.candidates) == 2
     assert result.candidates[0].state == CandidateState.QUARANTINED
-    assert result.candidates[0].metadata["source_visibility"] == "needs_classification"
+    assert result.candidates[0].metadata.get("source_visibility") is None
     assert len(store.list_imported_candidates(household_id="hh_123", member_id="mem_123")) == 2
     source_rules = store.list_household_source_rules(household_id="hh_123", source_kind=GoogleSourceKind.GMAIL)
     assert source_rules == []
@@ -197,7 +197,7 @@ def test_candidate_review_prompt_asks_once_for_unknown_source_classification(tmp
     prompt = review_service.build_next_review_prompt(household_id="hh_123", member_id="mem_123")
 
     assert prompt is not None
-    assert "Reply share to treat future items from this source as household-shared" in prompt.text
+    assert "Reply share" not in prompt.text
     store.close()
 
 
@@ -284,7 +284,7 @@ def test_google_sync_persistence_service_marks_grounded_candidates_as_steady_sta
     )
 
     assert result.candidates[0].state == CandidateState.PENDING_REVIEW
-    assert result.candidates[0].metadata["source_visibility"] == "needs_classification"
+    assert result.candidates[0].metadata.get("source_visibility") is None
     store.close()
 
 
@@ -1238,7 +1238,6 @@ def test_group_share_service_promotes_existing_shareable_message(tmp_path):
         store,
         channel_log=FlorenceChannelLog(store),
         household_chat_service=_StubGroupShareChatService(),
-        review_confirmation_suffix="Reply yes if I should add it, no if it's wrong, or skip for later.",
     )
 
     result = service.handle_explicit_share_request(
@@ -1285,7 +1284,6 @@ def test_group_share_service_ignores_share_request_when_latest_message_is_review
         store,
         channel_log=FlorenceChannelLog(store),
         household_chat_service=chat_service,
-        review_confirmation_suffix="Reply yes if I should add it, no if it's wrong, or skip for later.",
     )
     store.append_channel_message(
         ChannelMessage(
@@ -1374,10 +1372,105 @@ def test_operations_review_nudge_records_candidate_review_prompt_metadata(tmp_pa
 
     latest = FlorenceChannelLog(store).latest_assistant_message(channel_id="chan_dm_123")
     persisted = store.get_imported_candidate("cand_999")
+    events = store.list_pilot_events(household_id="hh_123", event_type="review_prompt_sent")
     assert nudged is True
     assert linq.sent
     assert latest is not None
     assert latest.metadata["protocol_kind"] == CANDIDATE_REVIEW_PROMPT_KIND
+    assert latest.metadata["pending_action_type"] == "candidate_review"
+    assert latest.metadata["pending_action_target_kind"] == "imported_candidate"
+    assert latest.metadata["pending_action_target_id"] == "cand_999"
     assert persisted is not None
     assert persisted.metadata["review_nudged_at"]
+    assert len(events) == 1
+    assert events[0].member_id == "mem_123"
+    assert events[0].channel_id == "chan_dm_123"
+    assert events[0].metadata["candidate_id"] == "cand_999"
+    assert events[0].metadata["source_kind"] == "gmail"
+    assert events[0].metadata["source_identifier"] == "gmail:gmail_999"
+    assert events[0].metadata["candidate_title"] == "Young Minds invoice"
+    assert events[0].metadata["confirmation_question"] == "Should I add this?"
+    assert events[0].metadata["newly_pending_count"] == 1
+    assert events[0].metadata["trigger"] == "new_pending_candidate"
+    store.close()
+
+
+def test_operations_review_nudge_defers_during_active_conversation(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    onboarding_service = FlorenceOnboardingSessionService(store)
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        display_name="Maya",
+    )
+    store.append_channel_message(
+        ChannelMessage(
+            id="msg_recent_user",
+            household_id="hh_123",
+            channel_id="chan_dm_123",
+            sender_role=ChannelMessageRole.USER,
+            sender_member_id="mem_123",
+            body="What is Theo's schedule on June 10?",
+            created_at=datetime.now(timezone.utc).timestamp(),
+        )
+    )
+    candidate = store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_1000",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:gmail_1000",
+            title="Theo music class",
+            summary="Needs confirmation.",
+            state=CandidateState.PENDING_REVIEW,
+            requires_confirmation=True,
+            metadata={"confirmation_question": "Should I add this?"},
+        )
+    )
+    linq = _FakeLinqClient()
+    delivery = FlorenceChannelDeliveryService(
+        store,
+        linq_client_getter=lambda: linq,
+        sendblue_client_getter=lambda: None,
+    )
+    operations = FlorenceHouseholdOperationsService(
+        store,
+        delivery_service=delivery,
+        household_chat_service_getter=lambda: _StubReviewPromptChatService(),
+    )
+
+    nudged = operations.nudge_for_new_pending_candidates(
+        household_id="hh_123",
+        member_id="mem_123",
+        candidates=[candidate],
+    )
+
+    persisted = store.get_imported_candidate("cand_1000")
+    events = store.list_pilot_events(household_id="hh_123", event_type="review_prompt_sent")
+    assert nudged is False
+    assert linq.sent == []
+    assert persisted is not None
+    assert persisted.metadata.get("review_nudged_at") is None
+    assert events == []
     store.close()

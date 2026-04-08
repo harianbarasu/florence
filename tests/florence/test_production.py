@@ -399,6 +399,231 @@ def test_production_service_google_callback_keeps_onboarding_prompt_separate_fro
     store.close()
 
 
+def test_production_service_google_callback_sends_shared_calendar_link_when_projection_is_available(tmp_path, monkeypatch):
+    settings = _build_settings(tmp_path)
+    store = FlorenceStateDB(settings.server.db_path)
+    service = FlorenceProductionService(settings, store=store)
+    service.household_chat_service = _FakeBriefingChatService()
+    service.linq = _FakeLinqClient()
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    service.entrypoints.onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        display_name="Maya",
+    )
+    service.entrypoints.onboarding_service.record_child_names(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        child_names=["Ava"],
+    )
+    link = service.entrypoints.google_account_link_service.build_connect_link(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        now_ms=int(time.time() * 1000),
+        nonce="nonce-123",
+    )
+    raw_state = parse_qs(urlparse(link.url).query)["state"][0]
+
+    monkeypatch.setattr(
+        "florence.runtime.google_services.exchange_google_code_for_tokens",
+        lambda **_: GoogleTokenResponse(
+            access_token="access-token",
+            refresh_token="refresh-token",
+            expires_in=3600,
+        ),
+    )
+    monkeypatch.setattr("florence.runtime.google_services.fetch_google_user_email", lambda **_: "parent@example.com")
+    monkeypatch.setattr(
+        "florence.runtime.google_services.list_google_calendars",
+        lambda **_: [
+            GoogleCalendarMetadata(
+                id="primary",
+                summary="Family",
+                timezone="America/Los_Angeles",
+                access_role="owner",
+                primary=True,
+            )
+        ],
+    )
+    monkeypatch.setattr("florence.runtime.google_services.list_recent_gmail_sync_items", lambda **_: [])
+    monkeypatch.setattr("florence.runtime.google_services.list_recent_parent_calendar_sync_items", lambda **_: [])
+    monkeypatch.setattr(
+        service.household_calendar_projection_service,
+        "ensure_projection",
+        lambda **_: {
+            "calendar_id": "cal_shared_123",
+            "calendar_web_url": "https://calendar.google.com/calendar/u/0/r?cid=cal_shared_123",
+            "status": "active",
+        },
+    )
+    monkeypatch.setattr(
+        service.household_calendar_projection_service,
+        "sync_household",
+        lambda **_: {
+            "calendar_id": "cal_shared_123",
+            "calendar_web_url": "https://calendar.google.com/calendar/u/0/r?cid=cal_shared_123",
+            "status": "active",
+        },
+    )
+    launched: list[dict[str, object]] = []
+    monkeypatch.setattr(service, "_launch_google_sync_job", lambda **kwargs: launched.append(kwargs))
+
+    result = service.handle_google_callback(code="auth-code", state=raw_state)
+
+    assert result.status_code == 200
+    assert len(service.linq.sent) == 2
+    assert service.linq.sent[0]["message"] == (
+        "Google is connected. I’m pulling in the first pass in the background and I’ll text you here when it’s ready."
+    )
+    assert service.linq.sent[1]["message"] == (
+        "Your shared household calendar is here:\n"
+        "https://calendar.google.com/calendar/u/0/r?cid=cal_shared_123\n"
+        "I’ll keep confirmed shared events synced there."
+    )
+    household = store.get_household("hh_123")
+    assert household is not None
+    projection = household.settings["shared_google_calendar_projection"]
+    assert projection["calendar_link_shared_member_ids"] == ["mem_123"]
+    assert len(launched) == 1
+    store.close()
+
+
+def test_production_service_google_callback_only_sends_shared_calendar_link_once_per_member(tmp_path, monkeypatch):
+    settings = _build_settings(tmp_path)
+    store = FlorenceStateDB(settings.server.db_path)
+    store.upsert_household(
+        Household(
+            id="hh_123",
+            name="Maya's household",
+            timezone="America/Los_Angeles",
+            settings={
+                "shared_google_calendar_projection": {
+                    "calendar_id": "cal_shared_123",
+                    "calendar_web_url": "https://calendar.google.com/calendar/u/0/r?cid=cal_shared_123",
+                    "status": "active",
+                    "calendar_link_shared_member_ids": ["mem_123"],
+                }
+            },
+        )
+    )
+    service = FlorenceProductionService(settings, store=store)
+    service.household_chat_service = _FakeBriefingChatService()
+    service.linq = _FakeLinqClient()
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    service.entrypoints.onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        display_name="Maya",
+    )
+    service.entrypoints.onboarding_service.record_child_names(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        child_names=["Ava"],
+    )
+    link = service.entrypoints.google_account_link_service.build_connect_link(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        now_ms=int(time.time() * 1000),
+        nonce="nonce-123",
+    )
+    raw_state = parse_qs(urlparse(link.url).query)["state"][0]
+
+    monkeypatch.setattr(
+        "florence.runtime.google_services.exchange_google_code_for_tokens",
+        lambda **_: GoogleTokenResponse(
+            access_token="access-token",
+            refresh_token="refresh-token",
+            expires_in=3600,
+        ),
+    )
+    monkeypatch.setattr("florence.runtime.google_services.fetch_google_user_email", lambda **_: "parent@example.com")
+    monkeypatch.setattr(
+        "florence.runtime.google_services.list_google_calendars",
+        lambda **_: [
+            GoogleCalendarMetadata(
+                id="primary",
+                summary="Family",
+                timezone="America/Los_Angeles",
+                access_role="owner",
+                primary=True,
+            )
+        ],
+    )
+    monkeypatch.setattr("florence.runtime.google_services.list_recent_gmail_sync_items", lambda **_: [])
+    monkeypatch.setattr("florence.runtime.google_services.list_recent_parent_calendar_sync_items", lambda **_: [])
+    monkeypatch.setattr(
+        service.household_calendar_projection_service,
+        "ensure_projection",
+        lambda **_: {
+            "calendar_id": "cal_shared_123",
+            "calendar_web_url": "https://calendar.google.com/calendar/u/0/r?cid=cal_shared_123",
+            "status": "active",
+            "calendar_link_shared_member_ids": ["mem_123"],
+        },
+    )
+    monkeypatch.setattr(
+        service.household_calendar_projection_service,
+        "sync_household",
+        lambda **_: {
+            "calendar_id": "cal_shared_123",
+            "calendar_web_url": "https://calendar.google.com/calendar/u/0/r?cid=cal_shared_123",
+            "status": "active",
+            "calendar_link_shared_member_ids": ["mem_123"],
+        },
+    )
+    monkeypatch.setattr(service, "_launch_google_sync_job", lambda **kwargs: None)
+
+    result = service.handle_google_callback(code="auth-code", state=raw_state)
+
+    assert result.status_code == 200
+    assert len(service.linq.sent) == 1
+    assert service.linq.sent[0]["message"] == (
+        "Google is connected. I’m pulling in the first pass in the background and I’ll text you here when it’s ready."
+    )
+    store.close()
+
+
 def test_process_google_sync_job_skips_already_nudged_review_candidates(tmp_path, monkeypatch):
     settings = _build_settings(tmp_path)
     store = FlorenceStateDB(settings.server.db_path)

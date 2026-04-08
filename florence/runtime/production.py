@@ -7,7 +7,7 @@ import logging
 import json
 import threading
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 from urllib.parse import urlencode
 
@@ -24,6 +24,10 @@ from florence.runtime.google_services import (
     FlorenceGoogleSyncPersistenceService,
     FlorenceGoogleSyncWorkerService,
 )
+from florence.runtime.household_calendar_projection import (
+    HOUSEHOLD_CALENDAR_PROJECTION_SETTINGS_KEY,
+    FlorenceHouseholdCalendarProjectionService,
+)
 from florence.runtime.queue import FlorenceGoogleSyncJob, FlorenceRedisGoogleSyncQueue
 from florence.runtime.entrypoints import (
     FlorenceEntrypointResult,
@@ -38,6 +42,8 @@ from florence.sendblue.media import enrich_sendblue_payload_with_media_text
 from florence.state import FlorenceStateDB
 
 logger = logging.getLogger(__name__)
+
+_HOUSEHOLD_CALENDAR_LINK_SHARED_MEMBER_IDS_KEY = "calendar_link_shared_member_ids"
 
 @dataclass(slots=True)
 class FlorenceHTTPResult:
@@ -75,6 +81,11 @@ class FlorenceProductionService:
         self.sendblue = FlorenceSendblueClient(settings.sendblue)
         self.candidate_review_service = FlorenceCandidateReviewService(self.store)
         self.household_manager_service = FlorenceHouseholdManagerService(self.store)
+        self.household_calendar_projection_service = FlorenceHouseholdCalendarProjectionService(
+            self.store,
+            client_id=settings.google.client_id,
+            client_secret=settings.google.client_secret,
+        )
         self.delivery_service = FlorenceChannelDeliveryService(
             self.store,
             linq_client_getter=lambda: self.linq,
@@ -110,6 +121,54 @@ class FlorenceProductionService:
 
     def close(self) -> None:
         self.store.close()
+
+    def _build_household_calendar_link_message(self, *, calendar_web_url: str) -> str:
+        return (
+            "Your shared household calendar is here:\n"
+            f"{calendar_web_url}\n"
+            "I’ll keep confirmed shared events synced there."
+        )
+
+    def _maybe_send_household_calendar_link(
+        self,
+        *,
+        household_id: str,
+        member_id: str,
+        channel,
+        projection_config: dict[str, Any] | None,
+    ) -> None:
+        if channel is None or projection_config is None:
+            return
+        calendar_web_url = str(projection_config.get("calendar_web_url") or "").strip()
+        if not calendar_web_url:
+            return
+
+        household = self.store.get_household(household_id)
+        if household is None:
+            return
+        raw_projection = household.settings.get(HOUSEHOLD_CALENDAR_PROJECTION_SETTINGS_KEY)
+        current_projection = dict(raw_projection) if isinstance(raw_projection, dict) else dict(projection_config)
+        shared_member_ids = {
+            str(item).strip()
+            for item in (
+                current_projection.get(_HOUSEHOLD_CALENDAR_LINK_SHARED_MEMBER_IDS_KEY)
+                if isinstance(current_projection.get(_HOUSEHOLD_CALENDAR_LINK_SHARED_MEMBER_IDS_KEY), list)
+                else []
+            )
+            if str(item).strip()
+        }
+        if member_id in shared_member_ids:
+            return
+
+        self.delivery_service.send_channel_message(
+            channel=channel,
+            message=self._build_household_calendar_link_message(calendar_web_url=calendar_web_url),
+        )
+        shared_member_ids.add(member_id)
+        current_projection[_HOUSEHOLD_CALENDAR_LINK_SHARED_MEMBER_IDS_KEY] = sorted(shared_member_ids)
+        settings = dict(household.settings)
+        settings[HOUSEHOLD_CALENDAR_PROJECTION_SETTINGS_KEY] = current_projection
+        self.store.upsert_household(replace(household, settings=settings))
 
     def handle_linq_webhook(
         self,
@@ -244,6 +303,30 @@ class FlorenceProductionService:
                     household_id=callback.connection.household_id,
                     member_id=callback.connection.member_id,
                     channel_id=resolved_channel.id if resolved_channel is not None else "google_callback",
+                )
+
+            projection_config = None
+            try:
+                projection_config = self.household_calendar_projection_service.ensure_projection(
+                    household_id=callback.connection.household_id,
+                    preferred_connection_id=callback.connection.id,
+                )
+                projection_config = self.household_calendar_projection_service.sync_household(
+                    household_id=callback.connection.household_id,
+                    preferred_connection_id=callback.connection.id,
+                )
+            except Exception:
+                logger.exception(
+                    "Florence household calendar projection setup failed household_id=%s connection_id=%s",
+                    callback.connection.household_id,
+                    callback.connection.id,
+                )
+            if resolved_channel is not None:
+                self._maybe_send_household_calendar_link(
+                    household_id=callback.connection.household_id,
+                    member_id=callback.connection.member_id,
+                    channel=resolved_channel,
+                    projection_config=projection_config,
                 )
 
             self._launch_google_sync_job(

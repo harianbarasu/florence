@@ -36,6 +36,78 @@ def test_review_confirmation_promotes_candidate_into_household_event(tmp_path):
     store.close()
 
 
+def test_review_confirmation_can_apply_corrected_fields(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    candidate = ImportedCandidate(
+        id="cand_124",
+        household_id="hh_123",
+        member_id="mem_123",
+        source_kind=GoogleSourceKind.GMAIL,
+        source_identifier="gmail:gmail_124",
+        title="Theo music class",
+        summary="Theo has music class June 10 at 4:15 PM.",
+        state=CandidateState.PENDING_REVIEW,
+        metadata={
+            "proposed_fields": {
+                "title": "Theo music class",
+                "starts_at": "2026-06-10T16:15:00-07:00",
+                "ends_at": "2026-06-10T17:00:00-07:00",
+                "timezone": "America/Los_Angeles",
+            },
+        },
+    )
+    store.upsert_imported_candidate(candidate)
+
+    result = review_service.confirm_candidate(
+        candidate_id="cand_124",
+        overrides={
+            "starts_at": "2026-06-10T15:30:00-07:00",
+            "ends_at": "2026-06-10T16:15:00-07:00",
+        },
+    )
+
+    assert result.event is not None
+    assert result.event.starts_at == "2026-06-10T15:30:00-07:00"
+    assert result.event.ends_at == "2026-06-10T16:15:00-07:00"
+    assert result.candidate.state == CandidateState.CONFIRMED
+    store.close()
+
+
+def test_review_confirmation_syncs_household_calendar_projection(tmp_path, monkeypatch):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    candidate = ImportedCandidate(
+        id="cand_projection_123",
+        household_id="hh_123",
+        member_id="mem_123",
+        source_kind=GoogleSourceKind.GMAIL,
+        source_identifier="gmail:gmail_projection_123",
+        title="Ava soccer practice",
+        summary="Soccer practice moved to Thursday.",
+        state=CandidateState.PENDING_REVIEW,
+        metadata={
+            "proposed_fields": {
+                "title": "Ava soccer practice",
+                "starts_at": "2026-09-18T23:00:00+00:00",
+                "ends_at": "2026-09-19T00:00:00+00:00",
+                "timezone": "America/Los_Angeles",
+            },
+        },
+    )
+    store.upsert_imported_candidate(candidate)
+    synced_households: list[str] = []
+    monkeypatch.setattr(
+        "florence.runtime.candidate_review.FlorenceHouseholdCalendarProjectionService.sync_household",
+        lambda self, *, household_id, preferred_connection_id=None: synced_households.append(household_id) or None,
+    )
+
+    review_service.confirm_candidate(candidate_id="cand_projection_123")
+
+    assert synced_households == ["hh_123"]
+    store.close()
+
+
 def test_review_response_can_classify_source_and_confirm_candidate(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)

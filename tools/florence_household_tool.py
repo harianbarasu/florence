@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import threading
+from datetime import datetime
 from dataclasses import dataclass
 from typing import Any
 
@@ -22,11 +23,17 @@ from florence.contracts import (
     HouseholdRoutineStatus,
     HouseholdShoppingItem,
     HouseholdShoppingItemStatus,
+    HouseholdSourceVisibility,
     HouseholdWorkItem,
     HouseholdWorkItemStatus,
     ImportedCandidate,
 )
+from florence.messaging.channel_log import FlorenceChannelLog
+from florence.messaging.protocol_types import CANDIDATE_REVIEW_PROMPT_KIND, PENDING_ACTION_TARGET_ID_KEY
+from florence.runtime.candidate_review import FlorenceCandidateReviewService
+from florence.runtime.household_calendar_projection import FlorenceHouseholdCalendarProjectionService
 from florence.runtime.household_manager import FlorenceHouseholdManagerService
+from florence.runtime.onboarding_service import FlorenceOnboardingSessionService
 from florence.runtime.visibility import resolve_conversation_scope, resolve_google_inbox_scope
 from florence.state import FlorenceStateDB
 from tools.registry import registry
@@ -333,9 +340,9 @@ SEARCH_STATE_SCHEMA = {
     "description": (
         "Search Florence household state when you need to pull the latest tracked work, routines, nudges, meals, "
         "shopping items, events, children, or profile items including household preferences. "
-        "The result also includes structured scope context showing the current channel scope, tentative tracked state, "
-        "and any private review state available in the current DM. Use this before updating existing state if the "
-        "current household picture is unclear."
+        "The result also includes structured scope context showing the current channel scope and tentative tracked "
+        "state. Private review details are hidden by default unless you explicitly request them. Use this before "
+        "updating existing state if the current household picture is unclear."
     ),
     "parameters": {
         "type": "object",
@@ -372,6 +379,103 @@ SEARCH_STATE_SCHEMA = {
                 "type": "integer",
                 "description": "Maximum results per entity bucket. Default 10.",
             },
+            "include_private_review_state": {
+                "type": "boolean",
+                "description": (
+                    "When true in a parent DM, include the current private review queue details. "
+                    "Leave false for ordinary household chat."
+                ),
+            },
+        },
+        "required": [],
+    },
+}
+
+APPLY_CANDIDATE_REVIEW_SCHEMA = {
+    "name": "household_apply_candidate_review",
+    "description": (
+        "Resolve the one currently surfaced imported-item review action in a parent DM. Use this only when the "
+        "user is clearly responding to that exact review item. It can confirm, reject, skip, or confirm with "
+        "corrected event fields."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "candidate_id": {"type": "string", "description": "The exact imported candidate id being resolved."},
+            "resolution": {
+                "type": "string",
+                "enum": ["confirm", "reject", "skip"],
+                "description": "How to resolve the surfaced review item.",
+            },
+            "source_visibility": {
+                "type": "string",
+                "enum": ["shared", "private"],
+                "description": "Optional source-sharing rule to apply for future items from the same source.",
+            },
+            "title": {"type": "string", "description": "Optional corrected event title when confirming."},
+            "starts_at": {"type": "string", "description": "Optional corrected ISO start timestamp when confirming."},
+            "ends_at": {"type": "string", "description": "Optional corrected ISO end timestamp when confirming."},
+            "timezone": {"type": "string", "description": "Optional corrected timezone when confirming."},
+            "all_day": {"type": "boolean", "description": "Optional corrected all-day flag when confirming."},
+            "location": {"type": "string", "description": "Optional corrected location when confirming."},
+            "description": {"type": "string", "description": "Optional corrected description when confirming."},
+        },
+        "required": ["candidate_id", "resolution"],
+    },
+}
+
+APPLY_NUDGE_ACTION_SCHEMA = {
+    "name": "household_apply_nudge_action",
+    "description": (
+        "Resolve the one currently surfaced reminder/nudge action in a parent DM. Use this only when the user is "
+        "clearly responding to that exact reminder. It can mark it done, snooze it until a new time, or leave it "
+        "alone for now."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "nudge_id": {"type": "string", "description": "The exact household nudge id being updated."},
+            "action": {
+                "type": "string",
+                "enum": ["done", "snooze", "skip"],
+                "description": "How to resolve the surfaced nudge.",
+            },
+            "scheduled_for": {
+                "type": "string",
+                "description": "Required ISO timestamp when action is snooze.",
+            },
+        },
+        "required": ["nudge_id", "action"],
+    },
+}
+
+APPLY_ONBOARDING_UPDATE_SCHEMA = {
+    "name": "household_apply_onboarding_update",
+    "description": (
+        "Store explicit onboarding facts for the current incomplete parent DM. Use this only for concrete setup facts "
+        "the user actually provided, such as parent name, child names, one child's age/school/activities, or that Google is connected."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "parent_name": {"type": "string", "description": "Parent display name when the user gives it."},
+            "child_names": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "One or more child names when the user lists them explicitly.",
+            },
+            "child_name": {"type": "string", "description": "Child name for a specific child detail update."},
+            "age": {"type": "string", "description": "Age detail for the named or current child."},
+            "school": {"type": "string", "description": "School detail for the named or current child."},
+            "activities": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Activity labels for the named or current child.",
+            },
+            "google_connected": {
+                "type": "boolean",
+                "description": "Set true when the user clearly says Google is now connected.",
+            },
         },
         "required": [],
     },
@@ -397,6 +501,7 @@ def _build_visibility_summary(
     *,
     query: str,
     limit: int,
+    include_private_review_state: bool = False,
 ) -> dict[str, Any]:
     scope = resolve_conversation_scope(
         context.store,
@@ -414,6 +519,9 @@ def _build_visibility_summary(
         for event in context.store.list_household_events(household_id=context.household_id)
         if event.status == HouseholdEventStatus.CONFIRMED
     )
+    projection = FlorenceHouseholdCalendarProjectionService(context.store).get_projection_config(
+        household_id=context.household_id,
+    )
     visibility: dict[str, Any] = {
         "current_scope": {
             "channel_type": scope.channel_type.value if scope.channel_type is not None else None,
@@ -424,13 +532,23 @@ def _build_visibility_summary(
         "shared_household_state": {
             "confirmed_event_count": confirmed_event_count,
         },
+        "shared_calendar_projection": {
+            "available": projection is not None,
+            "status": str(projection.get("status") or "").strip() if projection else None,
+            "calendar_id": str(projection.get("calendar_id") or "").strip() if projection else None,
+            "calendar_summary": str(projection.get("calendar_summary") or "").strip() if projection else None,
+            "calendar_web_url": str(projection.get("calendar_web_url") or "").strip() if projection else None,
+            "host_email": str(projection.get("host_email") or "").strip() if projection else None,
+            "shared_with_emails": list(projection.get("shared_with_emails") or []) if projection else [],
+            "last_synced_at": str(projection.get("last_synced_at") or "").strip() if projection else None,
+        },
         "tentative_state": {
             "event_count": len(tentative_events),
             "events": tentative_events[:limit],
         },
     }
 
-    if scope.private_review_available:
+    if scope.private_review_available and include_private_review_state:
         pending_candidates = [
             _serialize_review_candidate(candidate)
             for candidate in context.store.list_imported_candidates(
@@ -451,12 +569,14 @@ def _build_visibility_summary(
         ]
         visibility["private_review_state"] = {
             "available_in_current_scope": True,
+            "included_in_response": True,
             "pending_candidate_count": len(pending_candidates),
             "pending_candidates": pending_candidates[:limit],
         }
     else:
         visibility["private_review_state"] = {
-            "available_in_current_scope": False,
+            "available_in_current_scope": scope.private_review_available,
+            "included_in_response": False,
             "pending_candidate_count": 0,
             "pending_candidates": [],
         }
@@ -704,6 +824,7 @@ def _handle_search_state(args: dict, *, task_id: str | None = None, **_: Any) ->
     context = _require_context(task_id)
     query = _normalize_text(args.get("query")).lower()
     limit = max(1, min(int(args.get("limit", 10) or 10), 25))
+    include_private_review_state = bool(args.get("include_private_review_state"))
     requested_types = args.get("entity_types")
     if isinstance(requested_types, list) and requested_types:
         entity_types = {_normalize_text(item) for item in requested_types if _normalize_text(item)}
@@ -823,10 +944,263 @@ def _handle_search_state(args: dict, *, task_id: str | None = None, **_: Any) ->
                 context,
                 query=query,
                 limit=limit,
+                include_private_review_state=include_private_review_state,
             ),
             "results": results,
         }
     )
+
+
+def _handle_apply_candidate_review(args: dict, *, task_id: str | None = None, **_: Any) -> str:
+    context = _require_context(task_id)
+    candidate_id = _normalize_text(args.get("candidate_id"))
+    if not candidate_id:
+        return json.dumps({"error": "Missing required parameter: candidate_id"})
+    resolution = _normalize_text(args.get("resolution")).lower()
+    if resolution not in {"confirm", "reject", "skip"}:
+        return json.dumps({"error": "Missing or invalid parameter: resolution"})
+    source_visibility_raw = _normalize_optional_text(args.get("source_visibility"))
+    source_visibility = None
+    if source_visibility_raw:
+        source_visibility = _enum_value(HouseholdSourceVisibility, source_visibility_raw, None)
+    active_review_candidate_id = _active_review_candidate_id(context, requested_candidate_id=candidate_id)
+    if active_review_candidate_id != candidate_id:
+        return json.dumps(
+            {
+                "error": "Candidate review is only allowed for the one currently surfaced review item in this DM.",
+                "active_candidate_id": active_review_candidate_id,
+            }
+        )
+    overrides = {
+        key: value
+        for key, value in {
+            "title": _normalize_optional_text(args.get("title")),
+            "starts_at": _normalize_optional_text(args.get("starts_at")),
+            "ends_at": _normalize_optional_text(args.get("ends_at")),
+            "timezone": _normalize_optional_text(args.get("timezone")),
+            "all_day": args.get("all_day") if "all_day" in args else None,
+            "location": _normalize_optional_text(args.get("location")),
+            "description": _normalize_optional_text(args.get("description")),
+        }.items()
+        if value is not None
+    }
+    review_service = FlorenceCandidateReviewService(context.store)
+    reply = review_service.apply_review_response(
+        candidate_id=candidate_id,
+        member_id=context.actor_member_id,
+        source_visibility=source_visibility,
+        resolution=resolution,
+        overrides=overrides if resolution == "confirm" else None,
+    )
+    candidate = context.store.get_imported_candidate(candidate_id)
+    event_id = None
+    event = None
+    if candidate is not None:
+        event_id = str(candidate.metadata.get("confirmed_event_id") or "").strip() or None
+        if event_id:
+            event = next(
+                (
+                    item
+                    for item in context.store.list_household_events(household_id=context.household_id)
+                    if item.id == event_id
+                ),
+                None,
+            )
+    return json.dumps(
+        {
+            "result": {
+                "candidate_id": candidate_id,
+                "resolution": resolution,
+                "reply_text": reply.reply_text,
+                "group_announcement": reply.group_announcement,
+                "event": _serialize_event(event) if event is not None else None,
+            }
+        }
+    )
+
+
+def _parse_iso_datetime_argument(value: str | None) -> datetime | None:
+    normalized = _normalize_optional_text(value)
+    if normalized is None:
+        return None
+    try:
+        return datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _sync_household_calendar_projection(context: FlorenceHouseholdToolContext) -> None:
+    try:
+        FlorenceHouseholdCalendarProjectionService(context.store).sync_household(
+            household_id=context.household_id,
+        )
+    except Exception:
+        return
+
+
+def _active_nudge_id(context: FlorenceHouseholdToolContext) -> str | None:
+    latest_assistant = FlorenceChannelLog(context.store).latest_assistant_message(channel_id=context.channel_id, limit=8)
+    if latest_assistant is None:
+        return None
+    return str(latest_assistant.metadata.get(PENDING_ACTION_TARGET_ID_KEY) or "").strip() or None
+
+
+def _handle_apply_nudge_action(args: dict, *, task_id: str | None = None, **_: Any) -> str:
+    context = _require_context(task_id)
+    nudge_id = _normalize_text(args.get("nudge_id"))
+    if not nudge_id:
+        return json.dumps({"error": "Missing required parameter: nudge_id"})
+    action = _normalize_text(args.get("action")).lower()
+    if action not in {"done", "snooze", "skip"}:
+        return json.dumps({"error": "Missing or invalid parameter: action"})
+    active_nudge_id = _active_nudge_id(context)
+    if active_nudge_id != nudge_id:
+        return json.dumps(
+            {
+                "error": "Reminder updates are only allowed for the one currently surfaced reminder in this DM.",
+                "active_nudge_id": active_nudge_id,
+            }
+        )
+
+    manager = FlorenceHouseholdManagerService(context.store)
+    if context.actor_member_id is None:
+        return json.dumps({"error": "Reminder updates require an active household member."})
+
+    if action == "skip":
+        return json.dumps({"result": {"nudge_id": nudge_id, "action": action, "reply_text": "Okay. I’ll leave that reminder as-is for now."}})
+
+    if action == "done":
+        result = manager.complete_actionable_nudge(
+            household_id=context.household_id,
+            member_id=context.actor_member_id,
+            channel_id=context.channel_id,
+            nudge_id=nudge_id,
+        )
+        if result is None:
+            return json.dumps({"error": "Unable to resolve the active reminder."})
+        return json.dumps({"result": {"nudge_id": nudge_id, "action": action, "reply_text": result.reply_text}})
+
+    scheduled_for = _parse_iso_datetime_argument(args.get("scheduled_for"))
+    if scheduled_for is None:
+        return json.dumps({"error": "Missing or invalid parameter: scheduled_for"})
+    result = manager.snooze_actionable_nudge(
+        household_id=context.household_id,
+        member_id=context.actor_member_id,
+        channel_id=context.channel_id,
+        nudge_id=nudge_id,
+        scheduled_for=scheduled_for,
+    )
+    if result is None:
+        return json.dumps({"error": "Unable to resolve the active reminder."})
+    return json.dumps(
+        {
+            "result": {
+                "nudge_id": nudge_id,
+                "action": action,
+                "scheduled_for": scheduled_for.isoformat(),
+                "reply_text": result.reply_text,
+            }
+        }
+    )
+
+
+def _handle_apply_onboarding_update(args: dict, *, task_id: str | None = None, **_: Any) -> str:
+    context = _require_context(task_id)
+    if context.actor_member_id is None:
+        return json.dumps({"error": "Onboarding updates require an active household member."})
+    channel = context.store.get_channel(context.channel_id)
+    if channel is None or not channel.provider_channel_id:
+        return json.dumps({"error": "Onboarding updates require a DM thread context."})
+
+    service = FlorenceOnboardingSessionService(context.store)
+    previous_stage = service.get_or_create_session(
+        household_id=context.household_id,
+        member_id=context.actor_member_id,
+        thread_id=channel.provider_channel_id,
+    ).stage
+    transition = service.apply_explicit_update(
+        household_id=context.household_id,
+        member_id=context.actor_member_id,
+        thread_id=channel.provider_channel_id,
+        parent_name=_normalize_optional_text(args.get("parent_name")),
+        child_names=[
+            item
+            for item in (
+                _normalize_optional_text(item)
+                for item in (args.get("child_names") if isinstance(args.get("child_names"), list) else [])
+            )
+            if item
+        ],
+        child_name=_normalize_optional_text(args.get("child_name")),
+        age=_normalize_optional_text(args.get("age")),
+        school=_normalize_optional_text(args.get("school")),
+        activities=[
+            item
+            for item in (
+                _normalize_optional_text(item)
+                for item in (args.get("activities") if isinstance(args.get("activities"), list) else [])
+            )
+            if item
+        ]
+        or None,
+        google_connected=bool(args.get("google_connected")) if "google_connected" in args else None,
+    )
+    if transition.state.is_complete:
+        manager = FlorenceHouseholdManagerService(context.store)
+        existing = context.store.list_pilot_events(
+            household_id=context.household_id,
+            event_type="onboarding_complete",
+            limit=5,
+        )
+        if not any(event.member_id == context.actor_member_id for event in existing):
+            manager.finalize_onboarding_completion(
+                household_id=context.household_id,
+                member_id=context.actor_member_id,
+                channel_id=context.channel_id,
+            )
+    prompt_messages = service.get_transition_messages(
+        transition,
+        previous_stage=previous_stage,
+        household_id=context.household_id,
+        member_id=context.actor_member_id,
+        thread_id=channel.provider_channel_id,
+    )
+    return json.dumps(
+        {
+            "result": {
+                "stage": transition.state.stage.value,
+                "is_complete": transition.state.is_complete,
+                "child_names": list(transition.state.child_names),
+                "reply_messages": list(prompt_messages),
+            }
+        }
+    )
+
+
+def _active_review_candidate_id(
+    context: FlorenceHouseholdToolContext,
+    *,
+    requested_candidate_id: str,
+) -> str | None:
+    latest_assistant = FlorenceChannelLog(context.store).latest_assistant_message(channel_id=context.channel_id, limit=8)
+    if latest_assistant is None:
+        return None
+    if latest_assistant.metadata.get("protocol_kind") != CANDIDATE_REVIEW_PROMPT_KIND:
+        return None
+    explicit_candidate_id = str(latest_assistant.metadata.get(PENDING_ACTION_TARGET_ID_KEY) or "").strip()
+    if explicit_candidate_id:
+        return explicit_candidate_id
+    if context.actor_member_id is None:
+        return None
+    prompt = FlorenceCandidateReviewService(context.store).build_next_dm_review_prompt(
+        household_id=context.household_id,
+        member_id=context.actor_member_id,
+    )
+    if prompt is None:
+        return None
+    if prompt.candidate.id == requested_candidate_id:
+        return requested_candidate_id
+    return prompt.candidate.id
 
 
 def _gmail_query_token(value: str) -> str:
@@ -1002,6 +1376,7 @@ def _handle_upsert_event(args: dict, *, task_id: str | None = None, **_: Any) ->
             metadata=_normalize_metadata(args.get("metadata")),
         )
     )
+    _sync_household_calendar_projection(context)
     return json.dumps({"result": _serialize_event(event)})
 
 
@@ -1176,6 +1551,27 @@ registry.register(
     toolset="florence_household",
     schema=SEARCH_GOOGLE_INBOX_SCHEMA,
     handler=_handle_search_google_inbox,
+    check_fn=_check_household_tool_requirements,
+)
+registry.register(
+    name="household_apply_candidate_review",
+    toolset="florence_household",
+    schema=APPLY_CANDIDATE_REVIEW_SCHEMA,
+    handler=_handle_apply_candidate_review,
+    check_fn=_check_household_tool_requirements,
+)
+registry.register(
+    name="household_apply_nudge_action",
+    toolset="florence_household",
+    schema=APPLY_NUDGE_ACTION_SCHEMA,
+    handler=_handle_apply_nudge_action,
+    check_fn=_check_household_tool_requirements,
+)
+registry.register(
+    name="household_apply_onboarding_update",
+    toolset="florence_household",
+    schema=APPLY_ONBOARDING_UPDATE_SCHEMA,
+    handler=_handle_apply_onboarding_update,
     check_fn=_check_household_tool_requirements,
 )
 registry.register(

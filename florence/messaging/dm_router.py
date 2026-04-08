@@ -79,6 +79,21 @@ class FlorenceDmRouter:
             )
             if review_result is not None:
                 return self._result_from_protocol_reply(review_result)
+            if self.review_protocol.is_reply_armed(
+                channel_id=resolved.channel_id,
+                review_prompt_text=review_prompt_text or "",
+            ):
+                chat_result = self.chat_bridge.respond_as_protocol(
+                    household_id=resolved.household_id,
+                    channel_id=resolved.channel_id,
+                    actor_member_id=resolved.member_id,
+                    message_text=self.review_protocol.build_chat_followup_context(
+                        text=text,
+                        prompt=review_prompt,
+                    ),
+                )
+                if chat_result is not None:
+                    return self._result_from_protocol_reply(chat_result)
 
         if not session.is_complete:
             return self._result_from_protocol_reply(self.setup_protocol.handle_incomplete_turn(
@@ -105,6 +120,22 @@ class FlorenceDmRouter:
         )
         if reminder_result is not None:
             return self._result_from_protocol_reply(reminder_result)
+        if self.reminder_protocol.is_reply_armed(channel_id=resolved.channel_id):
+            reminder_context = self.reminder_protocol.build_chat_followup_context(
+                household_id=resolved.household_id,
+                member_id=member_id,
+                channel_id=resolved.channel_id,
+                text=text,
+            )
+            if reminder_context is not None:
+                chat_result = self.chat_bridge.respond_as_protocol(
+                    household_id=resolved.household_id,
+                    channel_id=resolved.channel_id,
+                    actor_member_id=resolved.member_id,
+                    message_text=reminder_context,
+                )
+                if chat_result is not None:
+                    return self._result_from_protocol_reply(chat_result)
 
         chat_result = self.chat_bridge.respond_as_protocol(
             household_id=resolved.household_id,

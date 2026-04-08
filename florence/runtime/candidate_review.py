@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -13,14 +14,16 @@ from florence.contracts import (
     HouseholdSourceVisibility,
     ImportedCandidate,
 )
+from florence.runtime.household_calendar_projection import FlorenceHouseholdCalendarProjectionService
 from florence.runtime.services import _stable_id
 from florence.source_rules import (
     build_candidate_source_profile,
     build_rules_for_candidate,
-    build_source_rule_prompt,
     candidate_matches_source_rule,
 )
 from florence.state import FlorenceStateDB
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -58,14 +61,7 @@ class _SourceRuleService:
             metadata["source_rule_label"] = matched_rule.label or matched_rule.matcher_value
             metadata.pop("source_rule_prompt", None)
             return replace(candidate, metadata=metadata)
-
-        profile = build_candidate_source_profile(candidate)
-        if profile is None:
-            return candidate
-
-        metadata["source_visibility"] = "needs_classification"
-        metadata["source_rule_label"] = profile.label
-        metadata["source_rule_prompt"] = build_source_rule_prompt(candidate)
+        metadata.pop("source_rule_prompt", None)
         return replace(candidate, metadata=metadata)
 
     def set_candidate_visibility(
@@ -94,17 +90,8 @@ class _SourceRuleService:
         return profile.label if profile is not None else None
 
     def build_candidate_source_prompt(self, candidate: ImportedCandidate) -> str | None:
-        if candidate.metadata.get("source_visibility") in {
-            HouseholdSourceVisibility.SHARED.value,
-            HouseholdSourceVisibility.PRIVATE.value,
-        }:
-            return None
-        if self._match_rule(candidate) is not None:
-            return None
-        prompt = candidate.metadata.get("source_rule_prompt")
-        if isinstance(prompt, str) and prompt.strip():
-            return prompt.strip()
-        return build_source_rule_prompt(candidate)
+        _ = candidate
+        return None
 
     def _match_rule(self, candidate: ImportedCandidate) -> HouseholdSourceRule | None:
         for rule in self.store.list_household_source_rules(
@@ -170,6 +157,7 @@ class FlorenceCandidateReviewService:
         member_id: str | None,
         source_visibility: HouseholdSourceVisibility | None = None,
         resolution: str | None = None,
+        overrides: dict[str, Any] | None = None,
     ) -> _CandidateReviewReply:
         prefix: str | None = None
         if source_visibility is not None:
@@ -190,7 +178,7 @@ class FlorenceCandidateReviewService:
             )
 
         if resolution == "confirm":
-            result = self.confirm_candidate(candidate_id=candidate_id)
+            result = self.confirm_candidate(candidate_id=candidate_id, overrides=overrides)
             if prefix:
                 suffix = (
                     f" Confirmed. I added {result.event.title} to the family plan."
@@ -249,6 +237,16 @@ class FlorenceCandidateReviewService:
 
         event = self._candidate_to_event(candidate, overrides=overrides or {})
         self.store.upsert_household_event(event)
+        try:
+            FlorenceHouseholdCalendarProjectionService(self.store).sync_household(
+                household_id=candidate.household_id,
+            )
+        except Exception:
+            logger.exception(
+                "Florence household calendar projection sync failed after candidate confirmation household_id=%s candidate_id=%s",
+                candidate.household_id,
+                candidate_id,
+            )
         confirmed_metadata = dict(candidate.metadata)
         confirmed_metadata["confirmed_event_id"] = event.id
         confirmed = replace(candidate, state=CandidateState.CONFIRMED, metadata=confirmed_metadata)
@@ -326,6 +324,8 @@ class FlorenceCandidateReviewService:
                 "source_kind": candidate.source_kind.value,
                 "source_identifier": candidate.source_identifier,
                 "candidate_summary": candidate.summary,
+                "source_provenance": candidate.metadata.get("source_provenance"),
+                "candidate_raw_metadata": candidate.metadata.get("raw_metadata"),
             },
         )
 

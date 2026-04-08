@@ -40,8 +40,8 @@ def _is_postgres_database(database_url: str) -> bool:
 def _set_timeouts(store: FlorenceStateDB) -> None:
     if not _is_postgres_database(str(store.database)):
         return
-    store._conn.execute("SET lock_timeout = ?", ("3s",))
-    store._conn.execute("SET statement_timeout = ?", ("15s",))
+    store._conn.execute("SET lock_timeout = '3s'")
+    store._conn.execute("SET statement_timeout = '15s'")
     store._conn.commit()
 
 

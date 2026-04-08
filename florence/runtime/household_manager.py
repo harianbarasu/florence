@@ -515,12 +515,14 @@ class FlorenceHouseholdManagerService:
         household_id: str,
         member_id: str,
         channel_id: str,
+        nudge_id: str | None = None,
         now: datetime | None = None,
     ) -> _ReminderActionResult | None:
-        actionable_nudge = self._actionable_nudge(
+        actionable_nudge = self._resolve_actionable_nudge(
             household_id=household_id,
             member_id=member_id,
             channel_id=channel_id,
+            nudge_id=nudge_id,
         )
         if actionable_nudge is None:
             return None
@@ -571,12 +573,14 @@ class FlorenceHouseholdManagerService:
         member_id: str,
         channel_id: str,
         scheduled_for: datetime,
+        nudge_id: str | None = None,
         now: datetime | None = None,
     ) -> _ReminderActionResult | None:
-        actionable_nudge = self._actionable_nudge(
+        actionable_nudge = self._resolve_actionable_nudge(
             household_id=household_id,
             member_id=member_id,
             channel_id=channel_id,
+            nudge_id=nudge_id,
         )
         if actionable_nudge is None:
             return None
@@ -602,6 +606,31 @@ class FlorenceHouseholdManagerService:
         )
         until_text = (updated_nudge.scheduled_for if updated_nudge else scheduled_for.isoformat()).replace("T", " ").replace("+00:00", "Z")
         return _ReminderActionResult(reply_text=f"Okay, snoozed. I’ll remind you again around {until_text}.")
+
+    def _resolve_actionable_nudge(
+        self,
+        *,
+        household_id: str,
+        member_id: str,
+        channel_id: str,
+        nudge_id: str | None = None,
+    ) -> HouseholdNudge | None:
+        if nudge_id:
+            nudge = self.store.get_household_nudge(nudge_id)
+            if nudge is None or nudge.household_id != household_id:
+                return None
+            if nudge.recipient_member_id and nudge.recipient_member_id != member_id:
+                return None
+            if nudge.channel_id and nudge.channel_id != channel_id:
+                return None
+            if nudge.status not in {HouseholdNudgeStatus.SCHEDULED, HouseholdNudgeStatus.SENT}:
+                return None
+            return nudge
+        return self._actionable_nudge(
+            household_id=household_id,
+            member_id=member_id,
+            channel_id=channel_id,
+        )
 
     def mark_nudge_sent(
         self,

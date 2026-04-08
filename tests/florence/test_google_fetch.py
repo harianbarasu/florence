@@ -1,5 +1,6 @@
 import sys
 import types
+import base64
 
 import florence.google.fetch as google_fetch
 from florence.google import (
@@ -45,6 +46,37 @@ def test_build_gmail_sync_item_extracts_headers_body_and_attachment_count():
     assert item.body_text == "Ava practice moved to Thursday at 4 pm."
     assert item.attachment_count == 1
     assert item.attachment_text is None
+
+
+def test_build_gmail_sync_item_preserves_multiline_body_structure():
+    def _to_b64url_text(raw: str) -> str:
+        return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("utf-8").rstrip("=")
+
+    message = {
+        "id": "gmail_multiline",
+        "threadId": "thread_multiline",
+        "snippet": "School calendar attached.",
+        "internalDate": "1799726400000",
+        "payload": {
+            "mimeType": "multipart/alternative",
+            "headers": [
+                {"name": "From", "value": "school@example.com"},
+                {"name": "Subject", "value": "Theo schedule"},
+            ],
+            "parts": [
+                {
+                    "mimeType": "text/plain",
+                    "body": {
+                        "data": _to_b64url_text("Theo's music class\n\nJune 10 3:30-4:15 PM\nBring snack"),
+                    },
+                }
+            ],
+        },
+    }
+
+    item = build_gmail_sync_item(message)
+
+    assert item.body_text == "Theo's music class\n\nJune 10 3:30-4:15 PM\nBring snack"
 
 
 def test_build_parent_calendar_sync_item_skips_cancelled_events():

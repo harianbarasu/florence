@@ -271,6 +271,63 @@ class FlorenceOnboardingSessionService:
             )
         )
 
+    def apply_explicit_update(
+        self,
+        *,
+        household_id: str,
+        member_id: str,
+        thread_id: str,
+        parent_name: str | None = None,
+        child_names: list[str] | None = None,
+        child_name: str | None = None,
+        age: str | None = None,
+        school: str | None = None,
+        activities: list[str] | None = None,
+        google_connected: bool | None = None,
+    ) -> OnboardingTransition:
+        state = self.get_or_create_session(household_id=household_id, member_id=member_id, thread_id=thread_id)
+        next_state = state
+
+        cleaned_parent_name = _clean_label(parent_name)
+        if cleaned_parent_name and cleaned_parent_name != next_state.parent_display_name:
+            next_state = apply_parent_name(next_state, cleaned_parent_name).state
+            member = self.store.get_member(member_id)
+            if member is not None:
+                self.store.upsert_member(replace(member, display_name=cleaned_parent_name))
+
+        cleaned_child_names = [name for name in (_clean_label(value) for value in (child_names or [])) if name]
+        if cleaned_child_names:
+            next_state = apply_child_names(next_state, cleaned_child_names).state
+
+        update: dict[str, Any] = {}
+        cleaned_child_name = _clean_label(child_name) or next_state.current_child_name
+        if cleaned_child_name:
+            update["name"] = cleaned_child_name
+        cleaned_age = _clean_label(age)
+        cleaned_school = _clean_label(school)
+        cleaned_activities = [_clean_label(value) for value in (activities or [])]
+        cleaned_activities = [value for value in cleaned_activities if value]
+        if cleaned_age is not None:
+            update["age"] = cleaned_age
+        if cleaned_school is not None:
+            update["school"] = cleaned_school
+        if activities is not None:
+            update["activities"] = cleaned_activities
+        if any(key != "name" for key in update):
+            next_state = apply_child_profile_updates(next_state, [update]).state
+
+        if google_connected and not next_state.google_connected:
+            next_state = mark_google_connected(next_state).state
+
+        next_state = sync_onboarding_stage(next_state)
+        return self._persist_transition(
+            OnboardingTransition(
+                state=next_state,
+                prompt=build_onboarding_prompt(next_state),
+                changed=next_state != state,
+            )
+        )
+
     @staticmethod
     def _should_absorb_fragmented_child_names(*, state: OnboardingState, text: str) -> bool:
         if state.stage != OnboardingStage.COLLECT_CHILD_AGE:

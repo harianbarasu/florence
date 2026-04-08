@@ -7,11 +7,13 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from html import unescape
 from typing import Any
 from urllib.parse import quote
 
 import httpx
 
+from florence.contracts import HouseholdEvent
 from florence.media.openai_extract import (
     extract_image_text_with_openai,
     extract_pdf_text_with_openai,
@@ -55,7 +57,10 @@ def _base64url_decode_bytes(value: str | None) -> bytes:
 
 
 def _strip_html_tags(html: str) -> str:
-    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html)).strip()
+    with_breaks = re.sub(r"(?i)<\s*br\s*/?>", "\n", html)
+    with_breaks = re.sub(r"(?i)</\s*(p|div|li|tr|td|th|h[1-6]|ul|ol|table)\s*>", "\n", with_breaks)
+    stripped = re.sub(r"<[^>]+>", " ", with_breaks)
+    return _normalize_preserving_line_structure(unescape(stripped))
 
 
 def _normalize_maybe_html_text(value: str, mime_type: str | None) -> str:
@@ -64,14 +69,33 @@ def _normalize_maybe_html_text(value: str, mime_type: str | None) -> str:
     normalized_mime = (mime_type or "").lower()
     if "html" in normalized_mime or re.search(r"</?[a-z][\s\S]*>", value, re.IGNORECASE):
         return _strip_html_tags(value)
-    return value.replace("\r\n", "\n").strip()
+    return _normalize_preserving_line_structure(value)
 
 
 def _compact_text(raw: str, max_length: int = 8_000) -> str:
-    normalized = " ".join(raw.split())
+    normalized = _normalize_preserving_line_structure(raw)
     if len(normalized) <= max_length:
         return normalized
     return f"{normalized[: max_length - 1].rstrip()}..."
+
+
+def _normalize_preserving_line_structure(raw: str) -> str:
+    text = raw.replace("\r\n", "\n").replace("\r", "\n")
+    normalized_lines: list[str] = []
+    blank_pending = False
+    for line in text.split("\n"):
+        cleaned = " ".join(line.split())
+        if not cleaned:
+            if normalized_lines and not blank_pending:
+                normalized_lines.append("")
+            blank_pending = True
+            continue
+        blank_pending = False
+        normalized_lines.append(cleaned)
+
+    while normalized_lines and not normalized_lines[-1]:
+        normalized_lines.pop()
+    return "\n".join(normalized_lines).strip()
 
 
 def _read_gmail_header(headers: list[dict[str, Any]] | None, name: str) -> str:
@@ -553,3 +577,155 @@ def list_recent_parent_calendar_sync_items(
             break
 
     return results
+
+
+def create_google_calendar(
+    *,
+    access_token: str,
+    summary: str,
+    timezone: str,
+    timeout_seconds: float = 30.0,
+) -> GoogleCalendarMetadata:
+    response = httpx.post(
+        "https://www.googleapis.com/calendar/v3/calendars",
+        headers={"authorization": f"Bearer {access_token}"},
+        json={"summary": summary, "timeZone": timezone},
+        timeout=timeout_seconds,
+    )
+    payload = response.json()
+    response.raise_for_status()
+    return GoogleCalendarMetadata(
+        id=str(payload.get("id") or ""),
+        summary=str(payload.get("summary") or summary),
+        timezone=str(payload.get("timeZone") or timezone),
+        access_role=str(payload.get("accessRole") or "") or None,
+        primary=bool(payload.get("primary")),
+        selected=bool(payload.get("selected", True)),
+        hidden=bool(payload.get("hidden", False)),
+    )
+
+
+def build_google_calendar_web_url(*, calendar_id: str) -> str:
+    """Return the Google Calendar web UI URL for an existing calendar id."""
+
+    return f"https://calendar.google.com/calendar/u/0/r?cid={quote(calendar_id, safe='')}"
+
+
+def share_google_calendar_with_user(
+    *,
+    access_token: str,
+    calendar_id: str,
+    user_email: str,
+    role: str = "reader",
+    send_notifications: bool = False,
+    timeout_seconds: float = 30.0,
+) -> dict[str, Any]:
+    response = httpx.post(
+        f"https://www.googleapis.com/calendar/v3/calendars/{quote(calendar_id, safe='')}/acl",
+        headers={"authorization": f"Bearer {access_token}"},
+        params={"sendNotifications": "true" if send_notifications else "false"},
+        json={
+            "role": role,
+            "scope": {
+                "type": "user",
+                "value": user_email,
+            },
+        },
+        timeout=timeout_seconds,
+    )
+    if response.status_code == 409:
+        return {
+            "calendar_id": calendar_id,
+            "user_email": user_email,
+            "role": role,
+            "already_exists": True,
+        }
+    payload = response.json()
+    response.raise_for_status()
+    return payload if isinstance(payload, dict) else {}
+
+
+def add_google_calendar_to_calendar_list(
+    *,
+    access_token: str,
+    calendar_id: str,
+    selected: bool = True,
+    timeout_seconds: float = 30.0,
+) -> dict[str, Any]:
+    response = httpx.post(
+        "https://www.googleapis.com/calendar/v3/users/me/calendarList",
+        headers={"authorization": f"Bearer {access_token}"},
+        json={
+            "id": calendar_id,
+            "selected": selected,
+        },
+        timeout=timeout_seconds,
+    )
+    if response.status_code == 409:
+        return {
+            "id": calendar_id,
+            "selected": selected,
+            "already_exists": True,
+        }
+    payload = response.json()
+    response.raise_for_status()
+    return payload if isinstance(payload, dict) else {}
+
+
+def _google_calendar_event_payload(event: HouseholdEvent) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "summary": event.title,
+        "location": event.location,
+        "description": event.description,
+    }
+    if event.all_day and event.starts_at and event.ends_at:
+        payload["start"] = {"date": str(event.starts_at)[:10]}
+        payload["end"] = {"date": str(event.ends_at)[:10]}
+        return payload
+    payload["start"] = {"dateTime": event.starts_at, "timeZone": event.timezone}
+    payload["end"] = {"dateTime": event.ends_at, "timeZone": event.timezone}
+    return payload
+
+
+def upsert_google_calendar_event(
+    *,
+    access_token: str,
+    calendar_id: str,
+    event: HouseholdEvent,
+    google_event_id: str | None = None,
+    timeout_seconds: float = 30.0,
+) -> dict[str, Any]:
+    encoded_calendar_id = quote(calendar_id, safe="")
+    payload = _google_calendar_event_payload(event)
+    if google_event_id:
+        response = httpx.put(
+            f"https://www.googleapis.com/calendar/v3/calendars/{encoded_calendar_id}/events/{quote(google_event_id, safe='')}",
+            headers={"authorization": f"Bearer {access_token}"},
+            json=payload,
+            timeout=timeout_seconds,
+        )
+    else:
+        response = httpx.post(
+            f"https://www.googleapis.com/calendar/v3/calendars/{encoded_calendar_id}/events",
+            headers={"authorization": f"Bearer {access_token}"},
+            json=payload,
+            timeout=timeout_seconds,
+        )
+    result = response.json()
+    response.raise_for_status()
+    return dict(result) if isinstance(result, dict) else {}
+
+
+def delete_google_calendar_event(
+    *,
+    access_token: str,
+    calendar_id: str,
+    google_event_id: str,
+    timeout_seconds: float = 30.0,
+) -> None:
+    response = httpx.delete(
+        f"https://www.googleapis.com/calendar/v3/calendars/{quote(calendar_id, safe='')}/events/{quote(google_event_id, safe='')}",
+        headers={"authorization": f"Bearer {access_token}"},
+        timeout=timeout_seconds,
+    )
+    response.raise_for_status()

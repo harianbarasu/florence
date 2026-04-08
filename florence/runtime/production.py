@@ -18,6 +18,7 @@ from florence.google import decode_google_oauth_state
 from florence.onboarding import (
     build_google_connected_syncing_message_sequence,
     build_onboarding_ready_message_sequence,
+    build_onboarding_ready_syncing_message_sequence,
 )
 from florence.runtime.delivery import FlorenceChannelDeliveryService
 from florence.runtime.google_services import (
@@ -45,6 +46,14 @@ from florence.state import FlorenceStateDB
 logger = logging.getLogger(__name__)
 
 _HOUSEHOLD_CALENDAR_LINK_SHARED_MEMBER_IDS_KEY = "calendar_link_shared_member_ids"
+
+
+class _StaleGoogleSyncJobError(RuntimeError):
+    """Raised when a queued Google sync job points at a deleted connection."""
+
+
+def _is_unknown_google_connection_error(error: Exception) -> bool:
+    return isinstance(error, ValueError) and str(error) == "unknown_google_connection"
 
 @dataclass(slots=True)
 class FlorenceHTTPResult:
@@ -273,7 +282,7 @@ class FlorenceProductionService:
                     resolved_channel = self.delivery_service.find_channel_by_provider_id(oauth_state.thread_id)
 
             if became_complete:
-                dm_messages = build_onboarding_ready_message_sequence()
+                dm_messages = build_onboarding_ready_syncing_message_sequence()
             else:
                 dm_messages = ()
                 if resolved_channel is not None:
@@ -437,7 +446,15 @@ class FlorenceProductionService:
                 candidates=result.sync_result.candidates,
                 store=store,
             )
-        except Exception:
+        except Exception as exc:
+            if _is_unknown_google_connection_error(exc):
+                logger.warning(
+                    "Florence background Google sync dropped stale job for deleted connection_id=%s",
+                    connection_id,
+                )
+                if raise_on_error:
+                    raise _StaleGoogleSyncJobError(connection_id) from exc
+                return
             logger.exception("Florence background Google sync failed connection_id=%s", connection_id)
             self.household_operations.mark_connection_sync_error(
                 store,
@@ -471,6 +488,13 @@ class FlorenceProductionService:
                 thread_id=claimed.job.thread_id,
                 notify_when_finished=claimed.job.notify_when_finished,
                 raise_on_error=True,
+            )
+            self.google_sync_queue.acknowledge(claimed)
+            return True
+        except _StaleGoogleSyncJobError:
+            logger.warning(
+                "Florence queued Google sync acknowledged stale deleted connection_id=%s",
+                claimed.job.connection_id,
             )
             self.google_sync_queue.acknowledge(claimed)
             return True

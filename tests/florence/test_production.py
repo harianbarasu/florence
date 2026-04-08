@@ -5,6 +5,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
+import florence.runtime.production as production_module
 from florence.config import (
     FlorenceGoogleRuntimeConfig,
     FlorenceHermesRuntimeConfig,
@@ -28,7 +29,7 @@ from florence.contracts import (
     MemberRole,
 )
 from florence.google import GoogleCalendarMetadata, GoogleTokenResponse
-from florence.onboarding import build_onboarding_ready_message_sequence
+from florence.onboarding import build_onboarding_ready_syncing_message_sequence
 from florence.runtime import FlorenceEntrypointResult, FlorenceProductionService
 from florence.state import FlorenceStateDB
 
@@ -290,13 +291,60 @@ def test_production_service_google_callback_sends_dm_follow_up(tmp_path, monkeyp
     assert "Go back to your Messages conversation" in result.body
     assert service.linq.sent
     assert service.linq.sent[0]["chat_id"] == "dm-thread-123"
-    assert [message["message"] for message in service.linq.sent] == list(build_onboarding_ready_message_sequence())
+    assert [message["message"] for message in service.linq.sent] == list(build_onboarding_ready_syncing_message_sequence())
     onboarding_events = store.list_pilot_events(household_id="hh_123", event_type="onboarding_complete")
     assert len(onboarding_events) == 1
     assert len(launched) == 1
     assert str(launched[0]["connection_id"]).startswith("gconn_")
     assert launched[0]["thread_id"] == "dm-thread-123"
     assert launched[0]["notify_when_finished"] is True
+    store.close()
+
+
+def test_production_service_run_google_sync_queue_once_acknowledges_stale_deleted_connection(tmp_path, monkeypatch):
+    settings = _build_settings(tmp_path)
+    store = FlorenceStateDB(settings.server.db_path)
+    service = FlorenceProductionService(settings, store=store)
+
+    claimed = SimpleNamespace(
+        job=SimpleNamespace(
+            connection_id="gconn_deleted",
+            thread_id="dm-thread-123",
+            notify_when_finished=True,
+            attempt=1,
+        ),
+        raw_payload='{"connection_id":"gconn_deleted"}',
+    )
+
+    class _FakeQueue:
+        configured = True
+
+        def __init__(self):
+            self.acknowledged = []
+            self.retried = []
+
+        def claim(self, *, timeout_seconds=None):
+            return claimed
+
+        def acknowledge(self, item):
+            self.acknowledged.append(item)
+
+        def retry(self, item):
+            self.retried.append(item)
+
+    fake_queue = _FakeQueue()
+    service.google_sync_queue = fake_queue
+
+    def _raise_stale(**kwargs):
+        raise production_module._StaleGoogleSyncJobError("gconn_deleted")
+
+    monkeypatch.setattr(service, "process_google_sync_job", _raise_stale)
+
+    handled = service.run_google_sync_queue_once()
+
+    assert handled is True
+    assert fake_queue.acknowledged == [claimed]
+    assert fake_queue.retried == []
     store.close()
 
 

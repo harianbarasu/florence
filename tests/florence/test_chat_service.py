@@ -271,6 +271,8 @@ def test_household_chat_service_uses_hermes_agent_with_confirmed_state(tmp_path)
     assert "household_search_state now returns scope context too: current visibility scope and tentative tracked state." in _FakeAgent.last_run["system_message"]
     assert "ground the answer in household_search_state and session_search first" in _FakeAgent.last_run["system_message"]
     assert "Use session_search and Honcho memory to recover earlier commitments, preferences, and threads of work" in _FakeAgent.last_run["system_message"]
+    assert "private parent dm, be willing to search the connected inbox" in _FakeAgent.last_run["system_message"].lower()
+    assert "points florence toward their inbox as the source of truth" in _FakeAgent.last_run["system_message"].lower()
     assert "use web_search and web_extract instead of guessing" in _FakeAgent.last_run["system_message"]
     assert "use the browser tools instead of pretending you already know the result" in _FakeAgent.last_run["system_message"]
     assert "use delegate_task to gather evidence in parallel" in _FakeAgent.last_run["system_message"]
@@ -1185,6 +1187,12 @@ def test_household_chat_service_compose_operator_message_group_share_turn_uses_e
     assert "reply exactly EXECUTE_GROUP_SHARE" in _FakeAgent.last_run["system_message"]
     assert "reply exactly NO_GROUP_SHARE_PROTOCOL_ACTION" in _FakeAgent.last_run["system_message"]
     assert "\"task\": \"group_share_turn_decision\"" in _FakeAgent.last_run["user_message"]
+    assert _FakeAgent.created[0]["skip_memory"] is True
+    assert _FakeAgent.created[0]["honcho_session_key"] is None
+    assert _FakeAgent.created[0]["session_id"].startswith("florence-channel-chan_dm_123-internal-group_share_turn-")
+    updated = store.get_channel("chan_dm_123")
+    assert updated is not None
+    assert not updated.metadata
     store.close()
 
 
@@ -1528,6 +1536,9 @@ def test_household_chat_service_compose_onboarding_turn_includes_explicit_setup_
     assert "\"task\": \"handle_onboarding_turn\"" in _FakeAgent.last_run["user_message"]
     assert _FakeAgent.created[0]["enabled_toolsets"] == ["florence_onboarding"]
     assert _FakeAgent.created[0]["max_iterations"] == 2
+    assert _FakeAgent.created[0]["skip_memory"] is True
+    assert _FakeAgent.created[0]["honcho_session_key"] is None
+    assert _FakeAgent.created[0]["session_id"].startswith("florence-channel-chan_dm_123-internal-onboarding_turn-")
     store.close()
 
 

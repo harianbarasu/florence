@@ -41,6 +41,19 @@ _GROUP_SHARE_NO_ACTION_SENTINEL = "NO_GROUP_SHARE_PROTOCOL_ACTION"
 _GROUP_INTRO_SHOW_SENTINEL = "SHOW_GROUP_INTRO"
 _GROUP_INTRO_NO_ACTION_SENTINEL = "NO_GROUP_INTRO_PROTOCOL_ACTION"
 _SLOW_HERMES_TURN_MS = 3_000
+_PROTOCOL_SENTINELS = frozenset(
+    {
+        _ONBOARDING_SYNC_WAITING_SENTINEL,
+        _ONBOARDING_CONTEXTUAL_CHAT_SENTINEL,
+        _ONBOARDING_NO_REPLY_SENTINEL,
+        _REVIEW_SHOW_PROMPT_SENTINEL,
+        _REVIEW_NO_ACTION_SENTINEL,
+        _GROUP_SHARE_EXECUTE_SENTINEL,
+        _GROUP_SHARE_NO_ACTION_SENTINEL,
+        _GROUP_INTRO_SHOW_SENTINEL,
+        _GROUP_INTRO_NO_ACTION_SENTINEL,
+    }
+)
 
 
 @dataclass(slots=True)
@@ -487,6 +500,7 @@ class FlorenceHouseholdChatService:
             enabled_toolsets=enabled_toolsets,
             max_iterations=max_iterations,
             turn_kind=kind,
+            internal_turn=True,
         )
         final_response = str(result.get("final_response") or "").strip()
         if kind == "group_promotion" and final_response == "NO_GROUP_SHARE":
@@ -599,6 +613,7 @@ class FlorenceHouseholdChatService:
             enabled_toolsets=["florence_onboarding"],
             max_iterations=min(self.max_iterations, 2),
             turn_kind="onboarding_turn",
+            internal_turn=True,
         )
         tool_reply_messages = self._extract_onboarding_reply_messages(result)
         if tool_reply_messages:
@@ -702,12 +717,26 @@ class FlorenceHouseholdChatService:
         enabled_toolsets: list[str],
         max_iterations: int | None = None,
         turn_kind: str = "chat",
+        internal_turn: bool = False,
     ) -> dict[str, Any]:
         task_id = f"florence-household-{uuid.uuid4()}"
         result: dict[str, Any] | None = None
         error: Exception | None = None
         turn_started = perf_counter()
         resolved_max_iterations = max_iterations if max_iterations is not None else self.max_iterations
+        resolved_session_id = session_id
+        resolved_skip_memory = False
+        resolved_honcho_session_key = self._build_honcho_session_key(
+            household_id=household_id,
+            channel_id=channel_id,
+            actor_member_id=actor_member_id,
+        )
+        if internal_turn:
+            resolved_session_id = session_id or (
+                f"{self._default_session_id(channel_id)}-internal-{turn_kind}-{uuid.uuid4().hex[:8]}"
+            )
+            resolved_skip_memory = True
+            resolved_honcho_session_key = None
 
         agent_factory = self.agent_factory
         if agent_factory is None:
@@ -733,17 +762,13 @@ class FlorenceHouseholdChatService:
                 provider=self.provider,
                 enabled_toolsets=enabled_toolsets,
                 quiet_mode=True,
-                skip_memory=False,
+                skip_memory=resolved_skip_memory,
                 skip_local_memory=True,
                 skip_context_files=False,
                 platform="florence",
-                session_id=session_id,
+                session_id=resolved_session_id,
                 session_db=self.session_db,
-                honcho_session_key=self._build_honcho_session_key(
-                    household_id=household_id,
-                    channel_id=channel_id,
-                    actor_member_id=actor_member_id,
-                ),
+                honcho_session_key=resolved_honcho_session_key,
                 session_search_kwargs=self._build_session_search_kwargs(
                     household_id=household_id,
                     channel_id=channel_id,
@@ -756,10 +781,11 @@ class FlorenceHouseholdChatService:
                 conversation_history=conversation_history,
                 task_id=task_id,
             )
-            self._persist_channel_session_id(
-                channel_id=channel_id,
-                session_id=str(getattr(agent, "session_id", "") or "").strip(),
-            )
+            if not internal_turn:
+                self._persist_channel_session_id(
+                    channel_id=channel_id,
+                    session_id=str(getattr(agent, "session_id", "") or "").strip(),
+                )
             return result
         except Exception as exc:
             error = exc
@@ -830,6 +856,11 @@ class FlorenceHouseholdChatService:
                 )
                 or "-",
             )
+
+    @staticmethod
+    def looks_like_protocol_sentinel(reply_text: str | None) -> bool:
+        normalized = str(reply_text or "").strip()
+        return normalized in _PROTOCOL_SENTINELS
 
     @staticmethod
     def _verbose_turn_logging_enabled() -> bool:
@@ -1220,7 +1251,9 @@ class FlorenceHouseholdChatService:
             "When the user asks what Florence said before, refers to an earlier conversation, or wants prior household context, use session_search to recall earlier Florence threads for this household.",
             "When the user asks what they are forgetting, what changed, what matters this week, what still needs handling, or asks for a plan, ground the answer in household_search_state and session_search first, then check Gmail when relevant.",
             "Use session_search and Honcho memory to recover earlier commitments, preferences, and threads of work instead of making the user repeat themselves.",
-            "When the user explicitly asks you to check email, search Gmail, or find a message from a school, camp, teacher, coach, or sender, use household_search_google_inbox.",
+            "Use household_search_google_inbox whenever connected inbox context is likely to be the fastest grounded way to answer or act on the request.",
+            "In a private parent DM, be willing to search the connected inbox before asking the parent to restate details that likely already live in an email, invite, or forwarded message.",
+            "If the user points Florence toward their inbox as the source of truth, treat that as a strong cue to search the connected inbox instead of bouncing the question back.",
             "household_search_google_inbox respects scope: in a parent DM it defaults to that parent's inbox, while in the family group it only uses shared-household inbox scope.",
             "When the user needs current information from the public web such as school calendars, camp policies, activity schedules, vendor details, or comparisons, use web_search and web_extract instead of guessing.",
             "When the task requires interacting with a website or portal, following multi-step navigation, checking dynamic page state, or inspecting console/browser output, use the browser tools instead of pretending you already know the result.",

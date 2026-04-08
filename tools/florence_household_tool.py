@@ -634,8 +634,8 @@ def _build_visibility_summary(
 SEARCH_GOOGLE_INBOX_SCHEMA = {
     "name": "household_search_google_inbox",
     "description": (
-        "Search Florence's mirrored Gmail inbox when the user explicitly asks Florence to check email from a sender, "
-        "school, camp, teacher, coach, or keyword. Use this instead of asking the user to forward the email when "
+        "Search Florence's mirrored Gmail inbox for the message, invite, or email-derived detail that best answers the current request. "
+        "Use this when inbox context is likely to be the fastest grounded source of truth, instead of asking the user to restate or forward the email when "
         "Google is already connected. In a parent DM, this defaults to that parent's inbox unless the request clearly "
         "matches shared household source rules. In the family group, only shared-household inbox scope is allowed."
     ),

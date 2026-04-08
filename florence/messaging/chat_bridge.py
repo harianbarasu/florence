@@ -9,10 +9,15 @@ from florence.messaging.protocol_types import FlorenceProtocolReply
 from florence.onboarding import build_google_connected_syncing_message_sequence
 from florence.runtime.chat import (
     FlorenceHouseholdChatService,
+    _GROUP_INTRO_NO_ACTION_SENTINEL,
     _GROUP_INTRO_SHOW_SENTINEL,
+    _GROUP_SHARE_EXECUTE_SENTINEL,
+    _GROUP_SHARE_NO_ACTION_SENTINEL,
     _ONBOARDING_CONTEXTUAL_CHAT_SENTINEL,
     _ONBOARDING_NO_REPLY_SENTINEL,
     _ONBOARDING_SYNC_WAITING_SENTINEL,
+    _REVIEW_NO_ACTION_SENTINEL,
+    _REVIEW_SHOW_PROMPT_SENTINEL,
 )
 
 logger = logging.getLogger(__name__)
@@ -52,6 +57,14 @@ class FlorenceHouseholdChatBridge:
             conversation_history=history,
         )
         if reply is None or not reply.text.strip():
+            return None
+        if self._looks_like_protocol_sentinel(reply.text):
+            logger.warning(
+                "Suppressing leaked Florence protocol sentinel in normal chat reply household_id=%s channel_id=%s text=%s",
+                household_id,
+                channel_id,
+                reply.text.strip(),
+            )
             return None
         return FlorenceProtocolReply(reply_text=reply.text, consumed=True)
 
@@ -239,3 +252,18 @@ class FlorenceHouseholdChatBridge:
     def _looks_like_agent_failure(reply_text: str) -> bool:
         normalized = " ".join(reply_text.split()).strip().lower()
         return normalized.startswith("api call failed after ")
+
+    @staticmethod
+    def _looks_like_protocol_sentinel(reply_text: str) -> bool:
+        normalized = str(reply_text or "").strip()
+        return normalized in {
+            _ONBOARDING_SYNC_WAITING_SENTINEL,
+            _ONBOARDING_CONTEXTUAL_CHAT_SENTINEL,
+            _ONBOARDING_NO_REPLY_SENTINEL,
+            _REVIEW_SHOW_PROMPT_SENTINEL,
+            _REVIEW_NO_ACTION_SENTINEL,
+            _GROUP_SHARE_EXECUTE_SENTINEL,
+            _GROUP_SHARE_NO_ACTION_SENTINEL,
+            _GROUP_INTRO_SHOW_SENTINEL,
+            _GROUP_INTRO_NO_ACTION_SENTINEL,
+        }

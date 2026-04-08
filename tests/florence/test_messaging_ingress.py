@@ -1343,6 +1343,42 @@ def test_completed_group_media_message_routes_through_household_chat(tmp_path):
     store.close()
 
 
+def test_completed_dm_suppresses_protocol_sentinel_if_chat_model_leaks_one(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_onboarding_service(store, review_service)
+    _complete_hybrid_onboarding(onboarding_service)
+    chat_service = _StubHouseholdChatService("NO_GROUP_SHARE_PROTOCOL_ACTION")
+    ingress = _build_ingress(
+        store,
+        onboarding_service,
+        review_service,
+        household_chat_service=chat_service,
+    )
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_protocol_leak",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="You should see it in my email from today.",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert result.consumed is False
+    assert result.reply_text is None
+    assert chat_service.calls[0]["message_text"] == "You should see it in my email from today."
+    store.close()
+
+
 def test_dm_acknowledgement_during_sync_does_not_loop_setup_messages(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)

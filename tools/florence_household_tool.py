@@ -95,6 +95,34 @@ def _require_context(task_id: str | None) -> FlorenceHouseholdToolContext:
     return context
 
 
+def _build_onboarding_service(context: FlorenceHouseholdToolContext) -> FlorenceOnboardingSessionService:
+    service = FlorenceOnboardingSessionService(context.store)
+    try:
+        from florence.config import FlorenceSettings
+        from florence.runtime.google_services import FlorenceGoogleAccountLinkService
+
+        settings = FlorenceSettings.from_env()
+        if settings.google.configured:
+            google_account_link_service = FlorenceGoogleAccountLinkService(
+                context.store,
+                service,
+                client_id=settings.google.client_id or "",
+                client_secret=settings.google.client_secret or "",
+                redirect_uri=settings.google.redirect_uri or "",
+                state_secret=settings.google.state_secret or "",
+            )
+            service.set_link_url_builder(
+                lambda household_id, member_id, thread_id: google_account_link_service.build_connect_link(
+                    household_id=household_id,
+                    member_id=member_id,
+                    thread_id=thread_id,
+                ).url
+            )
+    except Exception:
+        pass
+    return service
+
+
 def _stable_id(prefix: str, *parts: str) -> str:
     raw = ":".join(parts).encode("utf-8")
     digest = hashlib.sha256(raw).hexdigest()[:20]
@@ -1133,7 +1161,7 @@ def _handle_apply_onboarding_update(args: dict, *, task_id: str | None = None, *
     if channel is None or not channel.provider_channel_id:
         return json.dumps({"error": "Onboarding updates require a DM thread context."})
 
-    service = FlorenceOnboardingSessionService(context.store)
+    service = _build_onboarding_service(context)
     previous_stage = service.get_or_create_session(
         household_id=context.household_id,
         member_id=context.actor_member_id,

@@ -95,6 +95,10 @@ _FLORENCE_HOUSEHOLD_TOOLS = [
     "household_record_preference",
 ]
 
+_FLORENCE_ONBOARDING_TOOLS = [
+    "household_apply_onboarding_update",
+]
+
 _FLORENCE_BRIEFING_TOOLS = [
     "household_search_state",
     "household_search_google_inbox",
@@ -248,6 +252,12 @@ TOOLSETS = {
     "florence_chat": {
         "description": "Florence household-general Hermes profile without coding or admin tools",
         "tools": _FLORENCE_HOUSEHOLD_TOOLS,
+        "includes": []
+    },
+
+    "florence_onboarding": {
+        "description": "Florence onboarding profile for fast structured setup updates",
+        "tools": _FLORENCE_ONBOARDING_TOOLS,
         "includes": []
     },
 

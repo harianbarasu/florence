@@ -2218,7 +2218,7 @@ def test_incomplete_dm_can_route_multi_child_school_updates_through_hermes_onboa
     assert session.stage == "collect_child_activities"
     assert [created["enabled_toolsets"] for created in _OnboardingToolAgent.created[:2]] == [
         ["florence_briefing"],
-        ["florence_chat"],
+        ["florence_onboarding"],
     ]
     assert "Use household_apply_onboarding_update to store only explicit setup facts" in _OnboardingToolAgent.last_run["system_message"]
     payload = json.loads(_OnboardingToolAgent.last_run["user_message"])

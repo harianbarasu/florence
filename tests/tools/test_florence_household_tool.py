@@ -1051,6 +1051,61 @@ def test_household_apply_onboarding_update_records_batched_child_details(tmp_pat
         store.close()
 
 
+def test_household_apply_onboarding_update_includes_google_connect_link_when_configured(tmp_path, monkeypatch):
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "google-client-id")
+    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "google-client-secret")
+    monkeypatch.setenv("GOOGLE_OAUTH_STATE_SECRET", "google-state-secret")
+    monkeypatch.setenv("FLORENCE_PUBLIC_BASE_URL", "https://florence.example.com")
+
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="sendblue",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    task_id = "task-household-onboarding-link"
+    set_household_tool_context(
+        task_id,
+        store=store,
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_dm_123",
+    )
+    try:
+        result = json.loads(
+            handle_function_call(
+                "household_apply_onboarding_update",
+                {
+                    "parent_name": "Maya",
+                },
+                task_id=task_id,
+            )
+        )
+        reply_messages = result["result"]["reply_messages"]
+        assert any(
+            message.startswith("https://florence.example.com/v1/florence/google/callback")
+            or "accounts.google.com" in message
+            for message in reply_messages
+        )
+    finally:
+        clear_household_tool_context(task_id)
+        store.close()
+
+
 def test_household_record_preference_persists_preference_items(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     store.upsert_household(

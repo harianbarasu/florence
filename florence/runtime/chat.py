@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
+from time import perf_counter
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
@@ -38,6 +40,7 @@ _GROUP_SHARE_EXECUTE_SENTINEL = "EXECUTE_GROUP_SHARE"
 _GROUP_SHARE_NO_ACTION_SENTINEL = "NO_GROUP_SHARE_PROTOCOL_ACTION"
 _GROUP_INTRO_SHOW_SENTINEL = "SHOW_GROUP_INTRO"
 _GROUP_INTRO_NO_ACTION_SENTINEL = "NO_GROUP_INTRO_PROTOCOL_ACTION"
+_SLOW_HERMES_TURN_MS = 3_000
 
 
 @dataclass(slots=True)
@@ -266,6 +269,7 @@ class FlorenceHouseholdChatService:
         if conversation_history is not None:
             conversation_context = self._build_conversation_history(conversation_history)
         enabled_toolsets = ["florence_briefing"]
+        max_iterations = self.max_iterations
 
         if kind == "activation_brief":
             system_message = "\n".join(
@@ -317,8 +321,15 @@ class FlorenceHouseholdChatService:
                 ensure_ascii=True,
             )
         elif kind == "onboarding_turn":
-            enabled_toolsets = ["florence_chat"]
-            system_message = self._build_onboarding_turn_system_message(base_system)
+            enabled_toolsets = ["florence_onboarding"]
+            max_iterations = min(self.max_iterations, 2)
+            system_message = self._build_onboarding_turn_system_message(
+                self._build_onboarding_system_message(
+                    household_id=household_id,
+                    channel_id=channel_id,
+                    actor_member_id=actor_member_id,
+                )
+            )
             user_message = self._build_onboarding_turn_user_message(payload)
         elif kind == "review_prompt":
             system_message = "\n".join(
@@ -474,6 +485,8 @@ class FlorenceHouseholdChatService:
             system_message=system_message,
             conversation_history=conversation_context,
             enabled_toolsets=enabled_toolsets,
+            max_iterations=max_iterations,
+            turn_kind=kind,
         )
         final_response = str(result.get("final_response") or "").strip()
         if kind == "group_promotion" and final_response == "NO_GROUP_SHARE":
@@ -562,7 +575,7 @@ class FlorenceHouseholdChatService:
         payload: dict[str, Any] | None = None,
         conversation_history: list[ChannelMessage] | None = None,
     ) -> tuple[str, ...] | None:
-        base_system = self._build_system_message(
+        base_system = self._build_onboarding_system_message(
             household_id=household_id,
             channel_id=channel_id,
             actor_member_id=actor_member_id,
@@ -583,7 +596,9 @@ class FlorenceHouseholdChatService:
             user_message=user_message,
             system_message=system_message,
             conversation_history=conversation_context,
-            enabled_toolsets=["florence_chat"],
+            enabled_toolsets=["florence_onboarding"],
+            max_iterations=min(self.max_iterations, 2),
+            turn_kind="onboarding_turn",
         )
         tool_reply_messages = self._extract_onboarding_reply_messages(result)
         if tool_reply_messages:
@@ -622,6 +637,41 @@ class FlorenceHouseholdChatService:
             ]
         )
 
+    def _build_onboarding_system_message(
+        self,
+        *,
+        household_id: str,
+        channel_id: str,
+        actor_member_id: str | None,
+    ) -> str:
+        household = self.store.get_household(household_id)
+        if household is None:
+            return ""
+        actor_name = None
+        if actor_member_id:
+            member = self.store.get_member(actor_member_id)
+            if member is not None:
+                actor_name = member.display_name
+        scope = resolve_conversation_scope(
+            self.store,
+            channel_id=channel_id,
+            actor_member_id=actor_member_id,
+        )
+        lines = [
+            "You are Florence, the Hermes-powered household onboarding agent for this private parent DM.",
+            "This lane is only for setup. Florence household state is the source of truth.",
+            "Keep this turn narrow: interpret the user's setup reply, store explicit facts, and move to the next onboarding step.",
+            "Do not browse, research, search Gmail, or use general household planning behavior in this lane.",
+            "Do not use any Florence tool except household_apply_onboarding_update.",
+            f"Household: {household.name}",
+            f"Timezone: {household.timezone}",
+        ]
+        lines.extend(build_scope_model_lines(scope=scope))
+        lines.append("Channel context: this is an active private parent-DM onboarding thread.")
+        if actor_name:
+            lines.append(f"Current speaker: {actor_name}")
+        return "\n".join(lines)
+
     @staticmethod
     def _build_onboarding_turn_user_message(payload: dict[str, Any]) -> str:
         return json.dumps(
@@ -650,8 +700,14 @@ class FlorenceHouseholdChatService:
         conversation_history: list[dict[str, str]] | None,
         session_id: str | None = None,
         enabled_toolsets: list[str],
+        max_iterations: int | None = None,
+        turn_kind: str = "chat",
     ) -> dict[str, Any]:
         task_id = f"florence-household-{uuid.uuid4()}"
+        result: dict[str, Any] | None = None
+        error: Exception | None = None
+        turn_started = perf_counter()
+        resolved_max_iterations = max_iterations if max_iterations is not None else self.max_iterations
 
         agent_factory = self.agent_factory
         if agent_factory is None:
@@ -673,7 +729,7 @@ class FlorenceHouseholdChatService:
         try:
             agent = agent_factory(
                 model=self.model,
-                max_iterations=self.max_iterations,
+                max_iterations=resolved_max_iterations,
                 provider=self.provider,
                 enabled_toolsets=enabled_toolsets,
                 quiet_mode=True,
@@ -705,8 +761,140 @@ class FlorenceHouseholdChatService:
                 session_id=str(getattr(agent, "session_id", "") or "").strip(),
             )
             return result
+        except Exception as exc:
+            error = exc
+            raise
         finally:
+            self._log_agent_turn(
+                turn_kind=turn_kind,
+                household_id=household_id,
+                channel_id=channel_id,
+                actor_member_id=actor_member_id,
+                enabled_toolsets=enabled_toolsets,
+                max_iterations=resolved_max_iterations,
+                conversation_history=conversation_history,
+                duration_ms=int((perf_counter() - turn_started) * 1000),
+                result=result,
+                error=error,
+            )
             clear_household_tool_context(task_id)
+
+    def _log_agent_turn(
+        self,
+        *,
+        turn_kind: str,
+        household_id: str,
+        channel_id: str,
+        actor_member_id: str | None,
+        enabled_toolsets: list[str],
+        max_iterations: int,
+        conversation_history: list[dict[str, str]] | None,
+        duration_ms: int,
+        result: dict[str, Any] | None,
+        error: Exception | None,
+    ) -> None:
+        tool_calls = self._extract_tool_call_names(result)
+        onboarding_reply_messages = (
+            len(self._extract_onboarding_reply_messages(result))
+            if turn_kind == "onboarding_turn"
+            else 0
+        )
+        final_response_preview = self._preview_text(
+            result.get("final_response") if isinstance(result, dict) else None
+        )
+        log_level = logging.WARNING if error is not None or duration_ms >= _SLOW_HERMES_TURN_MS else logging.INFO
+        logger.log(
+            log_level,
+            "Florence Hermes turn kind=%s household_id=%s channel_id=%s actor_member_id=%s duration_ms=%s history_messages=%s toolsets=%s max_iterations=%s tool_calls=%s onboarding_reply_messages=%s final_response=%s error=%s",
+            turn_kind,
+            household_id,
+            channel_id,
+            actor_member_id,
+            duration_ms,
+            len(conversation_history or []),
+            ",".join(enabled_toolsets),
+            max_iterations,
+            ",".join(tool_calls) if tool_calls else "-",
+            onboarding_reply_messages,
+            final_response_preview or "-",
+            str(error) if error is not None else "-",
+        )
+        if self._verbose_turn_logging_enabled():
+            logger.info(
+                "Florence Hermes turn detail kind=%s assistant_messages=%s last_reasoning=%s",
+                turn_kind,
+                json.dumps(self._assistant_message_summaries(result), ensure_ascii=False),
+                self._preview_text(
+                    result.get("last_reasoning") if isinstance(result, dict) else None,
+                    limit=400,
+                )
+                or "-",
+            )
+
+    @staticmethod
+    def _verbose_turn_logging_enabled() -> bool:
+        return str(os.getenv("FLORENCE_HERMES_VERBOSE_LOGGING") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    @staticmethod
+    def _preview_text(value: Any, *, limit: int = 200) -> str:
+        text = " ".join(str(value or "").split())
+        if not text:
+            return ""
+        if len(text) <= limit:
+            return text
+        return f"{text[: limit - 3]}..."
+
+    @classmethod
+    def _assistant_message_summaries(cls, result: dict[str, Any] | None) -> list[dict[str, Any]]:
+        if not isinstance(result, dict):
+            return []
+        summaries: list[dict[str, Any]] = []
+        for message in result.get("messages") or []:
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            tool_calls = []
+            for tool_call in message.get("tool_calls") or []:
+                if not isinstance(tool_call, dict):
+                    continue
+                function = tool_call.get("function")
+                if not isinstance(function, dict):
+                    continue
+                name = str(function.get("name") or "").strip()
+                if name:
+                    tool_calls.append(name)
+            summaries.append(
+                {
+                    "tool_calls": tool_calls,
+                    "content": cls._preview_text(message.get("content")),
+                }
+            )
+        return summaries
+
+    @staticmethod
+    def _extract_tool_call_names(result: dict[str, Any] | None) -> tuple[str, ...]:
+        if not isinstance(result, dict):
+            return ()
+        names: list[str] = []
+        seen: set[str] = set()
+        for message in result.get("messages") or []:
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            for tool_call in message.get("tool_calls") or []:
+                if not isinstance(tool_call, dict):
+                    continue
+                function = tool_call.get("function")
+                if not isinstance(function, dict):
+                    continue
+                name = str(function.get("name") or "").strip()
+                if name and name not in seen:
+                    seen.add(name)
+                    names.append(name)
+        return tuple(names)
 
     @staticmethod
     def _extract_onboarding_reply_messages(result: dict[str, Any]) -> tuple[str, ...]:

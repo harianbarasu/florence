@@ -1526,6 +1526,8 @@ def test_household_chat_service_compose_onboarding_turn_includes_explicit_setup_
     assert "reply exactly HANDOFF_TO_CONTEXTUAL_CHAT" in _FakeAgent.last_run["system_message"]
     assert "reply exactly NO_SETUP_REPLY" in _FakeAgent.last_run["system_message"]
     assert "\"task\": \"handle_onboarding_turn\"" in _FakeAgent.last_run["user_message"]
+    assert _FakeAgent.created[0]["enabled_toolsets"] == ["florence_onboarding"]
+    assert _FakeAgent.created[0]["max_iterations"] == 2
     store.close()
 
 

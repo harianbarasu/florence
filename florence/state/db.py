@@ -83,7 +83,7 @@ class SQLiteConnectionAdapter:
 
 
 class PostgresCursorAdapter:
-    def __init__(self, cursor: Any, connection: Any):
+    def __init__(self, cursor: Any, connection: "PostgresConnectionAdapter"):
         self._cursor = cursor
         self._connection = connection
 
@@ -91,7 +91,7 @@ class PostgresCursorAdapter:
         try:
             self._cursor.execute(_rewrite_placeholders(query), params)
         except Exception:
-            self._connection.rollback()
+            self._connection._rollback_if_possible()
             raise
         return self
 
@@ -100,7 +100,7 @@ class PostgresCursorAdapter:
             for statement in _split_sql_script(script):
                 self._cursor.execute(statement)
         except Exception:
-            self._connection.rollback()
+            self._connection._rollback_if_possible()
             raise
 
     def fetchone(self) -> RowLike | None:
@@ -114,24 +114,96 @@ class PostgresConnectionAdapter:
     def __init__(self, dsn: str):
         if psycopg is None or dict_row is None:
             raise RuntimeError("psycopg_required_for_postgres")
-        self._conn = psycopg.connect(dsn, row_factory=dict_row)
+        self._dsn = dsn
+        self._conn = self._open_connection()
+
+    def _open_connection(self) -> Any:
+        return psycopg.connect(self._dsn, row_factory=dict_row)
+
+    def _connection_is_closed(self) -> bool:
+        conn = self._conn
+        if conn is None:
+            return True
+        if bool(getattr(conn, "broken", False)):
+            return True
+        closed = getattr(conn, "closed", False)
+        if isinstance(closed, bool):
+            return closed
+        if isinstance(closed, int):
+            return closed != 0
+        return False
+
+    def _is_recoverable_connection_error(self, exc: Exception) -> bool:
+        operational_error = getattr(psycopg, "OperationalError", None) if psycopg is not None else None
+        if operational_error is not None and isinstance(exc, operational_error):
+            message = str(exc).lower()
+            if (
+                "connection is closed" in message
+                or "server closed the connection unexpectedly" in message
+                or "terminating connection" in message
+            ):
+                return True
+        return self._connection_is_closed()
+
+    def _reconnect(self) -> None:
+        try:
+            if self._conn is not None:
+                self._conn.close()
+        except Exception:
+            pass
+        self._conn = self._open_connection()
+
+    def _rollback_if_possible(self) -> None:
+        try:
+            if self._conn is not None and not self._connection_is_closed():
+                self._conn.rollback()
+        except Exception:
+            pass
 
     def execute(self, query: str, params: tuple[Any, ...] = ()) -> PostgresCursorAdapter:
+        try:
+            cursor = self.cursor()
+            cursor.execute(query, params)
+            return cursor
+        except Exception as exc:
+            if not self._is_recoverable_connection_error(exc):
+                raise
+        self._reconnect()
         cursor = self.cursor()
         cursor.execute(query, params)
         return cursor
 
     def cursor(self) -> PostgresCursorAdapter:
-        return PostgresCursorAdapter(self._conn.cursor(), self._conn)
+        if self._connection_is_closed():
+            self._reconnect()
+        try:
+            return PostgresCursorAdapter(self._conn.cursor(), self)
+        except Exception as exc:
+            if not self._is_recoverable_connection_error(exc):
+                raise
+        self._reconnect()
+        return PostgresCursorAdapter(self._conn.cursor(), self)
 
     def commit(self) -> None:
-        self._conn.commit()
+        try:
+            self._conn.commit()
+        except Exception as exc:
+            if self._is_recoverable_connection_error(exc):
+                self._reconnect()
+            raise
 
     def rollback(self) -> None:
-        self._conn.rollback()
+        try:
+            self._conn.rollback()
+        except Exception as exc:
+            if self._is_recoverable_connection_error(exc):
+                self._reconnect()
+            raise
 
     def close(self) -> None:
-        self._conn.close()
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
 
 
 def connect_florence_db(database: Path | str) -> FlorenceConnection:

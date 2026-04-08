@@ -29,7 +29,12 @@ from florence.contracts import (
     ImportedCandidate,
 )
 from florence.messaging.channel_log import FlorenceChannelLog
-from florence.messaging.protocol_types import CANDIDATE_REVIEW_PROMPT_KIND, PENDING_ACTION_TARGET_ID_KEY
+from florence.messaging.protocol_types import (
+    CANDIDATE_REVIEW_PROMPT_KIND,
+    PENDING_ACTION_TARGET_ID_KEY,
+    build_google_connect_prompt_metadata,
+)
+from florence.onboarding import OnboardingStage
 from florence.runtime.candidate_review import FlorenceCandidateReviewService
 from florence.runtime.household_calendar_projection import FlorenceHouseholdCalendarProjectionService
 from florence.runtime.household_manager import FlorenceHouseholdManagerService
@@ -1236,6 +1241,12 @@ def _handle_apply_onboarding_update(args: dict, *, task_id: str | None = None, *
         member_id=context.actor_member_id,
         thread_id=channel.provider_channel_id,
     )
+    reply_metadata: dict[str, object] = {}
+    if (
+        transition.state.stage == OnboardingStage.CONNECT_GOOGLE
+        or (previous_stage == OnboardingStage.COLLECT_PARENT_NAME and not transition.state.google_connected)
+    ):
+        reply_metadata = build_google_connect_prompt_metadata()
     return json.dumps(
         {
             "result": {
@@ -1243,6 +1254,7 @@ def _handle_apply_onboarding_update(args: dict, *, task_id: str | None = None, *
                 "is_complete": transition.state.is_complete,
                 "child_names": list(transition.state.child_names),
                 "reply_messages": list(prompt_messages),
+                "reply_metadata": reply_metadata,
             }
         }
     )
@@ -1348,6 +1360,22 @@ def _handle_search_google_inbox(args: dict, *, task_id: str | None = None, **_: 
     connections = google_scope.connections
     search_scope = google_scope.search_scope
     scope_reason = google_scope.scope_reason
+    connection_sync_statuses = [
+        {
+            "email": connection.email,
+            "initial_sync_state": (dict(connection.metadata).get("initial_sync_state") if isinstance(connection.metadata, dict) else None),
+            "last_sync_status": (dict(connection.metadata).get("last_sync_status") if isinstance(connection.metadata, dict) else None),
+            "last_sync_error": (dict(connection.metadata).get("last_sync_error") if isinstance(connection.metadata, dict) else None),
+            "sync_phase": (dict(connection.metadata).get("sync_phase") if isinstance(connection.metadata, dict) else None),
+            "gmail_last_synced_at": (dict(connection.metadata).get("gmail_last_synced_at") if isinstance(connection.metadata, dict) else None),
+            "last_gmail_item_count": (dict(connection.metadata).get("last_gmail_item_count") if isinstance(connection.metadata, dict) else None),
+        }
+        for connection in connections
+    ]
+    mirror_sync_running = any(
+        status.get("initial_sync_state") == "running" or status.get("last_sync_status") == "running"
+        for status in connection_sync_statuses
+    )
 
     if not connections:
         return json.dumps(
@@ -1355,6 +1383,8 @@ def _handle_search_google_inbox(args: dict, *, task_id: str | None = None, **_: 
                 "error": "No active Google inbox is connected for this household member.",
                 "search_scope": search_scope,
                 "scope_reason": scope_reason,
+                "mirror_sync_running": False,
+                "connection_sync_statuses": [],
                 "results": [],
             }
         )
@@ -1386,6 +1416,8 @@ def _handle_search_google_inbox(args: dict, *, task_id: str | None = None, **_: 
             "search_backend": "local_mirror",
             "search_scope": search_scope,
             "scope_reason": scope_reason,
+            "mirror_sync_running": mirror_sync_running,
+            "connection_sync_statuses": connection_sync_statuses,
             "searched_connection_emails": searched_connection_emails,
             "results": results[:max_results],
         }

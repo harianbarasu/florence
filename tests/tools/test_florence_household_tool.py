@@ -315,6 +315,78 @@ def test_household_google_inbox_search_uses_shared_source_rules_across_connected
         store.close()
 
 
+def test_household_google_inbox_search_matches_human_query_terms_without_exact_phrase(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Jackson",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Jackson",
+        )
+    )
+    connection = GoogleConnection(
+        id="gconn_123",
+        household_id="hh_123",
+        member_id="mem_123",
+        email="jackson@example.com",
+        connected_scopes=(GoogleSourceKind.GMAIL,),
+        access_token="access-token",
+    )
+    store.upsert_google_connection(connection)
+    store.upsert_google_gmail_messages(
+        connection=connection,
+        items=[
+            GmailSyncItem(
+                gmail_message_id="gmail_invite_123",
+                thread_id="thread_invite_123",
+                from_address="Kendall <kendall@example.com>",
+                subject="Theo birthday celebration at Pump It Up",
+                snippet="Party is next month on Saturday at 2pm.",
+                body_text="Kendall forwarded Theo's birthday celebration invite. The party is next month on Saturday at 2pm.",
+                attachment_text=None,
+                attachment_count=0,
+                received_at=datetime.now(timezone.utc),
+            )
+        ],
+    )
+    task_id = "task-human-inbox-query"
+    set_household_tool_context(
+        task_id,
+        store=store,
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_dm_123",
+    )
+    try:
+        inbox_result = json.loads(
+            handle_function_call(
+                "household_search_google_inbox",
+                {
+                    "query": "birthday party invite next month",
+                },
+                task_id=task_id,
+            )
+        )
+
+        assert inbox_result["results"]
+        assert inbox_result["results"][0]["gmail_message_id"] == "gmail_invite_123"
+    finally:
+        clear_household_tool_context(task_id)
+        store.close()
+
+
 def test_household_google_inbox_search_from_group_requires_shared_scope(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))

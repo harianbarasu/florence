@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -73,6 +74,65 @@ _RESET_ALL_TABLES = (
     "onboarding_sessions",
     "pilot_events",
 )
+
+
+def _normalized_search_terms(value: str | None) -> list[str]:
+    normalized = " ".join(str(value or "").split()).strip().lower()
+    if not normalized:
+        return []
+    return [
+        token
+        for token in re.findall(r"[a-z0-9@._'+-]+", normalized)
+        if len(token) >= 2
+    ]
+
+
+def _gmail_match_score(
+    item: StoredGmailSyncItem,
+    *,
+    query: str | None,
+    query_terms: list[str],
+) -> int:
+    normalized_query = " ".join(str(query or "").split()).strip().lower()
+    sender_text = str(item.from_address or "").lower()
+    subject_text = str(item.subject or "").lower()
+    snippet_text = str(item.snippet or "").lower()
+    body_text = str(item.body_text or "").lower()
+    attachment_text = str(item.attachment_text or "").lower()
+
+    score = 0
+    if normalized_query:
+        if normalized_query in subject_text:
+            score += 18
+        if normalized_query in sender_text:
+            score += 14
+        if normalized_query in snippet_text:
+            score += 10
+        if normalized_query in body_text:
+            score += 10
+        if normalized_query in attachment_text:
+            score += 10
+
+    matched_terms = 0
+    for term in query_terms:
+        term_score = 0
+        if term in sender_text:
+            term_score = max(term_score, 5)
+        if term in subject_text:
+            term_score = max(term_score, 7)
+        if term in snippet_text:
+            term_score = max(term_score, 4)
+        if term in body_text:
+            term_score = max(term_score, 3)
+        if term in attachment_text:
+            term_score = max(term_score, 3)
+        if term_score:
+            matched_terms += 1
+            score += term_score
+
+    if query_terms and matched_terms == len(query_terms):
+        score += len(query_terms) * 2
+    return score
 
 _RESET_HOUSEHOLD_TABLES = (
     "channel_messages",
@@ -1503,23 +1563,24 @@ class FlorenceStateDB:
             sql += " AND LOWER(COALESCE(gm.subject, '')) LIKE ?"
             params.append(f"%{normalized_subject}%")
 
-        normalized_query = " ".join(str(query or "").split()).strip().lower()
-        if normalized_query:
-            sql += """
-                AND LOWER(
-                    COALESCE(gm.from_address, '') || ' ' ||
-                    COALESCE(gm.subject, '') || ' ' ||
-                    COALESCE(gm.snippet, '') || ' ' ||
-                    COALESCE(gm.body_text, '') || ' ' ||
-                    COALESCE(gm.attachment_text, '')
-                ) LIKE ?
-            """
-            params.append(f"%{normalized_query}%")
-
-        sql += " ORDER BY COALESCE(gm.received_at_ts, 0) DESC, gm.updated_at DESC LIMIT ?"
-        params.append(max(1, limit))
+        sql += " ORDER BY COALESCE(gm.received_at_ts, 0) DESC, gm.updated_at DESC"
         rows = self._conn.execute(sql, tuple(params)).fetchall()
-        return [self._row_to_stored_gmail_sync_item(row) for row in rows]
+        items = [self._row_to_stored_gmail_sync_item(row) for row in rows]
+        query_terms = _normalized_search_terms(query)
+        if query_terms:
+            scored: list[tuple[int, StoredGmailSyncItem]] = []
+            for item in items:
+                score = _gmail_match_score(item, query=query, query_terms=query_terms)
+                if score > 0:
+                    scored.append((score, item))
+            scored.sort(
+                key=lambda pair: (
+                    -pair[0],
+                    -(pair[1].received_at.timestamp() if pair[1].received_at is not None else 0.0),
+                )
+            )
+            return [item for _, item in scored[: max(1, limit)]]
+        return items[: max(1, limit)]
 
     def upsert_google_calendar_events(
         self,

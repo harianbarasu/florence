@@ -81,7 +81,6 @@ class FlorenceDmRouter:
                 return self._result_from_protocol_reply(review_result)
             if self.review_protocol.is_reply_armed(
                 channel_id=resolved.channel_id,
-                review_prompt_text=review_prompt_text or "",
             ):
                 chat_result = self.chat_bridge.respond_as_protocol(
                     household_id=resolved.household_id,

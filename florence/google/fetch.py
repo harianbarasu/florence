@@ -18,7 +18,7 @@ from florence.media.openai_extract import (
     extract_image_text_with_openai,
     extract_pdf_text_with_openai,
 )
-from florence.google.types import GmailSyncItem, GoogleCalendarMetadata, ParentCalendarSyncItem
+from florence.google.types import GmailSyncItem, GmailSyncPage, GoogleCalendarMetadata, ParentCalendarSyncItem
 
 logger = logging.getLogger(__name__)
 
@@ -371,53 +371,43 @@ def build_gmail_sync_item(
     )
 
 
-def list_recent_gmail_sync_items(
+def list_recent_gmail_sync_page(
     *,
     access_token: str,
     max_results: int | None = None,
     gmail_query: str | None = None,
+    page_token: str | None = None,
     timeout_seconds: float = 30.0,
-) -> list[GmailSyncItem]:
-    message_refs: list[dict[str, Any]] = []
-    page_token: str | None = None
+) -> GmailSyncPage:
     page_size = min(100, max_results) if max_results else 100
 
-    while True:
-        list_url = "https://gmail.googleapis.com/gmail/v1/users/me/messages"
-        normalized_query = " ".join(str(gmail_query or "").split()).strip()
-        if normalized_query:
-            query = normalized_query
-            lowered_query = normalized_query.lower()
-            if "-in:trash" not in lowered_query:
-                query = f"{query} -in:trash"
-            if "-in:spam" not in lowered_query:
-                query = f"{query} -in:spam"
-        else:
-            query = "newer_than:90d -in:trash -in:spam"
-        params = {
-            "maxResults": str(page_size),
-            "q": query,
-        }
-        if page_token:
-            params["pageToken"] = page_token
-        response = httpx.get(
-            list_url,
-            params=params,
-            headers={"authorization": f"Bearer {access_token}"},
-            timeout=timeout_seconds,
-        )
-        payload = response.json()
-        response.raise_for_status()
-
-        message_refs.extend(payload.get("messages") or [])
-        page_token = payload.get("nextPageToken")
-        if not page_token:
-            break
-        if max_results and len(message_refs) >= max_results:
-            break
-
-    if max_results:
-        message_refs = message_refs[:max_results]
+    list_url = "https://gmail.googleapis.com/gmail/v1/users/me/messages"
+    normalized_query = " ".join(str(gmail_query or "").split()).strip()
+    if normalized_query:
+        query = normalized_query
+        lowered_query = normalized_query.lower()
+        if "-in:trash" not in lowered_query:
+            query = f"{query} -in:trash"
+        if "-in:spam" not in lowered_query:
+            query = f"{query} -in:spam"
+    else:
+        query = "newer_than:90d -in:trash -in:spam"
+    params = {
+        "maxResults": str(page_size),
+        "q": query,
+    }
+    if page_token:
+        params["pageToken"] = page_token
+    response = httpx.get(
+        list_url,
+        params=params,
+        headers={"authorization": f"Bearer {access_token}"},
+        timeout=timeout_seconds,
+    )
+    payload = response.json()
+    response.raise_for_status()
+    message_refs = payload.get("messages") or []
+    next_page_token = payload.get("nextPageToken")
 
     results: list[GmailSyncItem] = []
     for ref in message_refs:
@@ -455,7 +445,36 @@ def list_recent_gmail_sync_items(
                 )
             )
 
-    return results
+    return GmailSyncPage(items=results, next_page_token=str(next_page_token) if next_page_token else None)
+
+
+def list_recent_gmail_sync_items(
+    *,
+    access_token: str,
+    max_results: int | None = None,
+    gmail_query: str | None = None,
+    timeout_seconds: float = 30.0,
+) -> list[GmailSyncItem]:
+    results: list[GmailSyncItem] = []
+    next_page_token: str | None = None
+    remaining = max_results
+
+    while True:
+        page = list_recent_gmail_sync_page(
+            access_token=access_token,
+            max_results=remaining,
+            gmail_query=gmail_query,
+            page_token=next_page_token,
+            timeout_seconds=timeout_seconds,
+        )
+        results.extend(page.items)
+        next_page_token = page.next_page_token
+        if max_results is not None:
+            remaining = max(0, max_results - len(results))
+            if remaining <= 0:
+                return results[:max_results]
+        if not next_page_token:
+            return results
 
 
 def _parse_google_calendar_event_datetime(

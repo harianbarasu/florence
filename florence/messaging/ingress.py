@@ -24,7 +24,6 @@ from florence.runtime.onboarding_service import FlorenceOnboardingSessionService
 from florence.state import FlorenceStateDB
 
 logger = logging.getLogger(__name__)
-_REVIEW_CONFIRMATION_SUFFIX = "Reply yes if I should add it, no if it's wrong, or skip for later."
 
 class FlorenceMessagingIngressService:
     """Routes normalized transport messages into Florence onboarding and chat flows."""
@@ -52,7 +51,6 @@ class FlorenceMessagingIngressService:
             channel_log=self.channel_log,
             candidate_review_service=self.candidate_review_service,
             household_chat_service=self.household_chat_service,
-            confirmation_suffix=_REVIEW_CONFIRMATION_SUFFIX,
         )
         self.group_share_service = FlorenceGroupShareService(
             store,

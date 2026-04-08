@@ -6,27 +6,12 @@ from typing import Callable
 
 from florence.messaging.channel_log import FlorenceChannelLog
 from florence.messaging.protocol_types import (
+    GOOGLE_CONNECT_PROMPT_KIND,
     HOUSEHOLD_NUDGE_PROMPT_KIND,
     PENDING_ACTION_TARGET_ID_KEY,
     PENDING_ACTION_TYPE_KEY,
     FlorenceProtocolReply,
 )
-
-
-def _looks_like_google_done_prompt(text: str) -> bool:
-    lowered = " ".join(text.split()).lower()
-    return "reply done" in lowered and any(
-        token in lowered
-        for token in (
-            "google",
-            "connect",
-            "connected",
-            "link",
-            "gmail",
-            "calendar",
-            "email",
-        )
-    )
 
 
 class FlorenceReminderProtocol:
@@ -57,7 +42,7 @@ class FlorenceReminderProtocol:
             member_id=member_id,
             thread_id=thread_id,
             text=text,
-            latest_assistant_message_body=self.channel_log.latest_assistant_message_body(channel_id=channel_id),
+            channel_id=channel_id,
             respond_with_household_chat=respond_with_household_chat,
         )
         if google_done_result is not None:
@@ -101,13 +86,12 @@ class FlorenceReminderProtocol:
         member_id: str,
         thread_id: str,
         text: str,
-        latest_assistant_message_body: str | None,
+        channel_id: str,
         respond_with_household_chat: Callable[[str], FlorenceProtocolReply | None],
     ) -> FlorenceProtocolReply | None:
         if not (
             " ".join(text.strip().lower().split()) == "done"
-            and latest_assistant_message_body is not None
-            and _looks_like_google_done_prompt(latest_assistant_message_body)
+            and self._google_connect_reply_is_armed(channel_id=channel_id)
         ):
             return None
 
@@ -125,6 +109,12 @@ class FlorenceReminderProtocol:
             reply_messages=onboarding_reply.reply_messages,
             consumed=True,
         )
+
+    def _google_connect_reply_is_armed(self, *, channel_id: str) -> bool:
+        latest_assistant = self.channel_log.latest_assistant_message(channel_id=channel_id, limit=8)
+        if latest_assistant is None:
+            return False
+        return str(latest_assistant.metadata.get("protocol_kind") or "").strip() == GOOGLE_CONNECT_PROMPT_KIND
 
     @staticmethod
     def _continue_with_household_chat(

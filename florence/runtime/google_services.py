@@ -26,6 +26,7 @@ from florence.google import (
     fetch_google_user_email,
     fetch_primary_google_calendar,
     list_google_calendars,
+    list_recent_gmail_sync_page,
     list_recent_gmail_sync_items,
     list_recent_parent_calendar_sync_items,
     merge_google_grounding_hints,
@@ -487,18 +488,47 @@ class FlorenceGoogleSyncWorkerService:
             else (_gmail_incremental_max_results() if bootstrap_complete else _gmail_bootstrap_max_results())
         )
 
-        gmail_items, hydrated_connection = self._run_google_fetch_with_refresh_retry(
-            hydrated_connection,
-            now=now,
-            client_id=client_id,
-            client_secret=client_secret,
-            operation="gmail sync",
-            fetch=lambda refreshed_access_token: list_recent_gmail_sync_items(
-                access_token=refreshed_access_token,
-                max_results=resolved_max_gmail_results,
-                gmail_query=gmail_query,
-            ),
-        )
+        if bootstrap_complete:
+            gmail_items, hydrated_connection = self._run_google_fetch_with_refresh_retry(
+                hydrated_connection,
+                now=now,
+                client_id=client_id,
+                client_secret=client_secret,
+                operation="gmail sync",
+                fetch=lambda refreshed_access_token: list_recent_gmail_sync_items(
+                    access_token=refreshed_access_token,
+                    max_results=resolved_max_gmail_results,
+                    gmail_query=gmail_query,
+                ),
+            )
+        else:
+            gmail_items = []
+            next_page_token: str | None = None
+            while True:
+                gmail_page, hydrated_connection = self._run_google_fetch_with_refresh_retry(
+                    hydrated_connection,
+                    now=now,
+                    client_id=client_id,
+                    client_secret=client_secret,
+                    operation="gmail sync",
+                    fetch=lambda refreshed_access_token, page_token=next_page_token: list_recent_gmail_sync_page(
+                        access_token=refreshed_access_token,
+                        max_results=resolved_max_gmail_results,
+                        gmail_query=gmail_query,
+                        page_token=page_token,
+                    ),
+                )
+                if gmail_page.items:
+                    # Mirror Gmail rows incrementally during the first bootstrap so Florence can
+                    # search partial inbox state before the full year-long scan completes.
+                    self.store.upsert_google_gmail_messages(
+                        connection=hydrated_connection,
+                        items=list(gmail_page.items),
+                    )
+                    gmail_items.extend(gmail_page.items)
+                next_page_token = gmail_page.next_page_token
+                if not next_page_token:
+                    break
         access_token = hydrated_connection.access_token
         if not access_token:
             raise ValueError("google_access_token_missing")

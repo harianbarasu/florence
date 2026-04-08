@@ -14,6 +14,7 @@ from florence.google.oauth import (
 from florence.google.fetch import (
     build_gmail_sync_item,
     build_parent_calendar_sync_item,
+    list_recent_gmail_sync_page,
     list_recent_gmail_sync_items,
     list_recent_parent_calendar_sync_items,
 )
@@ -27,6 +28,7 @@ from florence.google.sync import (
 from florence.google.types import (
     FlorenceGoogleOauthState,
     GmailSyncItem,
+    GmailSyncPage,
     GoogleCalendarMetadata,
     GoogleTokenResponse,
     ParentCalendarSyncItem,
@@ -40,6 +42,7 @@ __all__ = [
     "FlorenceGoogleSyncBatch",
     "FlorenceGoogleSyncResult",
     "GmailSyncItem",
+    "GmailSyncPage",
     "GoogleCalendarMetadata",
     "GoogleTokenResponse",
     "ParentCalendarSyncItem",
@@ -57,6 +60,7 @@ __all__ = [
     "fetch_google_user_email",
     "list_google_calendars",
     "fetch_primary_google_calendar",
+    "list_recent_gmail_sync_page",
     "list_recent_gmail_sync_items",
     "list_recent_parent_calendar_sync_items",
     "refresh_google_access_token",

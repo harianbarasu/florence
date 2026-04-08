@@ -6,7 +6,10 @@ from typing import Any, Callable
 
 from florence.onboarding import OnboardingStage
 
-from florence.messaging.protocol_types import FlorenceProtocolReply
+from florence.messaging.protocol_types import (
+    FlorenceProtocolReply,
+    build_google_connect_prompt_metadata,
+)
 
 
 class FlorenceSetupProtocol:
@@ -92,7 +95,8 @@ class FlorenceSetupProtocol:
                     household_id=household_id,
                     member_id=member_id,
                     thread_id=thread_id,
-                )
+                ),
+                reply_metadata=build_google_connect_prompt_metadata(),
             )
         transition = self.onboarding_service.record_google_connected(
             household_id=household_id,
@@ -136,16 +140,33 @@ class FlorenceSetupProtocol:
         member_id: str,
         thread_id: str,
     ) -> FlorenceProtocolReply:
-        return self._messages_reply(self.onboarding_service.get_prompt_messages(
+        prompt = self.onboarding_service.get_prompt(
             household_id=household_id,
             member_id=member_id,
             thread_id=thread_id,
-        ))
+        )
+        return self._messages_reply(
+            self.onboarding_service.get_prompt_messages(
+                household_id=household_id,
+                member_id=member_id,
+                thread_id=thread_id,
+            ),
+            reply_metadata=(
+                build_google_connect_prompt_metadata()
+                if prompt is not None and prompt.stage == OnboardingStage.CONNECT_GOOGLE
+                else None
+            ),
+        )
 
     @staticmethod
-    def _messages_reply(messages: tuple[str, ...]) -> FlorenceProtocolReply:
+    def _messages_reply(
+        messages: tuple[str, ...],
+        *,
+        reply_metadata: dict[str, object] | None = None,
+    ) -> FlorenceProtocolReply:
         return FlorenceProtocolReply(
             reply_text=messages[0] if messages else None,
             reply_messages=messages,
+            reply_metadata=dict(reply_metadata or {}),
             consumed=True,
         )

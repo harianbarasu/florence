@@ -26,12 +26,10 @@ class FlorenceCandidateReviewProtocol:
         channel_log: FlorenceChannelLog,
         candidate_review_service,
         household_chat_service,
-        confirmation_suffix: str,
     ) -> None:
         self.channel_log = channel_log
         self.candidate_review_service = candidate_review_service
         self.household_chat_service = household_chat_service
-        self.confirmation_suffix = confirmation_suffix
 
     def current_prompt(
         self,
@@ -77,7 +75,6 @@ class FlorenceCandidateReviewProtocol:
         )
         prompt_armed = self._is_candidate_review_reply_armed(
             channel_id=channel_id,
-            review_prompt_text=prompt_text,
         )
         decision = self.household_chat_service.compose_operator_message(
             household_id=household_id,
@@ -108,11 +105,9 @@ class FlorenceCandidateReviewProtocol:
         self,
         *,
         channel_id: str,
-        review_prompt_text: str,
     ) -> bool:
         return self._is_candidate_review_reply_armed(
             channel_id=channel_id,
-            review_prompt_text=review_prompt_text,
         )
 
     def build_chat_followup_context(
@@ -182,18 +177,11 @@ class FlorenceCandidateReviewProtocol:
             )
         return prompt.text
 
-    def _is_candidate_review_reply_armed(self, *, channel_id: str, review_prompt_text: str) -> bool:
+    def _is_candidate_review_reply_armed(self, *, channel_id: str) -> bool:
         latest_assistant = self.channel_log.latest_assistant_message(channel_id=channel_id, limit=8)
         if latest_assistant is None:
             return False
-        latest_body = latest_assistant.body.strip()
-        if not latest_body:
-            return False
-        if latest_assistant.metadata.get("protocol_kind") == CANDIDATE_REVIEW_PROMPT_KIND:
-            return True
-        if latest_body == review_prompt_text.strip():
-            return True
-        return self.confirmation_suffix in latest_body
+        return latest_assistant.metadata.get("protocol_kind") == CANDIDATE_REVIEW_PROMPT_KIND
 
     def active_candidate_id(self, *, channel_id: str) -> str | None:
         latest_assistant = self.channel_log.latest_assistant_message(channel_id=channel_id, limit=8)

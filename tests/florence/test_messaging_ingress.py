@@ -5,7 +5,7 @@ from florence.messaging import (
     FlorenceMessagingIngressService,
     FlorenceResolvedInboundMessage,
 )
-from florence.messaging.protocol_types import CANDIDATE_REVIEW_PROMPT_KIND
+from florence.messaging.protocol_types import CANDIDATE_REVIEW_PROMPT_KIND, build_google_connect_prompt_metadata
 from datetime import datetime, timedelta, timezone
 from florence.onboarding import OnboardingStage
 
@@ -2743,6 +2743,7 @@ def test_done_after_google_connect_prompt_routes_back_to_agent_not_reminder_ack(
         household_id="hh_123",
         channel_id="chan_dm_123",
         body="If you already finished the link I sent you earlier, reply done and I'll look for emails from Linda at Musical Beginnings.",
+        metadata=build_google_connect_prompt_metadata(),
     )
 
     result = ingress.handle_message(

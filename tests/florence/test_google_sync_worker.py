@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 import httpx
 
 from florence.contracts import CandidateState, ChildProfile, GoogleConnection, GoogleSourceKind, HouseholdProfileItem, HouseholdProfileKind
-from florence.google import GmailSyncItem, GoogleTokenResponse, ParentCalendarSyncItem
+from florence.google import GmailSyncItem, GmailSyncPage, GoogleTokenResponse, ParentCalendarSyncItem
 from florence.onboarding import OnboardingState
 from florence.runtime import FlorenceGoogleSyncPersistenceService, FlorenceGoogleSyncWorkerService
 from florence.runtime.google_services import _calendar_sync_targets
@@ -77,20 +77,23 @@ def test_google_sync_worker_fetches_and_persists_candidates(tmp_path, monkeypatc
     )
 
     monkeypatch.setattr(
-        "florence.runtime.google_services.list_recent_gmail_sync_items",
-        lambda **_: [
-            GmailSyncItem(
-                gmail_message_id="gmail_123",
-                thread_id="thread_123",
-                from_address="teacher@school.edu",
-                subject="Soccer practice update",
-                snippet="Practice moves to Thursday 4pm to 5pm",
-                body_text="Ava soccer practice is on September 18 from 4pm to 5pm.",
-                attachment_text=None,
-                attachment_count=0,
-                received_at=datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc),
-            )
-        ],
+        "florence.runtime.google_services.list_recent_gmail_sync_page",
+        lambda **_: GmailSyncPage(
+            items=[
+                GmailSyncItem(
+                    gmail_message_id="gmail_123",
+                    thread_id="thread_123",
+                    from_address="teacher@school.edu",
+                    subject="Soccer practice update",
+                    snippet="Practice moves to Thursday 4pm to 5pm",
+                    body_text="Ava soccer practice is on September 18 from 4pm to 5pm.",
+                    attachment_text=None,
+                    attachment_count=0,
+                    received_at=datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc),
+                )
+            ],
+            next_page_token=None,
+        ),
     )
     monkeypatch.setattr(
         "florence.runtime.google_services.list_recent_parent_calendar_sync_items",
@@ -158,7 +161,7 @@ def test_google_sync_worker_uses_deep_bootstrap_scan_on_first_sync(tmp_path, mon
 
     def _fake_gmail(**kwargs):
         observed.update(kwargs)
-        return []
+        return GmailSyncPage(items=[], next_page_token=None)
 
     def _fake_calendar(**kwargs):
         observed_calendar.update(kwargs)
@@ -166,7 +169,7 @@ def test_google_sync_worker_uses_deep_bootstrap_scan_on_first_sync(tmp_path, mon
 
     monkeypatch.setenv("FLORENCE_GMAIL_BOOTSTRAP_MAX_RESULTS", "321")
     monkeypatch.setenv("FLORENCE_CALENDAR_BOOTSTRAP_MAX_RESULTS", "654")
-    monkeypatch.setattr("florence.runtime.google_services.list_recent_gmail_sync_items", _fake_gmail)
+    monkeypatch.setattr("florence.runtime.google_services.list_recent_gmail_sync_page", _fake_gmail)
     monkeypatch.setattr("florence.runtime.google_services.list_recent_parent_calendar_sync_items", _fake_calendar)
 
     worker = FlorenceGoogleSyncWorkerService(store, FlorenceGoogleSyncPersistenceService(store))
@@ -231,6 +234,79 @@ def test_google_sync_worker_uses_incremental_window_after_bootstrap(tmp_path, mo
     assert result.connection.metadata["gmail_last_synced_at"] == "2026-03-25T18:00:00+00:00"
     assert result.connection.metadata["gmail_last_max_results"] == 111
     assert result.connection.metadata["calendar_last_max_results"] == 222
+    store.close()
+
+
+def test_google_sync_worker_bootstrap_walks_multiple_gmail_pages_and_persists_rows(tmp_path, monkeypatch):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_google_connection(
+        GoogleConnection(
+            id="gconn_multipage",
+            household_id="hh_123",
+            member_id="mem_123",
+            email="parent@example.com",
+            connected_scopes=(GoogleSourceKind.GMAIL,),
+            access_token="access-token",
+            metadata={
+                "primary_calendar_id": "family",
+                "primary_calendar_summary": "Family calendar",
+                "primary_calendar_timezone": "America/Los_Angeles",
+            },
+        )
+    )
+    observed_page_tokens: list[str | None] = []
+
+    def _fake_gmail_page(**kwargs):
+        observed_page_tokens.append(kwargs.get("page_token"))
+        if kwargs.get("page_token") == "page-2":
+            return GmailSyncPage(
+                items=[
+                    GmailSyncItem(
+                        gmail_message_id="gmail_2",
+                        thread_id="thread_2",
+                        from_address="coach@example.com",
+                        subject="Practice moved",
+                        snippet="Practice moved to Thursday.",
+                        body_text="Practice moved to Thursday.",
+                        attachment_text=None,
+                        attachment_count=0,
+                        received_at=datetime(2026, 9, 11, 12, 0, tzinfo=timezone.utc),
+                    )
+                ],
+                next_page_token=None,
+            )
+        return GmailSyncPage(
+            items=[
+                GmailSyncItem(
+                    gmail_message_id="gmail_1",
+                    thread_id="thread_1",
+                    from_address="school@example.com",
+                    subject="Picture day reminder",
+                    snippet="Picture day is Friday.",
+                    body_text="Picture day is Friday.",
+                    attachment_text=None,
+                    attachment_count=0,
+                    received_at=datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc),
+                )
+            ],
+            next_page_token="page-2",
+        )
+
+    monkeypatch.setattr("florence.runtime.google_services.list_recent_gmail_sync_page", _fake_gmail_page)
+    monkeypatch.setattr("florence.runtime.google_services.list_recent_parent_calendar_sync_items", lambda **_: [])
+
+    worker = FlorenceGoogleSyncWorkerService(store, FlorenceGoogleSyncPersistenceService(store))
+    result = worker.sync_connection("gconn_multipage")
+
+    assert observed_page_tokens == [None, "page-2"]
+    mirrored_messages = store.search_google_gmail_messages(
+        household_id="hh_123",
+        connection_ids=["gconn_multipage"],
+        newer_than_days=400,
+        limit=10,
+    )
+    assert [item.gmail_message_id for item in mirrored_messages] == ["gmail_2", "gmail_1"]
+    assert result.connection.metadata["gmail_bootstrap_completed_at"] is not None
     store.close()
 
 
@@ -315,7 +391,10 @@ def test_google_sync_worker_honors_calendar_preferences_and_keeps_non_primary_id
     )
     observed_calendar_ids: list[str] = []
 
-    monkeypatch.setattr("florence.runtime.google_services.list_recent_gmail_sync_items", lambda **_: [])
+    monkeypatch.setattr(
+        "florence.runtime.google_services.list_recent_gmail_sync_page",
+        lambda **_: GmailSyncPage(items=[], next_page_token=None),
+    )
 
     def _fake_calendar_fetch(*, calendar, **kwargs):
         observed_calendar_ids.append(calendar.id)
@@ -419,10 +498,10 @@ def test_google_sync_worker_refreshes_when_expiry_metadata_is_missing(tmp_path, 
 
     def _fake_gmail(**kwargs):
         observed_tokens.append(kwargs["access_token"])
-        return []
+        return GmailSyncPage(items=[], next_page_token=None)
 
     monkeypatch.setattr("florence.runtime.google_services.refresh_google_access_token", _fake_refresh)
-    monkeypatch.setattr("florence.runtime.google_services.list_recent_gmail_sync_items", _fake_gmail)
+    monkeypatch.setattr("florence.runtime.google_services.list_recent_gmail_sync_page", _fake_gmail)
     monkeypatch.setattr("florence.runtime.google_services.list_recent_parent_calendar_sync_items", lambda **_: [])
 
     worker = FlorenceGoogleSyncWorkerService(store, FlorenceGoogleSyncPersistenceService(store))
@@ -474,10 +553,10 @@ def test_google_sync_worker_retries_gmail_fetch_once_after_google_401(tmp_path, 
             request = httpx.Request("GET", "https://gmail.googleapis.com/gmail/v1/users/me/messages")
             response = httpx.Response(401, request=request)
             raise httpx.HTTPStatusError("401 Unauthorized", request=request, response=response)
-        return []
+        return GmailSyncPage(items=[], next_page_token=None)
 
     monkeypatch.setattr("florence.runtime.google_services.refresh_google_access_token", _fake_refresh)
-    monkeypatch.setattr("florence.runtime.google_services.list_recent_gmail_sync_items", _fake_gmail)
+    monkeypatch.setattr("florence.runtime.google_services.list_recent_gmail_sync_page", _fake_gmail)
     monkeypatch.setattr("florence.runtime.google_services.list_recent_parent_calendar_sync_items", lambda **_: [])
 
     worker = FlorenceGoogleSyncWorkerService(store, FlorenceGoogleSyncPersistenceService(store))

@@ -49,6 +49,12 @@ class GmailSyncItem:
 
 
 @dataclass(slots=True)
+class GmailSyncPage:
+    items: list[GmailSyncItem]
+    next_page_token: str | None = None
+
+
+@dataclass(slots=True)
 class StoredGmailSyncItem:
     connection_id: str
     connection_email: str

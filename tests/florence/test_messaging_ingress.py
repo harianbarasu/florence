@@ -6,7 +6,11 @@ from florence.messaging import (
     FlorenceMessagingIngressService,
     FlorenceResolvedInboundMessage,
 )
-from florence.messaging.protocol_types import CANDIDATE_REVIEW_PROMPT_KIND, build_google_connect_prompt_metadata
+from florence.messaging.protocol_types import (
+    CANDIDATE_REVIEW_PROMPT_KIND,
+    build_google_connect_prompt_metadata,
+    build_household_link_prompt_metadata,
+)
 from datetime import datetime, timedelta, timezone
 from florence.onboarding import OnboardingStage
 
@@ -16,6 +20,7 @@ from florence.contracts import (
     ChannelMessage,
     ChannelMessageRole,
     ChannelType,
+    ChildProfile,
     GoogleConnection,
     GoogleSourceKind,
     Household,
@@ -24,8 +29,10 @@ from florence.contracts import (
     HouseholdNudgeStatus,
     HouseholdNudgeTargetKind,
     HouseholdProfileKind,
+    IdentityKind,
     ImportedCandidate,
     Member,
+    MemberIdentity,
     MemberRole,
     HouseholdWorkItem,
     HouseholdWorkItemStatus,
@@ -33,6 +40,7 @@ from florence.contracts import (
 from florence.runtime import (
     FlorenceCandidateReviewService,
     FlorenceHouseholdManagerService,
+    FlorenceHouseholdLinkService,
     FlorenceIdentityResolver,
     FlorenceOnboardingSessionService,
 )
@@ -693,6 +701,236 @@ def _complete_hybrid_onboarding(onboarding_service):
         member_id="mem_123",
         thread_id="dm_thread_123",
     )
+
+
+def test_dm_pending_household_link_request_prompts_and_auto_merges_lightweight_household(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_onboarding_service(store, review_service)
+    store.upsert_household(Household(id="hh_jackson", name="Jackson household", timezone="America/Los_Angeles"))
+    store.upsert_household(Household(id="hh_kendall", name="Kendall household", timezone="America/Los_Angeles"))
+    store.upsert_member(Member(id="mem_jackson", household_id="hh_jackson", display_name="Jackson", role=MemberRole.ADMIN))
+    store.upsert_member(Member(id="mem_kendall", household_id="hh_kendall", display_name="Kendall", role=MemberRole.ADMIN))
+    store.upsert_member_identity(
+        MemberIdentity(
+            id="ident_kendall",
+            member_id="mem_kendall",
+            kind=IdentityKind.PHONE,
+            value="+1 (555) 555-0124",
+            normalized_value="+15555550124",
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_kendall_dm",
+            household_id="hh_kendall",
+            provider="sendblue",
+            provider_channel_id="thread-kendall",
+            channel_type=ChannelType.PARENT_DM,
+            title="Kendall",
+            metadata={"sender_handle": "+15555550124"},
+        )
+    )
+    FlorenceHouseholdLinkService(store).create_phone_link_request(
+        household_id="hh_jackson",
+        inviting_member_id="mem_jackson",
+        invited_phone="+1 (555) 555-0124",
+        invited_display_name="Kendall",
+    )
+    ingress = _build_ingress(store, onboarding_service, review_service)
+
+    prompt = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_kendall",
+            member_id="mem_kendall",
+            channel_id="chan_kendall_dm",
+            thread_id="thread-kendall",
+            message=FlorenceInboundMessage(
+                provider="sendblue",
+                message_id="msg-kendall-1",
+                thread_id="thread-kendall",
+                sender_handle="+1 (555) 555-0124",
+                body="hey",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert prompt.consumed is True
+    assert "Jackson wants to connect you to the same household here." in prompt.reply_text
+
+    merged = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_kendall",
+            member_id="mem_kendall",
+            channel_id="chan_kendall_dm",
+            thread_id="thread-kendall",
+            message=FlorenceInboundMessage(
+                provider="sendblue",
+                message_id="msg-kendall-2",
+                thread_id="thread-kendall",
+                sender_handle="+1 (555) 555-0124",
+                body="yes",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert merged.consumed is True
+    assert "linked into the same household now" in (merged.reply_text or "").lower()
+    assert store.get_member("mem_kendall").household_id == "hh_jackson"
+    assert store.get_channel("chan_kendall_dm").household_id == "hh_jackson"
+    assert store.list_channel_messages(channel_id="chan_kendall_dm")[-1].household_id == "hh_jackson"
+    store.close()
+
+
+def test_dm_mature_household_link_waits_for_inviting_parent_confirmation(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_onboarding_service(store, review_service)
+    store.upsert_household(Household(id="hh_jackson", name="Jackson household", timezone="America/Los_Angeles"))
+    store.upsert_household(Household(id="hh_kendall", name="Kendall household", timezone="America/Los_Angeles"))
+    store.upsert_member(Member(id="mem_jackson", household_id="hh_jackson", display_name="Jackson", role=MemberRole.ADMIN))
+    store.upsert_member(Member(id="mem_kendall", household_id="hh_kendall", display_name="Kendall", role=MemberRole.ADMIN))
+    store.upsert_member_identity(
+        MemberIdentity(
+            id="ident_jackson",
+            member_id="mem_jackson",
+            kind=IdentityKind.PHONE,
+            value="+1 (555) 555-0199",
+            normalized_value="+15555550199",
+        )
+    )
+    store.upsert_member_identity(
+        MemberIdentity(
+            id="ident_kendall",
+            member_id="mem_kendall",
+            kind=IdentityKind.PHONE,
+            value="+1 (555) 555-0124",
+            normalized_value="+15555550124",
+        )
+    )
+    store.replace_child_profiles(
+        household_id="hh_kendall",
+        children=[ChildProfile(id="child_theo", household_id="hh_kendall", full_name="Theo Williams")],
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_jackson_dm",
+            household_id="hh_jackson",
+            provider="sendblue",
+            provider_channel_id="thread-jackson",
+            channel_type=ChannelType.PARENT_DM,
+            title="Jackson",
+            metadata={"sender_handle": "+15555550199"},
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_kendall_dm",
+            household_id="hh_kendall",
+            provider="sendblue",
+            provider_channel_id="thread-kendall",
+            channel_type=ChannelType.PARENT_DM,
+            title="Kendall",
+            metadata={"sender_handle": "+15555550124"},
+        )
+    )
+    FlorenceHouseholdLinkService(store).create_phone_link_request(
+        household_id="hh_jackson",
+        inviting_member_id="mem_jackson",
+        invited_phone="+1 (555) 555-0124",
+        invited_display_name="Kendall",
+    )
+    ingress = _build_ingress(store, onboarding_service, review_service)
+
+    ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_kendall",
+            member_id="mem_kendall",
+            channel_id="chan_kendall_dm",
+            thread_id="thread-kendall",
+            message=FlorenceInboundMessage(
+                provider="sendblue",
+                message_id="msg-kendall-1",
+                thread_id="thread-kendall",
+                sender_handle="+1 (555) 555-0124",
+                body="hi",
+                is_group_chat=False,
+            ),
+        )
+    )
+    invited_yes = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_kendall",
+            member_id="mem_kendall",
+            channel_id="chan_kendall_dm",
+            thread_id="thread-kendall",
+            message=FlorenceInboundMessage(
+                provider="sendblue",
+                message_id="msg-kendall-2",
+                thread_id="thread-kendall",
+                sender_handle="+1 (555) 555-0124",
+                body="yes",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert "wait for Jackson to confirm" in (invited_yes.reply_text or "")
+    assert store.get_member("mem_kendall").household_id == "hh_kendall"
+
+    inviter_prompt = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_jackson",
+            member_id="mem_jackson",
+            channel_id="chan_jackson_dm",
+            thread_id="thread-jackson",
+            message=FlorenceInboundMessage(
+                provider="sendblue",
+                message_id="msg-jackson-1",
+                thread_id="thread-jackson",
+                sender_handle="+1 (555) 555-0199",
+                body="anything else?",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert "Kendall said yes." in (inviter_prompt.reply_text or "")
+    assert store.list_channel_messages(channel_id="chan_jackson_dm")[-1].metadata == build_household_link_prompt_metadata(
+        store.list_household_link_requests(
+            household_id="hh_jackson",
+            statuses=(),
+        )[0].id,
+        role="inviting",
+    ) | {
+        "provider": "sendblue",
+        "transport_thread_id": "thread-jackson",
+        "transport_reply_to": "msg-jackson-1",
+    }
+
+    inviter_yes = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_jackson",
+            member_id="mem_jackson",
+            channel_id="chan_jackson_dm",
+            thread_id="thread-jackson",
+            message=FlorenceInboundMessage(
+                provider="sendblue",
+                message_id="msg-jackson-2",
+                thread_id="thread-jackson",
+                sender_handle="+1 (555) 555-0199",
+                body="yes",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert "linked into the same household now" in (inviter_yes.reply_text or "").lower()
+    assert store.get_member("mem_kendall").household_id == "hh_jackson"
+    assert store.get_household("hh_kendall") is None
+    store.close()
 
 
 def test_dm_parent_name_reply_includes_friendly_google_link(tmp_path):

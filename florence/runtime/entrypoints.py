@@ -246,12 +246,14 @@ class FlorenceEntrypointService:
                 if group_announcement
                 else resolved.group_private_dm_hint
             )
+        current_channel = self.store.get_channel(resolved.channel.id) or resolved.channel
+        current_member = self.store.get_member(member_id) if member_id is not None else None
         return FlorenceEntrypointResult(
             reply_text=reply_text,
             reply_messages=reply_messages,
             group_announcement=group_announcement,
             consumed=consumed or bool(group_announcement),
-            household_id=resolved.household.id,
-            member_id=member_id,
-            channel_id=resolved.channel.id,
+            household_id=current_channel.household_id,
+            member_id=current_member.id if current_member is not None else member_id,
+            channel_id=current_channel.id,
         )

@@ -28,6 +28,7 @@ class FlorenceDmRouter:
         *,
         onboarding_service,
         group_share_protocol,
+        household_link_protocol,
         review_protocol,
         setup_protocol,
         reminder_protocol,
@@ -35,6 +36,7 @@ class FlorenceDmRouter:
     ) -> None:
         self.onboarding_service = onboarding_service
         self.group_share_protocol = group_share_protocol
+        self.household_link_protocol = household_link_protocol
         self.review_protocol = review_protocol
         self.setup_protocol = setup_protocol
         self.reminder_protocol = reminder_protocol
@@ -61,6 +63,16 @@ class FlorenceDmRouter:
         )
         if group_share_result is not None:
             return self._result_from_protocol_reply(group_share_result)
+
+        household_link_result = self.household_link_protocol.handle_turn(
+            household_id=resolved.household_id,
+            member_id=member_id,
+            channel_id=resolved.channel_id,
+            sender_handle=resolved.message.sender_handle,
+            text=text,
+        )
+        if household_link_result is not None:
+            return self._result_from_protocol_reply(household_link_result)
 
         review_prompt, review_prompt_text = self.review_protocol.current_prompt(
             household_id=resolved.household_id,

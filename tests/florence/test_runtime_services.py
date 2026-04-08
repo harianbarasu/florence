@@ -27,7 +27,11 @@ from florence.contracts import (
 )
 from florence.google import FlorenceGoogleSyncBatch, GmailSyncItem, ParentCalendarSyncItem
 from florence.messaging.channel_log import FlorenceChannelLog
-from florence.messaging.protocol_types import CANDIDATE_REVIEW_PROMPT_KIND
+from florence.messaging.protocol_types import (
+    CANDIDATE_REVIEW_PROMPT_KIND,
+    HOUSEHOLD_LINK_PROMPT_KIND,
+    build_household_link_prompt_metadata,
+)
 from florence.onboarding import OnboardingStage
 from florence.runtime import (
     FlorenceCandidateReviewService,
@@ -1734,6 +1738,67 @@ def test_operations_review_nudge_defers_during_active_conversation(tmp_path):
     assert persisted is not None
     assert persisted.metadata.get("review_nudged_at") is None
     assert events == []
+    store.close()
+
+
+def test_operations_due_nudge_can_deliver_household_link_prompt_metadata(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    store.upsert_household_nudge(
+        HouseholdNudge(
+            id="nudge_link_123",
+            household_id="hh_123",
+            target_kind=HouseholdNudgeTargetKind.GENERAL,
+            target_id="linkreq_123",
+            message="Kendall said yes. Reply yes if you want me to finish linking everything into one household.",
+            status=HouseholdNudgeStatus.SCHEDULED,
+            recipient_member_id="mem_123",
+            channel_id="chan_dm_123",
+            scheduled_for="2026-03-24T12:00:00+00:00",
+            metadata={
+                "delivery_message_metadata": build_household_link_prompt_metadata("linkreq_123", role="inviting"),
+            },
+        )
+    )
+    linq = _FakeLinqClient()
+    delivery = FlorenceChannelDeliveryService(
+        store,
+        linq_client_getter=lambda: linq,
+        sendblue_client_getter=lambda: None,
+    )
+    operations = FlorenceHouseholdOperationsService(
+        store,
+        delivery_service=delivery,
+        household_chat_service_getter=lambda: _StubReviewPromptChatService(),
+    )
+
+    sent = operations.dispatch_due_household_nudges(household_id="hh_123")
+
+    latest = FlorenceChannelLog(store).latest_assistant_message(channel_id="chan_dm_123")
+    assert sent == 1
+    assert linq.sent
+    assert latest is not None
+    assert latest.metadata["protocol_kind"] == HOUSEHOLD_LINK_PROMPT_KIND
+    assert latest.metadata["pending_action_type"] == "household_link_request"
+    assert latest.metadata["pending_action_target_id"] == "linkreq_123"
     store.close()
 
 

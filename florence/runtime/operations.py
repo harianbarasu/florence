@@ -333,11 +333,20 @@ class FlorenceHouseholdOperationsService:
                     channel = target_store.get_channel(fallback_channel_id)
             if channel is None or not nudge.message.strip():
                 continue
+            nudge_metadata = dict(nudge.metadata) if isinstance(nudge.metadata, dict) else {}
+            custom_delivery_metadata = (
+                dict(nudge_metadata.get("delivery_message_metadata"))
+                if isinstance(nudge_metadata.get("delivery_message_metadata"), dict)
+                else {}
+            )
             if self.delivery_service.send_channel_message(
                 channel=channel,
                 message=nudge.message,
                 store=target_store,
-                message_metadata=build_household_nudge_metadata(nudge.id),
+                message_metadata={
+                    **build_household_nudge_metadata(nudge.id),
+                    **custom_delivery_metadata,
+                },
             ):
                 manager_service.mark_nudge_sent(nudge_id=nudge.id)
                 manager_service.record_pilot_event(

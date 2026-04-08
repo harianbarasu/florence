@@ -21,6 +21,8 @@ from florence.contracts import (
     HouseholdSourceMatcherKind,
     HouseholdSourceRule,
     HouseholdSourceVisibility,
+    HouseholdWorkItem,
+    HouseholdWorkItemStatus,
     ImportedCandidate,
     Member,
     MemberRole,
@@ -677,6 +679,58 @@ def test_household_import_calendar_feed_ingests_webcal_schedule(monkeypatch, tmp
         assert saved_event.metadata["imported_from_calendar_feed"] is True
         assert saved_event.metadata["calendar_feed_uid"] == "evt-1"
         assert saved_event.metadata["child_name"] == "Theo"
+    finally:
+        clear_household_tool_context(task_id)
+        store.close()
+
+
+def test_household_request_parent_link_creates_privacy_safe_pending_request(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Jackson household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Jackson",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Jackson",
+        )
+    )
+    task_id = "task-parent-link"
+    set_household_tool_context(
+        task_id,
+        store=store,
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_dm_123",
+    )
+    try:
+        result = json.loads(
+            handle_function_call(
+                "household_request_parent_link",
+                {
+                    "phone_number": "+1 (555) 555-0124",
+                    "display_name": "Kendall",
+                },
+                task_id=task_id,
+            )
+        )
+
+        assert result["result"]["status"] == "pending"
+        assert result["result"]["requires_merge_confirmation"] is False
+        assert "link Kendall into this household once they confirm from their side" in result["result"]["reply_text"]
+        saved_requests = store.list_household_link_requests(household_id="hh_123")
+        assert len(saved_requests) == 1
+        assert saved_requests[0].invited_identity_normalized_value == "+15555550124"
     finally:
         clear_household_tool_context(task_id)
         store.close()
@@ -1702,6 +1756,190 @@ def test_household_record_preference_refreshes_briefing_routines_for_operating_r
         assert morning["metadata"]["planning_source"] == "hermes"
         assert morning["metadata"]["local_time"] == "06:30"
         assert weekly["status"] == "paused"
+    finally:
+        clear_household_tool_context(task_id)
+        store.close()
+
+
+def test_household_upsert_work_item_can_update_existing_item_by_id_without_title(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    store.upsert_household_work_item(
+        HouseholdWorkItem(
+            id="work_123",
+            household_id="hh_123",
+            title="Review overlapping preferences",
+            description="Old description",
+            status=HouseholdWorkItemStatus.OPEN,
+            metadata={"category": "merge_cleanup"},
+        )
+    )
+    task_id = "task-household-update-work-item"
+    set_household_tool_context(
+        task_id,
+        store=store,
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_dm_123",
+    )
+    try:
+        result = json.loads(
+            handle_function_call(
+                "household_upsert_work_item",
+                {
+                    "id": "work_123",
+                    "status": "done",
+                    "metadata": {"resolved_by": "mem_123"},
+                },
+                task_id=task_id,
+            )
+        )
+
+        updated = store.get_household_work_item("work_123")
+        assert result["result"]["id"] == "work_123"
+        assert result["result"]["title"] == "Review overlapping preferences"
+        assert updated is not None
+        assert updated.title == "Review overlapping preferences"
+        assert updated.status == HouseholdWorkItemStatus.DONE
+        assert updated.metadata["category"] == "merge_cleanup"
+        assert updated.metadata["resolved_by"] == "mem_123"
+    finally:
+        clear_household_tool_context(task_id)
+        store.close()
+
+
+def test_household_resolve_merge_followup_updates_child_and_closes_followup(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    store.replace_child_profiles(
+        household_id="hh_123",
+        children=[ChildProfile(id="child_theo", household_id="hh_123", full_name="Theo Williams")],
+    )
+    store.replace_household_profile_items(
+        household_id="hh_123",
+        kind=HouseholdProfileKind.SCHOOL,
+        items=[
+            HouseholdProfileItem(
+                id="school_1",
+                household_id="hh_123",
+                kind=HouseholdProfileKind.SCHOOL,
+                label="Wish Elementary",
+                child_id="child_theo",
+                metadata={"domains": ["wish.example.org"]},
+            ),
+            HouseholdProfileItem(
+                id="school_2",
+                household_id="hh_123",
+                kind=HouseholdProfileKind.SCHOOL,
+                label="WISH Charter",
+                child_id="child_theo",
+                metadata={"contacts": ["Front desk"]},
+            ),
+        ],
+    )
+    store.upsert_household_work_item(
+        HouseholdWorkItem(
+            id="work_merge_123",
+            household_id="hh_123",
+            title="Review child details after linking",
+            status=HouseholdWorkItemStatus.OPEN,
+            metadata={
+                "category": "merge_cleanup",
+                "cleanup_kind": "child_profiles",
+                "duplicate_groups": [
+                    {
+                        "child_id": "child_theo",
+                        "items": [{"id": "child_theo", "label": "Theo Williams"}],
+                        "birthdates": ["2018-03-01", "2019-03-01"],
+                        "school_labels": ["Wish Elementary", "WISH Charter"],
+                        "diff_lines": [
+                            "Birthdate differs: 2018-03-01, 2019-03-01.",
+                            "School differs: Wish Elementary, WISH Charter.",
+                        ],
+                    }
+                ],
+                "preview_lines": [
+                    'Theo Williams: Birthdate differs: 2018-03-01, 2019-03-01.',
+                ],
+            },
+        )
+    )
+    task_id = "task-household-resolve-merge-followup"
+    set_household_tool_context(
+        task_id,
+        store=store,
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_dm_123",
+    )
+    try:
+        result = json.loads(
+            handle_function_call(
+                "household_resolve_merge_followup",
+                {
+                    "work_item_id": "work_merge_123",
+                    "birthdate": "2018-03-01",
+                    "school": "WISH Charter",
+                    "resolution_note": "Jackson confirmed the current school name.",
+                },
+                task_id=task_id,
+            )
+        )
+
+        updated_child = store.list_child_profiles(household_id="hh_123")[0]
+        school_items = store.list_household_profile_items(
+            household_id="hh_123",
+            kind=HouseholdProfileKind.SCHOOL,
+        )
+        updated_work_item = store.get_household_work_item("work_merge_123")
+
+        assert result["resolved"] is True
+        assert result["child"]["birthdate"] == "2018-03-01"
+        assert result["remaining_conflicts"] == []
+        assert updated_child.birthdate == "2018-03-01"
+        assert updated_child.metadata["merge_resolution_note"] == "Jackson confirmed the current school name."
+        assert len(school_items) == 1
+        assert school_items[0].label == "WISH Charter"
+        assert sorted(school_items[0].metadata["domains"]) == ["wish.example.org"]
+        assert sorted(school_items[0].metadata["contacts"]) == ["Front desk"]
+        assert updated_work_item is not None
+        assert updated_work_item.status == HouseholdWorkItemStatus.DONE
     finally:
         clear_household_tool_context(task_id)
         store.close()

@@ -3,6 +3,9 @@ from florence.contracts import (
     ChildProfile,
     GoogleConnection,
     GoogleSourceKind,
+    Household,
+    HouseholdLinkRequest,
+    HouseholdLinkRequestStatus,
     HouseholdMeal,
     HouseholdMealStatus,
     HouseholdNudge,
@@ -19,7 +22,10 @@ from florence.contracts import (
     HouseholdSourceVisibility,
     HouseholdWorkItem,
     HouseholdWorkItemStatus,
+    IdentityKind,
     ImportedCandidate,
+    Member,
+    MemberRole,
     PilotEvent,
 )
 from florence.onboarding import OnboardingStage, OnboardingState
@@ -286,4 +292,80 @@ def test_state_db_round_trips_pilot_events(tmp_path):
     assert store.list_pilot_events(household_id="hh_123") == [event]
     assert store.list_pilot_events(household_id="hh_123", event_type="briefing_sent") == [event]
 
+    store.close()
+
+
+def test_state_db_round_trips_household_link_requests(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    request = HouseholdLinkRequest(
+        id="linkreq_123",
+        household_id="hh_jackson",
+        inviting_member_id="mem_jackson",
+        invited_identity_kind=IdentityKind.PHONE,
+        invited_identity_normalized_value="+15555550124",
+        invited_identity_value="+1 (555) 555-0124",
+        invited_display_name="Kendall",
+        invited_member_id="mem_kendall",
+        source_household_id="hh_kendall",
+        requires_merge_confirmation=True,
+        status=HouseholdLinkRequestStatus.PENDING,
+        expires_at="2026-04-15T19:00:00+00:00",
+        metadata={"requested_by_display_name": "Jackson"},
+    )
+
+    saved = store.upsert_household_link_request(request)
+    loaded = store.get_household_link_request("linkreq_123")
+    listed = store.list_household_link_requests(household_id="hh_jackson")
+    active = store.find_active_household_link_request(
+        invited_identity_kind=IdentityKind.PHONE,
+        invited_identity_normalized_value="+15555550124",
+    )
+
+    assert saved == loaded
+    assert loaded is not None
+    assert loaded.invited_display_name == "Kendall"
+    assert listed == [loaded]
+    assert active == loaded
+    store.close()
+
+
+def test_state_db_counts_and_deletes_household_link_requests_for_target_or_source_household(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_jackson", name="Jackson's household", timezone="America/Los_Angeles"))
+    store.upsert_household(Household(id="hh_kendall", name="Kendall's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_jackson",
+            household_id="hh_jackson",
+            display_name="Jackson",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_member(
+        Member(
+            id="mem_kendall",
+            household_id="hh_kendall",
+            display_name="Kendall",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_household_link_request(
+        HouseholdLinkRequest(
+            id="linkreq_123",
+            household_id="hh_jackson",
+            inviting_member_id="mem_jackson",
+            invited_identity_kind=IdentityKind.PHONE,
+            invited_identity_normalized_value="+15555550124",
+            invited_member_id="mem_kendall",
+            source_household_id="hh_kendall",
+            status=HouseholdLinkRequestStatus.PENDING,
+        )
+    )
+
+    assert store.count_household_state_rows("hh_jackson")["household_link_requests"] == 1
+    assert store.count_household_state_rows("hh_kendall")["household_link_requests"] == 1
+
+    store.delete_household_state("hh_kendall")
+
+    assert store.get_household_link_request("linkreq_123") is None
     store.close()

@@ -66,6 +66,21 @@ class FlorenceHouseholdMergeService:
             )
         return target_household_id
 
+    def merge_households(
+        self,
+        *,
+        target_household_id: str,
+        source_household_id: str,
+    ) -> str:
+        """Explicitly merge one known household into another."""
+        if target_household_id == source_household_id:
+            return target_household_id
+        self._merge_one_into_target(
+            target_household_id=target_household_id,
+            source_household_id=source_household_id,
+        )
+        return target_household_id
+
     def _is_mergeable_source_household(
         self,
         *,

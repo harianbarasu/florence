@@ -6,6 +6,7 @@ import json
 import os
 import re
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -20,6 +21,8 @@ from florence.contracts import (
     GoogleSourceKind,
     HouseholdEvent,
     HouseholdEventStatus,
+    HouseholdLinkRequest,
+    HouseholdLinkRequestStatus,
     HouseholdMeal,
     HouseholdMealStatus,
     HouseholdNudge,
@@ -50,7 +53,7 @@ from florence.state.db import RowLike, connect_florence_db
 from florence.google.types import StoredCalendarSyncItem, StoredGmailSyncItem
 
 FLORENCE_DB_PATH = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes")) / "florence.db"
-FLORENCE_SCHEMA_VERSION = 10
+FLORENCE_SCHEMA_VERSION = 11
 
 _RESET_ALL_TABLES = (
     "channel_messages",
@@ -60,6 +63,7 @@ _RESET_ALL_TABLES = (
     "google_calendar_events",
     "google_gmail_messages",
     "household_events",
+    "household_link_requests",
     "household_meals",
     "household_nudges",
     "household_profile_items",
@@ -190,6 +194,7 @@ _RESET_HOUSEHOLD_TABLES = (
     "google_calendar_events",
     "google_gmail_messages",
     "household_events",
+    "household_link_requests",
     "household_meals",
     "household_nudges",
     "household_profile_items",
@@ -348,6 +353,30 @@ CREATE TABLE IF NOT EXISTS google_connections (
 
 CREATE INDEX IF NOT EXISTS idx_google_connections_household
 ON google_connections(household_id, member_id, active);
+
+CREATE TABLE IF NOT EXISTS household_link_requests (
+    id TEXT PRIMARY KEY,
+    household_id TEXT NOT NULL,
+    inviting_member_id TEXT NOT NULL,
+    invited_identity_kind TEXT NOT NULL,
+    invited_identity_normalized_value TEXT NOT NULL,
+    invited_identity_value TEXT,
+    invited_display_name TEXT,
+    invited_member_id TEXT,
+    source_household_id TEXT,
+    requires_merge_confirmation INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL,
+    expires_at TEXT,
+    metadata_json TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_household_link_requests_household_status
+ON household_link_requests(household_id, status, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_household_link_requests_invited_identity
+ON household_link_requests(invited_identity_kind, invited_identity_normalized_value, status, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS google_gmail_messages (
     id TEXT PRIMARY KEY,
@@ -675,11 +704,23 @@ class FlorenceStateDB:
     def count_household_state_rows(self, household_id: str) -> dict[str, int]:
         counts: dict[str, int] = {}
         for table in _RESET_HOUSEHOLD_TABLES:
+            if table == "household_link_requests":
+                continue
             row = self._conn.execute(
                 f"SELECT COUNT(*) AS count FROM {table} WHERE household_id = ?",
                 (household_id,),
             ).fetchone()
             counts[table] = int(row["count"]) if row is not None else 0
+
+        link_row = self._conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM household_link_requests
+            WHERE household_id = ? OR source_household_id = ?
+            """,
+            (household_id, household_id),
+        ).fetchone()
+        counts["household_link_requests"] = int(link_row["count"]) if link_row is not None else 0
 
         member_row = self._conn.execute(
             "SELECT COUNT(*) AS count FROM members WHERE household_id = ?",
@@ -728,7 +769,13 @@ class FlorenceStateDB:
         member_ids = [str(row["id"]) for row in member_rows]
 
         for table in _RESET_HOUSEHOLD_TABLES:
+            if table == "household_link_requests":
+                continue
             self._conn.execute(f"DELETE FROM {table} WHERE household_id = ?", (household_id,))
+        self._conn.execute(
+            "DELETE FROM household_link_requests WHERE household_id = ? OR source_household_id = ?",
+            (household_id, household_id),
+        )
         for member_id in member_ids:
             self._conn.execute("DELETE FROM member_identities WHERE member_id = ?", (member_id,))
         self._conn.execute("DELETE FROM members WHERE household_id = ?", (household_id,))
@@ -802,6 +849,7 @@ class FlorenceStateDB:
                 "google_calendar_events",
                 "google_gmail_messages",
                 "household_events",
+                "household_link_requests",
                 "household_meals",
                 "household_nudges",
                 "household_profile_items",
@@ -811,6 +859,24 @@ class FlorenceStateDB:
                 "imported_candidates",
                 "pilot_events",
             ):
+                if table == "household_link_requests":
+                    self._conn.execute(
+                        """
+                        UPDATE household_link_requests
+                        SET household_id = CASE WHEN household_id = ? THEN ? ELSE household_id END,
+                            source_household_id = CASE WHEN source_household_id = ? THEN ? ELSE source_household_id END
+                        WHERE household_id = ? OR source_household_id = ?
+                        """,
+                        (
+                            source_household_id,
+                            target_household_id,
+                            source_household_id,
+                            target_household_id,
+                            source_household_id,
+                            source_household_id,
+                        ),
+                    )
+                    continue
                 self._conn.execute(
                     f"UPDATE {table} SET household_id = ? WHERE household_id = ?",
                     (target_household_id, source_household_id),
@@ -1108,6 +1174,129 @@ class FlorenceStateDB:
             (household_id,),
         ).fetchall()
         return [self._row_to_member(row) for row in rows]
+
+    def get_household_link_request(self, request_id: str) -> HouseholdLinkRequest | None:
+        row = self._conn.execute(
+            "SELECT * FROM household_link_requests WHERE id = ?",
+            (request_id,),
+        ).fetchone()
+        return self._row_to_household_link_request(row) if row else None
+
+    def upsert_household_link_request(self, request: HouseholdLinkRequest) -> HouseholdLinkRequest:
+        now = time.time()
+        existing = self._conn.execute(
+            "SELECT created_at FROM household_link_requests WHERE id = ?",
+            (request.id,),
+        ).fetchone()
+        created_at = float(existing["created_at"]) if existing else (request.created_at or now)
+        updated_at = request.updated_at or now
+        self._conn.execute(
+            """
+            INSERT INTO household_link_requests (
+                id,
+                household_id,
+                inviting_member_id,
+                invited_identity_kind,
+                invited_identity_normalized_value,
+                invited_identity_value,
+                invited_display_name,
+                invited_member_id,
+                source_household_id,
+                requires_merge_confirmation,
+                status,
+                expires_at,
+                metadata_json,
+                created_at,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                household_id = excluded.household_id,
+                inviting_member_id = excluded.inviting_member_id,
+                invited_identity_kind = excluded.invited_identity_kind,
+                invited_identity_normalized_value = excluded.invited_identity_normalized_value,
+                invited_identity_value = excluded.invited_identity_value,
+                invited_display_name = excluded.invited_display_name,
+                invited_member_id = excluded.invited_member_id,
+                source_household_id = excluded.source_household_id,
+                requires_merge_confirmation = excluded.requires_merge_confirmation,
+                status = excluded.status,
+                expires_at = excluded.expires_at,
+                metadata_json = excluded.metadata_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                request.id,
+                request.household_id,
+                request.inviting_member_id,
+                request.invited_identity_kind.value,
+                request.invited_identity_normalized_value,
+                request.invited_identity_value,
+                request.invited_display_name,
+                request.invited_member_id,
+                request.source_household_id,
+                1 if request.requires_merge_confirmation else 0,
+                request.status.value,
+                request.expires_at,
+                _json_dumps(request.metadata),
+                created_at,
+                updated_at,
+            ),
+        )
+        self._conn.commit()
+        return self.get_household_link_request(request.id) or request
+
+    def list_household_link_requests(
+        self,
+        *,
+        household_id: str,
+        statuses: list[HouseholdLinkRequestStatus] | tuple[HouseholdLinkRequestStatus, ...] | None = None,
+    ) -> list[HouseholdLinkRequest]:
+        params: list[object] = [household_id]
+        sql = "SELECT * FROM household_link_requests WHERE household_id = ?"
+        if statuses:
+            sql += f" AND status IN ({_placeholders(len(statuses))})"
+            params.extend(status.value for status in statuses)
+        sql += " ORDER BY updated_at DESC, created_at DESC"
+        rows = self._conn.execute(sql, tuple(params)).fetchall()
+        return [self._row_to_household_link_request(row) for row in rows]
+
+    def find_active_household_link_request(
+        self,
+        *,
+        invited_identity_kind: IdentityKind,
+        invited_identity_normalized_value: str,
+        now_utc: datetime | None = None,
+    ) -> HouseholdLinkRequest | None:
+        row = self._conn.execute(
+            """
+            SELECT * FROM household_link_requests
+            WHERE invited_identity_kind = ?
+              AND invited_identity_normalized_value = ?
+              AND status = ?
+            ORDER BY updated_at DESC, created_at DESC
+            LIMIT 1
+            """,
+            (
+                invited_identity_kind.value,
+                invited_identity_normalized_value,
+                HouseholdLinkRequestStatus.PENDING.value,
+            ),
+        ).fetchone()
+        request = self._row_to_household_link_request(row) if row else None
+        if request is None:
+            return None
+        if request.expires_at:
+            expires_at = _parse_datetime(request.expires_at)
+            comparison_now = now_utc or datetime.now(timezone.utc)
+            if expires_at is not None and expires_at <= comparison_now:
+                expired = replace(
+                    request,
+                    status=HouseholdLinkRequestStatus.EXPIRED,
+                    updated_at=comparison_now.timestamp(),
+                )
+                self.upsert_household_link_request(expired)
+                return None
+        return request
 
     def upsert_member_identity(self, identity: MemberIdentity) -> MemberIdentity:
         now = time.time()
@@ -2583,6 +2772,26 @@ class FlorenceStateDB:
             kind=IdentityKind(str(row["kind"])),
             value=str(row["value"]),
             normalized_value=str(row["normalized_value"]),
+        )
+
+    @staticmethod
+    def _row_to_household_link_request(row: RowLike) -> HouseholdLinkRequest:
+        return HouseholdLinkRequest(
+            id=str(row["id"]),
+            household_id=str(row["household_id"]),
+            inviting_member_id=str(row["inviting_member_id"]),
+            invited_identity_kind=IdentityKind(str(row["invited_identity_kind"])),
+            invited_identity_normalized_value=str(row["invited_identity_normalized_value"]),
+            invited_identity_value=str(row["invited_identity_value"]) if row["invited_identity_value"] is not None else None,
+            invited_display_name=str(row["invited_display_name"]) if row["invited_display_name"] is not None else None,
+            invited_member_id=str(row["invited_member_id"]) if row["invited_member_id"] is not None else None,
+            source_household_id=str(row["source_household_id"]) if row["source_household_id"] is not None else None,
+            requires_merge_confirmation=bool(row["requires_merge_confirmation"]),
+            status=HouseholdLinkRequestStatus(str(row["status"])),
+            expires_at=str(row["expires_at"]) if row["expires_at"] is not None else None,
+            metadata=dict(_json_loads(row["metadata_json"], default={})),
+            created_at=float(row["created_at"]),
+            updated_at=float(row["updated_at"]),
         )
 
     @staticmethod

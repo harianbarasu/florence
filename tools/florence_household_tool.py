@@ -42,6 +42,7 @@ from florence.runtime.household_calendar_projection import (
     HOUSEHOLD_CALENDAR_PROJECTION_EVENT_ID_KEY,
     FlorenceHouseholdCalendarProjectionService,
 )
+from florence.runtime.household_link import FlorenceHouseholdLinkService
 from florence.runtime.household_manager import FlorenceHouseholdManagerService
 from florence.runtime.onboarding_service import FlorenceOnboardingSessionService
 from florence.runtime.visibility import (
@@ -707,6 +708,29 @@ APPLY_ONBOARDING_UPDATE_SCHEMA = {
     },
 }
 
+REQUEST_PARENT_LINK_SCHEMA = {
+    "name": "household_request_parent_link",
+    "description": (
+        "Start a private second-parent household link request by phone number. Use this when a parent wants Florence "
+        "to connect another parent into the same household without making them redo the family setup. "
+        "Jackson-facing copy must stay privacy-safe and should not reveal whether Florence already knew that number."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "phone_number": {
+                "type": "string",
+                "description": "Required phone number for the other parent Florence should link.",
+            },
+            "display_name": {
+                "type": "string",
+                "description": "Optional name label like Kendall for a more natural reply.",
+            },
+        },
+        "required": ["phone_number"],
+    },
+}
+
 
 def _serialize_review_candidate(candidate: ImportedCandidate) -> dict[str, Any]:
     metadata = candidate.metadata if isinstance(candidate.metadata, dict) else {}
@@ -950,7 +974,7 @@ UPSERT_WORK_ITEM_SCHEMA = {
         "type": "object",
         "properties": {
             "id": {"type": "string", "description": "Existing work-item id to update. Omit to upsert by normalized title."},
-            "title": {"type": "string", "description": "Short work-item title."},
+            "title": {"type": "string", "description": "Short work-item title. Required when creating a new item, optional when updating an existing id."},
             "description": {"type": "string", "description": "Optional notes or details."},
             "status": {
                 "type": "string",
@@ -964,7 +988,42 @@ UPSERT_WORK_ITEM_SCHEMA = {
             "completed_at": {"type": "string", "description": "Optional ISO timestamp when this item was finished."},
             "metadata": {"type": "object", "description": "Optional structured metadata."},
         },
-        "required": ["title"],
+        "required": [],
+    },
+}
+
+
+RESOLVE_MERGE_FOLLOWUP_SCHEMA = {
+    "name": "household_resolve_merge_followup",
+    "description": (
+        "Resolve a shared-household merge follow-up after linking parents, especially when Florence needs one clear child fact "
+        "such as the correct birthdate or school. Use this to apply the chosen shared fact and close or shrink the follow-up item."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "work_item_id": {
+                "type": "string",
+                "description": "Required merge follow-up work item id.",
+            },
+            "birthdate": {
+                "type": "string",
+                "description": "Optional canonical child birthdate to keep, if this merge follow-up is about conflicting birthdates.",
+            },
+            "school": {
+                "type": "string",
+                "description": "Optional canonical school name to keep for this child, if the merge follow-up is about conflicting schools.",
+            },
+            "resolution_note": {
+                "type": "string",
+                "description": "Optional short note about why this was resolved this way.",
+            },
+            "group_index": {
+                "type": "integer",
+                "description": "Optional conflict-group index within the work item. Default 0.",
+            },
+        },
+        "required": ["work_item_id"],
     },
 }
 
@@ -1523,6 +1582,37 @@ def _handle_apply_onboarding_update(args: dict, *, task_id: str | None = None, *
     )
 
 
+def _handle_request_parent_link(args: dict, *, task_id: str | None = None, **_: Any) -> str:
+    context = _require_context(task_id)
+    if context.actor_member_id is None:
+        return json.dumps({"error": "Parent linking requires an active household member."})
+
+    phone_number = _normalize_text(args.get("phone_number"))
+    if not phone_number:
+        return json.dumps({"error": "Missing required parameter: phone_number"})
+
+    display_name = _normalize_optional_text(args.get("display_name"))
+    service = FlorenceHouseholdLinkService(context.store)
+    request = service.create_phone_link_request(
+        household_id=context.household_id,
+        inviting_member_id=context.actor_member_id,
+        invited_phone=phone_number,
+        invited_display_name=display_name,
+    )
+    return json.dumps(
+        {
+            "result": {
+                "request_id": request.id,
+                "status": request.status.value,
+                "requires_merge_confirmation": bool(request.requires_merge_confirmation),
+                "invited_display_name": request.invited_display_name,
+                "expires_at": request.expires_at,
+                "reply_text": service.build_inviting_request_reply(request),
+            }
+        }
+    )
+
+
 def _active_review_candidate_id(
     context: FlorenceHouseholdToolContext,
     *,
@@ -1892,7 +1982,9 @@ def _handle_import_calendar_feed(args: dict, *, task_id: str | None = None, **_:
 def _handle_upsert_work_item(args: dict, *, task_id: str | None = None, **_: Any) -> str:
     context = _require_context(task_id)
     manager = FlorenceHouseholdManagerService(context.store)
-    title = _normalize_text(args.get("title"))
+    work_item_id = _normalize_optional_text(args.get("id"))
+    existing_item = context.store.get_household_work_item(work_item_id) if work_item_id else None
+    title = _normalize_text(args.get("title")) or (existing_item.title if existing_item is not None else "")
     if not title:
         return json.dumps({"error": "Missing required parameter: title"})
     owner_member_id = _resolve_member_id(
@@ -1902,20 +1994,63 @@ def _handle_upsert_work_item(args: dict, *, task_id: str | None = None, **_: Any
     )
     item = manager.upsert_work_item(
         HouseholdWorkItem(
-            id=_normalize_optional_text(args.get("id"))
-            or _stable_id("work", context.household_id, title.lower()),
+            id=work_item_id or _stable_id("work", context.household_id, title.lower()),
             household_id=context.household_id,
             title=title,
-            description=_normalize_optional_text(args.get("description")),
-            status=_enum_value(HouseholdWorkItemStatus, args.get("status"), HouseholdWorkItemStatus.OPEN),
-            owner_member_id=owner_member_id,
-            due_at=_normalize_optional_text(args.get("due_at")),
-            starts_at=_normalize_optional_text(args.get("starts_at")),
-            completed_at=_normalize_optional_text(args.get("completed_at")),
-            metadata=_normalize_metadata(args.get("metadata")),
+            description=_normalize_optional_text(args.get("description")) or (existing_item.description if existing_item is not None else None),
+            status=_enum_value(
+                HouseholdWorkItemStatus,
+                args.get("status"),
+                existing_item.status if existing_item is not None else HouseholdWorkItemStatus.OPEN,
+            ),
+            owner_member_id=owner_member_id or (existing_item.owner_member_id if existing_item is not None else None),
+            child_id=existing_item.child_id if existing_item is not None else None,
+            due_at=_normalize_optional_text(args.get("due_at")) or (existing_item.due_at if existing_item is not None else None),
+            starts_at=_normalize_optional_text(args.get("starts_at")) or (existing_item.starts_at if existing_item is not None else None),
+            completed_at=_normalize_optional_text(args.get("completed_at")) or (existing_item.completed_at if existing_item is not None else None),
+            metadata=(
+                {
+                    **(dict(existing_item.metadata) if existing_item is not None and isinstance(existing_item.metadata, dict) else {}),
+                    **_normalize_metadata(args.get("metadata")),
+                }
+                if "metadata" in args or existing_item is not None
+                else _normalize_metadata(args.get("metadata"))
+            ),
         )
     )
     return json.dumps({"result": _serialize_work_item(item)})
+
+
+def _handle_resolve_merge_followup(args: dict, *, task_id: str | None = None, **_: Any) -> str:
+    context = _require_context(task_id)
+    service = FlorenceHouseholdLinkService(context.store)
+    work_item_id = _normalize_optional_text(args.get("work_item_id"))
+    if not work_item_id:
+        return json.dumps({"error": "Missing required parameter: work_item_id"})
+    try:
+        group_index = max(0, int(args.get("group_index") or 0))
+    except (TypeError, ValueError):
+        return json.dumps({"error": "Invalid parameter: group_index"})
+    try:
+        result = service.resolve_merge_followup(
+            household_id=context.household_id,
+            work_item_id=work_item_id,
+            actor_member_id=context.actor_member_id,
+            birthdate=_normalize_optional_text(args.get("birthdate")),
+            school=_normalize_optional_text(args.get("school")),
+            resolution_note=_normalize_optional_text(args.get("resolution_note")),
+            group_index=group_index,
+        )
+    except ValueError as exc:
+        return json.dumps({"error": str(exc)})
+    return json.dumps(
+        {
+            "result": _serialize_work_item(result.work_item),
+            "child": _serialize_child(result.child) if result.child is not None else None,
+            "remaining_conflicts": list(result.remaining_conflicts or []),
+            "resolved": result.work_item.status == HouseholdWorkItemStatus.DONE,
+        }
+    )
 
 
 def _handle_upsert_event(args: dict, *, task_id: str | None = None, **_: Any) -> str:
@@ -2188,6 +2323,13 @@ registry.register(
     check_fn=_check_household_tool_requirements,
 )
 registry.register(
+    name="household_request_parent_link",
+    toolset="florence_household",
+    schema=REQUEST_PARENT_LINK_SCHEMA,
+    handler=_handle_request_parent_link,
+    check_fn=_check_household_tool_requirements,
+)
+registry.register(
     name="household_upsert_event",
     toolset="florence_household",
     schema=UPSERT_EVENT_SCHEMA,
@@ -2199,6 +2341,13 @@ registry.register(
     toolset="florence_household",
     schema=UPSERT_WORK_ITEM_SCHEMA,
     handler=_handle_upsert_work_item,
+    check_fn=_check_household_tool_requirements,
+)
+registry.register(
+    name="household_resolve_merge_followup",
+    toolset="florence_household",
+    schema=RESOLVE_MERGE_FOLLOWUP_SCHEMA,
+    handler=_handle_resolve_merge_followup,
     check_fn=_check_household_tool_requirements,
 )
 registry.register(

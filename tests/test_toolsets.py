@@ -156,6 +156,8 @@ class TestToolsetConsistency:
         assert "household_apply_candidate_review" in tools
         assert "household_apply_nudge_action" in tools
         assert "household_apply_onboarding_update" in tools
+        assert "household_request_parent_link" in tools
+        assert "household_resolve_merge_followup" in tools
         assert "household_upsert_event" in tools
         assert "household_upsert_meal" in tools
         assert "household_schedule_nudge" in tools

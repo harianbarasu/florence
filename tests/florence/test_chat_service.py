@@ -194,6 +194,17 @@ def test_household_chat_service_uses_hermes_agent_with_confirmed_state(tmp_path)
             metadata={"category": "school_admin"},
         )
     )
+    store.upsert_household_work_item(
+        HouseholdWorkItem(
+            id="work_merge_123",
+            household_id="hh_123",
+            title="Review overlapping preferences",
+            metadata={
+                "category": "merge_cleanup",
+                "preview_lines": ['Reminder style: Saved value differs: "Morning only" vs "Only after 8 AM".'],
+            },
+        )
+    )
     store.upsert_household_routine(
         HouseholdRoutine(
             id="routine_123",
@@ -275,6 +286,7 @@ def test_household_chat_service_uses_hermes_agent_with_confirmed_state(tmp_path)
     assert "Ava soccer practice" in _FakeAgent.last_run["system_message"]
     assert "Open household work items" in _FakeAgent.last_run["system_message"]
     assert "Order school lunches" in _FakeAgent.last_run["system_message"]
+    assert 'diff: Reminder style: Saved value differs: "Morning only" vs "Only after 8 AM".' in _FakeAgent.last_run["system_message"]
     assert "Active household routines" in _FakeAgent.last_run["system_message"]
     assert "Friday lunch order check" in _FakeAgent.last_run["system_message"]
     assert "Pending household nudges" in _FakeAgent.last_run["system_message"]
@@ -294,6 +306,8 @@ def test_household_chat_service_uses_hermes_agent_with_confirmed_state(tmp_path)
     assert "use household_import_calendar_feed instead of only summarizing the feed in chat" in _FakeAgent.last_run["system_message"]
     assert "Prefer 'I added Violet's Wednesday music class' over internal phrases like 'grounded parts', 'baseline cleanup', 'durable fact', or 'private context'." in _FakeAgent.last_run["system_message"]
     assert "Your memory stack is: authoritative Florence household state, Florence session history, and Florence-scoped Honcho memory." in _FakeAgent.last_run["system_message"]
+    assert "use household_request_parent_link with their phone number instead of telling them to wait for the family group chat" in _FakeAgent.last_run["system_message"]
+    assert "keep the reply privacy-safe" in _FakeAgent.last_run["system_message"]
     assert "Household scope model:" in _FakeAgent.last_run["system_message"]
     assert "Shared household scope: facts, plans, reminders, meals, grocery items, routines, and events" in _FakeAgent.last_run["system_message"]
     assert "Private parent scope: DM-only context, mental-load triage, emotional processing" in _FakeAgent.last_run["system_message"]
@@ -318,6 +332,8 @@ def test_household_chat_service_uses_hermes_agent_with_confirmed_state(tmp_path)
     assert "use delegate_task to gather evidence in parallel" in _FakeAgent.last_run["system_message"]
     assert "Use household_apply_candidate_review to confirm, reject, skip, set source_visibility, or confirm with corrected fields." in _FakeAgent.last_run["system_message"]
     assert "Use household_apply_nudge_action for done or snooze changes." in _FakeAgent.last_run["system_message"]
+    assert "use household_resolve_merge_followup to apply the chosen shared fact" in _FakeAgent.last_run["system_message"].lower()
+    assert "merge_followup_id: work_merge_123" in _FakeAgent.last_run["system_message"]
     assert "use household_apply_onboarding_update to store only the specific missing setup facts" in _FakeAgent.last_run["system_message"]
     assert "For imported Gmail review items, use source_provenance as the primary evidence." in _FakeAgent.last_run["system_message"]
     assert "Do not reach into unrelated hidden review items during ordinary household chat." in _FakeAgent.last_run["system_message"]

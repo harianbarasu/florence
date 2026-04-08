@@ -1589,6 +1589,8 @@ class FlorenceHouseholdChatService:
             "Do not explain storage layers, sync pipelines, projection mechanics, or visibility models in ordinary replies.",
             "Your memory stack is: authoritative Florence household state, Florence session history, and Florence-scoped Honcho memory.",
             "You also have Florence household-state tools. Use them to persist durable household state when the user wants Florence to remember or manage something over time.",
+            "If a parent wants Florence to connect another parent into the same household, use household_request_parent_link with their phone number instead of telling them to wait for the family group chat.",
+            "When using household_request_parent_link, keep the reply privacy-safe. Do not reveal whether Florence already knew that number or had an existing thread with that person.",
             "Before creating duplicate tasks, events, meals, grocery items, or reminders, check household state, recent Florence context, and connected inbox context when they help.",
             "When the user is asking Florence to capture, track, plan, or manage something, prefer updating durable household state and reply with a concise handled summary of what Florence saved, planned, or still needs.",
             "For meal and grocery requests, prefer creating or updating household meals and shopping items instead of leaving the plan only in chat.",
@@ -1619,6 +1621,9 @@ class FlorenceHouseholdChatService:
             "If external research or website investigation branches into a bounded sidecar task, use delegate_task to gather evidence in parallel, then return to the main Florence turn to synthesize the result and make any final household-state updates yourself.",
             "When the user is replying to one currently surfaced imported-item review prompt, treat only that item as actionable. Use household_apply_candidate_review to confirm, reject, skip, set source_visibility, or confirm with corrected fields.",
             "When the user is replying to one currently surfaced reminder/nudge prompt, treat only that one nudge as actionable. Use household_apply_nudge_action for done or snooze changes.",
+            "If Florence surfaced a merge follow-up after linking households, focus only on the remaining differences Florence still needs help reconciling, not a dump of both sides.",
+            "For merge follow-up items about shared child facts, use household_resolve_merge_followup to apply the chosen shared fact and close or shrink the follow-up in one step.",
+            "For other merge follow-up items, summarize the diff plainly, ask for one short keep/merge choice when needed, and mark the work item done with household_upsert_work_item once the overlap is resolved.",
             "When the user gives feedback about reminder style, timing, or Florence being too proactive or not proactive enough, save it with household_record_preference instead of treating it as a deterministic Florence protocol.",
             "When a parent DM is still in onboarding and the message context says onboarding is active, use household_apply_onboarding_update to store only the specific missing setup facts the user actually provided.",
             "For imported Gmail review items, use source_provenance as the primary evidence. Florence may preserve light proposed_fields, but do not trust Gmail-derived times or dates unless they are clearly supported by the raw source.",
@@ -1698,6 +1703,13 @@ class FlorenceHouseholdChatService:
                 if item.status != HouseholdWorkItemStatus.OPEN:
                     label = f"{label} | status {item.status.value}"
                 lines.append(f"- {label}")
+                metadata = dict(item.metadata) if isinstance(item.metadata, dict) else {}
+                if metadata.get("category") == "merge_cleanup":
+                    lines.append(f"  merge_followup_id: {item.id}")
+                    for preview_line in list(metadata.get("preview_lines") or [])[:2]:
+                        rendered_preview = str(preview_line).strip()
+                        if rendered_preview:
+                            lines.append(f"  diff: {rendered_preview}")
 
         if routines:
             lines.append("Active household routines:")

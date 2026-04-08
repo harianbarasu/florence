@@ -9,6 +9,7 @@ from florence.messaging.channel_log import FlorenceChannelLog
 from florence.messaging.dm_router import FlorenceDmRouter
 from florence.messaging.group_share_protocol import FlorenceGroupShareProtocol
 from florence.messaging.group_router import FlorenceGroupRouter
+from florence.messaging.household_link_protocol import FlorenceHouseholdLinkProtocol
 from florence.messaging.ingress_types import (
     FlorenceMessagingIngressResult,
     FlorenceResolvedInboundMessage,
@@ -20,6 +21,7 @@ from florence.runtime.chat import FlorenceHouseholdChatService
 from florence.runtime.candidate_review import FlorenceCandidateReviewService
 from florence.runtime.group_share import FlorenceGroupShareService
 from florence.runtime.household_manager import FlorenceHouseholdManagerService
+from florence.runtime.household_link import FlorenceHouseholdLinkService
 from florence.runtime.onboarding_service import FlorenceOnboardingSessionService
 from florence.state import FlorenceStateDB
 
@@ -47,6 +49,7 @@ class FlorenceMessagingIngressService:
             channel_log=self.channel_log,
         )
         self.household_manager_service = household_manager_service or FlorenceHouseholdManagerService(store)
+        self.household_link_service = FlorenceHouseholdLinkService(store)
         self.review_protocol = FlorenceCandidateReviewProtocol(
             channel_log=self.channel_log,
             candidate_review_service=self.candidate_review_service,
@@ -81,6 +84,10 @@ class FlorenceMessagingIngressService:
         self.group_share_protocol = FlorenceGroupShareProtocol(
             group_share_service=self.group_share_service,
         )
+        self.household_link_protocol = FlorenceHouseholdLinkProtocol(
+            channel_log=self.channel_log,
+            household_link_service=self.household_link_service,
+        )
         self.reminder_protocol = FlorenceReminderProtocol(
             channel_log=self.channel_log,
             household_manager_service=self.household_manager_service,
@@ -89,6 +96,7 @@ class FlorenceMessagingIngressService:
         self.dm_router = FlorenceDmRouter(
             onboarding_service=self.onboarding_service,
             group_share_protocol=self.group_share_protocol,
+            household_link_protocol=self.household_link_protocol,
             review_protocol=self.review_protocol,
             setup_protocol=self.setup_protocol,
             reminder_protocol=self.reminder_protocol,
@@ -127,8 +135,14 @@ class FlorenceMessagingIngressService:
         result = self.group_router.handle_message(resolved) if resolved.is_group else self.dm_router.handle_message(resolved)
 
         reply_messages = result.reply_messages or ((result.reply_text,) if result.reply_text else ())
+        persisted_channel = self.store.get_channel(resolved.channel_id)
+        persisted_household_id = (
+            persisted_channel.household_id
+            if persisted_channel is not None
+            else resolved.household_id
+        )
         self.channel_log.append_transport_reply_messages(
-            household_id=resolved.household_id,
+            household_id=persisted_household_id,
             channel_id=resolved.channel_id,
             provider=resolved.message.provider,
             thread_id=resolved.thread_id,

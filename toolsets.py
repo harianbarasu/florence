@@ -88,6 +88,8 @@ _FLORENCE_HOUSEHOLD_TOOLS = [
     "household_apply_candidate_review",
     "household_apply_nudge_action",
     "household_apply_onboarding_update",
+    "household_request_parent_link",
+    "household_resolve_merge_followup",
     "household_upsert_event",
     "household_upsert_work_item",
     "household_upsert_routine",

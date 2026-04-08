@@ -129,6 +129,15 @@ class HouseholdBriefingKind(StrEnum):
     WEEKLY = "weekly"
 
 
+class HouseholdLinkRequestStatus(StrEnum):
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+    DECLINED = "declined"
+    CANCELLED = "cancelled"
+    EXPIRED = "expired"
+    MERGED = "merged"
+
+
 @dataclass(slots=True)
 class Household:
     id: str
@@ -186,6 +195,25 @@ class MemberIdentity:
     kind: IdentityKind
     value: str
     normalized_value: str
+
+
+@dataclass(slots=True)
+class HouseholdLinkRequest:
+    id: str
+    household_id: str
+    inviting_member_id: str
+    invited_identity_kind: IdentityKind
+    invited_identity_normalized_value: str
+    invited_identity_value: str | None = None
+    invited_display_name: str | None = None
+    invited_member_id: str | None = None
+    source_household_id: str | None = None
+    requires_merge_confirmation: bool = False
+    status: HouseholdLinkRequestStatus = HouseholdLinkRequestStatus.PENDING
+    expires_at: str | None = None
+    metadata: dict[str, object] = field(default_factory=dict)
+    created_at: float = 0.0
+    updated_at: float = 0.0
 
 
 @dataclass(slots=True)

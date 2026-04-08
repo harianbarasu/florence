@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 CANDIDATE_REVIEW_PROMPT_KIND = "candidate_review_prompt"
 HOUSEHOLD_NUDGE_PROMPT_KIND = "household_nudge_prompt"
 GOOGLE_CONNECT_PROMPT_KIND = "google_connect_prompt"
+HOUSEHOLD_LINK_PROMPT_KIND = "household_link_prompt"
+HOUSEHOLD_LINK_PROMPT_ROLE_KEY = "household_link_prompt_role"
 PENDING_ACTION_TYPE_KEY = "pending_action_type"
 PENDING_ACTION_TARGET_ID_KEY = "pending_action_target_id"
 PENDING_ACTION_TARGET_KIND_KEY = "pending_action_target_kind"
@@ -36,6 +38,16 @@ def build_google_connect_prompt_metadata() -> dict[str, object]:
         "protocol_kind": GOOGLE_CONNECT_PROMPT_KIND,
         PENDING_ACTION_TYPE_KEY: "google_connect",
         PENDING_ACTION_TARGET_KIND_KEY: "google_connection",
+    }
+
+
+def build_household_link_prompt_metadata(request_id: str, *, role: str) -> dict[str, object]:
+    return {
+        "protocol_kind": HOUSEHOLD_LINK_PROMPT_KIND,
+        PENDING_ACTION_TYPE_KEY: "household_link_request",
+        PENDING_ACTION_TARGET_KIND_KEY: "household_link_request",
+        PENDING_ACTION_TARGET_ID_KEY: request_id,
+        HOUSEHOLD_LINK_PROMPT_ROLE_KEY: role,
     }
 
 

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
+from typing import Any, Callable
 
 from florence.contracts import (
     ChannelType,
@@ -36,17 +38,37 @@ from florence.runtime.services import (
 )
 from florence.state import FlorenceStateDB
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass(slots=True)
 class _ReminderActionResult:
     reply_text: str
 
 
+@dataclass(slots=True)
+class _BriefingRoutineSpec:
+    kind: HouseholdBriefingKind
+    title: str
+    hour: int
+    minute: int
+    days: list[int]
+    disabled: bool
+    planning_source: str
+    planning_preferences_fingerprint: str
+
+
 class FlorenceHouseholdManagerService:
     """Generic Florence operating-state service for the household agent."""
 
-    def __init__(self, store: FlorenceStateDB):
+    def __init__(
+        self,
+        store: FlorenceStateDB,
+        *,
+        household_chat_service_getter: Callable[[], Any] | None = None,
+    ):
         self.store = store
+        self._household_chat_service_getter = household_chat_service_getter
 
     def upsert_work_item(self, work_item: HouseholdWorkItem) -> HouseholdWorkItem:
         return self.store.upsert_household_work_item(work_item)
@@ -258,17 +280,188 @@ class FlorenceHouseholdManagerService:
             return []
         current = now or _utc_now()
         timezone_name = household.timezone or "America/Los_Angeles"
-        operating_preferences = " | ".join(
-            self.preference_statements(
-                household_id=household_id,
-                categories={"operating_rule", "operating_preference"},
-            )
+        operating_preference_statements = self.preference_statements(
+            household_id=household_id,
+            categories={"operating_rule", "operating_preference"},
         )
+        operating_preferences = " | ".join(operating_preference_statements)
+        preferences_fingerprint = _stable_id("briefing_pref", household_id, operating_preferences or "__empty__")
         default_owner = self.default_recipient_member_id(household_id)
         default_channel = self.default_dm_channel_id(household_id=household_id, member_id=default_owner)
         if default_owner is None:
             return []
+        routine_specs = (
+            self._stored_briefing_routine_specs(
+                household_id=household_id,
+                preferences_fingerprint=preferences_fingerprint,
+            )
+            or self._hermes_briefing_routine_specs(
+                household_id=household_id,
+                channel_id=default_channel,
+                actor_member_id=default_owner,
+                operating_preferences=operating_preference_statements,
+                preferences_fingerprint=preferences_fingerprint,
+            )
+            or self._fallback_briefing_routine_specs(
+                operating_preferences=operating_preferences,
+                preferences_fingerprint=preferences_fingerprint,
+            )
+        )
 
+        upserted: list[HouseholdRoutine] = []
+        for spec in routine_specs:
+            routine_id = _stable_id("routine", household_id, "briefing", spec.kind.value)
+            existing = self.store.get_household_routine(routine_id)
+            metadata = {
+                "automation_kind": "briefing",
+                "brief_kind": spec.kind.value,
+                "local_time": f"{spec.hour:02d}:{spec.minute:02d}",
+                "days": list(spec.days),
+                "channel_id": default_channel,
+                "planning_source": spec.planning_source,
+                "planning_preferences_fingerprint": spec.planning_preferences_fingerprint,
+            }
+            cadence = (
+                f"briefing on weekdays at {spec.hour:02d}:{spec.minute:02d} local"
+                if spec.days == [0, 1, 2, 3, 4]
+                else f"briefing at {spec.hour:02d}:{spec.minute:02d} local on days {','.join(str(day) for day in spec.days)}"
+            )
+            if spec.disabled:
+                paused = HouseholdRoutine(
+                    id=routine_id,
+                    household_id=household_id,
+                    title=spec.title,
+                    cadence=cadence,
+                    description="Automatic Florence household briefing routine",
+                    status=HouseholdRoutineStatus.PAUSED,
+                    owner_member_id=(existing.owner_member_id if existing is not None and existing.owner_member_id else default_owner),
+                    next_due_at=None,
+                    last_completed_at=existing.last_completed_at if existing is not None else None,
+                    metadata=metadata,
+                )
+                upserted.append(self.store.upsert_household_routine(paused))
+                continue
+
+            next_due = _next_due_local_schedule_iso(
+                household_timezone=timezone_name,
+                hour=int(spec.hour),
+                minute=int(spec.minute),
+                days=list(spec.days),
+                now=current,
+            )
+            routine = HouseholdRoutine(
+                id=routine_id,
+                household_id=household_id,
+                title=spec.title,
+                cadence=cadence,
+                description="Automatic Florence household briefing routine",
+                status=HouseholdRoutineStatus.ACTIVE,
+                owner_member_id=(existing.owner_member_id if existing is not None and existing.owner_member_id else default_owner),
+                next_due_at=next_due if existing is None or existing.status != HouseholdRoutineStatus.ACTIVE else (existing.next_due_at or next_due),
+                last_completed_at=existing.last_completed_at if existing is not None else None,
+                metadata=metadata,
+            )
+            upserted.append(self.store.upsert_household_routine(routine))
+        return upserted
+
+    def _stored_briefing_routine_specs(
+        self,
+        *,
+        household_id: str,
+        preferences_fingerprint: str,
+    ) -> list[_BriefingRoutineSpec] | None:
+        specs: list[_BriefingRoutineSpec] = []
+        for kind in (HouseholdBriefingKind.MORNING, HouseholdBriefingKind.EVENING, HouseholdBriefingKind.WEEKLY):
+            routine = self.store.get_household_routine(_stable_id("routine", household_id, "briefing", kind.value))
+            if routine is None:
+                return None
+            metadata = dict(routine.metadata) if isinstance(routine.metadata, dict) else {}
+            if str(metadata.get("planning_preferences_fingerprint") or "").strip() != preferences_fingerprint:
+                return None
+            parsed_time = _parse_local_time_spec(str(metadata.get("local_time") or ""))
+            days = self._coerce_routine_days(metadata.get("days"))
+            if parsed_time is None or not days:
+                return None
+            specs.append(
+                _BriefingRoutineSpec(
+                    kind=kind,
+                    title=self._briefing_title(kind),
+                    hour=parsed_time[0],
+                    minute=parsed_time[1],
+                    days=days,
+                    disabled=routine.status != HouseholdRoutineStatus.ACTIVE,
+                    planning_source=str(metadata.get("planning_source") or "stored").strip() or "stored",
+                    planning_preferences_fingerprint=preferences_fingerprint,
+                )
+            )
+        return specs
+
+    def _hermes_briefing_routine_specs(
+        self,
+        *,
+        household_id: str,
+        channel_id: str | None,
+        actor_member_id: str | None,
+        operating_preferences: list[str],
+        preferences_fingerprint: str,
+    ) -> list[_BriefingRoutineSpec] | None:
+        if not operating_preferences or channel_id is None or self._household_chat_service_getter is None:
+            return None
+        chat_service = self._household_chat_service_getter()
+        planner = getattr(chat_service, "compose_briefing_routine_plan", None)
+        if not callable(planner):
+            return None
+        try:
+            plan = planner(
+                household_id=household_id,
+                channel_id=channel_id,
+                actor_member_id=actor_member_id,
+                operating_preferences=operating_preferences,
+            )
+        except Exception:
+            logger.exception("Failed to compose Hermes briefing routine plan household_id=%s", household_id)
+            return None
+        if not isinstance(plan, list) or not plan:
+            return None
+
+        specs: list[_BriefingRoutineSpec] = []
+        plan_by_kind = {
+            str(item.get("kind") or "").strip().lower(): item
+            for item in plan
+            if isinstance(item, dict)
+        }
+        for kind in (HouseholdBriefingKind.MORNING, HouseholdBriefingKind.EVENING, HouseholdBriefingKind.WEEKLY):
+            default_hour, default_minute = self._default_briefing_time(kind)
+            item = plan_by_kind.get(kind.value, {})
+            try:
+                hour = int(item.get("hour", default_hour))
+                minute = int(item.get("minute", default_minute))
+            except (TypeError, ValueError):
+                hour, minute = default_hour, default_minute
+            if not (0 <= hour <= 23):
+                hour = default_hour
+            if not (0 <= minute <= 59):
+                minute = default_minute
+            specs.append(
+                _BriefingRoutineSpec(
+                    kind=kind,
+                    title=self._briefing_title(kind),
+                    hour=hour,
+                    minute=minute,
+                    days=self._coerce_routine_days(item.get("days")) or self._default_briefing_days(kind),
+                    disabled=not bool(item.get("enabled", True)),
+                    planning_source="hermes",
+                    planning_preferences_fingerprint=preferences_fingerprint,
+                )
+            )
+        return specs
+
+    def _fallback_briefing_routine_specs(
+        self,
+        *,
+        operating_preferences: str,
+        preferences_fingerprint: str,
+    ) -> list[_BriefingRoutineSpec]:
         disable_morning = bool(re.search(r"\b(?:no|skip|disable)\s+morning\s+brief\b", operating_preferences, re.IGNORECASE))
         disable_evening = bool(re.search(r"\b(?:no|skip|disable)\s+evening\s+(?:check[- ]?in|brief)\b", operating_preferences, re.IGNORECASE))
         disable_weekly = bool(re.search(r"\b(?:no|skip|disable)\s+(?:weekly\s+brief|weekend\s+preview)\b", operating_preferences, re.IGNORECASE))
@@ -291,86 +484,74 @@ class FlorenceHouseholdManagerService:
             default_hour=17,
             default_minute=30,
         )
-
-        routine_specs = [
-            {
-                "kind": HouseholdBriefingKind.MORNING,
-                "title": "Morning brief",
-                "hour": morning_hour,
-                "minute": morning_minute,
-                "days": _local_schedule_days(text=operating_preferences, kind=HouseholdBriefingKind.MORNING),
-                "disabled": disable_morning,
-            },
-            {
-                "kind": HouseholdBriefingKind.EVENING,
-                "title": "Evening check-in",
-                "hour": evening_hour,
-                "minute": evening_minute,
-                "days": _local_schedule_days(text=operating_preferences, kind=HouseholdBriefingKind.EVENING),
-                "disabled": disable_evening,
-            },
-            {
-                "kind": HouseholdBriefingKind.WEEKLY,
-                "title": "Weekly preview",
-                "hour": weekly_hour,
-                "minute": weekly_minute,
-                "days": _local_schedule_days(text=operating_preferences, kind=HouseholdBriefingKind.WEEKLY),
-                "disabled": disable_weekly,
-            },
+        return [
+            _BriefingRoutineSpec(
+                kind=HouseholdBriefingKind.MORNING,
+                title=self._briefing_title(HouseholdBriefingKind.MORNING),
+                hour=morning_hour,
+                minute=morning_minute,
+                days=_local_schedule_days(text=operating_preferences, kind=HouseholdBriefingKind.MORNING),
+                disabled=disable_morning,
+                planning_source="deterministic_fallback",
+                planning_preferences_fingerprint=preferences_fingerprint,
+            ),
+            _BriefingRoutineSpec(
+                kind=HouseholdBriefingKind.EVENING,
+                title=self._briefing_title(HouseholdBriefingKind.EVENING),
+                hour=evening_hour,
+                minute=evening_minute,
+                days=_local_schedule_days(text=operating_preferences, kind=HouseholdBriefingKind.EVENING),
+                disabled=disable_evening,
+                planning_source="deterministic_fallback",
+                planning_preferences_fingerprint=preferences_fingerprint,
+            ),
+            _BriefingRoutineSpec(
+                kind=HouseholdBriefingKind.WEEKLY,
+                title=self._briefing_title(HouseholdBriefingKind.WEEKLY),
+                hour=weekly_hour,
+                minute=weekly_minute,
+                days=_local_schedule_days(text=operating_preferences, kind=HouseholdBriefingKind.WEEKLY),
+                disabled=disable_weekly,
+                planning_source="deterministic_fallback",
+                planning_preferences_fingerprint=preferences_fingerprint,
+            ),
         ]
 
-        upserted: list[HouseholdRoutine] = []
-        for spec in routine_specs:
-            routine_id = _stable_id("routine", household_id, "briefing", spec["kind"].value)
-            existing = self.store.get_household_routine(routine_id)
-            metadata = {
-                "automation_kind": "briefing",
-                "brief_kind": spec["kind"].value,
-                "local_time": f"{spec['hour']:02d}:{spec['minute']:02d}",
-                "days": list(spec["days"]),
-                "channel_id": default_channel,
-            }
-            cadence = (
-                f"briefing on weekdays at {spec['hour']:02d}:{spec['minute']:02d} local"
-                if spec["days"] == [0, 1, 2, 3, 4]
-                else f"briefing at {spec['hour']:02d}:{spec['minute']:02d} local on days {','.join(str(day) for day in spec['days'])}"
-            )
-            if spec["disabled"]:
-                if existing is None:
-                    continue
-                paused = replace(
-                    existing,
-                    title=spec["title"],
-                    cadence=cadence,
-                    status=HouseholdRoutineStatus.PAUSED,
-                    owner_member_id=existing.owner_member_id or default_owner,
-                    next_due_at=None,
-                    metadata=metadata,
-                )
-                upserted.append(self.store.upsert_household_routine(paused))
-                continue
+    @staticmethod
+    def _briefing_title(kind: HouseholdBriefingKind) -> str:
+        if kind == HouseholdBriefingKind.MORNING:
+            return "Morning brief"
+        if kind == HouseholdBriefingKind.EVENING:
+            return "Evening check-in"
+        return "Weekly preview"
 
-            next_due = _next_due_local_schedule_iso(
-                household_timezone=timezone_name,
-                hour=int(spec["hour"]),
-                minute=int(spec["minute"]),
-                days=list(spec["days"]),
-                now=current,
-            )
-            routine = HouseholdRoutine(
-                id=routine_id,
-                household_id=household_id,
-                title=spec["title"],
-                cadence=cadence,
-                description="Automatic Florence household briefing routine",
-                status=HouseholdRoutineStatus.ACTIVE,
-                owner_member_id=(existing.owner_member_id if existing is not None and existing.owner_member_id else default_owner),
-                next_due_at=next_due if existing is None or existing.status != HouseholdRoutineStatus.ACTIVE else (existing.next_due_at or next_due),
-                last_completed_at=existing.last_completed_at if existing is not None else None,
-                metadata=metadata,
-            )
-            upserted.append(self.store.upsert_household_routine(routine))
-        return upserted
+    @staticmethod
+    def _default_briefing_time(kind: HouseholdBriefingKind) -> tuple[int, int]:
+        if kind == HouseholdBriefingKind.MORNING:
+            return (6, 45)
+        if kind == HouseholdBriefingKind.EVENING:
+            return (20, 15)
+        return (17, 30)
+
+    @staticmethod
+    def _default_briefing_days(kind: HouseholdBriefingKind) -> list[int]:
+        if kind == HouseholdBriefingKind.WEEKLY:
+            return [6]
+        return [0, 1, 2, 3, 4]
+
+    @staticmethod
+    def _coerce_routine_days(raw_value: object) -> list[int]:
+        if not isinstance(raw_value, list):
+            return []
+        days: list[int] = []
+        for item in raw_value:
+            try:
+                day = int(item)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= day <= 6 and day not in days:
+                days.append(day)
+        return days
 
     def list_due_briefing_routines(
         self,

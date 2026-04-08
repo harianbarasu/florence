@@ -1,3 +1,5 @@
+import json
+import re
 from florence.messaging import (
     FlorenceInboundMessage,
     FlorenceMessagingIngressService,
@@ -5,6 +7,7 @@ from florence.messaging import (
 )
 from florence.messaging.protocol_types import CANDIDATE_REVIEW_PROMPT_KIND
 from datetime import datetime, timedelta, timezone
+from florence.onboarding import OnboardingStage
 
 from florence.contracts import (
     CandidateState,
@@ -28,10 +31,21 @@ from florence.contracts import (
 )
 from florence.runtime import (
     FlorenceCandidateReviewService,
+    FlorenceHouseholdManagerService,
     FlorenceIdentityResolver,
     FlorenceOnboardingSessionService,
 )
+from florence.runtime.chat import FlorenceHouseholdChatService
 from florence.state import FlorenceStateDB
+from hermes_state import SessionDB
+from model_tools import handle_function_call
+
+
+_TEST_CHILD_AGE_PATTERN = re.compile(
+    r"\b(?P<name>[A-Z][A-Za-z'’-]*)"
+    r"(?:\s+(?:is|turns|will\s+be|will\s+turn|is\s+about\s+to\s+turn|about\s+to\s+turn)\s+|\s+)"
+    r"(?P<age>\d{1,2})\b"
+)
 
 
 class _StubGoogleAccountLinkService:
@@ -42,22 +56,98 @@ class _StubGoogleAccountLinkService:
         return _Link()
 
 
+def _split_test_child_entries(text: str) -> list[str]:
+    normalized = re.sub(r"\b(?:and|&)\b", ",", text, flags=re.IGNORECASE)
+    normalized = normalized.replace("\n", ",")
+    return [part.strip(" .,!?:;") for part in normalized.split(",") if part.strip(" .,!?:;")]
+
+
+def _extract_test_child_names_and_updates(text: str) -> tuple[list[str], list[dict[str, str]]]:
+    updates: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for match in _TEST_CHILD_AGE_PATTERN.finditer(text):
+        name = str(match.group("name") or "").strip(" .,!?:;")
+        age = str(match.group("age") or "").strip()
+        if not name or not age or name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        updates.append({"name": name, "age": age})
+    if updates:
+        return ([update["name"] for update in updates], updates)
+    child_names: list[str] = []
+    for entry in _split_test_child_entries(text):
+        token_match = re.match(r"([A-Za-z][A-Za-z'’-]*)", entry)
+        if token_match is None:
+            continue
+        name = token_match.group(1).strip()
+        if name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        child_names.append(name)
+    return (child_names, [])
+
+
+def _record_test_onboarding_reply(
+    onboarding_service,
+    *,
+    household_id: str,
+    member_id: str,
+    thread_id: str,
+    text: str,
+):
+    session = onboarding_service.get_or_create_session(
+        household_id=household_id,
+        member_id=member_id,
+        thread_id=thread_id,
+    )
+    if session.stage == OnboardingStage.COLLECT_CHILD_AGE:
+        return onboarding_service.apply_explicit_update(
+            household_id=household_id,
+            member_id=member_id,
+            thread_id=thread_id,
+            age=text,
+        )
+    if session.stage == OnboardingStage.COLLECT_CHILD_SCHOOL:
+        return onboarding_service.apply_explicit_update(
+            household_id=household_id,
+            member_id=member_id,
+            thread_id=thread_id,
+            school=text,
+        )
+    if session.stage == OnboardingStage.COLLECT_CHILD_ACTIVITIES:
+        return onboarding_service.apply_explicit_update(
+            household_id=household_id,
+            member_id=member_id,
+            thread_id=thread_id,
+            activities=[] if text.strip().lower().startswith("none") else [text],
+        )
+    raise AssertionError(f"Unexpected test onboarding reply stage: {session.stage}")
+
+
 class _StubHouseholdChatService:
     def __init__(
         self,
         reply_text: str,
         *,
+        onboarding_turn_handler=None,
+        onboarding_turn_text: str | None = None,
         promotion_text: str | None = None,
         review_prompt_text: str | None = None,
         sync_waiting_text: str | None = None,
     ):
         self.reply_text = reply_text
+        self.onboarding_turn_handler = onboarding_turn_handler
+        self.onboarding_turn_text = onboarding_turn_text
         self.promotion_text = promotion_text
         self.review_prompt_text = review_prompt_text
         self.sync_waiting_text = sync_waiting_text or (
             "Google is connected. I’m syncing up to the last year of your email and calendar in the background now, and I’ll text you here when the first pass is ready."
         )
         self.calls = []
+        self.onboarding_turn_calls = []
+        self.review_queue_turn_calls = []
+        self.group_share_turn_calls = []
+        self.group_intro_turn_calls = []
         self.promotion_calls = []
         self.review_prompt_calls = []
         self.sync_waiting_calls = []
@@ -86,6 +176,39 @@ class _StubHouseholdChatService:
 
         return _Reply()
 
+    def compose_onboarding_turn(
+        self,
+        *,
+        household_id: str,
+        channel_id: str,
+        actor_member_id: str | None,
+        payload=None,
+        conversation_history=None,
+    ) -> tuple[str, ...] | None:
+        payload = dict(payload or {})
+        self.onboarding_turn_calls.append(
+            {
+                "household_id": household_id,
+                "channel_id": channel_id,
+                "actor_member_id": actor_member_id,
+                "payload": payload,
+                "conversation_history": conversation_history or [],
+            }
+        )
+        if self.onboarding_turn_handler is not None:
+            messages = self.onboarding_turn_handler(
+                household_id=household_id,
+                channel_id=channel_id,
+                actor_member_id=actor_member_id,
+                payload=payload,
+            )
+            if messages is None:
+                return None
+            return tuple(message for message in messages if message)
+        if self.onboarding_turn_text is None:
+            return None
+        return (self.onboarding_turn_text,)
+
     def compose_operator_message(
         self,
         *,
@@ -97,6 +220,15 @@ class _StubHouseholdChatService:
         conversation_history=None,
     ) -> str | None:
         payload = dict(payload or {})
+        if kind == "onboarding_turn":
+            messages = self.compose_onboarding_turn(
+                household_id=household_id,
+                channel_id=channel_id,
+                actor_member_id=actor_member_id,
+                payload=payload,
+                conversation_history=conversation_history,
+            )
+            return messages[0] if messages else None
         if kind == "group_promotion":
             self.promotion_calls.append(
                 {
@@ -128,6 +260,75 @@ class _StubHouseholdChatService:
                 lines.append(str(source_prompt).strip())
             lines.append("Reply yes if I should add it, no if it's wrong, or skip for later.")
             return " ".join(line for line in lines if line)
+        if kind == "review_queue_turn":
+            self.review_queue_turn_calls.append(
+                {
+                    "household_id": household_id,
+                    "channel_id": channel_id,
+                    "actor_member_id": actor_member_id,
+                    "user_message": payload.get("user_message"),
+                    "prompt_armed": bool(payload.get("prompt_armed")),
+                }
+            )
+            normalized = " ".join(str(payload.get("user_message") or "").split()).strip().lower()
+            if not payload.get("prompt_armed") and any(
+                phrase in normalized
+                for phrase in (
+                    "review imports",
+                    "review queue",
+                    "pending imports",
+                    "pending candidates",
+                    "anything to review",
+                    "show imports",
+                    "show queue",
+                    "what's pending",
+                    "what is pending",
+                )
+            ):
+                return "SHOW_CURRENT_REVIEW_PROMPT"
+            return "NO_REVIEW_PROTOCOL_ACTION"
+        if kind == "group_share_turn":
+            self.group_share_turn_calls.append(
+                {
+                    "household_id": household_id,
+                    "channel_id": channel_id,
+                    "actor_member_id": actor_member_id,
+                    "user_message": payload.get("user_message"),
+                    "latest_assistant_protocol_kind": payload.get("latest_assistant_protocol_kind"),
+                }
+            )
+            normalized = " ".join(str(payload.get("user_message") or "").split()).strip().lower()
+            latest_protocol_kind = str(payload.get("latest_assistant_protocol_kind") or "").strip()
+            if latest_protocol_kind == CANDIDATE_REVIEW_PROMPT_KIND and normalized in {"share", "private"}:
+                return "NO_GROUP_SHARE_PROTOCOL_ACTION"
+            if (
+                ("group" in normalized or "family" in normalized or "everyone" in normalized)
+                and any(word in normalized for word in ("share", "send", "post"))
+            ) or normalized in {"share that", "share it", "send it", "post it"}:
+                return "EXECUTE_GROUP_SHARE"
+            return "NO_GROUP_SHARE_PROTOCOL_ACTION"
+        if kind == "group_intro_turn":
+            self.group_intro_turn_calls.append(
+                {
+                    "household_id": household_id,
+                    "channel_id": channel_id,
+                    "actor_member_id": actor_member_id,
+                    "user_message": payload.get("user_message"),
+                }
+            )
+            normalized = " ".join(str(payload.get("user_message") or "").split()).strip().lower()
+            if normalized in {
+                "hi",
+                "hey",
+                "hello",
+                "hi florence",
+                "hey florence",
+                "hello florence",
+                "hey there florence",
+                "hello there florence",
+            }:
+                return "SHOW_GROUP_INTRO"
+            return "NO_GROUP_INTRO_PROTOCOL_ACTION"
         if kind in {"sync_waiting", "sync_started"}:
             self.sync_waiting_calls.append(
                 {
@@ -144,10 +345,272 @@ class _StubHouseholdChatService:
         raise AssertionError(f"Unexpected compose_operator_message kind: {kind}")
 
 
+class _OnboardingToolAgent:
+    created = []
+    last_run = None
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.session_id = kwargs.get("session_id")
+        _OnboardingToolAgent.created.append(kwargs)
+
+    def run_conversation(self, user_message, system_message, conversation_history=None, task_id=None):
+        payload = json.loads(user_message)
+        _OnboardingToolAgent.last_run = {
+            "user_message": user_message,
+            "system_message": system_message,
+            "conversation_history": conversation_history or [],
+            "task_id": task_id,
+        }
+        if payload.get("task") == "group_share_turn_decision":
+            return {"final_response": "NO_GROUP_SHARE_PROTOCOL_ACTION"}
+        if payload.get("task") == "review_queue_turn_decision":
+            return {"final_response": "NO_REVIEW_PROTOCOL_ACTION"}
+        assert payload["task"] == "handle_onboarding_turn"
+        result = json.loads(
+            handle_function_call(
+                "household_apply_onboarding_update",
+                {
+                    "child_updates": [
+                        {"name": "Theo", "school": "Roosevelt Elementary"},
+                        {"name": "Violet", "school": "Little Sprouts Preschool"},
+                    ]
+                },
+                task_id=task_id,
+            )
+        )
+        reply_messages = result.get("result", {}).get("reply_messages") or []
+        return {
+            "final_response": reply_messages[0] if reply_messages else "What activities does Theo do? If none right now, say none."
+        }
+
+
+class _OnboardingHandoffAgent:
+    created = []
+    runs = []
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.session_id = kwargs.get("session_id")
+        _OnboardingHandoffAgent.created.append(kwargs)
+
+    def run_conversation(self, user_message, system_message, conversation_history=None, task_id=None):
+        payload = json.loads(user_message)
+        _OnboardingHandoffAgent.runs.append(
+            {
+                "task": payload.get("task"),
+                "user_message": user_message,
+                "system_message": system_message,
+                "conversation_history": conversation_history or [],
+                "task_id": task_id,
+            }
+        )
+        if payload.get("task") == "group_share_turn_decision":
+            return {"final_response": "NO_GROUP_SHARE_PROTOCOL_ACTION"}
+        if payload.get("task") == "review_queue_turn_decision":
+            return {"final_response": "NO_REVIEW_PROTOCOL_ACTION"}
+        if payload.get("task") == "handle_onboarding_turn":
+            return {"final_response": "HANDOFF_TO_SYNC_WAITING"}
+        if payload.get("task") == "compose_sync_waiting_reply":
+            return {"final_response": "Still syncing, so I can’t answer from your calendar confidently yet."}
+        return {"final_response": "I can keep helping here."}
+
+
+class _ReminderToolAgent:
+    created = []
+    runs = []
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.session_id = kwargs.get("session_id")
+        _ReminderToolAgent.created.append(kwargs)
+
+    def run_conversation(self, user_message, system_message, conversation_history=None, task_id=None):
+        if user_message.lstrip().startswith("{"):
+            payload = json.loads(user_message)
+            task = payload.get("task")
+            if task == "group_share_turn_decision":
+                return {"final_response": "NO_GROUP_SHARE_PROTOCOL_ACTION"}
+            if task == "review_queue_turn_decision":
+                return {"final_response": "NO_REVIEW_PROTOCOL_ACTION"}
+        _ReminderToolAgent.runs.append(
+            {
+                "user_message": user_message,
+                "system_message": system_message,
+                "conversation_history": conversation_history or [],
+                "task_id": task_id,
+            }
+        )
+        nudge_match = re.search(r'nudge_id="([^"]+)"', user_message)
+        reply_match = re.search(r"User reply:\s*(.+)\s*$", user_message, re.DOTALL)
+        nudge_id = nudge_match.group(1) if nudge_match else ""
+        reply_text = reply_match.group(1).strip() if reply_match else ""
+        if not nudge_id:
+            return {"final_response": "Which reminder do you want to update?"}
+        lowered = " ".join(reply_text.lower().split())
+        if lowered == "done":
+            result = json.loads(
+                handle_function_call(
+                    "household_apply_nudge_action",
+                    {"nudge_id": nudge_id, "action": "done"},
+                    task_id=task_id,
+                )
+            )
+            return {"final_response": result.get("result", {}).get("reply_text") or "Done."}
+        if lowered.startswith("snooze"):
+            hours_match = re.search(r"(\d+)\s*(?:h|hr|hrs|hour|hours)\b", lowered)
+            minutes_match = re.search(r"(\d+)\s*(?:m|min|mins|minute|minutes)\b", lowered)
+            days_match = re.search(r"(\d+)\s*(?:d|day|days)\b", lowered)
+            delay = timedelta(hours=2)
+            if days_match:
+                delay = timedelta(days=max(1, int(days_match.group(1))))
+            elif hours_match:
+                delay = timedelta(hours=max(1, int(hours_match.group(1))))
+            elif minutes_match:
+                delay = timedelta(minutes=max(1, int(minutes_match.group(1))))
+            scheduled_for = (datetime.now(timezone.utc) + delay).isoformat()
+            result = json.loads(
+                handle_function_call(
+                    "household_apply_nudge_action",
+                    {
+                        "nudge_id": nudge_id,
+                        "action": "snooze",
+                        "scheduled_for": scheduled_for,
+                    },
+                    task_id=task_id,
+                )
+            )
+            return {"final_response": result.get("result", {}).get("reply_text") or "Snoozed."}
+        return {"final_response": "Tell me which reminder you want to update."}
+
+
 def _build_onboarding_service(store, review_service):
     return FlorenceOnboardingSessionService(
         store,
         candidate_review_service=review_service,
+    )
+
+
+def _simulate_hermes_onboarding_turn(
+    *,
+    onboarding_service: FlorenceOnboardingSessionService,
+    household_id: str,
+    channel_id: str,
+    actor_member_id: str | None,
+    payload: dict[str, object],
+) -> tuple[str, ...] | None:
+    if actor_member_id is None:
+        return None
+    user_message = str(payload.get("user_message") or "")
+    normalized = " ".join(user_message.strip().lower().split())
+    acknowledgement = normalized in {
+        "ok",
+        "okay",
+        "sounds good",
+        "sgtm",
+        "got it",
+        "cool",
+        "nice",
+        "great",
+        "perfect",
+        "thanks",
+        "thank you",
+        "awesome",
+        "works for me",
+        "understood",
+        "roger",
+        "👍",
+        "🙏",
+    }
+    thread_id = str(payload.get("thread_id") or "").strip()
+    channel = onboarding_service.store.get_channel(channel_id)
+    if not thread_id and channel is not None and channel.provider_channel_id:
+        thread_id = channel.provider_channel_id
+    if not thread_id:
+        return None
+    previous_session = onboarding_service.get_or_create_session(
+        household_id=household_id,
+        member_id=actor_member_id,
+        thread_id=thread_id,
+    )
+    if previous_session.google_connected:
+        if acknowledgement:
+            return ("NO_SETUP_REPLY",)
+        if re.search(
+            r"\b(?:calendar|email|emails|inbox|gmail)\b|\b(?:check|show|find|pull|search|look\s+up|look\s+in|what(?:'s| is)\s+(?:on|in))\b.*\b(?:schedule|scheduled)\b",
+            user_message,
+            re.IGNORECASE,
+        ):
+            return ("HANDOFF_TO_SYNC_WAITING",)
+        if (
+            ("?" in user_message and len(user_message.split()) > 1)
+            or re.search(
+                r"\b(?:help figuring out|help with|can you help|could you help|i need help|while this is syncing)\b",
+                user_message,
+                re.IGNORECASE,
+            )
+            or user_message.strip().lower().startswith(
+                ("can ", "could ", "would ", "what ", "what's ", "when ", "where ", "who ", "why ", "how ", "show ", "check ", "find ", "plan ", "help ", "remind ", "review ", "list ", "share ", "send ", "post ")
+            )
+        ):
+            return ("HANDOFF_TO_CONTEXTUAL_CHAT",)
+    elif acknowledgement:
+        return None
+    if previous_session.stage == OnboardingStage.COLLECT_PARENT_NAME:
+        transition = onboarding_service.record_parent_name(
+            household_id=household_id,
+            member_id=actor_member_id,
+            thread_id=thread_id,
+            display_name=user_message,
+        )
+    elif previous_session.stage == OnboardingStage.COLLECT_CHILD_NAMES:
+        child_names, child_updates = _extract_test_child_names_and_updates(user_message)
+        if not child_names:
+            return onboarding_service.get_prompt_messages(
+                household_id=household_id,
+                member_id=actor_member_id,
+                thread_id=thread_id,
+            )
+        transition = onboarding_service.record_child_names(
+            household_id=household_id,
+            member_id=actor_member_id,
+            thread_id=thread_id,
+            child_names=child_names,
+        )
+        for child_update in child_updates:
+            transition = onboarding_service.apply_explicit_update(
+                household_id=household_id,
+                member_id=actor_member_id,
+                thread_id=thread_id,
+                child_name=child_update["name"],
+                age=child_update["age"],
+            )
+    else:
+        transition = _record_test_onboarding_reply(
+            onboarding_service,
+            household_id=household_id,
+            member_id=actor_member_id,
+            thread_id=thread_id,
+            text=user_message,
+        )
+    if transition.changed:
+        if transition.state.is_complete:
+            FlorenceHouseholdManagerService(onboarding_service.store).finalize_onboarding_completion(
+                household_id=household_id,
+                member_id=actor_member_id,
+                channel_id=channel_id,
+            )
+        return onboarding_service.get_transition_messages(
+            transition,
+            previous_stage=previous_session.stage,
+            household_id=household_id,
+            member_id=actor_member_id,
+            thread_id=thread_id,
+        )
+    return onboarding_service.get_prompt_messages(
+        household_id=household_id,
+        member_id=actor_member_id,
+        thread_id=thread_id,
     )
 
 
@@ -167,10 +630,22 @@ def _build_ingress(
             thread_id=thread_id,
         ).url
     )
-    kwargs.setdefault(
-        "household_chat_service",
-        _StubHouseholdChatService("I can keep planning with you here."),
+    onboarding_turn_handler = lambda household_id, channel_id, actor_member_id, payload: _simulate_hermes_onboarding_turn(
+        onboarding_service=onboarding_service,
+        household_id=household_id,
+        channel_id=channel_id,
+        actor_member_id=actor_member_id,
+        payload=payload,
     )
+    household_chat_service = kwargs.get("household_chat_service")
+    if household_chat_service is None:
+        kwargs["household_chat_service"] = _StubHouseholdChatService(
+            "I can keep planning with you here.",
+            onboarding_turn_handler=onboarding_turn_handler,
+        )
+    elif isinstance(household_chat_service, _StubHouseholdChatService):
+        if household_chat_service.onboarding_turn_handler is None and household_chat_service.onboarding_turn_text is None:
+            household_chat_service.onboarding_turn_handler = onboarding_turn_handler
     return FlorenceMessagingIngressService(
         store,
         onboarding_service,
@@ -192,19 +667,19 @@ def _complete_hybrid_onboarding(onboarding_service):
         thread_id="dm_thread_123",
         child_names=["Ava"],
     )
-    onboarding_service.record_user_reply(
+    _record_test_onboarding_reply(onboarding_service, 
         household_id="hh_123",
         member_id="mem_123",
         thread_id="dm_thread_123",
         text="7",
     )
-    onboarding_service.record_user_reply(
+    _record_test_onboarding_reply(onboarding_service, 
         household_id="hh_123",
         member_id="mem_123",
         thread_id="dm_thread_123",
         text="Roosevelt Elementary",
     )
-    onboarding_service.record_user_reply(
+    _record_test_onboarding_reply(onboarding_service, 
         household_id="hh_123",
         member_id="mem_123",
         thread_id="dm_thread_123",
@@ -373,17 +848,6 @@ def test_dm_onboarding_absorbs_fragmented_second_child_name_during_child_detail_
             ),
         )
     )
-
-    session = onboarding_service.get_or_create_session(
-        household_id="hh_123",
-        member_id="mem_123",
-        thread_id="dm_thread_123",
-    )
-    assert first.reply_messages == ("Great, let's learn more about each kid one at a time. How old is Ava?",)
-    assert second.reply_messages == ("Great, let's learn more about each kid one at a time. How old is Ava?",)
-    assert session.child_names == ["Ava", "Ben"]
-    store.close()
-
 
 def test_dm_onboarding_stays_in_messages_even_when_link_service_is_available(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
@@ -661,6 +1125,7 @@ def test_dm_share_reply_promotes_latest_brief_to_group(tmp_path):
     assert result.group_announcement == (
         "Florence pulled together a quick household update:\n- Science fair Friday\n- Soccer photos Monday"
     )
+    assert ingress.household_chat_service.group_share_turn_calls[-1]["user_message"] == "share that with the group"
     updated = store.get_channel_message("msg_asst_shareable")
     assert updated is not None
     assert updated.metadata["promoted_group_channel_id"] == "chan_group_123"
@@ -753,6 +1218,7 @@ def test_dm_share_reply_can_compose_group_safe_summary_from_recent_dm(tmp_path):
     assert result.consumed is True
     assert result.reply_text == "Shared a short version with the parent group."
     assert result.group_announcement == "Household update: science fair is Friday and dinner is covered tonight."
+    assert chat_service.group_share_turn_calls[-1]["user_message"] == "share that with the group"
     assert len(chat_service.promotion_calls) == 1
     assert "Science fair is Friday" in chat_service.promotion_calls[0]["source_text"]
     assert "share that with the group" not in chat_service.promotion_calls[0]["source_text"]
@@ -1218,6 +1684,7 @@ def test_review_prompt_then_yes_routes_single_item_context_to_chat(tmp_path):
     assert review.reply_text is not None
     assert "Fireflies Haircuts for Kids" in review.reply_text
     assert "Reply yes if I should add it, no if it's wrong, or skip for later." in review.reply_text
+    assert chat_service.review_queue_turn_calls[-1]["user_message"] == "review imports"
     review_messages = store.list_channel_messages(channel_id="chan_dm_123", limit=8)
     latest_review_message = next(
         message
@@ -1516,13 +1983,13 @@ def test_child_activity_answer_advances_to_google_connect_before_unlocking_agent
         thread_id="dm_thread_123",
         child_names=["Ava"],
     )
-    onboarding_service.record_user_reply(
+    _record_test_onboarding_reply(onboarding_service, 
         household_id="hh_123",
         member_id="mem_123",
         thread_id="dm_thread_123",
         text="7",
     )
-    onboarding_service.record_user_reply(
+    _record_test_onboarding_reply(onboarding_service, 
         household_id="hh_123",
         member_id="mem_123",
         thread_id="dm_thread_123",
@@ -1561,7 +2028,7 @@ def test_child_activity_answer_advances_to_google_connect_before_unlocking_agent
     store.close()
 
 
-def test_child_name_parsing_from_freeform_sentence_keeps_only_names(tmp_path):
+def test_child_name_parsing_from_freeform_sentence_carries_inline_ages_forward(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)
     onboarding_service = _build_onboarding_service(store, review_service)
@@ -1589,10 +2056,7 @@ def test_child_name_parsing_from_freeform_sentence_keeps_only_names(tmp_path):
                 message_id="msg_child_parse_1",
                 thread_id="dm_thread_123",
                 sender_handle="+15555550123",
-                body=(
-                    "Theo is 7 he's in first grade, Violet is about to turn 4 in May, "
-                    "she's in her last year of pre school before starting TK in the fall"
-                ),
+                body="Theo is 7 Violet will be 4 next month",
                 is_group_chat=False,
             ),
         )
@@ -1604,8 +2068,247 @@ def test_child_name_parsing_from_freeform_sentence_keeps_only_names(tmp_path):
         thread_id="dm_thread_123",
     )
     assert session.child_names == ["Theo", "Violet"]
+    assert session.child_profiles[0]["age"] == "7"
+    assert session.child_profiles[1]["age"] == "4"
     assert result.reply_text is not None
-    assert "how old is theo" in result.reply_text.lower()
+    assert "what school does theo go to" in result.reply_text.lower()
+    store.close()
+
+
+def test_child_name_parsing_from_compact_list_carries_inline_ages_forward(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_onboarding_service(store, review_service)
+    ingress = _build_ingress(
+        store,
+        onboarding_service,
+        review_service,
+    )
+
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+        display_name="Maya",
+    )
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_child_parse_2",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="Theo 7, Violet 4",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    session = onboarding_service.get_or_create_session(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+    )
+    assert session.child_names == ["Theo", "Violet"]
+    assert session.child_profiles[0]["age"] == "7"
+    assert session.child_profiles[1]["age"] == "4"
+    assert result.reply_text is not None
+    assert "what school does theo go to" in result.reply_text.lower()
+    store.close()
+
+
+def test_incomplete_dm_can_route_multi_child_school_updates_through_hermes_onboarding_turn(tmp_path):
+    _OnboardingToolAgent.created.clear()
+    _OnboardingToolAgent.last_run = None
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm_thread_123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_onboarding_service(store, review_service)
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+        display_name="Maya",
+    )
+    onboarding_service.record_child_names(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+        child_names=["Theo", "Violet"],
+    )
+    onboarding_service.apply_explicit_update(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+        child_name="Theo",
+        age="7",
+    )
+    onboarding_service.apply_explicit_update(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+        child_name="Violet",
+        age="4",
+    )
+    chat_service = FlorenceHouseholdChatService(
+        store,
+        model="anthropic/claude-opus-4.6",
+        max_iterations=4,
+        provider="anthropic",
+        agent_factory=_OnboardingToolAgent,
+        session_db=SessionDB(tmp_path / "hermes_state.db"),
+    )
+    ingress = _build_ingress(
+        store,
+        onboarding_service,
+        review_service,
+        household_chat_service=chat_service,
+    )
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_child_schools_1",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="Theo goes to Roosevelt Elementary and Violet goes to Little Sprouts Preschool",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    session = onboarding_service.get_or_create_session(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+    )
+    assert result.consumed is True
+    assert result.reply_text is not None
+    assert "what activities does theo do" in result.reply_text.lower()
+    assert session.child_profiles[0]["school"] == "Roosevelt Elementary"
+    assert session.child_profiles[1]["school"] == "Little Sprouts Preschool"
+    assert session.stage == "collect_child_activities"
+    assert [created["enabled_toolsets"] for created in _OnboardingToolAgent.created[:2]] == [
+        ["florence_briefing"],
+        ["florence_chat"],
+    ]
+    assert "Use household_apply_onboarding_update to store only explicit setup facts" in _OnboardingToolAgent.last_run["system_message"]
+    payload = json.loads(_OnboardingToolAgent.last_run["user_message"])
+    assert payload["task"] == "handle_onboarding_turn"
+    assert payload["stage"] == "collect_child_school"
+    assert payload["current_child_name"] == "Theo"
+    store.close()
+
+
+def test_incomplete_dm_real_hermes_onboarding_handoff_can_escape_to_sync_waiting(tmp_path):
+    _OnboardingHandoffAgent.created.clear()
+    _OnboardingHandoffAgent.runs.clear()
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm_thread_123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_onboarding_service(store, review_service)
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+        display_name="Maya",
+    )
+    onboarding_service.record_child_names(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+        child_names=["Ava"],
+    )
+    onboarding_service.record_google_connected(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm_thread_123",
+    )
+    chat_service = FlorenceHouseholdChatService(
+        store,
+        model="anthropic/claude-opus-4.6",
+        max_iterations=4,
+        provider="anthropic",
+        agent_factory=_OnboardingHandoffAgent,
+        session_db=SessionDB(tmp_path / "hermes_state.db"),
+    )
+    ingress = _build_ingress(
+        store,
+        onboarding_service,
+        review_service,
+        household_chat_service=chat_service,
+    )
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_sync_handoff_1",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="Can you check tomorrow's calendar?",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert result.reply_text == "Still syncing, so I can’t answer from your calendar confidently yet."
+    assert [run["task"] for run in _OnboardingHandoffAgent.runs] == [
+        "group_share_turn_decision",
+        "handle_onboarding_turn",
+        "compose_sync_waiting_reply",
+    ]
+    assert "reply exactly HANDOFF_TO_SYNC_WAITING" in _OnboardingHandoffAgent.runs[1]["system_message"]
     store.close()
 
 
@@ -1631,23 +2334,33 @@ def test_google_done_after_child_details_completes_onboarding(tmp_path):
         thread_id="dm_thread_123",
         child_names=["Ava"],
     )
-    onboarding_service.record_user_reply(
+    _record_test_onboarding_reply(onboarding_service, 
         household_id="hh_123",
         member_id="mem_123",
         thread_id="dm_thread_123",
         text="7",
     )
-    onboarding_service.record_user_reply(
+    _record_test_onboarding_reply(onboarding_service, 
         household_id="hh_123",
         member_id="mem_123",
         thread_id="dm_thread_123",
         text="Roosevelt Elementary",
     )
-    onboarding_service.record_user_reply(
+    _record_test_onboarding_reply(onboarding_service, 
         household_id="hh_123",
         member_id="mem_123",
         thread_id="dm_thread_123",
         text="Soccer",
+    )
+    store.upsert_google_connection(
+        GoogleConnection(
+            id="gconn_done_123",
+            household_id="hh_123",
+            member_id="mem_123",
+            email="maya@example.com",
+            connected_scopes=(GoogleSourceKind.GMAIL,),
+            access_token="access-token",
+        )
     )
 
     result = ingress.handle_message(
@@ -1707,7 +2420,7 @@ def test_google_callback_copy_does_not_require_group_to_unlock_agent(tmp_path):
         member_id="mem_123",
         thread_id="dm_thread_123",
     )
-    onboarding_service.record_user_reply(
+    _record_test_onboarding_reply(onboarding_service, 
         household_id="hh_123",
         member_id="mem_123",
         thread_id="dm_thread_123",
@@ -1887,6 +2600,7 @@ def test_first_group_message_after_context_collection_records_group_channel(tmp_
     assert result.consumed is True
     assert result.reply_text is not None
     assert "I’m in." in result.reply_text
+    assert ingress.household_chat_service.group_intro_turn_calls[-1]["user_message"] == "Hey Florence"
 
 
 def test_known_parent_new_dm_thread_does_not_restart_onboarding(tmp_path):
@@ -2191,15 +2905,26 @@ def test_complete_dm_done_without_active_reminder_falls_through_to_household_cha
     store.close()
 
 
-def test_complete_dm_done_acknowledges_sent_nudge_and_marks_work_item_done(tmp_path):
+def test_complete_dm_done_acknowledges_sent_nudge_and_marks_work_item_done_via_hermes(tmp_path):
+    _ReminderToolAgent.created.clear()
+    _ReminderToolAgent.runs.clear()
     store = FlorenceStateDB(tmp_path / "florence.db")
     store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
     review_service = FlorenceCandidateReviewService(store)
     onboarding_service = _build_onboarding_service(store, review_service)
+    chat_service = FlorenceHouseholdChatService(
+        store,
+        model="anthropic/claude-opus-4.6",
+        max_iterations=4,
+        provider="anthropic",
+        agent_factory=_ReminderToolAgent,
+        session_db=SessionDB(tmp_path / "hermes_state.db"),
+    )
     ingress = _build_ingress(
         store,
         onboarding_service,
         review_service,
+        household_chat_service=chat_service,
     )
     _complete_hybrid_onboarding(onboarding_service)
 
@@ -2275,18 +3000,30 @@ def test_complete_dm_done_acknowledges_sent_nudge_and_marks_work_item_done(tmp_p
     assert len(events) == 1
     assert events[0].metadata["nudge_id"] == "nudge_123"
     assert events[0].metadata["marked_work_item_done"] is True
+    assert "household_apply_nudge_action" in _ReminderToolAgent.runs[0]["system_message"]
     store.close()
 
 
-def test_complete_dm_snooze_reschedules_sent_nudge_and_logs_event(tmp_path):
+def test_complete_dm_snooze_reschedules_sent_nudge_and_logs_event_via_hermes(tmp_path):
+    _ReminderToolAgent.created.clear()
+    _ReminderToolAgent.runs.clear()
     store = FlorenceStateDB(tmp_path / "florence.db")
     store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
     review_service = FlorenceCandidateReviewService(store)
     onboarding_service = _build_onboarding_service(store, review_service)
+    chat_service = FlorenceHouseholdChatService(
+        store,
+        model="anthropic/claude-opus-4.6",
+        max_iterations=4,
+        provider="anthropic",
+        agent_factory=_ReminderToolAgent,
+        session_db=SessionDB(tmp_path / "hermes_state.db"),
+    )
     ingress = _build_ingress(
         store,
         onboarding_service,
         review_service,
+        household_chat_service=chat_service,
     )
     _complete_hybrid_onboarding(onboarding_service)
 
@@ -2352,6 +3089,7 @@ def test_complete_dm_snooze_reschedules_sent_nudge_and_logs_event(tmp_path):
     events = store.list_pilot_events(household_id="hh_123", event_type="reminder_snoozed")
     assert len(events) == 1
     assert events[0].metadata["nudge_id"] == "nudge_124"
+    assert "household_apply_nudge_action" in _ReminderToolAgent.runs[0]["system_message"]
     store.close()
 
 

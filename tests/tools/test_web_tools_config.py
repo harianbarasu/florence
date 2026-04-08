@@ -130,7 +130,16 @@ class TestBackendSelection:
     setups.
     """
 
-    _ENV_KEYS = ("PARALLEL_API_KEY", "FIRECRAWL_API_KEY", "FIRECRAWL_API_URL", "TAVILY_API_KEY")
+    _ENV_KEYS = (
+        "PARALLEL_API_KEY",
+        "FIRECRAWL_API_KEY",
+        "FIRECRAWL_API_URL",
+        "TAVILY_API_KEY",
+        "EXA_API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_TOKEN",
+    )
 
     def setup_method(self):
         for key in self._ENV_KEYS:
@@ -180,6 +189,22 @@ class TestBackendSelection:
         with patch("tools.web_tools._load_web_config", return_value={"backend": "Tavily"}):
             assert _get_backend() == "tavily"
 
+    def test_config_openai(self):
+        """web.backend=openai in config → 'openai' regardless of other keys."""
+        from tools.web_tools import _get_backend
+        with patch("tools.web_tools._load_web_config", return_value={"backend": "openai"}), \
+             patch.dict(os.environ, {"FIRECRAWL_API_KEY": "fc-test"}), \
+             patch("tools.web_tools._has_anthropic_web_credentials", return_value=False):
+            assert _get_backend() == "openai"
+
+    def test_config_anthropic(self):
+        """web.backend=anthropic in config → 'anthropic' regardless of OpenAI key."""
+        from tools.web_tools import _get_backend
+        with patch("tools.web_tools._load_web_config", return_value={"backend": "anthropic"}), \
+             patch.dict(os.environ, {"OPENAI_API_KEY": "openai-test"}), \
+             patch("tools.web_tools._has_anthropic_web_credentials", return_value=True):
+            assert _get_backend() == "anthropic"
+
     # ── Fallback (no web.backend in config) ───────────────────────────
 
     def test_fallback_parallel_only_key(self):
@@ -228,7 +253,8 @@ class TestBackendSelection:
     def test_fallback_no_keys_defaults_to_firecrawl(self):
         """No keys, no config → 'firecrawl' (will fail at client init)."""
         from tools.web_tools import _get_backend
-        with patch("tools.web_tools._load_web_config", return_value={}):
+        with patch("tools.web_tools._load_web_config", return_value={}), \
+             patch("tools.web_tools._has_anthropic_web_credentials", return_value=False):
             assert _get_backend() == "firecrawl"
 
     def test_invalid_config_falls_through_to_fallback(self):
@@ -237,6 +263,29 @@ class TestBackendSelection:
         with patch("tools.web_tools._load_web_config", return_value={"backend": "nonexistent"}), \
              patch.dict(os.environ, {"PARALLEL_API_KEY": "test-key"}):
             assert _get_backend() == "parallel"
+
+    def test_fallback_openai_only_key(self):
+        """Only OPENAI_API_KEY set → 'openai'."""
+        from tools.web_tools import _get_backend
+        with patch("tools.web_tools._load_web_config", return_value={}), \
+             patch.dict(os.environ, {"OPENAI_API_KEY": "openai-test"}), \
+             patch("tools.web_tools._has_anthropic_web_credentials", return_value=False):
+            assert _get_backend() == "openai"
+
+    def test_fallback_anthropic_only_credentials(self):
+        """Only Anthropic credentials set → 'anthropic'."""
+        from tools.web_tools import _get_backend
+        with patch("tools.web_tools._load_web_config", return_value={}), \
+             patch("tools.web_tools._has_anthropic_web_credentials", return_value=True):
+            assert _get_backend() == "anthropic"
+
+    def test_fallback_exa_with_openai_prefers_exa(self):
+        """Dedicated web providers should beat OpenAI fallback in legacy mode."""
+        from tools.web_tools import _get_backend
+        with patch("tools.web_tools._load_web_config", return_value={}), \
+             patch.dict(os.environ, {"EXA_API_KEY": "exa-test", "OPENAI_API_KEY": "openai-test"}), \
+             patch("tools.web_tools._has_anthropic_web_credentials", return_value=False):
+            assert _get_backend() == "exa"
 
 
 class TestParallelClientConfig:
@@ -256,30 +305,42 @@ class TestParallelClientConfig:
         """PARALLEL_API_KEY set → creates Parallel client."""
         with patch.dict(os.environ, {"PARALLEL_API_KEY": "test-key"}):
             from tools.web_tools import _get_parallel_client
-            from parallel import Parallel
-            client = _get_parallel_client()
-            assert client is not None
-            assert isinstance(client, Parallel)
+            fake_parallel_cls = type("Parallel", (), {})
+            fake_parallel_instance = fake_parallel_cls()
+            with patch.dict("sys.modules", {"parallel": MagicMock(Parallel=MagicMock(return_value=fake_parallel_instance))}):
+                client = _get_parallel_client()
+            assert client is fake_parallel_instance
 
     def test_no_key_raises_with_helpful_message(self):
         """No PARALLEL_API_KEY → ValueError with guidance."""
         from tools.web_tools import _get_parallel_client
-        with pytest.raises(ValueError, match="PARALLEL_API_KEY"):
-            _get_parallel_client()
+        with patch.dict("sys.modules", {"parallel": MagicMock(Parallel=MagicMock())}):
+            with pytest.raises(ValueError, match="PARALLEL_API_KEY"):
+                _get_parallel_client()
 
     def test_singleton_returns_same_instance(self):
         """Second call returns cached client."""
         with patch.dict(os.environ, {"PARALLEL_API_KEY": "test-key"}):
             from tools.web_tools import _get_parallel_client
-            client1 = _get_parallel_client()
-            client2 = _get_parallel_client()
+            fake_parallel_instance = object()
+            with patch.dict("sys.modules", {"parallel": MagicMock(Parallel=MagicMock(return_value=fake_parallel_instance))}):
+                client1 = _get_parallel_client()
+                client2 = _get_parallel_client()
             assert client1 is client2
 
 
 class TestCheckWebApiKey:
     """Test suite for check_web_api_key() unified availability check."""
 
-    _ENV_KEYS = ("PARALLEL_API_KEY", "FIRECRAWL_API_KEY", "FIRECRAWL_API_URL", "TAVILY_API_KEY")
+    _ENV_KEYS = (
+        "PARALLEL_API_KEY",
+        "FIRECRAWL_API_KEY",
+        "FIRECRAWL_API_URL",
+        "TAVILY_API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_TOKEN",
+    )
 
     def setup_method(self):
         for key in self._ENV_KEYS:
@@ -309,9 +370,21 @@ class TestCheckWebApiKey:
             from tools.web_tools import check_web_api_key
             assert check_web_api_key() is True
 
+    def test_openai_key_only(self):
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "openai-test"}), \
+             patch("tools.web_tools._has_anthropic_web_credentials", return_value=False):
+            from tools.web_tools import check_web_api_key
+            assert check_web_api_key() is True
+
+    def test_anthropic_credentials_only(self):
+        with patch("tools.web_tools._has_anthropic_web_credentials", return_value=True):
+            from tools.web_tools import check_web_api_key
+            assert check_web_api_key() is True
+
     def test_no_keys_returns_false(self):
-        from tools.web_tools import check_web_api_key
-        assert check_web_api_key() is False
+        with patch("tools.web_tools._has_anthropic_web_credentials", return_value=False):
+            from tools.web_tools import check_web_api_key
+            assert check_web_api_key() is False
 
     def test_both_keys_returns_true(self):
         with patch.dict(os.environ, {

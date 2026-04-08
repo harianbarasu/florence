@@ -361,8 +361,8 @@ class FlorenceHouseholdCalendarProjectionService:
 
     def _ensure_fresh_access_token(self, connection: GoogleConnection) -> GoogleConnection:
         expiry = _parse_iso_datetime(connection.access_token_expires_at)
-        refresh_needed = connection.access_token is None or (
-            expiry is not None and expiry <= datetime.now(timezone.utc) + timedelta(minutes=5)
+        refresh_needed = connection.access_token is None or expiry is None or (
+            expiry <= datetime.now(timezone.utc) + timedelta(minutes=5)
         )
         if not refresh_needed:
             return connection

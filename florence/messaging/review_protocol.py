@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 
 from florence.messaging.channel_log import FlorenceChannelLog
 from florence.messaging.protocol_types import (
@@ -13,25 +12,9 @@ from florence.messaging.protocol_types import (
     build_candidate_review_prompt_metadata,
     FlorenceProtocolReply,
 )
+from florence.runtime.chat import _REVIEW_SHOW_PROMPT_SENTINEL
 
 logger = logging.getLogger(__name__)
-
-
-def _looks_like_review_queue_request(text: str) -> bool:
-    normalized = " ".join(text.split()).strip()
-    if not normalized:
-        return False
-    return bool(
-        re.search(
-            r"\b(?:review\s+(?:imports?|queue|candidates?)|pending\s+(?:imports?|candidates?)|show\s+(?:imports?|queue|candidates?)|check\s+(?:imports?|queue|candidates?)|anything\s+to\s+review|what(?:'s| is)\s+(?:pending|in\s+the\s+review\s+queue))\b",
-            normalized,
-            re.IGNORECASE,
-        )
-    )
-
-
-def _looks_like_candidate_review_prompt(text: str, *, confirmation_suffix: str) -> bool:
-    return confirmation_suffix in text.strip()
 
 
 class FlorenceCandidateReviewProtocol:
@@ -92,7 +75,28 @@ class FlorenceCandidateReviewProtocol:
             actor_member_id=member_id,
             prompt=prompt,
         )
-        if _looks_like_review_queue_request(text):
+        prompt_armed = self._is_candidate_review_reply_armed(
+            channel_id=channel_id,
+            review_prompt_text=prompt_text,
+        )
+        decision = self.household_chat_service.compose_operator_message(
+            household_id=household_id,
+            channel_id=channel_id,
+            actor_member_id=member_id,
+            kind="review_queue_turn",
+            payload={
+                "user_message": text,
+                "prompt_armed": prompt_armed,
+                "rendered_prompt_text": prompt_text,
+                "candidate": {
+                    "id": getattr(prompt.candidate, "id", ""),
+                    "title": getattr(prompt.candidate, "title", ""),
+                    "summary": getattr(prompt.candidate, "summary", ""),
+                    "confirmation_question": (getattr(prompt.candidate, "metadata", {}) or {}).get("confirmation_question"),
+                },
+            },
+        )
+        if decision == _REVIEW_SHOW_PROMPT_SENTINEL:
             return FlorenceProtocolReply(
                 reply_text=prompt_text,
                 reply_metadata=build_candidate_review_prompt_metadata(prompt.candidate.id),
@@ -189,7 +193,7 @@ class FlorenceCandidateReviewProtocol:
             return True
         if latest_body == review_prompt_text.strip():
             return True
-        return _looks_like_candidate_review_prompt(latest_body, confirmation_suffix=self.confirmation_suffix)
+        return self.confirmation_suffix in latest_body
 
     def active_candidate_id(self, *, channel_id: str) -> str | None:
         latest_assistant = self.channel_log.latest_assistant_message(channel_id=channel_id, limit=8)

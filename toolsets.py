@@ -72,12 +72,13 @@ _FLORENCE_HOUSEHOLD_TOOLS = [
     "browser_navigate", "browser_snapshot", "browser_click",
     "browser_type", "browser_scroll", "browser_back",
     "browser_press", "browser_close", "browser_get_images",
-    "browser_vision",
+    "browser_vision", "browser_console",
     # Media + lightweight planning support
     "vision_analyze", "image_generate", "text_to_speech",
     # Household operations
     "todo", "session_search", "clarify",
-    "schedule_cronjob", "list_cronjobs", "remove_cronjob",
+    "cronjob",
+    "delegate_task",
     "send_message",
     "honcho_context", "honcho_profile", "honcho_search", "honcho_conclude",
     "household_search_state",

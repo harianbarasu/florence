@@ -9,6 +9,8 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import Any
 
+import httpx
+
 from florence.contracts import CandidateState, GoogleConnection, GoogleSourceKind
 from florence.google import (
     GoogleCalendarMetadata,
@@ -46,6 +48,10 @@ from florence.state import FlorenceStateDB
 
 
 logger = logging.getLogger(__name__)
+
+
+def _is_google_auth_error(exc: Exception) -> bool:
+    return isinstance(exc, httpx.HTTPStatusError) and exc.response is not None and exc.response.status_code == 401
 
 
 def _int_env(name: str, default: int, *, minimum: int = 1) -> int:
@@ -481,11 +487,21 @@ class FlorenceGoogleSyncWorkerService:
             else (_gmail_incremental_max_results() if bootstrap_complete else _gmail_bootstrap_max_results())
         )
 
-        gmail_items = list_recent_gmail_sync_items(
-            access_token=access_token,
-            max_results=resolved_max_gmail_results,
-            gmail_query=gmail_query,
+        gmail_items, hydrated_connection = self._run_google_fetch_with_refresh_retry(
+            hydrated_connection,
+            now=now,
+            client_id=client_id,
+            client_secret=client_secret,
+            operation="gmail sync",
+            fetch=lambda refreshed_access_token: list_recent_gmail_sync_items(
+                access_token=refreshed_access_token,
+                max_results=resolved_max_gmail_results,
+                gmail_query=gmail_query,
+            ),
         )
+        access_token = hydrated_connection.access_token
+        if not access_token:
+            raise ValueError("google_access_token_missing")
         logger.info(
             "Florence Google sync fetched Gmail items connection_id=%s count=%s query=%s",
             connection_id,
@@ -517,15 +533,23 @@ class FlorenceGoogleSyncWorkerService:
             )
         )
         for target in _calendar_sync_targets(hydrated_connection.metadata):
-            fetched_items = list_recent_parent_calendar_sync_items(
-                access_token=access_token,
-                calendar=target.calendar,
-                family_member_names=family_member_names,
-                max_results=resolved_max_calendar_results,
-                past_window_days=calendar_past_window_days,
-                future_window_days=calendar_future_window_days,
+            fetched_items, hydrated_connection = self._run_google_fetch_with_refresh_retry(
+                hydrated_connection,
                 now=now,
+                client_id=client_id,
+                client_secret=client_secret,
+                operation=f"calendar sync ({target.calendar.id})",
+                fetch=lambda refreshed_access_token, target=target: list_recent_parent_calendar_sync_items(
+                    access_token=refreshed_access_token,
+                    calendar=target.calendar,
+                    family_member_names=family_member_names,
+                    max_results=resolved_max_calendar_results,
+                    past_window_days=calendar_past_window_days,
+                    future_window_days=calendar_future_window_days,
+                    now=now,
+                ),
             )
+            access_token = hydrated_connection.access_token or access_token
             fetched_calendar_item_count += len(fetched_items)
             for item in fetched_items:
                 calendar_items.append(
@@ -612,11 +636,12 @@ class FlorenceGoogleSyncWorkerService:
         now: datetime | None,
         client_id: str | None,
         client_secret: str | None,
+        force: bool = False,
     ) -> GoogleConnection:
         current = connection
         expiry = _parse_iso_datetime(connection.access_token_expires_at)
-        refresh_needed = connection.access_token is None or (
-            expiry is not None and expiry <= (now or _utc_now()) + timedelta(minutes=5)
+        refresh_needed = force or connection.access_token is None or expiry is None or (
+            expiry <= (now or _utc_now()) + timedelta(minutes=5)
         )
         if not refresh_needed:
             return current
@@ -636,3 +661,38 @@ class FlorenceGoogleSyncWorkerService:
         )
         self.store.upsert_google_connection(current)
         return current
+
+    def _run_google_fetch_with_refresh_retry(
+        self,
+        connection: GoogleConnection,
+        *,
+        now: datetime | None,
+        client_id: str | None,
+        client_secret: str | None,
+        operation: str,
+        fetch,
+    ) -> tuple[Any, GoogleConnection]:
+        access_token = connection.access_token
+        if not access_token:
+            raise ValueError("google_access_token_missing")
+        try:
+            return fetch(access_token), connection
+        except Exception as exc:
+            if not _is_google_auth_error(exc):
+                raise
+            refreshed = self._ensure_fresh_access_token(
+                connection,
+                now=now,
+                client_id=client_id,
+                client_secret=client_secret,
+                force=True,
+            )
+            refreshed_access_token = refreshed.access_token
+            if refreshed is connection or not refreshed_access_token:
+                raise
+            logger.warning(
+                "Florence Google sync received 401 during %s for connection_id=%s; refreshed token and retrying once",
+                operation,
+                connection.id,
+            )
+            return fetch(refreshed_access_token), refreshed

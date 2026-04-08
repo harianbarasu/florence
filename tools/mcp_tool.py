@@ -1428,15 +1428,20 @@ def _convert_mcp_schema(server_name: str, mcp_tool) -> dict:
     }
 
 
+def _should_inject_default_mcp_tools(toolset_name: str) -> bool:
+    """Return True when discovered MCP tools should be injected into *toolset_name*."""
+    return toolset_name.startswith("hermes-") or toolset_name == "florence_chat"
+
+
 def _sync_mcp_toolsets(server_names: Optional[List[str]] = None) -> None:
-    """Expose each MCP server as a standalone toolset and inject into hermes-* sets.
+    """Expose each MCP server as a standalone toolset and inject into default sets.
 
     Creates a real toolset entry in TOOLSETS for each server name (e.g.
     TOOLSETS["github"] = {"tools": ["mcp_github_list_files", ...]}). This
     makes raw server names resolvable in platform_toolsets overrides.
 
-    Also injects all MCP tools into hermes-* umbrella toolsets for the
-    default behavior.
+    Also injects all MCP tools into hermes-* umbrella toolsets and the
+    Florence household chat toolset for the default behavior.
 
     Skips server names that collide with built-in toolsets.
     """
@@ -1470,9 +1475,9 @@ def _sync_mcp_toolsets(server_names: Optional[List[str]] = None) -> None:
             "includes": [],
         }
 
-    # Also inject into hermes-* umbrella toolsets for default behavior.
+    # Also inject into default umbrella toolsets for default behavior.
     for ts_name, ts in TOOLSETS.items():
-        if not ts_name.startswith("hermes-"):
+        if not _should_inject_default_mcp_tools(ts_name):
             continue
         for tool_name in all_mcp_tools:
             if tool_name not in ts["tools"]:
@@ -1632,7 +1637,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
     """Register tools from an already-connected server into the registry.
 
     Handles include/exclude filtering, utility tools, toolset creation,
-    and hermes-* umbrella toolset injection.
+    and default toolset injection.
 
     Used by both initial discovery and dynamic refresh (list_changed).
 
@@ -1733,12 +1738,13 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             description=f"MCP tools from {name} server",
             tools=registered_names,
         )
-        # Inject into hermes-* umbrella toolsets for default behavior
+        # Inject into default umbrella toolsets for default behavior.
         for ts_name, ts in TOOLSETS.items():
-            if ts_name.startswith("hermes-"):
-                for tool_name in registered_names:
-                    if tool_name not in ts["tools"]:
-                        ts["tools"].append(tool_name)
+            if not _should_inject_default_mcp_tools(ts_name):
+                continue
+            for tool_name in registered_names:
+                if tool_name not in ts["tools"]:
+                    ts["tools"].append(tool_name)
 
     return registered_names
 

@@ -45,6 +45,7 @@ class FlorenceHouseholdToolContext:
     household_id: str
     actor_member_id: str | None
     channel_id: str
+    household_chat_service: Any | None = None
 
 
 _context_lock = threading.Lock()
@@ -58,6 +59,7 @@ def set_household_tool_context(
     household_id: str,
     actor_member_id: str | None,
     channel_id: str,
+    household_chat_service: Any | None = None,
 ) -> None:
     with _context_lock:
         _tool_contexts[task_id] = FlorenceHouseholdToolContext(
@@ -65,6 +67,7 @@ def set_household_tool_context(
             household_id=household_id,
             actor_member_id=actor_member_id,
             channel_id=channel_id,
+            household_chat_service=household_chat_service,
         )
 
 
@@ -453,7 +456,7 @@ APPLY_ONBOARDING_UPDATE_SCHEMA = {
     "name": "household_apply_onboarding_update",
     "description": (
         "Store explicit onboarding facts for the current incomplete parent DM. Use this only for concrete setup facts "
-        "the user actually provided, such as parent name, child names, one child's age/school/activities, or that Google is connected."
+        "the user actually provided, such as parent name, child names, one or more children's age/school/activities, or that Google is connected."
     ),
     "parameters": {
         "type": "object",
@@ -471,6 +474,24 @@ APPLY_ONBOARDING_UPDATE_SCHEMA = {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": "Activity labels for the named or current child.",
+            },
+            "child_updates": {
+                "type": "array",
+                "description": "Optional batch of explicit child detail updates when the user provides multiple kids' facts in one message.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Child name for this explicit update."},
+                        "age": {"type": "string", "description": "Age detail for this child."},
+                        "school": {"type": "string", "description": "School detail for this child."},
+                        "activities": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Activity labels for this child.",
+                        },
+                    },
+                    "required": ["name"],
+                },
             },
             "google_connected": {
                 "type": "boolean",
@@ -1145,6 +1166,28 @@ def _handle_apply_onboarding_update(args: dict, *, task_id: str | None = None, *
         or None,
         google_connected=bool(args.get("google_connected")) if "google_connected" in args else None,
     )
+    raw_child_updates = args.get("child_updates")
+    if isinstance(raw_child_updates, list):
+        for raw_update in raw_child_updates:
+            if not isinstance(raw_update, dict):
+                continue
+            transition = service.apply_explicit_update(
+                household_id=context.household_id,
+                member_id=context.actor_member_id,
+                thread_id=channel.provider_channel_id,
+                child_name=_normalize_optional_text(raw_update.get("name")),
+                age=_normalize_optional_text(raw_update.get("age")),
+                school=_normalize_optional_text(raw_update.get("school")),
+                activities=[
+                    item
+                    for item in (
+                        _normalize_optional_text(item)
+                        for item in (raw_update.get("activities") if isinstance(raw_update.get("activities"), list) else [])
+                    )
+                    if item
+                ]
+                or None,
+            )
     if transition.state.is_complete:
         manager = FlorenceHouseholdManagerService(context.store)
         existing = context.store.list_pilot_events(
@@ -1504,7 +1547,14 @@ def _handle_upsert_shopping_item(args: dict, *, task_id: str | None = None, **_:
 
 def _handle_record_preference(args: dict, *, task_id: str | None = None, **_: Any) -> str:
     context = _require_context(task_id)
-    manager = FlorenceHouseholdManagerService(context.store)
+    manager = FlorenceHouseholdManagerService(
+        context.store,
+        household_chat_service_getter=(
+            (lambda: context.household_chat_service)
+            if context.household_chat_service is not None
+            else None
+        ),
+    )
     label = _normalize_text(args.get("label"))
     value = _normalize_text(args.get("value"))
     if not label:
@@ -1532,9 +1582,18 @@ def _handle_record_preference(args: dict, *, task_id: str | None = None, **_: An
         channel_id=context.channel_id,
         metadata=_normalize_metadata(args.get("metadata")),
     )
+    category = str(preference_item.metadata.get("category") or "").strip().lower()
+    refreshed_routines: list[dict[str, Any]] = []
+    if category in {"operating_rule", "operating_preference"}:
+        refreshed_routines = [
+            _serialize_routine(routine)
+            for routine in manager.ensure_briefing_routines(household_id=context.household_id)
+        ]
     return json.dumps(
         {
             "result": _serialize_profile_item(preference_item),
+            "briefing_routines_refreshed": bool(refreshed_routines),
+            "briefing_routines": refreshed_routines,
         }
     )
 

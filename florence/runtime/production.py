@@ -81,6 +81,11 @@ class FlorenceProductionService:
             briefing_style=settings.briefing.style,
             briefing_emoji_mode=settings.briefing.emoji_mode,
         )
+        self._household_chat_service = household_chat_service
+        self.household_manager_service = FlorenceHouseholdManagerService(
+            self.store,
+            household_chat_service_getter=lambda: self.household_chat_service,
+        )
         self.household_calendar_projection_service = FlorenceHouseholdCalendarProjectionService(
             self.store,
             client_id=settings.google.client_id,
@@ -89,17 +94,16 @@ class FlorenceProductionService:
         self.entrypoints = FlorenceEntrypointService(
             self.store,
             google_oauth=(settings.google if settings.google.configured else None),
-            household_chat_service=household_chat_service,
+            household_chat_service=self.household_chat_service,
+            household_manager_service=self.household_manager_service,
             household_merge_service=FlorenceHouseholdMergeService(
                 self.store,
                 household_calendar_projection_service=self.household_calendar_projection_service,
             ),
         )
-        self._household_chat_service = household_chat_service
         self.linq = FlorenceLinqClient(settings.linq)
         self.sendblue = FlorenceSendblueClient(settings.sendblue)
         self.candidate_review_service = FlorenceCandidateReviewService(self.store)
-        self.household_manager_service = FlorenceHouseholdManagerService(self.store)
         self.delivery_service = FlorenceChannelDeliveryService(
             self.store,
             linq_client_getter=lambda: self.linq,
@@ -132,6 +136,7 @@ class FlorenceProductionService:
         self._household_chat_service = value
         self.entrypoints.household_chat_service = value
         self.entrypoints.ingress.household_chat_service = value
+        self.entrypoints.ingress.chat_bridge.household_chat_service = value
 
     def close(self) -> None:
         self.store.close()
@@ -414,6 +419,7 @@ class FlorenceProductionService:
     ) -> None:
         store = FlorenceStateDB(self.settings.server.database_url or self.settings.server.db_path)
         try:
+            previous_connection = store.get_google_connection(connection_id)
             sync_worker = FlorenceGoogleSyncWorkerService(
                 store,
                 FlorenceGoogleSyncPersistenceService(store),
@@ -434,12 +440,20 @@ class FlorenceProductionService:
 
             freshest_connection = store.get_google_connection(result.connection.id) or result.connection
             if notify_when_finished:
-                self.household_operations.deliver_sync_activation_brief(
+                sent_activation = self.household_operations.deliver_sync_activation_brief(
                     connection=freshest_connection,
                     candidates=list(result.sync_result.candidates),
                     fallback_channel=channel,
                     store=store,
                 )
+                if not sent_activation:
+                    self.household_operations.deliver_sync_update_brief(
+                        connection=freshest_connection,
+                        previous_connection=previous_connection,
+                        candidates=list(result.sync_result.candidates),
+                        fallback_channel=channel,
+                        store=store,
+                    )
             self._nudge_for_new_pending_candidates(
                 household_id=result.connection.household_id,
                 member_id=result.connection.member_id,
@@ -517,12 +531,18 @@ class FlorenceProductionService:
             "connections": 0,
             "candidates": 0,
             "review_nudges": 0,
+            "review_sweeps": 0,
+            "sync_update_briefs": 0,
             "nudges_sent": 0,
             "briefings_sent": 0,
             "nudges": 0,
         }
         for household in households:
             self.household_manager_service.ensure_briefing_routines(household_id=household.id)
+            previous_connections = {
+                connection.id: connection
+                for connection in self.store.list_google_connections(household_id=household.id)
+            }
             results = self.sync_worker.sync_household(
                 household_id=household.id,
                 client_id=self.settings.google.client_id,
@@ -540,6 +560,10 @@ class FlorenceProductionService:
                     counters["review_nudges"] += 1
                     counters["nudges"] += 1
                     household_touched = True
+            sent_review_sweeps = self.household_operations.dispatch_due_review_sweeps(household_id=household.id)
+            counters["review_sweeps"] += sent_review_sweeps
+            if sent_review_sweeps:
+                household_touched = True
             sent_nudges = self.household_operations.dispatch_due_household_nudges(household_id=household.id)
             counters["nudges_sent"] += sent_nudges
             counters["nudges"] += sent_nudges
@@ -548,6 +572,14 @@ class FlorenceProductionService:
             sent_briefings = self.household_operations.dispatch_due_household_briefings(household_id=household.id)
             counters["briefings_sent"] += sent_briefings
             if sent_briefings:
+                household_touched = True
+            sent_sync_update_briefs = self.household_operations.dispatch_due_sync_update_briefs(
+                household_id=household.id,
+                sync_results=results,
+                previous_connections=previous_connections,
+            )
+            counters["sync_update_briefs"] += sent_sync_update_briefs
+            if sent_sync_update_briefs:
                 household_touched = True
             if household_touched:
                 counters["households"] += 1

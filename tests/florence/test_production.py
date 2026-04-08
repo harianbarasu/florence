@@ -22,6 +22,8 @@ from florence.contracts import (
     GoogleSourceKind,
     Household,
     HouseholdEvent,
+    HouseholdProfileItem,
+    HouseholdProfileKind,
     HouseholdRoutine,
     HouseholdRoutineStatus,
     ImportedCandidate,
@@ -31,6 +33,7 @@ from florence.contracts import (
 from florence.google import GoogleCalendarMetadata, GoogleTokenResponse
 from florence.onboarding import build_onboarding_ready_syncing_message_sequence
 from florence.runtime import FlorenceEntrypointResult, FlorenceProductionService
+from florence.runtime import FlorenceHouseholdManagerService
 from florence.state import FlorenceStateDB
 
 
@@ -51,6 +54,22 @@ class _FakeBriefingChatService:
         self.sync_waiting_text = (
             "Google is connected. I’m pulling in the first pass in the background and I’ll text you here when it’s ready."
         )
+
+    def compose_briefing_routine_plan(self, *, household_id, channel_id, actor_member_id, operating_preferences=None):
+        self.calls.append(
+            {
+                "household_id": household_id,
+                "channel_id": channel_id,
+                "actor_member_id": actor_member_id,
+                "kind": "briefing_routine_plan",
+                "operating_preferences": list(operating_preferences or []),
+            }
+        )
+        return [
+            {"kind": "morning", "enabled": True, "hour": 6, "minute": 45, "days": [0, 1, 2, 3, 4]},
+            {"kind": "evening", "enabled": True, "hour": 20, "minute": 15, "days": [0, 1, 2, 3, 4]},
+            {"kind": "weekly", "enabled": True, "hour": 17, "minute": 30, "days": [6]},
+        ]
 
     def compose_brief(self, *, household_id, channel_id, actor_member_id, brief_kind):
         self.calls.append(
@@ -87,11 +106,155 @@ class _FakeBriefingChatService:
         )
         if kind == "activation_brief":
             return "A few things look important from your recent email and calendar, including Science fair reminder. I can dig into any of them if you want."
+        if kind == "sync_update_brief":
+            current_sync = dict(payload.get("current_sync") or {})
+            candidates = current_sync.get("candidates") if isinstance(current_sync.get("candidates"), list) else []
+            headline = "another household update"
+            if candidates:
+                headline = str(candidates[0].get("title") or headline).strip() or headline
+            return f"I finished another sync pass and {headline} looks like the main thing to double-check. Ask what changed if you want the short version."
         if kind == "group_promotion":
             return "Household update: Science fair reminder looks important from recent email and calendar."
         if kind == "review_prompt":
             return "This looks like a household item to double-check. Reply yes if I should add it, no if it's wrong, or skip for later."
         return self.sync_waiting_text
+
+
+def _simulate_test_onboarding_turn(
+    onboarding_service,
+    *,
+    household_id,
+    channel_id,
+    actor_member_id,
+    payload=None,
+):
+    if actor_member_id is None:
+        return None
+    payload = dict(payload or {})
+    thread_id = str(payload.get("thread_id") or "").strip()
+    channel = onboarding_service.store.get_channel(channel_id)
+    if not thread_id and channel is not None and channel.provider_channel_id:
+        thread_id = channel.provider_channel_id
+    if not thread_id:
+        return None
+    previous_session = onboarding_service.get_or_create_session(
+        household_id=household_id,
+        member_id=actor_member_id,
+        thread_id=thread_id,
+    )
+    user_message = str(payload.get("user_message") or "").strip()
+    stage = str(payload.get("stage") or previous_session.stage.value)
+
+    if stage == "collect_parent_name" and user_message:
+        transition = onboarding_service.record_parent_name(
+            household_id=household_id,
+            member_id=actor_member_id,
+            thread_id=thread_id,
+            display_name=user_message,
+        )
+    elif stage == "collect_child_names" and user_message:
+        child_names = [
+            part.strip(" .,!?:;")
+            for part in user_message.replace("\n", ",").split(",")
+            if part.strip(" .,!?:;")
+        ]
+        if not child_names:
+            return onboarding_service.get_prompt_messages(
+                household_id=household_id,
+                member_id=actor_member_id,
+                thread_id=thread_id,
+            )
+        transition = onboarding_service.record_child_names(
+            household_id=household_id,
+            member_id=actor_member_id,
+            thread_id=thread_id,
+            child_names=child_names,
+        )
+    elif stage == "collect_child_age" and user_message:
+        transition = onboarding_service.apply_explicit_update(
+            household_id=household_id,
+            member_id=actor_member_id,
+            thread_id=thread_id,
+            age=user_message,
+        )
+    elif stage == "collect_child_school" and user_message:
+        transition = onboarding_service.apply_explicit_update(
+            household_id=household_id,
+            member_id=actor_member_id,
+            thread_id=thread_id,
+            school=user_message,
+        )
+    elif stage == "collect_child_activities":
+        transition = onboarding_service.apply_explicit_update(
+            household_id=household_id,
+            member_id=actor_member_id,
+            thread_id=thread_id,
+            activities=[] if user_message.lower().startswith("none") else ([user_message] if user_message else []),
+        )
+    else:
+        return onboarding_service.get_prompt_messages(
+            household_id=household_id,
+            member_id=actor_member_id,
+            thread_id=thread_id,
+        )
+
+    if transition.state.is_complete:
+        FlorenceHouseholdManagerService(onboarding_service.store).finalize_onboarding_completion(
+            household_id=household_id,
+            member_id=actor_member_id,
+            channel_id=channel_id,
+        )
+    return onboarding_service.get_transition_messages(
+        transition,
+        previous_stage=previous_session.stage,
+        household_id=household_id,
+        member_id=actor_member_id,
+        thread_id=thread_id,
+    )
+
+
+class _OnboardingSequenceChatService:
+    def __init__(self, reply_text: str = "I can keep planning with you here."):
+        self.reply_text = reply_text
+        self.onboarding_service = None
+
+    def bind_onboarding_service(self, onboarding_service) -> None:
+        self.onboarding_service = onboarding_service
+
+    def respond(self, **_kwargs):
+        return SimpleNamespace(text=self.reply_text)
+
+    def compose_onboarding_turn(
+        self,
+        *,
+        household_id,
+        channel_id,
+        actor_member_id,
+        payload=None,
+        conversation_history=None,
+    ):
+        _ = conversation_history
+        if self.onboarding_service is None or actor_member_id is None:
+            return None
+        return _simulate_test_onboarding_turn(
+            self.onboarding_service,
+            household_id=household_id,
+            channel_id=channel_id,
+            actor_member_id=actor_member_id,
+            payload=payload,
+        )
+
+    def compose_operator_message(self, *, household_id, channel_id, actor_member_id, kind, payload=None, conversation_history=None):
+        if kind == "onboarding_turn":
+            messages = self.compose_onboarding_turn(
+                household_id=household_id,
+                channel_id=channel_id,
+                actor_member_id=actor_member_id,
+                payload=payload,
+                conversation_history=conversation_history,
+            )
+            return messages[0] if messages else None
+        return self.reply_text
 
 
 def _build_settings(tmp_path):
@@ -122,23 +285,23 @@ def _build_settings(tmp_path):
 
 
 def _complete_child_profile(onboarding_service, *, household_id: str, member_id: str, thread_id: str, age: str = "7", school: str = "Roosevelt Elementary", activities: str = "Soccer"):
-    onboarding_service.record_user_reply(
+    onboarding_service.apply_explicit_update(
         household_id=household_id,
         member_id=member_id,
         thread_id=thread_id,
-        text=age,
+        age=age,
     )
-    onboarding_service.record_user_reply(
+    onboarding_service.apply_explicit_update(
         household_id=household_id,
         member_id=member_id,
         thread_id=thread_id,
-        text=school,
+        school=school,
     )
-    onboarding_service.record_user_reply(
+    onboarding_service.apply_explicit_update(
         household_id=household_id,
         member_id=member_id,
         thread_id=thread_id,
-        text=activities,
+        activities=[] if activities.lower().startswith("none") else [activities],
     )
 
 
@@ -864,6 +1027,7 @@ def test_process_google_sync_job_prefers_household_group_for_activation_brief(tm
     assert updated_connection is not None
     assert updated_connection.metadata["initial_sync_activation_brief_sent_at"]
     assert updated_connection.metadata["initial_sync_activation_brief_channel_id"] == "chan_group_123"
+    assert updated_connection.metadata["last_sync_brief_kind"] == "activation"
     assert service.household_chat_service.calls[0]["channel_id"] == "chan_group_123"
     store.close()
 
@@ -944,11 +1108,148 @@ def test_production_service_process_google_sync_job_does_not_repeat_activation_b
     store.close()
 
 
+def test_production_service_process_google_sync_job_sends_sync_update_brief_after_activation(tmp_path, monkeypatch):
+    settings = _build_settings(tmp_path)
+    store = FlorenceStateDB(settings.server.db_path)
+    service = FlorenceProductionService(settings, store=store)
+    service.linq = _FakeLinqClient()
+    service.household_chat_service = _FakeBriefingChatService()
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(Member(id="mem_123", household_id="hh_123", display_name="Maya", role=MemberRole.ADMIN))
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    initial_connection = store.upsert_google_connection(
+        GoogleConnection(
+            id="gconn_123",
+            household_id="hh_123",
+            member_id="mem_123",
+            email="parent@example.com",
+            connected_scopes=(GoogleSourceKind.GMAIL, GoogleSourceKind.GOOGLE_CALENDAR),
+            access_token="access-token",
+            metadata={
+                "last_gmail_item_count": 9,
+                "last_calendar_item_count": 3,
+                "last_candidate_count": 1,
+                "primary_calendar_id": "primary",
+                "primary_calendar_summary": "Family",
+                "primary_calendar_timezone": "America/Los_Angeles",
+            },
+        )
+    )
+    first_candidate = ImportedCandidate(
+        id="cand_123",
+        household_id="hh_123",
+        member_id="mem_123",
+        source_kind=GoogleSourceKind.GMAIL,
+        source_identifier="gmail:gmail_123",
+        title="Science fair reminder",
+        summary="Science fair is Friday.",
+        state=CandidateState.PENDING_REVIEW,
+    )
+    second_candidate = ImportedCandidate(
+        id="cand_456",
+        household_id="hh_123",
+        member_id="mem_123",
+        source_kind=GoogleSourceKind.GOOGLE_CALENDAR,
+        source_identifier="google_calendar:event_456",
+        title="Dentist appointment moved",
+        summary="Pickup timing may need a tweak.",
+        state=CandidateState.PENDING_REVIEW,
+    )
+    sync_results = [
+        (
+            {
+                "last_gmail_item_count": 9,
+                "last_calendar_item_count": 3,
+                "last_candidate_count": 1,
+            },
+            [first_candidate],
+        ),
+        (
+            {
+                "last_gmail_item_count": 2,
+                "last_calendar_item_count": 1,
+                "last_candidate_count": 1,
+            },
+            [second_candidate],
+        ),
+    ]
+
+    call_index = {"value": 0}
+
+    class _FakeSyncWorkerService:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def sync_connection(self, connection_id, **_kwargs):
+            assert connection_id == "gconn_123"
+            metadata_update, candidates = sync_results[call_index["value"]]
+            call_index["value"] += 1
+            current = store.get_google_connection(connection_id) or initial_connection
+            updated = store.upsert_google_connection(
+                replace(
+                    current,
+                    metadata={
+                        **dict(current.metadata),
+                        **metadata_update,
+                    },
+                )
+            )
+            return SimpleNamespace(
+                connection=updated,
+                sync_result=SimpleNamespace(candidates=candidates),
+            )
+
+    monkeypatch.setattr("florence.runtime.production.FlorenceGoogleSyncWorkerService", _FakeSyncWorkerService)
+    monkeypatch.setattr(service, "_nudge_for_new_pending_candidates", lambda **_kwargs: False)
+
+    service.process_google_sync_job(
+        connection_id="gconn_123",
+        thread_id="dm-thread-123",
+        notify_when_finished=True,
+        raise_on_error=True,
+    )
+    service.process_google_sync_job(
+        connection_id="gconn_123",
+        thread_id="dm-thread-123",
+        notify_when_finished=True,
+        raise_on_error=True,
+    )
+
+    assert len(service.linq.sent) == 2
+    assert "A few things look important from your recent email and calendar" in service.linq.sent[0]["message"]
+    assert "I finished another sync pass" in service.linq.sent[1]["message"]
+    assert "Dentist appointment moved" in service.linq.sent[1]["message"]
+    sync_update_calls = [
+        call
+        for call in service.household_chat_service.calls
+        if call["kind"] == "sync_update_brief"
+    ]
+    assert len(sync_update_calls) == 1
+    assert sync_update_calls[0]["payload"]["previous_sync"]["candidate_titles"] == ["Science fair reminder"]
+    assert sync_update_calls[0]["payload"]["current_sync"]["candidate_count"] == 1
+    updated_connection = store.get_google_connection("gconn_123")
+    assert updated_connection is not None
+    assert updated_connection.metadata["last_sync_update_brief_sent_at"]
+    assert updated_connection.metadata["last_sync_brief_kind"] == "update"
+    store.close()
+
+
 def test_production_service_first_dm_sends_onboarding_sequence_as_separate_messages(tmp_path):
     settings = _build_settings(tmp_path)
     store = FlorenceStateDB(settings.server.db_path)
     service = FlorenceProductionService(settings, store=store)
     service.linq = _FakeLinqClient()
+    service.household_chat_service = _OnboardingSequenceChatService()
+    service.household_chat_service.bind_onboarding_service(service.entrypoints.onboarding_service)
 
     payload = {
         "webhook_version": "2026-02-03",
@@ -1330,4 +1631,236 @@ def test_production_service_run_sync_pass_prefers_household_group_for_briefing(t
         }
     ]
     assert fake_chat.calls[0]["channel_id"] == "chan_group_123"
+    store.close()
+
+
+def test_production_service_run_sync_pass_sends_review_sweep_for_pending_backlog(tmp_path):
+    settings = _build_settings(tmp_path)
+    store = FlorenceStateDB(settings.server.db_path)
+    service = FlorenceProductionService(settings, store=store)
+    service.linq = _FakeLinqClient()
+    fake_chat = _FakeBriefingChatService()
+    service.household_chat_service = fake_chat
+    store.upsert_household(
+        Household(
+            id="hh_123",
+            name="Maya's household",
+            timezone="America/Los_Angeles",
+        )
+    )
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    service.entrypoints.onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        display_name="Maya",
+    )
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_123",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:gmail_123",
+            title="Young Minds invoice",
+            summary="Needs confirmation.",
+            state=CandidateState.PENDING_REVIEW,
+            requires_confirmation=True,
+            metadata={"confirmation_question": "Should I add this?"},
+        )
+    )
+
+    result = service.run_sync_pass()
+
+    assert result["review_sweeps"] == 1
+    assert len(service.linq.sent) == 1
+    assert service.linq.sent[0]["chat_id"] == "dm-thread-123"
+    review_call = next(call for call in fake_chat.calls if call.get("kind") == "review_prompt")
+    assert review_call["payload"]["trigger"] == "scheduled_review_sweep"
+    assert review_call["payload"]["pending_review_count"] == 1
+    store.close()
+
+
+def test_production_service_run_sync_pass_sends_scheduled_sync_update_brief(tmp_path):
+    settings = _build_settings(tmp_path)
+    store = FlorenceStateDB(settings.server.db_path)
+    service = FlorenceProductionService(settings, store=store)
+    service.linq = _FakeLinqClient()
+    fake_chat = _FakeBriefingChatService()
+    service.household_chat_service = fake_chat
+    store.upsert_household(
+        Household(
+            id="hh_123",
+            name="Maya's household",
+            timezone="America/Los_Angeles",
+        )
+    )
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    service.entrypoints.onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        display_name="Maya",
+    )
+    previous_connection = store.upsert_google_connection(
+        GoogleConnection(
+            id="gconn_123",
+            household_id="hh_123",
+            member_id="mem_123",
+            email="parent@example.com",
+            connected_scopes=(GoogleSourceKind.GMAIL, GoogleSourceKind.GOOGLE_CALENDAR),
+            access_token="access-token",
+            metadata={
+                "initial_sync_activation_brief_sent_at": "2026-03-20T08:00:00+00:00",
+                "initial_sync_activation_brief_channel_id": "chan_dm_123",
+                "last_sync_brief_channel_id": "chan_dm_123",
+                "last_sync_brief_kind": "activation",
+                "last_sync_brief_snapshot": {
+                    "gmail_count": 3,
+                    "calendar_count": 1,
+                    "candidate_count": 1,
+                    "candidate_titles": ["Science fair reminder"],
+                    "candidate_ids": ["cand_123"],
+                    "signature": "previous",
+                },
+                "last_gmail_item_count": 3,
+                "last_calendar_item_count": 1,
+                "last_candidate_count": 1,
+                "primary_calendar_id": "primary",
+                "primary_calendar_summary": "Family",
+                "primary_calendar_timezone": "America/Los_Angeles",
+            },
+        )
+    )
+    updated_connection = store.upsert_google_connection(
+        replace(
+            previous_connection,
+            metadata={
+                **dict(previous_connection.metadata),
+                "last_gmail_item_count": 2,
+                "last_calendar_item_count": 1,
+                "last_candidate_count": 1,
+            },
+        )
+    )
+    candidate = ImportedCandidate(
+        id="cand_456",
+        household_id="hh_123",
+        member_id="mem_123",
+        source_kind=GoogleSourceKind.GOOGLE_CALENDAR,
+        source_identifier="google_calendar:event_456",
+        title="Dentist appointment moved",
+        summary="Pickup timing may need a tweak.",
+        state=CandidateState.PENDING_REVIEW,
+    )
+    service.sync_worker = SimpleNamespace(
+        sync_household=lambda **_kwargs: [
+            SimpleNamespace(connection=updated_connection, sync_result=SimpleNamespace(candidates=[candidate]))
+        ]
+    )
+    service._nudge_for_new_pending_candidates = lambda **_kwargs: False
+
+    result = service.run_sync_pass()
+
+    assert result["sync_update_briefs"] == 1
+    assert len(service.linq.sent) == 1
+    assert service.linq.sent[0]["chat_id"] == "dm-thread-123"
+    assert "I finished another sync pass" in service.linq.sent[0]["message"]
+    sync_update_call = next(call for call in fake_chat.calls if call["kind"] == "sync_update_brief")
+    assert sync_update_call["payload"]["previous_sync"]["candidate_titles"] == ["Science fair reminder"]
+    assert sync_update_call["payload"]["current_sync"]["candidate_count"] == 1
+    events = store.list_pilot_events(household_id="hh_123", event_type="sync_update_brief_sent")
+    assert len(events) == 1
+    assert events[0].metadata["trigger"] == "scheduled_sync_pass"
+    store.close()
+
+
+def test_production_service_briefing_routine_planning_uses_hermes_for_operating_preferences(tmp_path):
+    settings = _build_settings(tmp_path)
+    store = FlorenceStateDB(settings.server.db_path)
+    service = FlorenceProductionService(settings, store=store)
+    fake_chat = _FakeBriefingChatService()
+    service.household_chat_service = fake_chat
+    store.upsert_household(
+        Household(
+            id="hh_123",
+            name="Maya's household",
+            timezone="America/Los_Angeles",
+        )
+    )
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    store.replace_household_profile_items(
+        household_id="hh_123",
+        kind=HouseholdProfileKind.PREFERENCE,
+        items=[
+            HouseholdProfileItem(
+                id="pref_briefing_123",
+                household_id="hh_123",
+                kind=HouseholdProfileKind.PREFERENCE,
+                label="Briefing cadence",
+                metadata={
+                    "category": "operating_rule",
+                    "value": "Weekday morning brief at 6:45 and evening check-in on school nights at 8:30pm.",
+                },
+            )
+        ],
+    )
+
+    routines = service.household_manager_service.ensure_briefing_routines(household_id="hh_123")
+
+    assert len(routines) == 3
+    assert any(call.get("kind") == "briefing_routine_plan" for call in fake_chat.calls)
+    morning = next(routine for routine in routines if routine.metadata.get("brief_kind") == "morning")
+    assert morning.metadata["planning_source"] == "hermes"
     store.close()

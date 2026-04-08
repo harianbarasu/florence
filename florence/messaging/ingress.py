@@ -66,6 +66,12 @@ class FlorenceMessagingIngressService:
                 member_id=member_id,
                 channel_id=channel_id,
             ),
+            handle_onboarding_turn=lambda household_id, channel_id, member_id, payload: self.chat_bridge.handle_setup_onboarding_turn(
+                household_id=household_id,
+                channel_id=channel_id,
+                member_id=member_id,
+                payload=payload,
+            ),
             handle_sync_waiting_turn=lambda household_id, channel_id, member_id, user_message, data_dependent: self.chat_bridge.handle_setup_sync_waiting_turn(
                 household_id=household_id,
                 channel_id=channel_id,

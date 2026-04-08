@@ -1,7 +1,10 @@
+from types import SimpleNamespace
+
 from florence.config import FlorenceGoogleRuntimeConfig
 from florence.contracts import ChannelType
 from florence.messaging import FlorenceMessagingIngressResult
 from florence.runtime.chat import FlorenceHouseholdChatService
+from florence.runtime import FlorenceHouseholdManagerService
 from florence.runtime import FlorenceEntrypointService
 from florence.state import FlorenceStateDB
 
@@ -28,16 +31,152 @@ def _linq_payload(*, message_id: str, text: str, chat_id: str, sender: str, is_g
     }
 
 
+def _simulate_test_onboarding_turn(
+    onboarding_service,
+    *,
+    household_id,
+    channel_id,
+    actor_member_id,
+    payload=None,
+):
+    if actor_member_id is None:
+        return None
+    payload = dict(payload or {})
+    thread_id = str(payload.get("thread_id") or "").strip()
+    channel = onboarding_service.store.get_channel(channel_id)
+    if not thread_id and channel is not None and channel.provider_channel_id:
+        thread_id = channel.provider_channel_id
+    if not thread_id:
+        return None
+    previous_session = onboarding_service.get_or_create_session(
+        household_id=household_id,
+        member_id=actor_member_id,
+        thread_id=thread_id,
+    )
+    user_message = str(payload.get("user_message") or "").strip()
+    stage = str(payload.get("stage") or previous_session.stage.value)
+
+    if stage == "collect_parent_name" and user_message:
+        transition = onboarding_service.record_parent_name(
+            household_id=household_id,
+            member_id=actor_member_id,
+            thread_id=thread_id,
+            display_name=user_message,
+        )
+    elif stage == "collect_child_names" and user_message:
+        child_names = [
+            part.strip(" .,!?:;")
+            for part in user_message.replace("\n", ",").split(",")
+            if part.strip(" .,!?:;")
+        ]
+        if not child_names:
+            return onboarding_service.get_prompt_messages(
+                household_id=household_id,
+                member_id=actor_member_id,
+                thread_id=thread_id,
+            )
+        transition = onboarding_service.record_child_names(
+            household_id=household_id,
+            member_id=actor_member_id,
+            thread_id=thread_id,
+            child_names=child_names,
+        )
+    elif stage == "collect_child_age" and user_message:
+        transition = onboarding_service.apply_explicit_update(
+            household_id=household_id,
+            member_id=actor_member_id,
+            thread_id=thread_id,
+            age=user_message,
+        )
+    elif stage == "collect_child_school" and user_message:
+        transition = onboarding_service.apply_explicit_update(
+            household_id=household_id,
+            member_id=actor_member_id,
+            thread_id=thread_id,
+            school=user_message,
+        )
+    elif stage == "collect_child_activities":
+        transition = onboarding_service.apply_explicit_update(
+            household_id=household_id,
+            member_id=actor_member_id,
+            thread_id=thread_id,
+            activities=[] if user_message.lower().startswith("none") else ([user_message] if user_message else []),
+        )
+    else:
+        return onboarding_service.get_prompt_messages(
+            household_id=household_id,
+            member_id=actor_member_id,
+            thread_id=thread_id,
+        )
+
+    if transition.state.is_complete:
+        FlorenceHouseholdManagerService(onboarding_service.store).finalize_onboarding_completion(
+            household_id=household_id,
+            member_id=actor_member_id,
+            channel_id=channel_id,
+        )
+    return onboarding_service.get_transition_messages(
+        transition,
+        previous_stage=previous_session.stage,
+        household_id=household_id,
+        member_id=actor_member_id,
+        thread_id=thread_id,
+    )
+
+
+class _OnboardingSequenceChatService:
+    def __init__(self, reply_text: str = "I can keep planning with you here."):
+        self.reply_text = reply_text
+        self.onboarding_service = None
+
+    def bind_onboarding_service(self, onboarding_service) -> None:
+        self.onboarding_service = onboarding_service
+
+    def respond(self, **_kwargs):
+        return SimpleNamespace(text=self.reply_text)
+
+    def compose_onboarding_turn(
+        self,
+        *,
+        household_id,
+        channel_id,
+        actor_member_id,
+        payload=None,
+        conversation_history=None,
+    ):
+        _ = conversation_history
+        if self.onboarding_service is None or actor_member_id is None:
+            return None
+        return _simulate_test_onboarding_turn(
+            self.onboarding_service,
+            household_id=household_id,
+            channel_id=channel_id,
+            actor_member_id=actor_member_id,
+            payload=payload,
+        )
+
+    def compose_operator_message(self, *, household_id, channel_id, actor_member_id, kind, payload=None, conversation_history=None):
+        if kind == "onboarding_turn":
+            messages = self.compose_onboarding_turn(
+                household_id=household_id,
+                channel_id=channel_id,
+                actor_member_id=actor_member_id,
+                payload=payload,
+                conversation_history=conversation_history,
+            )
+            return messages[0] if messages else None
+        return self.reply_text
+
+
 def _build_entrypoints(store: FlorenceStateDB, **kwargs) -> FlorenceEntrypointService:
     kwargs.setdefault(
         "household_chat_service",
-        FlorenceHouseholdChatService(
-            store,
-            model="openai/gpt-5.4",
-            provider="custom",
-        ),
+        _OnboardingSequenceChatService(),
     )
-    return FlorenceEntrypointService(store, **kwargs)
+    service = FlorenceEntrypointService(store, **kwargs)
+    if hasattr(service.household_chat_service, "bind_onboarding_service"):
+        service.household_chat_service.bind_onboarding_service(service.onboarding_service)
+    return service
 
 
 def test_entrypoints_group_without_resolved_household_returns_dm_first_message(tmp_path):
@@ -64,6 +203,7 @@ def test_entrypoints_hybrid_onboarding_offers_google_link_immediately_after_name
     store = FlorenceStateDB(tmp_path / "florence.db")
     service = _build_entrypoints(
         store,
+        household_chat_service=_OnboardingSequenceChatService(),
         google_oauth=FlorenceGoogleRuntimeConfig(
             client_id="client-id",
             client_secret="client-secret",

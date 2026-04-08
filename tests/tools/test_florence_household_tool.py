@@ -34,6 +34,33 @@ from tools.florence_household_tool import (
 )
 
 
+class _StubBriefingPlanChatService:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def compose_briefing_routine_plan(
+        self,
+        *,
+        household_id: str,
+        channel_id: str,
+        actor_member_id: str | None,
+        operating_preferences: list[str] | None = None,
+    ) -> list[dict[str, object]]:
+        self.calls.append(
+            {
+                "household_id": household_id,
+                "channel_id": channel_id,
+                "actor_member_id": actor_member_id,
+                "operating_preferences": list(operating_preferences or []),
+            }
+        )
+        return [
+            {"kind": "morning", "enabled": True, "hour": 6, "minute": 30, "days": [0, 1, 2, 3, 4]},
+            {"kind": "evening", "enabled": True, "hour": 20, "minute": 30, "days": [0, 1, 2, 3, 6]},
+            {"kind": "weekly", "enabled": False, "hour": 17, "minute": 0, "days": [5]},
+        ]
+
+
 def test_household_tools_can_create_event_meal_shopping_item_and_nudge(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
@@ -964,6 +991,66 @@ def test_household_apply_onboarding_update_records_explicit_child_detail(tmp_pat
         store.close()
 
 
+def test_household_apply_onboarding_update_records_batched_child_details(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    task_id = "task-household-onboarding-batch"
+    set_household_tool_context(
+        task_id,
+        store=store,
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_dm_123",
+    )
+    try:
+        result = json.loads(
+            handle_function_call(
+                "household_apply_onboarding_update",
+                {
+                    "parent_name": "Maya",
+                    "child_names": ["Theo", "Violet"],
+                    "child_updates": [
+                        {"name": "Theo", "age": "7"},
+                        {"name": "Violet", "age": "4"},
+                    ],
+                },
+                task_id=task_id,
+            )
+        )
+
+        session = store.get_onboarding_session(
+            household_id="hh_123",
+            member_id="mem_123",
+            thread_id="dm-thread-123",
+        )
+        assert session is not None
+        assert session.child_profiles[0]["age"] == "7"
+        assert session.child_profiles[1]["age"] == "4"
+        assert result["result"]["stage"] == "collect_child_school"
+        assert result["result"]["child_names"] == ["Theo", "Violet"]
+    finally:
+        clear_household_tool_context(task_id)
+        store.close()
+
+
 def test_household_record_preference_persists_preference_items(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     store.upsert_household(
@@ -1048,6 +1135,70 @@ def test_household_record_preference_persists_preference_items(tmp_path):
         assert len(preferences) == 2
         assert any(item.label == "Reminder style" and item.metadata["value"] == "Morning-of is enough for practice reminders." for item in preferences)
         assert any(item.label == "Kid spice preference" and item.child_id == "child_ava" for item in preferences)
+    finally:
+        clear_household_tool_context(task_id)
+        store.close()
+
+
+def test_household_record_preference_refreshes_briefing_routines_for_operating_rules(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(
+        Household(
+            id="hh_123",
+            name="Maya's household",
+            timezone="America/Los_Angeles",
+        )
+    )
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    task_id = "task-household-record-operating-preference"
+    chat_service = _StubBriefingPlanChatService()
+    set_household_tool_context(
+        task_id,
+        store=store,
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_dm_123",
+        household_chat_service=chat_service,
+    )
+    try:
+        result = json.loads(
+            handle_function_call(
+                "household_record_preference",
+                {
+                    "label": "Briefing cadence",
+                    "value": "Weekday morning brief at 6:30, evening check-in on school nights at 8:30pm, and skip the weekly preview.",
+                    "category": "operating_rule",
+                },
+                task_id=task_id,
+            )
+        )
+
+        assert result["result"]["metadata"]["category"] == "operating_rule"
+        assert result["briefing_routines_refreshed"] is True
+        assert len(result["briefing_routines"]) == 3
+        assert len(chat_service.calls) == 1
+        morning = next(routine for routine in result["briefing_routines"] if routine["metadata"]["brief_kind"] == "morning")
+        weekly = next(routine for routine in result["briefing_routines"] if routine["metadata"]["brief_kind"] == "weekly")
+        assert morning["metadata"]["planning_source"] == "hermes"
+        assert morning["metadata"]["local_time"] == "06:30"
+        assert weekly["status"] == "paused"
     finally:
         clear_household_tool_context(task_id)
         store.close()

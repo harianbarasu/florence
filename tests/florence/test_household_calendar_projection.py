@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 from florence.contracts import (
     GoogleConnection,
     GoogleSourceKind,
@@ -16,6 +18,7 @@ from florence.runtime.household_calendar_projection import (
 )
 from florence.runtime.household_merge import FlorenceHouseholdMergeService
 from florence.state import FlorenceStateDB
+from florence.google.types import GoogleTokenResponse
 
 
 def test_household_calendar_projection_ensures_shared_calendar_and_marks_connection(monkeypatch, tmp_path):
@@ -154,6 +157,55 @@ def test_household_calendar_projection_reuses_existing_calendar_and_shares_to_la
     assert viewer_connection is not None
     assert host_connection.metadata[HOUSEHOLD_CALENDAR_MANAGED_IDS_METADATA_KEY] == ["cal_shared_123"]
     assert viewer_connection.metadata[HOUSEHOLD_CALENDAR_MANAGED_IDS_METADATA_KEY] == ["cal_shared_123"]
+    store.close()
+
+
+def test_household_calendar_projection_refreshes_missing_token_expiry(monkeypatch, tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya household", timezone="America/Los_Angeles"))
+    store.upsert_google_connection(
+        GoogleConnection(
+            id="gconn_123",
+            household_id="hh_123",
+            member_id="mem_123",
+            email="maya@example.com",
+            connected_scopes=(GoogleSourceKind.GMAIL, GoogleSourceKind.GOOGLE_CALENDAR),
+            access_token="stale-access-token",
+            refresh_token="refresh-token",
+            access_token_expires_at=None,
+            metadata={},
+        )
+    )
+
+    monkeypatch.setattr(
+        "florence.runtime.household_calendar_projection.refresh_google_access_token",
+        lambda **_: GoogleTokenResponse(
+            access_token="fresh-access-token",
+            refresh_token="refresh-token",
+            expires_in=3600,
+        ),
+    )
+    monkeypatch.setattr(
+        "florence.runtime.household_calendar_projection.create_google_calendar",
+        lambda **_: GoogleCalendarMetadata(
+            id="cal_shared_123",
+            summary="Florence - Maya household",
+            timezone="America/Los_Angeles",
+        ),
+    )
+
+    service = FlorenceHouseholdCalendarProjectionService(
+        store,
+        client_id="google-client",
+        client_secret="google-secret",
+    )
+    projection = service.ensure_projection(household_id="hh_123", preferred_connection_id="gconn_123")
+
+    connection = store.get_google_connection("gconn_123")
+    assert projection is not None
+    assert connection is not None
+    assert connection.access_token == "fresh-access-token"
+    assert datetime.fromisoformat(connection.access_token_expires_at).tzinfo == timezone.utc
     store.close()
 
 

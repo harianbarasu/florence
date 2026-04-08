@@ -2,19 +2,8 @@
 
 from __future__ import annotations
 
-import re
-
 from florence.messaging.protocol_types import FlorenceProtocolReply
-
-
-def _looks_like_group_share_request(text: str) -> bool:
-    return bool(
-        re.search(
-            r"\b(?:share|send|post)\b.*\b(?:group|family|parent group|everyone)\b|^(?:share|send it|post it)\b",
-            text.strip(),
-            re.IGNORECASE,
-        )
-    )
+from florence.runtime.chat import _GROUP_SHARE_EXECUTE_SENTINEL
 
 class FlorenceGroupShareProtocol:
     """DM-only explicit promotion from a private parent thread into the household group."""
@@ -36,7 +25,22 @@ class FlorenceGroupShareProtocol:
         current_message_id: str,
         text: str,
     ) -> FlorenceProtocolReply | None:
-        if not _looks_like_group_share_request(text):
+        latest_assistant = self.group_share_service.channel_log.latest_assistant_message(channel_id=channel_id)
+        decision = self.group_share_service.household_chat_service.compose_operator_message(
+            household_id=household_id,
+            channel_id=channel_id,
+            actor_member_id=actor_member_id,
+            kind="group_share_turn",
+            payload={
+                "user_message": text,
+                "latest_assistant_protocol_kind": (
+                    str((latest_assistant.metadata or {}).get("protocol_kind") or "").strip()
+                    if latest_assistant is not None
+                    else ""
+                ),
+            },
+        )
+        if decision != _GROUP_SHARE_EXECUTE_SENTINEL:
             return None
 
         share_result = self.group_share_service.handle_explicit_share_request(

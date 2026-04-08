@@ -26,11 +26,13 @@ class TestRegisterServerTools:
         return {
             "hermes-cli": {"tools": ["terminal"], "description": "CLI", "includes": []},
             "hermes-telegram": {"tools": ["terminal"], "description": "TG", "includes": []},
+            "florence_chat": {"tools": ["household_search_state"], "description": "Florence chat", "includes": []},
+            "florence_briefing": {"tools": ["household_search_state"], "description": "Florence briefing", "includes": []},
             "custom-toolset": {"tools": [], "description": "Other", "includes": []},
         }
 
     def test_injects_hermes_toolsets(self, mock_registry, mock_toolsets):
-        """Tools are injected into hermes-* toolsets but not custom ones."""
+        """Tools are injected into Hermes defaults plus florence_chat only."""
         server = MCPServerTask("my_srv")
         server._tools = [_make_mcp_tool("my_tool", "desc")]
         server.session = MagicMock()
@@ -47,7 +49,9 @@ class TestRegisterServerTools:
         # Injected into hermes-* toolsets
         assert "mcp_my_srv_my_tool" in mock_toolsets["hermes-cli"]["tools"]
         assert "mcp_my_srv_my_tool" in mock_toolsets["hermes-telegram"]["tools"]
-        # NOT into non-hermes toolsets
+        assert "mcp_my_srv_my_tool" in mock_toolsets["florence_chat"]["tools"]
+        # NOT into read-only or unrelated toolsets
+        assert "mcp_my_srv_my_tool" not in mock_toolsets["florence_briefing"]["tools"]
         assert "mcp_my_srv_my_tool" not in mock_toolsets["custom-toolset"]["tools"]
 
 
@@ -63,6 +67,7 @@ class TestRefreshTools:
         return {
             "hermes-cli": {"tools": ["terminal"], "description": "CLI", "includes": []},
             "hermes-telegram": {"tools": ["terminal"], "description": "TG", "includes": []},
+            "florence_chat": {"tools": ["household_search_state"], "description": "Florence chat", "includes": []},
         }
 
     @pytest.mark.asyncio
@@ -98,10 +103,12 @@ class TestRefreshTools:
         # Old tool completely gone
         assert "mcp_live_srv_old_tool" not in mock_registry.get_all_tool_names()
         assert "mcp_live_srv_old_tool" not in mock_toolsets["hermes-cli"]["tools"]
+        assert "mcp_live_srv_old_tool" not in mock_toolsets["florence_chat"]["tools"]
 
         # New tool registered
         assert "mcp_live_srv_new_tool" in mock_registry.get_all_tool_names()
         assert "mcp_live_srv_new_tool" in mock_toolsets["hermes-cli"]["tools"]
+        assert "mcp_live_srv_new_tool" in mock_toolsets["florence_chat"]["tools"]
         assert server._registered_tool_names == ["mcp_live_srv_new_tool"]
 
 

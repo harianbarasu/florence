@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, patch
 
 from tools.delegate_tool import (
     DELEGATE_BLOCKED_TOOLS,
+    DELEGATE_BLOCKED_TOOLSETS,
     DELEGATE_TASK_SCHEMA,
     MAX_CONCURRENT_CHILDREN,
     MAX_DEPTH,
@@ -85,7 +86,7 @@ class TestChildSystemPrompt(unittest.TestCase):
 
 class TestStripBlockedTools(unittest.TestCase):
     def test_removes_blocked_toolsets(self):
-        result = _strip_blocked_tools(["terminal", "file", "delegation", "clarify", "memory", "code_execution"])
+        result = _strip_blocked_tools(["terminal", "file", "delegation", "clarify", "memory", "code_execution", "messaging"])
         self.assertEqual(sorted(result), ["file", "terminal"])
 
     def test_preserves_allowed_toolsets(self):
@@ -248,6 +249,25 @@ class TestDelegateTask(unittest.TestCase):
             self.assertEqual(kwargs["api_key"], parent.api_key)
             self.assertEqual(kwargs["provider"], parent.provider)
             self.assertEqual(kwargs["api_mode"], parent.api_mode)
+
+    def test_child_disables_blocked_toolsets_even_for_composite_parent(self):
+        parent = _make_mock_parent(depth=0)
+        parent.enabled_toolsets = ["florence_chat"]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "ok",
+                "completed": True,
+                "api_calls": 1,
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(goal="Research this school portal flow", parent_agent=parent)
+
+            _, kwargs = MockAgent.call_args
+            self.assertEqual(kwargs["enabled_toolsets"], ["florence_chat"])
+            self.assertEqual(kwargs["disabled_toolsets"], sorted(DELEGATE_BLOCKED_TOOLSETS))
 
 
 class TestToolNamePreservation(unittest.TestCase):
@@ -512,6 +532,10 @@ class TestBlockedTools(unittest.TestCase):
     def test_blocked_tools_constant(self):
         for tool in ["delegate_task", "clarify", "memory", "send_message", "execute_code"]:
             self.assertIn(tool, DELEGATE_BLOCKED_TOOLS)
+
+    def test_blocked_toolsets_constant(self):
+        for toolset in ["delegation", "clarify", "memory", "code_execution", "messaging"]:
+            self.assertIn(toolset, DELEGATE_BLOCKED_TOOLSETS)
 
     def test_constants(self):
         self.assertEqual(MAX_CONCURRENT_CHILDREN, 3)

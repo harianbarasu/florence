@@ -1,4 +1,6 @@
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from florence.contracts import (
     CandidateState,
@@ -76,6 +78,9 @@ class _FakeLinqClient:
 
 
 class _StubReviewPromptChatService:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
     def compose_operator_message(
         self,
         *,
@@ -88,14 +93,120 @@ class _StubReviewPromptChatService:
     ) -> str:
         assert kind == "review_prompt"
         payload = dict(payload or {})
+        self.calls.append(
+            {
+                "household_id": household_id,
+                "channel_id": channel_id,
+                "actor_member_id": actor_member_id,
+                "payload": payload,
+            }
+        )
         candidate = dict(payload.get("candidate") or {})
         source_prompt = payload.get("source_prompt")
         title = str(candidate.get("title") or "").strip() or "This looks worth double-checking."
         lines = [title]
+        pending_review_count = int(payload.get("pending_review_count") or 0)
+        if str(payload.get("trigger") or "").strip() == "scheduled_review_sweep" and pending_review_count > 1:
+            lines.append(f"I still have {pending_review_count} things to review, starting with this one.")
         if source_prompt:
             lines.append(str(source_prompt).strip())
         lines.append("Reply yes if I should add it, no if it's wrong, or skip for later.")
         return " ".join(lines)
+
+
+class _StubBriefingPlanChatService:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def compose_briefing_routine_plan(
+        self,
+        *,
+        household_id: str,
+        channel_id: str,
+        actor_member_id: str | None,
+        operating_preferences: list[str] | None = None,
+    ) -> list[dict[str, object]]:
+        self.calls.append(
+            {
+                "household_id": household_id,
+                "channel_id": channel_id,
+                "actor_member_id": actor_member_id,
+                "operating_preferences": list(operating_preferences or []),
+            }
+        )
+        return [
+            {"kind": "morning", "enabled": True, "hour": 6, "minute": 30, "days": [0, 1, 2, 3, 4]},
+            {"kind": "evening", "enabled": True, "hour": 20, "minute": 30, "days": [0, 1, 2, 3, 6]},
+            {"kind": "weekly", "enabled": False, "hour": 17, "minute": 0, "days": [5]},
+        ]
+
+
+class _StubSyncUpdateChatService:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def compose_operator_message(
+        self,
+        *,
+        household_id: str,
+        channel_id: str,
+        actor_member_id: str | None,
+        kind: str,
+        payload=None,
+        conversation_history=None,  # noqa: ARG002
+    ) -> str:
+        payload = dict(payload or {})
+        self.calls.append(
+            {
+                "household_id": household_id,
+                "channel_id": channel_id,
+                "actor_member_id": actor_member_id,
+                "kind": kind,
+                "payload": payload,
+            }
+        )
+        assert kind == "sync_update_brief"
+        current_sync = dict(payload.get("current_sync") or {})
+        candidates = current_sync.get("candidates") if isinstance(current_sync.get("candidates"), list) else []
+        title = str(candidates[0].get("title") or "a household update").strip() if candidates else "a household update"
+        return f"I finished another sync pass and {title} is the main thing I want to flag."
+
+
+def _record_test_onboarding_reply(
+    onboarding_service,
+    *,
+    household_id: str,
+    member_id: str,
+    thread_id: str,
+    text: str,
+):
+    session = onboarding_service.get_or_create_session(
+        household_id=household_id,
+        member_id=member_id,
+        thread_id=thread_id,
+    )
+    if session.stage == OnboardingStage.COLLECT_CHILD_AGE:
+        return onboarding_service.apply_explicit_update(
+            household_id=household_id,
+            member_id=member_id,
+            thread_id=thread_id,
+            age=text,
+        )
+    if session.stage == OnboardingStage.COLLECT_CHILD_SCHOOL:
+        return onboarding_service.apply_explicit_update(
+            household_id=household_id,
+            member_id=member_id,
+            thread_id=thread_id,
+            school=text,
+        )
+    if session.stage == OnboardingStage.COLLECT_CHILD_ACTIVITIES:
+        return onboarding_service.apply_explicit_update(
+            household_id=household_id,
+            member_id=member_id,
+            thread_id=thread_id,
+            activities=[] if text.strip().lower().startswith("none") else [text],
+        )
+    raise AssertionError(f"Unexpected test onboarding reply stage: {session.stage}")
 
 
 def test_google_sync_persistence_service_stores_connection_and_candidates(tmp_path):
@@ -468,19 +579,19 @@ def test_onboarding_service_releases_quarantined_candidates_once_grounded(tmp_pa
     )
     assert len(candidates_before) == 1
 
-    onboarding_service.record_user_reply(
+    _record_test_onboarding_reply(onboarding_service, 
         household_id="hh_123",
         member_id="mem_123",
         thread_id="thread_dm_123",
         text="7",
     )
-    onboarding_service.record_user_reply(
+    _record_test_onboarding_reply(onboarding_service, 
         household_id="hh_123",
         member_id="mem_123",
         thread_id="thread_dm_123",
         text="Roosevelt Elementary",
     )
-    onboarding_service.record_user_reply(
+    _record_test_onboarding_reply(onboarding_service, 
         household_id="hh_123",
         member_id="mem_123",
         thread_id="thread_dm_123",
@@ -534,13 +645,13 @@ def test_second_parent_early_onboarding_does_not_clear_existing_household_ground
         thread_id="dm_primary",
         child_names=["Ava"],
     )
-    onboarding_service.record_user_reply(
+    _record_test_onboarding_reply(onboarding_service, 
         household_id="hh_123",
         member_id="mem_primary",
         thread_id="dm_primary",
         text="7",
     )
-    onboarding_service.record_user_reply(
+    _record_test_onboarding_reply(onboarding_service, 
         household_id="hh_123",
         member_id="mem_primary",
         thread_id="dm_primary",
@@ -586,19 +697,19 @@ def test_onboarding_service_reuses_latest_member_state_for_new_thread(tmp_path):
         thread_id="dm_old",
         child_names=["Lexie"],
     )
-    onboarding_service.record_user_reply(
+    _record_test_onboarding_reply(onboarding_service, 
         household_id="hh_123",
         member_id="mem_123",
         thread_id="dm_old",
         text="5",
     )
-    onboarding_service.record_user_reply(
+    _record_test_onboarding_reply(onboarding_service, 
         household_id="hh_123",
         member_id="mem_123",
         thread_id="dm_old",
         text="Bright Horizons",
     )
-    onboarding_service.record_user_reply(
+    _record_test_onboarding_reply(onboarding_service, 
         household_id="hh_123",
         member_id="mem_123",
         thread_id="dm_old",
@@ -616,46 +727,6 @@ def test_onboarding_service_reuses_latest_member_state_for_new_thread(tmp_path):
     assert resumed.child_names == ["Lexie"]
     assert resumed.google_connected is True
     assert resumed.is_complete is True
-    store.close()
-
-
-def test_onboarding_service_ignores_generic_planning_message_during_child_detail_collection(tmp_path):
-    store = FlorenceStateDB(tmp_path / "florence.db")
-    onboarding_service = FlorenceOnboardingSessionService(store)
-
-    onboarding_service.record_parent_name(
-        household_id="hh_123",
-        member_id="mem_123",
-        thread_id="thread_dm_123",
-        display_name="Maya",
-    )
-    onboarding_service.record_google_connected(
-        household_id="hh_123",
-        member_id="mem_123",
-        thread_id="thread_dm_123",
-    )
-    onboarding_service.record_child_names(
-        household_id="hh_123",
-        member_id="mem_123",
-        thread_id="thread_dm_123",
-        child_names=["Ava"],
-    )
-
-    transition = onboarding_service.record_user_reply(
-        household_id="hh_123",
-        member_id="mem_123",
-        thread_id="thread_dm_123",
-        text="I need help figuring out Friday pickup while this is syncing",
-    )
-
-    session = onboarding_service.get_or_create_session(
-        household_id="hh_123",
-        member_id="mem_123",
-        thread_id="thread_dm_123",
-    )
-    assert transition.changed is False
-    assert session.stage == OnboardingStage.COLLECT_CHILD_AGE
-    assert session.child_profiles == [{"name": "Ava"}]
     store.close()
 
 
@@ -708,7 +779,7 @@ def test_onboarding_prompt_surfaces_google_grounding_suggestions(tmp_path):
         thread_id="thread_dm_123",
         child_names=["Ava"],
     )
-    onboarding_service.record_user_reply(
+    _record_test_onboarding_reply(onboarding_service, 
         household_id="hh_123",
         member_id="mem_123",
         thread_id="thread_dm_123",
@@ -725,7 +796,7 @@ def test_onboarding_prompt_surfaces_google_grounding_suggestions(tmp_path):
     assert "Roosevelt Elementary" in school_prompt.text
     assert "ParentSquare" in school_prompt.text
 
-    onboarding_service.record_user_reply(
+    _record_test_onboarding_reply(onboarding_service, 
         household_id="hh_123",
         member_id="mem_123",
         thread_id="thread_dm_123",
@@ -784,7 +855,7 @@ def test_onboarding_service_renders_transition_and_repeat_messages(tmp_path):
     store.close()
 
 
-def test_onboarding_service_accepts_long_school_reply_and_advances(tmp_path):
+def test_onboarding_service_accepts_long_school_value_and_advances(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     onboarding_service = FlorenceOnboardingSessionService(store)
 
@@ -800,14 +871,14 @@ def test_onboarding_service_accepts_long_school_reply_and_advances(tmp_path):
         thread_id="thread_dm_123",
         child_names=["Violet"],
     )
-    onboarding_service.record_user_reply(
+    _record_test_onboarding_reply(onboarding_service, 
         household_id="hh_123",
         member_id="mem_123",
         thread_id="thread_dm_123",
         text="She'll be 4 next month",
     )
 
-    transition = onboarding_service.record_user_reply(
+    transition = _record_test_onboarding_reply(onboarding_service, 
         household_id="hh_123",
         member_id="mem_123",
         thread_id="thread_dm_123",
@@ -819,12 +890,12 @@ def test_onboarding_service_accepts_long_school_reply_and_advances(tmp_path):
     assert transition.prompt is not None
     assert transition.prompt.text == "What activities does Violet do? If none right now, say none."
     assert transition.state.child_profiles[0]["school"] == (
-        "Young Minds Preschool. Last year before she starts TK at WISH next year."
+        "Young Minds Preschool. Last year before she starts TK at WISH next year"
     )
     store.close()
 
 
-def test_onboarding_service_accepts_long_activities_reply_and_advances_to_next_child(tmp_path):
+def test_onboarding_service_accepts_long_activity_value_and_advances_to_next_child(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     onboarding_service = FlorenceOnboardingSessionService(store)
 
@@ -840,20 +911,20 @@ def test_onboarding_service_accepts_long_activities_reply_and_advances_to_next_c
         thread_id="thread_dm_123",
         child_names=["Theo", "Violet"],
     )
-    onboarding_service.record_user_reply(
+    _record_test_onboarding_reply(onboarding_service, 
         household_id="hh_123",
         member_id="mem_123",
         thread_id="thread_dm_123",
         text="5",
     )
-    onboarding_service.record_user_reply(
+    _record_test_onboarding_reply(onboarding_service, 
         household_id="hh_123",
         member_id="mem_123",
         thread_id="thread_dm_123",
         text="WISH charter",
     )
 
-    transition = onboarding_service.record_user_reply(
+    transition = _record_test_onboarding_reply(onboarding_service, 
         household_id="hh_123",
         member_id="mem_123",
         thread_id="thread_dm_123",
@@ -866,7 +937,7 @@ def test_onboarding_service_accepts_long_activities_reply_and_advances_to_next_c
     assert transition.prompt.text == "Okay, next one. How old is Violet?"
     assert transition.state.current_child_name == "Violet"
     assert transition.state.child_profiles[0]["activities"] == [
-        "He plays little league baseball with DRALL and does music class with Musical Beginnings."
+        "He plays little league baseball with DRALL and does music class with Musical Beginnings"
     ]
     store.close()
 
@@ -969,19 +1040,19 @@ def test_onboarding_sync_merges_grounding_hints_into_profile_metadata(tmp_path):
         thread_id="thread_dm_123",
         child_names=["Ava Johnson"],
     )
-    onboarding_service.record_user_reply(
+    _record_test_onboarding_reply(onboarding_service, 
         household_id="hh_123",
         member_id="mem_123",
         thread_id="thread_dm_123",
         text="7",
     )
-    onboarding_service.record_user_reply(
+    _record_test_onboarding_reply(onboarding_service, 
         household_id="hh_123",
         member_id="mem_123",
         thread_id="thread_dm_123",
         text="Roosevelt Elementary",
     )
-    onboarding_service.record_user_reply(
+    _record_test_onboarding_reply(onboarding_service, 
         household_id="hh_123",
         member_id="mem_123",
         thread_id="thread_dm_123",
@@ -1024,19 +1095,19 @@ def test_onboarding_sync_persists_structured_household_profiles_without_manager_
         thread_id="thread_dm_123",
         child_names=["Ava"],
     )
-    onboarding_service.record_user_reply(
+    _record_test_onboarding_reply(onboarding_service, 
         household_id="hh_123",
         member_id="mem_123",
         thread_id="thread_dm_123",
         text="7",
     )
-    onboarding_service.record_user_reply(
+    _record_test_onboarding_reply(onboarding_service, 
         household_id="hh_123",
         member_id="mem_123",
         thread_id="thread_dm_123",
         text="Roosevelt Elementary",
     )
-    onboarding_service.record_user_reply(
+    _record_test_onboarding_reply(onboarding_service, 
         household_id="hh_123",
         member_id="mem_123",
         thread_id="thread_dm_123",
@@ -1289,6 +1360,71 @@ def test_household_manager_service_briefing_routines_due_and_advance(tmp_path):
     assert updated.last_completed_at == "2026-03-24T14:01:00+00:00"
     assert updated.next_due_at is not None
     assert updated.next_due_at > "2026-03-24T14:01:00+00:00"
+    store.close()
+
+
+def test_household_manager_service_reuses_cached_hermes_briefing_plan(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    store.replace_household_profile_items(
+        household_id="hh_123",
+        kind=HouseholdProfileKind.PREFERENCE,
+        items=[
+            HouseholdProfileItem(
+                id="pref_briefing_123",
+                household_id="hh_123",
+                kind=HouseholdProfileKind.PREFERENCE,
+                label="Briefing cadence",
+                metadata={
+                    "category": "operating_rule",
+                    "value": "Weekday morning brief at 6:30 and evening check-in on school nights at 8:30pm. Skip the weekly preview.",
+                },
+            )
+        ],
+    )
+    chat_service = _StubBriefingPlanChatService()
+    manager = FlorenceHouseholdManagerService(
+        store,
+        household_chat_service_getter=lambda: chat_service,
+    )
+
+    first = manager.ensure_briefing_routines(
+        household_id="hh_123",
+        now=datetime(2026, 3, 24, 12, 0, tzinfo=timezone.utc),
+    )
+    second = manager.ensure_briefing_routines(
+        household_id="hh_123",
+        now=datetime(2026, 3, 24, 12, 5, tzinfo=timezone.utc),
+    )
+
+    assert len(chat_service.calls) == 1
+    assert len(first) == 3
+    assert len(second) == 3
+    morning = next(routine for routine in first if routine.metadata.get("brief_kind") == "morning")
+    evening = next(routine for routine in first if routine.metadata.get("brief_kind") == "evening")
+    weekly = next(routine for routine in second if routine.metadata.get("brief_kind") == "weekly")
+    assert morning.metadata["planning_source"] == "hermes"
+    assert morning.metadata["local_time"] == "06:30"
+    assert evening.metadata["days"] == [0, 1, 2, 3, 6]
+    assert weekly.status == HouseholdRoutineStatus.PAUSED
     store.close()
 
 
@@ -1598,4 +1734,376 @@ def test_operations_review_nudge_defers_during_active_conversation(tmp_path):
     assert persisted is not None
     assert persisted.metadata.get("review_nudged_at") is None
     assert events == []
+    store.close()
+
+
+def test_operations_review_sweep_sends_proactive_prompt_for_pending_backlog(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    onboarding_service = FlorenceOnboardingSessionService(store)
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        display_name="Maya",
+    )
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_1001",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:gmail_1001",
+            title="Theo music class",
+            summary="Needs confirmation.",
+            state=CandidateState.PENDING_REVIEW,
+            requires_confirmation=True,
+            metadata={"confirmation_question": "Should I add this?"},
+        )
+    )
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_1002",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:gmail_1002",
+            title="Young Minds invoice",
+            summary="Needs confirmation too.",
+            state=CandidateState.PENDING_REVIEW,
+            requires_confirmation=True,
+            metadata={"confirmation_question": "Should I add this too?"},
+        )
+    )
+    linq = _FakeLinqClient()
+    delivery = FlorenceChannelDeliveryService(
+        store,
+        linq_client_getter=lambda: linq,
+        sendblue_client_getter=lambda: None,
+    )
+    chat_service = _StubReviewPromptChatService()
+    operations = FlorenceHouseholdOperationsService(
+        store,
+        delivery_service=delivery,
+        household_chat_service_getter=lambda: chat_service,
+    )
+
+    sent = operations.dispatch_due_review_sweeps(household_id="hh_123")
+
+    latest = FlorenceChannelLog(store).latest_assistant_message(channel_id="chan_dm_123")
+    events = store.list_pilot_events(household_id="hh_123", event_type="review_prompt_sent")
+    prompted = store.get_imported_candidate("cand_1002")
+    assert sent == 1
+    assert linq.sent
+    assert latest is not None
+    assert latest.metadata["protocol_kind"] == CANDIDATE_REVIEW_PROMPT_KIND
+    assert latest.metadata["pending_action_target_id"] == "cand_1002"
+    assert "I still have 2 things to review" in latest.body
+    assert chat_service.calls[0]["payload"]["pending_review_count"] == 2
+    assert chat_service.calls[0]["payload"]["trigger"] == "scheduled_review_sweep"
+    assert prompted is not None
+    assert prompted.metadata["review_nudged_at"]
+    assert events[0].metadata["trigger"] == "scheduled_review_sweep"
+    assert events[0].metadata["pending_review_count"] == 2
+    store.close()
+
+
+def test_operations_review_sweep_skips_when_recent_review_prompt_exists(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    onboarding_service = FlorenceOnboardingSessionService(store)
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        display_name="Maya",
+    )
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_1003",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:gmail_1003",
+            title="School reminder",
+            summary="Needs confirmation.",
+            state=CandidateState.PENDING_REVIEW,
+            requires_confirmation=True,
+            metadata={"confirmation_question": "Should I add this?"},
+        )
+    )
+    FlorenceHouseholdManagerService(store).record_pilot_event(
+        household_id="hh_123",
+        event_type="review_prompt_sent",
+        member_id="mem_123",
+        channel_id="chan_dm_123",
+        metadata={"trigger": "new_pending_candidate"},
+    )
+    linq = _FakeLinqClient()
+    delivery = FlorenceChannelDeliveryService(
+        store,
+        linq_client_getter=lambda: linq,
+        sendblue_client_getter=lambda: None,
+    )
+    chat_service = _StubReviewPromptChatService()
+    operations = FlorenceHouseholdOperationsService(
+        store,
+        delivery_service=delivery,
+        household_chat_service_getter=lambda: chat_service,
+    )
+
+    sent = operations.dispatch_due_review_sweeps(household_id="hh_123")
+
+    assert sent == 0
+    assert linq.sent == []
+    assert chat_service.calls == []
+    store.close()
+
+
+def test_operations_sync_update_sweep_sends_proactive_summary_for_changed_sync(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    onboarding_service = FlorenceOnboardingSessionService(store)
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        display_name="Maya",
+    )
+    previous_connection = store.upsert_google_connection(
+        GoogleConnection(
+            id="gconn_123",
+            household_id="hh_123",
+            member_id="mem_123",
+            email="parent@example.com",
+            connected_scopes=(GoogleSourceKind.GMAIL, GoogleSourceKind.GOOGLE_CALENDAR),
+            metadata={
+                "initial_sync_activation_brief_sent_at": "2026-03-20T08:00:00+00:00",
+                "initial_sync_activation_brief_channel_id": "chan_dm_123",
+                "last_sync_brief_channel_id": "chan_dm_123",
+                "last_sync_brief_kind": "activation",
+                "last_sync_brief_snapshot": {
+                    "gmail_count": 3,
+                    "calendar_count": 1,
+                    "candidate_count": 1,
+                    "candidate_titles": ["Science fair reminder"],
+                    "candidate_ids": ["cand_1000"],
+                    "signature": "previous",
+                },
+                "last_gmail_item_count": 3,
+                "last_calendar_item_count": 1,
+                "last_candidate_count": 1,
+            },
+        )
+    )
+    current_connection = store.upsert_google_connection(
+        replace(
+            previous_connection,
+            metadata={
+                **dict(previous_connection.metadata),
+                "last_gmail_item_count": 2,
+                "last_calendar_item_count": 1,
+                "last_candidate_count": 1,
+            },
+        )
+    )
+    candidate = ImportedCandidate(
+        id="cand_2000",
+        household_id="hh_123",
+        member_id="mem_123",
+        source_kind=GoogleSourceKind.GOOGLE_CALENDAR,
+        source_identifier="google_calendar:event_2000",
+        title="Dentist appointment moved",
+        summary="Pickup timing may need a tweak.",
+        state=CandidateState.PENDING_REVIEW,
+    )
+    linq = _FakeLinqClient()
+    delivery = FlorenceChannelDeliveryService(
+        store,
+        linq_client_getter=lambda: linq,
+        sendblue_client_getter=lambda: None,
+    )
+    chat_service = _StubSyncUpdateChatService()
+    operations = FlorenceHouseholdOperationsService(
+        store,
+        delivery_service=delivery,
+        household_chat_service_getter=lambda: chat_service,
+    )
+
+    sent = operations.dispatch_due_sync_update_briefs(
+        household_id="hh_123",
+        sync_results=[SimpleNamespace(connection=current_connection, sync_result=SimpleNamespace(candidates=[candidate]))],
+        previous_connections={"gconn_123": previous_connection},
+    )
+
+    events = store.list_pilot_events(household_id="hh_123", event_type="sync_update_brief_sent")
+    updated_connection = store.get_google_connection("gconn_123")
+    assert sent == 1
+    assert linq.sent == [
+        {
+            "chat_id": "dm-thread-123",
+            "message": "I finished another sync pass and Dentist appointment moved is the main thing I want to flag.",
+        }
+    ]
+    assert chat_service.calls[0]["payload"]["previous_sync"]["candidate_titles"] == ["Science fair reminder"]
+    assert chat_service.calls[0]["payload"]["current_sync"]["candidate_count"] == 1
+    assert len(events) == 1
+    assert events[0].metadata["trigger"] == "scheduled_sync_pass"
+    assert updated_connection is not None
+    assert updated_connection.metadata["last_sync_brief_kind"] == "update"
+    store.close()
+
+
+def test_operations_sync_update_sweep_skips_during_recent_channel_activity(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    onboarding_service = FlorenceOnboardingSessionService(store)
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        display_name="Maya",
+    )
+    connection = store.upsert_google_connection(
+        GoogleConnection(
+            id="gconn_123",
+            household_id="hh_123",
+            member_id="mem_123",
+            email="parent@example.com",
+            connected_scopes=(GoogleSourceKind.GMAIL, GoogleSourceKind.GOOGLE_CALENDAR),
+            metadata={
+                "initial_sync_activation_brief_sent_at": "2026-03-20T08:00:00+00:00",
+                "initial_sync_activation_brief_channel_id": "chan_dm_123",
+                "last_sync_brief_channel_id": "chan_dm_123",
+                "last_sync_brief_kind": "activation",
+                "last_sync_brief_snapshot": {
+                    "gmail_count": 1,
+                    "calendar_count": 1,
+                    "candidate_count": 1,
+                    "candidate_titles": ["Science fair reminder"],
+                    "candidate_ids": ["cand_1000"],
+                    "signature": "previous",
+                },
+                "last_gmail_item_count": 2,
+                "last_calendar_item_count": 1,
+                "last_candidate_count": 1,
+            },
+        )
+    )
+    store.append_channel_message(
+        ChannelMessage(
+            id="msg_recent_user",
+            household_id="hh_123",
+            channel_id="chan_dm_123",
+            sender_role=ChannelMessageRole.USER,
+            sender_member_id="mem_123",
+            body="Can you check Theo's afternoon pickup?",
+            created_at=datetime.now(timezone.utc).timestamp(),
+        )
+    )
+    candidate = ImportedCandidate(
+        id="cand_3000",
+        household_id="hh_123",
+        member_id="mem_123",
+        source_kind=GoogleSourceKind.GOOGLE_CALENDAR,
+        source_identifier="google_calendar:event_3000",
+        title="Piano lesson moved",
+        summary="Timing changed.",
+        state=CandidateState.PENDING_REVIEW,
+    )
+    linq = _FakeLinqClient()
+    delivery = FlorenceChannelDeliveryService(
+        store,
+        linq_client_getter=lambda: linq,
+        sendblue_client_getter=lambda: None,
+    )
+    chat_service = _StubSyncUpdateChatService()
+    operations = FlorenceHouseholdOperationsService(
+        store,
+        delivery_service=delivery,
+        household_chat_service_getter=lambda: chat_service,
+    )
+
+    sent = operations.dispatch_due_sync_update_briefs(
+        household_id="hh_123",
+        sync_results=[SimpleNamespace(connection=connection, sync_result=SimpleNamespace(candidates=[candidate]))],
+        previous_connections={"gconn_123": connection},
+    )
+
+    assert sent == 0
+    assert linq.sent == []
+    assert chat_service.calls == []
+    assert store.list_pilot_events(household_id="hh_123", event_type="sync_update_brief_sent") == []
     store.close()

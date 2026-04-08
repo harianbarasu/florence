@@ -33,6 +33,13 @@ DELEGATE_BLOCKED_TOOLS = frozenset([
     "send_message",    # no cross-platform side effects
     "execute_code",    # children should reason step-by-step, not write scripts
 ])
+DELEGATE_BLOCKED_TOOLSETS = frozenset([
+    "delegation",
+    "clarify",
+    "memory",
+    "code_execution",
+    "messaging",
+])
 
 MAX_CONCURRENT_CHILDREN = 3
 MAX_DEPTH = 2  # parent (0) -> child (1) -> grandchild rejected (2)
@@ -68,11 +75,8 @@ def _build_child_system_prompt(goal: str, context: Optional[str] = None) -> str:
 
 
 def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
-    """Remove toolsets that contain only blocked tools."""
-    blocked_toolset_names = {
-        "delegation", "clarify", "memory", "code_execution",
-    }
-    return [t for t in toolsets if t not in blocked_toolset_names]
+    """Remove blocked standalone toolsets from an enabled-toolset list."""
+    return [t for t in toolsets if t not in DELEGATE_BLOCKED_TOOLSETS]
 
 
 def _build_child_progress_callback(task_index: int, parent_agent, task_count: int = 1) -> Optional[callable]:
@@ -182,6 +186,7 @@ def _build_child_agent(
         child_toolsets = _strip_blocked_tools(parent_agent.enabled_toolsets)
     else:
         child_toolsets = _strip_blocked_tools(DEFAULT_TOOLSETS)
+    child_disabled_toolsets = sorted(DELEGATE_BLOCKED_TOOLSETS)
 
     child_prompt = _build_child_system_prompt(goal, context)
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
@@ -219,6 +224,7 @@ def _build_child_agent(
         reasoning_config=getattr(parent_agent, "reasoning_config", None),
         prefill_messages=getattr(parent_agent, "prefill_messages", None),
         enabled_toolsets=child_toolsets,
+        disabled_toolsets=child_disabled_toolsets,
         quiet_mode=True,
         ephemeral_system_prompt=child_prompt,
         log_prefix=f"[subagent-{task_index}]",

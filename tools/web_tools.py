@@ -36,11 +36,14 @@ Usage:
     crawl_data = web_crawl_tool("example.com", "Find contact information")
 """
 
+import base64
 import json
 import logging
 import os
 import re
 import asyncio
+from html import unescape
+from urllib.parse import urlparse
 from typing import List, Dict, Any, Optional
 import httpx
 from firecrawl import Firecrawl
@@ -50,6 +53,57 @@ from tools.url_safety import is_safe_url
 from tools.website_policy import check_website_access
 
 logger = logging.getLogger(__name__)
+
+_HTTP_FETCH_HEADERS = {
+    "User-Agent": "Hermes-Agent/1.0 (+https://hermes-agent.nousresearch.com)",
+    "Accept": "text/html,application/xhtml+xml,application/xml,text/plain,application/pdf;q=0.9,*/*;q=0.8",
+}
+
+_OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1"
+_ANTHROPIC_WEB_DEFAULT_MODEL = os.getenv("ANTHROPIC_WEB_MODEL", "").strip() or "claude-sonnet-4-20250514"
+_OPENAI_WEB_DEFAULT_MODEL = os.getenv("OPENAI_WEB_MODEL", "").strip() or "gpt-4.1-mini"
+_OPENAI_WEB_SEARCH_TOOL_TYPE = "web_search"
+_ANTHROPIC_WEB_SEARCH_TOOL_TYPE = "web_search_20260209"
+_ANTHROPIC_WEB_FETCH_TOOL_TYPE = "web_fetch_20260209"
+_USER_LOCATION_OPENAI = {
+    "type": "approximate",
+    "country": "US",
+    "timezone": "America/Los_Angeles",
+}
+_USER_LOCATION_ANTHROPIC = {
+    "type": "approximate",
+    "country": "US",
+    "timezone": "America/Los_Angeles",
+}
+_SEARCH_RESULTS_JSON_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "results": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "title": {"type": "string"},
+                    "url": {"type": "string"},
+                    "description": {"type": "string"},
+                },
+                "required": ["title", "url", "description"],
+            },
+        }
+    },
+    "required": ["results"],
+}
+_EXTRACT_RESULT_JSON_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "title": {"type": "string"},
+        "content": {"type": "string"},
+    },
+    "required": ["title", "content"],
+}
 
 
 # ─── Backend Selection ────────────────────────────────────────────────────────
@@ -74,7 +128,7 @@ def _get_backend() -> str:
     keys manually without running setup.
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured in ("parallel", "firecrawl", "tavily", "exa"):
+    if configured in ("parallel", "firecrawl", "tavily", "exa", "openai", "anthropic"):
         return configured
 
     # Fallback for manual / legacy config — use whichever key is present.
@@ -82,15 +136,35 @@ def _get_backend() -> str:
     has_parallel = _has_env("PARALLEL_API_KEY")
     has_tavily = _has_env("TAVILY_API_KEY")
     has_exa = _has_env("EXA_API_KEY")
+    has_openai = _has_env("OPENAI_API_KEY")
+    has_anthropic = _has_anthropic_web_credentials()
     if has_exa and not has_firecrawl and not has_parallel and not has_tavily:
         return "exa"
     if has_tavily and not has_firecrawl and not has_parallel:
         return "tavily"
     if has_parallel and not has_firecrawl:
         return "parallel"
+    if has_openai and not has_firecrawl and not has_parallel and not has_tavily and not has_exa and not has_anthropic:
+        return "openai"
+    if has_anthropic and not has_firecrawl and not has_parallel and not has_tavily and not has_exa and not has_openai:
+        return "anthropic"
+    if has_openai and has_anthropic and not has_firecrawl and not has_parallel and not has_tavily and not has_exa:
+        return "openai"
 
     # Default to firecrawl (backward compat, or when both are set)
     return "firecrawl"
+
+
+def _has_anthropic_web_credentials() -> bool:
+    """Best-effort Anthropic credential probe for web tooling."""
+    try:
+        from agent.anthropic_adapter import resolve_anthropic_token
+    except Exception:
+        return bool(os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_TOKEN"))
+    try:
+        return bool(resolve_anthropic_token())
+    except Exception:
+        return False
 
 # ─── Firecrawl Client ────────────────────────────────────────────────────────
 
@@ -127,6 +201,8 @@ def _get_firecrawl_client():
 
 _parallel_client = None
 _async_parallel_client = None
+_openai_web_client = None
+_anthropic_web_client = None
 
 def _get_parallel_client():
     """Get or create the Parallel sync client (lazy initialization).
@@ -162,6 +238,39 @@ def _get_async_parallel_client():
             )
         _async_parallel_client = AsyncParallel(api_key=api_key)
     return _async_parallel_client
+
+
+def _get_openai_web_client():
+    """Get or create the OpenAI client used for native web search."""
+    global _openai_web_client
+    if _openai_web_client is None:
+        api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        if not api_key:
+            raise ValueError(
+                "OPENAI_API_KEY environment variable not set. "
+                "OpenAI web search requires a direct OpenAI API key."
+            )
+        from openai import OpenAI
+
+        base_url = (os.getenv("OPENAI_BASE_URL") or _OPENAI_DEFAULT_BASE_URL).strip() or _OPENAI_DEFAULT_BASE_URL
+        _openai_web_client = OpenAI(api_key=api_key, base_url=base_url.rstrip("/"))
+    return _openai_web_client
+
+
+def _get_anthropic_web_client():
+    """Get or create the Anthropic client used for native web search and fetch."""
+    global _anthropic_web_client
+    if _anthropic_web_client is None:
+        from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
+
+        token = resolve_anthropic_token()
+        if not token:
+            raise ValueError(
+                "Anthropic credentials not found. "
+                "Set ANTHROPIC_API_KEY or ANTHROPIC_TOKEN, or sign in with Claude Code."
+            )
+        _anthropic_web_client = build_anthropic_client(token)
+    return _anthropic_web_client
 
 # ─── Tavily Client ───────────────────────────────────────────────────────────
 
@@ -607,6 +716,447 @@ def clean_base64_images(text: str) -> str:
     return cleaned_text
 
 
+def _normalize_preserving_line_structure(raw: str) -> str:
+    text = raw.replace("\r\n", "\n").replace("\r", "\n")
+    normalized_lines: List[str] = []
+    blank_pending = False
+    for line in text.split("\n"):
+        cleaned = " ".join(line.split())
+        if not cleaned:
+            if normalized_lines and not blank_pending:
+                normalized_lines.append("")
+            blank_pending = True
+            continue
+        blank_pending = False
+        normalized_lines.append(cleaned)
+
+    while normalized_lines and not normalized_lines[-1]:
+        normalized_lines.pop()
+    return "\n".join(normalized_lines).strip()
+
+
+def _strip_html_tags(html: str) -> str:
+    text = re.sub(r"(?is)<(script|style|noscript).*?>.*?</\\1>", " ", html)
+    text = re.sub(r"(?i)<br\\s*/?>", "\n", text)
+    text = re.sub(r"(?i)</(p|div|section|article|li|tr|h1|h2|h3|h4|h5|h6)>", "\n", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return _normalize_preserving_line_structure(unescape(text))
+
+
+def _extract_title_from_html(html: str, fallback_url: str) -> str:
+    match = re.search(r"(?is)<title[^>]*>(.*?)</title>", html)
+    if match:
+        title = " ".join(unescape(match.group(1)).split()).strip()
+        if title:
+            return title
+    parsed = urlparse(fallback_url)
+    if parsed.path and parsed.path != "/":
+        tail = parsed.path.rstrip("/").split("/")[-1]
+        if tail:
+            return tail
+    return fallback_url
+
+
+def _content_type_is_pdf(content_type: str, url: str, filename: str) -> bool:
+    lowered = (content_type or "").lower()
+    return "application/pdf" in lowered or url.lower().endswith(".pdf") or filename.lower().endswith(".pdf")
+
+
+def _derive_filename(url: str, content_disposition: str = "") -> str:
+    match = re.search(r'filename\\*?=(?:UTF-8\'\')?"?([^";]+)"?', content_disposition or "", flags=re.IGNORECASE)
+    if match:
+        return match.group(1).strip().strip('"')
+    parsed = urlparse(url)
+    tail = parsed.path.rstrip("/").split("/")[-1]
+    return tail or "document"
+
+
+def _parse_model_json(text: Any) -> Optional[dict]:
+    if not isinstance(text, str):
+        return None
+    candidate = text.strip()
+    if not candidate:
+        return None
+    if candidate.startswith("```"):
+        candidate = re.sub(r"^```(?:json)?\\s*", "", candidate, count=1)
+        candidate = re.sub(r"\\s*```$", "", candidate, count=1)
+    try:
+        parsed = json.loads(candidate)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _normalize_search_results_payload(payload: Optional[dict], *, limit: int) -> dict:
+    raw_results = payload.get("results") if isinstance(payload, dict) else []
+    if not isinstance(raw_results, list):
+        raw_results = []
+    web_results = []
+    for item in raw_results:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "").strip()
+        if not url:
+            continue
+        title = str(item.get("title") or "").strip() or url
+        description = str(item.get("description") or "").strip()
+        web_results.append({
+            "url": url,
+            "title": title,
+            "description": description,
+            "position": len(web_results) + 1,
+        })
+        if len(web_results) >= limit:
+            break
+    return {"success": True, "data": {"web": web_results}}
+
+
+def _normalize_extract_result_payload(payload: Optional[dict], *, fallback_title: str = "") -> dict:
+    title = fallback_title
+    content = ""
+    if isinstance(payload, dict):
+        title = str(payload.get("title") or fallback_title).strip() or fallback_title
+        content = str(payload.get("content") or "").strip()
+    return {"title": title, "content": content}
+
+
+def _openai_search_result_fallback(response: Any, limit: int) -> dict:
+    web_results = []
+    seen_urls = set()
+    output_items = getattr(response, "output", None) or []
+    for item in output_items:
+        if getattr(item, "type", None) != "message":
+            continue
+        for part in getattr(item, "content", []) or []:
+            if getattr(part, "type", None) != "output_text":
+                continue
+            text = getattr(part, "text", "") or ""
+            for annotation in getattr(part, "annotations", []) or []:
+                if getattr(annotation, "type", None) != "url_citation":
+                    continue
+                url = str(getattr(annotation, "url", "") or "").strip()
+                if not url or url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                start = max(0, int(getattr(annotation, "start_index", 0) or 0) - 80)
+                end = min(len(text), int(getattr(annotation, "end_index", 0) or 0) + 220)
+                snippet = " ".join(text[start:end].split())
+                web_results.append({
+                    "url": url,
+                    "title": str(getattr(annotation, "title", "") or url).strip() or url,
+                    "description": snippet,
+                    "position": len(web_results) + 1,
+                })
+                if len(web_results) >= limit:
+                    return {"success": True, "data": {"web": web_results}}
+    return {"success": True, "data": {"web": web_results}}
+
+
+def _anthropic_search_result_fallback(response: Any, limit: int) -> dict:
+    web_results = []
+    seen_urls = set()
+    for block in getattr(response, "content", []) or []:
+        if getattr(block, "type", None) != "web_search_tool_result":
+            continue
+        entries = getattr(block, "content", None)
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            url = str(getattr(entry, "url", "") or "").strip()
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            web_results.append({
+                "url": url,
+                "title": str(getattr(entry, "title", "") or url).strip() or url,
+                "description": "",
+                "position": len(web_results) + 1,
+            })
+            if len(web_results) >= limit:
+                return {"success": True, "data": {"web": web_results}}
+    return {"success": True, "data": {"web": web_results}}
+
+
+def _extract_anthropic_text(response: Any) -> str:
+    parts: List[str] = []
+    for block in getattr(response, "content", []) or []:
+        if getattr(block, "type", None) == "text" and getattr(block, "text", None):
+            parts.append(block.text)
+    return "\n".join(parts).strip()
+
+
+def _openai_search(query: str, limit: int = 5) -> dict:
+    from tools.interrupt import is_interrupted
+
+    if is_interrupted():
+        return {"error": "Interrupted", "success": False}
+
+    logger.info("OpenAI web search: '%s' (limit=%d)", query, limit)
+    prompt = (
+        f"Search the public web for the user's query and return up to {limit} strong results. "
+        "Descriptions should be brief, factual, and grounded in the source."
+    )
+    response = _get_openai_web_client().responses.create(
+        model=_OPENAI_WEB_DEFAULT_MODEL,
+        instructions=prompt,
+        input=query,
+        max_output_tokens=1200,
+        include=["web_search_call.action.sources"],
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "web_search_results",
+                "strict": True,
+                "description": "Structured web search results.",
+                "schema": _SEARCH_RESULTS_JSON_SCHEMA,
+            },
+            "verbosity": "low",
+        },
+        tools=[
+            {
+                "type": _OPENAI_WEB_SEARCH_TOOL_TYPE,
+                "search_context_size": "medium",
+                "user_location": _USER_LOCATION_OPENAI,
+            }
+        ],
+    )
+    parsed = _parse_model_json(getattr(response, "output_text", ""))
+    normalized = _normalize_search_results_payload(parsed, limit=limit)
+    if normalized["data"]["web"]:
+        return normalized
+    return _openai_search_result_fallback(response, limit)
+
+
+def _anthropic_search(query: str, limit: int = 5) -> dict:
+    from tools.interrupt import is_interrupted
+
+    if is_interrupted():
+        return {"error": "Interrupted", "success": False}
+
+    logger.info("Anthropic web search: '%s' (limit=%d)", query, limit)
+    response = _get_anthropic_web_client().beta.messages.create(
+        model=_ANTHROPIC_WEB_DEFAULT_MODEL,
+        max_tokens=1200,
+        messages=[
+            {
+                "role": "user",
+                "content": (
+                    f"Search the public web for: {query}\n\n"
+                    f"Return up to {limit} useful results with title, url, and a short grounded description."
+                ),
+            }
+        ],
+        output_config={
+            "format": {
+                "type": "json_schema",
+                "schema": _SEARCH_RESULTS_JSON_SCHEMA,
+            }
+        },
+        tools=[
+            {
+                "name": "web_search",
+                "type": _ANTHROPIC_WEB_SEARCH_TOOL_TYPE,
+                "max_uses": 1,
+                "user_location": _USER_LOCATION_ANTHROPIC,
+            }
+        ],
+    )
+    parsed = _parse_model_json(_extract_anthropic_text(response))
+    normalized = _normalize_search_results_payload(parsed, limit=limit)
+    if normalized["data"]["web"]:
+        return normalized
+    return _anthropic_search_result_fallback(response, limit)
+
+
+def _openai_extract_pdf_text(pdf_bytes: bytes, filename: str, url: str) -> str:
+    response = _get_openai_web_client().responses.create(
+        model=_OPENAI_WEB_DEFAULT_MODEL,
+        input=[
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": (
+                            "Extract readable plain text from this PDF. Preserve headings, lists, dates, times, "
+                            "names, places, fees, deadlines, and logistics-relevant details. Return plain text only."
+                        ),
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_file",
+                        "filename": filename or "document.pdf",
+                        "file_data": "data:application/pdf;base64," + base64.b64encode(pdf_bytes).decode("ascii"),
+                    },
+                    {"type": "input_text", "text": f"Source URL: {url}"},
+                ],
+            },
+        ],
+        max_output_tokens=4000,
+    )
+    return _normalize_preserving_line_structure(getattr(response, "output_text", "") or "")
+
+
+async def _direct_http_extract(urls: List[str]) -> List[Dict[str, Any]]:
+    results: List[Dict[str, Any]] = []
+    from tools.interrupt import is_interrupted
+
+    async with httpx.AsyncClient(
+        follow_redirects=True,
+        headers=_HTTP_FETCH_HEADERS,
+        timeout=httpx.Timeout(timeout=60.0, connect=10.0),
+    ) as client:
+        for url in urls:
+            if is_interrupted():
+                results.append({"url": url, "error": "Interrupted", "title": ""})
+                continue
+
+            blocked = check_website_access(url)
+            if blocked:
+                logger.info("Blocked web_extract for %s by rule %s", blocked["host"], blocked["rule"])
+                results.append({
+                    "url": url,
+                    "title": "",
+                    "content": "",
+                    "raw_content": "",
+                    "error": blocked["message"],
+                    "blocked_by_policy": {"host": blocked["host"], "rule": blocked["rule"], "source": blocked["source"]},
+                })
+                continue
+
+            try:
+                response = await client.get(url)
+                response.raise_for_status()
+                final_url = str(response.url)
+                final_blocked = check_website_access(final_url)
+                if final_blocked:
+                    logger.info("Blocked redirected web_extract for %s by rule %s", final_blocked["host"], final_blocked["rule"])
+                    results.append({
+                        "url": final_url,
+                        "title": "",
+                        "content": "",
+                        "raw_content": "",
+                        "error": final_blocked["message"],
+                        "blocked_by_policy": {"host": final_blocked["host"], "rule": final_blocked["rule"], "source": final_blocked["source"]},
+                    })
+                    continue
+
+                content_type = response.headers.get("content-type", "")
+                filename = _derive_filename(final_url, response.headers.get("content-disposition", ""))
+                if _content_type_is_pdf(content_type, final_url, filename):
+                    content = _openai_extract_pdf_text(response.content, filename, final_url)
+                    title = filename
+                else:
+                    body = response.text
+                    title = _extract_title_from_html(body, final_url)
+                    if "html" in content_type.lower():
+                        content = _strip_html_tags(body)
+                    else:
+                        content = _normalize_preserving_line_structure(unescape(body))
+
+                results.append({
+                    "url": final_url,
+                    "title": title,
+                    "content": content,
+                    "raw_content": content,
+                    "metadata": {"sourceURL": final_url, "title": title},
+                })
+            except Exception as exc:
+                logger.debug("Direct fetch failed for %s: %s", url, exc)
+                results.append({
+                    "url": url,
+                    "title": "",
+                    "content": "",
+                    "raw_content": "",
+                    "error": str(exc),
+                })
+    return results
+
+
+async def _anthropic_extract(urls: List[str]) -> List[Dict[str, Any]]:
+    results: List[Dict[str, Any]] = []
+    from tools.interrupt import is_interrupted
+
+    client = _get_anthropic_web_client()
+    for url in urls:
+        if is_interrupted():
+            results.append({"url": url, "error": "Interrupted", "title": ""})
+            continue
+        try:
+            response = client.beta.messages.create(
+                model=_ANTHROPIC_WEB_DEFAULT_MODEL,
+                max_tokens=4000,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Fetch this URL and extract the readable page content: {url}\n\n"
+                            "Return JSON with fields {title, content}. "
+                            "The content should preserve headings, lists, dates, names, logistics-relevant details, "
+                            "and other key text from the page. Do not add commentary outside the JSON."
+                        ),
+                    }
+                ],
+                output_config={
+                    "format": {
+                        "type": "json_schema",
+                        "schema": _EXTRACT_RESULT_JSON_SCHEMA,
+                    }
+                },
+                tools=[
+                    {
+                        "name": "web_fetch",
+                        "type": _ANTHROPIC_WEB_FETCH_TOOL_TYPE,
+                        "max_uses": 1,
+                        "max_content_tokens": 12000,
+                    }
+                ],
+            )
+            parsed = _parse_model_json(_extract_anthropic_text(response))
+            extracted = _normalize_extract_result_payload(parsed)
+            title = extracted["title"]
+            content = extracted["content"]
+            if not content:
+                raw_title = title
+                for block in getattr(response, "content", []) or []:
+                    if getattr(block, "type", None) != "web_fetch_tool_result":
+                        continue
+                    payload = getattr(block, "content", None)
+                    if getattr(payload, "type", None) != "web_fetch_result":
+                        continue
+                    doc = getattr(payload, "content", None)
+                    raw_title = str(getattr(doc, "title", "") or raw_title).strip() or raw_title
+                    source = getattr(doc, "source", None)
+                    if getattr(source, "type", None) == "text":
+                        content = _normalize_preserving_line_structure(str(getattr(source, "data", "") or ""))
+                        break
+                title = raw_title
+            if not content:
+                content = _extract_anthropic_text(response)
+            title = title or url
+            results.append({
+                "url": url,
+                "title": title,
+                "content": content,
+                "raw_content": content,
+                "metadata": {"sourceURL": url, "title": title},
+            })
+        except Exception as exc:
+            logger.debug("Anthropic fetch failed for %s: %s", url, exc)
+            results.append({
+                "url": url,
+                "title": "",
+                "content": "",
+                "raw_content": "",
+                "error": str(exc),
+            })
+    return results
+
+
 # ─── Exa Client ──────────────────────────────────────────────────────────────
 
 _exa_client = None
@@ -838,6 +1388,24 @@ def web_search_tool(query: str, limit: int = 5) -> str:
             _debug.save()
             return result_json
 
+        if backend == "openai":
+            response_data = _openai_search(query, limit)
+            debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
+            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
+            debug_call_data["final_response_size"] = len(result_json)
+            _debug.log_call("web_search_tool", debug_call_data)
+            _debug.save()
+            return result_json
+
+        if backend == "anthropic":
+            response_data = _anthropic_search(query, limit)
+            debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
+            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
+            debug_call_data["final_response_size"] = len(result_json)
+            _debug.log_call("web_search_tool", debug_call_data)
+            _debug.save()
+            return result_json
+
         if backend == "tavily":
             logger.info("Tavily search: '%s' (limit: %d)", query, limit)
             raw = _tavily_request("search", {
@@ -995,6 +1563,10 @@ async def web_extract_tool(
                 results = await _parallel_extract(safe_urls)
             elif backend == "exa":
                 results = _exa_extract(safe_urls)
+            elif backend == "openai":
+                results = await _direct_http_extract(safe_urls)
+            elif backend == "anthropic":
+                results = await _anthropic_extract(safe_urls)
             elif backend == "tavily":
                 logger.info("Tavily extract: %d URL(s)", len(safe_urls))
                 raw = _tavily_request("extract", {
@@ -1665,13 +2237,16 @@ def check_firecrawl_api_key() -> bool:
 
 
 def check_web_api_key() -> bool:
-    """Check if any web backend API key is available (Exa, Parallel, Firecrawl, or Tavily)."""
+    """Check if any supported web backend credentials are available."""
+    if _has_anthropic_web_credentials():
+        return True
     return bool(
         os.getenv("EXA_API_KEY")
         or os.getenv("PARALLEL_API_KEY")
         or os.getenv("FIRECRAWL_API_KEY")
         or os.getenv("FIRECRAWL_API_URL")
         or os.getenv("TAVILY_API_KEY")
+        or os.getenv("OPENAI_API_KEY")
     )
 
 
@@ -1713,11 +2288,15 @@ if __name__ == "__main__":
             print("   Using Parallel API (https://parallel.ai)")
         elif backend == "tavily":
             print("   Using Tavily API (https://tavily.com)")
+        elif backend == "openai":
+            print("   Using OpenAI Responses web search (https://platform.openai.com/)")
+        elif backend == "anthropic":
+            print("   Using Anthropic web search / fetch (https://console.anthropic.com/)")
         else:
             print("   Using Firecrawl API (https://firecrawl.dev)")
     else:
         print("❌ No web search backend configured")
-        print("Set EXA_API_KEY, PARALLEL_API_KEY, TAVILY_API_KEY, or FIRECRAWL_API_KEY")
+        print("Set EXA_API_KEY, PARALLEL_API_KEY, TAVILY_API_KEY, FIRECRAWL_API_KEY, OPENAI_API_KEY, or Anthropic credentials")
 
     if not nous_available:
         print("❌ No auxiliary model available for LLM content processing")
@@ -1827,7 +2406,7 @@ registry.register(
     schema=WEB_SEARCH_SCHEMA,
     handler=lambda args, **kw: web_search_tool(args.get("query", ""), limit=5),
     check_fn=check_web_api_key,
-    requires_env=["EXA_API_KEY", "PARALLEL_API_KEY", "FIRECRAWL_API_KEY", "TAVILY_API_KEY"],
+    requires_env=["EXA_API_KEY", "PARALLEL_API_KEY", "FIRECRAWL_API_KEY", "TAVILY_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN"],
     emoji="🔍",
 )
 registry.register(
@@ -1837,7 +2416,7 @@ registry.register(
     handler=lambda args, **kw: web_extract_tool(
         args.get("urls", [])[:5] if isinstance(args.get("urls"), list) else [], "markdown"),
     check_fn=check_web_api_key,
-    requires_env=["EXA_API_KEY", "PARALLEL_API_KEY", "FIRECRAWL_API_KEY", "TAVILY_API_KEY"],
+    requires_env=["EXA_API_KEY", "PARALLEL_API_KEY", "FIRECRAWL_API_KEY", "TAVILY_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN"],
     is_async=True,
     emoji="📄",
 )

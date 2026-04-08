@@ -11,6 +11,7 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from florence.contracts import (
+    Channel,
     ChannelMessage,
     ChannelMessageRole,
     ChannelType,
@@ -26,6 +27,17 @@ from florence.state import FlorenceStateDB
 from florence.runtime.visibility import build_scope_model_lines, resolve_conversation_scope
 
 logger = logging.getLogger(__name__)
+
+
+_ONBOARDING_SYNC_WAITING_SENTINEL = "HANDOFF_TO_SYNC_WAITING"
+_ONBOARDING_CONTEXTUAL_CHAT_SENTINEL = "HANDOFF_TO_CONTEXTUAL_CHAT"
+_ONBOARDING_NO_REPLY_SENTINEL = "NO_SETUP_REPLY"
+_REVIEW_SHOW_PROMPT_SENTINEL = "SHOW_CURRENT_REVIEW_PROMPT"
+_REVIEW_NO_ACTION_SENTINEL = "NO_REVIEW_PROTOCOL_ACTION"
+_GROUP_SHARE_EXECUTE_SENTINEL = "EXECUTE_GROUP_SHARE"
+_GROUP_SHARE_NO_ACTION_SENTINEL = "NO_GROUP_SHARE_PROTOCOL_ACTION"
+_GROUP_INTRO_SHOW_SENTINEL = "SHOW_GROUP_INTRO"
+_GROUP_INTRO_NO_ACTION_SENTINEL = "NO_GROUP_INTRO_PROTOCOL_ACTION"
 
 
 @dataclass(slots=True)
@@ -159,6 +171,55 @@ class FlorenceHouseholdChatService:
         final_response = str(result.get("final_response") or "").strip()
         return final_response or None
 
+    def compose_briefing_routine_plan(
+        self,
+        *,
+        household_id: str,
+        channel_id: str,
+        actor_member_id: str | None,
+        operating_preferences: list[str] | None = None,
+    ) -> list[dict[str, Any]] | None:
+        base_system = self._build_system_message(
+            household_id=household_id,
+            channel_id=channel_id,
+            actor_member_id=actor_member_id,
+        )
+        if not base_system:
+            return None
+        system_message = "\n".join(
+            [
+                base_system,
+                "You are interpreting household operating preferences into Florence's automatic briefing routine plan.",
+                "Reply with JSON only. Do not use markdown, code fences, or explanatory text.",
+                'Return an object shaped exactly like {"routines":[{"kind":"morning","enabled":true,"hour":6,"minute":45,"days":[0,1,2,3,4]},{"kind":"evening","enabled":true,"hour":20,"minute":15,"days":[0,1,2,3,4]},{"kind":"weekly","enabled":true,"hour":17,"minute":30,"days":[6]}]}.',
+                "The routines array must include exactly one item for each kind: morning, evening, weekly.",
+                "Use 24-hour local time integers for hour and minute.",
+                "Use weekday numbers where Monday=0 and Sunday=6.",
+                "Defaults if not specified: morning weekdays at 06:45, evening weekdays at 20:15, weekly Sunday at 17:30.",
+                "If the user disables a routine, set enabled to false.",
+                "Interpret school nights as [0,1,2,3,6] because the evening check-in prepares for the next school day.",
+                "Keep the plan conservative and do not invent unusual schedules unless the preferences clearly say so.",
+            ]
+        )
+        user_message = json.dumps(
+            {
+                "task": "plan_briefing_routines",
+                "operating_preferences": [statement for statement in (operating_preferences or []) if str(statement).strip()],
+            },
+            ensure_ascii=True,
+        )
+        result = self._run_agent_conversation(
+            household_id=household_id,
+            channel_id=channel_id,
+            actor_member_id=actor_member_id,
+            user_message=user_message,
+            system_message=system_message,
+            conversation_history=None,
+            enabled_toolsets=["florence_briefing"],
+        )
+        final_response = str(result.get("final_response") or "").strip()
+        return self._parse_briefing_routine_plan(final_response)
+
     def _briefing_style_instructions(self) -> list[str]:
         lines = [
             "Write for iMessage/SMS in plain text. Do not rely on markdown, bold markers, or other rich-text formatting.",
@@ -204,6 +265,7 @@ class FlorenceHouseholdChatService:
         conversation_context = None
         if conversation_history is not None:
             conversation_context = self._build_conversation_history(conversation_history)
+        enabled_toolsets = ["florence_briefing"]
 
         if kind == "activation_brief":
             system_message = "\n".join(
@@ -230,6 +292,34 @@ class FlorenceHouseholdChatService:
                 },
                 ensure_ascii=True,
             )
+        elif kind == "sync_update_brief":
+            system_message = "\n".join(
+                [
+                    base_system,
+                    "You are preparing a short Florence household update after a later Gmail and Calendar sync pass finishes.",
+                    "Summarize what changed since the prior notified sync snapshot when previous_sync is provided.",
+                    "If previous_sync is sparse, summarize what this sync pass surfaced without pretending you know an exact delta.",
+                    "Keep it calm, concise, and operator-like.",
+                    "Write at most 4 short bullets or short paragraphs.",
+                    "Lead with the 1-2 changes or possible slips that matter most.",
+                    "If Florence surfaced something to review or double-check, describe the underlying household item in natural language.",
+                    "Do not say 'candidate queue', 'scan counts', 'pipeline', or other tool internals unless truly essential.",
+                    "Do not claim exact numeric change deltas unless the payload clearly supports them.",
+                    "End with one short natural invitation for what the parent can ask next.",
+                ]
+            )
+            user_message = json.dumps(
+                {
+                    "task": "compose_sync_update_brief",
+                    "previous_sync": dict(payload.get("previous_sync") or {}),
+                    "current_sync": dict(payload.get("current_sync") or {}),
+                },
+                ensure_ascii=True,
+            )
+        elif kind == "onboarding_turn":
+            enabled_toolsets = ["florence_chat"]
+            system_message = self._build_onboarding_turn_system_message(base_system)
+            user_message = self._build_onboarding_turn_user_message(payload)
         elif kind == "review_prompt":
             system_message = "\n".join(
                 [
@@ -238,6 +328,7 @@ class FlorenceHouseholdChatService:
                     "Keep it calm, concise, and plainspoken.",
                     "Do not say 'Imported item', 'candidate', 'queue', or other pipeline language.",
                     "Summarize the underlying household fact or question in normal language.",
+                    "If trigger is scheduled_review_sweep and pending_review_count is greater than 1, briefly note that Florence still has a few items waiting after this one.",
                     "If the item is uncertain, frame it as something Florence wants to double-check before adding.",
                     "If there is source-sharing guidance, include it naturally in one short line.",
                     "End exactly with: Reply yes if I should add it, no if it's wrong, or skip for later.",
@@ -248,6 +339,29 @@ class FlorenceHouseholdChatService:
                     "task": "compose_review_prompt",
                     "candidate": dict(payload.get("candidate") or {}),
                     "source_prompt": str(payload.get("source_prompt") or "").strip(),
+                    "pending_review_count": int(payload.get("pending_review_count") or 0),
+                    "trigger": str(payload.get("trigger") or "").strip(),
+                },
+                ensure_ascii=True,
+            )
+        elif kind == "review_queue_turn":
+            system_message = "\n".join(
+                [
+                    base_system,
+                    "You are deciding whether Florence should surface the one currently available private review item in this DM.",
+                    f"If the user is explicitly asking to review pending imports, the review queue, or what needs review now, reply exactly {_REVIEW_SHOW_PROMPT_SENTINEL}.",
+                    f"Otherwise reply exactly {_REVIEW_NO_ACTION_SENTINEL}.",
+                    "Do not answer the underlying household question here.",
+                    "If prompt_armed is true, the review item is already surfaced, so do not re-surface it from this decision step.",
+                ]
+            )
+            user_message = json.dumps(
+                {
+                    "task": "review_queue_turn_decision",
+                    "user_message": str(payload.get("user_message") or "").strip(),
+                    "prompt_armed": bool(payload.get("prompt_armed")),
+                    "rendered_prompt_text": str(payload.get("rendered_prompt_text") or "").strip(),
+                    "candidate": dict(payload.get("candidate") or {}),
                 },
                 ensure_ascii=True,
             )
@@ -297,6 +411,43 @@ class FlorenceHouseholdChatService:
                 },
                 ensure_ascii=True,
             )
+        elif kind == "group_share_turn":
+            system_message = "\n".join(
+                [
+                    base_system,
+                    "You are deciding whether a private parent-DM message is an explicit request to share recent DM context into the household parent group.",
+                    f"If the user is clearly asking Florence to share, send, or post the recent DM update to the parent group, reply exactly {_GROUP_SHARE_EXECUTE_SENTINEL}.",
+                    f"Otherwise reply exactly {_GROUP_SHARE_NO_ACTION_SENTINEL}.",
+                    "Do not confuse this with source-visibility choices inside a review-item prompt.",
+                    "If the latest assistant protocol kind is candidate_review_prompt, plain replies like share/private usually belong to review handling, not group promotion.",
+                ]
+            )
+            user_message = json.dumps(
+                {
+                    "task": "group_share_turn_decision",
+                    "user_message": str(payload.get("user_message") or "").strip(),
+                    "latest_assistant_protocol_kind": str(payload.get("latest_assistant_protocol_kind") or "").strip(),
+                },
+                ensure_ascii=True,
+            )
+        elif kind == "group_intro_turn":
+            system_message = "\n".join(
+                [
+                    base_system,
+                    "You are deciding whether Florence should send the lightweight first-time intro for the household parent group.",
+                    f"If this message is just an opening greeting or simple hello into the newly active parent group, reply exactly {_GROUP_INTRO_SHOW_SENTINEL}.",
+                    f"Otherwise reply exactly {_GROUP_INTRO_NO_ACTION_SENTINEL}.",
+                    "Do not answer the underlying household question here.",
+                    "If the message already contains a substantive request, planning question, or task, do not use the intro.",
+                ]
+            )
+            user_message = json.dumps(
+                {
+                    "task": "group_intro_turn_decision",
+                    "user_message": str(payload.get("user_message") or "").strip(),
+                },
+                ensure_ascii=True,
+            )
         elif kind == "group_promotion":
             system_message = "\n".join(
                 [
@@ -322,12 +473,171 @@ class FlorenceHouseholdChatService:
             user_message=user_message,
             system_message=system_message,
             conversation_history=conversation_context,
-            enabled_toolsets=["florence_briefing"],
+            enabled_toolsets=enabled_toolsets,
         )
         final_response = str(result.get("final_response") or "").strip()
         if kind == "group_promotion" and final_response == "NO_GROUP_SHARE":
             return None
         return final_response
+
+    @staticmethod
+    def _parse_briefing_routine_plan(response_text: str) -> list[dict[str, Any]] | None:
+        defaults = {
+            "morning": {"kind": "morning", "enabled": True, "hour": 6, "minute": 45, "days": [0, 1, 2, 3, 4]},
+            "evening": {"kind": "evening", "enabled": True, "hour": 20, "minute": 15, "days": [0, 1, 2, 3, 4]},
+            "weekly": {"kind": "weekly", "enabled": True, "hour": 17, "minute": 30, "days": [6]},
+        }
+        payload = FlorenceHouseholdChatService._load_json_object(response_text)
+        if not isinstance(payload, dict):
+            return None
+        raw_routines = payload.get("routines")
+        if not isinstance(raw_routines, list):
+            return None
+
+        parsed: dict[str, dict[str, Any]] = {}
+        for item in raw_routines:
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("kind") or "").strip().lower()
+            default = defaults.get(kind)
+            if default is None:
+                continue
+            enabled = bool(item.get("enabled", default["enabled"]))
+            try:
+                hour = int(item.get("hour", default["hour"]))
+                minute = int(item.get("minute", default["minute"]))
+            except (TypeError, ValueError):
+                hour = int(default["hour"])
+                minute = int(default["minute"])
+            if not (0 <= hour <= 23):
+                hour = int(default["hour"])
+            if not (0 <= minute <= 59):
+                minute = int(default["minute"])
+            days: list[int] = []
+            for raw_day in item.get("days", default["days"]) if isinstance(item.get("days", default["days"]), list) else default["days"]:
+                try:
+                    day = int(raw_day)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= day <= 6 and day not in days:
+                    days.append(day)
+            if not days:
+                days = list(default["days"])
+            parsed[kind] = {
+                "kind": kind,
+                "enabled": enabled,
+                "hour": hour,
+                "minute": minute,
+                "days": days,
+            }
+
+        if not parsed:
+            return None
+        return [dict(parsed.get(kind, defaults[kind])) for kind in ("morning", "evening", "weekly")]
+
+    @staticmethod
+    def _load_json_object(response_text: str) -> Any | None:
+        cleaned = str(response_text or "").strip()
+        if not cleaned:
+            return None
+        candidates = [cleaned]
+        if cleaned.startswith("```"):
+            stripped = cleaned.strip("`").strip()
+            first_newline = stripped.find("\n")
+            if first_newline >= 0:
+                candidates.append(stripped[first_newline + 1 :].strip())
+        for candidate in candidates:
+            try:
+                return json.loads(candidate)
+            except Exception:
+                continue
+        return None
+
+    def compose_onboarding_turn(
+        self,
+        *,
+        household_id: str,
+        channel_id: str,
+        actor_member_id: str | None,
+        payload: dict[str, Any] | None = None,
+        conversation_history: list[ChannelMessage] | None = None,
+    ) -> tuple[str, ...] | None:
+        base_system = self._build_system_message(
+            household_id=household_id,
+            channel_id=channel_id,
+            actor_member_id=actor_member_id,
+        )
+        if not base_system:
+            return None
+        payload = dict(payload or {})
+        conversation_context = None
+        if conversation_history is not None:
+            conversation_context = self._build_conversation_history(conversation_history)
+
+        system_message = self._build_onboarding_turn_system_message(base_system)
+        user_message = self._build_onboarding_turn_user_message(payload)
+        result = self._run_agent_conversation(
+            household_id=household_id,
+            channel_id=channel_id,
+            actor_member_id=actor_member_id,
+            user_message=user_message,
+            system_message=system_message,
+            conversation_history=conversation_context,
+            enabled_toolsets=["florence_chat"],
+        )
+        tool_reply_messages = self._extract_onboarding_reply_messages(result)
+        if tool_reply_messages:
+            return tool_reply_messages
+        final_response = str(result.get("final_response") or "").strip()
+        if not final_response:
+            return None
+        return (final_response,)
+
+    @staticmethod
+    def _build_onboarding_turn_system_message(base_system: str) -> str:
+        return "\n".join(
+            [
+                base_system,
+                "You are handling one parent-DM onboarding turn before Florence transitions into normal household chat.",
+                "Treat the payload as the authoritative onboarding context for this DM thread.",
+                "Use household_apply_onboarding_update to store only explicit setup facts the parent actually provided in this message.",
+                "Do not infer unstated names, ages, schools, activities, or Google connection status.",
+                "Do not use unrelated Florence write tools in this turn.",
+                (
+                    f"If Google is already connected and the message is asking for inbox or calendar dependent information that still requires the first sync to finish, "
+                    f"reply exactly {_ONBOARDING_SYNC_WAITING_SENTINEL}."
+                ),
+                (
+                    f"If Google is already connected and the message is a sync-status question or a general household question that can continue while sync runs, "
+                    f"reply exactly {_ONBOARDING_CONTEXTUAL_CHAT_SENTINEL}."
+                ),
+                (
+                    f"If Google is already connected and the message is only a brief acknowledgement like ok, sounds good, or thanks with no substantive request, "
+                    f"reply exactly {_ONBOARDING_NO_REPLY_SENTINEL}."
+                ),
+                "If the user did not provide a concrete storable onboarding fact, do not call a write tool. Ask one short follow-up or restate the next onboarding question naturally.",
+                "If household_apply_onboarding_update returns reply_messages, base your reply on that result so Florence stays aligned with the deterministic onboarding state machine.",
+                "Keep the reply short, plainspoken, and specific to the next onboarding step.",
+                "Do not mention tools, hidden state, or backend mechanics.",
+            ]
+        )
+
+    @staticmethod
+    def _build_onboarding_turn_user_message(payload: dict[str, Any]) -> str:
+        return json.dumps(
+            {
+                "task": "handle_onboarding_turn",
+                "user_message": str(payload.get("user_message") or "").strip(),
+                "stage": str(payload.get("stage") or "").strip(),
+                "google_connected": bool(payload.get("google_connected")),
+                "parent_display_name": payload.get("parent_display_name"),
+                "child_names": list(payload.get("child_names") or []),
+                "child_profiles": list(payload.get("child_profiles") or []),
+                "current_child_name": payload.get("current_child_name"),
+                "next_prompt": payload.get("next_prompt"),
+            },
+            ensure_ascii=True,
+        )
 
     def _run_agent_conversation(
         self,
@@ -358,6 +668,7 @@ class FlorenceHouseholdChatService:
             household_id=household_id,
             actor_member_id=actor_member_id,
             channel_id=channel_id,
+            household_chat_service=self,
         )
         try:
             agent = agent_factory(
@@ -368,6 +679,7 @@ class FlorenceHouseholdChatService:
                 quiet_mode=True,
                 skip_memory=False,
                 skip_local_memory=True,
+                skip_context_files=False,
                 platform="florence",
                 session_id=session_id,
                 session_db=self.session_db,
@@ -379,6 +691,7 @@ class FlorenceHouseholdChatService:
                 session_search_kwargs=self._build_session_search_kwargs(
                     household_id=household_id,
                     channel_id=channel_id,
+                    actor_member_id=actor_member_id,
                 ),
             )
             result = agent.run_conversation(
@@ -394,6 +707,33 @@ class FlorenceHouseholdChatService:
             return result
         finally:
             clear_household_tool_context(task_id)
+
+    @staticmethod
+    def _extract_onboarding_reply_messages(result: dict[str, Any]) -> tuple[str, ...]:
+        raw_messages = result.get("messages")
+        if not isinstance(raw_messages, list):
+            return ()
+        for message in reversed(raw_messages):
+            if not isinstance(message, dict) or message.get("role") != "tool":
+                continue
+            content = message.get("content")
+            if not isinstance(content, str):
+                continue
+            try:
+                payload = json.loads(content)
+            except Exception:
+                continue
+            raw_reply_messages = ((payload.get("result") or {}) if isinstance(payload, dict) else {}).get("reply_messages")
+            if not isinstance(raw_reply_messages, list):
+                continue
+            reply_messages = tuple(
+                item.strip()
+                for item in (str(value) for value in raw_reply_messages)
+                if item.strip()
+            )
+            if reply_messages:
+                return reply_messages
+        return ()
 
     @staticmethod
     def _build_session_db() -> Any | None:
@@ -440,9 +780,19 @@ class FlorenceHouseholdChatService:
             current = parent
         return resolved
 
-    def _build_session_search_kwargs(self, *, household_id: str, channel_id: str) -> dict[str, Any]:
+    def _build_session_search_kwargs(
+        self,
+        *,
+        household_id: str,
+        channel_id: str,
+        actor_member_id: str | None,
+    ) -> dict[str, Any]:
         allowed_session_ids: set[str] = set()
-        for channel in self.store.list_channels(household_id=household_id):
+        for channel in self._session_search_channels(
+            household_id=household_id,
+            channel_id=channel_id,
+            actor_member_id=actor_member_id,
+        ):
             root = self._resolve_session_root(self._current_channel_session_id(channel.id))
             if root:
                 allowed_session_ids.add(root)
@@ -454,6 +804,64 @@ class FlorenceHouseholdChatService:
             "source_filter": ["florence"],
             "allowed_session_ids": sorted(allowed_session_ids),
         }
+
+    def _session_search_channels(
+        self,
+        *,
+        household_id: str,
+        channel_id: str,
+        actor_member_id: str | None,
+    ) -> list[Channel]:
+        current_channel = self.store.get_channel(channel_id)
+        if current_channel is None:
+            return []
+        household_channels = self.store.list_channels(household_id=household_id)
+        scope = resolve_conversation_scope(
+            self.store,
+            channel_id=channel_id,
+            actor_member_id=actor_member_id,
+        )
+        if scope.is_shared_household_group:
+            shared_channels = [
+                channel
+                for channel in household_channels
+                if channel.channel_type == ChannelType.HOUSEHOLD_GROUP
+            ]
+            return shared_channels or [current_channel]
+
+        if scope.is_private_parent_dm:
+            member_handles = self._member_identity_handles(actor_member_id=actor_member_id)
+            visible_channels: list[Channel] = []
+            for channel in household_channels:
+                if channel.channel_type == ChannelType.HOUSEHOLD_GROUP:
+                    visible_channels.append(channel)
+                    continue
+                if channel.id == channel_id:
+                    visible_channels.append(channel)
+                    continue
+                if channel.channel_type != ChannelType.PARENT_DM:
+                    continue
+                sender_handle = self._channel_sender_handle(channel)
+                if sender_handle and sender_handle in member_handles:
+                    visible_channels.append(channel)
+            return visible_channels or [current_channel]
+
+        return [current_channel]
+
+    def _member_identity_handles(self, *, actor_member_id: str | None) -> set[str]:
+        if not actor_member_id:
+            return set()
+        return {
+            str(identity.normalized_value).strip()
+            for identity in self.store.list_member_identities(actor_member_id)
+            if str(identity.normalized_value).strip()
+        }
+
+    @staticmethod
+    def _channel_sender_handle(channel: Any) -> str | None:
+        metadata = dict(channel.metadata) if isinstance(channel.metadata, dict) else {}
+        sender_handle = str(metadata.get("sender_handle") or "").strip()
+        return sender_handle or None
 
     def _build_honcho_session_key(
         self,
@@ -626,6 +1034,9 @@ class FlorenceHouseholdChatService:
             "Use session_search and Honcho memory to recover earlier commitments, preferences, and threads of work instead of making the user repeat themselves.",
             "When the user explicitly asks you to check email, search Gmail, or find a message from a school, camp, teacher, coach, or sender, use household_search_google_inbox.",
             "household_search_google_inbox respects scope: in a parent DM it defaults to that parent's inbox, while in the family group it only uses shared-household inbox scope.",
+            "When the user needs current information from the public web such as school calendars, camp policies, activity schedules, vendor details, or comparisons, use web_search and web_extract instead of guessing.",
+            "When the task requires interacting with a website or portal, following multi-step navigation, checking dynamic page state, or inspecting console/browser output, use the browser tools instead of pretending you already know the result.",
+            "If external research or website investigation branches into a bounded sidecar task, use delegate_task to gather evidence in parallel, then return to the main Florence turn to synthesize the result and make any final household-state updates yourself.",
             "When the user is replying to one currently surfaced imported-item review prompt, treat only that item as actionable. Use household_apply_candidate_review to confirm, reject, skip, set source_visibility, or confirm with corrected fields.",
             "When the user is replying to one currently surfaced reminder/nudge prompt, treat only that one nudge as actionable. Use household_apply_nudge_action for done or snooze changes.",
             "When the user gives feedback about reminder style, timing, or Florence being too proactive or not proactive enough, save it with household_record_preference instead of treating it as a deterministic Florence protocol.",
@@ -657,6 +1068,9 @@ class FlorenceHouseholdChatService:
                 "Memory policy: use private member-scoped memory and recall freely here, but do not leak private DM context into the parent group unless the user promotes it."
             )
             lines.append(
+                "Recall policy: session_search in this DM can use this parent's private Florence threads plus shared household group threads, but not another parent's private DM history."
+            )
+            lines.append(
                 "If something from this DM should become shared household state, create the structured event, task, meal, grocery item, or reminder first, then offer a concise group-safe summary instead of echoing the raw message."
             )
         elif scope.is_shared_household_group:
@@ -666,6 +1080,9 @@ class FlorenceHouseholdChatService:
             )
             lines.append(
                 "Memory policy: treat this thread as shared household memory. Favor facts, plans, reminders, and decisions that both parents can act on."
+            )
+            lines.append(
+                "Recall policy: session_search in the family group is limited to shared household group threads, not private parent DMs."
             )
         if actor_name:
             lines.append(f"Current speaker: {actor_name}")

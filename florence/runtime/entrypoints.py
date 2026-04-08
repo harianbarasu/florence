@@ -15,6 +15,7 @@ from florence.messaging import (
 from florence.runtime.chat import FlorenceHouseholdChatService
 from florence.runtime.candidate_review import FlorenceCandidateReviewService
 from florence.runtime.google_services import FlorenceGoogleAccountLinkService
+from florence.runtime.household_manager import FlorenceHouseholdManagerService
 from florence.runtime.household_merge import FlorenceHouseholdMergeService
 from florence.runtime.onboarding_service import FlorenceOnboardingSessionService
 from florence.runtime.resolver import FlorenceIdentityResolver
@@ -61,6 +62,7 @@ class FlorenceEntrypointService:
         *,
         google_oauth: FlorenceGoogleRuntimeConfig | None = None,
         household_chat_service: FlorenceHouseholdChatService,
+        household_manager_service: FlorenceHouseholdManagerService | None = None,
         household_merge_service: FlorenceHouseholdMergeService | None = None,
     ):
         self.store = store
@@ -83,6 +85,7 @@ class FlorenceEntrypointService:
             ),
         }
         self.household_chat_service = household_chat_service
+        self.household_manager_service = household_manager_service or FlorenceHouseholdManagerService(store)
         self.google_account_link_service = (
             FlorenceGoogleAccountLinkService(
                 store,
@@ -109,6 +112,7 @@ class FlorenceEntrypointService:
             self.onboarding_service,
             self.candidate_review_service,
             household_chat_service=self.household_chat_service,
+            household_manager_service=self.household_manager_service,
         )
 
     def handle_linq_payload(self, payload: dict[str, object]) -> FlorenceEntrypointResult:

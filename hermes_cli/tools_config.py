@@ -213,6 +213,22 @@ TOOL_CATEGORIES = {
                 ],
             },
             {
+                "name": "OpenAI",
+                "tag": "Native web search via Responses API; extract uses direct fetch fallback",
+                "web_backend": "openai",
+                "env_vars": [
+                    {"key": "OPENAI_API_KEY", "prompt": "OpenAI API key", "url": "https://platform.openai.com/api-keys"},
+                ],
+            },
+            {
+                "name": "Anthropic",
+                "tag": "Native web search and fetch via Claude beta tools",
+                "web_backend": "anthropic",
+                "env_vars": [
+                    {"key": "ANTHROPIC_API_KEY", "prompt": "Anthropic API key", "url": "https://console.anthropic.com/settings/keys"},
+                ],
+            },
+            {
                 "name": "Tavily",
                 "tag": "AI-native search, extract, and crawl",
                 "web_backend": "tavily",

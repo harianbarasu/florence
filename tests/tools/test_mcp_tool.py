@@ -478,7 +478,7 @@ class TestMCPServerTask:
 
 class TestToolsetInjection:
     def test_mcp_tools_added_to_all_hermes_toolsets(self):
-        """Discovered MCP tools are dynamically injected into all hermes-* toolsets."""
+        """Discovered MCP tools are injected into Hermes defaults plus florence_chat."""
         from tools.mcp_tool import MCPServerTask
 
         mock_tools = [_make_mcp_tool("list_files", "List files")]
@@ -496,6 +496,8 @@ class TestToolsetInjection:
             "hermes-cli": {"tools": ["terminal"], "description": "CLI", "includes": []},
             "hermes-telegram": {"tools": ["terminal"], "description": "TG", "includes": []},
             "hermes-gateway": {"tools": [], "description": "GW", "includes": []},
+            "florence_chat": {"tools": ["household_search_state"], "description": "Florence", "includes": []},
+            "florence_briefing": {"tools": ["household_search_state"], "description": "Briefing", "includes": []},
             "non-hermes": {"tools": [], "description": "other", "includes": []},
         }
         fake_config = {"fs": {"command": "npx", "args": []}}
@@ -513,7 +515,9 @@ class TestToolsetInjection:
         assert "mcp_fs_list_files" in fake_toolsets["hermes-cli"]["tools"]
         assert "mcp_fs_list_files" in fake_toolsets["hermes-telegram"]["tools"]
         assert "mcp_fs_list_files" in fake_toolsets["hermes-gateway"]["tools"]
-        # Non-hermes toolset should NOT get injection
+        assert "mcp_fs_list_files" in fake_toolsets["florence_chat"]["tools"]
+        # Read-only and unrelated toolsets should NOT get injection
+        assert "mcp_fs_list_files" not in fake_toolsets["florence_briefing"]["tools"]
         assert "mcp_fs_list_files" not in fake_toolsets["non-hermes"]["tools"]
         # Original tools preserved
         assert "terminal" in fake_toolsets["hermes-cli"]["tools"]

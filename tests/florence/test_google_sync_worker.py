@@ -1,7 +1,9 @@
 from datetime import datetime, timezone
 
+import httpx
+
 from florence.contracts import CandidateState, ChildProfile, GoogleConnection, GoogleSourceKind, HouseholdProfileItem, HouseholdProfileKind
-from florence.google import GmailSyncItem, ParentCalendarSyncItem
+from florence.google import GmailSyncItem, GoogleTokenResponse, ParentCalendarSyncItem
 from florence.onboarding import OnboardingState
 from florence.runtime import FlorenceGoogleSyncPersistenceService, FlorenceGoogleSyncWorkerService
 from florence.runtime.google_services import _calendar_sync_targets
@@ -384,3 +386,109 @@ def test_google_sync_targets_skip_florence_managed_shared_calendars_from_any_con
     )
 
     assert [target.calendar.id for target in targets] == ["family"]
+
+
+def test_google_sync_worker_refreshes_when_expiry_metadata_is_missing(tmp_path, monkeypatch):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_google_connection(
+        GoogleConnection(
+            id="gconn_missing_expiry",
+            household_id="hh_123",
+            member_id="mem_123",
+            email="parent@example.com",
+            connected_scopes=(GoogleSourceKind.GMAIL,),
+            access_token="stale-token",
+            refresh_token="refresh-token",
+            access_token_expires_at=None,
+            metadata={
+                "primary_calendar_id": "family",
+                "primary_calendar_summary": "Family calendar",
+                "primary_calendar_timezone": "America/Los_Angeles",
+            },
+        )
+    )
+
+    observed_tokens: list[str] = []
+
+    def _fake_refresh(**_kwargs):
+        return GoogleTokenResponse(
+            access_token="fresh-token",
+            refresh_token="refresh-token",
+            expires_in=3600,
+        )
+
+    def _fake_gmail(**kwargs):
+        observed_tokens.append(kwargs["access_token"])
+        return []
+
+    monkeypatch.setattr("florence.runtime.google_services.refresh_google_access_token", _fake_refresh)
+    monkeypatch.setattr("florence.runtime.google_services.list_recent_gmail_sync_items", _fake_gmail)
+    monkeypatch.setattr("florence.runtime.google_services.list_recent_parent_calendar_sync_items", lambda **_: [])
+
+    worker = FlorenceGoogleSyncWorkerService(store, FlorenceGoogleSyncPersistenceService(store))
+    result = worker.sync_connection(
+        "gconn_missing_expiry",
+        now=datetime(2026, 4, 8, 7, 0, tzinfo=timezone.utc),
+        client_id="google-client",
+        client_secret="google-secret",
+    )
+
+    assert observed_tokens == ["fresh-token"]
+    assert result.connection.access_token == "fresh-token"
+    assert result.connection.access_token_expires_at == "2026-04-08T08:00:00+00:00"
+    store.close()
+
+
+def test_google_sync_worker_retries_gmail_fetch_once_after_google_401(tmp_path, monkeypatch):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_google_connection(
+        GoogleConnection(
+            id="gconn_retry",
+            household_id="hh_123",
+            member_id="mem_123",
+            email="parent@example.com",
+            connected_scopes=(GoogleSourceKind.GMAIL,),
+            access_token="stale-token",
+            refresh_token="refresh-token",
+            access_token_expires_at="2026-04-08T12:00:00+00:00",
+            metadata={
+                "primary_calendar_id": "family",
+                "primary_calendar_summary": "Family calendar",
+                "primary_calendar_timezone": "America/Los_Angeles",
+            },
+        )
+    )
+
+    observed_tokens: list[str] = []
+
+    def _fake_refresh(**_kwargs):
+        return GoogleTokenResponse(
+            access_token="fresh-token",
+            refresh_token="refresh-token",
+            expires_in=3600,
+        )
+
+    def _fake_gmail(**kwargs):
+        observed_tokens.append(kwargs["access_token"])
+        if kwargs["access_token"] == "stale-token":
+            request = httpx.Request("GET", "https://gmail.googleapis.com/gmail/v1/users/me/messages")
+            response = httpx.Response(401, request=request)
+            raise httpx.HTTPStatusError("401 Unauthorized", request=request, response=response)
+        return []
+
+    monkeypatch.setattr("florence.runtime.google_services.refresh_google_access_token", _fake_refresh)
+    monkeypatch.setattr("florence.runtime.google_services.list_recent_gmail_sync_items", _fake_gmail)
+    monkeypatch.setattr("florence.runtime.google_services.list_recent_parent_calendar_sync_items", lambda **_: [])
+
+    worker = FlorenceGoogleSyncWorkerService(store, FlorenceGoogleSyncPersistenceService(store))
+    result = worker.sync_connection(
+        "gconn_retry",
+        now=datetime(2026, 4, 8, 7, 0, tzinfo=timezone.utc),
+        client_id="google-client",
+        client_secret="google-secret",
+    )
+
+    assert observed_tokens == ["stale-token", "fresh-token"]
+    assert result.connection.access_token == "fresh-token"
+    assert result.connection.access_token_expires_at == "2026-04-08T08:00:00+00:00"
+    store.close()

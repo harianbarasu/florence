@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import re
-
 from florence.contracts import ChannelMessageRole
 from florence.messaging.chat_bridge import FlorenceHouseholdChatBridge
 from florence.messaging.channel_log import FlorenceChannelLog
@@ -15,18 +13,8 @@ from florence.messaging.protocol_types import FlorenceProtocolReply
 from florence.state import FlorenceStateDB
 
 
-def _looks_like_group_intro(text: str) -> bool:
-    return bool(
-        re.search(
-            r"^(?:hi|hey|hello)(?:\s+there)?(?:\s+florence)?[.!?]*$|^hey\s+florence[.!?]*$|^hi\s+florence[.!?]*$",
-            text.strip(),
-            re.IGNORECASE,
-        )
-    )
-
-
 class FlorenceGroupRouter:
-    """Route household group turns with a lightweight intro gate and Hermes handoff."""
+    """Route household group turns through a Hermes intro decision and normal chat."""
 
     def __init__(
         self,
@@ -54,14 +42,15 @@ class FlorenceGroupRouter:
             latest is not None
             and latest.is_complete
             and not prior_assistant_messages
-            and _looks_like_group_intro(resolved.message.body)
         ):
-            return FlorenceMessagingIngressResult(
-                reply_text=(
-                    "I’m in. This group is the main household thread, so ask me what matters this week, what changed on the kids' schedule, or what we should handle next. Use DM when something should stay private."
-                ),
-                consumed=True,
+            intro_result = self.chat_bridge.handle_group_intro_turn(
+                household_id=resolved.household_id,
+                channel_id=resolved.channel_id,
+                member_id=resolved.member_id,
+                user_message=resolved.message.body,
             )
+            if intro_result is not None:
+                return self._result_from_protocol_reply(intro_result)
 
         chat_result = self.chat_bridge.respond_as_protocol(
             household_id=resolved.household_id,

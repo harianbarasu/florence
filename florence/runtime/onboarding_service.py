@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Callable
+from typing import Any, Callable
 
 from florence.contracts import ChildProfile, HouseholdProfileItem, HouseholdProfileKind
 from florence.onboarding import (
@@ -18,12 +18,9 @@ from florence.onboarding import (
     build_onboarding_prompt_message_sequence,
     build_onboarding_ready_message_sequence,
     build_onboarding_transition_message_sequence,
-    extract_child_names,
     mark_google_connected,
-    split_entries,
     sync_onboarding_stage,
 )
-from florence.onboarding.intake import FlorenceOnboardingIntakeService
 from florence.runtime.candidate_review import FlorenceCandidateReviewService
 from florence.runtime.services import (
     _augment_onboarding_prompt,
@@ -50,12 +47,10 @@ class FlorenceOnboardingSessionService:
         store: FlorenceStateDB,
         *,
         candidate_review_service: FlorenceCandidateReviewService | None = None,
-        intake_service: FlorenceOnboardingIntakeService | None = None,
         link_url_builder: Callable[[str, str, str], str | None] | None = None,
     ):
         self.store = store
         self.candidate_review_service = candidate_review_service
-        self.intake_service = intake_service or FlorenceOnboardingIntakeService()
         self.link_url_builder = link_url_builder
 
     def get_or_create_session(self, *, household_id: str, member_id: str, thread_id: str) -> OnboardingState:
@@ -228,49 +223,6 @@ class FlorenceOnboardingSessionService:
             self.store.upsert_member(replace(member, display_name=display_name.strip() or member.display_name))
         return self._persist_transition(apply_parent_name(state, display_name))
 
-    def record_user_reply(
-        self,
-        *,
-        household_id: str,
-        member_id: str,
-        thread_id: str,
-        text: str,
-    ) -> OnboardingTransition:
-        state = self.get_or_create_session(household_id=household_id, member_id=member_id, thread_id=thread_id)
-        intake = self.intake_service.parse(state=state, text=text)
-        next_state = state
-        absorbed_fragmented_child_names = False
-
-        if intake.parent_name and not next_state.parent_display_name:
-            next_state = apply_parent_name(next_state, intake.parent_name).state
-            member = self.store.get_member(member_id)
-            if member is not None:
-                self.store.upsert_member(replace(member, display_name=intake.parent_name))
-
-        if intake.child_names:
-            next_state = apply_child_names(next_state, intake.child_names).state
-        elif self._should_absorb_fragmented_child_names(state=state, text=text):
-            fragmented_names = extract_child_names(split_entries(text))
-            if fragmented_names:
-                next_state = apply_child_names(next_state, fragmented_names).state
-                absorbed_fragmented_child_names = True
-
-        if intake.child_updates and not absorbed_fragmented_child_names:
-            next_state = apply_child_profile_updates(next_state, intake.child_updates).state
-
-        if intake.google_connected and not next_state.google_connected:
-            next_state = mark_google_connected(next_state).state
-
-        next_state = sync_onboarding_stage(next_state)
-        changed = next_state != state
-        return self._persist_transition(
-            OnboardingTransition(
-                state=next_state,
-                prompt=build_onboarding_prompt(next_state),
-                changed=changed and not intake.ignore_message,
-            )
-        )
-
     def apply_explicit_update(
         self,
         *,
@@ -327,53 +279,6 @@ class FlorenceOnboardingSessionService:
                 changed=next_state != state,
             )
         )
-
-    @staticmethod
-    def _should_absorb_fragmented_child_names(*, state: OnboardingState, text: str) -> bool:
-        if state.stage != OnboardingStage.COLLECT_CHILD_AGE:
-            return False
-        cleaned = " ".join(str(text or "").split()).strip()
-        if not cleaned or any(char.isdigit() for char in cleaned):
-            return False
-        lowered = cleaned.lower()
-        disallowed_markers = (
-            "school",
-            "elementary",
-            "middle",
-            "high",
-            "preschool",
-            "pre school",
-            "pre-school",
-            "kindergarten",
-            "daycare",
-            "grade",
-            "years old",
-            "year old",
-            " years",
-            " year",
-            " old",
-            "turning",
-            "turns",
-            "soccer",
-            "baseball",
-            "basketball",
-            "dance",
-            "music",
-            "piano",
-            "violin",
-            "swim",
-            "camp",
-            "class",
-            "not yet",
-            "none",
-        )
-        if any(marker in lowered for marker in disallowed_markers):
-            return False
-        candidate_names = extract_child_names(split_entries(cleaned))
-        if not candidate_names:
-            return False
-        existing = {name.strip().lower() for name in state.child_names if name.strip()}
-        return any(name.strip().lower() not in existing for name in candidate_names)
 
     def record_google_connected(
         self,

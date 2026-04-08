@@ -2,10 +2,12 @@
 
 import json
 import pytest
+import tools.browser_tool as browser_tool_module
 
 from model_tools import (
     handle_function_call,
     get_all_tool_names,
+    get_tool_definitions,
     get_toolset_for_tool,
     _AGENT_LOOP_TOOLS,
     _LEGACY_TOOLSET_MAP,
@@ -101,3 +103,36 @@ class TestBackwardCompat:
     def test_tool_to_toolset_map(self):
         assert isinstance(TOOL_TO_TOOLSET_MAP, dict)
         assert len(TOOL_TO_TOOLSET_MAP) > 0
+
+
+class TestFlorenceToolDefinitions:
+    def test_florence_chat_exposes_runtime_cronjob_tool(self, monkeypatch):
+        monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+        tools = get_tool_definitions(enabled_toolsets=["florence_chat"], quiet_mode=True)
+        names = {tool["function"]["name"] for tool in tools}
+        assert "cronjob" in names
+        assert "delegate_task" in names
+        assert "schedule_cronjob" not in names
+        assert "list_cronjobs" not in names
+        assert "remove_cronjob" not in names
+
+    def test_florence_chat_exposes_browser_and_research_tools_when_available(self, monkeypatch):
+        monkeypatch.setenv("PARALLEL_API_KEY", "test-key")
+        monkeypatch.setattr(browser_tool_module, "_find_agent_browser", lambda: "/tmp/agent-browser")
+        monkeypatch.setattr(browser_tool_module, "_get_cloud_provider", lambda: None)
+        tools = get_tool_definitions(enabled_toolsets=["florence_chat"], quiet_mode=True)
+        names = {tool["function"]["name"] for tool in tools}
+        assert {"web_search", "web_extract", "browser_navigate", "browser_snapshot", "browser_console"}.issubset(names)
+
+    def test_disabled_toolsets_apply_after_enabled_toolsets(self, monkeypatch):
+        monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+        tools = get_tool_definitions(
+            enabled_toolsets=["florence_chat"],
+            disabled_toolsets=["delegation", "messaging", "clarify", "code_execution"],
+            quiet_mode=True,
+        )
+        names = {tool["function"]["name"] for tool in tools}
+        assert "delegate_task" not in names
+        assert "send_message" not in names
+        assert "clarify" not in names
+        assert "cronjob" in names

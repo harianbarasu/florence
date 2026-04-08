@@ -49,10 +49,11 @@ class TestToolsetIntersection:
 
     def test_strip_blocked_removes_delegation(self):
         """Blocked toolsets (delegation, clarify, etc.) are always removed."""
-        child = _strip_blocked_tools(["terminal", "delegation", "clarify", "memory"])
+        child = _strip_blocked_tools(["terminal", "delegation", "clarify", "memory", "messaging"])
         assert "delegation" not in child
         assert "clarify" not in child
         assert "memory" not in child
+        assert "messaging" not in child
         assert "terminal" in child
 
     def test_empty_intersection_yields_empty_toolsets(self):

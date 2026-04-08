@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
-import re
 from typing import Callable
 
 from florence.messaging.channel_log import FlorenceChannelLog
@@ -29,38 +27,6 @@ def _looks_like_google_done_prompt(text: str) -> bool:
             "email",
         )
     )
-
-
-def _looks_like_done_for_reminder(text: str) -> bool:
-    normalized = " ".join(text.strip().lower().split())
-    return normalized == "done"
-
-
-def _looks_like_snooze_request(text: str) -> bool:
-    lowered = " ".join(text.lower().split())
-    return lowered.startswith("snooze") or lowered == "remind me later" or lowered == "later"
-
-
-def _parse_snooze_deadline(text: str, *, now: datetime | None = None) -> datetime:
-    base = now or datetime.now(timezone.utc)
-    match = re.search(r"\b(\d+)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)\b", text, re.IGNORECASE)
-    if match:
-        quantity = max(1, int(match.group(1)))
-        unit = match.group(2).lower()
-        if unit.startswith("m"):
-            return base + timedelta(minutes=quantity)
-        if unit.startswith("h"):
-            return base + timedelta(hours=quantity)
-        return base + timedelta(days=quantity)
-    lowered = text.lower()
-    if "tomorrow morning" in lowered:
-        target = (base + timedelta(days=1)).astimezone(timezone.utc)
-        return datetime(target.year, target.month, target.day, 14, 0, tzinfo=timezone.utc)
-    if "tomorrow" in lowered:
-        return base + timedelta(days=1)
-    if "tonight" in lowered:
-        return base + timedelta(hours=4)
-    return base + timedelta(hours=2)
 
 
 class FlorenceReminderProtocol:
@@ -97,40 +63,6 @@ class FlorenceReminderProtocol:
         if google_done_result is not None:
             return google_done_result
 
-        active_nudge_id = self._active_nudge_id(channel_id=channel_id)
-
-        if active_nudge_id and _looks_like_done_for_reminder(text):
-            reminder_reply = self.household_manager_service.complete_actionable_nudge(
-                household_id=household_id,
-                member_id=member_id,
-                channel_id=channel_id,
-                nudge_id=active_nudge_id,
-            )
-            if reminder_reply is None:
-                return None
-            return FlorenceProtocolReply(
-                reply_text=reminder_reply.reply_text,
-                consumed=True,
-            )
-
-        if active_nudge_id and _looks_like_snooze_request(text):
-            now = datetime.now(timezone.utc)
-            snooze_until = _parse_snooze_deadline(text, now=now).astimezone(timezone.utc)
-            reminder_reply = self.household_manager_service.snooze_actionable_nudge(
-                household_id=household_id,
-                member_id=member_id,
-                channel_id=channel_id,
-                nudge_id=active_nudge_id,
-                scheduled_for=snooze_until,
-                now=now,
-            )
-            if reminder_reply is None:
-                return None
-            return FlorenceProtocolReply(
-                reply_text=reminder_reply.reply_text,
-                consumed=True,
-            )
-
         return None
 
     def is_reply_armed(self, *, channel_id: str) -> bool:
@@ -156,6 +88,7 @@ class FlorenceReminderProtocol:
             "Context for this turn: there is one currently surfaced reminder/nudge in this DM.\n"
             "Only that reminder is actionable right now.\n"
             "Use household_apply_nudge_action with the exact nudge_id if the user is completing, snoozing, or otherwise updating it.\n"
+            "Interpret the whole message yourself, including short done/snooze/later replies; Florence no longer resolves those deterministically here.\n"
             "Do not mutate reminder state for vague acknowledgements unless the user clearly means this exact reminder.\n"
             f"Active nudge: {self._render_nudge_context(nudge)}\n"
             f"User reply: {text}"
@@ -172,7 +105,7 @@ class FlorenceReminderProtocol:
         respond_with_household_chat: Callable[[str], FlorenceProtocolReply | None],
     ) -> FlorenceProtocolReply | None:
         if not (
-            _looks_like_done_for_reminder(text)
+            " ".join(text.strip().lower().split()) == "done"
             and latest_assistant_message_body is not None
             and _looks_like_google_done_prompt(latest_assistant_message_body)
         ):

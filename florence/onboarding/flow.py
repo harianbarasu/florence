@@ -96,6 +96,14 @@ def _child_detail_lines(profiles: list[dict[str, Any]]) -> list[str]:
     return details
 
 
+def _prompt_child_name(name: str | None) -> str:
+    cleaned = _clean_text(name)
+    if not cleaned:
+        return "your child"
+    first_token = cleaned.split()[0].strip()
+    return first_token or cleaned
+
+
 def _refresh_child_state(state: OnboardingState, profiles: list[dict[str, Any]]) -> OnboardingState:
     normalized = _normalize_child_profiles(profiles)
     metadata = dict(state.metadata)
@@ -251,14 +259,14 @@ def build_onboarding_prompt(state: OnboardingState) -> OnboardingPrompt | None:
     if current.stage == OnboardingStage.COLLECT_CHILD_NAMES:
         return OnboardingPrompt(
             stage=current.stage,
-            text="What are your kids' names? Send all of them in one message, one per line or comma-separated.",
+            text="What are your kids' names? You can send them all in one message, one per line or comma-separated.",
         )
 
-    child_name = current.current_child_name or "your child"
+    child_name = _prompt_child_name(current.current_child_name)
     if current.stage == OnboardingStage.COLLECT_CHILD_AGE:
-        intro = "Great, let's learn more about each kid one at a time."
+        intro = "Great, let's do one kid at a time."
         if current.current_child_index > 0:
-            intro = "Okay, next one."
+            intro = "Okay."
         return OnboardingPrompt(
             stage=current.stage,
             text=f"{intro} How old is {child_name}?",
@@ -267,13 +275,13 @@ def build_onboarding_prompt(state: OnboardingState) -> OnboardingPrompt | None:
     if current.stage == OnboardingStage.COLLECT_CHILD_SCHOOL:
         return OnboardingPrompt(
             stage=current.stage,
-            text=f"What school does {child_name} go to? If not in school yet, say not yet.",
+            text=f"What school does {child_name} go to? If not yet, just say not yet.",
         )
 
     if current.stage == OnboardingStage.COLLECT_CHILD_ACTIVITIES:
         return OnboardingPrompt(
             stage=current.stage,
-            text=f"What activities does {child_name} do? If none right now, say none.",
+            text=f"What activities does {child_name} do right now? If none, just say none.",
         )
 
     if current.stage == OnboardingStage.CONNECT_GOOGLE:

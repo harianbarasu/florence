@@ -86,6 +86,25 @@ def test_onboarding_goes_straight_to_kids_after_parent_name():
     assert "kids" in transition.prompt.text.lower()
 
 
+def test_onboarding_prompt_uses_short_name_for_full_child_name():
+    state = OnboardingState(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="thread_dm_123",
+        parent_display_name="Maya",
+        metadata={
+            "child_profiles": [{"name": "Theo Williams", "age": "7"}],
+            "current_child_index": 0,
+        },
+    )
+
+    prompt = build_onboarding_prompt(state)
+
+    assert prompt is not None
+    assert prompt.stage == OnboardingStage.COLLECT_CHILD_SCHOOL
+    assert prompt.text == "What school does Theo go to? If not yet, just say not yet."
+
+
 def test_transition_messages_after_parent_name_include_intro_and_google_connect():
     state = OnboardingState(
         household_id="hh_123",
@@ -106,5 +125,5 @@ def test_transition_messages_after_parent_name_include_intro_and_google_connect(
         "Connect your Google account so I can pull up to the last year of family email and calendar in the background while we keep going here.",
         "https://example.com/google/connect",
         "Once Google says you're connected, come right back here. You can also keep answering my questions while it runs.",
-        "What are your kids' names? Send all of them in one message, one per line or comma-separated.",
+        "What are your kids' names? You can send them all in one message, one per line or comma-separated.",
     )

@@ -847,10 +847,10 @@ def test_onboarding_service_renders_transition_and_repeat_messages(tmp_path):
         "Connect your Google account so I can pull up to the last year of family email and calendar in the background while we keep going here.",
         "https://example.com/google/connect",
         "Once Google says you're connected, come right back here. You can also keep answering my questions while it runs.",
-        "What are your kids' names? Send all of them in one message, one per line or comma-separated.",
+        "What are your kids' names? You can send them all in one message, one per line or comma-separated.",
     )
     assert repeat_messages == (
-        "What are your kids' names? Send all of them in one message, one per line or comma-separated.",
+        "What are your kids' names? You can send them all in one message, one per line or comma-separated.",
     )
     store.close()
 
@@ -888,7 +888,7 @@ def test_onboarding_service_accepts_long_school_value_and_advances(tmp_path):
     assert transition.changed is True
     assert transition.state.stage == OnboardingStage.COLLECT_CHILD_ACTIVITIES
     assert transition.prompt is not None
-    assert transition.prompt.text == "What activities does Violet do? If none right now, say none."
+    assert transition.prompt.text == "What activities does Violet do right now? If none, just say none."
     assert transition.state.child_profiles[0]["school"] == (
         "Young Minds Preschool. Last year before she starts TK at WISH next year"
     )
@@ -934,7 +934,7 @@ def test_onboarding_service_accepts_long_activity_value_and_advances_to_next_chi
     assert transition.changed is True
     assert transition.state.stage == OnboardingStage.COLLECT_CHILD_AGE
     assert transition.prompt is not None
-    assert transition.prompt.text == "Okay, next one. How old is Violet?"
+    assert transition.prompt.text == "Okay. How old is Violet?"
     assert transition.state.current_child_name == "Violet"
     assert transition.state.child_profiles[0]["activities"] == [
         "He plays little league baseball with DRALL and does music class with Musical Beginnings"

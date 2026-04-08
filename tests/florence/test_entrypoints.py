@@ -228,7 +228,7 @@ def test_entrypoints_hybrid_onboarding_offers_google_link_immediately_after_name
         "Connect your Google account so I can pull up to the last year of family email and calendar in the background while we keep going here."
     )
     assert first.reply_messages[3].startswith("https://accounts.google.com/")
-    assert first.reply_messages[-1] == "What are your kids' names? Send all of them in one message, one per line or comma-separated."
+    assert first.reply_messages[-1] == "What are your kids' names? You can send them all in one message, one per line or comma-separated."
     store.close()
 
 

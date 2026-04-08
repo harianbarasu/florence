@@ -1281,7 +1281,7 @@ def test_production_service_first_dm_sends_onboarding_sequence_as_separate_messa
     assert service.linq.sent[2]["message"] == "Connect your Google account so I can pull up to the last year of family email and calendar in the background while we keep going here."
     assert service.linq.sent[3]["message"].startswith("https://accounts.google.com/")
     assert service.linq.sent[4]["message"] == "Once Google says you're connected, come right back here. You can also keep answering my questions while it runs."
-    assert service.linq.sent[5]["message"] == "What are your kids' names? Send all of them in one message, one per line or comma-separated."
+    assert service.linq.sent[5]["message"] == "What are your kids' names? You can send them all in one message, one per line or comma-separated."
     store.close()
 
 

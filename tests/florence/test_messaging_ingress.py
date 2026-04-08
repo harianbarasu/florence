@@ -384,7 +384,7 @@ class _OnboardingToolAgent:
         )
         reply_messages = result.get("result", {}).get("reply_messages") or []
         return {
-            "final_response": reply_messages[0] if reply_messages else "What activities does Theo do? If none right now, say none."
+            "final_response": reply_messages[0] if reply_messages else "What activities does Theo do right now? If none, just say none."
         }
 
 
@@ -732,7 +732,7 @@ def test_dm_parent_name_reply_includes_friendly_google_link(tmp_path):
         "Connect your Google account so I can pull up to the last year of family email and calendar in the background while we keep going here.",
         "https://example.com/google/connect",
         "Once Google says you're connected, come right back here. You can also keep answering my questions while it runs.",
-        "What are your kids' names? Send all of them in one message, one per line or comma-separated.",
+        "What are your kids' names? You can send them all in one message, one per line or comma-separated.",
     )
     store.close()
 
@@ -787,7 +787,7 @@ def test_dm_onboarding_replies_immediately_to_child_name_message(tmp_path):
         member_id="mem_123",
         thread_id="dm_thread_123",
     )
-    assert result.reply_messages == ("Great, let's learn more about each kid one at a time. How old is Ava?",)
+    assert result.reply_messages == ("Great, let's do one kid at a time. How old is Ava?",)
     assert session.child_names == ["Ava"]
     store.close()
 
@@ -891,7 +891,7 @@ def test_dm_onboarding_stays_in_messages_even_when_link_service_is_available(tmp
         "Connect your Google account so I can pull up to the last year of family email and calendar in the background while we keep going here.",
         "https://example.com/google/connect",
         "Once Google says you're connected, come right back here. You can also keep answering my questions while it runs.",
-        "What are your kids' names? Send all of them in one message, one per line or comma-separated.",
+        "What are your kids' names? You can send them all in one message, one per line or comma-separated.",
     )
     assert session.parent_display_name == "Maya"
     assert session.stage == "collect_child_names"
@@ -2572,7 +2572,7 @@ def test_google_callback_copy_does_not_require_group_to_unlock_agent(tmp_path):
         thread_id="dm_thread_123",
     )
     assert result.consumed is True
-    assert result.reply_messages == ("What activities does Ava do? If none right now, say none.",)
+    assert result.reply_messages == ("What activities does Ava do right now? If none, just say none.",)
     assert session.is_complete is False
     store.close()
 
@@ -2622,7 +2622,7 @@ def test_child_age_reply_advances_immediately_after_google_connect(tmp_path):
         )
     )
 
-    assert result.reply_messages == ("What school does Lexie go to? If not in school yet, say not yet.",)
+    assert result.reply_messages == ("What school does Lexie go to? If not yet, just say not yet.",)
     store.close()
 
 
@@ -2678,7 +2678,7 @@ def test_activity_completion_after_google_records_onboarding_completion(tmp_path
     )
     events = store.list_pilot_events(household_id="hh_123", event_type="onboarding_complete")
     assert result.consumed is True
-    assert result.reply_messages == ("What school does Ava go to? If not in school yet, say not yet.",)
+    assert result.reply_messages == ("What school does Ava go to? If not yet, just say not yet.",)
     assert session.is_complete is False
     assert session.stage == "collect_child_school"
     assert len(events) == 0

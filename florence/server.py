@@ -7,8 +7,9 @@ import json
 import logging
 import os
 import sys
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
 from florence.config import FlorenceSettings
@@ -24,6 +25,11 @@ def _resolve_preflight_mode() -> str:
     if raw in {"warn", "warning"}:
         return "warn"
     return "strict"
+
+
+def _resolve_preflight_blocking() -> bool:
+    raw = os.getenv("FLORENCE_HERMES_PREFLIGHT_BLOCKING", "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 def _preflight_error_hint(exc: Exception) -> str:
@@ -86,6 +92,35 @@ def _run_hermes_preflight(
         raise RuntimeError(message) from exc
 
     logger.info("Florence Hermes preflight passed")
+
+
+def _start_hermes_preflight(
+    settings: FlorenceSettings,
+    *,
+    agent_factory: Callable[..., Any] | None = None,
+) -> None:
+    if _resolve_preflight_blocking():
+        logger.info("Florence Hermes preflight running in blocking mode")
+        _run_hermes_preflight(settings, agent_factory=agent_factory)
+        return
+
+    mode = _resolve_preflight_mode()
+    if mode == "off":
+        _run_hermes_preflight(settings, agent_factory=agent_factory)
+        return
+
+    def _target() -> None:
+        try:
+            _run_hermes_preflight(settings, agent_factory=agent_factory)
+        except Exception:
+            logger.exception("Florence Hermes preflight failed after startup")
+
+    threading.Thread(
+        target=_target,
+        name="florence-hermes-preflight",
+        daemon=True,
+    ).start()
+    logger.info("Florence Hermes preflight running in background mode=%s", mode)
 
 
 def _log_runtime_configuration(settings: FlorenceSettings) -> None:
@@ -275,12 +310,11 @@ def main() -> None:
     host = args.host or settings.server.host
     port = args.port or settings.server.port
 
-    _run_hermes_preflight(settings)
-
     service = FlorenceProductionService(settings)
     server = build_http_server(service, host=host, port=port)
 
     logger.info("Florence HTTP server listening on %s:%s", host, port)
+    _start_hermes_preflight(settings)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

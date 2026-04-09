@@ -170,6 +170,55 @@ def test_production_service_strips_markdown_before_sending_sendblue_message(tmp_
     store.close()
 
 
+def test_production_service_scrubs_internal_ids_before_sending_sendblue_message(tmp_path, monkeypatch):
+    settings = _build_settings(tmp_path)
+    store = FlorenceStateDB(settings.server.db_path)
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="sendblue",
+            provider_channel_id="+15122164639|+15555550123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    service = FlorenceProductionService(settings, store=store)
+    service.sendblue = _FakeSendblueClient()
+    monkeypatch.setattr(
+        service.entrypoints,
+        "handle_sendblue_payload",
+        lambda payload: FlorenceEntrypointResult(
+            reply_text='Review work_123 and check mem_abc before touching hh_123.',
+            consumed=True,
+            household_id="hh_123",
+            channel_id="chan_dm_123",
+        ),
+    )
+
+    payload = {
+        "content": "hello",
+        "is_outbound": False,
+        "status": "RECEIVED",
+        "message_handle": "msg_123",
+        "from_number": "+15555550123",
+        "number": "+15555550123",
+        "to_number": "+15122164639",
+        "sendblue_number": "+15122164639",
+        "service": "iMessage",
+    }
+    result = service.handle_sendblue_webhook(
+        payload=payload,
+        webhook_secret="sb-webhook-secret",
+    )
+
+    assert result.status_code == 200
+    assert json.loads(result.body)["ok"] is True
+    assert service.sendblue.sent[0]["message"] == "Review that item and check another parent before touching that item."
+    store.close()
+
+
 def test_server_accepts_sendblue_documented_secret_header():
     headers = {"sb-signing-secret": "sb-webhook-secret"}
 

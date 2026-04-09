@@ -29,6 +29,7 @@ from florence.runtime.household_merge import FlorenceHouseholdMergeService
 from florence.runtime.household_manager import FlorenceHouseholdManagerService
 from florence.runtime.resolver import normalize_identity_value
 from florence.state import FlorenceStateDB
+from florence.text_safety import scrub_internal_ids
 
 
 _MEANINGFUL_HOUSEHOLD_STATE_KEYS = (
@@ -1291,8 +1292,8 @@ class FlorenceHouseholdLinkService:
             )
         return results
 
-    def _routine_groups(self, *, household_id: str) -> dict[tuple[str, str, str], list[object]]:
-        grouped: dict[tuple[str, str, str], list[object]] = {}
+    def _routine_groups(self, *, household_id: str) -> dict[tuple[str, str, str, str], list[object]]:
+        grouped: dict[tuple[str, str, str, str], list[object]] = {}
         for routine in self.store.list_household_routines(household_id=household_id):
             if routine.status == HouseholdRoutineStatus.ARCHIVED:
                 continue
@@ -1303,6 +1304,7 @@ class FlorenceHouseholdLinkService:
                 normalized_title,
                 str(routine.cadence or "").strip().lower(),
                 str(routine.child_id or "").strip(),
+                str(routine.owner_member_id or "").strip(),
             )
             grouped.setdefault(key, []).append(routine)
         return grouped
@@ -1346,7 +1348,6 @@ class FlorenceHouseholdLinkService:
     def _routine_diff_lines(self, routines: list[object]) -> list[str]:
         return self._describe_field_differences(
             {
-                "Owner": [str(getattr(routine, "owner_member_id", "") or "").strip() for routine in routines],
                 "Description": [str(getattr(routine, "description", "") or "").strip() for routine in routines],
                 "Next due": [str(getattr(routine, "next_due_at", "") or "").strip() for routine in routines],
                 "Status": [str(getattr(routine, "status", "") or "").strip() for routine in routines],
@@ -1378,9 +1379,13 @@ class FlorenceHouseholdLinkService:
         group_count: int,
     ) -> tuple[str, str, list[str]]:
         items = list(first_group.get("items") or [])
-        labels = ", ".join(str(item.get("label") or "").strip() for item in items[:3] if str(item.get("label") or "").strip())
+        labels = ", ".join(
+            scrub_internal_ids(str(item.get("label") or "").strip())
+            for item in items[:3]
+            if str(item.get("label") or "").strip()
+        )
         diff_lines = [
-            str(line).strip()
+            scrub_internal_ids(str(line).strip())
             for line in (first_group.get("diff_lines") or [])
             if str(line).strip()
         ]
@@ -1415,7 +1420,10 @@ class FlorenceHouseholdLinkService:
         if count <= 0:
             return ""
         if preview_lines:
-            preview = "; ".join(line.rstrip(".") for line in preview_lines[:2])
+            preview = "; ".join(
+                scrub_internal_ids(line.rstrip("."))
+                for line in preview_lines[:2]
+            )
             return (
                 f" {lead_in} {count} follow-up item{'s' if count != 1 else ''} to review: "
                 f"{preview}."

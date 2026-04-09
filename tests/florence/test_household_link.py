@@ -447,6 +447,67 @@ def test_household_link_service_creates_merge_cleanup_work_items_for_obvious_dup
     store.close()
 
 
+def test_household_link_service_keeps_member_owned_briefing_routines_separate(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_jackson", name="Jackson's household", timezone="America/Los_Angeles"))
+    store.upsert_household(Household(id="hh_kendall", name="Kendall's household", timezone="America/Los_Angeles"))
+    store.upsert_member(Member(id="mem_jackson", household_id="hh_jackson", display_name="Jackson", role=MemberRole.ADMIN))
+    store.upsert_member(Member(id="mem_kendall", household_id="hh_kendall", display_name="Kendall", role=MemberRole.ADMIN))
+    normalized = normalize_identity_value(IdentityKind.PHONE, "+1 (555) 555-0124")
+    store.upsert_member_identity(
+        MemberIdentity(
+            id="ident_kendall",
+            member_id="mem_kendall",
+            kind=IdentityKind.PHONE,
+            value="+1 (555) 555-0124",
+            normalized_value=normalized,
+        )
+    )
+    store.upsert_household_routine(
+        HouseholdRoutine(
+            id="routine_jackson_morning",
+            household_id="hh_jackson",
+            title="Morning brief",
+            cadence="briefing on weekdays at 07:00 local",
+            description="Automatic Florence household briefing routine",
+            owner_member_id="mem_jackson",
+            metadata={"automation_kind": "briefing", "brief_kind": "morning"},
+        )
+    )
+    store.upsert_household_routine(
+        HouseholdRoutine(
+            id="routine_kendall_morning",
+            household_id="hh_kendall",
+            title="Morning brief",
+            cadence="briefing on weekdays at 07:00 local",
+            description="Automatic Florence household briefing routine",
+            owner_member_id="mem_kendall",
+            metadata={"automation_kind": "briefing", "brief_kind": "morning"},
+        )
+    )
+    service = FlorenceHouseholdLinkService(store)
+    request = service.create_phone_link_request(
+        household_id="hh_jackson",
+        inviting_member_id="mem_jackson",
+        invited_phone="+1 (555) 555-0124",
+        invited_display_name="Kendall",
+    )
+
+    result = service.accept_from_invited(request_id=request.id, invited_member_id="mem_kendall")
+
+    active_routines = [
+        item for item in store.list_household_routines(household_id="hh_jackson") if item.status != "archived"
+    ]
+    work_items = store.list_household_work_items(household_id="hh_jackson")
+
+    assert result.request.status == HouseholdLinkRequestStatus.MERGED
+    assert len(active_routines) == 2
+    assert work_items == []
+    assert "Morning brief" not in result.reply_text
+    assert "mem_" not in result.reply_text
+    store.close()
+
+
 def test_household_link_service_auto_dedupes_exact_preferences_and_routines(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     store.upsert_household(Household(id="hh_jackson", name="Jackson's household", timezone="America/Los_Angeles"))

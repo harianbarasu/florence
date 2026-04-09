@@ -24,6 +24,7 @@ from florence.runtime.household_manager import FlorenceHouseholdManagerService
 from florence.runtime.household_link import FlorenceHouseholdLinkService
 from florence.runtime.onboarding_service import FlorenceOnboardingSessionService
 from florence.state import FlorenceStateDB
+from florence.text_safety import scrub_internal_ids
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +135,8 @@ class FlorenceMessagingIngressService:
 
         result = self.group_router.handle_message(resolved) if resolved.is_group else self.dm_router.handle_message(resolved)
 
-        reply_messages = result.reply_messages or ((result.reply_text,) if result.reply_text else ())
+        raw_reply_messages = result.reply_messages or ((result.reply_text,) if result.reply_text else ())
+        reply_messages = tuple(scrub_internal_ids(message) for message in raw_reply_messages if message)
         persisted_channel = self.store.get_channel(resolved.channel_id)
         persisted_household_id = (
             persisted_channel.household_id

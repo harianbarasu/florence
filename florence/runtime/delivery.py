@@ -10,6 +10,7 @@ from typing import Any, Callable
 from florence.contracts import ChannelMessage, ChannelMessageRole, ChannelType, PilotEvent
 from florence.runtime.entrypoints import FlorenceEntrypointResult
 from florence.state import FlorenceStateDB
+from florence.text_safety import scrub_internal_ids
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +26,7 @@ def _plain_text_transport_message(message: str) -> str:
     text = re.sub(r"(?<!\S)_([^\n_]+)_(?!\S)", r"\1", text)
     text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
     text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
+    return scrub_internal_ids(text.strip())
 
 
 class FlorenceChannelDeliveryService:

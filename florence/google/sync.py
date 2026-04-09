@@ -448,6 +448,7 @@ def _build_imported_candidate(
             "review_channel_type": ChannelType.PARENT_DM.value,
             "google_connection_id": connection.id,
             "connected_email": connection.email,
+            "candidate_scope": str((decision.raw_metadata or {}).get("candidate_scope") or "shared_household"),
             "confirmation_question": _default_confirmation_question(decision),
             "source_requires_detail_confirmation": decision.requires_confirmation,
             "proposed_fields": decision.proposed_fields or {},

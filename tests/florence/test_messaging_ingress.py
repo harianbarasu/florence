@@ -2105,6 +2105,169 @@ def test_review_prompt_then_yes_routes_single_item_context_to_chat(tmp_path):
     store.close()
 
 
+def test_review_prompt_yes_stays_bound_to_visible_candidate_even_if_newer_pending_item_arrives(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_onboarding_service(store, review_service)
+    chat_service = _StubHouseholdChatService("Confirmed. I’m adding that review item now.")
+    ingress = _build_ingress(
+        store,
+        onboarding_service,
+        review_service,
+        household_chat_service=chat_service,
+    )
+    _complete_hybrid_onboarding(onboarding_service)
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_visible",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:one-medical",
+            title="One Medical receipt",
+            summary="Payment of $37.43 on April 8 for Kendall.",
+            state=CandidateState.PENDING_REVIEW,
+        )
+    )
+
+    review = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_visible",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="review imports",
+                is_group_chat=False,
+            ),
+        )
+    )
+    assert review.reply_text is not None
+    assert "One Medical receipt" in review.reply_text
+
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_hidden",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:violet-dance",
+            title="Violet Dance",
+            summary="Dance schedule update.",
+            state=CandidateState.PENDING_REVIEW,
+        )
+    )
+
+    confirmation = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_yes",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="yes",
+                is_group_chat=False,
+            ),
+        )
+    )
+    assert confirmation.reply_text == "Confirmed. I’m adding that review item now."
+    contextual_message = chat_service.calls[-1]["message_text"]
+    assert '"candidate_id": "cand_visible"' in contextual_message
+    assert '"candidate_id": "cand_hidden"' not in contextual_message
+    store.close()
+
+
+def test_review_batch_reply_context_includes_numbered_active_items(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_onboarding_service(store, review_service)
+    chat_service = _StubHouseholdChatService("Okay — which number do you mean?")
+    ingress = _build_ingress(
+        store,
+        onboarding_service,
+        review_service,
+        household_chat_service=chat_service,
+    )
+    _complete_hybrid_onboarding(onboarding_service)
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_batch_1",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:batch-1",
+            title="Charlie Cooper birthday",
+            summary="Saturday, April 11 at 10:00 AM.",
+            state=CandidateState.PENDING_REVIEW,
+        )
+    )
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_batch_2",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:batch-2",
+            title="One Medical receipt",
+            summary="$37.43 on April 8 for Kendall.",
+            state=CandidateState.PENDING_REVIEW,
+            metadata={"candidate_scope": "private_parent"},
+        )
+    )
+    store.append_channel_message(
+        ChannelMessage(
+            id="msg_review_batch",
+            household_id="hh_123",
+            channel_id="chan_dm_123",
+            sender_role=ChannelMessageRole.ASSISTANT,
+            body="📬 I found a few things to review:\n1. Charlie Cooper birthday\n2. One Medical receipt\nReply with 1 yes, 2 no, 3 skip, or ask me about one of them.",
+            metadata={
+                "protocol_kind": CANDIDATE_REVIEW_PROMPT_KIND,
+                "pending_action_type": "candidate_review",
+                "pending_action_target_kind": "imported_candidate",
+                "pending_action_target_id": "cand_batch_1",
+                "pending_action_target_ids": ["cand_batch_1", "cand_batch_2"],
+            },
+            created_at=datetime.now(timezone.utc).timestamp(),
+        )
+    )
+
+    confirmation = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_batch_reply",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="2 no",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert confirmation.reply_text == "Okay — which number do you mean?"
+    contextual_message = chat_service.calls[-1]["message_text"]
+    assert '"index": 1' in contextual_message
+    assert '"candidate_id": "cand_batch_1"' in contextual_message
+    assert '"index": 2' in contextual_message
+    assert '"candidate_id": "cand_batch_2"' in contextual_message
+    assert "If the user replies with numbered decisions like 1 yes, 2 no, 3 skip" in contextual_message
+    assert "User reply: 2 no" in contextual_message
+    store.close()
+
+
 def test_review_prompt_then_corrective_yes_routes_single_item_context_to_chat(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)

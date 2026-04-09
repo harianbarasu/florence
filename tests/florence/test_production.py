@@ -1682,8 +1682,17 @@ def test_production_service_run_sync_pass_sends_review_sweep_for_pending_backlog
             title="Young Minds invoice",
             summary="Needs confirmation.",
             state=CandidateState.PENDING_REVIEW,
+            confidence_bps=7600,
             requires_confirmation=True,
-            metadata={"confirmation_question": "Should I add this?"},
+            metadata={
+                "confirmation_question": "Should I add this?",
+                "raw_metadata": {
+                    "anchor_hits": 2,
+                    "sender_looks_school": False,
+                    "reason_tags": ["household_anchor", "logistics_signal"],
+                    "temporal_evidence": {"date_match": {"date": "2026-04-01"}},
+                },
+            },
         )
     )
 

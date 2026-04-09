@@ -354,6 +354,104 @@ def test_household_chat_service_uses_hermes_agent_with_confirmed_state(tmp_path)
     assert "Tentative tracked events:" in _FakeAgent.last_run["system_message"]
 
 
+def test_household_chat_service_hides_other_parent_private_items_from_group_and_other_dm(tmp_path):
+    _FakeAgent.created.clear()
+    _FakeAgent.last_run = None
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(Member(id="mem_jackson", household_id="hh_123", display_name="Jackson", role=MemberRole.ADMIN))
+    store.upsert_member(Member(id="mem_kendall", household_id="hh_123", display_name="Kendall", role=MemberRole.PARENT))
+    store.upsert_channel(
+        Channel(
+            id="chan_group_123",
+            household_id="hh_123",
+            provider="sendblue",
+            provider_channel_id="group-thread-123",
+            channel_type=ChannelType.HOUSEHOLD_GROUP,
+            title="Family group",
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_jackson",
+            household_id="hh_123",
+            provider="sendblue",
+            provider_channel_id="dm-jackson",
+            channel_type=ChannelType.PARENT_DM,
+            title="Jackson",
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_kendall",
+            household_id="hh_123",
+            provider="sendblue",
+            provider_channel_id="dm-kendall",
+            channel_type=ChannelType.PARENT_DM,
+            title="Kendall",
+        )
+    )
+    store.upsert_household_work_item(
+        HouseholdWorkItem(
+            id="work_private_123",
+            household_id="hh_123",
+            title="Book haircut",
+            owner_member_id="mem_jackson",
+            metadata={"category": "private_import"},
+        )
+    )
+    store.replace_household_profile_items(
+        household_id="hh_123",
+        kind=HouseholdProfileKind.PREFERENCE,
+        items=[
+            HouseholdProfileItem(
+                id="pref_private_123",
+                household_id="hh_123",
+                kind=HouseholdProfileKind.PREFERENCE,
+                label="Workout preference",
+                member_id="mem_jackson",
+                metadata={"value": "Gym before work."},
+            )
+        ],
+    )
+
+    service = FlorenceHouseholdChatService(
+        store,
+        model="anthropic/claude-opus-4.6",
+        max_iterations=4,
+        provider="anthropic",
+        agent_factory=_FakeAgent,
+        now_getter=lambda: datetime(2026, 3, 18, 12, 0, tzinfo=timezone.utc),
+    )
+
+    service.respond(
+        household_id="hh_123",
+        channel_id="chan_group_123",
+        actor_member_id="mem_jackson",
+        message_text="What matters here?",
+    )
+    assert "Book haircut" not in _FakeAgent.last_run["system_message"]
+    assert "Workout preference" not in _FakeAgent.last_run["system_message"]
+
+    service.respond(
+        household_id="hh_123",
+        channel_id="chan_dm_kendall",
+        actor_member_id="mem_kendall",
+        message_text="What matters for me?",
+    )
+    assert "Book haircut" not in _FakeAgent.last_run["system_message"]
+    assert "Workout preference" not in _FakeAgent.last_run["system_message"]
+
+    service.respond(
+        household_id="hh_123",
+        channel_id="chan_dm_jackson",
+        actor_member_id="mem_jackson",
+        message_text="What matters for me?",
+    )
+    assert "Book haircut" in _FakeAgent.last_run["system_message"]
+    assert "Workout preference" in _FakeAgent.last_run["system_message"]
+
+
 def test_household_chat_service_omits_stale_past_events_from_default_snapshot(tmp_path):
     _FakeAgent.created.clear()
     _FakeAgent.last_run = None
@@ -1434,9 +1532,11 @@ def test_household_chat_service_compose_operator_message_review_prompt_uses_agen
 
     assert prompt is not None
     assert _FakeAgent.created[0]["enabled_toolsets"] == ["florence_briefing"]
-    assert "short Florence review prompt for one possible household item" in _FakeAgent.last_run["system_message"]
+    assert "short Florence review prompt for one or a few imported items" in _FakeAgent.last_run["system_message"]
     assert "Do not say 'Imported item', 'candidate', 'queue'" in _FakeAgent.last_run["system_message"]
-    assert "End exactly with: Reply yes if I should add it, no if it's wrong, or skip for later." in _FakeAgent.last_run["system_message"]
+    assert "If candidate_scope is private_parent, make it clear that item would stay in the parent's private Florence thread." in _FakeAgent.last_run["system_message"]
+    assert "If there is only one item, end exactly with: Reply yes if I should keep track of it, no if it's wrong, or skip for later." in _FakeAgent.last_run["system_message"]
+    assert "If items contains more than 1 entry, write one short batched message instead of separate prompts." in _FakeAgent.last_run["system_message"]
     assert "\"task\": \"compose_review_prompt\"" in _FakeAgent.last_run["user_message"]
     store.close()
 

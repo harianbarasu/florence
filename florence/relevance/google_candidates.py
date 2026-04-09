@@ -199,6 +199,50 @@ def _build_gmail_candidate_decision_heuristic(
     else:
         looks_relevant = anchor_hits > 0 and (logistics_hits > 0 or has_scheduling_evidence or activity_hint_hits > 0)
     if not looks_relevant:
+        if (
+            anchor_hits == 0
+            and not sender_looks_school
+            and promotional_hits == 0
+            and has_scheduling_evidence
+            and logistics_hits > 0
+        ):
+            summary = compact_text(
+                " - ".join(
+                    bit
+                    for bit in (
+                        item.from_address.strip() or None,
+                        snippet or None,
+                    )
+                    if bit
+                ),
+                240,
+            )
+            return CandidateDecision(
+                kind=CandidateDecisionKind.CANDIDATE,
+                title=subject,
+                summary=summary,
+                proposed_fields={
+                    "title": subject,
+                    "description": compact_text(snippet or body_text or attachment_text, 300) or None,
+                },
+                confidence_bps=clamp_confidence_bps(7_200, minimum=5_000),
+                requires_confirmation=True,
+                confirmation_question=f"This looks like a personal item from {subject}. Want me to keep track of it just for you?",
+                raw_metadata={
+                    "classifier": "gmail_heuristics_v2",
+                    "reason_tags": ["private_parent", "logistics_signal", "schedule_signal"],
+                    "anchor_hits": anchor_hits,
+                    "sender_looks_school": sender_looks_school,
+                    "candidate_scope": "private_parent",
+                    "temporal_evidence": _temporal_evidence_payload(
+                        date_match=date_match,
+                        time_range=time_range,
+                        single_time=single_time,
+                    ),
+                },
+            )
+        if anchor_hits == 0 and not sender_looks_school and promotional_hits > 0:
+            return CandidateDecision(kind=CandidateDecisionKind.SKIP, reason="promotional_noise")
         return CandidateDecision(kind=CandidateDecisionKind.SKIP, reason="not_household_logistics")
 
     proposed_fields: dict[str, object] = {"title": subject}
@@ -247,6 +291,7 @@ def _build_gmail_candidate_decision_heuristic(
             "reason_tags": reason_tags,
             "anchor_hits": anchor_hits,
             "sender_looks_school": sender_looks_school,
+            "candidate_scope": "shared_household",
             "temporal_evidence": _temporal_evidence_payload(
                 date_match=date_match,
                 time_range=time_range,
@@ -301,19 +346,67 @@ def build_parent_calendar_candidate_decision(
         + known_contact_hits
     )
     likely_child_logistics = logistics_hits > 0 or family_signal_hits > 0
-
-    if not likely_child_logistics:
-        return CandidateDecision(kind=CandidateDecisionKind.SKIP, reason="not_child_or_family_logistics")
-
-    if personal_hits > (logistics_hits + family_signal_hits) and family_signal_hits == 0:
-        return CandidateDecision(kind=CandidateDecisionKind.SKIP, reason="looks_personal_not_family")
-
     summary_bits = [
         item.calendar_summary or "Parent calendar",
         item.starts_at.isoformat(),
         description or None,
     ]
     summary = compact_text(" · ".join(bit for bit in summary_bits if bit), 300)
+
+    if not likely_child_logistics:
+        if personal_hits > 0:
+            return CandidateDecision(
+                kind=CandidateDecisionKind.CANDIDATE,
+                title=title,
+                summary=summary,
+                proposed_fields={
+                    "title": title,
+                    "description": description or None,
+                    "location": location or None,
+                    "starts_at": item.starts_at.isoformat(),
+                    "ends_at": item.ends_at.isoformat(),
+                    "timezone": item.timezone,
+                    "all_day": item.all_day,
+                },
+                confidence_bps=6_900,
+                requires_confirmation=True,
+                confirmation_question=f"This looks like a personal calendar item from {title}. Want me to keep track of it just for you?",
+                raw_metadata={
+                    "classifier": "parent_calendar_heuristics_v1",
+                    "known_activity_hits": known_activity_hits,
+                    "known_location_hits": known_location_hits,
+                    "family_signal_hits": family_signal_hits,
+                    "candidate_scope": "private_parent",
+                },
+            )
+        return CandidateDecision(kind=CandidateDecisionKind.SKIP, reason="not_child_or_family_logistics")
+
+    if personal_hits > (logistics_hits + family_signal_hits) and family_signal_hits == 0:
+        return CandidateDecision(
+            kind=CandidateDecisionKind.CANDIDATE,
+            title=title,
+            summary=summary,
+            proposed_fields={
+                "title": title,
+                "description": description or None,
+                "location": location or None,
+                "starts_at": item.starts_at.isoformat(),
+                "ends_at": item.ends_at.isoformat(),
+                "timezone": item.timezone,
+                "all_day": item.all_day,
+            },
+            confidence_bps=7_200,
+            requires_confirmation=True,
+            confirmation_question=f"This looks like a personal calendar item from {title}. Want me to keep track of it just for you?",
+            raw_metadata={
+                "classifier": "parent_calendar_heuristics_v1",
+                "known_activity_hits": known_activity_hits,
+                "known_location_hits": known_location_hits,
+                "family_signal_hits": family_signal_hits,
+                "candidate_scope": "private_parent",
+            },
+        )
+
     confidence_bps = min(
         9_200,
         5_600
@@ -346,5 +439,6 @@ def build_parent_calendar_candidate_decision(
             "known_activity_hits": known_activity_hits,
             "known_location_hits": known_location_hits,
             "family_signal_hits": family_signal_hits,
+            "candidate_scope": "shared_household",
         },
     )

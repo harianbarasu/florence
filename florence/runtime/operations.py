@@ -7,10 +7,14 @@ import logging
 from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
-from florence.contracts import CandidateState, ChannelMessageRole, ChannelType, HouseholdBriefingKind
+from florence.contracts import CandidateState, ChannelMessageRole, ChannelType, GoogleSourceKind, HouseholdBriefingKind
+from florence.messaging.channel_log import FlorenceChannelLog
 from florence.messaging.protocol_types import (
     CANDIDATE_REVIEW_PROMPT_KIND,
+    PENDING_ACTION_TARGET_ID_KEY,
+    PENDING_ACTION_TARGET_IDS_KEY,
     build_candidate_review_prompt_metadata,
     build_household_nudge_metadata,
 )
@@ -23,6 +27,9 @@ logger = logging.getLogger(__name__)
 _ACTIVE_REVIEW_NUDGE_WINDOW_SECONDS = 15 * 60
 _REVIEW_SWEEP_INTERVAL_SECONDS = 12 * 60 * 60
 _SYNC_UPDATE_BRIEF_INTERVAL_SECONDS = 6 * 60 * 60
+_REVIEW_BATCH_LIMIT = 3
+_REVIEW_QUIET_HOURS_START = 21
+_REVIEW_QUIET_HOURS_END = 8
 
 
 class FlorenceHouseholdOperationsService:
@@ -96,6 +103,13 @@ class FlorenceHouseholdOperationsService:
 
         if not newly_pending:
             return False
+        proactive_candidates = [
+            candidate
+            for candidate in newly_pending
+            if self._candidate_warrants_proactive_review_prompt(candidate, store=target_store)
+        ]
+        if not proactive_candidates:
+            return False
 
         channel = self._review_dm_channel(
             household_id=household_id,
@@ -104,9 +118,23 @@ class FlorenceHouseholdOperationsService:
         )
         if channel is None:
             return False
-        prompt = candidate_review_service.build_next_dm_review_prompt(
+        if self._has_armed_pending_review_prompt(
             household_id=household_id,
             member_id=member_id,
+            channel_id=channel.id,
+            store=target_store,
+        ):
+            return False
+        if self._is_review_quiet_hours(household_id=household_id, store=target_store):
+            return False
+        prompt = candidate_review_service.build_dm_review_batch_prompt(
+            household_id=household_id,
+            member_id=member_id,
+            candidate_filter=lambda candidate: self._candidate_warrants_proactive_review_prompt(
+                candidate,
+                store=target_store,
+            ),
+            limit=_REVIEW_BATCH_LIMIT,
         )
         if prompt is None:
             return False
@@ -138,7 +166,9 @@ class FlorenceHouseholdOperationsService:
                             "summary": str(getattr(prompt.candidate, "summary", "") or "").strip(),
                             "state": str(getattr(prompt.candidate, "state", "") or "").strip(),
                             "confirmation_question": str(getattr(prompt.candidate, "metadata", {}).get("confirmation_question") or "").strip(),
+                            "candidate_scope": str(getattr(prompt.candidate, "metadata", {}).get("candidate_scope") or "").strip(),
                         },
+                        "items": self._review_prompt_items(prompt),
                         "source_prompt": source_prompt,
                         "pending_review_count": len(
                             target_store.list_imported_candidates(
@@ -163,7 +193,10 @@ class FlorenceHouseholdOperationsService:
                 channel=channel,
                 message=prompt_text,
                 store=target_store,
-                message_metadata=build_candidate_review_prompt_metadata(prompt.candidate.id),
+                message_metadata=build_candidate_review_prompt_metadata(
+                    prompt.candidate.id,
+                    candidate_ids=[candidate.id for candidate in prompt.candidates],
+                ),
             )
             if sent_prompt:
                 candidate_metadata = dict(prompt.candidate.metadata) if isinstance(prompt.candidate.metadata, dict) else {}
@@ -182,6 +215,8 @@ class FlorenceHouseholdOperationsService:
                         "source_visibility": str(candidate_metadata.get("source_visibility") or "").strip() or None,
                         "source_rule_label": str(candidate_metadata.get("source_rule_label") or "").strip() or None,
                         "newly_pending_count": len(newly_pending),
+                        "candidate_ids": [candidate.id for candidate in prompt.candidates],
+                        "batch_count": len(prompt.candidates),
                         "trigger": "new_pending_candidate",
                     },
                 )
@@ -189,8 +224,8 @@ class FlorenceHouseholdOperationsService:
         if not sent_prompt:
             return False
 
-        nudged_at = datetime.now(timezone.utc).isoformat()
-        for candidate in newly_pending:
+        nudged_at = self._utc_now().isoformat()
+        for candidate in prompt.candidates:
             metadata = dict(candidate.metadata)
             metadata["review_nudged_at"] = nudged_at
             target_store.upsert_imported_candidate(replace(candidate, metadata=metadata))
@@ -234,6 +269,15 @@ class FlorenceHouseholdOperationsService:
             )
             if channel is None:
                 continue
+            if self._has_armed_pending_review_prompt(
+                household_id=household_id,
+                member_id=member_id,
+                channel_id=channel.id,
+                store=target_store,
+            ):
+                continue
+            if self._is_review_quiet_hours(household_id=household_id, store=target_store):
+                continue
             if self._should_defer_review_nudge_for_active_conversation(
                 channel_id=channel.id,
                 store=target_store,
@@ -247,9 +291,21 @@ class FlorenceHouseholdOperationsService:
                 window_seconds=_REVIEW_SWEEP_INTERVAL_SECONDS,
             ):
                 continue
-            prompt = candidate_review_service.build_next_dm_review_prompt(
+            proactive_pending = [
+                candidate
+                for candidate in member_pending
+                if self._candidate_warrants_proactive_review_prompt(candidate, store=target_store)
+            ]
+            if not proactive_pending:
+                continue
+            prompt = candidate_review_service.build_dm_review_batch_prompt(
                 household_id=household_id,
                 member_id=member_id,
+                candidate_filter=lambda candidate: self._candidate_warrants_proactive_review_prompt(
+                    candidate,
+                    store=target_store,
+                ),
+                limit=_REVIEW_BATCH_LIMIT,
             )
             if prompt is None:
                 continue
@@ -267,7 +323,9 @@ class FlorenceHouseholdOperationsService:
                             "summary": str(getattr(prompt.candidate, "summary", "") or "").strip(),
                             "state": str(getattr(prompt.candidate, "state", "") or "").strip(),
                             "confirmation_question": str(getattr(prompt.candidate, "metadata", {}).get("confirmation_question") or "").strip(),
+                            "candidate_scope": str(getattr(prompt.candidate, "metadata", {}).get("candidate_scope") or "").strip(),
                         },
+                        "items": self._review_prompt_items(prompt),
                         "source_prompt": source_prompt,
                         "pending_review_count": len(member_pending),
                         "trigger": "scheduled_review_sweep",
@@ -286,12 +344,18 @@ class FlorenceHouseholdOperationsService:
                 channel=channel,
                 message=prompt_text,
                 store=target_store,
-                message_metadata=build_candidate_review_prompt_metadata(prompt.candidate.id),
+                message_metadata=build_candidate_review_prompt_metadata(
+                    prompt.candidate.id,
+                    candidate_ids=[candidate.id for candidate in prompt.candidates],
+                ),
             ):
                 continue
             metadata = dict(prompt.candidate.metadata) if isinstance(prompt.candidate.metadata, dict) else {}
-            metadata["review_nudged_at"] = datetime.now(timezone.utc).isoformat()
-            target_store.upsert_imported_candidate(replace(prompt.candidate, metadata=metadata))
+            nudged_at = self._utc_now().isoformat()
+            for candidate in prompt.candidates:
+                candidate_metadata = dict(candidate.metadata) if isinstance(candidate.metadata, dict) else {}
+                candidate_metadata["review_nudged_at"] = nudged_at
+                target_store.upsert_imported_candidate(replace(candidate, metadata=candidate_metadata))
             self._manager_service(store).record_pilot_event(
                 household_id=household_id,
                 event_type="review_prompt_sent",
@@ -307,6 +371,8 @@ class FlorenceHouseholdOperationsService:
                     "source_visibility": str(metadata.get("source_visibility") or "").strip() or None,
                     "source_rule_label": str(metadata.get("source_rule_label") or "").strip() or None,
                     "pending_review_count": len(member_pending),
+                    "candidate_ids": [candidate.id for candidate in prompt.candidates],
+                    "batch_count": len(prompt.candidates),
                     "trigger": "scheduled_review_sweep",
                 },
             )
@@ -413,6 +479,73 @@ class FlorenceHouseholdOperationsService:
             if event.created_at < cutoff:
                 break
             if event.member_id == member_id and event.channel_id == channel_id:
+                return True
+        return False
+
+    def _utc_now(self) -> datetime:
+        return datetime.now(timezone.utc)
+
+    def _is_review_quiet_hours(
+        self,
+        *,
+        household_id: str,
+        store: FlorenceStateDB,
+    ) -> bool:
+        household = store.get_household(household_id)
+        if household is None or not str(household.timezone or "").strip():
+            return False
+        try:
+            local_now = self._utc_now().astimezone(ZoneInfo(household.timezone))
+        except Exception:
+            return False
+        return local_now.hour >= _REVIEW_QUIET_HOURS_START or local_now.hour < _REVIEW_QUIET_HOURS_END
+
+    @staticmethod
+    def _review_prompt_items(prompt: Any) -> list[dict[str, object]]:
+        return [
+            {
+                "index": index,
+                "title": str(getattr(candidate, "title", "") or "").strip(),
+                "summary": str(getattr(candidate, "summary", "") or "").strip(),
+                "confirmation_question": str(getattr(candidate, "metadata", {}).get("confirmation_question") or "").strip(),
+                "candidate_scope": str(getattr(candidate, "metadata", {}).get("candidate_scope") or "").strip(),
+            }
+            for index, candidate in enumerate(tuple(getattr(prompt, "candidates", ()) or ()), start=1)
+        ]
+
+    def _has_armed_pending_review_prompt(
+        self,
+        *,
+        household_id: str,
+        member_id: str,
+        channel_id: str,
+        store: FlorenceStateDB,
+    ) -> bool:
+        latest_assistant = FlorenceChannelLog(store).latest_assistant_message(channel_id=channel_id, limit=8)
+        if latest_assistant is None:
+            return False
+        if latest_assistant.metadata.get("protocol_kind") != CANDIDATE_REVIEW_PROMPT_KIND:
+            return False
+        candidate_ids = [
+            str(candidate_id).strip()
+            for candidate_id in list(latest_assistant.metadata.get(PENDING_ACTION_TARGET_IDS_KEY) or [])
+            if str(candidate_id).strip()
+        ]
+        if not candidate_ids:
+            candidate_id = str(latest_assistant.metadata.get(PENDING_ACTION_TARGET_ID_KEY) or "").strip()
+            if candidate_id:
+                candidate_ids = [candidate_id]
+        if not candidate_ids:
+            return False
+        for candidate_id in candidate_ids:
+            candidate = store.get_imported_candidate(candidate_id)
+            if candidate is None:
+                continue
+            if (
+                candidate.household_id == household_id
+                and candidate.member_id == member_id
+                and candidate.state == CandidateState.PENDING_REVIEW
+            ):
                 return True
         return False
 
@@ -995,6 +1128,72 @@ class FlorenceHouseholdOperationsService:
             fallback_channel=resolved_fallback,
             store=store,
         )
+
+    def _candidate_warrants_proactive_review_prompt(
+        self,
+        candidate: Any,
+        *,
+        store: FlorenceStateDB,
+    ) -> bool:
+        if getattr(candidate, "state", None) != CandidateState.PENDING_REVIEW:
+            return False
+
+        metadata = dict(getattr(candidate, "metadata", {}) or {})
+        candidate_scope = str(metadata.get("candidate_scope") or "shared_household").strip().lower()
+        raw_metadata = dict(metadata.get("raw_metadata") or {})
+        temporal_evidence = dict(raw_metadata.get("temporal_evidence") or {})
+        has_temporal_evidence = any(
+            temporal_evidence.get(key) for key in ("date_match", "time_range", "single_time")
+        )
+        reason_tags = {
+            str(tag).strip().lower()
+            for tag in list(raw_metadata.get("reason_tags") or [])
+            if str(tag).strip()
+        }
+        confidence_bps = int(getattr(candidate, "confidence_bps", 0) or 0)
+        if candidate_scope == "private_parent":
+            if getattr(candidate, "source_kind", None) == GoogleSourceKind.GOOGLE_CALENDAR:
+                return True
+            connection_id = str(metadata.get("google_connection_id") or "").strip()
+            if connection_id:
+                connection = store.get_google_connection(connection_id)
+                connection_metadata = dict(getattr(connection, "metadata", {}) or {}) if connection is not None else {}
+                if str(connection_metadata.get("initial_sync_state") or "").strip().lower() == "running":
+                    return False
+            return confidence_bps >= 7_200 and (
+                has_temporal_evidence
+                or "logistics_signal" in reason_tags
+                or "schedule_signal" in reason_tags
+            )
+
+        if getattr(candidate, "source_kind", None) == GoogleSourceKind.GOOGLE_CALENDAR:
+            return True
+
+        if str(metadata.get("source_visibility") or "").strip().lower() == "shared":
+            return True
+
+        connection_id = str(metadata.get("google_connection_id") or "").strip()
+        if connection_id:
+            connection = store.get_google_connection(connection_id)
+            connection_metadata = dict(getattr(connection, "metadata", {}) or {}) if connection is not None else {}
+            if str(connection_metadata.get("initial_sync_state") or "").strip().lower() == "running":
+                return False
+
+        anchor_hits = int(raw_metadata.get("anchor_hits") or 0)
+        sender_looks_school = bool(raw_metadata.get("sender_looks_school"))
+
+        if sender_looks_school and (anchor_hits > 0 or has_temporal_evidence) and confidence_bps >= 7_600:
+            return True
+        if anchor_hits >= 2 and has_temporal_evidence and confidence_bps >= 7_200:
+            return True
+        if (
+            anchor_hits > 0
+            and "activity_signal" in reason_tags
+            and has_temporal_evidence
+            and confidence_bps >= 8_000
+        ):
+            return True
+        return False
 
     def _manager_service(self, store: FlorenceStateDB | None) -> FlorenceHouseholdManagerService:
         target_store = store or self.store

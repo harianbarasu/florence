@@ -53,6 +53,25 @@ def test_gmail_candidate_skips_unrelated_email():
     assert decision.reason == "promotional_noise"
 
 
+def test_gmail_candidate_skips_linkedin_noise_without_household_anchors():
+    item = GmailSyncItem(
+        gmail_message_id="gmail_124b",
+        thread_id="thread_124b",
+        from_address="jobs-noreply@linkedin.com",
+        subject="22 connections finished the puzzle",
+        snippet="See who solved LinkedIn’s latest puzzle",
+        body_text="Read the article and compare your score with your network.",
+        attachment_text=None,
+        attachment_count=0,
+        received_at=datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc),
+    )
+
+    decision = build_gmail_candidate_decision(item, "America/Los_Angeles")
+
+    assert decision.kind == CandidateDecisionKind.SKIP
+    assert decision.reason == "promotional_noise"
+
+
 def test_parent_calendar_candidate_detects_child_activity():
     item = ParentCalendarSyncItem(
         google_event_id="event_123",
@@ -76,7 +95,7 @@ def test_parent_calendar_candidate_detects_child_activity():
     assert decision.proposed_fields["title"] == "Ava soccer practice"
 
 
-def test_parent_calendar_candidate_skips_personal_meeting():
+def test_parent_calendar_candidate_routes_personal_meeting_to_private_parent():
     item = ParentCalendarSyncItem(
         google_event_id="event_124",
         title="Client meeting",
@@ -94,8 +113,33 @@ def test_parent_calendar_candidate_skips_personal_meeting():
 
     decision = build_parent_calendar_candidate_decision(item)
 
-    assert decision.kind == CandidateDecisionKind.SKIP
-    assert decision.reason == "not_child_or_family_logistics"
+    assert decision.kind == CandidateDecisionKind.CANDIDATE
+    assert decision.raw_metadata["candidate_scope"] == "private_parent"
+    assert decision.confirmation_question is not None
+
+
+def test_gmail_candidate_routes_personal_logistics_to_private_parent():
+    item = GmailSyncItem(
+        gmail_message_id="gmail_private_125",
+        thread_id="thread_private_125",
+        from_address="office@dentist.example.com",
+        subject="Dentist appointment reminder",
+        snippet="Your appointment is Tuesday at 3:30 PM.",
+        body_text="Reminder: your dentist appointment is Tuesday June 10 at 3:30 PM.",
+        attachment_text=None,
+        attachment_count=0,
+        received_at=datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc),
+    )
+
+    decision = build_gmail_candidate_decision(
+        item,
+        "America/Los_Angeles",
+        now=datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc),
+    )
+
+    assert decision.kind == CandidateDecisionKind.CANDIDATE
+    assert decision.raw_metadata["candidate_scope"] == "private_parent"
+    assert "just for you" in (decision.confirmation_question or "").lower()
 
 
 def test_gmail_candidate_uses_household_platform_and_child_alias_context():

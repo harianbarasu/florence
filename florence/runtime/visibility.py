@@ -33,6 +33,36 @@ class FlorenceConversationScope:
         return bool(self.is_private_parent_dm and self.actor_member_id)
 
 
+def member_scoped_item_visible(
+    scope: FlorenceConversationScope,
+    *,
+    member_id: str | None,
+) -> bool:
+    if not str(member_id or "").strip():
+        return True
+    return bool(
+        scope.is_private_parent_dm
+        and scope.actor_member_id
+        and str(member_id).strip() == str(scope.actor_member_id).strip()
+    )
+
+
+def owner_scoped_item_visible(
+    scope: FlorenceConversationScope,
+    *,
+    owner_member_id: str | None,
+) -> bool:
+    return member_scoped_item_visible(scope, member_id=owner_member_id)
+
+
+def recipient_scoped_item_visible(
+    scope: FlorenceConversationScope,
+    *,
+    recipient_member_id: str | None,
+) -> bool:
+    return member_scoped_item_visible(scope, member_id=recipient_member_id)
+
+
 @dataclass(slots=True)
 class FlorenceGoogleInboxScope:
     search_scope: str

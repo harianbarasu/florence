@@ -36,6 +36,7 @@ from florence.messaging.channel_log import FlorenceChannelLog
 from florence.messaging.protocol_types import (
     CANDIDATE_REVIEW_PROMPT_KIND,
     PENDING_ACTION_TARGET_ID_KEY,
+    PENDING_ACTION_TARGET_IDS_KEY,
     build_google_connect_prompt_metadata,
 )
 from florence.onboarding import OnboardingStage
@@ -48,6 +49,9 @@ from florence.runtime.household_link import FlorenceHouseholdLinkService
 from florence.runtime.household_manager import FlorenceHouseholdManagerService
 from florence.runtime.onboarding_service import FlorenceOnboardingSessionService
 from florence.runtime.visibility import (
+    member_scoped_item_visible,
+    owner_scoped_item_visible,
+    recipient_scoped_item_visible,
     resolve_conversation_scope,
     resolve_google_calendar_scope,
     resolve_google_inbox_scope,
@@ -856,6 +860,7 @@ def _serialize_review_candidate(candidate: ImportedCandidate) -> dict[str, Any]:
         "summary": candidate.summary,
         "state": candidate.state.value,
         "source_kind": candidate.source_kind.value,
+        "candidate_scope": str(metadata.get("candidate_scope") or "").strip() or None,
         "source_visibility": str(metadata.get("source_visibility") or "").strip() or None,
         "source_rule_label": str(metadata.get("source_rule_label") or "").strip() or None,
         "requires_confirmation": candidate.requires_confirmation,
@@ -1292,6 +1297,11 @@ def _handle_search_state(args: dict, *, task_id: str | None = None, **_: Any) ->
     query = _normalize_text(args.get("query")).lower()
     limit = max(1, min(int(args.get("limit", 10) or 10), 25))
     include_private_review_state = bool(args.get("include_private_review_state"))
+    scope = resolve_conversation_scope(
+        context.store,
+        channel_id=context.channel_id,
+        actor_member_id=context.actor_member_id,
+    )
     requested_types = args.get("entity_types")
     if isinstance(requested_types, list) and requested_types:
         entity_types = {_normalize_text(item) for item in requested_types if _normalize_text(item)}
@@ -1321,6 +1331,7 @@ def _handle_search_state(args: dict, *, task_id: str | None = None, **_: Any) ->
         matches = [
             _serialize_work_item(item)
             for item in context.store.list_household_work_items(household_id=context.household_id)
+            if owner_scoped_item_visible(scope, owner_member_id=item.owner_member_id)
             if _matches_query([item.title, item.description, item.status.value, item.metadata], query)
         ]
         results["work_items"] = matches[:limit]
@@ -1329,6 +1340,7 @@ def _handle_search_state(args: dict, *, task_id: str | None = None, **_: Any) ->
         matches = [
             _serialize_routine(item)
             for item in context.store.list_household_routines(household_id=context.household_id)
+            if owner_scoped_item_visible(scope, owner_member_id=item.owner_member_id)
             if _matches_query([item.title, item.description, item.cadence, item.status.value, item.metadata], query)
         ]
         results["routines"] = matches[:limit]
@@ -1337,6 +1349,7 @@ def _handle_search_state(args: dict, *, task_id: str | None = None, **_: Any) ->
         matches = [
             _serialize_nudge(item)
             for item in context.store.list_household_nudges(household_id=context.household_id)
+            if recipient_scoped_item_visible(scope, recipient_member_id=item.recipient_member_id)
             if _matches_query([item.message, item.status.value, item.metadata], query)
         ]
         results["nudges"] = matches[:limit]
@@ -1422,6 +1435,7 @@ def _handle_search_state(args: dict, *, task_id: str | None = None, **_: Any) ->
         matches = [
             _serialize_profile_item(item)
             for item in items
+            if member_scoped_item_visible(scope, member_id=item.member_id)
             if _matches_query([item.label, item.kind.value, item.metadata], query)
         ]
         results[entity_type] = matches[:limit]
@@ -1487,8 +1501,11 @@ def _handle_apply_candidate_review(args: dict, *, task_id: str | None = None, **
     candidate = context.store.get_imported_candidate(candidate_id)
     event_id = None
     event = None
+    work_item_id = None
+    work_item = None
     if candidate is not None:
         event_id = str(candidate.metadata.get("confirmed_event_id") or "").strip() or None
+        work_item_id = str(candidate.metadata.get("confirmed_work_item_id") or "").strip() or None
         if event_id:
             event = next(
                 (
@@ -1498,6 +1515,8 @@ def _handle_apply_candidate_review(args: dict, *, task_id: str | None = None, **
                 ),
                 None,
             )
+        if work_item_id:
+            work_item = context.store.get_household_work_item(work_item_id)
     return json.dumps(
         {
             "result": {
@@ -1506,6 +1525,7 @@ def _handle_apply_candidate_review(args: dict, *, task_id: str | None = None, **
                 "reply_text": reply.reply_text,
                 "group_announcement": reply.group_announcement,
                 "event": _serialize_event(event) if event is not None else None,
+                "work_item": _serialize_work_item(work_item) if work_item is not None else None,
             }
         }
     )
@@ -1784,6 +1804,15 @@ def _active_review_candidate_id(
         return None
     if latest_assistant.metadata.get("protocol_kind") != CANDIDATE_REVIEW_PROMPT_KIND:
         return None
+    explicit_candidate_ids = [
+        str(candidate_id).strip()
+        for candidate_id in list(latest_assistant.metadata.get(PENDING_ACTION_TARGET_IDS_KEY) or [])
+        if str(candidate_id).strip()
+    ]
+    if explicit_candidate_ids:
+        if requested_candidate_id in explicit_candidate_ids:
+            return requested_candidate_id
+        return explicit_candidate_ids[0]
     explicit_candidate_id = str(latest_assistant.metadata.get(PENDING_ACTION_TARGET_ID_KEY) or "").strip()
     if explicit_candidate_id:
         return explicit_candidate_id

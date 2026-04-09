@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Callable
 
 from florence.contracts import (
     CandidateState,
     HouseholdEvent,
     HouseholdEventStatus,
+    HouseholdWorkItem,
+    HouseholdWorkItemStatus,
     HouseholdSourceRule,
     HouseholdSourceVisibility,
     ImportedCandidate,
@@ -25,11 +27,23 @@ from florence.state import FlorenceStateDB
 
 logger = logging.getLogger(__name__)
 
+_SHARED_CANDIDATE_SCOPE = "shared_household"
+_PRIVATE_CANDIDATE_SCOPE = "private_parent"
+
+
+def _candidate_scope(candidate: ImportedCandidate) -> str:
+    metadata = dict(candidate.metadata) if isinstance(candidate.metadata, dict) else {}
+    scope = str(metadata.get("candidate_scope") or "").strip().lower()
+    if scope == _PRIVATE_CANDIDATE_SCOPE:
+        return _PRIVATE_CANDIDATE_SCOPE
+    return _SHARED_CANDIDATE_SCOPE
+
 
 @dataclass(slots=True)
 class _CandidateReviewPrompt:
     candidate: ImportedCandidate
     text: str
+    candidates: tuple[ImportedCandidate, ...] = ()
     source_prompt: str | None = None
 
 
@@ -37,6 +51,7 @@ class _CandidateReviewPrompt:
 class _CandidateReviewResult:
     candidate: ImportedCandidate
     event: HouseholdEvent | None = None
+    work_item: HouseholdWorkItem | None = None
     group_announcement: str | None = None
 
 
@@ -144,11 +159,97 @@ class FlorenceCandidateReviewService:
             released.append(promoted)
         return released
 
-    def build_next_dm_review_prompt(self, *, household_id: str, member_id: str) -> _CandidateReviewPrompt | None:
-        return self.build_next_review_prompt(household_id=household_id, member_id=member_id)
+    def build_next_dm_review_prompt(
+        self,
+        *,
+        household_id: str,
+        member_id: str,
+        candidate_filter: Callable[[ImportedCandidate], bool] | None = None,
+    ) -> _CandidateReviewPrompt | None:
+        return self.build_next_review_prompt(
+            household_id=household_id,
+            member_id=member_id,
+            candidate_filter=candidate_filter,
+        )
 
-    def build_next_review_prompt(self, *, household_id: str, member_id: str) -> _CandidateReviewPrompt | None:
-        return self._build_review_prompt(household_id=household_id, member_id=member_id)
+    def build_dm_review_batch_prompt(
+        self,
+        *,
+        household_id: str,
+        member_id: str,
+        candidate_filter: Callable[[ImportedCandidate], bool] | None = None,
+        limit: int = 3,
+        candidate_ids: list[str] | tuple[str, ...] | None = None,
+    ) -> _CandidateReviewPrompt | None:
+        return self.build_review_batch_prompt(
+            household_id=household_id,
+            member_id=member_id,
+            candidate_filter=candidate_filter,
+            limit=limit,
+            candidate_ids=candidate_ids,
+        )
+
+    def build_next_review_prompt(
+        self,
+        *,
+        household_id: str,
+        member_id: str,
+        candidate_filter: Callable[[ImportedCandidate], bool] | None = None,
+    ) -> _CandidateReviewPrompt | None:
+        return self._build_review_prompt(
+            household_id=household_id,
+            member_id=member_id,
+            candidate_filter=candidate_filter,
+        )
+
+    def build_review_batch_prompt(
+        self,
+        *,
+        household_id: str,
+        member_id: str,
+        candidate_filter: Callable[[ImportedCandidate], bool] | None = None,
+        limit: int = 3,
+        candidate_ids: list[str] | tuple[str, ...] | None = None,
+    ) -> _CandidateReviewPrompt | None:
+        candidates = self._list_pending_review_candidates(
+            household_id=household_id,
+            member_id=member_id,
+            candidate_filter=candidate_filter,
+        )
+        if candidate_ids is not None:
+            candidate_map = {candidate.id: candidate for candidate in candidates}
+            ordered_candidates = [
+                candidate_map[candidate_id]
+                for candidate_id in candidate_ids
+                if candidate_id in candidate_map
+            ]
+            candidates = ordered_candidates
+        candidates = candidates[: max(1, int(limit or 1))]
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return self._build_review_prompt(
+                household_id=household_id,
+                member_id=member_id,
+                candidate_filter=lambda candidate: candidate.id == candidates[0].id,
+            )
+
+        lines = ["I found a few things to review:"]
+        for index, candidate in enumerate(candidates, start=1):
+            title = " ".join(str(candidate.title or "").split()).strip() or "Untitled item"
+            summary = " ".join(str(candidate.summary or "").split()).strip()
+            emoji = "👤" if _candidate_scope(candidate) == _PRIVATE_CANDIDATE_SCOPE else "🏠"
+            line = f"{index}. {emoji} {title}"
+            if summary and summary != title:
+                line = f"{line} — {summary}"
+            lines.append(line)
+        lines.append("Reply with 1 yes, 2 no, 3 skip, or ask me about one of them.")
+        return _CandidateReviewPrompt(
+            candidate=candidates[0],
+            candidates=tuple(candidates),
+            text="\n".join(lines),
+            source_prompt=None,
+        )
 
     def apply_review_response(
         self,
@@ -179,22 +280,20 @@ class FlorenceCandidateReviewService:
 
         if resolution == "confirm":
             result = self.confirm_candidate(candidate_id=candidate_id, overrides=overrides)
+            confirmation_suffix = (
+                f" Confirmed. I’ll keep track of {result.work_item.title} just for you."
+                if result.work_item is not None
+                else f" Confirmed. I added {result.event.title} to the family plan."
+                if result.event is not None
+                else " Confirmed."
+            )
             if prefix:
-                suffix = (
-                    f" Confirmed. I added {result.event.title} to the family plan."
-                    if result.event
-                    else " Confirmed."
-                )
                 return _CandidateReviewReply(
-                    reply_text=f"{prefix}{suffix}",
+                    reply_text=f"{prefix}{confirmation_suffix}",
                     group_announcement=result.group_announcement,
                 )
             return _CandidateReviewReply(
-                reply_text=(
-                    f"Confirmed. I added {result.event.title} to the family plan."
-                    if result.event
-                    else "Confirmed."
-                ),
+                reply_text=confirmation_suffix.strip(),
                 group_announcement=result.group_announcement,
             )
 
@@ -235,6 +334,18 @@ class FlorenceCandidateReviewService:
         if candidate is None:
             raise ValueError("unknown_candidate")
 
+        if _candidate_scope(candidate) == _PRIVATE_CANDIDATE_SCOPE:
+            work_item = self._candidate_to_private_work_item(candidate, overrides=overrides or {})
+            self.store.upsert_household_work_item(work_item)
+            confirmed_metadata = dict(candidate.metadata)
+            confirmed_metadata["confirmed_work_item_id"] = work_item.id
+            confirmed = replace(candidate, state=CandidateState.CONFIRMED, metadata=confirmed_metadata)
+            self.store.upsert_imported_candidate(confirmed)
+            return _CandidateReviewResult(
+                candidate=confirmed,
+                work_item=work_item,
+            )
+
         event = self._candidate_to_event(candidate, overrides=overrides or {})
         self.store.upsert_household_event(event)
         try:
@@ -270,11 +381,12 @@ class FlorenceCandidateReviewService:
         *,
         household_id: str,
         member_id: str,
+        candidate_filter: Callable[[ImportedCandidate], bool] | None = None,
     ) -> _CandidateReviewPrompt | None:
-        candidates = self.store.list_imported_candidates(
+        candidates = self._list_pending_review_candidates(
             household_id=household_id,
             member_id=member_id,
-            state=CandidateState.PENDING_REVIEW,
+            candidate_filter=candidate_filter,
         )
         candidate = candidates[0] if candidates else None
         if candidate is None:
@@ -286,15 +398,34 @@ class FlorenceCandidateReviewService:
         if summary and summary != title:
             lines.append(summary)
         lines.append(question)
+        if _candidate_scope(candidate) == _PRIVATE_CANDIDATE_SCOPE:
+            lines.append("This would stay private to your own Florence thread.")
         source_prompt = self.source_rule_service.build_candidate_source_prompt(candidate)
         if source_prompt:
             lines.append(source_prompt)
-        lines.append("Reply yes if I should add it, no if it's wrong, or skip for later.")
+        lines.append("Reply yes if I should keep track of it, no if it's wrong, or skip for later.")
         return _CandidateReviewPrompt(
             candidate=candidate,
+            candidates=(candidate,),
             text="\n".join(line for line in lines if line),
             source_prompt=source_prompt,
         )
+
+    def _list_pending_review_candidates(
+        self,
+        *,
+        household_id: str,
+        member_id: str,
+        candidate_filter: Callable[[ImportedCandidate], bool] | None = None,
+    ) -> list[ImportedCandidate]:
+        candidates = self.store.list_imported_candidates(
+            household_id=household_id,
+            member_id=member_id,
+            state=CandidateState.PENDING_REVIEW,
+        )
+        if candidate_filter is not None:
+            candidates = [candidate for candidate in candidates if candidate_filter(candidate)]
+        return candidates
 
     def _candidate_to_event(self, candidate: ImportedCandidate, *, overrides: dict[str, Any]) -> HouseholdEvent:
         proposed_fields = candidate.metadata.get("proposed_fields")
@@ -321,6 +452,39 @@ class FlorenceCandidateReviewService:
             source_candidate_id=candidate.id,
             status=status,
             metadata={
+                "source_kind": candidate.source_kind.value,
+                "source_identifier": candidate.source_identifier,
+                "candidate_summary": candidate.summary,
+                "source_provenance": candidate.metadata.get("source_provenance"),
+                "candidate_raw_metadata": candidate.metadata.get("raw_metadata"),
+            },
+        )
+
+    def _candidate_to_private_work_item(
+        self,
+        candidate: ImportedCandidate,
+        *,
+        overrides: dict[str, Any],
+    ) -> HouseholdWorkItem:
+        proposed_fields = candidate.metadata.get("proposed_fields")
+        base_fields = dict(proposed_fields) if isinstance(proposed_fields, dict) else {}
+        item_fields = {**base_fields, **overrides}
+        title = str(item_fields.get("title") or candidate.title).strip() or candidate.title
+        description = str(item_fields.get("description") or candidate.summary).strip() or None
+        starts_at = item_fields.get("starts_at")
+        due_at = item_fields.get("due_at") or starts_at
+        return HouseholdWorkItem(
+            id=_stable_id("work", candidate.household_id, candidate.member_id, candidate.id),
+            household_id=candidate.household_id,
+            title=title,
+            description=description,
+            status=HouseholdWorkItemStatus.OPEN,
+            owner_member_id=candidate.member_id,
+            due_at=str(due_at) if due_at is not None else None,
+            starts_at=str(starts_at) if starts_at is not None else None,
+            metadata={
+                "category": "private_import",
+                "source_candidate_id": candidate.id,
                 "source_kind": candidate.source_kind.value,
                 "source_identifier": candidate.source_identifier,
                 "candidate_summary": candidate.summary,

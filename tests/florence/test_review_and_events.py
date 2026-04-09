@@ -74,6 +74,42 @@ def test_review_confirmation_can_apply_corrected_fields(tmp_path):
     store.close()
 
 
+def test_review_confirmation_can_keep_private_candidate_as_member_work_item(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    candidate = ImportedCandidate(
+        id="cand_private_123",
+        household_id="hh_123",
+        member_id="mem_123",
+        source_kind=GoogleSourceKind.GMAIL,
+        source_identifier="gmail:gmail_private_123",
+        title="Dentist appointment reminder",
+        summary="Reminder from dentist@example.com for next Tuesday.",
+        state=CandidateState.PENDING_REVIEW,
+        metadata={
+            "candidate_scope": "private_parent",
+            "confirmation_question": "Want me to keep track of this just for you?",
+            "proposed_fields": {
+                "title": "Dentist appointment reminder",
+                "description": "Reminder from dentist@example.com for next Tuesday.",
+                "starts_at": "2026-06-10T15:30:00-07:00",
+            },
+        },
+    )
+    store.upsert_imported_candidate(candidate)
+
+    result = review_service.confirm_candidate(candidate_id="cand_private_123")
+
+    assert result.event is None
+    assert result.work_item is not None
+    assert result.work_item.owner_member_id == "mem_123"
+    assert result.work_item.starts_at == "2026-06-10T15:30:00-07:00"
+    assert result.candidate.state == CandidateState.CONFIRMED
+    assert store.list_household_events(household_id="hh_123") == []
+    assert len(store.list_household_work_items(household_id="hh_123", owner_member_id="mem_123")) == 1
+    store.close()
+
+
 def test_review_confirmation_syncs_household_calendar_projection(tmp_path, monkeypatch):
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)

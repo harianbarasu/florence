@@ -12,16 +12,29 @@ HOUSEHOLD_LINK_PROMPT_KIND = "household_link_prompt"
 HOUSEHOLD_LINK_PROMPT_ROLE_KEY = "household_link_prompt_role"
 PENDING_ACTION_TYPE_KEY = "pending_action_type"
 PENDING_ACTION_TARGET_ID_KEY = "pending_action_target_id"
+PENDING_ACTION_TARGET_IDS_KEY = "pending_action_target_ids"
 PENDING_ACTION_TARGET_KIND_KEY = "pending_action_target_kind"
 
 
-def build_candidate_review_prompt_metadata(candidate_id: str) -> dict[str, object]:
-    return {
+def build_candidate_review_prompt_metadata(
+    candidate_id: str,
+    *,
+    candidate_ids: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, object]:
+    metadata: dict[str, object] = {
         "protocol_kind": CANDIDATE_REVIEW_PROMPT_KIND,
         PENDING_ACTION_TYPE_KEY: "candidate_review",
         PENDING_ACTION_TARGET_KIND_KEY: "imported_candidate",
         PENDING_ACTION_TARGET_ID_KEY: candidate_id,
     }
+    normalized_ids = [
+        str(item).strip()
+        for item in list(candidate_ids or [])
+        if str(item).strip()
+    ]
+    if normalized_ids:
+        metadata[PENDING_ACTION_TARGET_IDS_KEY] = normalized_ids
+    return metadata
 
 
 def build_household_nudge_metadata(nudge_id: str) -> dict[str, object]:

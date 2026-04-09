@@ -30,6 +30,9 @@ from florence.messaging.types import FlorenceInboundAttachment
 from florence.state import FlorenceStateDB
 from florence.runtime.visibility import (
     build_scope_model_lines,
+    member_scoped_item_visible,
+    owner_scoped_item_visible,
+    recipient_scoped_item_visible,
     resolve_conversation_scope,
     resolve_google_calendar_scope,
     resolve_google_inbox_scope,
@@ -369,20 +372,28 @@ class FlorenceHouseholdChatService:
             system_message = "\n".join(
                 [
                     base_system,
-                    "You are preparing a short Florence review prompt for one possible household item.",
+                    "You are preparing a short Florence review prompt for one or a few imported items.",
                     "Keep it calm, concise, and plainspoken.",
                     "Do not say 'Imported item', 'candidate', 'queue', or other pipeline language.",
-                    "Summarize the underlying household fact or question in normal language.",
-                    "If trigger is scheduled_review_sweep and pending_review_count is greater than 1, briefly note that Florence still has a few items waiting after this one.",
-                    "If the item is uncertain, frame it as something Florence wants to double-check before adding.",
+                    "Summarize the underlying fact or question in normal language.",
+                    "If items contains more than 1 entry, write one short batched message instead of separate prompts.",
+                    "For a batch, use a short opener, then a numbered list like 1. 2. 3.",
+                    "Use one light semantic emoji per item when helpful, like 🗓️ for schedule items, 👤 for private items, 💳 for receipts, or 🗞️ for likely noise.",
+                    "Keep each batch line compact and scannable.",
+                    "If candidate_scope is private_parent, make it clear that item would stay in the parent's private Florence thread.",
+                    "If candidate_scope is shared_household, make it clear Florence is deciding whether to add or update a shared household item.",
+                    "If trigger is scheduled_review_sweep and pending_review_count is greater than 1, you may briefly note that Florence grouped a few things together.",
+                    "If an item is uncertain, frame it as something Florence wants to double-check before adding.",
                     "If there is source-sharing guidance, include it naturally in one short line.",
-                    "End exactly with: Reply yes if I should add it, no if it's wrong, or skip for later.",
+                    "If there is only one item, end exactly with: Reply yes if I should keep track of it, no if it's wrong, or skip for later.",
+                    "If there are multiple items, end exactly with: Reply with 1 yes, 2 no, 3 skip, or ask me about one of them.",
                 ]
             )
             user_message = json.dumps(
                 {
                     "task": "compose_review_prompt",
                     "candidate": dict(payload.get("candidate") or {}),
+                    "items": list(payload.get("items") or []),
                     "source_prompt": str(payload.get("source_prompt") or "").strip(),
                     "pending_review_count": int(payload.get("pending_review_count") or 0),
                     "trigger": str(payload.get("trigger") or "").strip(),
@@ -393,11 +404,11 @@ class FlorenceHouseholdChatService:
             system_message = "\n".join(
                 [
                     base_system,
-                    "You are deciding whether Florence should surface the one currently available private review item in this DM.",
+                    "You are deciding whether Florence should surface the currently available private review item or review batch in this DM.",
                     f"If the user is explicitly asking to review pending imports, the review queue, or what needs review now, reply exactly {_REVIEW_SHOW_PROMPT_SENTINEL}.",
                     f"Otherwise reply exactly {_REVIEW_NO_ACTION_SENTINEL}.",
                     "Do not answer the underlying household question here.",
-                    "If prompt_armed is true, the review item is already surfaced, so do not re-surface it from this decision step.",
+                    "If prompt_armed is true, the review item or batch is already surfaced, so do not re-surface it from this decision step.",
                 ]
             )
             user_message = json.dumps(
@@ -406,6 +417,7 @@ class FlorenceHouseholdChatService:
                     "user_message": str(payload.get("user_message") or "").strip(),
                     "prompt_armed": bool(payload.get("prompt_armed")),
                     "rendered_prompt_text": str(payload.get("rendered_prompt_text") or "").strip(),
+                    "review_items": list(payload.get("review_items") or []),
                     "candidate": dict(payload.get("candidate") or {}),
                 },
                 ensure_ascii=True,
@@ -1575,6 +1587,26 @@ class FlorenceHouseholdChatService:
             actor_member_id=actor_member_id,
         )
         channel_type = scope.channel_type
+        work_items = [
+            item
+            for item in work_items
+            if owner_scoped_item_visible(scope, owner_member_id=item.owner_member_id)
+        ]
+        routines = [
+            routine
+            for routine in routines
+            if owner_scoped_item_visible(scope, owner_member_id=routine.owner_member_id)
+        ]
+        nudges = [
+            nudge
+            for nudge in nudges
+            if recipient_scoped_item_visible(scope, recipient_member_id=nudge.recipient_member_id)
+        ]
+        preference_items = [
+            item
+            for item in preference_items
+            if member_scoped_item_visible(scope, member_id=item.member_id)
+        ]
 
         lines = [
             "You are Florence, the Hermes-powered household agent for this household conversation.",
@@ -1621,7 +1653,9 @@ class FlorenceHouseholdChatService:
             "When the user needs current information from the public web such as school calendars, camp policies, activity schedules, vendor details, or comparisons, use web_search and web_extract instead of guessing.",
             "When the task requires interacting with a website or portal, following multi-step navigation, checking dynamic page state, or inspecting console/browser output, use the browser tools instead of pretending you already know the result.",
             "If external research or website investigation branches into a bounded sidecar task, use delegate_task to gather evidence in parallel, then return to the main Florence turn to synthesize the result and make any final household-state updates yourself.",
-            "When the user is replying to one currently surfaced imported-item review prompt, treat only that item as actionable. Use household_apply_candidate_review to confirm, reject, skip, set source_visibility, or confirm with corrected fields.",
+            "When the user is replying to a currently surfaced imported-item review prompt or review batch, treat only the surfaced item ids as actionable. Use household_apply_candidate_review to confirm, reject, skip, set source_visibility, or confirm with corrected fields.",
+            "Some imported review items are shared_household and some are private_parent. Keep private_parent confirmations in that parent's private lane instead of turning them into shared household state.",
+            "If Florence surfaced a numbered review batch, interpret replies like 1 yes, 2 no, 3 skip against those numbered items. If the user says plain yes/no/skip with multiple active items, ask which number they mean instead of guessing.",
             "When the user is replying to one currently surfaced reminder/nudge prompt, treat only that one nudge as actionable. Use household_apply_nudge_action for done or snooze changes.",
             "If Florence surfaced a merge follow-up after linking households, focus only on the remaining differences Florence still needs help reconciling, not a dump of both sides.",
             "For merge follow-up items about shared child facts, use household_resolve_merge_followup to apply the chosen shared fact and close or shrink the follow-up in one step.",

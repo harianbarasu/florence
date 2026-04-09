@@ -29,6 +29,7 @@ from florence.contracts import (
 from florence.google.types import GmailSyncItem, ParentCalendarSyncItem
 from florence.messaging.types import FlorenceInboundAttachment
 from florence.runtime.chat import FlorenceHouseholdChatService
+from florence.runtime.household_link import FlorenceHouseholdLinkService
 from florence.state import FlorenceStateDB
 from hermes_state import SessionDB
 
@@ -423,6 +424,66 @@ def test_household_chat_service_omits_stale_past_events_from_default_snapshot(tm
     assert "Current household-local date/time: 2026-04-07" in _FakeAgent.last_run["system_message"]
     assert "Theo music class" in _FakeAgent.last_run["system_message"]
     assert "March flight to Los Angeles" not in _FakeAgent.last_run["system_message"]
+    store.close()
+
+
+def test_household_chat_service_includes_open_parent_link_request_context(tmp_path):
+    _FakeAgent.created.clear()
+    _FakeAgent.last_run = None
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(
+        Household(
+            id="hh_123",
+            name="Jackson household",
+            timezone="America/Los_Angeles",
+        )
+    )
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Jackson",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="sendblue",
+            provider_channel_id="+15122164639|+15555550199",
+            channel_type=ChannelType.PARENT_DM,
+            title="Jackson",
+            metadata={"sendblue_number": "+15122164639", "sender_handle": "+15555550199"},
+        )
+    )
+    request = FlorenceHouseholdLinkService(store).create_phone_link_request(
+        household_id="hh_123",
+        inviting_member_id="mem_123",
+        invited_phone="+1 (555) 555-0124",
+        invited_display_name="Kendall",
+    )
+
+    service = FlorenceHouseholdChatService(
+        store,
+        model="anthropic/claude-opus-4.6",
+        max_iterations=4,
+        provider="anthropic",
+        agent_factory=_FakeAgent,
+        now_getter=lambda: datetime(2026, 4, 8, 17, 20, tzinfo=timezone.utc),
+    )
+
+    reply = service.respond(
+        household_id="hh_123",
+        channel_id="chan_dm_123",
+        actor_member_id="mem_123",
+        message_text="yes",
+    )
+
+    assert reply is not None
+    assert "open parent-link request for this parent" in _FakeAgent.last_run["system_message"].lower()
+    assert "send_invite_now=true" in _FakeAgent.last_run["system_message"]
+    assert f"request_id {request.id} | target Kendall | invite_sent no" in _FakeAgent.last_run["system_message"]
     store.close()
 
 

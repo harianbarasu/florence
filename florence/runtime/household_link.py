@@ -207,9 +207,14 @@ class FlorenceHouseholdLinkService:
                 f"{target_name} already said yes. Because this will combine information from both sides, "
                 "reply yes when you're ready for me to finish linking everything into one household."
             )
+        if str(metadata.get("invited_message_sent_at") or "").strip():
+            return (
+                f"I texted {target_name}. Once they reply yes from their side, I can keep going here. "
+                "Their 1:1 thread with me will stay private."
+            )
         return (
-            f"I can link {target_name} into this household once they confirm from their side. "
-            "Their 1:1 thread with me will stay private."
+            f"I can link {target_name} into this household. If you want, I can text them now so they can confirm "
+            "from their side. Their 1:1 thread with me will stay private."
         )
 
     def build_invited_confirmation_prompt(self, request: HouseholdLinkRequest, *, inviting_member_name: str | None) -> str:
@@ -219,11 +224,99 @@ class FlorenceHouseholdLinkService:
             "Your own thread with me will still stay private. Reply yes if you want me to link you in."
         )
 
+    def build_outbound_invited_prompt(self, request: HouseholdLinkRequest, *, inviting_member_name: str | None) -> str:
+        inviter_name = (inviting_member_name or "Your partner").strip() or "Your partner"
+        return (
+            f"{inviter_name} invited you to join your household in Florence. "
+            "I'm the family assistant here in iMessage. Reply yes if you want me to link you in. "
+            "Your 1:1 chat with me stays private."
+        )
+
     def build_inviting_confirmation_prompt(self, request: HouseholdLinkRequest) -> str:
         target_name = self._preferred_name(request)
         return (
             f"{target_name} said yes. Because this will combine information from both sides, "
             "reply yes if you want me to finish linking everything into one household."
+        )
+
+    def find_sendable_request_for_inviting_member(
+        self,
+        *,
+        household_id: str,
+        inviting_member_id: str,
+    ) -> HouseholdLinkRequest | None:
+        for request in self.store.list_household_link_requests(
+            household_id=household_id,
+            statuses=(HouseholdLinkRequestStatus.PENDING,),
+        ):
+            if request.inviting_member_id != inviting_member_id:
+                continue
+            metadata = dict(request.metadata) if isinstance(request.metadata, dict) else {}
+            if metadata.get("already_linked") is True:
+                continue
+            return request
+        return None
+
+    def send_invited_parent_invite(
+        self,
+        *,
+        request_id: str,
+        inviting_member_id: str,
+        send_invite: Callable[[HouseholdLinkRequest, str], dict[str, object] | None],
+    ) -> HouseholdLinkActionResult:
+        request = self._require_request(request_id)
+        if request.inviting_member_id != inviting_member_id:
+            raise ValueError("household_link_request_not_owned_by_member")
+        metadata = dict(request.metadata) if isinstance(request.metadata, dict) else {}
+        if request.status == HouseholdLinkRequestStatus.MERGED or metadata.get("already_linked") is True:
+            return HouseholdLinkActionResult(
+                request=request,
+                reply_text=f"{self._preferred_name(request)} is already linked into this household.",
+            )
+        if request.status != HouseholdLinkRequestStatus.PENDING:
+            raise ValueError("household_link_request_not_pending")
+        if str(metadata.get("invited_message_sent_at") or "").strip():
+            return HouseholdLinkActionResult(
+                request=request,
+                reply_text=(
+                    f"I already texted {self._preferred_name(request)}. Once they reply yes from their side, "
+                    "I can keep going here."
+                ),
+            )
+
+        inviter = self.store.get_member(request.inviting_member_id)
+        invite_text = self.build_outbound_invited_prompt(
+            request,
+            inviting_member_name=inviter.display_name if inviter is not None else None,
+        )
+        delivery_metadata = send_invite(request, invite_text) or {}
+        updated = self._save_request(
+            replace(
+                request,
+                metadata={
+                    **metadata,
+                    "invited_message_sent_at": self.now_getter().isoformat(),
+                    "invite_delivery": dict(delivery_metadata),
+                },
+            )
+        )
+        FlorenceHouseholdManagerService(self.store).record_pilot_event(
+            household_id=updated.household_id,
+            event_type="household_link_invite_sent",
+            member_id=inviting_member_id,
+            metadata={
+                "request_id": updated.id,
+                "invited_display_name": updated.invited_display_name,
+                "delivery": dict(delivery_metadata),
+            },
+            created_at=self.now_getter(),
+        )
+        return HouseholdLinkActionResult(
+            request=updated,
+            reply_text=(
+                f"Done. I texted {self._preferred_name(updated)}. Once they reply yes from their side, "
+                "I can link them into the same household here."
+            ),
         )
 
     def decline_from_invited(

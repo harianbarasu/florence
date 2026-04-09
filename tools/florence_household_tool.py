@@ -14,9 +14,11 @@ import httpx
 from florence.calendar_feed import parse_calendar_feed
 from florence.contracts import (
     CandidateState,
+    ChannelType,
     GoogleSourceKind,
     HouseholdEvent,
     HouseholdEventStatus,
+    HouseholdLinkRequest,
     HouseholdMeal,
     HouseholdMealStatus,
     HouseholdNudgeTargetKind,
@@ -138,6 +140,111 @@ def _build_onboarding_service(context: FlorenceHouseholdToolContext) -> Florence
     except Exception:
         pass
     return service
+
+
+def _find_parent_dm_channel_by_phone(
+    store: FlorenceStateDB,
+    *,
+    phone_number: str,
+    member_id: str | None = None,
+    household_id: str | None = None,
+    provider: str | None = None,
+) -> Any | None:
+    normalized_phone = _normalize_text(phone_number)
+    if not normalized_phone:
+        return None
+    candidate_household_ids: list[str] = []
+    if household_id:
+        candidate_household_ids.append(household_id)
+    if member_id:
+        member = store.get_member(member_id)
+        if member is not None and member.household_id not in candidate_household_ids:
+            candidate_household_ids.append(member.household_id)
+    if not candidate_household_ids:
+        households = store.list_households()
+        candidate_household_ids.extend(household.id for household in households)
+    for candidate_household_id in candidate_household_ids:
+        for channel in store.list_channels(
+            household_id=candidate_household_id,
+            channel_type=ChannelType.PARENT_DM,
+        ):
+            if provider and channel.provider != provider:
+                continue
+            metadata = dict(getattr(channel, "metadata", {}) or {})
+            sender_handle = _normalize_text(metadata.get("sender_handle"))
+            if sender_handle and sender_handle == normalized_phone:
+                return channel
+            provider_channel_id = _normalize_text(getattr(channel, "provider_channel_id", ""))
+            if provider_channel_id.endswith(f"|{normalized_phone}"):
+                return channel
+    return None
+
+
+def _sendblue_number_for_channel(channel: Any) -> str | None:
+    metadata = dict(getattr(channel, "metadata", {}) or {})
+    explicit = _normalize_text(metadata.get("sendblue_number"))
+    if explicit:
+        return explicit
+    provider_channel_id = _normalize_text(getattr(channel, "provider_channel_id", ""))
+    if "|" not in provider_channel_id:
+        return None
+    line_handle, _ = provider_channel_id.split("|", 1)
+    return _normalize_text(line_handle) or None
+
+
+def _send_parent_link_invite_via_current_transport(
+    context: FlorenceHouseholdToolContext,
+    *,
+    request: HouseholdLinkRequest,
+    invite_text: str,
+) -> dict[str, object]:
+    channel = context.store.get_channel(context.channel_id)
+    if channel is None:
+        raise ValueError("unknown_channel_id")
+    if channel.provider != "sendblue":
+        raise ValueError("parent_link_invite_transport_unsupported")
+
+    from florence.config import FlorenceSettings
+    from florence.messaging.protocol_types import build_household_link_prompt_metadata
+    from florence.sendblue import FlorenceSendblueClient, build_sendblue_thread_id
+
+    sendblue_number = _sendblue_number_for_channel(channel)
+    if not sendblue_number:
+        raise ValueError("sendblue_thread_id_required")
+
+    settings = FlorenceSettings.from_env()
+    client = FlorenceSendblueClient(settings.sendblue)
+    thread_id = build_sendblue_thread_id(
+        sendblue_number=sendblue_number,
+        contact_number=request.invited_identity_normalized_value,
+    )
+    client.send_text(thread_id=thread_id, message=invite_text)
+
+    target_channel = _find_parent_dm_channel_by_phone(
+        context.store,
+        phone_number=request.invited_identity_normalized_value,
+        member_id=request.invited_member_id,
+        household_id=request.source_household_id,
+        provider="sendblue",
+    )
+    if target_channel is not None:
+        FlorenceChannelLog(context.store).append_assistant_message(
+            household_id=target_channel.household_id,
+            channel_id=target_channel.id,
+            body=invite_text,
+            metadata={
+                "provider": "sendblue",
+                "transport_thread_id": target_channel.provider_channel_id or thread_id,
+                "direct_parent_link_invite": True,
+                **build_household_link_prompt_metadata(request.id, role="invited"),
+            },
+        )
+
+    return {
+        "provider": "sendblue",
+        "thread_id": thread_id,
+        "target_channel_id": target_channel.id if target_channel is not None else None,
+    }
 
 
 def _stable_id(prefix: str, *parts: str) -> str:
@@ -713,21 +820,30 @@ REQUEST_PARENT_LINK_SCHEMA = {
     "description": (
         "Start a private second-parent household link request by phone number. Use this when a parent wants Florence "
         "to connect another parent into the same household without making them redo the family setup. "
-        "Jackson-facing copy must stay privacy-safe and should not reveal whether Florence already knew that number."
+        "The same tool can also send the invite text once the current parent says yes. Jackson-facing copy must stay "
+        "privacy-safe and should not reveal whether Florence already knew that number."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "phone_number": {
                 "type": "string",
-                "description": "Required phone number for the other parent Florence should link.",
+                "description": "Phone number for the other parent Florence should link. Required when starting a new request.",
             },
             "display_name": {
                 "type": "string",
                 "description": "Optional name label like Kendall for a more natural reply.",
             },
+            "request_id": {
+                "type": "string",
+                "description": "Existing pending parent-link request id. Use this when the parent is replying yes to Florence texting the other parent now.",
+            },
+            "send_invite_now": {
+                "type": "boolean",
+                "description": "Set true when the current parent explicitly wants Florence to text the other parent now.",
+            },
         },
-        "required": ["phone_number"],
+        "required": [],
     },
 }
 
@@ -1588,17 +1704,61 @@ def _handle_request_parent_link(args: dict, *, task_id: str | None = None, **_: 
         return json.dumps({"error": "Parent linking requires an active household member."})
 
     phone_number = _normalize_text(args.get("phone_number"))
-    if not phone_number:
+    display_name = _normalize_optional_text(args.get("display_name"))
+    request_id = _normalize_optional_text(args.get("request_id"))
+    send_invite_now = bool(args.get("send_invite_now"))
+    service = FlorenceHouseholdLinkService(context.store)
+    request = None
+    if request_id:
+        request = context.store.get_household_link_request(request_id)
+        if request is None:
+            return json.dumps({"error": "Unknown parent-link request id."})
+    elif phone_number:
+        request = service.create_phone_link_request(
+            household_id=context.household_id,
+            inviting_member_id=context.actor_member_id,
+            invited_phone=phone_number,
+            invited_display_name=display_name,
+        )
+    elif send_invite_now:
+        request = service.find_sendable_request_for_inviting_member(
+            household_id=context.household_id,
+            inviting_member_id=context.actor_member_id,
+        )
+        if request is None:
+            return json.dumps({"error": "No pending parent-link request is waiting for an invite text."})
+    else:
         return json.dumps({"error": "Missing required parameter: phone_number"})
 
-    display_name = _normalize_optional_text(args.get("display_name"))
-    service = FlorenceHouseholdLinkService(context.store)
-    request = service.create_phone_link_request(
-        household_id=context.household_id,
-        inviting_member_id=context.actor_member_id,
-        invited_phone=phone_number,
-        invited_display_name=display_name,
-    )
+    if request.inviting_member_id != context.actor_member_id:
+        return json.dumps({"error": "Parent-link request belongs to a different household member."})
+
+    if send_invite_now:
+        try:
+            action_result = service.send_invited_parent_invite(
+                request_id=request.id,
+                inviting_member_id=context.actor_member_id,
+                send_invite=lambda active_request, invite_text: _send_parent_link_invite_via_current_transport(
+                    context,
+                    request=active_request,
+                    invite_text=invite_text,
+                ),
+            )
+        except ValueError as exc:
+            error_code = str(exc)
+            if error_code == "parent_link_invite_transport_unsupported":
+                return json.dumps(
+                    {
+                        "error": "Parent-link invite texts are only available from a Sendblue-backed parent DM right now."
+                    }
+                )
+            return json.dumps({"error": error_code})
+        request = action_result.request
+        reply_text = action_result.reply_text
+        invite_sent = True
+    else:
+        reply_text = service.build_inviting_request_reply(request)
+        invite_sent = bool(str((request.metadata or {}).get("invited_message_sent_at") or "").strip())
     return json.dumps(
         {
             "result": {
@@ -1607,7 +1767,8 @@ def _handle_request_parent_link(args: dict, *, task_id: str | None = None, **_: 
                 "requires_merge_confirmation": bool(request.requires_merge_confirmation),
                 "invited_display_name": request.invited_display_name,
                 "expires_at": request.expires_at,
-                "reply_text": service.build_inviting_request_reply(request),
+                "invite_sent": invite_sent,
+                "reply_text": reply_text,
             }
         }
     )

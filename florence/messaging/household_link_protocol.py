@@ -99,7 +99,10 @@ class FlorenceHouseholdLinkProtocol:
         text: str,
     ) -> FlorenceProtocolReply:
         decision = _normalize_confirmation(text)
-        if self._armed_request_id(channel_id=channel_id, role="invited") != request.id or decision is None:
+        metadata = dict(request.metadata) if isinstance(request.metadata, dict) else {}
+        invite_was_sent = bool(str(metadata.get("invited_message_sent_at") or "").strip())
+        armed_request_id = self._armed_request_id(channel_id=channel_id, role="invited")
+        if decision is None or (armed_request_id != request.id and not invite_was_sent):
             inviter = self.household_link_service.store.get_member(request.inviting_member_id)
             return FlorenceProtocolReply(
                 reply_text=self.household_link_service.build_invited_confirmation_prompt(

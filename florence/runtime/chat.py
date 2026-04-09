@@ -18,6 +18,7 @@ from florence.contracts import (
     ChannelMessageRole,
     ChannelType,
     HouseholdBriefingKind,
+    HouseholdLinkRequestStatus,
     HouseholdMealStatus,
     HouseholdNudgeStatus,
     HouseholdProfileKind,
@@ -1591,6 +1592,7 @@ class FlorenceHouseholdChatService:
             "You also have Florence household-state tools. Use them to persist durable household state when the user wants Florence to remember or manage something over time.",
             "If a parent wants Florence to connect another parent into the same household, use household_request_parent_link with their phone number instead of telling them to wait for the family group chat.",
             "When using household_request_parent_link, keep the reply privacy-safe. Do not reveal whether Florence already knew that number or had an existing thread with that person.",
+            "If there is an open parent-link request for this parent and they reply with yes, text her, send it, or do it, use household_request_parent_link again with request_id and send_invite_now=true instead of making them repeat the phone number.",
             "Before creating duplicate tasks, events, meals, grocery items, or reminders, check household state, recent Florence context, and connected inbox context when they help.",
             "When the user is asking Florence to capture, track, plan, or manage something, prefer updating durable household state and reply with a concise handled summary of what Florence saved, planned, or still needs.",
             "For meal and grocery requests, prefer creating or updating household meals and shopping items instead of leaving the plan only in chat.",
@@ -1692,6 +1694,40 @@ class FlorenceHouseholdChatService:
                     label = f"{member_name_by_id[item.member_id]} | {label}"
                 rendered = f"{label}: {value}" if value else label
                 lines.append(f"- {rendered}")
+        if actor_member_id:
+            pending_parent_links = [
+                request
+                for request in self.store.list_household_link_requests(
+                    household_id=household_id,
+                    statuses=(
+                        HouseholdLinkRequestStatus.PENDING,
+                        HouseholdLinkRequestStatus.ACCEPTED,
+                    ),
+                )
+                if request.inviting_member_id == actor_member_id
+            ]
+            if pending_parent_links:
+                lines.append("Open parent-link requests for this parent:")
+                for request in pending_parent_links[:6]:
+                    request_metadata = dict(request.metadata) if isinstance(request.metadata, dict) else {}
+                    target_name = str(request.invited_display_name or "").strip()
+                    if not target_name and request.invited_member_id:
+                        invited_member = self.store.get_member(request.invited_member_id)
+                        if invited_member is not None and invited_member.display_name.strip():
+                            target_name = invited_member.display_name.strip()
+                    if not target_name:
+                        target_name = "the other parent"
+                    invite_sent = "yes" if str(request_metadata.get("invited_message_sent_at") or "").strip() else "no"
+                    awaiting_merge_yes = (
+                        "yes"
+                        if request.status == HouseholdLinkRequestStatus.ACCEPTED
+                        and bool(request_metadata.get("awaiting_inviting_confirmation"))
+                        else "no"
+                    )
+                    lines.append(
+                        f"- request_id {request.id} | target {target_name} | invite_sent {invite_sent} | "
+                        f"awaiting_final_yes {awaiting_merge_yes} | status {request.status.value}"
+                    )
         lines.extend(self._build_event_snapshot_lines(events))
 
         if work_items:

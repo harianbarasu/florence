@@ -1,5 +1,6 @@
 import json
 import re
+from dataclasses import replace
 from florence.messaging import (
     FlorenceInboundAttachment,
     FlorenceInboundMessage,
@@ -781,6 +782,75 @@ def test_dm_pending_household_link_request_prompts_and_auto_merges_lightweight_h
     assert store.get_member("mem_kendall").household_id == "hh_jackson"
     assert store.get_channel("chan_kendall_dm").household_id == "hh_jackson"
     assert store.list_channel_messages(channel_id="chan_kendall_dm")[-1].household_id == "hh_jackson"
+    store.close()
+
+
+def test_dm_pending_household_link_accepts_first_yes_after_outbound_invite(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_onboarding_service(store, review_service)
+    store.upsert_household(Household(id="hh_jackson", name="Jackson household", timezone="America/Los_Angeles"))
+    store.upsert_household(Household(id="hh_kendall", name="Kendall household", timezone="America/Los_Angeles"))
+    store.upsert_member(Member(id="mem_jackson", household_id="hh_jackson", display_name="Jackson", role=MemberRole.ADMIN))
+    store.upsert_member(Member(id="mem_kendall", household_id="hh_kendall", display_name="Kendall", role=MemberRole.ADMIN))
+    store.upsert_member_identity(
+        MemberIdentity(
+            id="ident_kendall",
+            member_id="mem_kendall",
+            kind=IdentityKind.PHONE,
+            value="+1 (555) 555-0124",
+            normalized_value="+15555550124",
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_kendall_dm",
+            household_id="hh_kendall",
+            provider="sendblue",
+            provider_channel_id="thread-kendall",
+            channel_type=ChannelType.PARENT_DM,
+            title="Kendall",
+            metadata={"sender_handle": "+15555550124"},
+        )
+    )
+    service = FlorenceHouseholdLinkService(store)
+    request = service.create_phone_link_request(
+        household_id="hh_jackson",
+        inviting_member_id="mem_jackson",
+        invited_phone="+1 (555) 555-0124",
+        invited_display_name="Kendall",
+    )
+    store.upsert_household_link_request(
+        replace(
+            request,
+            metadata={
+                **dict(request.metadata),
+                "invited_message_sent_at": "2026-04-08T21:00:00+00:00",
+            },
+        )
+    )
+    ingress = _build_ingress(store, onboarding_service, review_service)
+
+    merged = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_kendall",
+            member_id="mem_kendall",
+            channel_id="chan_kendall_dm",
+            thread_id="thread-kendall",
+            message=FlorenceInboundMessage(
+                provider="sendblue",
+                message_id="msg-kendall-yes",
+                thread_id="thread-kendall",
+                sender_handle="+1 (555) 555-0124",
+                body="yes",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert merged.consumed is True
+    assert "linked into the same household now" in (merged.reply_text or "").lower()
+    assert store.get_member("mem_kendall").household_id == "hh_jackson"
     store.close()
 
 

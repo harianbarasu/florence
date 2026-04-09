@@ -268,6 +268,51 @@ def test_household_link_service_waits_for_both_parents_on_mature_merge(tmp_path)
     store.close()
 
 
+def test_household_link_service_sends_outbound_invite_text_once(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_jackson", name="Jackson's household", timezone="America/Los_Angeles"))
+    store.upsert_member(Member(id="mem_jackson", household_id="hh_jackson", display_name="Jackson", role=MemberRole.ADMIN))
+    service = FlorenceHouseholdLinkService(
+        store,
+        now_getter=lambda: datetime(2026, 4, 8, 20, 0, tzinfo=timezone.utc),
+    )
+    request = service.create_phone_link_request(
+        household_id="hh_jackson",
+        inviting_member_id="mem_jackson",
+        invited_phone="+1 (555) 555-0124",
+        invited_display_name="Kendall",
+    )
+    sent: list[dict[str, object]] = []
+
+    def _send_invite(active_request, invite_text):
+        sent.append(
+            {
+                "request_id": active_request.id,
+                "invite_text": invite_text,
+            }
+        )
+        return {"provider": "sendblue", "thread_id": "+15122164639|+15555550124"}
+
+    first = service.send_invited_parent_invite(
+        request_id=request.id,
+        inviting_member_id="mem_jackson",
+        send_invite=_send_invite,
+    )
+    second = service.send_invited_parent_invite(
+        request_id=request.id,
+        inviting_member_id="mem_jackson",
+        send_invite=_send_invite,
+    )
+
+    assert len(sent) == 1
+    assert "Jackson invited you to join your household in Florence." in sent[0]["invite_text"]
+    assert first.request.metadata["invited_message_sent_at"] == "2026-04-08T20:00:00+00:00"
+    assert first.request.metadata["invite_delivery"]["provider"] == "sendblue"
+    assert "Done. I texted Kendall." in first.reply_text
+    assert "already texted Kendall" in second.reply_text
+    store.close()
+
+
 def test_household_link_service_schedules_inviting_confirmation_prompt_for_mature_merge(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     store.upsert_household(Household(id="hh_jackson", name="Jackson's household", timezone="America/Los_Angeles"))

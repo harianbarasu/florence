@@ -727,10 +727,92 @@ def test_household_request_parent_link_creates_privacy_safe_pending_request(tmp_
 
         assert result["result"]["status"] == "pending"
         assert result["result"]["requires_merge_confirmation"] is False
-        assert "link Kendall into this household once they confirm from their side" in result["result"]["reply_text"]
+        assert "I can text them now" in result["result"]["reply_text"]
+        assert result["result"]["invite_sent"] is False
         saved_requests = store.list_household_link_requests(household_id="hh_123")
         assert len(saved_requests) == 1
         assert saved_requests[0].invited_identity_normalized_value == "+15555550124"
+    finally:
+        clear_household_tool_context(task_id)
+        store.close()
+
+
+def test_household_request_parent_link_can_send_invite_for_pending_request(tmp_path, monkeypatch):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Jackson household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Jackson",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="sendblue",
+            provider_channel_id="+15122164639|+15555550199",
+            channel_type=ChannelType.PARENT_DM,
+            title="Jackson",
+            metadata={"sendblue_number": "+15122164639", "sender_handle": "+15555550199"},
+        )
+    )
+    sent: list[dict[str, object]] = []
+
+    def _fake_send_parent_link_invite(context, *, request, invite_text):
+        sent.append(
+            {
+                "channel_id": context.channel_id,
+                "request_id": request.id,
+                "invite_text": invite_text,
+            }
+        )
+        return {"provider": "sendblue", "thread_id": "+15122164639|+15555550124"}
+
+    monkeypatch.setattr(
+        "tools.florence_household_tool._send_parent_link_invite_via_current_transport",
+        _fake_send_parent_link_invite,
+    )
+
+    task_id = "task-parent-link-send"
+    set_household_tool_context(
+        task_id,
+        store=store,
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_dm_123",
+    )
+    try:
+        created = json.loads(
+            handle_function_call(
+                "household_request_parent_link",
+                {
+                    "phone_number": "+1 (555) 555-0124",
+                    "display_name": "Kendall",
+                },
+                task_id=task_id,
+            )
+        )
+        sent_result = json.loads(
+            handle_function_call(
+                "household_request_parent_link",
+                {
+                    "request_id": created["result"]["request_id"],
+                    "send_invite_now": True,
+                },
+                task_id=task_id,
+            )
+        )
+
+        assert len(sent) == 1
+        assert "Jackson invited you to join your household in Florence." in sent[0]["invite_text"]
+        assert sent_result["result"]["invite_sent"] is True
+        assert "Done. I texted Kendall." in sent_result["result"]["reply_text"]
+        saved_request = store.get_household_link_request(created["result"]["request_id"])
+        assert saved_request is not None
+        assert saved_request.metadata["invite_delivery"]["provider"] == "sendblue"
     finally:
         clear_household_tool_context(task_id)
         store.close()

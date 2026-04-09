@@ -6,7 +6,6 @@ from florence.contracts import (
     ChildProfile,
     Household,
     HouseholdEvent,
-    HouseholdNudgeStatus,
     HouseholdLinkRequestStatus,
     HouseholdProfileItem,
     HouseholdProfileKind,
@@ -16,7 +15,6 @@ from florence.contracts import (
     MemberRole,
     IdentityKind,
 )
-from florence.messaging.protocol_types import build_household_link_prompt_metadata
 from florence.runtime.household_link import FlorenceHouseholdLinkService
 from florence.runtime.resolver import normalize_identity_value
 from florence.state import FlorenceStateDB
@@ -211,7 +209,7 @@ def test_household_link_service_accepts_invited_parent_and_auto_merges_lightweig
     store.close()
 
 
-def test_household_link_service_waits_for_both_parents_on_mature_merge(tmp_path):
+def test_household_link_service_merges_mature_household_after_invited_yes(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     store.upsert_household(Household(id="hh_jackson", name="Jackson's household", timezone="America/Los_Angeles"))
     store.upsert_household(Household(id="hh_kendall", name="Kendall's household", timezone="America/Los_Angeles"))
@@ -254,15 +252,7 @@ def test_household_link_service_waits_for_both_parents_on_mature_merge(tmp_path)
         request_id=request.id,
         invited_member_id="mem_kendall",
     )
-    assert invited_result.request.status == HouseholdLinkRequestStatus.ACCEPTED
-    assert invited_result.request.metadata["awaiting_inviting_confirmation"] is True
-    assert store.get_member("mem_kendall").household_id == "hh_kendall"
-
-    inviting_result = service.accept_from_inviting_member(
-        request_id=request.id,
-        inviting_member_id="mem_jackson",
-    )
-    assert inviting_result.request.status == HouseholdLinkRequestStatus.MERGED
+    assert invited_result.request.status == HouseholdLinkRequestStatus.MERGED
     assert store.get_member("mem_kendall").household_id == "hh_jackson"
     assert store.get_household("hh_kendall") is None
     store.close()
@@ -313,7 +303,7 @@ def test_household_link_service_sends_outbound_invite_text_once(tmp_path):
     store.close()
 
 
-def test_household_link_service_schedules_inviting_confirmation_prompt_for_mature_merge(tmp_path):
+def test_household_link_service_does_not_schedule_inviting_confirmation_prompt_for_mature_merge(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     store.upsert_household(Household(id="hh_jackson", name="Jackson's household", timezone="America/Los_Angeles"))
     store.upsert_household(Household(id="hh_kendall", name="Kendall's household", timezone="America/Los_Angeles"))
@@ -362,11 +352,8 @@ def test_household_link_service_schedules_inviting_confirmation_prompt_for_matur
         for item in store.list_household_nudges(household_id="hh_jackson")
         if item.target_id == request.id
     ]
-    assert accepted.request.status == HouseholdLinkRequestStatus.ACCEPTED
-    assert len(scheduled) == 1
-    assert scheduled[0].status == HouseholdNudgeStatus.SCHEDULED
-    assert scheduled[0].recipient_member_id == "mem_jackson"
-    assert scheduled[0].metadata["delivery_message_metadata"] == build_household_link_prompt_metadata(request.id, role="inviting")
+    assert accepted.request.status == HouseholdLinkRequestStatus.MERGED
+    assert scheduled == []
     store.close()
 
 
@@ -444,11 +431,7 @@ def test_household_link_service_creates_merge_cleanup_work_items_for_obvious_dup
         invited_phone="+1 (555) 555-0124",
         invited_display_name="Kendall",
     )
-    service.accept_from_invited(request_id=request.id, invited_member_id="mem_kendall")
-    result = service.accept_from_inviting_member(
-        request_id=request.id,
-        inviting_member_id="mem_jackson",
-    )
+    result = service.accept_from_invited(request_id=request.id, invited_member_id="mem_kendall")
 
     work_items = store.list_household_work_items(household_id="hh_jackson")
     titles = {item.title for item in work_items}
@@ -520,11 +503,7 @@ def test_household_link_service_auto_dedupes_exact_preferences_and_routines(tmp_
         invited_phone="+1 (555) 555-0124",
         invited_display_name="Kendall",
     )
-    service.accept_from_invited(request_id=request.id, invited_member_id="mem_kendall")
-    result = service.accept_from_inviting_member(
-        request_id=request.id,
-        inviting_member_id="mem_jackson",
-    )
+    result = service.accept_from_invited(request_id=request.id, invited_member_id="mem_kendall")
 
     work_items = store.list_household_work_items(household_id="hh_jackson")
     titles = {item.title for item in work_items}
@@ -608,11 +587,7 @@ def test_household_link_service_repoints_child_linked_records_to_canonical_child
         invited_display_name="Kendall",
     )
 
-    service.accept_from_invited(request_id=request.id, invited_member_id="mem_kendall")
-    result = service.accept_from_inviting_member(
-        request_id=request.id,
-        inviting_member_id="mem_jackson",
-    )
+    result = service.accept_from_invited(request_id=request.id, invited_member_id="mem_kendall")
 
     child_profiles = store.list_child_profiles(household_id="hh_jackson")
     school_items = store.list_household_profile_items(

@@ -132,6 +132,12 @@ class FlorenceHouseholdLinkProtocol:
         request,
         text: str,
     ) -> FlorenceProtocolReply:
+        if request.status.value == "accepted":
+            result = self.household_link_service.accept_from_inviting_member(
+                request_id=request.id,
+                inviting_member_id=member_id,
+            )
+            return FlorenceProtocolReply(reply_text=result.reply_text, consumed=True)
         decision = _normalize_confirmation(text)
         if self._armed_request_id(channel_id=channel_id, role="inviting") != request.id or decision is None:
             return FlorenceProtocolReply(

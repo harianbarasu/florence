@@ -10,7 +10,6 @@ from florence.messaging import (
 from florence.messaging.protocol_types import (
     CANDIDATE_REVIEW_PROMPT_KIND,
     build_google_connect_prompt_metadata,
-    build_household_link_prompt_metadata,
 )
 from datetime import datetime, timedelta, timezone
 from florence.onboarding import OnboardingStage
@@ -854,7 +853,7 @@ def test_dm_pending_household_link_accepts_first_yes_after_outbound_invite(tmp_p
     store.close()
 
 
-def test_dm_mature_household_link_waits_for_inviting_parent_confirmation(tmp_path):
+def test_dm_mature_household_link_merges_after_invited_yes(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)
     onboarding_service = _build_onboarding_service(store, review_service)
@@ -947,57 +946,7 @@ def test_dm_mature_household_link_waits_for_inviting_parent_confirmation(tmp_pat
         )
     )
 
-    assert "wait for Jackson to confirm" in (invited_yes.reply_text or "")
-    assert store.get_member("mem_kendall").household_id == "hh_kendall"
-
-    inviter_prompt = ingress.handle_message(
-        FlorenceResolvedInboundMessage(
-            household_id="hh_jackson",
-            member_id="mem_jackson",
-            channel_id="chan_jackson_dm",
-            thread_id="thread-jackson",
-            message=FlorenceInboundMessage(
-                provider="sendblue",
-                message_id="msg-jackson-1",
-                thread_id="thread-jackson",
-                sender_handle="+1 (555) 555-0199",
-                body="anything else?",
-                is_group_chat=False,
-            ),
-        )
-    )
-
-    assert "Kendall said yes." in (inviter_prompt.reply_text or "")
-    assert store.list_channel_messages(channel_id="chan_jackson_dm")[-1].metadata == build_household_link_prompt_metadata(
-        store.list_household_link_requests(
-            household_id="hh_jackson",
-            statuses=(),
-        )[0].id,
-        role="inviting",
-    ) | {
-        "provider": "sendblue",
-        "transport_thread_id": "thread-jackson",
-        "transport_reply_to": "msg-jackson-1",
-    }
-
-    inviter_yes = ingress.handle_message(
-        FlorenceResolvedInboundMessage(
-            household_id="hh_jackson",
-            member_id="mem_jackson",
-            channel_id="chan_jackson_dm",
-            thread_id="thread-jackson",
-            message=FlorenceInboundMessage(
-                provider="sendblue",
-                message_id="msg-jackson-2",
-                thread_id="thread-jackson",
-                sender_handle="+1 (555) 555-0199",
-                body="yes",
-                is_group_chat=False,
-            ),
-        )
-    )
-
-    assert "linked into the same household now" in (inviter_yes.reply_text or "").lower()
+    assert "linked into the same household now" in (invited_yes.reply_text or "").lower()
     assert store.get_member("mem_kendall").household_id == "hh_jackson"
     assert store.get_household("hh_kendall") is None
     store.close()

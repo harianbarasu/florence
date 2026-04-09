@@ -25,7 +25,6 @@ from florence.contracts import (
     IdentityKind,
     MemberRole,
 )
-from florence.messaging.protocol_types import build_household_link_prompt_metadata
 from florence.runtime.household_merge import FlorenceHouseholdMergeService
 from florence.runtime.household_manager import FlorenceHouseholdManagerService
 from florence.runtime.resolver import normalize_identity_value
@@ -45,6 +44,16 @@ _MEANINGFUL_HOUSEHOLD_STATE_KEYS = (
 )
 _MERGE_CLEANUP_WORK_ITEM_KIND = "merge_cleanup"
 _INVITING_CONFIRM_NUDGE_KIND = "household_link_confirmation"
+
+
+def _build_household_link_prompt_metadata(request_id: str, *, role: str) -> dict[str, object]:
+    return {
+        "protocol_kind": "household_link_prompt",
+        "pending_action_type": "household_link_request",
+        "pending_action_target_kind": "household_link_request",
+        "pending_action_target_id": request_id,
+        "household_link_prompt_role": role,
+    }
 
 
 def _stable_id(prefix: str, *parts: str) -> str:
@@ -204,8 +213,7 @@ class FlorenceHouseholdLinkService:
             return f"{target_name} is already linked into this household."
         if request.status == HouseholdLinkRequestStatus.ACCEPTED and request.requires_merge_confirmation:
             return (
-                f"{target_name} already said yes. Because this will combine information from both sides, "
-                "reply yes when you're ready for me to finish linking everything into one household."
+                f"{target_name} already said yes. I can finish linking everything into one household now."
             )
         if str(metadata.get("invited_message_sent_at") or "").strip():
             return (
@@ -394,27 +402,6 @@ class FlorenceHouseholdLinkService:
             return HouseholdLinkActionResult(
                 request=merged,
                 reply_text="You're already linked into this household here. Your 1:1 thread will stay private.",
-            )
-
-        if request.requires_merge_confirmation:
-            accepted = self._save_request(
-                replace(
-                    request,
-                    status=HouseholdLinkRequestStatus.ACCEPTED,
-                    metadata={
-                        **dict(request.metadata),
-                        "invited_confirmed_at": self.now_getter().isoformat(),
-                        "awaiting_inviting_confirmation": True,
-                    },
-                )
-            )
-            self._schedule_inviting_confirmation_prompt(request=accepted)
-            return HouseholdLinkActionResult(
-                request=accepted,
-                reply_text=(
-                    "Thanks — I’ve got your yes. Because this will combine information from both sides, "
-                    "I’ll wait for Jackson to confirm before I merge everything."
-                ),
             )
 
         preferred_child_ids = {
@@ -747,7 +734,7 @@ class FlorenceHouseholdLinkService:
             scheduled_for=self.now_getter().isoformat(),
             metadata={
                 "kind": _INVITING_CONFIRM_NUDGE_KIND,
-                "delivery_message_metadata": build_household_link_prompt_metadata(request.id, role="inviting"),
+                "delivery_message_metadata": _build_household_link_prompt_metadata(request.id, role="inviting"),
             },
         )
         self.store.upsert_household_nudge(nudge)

@@ -368,6 +368,36 @@ def test_delivery_service_records_outbound_audit_event(tmp_path):
     store.close()
 
 
+def test_delivery_service_strips_leftover_markdown_emphasis_markers(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    linq = _FakeLinqClient()
+    delivery = FlorenceChannelDeliveryService(
+        store,
+        linq_client_getter=lambda: linq,
+        sendblue_client_getter=lambda: None,
+    )
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    channel = store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+
+    sent = delivery.send_channel_message(
+        channel=channel,
+        message="Done.\n\n- 1** added: Flight to CDG (DL 96) on July 1**",
+    )
+
+    assert sent is True
+    assert linq.sent == [{"chat_id": "dm-thread-123", "message": "Done.\n\n- 1 added: Flight to CDG (DL 96) on July 1"}]
+    store.close()
+
+
 def test_candidate_review_prompt_returns_latest_pending_candidate(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)
@@ -406,6 +436,78 @@ def test_candidate_review_prompt_returns_latest_pending_candidate(tmp_path):
 
     assert prompt is not None
     assert prompt.candidate.id == "cand_bootstrap_123"
+    store.close()
+
+
+def test_candidate_review_prompt_skips_past_time_bound_candidate(tmp_path, monkeypatch):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    review_service = FlorenceCandidateReviewService(store)
+    monkeypatch.setattr(
+        review_service,
+        "_utc_now",
+        lambda: datetime(2026, 4, 9, 18, 0, tzinfo=timezone.utc),
+    )
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_past_music",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:gmail_past_music",
+            title="Theo music class",
+            summary="Theo has a music class on March 31 at 4:15 PM.",
+            state=CandidateState.PENDING_REVIEW,
+            metadata={
+                "confirmation_question": "Should I add Theo's music class to the shared household plan?",
+                "raw_metadata": {
+                    "reason_tags": ["household_anchor", "schedule_signal", "activity_signal"],
+                    "temporal_evidence": {"date_match": {"date": "2026-03-31"}},
+                },
+            },
+        )
+    )
+
+    prompt = review_service.build_next_dm_review_prompt(household_id="hh_123", member_id="mem_123")
+
+    assert prompt is None
+    store.close()
+
+
+def test_candidate_review_prompt_keeps_recent_financial_record(tmp_path, monkeypatch):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    review_service = FlorenceCandidateReviewService(store)
+    monkeypatch.setattr(
+        review_service,
+        "_utc_now",
+        lambda: datetime(2026, 4, 9, 18, 0, tzinfo=timezone.utc),
+    )
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_receipt",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:gmail_receipt",
+            title="One Medical receipt",
+            summary="$37.43 payment on April 8 for Kendall.",
+            state=CandidateState.PENDING_REVIEW,
+            metadata={
+                "candidate_scope": "private_parent",
+                "confirmation_question": "If you want, I can keep that as a private expense note.",
+                "raw_metadata": {
+                    "reason_tags": ["private_parent", "logistics_signal", "schedule_signal"],
+                    "temporal_evidence": {"date_match": {"date": "2026-04-08"}},
+                },
+            },
+        )
+    )
+
+    prompt = review_service.build_next_dm_review_prompt(household_id="hh_123", member_id="mem_123")
+
+    assert prompt is not None
+    assert prompt.candidate.id == "cand_receipt"
     store.close()
 
 
@@ -1942,6 +2044,90 @@ def test_operations_review_nudge_suppresses_proactive_prompt_during_quiet_hours(
     store.close()
 
 
+def test_operations_review_nudge_skips_stale_schedule_candidate(tmp_path, monkeypatch):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    onboarding_service = FlorenceOnboardingSessionService(store)
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        display_name="Maya",
+    )
+    candidate = store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_stale_1",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:gmail_stale_1",
+            title="Theo music class",
+            summary="Theo has a music class on March 31 at 4:15 PM.",
+            state=CandidateState.PENDING_REVIEW,
+            confidence_bps=8200,
+            requires_confirmation=True,
+            metadata={
+                "confirmation_question": "Should I add Theo's music class to the shared household plan?",
+                "raw_metadata": {
+                    "anchor_hits": 2,
+                    "sender_looks_school": False,
+                    "reason_tags": ["household_anchor", "schedule_signal", "activity_signal"],
+                    "temporal_evidence": {"date_match": {"date": "2026-03-31"}},
+                },
+            },
+        )
+    )
+    linq = _FakeLinqClient()
+    delivery = FlorenceChannelDeliveryService(
+        store,
+        linq_client_getter=lambda: linq,
+        sendblue_client_getter=lambda: None,
+    )
+    operations = FlorenceHouseholdOperationsService(
+        store,
+        delivery_service=delivery,
+        household_chat_service_getter=lambda: _StubReviewPromptChatService(),
+    )
+    monkeypatch.setattr(
+        operations,
+        "_utc_now",
+        lambda: datetime(2026, 4, 9, 18, 0, tzinfo=timezone.utc),
+    )
+    monkeypatch.setattr(
+        operations._candidate_review_service,
+        "_utc_now",
+        lambda: datetime(2026, 4, 9, 18, 0, tzinfo=timezone.utc),
+    )
+
+    nudged = operations.nudge_for_new_pending_candidates(
+        household_id="hh_123",
+        member_id="mem_123",
+        candidates=[candidate],
+    )
+
+    assert nudged is False
+    assert linq.sent == []
+    store.close()
+
+
 def test_operations_review_nudge_skips_weak_gmail_candidate_during_initial_sync(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
@@ -2649,6 +2835,92 @@ def test_operations_review_sweep_skips_when_review_prompt_is_already_armed(tmp_p
 
     assert sent == 0
     assert linq.sent == []
+    assert chat_service.calls == []
+    store.close()
+
+
+def test_operations_review_sweep_groups_recurring_calendar_candidates_into_one_visible_item(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    onboarding_service = FlorenceOnboardingSessionService(store)
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        display_name="Maya",
+    )
+    for candidate_id, starts_at, ends_at in (
+        ("cand_gym_june", "2026-06-04T17:30:00-07:00", "2026-06-04T18:30:00-07:00"),
+        ("cand_gym_aug", "2026-08-06T17:30:00-07:00", "2026-08-06T18:30:00-07:00"),
+    ):
+        store.upsert_imported_candidate(
+            ImportedCandidate(
+                id=candidate_id,
+                household_id="hh_123",
+                member_id="mem_123",
+                source_kind=GoogleSourceKind.GOOGLE_CALENDAR,
+                source_identifier=f"google_calendar:{candidate_id}",
+                title="Violet Gymnastics",
+                summary="Family calendar",
+                state=CandidateState.PENDING_REVIEW,
+                confidence_bps=8300,
+                requires_confirmation=True,
+                metadata={
+                    "confirmation_question": "Should I add this to the shared household plan?",
+                    "calendar_id": "family-calendar",
+                    "proposed_fields": {
+                        "title": "Violet Gymnastics",
+                        "starts_at": starts_at,
+                        "ends_at": ends_at,
+                        "timezone": "America/Los_Angeles",
+                    },
+                    "raw_metadata": {
+                        "reason_tags": ["activity_signal", "schedule_signal"],
+                    },
+                },
+            )
+        )
+    linq = _FakeLinqClient()
+    delivery = FlorenceChannelDeliveryService(
+        store,
+        linq_client_getter=lambda: linq,
+        sendblue_client_getter=lambda: None,
+    )
+    chat_service = _StubReviewPromptChatService()
+    operations = FlorenceHouseholdOperationsService(
+        store,
+        delivery_service=delivery,
+        household_chat_service_getter=lambda: chat_service,
+    )
+
+    sent = operations.dispatch_due_review_sweeps(household_id="hh_123")
+
+    latest = FlorenceChannelLog(store).latest_assistant_message(channel_id="chan_dm_123")
+    assert sent == 1
+    assert latest is not None
+    assert latest.metadata["pending_action_target_id"] in {"cand_gym_june", "cand_gym_aug"}
+    assert set(latest.metadata["pending_action_target_ids"]) == {"cand_gym_june", "cand_gym_aug"}
+    assert latest.body.count("Violet Gymnastics") == 1
+    assert "Thursdays at 5:30 PM" in latest.body
+    assert "Jun 4 and Aug 6" in latest.body
     assert chat_service.calls == []
     store.close()
 

@@ -89,17 +89,6 @@ def parse_explicit_date(source: str, time_zone: str, now: datetime | None = None
         label = relative.group(1).lower()
         return ParsedExplicitDate(relative.group(0), add_days(today, 1) if label == "tomorrow" else today)
 
-    weekday = re.search(
-        r"\b(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b",
-        source,
-        flags=re.IGNORECASE,
-    )
-    if weekday:
-        target = WEEKDAYS[weekday.group(1).lower()]
-        delta = (target - today.weekday()) % 7
-        delta = delta or 7
-        return ParsedExplicitDate(weekday.group(0), add_days(today, delta))
-
     iso = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", source)
     if iso:
         parsed = _safe_date(int(iso.group(1)), int(iso.group(2)), int(iso.group(3)))
@@ -123,6 +112,17 @@ def parse_explicit_date(source: str, time_zone: str, now: datetime | None = None
             parsed = _safe_date(year, month, int(month_name.group(2)))
             if parsed is not None:
                 return ParsedExplicitDate(month_name.group(0), parsed)
+
+    weekday = re.search(
+        r"\b(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b",
+        source,
+        flags=re.IGNORECASE,
+    )
+    if weekday:
+        target = WEEKDAYS[weekday.group(1).lower()]
+        delta = (target - today.weekday()) % 7
+        delta = delta or 7
+        return ParsedExplicitDate(weekday.group(0), add_days(today, delta))
 
     return None
 

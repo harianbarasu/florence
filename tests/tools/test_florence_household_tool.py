@@ -1435,6 +1435,98 @@ def test_household_apply_candidate_review_rejects_non_active_candidate(tmp_path)
         store.close()
 
 
+def test_household_apply_candidate_review_confirms_grouped_calendar_series(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    store.append_channel_message(
+        ChannelMessage(
+            id="assistant_review_prompt_grouped",
+            household_id="hh_123",
+            channel_id="chan_dm_123",
+            sender_role=ChannelMessageRole.ASSISTANT,
+            body="📬 I found a few things to review:\n1. Violet Gymnastics — Thursdays at 5:30 PM — dates I found: Jun 4 and Aug 6",
+            metadata={
+                "protocol_kind": "candidate_review_prompt",
+                "pending_action_type": "candidate_review",
+                "pending_action_target_kind": "imported_candidate",
+                "pending_action_target_id": "cand_gym_june",
+                "pending_action_target_ids": ["cand_gym_june", "cand_gym_aug"],
+            },
+            created_at=datetime.now(timezone.utc).timestamp(),
+        )
+    )
+    for candidate_id, starts_at, ends_at in (
+        ("cand_gym_june", "2026-06-04T17:30:00-07:00", "2026-06-04T18:30:00-07:00"),
+        ("cand_gym_aug", "2026-08-06T17:30:00-07:00", "2026-08-06T18:30:00-07:00"),
+    ):
+        store.upsert_imported_candidate(
+            ImportedCandidate(
+                id=candidate_id,
+                household_id="hh_123",
+                member_id="mem_123",
+                source_kind=GoogleSourceKind.GOOGLE_CALENDAR,
+                source_identifier=f"google_calendar:{candidate_id}",
+                title="Violet Gymnastics",
+                summary="Family calendar",
+                state=CandidateState.PENDING_REVIEW,
+                metadata={
+                    "proposed_fields": {
+                        "title": "Violet Gymnastics",
+                        "starts_at": starts_at,
+                        "ends_at": ends_at,
+                        "timezone": "America/Los_Angeles",
+                    }
+                },
+            )
+        )
+    task_id = "task-apply-candidate-review-grouped"
+    set_household_tool_context(
+        task_id,
+        store=store,
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_dm_123",
+    )
+    try:
+        result = json.loads(
+            handle_function_call(
+                "household_apply_candidate_review",
+                {
+                    "candidate_id": "cand_gym_june",
+                    "resolution": "confirm",
+                },
+                task_id=task_id,
+            )
+        )
+
+        assert result["result"]["candidate_ids"] == ["cand_gym_june", "cand_gym_aug"]
+        assert "2 dates for Violet Gymnastics" in result["result"]["reply_text"]
+        assert store.get_imported_candidate("cand_gym_june").state == CandidateState.CONFIRMED
+        assert store.get_imported_candidate("cand_gym_aug").state == CandidateState.CONFIRMED
+        assert len(store.list_household_events(household_id="hh_123")) == 2
+    finally:
+        clear_household_tool_context(task_id)
+        store.close()
+
+
 def test_household_apply_nudge_action_marks_active_nudge_done(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))

@@ -7,7 +7,7 @@ import os
 import re
 import time
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from florence.contracts import (
@@ -91,6 +91,64 @@ def _normalized_search_terms(value: str | None) -> list[str]:
     ]
 
 
+def _parsed_query_date(value: str | None) -> date | None:
+    normalized = " ".join(str(value or "").split()).strip()
+    if not normalized:
+        return None
+    from florence.relevance.temporal import parse_explicit_date
+
+    parsed = parse_explicit_date(normalized, "UTC", now=datetime.now(timezone.utc))
+    return parsed.value if parsed is not None else None
+
+
+def _gmail_item_explicit_date(item: StoredGmailSyncItem) -> date | None:
+    from florence.relevance.temporal import parse_explicit_date
+
+    source = "\n".join(
+        part
+        for part in (
+            item.subject,
+            item.snippet,
+            item.body_text,
+            item.attachment_text,
+        )
+        if part
+    )
+    if not source.strip():
+        return None
+    parsed = parse_explicit_date(source, "UTC", now=item.received_at or datetime.now(timezone.utc))
+    return parsed.value if parsed is not None else None
+
+
+def _calendar_item_explicit_date(item: StoredCalendarSyncItem) -> date | None:
+    if item.starts_at is not None:
+        return item.starts_at.astimezone(timezone.utc).date()
+    from florence.relevance.temporal import parse_explicit_date
+
+    source = "\n".join(
+        part
+        for part in (
+            item.title,
+            item.description,
+            item.location,
+            item.calendar_summary,
+        )
+        if part
+    )
+    if not source.strip():
+        return None
+    parsed = parse_explicit_date(source, "UTC", now=datetime.now(timezone.utc))
+    return parsed.value if parsed is not None else None
+
+
+def _date_alignment_score(query_date: date | None, item_date: date | None) -> int:
+    if query_date is None or item_date is None:
+        return 0
+    if item_date == query_date:
+        return 18
+    return -30
+
+
 def _gmail_match_score(
     item: StoredGmailSyncItem,
     *,
@@ -136,6 +194,7 @@ def _gmail_match_score(
 
     if query_terms and matched_terms == len(query_terms):
         score += len(query_terms) * 2
+    score += _date_alignment_score(_parsed_query_date(query), _gmail_item_explicit_date(item))
     return score
 
 
@@ -184,6 +243,7 @@ def _calendar_match_score(
 
     if query_terms and matched_terms == len(query_terms):
         score += len(query_terms) * 2
+    score += _date_alignment_score(_parsed_query_date(query), _calendar_item_explicit_date(item))
     return score
 
 _RESET_HOUSEHOLD_TABLES = (

@@ -153,49 +153,50 @@ class FlorenceHouseholdOperationsService:
                 )
                 return False
             prompt_text = prompt.text
-            try:
-                source_prompt = candidate_review_service.source_rule_service.build_candidate_source_prompt(prompt.candidate)
-                rendered = self._household_chat_service_getter().compose_operator_message(
-                    household_id=household_id,
-                    channel_id=channel.id,
-                    actor_member_id=member_id,
-                    kind="review_prompt",
-                    payload={
-                        "candidate": {
-                            "title": str(getattr(prompt.candidate, "title", "") or "").strip(),
-                            "summary": str(getattr(prompt.candidate, "summary", "") or "").strip(),
-                            "state": str(getattr(prompt.candidate, "state", "") or "").strip(),
-                            "confirmation_question": str(getattr(prompt.candidate, "metadata", {}).get("confirmation_question") or "").strip(),
-                            "candidate_scope": str(getattr(prompt.candidate, "metadata", {}).get("candidate_scope") or "").strip(),
+            if not self._review_prompt_should_use_raw_text(prompt):
+                try:
+                    source_prompt = candidate_review_service.source_rule_service.build_candidate_source_prompt(prompt.candidate)
+                    rendered = self._household_chat_service_getter().compose_operator_message(
+                        household_id=household_id,
+                        channel_id=channel.id,
+                        actor_member_id=member_id,
+                        kind="review_prompt",
+                        payload={
+                            "candidate": {
+                                "title": str(getattr(prompt.candidate, "title", "") or "").strip(),
+                                "summary": str(getattr(prompt.candidate, "summary", "") or "").strip(),
+                                "state": str(getattr(prompt.candidate, "state", "") or "").strip(),
+                                "confirmation_question": str(getattr(prompt.candidate, "metadata", {}).get("confirmation_question") or "").strip(),
+                                "candidate_scope": str(getattr(prompt.candidate, "metadata", {}).get("candidate_scope") or "").strip(),
+                            },
+                            "items": self._review_prompt_items(prompt),
+                            "source_prompt": source_prompt,
+                            "pending_review_count": len(
+                                target_store.list_imported_candidates(
+                                    household_id=household_id,
+                                    member_id=member_id,
+                                    state=CandidateState.PENDING_REVIEW,
+                                )
+                            ),
+                            "trigger": "new_pending_candidate",
                         },
-                        "items": self._review_prompt_items(prompt),
-                        "source_prompt": source_prompt,
-                        "pending_review_count": len(
-                            target_store.list_imported_candidates(
-                                household_id=household_id,
-                                member_id=member_id,
-                                state=CandidateState.PENDING_REVIEW,
-                            )
-                        ),
-                        "trigger": "new_pending_candidate",
-                    },
-                )
-                if rendered is not None and rendered.strip():
-                    prompt_text = rendered.strip()
-            except Exception:
-                logger.exception(
-                    "Florence review nudge compose failed household_id=%s member_id=%s candidate_id=%s",
-                    household_id,
-                    member_id,
-                    prompt.candidate.id,
-                )
+                    )
+                    if rendered is not None and rendered.strip():
+                        prompt_text = rendered.strip()
+                except Exception:
+                    logger.exception(
+                        "Florence review nudge compose failed household_id=%s member_id=%s candidate_id=%s",
+                        household_id,
+                        member_id,
+                        prompt.candidate.id,
+                    )
             sent_prompt = self.delivery_service.send_channel_message(
                 channel=channel,
                 message=prompt_text,
                 store=target_store,
                 message_metadata=build_candidate_review_prompt_metadata(
                     prompt.candidate.id,
-                    candidate_ids=[candidate.id for candidate in prompt.candidates],
+                    candidate_ids=self._review_prompt_target_ids(prompt),
                 ),
             )
             if sent_prompt:
@@ -215,7 +216,7 @@ class FlorenceHouseholdOperationsService:
                         "source_visibility": str(candidate_metadata.get("source_visibility") or "").strip() or None,
                         "source_rule_label": str(candidate_metadata.get("source_rule_label") or "").strip() or None,
                         "newly_pending_count": len(newly_pending),
-                        "candidate_ids": [candidate.id for candidate in prompt.candidates],
+                        "candidate_ids": self._review_prompt_target_ids(prompt),
                         "batch_count": len(prompt.candidates),
                         "trigger": "new_pending_candidate",
                     },
@@ -310,43 +311,44 @@ class FlorenceHouseholdOperationsService:
             if prompt is None:
                 continue
             prompt_text = prompt.text
-            try:
-                source_prompt = candidate_review_service.source_rule_service.build_candidate_source_prompt(prompt.candidate)
-                rendered = self._household_chat_service_getter().compose_operator_message(
-                    household_id=household_id,
-                    channel_id=channel.id,
-                    actor_member_id=member_id,
-                    kind="review_prompt",
-                    payload={
-                        "candidate": {
-                            "title": str(getattr(prompt.candidate, "title", "") or "").strip(),
-                            "summary": str(getattr(prompt.candidate, "summary", "") or "").strip(),
-                            "state": str(getattr(prompt.candidate, "state", "") or "").strip(),
-                            "confirmation_question": str(getattr(prompt.candidate, "metadata", {}).get("confirmation_question") or "").strip(),
-                            "candidate_scope": str(getattr(prompt.candidate, "metadata", {}).get("candidate_scope") or "").strip(),
+            if not self._review_prompt_should_use_raw_text(prompt):
+                try:
+                    source_prompt = candidate_review_service.source_rule_service.build_candidate_source_prompt(prompt.candidate)
+                    rendered = self._household_chat_service_getter().compose_operator_message(
+                        household_id=household_id,
+                        channel_id=channel.id,
+                        actor_member_id=member_id,
+                        kind="review_prompt",
+                        payload={
+                            "candidate": {
+                                "title": str(getattr(prompt.candidate, "title", "") or "").strip(),
+                                "summary": str(getattr(prompt.candidate, "summary", "") or "").strip(),
+                                "state": str(getattr(prompt.candidate, "state", "") or "").strip(),
+                                "confirmation_question": str(getattr(prompt.candidate, "metadata", {}).get("confirmation_question") or "").strip(),
+                                "candidate_scope": str(getattr(prompt.candidate, "metadata", {}).get("candidate_scope") or "").strip(),
+                            },
+                            "items": self._review_prompt_items(prompt),
+                            "source_prompt": source_prompt,
+                            "pending_review_count": len(member_pending),
+                            "trigger": "scheduled_review_sweep",
                         },
-                        "items": self._review_prompt_items(prompt),
-                        "source_prompt": source_prompt,
-                        "pending_review_count": len(member_pending),
-                        "trigger": "scheduled_review_sweep",
-                    },
-                )
-                if rendered is not None and rendered.strip():
-                    prompt_text = rendered.strip()
-            except Exception:
-                logger.exception(
-                    "Florence review sweep compose failed household_id=%s member_id=%s candidate_id=%s",
-                    household_id,
-                    member_id,
-                    prompt.candidate.id,
-                )
+                    )
+                    if rendered is not None and rendered.strip():
+                        prompt_text = rendered.strip()
+                except Exception:
+                    logger.exception(
+                        "Florence review sweep compose failed household_id=%s member_id=%s candidate_id=%s",
+                        household_id,
+                        member_id,
+                        prompt.candidate.id,
+                    )
             if not self.delivery_service.send_channel_message(
                 channel=channel,
                 message=prompt_text,
                 store=target_store,
                 message_metadata=build_candidate_review_prompt_metadata(
                     prompt.candidate.id,
-                    candidate_ids=[candidate.id for candidate in prompt.candidates],
+                    candidate_ids=self._review_prompt_target_ids(prompt),
                 ),
             ):
                 continue
@@ -371,7 +373,7 @@ class FlorenceHouseholdOperationsService:
                     "source_visibility": str(metadata.get("source_visibility") or "").strip() or None,
                     "source_rule_label": str(metadata.get("source_rule_label") or "").strip() or None,
                     "pending_review_count": len(member_pending),
-                    "candidate_ids": [candidate.id for candidate in prompt.candidates],
+                    "candidate_ids": self._review_prompt_target_ids(prompt),
                     "batch_count": len(prompt.candidates),
                     "trigger": "scheduled_review_sweep",
                 },
@@ -512,6 +514,43 @@ class FlorenceHouseholdOperationsService:
             }
             for index, candidate in enumerate(tuple(getattr(prompt, "candidates", ()) or ()), start=1)
         ]
+
+    @staticmethod
+    def _review_prompt_target_ids(prompt: Any) -> list[str]:
+        normalized: list[str] = []
+        candidates = tuple(getattr(prompt, "candidates", ()) or ())
+        for candidate in candidates:
+            metadata = dict(getattr(candidate, "metadata", {}) or {})
+            group_ids = [
+                str(candidate_id).strip()
+                for candidate_id in list(metadata.get("review_group_candidate_ids") or [])
+                if str(candidate_id).strip()
+            ]
+            if not group_ids:
+                group_ids = [str(getattr(candidate, "id", "") or "").strip()]
+            for candidate_id in group_ids:
+                if candidate_id and candidate_id not in normalized:
+                    normalized.append(candidate_id)
+        return normalized
+
+    @staticmethod
+    def _review_prompt_should_use_raw_text(prompt: Any) -> bool:
+        candidates = tuple(getattr(prompt, "candidates", ()) or ())
+        if len(candidates) != 1:
+            return False
+        candidate = candidates[0]
+        metadata = dict(getattr(candidate, "metadata", {}) or {})
+        group_ids = [
+            str(candidate_id).strip()
+            for candidate_id in list(metadata.get("review_group_candidate_ids") or [])
+            if str(candidate_id).strip()
+        ]
+        summary = str(getattr(candidate, "summary", "") or "").strip()
+        title = str(getattr(candidate, "title", "") or "").strip()
+        is_calendar_candidate = getattr(candidate, "source_kind", None) == GoogleSourceKind.GOOGLE_CALENDAR
+        return bool(group_ids and len(group_ids) > 1) or (
+            is_calendar_candidate and bool(summary) and summary != title
+        )
 
     def _has_armed_pending_review_prompt(
         self,
@@ -1136,6 +1175,8 @@ class FlorenceHouseholdOperationsService:
         store: FlorenceStateDB,
     ) -> bool:
         if getattr(candidate, "state", None) != CandidateState.PENDING_REVIEW:
+            return False
+        if not self._review_service(store).is_candidate_reviewable_now(candidate=candidate):
             return False
 
         metadata = dict(getattr(candidate, "metadata", {}) or {})

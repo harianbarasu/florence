@@ -136,7 +136,7 @@ class FlorenceCandidateReviewProtocol:
                 reply_text=prompt_text,
                 reply_metadata=build_candidate_review_prompt_metadata(
                     prompt.candidate.id,
-                    candidate_ids=[candidate.id for candidate in (getattr(prompt, "candidates", ()) or ())],
+                    candidate_ids=self._prompt_target_ids(prompt),
                 ),
                 consumed=True,
             )
@@ -172,6 +172,7 @@ class FlorenceCandidateReviewProtocol:
                         "proposed_fields": metadata.get("proposed_fields"),
                         "source_provenance": metadata.get("source_provenance"),
                         "temporal_evidence": (metadata.get("raw_metadata") or {}).get("temporal_evidence"),
+                        "related_candidate_ids": metadata.get("review_group_candidate_ids"),
                         "source_visibility": metadata.get("source_visibility"),
                         "source_rule_label": metadata.get("source_rule_label"),
                         "candidate_scope": metadata.get("candidate_scope"),
@@ -182,6 +183,9 @@ class FlorenceCandidateReviewProtocol:
                 "Treat only the numbered review items listed here as actionable right now. Do not act on any other hidden review items.\n"
                 "If the user replies with numbered decisions like 1 yes, 2 no, 3 skip, apply household_apply_candidate_review to those exact candidate_ids.\n"
                 "You may handle multiple numbered items from one user reply.\n"
+                "If the user does not use numbers but clearly refers to exactly one listed item by title, sender, place, child, or date, treat that as the targeted review item instead of asking them to restate it mechanically.\n"
+                "A reply like 'Zimmi is correct but it's at 7 PM EST' should be treated as confirm-with-correction for the uniquely referenced Zimmi item.\n"
+                "If a listed item includes related_candidate_ids, that visible line represents a grouped recurring series, so one confirm/reject/skip should apply to the whole grouped item.\n"
                 "If the user says plain yes, no, or skip without a number and multiple items are active, ask which number they mean instead of guessing.\n"
                 "If a review item has candidate_scope private_parent, a confirm should keep it in this parent's private lane, not promote it to shared household state.\n"
                 "Interpret the whole message yourself, including short numbered replies and corrections.\n"
@@ -200,6 +204,7 @@ class FlorenceCandidateReviewProtocol:
             "proposed_fields": metadata.get("proposed_fields"),
             "source_provenance": metadata.get("source_provenance"),
             "temporal_evidence": (metadata.get("raw_metadata") or {}).get("temporal_evidence"),
+            "related_candidate_ids": metadata.get("review_group_candidate_ids"),
             "source_visibility": metadata.get("source_visibility"),
             "source_rule_label": metadata.get("source_rule_label"),
             "candidate_scope": metadata.get("candidate_scope"),
@@ -218,6 +223,23 @@ class FlorenceCandidateReviewProtocol:
             f"User reply: {text.strip()}"
         )
 
+    @staticmethod
+    def _prompt_target_ids(prompt) -> list[str]:
+        normalized: list[str] = []
+        for candidate in tuple(getattr(prompt, "candidates", ()) or ()):
+            metadata = dict(getattr(candidate, "metadata", {}) or {})
+            group_ids = [
+                str(candidate_id).strip()
+                for candidate_id in list(metadata.get("review_group_candidate_ids") or [])
+                if str(candidate_id).strip()
+            ]
+            if not group_ids:
+                group_ids = [str(getattr(candidate, "id", "") or "").strip()]
+            for candidate_id in group_ids:
+                if candidate_id and candidate_id not in normalized:
+                    normalized.append(candidate_id)
+        return normalized
+
     def _render_review_prompt_text(
         self,
         *,
@@ -226,6 +248,8 @@ class FlorenceCandidateReviewProtocol:
         actor_member_id: str | None,
         prompt,
     ) -> str:
+        if self._prompt_should_use_raw_text(prompt):
+            return prompt.text
         try:
             rendered = self.household_chat_service.compose_operator_message(
                 household_id=household_id,
@@ -262,6 +286,25 @@ class FlorenceCandidateReviewProtocol:
                 getattr(prompt.candidate, "id", ""),
             )
         return prompt.text
+
+    @staticmethod
+    def _prompt_should_use_raw_text(prompt) -> bool:
+        candidates = tuple(getattr(prompt, "candidates", ()) or ())
+        if len(candidates) != 1:
+            return False
+        candidate = candidates[0]
+        metadata = dict(getattr(candidate, "metadata", {}) or {})
+        group_ids = [
+            str(candidate_id).strip()
+            for candidate_id in list(metadata.get("review_group_candidate_ids") or [])
+            if str(candidate_id).strip()
+        ]
+        summary = str(getattr(candidate, "summary", "") or "").strip()
+        title = str(getattr(candidate, "title", "") or "").strip()
+        is_calendar_candidate = str(getattr(candidate, "source_kind", "") or "") == "google_calendar"
+        return bool(group_ids and len(group_ids) > 1) or (
+            is_calendar_candidate and bool(summary) and summary != title
+        )
 
     def _is_candidate_review_reply_armed(self, *, channel_id: str) -> bool:
         latest_assistant = self.channel_log.latest_assistant_message(channel_id=channel_id, limit=8)

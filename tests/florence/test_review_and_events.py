@@ -1,4 +1,4 @@
-from florence.contracts import CandidateState, GoogleSourceKind, HouseholdSourceVisibility, ImportedCandidate
+from florence.contracts import CandidateState, GoogleSourceKind, Household, HouseholdSourceVisibility, ImportedCandidate
 from florence.runtime import FlorenceCandidateReviewService
 from florence.state import FlorenceStateDB
 
@@ -217,4 +217,109 @@ def test_review_response_can_classify_source_without_confirming_candidate(tmp_pa
     assert persisted is not None
     assert persisted.state == CandidateState.PENDING_REVIEW
     assert any(rule.matcher_value == "billing@camp-example.com" for rule in rules)
+    store.close()
+
+
+def test_review_prompt_groups_recurring_calendar_candidates_and_confirms_them_together(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya household", timezone="America/Los_Angeles"))
+    review_service = FlorenceCandidateReviewService(store)
+    for candidate_id, starts_at, ends_at in (
+        ("cand_gym_june", "2026-06-04T17:30:00-07:00", "2026-06-04T18:30:00-07:00"),
+        ("cand_gym_aug", "2026-08-06T17:30:00-07:00", "2026-08-06T18:30:00-07:00"),
+    ):
+        store.upsert_imported_candidate(
+            ImportedCandidate(
+                id=candidate_id,
+                household_id="hh_123",
+                member_id="mem_123",
+                source_kind=GoogleSourceKind.GOOGLE_CALENDAR,
+                source_identifier=f"google_calendar:{candidate_id}",
+                title="Violet Gymnastics",
+                summary="Family calendar · 2026-06-04T17:30:00-07:00",
+                state=CandidateState.PENDING_REVIEW,
+                metadata={
+                    "confirmation_question": "Should I add this to the shared household plan?",
+                    "calendar_id": "family-calendar",
+                    "proposed_fields": {
+                        "title": "Violet Gymnastics",
+                        "starts_at": starts_at,
+                        "ends_at": ends_at,
+                        "timezone": "America/Los_Angeles",
+                        "location": "The Little Gym",
+                    },
+                    "source_provenance": {
+                        "location": "The Little Gym",
+                    },
+                },
+            )
+        )
+
+    prompt = review_service.build_review_batch_prompt(
+        household_id="hh_123",
+        member_id="mem_123",
+        limit=3,
+    )
+
+    assert prompt is not None
+    assert len(prompt.candidates) == 1
+    assert "Violet Gymnastics" in prompt.text
+    assert "Thursdays at 5:30 PM" in prompt.text
+    assert "Jun 4 and Aug 6" in prompt.text
+
+    group_candidate_ids = review_service.resolve_review_group_candidate_ids(
+        household_id="hh_123",
+        member_id="mem_123",
+        candidate_id=prompt.candidate.id,
+        candidate_ids=["cand_gym_june", "cand_gym_aug"],
+    )
+    reply = review_service.apply_review_response(
+        candidate_id=prompt.candidate.id,
+        candidate_ids=group_candidate_ids,
+        member_id="mem_123",
+        resolution="confirm",
+    )
+
+    assert "2 dates for Violet Gymnastics" in reply.reply_text
+    assert store.get_imported_candidate("cand_gym_june").state == CandidateState.CONFIRMED
+    assert store.get_imported_candidate("cand_gym_aug").state == CandidateState.CONFIRMED
+    assert len(store.list_household_events(household_id="hh_123")) == 2
+    store.close()
+
+
+def test_review_prompt_shows_household_and_source_timezone_for_calendar_candidate(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya household", timezone="America/Los_Angeles"))
+    review_service = FlorenceCandidateReviewService(store)
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_zimmi",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GOOGLE_CALENDAR,
+            source_identifier="google_calendar:zimmi",
+            title="Reservation at Zimmi's",
+            summary="Family calendar · 2026-04-17T19:00:00-04:00",
+            state=CandidateState.PENDING_REVIEW,
+            metadata={
+                "confirmation_question": "Should I add this to the shared household plan?",
+                "calendar_id": "family-calendar",
+                "proposed_fields": {
+                    "title": "Reservation at Zimmi's",
+                    "starts_at": "2026-04-17T19:00:00-04:00",
+                    "ends_at": "2026-04-17T21:00:00-04:00",
+                    "timezone": "America/New_York",
+                },
+            },
+        )
+    )
+
+    prompt = review_service.build_next_review_prompt(
+        household_id="hh_123",
+        member_id="mem_123",
+    )
+
+    assert prompt is not None
+    assert "Reservation at Zimmi's" in prompt.text
+    assert "Fri, Apr 17 at 4:00 PM PDT (7:00 PM EDT)" in prompt.text
     store.close()

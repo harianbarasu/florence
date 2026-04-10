@@ -1491,9 +1491,16 @@ def _handle_apply_candidate_review(args: dict, *, task_id: str | None = None, **
         if value is not None
     }
     review_service = FlorenceCandidateReviewService(context.store)
+    related_candidate_ids = review_service.resolve_review_group_candidate_ids(
+        household_id=context.household_id,
+        member_id=context.actor_member_id or "",
+        candidate_id=candidate_id,
+        candidate_ids=_active_review_candidate_ids(context),
+    )
     reply = review_service.apply_review_response(
         candidate_id=candidate_id,
         member_id=context.actor_member_id,
+        candidate_ids=related_candidate_ids,
         source_visibility=source_visibility,
         resolution=resolution,
         overrides=overrides if resolution == "confirm" else None,
@@ -1521,6 +1528,7 @@ def _handle_apply_candidate_review(args: dict, *, task_id: str | None = None, **
         {
             "result": {
                 "candidate_id": candidate_id,
+                "candidate_ids": related_candidate_ids,
                 "resolution": resolution,
                 "reply_text": reply.reply_text,
                 "group_announcement": reply.group_announcement,
@@ -1827,6 +1835,19 @@ def _active_review_candidate_id(
     if prompt.candidate.id == requested_candidate_id:
         return requested_candidate_id
     return prompt.candidate.id
+
+
+def _active_review_candidate_ids(context: FlorenceHouseholdToolContext) -> list[str]:
+    latest_assistant = FlorenceChannelLog(context.store).latest_assistant_message(channel_id=context.channel_id, limit=8)
+    if latest_assistant is None:
+        return []
+    if latest_assistant.metadata.get("protocol_kind") != CANDIDATE_REVIEW_PROMPT_KIND:
+        return []
+    return [
+        str(candidate_id).strip()
+        for candidate_id in list(latest_assistant.metadata.get(PENDING_ACTION_TARGET_IDS_KEY) or [])
+        if str(candidate_id).strip()
+    ]
 
 
 def _gmail_query_token(value: str) -> str:

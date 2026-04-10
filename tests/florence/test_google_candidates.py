@@ -7,6 +7,7 @@ from florence.relevance import (
     build_gmail_candidate_decision,
     build_parent_calendar_candidate_decision,
 )
+from florence.relevance.temporal import parse_explicit_date
 
 
 def test_gmail_candidate_detects_school_logistics_event():
@@ -140,6 +141,17 @@ def test_gmail_candidate_routes_personal_logistics_to_private_parent():
     assert decision.kind == CandidateDecisionKind.CANDIDATE
     assert decision.raw_metadata["candidate_scope"] == "private_parent"
     assert "just for you" in (decision.confirmation_question or "").lower()
+
+
+def test_parse_explicit_date_prefers_month_day_over_bare_weekday():
+    parsed = parse_explicit_date(
+        "Wednesday, July 2: DL 3812 from LAX to Sacramento.",
+        "America/Los_Angeles",
+        now=datetime(2026, 4, 9, 12, 0, tzinfo=timezone.utc),
+    )
+
+    assert parsed is not None
+    assert parsed.value.isoformat() == "2026-07-02"
 
 
 def test_gmail_candidate_uses_household_platform_and_child_alias_context():

@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 from florence.contracts import (
     CandidateState,
     ChildProfile,
@@ -28,6 +30,7 @@ from florence.contracts import (
     MemberRole,
     PilotEvent,
 )
+from florence.google import GmailSyncItem, ParentCalendarSyncItem
 from florence.onboarding import OnboardingStage, OnboardingState
 from florence.state import FlorenceStateDB
 
@@ -196,6 +199,91 @@ def test_state_db_round_trips_household_source_rules(tmp_path):
     )
 
     assert loaded == [rule]
+    store.close()
+
+
+def test_search_google_gmail_messages_filters_out_explicit_date_mismatch(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    household = Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles")
+    connection = GoogleConnection(
+        id="gconn_123",
+        household_id="hh_123",
+        member_id="mem_123",
+        email="maya@example.com",
+        connected_scopes=(GoogleSourceKind.GMAIL,),
+    )
+    store.upsert_household(household)
+    store.upsert_google_connection(connection)
+    store.upsert_google_gmail_messages(
+        connection=connection,
+        items=[
+            GmailSyncItem(
+                gmail_message_id="gmail_123",
+                thread_id="thread_123",
+                from_address="Delta <delta@example.com>",
+                subject="Delta flight confirmation",
+                snippet="Wednesday, July 2: DL 3812 from LAX to Sacramento.",
+                body_text="Wednesday, July 2: DL 3812 departing 12:00 PM and arriving 1:29 PM.",
+                attachment_text=None,
+                attachment_count=0,
+                received_at=datetime(2026, 4, 9, 12, 0, tzinfo=timezone.utc),
+            )
+        ],
+    )
+
+    results = store.search_google_gmail_messages(
+        household_id="hh_123",
+        connection_ids=["gconn_123"],
+        query="July 1 flight",
+        newer_than_days=365,
+        limit=3,
+    )
+
+    assert results == []
+    store.close()
+
+
+def test_search_google_calendar_events_filters_out_explicit_date_mismatch(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    household = Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles")
+    connection = GoogleConnection(
+        id="gconn_123",
+        household_id="hh_123",
+        member_id="mem_123",
+        email="maya@example.com",
+        connected_scopes=(GoogleSourceKind.GOOGLE_CALENDAR,),
+    )
+    store.upsert_household(household)
+    store.upsert_google_connection(connection)
+    store.upsert_google_calendar_events(
+        connection=connection,
+        items=[
+            ParentCalendarSyncItem(
+                google_event_id="gcal_123",
+                title="Flight to Sacramento",
+                description="DL 3812 on July 2",
+                location="LAX",
+                html_link=None,
+                starts_at=datetime(2026, 7, 2, 19, 0, tzinfo=timezone.utc),
+                ends_at=datetime(2026, 7, 2, 20, 29, tzinfo=timezone.utc),
+                timezone="America/Los_Angeles",
+                all_day=False,
+                updated_at=datetime(2026, 4, 9, 12, 0, tzinfo=timezone.utc),
+                calendar_summary="Maya",
+                family_member_names=[],
+            )
+        ],
+    )
+
+    results = store.search_google_calendar_events(
+        household_id="hh_123",
+        connection_ids=["gconn_123"],
+        query="July 1 flight",
+        newer_than_days=365,
+        limit=3,
+    )
+
+    assert results == []
     store.close()
 
 

@@ -2264,6 +2264,8 @@ def test_review_batch_reply_context_includes_numbered_active_items(tmp_path):
     assert '"index": 2' in contextual_message
     assert '"candidate_id": "cand_batch_2"' in contextual_message
     assert "If the user replies with numbered decisions like 1 yes, 2 no, 3 skip" in contextual_message
+    assert "clearly refers to exactly one listed item by title, sender, place, child, or date" in contextual_message
+    assert "Zimmi is correct but it's at 7 PM EST" in contextual_message
     assert "User reply: 2 no" in contextual_message
     store.close()
 

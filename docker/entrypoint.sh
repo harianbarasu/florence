@@ -1,14 +1,17 @@
 #!/bin/bash
-# Docker entrypoint: bootstrap config files into the mounted volume, then run hermes.
+# Docker entrypoint: bootstrap config files into the Hermes home path, then run hermes.
 set -e
 
-HERMES_HOME="/opt/data"
+HERMES_HOME="${HERMES_HOME:-${RAILWAY_VOLUME_MOUNT_PATH:-/opt/data}}"
+export HERMES_HOME
 INSTALL_DIR="/opt/hermes"
 
 # --- Privilege dropping via gosu ---
 # When started as root (the default), optionally remap the hermes user/group
 # to match host-side ownership, fix volume permissions, then re-exec as hermes.
 if [ "$(id -u)" = "0" ]; then
+    mkdir -p "$HERMES_HOME"
+
     if [ -n "$HERMES_UID" ] && [ "$HERMES_UID" != "$(id -u hermes)" ]; then
         echo "Changing hermes UID to $HERMES_UID"
         usermod -u "$HERMES_UID" hermes

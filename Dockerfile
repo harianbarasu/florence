@@ -12,8 +12,8 @@ ARG INSTALL_WHATSAPP_BRIDGE=0
 ENV PYTHONUNBUFFERED=1 \
     NPM_CONFIG_UPDATE_NOTIFIER=false
 
-# Store Playwright browsers outside the volume mount so the build-time
-# install survives the /opt/data volume overlay at runtime.
+# Store Playwright browsers outside the Hermes home mount so the build-time
+# install survives any Railway/runtime volume overlay.
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
 
 # Install system dependencies in one layer, clear APT cache.
@@ -76,5 +76,4 @@ RUN chmod +x /opt/hermes/docker/entrypoint.sh
 
 ENV HERMES_HOME=/opt/data
 RUN mkdir -p /opt/data
-VOLUME [ "/opt/data" ]
 ENTRYPOINT [ "/opt/hermes/docker/entrypoint.sh" ]

@@ -24,9 +24,11 @@ Florence can now run on Postgres. On Railway, Postgres is the preferred setup.
 3. Set the worker start command to `florence-worker`.
 4. Add a Railway Postgres service.
 5. Add a Railway Redis service.
-6. Set `DATABASE_URL` or `FLORENCE_DATABASE_URL` on both Florence services from Postgres.
-7. Set `REDIS_URL` or `FLORENCE_REDIS_URL` on both Florence services from Redis.
-8. Expose the generated Railway domain or attach your own custom domain on the web service.
+6. Add a Railway volume to each Florence service if you want persistent Hermes home storage.
+7. Mount that volume at the same path you plan to use for `HERMES_HOME` (for example `/data/hermes-home`).
+8. Set `DATABASE_URL` or `FLORENCE_DATABASE_URL` on both Florence services from Postgres.
+9. Set `REDIS_URL` or `FLORENCE_REDIS_URL` on both Florence services from Redis.
+10. Expose the generated Railway domain or attach your own custom domain on the web service.
 
 `railway.json` already tells Railway to use the Dockerfile. Set service-specific
 healthchecks in Railway itself:
@@ -67,6 +69,7 @@ OPENAI_API_KEY=...
 
 Notes:
 
+- Railway rejects Dockerfile `VOLUME` instructions. Configure persistence by attaching a Railway volume to the service instead.
 - Railway injects `PORT` automatically. Florence now honors `PORT` directly.
 - If you use the Railway public domain, Florence now derives its public base URL
   automatically from `RAILWAY_PUBLIC_DOMAIN`.

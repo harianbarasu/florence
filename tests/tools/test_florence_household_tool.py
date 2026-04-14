@@ -58,8 +58,11 @@ class _StubBriefingPlanChatService:
         )
         return [
             {"kind": "morning", "enabled": True, "hour": 6, "minute": 30, "days": [0, 1, 2, 3, 4]},
+            {"kind": "pickup", "enabled": True, "hour": 14, "minute": 30, "days": [0, 1, 2, 3, 4]},
+            {"kind": "school", "enabled": True, "hour": 15, "minute": 0, "days": [2]},
             {"kind": "evening", "enabled": True, "hour": 20, "minute": 30, "days": [0, 1, 2, 3, 6]},
-            {"kind": "weekly", "enabled": False, "hour": 17, "minute": 0, "days": [5]},
+            {"kind": "weekly", "enabled": False, "hour": 18, "minute": 0, "days": [4]},
+            {"kind": "meal", "enabled": True, "hour": 16, "minute": 0, "days": [6]},
         ]
 
 
@@ -1923,12 +1926,18 @@ def test_household_record_preference_refreshes_briefing_routines_for_operating_r
 
         assert result["result"]["metadata"]["category"] == "operating_rule"
         assert result["briefing_routines_refreshed"] is True
-        assert len(result["briefing_routines"]) == 3
+        assert len(result["briefing_routines"]) == 6
         assert len(chat_service.calls) == 1
         morning = next(routine for routine in result["briefing_routines"] if routine["metadata"]["brief_kind"] == "morning")
+        pickup = next(routine for routine in result["briefing_routines"] if routine["metadata"]["brief_kind"] == "pickup")
+        school = next(routine for routine in result["briefing_routines"] if routine["metadata"]["brief_kind"] == "school")
         weekly = next(routine for routine in result["briefing_routines"] if routine["metadata"]["brief_kind"] == "weekly")
+        meal = next(routine for routine in result["briefing_routines"] if routine["metadata"]["brief_kind"] == "meal")
         assert morning["metadata"]["planning_source"] == "hermes"
         assert morning["metadata"]["local_time"] == "06:30"
+        assert pickup["metadata"]["local_time"] == "14:30"
+        assert school["metadata"]["local_time"] == "15:00"
+        assert meal["metadata"]["local_time"] == "16:00"
         assert weekly["status"] == "paused"
     finally:
         clear_household_tool_context(task_id)

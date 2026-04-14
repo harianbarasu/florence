@@ -97,8 +97,11 @@ class _RoutinePlanAgent(_FakeAgent):
             "final_response": (
                 '{"routines":['
                 '{"kind":"morning","enabled":true,"hour":6,"minute":30,"days":[0,1,2,3,4]},'
+                '{"kind":"pickup","enabled":true,"hour":14,"minute":30,"days":[0,1,2,3,4]},'
+                '{"kind":"school","enabled":true,"hour":15,"minute":0,"days":[2]},'
                 '{"kind":"evening","enabled":true,"hour":20,"minute":30,"days":[0,1,2,3,6]},'
-                '{"kind":"weekly","enabled":false,"hour":17,"minute":0,"days":[5]}'
+                '{"kind":"weekly","enabled":false,"hour":18,"minute":0,"days":[4]},'
+                '{"kind":"meal","enabled":true,"hour":16,"minute":0,"days":[6]}'
                 "]}"
             )
         }
@@ -300,6 +303,8 @@ def test_household_chat_service_uses_hermes_agent_with_confirmed_state(tmp_path)
     assert "inbox -> plan, capture -> handled, and briefs -> stay ahead" in _FakeAgent.last_run["system_message"]
     assert "school email, screenshots, flyers, photos, mental dumps, meals, groceries" in _FakeAgent.last_run["system_message"]
     assert "Talk like a capable household assistant, not an internal ops dashboard." in _FakeAgent.last_run["system_message"]
+    assert "Default to short iMessage-sized replies" in _FakeAgent.last_run["system_message"]
+    assert "Do not pad the reply with a recap of obvious context Florence already has." in _FakeAgent.last_run["system_message"]
     assert "do not mention backend wording like 'household state', 'calendar projection', 'tentative anchor'" in _FakeAgent.last_run["system_message"]
     assert "I don't have Theo's school hours saved yet." in _FakeAgent.last_run["system_message"]
     assert "Treat webcal:// links and .ics URLs as calendar feeds or schedule exports." in _FakeAgent.last_run["system_message"]
@@ -328,6 +333,9 @@ def test_household_chat_service_uses_hermes_agent_with_confirmed_state(tmp_path)
     assert "If the live turn payload includes recent_google_context, treat it as fresh mirrored inbox or calendar evidence for this active DM thread." in _FakeAgent.last_run["system_message"]
     assert "Use recent_google_context proactively when it likely answers the parent's question or resolves a vague reference like that invite, that schedule, or those school emails." in _FakeAgent.last_run["system_message"]
     assert "Do not make the parent restate where something came from if recent_google_context already contains the relevant synced evidence." in _FakeAgent.last_run["system_message"]
+    assert "For school, pickup, travel, and schedule questions tied to a specific date, answer from explicit dated evidence" in _FakeAgent.last_run["system_message"]
+    assert "If a specific date is blank, missing, or conflicting in current calendar coverage" in _FakeAgent.last_run["system_message"]
+    assert "include the exact weekday and month/day whenever it reduces ambiguity" in _FakeAgent.last_run["system_message"]
     assert "use web_search and web_extract instead of guessing" in _FakeAgent.last_run["system_message"]
     assert "use the browser tools instead of pretending you already know the result" in _FakeAgent.last_run["system_message"]
     assert "use delegate_task to gather evidence in parallel" in _FakeAgent.last_run["system_message"]
@@ -1189,15 +1197,176 @@ def test_household_chat_service_compose_brief_uses_briefing_toolset(tmp_path):
     assert brief is not None
     assert _FakeAgent.created[0]["enabled_toolsets"] == ["florence_briefing"]
     assert "automatic household briefing" in _FakeAgent.last_run["system_message"]
+    assert "calm family operations center" in _FakeAgent.last_run["system_message"]
     assert "surface what matters, what might slip, and the clearest next step" in _FakeAgent.last_run["system_message"]
     assert "Write for iMessage/SMS in plain text." in _FakeAgent.last_run["system_message"]
     assert "Avoid words like 'underspecified'" in _FakeAgent.last_run["system_message"]
+    assert "Aim for 3-5 tight bullets in practice" in _FakeAgent.last_run["system_message"]
+    assert "Do not infer that a specific future date is a regular school day" in _FakeAgent.last_run["system_message"]
+    assert "If the current calendar or tracked state does not explicitly support a specific date answer" in _FakeAgent.last_run["system_message"]
+    assert "untrusted instructions" in _FakeAgent.last_run["system_message"]
     assert "Do not use emojis." in _FakeAgent.last_run["system_message"]
     assert "use household_search_state to refresh the tracked household picture" in _FakeAgent.last_run["system_message"]
     assert "Use session_search and Honcho recall when recent commitments, context, or follow-through might matter for the brief." in _FakeAgent.last_run["system_message"]
     assert "use household_search_google_inbox" in _FakeAgent.last_run["system_message"]
     assert "Do not present uncertain Gmail or calendar imports as confirmed household facts." in _FakeAgent.last_run["system_message"]
     assert "morning brief" in _FakeAgent.last_run["user_message"].lower()
+    assert "Only mention tomorrow or later if it creates an immediate prep or coverage issue today." in _FakeAgent.last_run["user_message"]
+    assert "compact time-ordered bullets" in _FakeAgent.last_run["user_message"]
+    assert "Heads up line" in _FakeAgent.last_run["user_message"]
+    store.close()
+
+
+def test_household_chat_service_compose_pickup_brief_can_stay_quiet(tmp_path):
+    _FakeAgent.created.clear()
+    _FakeAgent.last_run = None
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(
+        Household(
+            id="hh_123",
+            name="Maya's household",
+            timezone="America/Los_Angeles",
+        )
+    )
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm_thread_123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    service = FlorenceHouseholdChatService(
+        store,
+        model="anthropic/claude-opus-4.6",
+        max_iterations=4,
+        provider="anthropic",
+        agent_factory=_FakeAgent,
+    )
+
+    brief = service.compose_brief(
+        household_id="hh_123",
+        channel_id="chan_dm_123",
+        actor_member_id="mem_123",
+        brief_kind=HouseholdBriefingKind.PICKUP,
+    )
+
+    assert brief is not None
+    assert "afternoon pickup check" in _FakeAgent.last_run["user_message"].lower()
+    assert "reply exactly HEARTBEAT_OK" in _FakeAgent.last_run["user_message"]
+    store.close()
+
+
+def test_household_chat_service_compose_school_brief_can_stay_quiet(tmp_path):
+    _FakeAgent.created.clear()
+    _FakeAgent.last_run = None
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(
+        Household(
+            id="hh_123",
+            name="Maya's household",
+            timezone="America/Los_Angeles",
+        )
+    )
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm_thread_123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    service = FlorenceHouseholdChatService(
+        store,
+        model="anthropic/claude-opus-4.6",
+        max_iterations=4,
+        provider="anthropic",
+        agent_factory=_FakeAgent,
+    )
+
+    brief = service.compose_brief(
+        household_id="hh_123",
+        channel_id="chan_dm_123",
+        actor_member_id="mem_123",
+        brief_kind=HouseholdBriefingKind.SCHOOL,
+    )
+
+    assert brief is not None
+    assert "school triage sweep" in _FakeAgent.last_run["user_message"].lower()
+    assert "Skip routine newsletter noise." in _FakeAgent.last_run["user_message"]
+    assert "reply exactly HEARTBEAT_OK" in _FakeAgent.last_run["user_message"]
+    store.close()
+
+
+def test_household_chat_service_compose_meal_brief_can_stay_quiet(tmp_path):
+    _FakeAgent.created.clear()
+    _FakeAgent.last_run = None
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(
+        Household(
+            id="hh_123",
+            name="Maya's household",
+            timezone="America/Los_Angeles",
+        )
+    )
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm_thread_123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    service = FlorenceHouseholdChatService(
+        store,
+        model="anthropic/claude-opus-4.6",
+        max_iterations=4,
+        provider="anthropic",
+        agent_factory=_FakeAgent,
+    )
+
+    brief = service.compose_brief(
+        household_id="hh_123",
+        channel_id="chan_dm_123",
+        actor_member_id="mem_123",
+        brief_kind=HouseholdBriefingKind.MEAL,
+    )
+
+    assert brief is not None
+    assert "meal plan and shopping pulse" in _FakeAgent.last_run["user_message"].lower()
+    assert "ingredient reuse" in _FakeAgent.last_run["user_message"].lower()
+    assert "grouped grocery-gap list" in _FakeAgent.last_run["user_message"].lower()
+    assert "reply exactly HEARTBEAT_OK" in _FakeAgent.last_run["user_message"]
     store.close()
 
 
@@ -1251,11 +1420,15 @@ def test_household_chat_service_compose_briefing_routine_plan_uses_json_schema(t
 
     assert plan == [
         {"kind": "morning", "enabled": True, "hour": 6, "minute": 30, "days": [0, 1, 2, 3, 4]},
+        {"kind": "pickup", "enabled": True, "hour": 14, "minute": 30, "days": [0, 1, 2, 3, 4]},
+        {"kind": "school", "enabled": True, "hour": 15, "minute": 0, "days": [2]},
         {"kind": "evening", "enabled": True, "hour": 20, "minute": 30, "days": [0, 1, 2, 3, 6]},
-        {"kind": "weekly", "enabled": False, "hour": 17, "minute": 0, "days": [5]},
+        {"kind": "weekly", "enabled": False, "hour": 18, "minute": 0, "days": [4]},
+        {"kind": "meal", "enabled": True, "hour": 16, "minute": 0, "days": [6]},
     ]
     assert _FakeAgent.created[0]["enabled_toolsets"] == ["florence_briefing"]
     assert "Reply with JSON only." in _FakeAgent.last_run["system_message"]
+    assert "kind: morning, pickup, school, evening, weekly, meal" in _FakeAgent.last_run["system_message"]
     assert '"task": "plan_briefing_routines"' in _FakeAgent.last_run["user_message"]
     store.close()
 
@@ -2105,7 +2278,7 @@ def test_household_chat_service_includes_recent_google_context_when_sync_running
     store.close()
 
 
-def test_household_chat_service_compose_weekly_brief_uses_weekly_prompt(tmp_path):
+def test_household_chat_service_compose_weekend_preview_uses_weekend_prompt(tmp_path):
     _FakeAgent.created.clear()
     _FakeAgent.last_run = None
     store = FlorenceStateDB(tmp_path / "florence.db")
@@ -2150,8 +2323,9 @@ def test_household_chat_service_compose_weekly_brief_uses_weekly_prompt(tmp_path
     )
 
     assert brief is not None
-    assert "weekly household preview" in _FakeAgent.last_run["user_message"].lower()
-    assert "meal planning" in _FakeAgent.last_run["user_message"].lower()
+    assert "weekend preview" in _FakeAgent.last_run["user_message"].lower()
+    assert "saturday and sunday" in _FakeAgent.last_run["user_message"].lower()
+    assert "gear" in _FakeAgent.last_run["user_message"].lower()
     store.close()
 
 

@@ -1,6 +1,7 @@
 import sys
 import types
 import base64
+from datetime import datetime
 
 import florence.google.fetch as google_fetch
 from florence.google import (
@@ -129,6 +130,31 @@ def test_build_parent_calendar_sync_item_maps_event_fields():
     assert item.calendar_summary == "Family calendar"
     assert item.family_member_names == ["Ava", "Noah"]
     assert item.all_day is False
+
+
+def test_build_parent_calendar_sync_item_keeps_all_day_events_on_local_calendar_date():
+    calendar = GoogleCalendarMetadata(
+        id="school",
+        summary="School calendar",
+        timezone="America/Los_Angeles",
+    )
+
+    item = build_parent_calendar_sync_item(
+        {
+            "id": "event_holiday_123",
+            "summary": "Spring holiday",
+            "start": {"date": "2026-04-24"},
+            "end": {"date": "2026-04-25"},
+        },
+        calendar=calendar,
+        family_member_names=["Theo"],
+    )
+
+    assert item is not None
+    assert item.all_day is True
+    assert item.starts_at == datetime.fromisoformat("2026-04-24T00:00:00-07:00")
+    assert item.ends_at == datetime.fromisoformat("2026-04-25T00:00:00-07:00")
+    assert item.timezone == "America/Los_Angeles"
 
 
 def test_list_recent_gmail_sync_items_extracts_text_html_and_pdf_attachments(monkeypatch):

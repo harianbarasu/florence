@@ -80,8 +80,30 @@ def _local_schedule_days(*, text: str | None, kind: HouseholdBriefingKind) -> li
             return [4]
         if "saturday" in lowered:
             return [5]
+        if "sunday" in lowered:
+            return [6]
         if "monday" in lowered:
             return [0]
+        return [4]
+    if kind == HouseholdBriefingKind.SCHOOL:
+        if "daily" in lowered or "every day" in lowered:
+            return [0, 1, 2, 3, 4]
+        if "tuesday" in lowered and "thursday" in lowered:
+            return [1, 3]
+        if "thursday" in lowered:
+            return [3]
+        if "tuesday" in lowered:
+            return [1]
+        if "monday" in lowered:
+            return [0]
+        return [2]
+    if kind == HouseholdBriefingKind.MEAL:
+        if "daily" in lowered or "every day" in lowered:
+            return [0, 1, 2, 3, 4, 5, 6]
+        if "friday" in lowered:
+            return [4]
+        if "saturday" in lowered:
+            return [5]
         return [6]
     if "daily" in lowered or "every day" in lowered:
         return [0, 1, 2, 3, 4, 5, 6]

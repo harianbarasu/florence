@@ -67,8 +67,11 @@ class _FakeBriefingChatService:
         )
         return [
             {"kind": "morning", "enabled": True, "hour": 6, "minute": 45, "days": [0, 1, 2, 3, 4]},
+            {"kind": "pickup", "enabled": True, "hour": 14, "minute": 30, "days": [0, 1, 2, 3, 4]},
+            {"kind": "school", "enabled": True, "hour": 15, "minute": 0, "days": [2]},
             {"kind": "evening", "enabled": True, "hour": 20, "minute": 15, "days": [0, 1, 2, 3, 4]},
-            {"kind": "weekly", "enabled": True, "hour": 17, "minute": 30, "days": [6]},
+            {"kind": "weekly", "enabled": True, "hour": 18, "minute": 0, "days": [4]},
+            {"kind": "meal", "enabled": True, "hour": 16, "minute": 0, "days": [6]},
         ]
 
     def compose_brief(self, *, household_id, channel_id, actor_member_id, brief_kind):
@@ -81,7 +84,13 @@ class _FakeBriefingChatService:
             }
         )
         if brief_kind.value == "weekly":
-            return "Weekly preview: science fair, pickup swap, and dinner coverage need attention."
+            return "Weekend preview: science fair, pickup swap, and dinner coverage need attention."
+        if brief_kind.value == "pickup":
+            return "Pickup check: library book, after-school coverage, and dance shoes still need attention."
+        if brief_kind.value == "school":
+            return "School triage: field-trip form, spirit day gear, and a fee are still outstanding."
+        if brief_kind.value == "meal":
+            return "Meal pulse: two busy nights need easy dinners, and groceries are missing for taco night and pasta."
         return "Morning brief: soccer bag, lunch order, and pickup timing are all on deck."
 
     def compose_operator_message(
@@ -1499,6 +1508,56 @@ def test_production_service_run_sync_pass_sends_due_household_nudges_without_goo
     store.close()
 
 
+def test_production_service_run_automation_pass_sends_due_household_nudges_without_google_activity(tmp_path):
+    settings = _build_settings(tmp_path)
+    store = FlorenceStateDB(settings.server.db_path)
+    service = FlorenceProductionService(settings, store=store)
+    service.linq = _FakeLinqClient()
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    service.entrypoints.onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        display_name="Maya",
+    )
+    nudge = service.household_manager_service.schedule_nudge(
+        household_id="hh_123",
+        message="Pack Theo's library book.",
+        scheduled_for="2026-03-24T12:00:00+00:00",
+    )
+
+    result = service.run_automation_pass()
+
+    assert result["nudges_sent"] == 1
+    assert result["nudges"] == 1
+    assert result["briefings_sent"] == 0
+    assert result["review_sweeps"] == 0
+    assert service.linq.sent == [{"chat_id": "dm-thread-123", "message": "Pack Theo's library book."}]
+    stored_nudge = store.get_household_nudge(nudge.id)
+    assert stored_nudge is not None
+    assert stored_nudge.status.value == "sent"
+    assert stored_nudge.sent_at is not None
+    store.close()
+
+
 def test_production_service_run_sync_pass_sends_due_household_briefing(tmp_path):
     settings = _build_settings(tmp_path)
     store = FlorenceStateDB(settings.server.db_path)
@@ -1631,6 +1690,158 @@ def test_production_service_run_sync_pass_prefers_household_group_for_briefing(t
         }
     ]
     assert fake_chat.calls[0]["channel_id"] == "chan_group_123"
+    store.close()
+
+
+def test_production_service_run_automation_pass_skips_quiet_pickup_check(tmp_path):
+    settings = _build_settings(tmp_path)
+    store = FlorenceStateDB(settings.server.db_path)
+    service = FlorenceProductionService(settings, store=store)
+    service.linq = _FakeLinqClient()
+
+    class _QuietPickupChatService(_FakeBriefingChatService):
+        def compose_brief(self, *, household_id, channel_id, actor_member_id, brief_kind):
+            self.calls.append(
+                {
+                    "household_id": household_id,
+                    "channel_id": channel_id,
+                    "actor_member_id": actor_member_id,
+                    "brief_kind": brief_kind.value,
+                }
+            )
+            if brief_kind.value == "pickup":
+                return "HEARTBEAT_OK"
+            return super().compose_brief(
+                household_id=household_id,
+                channel_id=channel_id,
+                actor_member_id=actor_member_id,
+                brief_kind=brief_kind,
+            )
+
+    fake_chat = _QuietPickupChatService()
+    service.household_chat_service = fake_chat
+    store.upsert_household(
+        Household(
+            id="hh_123",
+            name="Maya's household",
+            timezone="America/Los_Angeles",
+        )
+    )
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    service.entrypoints.onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        display_name="Maya",
+    )
+    routines = service.household_manager_service.ensure_briefing_routines(household_id="hh_123")
+    pickup = next(routine for routine in routines if routine.metadata.get("brief_kind") == "pickup")
+    store.upsert_household_routine(
+        replace(
+            pickup,
+            status=HouseholdRoutineStatus.ACTIVE,
+            next_due_at="2026-03-24T00:00:00+00:00",
+        )
+    )
+
+    result = service.run_automation_pass()
+
+    assert result["briefings_sent"] == 0
+    assert service.linq.sent == []
+    updated = store.get_household_routine(pickup.id)
+    assert updated is not None
+    assert updated.last_completed_at is not None
+    assert any(call.get("brief_kind") == "pickup" for call in fake_chat.calls)
+    store.close()
+
+
+def test_production_service_run_automation_pass_respects_explicit_quiet_hours_for_briefings(tmp_path, monkeypatch):
+    settings = _build_settings(tmp_path)
+    store = FlorenceStateDB(settings.server.db_path)
+    service = FlorenceProductionService(settings, store=store)
+    service.linq = _FakeLinqClient()
+    fake_chat = _FakeBriefingChatService()
+    service.household_chat_service = fake_chat
+    store.upsert_household(
+        Household(
+            id="hh_123",
+            name="Maya's household",
+            timezone="America/Los_Angeles",
+        )
+    )
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    service.entrypoints.onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        display_name="Maya",
+    )
+    service.household_manager_service.record_preference(
+        household_id="hh_123",
+        label="Quiet hours",
+        value="Quiet hours are 9pm to 8am.",
+        category="quiet_hours",
+        recorded_by_member_id="mem_123",
+        channel_id="chan_dm_123",
+    )
+    routines = service.household_manager_service.ensure_briefing_routines(household_id="hh_123")
+    morning = next(routine for routine in routines if routine.metadata.get("brief_kind") == "morning")
+    store.upsert_household_routine(
+        replace(
+            morning,
+            status=HouseholdRoutineStatus.ACTIVE,
+            next_due_at="2026-03-24T00:00:00+00:00",
+        )
+    )
+    monkeypatch.setattr(
+        service.household_operations,
+        "_utc_now",
+        lambda: datetime(2026, 3, 24, 14, 0, tzinfo=timezone.utc),
+    )
+    monkeypatch.setattr(
+        service.household_operations,
+        "_is_household_quiet_hours",
+        lambda **_: True,
+    )
+
+    result = service.run_automation_pass()
+
+    assert result["briefings_sent"] == 0
+    assert service.linq.sent == []
     store.close()
 
 
@@ -1868,7 +2079,7 @@ def test_production_service_briefing_routine_planning_uses_hermes_for_operating_
 
     routines = service.household_manager_service.ensure_briefing_routines(household_id="hh_123")
 
-    assert len(routines) == 3
+    assert len(routines) == 6
     assert any(call.get("kind") == "briefing_routine_plan" for call in fake_chat.calls)
     morning = next(routine for routine in routines if routine.metadata.get("brief_kind") == "morning")
     assert morning.metadata["planning_source"] == "hermes"

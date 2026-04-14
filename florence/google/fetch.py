@@ -6,10 +6,11 @@ import base64
 import logging
 import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from html import unescape
 from typing import Any
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -493,11 +494,23 @@ def _parse_google_calendar_event_datetime(
 
     date_only = value.get("date")
     if isinstance(date_only, str):
+        timezone_name = str(value.get("timeZone") or fallback_timezone)
         try:
-            parsed = datetime.fromisoformat(f"{date_only}T00:00:00+00:00")
+            parsed_date = date.fromisoformat(date_only)
         except ValueError:
             return None
-        return parsed, str(value.get("timeZone") or fallback_timezone), True
+        try:
+            tzinfo = ZoneInfo(timezone_name)
+        except Exception:
+            tzinfo = timezone.utc
+            timezone_name = "UTC"
+        parsed = datetime(
+            parsed_date.year,
+            parsed_date.month,
+            parsed_date.day,
+            tzinfo=tzinfo,
+        )
+        return parsed, timezone_name, True
 
     return None
 

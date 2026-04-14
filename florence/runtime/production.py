@@ -525,6 +525,9 @@ class FlorenceProductionService:
             return True
 
     def run_sync_pass(self) -> dict[str, int]:
+        return self.run_sync_pass_with_options(include_automation=True)
+
+    def run_sync_pass_with_options(self, *, include_automation: bool) -> dict[str, int]:
         households = self.store.list_households()
         counters = {
             "households": 0,
@@ -537,6 +540,10 @@ class FlorenceProductionService:
             "briefings_sent": 0,
             "nudges": 0,
         }
+        if include_automation:
+            automation_counters = self.run_automation_pass()
+            for key, value in automation_counters.items():
+                counters[key] = counters.get(key, 0) + value
         for household in households:
             self.household_manager_service.ensure_briefing_routines(household_id=household.id)
             previous_connections = {
@@ -560,10 +567,30 @@ class FlorenceProductionService:
                     counters["review_nudges"] += 1
                     counters["nudges"] += 1
                     household_touched = True
-            sent_review_sweeps = self.household_operations.dispatch_due_review_sweeps(household_id=household.id)
-            counters["review_sweeps"] += sent_review_sweeps
-            if sent_review_sweeps:
+            sent_sync_update_briefs = self.household_operations.dispatch_due_sync_update_briefs(
+                household_id=household.id,
+                sync_results=results,
+                previous_connections=previous_connections,
+            )
+            counters["sync_update_briefs"] += sent_sync_update_briefs
+            if sent_sync_update_briefs:
                 household_touched = True
+            if household_touched:
+                counters["households"] += 1
+        return counters
+
+    def run_automation_pass(self) -> dict[str, int]:
+        households = self.store.list_households()
+        counters = {
+            "households": 0,
+            "review_sweeps": 0,
+            "nudges_sent": 0,
+            "briefings_sent": 0,
+            "nudges": 0,
+        }
+        for household in households:
+            household_touched = False
+            self.household_manager_service.ensure_briefing_routines(household_id=household.id)
             sent_nudges = self.household_operations.dispatch_due_household_nudges(household_id=household.id)
             counters["nudges_sent"] += sent_nudges
             counters["nudges"] += sent_nudges
@@ -573,13 +600,9 @@ class FlorenceProductionService:
             counters["briefings_sent"] += sent_briefings
             if sent_briefings:
                 household_touched = True
-            sent_sync_update_briefs = self.household_operations.dispatch_due_sync_update_briefs(
-                household_id=household.id,
-                sync_results=results,
-                previous_connections=previous_connections,
-            )
-            counters["sync_update_briefs"] += sent_sync_update_briefs
-            if sent_sync_update_briefs:
+            sent_review_sweeps = self.household_operations.dispatch_due_review_sweeps(household_id=household.id)
+            counters["review_sweeps"] += sent_review_sweeps
+            if sent_review_sweeps:
                 household_touched = True
             if household_touched:
                 counters["households"] += 1

@@ -79,11 +79,11 @@ def _gmail_bootstrap_window_days() -> int:
 
 
 def _calendar_bootstrap_max_results() -> int:
-    return _int_env("FLORENCE_CALENDAR_BOOTSTRAP_MAX_RESULTS", 1_000)
+    return _int_env("FLORENCE_CALENDAR_BOOTSTRAP_MAX_RESULTS", 2_000)
 
 
 def _calendar_incremental_max_results() -> int:
-    return _int_env("FLORENCE_CALENDAR_INCREMENTAL_MAX_RESULTS", 250)
+    return _int_env("FLORENCE_CALENDAR_INCREMENTAL_MAX_RESULTS", 1_000)
 
 
 def _calendar_bootstrap_past_window_days() -> int:

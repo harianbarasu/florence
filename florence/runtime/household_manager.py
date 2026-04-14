@@ -39,6 +39,14 @@ from florence.runtime.services import (
 from florence.state import FlorenceStateDB
 
 logger = logging.getLogger(__name__)
+_AUTOMATIC_BRIEFING_KINDS = (
+    HouseholdBriefingKind.MORNING,
+    HouseholdBriefingKind.PICKUP,
+    HouseholdBriefingKind.SCHOOL,
+    HouseholdBriefingKind.EVENING,
+    HouseholdBriefingKind.WEEKLY,
+    HouseholdBriefingKind.MEAL,
+)
 
 
 @dataclass(slots=True)
@@ -282,7 +290,7 @@ class FlorenceHouseholdManagerService:
         timezone_name = household.timezone or "America/Los_Angeles"
         operating_preference_statements = self.preference_statements(
             household_id=household_id,
-            categories={"operating_rule", "operating_preference"},
+            categories={"operating_rule", "operating_preference", "support_type", "automation_boundary"},
         )
         operating_preferences = " | ".join(operating_preference_statements)
         preferences_fingerprint = _stable_id("briefing_pref", household_id, operating_preferences or "__empty__")
@@ -371,7 +379,7 @@ class FlorenceHouseholdManagerService:
         preferences_fingerprint: str,
     ) -> list[_BriefingRoutineSpec] | None:
         specs: list[_BriefingRoutineSpec] = []
-        for kind in (HouseholdBriefingKind.MORNING, HouseholdBriefingKind.EVENING, HouseholdBriefingKind.WEEKLY):
+        for kind in _AUTOMATIC_BRIEFING_KINDS:
             routine = self.store.get_household_routine(_stable_id("routine", household_id, "briefing", kind.value))
             if routine is None:
                 return None
@@ -430,7 +438,7 @@ class FlorenceHouseholdManagerService:
             for item in plan
             if isinstance(item, dict)
         }
-        for kind in (HouseholdBriefingKind.MORNING, HouseholdBriefingKind.EVENING, HouseholdBriefingKind.WEEKLY):
+        for kind in _AUTOMATIC_BRIEFING_KINDS:
             default_hour, default_minute = self._default_briefing_time(kind)
             item = plan_by_kind.get(kind.value, {})
             try:
@@ -463,14 +471,47 @@ class FlorenceHouseholdManagerService:
         preferences_fingerprint: str,
     ) -> list[_BriefingRoutineSpec]:
         disable_morning = bool(re.search(r"\b(?:no|skip|disable)\s+morning\s+brief\b", operating_preferences, re.IGNORECASE))
+        disable_pickup = bool(
+            re.search(
+                r"\b(?:no|skip|disable)\s+(?:afternoon\s+)?(?:pickup\s+check|pickup\s+brief|afternoon\s+check)\b",
+                operating_preferences,
+                re.IGNORECASE,
+            )
+        )
+        disable_school = bool(
+            re.search(
+                r"\b(?:no|skip|disable)\s+(?:school\s+triage|school\s+sweep|school\s+deadline\s+sweep)\b",
+                operating_preferences,
+                re.IGNORECASE,
+            )
+        )
         disable_evening = bool(re.search(r"\b(?:no|skip|disable)\s+evening\s+(?:check[- ]?in|brief)\b", operating_preferences, re.IGNORECASE))
         disable_weekly = bool(re.search(r"\b(?:no|skip|disable)\s+(?:weekly\s+brief|weekend\s+preview)\b", operating_preferences, re.IGNORECASE))
+        disable_meal = bool(
+            re.search(
+                r"\b(?:no|skip|disable)\s+(?:meal\s+plan(?:ning)?|shopping\s+pulse|grocery\s+prompt|meal\s+prompt)\b",
+                operating_preferences,
+                re.IGNORECASE,
+            )
+        )
 
         morning_hour, morning_minute = _extract_local_time_from_preferences(
             operating_preferences,
             keywords=("morning brief", "morning"),
             default_hour=6,
             default_minute=45,
+        )
+        pickup_hour, pickup_minute = _extract_local_time_from_preferences(
+            operating_preferences,
+            keywords=("afternoon pickup check", "pickup check", "afternoon check", "pickup"),
+            default_hour=14,
+            default_minute=30,
+        )
+        school_hour, school_minute = _extract_local_time_from_preferences(
+            operating_preferences,
+            keywords=("school triage", "school deadline sweep", "school sweep"),
+            default_hour=15,
+            default_minute=0,
         )
         evening_hour, evening_minute = _extract_local_time_from_preferences(
             operating_preferences,
@@ -481,8 +522,14 @@ class FlorenceHouseholdManagerService:
         weekly_hour, weekly_minute = _extract_local_time_from_preferences(
             operating_preferences,
             keywords=("weekly brief", "weekend preview", "weekly", "weekend"),
-            default_hour=17,
-            default_minute=30,
+            default_hour=18,
+            default_minute=0,
+        )
+        meal_hour, meal_minute = _extract_local_time_from_preferences(
+            operating_preferences,
+            keywords=("meal plan", "meal planning", "shopping pulse", "grocery prompt", "grocery list"),
+            default_hour=16,
+            default_minute=0,
         )
         return [
             _BriefingRoutineSpec(
@@ -492,6 +539,26 @@ class FlorenceHouseholdManagerService:
                 minute=morning_minute,
                 days=_local_schedule_days(text=operating_preferences, kind=HouseholdBriefingKind.MORNING),
                 disabled=disable_morning,
+                planning_source="deterministic_fallback",
+                planning_preferences_fingerprint=preferences_fingerprint,
+            ),
+            _BriefingRoutineSpec(
+                kind=HouseholdBriefingKind.PICKUP,
+                title=self._briefing_title(HouseholdBriefingKind.PICKUP),
+                hour=pickup_hour,
+                minute=pickup_minute,
+                days=_local_schedule_days(text=operating_preferences, kind=HouseholdBriefingKind.PICKUP),
+                disabled=disable_pickup,
+                planning_source="deterministic_fallback",
+                planning_preferences_fingerprint=preferences_fingerprint,
+            ),
+            _BriefingRoutineSpec(
+                kind=HouseholdBriefingKind.SCHOOL,
+                title=self._briefing_title(HouseholdBriefingKind.SCHOOL),
+                hour=school_hour,
+                minute=school_minute,
+                days=_local_schedule_days(text=operating_preferences, kind=HouseholdBriefingKind.SCHOOL),
+                disabled=disable_school,
                 planning_source="deterministic_fallback",
                 planning_preferences_fingerprint=preferences_fingerprint,
             ),
@@ -515,27 +582,53 @@ class FlorenceHouseholdManagerService:
                 planning_source="deterministic_fallback",
                 planning_preferences_fingerprint=preferences_fingerprint,
             ),
+            _BriefingRoutineSpec(
+                kind=HouseholdBriefingKind.MEAL,
+                title=self._briefing_title(HouseholdBriefingKind.MEAL),
+                hour=meal_hour,
+                minute=meal_minute,
+                days=_local_schedule_days(text=operating_preferences, kind=HouseholdBriefingKind.MEAL),
+                disabled=disable_meal,
+                planning_source="deterministic_fallback",
+                planning_preferences_fingerprint=preferences_fingerprint,
+            ),
         ]
 
     @staticmethod
     def _briefing_title(kind: HouseholdBriefingKind) -> str:
         if kind == HouseholdBriefingKind.MORNING:
             return "Morning brief"
+        if kind == HouseholdBriefingKind.PICKUP:
+            return "Afternoon pickup check"
+        if kind == HouseholdBriefingKind.SCHOOL:
+            return "School triage sweep"
         if kind == HouseholdBriefingKind.EVENING:
             return "Evening check-in"
-        return "Weekly preview"
+        if kind == HouseholdBriefingKind.WEEKLY:
+            return "Weekend preview"
+        return "Meal plan and shopping pulse"
 
     @staticmethod
     def _default_briefing_time(kind: HouseholdBriefingKind) -> tuple[int, int]:
         if kind == HouseholdBriefingKind.MORNING:
             return (6, 45)
+        if kind == HouseholdBriefingKind.PICKUP:
+            return (14, 30)
+        if kind == HouseholdBriefingKind.SCHOOL:
+            return (15, 0)
         if kind == HouseholdBriefingKind.EVENING:
             return (20, 15)
-        return (17, 30)
+        if kind == HouseholdBriefingKind.WEEKLY:
+            return (18, 0)
+        return (16, 0)
 
     @staticmethod
     def _default_briefing_days(kind: HouseholdBriefingKind) -> list[int]:
+        if kind == HouseholdBriefingKind.SCHOOL:
+            return [2]
         if kind == HouseholdBriefingKind.WEEKLY:
+            return [4]
+        if kind == HouseholdBriefingKind.MEAL:
             return [6]
         return [0, 1, 2, 3, 4]
 

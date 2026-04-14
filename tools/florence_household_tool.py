@@ -1275,11 +1275,16 @@ RECORD_PREFERENCE_SCHEMA = {
                     "general",
                     "reminder_style",
                     "operating_rule",
+                    "quiet_hours",
+                    "support_type",
+                    "automation_boundary",
+                    "sensitive_topic",
+                    "household_profile",
                     "meal_preference",
                     "sharing_preference",
                     "child_preference",
                 ],
-                "description": "Preference category. Use reminder_style and operating_rule when it should directly shape Florence behavior.",
+                "description": "Preference category. Use operating_rule, support_type, automation_boundary, and quiet_hours when it should directly shape Florence behavior.",
             },
             "member_id": {"type": "string", "description": "Optional member the preference applies to."},
             "member_name": {"type": "string", "description": "Optional member name such as 'Maya' or 'me'."},
@@ -2470,7 +2475,7 @@ def _handle_record_preference(args: dict, *, task_id: str | None = None, **_: An
     )
     category = str(preference_item.metadata.get("category") or "").strip().lower()
     refreshed_routines: list[dict[str, Any]] = []
-    if category in {"operating_rule", "operating_preference"}:
+    if category in {"operating_rule", "operating_preference", "support_type", "automation_boundary"}:
         refreshed_routines = [
             _serialize_routine(routine)
             for routine in manager.ensure_briefing_routines(household_id=context.household_id)

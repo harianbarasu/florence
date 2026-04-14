@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
-from florence.contracts import CandidateState, ChannelMessageRole, ChannelType, GoogleSourceKind, HouseholdBriefingKind
+from florence.contracts import CandidateState, ChannelMessageRole, ChannelType, GoogleSourceKind, HouseholdBriefingKind, HouseholdProfileKind
 from florence.messaging.channel_log import FlorenceChannelLog
 from florence.messaging.protocol_types import (
     CANDIDATE_REVIEW_PROMPT_KIND,
@@ -21,6 +22,7 @@ from florence.messaging.protocol_types import (
 from florence.runtime.candidate_review import FlorenceCandidateReviewService
 from florence.runtime.delivery import FlorenceChannelDeliveryService
 from florence.runtime.household_manager import FlorenceHouseholdManagerService
+from florence.runtime.services import _parse_local_time_spec
 from florence.state import FlorenceStateDB
 
 logger = logging.getLogger(__name__)
@@ -30,6 +32,7 @@ _SYNC_UPDATE_BRIEF_INTERVAL_SECONDS = 6 * 60 * 60
 _REVIEW_BATCH_LIMIT = 3
 _REVIEW_QUIET_HOURS_START = 21
 _REVIEW_QUIET_HOURS_END = 8
+_HEARTBEAT_OK_SENTINEL = "HEARTBEAT_OK"
 
 
 class FlorenceHouseholdOperationsService:
@@ -493,6 +496,19 @@ class FlorenceHouseholdOperationsService:
         household_id: str,
         store: FlorenceStateDB,
     ) -> bool:
+        return self._is_household_quiet_hours(
+            household_id=household_id,
+            store=store,
+            fallback_window=(_REVIEW_QUIET_HOURS_START * 60, _REVIEW_QUIET_HOURS_END * 60),
+        )
+
+    def _is_household_quiet_hours(
+        self,
+        *,
+        household_id: str,
+        store: FlorenceStateDB,
+        fallback_window: tuple[int, int] | None = None,
+    ) -> bool:
         household = store.get_household(household_id)
         if household is None or not str(household.timezone or "").strip():
             return False
@@ -500,7 +516,63 @@ class FlorenceHouseholdOperationsService:
             local_now = self._utc_now().astimezone(ZoneInfo(household.timezone))
         except Exception:
             return False
-        return local_now.hour >= _REVIEW_QUIET_HOURS_START or local_now.hour < _REVIEW_QUIET_HOURS_END
+        window = self._quiet_hours_window(household_id=household_id, store=store) or fallback_window
+        if window is None:
+            return False
+        start_minutes, end_minutes = window
+        current_minutes = local_now.hour * 60 + local_now.minute
+        if start_minutes == end_minutes:
+            return False
+        if start_minutes < end_minutes:
+            return start_minutes <= current_minutes < end_minutes
+        return current_minutes >= start_minutes or current_minutes < end_minutes
+
+    def _quiet_hours_window(
+        self,
+        *,
+        household_id: str,
+        store: FlorenceStateDB,
+    ) -> tuple[int, int] | None:
+        items = store.list_household_profile_items(
+            household_id=household_id,
+            kind=HouseholdProfileKind.PREFERENCE,
+        )
+        category_priority = ("quiet_hours", "automation_boundary", "reminder_style", "operating_rule")
+        ordered_items = sorted(
+            items,
+            key=lambda item: (
+                category_priority.index(str(item.metadata.get("category") or "").strip().lower())
+                if str(item.metadata.get("category") or "").strip().lower() in category_priority
+                else len(category_priority)
+            ),
+        )
+        for item in ordered_items:
+            value = str(item.metadata.get("value") or "").strip()
+            label = str(item.label or "").strip()
+            parsed = self._parse_quiet_hours_window(f"{label}: {value}".strip())
+            if parsed is not None:
+                return parsed
+        return None
+
+    @staticmethod
+    def _parse_quiet_hours_window(text: str) -> tuple[int, int] | None:
+        lowered = str(text or "").strip().lower()
+        if not lowered:
+            return None
+        matches = list(re.finditer(r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b", lowered))
+        parsed_times: list[int] = []
+        for match in matches:
+            parsed = _parse_local_time_spec(match.group(0))
+            if parsed is None:
+                continue
+            parsed_times.append(parsed[0] * 60 + parsed[1])
+        if len(parsed_times) >= 2:
+            return (parsed_times[0], parsed_times[1])
+        if parsed_times and "after" in lowered:
+            return (parsed_times[0], 8 * 60)
+        if parsed_times and "before" in lowered:
+            return (21 * 60, parsed_times[0])
+        return None
 
     @staticmethod
     def _review_prompt_items(prompt: Any) -> list[dict[str, object]]:
@@ -632,6 +704,11 @@ class FlorenceHouseholdOperationsService:
         manager_service = self._manager_service(store)
         sent = 0
         for routine in manager_service.list_due_briefing_routines(household_id=household_id):
+            if self._is_household_quiet_hours(
+                household_id=household_id,
+                store=target_store,
+            ):
+                continue
             metadata = dict(routine.metadata)
             kind_raw = str(metadata.get("brief_kind") or HouseholdBriefingKind.MORNING.value).strip().lower()
             try:
@@ -668,6 +745,9 @@ class FlorenceHouseholdOperationsService:
                 )
                 continue
             if not brief_message or not brief_message.strip():
+                continue
+            if brief_message.strip() == _HEARTBEAT_OK_SENTINEL:
+                manager_service.mark_briefing_routine_sent(routine_id=routine.id)
                 continue
             if self.delivery_service.send_channel_message(channel=channel, message=brief_message, store=target_store):
                 manager_service.mark_briefing_routine_sent(routine_id=routine.id)

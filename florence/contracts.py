@@ -125,8 +125,11 @@ class HouseholdShoppingItemStatus(StrEnum):
 
 class HouseholdBriefingKind(StrEnum):
     MORNING = "morning"
+    PICKUP = "pickup"
+    SCHOOL = "school"
     EVENING = "evening"
     WEEKLY = "weekly"
+    MEAL = "meal"
 
 
 class HouseholdLinkRequestStatus(StrEnum):

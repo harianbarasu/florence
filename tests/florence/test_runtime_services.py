@@ -154,8 +154,11 @@ class _StubBriefingPlanChatService:
         )
         return [
             {"kind": "morning", "enabled": True, "hour": 6, "minute": 30, "days": [0, 1, 2, 3, 4]},
+            {"kind": "pickup", "enabled": True, "hour": 14, "minute": 30, "days": [0, 1, 2, 3, 4]},
+            {"kind": "school", "enabled": True, "hour": 15, "minute": 0, "days": [2]},
             {"kind": "evening", "enabled": True, "hour": 20, "minute": 30, "days": [0, 1, 2, 3, 6]},
-            {"kind": "weekly", "enabled": False, "hour": 17, "minute": 0, "days": [5]},
+            {"kind": "weekly", "enabled": False, "hour": 18, "minute": 0, "days": [4]},
+            {"kind": "meal", "enabled": True, "hour": 16, "minute": 0, "days": [6]},
         ]
 
 
@@ -1458,14 +1461,26 @@ def test_household_manager_service_briefing_routines_due_and_advance(tmp_path):
         household_id="hh_123",
         now=datetime(2026, 3, 24, 12, 0, tzinfo=timezone.utc),
     )
-    assert len(routines) == 3
+    assert len(routines) == 6
     assert all(routine.status == HouseholdRoutineStatus.ACTIVE for routine in routines)
 
     morning = next(routine for routine in routines if routine.metadata.get("brief_kind") == "morning")
+    pickup = next(routine for routine in routines if routine.metadata.get("brief_kind") == "pickup")
+    school = next(routine for routine in routines if routine.metadata.get("brief_kind") == "school")
     weekly = next(routine for routine in routines if routine.metadata.get("brief_kind") == "weekly")
-    assert weekly.title == "Weekly preview"
-    assert weekly.metadata["days"] == [6]
-    assert weekly.metadata["local_time"] == "17:30"
+    meal = next(routine for routine in routines if routine.metadata.get("brief_kind") == "meal")
+    assert pickup.title == "Afternoon pickup check"
+    assert pickup.metadata["days"] == [0, 1, 2, 3, 4]
+    assert pickup.metadata["local_time"] == "14:30"
+    assert school.title == "School triage sweep"
+    assert school.metadata["days"] == [2]
+    assert school.metadata["local_time"] == "15:00"
+    assert weekly.title == "Weekend preview"
+    assert weekly.metadata["days"] == [4]
+    assert weekly.metadata["local_time"] == "18:00"
+    assert meal.title == "Meal plan and shopping pulse"
+    assert meal.metadata["days"] == [6]
+    assert meal.metadata["local_time"] == "16:00"
     due = manager.list_due_briefing_routines(
         household_id="hh_123",
         now=datetime(2026, 3, 24, 14, 0, tzinfo=timezone.utc),
@@ -1536,15 +1551,23 @@ def test_household_manager_service_reuses_cached_hermes_briefing_plan(tmp_path):
     )
 
     assert len(chat_service.calls) == 1
-    assert len(first) == 3
-    assert len(second) == 3
+    assert len(first) == 6
+    assert len(second) == 6
     morning = next(routine for routine in first if routine.metadata.get("brief_kind") == "morning")
+    pickup = next(routine for routine in first if routine.metadata.get("brief_kind") == "pickup")
+    school = next(routine for routine in first if routine.metadata.get("brief_kind") == "school")
     evening = next(routine for routine in first if routine.metadata.get("brief_kind") == "evening")
     weekly = next(routine for routine in second if routine.metadata.get("brief_kind") == "weekly")
+    meal = next(routine for routine in second if routine.metadata.get("brief_kind") == "meal")
     assert morning.metadata["planning_source"] == "hermes"
     assert morning.metadata["local_time"] == "06:30"
+    assert pickup.metadata["planning_source"] == "hermes"
+    assert pickup.metadata["local_time"] == "14:30"
+    assert school.metadata["planning_source"] == "hermes"
+    assert school.metadata["local_time"] == "15:00"
     assert evening.metadata["days"] == [0, 1, 2, 3, 6]
     assert weekly.status == HouseholdRoutineStatus.PAUSED
+    assert meal.metadata["local_time"] == "16:00"
     store.close()
 
 
@@ -2041,6 +2064,84 @@ def test_operations_review_nudge_suppresses_proactive_prompt_during_quiet_hours(
 
     assert nudged is False
     assert linq.sent == []
+    store.close()
+
+
+def test_operations_briefing_respects_explicit_household_quiet_hours(tmp_path, monkeypatch):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    onboarding_service = FlorenceOnboardingSessionService(store)
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        display_name="Maya",
+    )
+    manager = FlorenceHouseholdManagerService(store)
+    manager.record_preference(
+        household_id="hh_123",
+        label="Quiet hours",
+        value="Quiet hours are 9pm to 8am.",
+        category="quiet_hours",
+        recorded_by_member_id="mem_123",
+        channel_id="chan_dm_123",
+    )
+    routines = manager.ensure_briefing_routines(household_id="hh_123")
+    morning = next(routine for routine in routines if routine.metadata.get("brief_kind") == "morning")
+    store.upsert_household_routine(
+        replace(
+            morning,
+            status=HouseholdRoutineStatus.ACTIVE,
+            next_due_at="2026-03-24T00:00:00+00:00",
+        )
+    )
+    linq = _FakeLinqClient()
+    delivery = FlorenceChannelDeliveryService(
+        store,
+        linq_client_getter=lambda: linq,
+        sendblue_client_getter=lambda: None,
+    )
+
+    class _BriefingChat:
+        def compose_brief(self, *, household_id, channel_id, actor_member_id, brief_kind):
+            return "Morning brief: Theo has school."
+
+    operations = FlorenceHouseholdOperationsService(
+        store,
+        delivery_service=delivery,
+        household_chat_service_getter=lambda: _BriefingChat(),
+    )
+    monkeypatch.setattr(
+        operations,
+        "_utc_now",
+        lambda: datetime(2026, 3, 24, 14, 0, tzinfo=timezone.utc),
+    )
+
+    sent = operations.dispatch_due_household_briefings(household_id="hh_123")
+
+    assert sent == 0
+    assert linq.sent == []
+    updated = store.get_household_routine(morning.id)
+    assert updated is not None
+    assert updated.last_completed_at is None
     store.close()
 
 

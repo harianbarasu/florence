@@ -1,6 +1,9 @@
 """Tests for trajectory_compressor.py — config, metrics, and compression logic."""
 
+import importlib
 import json
+import os
+import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch, MagicMock
 
@@ -12,6 +15,20 @@ from trajectory_compressor import (
     AggregateMetrics,
     TrajectoryCompressor,
 )
+
+
+def test_import_loads_env_from_hermes_home(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / ".env").write_text("OPENROUTER_API_KEY=from-hermes-home\n", encoding="utf-8")
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    sys.modules.pop("trajectory_compressor", None)
+    importlib.import_module("trajectory_compressor")
+
+    assert os.getenv("OPENROUTER_API_KEY") == "from-hermes-home"
 
 
 # ---------------------------------------------------------------------------
@@ -405,12 +422,13 @@ class TestGenerateSummary:
     @pytest.mark.asyncio
     async def test_generate_summary_async_handles_none_content(self):
         tc = _make_compressor()
-        tc.async_client = MagicMock()
-        tc.async_client.chat.completions.create = AsyncMock(
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(
             return_value=SimpleNamespace(
                 choices=[SimpleNamespace(message=SimpleNamespace(content=None))]
             )
         )
+        tc._get_async_client = MagicMock(return_value=mock_client)
         metrics = TrajectoryMetrics()
 
         summary = await tc._generate_summary_async("Turn content", metrics)

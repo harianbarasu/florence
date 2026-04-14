@@ -19,6 +19,7 @@ __pycache__
 
 # Dependencies
 node_modules
+.venv
 
 # Large docs / optional assets not needed in the base image
 tests

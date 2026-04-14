@@ -31,12 +31,14 @@ import importlib
 import importlib.metadata
 import importlib.util
 import logging
-import os
 import sys
 import types
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Union
+
+from hermes_constants import get_hermes_home
+from utils import env_var_enabled
 
 try:
     import yaml
@@ -54,8 +56,12 @@ VALID_HOOKS: Set[str] = {
     "post_tool_call",
     "pre_llm_call",
     "post_llm_call",
+    "pre_api_request",
+    "post_api_request",
     "on_session_start",
     "on_session_end",
+    "on_session_finalize",
+    "on_session_reset",
 }
 
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"
@@ -65,7 +71,7 @@ _NS_PARENT = "hermes_plugins"
 
 def _env_enabled(name: str) -> bool:
     """Return True when an env var is set to a truthy opt-in value."""
-    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+    return env_var_enabled(name)
 
 
 def _get_disabled_plugins() -> set:
@@ -91,7 +97,7 @@ class PluginManifest:
     version: str = ""
     description: str = ""
     author: str = ""
-    requires_env: List[str] = field(default_factory=list)
+    requires_env: List[Union[str, Dict[str, Any]]] = field(default_factory=list)
     provides_tools: List[str] = field(default_factory=list)
     provides_hooks: List[str] = field(default_factory=list)
     source: str = ""        # "user", "project", or "entrypoint"
@@ -152,6 +158,91 @@ class PluginContext:
         self._manager._plugin_tool_names.add(name)
         logger.debug("Plugin %s registered tool: %s", self.manifest.name, name)
 
+    # -- message injection --------------------------------------------------
+
+    def inject_message(self, content: str, role: str = "user") -> bool:
+        """Inject a message into the active conversation.
+
+        If the agent is idle (waiting for user input), this starts a new turn.
+        If the agent is running, this interrupts and injects the message.
+
+        This enables plugins (e.g. remote control viewers, messaging bridges)
+        to send messages into the conversation from external sources.
+
+        Returns True if the message was queued successfully.
+        """
+        cli = self._manager._cli_ref
+        if cli is None:
+            logger.warning("inject_message: no CLI reference (not available in gateway mode)")
+            return False
+
+        msg = content if role == "user" else f"[{role}] {content}"
+
+        if getattr(cli, "_agent_running", False):
+            # Agent is mid-turn — interrupt with the message
+            cli._interrupt_queue.put(msg)
+        else:
+            # Agent is idle — queue as next input
+            cli._pending_input.put(msg)
+        return True
+
+    # -- CLI command registration --------------------------------------------
+
+    def register_cli_command(
+        self,
+        name: str,
+        help: str,
+        setup_fn: Callable,
+        handler_fn: Callable | None = None,
+        description: str = "",
+    ) -> None:
+        """Register a CLI subcommand (e.g. ``hermes honcho ...``).
+
+        The *setup_fn* receives an argparse subparser and should add any
+        arguments/sub-subparsers.  If *handler_fn* is provided it is set
+        as the default dispatch function via ``set_defaults(func=...)``."""
+        self._manager._cli_commands[name] = {
+            "name": name,
+            "help": help,
+            "description": description,
+            "setup_fn": setup_fn,
+            "handler_fn": handler_fn,
+            "plugin": self.manifest.name,
+        }
+        logger.debug("Plugin %s registered CLI command: %s", self.manifest.name, name)
+
+    # -- context engine registration -----------------------------------------
+
+    def register_context_engine(self, engine) -> None:
+        """Register a context engine to replace the built-in ContextCompressor.
+
+        Only one context engine plugin is allowed. If a second plugin tries
+        to register one, it is rejected with a warning.
+
+        The engine must be an instance of ``agent.context_engine.ContextEngine``.
+        """
+        if self._manager._context_engine is not None:
+            logger.warning(
+                "Plugin '%s' tried to register a context engine, but one is "
+                "already registered. Only one context engine plugin is allowed.",
+                self.manifest.name,
+            )
+            return
+        # Defer the import to avoid circular deps at module level
+        from agent.context_engine import ContextEngine
+        if not isinstance(engine, ContextEngine):
+            logger.warning(
+                "Plugin '%s' tried to register a context engine that does not "
+                "inherit from ContextEngine. Ignoring.",
+                self.manifest.name,
+            )
+            return
+        self._manager._context_engine = engine
+        logger.info(
+            "Plugin '%s' registered context engine: %s",
+            self.manifest.name, engine.name,
+        )
+
     # -- hook registration --------------------------------------------------
 
     def register_hook(self, hook_name: str, callback: Callable) -> None:
@@ -171,6 +262,53 @@ class PluginContext:
         self._manager._hooks.setdefault(hook_name, []).append(callback)
         logger.debug("Plugin %s registered hook: %s", self.manifest.name, hook_name)
 
+    # -- skill registration -------------------------------------------------
+
+    def register_skill(
+        self,
+        name: str,
+        path: Path,
+        description: str = "",
+    ) -> None:
+        """Register a read-only skill provided by this plugin.
+
+        The skill becomes resolvable as ``'<plugin_name>:<name>'`` via
+        ``skill_view()``.  It does **not** enter the flat
+        ``~/.hermes/skills/`` tree and is **not** listed in the system
+        prompt's ``<available_skills>`` index — plugin skills are
+        opt-in explicit loads only.
+
+        Raises:
+            ValueError: if *name* contains ``':'`` or invalid characters.
+            FileNotFoundError: if *path* does not exist.
+        """
+        from agent.skill_utils import _NAMESPACE_RE
+
+        if ":" in name:
+            raise ValueError(
+                f"Skill name '{name}' must not contain ':' "
+                f"(the namespace is derived from the plugin name "
+                f"'{self.manifest.name}' automatically)."
+            )
+        if not name or not _NAMESPACE_RE.match(name):
+            raise ValueError(
+                f"Invalid skill name '{name}'. Must match [a-zA-Z0-9_-]+."
+            )
+        if not path.exists():
+            raise FileNotFoundError(f"SKILL.md not found at {path}")
+
+        qualified = f"{self.manifest.name}:{name}"
+        self._manager._plugin_skills[qualified] = {
+            "path": path,
+            "plugin": self.manifest.name,
+            "bare_name": name,
+            "description": description,
+        }
+        logger.debug(
+            "Plugin %s registered skill: %s",
+            self.manifest.name, qualified,
+        )
+
 
 # ---------------------------------------------------------------------------
 # PluginManager
@@ -183,7 +321,12 @@ class PluginManager:
         self._plugins: Dict[str, LoadedPlugin] = {}
         self._hooks: Dict[str, List[Callable]] = {}
         self._plugin_tool_names: Set[str] = set()
+        self._cli_commands: Dict[str, dict] = {}
+        self._context_engine = None  # Set by a plugin via register_context_engine()
         self._discovered: bool = False
+        self._cli_ref = None  # Set by CLI after plugin discovery
+        # Plugin skill registry: qualified name → metadata dict.
+        self._plugin_skills: Dict[str, Dict[str, Any]] = {}
 
     # -----------------------------------------------------------------------
     # Public
@@ -198,8 +341,7 @@ class PluginManager:
         manifests: List[PluginManifest] = []
 
         # 1. User plugins (~/.hermes/plugins/)
-        hermes_home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
-        user_dir = Path(hermes_home) / "plugins"
+        user_dir = get_hermes_home() / "plugins"
         manifests.extend(self._scan_directory(user_dir, source="user"))
 
         # 2. Project plugins (./.hermes/plugins/)
@@ -410,8 +552,18 @@ class PluginManager:
         plugin cannot break the core agent loop.
 
         Returns a list of non-``None`` return values from callbacks.
-        This allows hooks like ``pre_llm_call`` to contribute context
-        that the agent core can collect and inject.
+
+        For ``pre_llm_call``, callbacks may return a dict describing
+        context to inject into the current turn's user message::
+
+            {"context": "recalled text..."}
+            "recalled text..."          # plain string, equivalent
+
+        Context is ALWAYS injected into the user message, never the
+        system prompt.  This preserves the prompt cache prefix — the
+        system prompt stays identical across turns so cached tokens
+        are reused.  All injected context is ephemeral — never
+        persisted to session DB.
         """
         callbacks = self._hooks.get(hook_name, [])
         results: List[Any] = []
@@ -451,6 +603,28 @@ class PluginManager:
             )
         return result
 
+    # -----------------------------------------------------------------------
+    # Plugin skill lookups
+    # -----------------------------------------------------------------------
+
+    def find_plugin_skill(self, qualified_name: str) -> Optional[Path]:
+        """Return the ``Path`` to a plugin skill's SKILL.md, or ``None``."""
+        entry = self._plugin_skills.get(qualified_name)
+        return entry["path"] if entry else None
+
+    def list_plugin_skills(self, plugin_name: str) -> List[str]:
+        """Return sorted bare names of all skills registered by *plugin_name*."""
+        prefix = f"{plugin_name}:"
+        return sorted(
+            e["bare_name"]
+            for qn, e in self._plugin_skills.items()
+            if qn.startswith(prefix)
+        )
+
+    def remove_plugin_skill(self, qualified_name: str) -> None:
+        """Remove a stale registry entry (silently ignores missing keys)."""
+        self._plugin_skills.pop(qualified_name, None)
+
 
 # ---------------------------------------------------------------------------
 # Module-level singleton & convenience functions
@@ -480,9 +654,49 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     return get_plugin_manager().invoke_hook(hook_name, **kwargs)
 
 
-def get_plugin_tool_names() -> Set[str]:
-    """Return the set of tool names registered by plugins."""
-    return get_plugin_manager()._plugin_tool_names
+
+def get_pre_tool_call_block_message(
+    tool_name: str,
+    args: Optional[Dict[str, Any]],
+    task_id: str = "",
+    session_id: str = "",
+    tool_call_id: str = "",
+) -> Optional[str]:
+    """Check ``pre_tool_call`` hooks for a blocking directive.
+
+    Plugins that need to enforce policy (rate limiting, security
+    restrictions, approval workflows) can return::
+
+        {"action": "block", "message": "Reason the tool was blocked"}
+
+    from their ``pre_tool_call`` callback.  The first valid block
+    directive wins.  Invalid or irrelevant hook return values are
+    silently ignored so existing observer-only hooks are unaffected.
+    """
+    hook_results = invoke_hook(
+        "pre_tool_call",
+        tool_name=tool_name,
+        args=args if isinstance(args, dict) else {},
+        task_id=task_id,
+        session_id=session_id,
+        tool_call_id=tool_call_id,
+    )
+
+    for result in hook_results:
+        if not isinstance(result, dict):
+            continue
+        if result.get("action") != "block":
+            continue
+        message = result.get("message")
+        if isinstance(message, str) and message:
+            return message
+
+    return None
+
+
+def get_plugin_context_engine():
+    """Return the plugin-registered context engine, or None."""
+    return get_plugin_manager()._context_engine
 
 
 def get_plugin_toolsets() -> List[tuple]:
@@ -504,7 +718,7 @@ def get_plugin_toolsets() -> List[tuple]:
     toolset_tools: Dict[str, List[str]] = {}
     toolset_plugin: Dict[str, LoadedPlugin] = {}
     for tool_name in manager._plugin_tool_names:
-        entry = registry._tools.get(tool_name)
+        entry = registry.get_entry(tool_name)
         if not entry:
             continue
         ts = entry.toolset
@@ -513,7 +727,7 @@ def get_plugin_toolsets() -> List[tuple]:
     # Map toolsets back to the plugin that registered them
     for _name, loaded in manager._plugins.items():
         for tool_name in loaded.tools_registered:
-            entry = registry._tools.get(tool_name)
+            entry = registry.get_entry(tool_name)
             if entry and entry.toolset in toolset_tools:
                 toolset_plugin.setdefault(entry.toolset, loaded)
 

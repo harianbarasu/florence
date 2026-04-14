@@ -33,6 +33,5 @@ tinker-atropos
 mini-swe-agent
 
 # Lockfiles / local plans
-package-lock.json
 uv.lock
 PLAN-*.md

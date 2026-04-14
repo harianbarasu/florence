@@ -11,6 +11,7 @@ from florence.config import (
     FlorenceServerRuntimeConfig,
     FlorenceSettings,
 )
+from florence.deploy_metadata import format_railway_deploy_metadata, get_railway_deploy_metadata
 from florence.server import _run_hermes_preflight, _start_hermes_preflight
 
 
@@ -143,3 +144,48 @@ def test_start_hermes_preflight_blocking_mode_runs_inline(tmp_path, monkeypatch)
     _start_hermes_preflight(settings, agent_factory=_factory)
 
     assert calls["value"] == 1
+
+
+def test_get_railway_deploy_metadata_trims_commit_sha():
+    metadata = get_railway_deploy_metadata(
+        {
+            "RAILWAY_PROJECT_ID": "proj_123",
+            "RAILWAY_ENVIRONMENT_ID": "env_456",
+            "RAILWAY_SERVICE_ID": "svc_789",
+            "RAILWAY_DEPLOYMENT_ID": "dep_abc",
+            "RAILWAY_GIT_BRANCH": "main",
+            "RAILWAY_GIT_COMMIT_SHA": "213183a297d074e426756dce783a2eedd9b6557f",
+            "RAILWAY_GIT_COMMIT_MESSAGE": "Slim Florence Docker builds",
+        }
+    )
+
+    assert metadata == {
+        "project_id": "proj_123",
+        "environment_id": "env_456",
+        "service_id": "svc_789",
+        "deployment_id": "dep_abc",
+        "replica_id": None,
+        "branch": "main",
+        "commit_sha": "213183a297d0",
+        "commit_message": "Slim Florence Docker builds",
+    }
+
+
+def test_format_railway_deploy_metadata_returns_human_readable_summary():
+    summary = format_railway_deploy_metadata(
+        {
+            "RAILWAY_SERVICE_ID": "svc_789",
+            "RAILWAY_DEPLOYMENT_ID": "dep_abc",
+            "RAILWAY_GIT_COMMIT_SHA": "213183a297d074e426756dce783a2eedd9b6557f",
+            "RAILWAY_GIT_COMMIT_MESSAGE": "Slim Florence Docker builds",
+        }
+    )
+
+    assert summary == (
+        "service_id=svc_789, deployment_id=dep_abc, "
+        "commit_sha=213183a297d0, commit_message=Slim Florence Docker builds"
+    )
+
+
+def test_format_railway_deploy_metadata_handles_missing_values():
+    assert format_railway_deploy_metadata({}) == "Railway deployment metadata unavailable"

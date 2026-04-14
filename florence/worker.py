@@ -8,6 +8,7 @@ import sys
 import time
 
 from florence.config import FlorenceSettings
+from florence.deploy_metadata import format_railway_deploy_metadata
 from florence.runtime.production import FlorenceProductionService
 from florence.runtime.scheduler import FlorenceSyncScheduler
 
@@ -26,6 +27,7 @@ def main() -> None:
     )
     for noisy_logger in ("httpx", "httpcore", "openai", "openai._base_client"):
         logging.getLogger(noisy_logger).setLevel(logging.WARNING)
+    logger.info("Florence deployment context: %s", format_railway_deploy_metadata())
     settings = FlorenceSettings.from_env()
     service = FlorenceProductionService(settings)
 

@@ -13,6 +13,7 @@ from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
 from florence.config import FlorenceSettings
+from florence.deploy_metadata import format_railway_deploy_metadata
 from florence.runtime.production import FlorenceHTTPResult, FlorenceProductionService
 
 logger = logging.getLogger(__name__)
@@ -305,6 +306,7 @@ def main() -> None:
     for noisy_logger in ("httpx", "httpcore", "openai", "openai._base_client"):
         logging.getLogger(noisy_logger).setLevel(logging.WARNING)
 
+    logger.info("Florence deployment context: %s", format_railway_deploy_metadata())
     settings = FlorenceSettings.from_env()
     _log_runtime_configuration(settings)
     host = args.host or settings.server.host

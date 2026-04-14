@@ -74,6 +74,7 @@ RUN uv venv && \
 USER root
 RUN chmod +x /opt/hermes/docker/entrypoint.sh
 
-ENV HERMES_HOME=/opt/data
+ENV PATH="/opt/hermes/.venv/bin:${PATH}" \
+    HERMES_HOME=/opt/data
 RUN mkdir -p /opt/data
 ENTRYPOINT [ "/opt/hermes/docker/entrypoint.sh" ]

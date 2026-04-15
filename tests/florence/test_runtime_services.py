@@ -193,6 +193,33 @@ class _StubSyncUpdateChatService:
         return f"I finished another sync pass and {title} is the main thing I want to flag."
 
 
+class _FailingSyncUpdateChatService:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def compose_operator_message(
+        self,
+        *,
+        household_id: str,
+        channel_id: str,
+        actor_member_id: str | None,
+        kind: str,
+        payload=None,
+        conversation_history=None,  # noqa: ARG002
+    ) -> str:
+        payload = dict(payload or {})
+        self.calls.append(
+            {
+                "household_id": household_id,
+                "channel_id": channel_id,
+                "actor_member_id": actor_member_id,
+                "kind": kind,
+                "payload": payload,
+            }
+        )
+        raise RuntimeError("sync_update_compose_failed")
+
+
 def _record_test_onboarding_reply(
     onboarding_service,
     *,
@@ -3236,4 +3263,112 @@ def test_operations_sync_update_sweep_skips_during_recent_channel_activity(tmp_p
     assert linq.sent == []
     assert chat_service.calls == []
     assert store.list_pilot_events(household_id="hh_123", event_type="sync_update_brief_sent") == []
+    store.close()
+
+
+def test_operations_sync_update_brief_fallback_still_names_top_change(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    onboarding_service = FlorenceOnboardingSessionService(store)
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        display_name="Maya",
+    )
+    previous_connection = store.upsert_google_connection(
+        GoogleConnection(
+            id="gconn_123",
+            household_id="hh_123",
+            member_id="mem_123",
+            email="parent@example.com",
+            connected_scopes=(GoogleSourceKind.GMAIL, GoogleSourceKind.GOOGLE_CALENDAR),
+            metadata={
+                "initial_sync_activation_brief_sent_at": "2026-03-20T08:00:00+00:00",
+                "initial_sync_activation_brief_channel_id": "chan_dm_123",
+                "last_sync_brief_channel_id": "chan_dm_123",
+                "last_sync_brief_kind": "activation",
+                "last_sync_brief_snapshot": {
+                    "gmail_count": 2,
+                    "calendar_count": 1,
+                    "candidate_count": 1,
+                    "candidate_titles": ["Science fair reminder"],
+                    "candidate_ids": ["cand_1000"],
+                    "signature": "previous",
+                },
+                "last_gmail_item_count": 2,
+                "last_calendar_item_count": 1,
+                "last_candidate_count": 1,
+            },
+        )
+    )
+    current_connection = store.upsert_google_connection(
+        replace(
+            previous_connection,
+            metadata={
+                **dict(previous_connection.metadata),
+                "last_gmail_item_count": 4,
+                "last_calendar_item_count": 2,
+                "last_candidate_count": 1,
+            },
+        )
+    )
+    candidate = ImportedCandidate(
+        id="cand_456",
+        household_id="hh_123",
+        member_id="mem_123",
+        source_kind=GoogleSourceKind.GOOGLE_CALENDAR,
+        source_identifier="google_calendar:event_456",
+        title="Dentist appointment moved",
+        summary="Pickup timing may need a tweak.",
+        state=CandidateState.PENDING_REVIEW,
+    )
+    linq = _FakeLinqClient()
+    delivery = FlorenceChannelDeliveryService(
+        store,
+        linq_client_getter=lambda: linq,
+        sendblue_client_getter=lambda: None,
+    )
+    chat_service = _FailingSyncUpdateChatService()
+    operations = FlorenceHouseholdOperationsService(
+        store,
+        delivery_service=delivery,
+        household_chat_service_getter=lambda: chat_service,
+    )
+
+    sent = operations.dispatch_due_sync_update_briefs(
+        household_id="hh_123",
+        sync_results=[SimpleNamespace(connection=current_connection, sync_result=SimpleNamespace(candidates=[candidate]))],
+        previous_connections={"gconn_123": previous_connection},
+    )
+
+    assert sent == 1
+    assert linq.sent == [
+        {
+            "chat_id": "dm-thread-123",
+            "message": (
+                "I finished another sync pass. "
+                "The main thing I want you to check is Dentist appointment moved. "
+                "Pickup timing may need a tweak."
+            ),
+        }
+    ]
     store.close()

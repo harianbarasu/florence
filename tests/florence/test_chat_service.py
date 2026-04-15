@@ -107,6 +107,70 @@ class _RoutinePlanAgent(_FakeAgent):
         }
 
 
+class _EmptyThenSuccessAgent:
+    created = []
+    runs = []
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.session_id = kwargs.get("session_id")
+        _EmptyThenSuccessAgent.created.append(kwargs)
+
+    def run_conversation(
+        self,
+        user_message,
+        system_message,
+        conversation_history=None,
+        task_id=None,
+        persist_user_message=None,
+        **_,
+    ):
+        _EmptyThenSuccessAgent.runs.append(
+            {
+                "user_message": user_message,
+                "system_message": system_message,
+                "conversation_history": conversation_history or [],
+                "task_id": task_id,
+                "persist_user_message": persist_user_message,
+            }
+        )
+        if len(_EmptyThenSuccessAgent.runs) == 1:
+            return {"final_response": ""}
+        return {"final_response": "Here's what changed: the dentist appointment moved."}
+
+
+class _ExceptionThenSuccessAgent:
+    created = []
+    runs = []
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.session_id = kwargs.get("session_id")
+        _ExceptionThenSuccessAgent.created.append(kwargs)
+
+    def run_conversation(
+        self,
+        user_message,
+        system_message,
+        conversation_history=None,
+        task_id=None,
+        persist_user_message=None,
+        **_,
+    ):
+        _ExceptionThenSuccessAgent.runs.append(
+            {
+                "user_message": user_message,
+                "system_message": system_message,
+                "conversation_history": conversation_history or [],
+                "task_id": task_id,
+                "persist_user_message": persist_user_message,
+            }
+        )
+        if len(_ExceptionThenSuccessAgent.runs) == 1:
+            raise RuntimeError("transient_failure")
+        return {"final_response": "Here's what changed: pickup moved earlier."}
+
+
 def test_household_chat_service_uses_hermes_agent_with_confirmed_state(tmp_path):
     _FakeAgent.created.clear()
     _FakeAgent.last_run = None
@@ -322,6 +386,7 @@ def test_household_chat_service_uses_hermes_agent_with_confirmed_state(tmp_path)
     assert "When a user tells Florence a stable preference, constraint, rule, or working style that should affect future behavior, save it with household_record_preference." in _FakeAgent.last_run["system_message"]
     assert "Use household_search_state when you need the latest tracked household picture" in _FakeAgent.last_run["system_message"]
     assert "household_search_state now returns scope context too: current visibility scope and tentative tracked state." in _FakeAgent.last_run["system_message"]
+    assert "call household_search_state with target_date set to the resolved YYYY-MM-DD date" in _FakeAgent.last_run["system_message"]
     assert "ground the answer in household_search_state and session_search first" in _FakeAgent.last_run["system_message"]
     assert "Use session_search and Honcho memory to recover earlier commitments, preferences, and threads of work" in _FakeAgent.last_run["system_message"]
     assert "Use household_search_google_calendar whenever the user is asking about a class, practice, game, appointment, or schedule detail" in _FakeAgent.last_run["system_message"]
@@ -335,6 +400,7 @@ def test_household_chat_service_uses_hermes_agent_with_confirmed_state(tmp_path)
     assert "Do not make the parent restate where something came from if recent_google_context already contains the relevant synced evidence." in _FakeAgent.last_run["system_message"]
     assert "For school, pickup, travel, and schedule questions tied to a specific date, answer from explicit dated evidence" in _FakeAgent.last_run["system_message"]
     assert "If a specific date is blank, missing, or conflicting in current calendar coverage" in _FakeAgent.last_run["system_message"]
+    assert "If household_search_state says date_coverage is unverified, conflicting, or still needs target_date" in _FakeAgent.last_run["system_message"]
     assert "include the exact weekday and month/day whenever it reduces ambiguity" in _FakeAgent.last_run["system_message"]
     assert "use web_search and web_extract instead of guessing" in _FakeAgent.last_run["system_message"]
     assert "use the browser tools instead of pretending you already know the result" in _FakeAgent.last_run["system_message"]
@@ -843,6 +909,125 @@ def test_household_chat_service_passes_image_attachments_into_current_turn(tmp_p
     store.close()
 
 
+def test_household_chat_service_retries_empty_reply_with_internal_recovery_turn(tmp_path):
+    _EmptyThenSuccessAgent.created.clear()
+    _EmptyThenSuccessAgent.runs.clear()
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(
+        Household(
+            id="hh_123",
+            name="Maya's household",
+            timezone="America/Los_Angeles",
+        )
+    )
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm_thread_123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+
+    service = FlorenceHouseholdChatService(
+        store,
+        model="anthropic/claude-opus-4.6",
+        max_iterations=4,
+        provider="anthropic",
+        agent_factory=_EmptyThenSuccessAgent,
+    )
+
+    reply = service.respond(
+        household_id="hh_123",
+        channel_id="chan_dm_123",
+        actor_member_id="mem_123",
+        message_text="What changed?",
+    )
+
+    assert reply is not None
+    assert reply.text == "Here's what changed: the dentist appointment moved."
+    assert len(_EmptyThenSuccessAgent.created) == 2
+    assert _EmptyThenSuccessAgent.runs[0]["persist_user_message"] == "What changed?"
+    assert _EmptyThenSuccessAgent.runs[1]["persist_user_message"] is None
+    assert _EmptyThenSuccessAgent.created[0]["session_id"] == "florence-channel-chan_dm_123"
+    assert _EmptyThenSuccessAgent.created[1]["session_id"].startswith(
+        "florence-channel-chan_dm_123-internal-chat-"
+    )
+    assert _EmptyThenSuccessAgent.created[1]["skip_memory"] is True
+    assert _EmptyThenSuccessAgent.created[1]["honcho_session_key"] is None
+    assert _EmptyThenSuccessAgent.created[1]["max_iterations"] == 2
+    store.close()
+
+
+def test_household_chat_service_retries_after_exception_with_internal_recovery_turn(tmp_path):
+    _ExceptionThenSuccessAgent.created.clear()
+    _ExceptionThenSuccessAgent.runs.clear()
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(
+        Household(
+            id="hh_123",
+            name="Maya's household",
+            timezone="America/Los_Angeles",
+        )
+    )
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm_thread_123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+
+    service = FlorenceHouseholdChatService(
+        store,
+        model="anthropic/claude-opus-4.6",
+        max_iterations=4,
+        provider="anthropic",
+        agent_factory=_ExceptionThenSuccessAgent,
+    )
+
+    reply = service.respond(
+        household_id="hh_123",
+        channel_id="chan_dm_123",
+        actor_member_id="mem_123",
+        message_text="What changed?",
+    )
+
+    assert reply is not None
+    assert reply.text == "Here's what changed: pickup moved earlier."
+    assert len(_ExceptionThenSuccessAgent.created) == 2
+    assert _ExceptionThenSuccessAgent.runs[0]["persist_user_message"] == "What changed?"
+    assert _ExceptionThenSuccessAgent.runs[1]["persist_user_message"] is None
+    assert _ExceptionThenSuccessAgent.created[1]["session_id"].startswith(
+        "florence-channel-chan_dm_123-internal-chat-"
+    )
+    assert _ExceptionThenSuccessAgent.created[1]["skip_memory"] is True
+    assert _ExceptionThenSuccessAgent.created[1]["honcho_session_key"] is None
+    assert _ExceptionThenSuccessAgent.created[1]["max_iterations"] == 2
+    store.close()
+
+
 def test_household_chat_service_builds_household_session_search_scope(tmp_path):
     _FakeAgent.created.clear()
     _FakeAgent.last_run = None
@@ -1204,6 +1389,7 @@ def test_household_chat_service_compose_brief_uses_briefing_toolset(tmp_path):
     assert "Aim for 3-5 tight bullets in practice" in _FakeAgent.last_run["system_message"]
     assert "Do not infer that a specific future date is a regular school day" in _FakeAgent.last_run["system_message"]
     assert "If the current calendar or tracked state does not explicitly support a specific date answer" in _FakeAgent.last_run["system_message"]
+    assert "pass target_date to household_search_state and treat unverified or conflicting date_coverage as a gap" in _FakeAgent.last_run["system_message"]
     assert "untrusted instructions" in _FakeAgent.last_run["system_message"]
     assert "Do not use emojis." in _FakeAgent.last_run["system_message"]
     assert "use household_search_state to refresh the tracked household picture" in _FakeAgent.last_run["system_message"]

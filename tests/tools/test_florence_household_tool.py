@@ -18,6 +18,8 @@ from florence.contracts import (
     HouseholdNudgeTargetKind,
     HouseholdProfileItem,
     HouseholdProfileKind,
+    HouseholdRoutine,
+    HouseholdRoutineStatus,
     HouseholdSourceMatcherKind,
     HouseholdSourceRule,
     HouseholdSourceVisibility,
@@ -1121,6 +1123,182 @@ def test_household_search_state_includes_shared_calendar_projection_link(tmp_pat
         assert projection["calendar_web_url"] == "https://calendar.google.com/calendar/u/0/r?cid=cal_shared_123"
         assert projection["host_email"] == "maya@example.com"
         assert projection["shared_with_emails"] == ["kendall@example.com"]
+    finally:
+        clear_household_tool_context(task_id)
+        store.close()
+
+
+def test_household_search_state_requires_target_date_for_date_specific_schedule_queries(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    task_id = "task-household-date-coverage-needs-target"
+    set_household_tool_context(
+        task_id,
+        store=store,
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_dm_123",
+    )
+    try:
+        result = json.loads(
+            handle_function_call(
+                "household_search_state",
+                {
+                    "query": "do the kids have school next friday",
+                    "entity_types": ["events"],
+                },
+                task_id=task_id,
+            )
+        )
+
+        assert result["date_coverage"]["claim_readiness"] == "needs_target_date"
+        assert "target_date=YYYY-MM-DD" in result["date_coverage"]["guidance"]
+        assert (
+            result["date_answer_evidence_contract"]["claim_readiness_levels"]["needs_target_date"]
+            == "The query looks date-specific, but Florence still needs the exact YYYY-MM-DD date before using tracked state as evidence."
+        )
+    finally:
+        clear_household_tool_context(task_id)
+        store.close()
+
+
+def test_household_search_state_marks_explicit_holiday_date_as_verified(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    store.upsert_household_event(
+        HouseholdEvent(
+            id="evt_holiday_123",
+            household_id="hh_123",
+            title="No school - Spring holiday",
+            starts_at="2026-04-24T00:00:00-07:00",
+            ends_at="2026-04-24T23:59:00-07:00",
+            timezone="America/Los_Angeles",
+            all_day=True,
+            status=HouseholdEventStatus.CONFIRMED,
+        )
+    )
+    task_id = "task-household-date-coverage-holiday"
+    set_household_tool_context(
+        task_id,
+        store=store,
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_dm_123",
+    )
+    try:
+        result = json.loads(
+            handle_function_call(
+                "household_search_state",
+                {
+                    "query": "do the kids have school next friday",
+                    "entity_types": ["events"],
+                    "target_date": "2026-04-24",
+                },
+                task_id=task_id,
+            )
+        )
+
+        assert result["date_coverage"]["claim_readiness"] == "verified"
+        assert result["date_coverage"]["status_signal"] == "confirmed_no_school_or_holiday"
+        assert result["date_coverage"]["confirmed_evidence_labels"] == ["no_school_or_holiday"]
+        assert result["date_coverage"]["matched_confirmed_events"][0]["id"] == "evt_holiday_123"
+    finally:
+        clear_household_tool_context(task_id)
+        store.close()
+
+
+def test_household_search_state_marks_routine_only_exact_date_question_as_unverified(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    store.upsert_household_routine(
+        HouseholdRoutine(
+            id="routine_school_friday",
+            household_id="hh_123",
+            title="Friday school cadence",
+            cadence="Every Friday during the regular school year",
+            description="Friday usually follows the normal school schedule.",
+            status=HouseholdRoutineStatus.ACTIVE,
+        )
+    )
+    task_id = "task-household-date-coverage-routine-only"
+    set_household_tool_context(
+        task_id,
+        store=store,
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_dm_123",
+    )
+    try:
+        result = json.loads(
+            handle_function_call(
+                "household_search_state",
+                {
+                    "query": "",
+                    "entity_types": ["events", "routines"],
+                    "target_date": "2026-04-24",
+                },
+                task_id=task_id,
+            )
+        )
+
+        assert result["results"]["routines"][0]["id"] == "routine_school_friday"
+        assert result["date_coverage"]["claim_readiness"] == "unverified"
+        assert result["date_coverage"]["status_signal"] == "missing_explicit_date_evidence"
+        assert "Do not infer from routines or weekday patterns" in result["date_coverage"]["guidance"]
     finally:
         clear_household_tool_context(task_id)
         store.close()

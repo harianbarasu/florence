@@ -983,6 +983,7 @@ class FlorenceHouseholdOperationsService:
             update_message, group_message = self.fallback_sync_update_brief_messages(
                 deliver_to_group=deliver_to_group,
                 group_available=group_channel is not None,
+                candidates=candidates,
             )
         sent_update = self.delivery_service.send_channel_message(
             channel=primary_channel,
@@ -1039,11 +1040,33 @@ class FlorenceHouseholdOperationsService:
         *,
         deliver_to_group: bool,
         group_available: bool,
+        candidates: list[Any] | None = None,
     ) -> tuple[str, str | None]:
-        message = (
-            "I finished another sync pass and there are a few household updates worth checking. "
-            "Ask what changed or what Florence wants you to look at."
-        )
+        candidate_list = list(candidates or [])
+        titled_candidates = [
+            candidate for candidate in candidate_list
+            if str(getattr(candidate, "title", "") or "").strip()
+        ]
+        if titled_candidates:
+            first_title = str(getattr(titled_candidates[0], "title", "") or "").strip()
+            first_summary = str(getattr(titled_candidates[0], "summary", "") or "").strip()
+            if len(titled_candidates) == 1:
+                message = f"I finished another sync pass. The main thing I want you to check is {first_title}."
+                if first_summary and first_summary != first_title:
+                    message += f" {first_summary}"
+            else:
+                second_title = str(getattr(titled_candidates[1], "title", "") or "").strip()
+                message = (
+                    "I finished another sync pass. "
+                    f"The main things I want you to check are {first_title} and {second_title}."
+                )
+                if len(titled_candidates) > 2:
+                    message += " There are a couple more updates behind those too."
+        else:
+            message = (
+                "I finished another sync pass and there are a few household updates worth checking. "
+                "I can walk through the important ones."
+            )
         if not deliver_to_group and group_available:
             message += " If you want, I can also share a short version with the parent group."
         return message, None

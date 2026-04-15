@@ -1679,8 +1679,11 @@ def test_completed_dm_suppresses_protocol_sentinel_if_chat_model_leaks_one(tmp_p
         )
     )
 
-    assert result.consumed is False
-    assert result.reply_text is None
+    assert result.consumed is True
+    assert result.reply_text == (
+        "I saw your message, but I hit a reply problem on my side. "
+        "Send it again and I'll answer directly."
+    )
     assert chat_service.calls[0]["message_text"] == "You should see it in my email from today."
     store.close()
 
@@ -3222,6 +3225,48 @@ def test_complete_dm_schedule_question_routes_through_household_chat_service_bef
 
     assert result.reply_text == "I can check Musical Beginnings and pull the spring break dates."
     assert chat_service.calls[0]["message_text"] == "Do you know the spring break schedule for the kids music class?"
+    store.close()
+
+
+def test_completed_dm_followup_after_sync_update_brief_routes_back_through_household_chat(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_onboarding_service(store, review_service)
+    chat_service = _StubHouseholdChatService("The dentist appointment moved and pickup timing needs a tweak.")
+    ingress = _build_ingress(
+        store,
+        onboarding_service,
+        review_service,
+        household_chat_service=chat_service,
+    )
+    _complete_hybrid_onboarding(onboarding_service)
+    ingress.append_assistant_message(
+        household_id="hh_123",
+        channel_id="chan_dm_123",
+        body="I finished another sync pass. The main thing I want you to check is Dentist appointment moved.",
+        metadata={"promotion_kind": "sync_update_brief"},
+    )
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_sync_update_followup",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="What changed",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert result.consumed is True
+    assert result.reply_text == "The dentist appointment moved and pickup timing needs a tweak."
+    assert chat_service.calls[0]["message_text"] == "What changed"
     store.close()
 
 

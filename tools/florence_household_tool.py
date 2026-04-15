@@ -6,9 +6,10 @@ import hashlib
 import json
 import re
 import threading
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from dataclasses import dataclass
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 from florence.calendar_feed import parse_calendar_feed
@@ -494,6 +495,294 @@ def _matches_query(fields: list[Any], query: str) -> bool:
     return False
 
 
+_SPECIFIC_DATE_REFERENCE_RE = re.compile(
+    r"\b(?:"
+    r"today|tomorrow|tonight|yesterday|"
+    r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+    r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|"
+    r"aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|"
+    r"\d{4}-\d{2}-\d{2}|"
+    r"\d{1,2}/\d{1,2}(?:/\d{2,4})?"
+    r")\b",
+    re.IGNORECASE,
+)
+_DATE_LOGISTICS_KEYWORDS = (
+    "school",
+    "pickup",
+    "pick up",
+    "pick-up",
+    "dropoff",
+    "drop off",
+    "drop-off",
+    "dismissal",
+    "schedule",
+    "class",
+    "practice",
+    "game",
+    "travel",
+    "flight",
+    "trip",
+    "camp",
+    "holiday",
+    "break",
+    "release",
+)
+_NO_SCHOOL_EVENT_HINTS = (
+    "no school",
+    "school closed",
+    "student holiday",
+    "holiday",
+    "spring break",
+    "winter break",
+    "fall break",
+    "summer break",
+    "teacher workday",
+    "teacher work day",
+    "in-service",
+    "in service",
+    "professional development",
+    "pd day",
+    "campus closed",
+)
+_SCHEDULE_EVENT_HINTS = (
+    "school day",
+    "pickup",
+    "pick-up",
+    "dropoff",
+    "drop-off",
+    "dismissal",
+    "early release",
+    "class",
+    "practice",
+    "game",
+    "appointment",
+    "lesson",
+    "flight",
+    "trip",
+    "camp",
+    "dance",
+    "music",
+)
+
+
+def _query_needs_target_date(query: str) -> bool:
+    if not query:
+        return False
+    if not _SPECIFIC_DATE_REFERENCE_RE.search(query):
+        return False
+    return any(keyword in query for keyword in _DATE_LOGISTICS_KEYWORDS)
+
+
+def _resolve_zoneinfo(name: str | None) -> ZoneInfo:
+    try:
+        return ZoneInfo(str(name or "").strip() or "UTC")
+    except Exception:
+        return ZoneInfo("UTC")
+
+
+def _parse_iso_date_argument(value: str | None) -> date | None:
+    normalized = _normalize_optional_text(value)
+    if normalized is None:
+        return None
+    try:
+        return date.fromisoformat(normalized)
+    except Exception:
+        return None
+
+
+def _coerce_datetime_for_zone(value: datetime | None, *, zone_name: str | None) -> datetime | None:
+    if value is None:
+        return None
+    zone = _resolve_zoneinfo(zone_name)
+    if value.tzinfo is None:
+        return value.replace(tzinfo=zone)
+    return value.astimezone(zone)
+
+
+def _event_overlaps_local_date(
+    event: HouseholdEvent,
+    *,
+    target_date: date,
+    household_timezone: str | None,
+) -> bool:
+    start = _parse_iso_datetime_argument(event.starts_at)
+    end = _parse_iso_datetime_argument(event.ends_at) or start
+    if start is None and end is None:
+        return False
+    zone_name = _normalize_optional_text(event.timezone) or household_timezone or "UTC"
+    start_local = _coerce_datetime_for_zone(start or end, zone_name=zone_name)
+    end_local = _coerce_datetime_for_zone(end or start, zone_name=zone_name)
+    if start_local is None or end_local is None:
+        return False
+    start_date = start_local.date()
+    end_date = end_local.date()
+    if event.all_day and end_date > start_date:
+        end_date -= timedelta(days=1)
+    if end_date < start_date:
+        end_date = start_date
+    return start_date <= target_date <= end_date
+
+
+def _event_date_evidence_labels(event: HouseholdEvent) -> list[str]:
+    metadata = event.metadata if isinstance(event.metadata, dict) else {}
+    text = " ".join(
+        str(part or "")
+        for part in [
+            event.title,
+            event.description,
+            event.location,
+            metadata.get("child_name"),
+            metadata.get("activity_name"),
+            metadata.get("calendar_summary"),
+            metadata.get("source_label"),
+            metadata.get("school_name"),
+        ]
+    ).lower()
+    labels: list[str] = []
+    has_no_school_signal = any(phrase in text for phrase in _NO_SCHOOL_EVENT_HINTS)
+    has_schedule_signal = any(phrase in text for phrase in _SCHEDULE_EVENT_HINTS)
+    if not has_no_school_signal and "school" in text:
+        has_schedule_signal = True
+    if has_no_school_signal:
+        labels.append("no_school_or_holiday")
+    if has_schedule_signal:
+        labels.append("school_or_schedule_logistics")
+    if not labels:
+        labels.append("dated_schedule_event")
+    return labels
+
+
+def _build_date_answer_evidence_contract() -> dict[str, Any]:
+    return {
+        "scope": "Use for school, pickup, travel, holiday, and schedule questions tied to one exact date.",
+        "requirements": [
+            "Resolve the exact date first and pass target_date as YYYY-MM-DD for date-specific schedule questions.",
+            "Treat confirmed dated events, mirrored inbox/calendar evidence, and current web research as valid exact-date evidence.",
+            "Do not treat routines, profile labels, weekday defaults, or nearby recurring patterns as proof for one exact future date.",
+        ],
+        "claim_readiness_levels": {
+            "needs_target_date": "The query looks date-specific, but Florence still needs the exact YYYY-MM-DD date before using tracked state as evidence.",
+            "verified": "Tracked state includes confirmed dated evidence for that exact date.",
+            "unverified": "Tracked state does not yet justify a firm exact-date answer. Florence should verify with inbox/calendar/web evidence or say it cannot verify yet.",
+            "conflicting": "Tracked state contains conflicting exact-date evidence. Florence should explain the conflict instead of picking a side.",
+            "invalid_target_date": "The provided target_date could not be parsed. Re-run with YYYY-MM-DD.",
+        },
+        "routine_pattern_warning": "Routines, weekday defaults, and recurring school patterns do not verify one exact date.",
+    }
+
+
+def _build_date_coverage(
+    *,
+    query: str,
+    target_date_raw: str | None,
+    target_date_value: date | None,
+    household_timezone: str | None,
+    events: list[HouseholdEvent],
+) -> dict[str, Any] | None:
+    if target_date_raw and target_date_value is None:
+        return {
+            "target_date": target_date_raw,
+            "claim_readiness": "invalid_target_date",
+            "status_signal": "invalid_target_date",
+            "matched_confirmed_events": [],
+            "matched_tentative_events": [],
+            "matched_cancelled_events": [],
+            "confirmed_evidence_labels": [],
+            "guidance": "target_date must use YYYY-MM-DD before Florence can treat tracked state as exact-date evidence.",
+            "routine_pattern_warning": "Do not infer from routines or weekday patterns while the date is unresolved.",
+        }
+
+    if target_date_value is None:
+        if _query_needs_target_date(query):
+            return {
+                "target_date": None,
+                "claim_readiness": "needs_target_date",
+                "status_signal": "target_date_required",
+                "matched_confirmed_events": [],
+                "matched_tentative_events": [],
+                "matched_cancelled_events": [],
+                "confirmed_evidence_labels": [],
+                "guidance": (
+                    "This looks like a date-specific schedule question. Re-run household_search_state with "
+                    "target_date=YYYY-MM-DD before treating tracked state as evidence."
+                ),
+                "routine_pattern_warning": "Do not infer from routines or weekday patterns for an exact-date question.",
+            }
+        return None
+
+    matched_events = [
+        event
+        for event in events
+        if _event_overlaps_local_date(
+            event,
+            target_date=target_date_value,
+            household_timezone=household_timezone,
+        )
+    ]
+    confirmed_events = [event for event in matched_events if event.status == HouseholdEventStatus.CONFIRMED]
+    tentative_events = [event for event in matched_events if event.status == HouseholdEventStatus.TENTATIVE]
+    cancelled_events = [event for event in matched_events if event.status == HouseholdEventStatus.CANCELLED]
+    confirmed_labels = sorted({label for event in confirmed_events for label in _event_date_evidence_labels(event)})
+
+    if confirmed_events:
+        has_no_school_signal = "no_school_or_holiday" in confirmed_labels
+        has_schedule_signal = "school_or_schedule_logistics" in confirmed_labels
+        if has_no_school_signal and has_schedule_signal:
+            claim_readiness = "conflicting"
+            status_signal = "conflicting_explicit_date_evidence"
+            guidance = (
+                f"Tracked state has conflicting confirmed date evidence for {target_date_value.isoformat()}. "
+                "Explain the conflict and verify with inbox, calendar, or web evidence before answering firmly."
+            )
+        elif has_no_school_signal:
+            claim_readiness = "verified"
+            status_signal = "confirmed_no_school_or_holiday"
+            guidance = (
+                f"Tracked state has confirmed dated no-school or holiday evidence for {target_date_value.isoformat()}. "
+                "Answer from that evidence and name the exact date."
+            )
+        elif has_schedule_signal:
+            claim_readiness = "verified"
+            status_signal = "confirmed_school_or_schedule"
+            guidance = (
+                f"Tracked state has confirmed dated schedule evidence for {target_date_value.isoformat()}. "
+                "Answer only to the extent those confirmed events actually support."
+            )
+        else:
+            claim_readiness = "verified"
+            status_signal = "confirmed_other_dated_evidence"
+            guidance = (
+                f"Tracked state has confirmed dated events for {target_date_value.isoformat()}, but not a clear school/holiday signal. "
+                "Answer only from what those confirmed events actually say."
+            )
+    elif tentative_events:
+        claim_readiness = "unverified"
+        status_signal = "tentative_only"
+        guidance = (
+            f"Only tentative dated events exist for {target_date_value.isoformat()}. "
+            "Do not answer firmly from tracked state. Verify with inbox, calendar, or web evidence, or say Florence cannot verify yet."
+        )
+    else:
+        claim_readiness = "unverified"
+        status_signal = "missing_explicit_date_evidence"
+        guidance = (
+            f"There is no confirmed dated event evidence in tracked state for {target_date_value.isoformat()}. "
+            "Do not infer from routines or weekday patterns. Verify with inbox, calendar, or web evidence, or say Florence cannot verify yet."
+        )
+
+    return {
+        "target_date": target_date_value.isoformat(),
+        "claim_readiness": claim_readiness,
+        "status_signal": status_signal,
+        "matched_confirmed_events": [_serialize_event(event) for event in confirmed_events[:10]],
+        "matched_tentative_events": [_serialize_event(event) for event in tentative_events[:10]],
+        "matched_cancelled_events": [_serialize_event(event) for event in cancelled_events[:10]],
+        "confirmed_evidence_labels": confirmed_labels,
+        "guidance": guidance,
+        "routine_pattern_warning": "Routines, weekday defaults, and recurring school patterns do not verify one exact date.",
+    }
+
+
 _DUPLICATE_EVENT_STOPWORDS = {
     "the",
     "and",
@@ -661,8 +950,10 @@ SEARCH_STATE_SCHEMA = {
         "shopping items, events, children, or profile items including household preferences. "
         "The result also includes structured scope context showing the current channel scope and tentative tracked "
         "state. Private review details are hidden by default unless you explicitly request them. Event searches also "
-        "surface likely duplicate-event groups when Florence sees overlapping schedule entries. Use this before "
-        "updating existing state if the current household picture is unclear."
+        "surface likely duplicate-event groups when Florence sees overlapping schedule entries. For school, pickup, "
+        "holiday, travel, or schedule questions about one exact date, pass target_date in YYYY-MM-DD so the result "
+        "can tell you whether tracked state is verified, unverified, conflicting, or still missing the target date. "
+        "Use this before updating existing state if the current household picture is unclear."
     ),
     "parameters": {
         "type": "object",
@@ -704,6 +995,15 @@ SEARCH_STATE_SCHEMA = {
                 "description": (
                     "When true in a parent DM, include the current private review queue details. "
                     "Leave false for ordinary household chat."
+                ),
+            },
+            "target_date": {
+                "type": "string",
+                "description": (
+                    "Optional exact household-local date in YYYY-MM-DD for school, pickup, holiday, travel, or "
+                    "schedule questions tied to one specific day. When provided, the result includes date_coverage "
+                    "showing whether tracked state can verify that date or whether Florence still needs inbox, "
+                    "calendar, or web evidence."
                 ),
             },
         },
@@ -1302,6 +1602,10 @@ def _handle_search_state(args: dict, *, task_id: str | None = None, **_: Any) ->
     query = _normalize_text(args.get("query")).lower()
     limit = max(1, min(int(args.get("limit", 10) or 10), 25))
     include_private_review_state = bool(args.get("include_private_review_state"))
+    target_date_raw = _normalize_optional_text(args.get("target_date"))
+    target_date_value = _parse_iso_date_argument(target_date_raw)
+    household = context.store.get_household(context.household_id)
+    household_timezone = household.timezone if household is not None else None
     scope = resolve_conversation_scope(
         context.store,
         channel_id=context.channel_id,
@@ -1329,7 +1633,7 @@ def _handle_search_state(args: dict, *, task_id: str | None = None, **_: Any) ->
         }
 
     results: dict[str, list[dict[str, Any]]] = {}
-    event_matches: list[HouseholdEvent] = []
+    all_events: list[HouseholdEvent] = []
     duplicate_event_groups: list[dict[str, Any]] = []
 
     if "work_items" in entity_types:
@@ -1410,6 +1714,16 @@ def _handle_search_state(args: dict, *, task_id: str | None = None, **_: Any) ->
                     for event in group["events"]
                 )
             ]
+    elif target_date_raw or _query_needs_target_date(query):
+        all_events = context.store.list_household_events(household_id=context.household_id)
+
+    date_coverage = _build_date_coverage(
+        query=query,
+        target_date_raw=target_date_raw,
+        target_date_value=target_date_value,
+        household_timezone=household_timezone,
+        events=all_events,
+    )
 
     if "children" in entity_types:
         matches = [
@@ -1458,6 +1772,8 @@ def _handle_search_state(args: dict, *, task_id: str | None = None, **_: Any) ->
             "event_insights": {
                 "likely_duplicate_groups": duplicate_event_groups[:limit],
             },
+            "date_answer_evidence_contract": _build_date_answer_evidence_contract(),
+            "date_coverage": date_coverage,
         }
     )
 

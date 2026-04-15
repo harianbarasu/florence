@@ -13,6 +13,11 @@ from florence.messaging.protocol_types import FlorenceProtocolReply
 
 logger = logging.getLogger(__name__)
 
+_DM_CHAT_RECOVERY_REPLY = (
+    "I saw your message, but I hit a reply problem on my side. "
+    "Send it again and I'll answer directly."
+)
+
 
 def _require_member_id(member_id: str | None) -> str:
     if member_id is None or not member_id.strip():
@@ -162,7 +167,10 @@ class FlorenceDmRouter:
             resolved.household_id,
             resolved.channel_id,
         )
-        return FlorenceMessagingIngressResult(consumed=False)
+        return FlorenceMessagingIngressResult(
+            reply_text=_DM_CHAT_RECOVERY_REPLY,
+            consumed=True,
+        )
 
     @staticmethod
     def _result_from_protocol_reply(reply: FlorenceProtocolReply) -> FlorenceMessagingIngressResult:

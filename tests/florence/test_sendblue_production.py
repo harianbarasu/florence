@@ -377,7 +377,8 @@ def test_production_service_enriches_sendblue_media_payload_before_entrypoint(tm
 
     assert result.status_code == 200
     assert "Media context extracted from attachments" in str(captured_payload["content"])
-    assert "form.pdf: Permission slip due Friday at pickup." in str(captured_payload["content"])
+    assert "[form.pdf]" in str(captured_payload["content"])
+    assert "Permission slip due Friday at pickup." in str(captured_payload["content"])
     serialized = captured_payload[FLORENCE_MEDIA_ATTACHMENTS_METADATA_KEY]
     assert len(serialized) == 2
     assert serialized[0]["kind"] == "pdf"
@@ -475,7 +476,8 @@ def test_production_service_enriches_sendblue_image_payload_before_entrypoint(tm
 
     assert result.status_code == 200
     assert "Media context extracted from attachments" in str(captured_payload["content"])
-    assert "calendar.png: Young Minds school calendar:" in str(captured_payload["content"])
+    assert "[calendar.png]" in str(captured_payload["content"])
+    assert "Young Minds school calendar:" in str(captured_payload["content"])
     assert captured_payload[FLORENCE_MEDIA_ATTACHMENTS_METADATA_KEY][0]["kind"] == "image"
     assert captured_payload[FLORENCE_MEDIA_ATTACHMENTS_METADATA_KEY][0]["data_url"].startswith("data:image/png;base64,")
     store.close()

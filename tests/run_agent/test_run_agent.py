@@ -1013,6 +1013,22 @@ class TestBuildApiKwargs:
         )
         assert "extra_body" not in kwargs or "reasoning" not in kwargs["extra_body"]
 
+    def test_custom_provider_without_endpoint_fails_fast(self):
+        with (
+            patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch("agent.auxiliary_client.resolve_provider_client", return_value=(None, None)),
+        ):
+            with pytest.raises(RuntimeError, match="Provider 'custom' is set but no custom endpoint was resolved"):
+                AIAgent(
+                    provider="custom",
+                    model="gpt-5.4",
+                    quiet_mode=True,
+                    skip_context_files=True,
+                    skip_memory=True,
+                )
+
     def test_qwen_portal_formats_messages_and_metadata(self, agent):
         agent.base_url = "https://portal.qwen.ai/v1"
         agent._base_url_lower = agent.base_url.lower()

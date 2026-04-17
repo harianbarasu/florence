@@ -850,6 +850,11 @@ def _resolve_custom_runtime() -> Tuple[Optional[str], Optional[str], Optional[st
     endpoints where the base URL lives in config.yaml instead of the live
     environment.
     """
+    openai_base = os.getenv("OPENAI_BASE_URL", "").strip().rstrip("/")
+    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if openai_base:
+        return openai_base, openai_key, None
+
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
@@ -859,8 +864,6 @@ def _resolve_custom_runtime() -> Tuple[Optional[str], Optional[str], Optional[st
         runtime = None
 
     if not isinstance(runtime, dict):
-        openai_base = os.getenv("OPENAI_BASE_URL", "").strip().rstrip("/")
-        openai_key = os.getenv("OPENAI_API_KEY", "").strip()
         if not openai_base:
             return None, None, None
         runtime = {

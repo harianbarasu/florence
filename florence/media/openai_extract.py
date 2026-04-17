@@ -19,6 +19,7 @@ DEFAULT_IMAGE_EXTRACTION_PROMPT = (
     "Extract useful household context from this screenshot or image. "
     "If it contains text, focus on names, dates, times, locations, tasks, deadlines, and required items. "
     "For screenshots, tables, calendars, schedules, forms, or dense text images, do faithful OCR-style extraction of all visible logistics-relevant text instead of only summarizing the top few items. "
+    "Prefer literal transcription over paraphrase for text-heavy screenshots, and preserve line breaks or one-line-per-row structure when possible. "
     "Preserve date ranges, row-by-row closures, holidays, dismissal notes, and other schedule details when visible. "
     "For school flyers, forms, or logistics screenshots, also call out permission slips, uniforms, materials to bring, "
     "follow-up actions, and who the update is from when visible. "
@@ -41,6 +42,18 @@ def compact_text(raw: str, *, max_length: int) -> str:
     if len(normalized) <= max_length:
         return normalized
     return f"{normalized[: max_length - 1].rstrip()}..."
+
+
+def format_attachment_context_block(label: str | None, raw_text: str) -> str:
+    normalized_label = " ".join(str(label or "attachment").split()).strip() or "attachment"
+    normalized_text = _normalize_preserving_line_structure(raw_text)
+    if not normalized_text:
+        return f"[{normalized_label}]"
+    indented_lines = [
+        f"  {line}" if line else ""
+        for line in normalized_text.split("\n")
+    ]
+    return f"[{normalized_label}]\n" + "\n".join(indented_lines)
 
 
 def _normalize_preserving_line_structure(raw: str) -> str:

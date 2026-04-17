@@ -79,8 +79,10 @@ def test_enrich_linq_payload_with_media_text_appends_extracted_attachment_contex
 
     inbound = parse_linq_payload(payload)
     assert "Media context extracted from attachments" in inbound.body
-    assert "screenshot.png: Flyer says baseball practice Tuesday 4:30 PM." in inbound.body
-    assert "form.pdf: Picture Day form due Thursday at 8am." in inbound.body
+    assert "[screenshot.png]" in inbound.body
+    assert "Flyer says baseball practice Tuesday 4:30 PM." in inbound.body
+    assert "[form.pdf]" in inbound.body
+    assert "Picture Day form due Thursday at 8am." in inbound.body
     assert len(inbound.attachments) == 3
     assert inbound.attachments[0].kind == "image"
     assert inbound.attachments[0].data_url.startswith("data:image/png;base64,")
@@ -165,4 +167,66 @@ def test_enrich_linq_payload_with_media_text_handles_fridge_style_images(monkeyp
     assert changed is True
 
     inbound = parse_linq_payload(payload)
-    assert "fridge.png: Visible items: eggs, spinach, tortillas, salsa." in inbound.body
+    assert "[fridge.png]" in inbound.body
+    assert "Visible items: eggs, spinach, tortillas, salsa." in inbound.body
+
+
+def test_enrich_linq_payload_with_media_text_preserves_multiline_schedule_blocks(monkeypatch):
+    payload = {
+        "api_version": "v3",
+        "webhook_version": "2026-02-03",
+        "event_type": "message.received",
+        "data": {
+            "chat": {"id": "chat_123", "is_group": False},
+            "id": "msg_789",
+            "direction": "inbound",
+            "sender_handle": {"handle": "+15555550123", "is_me": False},
+            "parts": [
+                {"type": "text", "value": "Can you parse this closure screenshot?"},
+                {"type": "image", "url": "https://example.com/calendar.png", "filename": "calendar.png"},
+            ],
+            "service": "iMessage",
+        },
+    }
+
+    class _FakeResponse:
+        def __init__(self, *, content: bytes, content_type: str):
+            self.content = content
+            self.headers = {"content-type": content_type}
+            self.status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+    def _fake_get(url, *, headers=None, timeout=None):  # noqa: ARG001
+        if url.endswith("calendar.png"):
+            return _FakeResponse(content=b"\x89PNGfake", content_type="image/png")
+        raise AssertionError(f"Unexpected URL: {url}")
+
+    monkeypatch.setattr(linq_media.httpx, "get", _fake_get)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+
+    class _FakeResponses:
+        def create(self, **kwargs):
+            return types.SimpleNamespace(
+                output_text=(
+                    "Young Minds school calendar\n"
+                    "Mar 30-Apr 3: Spring Break\n"
+                    "May 25: Memorial Day"
+                )
+            )
+
+    class _FakeOpenAI:
+        def __init__(self, **kwargs):  # noqa: ARG002
+            self.responses = _FakeResponses()
+
+    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=_FakeOpenAI))
+
+    changed = linq_media.enrich_linq_payload_with_media_text(payload, linq_api_key=None)
+    assert changed is True
+
+    inbound = parse_linq_payload(payload)
+    assert "Media context extracted from attachments:\n[calendar.png]" in inbound.body
+    assert "  Young Minds school calendar" in inbound.body
+    assert "  Mar 30-Apr 3: Spring Break" in inbound.body
+    assert "  May 25: Memorial Day" in inbound.body

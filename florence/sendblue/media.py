@@ -16,6 +16,7 @@ from florence.media.openai_extract import (
     compact_text,
     extract_image_text_with_openai,
     extract_pdf_text_with_openai,
+    format_attachment_context_block,
     render_pdf_pages_to_images,
 )
 
@@ -279,7 +280,7 @@ def enrich_sendblue_payload_with_media_text(
         if not text:
             continue
         label = ref.filename or ref.mime_type or content_type or "attachment"
-        snippets.append(f"{label}: {text}")
+        snippets.append(format_attachment_context_block(label, text))
 
     if serialized_attachments:
         payload[FLORENCE_MEDIA_ATTACHMENTS_METADATA_KEY] = serialized_attachments
@@ -288,6 +289,6 @@ def enrich_sendblue_payload_with_media_text(
         return False
 
     existing = _read_string(payload.get("content")) or ""
-    suffix = "Media context extracted from attachments:\n" + "\n".join(snippets)
+    suffix = "Media context extracted from attachments:\n" + "\n\n".join(snippets)
     payload["content"] = f"{existing}\n\n{suffix}" if existing else suffix
     return True

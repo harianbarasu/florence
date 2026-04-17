@@ -643,6 +643,20 @@ class TestGetTextAuxiliaryClient:
         assert mock_openai.call_args.kwargs["base_url"] == "https://api.openai.com/v1"
         assert mock_openai.call_args.kwargs["api_key"] == "sk-test"
 
+    def test_custom_runtime_prefers_openai_base_url_env(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-env")
+
+        with patch("hermes_cli.runtime_provider.resolve_runtime_provider") as mock_runtime:
+            from agent.auxiliary_client import _resolve_custom_runtime
+
+            base_url, api_key, api_mode = _resolve_custom_runtime()
+
+        mock_runtime.assert_not_called()
+        assert base_url == "https://api.openai.com/v1"
+        assert api_key == "sk-env"
+        assert api_mode is None
+
 
 class TestVisionClientFallback:
     """Vision client auto mode resolves known-good multimodal backends."""

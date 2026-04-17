@@ -16,6 +16,7 @@ from florence.media.openai_extract import (
     compact_text,
     extract_image_text_with_openai,
     extract_pdf_text_with_openai,
+    format_attachment_context_block,
     render_pdf_pages_to_images,
 )
 
@@ -323,7 +324,7 @@ def enrich_linq_payload_with_media_text(
         if not text:
             continue
         label = ref.filename or (ref.mime_type or content_type or "attachment").split(";")[0]
-        extracted_lines.append(f"{label}: {text}")
+        extracted_lines.append(format_attachment_context_block(label, text))
 
     if serialized_attachments:
         payload[FLORENCE_MEDIA_ATTACHMENTS_METADATA_KEY] = serialized_attachments
@@ -334,7 +335,7 @@ def enrich_linq_payload_with_media_text(
     parts.append(
         {
             "type": "text",
-            "value": "Media context extracted from attachments:\n" + "\n".join(f"- {line}" for line in extracted_lines),
+            "value": "Media context extracted from attachments:\n" + "\n\n".join(extracted_lines),
         }
     )
     return True

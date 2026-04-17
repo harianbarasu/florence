@@ -959,6 +959,12 @@ class AIAgent:
                     # but no credentials were found, fail fast with a clear
                     # message instead of silently routing through OpenRouter.
                     _explicit = (self.provider or "").strip().lower()
+                    if _explicit == "custom":
+                        raise RuntimeError(
+                            "Provider 'custom' is set but no custom endpoint was resolved. "
+                            "Set model.base_url in config.yaml or OPENAI_BASE_URL, provide "
+                            "the matching API key, or switch to a different provider."
+                        )
                     if _explicit and _explicit not in ("auto", "openrouter", "custom"):
                         raise RuntimeError(
                             f"Provider '{_explicit}' is set in config.yaml but no API key "

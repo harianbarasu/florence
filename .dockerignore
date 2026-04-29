@@ -19,7 +19,9 @@ __pycache__
 
 # Dependencies
 node_modules
+**/node_modules
 .venv
+**/.venv
 
 # Large docs / optional assets not needed in the base image
 tests
@@ -35,3 +37,6 @@ mini-swe-agent
 # Lockfiles / local plans
 uv.lock
 PLAN-*.md
+
+# Runtime data (bind-mounted at /opt/data; must not leak into build context)
+data/

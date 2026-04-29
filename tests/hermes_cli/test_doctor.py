@@ -3,6 +3,8 @@
 import os
 import sys
 import types
+import io
+import contextlib
 from argparse import Namespace
 from types import SimpleNamespace
 
@@ -159,6 +161,38 @@ def test_check_gateway_service_linger_skips_when_service_not_installed(monkeypat
     assert issues == []
 
 
+def test_doctor_reports_vercel_backend_diagnostics(monkeypatch, tmp_path):
+    monkeypatch.setenv("TERMINAL_ENV", "vercel_sandbox")
+    monkeypatch.setenv("TERMINAL_VERCEL_RUNTIME", "python3.13")
+    monkeypatch.setenv("TERMINAL_CONTAINER_DISK", "2048")
+    monkeypatch.setenv("VERCEL_TOKEN", "super-secret-value")
+    monkeypatch.delenv("VERCEL_PROJECT_ID", raising=False)
+    monkeypatch.setenv("VERCEL_TEAM_ID", "team")
+    monkeypatch.setattr(doctor_mod.importlib.util, "find_spec", lambda name: object() if name == "vercel" else None)
+
+    fake_model_tools = types.SimpleNamespace(
+        check_tool_availability=lambda *a, **kw: ([], []),
+        TOOLSET_REQUIREMENTS={},
+    )
+    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        doctor_mod.run_doctor(Namespace(fix=False))
+
+    out = buf.getvalue()
+    assert "Vercel runtime" in out
+    assert "python3.13" in out
+    assert "Vercel custom disk unsupported" in out
+    assert "Vercel auth incomplete" in out
+    assert "VERCEL_PROJECT_ID" in out
+    assert "Vercel auth mode: incomplete access token" in out
+    assert "Vercel auth present env: VERCEL_TOKEN, VERCEL_TEAM_ID" in out
+    assert "Vercel auth missing env: VERCEL_PROJECT_ID" in out
+    assert "super-secret-value" not in out
+    assert "snapshot filesystem only" in out
+
+
 # ── Memory provider section (doctor should only check the *active* provider) ──
 
 
@@ -255,6 +289,147 @@ def test_run_doctor_termux_treats_docker_and_browser_warnings_as_expected(monkey
     assert "docker not found (optional)" not in out
 
 
+def test_run_doctor_accepts_named_provider_from_providers_section(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir(parents=True, exist_ok=True)
+
+    import yaml
+
+    (home / "config.yaml").write_text(
+        yaml.dump(
+            {
+                "model": {
+                    "provider": "volcengine-plan",
+                    "default": "doubao-seed-2.0-code",
+                },
+                "providers": {
+                    "volcengine-plan": {
+                        "name": "volcengine-plan",
+                        "base_url": "https://ark.cn-beijing.volces.com/api/coding/v3",
+                        "default_model": "doubao-seed-2.0-code",
+                        "models": {"doubao-seed-2.0-code": {}},
+                    }
+                },
+            }
+        )
+    )
+
+    monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path / "project")
+    monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+    (tmp_path / "project").mkdir(exist_ok=True)
+
+    fake_model_tools = types.SimpleNamespace(
+        check_tool_availability=lambda *a, **kw: ([], []),
+        TOOLSET_REQUIREMENTS={},
+    )
+    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+    try:
+        from hermes_cli import auth as _auth_mod
+        monkeypatch.setattr(_auth_mod, "get_nous_auth_status", lambda: {})
+        monkeypatch.setattr(_auth_mod, "get_codex_auth_status", lambda: {})
+    except Exception:
+        pass
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        doctor_mod.run_doctor(Namespace(fix=False))
+
+    out = buf.getvalue()
+    assert "model.provider 'volcengine-plan' is not a recognised provider" not in out
+
+
+def test_run_doctor_accepts_bare_custom_provider(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        "model:\n"
+        "  provider: custom\n"
+        "  default: local-model\n"
+        "  base_url: http://localhost:8000/v1\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path / "project")
+    monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+    (tmp_path / "project").mkdir(exist_ok=True)
+
+    fake_model_tools = types.SimpleNamespace(
+        check_tool_availability=lambda *a, **kw: ([], []),
+        TOOLSET_REQUIREMENTS={},
+    )
+    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+    try:
+        from hermes_cli import auth as _auth_mod
+        monkeypatch.setattr(_auth_mod, "get_nous_auth_status", lambda: {})
+        monkeypatch.setattr(_auth_mod, "get_codex_auth_status", lambda: {})
+    except Exception:
+        pass
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        doctor_mod.run_doctor(Namespace(fix=False))
+
+    out = buf.getvalue()
+    assert "model.provider 'custom' is not a recognised provider" not in out
+
+
+@pytest.mark.parametrize(
+    ("provider", "default_model"),
+    [
+        ("ai-gateway", "anthropic/claude-sonnet-4.6"),
+        ("opencode-zen", "anthropic/claude-sonnet-4.6"),
+        ("kilocode", "anthropic/claude-sonnet-4.6"),
+        ("kimi-coding", "kimi-k2"),
+    ],
+)
+def test_run_doctor_accepts_hermes_provider_ids_that_catalog_aliases(
+    monkeypatch, tmp_path, provider, default_model
+):
+    home = tmp_path / ".hermes"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        "model:\n"
+        f"  provider: {provider}\n"
+        f"  default: {default_model}\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path / "project")
+    monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+    (tmp_path / "project").mkdir(exist_ok=True)
+
+    fake_model_tools = types.SimpleNamespace(
+        check_tool_availability=lambda *a, **kw: ([], []),
+        TOOLSET_REQUIREMENTS={},
+    )
+    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+    try:
+        from hermes_cli import auth as _auth_mod
+        monkeypatch.setattr(_auth_mod, "get_nous_auth_status", lambda: {})
+        monkeypatch.setattr(_auth_mod, "get_codex_auth_status", lambda: {})
+    except Exception:
+        pass
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        doctor_mod.run_doctor(Namespace(fix=False))
+
+    out = buf.getvalue()
+    assert f"model.provider '{provider}' is not a recognised provider" not in out
+    assert f"model.provider '{provider}' is unknown" not in out
+    if provider in {"ai-gateway", "opencode-zen", "kilocode"}:
+        assert (
+            f"model.default '{default_model}' uses a vendor/model slug but provider is '{provider}'"
+            not in out
+        )
+
+
 def test_run_doctor_termux_does_not_mark_browser_available_without_agent_browser(monkeypatch, tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir(parents=True, exist_ok=True)
@@ -343,3 +518,57 @@ def test_run_doctor_kimi_cn_env_is_detected_and_probe_is_null_safe(monkeypatch, 
     assert "Kimi / Moonshot (China)" in out
     assert "str expected, not NoneType" not in out
     assert any(url == "https://api.moonshot.cn/v1/models" for url, _, _ in calls)
+
+
+@pytest.mark.parametrize("base_url", [None, "https://opencode.ai/zen/go/v1"])
+def test_run_doctor_opencode_go_skips_invalid_models_probe(monkeypatch, tmp_path, base_url):
+    home = tmp_path / ".hermes"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text("memory: {}\n", encoding="utf-8")
+    (home / ".env").write_text("OPENCODE_GO_API_KEY=***\n", encoding="utf-8")
+    project = tmp_path / "project"
+    project.mkdir(exist_ok=True)
+
+    monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project)
+    monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+    monkeypatch.setenv("OPENCODE_GO_API_KEY", "sk-test")
+    if base_url:
+        monkeypatch.setenv("OPENCODE_GO_BASE_URL", base_url)
+    else:
+        monkeypatch.delenv("OPENCODE_GO_BASE_URL", raising=False)
+
+    fake_model_tools = types.SimpleNamespace(
+        check_tool_availability=lambda *a, **kw: ([], []),
+        TOOLSET_REQUIREMENTS={},
+    )
+    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+    try:
+        from hermes_cli import auth as _auth_mod
+        monkeypatch.setattr(_auth_mod, "get_nous_auth_status", lambda: {})
+        monkeypatch.setattr(_auth_mod, "get_codex_auth_status", lambda: {})
+    except ImportError:
+        pass
+
+    calls = []
+
+    def fake_get(url, headers=None, timeout=None):
+        calls.append((url, headers, timeout))
+        return types.SimpleNamespace(status_code=200)
+
+    import httpx
+    monkeypatch.setattr(httpx, "get", fake_get)
+
+    import io, contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        doctor_mod.run_doctor(Namespace(fix=False))
+    out = buf.getvalue()
+
+    assert any(
+        "OpenCode Go" in line and "(key configured)" in line
+        for line in out.splitlines()
+    )
+    assert not any(url == "https://opencode.ai/zen/go/v1/models" for url, _, _ in calls)
+    assert not any("opencode" in url.lower() and "models" in url.lower() for url, _, _ in calls)

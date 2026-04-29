@@ -20,7 +20,7 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
 # Florence's default production image stays lean; browser and WhatsApp
 # tooling are opt-in via build args so hosted builders do not time out.
 RUN set -eux; \
-    packages="build-essential python3 ripgrep gcc python3-dev libffi-dev procps git"; \
+    packages="build-essential python3 ripgrep ffmpeg gcc python3-dev libffi-dev procps git openssh-client docker-cli tini"; \
     if [ "$INSTALL_NODE_RUNTIME" = "1" ] || [ "$INSTALL_BROWSER_TOOLS" = "1" ] || [ "$INSTALL_PLAYWRIGHT_BROWSERS" = "1" ] || [ "$INSTALL_WHATSAPP_BRIDGE" = "1" ]; then \
         packages="$packages nodejs npm"; \
     fi; \
@@ -60,10 +60,15 @@ RUN set -eux; \
 
 COPY . /opt/hermes
 
-# Hand ownership to hermes user, then install Python deps in a virtualenv
-RUN chown -R hermes:hermes /opt/hermes
-USER hermes
+# ---------- Permissions ----------
+# Make install dir world-readable so any HERMES_UID can read it at runtime.
+# The venv needs to be traversable too.
+USER root
+RUN chmod -R a+rX /opt/hermes
+# Start as root so the entrypoint can usermod/groupmod + gosu.
+# If HERMES_UID is unset, the entrypoint drops to the default hermes user (10000).
 
+# ---------- Python virtualenv ----------
 RUN uv venv && \
     if [ -n "$HERMES_PYTHON_EXTRAS" ]; then \
         uv pip install --no-cache-dir ".[${HERMES_PYTHON_EXTRAS}]"; \
@@ -74,7 +79,8 @@ RUN uv venv && \
 USER root
 RUN chmod +x /opt/hermes/docker/entrypoint.sh
 
-ENV PATH="/opt/hermes/.venv/bin:${PATH}" \
-    HERMES_HOME=/opt/data
+ENV HERMES_HOME=/opt/data
+ENV PATH="/opt/hermes/.venv/bin:/opt/data/.local/bin:${PATH}"
 RUN mkdir -p /opt/data
-ENTRYPOINT [ "/opt/hermes/docker/entrypoint.sh" ]
+VOLUME [ "/opt/data" ]
+ENTRYPOINT [ "/usr/bin/tini", "-g", "--", "/opt/hermes/docker/entrypoint.sh" ]

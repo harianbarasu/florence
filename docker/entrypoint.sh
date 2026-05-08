@@ -93,7 +93,54 @@ if [ -d "$INSTALL_DIR/skills" ]; then
     python3 "$INSTALL_DIR/tools/skills_sync.py"
 fi
 
-if [ "$#" -gt 0 ] && command -v "$1" >/dev/null 2>&1; then
+# Optionally start `hermes dashboard` as a side-process.
+#
+# Toggled by HERMES_DASHBOARD=1 (also accepts "true"/"yes", case-insensitive).
+# Host/port/TUI can be overridden via:
+#   HERMES_DASHBOARD_HOST  (default 0.0.0.0 — exposed outside the container)
+#   HERMES_DASHBOARD_PORT  (default 9119, matches `hermes dashboard` default)
+#   HERMES_DASHBOARD_TUI   (already honored by `hermes dashboard` itself)
+#
+# The dashboard is a long-lived server.  We background it *before* the final
+# `exec hermes "$@"` so the user's chosen foreground command (chat, gateway,
+# sleep infinity, …) remains PID-of-interest for the container runtime.  When
+# the container stops the whole process tree is torn down, so no explicit
+# cleanup is needed.
+case "${HERMES_DASHBOARD:-}" in
+    1|true|TRUE|True|yes|YES|Yes)
+        dash_host="${HERMES_DASHBOARD_HOST:-0.0.0.0}"
+        dash_port="${HERMES_DASHBOARD_PORT:-9119}"
+        dash_args=(--host "$dash_host" --port "$dash_port" --no-open)
+        # Binding to anything other than localhost requires --insecure — the
+        # dashboard refuses otherwise because it exposes API keys.  Inside a
+        # container this is the expected deployment (host reaches it via
+        # published port), so opt in automatically.
+        if [ "$dash_host" != "127.0.0.1" ] && [ "$dash_host" != "localhost" ]; then
+            dash_args+=(--insecure)
+        fi
+        echo "Starting hermes dashboard on ${dash_host}:${dash_port} (background)"
+        # Prefix dashboard output so it's distinguishable from the main
+        # process in `docker logs`.  stdbuf keeps the pipe line-buffered.
+        (
+            stdbuf -oL -eL hermes dashboard "${dash_args[@]}" 2>&1 \
+                | sed -u 's/^/[dashboard] /'
+        ) &
+        ;;
+esac
+
+# Final exec: two supported invocation patterns.
+#
+#   docker run <image>                 -> exec `hermes` with no args (legacy default)
+#   docker run <image> chat -q "..."   -> exec `hermes chat -q "..."` (legacy wrap)
+#   docker run <image> sleep infinity  -> exec `sleep infinity` directly
+#   docker run <image> bash            -> exec `bash` directly
+#
+# If the first positional arg resolves to an executable on PATH, we assume the
+# caller wants to run it directly (needed by the launcher which runs long-lived
+# `sleep infinity` sandbox containers — see tools/environments/docker.py).
+# Otherwise we treat the args as a hermes subcommand and wrap with `hermes`,
+# preserving the documented `docker run <image> <subcommand>` behavior.
+if [ $# -gt 0 ] && command -v "$1" >/dev/null 2>&1; then
     exec "$@"
 fi
 

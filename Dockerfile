@@ -19,8 +19,10 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
 # Install system dependencies in one layer, clear APT cache.
 # Florence's default production image stays lean; browser and WhatsApp
 # tooling are opt-in via build args so hosted builders do not time out.
+# tini reaps orphaned zombie processes (MCP stdio subprocesses, git, bun, etc.)
+# that would otherwise accumulate when hermes runs as PID 1. See #15012.
 RUN set -eux; \
-    packages="build-essential python3 ripgrep ffmpeg gcc python3-dev libffi-dev procps git openssh-client docker-cli tini"; \
+    packages="build-essential curl python3 ripgrep ffmpeg gcc python3-dev libffi-dev procps git openssh-client docker-cli tini"; \
     if [ "$INSTALL_NODE_RUNTIME" = "1" ] || [ "$INSTALL_BROWSER_TOOLS" = "1" ] || [ "$INSTALL_PLAYWRIGHT_BROWSERS" = "1" ] || [ "$INSTALL_WHATSAPP_BRIDGE" = "1" ]; then \
         packages="$packages nodejs npm"; \
     fi; \
@@ -40,6 +42,17 @@ WORKDIR /opt/hermes
 # across normal Python/source edits.
 COPY package.json package-lock.json /opt/hermes/
 COPY scripts/whatsapp-bridge/package.json scripts/whatsapp-bridge/package-lock.json /opt/hermes/scripts/whatsapp-bridge/
+
+# `npm_config_install_links=false` forces npm to install `file:` deps as
+# symlinks (the npm 10+ default) even on Debian's older bundled npm 9.x,
+# which defaults to `install-links=true` and installs file deps as *copies*.
+# The host-side package-lock.json is generated with a newer npm that uses
+# symlinks, so an install-as-copy produces a hidden node_modules/.package-lock.json
+# that permanently disagrees with the root lock on the @hermes/ink entry.
+# That disagreement trips the TUI launcher's `_tui_need_npm_install()`
+# check on every startup and triggers a runtime `npm install` that then
+# fails with EACCES (node_modules/ is root-owned from build time).
+ENV npm_config_install_links=false
 
 # Install optional Node dependencies and Playwright as root. The default
 # Florence deploy does not need these, so they are opt-in.

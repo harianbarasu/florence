@@ -3,6 +3,7 @@
 .plans
 docs
 website
+web
 vendor/hermes-agent
 optional-skills
 skills

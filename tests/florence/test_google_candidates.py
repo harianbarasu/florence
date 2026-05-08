@@ -73,6 +73,50 @@ def test_gmail_candidate_skips_linkedin_noise_without_household_anchors():
     assert decision.reason == "promotional_noise"
 
 
+def test_gmail_candidate_skips_already_read_mail():
+    item = GmailSyncItem(
+        gmail_message_id="gmail_read_124",
+        thread_id="thread_read_124",
+        from_address="teacher@school.edu",
+        subject="Practice moved",
+        snippet="Practice moves to Thursday 4pm to 5pm",
+        body_text="Ava soccer practice is on September 18 from 4pm to 5pm.",
+        attachment_text=None,
+        attachment_count=0,
+        received_at=datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc),
+        label_ids=("INBOX", "CATEGORY_UPDATES"),
+    )
+
+    decision = build_gmail_candidate_decision(
+        item,
+        "America/Los_Angeles",
+        now=datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc),
+    )
+
+    assert decision.kind == CandidateDecisionKind.SKIP
+    assert decision.reason == "gmail_already_read"
+
+
+def test_gmail_candidate_skips_low_value_gmail_categories():
+    item = GmailSyncItem(
+        gmail_message_id="gmail_social_124",
+        thread_id="thread_social_124",
+        from_address="updates@example.com",
+        subject="Ava has an event Friday at 4 PM",
+        snippet="Ava has a social update Friday at 4 PM.",
+        body_text="Ava has a social update Friday at 4 PM.",
+        attachment_text=None,
+        attachment_count=0,
+        received_at=datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc),
+        label_ids=("INBOX", "UNREAD", "CATEGORY_SOCIAL"),
+    )
+
+    decision = build_gmail_candidate_decision(item, "America/Los_Angeles")
+
+    assert decision.kind == CandidateDecisionKind.SKIP
+    assert decision.reason == "low_value_gmail_category"
+
+
 def test_parent_calendar_candidate_detects_child_activity():
     item = ParentCalendarSyncItem(
         google_event_id="event_123",
@@ -288,6 +332,31 @@ def test_gmail_candidate_parses_single_side_meridiem_with_dash_range():
         "start": "15:30",
         "end": "16:15",
     }
+
+
+def test_gmail_candidate_parses_standalone_single_time_for_staleness_checks():
+    item = GmailSyncItem(
+        gmail_message_id="gmail_127d",
+        thread_id="thread_127d",
+        from_address="booking@example.com",
+        subject="4 Star / GTS open gym schedule",
+        snippet="Open gym booking Friday 5/8 9:00 AM.",
+        body_text="Your booking schedule is Friday 5/8 9:00 AM.",
+        attachment_text=None,
+        attachment_count=0,
+        received_at=datetime(2026, 5, 8, 16, 0, tzinfo=timezone.utc),
+        label_ids=("INBOX", "UNREAD"),
+    )
+
+    decision = build_gmail_candidate_decision(
+        item,
+        "America/Los_Angeles",
+        now=datetime(2026, 5, 8, 16, 0, tzinfo=timezone.utc),
+    )
+
+    assert decision.kind == CandidateDecisionKind.CANDIDATE
+    assert decision.raw_metadata["temporal_evidence"]["date_match"]["date"] == "2026-05-08"
+    assert decision.raw_metadata["temporal_evidence"]["single_time"] == "09:00"
 
 
 def test_parent_calendar_candidate_uses_known_location_context():

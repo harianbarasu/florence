@@ -182,5 +182,33 @@ SCHOOL_SENDER_HINTS = (
 )
 
 
+GMAIL_LOW_VALUE_CATEGORY_LABELS = frozenset(
+    {
+        "CATEGORY_PROMOTIONS",
+        "CATEGORY_SOCIAL",
+        "CATEGORY_FORUMS",
+    }
+)
+
+GMAIL_NON_ACTIONABLE_LABELS = frozenset({"SENT", "DRAFT", "TRASH", "SPAM"})
+
+
 def count_hint_hits(source: str, hints: tuple[str, ...]) -> int:
     return sum(1 for hint in hints if hint in source)
+
+
+def normalize_gmail_label_ids(label_ids: tuple[str, ...] | list[str] | set[str]) -> set[str]:
+    return {str(label).strip().upper() for label in label_ids if str(label).strip()}
+
+
+def gmail_label_suppression_reason(label_ids: tuple[str, ...] | list[str] | set[str]) -> str | None:
+    labels = normalize_gmail_label_ids(label_ids)
+    if not labels:
+        return None
+    if labels.intersection(GMAIL_NON_ACTIONABLE_LABELS):
+        return "non_inbox_gmail_label"
+    if "UNREAD" not in labels:
+        return "gmail_already_read"
+    if labels.intersection(GMAIL_LOW_VALUE_CATEGORY_LABELS):
+        return "low_value_gmail_category"
+    return None

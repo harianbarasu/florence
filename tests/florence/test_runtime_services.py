@@ -346,6 +346,59 @@ def test_google_sync_persistence_service_stores_connection_and_candidates(tmp_pa
     store.close()
 
 
+def test_google_sync_persistence_rejects_existing_candidate_after_gmail_is_read(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    google_service = FlorenceGoogleSyncPersistenceService(store)
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    connection = GoogleConnection(
+        id="gconn_123",
+        household_id="hh_123",
+        member_id="mem_123",
+        email="parent@example.com",
+        connected_scopes=(GoogleSourceKind.GMAIL,),
+        metadata={"primary_calendar_timezone": "America/Los_Angeles"},
+    )
+    store.upsert_google_connection(connection)
+    context = HouseholdContext(
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_dm_123",
+        visible_child_names=["Ava"],
+        school_labels=["Roosevelt Elementary"],
+        activity_labels=["Soccer"],
+    )
+
+    unread_item = GmailSyncItem(
+        gmail_message_id="gmail_123",
+        thread_id="thread_123",
+        from_address="Ms. Kim <teacher@roosevelt.k12.ca.us>",
+        subject="Roosevelt Elementary soccer practice update",
+        snippet="ParentSquare reminder",
+        body_text="Ava soccer practice is on September 18 from 4pm to 5pm.",
+        attachment_text=None,
+        attachment_count=0,
+        received_at=datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc),
+        label_ids=("INBOX", "UNREAD", "CATEGORY_UPDATES"),
+    )
+    first = google_service.persist_sync_batch(
+        FlorenceGoogleSyncBatch(connection=connection, context=context, gmail_items=[unread_item])
+    )
+    assert first.pending_review_count == 1
+    candidate_id = first.candidates[0].id
+
+    read_item = replace(unread_item, label_ids=("INBOX", "CATEGORY_UPDATES"))
+    second = google_service.persist_sync_batch(
+        FlorenceGoogleSyncBatch(connection=connection, context=context, gmail_items=[read_item])
+    )
+
+    assert second.candidates == []
+    persisted = store.get_imported_candidate(candidate_id)
+    assert persisted is not None
+    assert persisted.state == CandidateState.REJECTED
+    assert persisted.metadata["suppressed_reason"] == "gmail_already_read"
+    store.close()
+
+
 def test_candidate_review_prompt_asks_once_for_unknown_source_classification(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     review_service = FlorenceCandidateReviewService(store)
@@ -2394,6 +2447,9 @@ def test_operations_briefing_respects_explicit_household_quiet_hours(tmp_path, m
     )
     routines = manager.ensure_briefing_routines(household_id="hh_123")
     morning = next(routine for routine in routines if routine.metadata.get("brief_kind") == "morning")
+    for routine in routines:
+        if routine.id != morning.id:
+            store.upsert_household_routine(replace(routine, status=HouseholdRoutineStatus.PAUSED, next_due_at=None))
     store.upsert_household_routine(
         replace(
             morning,
@@ -2431,6 +2487,96 @@ def test_operations_briefing_respects_explicit_household_quiet_hours(tmp_path, m
     updated = store.get_household_routine(morning.id)
     assert updated is not None
     assert updated.last_completed_at is None
+    store.close()
+
+
+def test_operations_skips_stale_morning_briefing_in_afternoon(tmp_path, monkeypatch):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    onboarding_service = FlorenceOnboardingSessionService(store)
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        display_name="Maya",
+    )
+    manager = FlorenceHouseholdManagerService(store)
+    routines = manager.ensure_briefing_routines(
+        household_id="hh_123",
+        now=datetime(2026, 3, 24, 12, 0, tzinfo=timezone.utc),
+    )
+    morning = next(routine for routine in routines if routine.metadata.get("brief_kind") == "morning")
+    for routine in routines:
+        if routine.id != morning.id:
+            store.upsert_household_routine(replace(routine, status=HouseholdRoutineStatus.PAUSED, next_due_at=None))
+    store.upsert_household_routine(
+        replace(
+            morning,
+            status=HouseholdRoutineStatus.ACTIVE,
+            next_due_at="2026-03-24T13:45:00+00:00",
+            last_completed_at=None,
+        )
+    )
+
+    class _BriefingChat:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def compose_brief(self, *, household_id, channel_id, actor_member_id, brief_kind):  # noqa: ARG002
+            self.calls += 1
+            return "Morning brief: Theo has school."
+
+    chat = _BriefingChat()
+    linq = _FakeLinqClient()
+    delivery = FlorenceChannelDeliveryService(
+        store,
+        linq_client_getter=lambda: linq,
+        sendblue_client_getter=lambda: None,
+    )
+    operations = FlorenceHouseholdOperationsService(
+        store,
+        delivery_service=delivery,
+        household_chat_service_getter=lambda: chat,
+        now_getter=lambda: datetime(2026, 3, 24, 19, 30, tzinfo=timezone.utc),
+    )
+    monkeypatch.setattr(
+        operations,
+        "_utc_now",
+        lambda: datetime(2026, 3, 24, 19, 30, tzinfo=timezone.utc),
+    )
+
+    sent = operations.dispatch_due_household_briefings(household_id="hh_123")
+
+    assert sent == 0
+    assert chat.calls == 0
+    assert linq.sent == []
+    updated = store.get_household_routine(morning.id)
+    assert updated is not None
+    assert updated.last_completed_at is not None
+    records = [
+        record
+        for record in store.list_turn_records(household_id="hh_123")
+        if record["trigger_kind"] == "scheduled_brief"
+    ]
+    assert records[0]["outcome"]["no_reply_reason"] == "briefing_window_expired"
     store.close()
 
 

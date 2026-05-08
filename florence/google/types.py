@@ -46,6 +46,7 @@ class GmailSyncItem:
     attachment_text: str | None
     attachment_count: int
     received_at: datetime | None
+    label_ids: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)

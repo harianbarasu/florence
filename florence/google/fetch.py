@@ -358,6 +358,7 @@ def build_gmail_sync_item(
             received_at = datetime.fromtimestamp(int(str(internal_date)) / 1000, tz=timezone.utc)
         except (TypeError, ValueError):
             received_at = None
+    label_ids = tuple(str(label).strip() for label in list(message.get("labelIds") or []) if str(label).strip())
 
     return GmailSyncItem(
         gmail_message_id=str(message.get("id") or ""),
@@ -369,6 +370,7 @@ def build_gmail_sync_item(
         attachment_text=attachment_text,
         attachment_count=_count_attachment_parts(payload) if attachment_count is None else attachment_count,
         received_at=received_at,
+        label_ids=label_ids,
     )
 
 

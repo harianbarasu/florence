@@ -32,6 +32,7 @@ from florence.google import (
     merge_google_grounding_hints,
     refresh_google_access_token,
 )
+from florence.google.sync import _stable_candidate_id, gmail_handled_or_low_value_reason, gmail_labels
 from florence.onboarding import OnboardingTransition
 from florence.runtime.candidate_review import (
     _SourceRuleService,
@@ -291,6 +292,25 @@ class FlorenceGoogleSyncPersistenceService:
             metadata=merged_metadata,
         )
 
+    def _suppress_existing_handled_gmail_candidates(self, batch: FlorenceGoogleSyncBatch) -> None:
+        for item in batch.gmail_items:
+            reason = gmail_handled_or_low_value_reason(item)
+            if reason is None:
+                continue
+            candidate_id = _stable_candidate_id(
+                batch.connection.household_id,
+                batch.connection.member_id,
+                GoogleSourceKind.GMAIL,
+                f"gmail:{item.gmail_message_id}",
+            )
+            existing = self.store.get_imported_candidate(candidate_id)
+            if existing is None or existing.state not in {CandidateState.PENDING_REVIEW, CandidateState.QUARANTINED}:
+                continue
+            metadata = dict(existing.metadata)
+            metadata["suppressed_reason"] = reason
+            metadata["suppressed_by_gmail_labels"] = sorted(gmail_labels(item))
+            self.store.upsert_imported_candidate(replace(existing, state=CandidateState.REJECTED, metadata=metadata))
+
     def persist_sync_batch(self, batch: FlorenceGoogleSyncBatch) -> FlorenceGoogleSyncResult:
         self.store.upsert_google_gmail_messages(
             connection=batch.connection,
@@ -300,6 +320,7 @@ class FlorenceGoogleSyncPersistenceService:
             connection=batch.connection,
             items=list(batch.calendar_items),
         )
+        self._suppress_existing_handled_gmail_candidates(batch)
         result = build_google_import_candidates(batch)
         persisted = [
             self.store.upsert_imported_candidate(

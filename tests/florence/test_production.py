@@ -2,7 +2,7 @@ import json
 import threading
 import time
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
@@ -1899,7 +1899,7 @@ def test_production_service_run_sync_pass_sends_due_household_briefing(tmp_path)
         replace(
             morning,
             status=HouseholdRoutineStatus.ACTIVE,
-            next_due_at="2026-03-24T00:00:00+00:00",
+                next_due_at=(datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
         )
     )
     result = service.run_sync_pass()
@@ -1984,7 +1984,7 @@ def test_production_service_run_sync_pass_prefers_household_group_for_briefing(t
         replace(
             morning,
             status=HouseholdRoutineStatus.ACTIVE,
-            next_due_at="2026-03-24T00:00:00+00:00",
+                next_due_at=(datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
         )
     )
     result = service.run_sync_pass()
@@ -2064,7 +2064,7 @@ def test_production_service_run_automation_pass_skips_quiet_pickup_check(tmp_pat
         replace(
             pickup,
             status=HouseholdRoutineStatus.ACTIVE,
-            next_due_at="2026-03-24T00:00:00+00:00",
+                next_due_at=(datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
         )
     )
 

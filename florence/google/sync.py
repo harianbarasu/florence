@@ -22,6 +22,7 @@ from florence.relevance import (
     build_gmail_candidate_decision,
     build_parent_calendar_candidate_decision,
 )
+from florence.relevance.common import gmail_label_suppression_reason, normalize_gmail_label_ids
 
 _PLATFORM_DOMAIN_HINTS = {
     "parentsquare": "ParentSquare",
@@ -372,6 +373,14 @@ def _calendar_source_identifier(item: ParentCalendarSyncItem) -> str:
     if item.calendar_primary or not item.calendar_id:
         return f"google_calendar:{item.google_event_id}"
     return f"google_calendar:{item.calendar_id}:{item.google_event_id}"
+
+
+def gmail_labels(item: GmailSyncItem) -> set[str]:
+    return normalize_gmail_label_ids(item.label_ids)
+
+
+def gmail_handled_or_low_value_reason(item: GmailSyncItem) -> str | None:
+    return gmail_label_suppression_reason(item.label_ids)
 
 
 def _compact_source_text(raw: str | None, *, max_length: int) -> str | None:

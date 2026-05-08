@@ -6,7 +6,7 @@ import json
 import logging
 import re
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
@@ -24,7 +24,7 @@ from florence.ops.turn_records import record_turn_outcome
 from florence.runtime.candidate_review import FlorenceCandidateReviewService
 from florence.runtime.delivery import FlorenceChannelDeliveryService
 from florence.runtime.household_manager import FlorenceHouseholdManagerService
-from florence.runtime.services import _parse_local_time_spec
+from florence.runtime.services import _parse_iso_datetime, _parse_local_time_spec
 from florence.state import FlorenceStateDB
 from florence.turns import FlorenceTurnDisposition, FlorenceTurnTrigger, build_system_turn_envelope
 
@@ -35,6 +35,14 @@ _SYNC_UPDATE_BRIEF_INTERVAL_SECONDS = 6 * 60 * 60
 _REVIEW_BATCH_LIMIT = 3
 _REVIEW_QUIET_HOURS_START = 21
 _REVIEW_QUIET_HOURS_END = 8
+_BRIEFING_STALE_GRACE_MINUTES = {
+    HouseholdBriefingKind.MORNING: 180,
+    HouseholdBriefingKind.PICKUP: 150,
+    HouseholdBriefingKind.SCHOOL: 180,
+    HouseholdBriefingKind.EVENING: 180,
+    HouseholdBriefingKind.WEEKLY: 360,
+    HouseholdBriefingKind.MEAL: 300,
+}
 
 
 class FlorenceHouseholdOperationsService:
@@ -929,6 +937,26 @@ class FlorenceHouseholdOperationsService:
                     no_reply_reason=blocked_reason,
                 )
                 continue
+            if self._briefing_window_expired(routine=routine, brief_kind=brief_kind, store=target_store):
+                manager_service.mark_briefing_routine_sent(routine_id=routine.id)
+                self._record_operation_turn(
+                    store=target_store,
+                    trigger_kind=FlorenceTurnTrigger.SCHEDULED_BRIEF,
+                    household_id=household_id,
+                    channel=channel,
+                    actor_member_id=recipient_member_id,
+                    message_text="",
+                    disposition=FlorenceTurnDisposition.NO_REPLY,
+                    metadata={
+                        "operation_kind": "scheduled_brief",
+                        "routine_id": routine.id,
+                        "brief_kind": brief_kind.value,
+                        "suppressed_reason": "briefing_window_expired",
+                    },
+                    scheduled_work_ids=(routine.id,),
+                    no_reply_reason="briefing_window_expired",
+                )
+                continue
             try:
                 brief_message = self._household_chat_service_getter().compose_brief(
                     household_id=household_id,
@@ -991,6 +1019,29 @@ class FlorenceHouseholdOperationsService:
                 )
                 sent += 1
         return sent
+
+    def _briefing_window_expired(
+        self,
+        *,
+        routine: Any,
+        brief_kind: HouseholdBriefingKind,
+        store: FlorenceStateDB,
+    ) -> bool:
+        scheduled_at = _parse_iso_datetime(getattr(routine, "next_due_at", None))
+        if scheduled_at is None:
+            return False
+        household = store.get_household(routine.household_id)
+        timezone_name = str(getattr(household, "timezone", "") or "").strip() or "UTC"
+        try:
+            zone = ZoneInfo(timezone_name)
+        except Exception:
+            zone = timezone.utc
+        local_due = scheduled_at.astimezone(zone)
+        local_now = self._utc_now().astimezone(zone)
+        if local_now <= local_due:
+            return False
+        grace_minutes = _BRIEFING_STALE_GRACE_MINUTES.get(brief_kind, 180)
+        return local_now > local_due + timedelta(minutes=grace_minutes)
 
     def dispatch_due_sync_update_briefs(
         self,

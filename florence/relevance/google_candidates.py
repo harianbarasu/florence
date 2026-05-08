@@ -19,6 +19,7 @@ from florence.relevance.common import (
     PROMOTIONAL_HINTS,
     SCHOOL_SENDER_HINTS,
     count_hint_hits,
+    gmail_label_suppression_reason,
 )
 from florence.relevance.temporal import (
     ParsedExplicitDate,
@@ -28,6 +29,7 @@ from florence.relevance.temporal import (
     parse_single_time,
     parse_time_range,
 )
+
 
 class CandidateDecisionKind(StrEnum):
     CANDIDATE = "candidate"
@@ -150,6 +152,10 @@ def _build_gmail_candidate_decision_heuristic(
     lowered_source = source_text.lower()
     sender_lower = item.from_address.lower()
     sender_domain = _sender_domain(item.from_address)
+
+    label_suppression_reason = gmail_label_suppression_reason(item.label_ids)
+    if label_suppression_reason is not None:
+        return CandidateDecision(kind=CandidateDecisionKind.SKIP, reason=label_suppression_reason)
 
     child_terms = list(context.visible_child_names) + list(context.child_aliases) if context is not None else []
     school_terms = list(context.school_labels) if context is not None else []

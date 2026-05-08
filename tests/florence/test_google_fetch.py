@@ -16,6 +16,7 @@ def test_build_gmail_sync_item_extracts_headers_body_and_attachment_count():
     message = {
         "id": "gmail_123",
         "threadId": "thread_123",
+        "labelIds": ["INBOX", "UNREAD", "CATEGORY_UPDATES"],
         "snippet": "Practice moved to Thursday.",
         "internalDate": "1799726400000",
         "payload": {
@@ -47,6 +48,7 @@ def test_build_gmail_sync_item_extracts_headers_body_and_attachment_count():
     assert item.body_text == "Ava practice moved to Thursday at 4 pm."
     assert item.attachment_count == 1
     assert item.attachment_text is None
+    assert item.label_ids == ("INBOX", "UNREAD", "CATEGORY_UPDATES")
 
 
 def test_build_gmail_sync_item_preserves_multiline_body_structure():

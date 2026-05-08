@@ -1888,7 +1888,7 @@ class FlorenceStateDB:
                     item.attachment_count,
                     _isoformat_or_none(item.received_at),
                     _timestamp_or_none(item.received_at),
-                    _json_dumps({}),
+                    _json_dumps({"label_ids": list(getattr(item, "label_ids", ()) or ())}),
                     now,
                     now,
                 ),

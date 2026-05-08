@@ -179,7 +179,13 @@ def parse_single_time(source: str) -> ParsedTime | None:
         flags=re.IGNORECASE,
     )
     if not match:
-        return None
+        match = re.search(
+            r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b",
+            source,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return None
 
     return ParsedTime(
         hours=_normalize_hours(int(match.group(1)), match.group(3)),

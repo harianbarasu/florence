@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 import html
 import hashlib
 import logging
@@ -22,7 +23,6 @@ from florence.contracts import (
     Household,
     HouseholdStatus,
     Member,
-    MemberRole,
 )
 from florence.linq import FlorenceLinqClient
 from florence.linq.media import enrich_linq_payload_with_media_text
@@ -60,7 +60,6 @@ logger = logging.getLogger(__name__)
 
 _HOUSEHOLD_CALENDAR_LINK_SHARED_MEMBER_IDS_KEY = "calendar_link_shared_member_ids"
 _WEB_CHAT_PROVIDER = "web"
-_DEFAULT_WEB_CHAT_HOUSEHOLD_ID = "hh_web_test"
 
 
 def _mask_transport_handle(value: Any) -> str | None:
@@ -201,11 +200,21 @@ class FlorenceProductionService:
     def close(self) -> None:
         self.store.close()
 
-    def handle_web_chat_snapshot(self) -> FlorenceHTTPResult:
+    def handle_web_chat_snapshot(
+        self,
+        *,
+        auth_email: str | None = None,
+        proxy_secret: str | None = None,
+    ) -> FlorenceHTTPResult:
         if not self.settings.web_chat.enabled:
             return self._json_result(404, {"ok": False, "error": "web_chat_disabled"})
+        access_error = self._authorize_web_chat_request(auth_email=auth_email, proxy_secret=proxy_secret)
+        if access_error is not None:
+            return access_error
         try:
-            household, member, channel = self._ensure_web_chat_context()
+            household, member, channel = self._ensure_web_chat_context(auth_email=auth_email)
+        except PermissionError as exc:
+            return self._json_result(403, {"ok": False, "error": str(exc)})
         except ValueError as exc:
             return self._json_result(400, {"ok": False, "error": str(exc)})
         except Exception:
@@ -213,16 +222,25 @@ class FlorenceProductionService:
             return self._json_result(500, {"ok": False, "error": "internal_web_chat_error"})
         return self._json_result(200, self._web_chat_payload(household=household, member=member, channel=channel))
 
-    def handle_web_chat_message(self, *, payload: dict[str, Any]) -> FlorenceHTTPResult:
+    def handle_web_chat_message(
+        self,
+        *,
+        payload: dict[str, Any],
+        auth_email: str | None = None,
+        proxy_secret: str | None = None,
+    ) -> FlorenceHTTPResult:
         if not self.settings.web_chat.enabled:
             return self._json_result(404, {"ok": False, "error": "web_chat_disabled"})
+        access_error = self._authorize_web_chat_request(auth_email=auth_email, proxy_secret=proxy_secret)
+        if access_error is not None:
+            return access_error
 
         message = str(payload.get("message") or "").strip()
         if not message:
             return self._json_result(400, {"ok": False, "error": "web_chat_message_required"})
 
         try:
-            household, member, channel = self._ensure_web_chat_context()
+            household, member, channel = self._ensure_web_chat_context(auth_email=auth_email)
             prior_history = self.store.list_channel_messages(channel_id=channel.id, limit=24)
             self._append_web_chat_message(
                 household_id=household.id,
@@ -257,73 +275,51 @@ class FlorenceProductionService:
                     reply=reply_text,
                 ),
             )
+        except PermissionError as exc:
+            return self._json_result(403, {"ok": False, "error": str(exc)})
         except ValueError as exc:
             return self._json_result(400, {"ok": False, "error": str(exc)})
         except Exception:
             logger.exception("Florence web chat turn failed")
             return self._json_result(500, {"ok": False, "error": "internal_web_chat_error"})
 
-    def _ensure_web_chat_context(self) -> tuple[Household, Member, Channel]:
-        config = self.settings.web_chat
-        household_id = config.household_id or _DEFAULT_WEB_CHAT_HOUSEHOLD_ID
-        household = self.store.get_household(household_id)
-        if household is None:
-            household = self.store.upsert_household(
-                Household(
-                    id=household_id,
-                    name=config.household_name,
-                    timezone=config.timezone,
-                    status=HouseholdStatus.ACTIVE,
-                    settings={"web_chat_test_surface": True},
-                )
-            )
+    def _authorize_web_chat_request(
+        self,
+        *,
+        auth_email: str | None,
+        proxy_secret: str | None,
+    ) -> FlorenceHTTPResult | None:
+        configured_secret = (self.settings.web_chat.proxy_secret or "").strip()
+        if not configured_secret:
+            return self._json_result(503, {"ok": False, "error": "web_chat_proxy_secret_unconfigured"})
+        supplied_secret = str(proxy_secret or "").strip()
+        if not supplied_secret or not hmac.compare_digest(supplied_secret, configured_secret):
+            return self._json_result(403, {"ok": False, "error": "web_chat_proxy_secret_invalid"})
+        if not self._normalize_web_chat_email(auth_email):
+            return self._json_result(401, {"ok": False, "error": "web_chat_auth_required"})
+        return None
 
-        member = self._resolve_web_chat_member(household=household)
+    def _ensure_web_chat_context(self, *, auth_email: str | None) -> tuple[Household, Member, Channel]:
+        connection = self.store.find_google_connection_by_email(
+            email=self._normalize_web_chat_email(auth_email),
+            active_only=True,
+        )
+        if connection is None:
+            raise PermissionError("unknown_web_google_identity")
+
+        household = self.store.get_household(connection.household_id)
+        member = self.store.get_member(connection.member_id)
+        if household is None or household.status != HouseholdStatus.ACTIVE:
+            raise PermissionError("unknown_web_google_identity")
+        if member is None or member.household_id != household.id or member.status != "active":
+            raise PermissionError("unknown_web_google_identity")
+
         channel = self._resolve_web_chat_channel(household=household, member=member)
         return household, member, channel
 
-    def _resolve_web_chat_member(self, *, household: Household) -> Member:
-        configured_member_id = self.settings.web_chat.member_id
-        if configured_member_id:
-            member = self.store.get_member(configured_member_id)
-            if member is not None:
-                if member.household_id != household.id:
-                    raise ValueError("web_chat_member_household_mismatch")
-                return member
-            return self.store.upsert_member(
-                Member(
-                    id=configured_member_id,
-                    household_id=household.id,
-                    display_name=self.settings.web_chat.member_name,
-                    role=MemberRole.ADMIN,
-                )
-            )
-
-        members = [
-            member
-            for member in self.store.list_members(household.id)
-            if member.status == "active" and member.role in {MemberRole.ADMIN, MemberRole.PARENT}
-        ]
-        if members and self.settings.web_chat.household_id:
-            return members[0]
-
-        member_id = _stable_web_id("mem", household.id, _WEB_CHAT_PROVIDER)
-        member = self.store.get_member(member_id)
-        if member is not None:
-            return member
-        return self.store.upsert_member(
-            Member(
-                id=member_id,
-                household_id=household.id,
-                display_name=self.settings.web_chat.member_name,
-                role=MemberRole.ADMIN,
-            )
-        )
-
     def _resolve_web_chat_channel(self, *, household: Household, member: Member) -> Channel:
-        configured_channel_id = self.settings.web_chat.channel_id
-        provider_channel_id = configured_channel_id or f"web-chat:{household.id}:{member.id}"
-        channel_id = configured_channel_id or _stable_web_id("chan", household.id, member.id, _WEB_CHAT_PROVIDER)
+        provider_channel_id = f"web-chat:{household.id}:{member.id}"
+        channel_id = _stable_web_id("chan", household.id, member.id, _WEB_CHAT_PROVIDER)
 
         channel = self.store.get_channel(channel_id)
         if channel is not None:
@@ -355,9 +351,9 @@ class FlorenceProductionService:
                 provider=_WEB_CHAT_PROVIDER,
                 provider_channel_id=provider_channel_id,
                 channel_type=ChannelType.WEB_CHAT,
-                title="Web chat test",
+                title="Web chat",
                 metadata={
-                    "test_surface": True,
+                    "auth_required": True,
                     "external_delivery": "disabled",
                 },
             )
@@ -371,7 +367,8 @@ class FlorenceProductionService:
         provider_channel_id: str,
     ) -> Channel:
         metadata = dict(channel.metadata)
-        metadata.setdefault("test_surface", True)
+        metadata.pop("test_surface", None)
+        metadata["auth_required"] = True
         metadata["external_delivery"] = "disabled"
         return self.store.upsert_channel(
             replace(
@@ -380,7 +377,7 @@ class FlorenceProductionService:
                 provider=_WEB_CHAT_PROVIDER,
                 provider_channel_id=channel.provider_channel_id or provider_channel_id,
                 channel_type=ChannelType.WEB_CHAT,
-                title=channel.title or "Web chat test",
+                title=channel.title or "Web chat",
                 metadata=metadata,
             )
         )
@@ -410,12 +407,16 @@ class FlorenceProductionService:
                 body=body,
                 metadata={
                     "provider": _WEB_CHAT_PROVIDER,
-                    "test_surface": True,
+                    "auth_required": True,
                     "external_delivery": "disabled",
                 },
                 created_at=time.time(),
             )
         )
+
+    @staticmethod
+    def _normalize_web_chat_email(email: str | None) -> str:
+        return str(email or "").strip().lower()
 
     def _web_chat_payload(
         self,

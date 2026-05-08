@@ -34,22 +34,12 @@ def test_florence_settings_reads_sendblue_blocked_numbers(tmp_path, monkeypatch)
 def test_florence_settings_reads_web_chat_config(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("FLORENCE_WEB_CHAT_ENABLED", "true")
-    monkeypatch.setenv("FLORENCE_WEB_CHAT_HOUSEHOLD_ID", "hh_test")
-    monkeypatch.setenv("FLORENCE_WEB_CHAT_MEMBER_ID", "mem_test")
-    monkeypatch.setenv("FLORENCE_WEB_CHAT_CHANNEL_ID", "chan_test")
-    monkeypatch.setenv("FLORENCE_WEB_CHAT_TIMEZONE", "America/New_York")
-    monkeypatch.setenv("FLORENCE_WEB_CHAT_HOUSEHOLD_NAME", "Test family")
-    monkeypatch.setenv("FLORENCE_WEB_CHAT_MEMBER_NAME", "Jackson")
+    monkeypatch.setenv("FLORENCE_WEB_CHAT_PROXY_SECRET", "proxy-secret")
 
     settings = FlorenceSettings.from_env()
 
     assert settings.web_chat.enabled is True
-    assert settings.web_chat.household_id == "hh_test"
-    assert settings.web_chat.member_id == "mem_test"
-    assert settings.web_chat.channel_id == "chan_test"
-    assert settings.web_chat.timezone == "America/New_York"
-    assert settings.web_chat.household_name == "Test family"
-    assert settings.web_chat.member_name == "Jackson"
+    assert settings.web_chat.proxy_secret == "proxy-secret"
 
 
 def test_florence_settings_supports_railway_public_domain_and_port(tmp_path, monkeypatch):

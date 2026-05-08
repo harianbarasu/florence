@@ -177,12 +177,7 @@ class FlorenceBriefingRuntimeConfig:
 @dataclass(slots=True)
 class FlorenceWebChatRuntimeConfig:
     enabled: bool = False
-    household_id: str | None = None
-    member_id: str | None = None
-    channel_id: str | None = None
-    timezone: str = "America/Los_Angeles"
-    household_name: str = "Florence web test household"
-    member_name: str = "Web tester"
+    proxy_secret: str | None = None
 
 
 @dataclass(slots=True)
@@ -438,63 +433,15 @@ class FlorenceSettings:
                         default=False,
                     )
                 ),
-                household_id=_as_optional_string(
+                proxy_secret=_as_optional_string(
                     _env_or_config(
-                        ("FLORENCE_WEB_CHAT_HOUSEHOLD_ID",),
+                        ("FLORENCE_WEB_CHAT_PROXY_SECRET",),
                         florence_cfg,
                         "web_chat",
-                        "household_id",
+                        "proxy_secret",
                         default=None,
                     )
                 ),
-                member_id=_as_optional_string(
-                    _env_or_config(
-                        ("FLORENCE_WEB_CHAT_MEMBER_ID",),
-                        florence_cfg,
-                        "web_chat",
-                        "member_id",
-                        default=None,
-                    )
-                ),
-                channel_id=_as_optional_string(
-                    _env_or_config(
-                        ("FLORENCE_WEB_CHAT_CHANNEL_ID",),
-                        florence_cfg,
-                        "web_chat",
-                        "channel_id",
-                        default=None,
-                    )
-                ),
-                timezone=str(
-                    _env_or_config(
-                        ("FLORENCE_WEB_CHAT_TIMEZONE",),
-                        florence_cfg,
-                        "web_chat",
-                        "timezone",
-                        default="America/Los_Angeles",
-                    )
-                ).strip()
-                or "America/Los_Angeles",
-                household_name=str(
-                    _env_or_config(
-                        ("FLORENCE_WEB_CHAT_HOUSEHOLD_NAME",),
-                        florence_cfg,
-                        "web_chat",
-                        "household_name",
-                        default="Florence web test household",
-                    )
-                ).strip()
-                or "Florence web test household",
-                member_name=str(
-                    _env_or_config(
-                        ("FLORENCE_WEB_CHAT_MEMBER_NAME",),
-                        florence_cfg,
-                        "web_chat",
-                        "member_name",
-                        default="Web tester",
-                    )
-                ).strip()
-                or "Web tester",
             ),
             redis=FlorenceRedisRuntimeConfig(
                 url=_env_or_config(

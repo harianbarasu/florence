@@ -196,7 +196,12 @@ class _FlorenceRequestHandler(BaseHTTPRequestHandler):
             self._write_response(result)
             return
         if parsed.path == "/v1/web/chat":
-            self._write_response(self._service().handle_web_chat_snapshot())
+            self._write_response(
+                self._service().handle_web_chat_snapshot(
+                    auth_email=self.headers.get("x-florence-auth-email"),
+                    proxy_secret=self.headers.get("x-florence-web-secret"),
+                )
+            )
             return
         self.send_error(404, "not_found")
 
@@ -254,7 +259,13 @@ class _FlorenceRequestHandler(BaseHTTPRequestHandler):
                     )
                 )
                 return
-            self._write_response(self._service().handle_web_chat_message(payload=payload))
+            self._write_response(
+                self._service().handle_web_chat_message(
+                    payload=payload,
+                    auth_email=self.headers.get("x-florence-auth-email"),
+                    proxy_secret=self.headers.get("x-florence-web-secret"),
+                )
+            )
             return
         self.send_error(404, "not_found")
 

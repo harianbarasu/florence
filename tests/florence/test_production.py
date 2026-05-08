@@ -144,6 +144,41 @@ class _FakeWebChatService:
         return SimpleNamespace(text=f"{self.reply_text}: {kwargs['message_text']}")
 
 
+def _seed_web_chat_identity(
+    store: FlorenceStateDB,
+    *,
+    email: str = "jackson@example.com",
+    household_id: str = "hh_web_family",
+    member_id: str = "mem_jackson",
+) -> str:
+    store.upsert_household(
+        Household(
+            id=household_id,
+            name="Jackson family",
+            timezone="America/Los_Angeles",
+        )
+    )
+    store.upsert_member(
+        Member(
+            id=member_id,
+            household_id=household_id,
+            display_name="Jackson",
+            role=MemberRole.PARENT,
+        )
+    )
+    store.upsert_google_connection(
+        GoogleConnection(
+            id="gconn_jackson",
+            household_id=household_id,
+            member_id=member_id,
+            email=email,
+            connected_scopes=(GoogleSourceKind.GOOGLE_CALENDAR,),
+            active=True,
+        )
+    )
+    return email
+
+
 def _simulate_test_onboarding_turn(
     onboarding_service,
     *,
@@ -345,20 +380,26 @@ def test_production_service_web_chat_disabled_by_default(tmp_path):
 def test_production_service_web_chat_uses_real_chat_path_without_external_delivery(tmp_path):
     settings = replace(
         _build_settings(tmp_path),
-        web_chat=FlorenceWebChatRuntimeConfig(enabled=True),
+        web_chat=FlorenceWebChatRuntimeConfig(enabled=True, proxy_secret="test-secret"),
     )
     store = FlorenceStateDB(settings.server.db_path)
+    auth_email = _seed_web_chat_identity(store)
     service = FlorenceProductionService(settings, store=store)
     service.household_chat_service = _FakeWebChatService("Florence")
     service.linq = _FakeLinqClient()
 
-    result = service.handle_web_chat_message(payload={"message": "What matters today?"})
+    result = service.handle_web_chat_message(
+        payload={"message": "What matters today?"},
+        auth_email=auth_email.upper(),
+        proxy_secret="test-secret",
+    )
 
     assert result.status_code == 200
     payload = json.loads(result.body)
     assert payload["ok"] is True
     assert payload["reply"] == "Florence: What matters today?"
-    assert payload["household"]["id"] == "hh_web_test"
+    assert payload["household"]["id"] == "hh_web_family"
+    assert payload["member"]["id"] == "mem_jackson"
     assert payload["channel"]["provider"] == "web"
     assert payload["channel"]["type"] == "web_chat"
     assert service.linq.sent == []
@@ -367,13 +408,18 @@ def test_production_service_web_chat_uses_real_chat_path_without_external_delive
     assert [message.sender_role.value for message in messages] == ["user", "assistant"]
     assert messages[0].body == "What matters today?"
     assert messages[0].metadata["provider"] == "web"
+    assert messages[0].metadata["auth_required"] is True
     assert messages[0].metadata["external_delivery"] == "disabled"
     assert messages[1].body == "Florence: What matters today?"
-    assert service.household_chat_service.calls[0]["household_id"] == "hh_web_test"
+    assert service.household_chat_service.calls[0]["household_id"] == "hh_web_family"
     assert service.household_chat_service.calls[0]["message_text"] == "What matters today?"
     assert service.household_chat_service.calls[0]["conversation_history"] == []
 
-    second = service.handle_web_chat_message(payload={"message": "And tomorrow?"})
+    second = service.handle_web_chat_message(
+        payload={"message": "And tomorrow?"},
+        auth_email=auth_email,
+        proxy_secret="test-secret",
+    )
 
     assert second.status_code == 200
     assert [message["role"] for message in json.loads(second.body)["messages"]] == [
@@ -389,35 +435,71 @@ def test_production_service_web_chat_uses_real_chat_path_without_external_delive
     store.close()
 
 
-def test_production_service_web_chat_uses_configured_context(tmp_path):
+def test_production_service_web_chat_requires_auth(tmp_path):
     settings = replace(
         _build_settings(tmp_path),
-        web_chat=FlorenceWebChatRuntimeConfig(
-            enabled=True,
-            household_id="hh_configured",
-            member_id="mem_configured",
-            channel_id="chan_configured",
-            household_name="Configured family",
-            member_name="Jackson",
-            timezone="America/New_York",
-        ),
+        web_chat=FlorenceWebChatRuntimeConfig(enabled=True, proxy_secret="test-secret"),
     )
     store = FlorenceStateDB(settings.server.db_path)
     service = FlorenceProductionService(settings, store=store)
-    service.household_chat_service = _FakeWebChatService()
 
-    result = service.handle_web_chat_snapshot()
+    result = service.handle_web_chat_snapshot(proxy_secret="test-secret")
+
+    assert result.status_code == 401
+    assert json.loads(result.body)["error"] == "web_chat_auth_required"
+    store.close()
+
+
+def test_production_service_web_chat_requires_proxy_secret(tmp_path):
+    settings = replace(
+        _build_settings(tmp_path),
+        web_chat=FlorenceWebChatRuntimeConfig(enabled=True, proxy_secret="test-secret"),
+    )
+    store = FlorenceStateDB(settings.server.db_path)
+    service = FlorenceProductionService(settings, store=store)
+
+    result = service.handle_web_chat_snapshot(auth_email="jackson@example.com")
+
+    assert result.status_code == 403
+    assert json.loads(result.body)["error"] == "web_chat_proxy_secret_invalid"
+    store.close()
+
+
+def test_production_service_web_chat_uses_authenticated_google_identity(tmp_path):
+    settings = replace(
+        _build_settings(tmp_path),
+        web_chat=FlorenceWebChatRuntimeConfig(enabled=True, proxy_secret="test-secret"),
+    )
+    store = FlorenceStateDB(settings.server.db_path)
+    auth_email = _seed_web_chat_identity(store, email="Jackson@Example.com")
+    service = FlorenceProductionService(settings, store=store)
+
+    result = service.handle_web_chat_snapshot(auth_email=auth_email.lower(), proxy_secret="test-secret")
 
     assert result.status_code == 200
     payload = json.loads(result.body)
-    assert payload["household"]["id"] == "hh_configured"
-    assert payload["household"]["name"] == "Configured family"
-    assert payload["household"]["timezone"] == "America/New_York"
-    assert payload["member"]["id"] == "mem_configured"
+    assert payload["household"]["id"] == "hh_web_family"
+    assert payload["household"]["name"] == "Jackson family"
+    assert payload["household"]["timezone"] == "America/Los_Angeles"
+    assert payload["member"]["id"] == "mem_jackson"
     assert payload["member"]["displayName"] == "Jackson"
-    assert payload["channel"]["id"] == "chan_configured"
     assert payload["channel"]["provider"] == "web"
     assert payload["channel"]["type"] == "web_chat"
+    store.close()
+
+
+def test_production_service_web_chat_rejects_unknown_google_identity(tmp_path):
+    settings = replace(
+        _build_settings(tmp_path),
+        web_chat=FlorenceWebChatRuntimeConfig(enabled=True, proxy_secret="test-secret"),
+    )
+    store = FlorenceStateDB(settings.server.db_path)
+    service = FlorenceProductionService(settings, store=store)
+
+    result = service.handle_web_chat_snapshot(auth_email="unknown@example.com", proxy_secret="test-secret")
+
+    assert result.status_code == 403
+    assert json.loads(result.body)["error"] == "unknown_web_google_identity"
     store.close()
 
 

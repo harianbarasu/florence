@@ -63,16 +63,24 @@ class _FailingAgent:
 class _FakeWebChatService:
     def __init__(self):
         self.payload = None
+        self.snapshot_auth_email = None
+        self.snapshot_proxy_secret = None
+        self.message_auth_email = None
+        self.message_proxy_secret = None
 
-    def handle_web_chat_snapshot(self):
+    def handle_web_chat_snapshot(self, *, auth_email, proxy_secret):
+        self.snapshot_auth_email = auth_email
+        self.snapshot_proxy_secret = proxy_secret
         return FlorenceHTTPResult(
             status_code=200,
             content_type="application/json; charset=utf-8",
             body=json.dumps({"ok": True, "messages": []}),
         )
 
-    def handle_web_chat_message(self, *, payload):
+    def handle_web_chat_message(self, *, payload, auth_email, proxy_secret):
         self.payload = payload
+        self.message_auth_email = auth_email
+        self.message_proxy_secret = proxy_secret
         return FlorenceHTTPResult(
             status_code=200,
             content_type="application/json; charset=utf-8",
@@ -87,20 +95,35 @@ def test_server_routes_web_chat_get_and_post():
     thread.start()
     base_url = f"http://127.0.0.1:{httpd.server_address[1]}"
     try:
-        with urllib.request.urlopen(f"{base_url}/v1/web/chat", timeout=2) as response:
+        request = urllib.request.Request(
+            f"{base_url}/v1/web/chat",
+            headers={
+                "x-florence-auth-email": "jackson@example.com",
+                "x-florence-web-secret": "proxy-secret",
+            },
+        )
+        with urllib.request.urlopen(request, timeout=2) as response:
             assert response.status == 200
             assert json.loads(response.read().decode("utf-8")) == {"ok": True, "messages": []}
+        assert service.snapshot_auth_email == "jackson@example.com"
+        assert service.snapshot_proxy_secret == "proxy-secret"
 
         request = urllib.request.Request(
             f"{base_url}/v1/web/chat",
             data=json.dumps({"message": "hi"}).encode("utf-8"),
-            headers={"content-type": "application/json"},
+            headers={
+                "content-type": "application/json",
+                "x-florence-auth-email": "jackson@example.com",
+                "x-florence-web-secret": "proxy-secret",
+            },
             method="POST",
         )
         with urllib.request.urlopen(request, timeout=2) as response:
             assert response.status == 200
             assert json.loads(response.read().decode("utf-8")) == {"ok": True, "reply": "hello"}
         assert service.payload == {"message": "hi"}
+        assert service.message_auth_email == "jackson@example.com"
+        assert service.message_proxy_secret == "proxy-secret"
     finally:
         httpd.shutdown()
         httpd.server_close()

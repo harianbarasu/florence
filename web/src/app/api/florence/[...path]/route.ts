@@ -22,6 +22,10 @@ function florenceApiBaseUrl() {
   return baseUrl;
 }
 
+function webChatProxySecret() {
+  return (process.env.FLORENCE_WEB_CHAT_PROXY_SECRET || "").trim();
+}
+
 async function forwardRequest(
   request: Request,
   { params }: { params: Promise<{ path: string[] }> },
@@ -33,6 +37,10 @@ async function forwardRequest(
   }
 
   const session = await auth();
+  if (joinedPath === "chat" && !session?.user?.email) {
+    return Response.json({ ok: false, error: "web_chat_auth_required" }, { status: 401 });
+  }
+
   const incomingUrl = new URL(request.url);
   const upstream = new URL(`${florenceApiBaseUrl()}/v1/web/${joinedPath}`);
   incomingUrl.searchParams.forEach((value, key) => {
@@ -46,6 +54,13 @@ async function forwardRequest(
   }
   if (session?.user?.email) {
     headers.set("x-florence-auth-email", session.user.email);
+  }
+  if (joinedPath === "chat") {
+    const secret = webChatProxySecret();
+    if (!secret) {
+      return Response.json({ ok: false, error: "missing_web_chat_proxy_secret" }, { status: 500 });
+    }
+    headers.set("x-florence-web-secret", secret);
   }
 
   const body = request.method === "GET" ? undefined : await request.text();

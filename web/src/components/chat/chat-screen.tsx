@@ -23,6 +23,18 @@ function normalizeError(error: unknown) {
     if (error.message === "web_chat_disabled") {
       return "Web chat is disabled for this deployment.";
     }
+    if (error.message === "web_chat_auth_required") {
+      return "Sign in with Google to use web chat.";
+    }
+    if (error.message === "unknown_web_google_identity") {
+      return "This Google account is not connected to a Florence household yet.";
+    }
+    if (
+      error.message === "web_chat_proxy_secret_unconfigured" ||
+      error.message === "missing_web_chat_proxy_secret"
+    ) {
+      return "Web chat is missing its server configuration.";
+    }
     return error.message;
   }
   return error instanceof Error ? error.message : "chat_request_failed";

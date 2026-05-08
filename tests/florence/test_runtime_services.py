@@ -551,6 +551,122 @@ def test_candidate_review_prompt_skips_past_time_bound_candidate(tmp_path, monke
     store.close()
 
 
+def test_candidate_review_prompt_skips_same_day_past_timed_candidate(tmp_path, monkeypatch):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    review_service = FlorenceCandidateReviewService(store)
+    monkeypatch.setattr(
+        review_service,
+        "_utc_now",
+        lambda: datetime(2026, 5, 8, 18, 0, tzinfo=timezone.utc),
+    )
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_past_open_gym",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GOOGLE_CALENDAR,
+            source_identifier="calendar:event_past_open_gym",
+            title="4 Star / GTS open gym",
+            summary="Friday 5/8 at 9:00 AM.",
+            state=CandidateState.PENDING_REVIEW,
+            metadata={
+                "confirmation_question": "Before I add this, is the date and time right?",
+                "proposed_fields": {
+                    "title": "4 Star / GTS open gym",
+                    "starts_at": "2026-05-08T09:00:00-07:00",
+                    "ends_at": "2026-05-08T10:00:00-07:00",
+                    "timezone": "America/Los_Angeles",
+                    "all_day": False,
+                },
+            },
+        )
+    )
+
+    prompt = review_service.build_next_dm_review_prompt(household_id="hh_123", member_id="mem_123")
+
+    assert prompt is None
+    store.close()
+
+
+def test_candidate_review_prompt_skips_same_day_past_raw_time_candidate(tmp_path, monkeypatch):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    review_service = FlorenceCandidateReviewService(store)
+    monkeypatch.setattr(
+        review_service,
+        "_utc_now",
+        lambda: datetime(2026, 5, 8, 18, 0, tzinfo=timezone.utc),
+    )
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_past_booking_email",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:gmail_past_booking",
+            title="4 Star / GTS open gym booking",
+            summary="Open gym today at 9:00 AM.",
+            state=CandidateState.PENDING_REVIEW,
+            confidence_bps=8200,
+            metadata={
+                "confirmation_question": "Before I add this, is the date and time right?",
+                "raw_metadata": {
+                    "reason_tags": ["household_anchor", "schedule_signal", "activity_signal"],
+                    "temporal_evidence": {
+                        "date_match": {"date": "2026-05-08"},
+                        "single_time": "09:00",
+                    },
+                },
+            },
+        )
+    )
+
+    prompt = review_service.build_next_dm_review_prompt(household_id="hh_123", member_id="mem_123")
+
+    assert prompt is None
+    store.close()
+
+
+def test_candidate_review_prompt_keeps_same_day_future_timed_candidate(tmp_path, monkeypatch):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    review_service = FlorenceCandidateReviewService(store)
+    monkeypatch.setattr(
+        review_service,
+        "_utc_now",
+        lambda: datetime(2026, 5, 8, 18, 0, tzinfo=timezone.utc),
+    )
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_future_open_gym",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GOOGLE_CALENDAR,
+            source_identifier="calendar:event_future_open_gym",
+            title="4 Star / GTS open gym",
+            summary="Friday 5/8 at 1:00 PM.",
+            state=CandidateState.PENDING_REVIEW,
+            metadata={
+                "confirmation_question": "Before I add this, is the date and time right?",
+                "proposed_fields": {
+                    "title": "4 Star / GTS open gym",
+                    "starts_at": "2026-05-08T13:00:00-07:00",
+                    "ends_at": "2026-05-08T14:00:00-07:00",
+                    "timezone": "America/Los_Angeles",
+                    "all_day": False,
+                },
+            },
+        )
+    )
+
+    prompt = review_service.build_next_dm_review_prompt(household_id="hh_123", member_id="mem_123")
+
+    assert prompt is not None
+    assert prompt.candidate.id == "cand_future_open_gym"
+    store.close()
+
+
 def test_candidate_review_prompt_keeps_recent_financial_record(tmp_path, monkeypatch):
     store = FlorenceStateDB(tmp_path / "florence.db")
     store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
@@ -1893,6 +2009,87 @@ def test_operations_review_nudge_records_candidate_review_prompt_metadata(tmp_pa
     assert records[0]["envelope"]["metadata"]["trigger"] == "new_pending_candidate"
     assert records[0]["outcome"]["reply_messages"] == [latest.body]
     assert records[0]["outcome"]["metadata"]["candidate_ids"] == ["cand_999"]
+    store.close()
+
+
+def test_operations_review_nudge_skips_same_day_past_timed_calendar_candidate(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    onboarding_service = FlorenceOnboardingSessionService(store)
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        display_name="Maya",
+    )
+    candidate = store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_past_open_gym",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GOOGLE_CALENDAR,
+            source_identifier="calendar:event_past_open_gym",
+            title="4 Star / GTS open gym",
+            summary="Friday 4/29 at 9:00 AM.",
+            state=CandidateState.PENDING_REVIEW,
+            confidence_bps=9000,
+            requires_confirmation=True,
+            metadata={
+                "confirmation_question": "Before I add this, is the date and time right?",
+                "proposed_fields": {
+                    "title": "4 Star / GTS open gym",
+                    "starts_at": "2026-04-29T09:00:00-07:00",
+                    "ends_at": "2026-04-29T10:00:00-07:00",
+                    "timezone": "America/Los_Angeles",
+                    "all_day": False,
+                },
+            },
+        )
+    )
+    linq = _FakeLinqClient()
+    delivery = FlorenceChannelDeliveryService(
+        store,
+        linq_client_getter=lambda: linq,
+        sendblue_client_getter=lambda: None,
+    )
+    chat_service = _StubReviewPromptChatService()
+    operations = FlorenceHouseholdOperationsService(
+        store,
+        delivery_service=delivery,
+        household_chat_service_getter=lambda: chat_service,
+        now_getter=lambda: _REVIEW_TEST_NOW,
+    )
+
+    nudged = operations.nudge_for_new_pending_candidates(
+        household_id="hh_123",
+        member_id="mem_123",
+        candidates=[candidate],
+    )
+
+    persisted = store.get_imported_candidate("cand_past_open_gym")
+    assert nudged is False
+    assert linq.sent == []
+    assert chat_service.calls == []
+    assert persisted is not None
+    assert persisted.metadata.get("review_nudged_at") is None
     store.close()
 
 

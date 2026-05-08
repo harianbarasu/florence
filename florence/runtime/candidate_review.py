@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, replace
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timezone
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
@@ -164,9 +164,11 @@ class FlorenceCandidateReviewService:
         store: FlorenceStateDB,
         *,
         source_rule_service: _SourceRuleService | None = None,
+        now_getter: Callable[[], datetime] | None = None,
     ):
         self.store = store
         self.source_rule_service = source_rule_service or _SourceRuleService(store)
+        self._now_getter = now_getter or (lambda: datetime.now(timezone.utc))
 
     def release_quarantined_candidates(self, *, household_id: str, member_id: str) -> list[ImportedCandidate]:
         candidates = self.store.list_imported_candidates(
@@ -597,13 +599,16 @@ class FlorenceCandidateReviewService:
     def _candidate_is_stale_review_item(self, candidate: ImportedCandidate) -> bool:
         if not self._candidate_is_time_bound_event(candidate):
             return False
-        candidate_date = self._candidate_local_date(candidate)
-        if candidate_date is None:
+        local_start = self._candidate_local_start(candidate)
+        if local_start is None:
             return False
+        start_at, has_clock_time, all_day = local_start
         household = self.store.get_household(candidate.household_id)
         timezone_name = str(getattr(household, "timezone", "") or "").strip()
-        local_today = self._utc_now().astimezone(self._tzinfo(timezone_name)).date()
-        return candidate_date < local_today
+        local_now = self._utc_now().astimezone(self._tzinfo(timezone_name))
+        if has_clock_time and not all_day:
+            return start_at <= local_now
+        return start_at.date() < local_now.date()
 
     def _candidate_is_time_bound_event(self, candidate: ImportedCandidate) -> bool:
         if self._candidate_looks_financial_record(candidate):
@@ -647,6 +652,12 @@ class FlorenceCandidateReviewService:
         return any(hint in text for hint in _FINANCIAL_RECORD_HINTS)
 
     def _candidate_local_date(self, candidate: ImportedCandidate) -> date | None:
+        local_start = self._candidate_local_start(candidate)
+        if local_start is not None:
+            return local_start[0].date()
+        return self._candidate_temporal_evidence_date(candidate)
+
+    def _candidate_local_start(self, candidate: ImportedCandidate) -> tuple[datetime, bool, bool] | None:
         metadata = dict(candidate.metadata) if isinstance(candidate.metadata, dict) else {}
         proposed_fields = dict(metadata.get("proposed_fields") or {})
         household = self.store.get_household(candidate.household_id)
@@ -655,12 +666,42 @@ class FlorenceCandidateReviewService:
             or str(getattr(household, "timezone", "") or "").strip()
         )
         tz = self._tzinfo(timezone_name)
+        all_day = bool(proposed_fields.get("all_day"))
 
-        for key in ("starts_at", "ends_at"):
-            parsed = self._parse_datetime(proposed_fields.get(key), timezone_name=timezone_name)
-            if parsed is not None:
-                return parsed.astimezone(tz).date()
+        parsed_start = self._parse_datetime(proposed_fields.get("starts_at"), timezone_name=timezone_name)
+        if parsed_start is not None:
+            return (parsed_start.astimezone(tz), True, all_day)
 
+        parsed_end = self._parse_datetime(proposed_fields.get("ends_at"), timezone_name=timezone_name)
+        if parsed_end is not None:
+            return (parsed_end.astimezone(tz), True, all_day)
+
+        candidate_date = self._candidate_temporal_evidence_date(candidate)
+        if candidate_date is None:
+            return None
+
+        raw_metadata = dict(metadata.get("raw_metadata") or {})
+        temporal_evidence = dict(raw_metadata.get("temporal_evidence") or {})
+        clock_time = self._candidate_temporal_evidence_clock(temporal_evidence)
+        if clock_time is not None:
+            return (datetime.combine(candidate_date, clock_time, tzinfo=tz), True, all_day)
+        return (datetime.combine(candidate_date, time.min, tzinfo=tz), False, all_day)
+
+    @staticmethod
+    def _candidate_temporal_evidence_clock(temporal_evidence: dict[str, Any]) -> time | None:
+        time_range = dict(temporal_evidence.get("time_range") or {})
+        raw_time = str(time_range.get("start") or temporal_evidence.get("single_time") or "").strip()
+        if not raw_time:
+            return None
+        try:
+            hour_text, minute_text = raw_time.split(":", 1)
+            return time(hour=int(hour_text), minute=int(minute_text))
+        except (TypeError, ValueError):
+            logger.debug("Failed to parse candidate review clock=%s", raw_time)
+            return None
+
+    def _candidate_temporal_evidence_date(self, candidate: ImportedCandidate) -> date | None:
+        metadata = dict(candidate.metadata) if isinstance(candidate.metadata, dict) else {}
         raw_metadata = dict(metadata.get("raw_metadata") or {})
         temporal_evidence = dict(raw_metadata.get("temporal_evidence") or {})
         date_match = dict(temporal_evidence.get("date_match") or {})
@@ -694,7 +735,10 @@ class FlorenceCandidateReviewService:
             return timezone.utc
 
     def _utc_now(self) -> datetime:
-        return datetime.now(timezone.utc)
+        value = self._now_getter()
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
 
     def _candidate_to_event(
         self,

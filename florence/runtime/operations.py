@@ -53,9 +53,12 @@ class FlorenceHouseholdOperationsService:
         self.store = store
         self.delivery_service = delivery_service
         self._household_chat_service_getter = household_chat_service_getter
-        self._candidate_review_service = candidate_review_service or FlorenceCandidateReviewService(store)
-        self._household_manager_service = household_manager_service or FlorenceHouseholdManagerService(store)
         self._now_getter = now_getter or (lambda: datetime.now(timezone.utc))
+        self._candidate_review_service = candidate_review_service or FlorenceCandidateReviewService(
+            store,
+            now_getter=self._now_getter,
+        )
+        self._household_manager_service = household_manager_service or FlorenceHouseholdManagerService(store)
 
     def _record_operation_turn(
         self,
@@ -1619,4 +1622,4 @@ class FlorenceHouseholdOperationsService:
         target_store = store or self.store
         if target_store is self.store:
             return self._candidate_review_service
-        return FlorenceCandidateReviewService(target_store)
+        return FlorenceCandidateReviewService(target_store, now_getter=self._now_getter)

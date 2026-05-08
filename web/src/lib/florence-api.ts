@@ -8,6 +8,7 @@ import type {
   FlorenceSessionResponse,
   FlorenceSettingsResponse,
   FlorenceSetupResponse,
+  FlorenceWebChatResponse,
 } from "@/lib/types";
 
 export class FlorenceApiError extends Error {
@@ -170,4 +171,23 @@ export async function getCalendar(params?: {
     },
   );
   return parseResponse<FlorenceCalendarResponse>(response);
+}
+
+export async function getWebChat(): Promise<FlorenceWebChatResponse> {
+  const response = await fetch("/api/florence/chat", {
+    method: "GET",
+    cache: "no-store",
+  });
+  return parseResponse<FlorenceWebChatResponse>(response);
+}
+
+export async function sendWebChatMessage(message: string): Promise<FlorenceWebChatResponse> {
+  const response = await fetch("/api/florence/chat", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ message }),
+  });
+  return parseResponse<FlorenceWebChatResponse>(response);
 }

@@ -14,6 +14,7 @@ from florence.config import (
     FlorenceRedisRuntimeConfig,
     FlorenceServerRuntimeConfig,
     FlorenceSettings,
+    FlorenceWebChatRuntimeConfig,
 )
 from florence.contracts import (
     CandidateState,
@@ -131,6 +132,16 @@ class _FakeBriefingChatService:
         if kind == "review_prompt":
             return "This looks like a household item to double-check. Reply yes if I should add it, no if it's wrong, or skip for later."
         return self.sync_waiting_text
+
+
+class _FakeWebChatService:
+    def __init__(self, reply_text: str = "Web reply"):
+        self.reply_text = reply_text
+        self.calls = []
+
+    def respond(self, **kwargs):
+        self.calls.append(kwargs)
+        return SimpleNamespace(text=f"{self.reply_text}: {kwargs['message_text']}")
 
 
 def _simulate_test_onboarding_turn(
@@ -316,6 +327,98 @@ def _complete_child_profile(onboarding_service, *, household_id: str, member_id:
         thread_id=thread_id,
         activities=[] if activities.lower().startswith("none") else [activities],
     )
+
+
+def test_production_service_web_chat_disabled_by_default(tmp_path):
+    settings = _build_settings(tmp_path)
+    store = FlorenceStateDB(settings.server.db_path)
+    service = FlorenceProductionService(settings, store=store)
+
+    result = service.handle_web_chat_message(payload={"message": "hello"})
+
+    assert result.status_code == 404
+    assert json.loads(result.body)["error"] == "web_chat_disabled"
+    assert store.list_households() == []
+    store.close()
+
+
+def test_production_service_web_chat_uses_real_chat_path_without_external_delivery(tmp_path):
+    settings = replace(
+        _build_settings(tmp_path),
+        web_chat=FlorenceWebChatRuntimeConfig(enabled=True),
+    )
+    store = FlorenceStateDB(settings.server.db_path)
+    service = FlorenceProductionService(settings, store=store)
+    service.household_chat_service = _FakeWebChatService("Florence")
+    service.linq = _FakeLinqClient()
+
+    result = service.handle_web_chat_message(payload={"message": "What matters today?"})
+
+    assert result.status_code == 200
+    payload = json.loads(result.body)
+    assert payload["ok"] is True
+    assert payload["reply"] == "Florence: What matters today?"
+    assert payload["household"]["id"] == "hh_web_test"
+    assert payload["channel"]["provider"] == "web"
+    assert payload["channel"]["type"] == "web_chat"
+    assert service.linq.sent == []
+
+    messages = store.list_channel_messages(channel_id=payload["channel"]["id"])
+    assert [message.sender_role.value for message in messages] == ["user", "assistant"]
+    assert messages[0].body == "What matters today?"
+    assert messages[0].metadata["provider"] == "web"
+    assert messages[0].metadata["external_delivery"] == "disabled"
+    assert messages[1].body == "Florence: What matters today?"
+    assert service.household_chat_service.calls[0]["household_id"] == "hh_web_test"
+    assert service.household_chat_service.calls[0]["message_text"] == "What matters today?"
+    assert service.household_chat_service.calls[0]["conversation_history"] == []
+
+    second = service.handle_web_chat_message(payload={"message": "And tomorrow?"})
+
+    assert second.status_code == 200
+    assert [message["role"] for message in json.loads(second.body)["messages"]] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+    assert [message.sender_role.value for message in service.household_chat_service.calls[1]["conversation_history"]] == [
+        "user",
+        "assistant",
+    ]
+    store.close()
+
+
+def test_production_service_web_chat_uses_configured_context(tmp_path):
+    settings = replace(
+        _build_settings(tmp_path),
+        web_chat=FlorenceWebChatRuntimeConfig(
+            enabled=True,
+            household_id="hh_configured",
+            member_id="mem_configured",
+            channel_id="chan_configured",
+            household_name="Configured family",
+            member_name="Jackson",
+            timezone="America/New_York",
+        ),
+    )
+    store = FlorenceStateDB(settings.server.db_path)
+    service = FlorenceProductionService(settings, store=store)
+    service.household_chat_service = _FakeWebChatService()
+
+    result = service.handle_web_chat_snapshot()
+
+    assert result.status_code == 200
+    payload = json.loads(result.body)
+    assert payload["household"]["id"] == "hh_configured"
+    assert payload["household"]["name"] == "Configured family"
+    assert payload["household"]["timezone"] == "America/New_York"
+    assert payload["member"]["id"] == "mem_configured"
+    assert payload["member"]["displayName"] == "Jackson"
+    assert payload["channel"]["id"] == "chan_configured"
+    assert payload["channel"]["provider"] == "web"
+    assert payload["channel"]["type"] == "web_chat"
+    store.close()
 
 
 def test_production_service_delivers_dm_reply_and_group_announcement(tmp_path, monkeypatch):

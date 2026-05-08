@@ -1,13 +1,13 @@
 import { Routes, Route, NavLink, Navigate } from "react-router-dom";
 import { Activity, BarChart3, Clock, FileText, KeyRound, MessageSquare, Package, Settings } from "lucide-react";
-import StatusPage from "@/pages/StatusPage";
-import ConfigPage from "@/pages/ConfigPage";
-import EnvPage from "@/pages/EnvPage";
-import SessionsPage from "@/pages/SessionsPage";
-import LogsPage from "@/pages/LogsPage";
-import AnalyticsPage from "@/pages/AnalyticsPage";
-import CronPage from "@/pages/CronPage";
-import SkillsPage from "@/pages/SkillsPage";
+import StatusPage from "@/dashboard-pages/StatusPage";
+import ConfigPage from "@/dashboard-pages/ConfigPage";
+import EnvPage from "@/dashboard-pages/EnvPage";
+import SessionsPage from "@/dashboard-pages/SessionsPage";
+import LogsPage from "@/dashboard-pages/LogsPage";
+import AnalyticsPage from "@/dashboard-pages/AnalyticsPage";
+import CronPage from "@/dashboard-pages/CronPage";
+import SkillsPage from "@/dashboard-pages/SkillsPage";
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { useI18n } from "@/i18n";
 

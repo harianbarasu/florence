@@ -273,3 +273,34 @@ export type FlorenceCalendarResponse = {
   };
   events: FlorenceCalendarEvent[];
 };
+
+export type FlorenceWebChatMessage = {
+  id: string;
+  role: "user" | "assistant" | "system";
+  body: string;
+  createdAt: number;
+};
+
+export type FlorenceWebChatResponse = {
+  ok: true;
+  enabled: boolean;
+  household: {
+    id: string;
+    name: string;
+    timezone: string;
+  };
+  member: {
+    id: string;
+    displayName: string;
+    role: string;
+  };
+  channel: {
+    id: string;
+    provider: string;
+    providerChannelId: string;
+    type: string;
+    title: string | null;
+  };
+  messages: FlorenceWebChatMessage[];
+  reply?: string;
+};

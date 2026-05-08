@@ -71,6 +71,26 @@ def _as_float(value: Any, default: float) -> float:
         return default
 
 
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on", "enabled"}:
+        return True
+    if normalized in {"0", "false", "no", "off", "disabled"}:
+        return False
+    return default
+
+
+def _as_optional_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
 def _normalize_public_base_url(value: Any) -> str | None:
     if value is None:
         return None
@@ -155,6 +175,17 @@ class FlorenceBriefingRuntimeConfig:
 
 
 @dataclass(slots=True)
+class FlorenceWebChatRuntimeConfig:
+    enabled: bool = False
+    household_id: str | None = None
+    member_id: str | None = None
+    channel_id: str | None = None
+    timezone: str = "America/Los_Angeles"
+    household_name: str = "Florence web test household"
+    member_name: str = "Web tester"
+
+
+@dataclass(slots=True)
 class FlorenceRedisRuntimeConfig:
     url: str | None
     google_sync_queue_name: str = "florence-google-sync"
@@ -187,6 +218,7 @@ class FlorenceSettings:
     redis: FlorenceRedisRuntimeConfig
     sendblue: FlorenceSendblueRuntimeConfig = field(default_factory=FlorenceSendblueRuntimeConfig)
     briefing: FlorenceBriefingRuntimeConfig = field(default_factory=FlorenceBriefingRuntimeConfig)
+    web_chat: FlorenceWebChatRuntimeConfig = field(default_factory=FlorenceWebChatRuntimeConfig)
 
     @classmethod
     def from_env(cls) -> "FlorenceSettings":
@@ -395,6 +427,74 @@ class FlorenceSettings:
                     allowed={"none", "minimal"},
                     default="none",
                 ),
+            ),
+            web_chat=FlorenceWebChatRuntimeConfig(
+                enabled=_as_bool(
+                    _env_or_config(
+                        ("FLORENCE_WEB_CHAT_ENABLED",),
+                        florence_cfg,
+                        "web_chat",
+                        "enabled",
+                        default=False,
+                    )
+                ),
+                household_id=_as_optional_string(
+                    _env_or_config(
+                        ("FLORENCE_WEB_CHAT_HOUSEHOLD_ID",),
+                        florence_cfg,
+                        "web_chat",
+                        "household_id",
+                        default=None,
+                    )
+                ),
+                member_id=_as_optional_string(
+                    _env_or_config(
+                        ("FLORENCE_WEB_CHAT_MEMBER_ID",),
+                        florence_cfg,
+                        "web_chat",
+                        "member_id",
+                        default=None,
+                    )
+                ),
+                channel_id=_as_optional_string(
+                    _env_or_config(
+                        ("FLORENCE_WEB_CHAT_CHANNEL_ID",),
+                        florence_cfg,
+                        "web_chat",
+                        "channel_id",
+                        default=None,
+                    )
+                ),
+                timezone=str(
+                    _env_or_config(
+                        ("FLORENCE_WEB_CHAT_TIMEZONE",),
+                        florence_cfg,
+                        "web_chat",
+                        "timezone",
+                        default="America/Los_Angeles",
+                    )
+                ).strip()
+                or "America/Los_Angeles",
+                household_name=str(
+                    _env_or_config(
+                        ("FLORENCE_WEB_CHAT_HOUSEHOLD_NAME",),
+                        florence_cfg,
+                        "web_chat",
+                        "household_name",
+                        default="Florence web test household",
+                    )
+                ).strip()
+                or "Florence web test household",
+                member_name=str(
+                    _env_or_config(
+                        ("FLORENCE_WEB_CHAT_MEMBER_NAME",),
+                        florence_cfg,
+                        "web_chat",
+                        "member_name",
+                        default="Web tester",
+                    )
+                ).strip()
+                or "Web tester",
             ),
             redis=FlorenceRedisRuntimeConfig(
                 url=_env_or_config(

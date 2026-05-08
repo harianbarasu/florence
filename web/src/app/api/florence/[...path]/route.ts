@@ -6,6 +6,7 @@ const ALLOWED_PATHS = new Set([
   "setup/profile",
   "review",
   "calendar",
+  "chat",
   "google/start",
   "google/connections",
   "google/add-account",

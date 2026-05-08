@@ -3,15 +3,27 @@
 from __future__ import annotations
 
 import html
+import hashlib
 import logging
 import json
 import threading
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import Any
 from urllib.parse import urlencode
 
 from florence.config import FlorenceSettings
+from florence.contracts import (
+    Channel,
+    ChannelMessage,
+    ChannelMessageRole,
+    ChannelType,
+    Household,
+    HouseholdStatus,
+    Member,
+    MemberRole,
+)
 from florence.linq import FlorenceLinqClient
 from florence.linq.media import enrich_linq_payload_with_media_text
 from florence.google import decode_google_oauth_state
@@ -47,6 +59,8 @@ from florence.turns import FlorenceTurnTrigger
 logger = logging.getLogger(__name__)
 
 _HOUSEHOLD_CALENDAR_LINK_SHARED_MEMBER_IDS_KEY = "calendar_link_shared_member_ids"
+_WEB_CHAT_PROVIDER = "web"
+_DEFAULT_WEB_CHAT_HOUSEHOLD_ID = "hh_web_test"
 
 
 def _mask_transport_handle(value: Any) -> str | None:
@@ -86,6 +100,11 @@ def _webhook_payload_summary(provider: str, payload: dict[str, Any]) -> dict[str
             "sender": _mask_transport_handle(sender.get("handle")),
         }
     return {}
+
+
+def _stable_web_id(prefix: str, *parts: str) -> str:
+    digest = hashlib.sha256(":".join(parts).encode("utf-8")).hexdigest()[:20]
+    return f"{prefix}_{digest}"
 
 
 class _StaleGoogleSyncJobError(RuntimeError):
@@ -181,6 +200,264 @@ class FlorenceProductionService:
 
     def close(self) -> None:
         self.store.close()
+
+    def handle_web_chat_snapshot(self) -> FlorenceHTTPResult:
+        if not self.settings.web_chat.enabled:
+            return self._json_result(404, {"ok": False, "error": "web_chat_disabled"})
+        try:
+            household, member, channel = self._ensure_web_chat_context()
+        except ValueError as exc:
+            return self._json_result(400, {"ok": False, "error": str(exc)})
+        except Exception:
+            logger.exception("Florence web chat snapshot failed")
+            return self._json_result(500, {"ok": False, "error": "internal_web_chat_error"})
+        return self._json_result(200, self._web_chat_payload(household=household, member=member, channel=channel))
+
+    def handle_web_chat_message(self, *, payload: dict[str, Any]) -> FlorenceHTTPResult:
+        if not self.settings.web_chat.enabled:
+            return self._json_result(404, {"ok": False, "error": "web_chat_disabled"})
+
+        message = str(payload.get("message") or "").strip()
+        if not message:
+            return self._json_result(400, {"ok": False, "error": "web_chat_message_required"})
+
+        try:
+            household, member, channel = self._ensure_web_chat_context()
+            prior_history = self.store.list_channel_messages(channel_id=channel.id, limit=24)
+            self._append_web_chat_message(
+                household_id=household.id,
+                channel_id=channel.id,
+                role=ChannelMessageRole.USER,
+                body=message,
+                sender_member_id=member.id,
+            )
+            reply = self.household_chat_service.respond(
+                household_id=household.id,
+                channel_id=channel.id,
+                actor_member_id=member.id,
+                message_text=message,
+                conversation_history=prior_history,
+            )
+            reply_text = str(getattr(reply, "text", "") or "").strip()
+            if not reply_text:
+                return self._json_result(502, {"ok": False, "error": "web_chat_empty_reply"})
+            self._append_web_chat_message(
+                household_id=household.id,
+                channel_id=channel.id,
+                role=ChannelMessageRole.ASSISTANT,
+                body=reply_text,
+                sender_member_id=None,
+            )
+            return self._json_result(
+                200,
+                self._web_chat_payload(
+                    household=household,
+                    member=member,
+                    channel=channel,
+                    reply=reply_text,
+                ),
+            )
+        except ValueError as exc:
+            return self._json_result(400, {"ok": False, "error": str(exc)})
+        except Exception:
+            logger.exception("Florence web chat turn failed")
+            return self._json_result(500, {"ok": False, "error": "internal_web_chat_error"})
+
+    def _ensure_web_chat_context(self) -> tuple[Household, Member, Channel]:
+        config = self.settings.web_chat
+        household_id = config.household_id or _DEFAULT_WEB_CHAT_HOUSEHOLD_ID
+        household = self.store.get_household(household_id)
+        if household is None:
+            household = self.store.upsert_household(
+                Household(
+                    id=household_id,
+                    name=config.household_name,
+                    timezone=config.timezone,
+                    status=HouseholdStatus.ACTIVE,
+                    settings={"web_chat_test_surface": True},
+                )
+            )
+
+        member = self._resolve_web_chat_member(household=household)
+        channel = self._resolve_web_chat_channel(household=household, member=member)
+        return household, member, channel
+
+    def _resolve_web_chat_member(self, *, household: Household) -> Member:
+        configured_member_id = self.settings.web_chat.member_id
+        if configured_member_id:
+            member = self.store.get_member(configured_member_id)
+            if member is not None:
+                if member.household_id != household.id:
+                    raise ValueError("web_chat_member_household_mismatch")
+                return member
+            return self.store.upsert_member(
+                Member(
+                    id=configured_member_id,
+                    household_id=household.id,
+                    display_name=self.settings.web_chat.member_name,
+                    role=MemberRole.ADMIN,
+                )
+            )
+
+        members = [
+            member
+            for member in self.store.list_members(household.id)
+            if member.status == "active" and member.role in {MemberRole.ADMIN, MemberRole.PARENT}
+        ]
+        if members and self.settings.web_chat.household_id:
+            return members[0]
+
+        member_id = _stable_web_id("mem", household.id, _WEB_CHAT_PROVIDER)
+        member = self.store.get_member(member_id)
+        if member is not None:
+            return member
+        return self.store.upsert_member(
+            Member(
+                id=member_id,
+                household_id=household.id,
+                display_name=self.settings.web_chat.member_name,
+                role=MemberRole.ADMIN,
+            )
+        )
+
+    def _resolve_web_chat_channel(self, *, household: Household, member: Member) -> Channel:
+        configured_channel_id = self.settings.web_chat.channel_id
+        provider_channel_id = configured_channel_id or f"web-chat:{household.id}:{member.id}"
+        channel_id = configured_channel_id or _stable_web_id("chan", household.id, member.id, _WEB_CHAT_PROVIDER)
+
+        channel = self.store.get_channel(channel_id)
+        if channel is not None:
+            if channel.household_id != household.id or channel.provider != _WEB_CHAT_PROVIDER:
+                raise ValueError("web_chat_channel_conflict")
+            return self._upsert_web_chat_channel(
+                channel=channel,
+                household=household,
+                provider_channel_id=provider_channel_id,
+            )
+
+        channel = self.store.get_channel_by_provider_id(
+            provider=_WEB_CHAT_PROVIDER,
+            provider_channel_id=provider_channel_id,
+        )
+        if channel is not None:
+            if channel.household_id != household.id:
+                raise ValueError("web_chat_channel_household_mismatch")
+            return self._upsert_web_chat_channel(
+                channel=channel,
+                household=household,
+                provider_channel_id=provider_channel_id,
+            )
+
+        return self.store.upsert_channel(
+            Channel(
+                id=channel_id,
+                household_id=household.id,
+                provider=_WEB_CHAT_PROVIDER,
+                provider_channel_id=provider_channel_id,
+                channel_type=ChannelType.WEB_CHAT,
+                title="Web chat test",
+                metadata={
+                    "test_surface": True,
+                    "external_delivery": "disabled",
+                },
+            )
+        )
+
+    def _upsert_web_chat_channel(
+        self,
+        *,
+        channel: Channel,
+        household: Household,
+        provider_channel_id: str,
+    ) -> Channel:
+        metadata = dict(channel.metadata)
+        metadata.setdefault("test_surface", True)
+        metadata["external_delivery"] = "disabled"
+        return self.store.upsert_channel(
+            replace(
+                channel,
+                household_id=household.id,
+                provider=_WEB_CHAT_PROVIDER,
+                provider_channel_id=channel.provider_channel_id or provider_channel_id,
+                channel_type=ChannelType.WEB_CHAT,
+                title=channel.title or "Web chat test",
+                metadata=metadata,
+            )
+        )
+
+    def _append_web_chat_message(
+        self,
+        *,
+        household_id: str,
+        channel_id: str,
+        role: ChannelMessageRole,
+        body: str,
+        sender_member_id: str | None,
+    ) -> ChannelMessage:
+        message_id = _stable_web_id(
+            "chatmsg" if role == ChannelMessageRole.USER else "assistant",
+            channel_id,
+            role.value,
+            str(time.time_ns()),
+        )
+        return self.store.append_channel_message(
+            ChannelMessage(
+                id=message_id,
+                household_id=household_id,
+                channel_id=channel_id,
+                sender_role=role,
+                sender_member_id=sender_member_id,
+                body=body,
+                metadata={
+                    "provider": _WEB_CHAT_PROVIDER,
+                    "test_surface": True,
+                    "external_delivery": "disabled",
+                },
+                created_at=time.time(),
+            )
+        )
+
+    def _web_chat_payload(
+        self,
+        *,
+        household: Household,
+        member: Member,
+        channel: Channel,
+        reply: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "ok": True,
+            "enabled": True,
+            "household": {
+                "id": household.id,
+                "name": household.name,
+                "timezone": household.timezone,
+            },
+            "member": {
+                "id": member.id,
+                "displayName": member.display_name,
+                "role": member.role.value,
+            },
+            "channel": {
+                "id": channel.id,
+                "provider": channel.provider,
+                "providerChannelId": channel.provider_channel_id,
+                "type": channel.channel_type.value,
+                "title": channel.title,
+            },
+            "messages": [
+                {
+                    "id": message.id,
+                    "role": message.sender_role.value,
+                    "body": message.body,
+                    "createdAt": message.created_at,
+                }
+                for message in self.store.list_channel_messages(channel_id=channel.id, limit=80)
+            ],
+        }
+        if reply is not None:
+            payload["reply"] = reply
+        return payload
 
     def _build_household_calendar_link_message(self, *, calendar_web_url: str) -> str:
         return (

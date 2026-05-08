@@ -1,4 +1,7 @@
 import logging
+import json
+import threading
+import urllib.request
 
 import pytest
 
@@ -13,6 +16,7 @@ from florence.config import (
 )
 from florence.deploy_metadata import format_railway_deploy_metadata, get_railway_deploy_metadata
 from florence.server import _run_hermes_preflight, _start_hermes_preflight
+from florence.runtime.production import FlorenceHTTPResult
 
 
 def _build_settings(tmp_path):
@@ -54,6 +58,53 @@ class _FailingAgent:
 
     def run_conversation(self, **kwargs):
         raise self.exc
+
+
+class _FakeWebChatService:
+    def __init__(self):
+        self.payload = None
+
+    def handle_web_chat_snapshot(self):
+        return FlorenceHTTPResult(
+            status_code=200,
+            content_type="application/json; charset=utf-8",
+            body=json.dumps({"ok": True, "messages": []}),
+        )
+
+    def handle_web_chat_message(self, *, payload):
+        self.payload = payload
+        return FlorenceHTTPResult(
+            status_code=200,
+            content_type="application/json; charset=utf-8",
+            body=json.dumps({"ok": True, "reply": "hello"}),
+        )
+
+
+def test_server_routes_web_chat_get_and_post():
+    service = _FakeWebChatService()
+    httpd = server_module.build_http_server(service, host="127.0.0.1", port=0)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        with urllib.request.urlopen(f"{base_url}/v1/web/chat", timeout=2) as response:
+            assert response.status == 200
+            assert json.loads(response.read().decode("utf-8")) == {"ok": True, "messages": []}
+
+        request = urllib.request.Request(
+            f"{base_url}/v1/web/chat",
+            data=json.dumps({"message": "hi"}).encode("utf-8"),
+            headers={"content-type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=2) as response:
+            assert response.status == 200
+            assert json.loads(response.read().decode("utf-8")) == {"ok": True, "reply": "hello"}
+        assert service.payload == {"message": "hi"}
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=2)
 
 
 def test_hermes_preflight_off_mode_skips_agent_startup(tmp_path, monkeypatch):

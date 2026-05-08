@@ -29,6 +29,7 @@ class ChannelType(StrEnum):
     HOUSEHOLD_GROUP = "household_group"
     PARENT_DM = "parent_dm"
     SYSTEM_NOTIFICATIONS = "system_notifications"
+    WEB_CHAT = "web_chat"
 
 
 class IdentityKind(StrEnum):

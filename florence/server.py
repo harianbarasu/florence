@@ -195,6 +195,9 @@ class _FlorenceRequestHandler(BaseHTTPRequestHandler):
             )
             self._write_response(result)
             return
+        if parsed.path == "/v1/web/chat":
+            self._write_response(self._service().handle_web_chat_snapshot())
+            return
         self.send_error(404, "not_found")
 
     def do_POST(self) -> None:  # noqa: N802
@@ -238,6 +241,20 @@ class _FlorenceRequestHandler(BaseHTTPRequestHandler):
                 webhook_secret=_extract_sendblue_webhook_secret(self.headers),
             )
             self._write_response(result)
+            return
+        if parsed.path == "/v1/web/chat":
+            try:
+                payload = self._parse_json_body(self._read_raw_body())
+            except ValueError as exc:
+                self._write_response(
+                    FlorenceHTTPResult(
+                        status_code=400,
+                        content_type="application/json; charset=utf-8",
+                        body=json.dumps({"ok": False, "error": str(exc)}),
+                    )
+                )
+                return
+            self._write_response(self._service().handle_web_chat_message(payload=payload))
             return
         self.send_error(404, "not_found")
 

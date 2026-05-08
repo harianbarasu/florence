@@ -173,6 +173,9 @@ export function ExplorePage() {
             </div>
           </Link>
           <div className="flex items-center gap-3">
+            <Button asChild variant="outline">
+              <Link href="/chat">Web chat</Link>
+            </Button>
             <Button asChild variant="ghost">
               <Link href="/login">Sign in</Link>
             </Button>

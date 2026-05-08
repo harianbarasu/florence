@@ -49,6 +49,45 @@ logger = logging.getLogger(__name__)
 _HOUSEHOLD_CALENDAR_LINK_SHARED_MEMBER_IDS_KEY = "calendar_link_shared_member_ids"
 
 
+def _mask_transport_handle(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if len(text) <= 6:
+        return "***"
+    return f"{text[:3]}…{text[-4:]}"
+
+
+def _webhook_payload_summary(provider: str, payload: dict[str, Any]) -> dict[str, Any]:
+    if provider == "sendblue":
+        return {
+            "message_id": str(payload.get("message_handle") or "").strip() or None,
+            "status": str(payload.get("status") or "").strip() or None,
+            "is_outbound": bool(payload.get("is_outbound")),
+            "message_type": str(payload.get("message_type") or "").strip() or None,
+            "group_id": str(payload.get("group_id") or "").strip() or None,
+            "from": _mask_transport_handle(payload.get("from_number")),
+            "to": _mask_transport_handle(payload.get("to_number")),
+            "number": _mask_transport_handle(payload.get("number")),
+            "sendblue_number": _mask_transport_handle(payload.get("sendblue_number")),
+            "content_length": len(str(payload.get("content") or "")),
+        }
+    if provider == "linq":
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        chat = data.get("chat") if isinstance(data.get("chat"), dict) else {}
+        sender = data.get("sender_handle") if isinstance(data.get("sender_handle"), dict) else {}
+        return {
+            "event_type": str(payload.get("event_type") or "").strip() or None,
+            "message_id": str(data.get("id") or "").strip() or None,
+            "chat_id": str(chat.get("id") or "").strip() or None,
+            "is_group": bool(chat.get("is_group")),
+            "direction": str(data.get("direction") or "").strip() or None,
+            "service": str(data.get("service") or "").strip() or None,
+            "sender": _mask_transport_handle(sender.get("handle")),
+        }
+    return {}
+
+
 class _StaleGoogleSyncJobError(RuntimeError):
     """Raised when a queued Google sync job points at a deleted connection."""
 
@@ -665,7 +704,18 @@ class FlorenceProductionService:
         enrich_error_log: str | None = None,
     ) -> FlorenceHTTPResult:
         if not verify():
+            logger.warning(
+                "Florence webhook rejected provider=%s error=%s summary=%s",
+                provider,
+                invalid_error,
+                _webhook_payload_summary(provider, payload),
+            )
             return self._json_result(403, {"ok": False, "error": invalid_error})
+        logger.info(
+            "Florence webhook received provider=%s summary=%s",
+            provider,
+            _webhook_payload_summary(provider, payload),
+        )
         if enrich is not None:
             try:
                 enrich()
@@ -676,9 +726,25 @@ class FlorenceProductionService:
             try:
                 result = handler(payload)
                 self.delivery_service.deliver_ingress_result(result=result, provider=provider)
+                logger.info(
+                    "Florence webhook handled provider=%s consumed=%s household_id=%s member_id=%s channel_id=%s error=%s reply_count=%d group_announcement=%s",
+                    provider,
+                    result.consumed,
+                    result.household_id,
+                    result.member_id,
+                    result.channel_id,
+                    result.error,
+                    len(result.reply_messages or ((result.reply_text,) if result.reply_text else ())),
+                    bool(result.group_announcement),
+                )
                 return self._webhook_success_result(result)
             except Exception:
-                logger.exception(failure_log)
+                logger.exception(
+                    "%s provider=%s summary=%s",
+                    failure_log,
+                    provider,
+                    _webhook_payload_summary(provider, payload),
+                )
                 return self._json_result(500, {"ok": False, "error": internal_error})
 
     def _webhook_success_result(self, result: FlorenceEntrypointResult) -> FlorenceHTTPResult:

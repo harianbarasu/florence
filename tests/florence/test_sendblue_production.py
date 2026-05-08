@@ -1,4 +1,5 @@
 import json
+import logging
 import sys
 import types
 
@@ -118,6 +119,61 @@ def test_production_service_handles_sendblue_webhook(tmp_path, monkeypatch):
     assert json.loads(result.body)["ok"] is True
     assert service.sendblue.sent[0]["thread_id"] == "+15122164639|+15555550123"
     assert service.sendblue.sent[0]["message"] == "Hi from Florence"
+    store.close()
+
+
+def test_production_service_logs_sendblue_webhook_edge_without_message_body(tmp_path, monkeypatch, caplog):
+    settings = _build_settings(tmp_path)
+    store = FlorenceStateDB(settings.server.db_path)
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="sendblue",
+            provider_channel_id="+15122164639|+15555550123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    service = FlorenceProductionService(settings, store=store)
+    service.sendblue = _FakeSendblueClient()
+    monkeypatch.setattr(
+        service.entrypoints,
+        "handle_sendblue_payload",
+        lambda payload: FlorenceEntrypointResult(
+            reply_text="Hi from Florence",
+            consumed=True,
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+        ),
+    )
+
+    payload = {
+        "content": "private family text should not be logged",
+        "is_outbound": False,
+        "status": "RECEIVED",
+        "message_handle": "msg_123",
+        "from_number": "+15555550123",
+        "number": "+15555550123",
+        "to_number": "+15122164639",
+        "sendblue_number": "+15122164639",
+        "service": "iMessage",
+    }
+    with caplog.at_level(logging.INFO):
+        result = service.handle_sendblue_webhook(
+            payload=payload,
+            webhook_secret="sb-webhook-secret",
+        )
+
+    assert result.status_code == 200
+    log_text = caplog.text
+    assert "Florence webhook received provider=sendblue" in log_text
+    assert "Florence webhook handled provider=sendblue" in log_text
+    assert "msg_123" in log_text
+    assert "+15555550123" not in log_text
+    assert "private family text" not in log_text
     store.close()
 
 

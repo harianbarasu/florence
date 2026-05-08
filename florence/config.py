@@ -87,6 +87,23 @@ def _normalize_choice(value: Any, *, allowed: set[str], default: str) -> str:
     return normalized if normalized in allowed else default
 
 
+def _as_string_tuple(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        values = value.split(",")
+    elif isinstance(value, (list, tuple, set)):
+        values = list(value)
+    else:
+        values = [value]
+    normalized = tuple(
+        str(item).strip()
+        for item in values
+        if str(item).strip()
+    )
+    return tuple(dict.fromkeys(normalized))
+
+
 @dataclass(slots=True)
 class FlorenceGoogleRuntimeConfig:
     client_id: str | None
@@ -117,6 +134,7 @@ class FlorenceSendblueRuntimeConfig:
     from_number: str | None = None
     webhook_secret: str | None = None
     base_url: str = "https://api.sendblue.co/api"
+    blocked_numbers: tuple[str, ...] = ()
 
     @property
     def configured(self) -> bool:
@@ -313,6 +331,15 @@ class FlorenceSettings:
                         default="https://api.sendblue.co/api",
                     )
                 ).rstrip("/"),
+                blocked_numbers=_as_string_tuple(
+                    _env_or_config(
+                        ("FLORENCE_SENDBLUE_BLOCKED_NUMBERS", "SENDBLUE_BLOCKED_NUMBERS"),
+                        florence_cfg,
+                        "sendblue",
+                        "blocked_numbers",
+                        default=(),
+                    )
+                ),
             ),
             hermes=FlorenceHermesRuntimeConfig(
                 model=str(

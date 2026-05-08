@@ -299,6 +299,33 @@ def test_entrypoints_ignores_partial_linq_payloads(tmp_path):
     store.close()
 
 
+def test_entrypoints_sendblue_ignores_blocked_sender_without_creating_household(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    service = _build_entrypoints(
+        store,
+        sendblue_blocked_numbers=("+15555550123",),
+    )
+
+    result = service.handle_sendblue_payload(
+        {
+            "content": "Anything?",
+            "is_outbound": False,
+            "status": "RECEIVED",
+            "message_handle": "msg_blocked_123",
+            "from_number": "(555) 555-0123",
+            "number": "+15555550123",
+            "to_number": "+15122164639",
+            "sendblue_number": "+15122164639",
+            "service": "iMessage",
+        }
+    )
+
+    assert result.consumed is False
+    assert result.error == "sendblue_blocked_contact_ignored"
+    assert store.list_households() == []
+    store.close()
+
+
 def test_entrypoints_sendblue_group_persists_group_id_on_channel(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     service = _build_entrypoints(store)

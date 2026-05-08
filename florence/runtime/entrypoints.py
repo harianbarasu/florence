@@ -6,6 +6,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from florence.config import FlorenceGoogleRuntimeConfig
+from florence.contracts import IdentityKind
 from florence.linq import parse_linq_payload
 from florence.messaging import (
     FlorenceInboundMessage,
@@ -18,7 +19,7 @@ from florence.runtime.google_services import FlorenceGoogleAccountLinkService
 from florence.runtime.household_manager import FlorenceHouseholdManagerService
 from florence.runtime.household_merge import FlorenceHouseholdMergeService
 from florence.runtime.onboarding_service import FlorenceOnboardingSessionService
-from florence.runtime.resolver import FlorenceIdentityResolver
+from florence.runtime.resolver import FlorenceIdentityResolver, normalize_identity_value
 from florence.sendblue import parse_sendblue_payload
 from florence.state import FlorenceStateDB
 
@@ -65,8 +66,14 @@ class FlorenceEntrypointService:
         household_chat_service: FlorenceHouseholdChatService,
         household_manager_service: FlorenceHouseholdManagerService | None = None,
         household_merge_service: FlorenceHouseholdMergeService | None = None,
+        sendblue_blocked_numbers: tuple[str, ...] | list[str] | set[str] = (),
     ):
         self.store = store
+        self.sendblue_blocked_numbers = frozenset(
+            normalize_identity_value(IdentityKind.PHONE, str(number))
+            for number in sendblue_blocked_numbers
+            if str(number).strip()
+        )
         self.candidate_review_service = FlorenceCandidateReviewService(store)
         self.onboarding_service = FlorenceOnboardingSessionService(
             store,
@@ -145,6 +152,8 @@ class FlorenceEntrypointService:
             raise
         if inbound.is_from_me:
             return FlorenceEntrypointResult(consumed=False)
+        if self._sendblue_sender_is_blocked(inbound.sender_handle):
+            return FlorenceEntrypointResult(consumed=False, error="sendblue_blocked_contact_ignored")
         return self._handle_transport_message(
             provider="sendblue",
             thread_id=inbound.thread_id,
@@ -153,6 +162,12 @@ class FlorenceEntrypointService:
             participant_handles=list(inbound.participant_handles),
             inbound_message=inbound,
         )
+
+    def _sendblue_sender_is_blocked(self, sender_handle: str) -> bool:
+        if not self.sendblue_blocked_numbers:
+            return False
+        normalized = normalize_identity_value(IdentityKind.PHONE, sender_handle)
+        return normalized in self.sendblue_blocked_numbers
 
     def _handle_transport_message(
         self,

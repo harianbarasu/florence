@@ -19,6 +19,18 @@ def test_florence_settings_reads_env_and_derives_google_redirect_uri(tmp_path, m
     assert settings.linq.configured is True
 
 
+def test_florence_settings_reads_sendblue_blocked_numbers(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv(
+        "FLORENCE_SENDBLUE_BLOCKED_NUMBERS",
+        " +16145579061, +18175591018,+18175591018 ",
+    )
+
+    settings = FlorenceSettings.from_env()
+
+    assert settings.sendblue.blocked_numbers == ("+16145579061", "+18175591018")
+
+
 def test_florence_settings_supports_railway_public_domain_and_port(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.delenv("FLORENCE_PUBLIC_BASE_URL", raising=False)

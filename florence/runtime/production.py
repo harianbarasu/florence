@@ -140,6 +140,7 @@ class FlorenceProductionService:
                 self.store,
                 household_calendar_projection_service=self.household_calendar_projection_service,
             ),
+            sendblue_blocked_numbers=settings.sendblue.blocked_numbers,
         )
         self.linq = FlorenceLinqClient(settings.linq)
         self.sendblue = FlorenceSendblueClient(settings.sendblue)

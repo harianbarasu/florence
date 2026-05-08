@@ -5,13 +5,13 @@ from __future__ import annotations
 import json
 import logging
 import os
-import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from time import perf_counter
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
+from florence.agent import FlorenceHermesAdapter, build_hermes_session_db
 from florence.contracts import (
     Channel,
     ChannelMessage,
@@ -27,7 +27,28 @@ from florence.contracts import (
     HouseholdWorkItemStatus,
 )
 from florence.messaging.types import FlorenceInboundAttachment
+from florence.messaging.protocol_types import (
+    latest_active_pending_action,
+    pending_action_to_model_context,
+)
+from florence.messaging.protocol_sentinels import (
+    GROUP_INTRO_NO_ACTION_SENTINEL,
+    GROUP_INTRO_SHOW_SENTINEL,
+    GROUP_SHARE_EXECUTE_SENTINEL,
+    GROUP_SHARE_NO_ACTION_SENTINEL,
+    HEARTBEAT_OK_SENTINEL,
+    ONBOARDING_CONTEXTUAL_CHAT_SENTINEL,
+    ONBOARDING_NO_REPLY_SENTINEL,
+    ONBOARDING_SYNC_WAITING_SENTINEL,
+    REVIEW_NO_ACTION_SENTINEL,
+    REVIEW_SHOW_PROMPT_SENTINEL,
+    looks_like_protocol_sentinel,
+)
 from florence.state import FlorenceStateDB
+from florence.runtime.google_freshness import (
+    build_google_mirror_connection_freshness,
+    build_google_mirror_freshness_summary,
+)
 from florence.runtime.visibility import (
     build_scope_model_lines,
     member_scoped_item_visible,
@@ -41,32 +62,9 @@ from florence.runtime.visibility import (
 logger = logging.getLogger(__name__)
 
 
-_ONBOARDING_SYNC_WAITING_SENTINEL = "HANDOFF_TO_SYNC_WAITING"
-_ONBOARDING_CONTEXTUAL_CHAT_SENTINEL = "HANDOFF_TO_CONTEXTUAL_CHAT"
-_ONBOARDING_NO_REPLY_SENTINEL = "NO_SETUP_REPLY"
-_REVIEW_SHOW_PROMPT_SENTINEL = "SHOW_CURRENT_REVIEW_PROMPT"
-_REVIEW_NO_ACTION_SENTINEL = "NO_REVIEW_PROTOCOL_ACTION"
-_GROUP_SHARE_EXECUTE_SENTINEL = "EXECUTE_GROUP_SHARE"
-_GROUP_SHARE_NO_ACTION_SENTINEL = "NO_GROUP_SHARE_PROTOCOL_ACTION"
-_GROUP_INTRO_SHOW_SENTINEL = "SHOW_GROUP_INTRO"
-_GROUP_INTRO_NO_ACTION_SENTINEL = "NO_GROUP_INTRO_PROTOCOL_ACTION"
-_HEARTBEAT_OK_SENTINEL = "HEARTBEAT_OK"
 _SLOW_HERMES_TURN_MS = 3_000
 _DM_REPLY_MAX_ATTEMPTS = 2
 _DM_REPLY_RETRY_MAX_ITERATIONS = 2
-_PROTOCOL_SENTINELS = frozenset(
-    {
-        _ONBOARDING_SYNC_WAITING_SENTINEL,
-        _ONBOARDING_CONTEXTUAL_CHAT_SENTINEL,
-        _ONBOARDING_NO_REPLY_SENTINEL,
-        _REVIEW_SHOW_PROMPT_SENTINEL,
-        _REVIEW_NO_ACTION_SENTINEL,
-        _GROUP_SHARE_EXECUTE_SENTINEL,
-        _GROUP_SHARE_NO_ACTION_SENTINEL,
-        _GROUP_INTRO_SHOW_SENTINEL,
-        _GROUP_INTRO_NO_ACTION_SENTINEL,
-    }
-)
 
 
 @dataclass(slots=True)
@@ -225,12 +223,12 @@ class FlorenceHouseholdChatService:
         elif brief_kind == HouseholdBriefingKind.PICKUP:
             user_message = (
                 "Prepare the afternoon pickup check for today. Only mention same-day actionable items affecting pickup, after-school coverage, gear, forms, snacks, uniforms, location changes, or timing conflicts. "
-                f"If nothing is newly actionable, reply exactly {_HEARTBEAT_OK_SENTINEL}."
+                f"If nothing is newly actionable, reply exactly {HEARTBEAT_OK_SENTINEL}."
             )
         elif brief_kind == HouseholdBriefingKind.SCHOOL:
             user_message = (
                 "Prepare the school triage sweep. Check recent school-related messages and tracked state for forms, signatures, fees, field trips, theme days, supply asks, health or safety items, and schedule changes. "
-                f"Skip routine newsletter noise. If nothing is newly actionable, reply exactly {_HEARTBEAT_OK_SENTINEL}."
+                f"Skip routine newsletter noise. If nothing is newly actionable, reply exactly {HEARTBEAT_OK_SENTINEL}."
             )
         elif brief_kind == HouseholdBriefingKind.WEEKLY:
             user_message = (
@@ -240,7 +238,7 @@ class FlorenceHouseholdChatService:
             user_message = (
                 "Prepare the meal plan and shopping pulse. Review the upcoming dinners against the current calendar load, existing meal plan, open grocery list, and saved household preferences. "
                 "Prefer practical meals over aspirational ones, easier dinners on busy nights, ingredient reuse across the week, and a short grouped grocery-gap list. "
-                f"If the week already looks covered and there is no useful shopping gap to flag, reply exactly {_HEARTBEAT_OK_SENTINEL}."
+                f"If the week already looks covered and there is no useful shopping gap to flag, reply exactly {HEARTBEAT_OK_SENTINEL}."
             )
         else:
             user_message = (
@@ -462,8 +460,8 @@ class FlorenceHouseholdChatService:
                 [
                     base_system,
                     "You are deciding whether Florence should surface the currently available private review item or review batch in this DM.",
-                    f"If the user is explicitly asking to review pending imports, the review queue, or what needs review now, reply exactly {_REVIEW_SHOW_PROMPT_SENTINEL}.",
-                    f"Otherwise reply exactly {_REVIEW_NO_ACTION_SENTINEL}.",
+                    f"If the user is explicitly asking to review pending imports, the review queue, or what needs review now, reply exactly {REVIEW_SHOW_PROMPT_SENTINEL}.",
+                    f"Otherwise reply exactly {REVIEW_NO_ACTION_SENTINEL}.",
                     "Do not answer the underlying household question here.",
                     "If prompt_armed is true, the review item or batch is already surfaced, so do not re-surface it from this decision step.",
                 ]
@@ -530,8 +528,8 @@ class FlorenceHouseholdChatService:
                 [
                     base_system,
                     "You are deciding whether a private parent-DM message is an explicit request to share recent DM context into the household parent group.",
-                    f"If the user is clearly asking Florence to share, send, or post the recent DM update to the parent group, reply exactly {_GROUP_SHARE_EXECUTE_SENTINEL}.",
-                    f"Otherwise reply exactly {_GROUP_SHARE_NO_ACTION_SENTINEL}.",
+                    f"If the user is clearly asking Florence to share, send, or post the recent DM update to the parent group, reply exactly {GROUP_SHARE_EXECUTE_SENTINEL}.",
+                    f"Otherwise reply exactly {GROUP_SHARE_NO_ACTION_SENTINEL}.",
                     "Bare links, screenshots, attachments, schedule feeds, webcal:// links, and .ics calendar URLs are not group-share requests by themselves.",
                     "Follow-ups like 'here is the calendar link', 'here is the schedule', or 'use this feed for Theo' are normal household-task turns unless they explicitly mention sharing to the group.",
                     "Do not confuse this with source-visibility choices inside a review-item prompt.",
@@ -551,8 +549,8 @@ class FlorenceHouseholdChatService:
                 [
                     base_system,
                     "You are deciding whether Florence should send the lightweight first-time intro for the household parent group.",
-                    f"If this message is just an opening greeting or simple hello into the newly active parent group, reply exactly {_GROUP_INTRO_SHOW_SENTINEL}.",
-                    f"Otherwise reply exactly {_GROUP_INTRO_NO_ACTION_SENTINEL}.",
+                    f"If this message is just an opening greeting or simple hello into the newly active parent group, reply exactly {GROUP_INTRO_SHOW_SENTINEL}.",
+                    f"Otherwise reply exactly {GROUP_INTRO_NO_ACTION_SENTINEL}.",
                     "Do not answer the underlying household question here.",
                     "If the message already contains a substantive request, planning question, or task, do not use the intro.",
                 ]
@@ -738,15 +736,15 @@ class FlorenceHouseholdChatService:
                 "If the parent says Florence should already have that answer from email or calendar, treat that as permission to check the connected Google context for the current onboarding question.",
                 (
                     f"If Google is already connected and the message is asking for inbox or calendar dependent information that still requires the first sync to finish, "
-                    f"reply exactly {_ONBOARDING_SYNC_WAITING_SENTINEL}."
+                    f"reply exactly {ONBOARDING_SYNC_WAITING_SENTINEL}."
                 ),
                 (
                     f"If Google is already connected and the message is a sync-status question or a general household question that can continue while sync runs, "
-                    f"reply exactly {_ONBOARDING_CONTEXTUAL_CHAT_SENTINEL}."
+                    f"reply exactly {ONBOARDING_CONTEXTUAL_CHAT_SENTINEL}."
                 ),
                 (
                     f"If Google is already connected and the message is only a brief acknowledgement like ok, sounds good, or thanks with no substantive request, "
-                    f"reply exactly {_ONBOARDING_NO_REPLY_SENTINEL}."
+                    f"reply exactly {ONBOARDING_NO_REPLY_SENTINEL}."
                 ),
                 "If the user did not provide a concrete storable onboarding fact, do not call a write tool. Ask one short follow-up or restate the next onboarding question naturally.",
                 "If household_apply_onboarding_update returns reply_messages, base your reply on that result so Florence stays aligned with the deterministic onboarding state machine.",
@@ -922,6 +920,10 @@ class FlorenceHouseholdChatService:
             "gmail_matches": gmail_matches,
             "calendar_matches": calendar_matches,
             "mirror_sync_running": mirror_sync_running,
+            "mirror_freshness": self._build_recent_google_mirror_freshness(
+                inbox_connections=list(inbox_scope.connections or []),
+                calendar_connections=list(calendar_scope.connections or []),
+            ),
             "connection_statuses": connection_statuses,
         }
 
@@ -941,7 +943,6 @@ class FlorenceHouseholdChatService:
         turn_kind: str = "chat",
         internal_turn: bool = False,
     ) -> dict[str, Any]:
-        task_id = f"florence-household-{uuid.uuid4()}"
         result: dict[str, Any] | None = None
         error: Exception | None = None
         turn_started = perf_counter()
@@ -955,41 +956,31 @@ class FlorenceHouseholdChatService:
         )
         if internal_turn:
             resolved_session_id = session_id or (
-                f"{self._default_session_id(channel_id)}-internal-{turn_kind}-{uuid.uuid4().hex[:8]}"
+                f"{self._default_session_id(channel_id)}-internal-{turn_kind}-{os.urandom(4).hex()}"
             )
             resolved_skip_memory = True
             resolved_honcho_session_key = None
-
-        agent_factory = self.agent_factory
-        if agent_factory is None:
-            from run_agent import AIAgent
-
-            agent_factory = AIAgent
-        from tools.florence_household_tool import (
-            clear_household_tool_context,
-            set_household_tool_context,
-        )
-        set_household_tool_context(
-            task_id,
-            store=self.store,
-            household_id=household_id,
-            actor_member_id=actor_member_id,
-            channel_id=channel_id,
-            household_chat_service=self,
-        )
         try:
-            agent = agent_factory(
+            adapter = FlorenceHermesAdapter(
+                store=self.store,
                 model=self.model,
-                max_iterations=resolved_max_iterations,
                 provider=self.provider,
-                enabled_toolsets=enabled_toolsets,
-                quiet_mode=True,
-                skip_memory=resolved_skip_memory,
-                skip_local_memory=True,
-                skip_context_files=False,
-                platform="florence",
-                session_id=resolved_session_id,
                 session_db=self.session_db,
+                agent_factory=self.agent_factory,
+                household_chat_service=self,
+            )
+            adapter_result = adapter.run_conversation(
+                household_id=household_id,
+                channel_id=channel_id,
+                actor_member_id=actor_member_id,
+                user_message=user_message,
+                persist_user_message=persist_user_message,
+                system_message=system_message,
+                conversation_history=conversation_history,
+                enabled_toolsets=enabled_toolsets,
+                max_iterations=resolved_max_iterations,
+                session_id=resolved_session_id,
+                skip_memory=resolved_skip_memory,
                 honcho_session_key=resolved_honcho_session_key,
                 session_search_kwargs=self._build_session_search_kwargs(
                     household_id=household_id,
@@ -997,25 +988,12 @@ class FlorenceHouseholdChatService:
                     actor_member_id=actor_member_id,
                 ),
             )
-            run_kwargs = {
-                "user_message": user_message,
-                "system_message": system_message,
-                "conversation_history": conversation_history,
-                "task_id": task_id,
-            }
-            if persist_user_message is not None:
-                run_kwargs["persist_user_message"] = persist_user_message
-            try:
-                result = agent.run_conversation(**run_kwargs)
-            except TypeError as exc:
-                if "persist_user_message" not in str(exc):
-                    raise
-                run_kwargs.pop("persist_user_message", None)
-                result = agent.run_conversation(**run_kwargs)
+            task_id = adapter_result.task_id
+            result = adapter_result.result
             if not internal_turn:
                 self._persist_channel_session_id(
                     channel_id=channel_id,
-                    session_id=str(getattr(agent, "session_id", "") or "").strip(),
+                    session_id=adapter_result.session_id,
                 )
             return result
         except Exception as exc:
@@ -1034,7 +1012,6 @@ class FlorenceHouseholdChatService:
                 result=result,
                 error=error,
             )
-            clear_household_tool_context(task_id)
 
     def _log_agent_turn(
         self,
@@ -1090,8 +1067,7 @@ class FlorenceHouseholdChatService:
 
     @staticmethod
     def looks_like_protocol_sentinel(reply_text: str | None) -> bool:
-        normalized = str(reply_text or "").strip()
-        return normalized in _PROTOCOL_SENTINELS
+        return looks_like_protocol_sentinel(reply_text)
 
     def _build_live_user_message(
         self,
@@ -1251,7 +1227,58 @@ class FlorenceHouseholdChatService:
             "gmail_matches": gmail_matches,
             "calendar_matches": calendar_matches,
             "mirror_sync_running": mirror_sync_running,
+            "mirror_freshness": self._build_recent_google_mirror_freshness(
+                inbox_connections=list(inbox_scope.connections or []),
+                calendar_connections=list(calendar_scope.connections or []),
+            ),
             "connection_statuses": connection_statuses,
+        }
+
+    def _build_recent_google_mirror_freshness(
+        self,
+        *,
+        inbox_connections: list[Any],
+        calendar_connections: list[Any],
+    ) -> dict[str, Any]:
+        now_utc = self._coerce_aware_datetime(self.now_getter())
+        gmail_connections = [
+            build_google_mirror_connection_freshness(
+                connection=connection,
+                metadata=dict(connection.metadata) if isinstance(connection.metadata, dict) else {},
+                last_synced_key="gmail_last_synced_at",
+                now_utc=now_utc,
+            )
+            for connection in inbox_connections
+        ]
+        calendar_connections_freshness = [
+            build_google_mirror_connection_freshness(
+                connection=connection,
+                metadata=dict(connection.metadata) if isinstance(connection.metadata, dict) else {},
+                last_synced_key="calendar_last_synced_at",
+                now_utc=now_utc,
+            )
+            for connection in calendar_connections
+        ]
+        gmail_summary = build_google_mirror_freshness_summary(
+            connection_freshness=gmail_connections,
+            source_kind="gmail",
+        )
+        calendar_summary = build_google_mirror_freshness_summary(
+            connection_freshness=calendar_connections_freshness,
+            source_kind="calendar",
+        )
+        summaries = [summary for summary in (gmail_summary, calendar_summary) if summary["status"] != "no_connections"]
+        return {
+            "fresh_enough_for_latest_claims": bool(summaries)
+            and all(bool(summary.get("fresh_enough_for_latest_claims")) for summary in summaries),
+            "sources": {
+                "gmail": gmail_summary,
+                "calendar": calendar_summary,
+            },
+            "guidance": (
+                "Use recent_google_context as fresh evidence only for sources whose mirror_freshness is fresh. "
+                "For stale, running, error, or never_synced mirrors, do not make latest, complete, or absence claims."
+            ),
         }
 
     @staticmethod
@@ -1344,7 +1371,9 @@ class FlorenceHouseholdChatService:
         return tuple(names)
 
     @staticmethod
-    def _extract_onboarding_reply_messages(result: dict[str, Any]) -> tuple[str, ...]:
+    def _extract_onboarding_reply_messages(result: dict[str, Any] | None) -> tuple[str, ...]:
+        if not isinstance(result, dict):
+            return ()
         raw_messages = result.get("messages")
         if not isinstance(raw_messages, list):
             return ()
@@ -1372,12 +1401,7 @@ class FlorenceHouseholdChatService:
 
     @staticmethod
     def _build_session_db() -> Any | None:
-        try:
-            from hermes_state import SessionDB
-
-            return SessionDB()
-        except Exception:
-            return None
+        return build_hermes_session_db()
 
     def _default_session_id(self, channel_id: str) -> str:
         return f"florence-channel-{channel_id}"
@@ -1711,11 +1735,13 @@ class FlorenceHouseholdChatService:
             "If the user points Florence toward their inbox as the source of truth, treat that as a strong cue to search the connected inbox instead of bouncing the question back.",
             "household_search_google_inbox respects scope: in a parent DM it defaults to that parent's inbox, while in the family group it only uses shared-household inbox scope.",
             "household_search_google_calendar respects the same privacy boundary: in a parent DM it defaults to that parent's mirrored calendar, while in the family group it only uses shared-household calendar scope.",
+            "When household_search_google_inbox or household_search_google_calendar returns mirror_freshness, read it before making latest, complete, or absence claims.",
+            "If mirror_freshness is stale, running, error, or never_synced, use returned matches as source evidence but do not claim Florence has the latest complete inbox/calendar view.",
             "If household_search_google_inbox returns no matches but reports mirror_sync_running=true, explain that Florence is still syncing that inbox instead of implying the email does not exist.",
             "If household_search_google_calendar returns no matches but reports mirror_sync_running=true, explain that Florence is still syncing that calendar instead of implying the schedule is absent.",
             "If household_search_google_inbox returns no matches and the user is pointing to a very recent forwarded invite or message, ask for one or two grounding details rather than claiming certainty that nothing is there.",
-            "If the live turn payload includes recent_google_context, treat it as fresh mirrored inbox or calendar evidence for this active DM thread.",
-            "Use recent_google_context proactively when it likely answers the parent's question or resolves a vague reference like that invite, that schedule, or those school emails.",
+            "If the live turn payload includes recent_google_context, inspect its mirror_freshness before using it as mirrored inbox or calendar evidence for this active DM thread.",
+            "Use recent_google_context proactively when its freshness and matches likely answer the parent's question or resolve a vague reference like that invite, that schedule, or those school emails.",
             "Do not make the parent restate where something came from if recent_google_context already contains the relevant synced evidence.",
             "For school, pickup, travel, and schedule questions tied to a specific date, answer from explicit dated evidence in confirmed household state, mirrored inbox/calendar results, or current web research.",
             "Do not infer that a specific future date is a normal school day, holiday-free, or covered just because nearby weekdays follow a pattern.",
@@ -1782,6 +1808,16 @@ class FlorenceHouseholdChatService:
             )
             lines.append(
                 "Recall policy: session_search in the family group is limited to shared household group threads, not private parent DMs."
+            )
+        active_pending_action = latest_active_pending_action(
+            self.store.list_channel_messages(channel_id=channel_id, limit=8)
+        )
+        if active_pending_action is not None:
+            lines.append("Active pending action in this channel:")
+            lines.append(json.dumps(pending_action_to_model_context(active_pending_action), ensure_ascii=True))
+            lines.append(
+                "If the parent is confirming, rejecting, skipping, snoozing, or otherwise updating this pending action, pass pending_action_id exactly to the relevant Florence tool. "
+                "If their reply is a generic acknowledgement or does not clearly bind to this pending action, do not mutate state for it."
             )
         if actor_name:
             lines.append(f"Current speaker: {actor_name}")

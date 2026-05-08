@@ -104,6 +104,7 @@ class FlorenceDmRouter:
                     channel_id=resolved.channel_id,
                     actor_member_id=resolved.member_id,
                     message_text=self.review_protocol.build_chat_followup_context(
+                        channel_id=resolved.channel_id,
                         text=text,
                         prompt=review_prompt,
                     ),

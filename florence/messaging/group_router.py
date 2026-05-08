@@ -10,7 +10,14 @@ from florence.messaging.ingress_types import (
     FlorenceResolvedInboundMessage,
 )
 from florence.messaging.protocol_types import FlorenceProtocolReply
+from florence.runtime.group_policy import FlorenceGroupTurnPolicy
 from florence.state import FlorenceStateDB
+from florence.turns import (
+    FlorenceTurnDisposition,
+    FlorenceTurnEnvelope,
+    FlorenceTurnOutcome,
+    build_inbound_turn_envelope,
+)
 
 
 class FlorenceGroupRouter:
@@ -26,10 +33,29 @@ class FlorenceGroupRouter:
         self.store = store
         self.channel_log = channel_log
         self.chat_bridge = chat_bridge
+        self.group_policy = FlorenceGroupTurnPolicy()
 
     def handle_message(self, resolved: FlorenceResolvedInboundMessage) -> FlorenceMessagingIngressResult:
+        return self.handle_turn(
+            envelope=build_inbound_turn_envelope(
+                self.store,
+                resolved,
+                recent_history=tuple(self.channel_log.recent_messages(channel_id=resolved.channel_id, limit=24)),
+            ),
+            resolved=resolved,
+        )
+
+    def handle_turn(
+        self,
+        *,
+        envelope: FlorenceTurnEnvelope,
+        resolved: FlorenceResolvedInboundMessage,
+    ) -> FlorenceMessagingIngressResult:
         if resolved.member_id is None:
-            return FlorenceMessagingIngressResult(consumed=False)
+            return self._result_from_turn_outcome(self.group_policy.no_actor_outcome(envelope))
+        chatter_outcome = self.group_policy.obvious_chatter_outcome(envelope)
+        if chatter_outcome is not None:
+            return self._result_from_turn_outcome(chatter_outcome)
 
         onboarding_sessions = self.store.list_member_onboarding_sessions(
             household_id=resolved.household_id,
@@ -50,7 +76,9 @@ class FlorenceGroupRouter:
                 user_message=resolved.message.body,
             )
             if intro_result is not None:
-                return self._result_from_protocol_reply(intro_result)
+                return self._result_from_turn_outcome(
+                    self._outcome_from_protocol_reply(envelope, intro_result)
+                )
 
         chat_result = self.chat_bridge.respond_as_protocol(
             household_id=resolved.household_id,
@@ -60,14 +88,39 @@ class FlorenceGroupRouter:
             message_attachments=resolved.message.attachments,
         )
         if chat_result is not None:
-            return self._result_from_protocol_reply(chat_result)
-        return FlorenceMessagingIngressResult(consumed=False)
+            return self._result_from_turn_outcome(
+                self._outcome_from_protocol_reply(envelope, chat_result)
+            )
+        return self._result_from_turn_outcome(
+            FlorenceTurnOutcome(
+                disposition=FlorenceTurnDisposition.NO_REPLY,
+                no_reply_reason="group_chat_no_result",
+                metadata={"florence_turn_id": envelope.turn_id},
+            )
+        )
 
-    @staticmethod
-    def _result_from_protocol_reply(reply: FlorenceProtocolReply) -> FlorenceMessagingIngressResult:
-        return FlorenceMessagingIngressResult(
+    def _outcome_from_protocol_reply(
+        self,
+        envelope: FlorenceTurnEnvelope,
+        reply: FlorenceProtocolReply,
+    ) -> FlorenceTurnOutcome:
+        return self.group_policy.reply_outcome(
+            envelope,
             reply_text=reply.reply_text,
             reply_messages=reply.reply_messages,
             group_announcement=reply.group_announcement,
-            consumed=reply.consumed,
+            metadata=reply.reply_metadata,
+        )
+
+    @staticmethod
+    def _result_from_turn_outcome(outcome: FlorenceTurnOutcome) -> FlorenceMessagingIngressResult:
+        metadata = dict(outcome.metadata)
+        if outcome.no_reply_reason:
+            metadata.setdefault("no_reply_reason", outcome.no_reply_reason)
+        return FlorenceMessagingIngressResult(
+            reply_text=outcome.reply_messages[0] if len(outcome.reply_messages) == 1 else None,
+            reply_messages=outcome.reply_messages if len(outcome.reply_messages) != 1 else (),
+            reply_metadata=metadata,
+            group_announcement=outcome.group_announcement,
+            consumed=outcome.consumed,
         )

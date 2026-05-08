@@ -51,9 +51,9 @@ def _preflight_error_hint(exc: Exception) -> str:
 
 
 def _default_preflight_agent_factory(**kwargs):
-    from run_agent import AIAgent
+    from florence.agent import build_hermes_agent
 
-    return AIAgent(**kwargs)
+    return build_hermes_agent(**kwargs)
 
 
 def _run_hermes_preflight(

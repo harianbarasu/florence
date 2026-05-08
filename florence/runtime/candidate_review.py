@@ -275,6 +275,7 @@ class FlorenceCandidateReviewService:
         source_visibility: HouseholdSourceVisibility | None = None,
         resolution: str | None = None,
         overrides: dict[str, Any] | None = None,
+        review_context: dict[str, Any] | None = None,
     ) -> _CandidateReviewReply:
         normalized_candidate_ids = self._normalize_candidate_ids(candidate_ids, fallback=candidate_id)
         prefix: str | None = None
@@ -304,10 +305,15 @@ class FlorenceCandidateReviewService:
                 result = self.confirm_candidate_group(
                     candidate_ids=normalized_candidate_ids,
                     overrides=overrides,
+                    review_context=review_context,
                 )
                 confirmation_suffix = self._group_confirmation_suffix(result)
             else:
-                result = self.confirm_candidate(candidate_id=candidate_id, overrides=overrides)
+                result = self.confirm_candidate(
+                    candidate_id=candidate_id,
+                    overrides=overrides,
+                    review_context=review_context,
+                )
                 confirmation_suffix = (
                     f" Confirmed. I’ll keep track of {result.work_item.title} just for you."
                     if result.work_item is not None
@@ -362,16 +368,24 @@ class FlorenceCandidateReviewService:
         *,
         candidate_id: str,
         overrides: dict[str, Any] | None = None,
+        review_context: dict[str, Any] | None = None,
     ) -> _CandidateReviewResult:
         candidate = self.store.get_imported_candidate(candidate_id)
         if candidate is None:
             raise ValueError("unknown_candidate")
 
         if _candidate_scope(candidate) == _PRIVATE_CANDIDATE_SCOPE:
-            work_item = self._candidate_to_private_work_item(candidate, overrides=overrides or {})
+            work_item = self._candidate_to_private_work_item(
+                candidate,
+                overrides=overrides or {},
+                review_context=review_context,
+            )
             self.store.upsert_household_work_item(work_item)
             confirmed_metadata = dict(candidate.metadata)
             confirmed_metadata["confirmed_work_item_id"] = work_item.id
+            normalized_review_context = self._normalize_review_context(review_context)
+            if normalized_review_context is not None:
+                confirmed_metadata["review_context"] = normalized_review_context
             confirmed = replace(candidate, state=CandidateState.CONFIRMED, metadata=confirmed_metadata)
             self.store.upsert_imported_candidate(confirmed)
             return _CandidateReviewResult(
@@ -380,7 +394,11 @@ class FlorenceCandidateReviewService:
                 work_items=(work_item,),
             )
 
-        event = self._candidate_to_event(candidate, overrides=overrides or {})
+        event = self._candidate_to_event(
+            candidate,
+            overrides=overrides or {},
+            review_context=review_context,
+        )
         self.store.upsert_household_event(event)
         try:
             FlorenceHouseholdCalendarProjectionService(self.store).sync_household(
@@ -394,6 +412,9 @@ class FlorenceCandidateReviewService:
             )
         confirmed_metadata = dict(candidate.metadata)
         confirmed_metadata["confirmed_event_id"] = event.id
+        normalized_review_context = self._normalize_review_context(review_context)
+        if normalized_review_context is not None:
+            confirmed_metadata["review_context"] = normalized_review_context
         confirmed = replace(candidate, state=CandidateState.CONFIRMED, metadata=confirmed_metadata)
         self.store.upsert_imported_candidate(confirmed)
         return _CandidateReviewResult(
@@ -408,6 +429,7 @@ class FlorenceCandidateReviewService:
         *,
         candidate_ids: list[str] | tuple[str, ...],
         overrides: dict[str, Any] | None = None,
+        review_context: dict[str, Any] | None = None,
     ) -> _CandidateReviewResult:
         normalized_candidate_ids = self._normalize_candidate_ids(candidate_ids)
         candidates = [
@@ -422,20 +444,34 @@ class FlorenceCandidateReviewService:
         work_items: list[HouseholdWorkItem] = []
         for candidate in candidates:
             if _candidate_scope(candidate) == _PRIVATE_CANDIDATE_SCOPE:
-                work_item = self._candidate_to_private_work_item(candidate, overrides=resolved_overrides)
+                work_item = self._candidate_to_private_work_item(
+                    candidate,
+                    overrides=resolved_overrides,
+                    review_context=review_context,
+                )
                 self.store.upsert_household_work_item(work_item)
                 confirmed_metadata = dict(candidate.metadata)
                 confirmed_metadata["confirmed_work_item_id"] = work_item.id
                 confirmed_metadata["confirmed_work_item_ids"] = [work_item.id]
+                normalized_review_context = self._normalize_review_context(review_context)
+                if normalized_review_context is not None:
+                    confirmed_metadata["review_context"] = normalized_review_context
                 confirmed = replace(candidate, state=CandidateState.CONFIRMED, metadata=confirmed_metadata)
                 self.store.upsert_imported_candidate(confirmed)
                 work_items.append(work_item)
                 continue
-            event = self._candidate_to_event(candidate, overrides=resolved_overrides)
+            event = self._candidate_to_event(
+                candidate,
+                overrides=resolved_overrides,
+                review_context=review_context,
+            )
             self.store.upsert_household_event(event)
             confirmed_metadata = dict(candidate.metadata)
             confirmed_metadata["confirmed_event_id"] = event.id
             confirmed_metadata["confirmed_event_ids"] = [event.id]
+            normalized_review_context = self._normalize_review_context(review_context)
+            if normalized_review_context is not None:
+                confirmed_metadata["review_context"] = normalized_review_context
             confirmed = replace(candidate, state=CandidateState.CONFIRMED, metadata=confirmed_metadata)
             self.store.upsert_imported_candidate(confirmed)
             events.append(event)
@@ -660,7 +696,13 @@ class FlorenceCandidateReviewService:
     def _utc_now(self) -> datetime:
         return datetime.now(timezone.utc)
 
-    def _candidate_to_event(self, candidate: ImportedCandidate, *, overrides: dict[str, Any]) -> HouseholdEvent:
+    def _candidate_to_event(
+        self,
+        candidate: ImportedCandidate,
+        *,
+        overrides: dict[str, Any],
+        review_context: dict[str, Any] | None = None,
+    ) -> HouseholdEvent:
         proposed_fields = candidate.metadata.get("proposed_fields")
         base_fields = dict(proposed_fields) if isinstance(proposed_fields, dict) else {}
         event_fields = {**base_fields, **overrides}
@@ -684,13 +726,12 @@ class FlorenceCandidateReviewService:
             description=str(event_fields.get("description")) if event_fields.get("description") is not None else None,
             source_candidate_id=candidate.id,
             status=status,
-            metadata={
-                "source_kind": candidate.source_kind.value,
-                "source_identifier": candidate.source_identifier,
-                "candidate_summary": candidate.summary,
-                "source_provenance": candidate.metadata.get("source_provenance"),
-                "candidate_raw_metadata": candidate.metadata.get("raw_metadata"),
-            },
+            metadata=self._candidate_confirmation_metadata(
+                candidate,
+                proposed_fields=base_fields,
+                overrides=overrides,
+                review_context=review_context,
+            ),
         )
 
     def _candidate_to_private_work_item(
@@ -698,6 +739,7 @@ class FlorenceCandidateReviewService:
         candidate: ImportedCandidate,
         *,
         overrides: dict[str, Any],
+        review_context: dict[str, Any] | None = None,
     ) -> HouseholdWorkItem:
         proposed_fields = candidate.metadata.get("proposed_fields")
         base_fields = dict(proposed_fields) if isinstance(proposed_fields, dict) else {}
@@ -717,14 +759,55 @@ class FlorenceCandidateReviewService:
             starts_at=str(starts_at) if starts_at is not None else None,
             metadata={
                 "category": "private_import",
-                "source_candidate_id": candidate.id,
-                "source_kind": candidate.source_kind.value,
-                "source_identifier": candidate.source_identifier,
-                "candidate_summary": candidate.summary,
-                "source_provenance": candidate.metadata.get("source_provenance"),
-                "candidate_raw_metadata": candidate.metadata.get("raw_metadata"),
+                **self._candidate_confirmation_metadata(
+                    candidate,
+                    proposed_fields=base_fields,
+                    overrides=overrides,
+                    review_context=review_context,
+                ),
             },
         )
+
+    def _candidate_confirmation_metadata(
+        self,
+        candidate: ImportedCandidate,
+        *,
+        proposed_fields: dict[str, Any],
+        overrides: dict[str, Any],
+        review_context: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        metadata = dict(candidate.metadata) if isinstance(candidate.metadata, dict) else {}
+        confirmation: dict[str, Any] = {
+            "source_candidate_id": candidate.id,
+            "source_candidate_member_id": candidate.member_id,
+            "source_kind": candidate.source_kind.value,
+            "source_identifier": candidate.source_identifier,
+            "candidate_scope": _candidate_scope(candidate),
+            "candidate_summary": candidate.summary,
+            "confirmed_at": self._utc_now().isoformat(),
+            "source_provenance": metadata.get("source_provenance"),
+            "candidate_raw_metadata": metadata.get("raw_metadata"),
+            "proposed_fields": proposed_fields,
+        }
+        normalized_review_context = self._normalize_review_context(review_context)
+        if normalized_review_context is not None:
+            confirmation["review_context"] = normalized_review_context
+        if overrides:
+            confirmation["confirmation_overrides"] = dict(overrides)
+        source_visibility = metadata.get("source_visibility")
+        if source_visibility is not None:
+            confirmation["source_visibility"] = source_visibility
+        source_rule_label = metadata.get("source_rule_label")
+        if source_rule_label is not None:
+            confirmation["source_rule_label"] = source_rule_label
+        return confirmation
+
+    @staticmethod
+    def _normalize_review_context(review_context: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not isinstance(review_context, dict):
+            return None
+        normalized = {str(key): value for key, value in review_context.items() if value is not None}
+        return normalized or None
 
     @staticmethod
     def _build_group_announcement(event: HouseholdEvent) -> str:

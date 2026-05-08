@@ -184,6 +184,12 @@ class TestRegistryOwnedToolsets:
 
 
 class TestToolsetConsistency:
+    @staticmethod
+    def _register_florence_toolsets():
+        from florence.agent import register_florence_toolsets
+
+        register_florence_toolsets()
+
     """Verify structural integrity of the built-in TOOLSETS dict."""
 
     def test_all_toolsets_have_required_keys(self):
@@ -216,6 +222,7 @@ class TestToolsetConsistency:
         assert len(core) > 20, f"Suspiciously small shared core: {len(core)} tools"
 
     def test_florence_chat_uses_general_non_coding_household_tools(self):
+        self._register_florence_toolsets()
         tools = set(resolve_toolset("florence_chat"))
         assert "web_search" in tools
         assert "browser_navigate" in tools
@@ -245,6 +252,7 @@ class TestToolsetConsistency:
         assert "session_search" in tools
 
     def test_florence_briefing_is_read_only_household_lookup(self):
+        self._register_florence_toolsets()
         tools = set(resolve_toolset("florence_briefing"))
         assert tools == {
             "household_search_state",
@@ -256,6 +264,7 @@ class TestToolsetConsistency:
         }
 
     def test_florence_onboarding_allows_narrow_google_lookup(self):
+        self._register_florence_toolsets()
         tools = set(resolve_toolset("florence_onboarding"))
         assert tools == {
             "household_apply_onboarding_update",

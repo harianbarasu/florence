@@ -52,17 +52,34 @@ class FlorenceChannelDeliveryService:
         result: FlorenceEntrypointResult,
         provider: str,
     ) -> None:
+        reply_metadata = dict(getattr(result, "reply_metadata", {}) or {})
         reply_messages = result.reply_messages or ((result.reply_text,) if result.reply_text else ())
         if reply_messages and result.channel_id:
             channel = self.store.get_channel(result.channel_id)
             if channel is not None:
                 for message in reply_messages:
-                    self.send_channel_message(channel=channel, message=message, record_message=False)
+                    self.send_channel_message(
+                        channel=channel,
+                        message=message,
+                        record_message=False,
+                        message_metadata={
+                            **reply_metadata,
+                            "delivery_kind": "reply",
+                        },
+                    )
 
         if result.group_announcement and result.household_id:
             group_channel = self.find_group_channel(result.household_id, provider=provider)
             if group_channel is not None:
-                self.send_channel_message(channel=group_channel, message=result.group_announcement)
+                self.send_channel_message(
+                    channel=group_channel,
+                    message=result.group_announcement,
+                    message_metadata={
+                        **reply_metadata,
+                        "delivery_kind": "group_announcement",
+                        "source_channel_id": result.channel_id,
+                    },
+                )
 
     def find_group_channel(
         self,

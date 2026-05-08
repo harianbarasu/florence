@@ -149,6 +149,43 @@ def test_state_db_round_trips_household_profiles(tmp_path):
     store.close()
 
 
+def test_state_db_round_trips_turn_records(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+
+    store.upsert_turn_record(
+        turn_id="turn_123",
+        household_id="hh_123",
+        channel_id="chan_group_123",
+        actor_member_id="mem_123",
+        trigger_kind="inbound_group",
+        disposition="reply",
+        envelope={
+            "turn_id": "turn_123",
+            "message_text": "Florence, what changed tomorrow?",
+            "visibility_scope": "shared_household_group",
+        },
+        outcome={
+            "reply_messages": ["Tomorrow pickup is early."],
+            "consumed": True,
+        },
+        hermes_version="b52b63396",
+        prompt_version="group-first-v1",
+    )
+
+    loaded = store.get_turn_record("turn_123")
+    listed = store.list_turn_records(household_id="hh_123")
+
+    assert loaded is not None
+    assert loaded["id"] == "turn_123"
+    assert loaded["trigger_kind"] == "inbound_group"
+    assert loaded["disposition"] == "reply"
+    assert loaded["envelope"]["message_text"] == "Florence, what changed tomorrow?"
+    assert loaded["outcome"]["reply_messages"] == ["Tomorrow pickup is early."]
+    assert loaded["hermes_version"] == "b52b63396"
+    assert listed == [loaded]
+    store.close()
+
+
 def test_state_db_updates_candidate_state(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     candidate = ImportedCandidate(
@@ -397,7 +434,7 @@ def test_state_db_round_trips_household_link_requests(tmp_path):
         source_household_id="hh_kendall",
         requires_merge_confirmation=True,
         status=HouseholdLinkRequestStatus.PENDING,
-        expires_at="2026-04-15T19:00:00+00:00",
+        expires_at="2027-04-15T19:00:00+00:00",
         metadata={"requested_by_display_name": "Jackson"},
     )
 

@@ -42,6 +42,7 @@ from florence.runtime.operations import FlorenceHouseholdOperationsService
 from florence.sendblue import FlorenceSendblueClient
 from florence.sendblue.media import enrich_sendblue_payload_with_media_text
 from florence.state import FlorenceStateDB
+from florence.turns import FlorenceTurnTrigger
 
 logger = logging.getLogger(__name__)
 
@@ -179,10 +180,22 @@ class FlorenceProductionService:
         if member_id in shared_member_ids:
             return
 
-        self.delivery_service.send_channel_message(
+        sent = self.household_operations.send_system_messages(
+            trigger_kind=FlorenceTurnTrigger.SYSTEM,
+            household_id=household_id,
             channel=channel,
-            message=self._build_household_calendar_link_message(calendar_web_url=calendar_web_url),
+            actor_member_id=member_id,
+            messages=(self._build_household_calendar_link_message(calendar_web_url=calendar_web_url),),
+            metadata={
+                "operation_kind": "household_calendar_link",
+                "calendar_web_url": calendar_web_url,
+            },
+            message_metadata={
+                "delivery_kind": "household_calendar_link",
+            },
         )
+        if not sent:
+            return
         shared_member_ids.add(member_id)
         current_projection[_HOUSEHOLD_CALENDAR_LINK_SHARED_MEMBER_IDS_KEY] = sorted(shared_member_ids)
         settings = dict(household.settings)
@@ -314,8 +327,25 @@ class FlorenceProductionService:
             if oauth_state.thread_id and dm_messages:
                 channel = resolved_channel
                 if channel is not None:
-                    for message in dm_messages:
-                        self.delivery_service.send_channel_message(channel=channel, message=message)
+                    self.household_operations.send_system_messages(
+                        trigger_kind=(
+                            FlorenceTurnTrigger.ONBOARDING
+                            if became_complete
+                            else FlorenceTurnTrigger.SYNC_BRIEF
+                        ),
+                        household_id=callback.connection.household_id,
+                        channel=channel,
+                        actor_member_id=callback.connection.member_id,
+                        messages=tuple(dm_messages),
+                        metadata={
+                            "operation_kind": "google_callback_followup",
+                            "connection_id": callback.connection.id,
+                            "became_complete": became_complete,
+                        },
+                        message_metadata={
+                            "delivery_kind": "google_callback_followup",
+                        },
+                    )
 
             if became_complete:
                 self.household_operations.record_onboarding_completion(
@@ -480,10 +510,22 @@ class FlorenceProductionService:
                 if channel is None:
                     channel = self.delivery_service.find_channel_by_provider_id(provider_channel_id=thread_id, store=store)
                 if channel is not None:
-                    self.delivery_service.send_channel_message(
+                    failed_connection = store.get_google_connection(connection_id)
+                    self.household_operations.send_system_messages(
+                        trigger_kind=FlorenceTurnTrigger.SYNC_BRIEF,
+                        household_id=channel.household_id,
                         channel=channel,
-                        message="Google connected, but the first sync hit an error. Ask me to retry if it keeps happening.",
+                        actor_member_id=failed_connection.member_id if failed_connection is not None else None,
+                        messages=("Google connected, but the first sync hit an error. Ask me to retry if it keeps happening.",),
                         store=store,
+                        metadata={
+                            "operation_kind": "google_sync_error",
+                            "connection_id": connection_id,
+                            "error_message": "initial_sync_failed",
+                        },
+                        message_metadata={
+                            "delivery_kind": "google_sync_error",
+                        },
                     )
             if raise_on_error:
                 raise

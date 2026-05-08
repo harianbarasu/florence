@@ -19,11 +19,14 @@ from florence.messaging.protocol_types import (
     build_candidate_review_prompt_metadata,
     build_household_nudge_metadata,
 )
+from florence.messaging.protocol_sentinels import HEARTBEAT_OK_SENTINEL
+from florence.ops.turn_records import record_turn_outcome
 from florence.runtime.candidate_review import FlorenceCandidateReviewService
 from florence.runtime.delivery import FlorenceChannelDeliveryService
 from florence.runtime.household_manager import FlorenceHouseholdManagerService
 from florence.runtime.services import _parse_local_time_spec
 from florence.state import FlorenceStateDB
+from florence.turns import FlorenceTurnDisposition, FlorenceTurnTrigger, build_system_turn_envelope
 
 logger = logging.getLogger(__name__)
 _ACTIVE_REVIEW_NUDGE_WINDOW_SECONDS = 15 * 60
@@ -32,7 +35,6 @@ _SYNC_UPDATE_BRIEF_INTERVAL_SECONDS = 6 * 60 * 60
 _REVIEW_BATCH_LIMIT = 3
 _REVIEW_QUIET_HOURS_START = 21
 _REVIEW_QUIET_HOURS_END = 8
-_HEARTBEAT_OK_SENTINEL = "HEARTBEAT_OK"
 
 
 class FlorenceHouseholdOperationsService:
@@ -46,12 +48,141 @@ class FlorenceHouseholdOperationsService:
         household_chat_service_getter: Callable[[], Any],
         candidate_review_service: FlorenceCandidateReviewService | None = None,
         household_manager_service: FlorenceHouseholdManagerService | None = None,
+        now_getter: Callable[[], datetime] | None = None,
     ) -> None:
         self.store = store
         self.delivery_service = delivery_service
         self._household_chat_service_getter = household_chat_service_getter
         self._candidate_review_service = candidate_review_service or FlorenceCandidateReviewService(store)
         self._household_manager_service = household_manager_service or FlorenceHouseholdManagerService(store)
+        self._now_getter = now_getter or (lambda: datetime.now(timezone.utc))
+
+    def _record_operation_turn(
+        self,
+        *,
+        store: FlorenceStateDB,
+        trigger_kind: FlorenceTurnTrigger,
+        household_id: str,
+        channel: Any,
+        actor_member_id: str | None,
+        message_text: str,
+        disposition: FlorenceTurnDisposition = FlorenceTurnDisposition.REPLY,
+        metadata: dict[str, Any] | None = None,
+        state_change_ids: tuple[str, ...] | list[str] = (),
+        scheduled_work_ids: tuple[str, ...] | list[str] = (),
+        no_reply_reason: str | None = None,
+    ) -> None:
+        try:
+            envelope = build_system_turn_envelope(
+                store,
+                trigger_kind=trigger_kind,
+                household_id=household_id,
+                channel_id=channel.id,
+                actor_member_id=actor_member_id,
+                message_text=message_text,
+                metadata=metadata,
+            )
+            record_turn_outcome(
+                store,
+                envelope=envelope,
+                disposition=disposition,
+                reply_messages=(message_text,) if message_text.strip() and disposition != FlorenceTurnDisposition.NO_REPLY else (),
+                state_change_ids=state_change_ids,
+                scheduled_work_ids=scheduled_work_ids,
+                no_reply_reason=no_reply_reason,
+                metadata=metadata,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to record Florence operation turn household_id=%s channel_id=%s trigger=%s",
+                household_id,
+                getattr(channel, "id", None),
+                trigger_kind.value,
+            )
+
+    def send_system_messages(
+        self,
+        *,
+        store: FlorenceStateDB | None = None,
+        trigger_kind: FlorenceTurnTrigger,
+        household_id: str,
+        channel: Any,
+        actor_member_id: str | None,
+        messages: tuple[str, ...] | list[str],
+        metadata: dict[str, Any] | None = None,
+        message_metadata: dict[str, Any] | None = None,
+    ) -> bool:
+        target_store = store or self.store
+        normalized_messages = tuple(str(message).strip() for message in messages if str(message or "").strip())
+        if not normalized_messages:
+            return False
+        turn_metadata = dict(metadata or {})
+        try:
+            envelope = build_system_turn_envelope(
+                target_store,
+                trigger_kind=trigger_kind,
+                household_id=household_id,
+                channel_id=channel.id,
+                actor_member_id=actor_member_id,
+                message_text="\n\n".join(normalized_messages),
+                metadata=turn_metadata,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to build Florence system delivery turn household_id=%s channel_id=%s trigger=%s",
+                household_id,
+                getattr(channel, "id", None),
+                trigger_kind.value,
+            )
+            return False
+
+        delivery_metadata = {
+            "florence_turn_id": envelope.turn_id,
+            "florence_turn_trigger": envelope.trigger_kind.value,
+            "florence_turn_scope": envelope.visibility_scope.scope,
+            **(message_metadata or {}),
+        }
+        sent_messages: list[str] = []
+        for message in normalized_messages:
+            if self.delivery_service.send_channel_message(
+                channel=channel,
+                message=message,
+                store=target_store,
+                message_metadata=delivery_metadata,
+            ):
+                sent_messages.append(message)
+
+        disposition = (
+            FlorenceTurnDisposition.REPLY_MULTIPLE
+            if len(sent_messages) > 1
+            else FlorenceTurnDisposition.REPLY
+            if sent_messages
+            else FlorenceTurnDisposition.FAILED
+        )
+        record_metadata = {
+            **turn_metadata,
+            "message_metadata": delivery_metadata,
+            "message_count": len(normalized_messages),
+            "sent_message_count": len(sent_messages),
+        }
+        try:
+            record_turn_outcome(
+                target_store,
+                envelope=envelope,
+                disposition=disposition,
+                reply_messages=tuple(sent_messages),
+                no_reply_reason=None if sent_messages else "delivery_failed",
+                metadata=record_metadata,
+                consumed=bool(sent_messages),
+            )
+        except Exception:
+            logger.exception(
+                "Failed to record Florence system delivery turn household_id=%s channel_id=%s trigger=%s",
+                household_id,
+                getattr(channel, "id", None),
+                trigger_kind.value,
+            )
+        return bool(sent_messages)
 
     def has_onboarding_completion_event(
         self,
@@ -193,36 +324,49 @@ class FlorenceHouseholdOperationsService:
                         member_id,
                         prompt.candidate.id,
                     )
+            candidate_ids = self._review_prompt_target_ids(prompt)
             sent_prompt = self.delivery_service.send_channel_message(
                 channel=channel,
                 message=prompt_text,
                 store=target_store,
                 message_metadata=build_candidate_review_prompt_metadata(
                     prompt.candidate.id,
-                    candidate_ids=self._review_prompt_target_ids(prompt),
+                    candidate_ids=candidate_ids,
                 ),
             )
             if sent_prompt:
                 candidate_metadata = dict(prompt.candidate.metadata) if isinstance(prompt.candidate.metadata, dict) else {}
+                turn_metadata = {
+                    "operation_kind": "review_prompt",
+                    "candidate_id": prompt.candidate.id,
+                    "source_kind": prompt.candidate.source_kind.value,
+                    "source_identifier": prompt.candidate.source_identifier,
+                    "candidate_title": prompt.candidate.title,
+                    "candidate_summary": prompt.candidate.summary,
+                    "confirmation_question": str(candidate_metadata.get("confirmation_question") or "").strip() or None,
+                    "source_visibility": str(candidate_metadata.get("source_visibility") or "").strip() or None,
+                    "source_rule_label": str(candidate_metadata.get("source_rule_label") or "").strip() or None,
+                    "newly_pending_count": len(newly_pending),
+                    "candidate_ids": candidate_ids,
+                    "batch_count": len(prompt.candidates),
+                    "trigger": "new_pending_candidate",
+                }
                 self._manager_service(store).record_pilot_event(
                     household_id=household_id,
                     event_type="review_prompt_sent",
                     member_id=member_id,
                     channel_id=channel.id,
-                    metadata={
-                        "candidate_id": prompt.candidate.id,
-                        "source_kind": prompt.candidate.source_kind.value,
-                        "source_identifier": prompt.candidate.source_identifier,
-                        "candidate_title": prompt.candidate.title,
-                        "candidate_summary": prompt.candidate.summary,
-                        "confirmation_question": str(candidate_metadata.get("confirmation_question") or "").strip() or None,
-                        "source_visibility": str(candidate_metadata.get("source_visibility") or "").strip() or None,
-                        "source_rule_label": str(candidate_metadata.get("source_rule_label") or "").strip() or None,
-                        "newly_pending_count": len(newly_pending),
-                        "candidate_ids": self._review_prompt_target_ids(prompt),
-                        "batch_count": len(prompt.candidates),
-                        "trigger": "new_pending_candidate",
-                    },
+                    metadata=turn_metadata,
+                )
+                self._record_operation_turn(
+                    store=target_store,
+                    trigger_kind=FlorenceTurnTrigger.REVIEW,
+                    household_id=household_id,
+                    channel=channel,
+                    actor_member_id=member_id,
+                    message_text=prompt_text,
+                    metadata=turn_metadata,
+                    state_change_ids=candidate_ids,
                 )
 
         if not sent_prompt:
@@ -345,13 +489,14 @@ class FlorenceHouseholdOperationsService:
                         member_id,
                         prompt.candidate.id,
                     )
+            candidate_ids = self._review_prompt_target_ids(prompt)
             if not self.delivery_service.send_channel_message(
                 channel=channel,
                 message=prompt_text,
                 store=target_store,
                 message_metadata=build_candidate_review_prompt_metadata(
                     prompt.candidate.id,
-                    candidate_ids=self._review_prompt_target_ids(prompt),
+                    candidate_ids=candidate_ids,
                 ),
             ):
                 continue
@@ -361,25 +506,37 @@ class FlorenceHouseholdOperationsService:
                 candidate_metadata = dict(candidate.metadata) if isinstance(candidate.metadata, dict) else {}
                 candidate_metadata["review_nudged_at"] = nudged_at
                 target_store.upsert_imported_candidate(replace(candidate, metadata=candidate_metadata))
+            turn_metadata = {
+                "operation_kind": "review_prompt",
+                "candidate_id": prompt.candidate.id,
+                "source_kind": prompt.candidate.source_kind.value,
+                "source_identifier": prompt.candidate.source_identifier,
+                "candidate_title": prompt.candidate.title,
+                "candidate_summary": prompt.candidate.summary,
+                "confirmation_question": str(metadata.get("confirmation_question") or "").strip() or None,
+                "source_visibility": str(metadata.get("source_visibility") or "").strip() or None,
+                "source_rule_label": str(metadata.get("source_rule_label") or "").strip() or None,
+                "pending_review_count": len(member_pending),
+                "candidate_ids": candidate_ids,
+                "batch_count": len(prompt.candidates),
+                "trigger": "scheduled_review_sweep",
+            }
             self._manager_service(store).record_pilot_event(
                 household_id=household_id,
                 event_type="review_prompt_sent",
                 member_id=member_id,
                 channel_id=channel.id,
-                metadata={
-                    "candidate_id": prompt.candidate.id,
-                    "source_kind": prompt.candidate.source_kind.value,
-                    "source_identifier": prompt.candidate.source_identifier,
-                    "candidate_title": prompt.candidate.title,
-                    "candidate_summary": prompt.candidate.summary,
-                    "confirmation_question": str(metadata.get("confirmation_question") or "").strip() or None,
-                    "source_visibility": str(metadata.get("source_visibility") or "").strip() or None,
-                    "source_rule_label": str(metadata.get("source_rule_label") or "").strip() or None,
-                    "pending_review_count": len(member_pending),
-                    "candidate_ids": self._review_prompt_target_ids(prompt),
-                    "batch_count": len(prompt.candidates),
-                    "trigger": "scheduled_review_sweep",
-                },
+                metadata=turn_metadata,
+            )
+            self._record_operation_turn(
+                store=target_store,
+                trigger_kind=FlorenceTurnTrigger.REVIEW,
+                household_id=household_id,
+                channel=channel,
+                actor_member_id=member_id,
+                message_text=prompt_text,
+                metadata=turn_metadata,
+                state_change_ids=candidate_ids,
             )
             sent += 1
         return sent
@@ -410,25 +567,40 @@ class FlorenceHouseholdOperationsService:
                 if isinstance(nudge_metadata.get("delivery_message_metadata"), dict)
                 else {}
             )
+            message_metadata = {
+                **build_household_nudge_metadata(nudge.id),
+                **custom_delivery_metadata,
+            }
             if self.delivery_service.send_channel_message(
                 channel=channel,
                 message=nudge.message,
                 store=target_store,
-                message_metadata={
-                    **build_household_nudge_metadata(nudge.id),
-                    **custom_delivery_metadata,
-                },
+                message_metadata=message_metadata,
             ):
                 manager_service.mark_nudge_sent(nudge_id=nudge.id)
+                turn_metadata = {
+                    "operation_kind": "scheduled_nudge",
+                    "nudge_id": nudge.id,
+                    "target_kind": nudge.target_kind.value,
+                    "target_id": nudge.target_id,
+                    "message_metadata": message_metadata,
+                }
                 manager_service.record_pilot_event(
                     household_id=household_id,
                     event_type="nudge_sent",
                     member_id=nudge.recipient_member_id,
                     channel_id=channel.id,
-                    metadata={
-                        "nudge_id": nudge.id,
-                        "target_kind": nudge.target_kind.value,
-                    },
+                    metadata=turn_metadata,
+                )
+                self._record_operation_turn(
+                    store=target_store,
+                    trigger_kind=FlorenceTurnTrigger.SCHEDULED_NUDGE,
+                    household_id=household_id,
+                    channel=channel,
+                    actor_member_id=nudge.recipient_member_id,
+                    message_text=nudge.message,
+                    metadata=turn_metadata,
+                    scheduled_work_ids=(nudge.id,),
                 )
                 sent += 1
         return sent
@@ -488,7 +660,10 @@ class FlorenceHouseholdOperationsService:
         return False
 
     def _utc_now(self) -> datetime:
-        return datetime.now(timezone.utc)
+        value = self._now_getter()
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
 
     def _is_review_quiet_hours(
         self,
@@ -746,20 +921,49 @@ class FlorenceHouseholdOperationsService:
                 continue
             if not brief_message or not brief_message.strip():
                 continue
-            if brief_message.strip() == _HEARTBEAT_OK_SENTINEL:
+            if brief_message.strip() == HEARTBEAT_OK_SENTINEL:
                 manager_service.mark_briefing_routine_sent(routine_id=routine.id)
+                self._record_operation_turn(
+                    store=target_store,
+                    trigger_kind=FlorenceTurnTrigger.SCHEDULED_BRIEF,
+                    household_id=household_id,
+                    channel=channel,
+                    actor_member_id=recipient_member_id,
+                    message_text="",
+                    disposition=FlorenceTurnDisposition.NO_REPLY,
+                    metadata={
+                        "operation_kind": "scheduled_brief",
+                        "routine_id": routine.id,
+                        "brief_kind": brief_kind.value,
+                        "suppressed_reason": "heartbeat_ok",
+                    },
+                    scheduled_work_ids=(routine.id,),
+                    no_reply_reason="heartbeat_ok",
+                )
                 continue
             if self.delivery_service.send_channel_message(channel=channel, message=brief_message, store=target_store):
                 manager_service.mark_briefing_routine_sent(routine_id=routine.id)
+                turn_metadata = {
+                    "operation_kind": "scheduled_brief",
+                    "routine_id": routine.id,
+                    "brief_kind": brief_kind.value,
+                }
                 manager_service.record_pilot_event(
                     household_id=household_id,
                     event_type="briefing_sent",
                     member_id=recipient_member_id,
                     channel_id=channel.id,
-                    metadata={
-                        "routine_id": routine.id,
-                        "brief_kind": brief_kind.value,
-                    },
+                    metadata=turn_metadata,
+                )
+                self._record_operation_turn(
+                    store=target_store,
+                    trigger_kind=FlorenceTurnTrigger.SCHEDULED_BRIEF,
+                    household_id=household_id,
+                    channel=channel,
+                    actor_member_id=recipient_member_id,
+                    message_text=brief_message,
+                    metadata=turn_metadata,
+                    scheduled_work_ids=(routine.id,),
                 )
                 sent += 1
         return sent
@@ -905,6 +1109,27 @@ class FlorenceHouseholdOperationsService:
                 channel_id=primary_channel.id,
                 snapshot=sync_snapshot,
             )
+            self._record_operation_turn(
+                store=target_store,
+                trigger_kind=FlorenceTurnTrigger.SYNC_BRIEF,
+                household_id=connection.household_id,
+                channel=primary_channel,
+                actor_member_id=connection.member_id,
+                message_text=activation_message,
+                metadata={
+                    "operation_kind": "sync_brief",
+                    "brief_kind": "activation",
+                    "connection_id": connection.id,
+                    "gmail_count": int(sync_snapshot.get("gmail_count") or 0),
+                    "calendar_count": int(sync_snapshot.get("calendar_count") or 0),
+                    "candidate_count": int(sync_snapshot.get("candidate_count") or 0),
+                    "candidate_ids": list(sync_snapshot.get("candidate_ids") or []),
+                    "candidate_titles": list(sync_snapshot.get("candidate_titles") or []),
+                    "delivery_channel_id": primary_channel.id,
+                    "delivery_channel_type": primary_channel.channel_type.value,
+                    "promotable_group_message": group_message,
+                },
+            )
         return sent_activation
 
     def deliver_sync_update_brief(
@@ -1016,6 +1241,30 @@ class FlorenceHouseholdOperationsService:
                 "gmail_count": int(current_snapshot.get("gmail_count") or 0),
                 "calendar_count": int(current_snapshot.get("calendar_count") or 0),
                 "candidate_count": int(current_snapshot.get("candidate_count") or 0),
+                "trigger": trigger,
+            },
+        )
+        self._record_operation_turn(
+            store=target_store,
+            trigger_kind=FlorenceTurnTrigger.SYNC_BRIEF,
+            household_id=connection.household_id,
+            channel=primary_channel,
+            actor_member_id=connection.member_id,
+            message_text=update_message,
+            metadata={
+                "operation_kind": "sync_brief",
+                "brief_kind": "update",
+                "connection_id": connection.id,
+                "gmail_count": int(current_snapshot.get("gmail_count") or 0),
+                "calendar_count": int(current_snapshot.get("calendar_count") or 0),
+                "candidate_count": int(current_snapshot.get("candidate_count") or 0),
+                "candidate_ids": list(current_snapshot.get("candidate_ids") or []),
+                "candidate_titles": list(current_snapshot.get("candidate_titles") or []),
+                "previous_snapshot": previous_snapshot,
+                "current_snapshot": current_snapshot,
+                "delivery_channel_id": primary_channel.id,
+                "delivery_channel_type": primary_channel.channel_type.value,
+                "promotable_group_message": group_message,
                 "trigger": trigger,
             },
         )

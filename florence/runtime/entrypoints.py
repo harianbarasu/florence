@@ -45,6 +45,7 @@ IGNORABLE_SENDBLUE_PARSE_ERRORS = {
 class FlorenceEntrypointResult:
     reply_text: str | None = None
     reply_messages: tuple[str, ...] = field(default_factory=tuple)
+    reply_metadata: dict[str, object] = field(default_factory=dict)
     group_announcement: str | None = None
     consumed: bool = False
     household_id: str | None = None
@@ -251,6 +252,7 @@ class FlorenceEntrypointService:
         return FlorenceEntrypointResult(
             reply_text=reply_text,
             reply_messages=reply_messages,
+            reply_metadata=result.reply_metadata,
             group_announcement=group_announcement,
             consumed=consumed or bool(group_announcement),
             household_id=current_channel.household_id,

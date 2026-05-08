@@ -393,10 +393,12 @@ def test_household_chat_service_uses_hermes_agent_with_confirmed_state(tmp_path)
     assert "private parent dm, be willing to search the connected inbox" in _FakeAgent.last_run["system_message"].lower()
     assert "points florence toward their inbox as the source of truth" in _FakeAgent.last_run["system_message"].lower()
     assert "household_search_google_calendar respects the same privacy boundary" in _FakeAgent.last_run["system_message"]
+    assert "When household_search_google_inbox or household_search_google_calendar returns mirror_freshness" in _FakeAgent.last_run["system_message"]
+    assert "If mirror_freshness is stale, running, error, or never_synced" in _FakeAgent.last_run["system_message"]
     assert "If household_search_google_calendar returns no matches but reports mirror_sync_running=true" in _FakeAgent.last_run["system_message"]
     assert "If the user thinks something was added twice or duplicated on the calendar, start with household_search_state for events." in _FakeAgent.last_run["system_message"]
-    assert "If the live turn payload includes recent_google_context, treat it as fresh mirrored inbox or calendar evidence for this active DM thread." in _FakeAgent.last_run["system_message"]
-    assert "Use recent_google_context proactively when it likely answers the parent's question or resolves a vague reference like that invite, that schedule, or those school emails." in _FakeAgent.last_run["system_message"]
+    assert "If the live turn payload includes recent_google_context, inspect its mirror_freshness" in _FakeAgent.last_run["system_message"]
+    assert "Use recent_google_context proactively when its freshness and matches likely answer the parent's question" in _FakeAgent.last_run["system_message"]
     assert "Do not make the parent restate where something came from if recent_google_context already contains the relevant synced evidence." in _FakeAgent.last_run["system_message"]
     assert "For school, pickup, travel, and schedule questions tied to a specific date, answer from explicit dated evidence" in _FakeAgent.last_run["system_message"]
     assert "If a specific date is blank, missing, or conflicting in current calendar coverage" in _FakeAgent.last_run["system_message"]
@@ -2460,6 +2462,9 @@ def test_household_chat_service_includes_recent_google_context_when_sync_running
     assert reply is not None
     assert "\"recent_google_context\"" in _FakeAgent.last_run["user_message"]
     assert "\"mirror_sync_running\": true" in _FakeAgent.last_run["user_message"]
+    assert "\"mirror_freshness\"" in _FakeAgent.last_run["user_message"]
+    assert "\"fresh_enough_for_latest_claims\": false" in _FakeAgent.last_run["user_message"]
+    assert "\"status\": \"running\"" in _FakeAgent.last_run["user_message"]
     assert "\"sync_phase\": \"syncing_inbox\"" in _FakeAgent.last_run["user_message"]
     store.close()
 

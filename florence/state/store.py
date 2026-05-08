@@ -53,7 +53,7 @@ from florence.state.db import RowLike, connect_florence_db
 from florence.google.types import StoredCalendarSyncItem, StoredGmailSyncItem
 
 FLORENCE_DB_PATH = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes")) / "florence.db"
-FLORENCE_SCHEMA_VERSION = 11
+FLORENCE_SCHEMA_VERSION = 12
 
 _RESET_ALL_TABLES = (
     "channel_messages",
@@ -77,6 +77,7 @@ _RESET_ALL_TABLES = (
     "members",
     "onboarding_sessions",
     "pilot_events",
+    "turn_records",
 )
 
 
@@ -389,6 +390,27 @@ CREATE TABLE IF NOT EXISTS channel_messages (
     metadata_json TEXT NOT NULL,
     created_at REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS turn_records (
+    id TEXT PRIMARY KEY,
+    household_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    actor_member_id TEXT,
+    trigger_kind TEXT NOT NULL,
+    disposition TEXT,
+    envelope_json TEXT NOT NULL,
+    outcome_json TEXT NOT NULL DEFAULT '{}',
+    hermes_version TEXT,
+    prompt_version TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_turn_records_household_created
+ON turn_records(household_id, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_turn_records_channel_created
+ON turn_records(channel_id, created_at);
 
 CREATE INDEX IF NOT EXISTS idx_channel_messages_channel
 ON channel_messages(channel_id, created_at ASC);
@@ -918,6 +940,7 @@ class FlorenceStateDB:
                 "household_work_items",
                 "imported_candidates",
                 "pilot_events",
+                "turn_records",
             ):
                 if table == "household_link_requests":
                     self._conn.execute(
@@ -1588,6 +1611,72 @@ class FlorenceStateDB:
         query += " ORDER BY updated_at DESC, label ASC"
         rows = self._conn.execute(query, tuple(params)).fetchall()
         return [self._row_to_household_profile_item(row) for row in rows]
+
+    def upsert_turn_record(
+        self,
+        *,
+        turn_id: str,
+        household_id: str,
+        channel_id: str,
+        actor_member_id: str | None,
+        trigger_kind: str,
+        envelope: dict[str, object],
+        outcome: dict[str, object] | None = None,
+        disposition: str | None = None,
+        hermes_version: str | None = None,
+        prompt_version: str | None = None,
+    ) -> None:
+        now = time.time()
+        self._conn.execute(
+            """
+            INSERT INTO turn_records (
+                id, household_id, channel_id, actor_member_id, trigger_kind, disposition,
+                envelope_json, outcome_json, hermes_version, prompt_version, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                household_id = excluded.household_id,
+                channel_id = excluded.channel_id,
+                actor_member_id = excluded.actor_member_id,
+                trigger_kind = excluded.trigger_kind,
+                disposition = excluded.disposition,
+                envelope_json = excluded.envelope_json,
+                outcome_json = excluded.outcome_json,
+                hermes_version = excluded.hermes_version,
+                prompt_version = excluded.prompt_version,
+                updated_at = excluded.updated_at
+            """,
+            (
+                turn_id,
+                household_id,
+                channel_id,
+                actor_member_id,
+                trigger_kind,
+                disposition,
+                _json_dumps(envelope),
+                _json_dumps(outcome or {}),
+                hermes_version,
+                prompt_version,
+                now,
+                now,
+            ),
+        )
+        self._conn.commit()
+
+    def get_turn_record(self, turn_id: str) -> dict[str, object] | None:
+        row = self._conn.execute("SELECT * FROM turn_records WHERE id = ?", (turn_id,)).fetchone()
+        return self._row_to_turn_record(row) if row else None
+
+    def list_turn_records(self, *, household_id: str, limit: int = 50) -> list[dict[str, object]]:
+        rows = self._conn.execute(
+            """
+            SELECT * FROM turn_records
+            WHERE household_id = ?
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (household_id, max(1, limit)),
+        ).fetchall()
+        return [self._row_to_turn_record(row) for row in rows]
 
     def append_channel_message(self, message: ChannelMessage) -> ChannelMessage:
         self._conn.execute(
@@ -2900,6 +2989,23 @@ class FlorenceStateDB:
             created_at=float(row["created_at"]),
             metadata=dict(_json_loads(row["metadata_json"], default={})),
         )
+
+    @staticmethod
+    def _row_to_turn_record(row: RowLike) -> dict[str, object]:
+        return {
+            "id": str(row["id"]),
+            "household_id": str(row["household_id"]),
+            "channel_id": str(row["channel_id"]),
+            "actor_member_id": str(row["actor_member_id"]) if row["actor_member_id"] is not None else None,
+            "trigger_kind": str(row["trigger_kind"]),
+            "disposition": str(row["disposition"]) if row["disposition"] is not None else None,
+            "envelope": dict(_json_loads(row["envelope_json"], default={})),
+            "outcome": dict(_json_loads(row["outcome_json"], default={})),
+            "hermes_version": str(row["hermes_version"]) if row["hermes_version"] is not None else None,
+            "prompt_version": str(row["prompt_version"]) if row["prompt_version"] is not None else None,
+            "created_at": float(row["created_at"]),
+            "updated_at": float(row["updated_at"]),
+        }
 
     @staticmethod
     def _row_to_google_connection(row: RowLike) -> GoogleConnection:

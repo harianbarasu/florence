@@ -7,14 +7,21 @@ import logging
 
 from florence.contracts import CandidateState
 from florence.messaging.channel_log import FlorenceChannelLog
+from florence.messaging.pending_actions import (
+    active_pending_target_ids,
+    latest_assistant_protocol_message,
+    latest_pending_action,
+)
+from florence.messaging.protocol_sentinels import REVIEW_SHOW_PROMPT_SENTINEL
 from florence.messaging.protocol_types import (
     CANDIDATE_REVIEW_PROMPT_KIND,
     PENDING_ACTION_TARGET_ID_KEY,
     PENDING_ACTION_TARGET_IDS_KEY,
     build_candidate_review_prompt_metadata,
     FlorenceProtocolReply,
+    latest_active_pending_action,
+    pending_action_to_model_context,
 )
-from florence.runtime.chat import _REVIEW_SHOW_PROMPT_SENTINEL
 
 logger = logging.getLogger(__name__)
 
@@ -131,7 +138,7 @@ class FlorenceCandidateReviewProtocol:
                 },
             },
         )
-        if decision == _REVIEW_SHOW_PROMPT_SENTINEL:
+        if decision == REVIEW_SHOW_PROMPT_SENTINEL:
             return FlorenceProtocolReply(
                 reply_text=prompt_text,
                 reply_metadata=build_candidate_review_prompt_metadata(
@@ -154,9 +161,18 @@ class FlorenceCandidateReviewProtocol:
     def build_chat_followup_context(
         self,
         *,
+        channel_id: str,
         text: str,
         prompt,
     ) -> str:
+        active_action = latest_active_pending_action(
+            self.channel_log.recent_messages(channel_id=channel_id, limit=8)
+        )
+        pending_action_context = (
+            pending_action_to_model_context(active_action)
+            if active_action is not None
+            else None
+        )
         candidates = tuple(getattr(prompt, "candidates", ()) or ())
         if len(candidates) > 1:
             review_items = []
@@ -188,8 +204,10 @@ class FlorenceCandidateReviewProtocol:
                 "If a listed item includes related_candidate_ids, that visible line represents a grouped recurring series, so one confirm/reject/skip should apply to the whole grouped item.\n"
                 "If the user says plain yes, no, or skip without a number and multiple items are active, ask which number they mean instead of guessing.\n"
                 "If a review item has candidate_scope private_parent, a confirm should keep it in this parent's private lane, not promote it to shared household state.\n"
+                "When calling household_apply_candidate_review, include pending_action_id from Active pending action if present.\n"
                 "Interpret the whole message yourself, including short numbered replies and corrections.\n"
                 "If the user's message is not actually about this review batch, ignore the review batch and just help normally.\n\n"
+                f"Active pending action:\n{json.dumps(pending_action_context, ensure_ascii=True)}\n\n"
                 f"Active review batch:\n{json.dumps(review_items, ensure_ascii=True)}\n\n"
                 f"User reply: {text.strip()}"
             )
@@ -214,11 +232,13 @@ class FlorenceCandidateReviewProtocol:
             "Treat only this item as review-actionable right now. Do not act on any other hidden review items.\n"
             "If the user's reply is clearly about this item, use household_apply_candidate_review with this exact "
             "candidate_id to confirm, reject, skip, set source_visibility, or confirm with corrected fields.\n"
+            "When calling household_apply_candidate_review, include pending_action_id from Active pending action if present.\n"
             "If candidate_scope is private_parent, a confirm should keep it in this parent's private lane, not promote it to shared household state.\n"
             "For imported Gmail items, treat source_provenance as the primary evidence. Florence may preserve light proposed_fields, but do not trust Gmail-derived times/dates unless they are clearly supported by the raw source.\n"
             "If the user is clarifying or correcting details, keep the same item in focus instead of treating it as a new request.\n"
             "Interpret the whole message yourself, including short yes/no/share/private replies; Florence no longer resolves those deterministically here.\n"
             "If the user's message is not actually about this review item, ignore the review item and just help normally.\n\n"
+            f"Active pending action:\n{json.dumps(pending_action_context, ensure_ascii=True)}\n\n"
             f"Active review item:\n{json.dumps(review_item, ensure_ascii=True)}\n\n"
             f"User reply: {text.strip()}"
         )
@@ -307,24 +327,40 @@ class FlorenceCandidateReviewProtocol:
         )
 
     def _is_candidate_review_reply_armed(self, *, channel_id: str) -> bool:
-        latest_assistant = self.channel_log.latest_assistant_message(channel_id=channel_id, limit=8)
-        if latest_assistant is None:
-            return False
-        return latest_assistant.metadata.get("protocol_kind") == CANDIDATE_REVIEW_PROMPT_KIND
+        return latest_assistant_protocol_message(
+            self.channel_log,
+            channel_id=channel_id,
+            protocol_kind=CANDIDATE_REVIEW_PROMPT_KIND,
+        ) is not None
 
     def active_candidate_id(self, *, channel_id: str) -> str | None:
         candidate_ids = self.active_candidate_ids(channel_id=channel_id)
         return candidate_ids[0] if candidate_ids else None
 
     def active_candidate_ids(self, *, channel_id: str) -> list[str]:
-        latest_assistant = self.channel_log.latest_assistant_message(channel_id=channel_id, limit=8)
+        active = latest_pending_action(
+            self.channel_log,
+            channel_id=channel_id,
+            protocol_kind=CANDIDATE_REVIEW_PROMPT_KIND,
+            action_type="candidate_review",
+            target_kind="imported_candidate",
+        )
+        candidate_ids = active_pending_target_ids(active)
+        if candidate_ids:
+            return candidate_ids
+        latest_assistant = latest_assistant_protocol_message(
+            self.channel_log,
+            channel_id=channel_id,
+            protocol_kind=CANDIDATE_REVIEW_PROMPT_KIND,
+        )
         if latest_assistant is None:
             return []
-        if latest_assistant.metadata.get("protocol_kind") != CANDIDATE_REVIEW_PROMPT_KIND:
-            return []
+        raw_candidate_ids = latest_assistant.metadata.get(PENDING_ACTION_TARGET_IDS_KEY)
+        if not isinstance(raw_candidate_ids, (list, tuple)):
+            raw_candidate_ids = []
         candidate_ids = [
             str(candidate_id).strip()
-            for candidate_id in list(latest_assistant.metadata.get(PENDING_ACTION_TARGET_IDS_KEY) or [])
+            for candidate_id in list(raw_candidate_ids)
             if str(candidate_id).strip()
         ]
         if candidate_ids:

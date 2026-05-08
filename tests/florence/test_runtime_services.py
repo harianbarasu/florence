@@ -46,6 +46,9 @@ from florence.runtime.operations import FlorenceHouseholdOperationsService
 from florence.state import FlorenceStateDB
 
 
+_REVIEW_TEST_NOW = datetime(2026, 4, 29, 19, 0, tzinfo=timezone.utc)
+
+
 class _StubGroupShareChatService:
     def __init__(self, *, promotion_text: str | None = None) -> None:
         self.promotion_text = promotion_text
@@ -1787,7 +1790,7 @@ def test_operations_review_nudge_records_candidate_review_prompt_metadata(tmp_pa
                     "anchor_hits": 2,
                     "sender_looks_school": False,
                     "reason_tags": ["household_anchor", "logistics_signal"],
-                    "temporal_evidence": {"date_match": {"date": "2026-04-01"}},
+                    "temporal_evidence": {"date_match": {"date": "2027-04-01"}},
                 },
             },
         )
@@ -1802,6 +1805,7 @@ def test_operations_review_nudge_records_candidate_review_prompt_metadata(tmp_pa
         store,
         delivery_service=delivery,
         household_chat_service_getter=lambda: _StubReviewPromptChatService(),
+        now_getter=lambda: _REVIEW_TEST_NOW,
     )
 
     nudged = operations.nudge_for_new_pending_candidates(
@@ -1832,6 +1836,19 @@ def test_operations_review_nudge_records_candidate_review_prompt_metadata(tmp_pa
     assert events[0].metadata["confirmation_question"] == "Should I add this?"
     assert events[0].metadata["newly_pending_count"] == 1
     assert events[0].metadata["trigger"] == "new_pending_candidate"
+    records = [
+        record
+        for record in store.list_turn_records(household_id="hh_123")
+        if record["trigger_kind"] == "review"
+    ]
+    assert len(records) == 1
+    assert records[0]["disposition"] == "reply"
+    assert records[0]["actor_member_id"] == "mem_123"
+    assert records[0]["envelope"]["channel_type"] == "parent_dm"
+    assert records[0]["envelope"]["message_text"] == latest.body
+    assert records[0]["envelope"]["metadata"]["trigger"] == "new_pending_candidate"
+    assert records[0]["outcome"]["reply_messages"] == [latest.body]
+    assert records[0]["outcome"]["metadata"]["candidate_ids"] == ["cand_999"]
     store.close()
 
 
@@ -1898,6 +1915,7 @@ def test_operations_review_nudge_defers_during_active_conversation(tmp_path):
         store,
         delivery_service=delivery,
         household_chat_service_getter=lambda: _StubReviewPromptChatService(),
+        now_getter=lambda: _REVIEW_TEST_NOW,
     )
 
     nudged = operations.nudge_for_new_pending_candidates(
@@ -1987,7 +2005,7 @@ def test_operations_review_nudge_skips_when_review_prompt_is_already_armed(tmp_p
                     "anchor_hits": 2,
                     "sender_looks_school": False,
                     "reason_tags": ["household_anchor", "logistics_signal"],
-                    "temporal_evidence": {"date_match": {"date": "2026-04-01"}},
+                    "temporal_evidence": {"date_match": {"date": "2027-04-01"}},
                 },
             },
         )
@@ -2002,6 +2020,7 @@ def test_operations_review_nudge_skips_when_review_prompt_is_already_armed(tmp_p
         store,
         delivery_service=delivery,
         household_chat_service_getter=lambda: _StubReviewPromptChatService(),
+        now_getter=lambda: _REVIEW_TEST_NOW,
     )
 
     nudged = operations.nudge_for_new_pending_candidates(
@@ -2076,6 +2095,7 @@ def test_operations_review_nudge_suppresses_proactive_prompt_during_quiet_hours(
         store,
         delivery_service=delivery,
         household_chat_service_getter=lambda: _StubReviewPromptChatService(),
+        now_getter=lambda: _REVIEW_TEST_NOW,
     )
     monkeypatch.setattr(
         operations,
@@ -2155,6 +2175,7 @@ def test_operations_briefing_respects_explicit_household_quiet_hours(tmp_path, m
         store,
         delivery_service=delivery,
         household_chat_service_getter=lambda: _BriefingChat(),
+        now_getter=lambda: _REVIEW_TEST_NOW,
     )
     monkeypatch.setattr(
         operations,
@@ -2233,6 +2254,7 @@ def test_operations_review_nudge_skips_stale_schedule_candidate(tmp_path, monkey
         store,
         delivery_service=delivery,
         household_chat_service_getter=lambda: _StubReviewPromptChatService(),
+        now_getter=lambda: _REVIEW_TEST_NOW,
     )
     monkeypatch.setattr(
         operations,
@@ -2328,6 +2350,7 @@ def test_operations_review_nudge_skips_weak_gmail_candidate_during_initial_sync(
         store,
         delivery_service=delivery,
         household_chat_service_getter=lambda: _StubReviewPromptChatService(),
+        now_getter=lambda: _REVIEW_TEST_NOW,
     )
 
     nudged = operations.nudge_for_new_pending_candidates(
@@ -2401,7 +2424,7 @@ def test_operations_review_nudge_prefers_strong_candidate_over_newest_weak_candi
                     "anchor_hits": 2,
                     "sender_looks_school": False,
                     "reason_tags": ["household_anchor", "activity_signal", "schedule_signal"],
-                    "temporal_evidence": {"date_match": {"date": "2026-06-10"}, "time_range": {"start": "15:30", "end": "16:15"}},
+                    "temporal_evidence": {"date_match": {"date": "2027-06-10"}, "time_range": {"start": "15:30", "end": "16:15"}},
                 },
             },
         )
@@ -2440,6 +2463,7 @@ def test_operations_review_nudge_prefers_strong_candidate_over_newest_weak_candi
         store,
         delivery_service=delivery,
         household_chat_service_getter=lambda: _StubReviewPromptChatService(),
+        now_getter=lambda: _REVIEW_TEST_NOW,
     )
 
     nudged = operations.nudge_for_new_pending_candidates(
@@ -2515,7 +2539,7 @@ def test_operations_review_nudge_surfaces_private_parent_candidate_in_parent_dm(
                     "anchor_hits": 0,
                     "sender_looks_school": False,
                     "reason_tags": ["private_parent", "logistics_signal", "schedule_signal"],
-                    "temporal_evidence": {"date_match": {"date": "2026-06-10"}},
+                    "temporal_evidence": {"date_match": {"date": "2027-06-10"}},
                 },
             },
         )
@@ -2530,6 +2554,7 @@ def test_operations_review_nudge_surfaces_private_parent_candidate_in_parent_dm(
         store,
         delivery_service=delivery,
         household_chat_service_getter=lambda: _StubReviewPromptChatService(),
+        now_getter=lambda: _REVIEW_TEST_NOW,
     )
 
     nudged = operations.nudge_for_new_pending_candidates(
@@ -2594,6 +2619,7 @@ def test_operations_due_nudge_can_deliver_household_link_prompt_metadata(tmp_pat
         store,
         delivery_service=delivery,
         household_chat_service_getter=lambda: _StubReviewPromptChatService(),
+        now_getter=lambda: _REVIEW_TEST_NOW,
     )
 
     sent = operations.dispatch_due_household_nudges(household_id="hh_123")
@@ -2605,6 +2631,17 @@ def test_operations_due_nudge_can_deliver_household_link_prompt_metadata(tmp_pat
     assert latest.metadata["protocol_kind"] == HOUSEHOLD_LINK_PROMPT_KIND
     assert latest.metadata["pending_action_type"] == "household_link_request"
     assert latest.metadata["pending_action_target_id"] == "linkreq_123"
+    records = [
+        record
+        for record in store.list_turn_records(household_id="hh_123")
+        if record["trigger_kind"] == "scheduled_nudge"
+    ]
+    assert len(records) == 1
+    assert records[0]["disposition"] == "reply"
+    assert records[0]["envelope"]["message_text"] == latest.body
+    assert records[0]["envelope"]["delivery_target"]["provider_thread_id"] == "dm-thread-123"
+    assert records[0]["outcome"]["scheduled_work_ids"] == ["nudge_link_123"]
+    assert records[0]["outcome"]["metadata"]["message_metadata"]["protocol_kind"] == HOUSEHOLD_LINK_PROMPT_KIND
     store.close()
 
 
@@ -2654,7 +2691,7 @@ def test_operations_review_sweep_sends_proactive_prompt_for_pending_backlog(tmp_
                     "anchor_hits": 2,
                     "sender_looks_school": False,
                     "reason_tags": ["household_anchor", "activity_signal", "schedule_signal"],
-                    "temporal_evidence": {"date_match": {"date": "2026-06-10"}, "time_range": {"start": "15:30", "end": "16:15"}},
+                    "temporal_evidence": {"date_match": {"date": "2027-06-10"}, "time_range": {"start": "15:30", "end": "16:15"}},
                 },
             },
         )
@@ -2677,7 +2714,7 @@ def test_operations_review_sweep_sends_proactive_prompt_for_pending_backlog(tmp_
                     "anchor_hits": 2,
                     "sender_looks_school": False,
                     "reason_tags": ["household_anchor", "logistics_signal"],
-                    "temporal_evidence": {"date_match": {"date": "2026-04-01"}},
+                    "temporal_evidence": {"date_match": {"date": "2027-04-01"}},
                 },
             },
         )
@@ -2693,6 +2730,7 @@ def test_operations_review_sweep_sends_proactive_prompt_for_pending_backlog(tmp_
         store,
         delivery_service=delivery,
         household_chat_service_getter=lambda: chat_service,
+        now_getter=lambda: _REVIEW_TEST_NOW,
     )
 
     sent = operations.dispatch_due_review_sweeps(household_id="hh_123")
@@ -2719,6 +2757,16 @@ def test_operations_review_sweep_sends_proactive_prompt_for_pending_backlog(tmp_
     assert events[0].metadata["pending_review_count"] == 2
     assert set(events[0].metadata["candidate_ids"]) == {"cand_1001", "cand_1002"}
     assert events[0].metadata["batch_count"] == 2
+    records = [
+        record
+        for record in store.list_turn_records(household_id="hh_123")
+        if record["trigger_kind"] == "review"
+    ]
+    assert len(records) == 1
+    assert records[0]["disposition"] == "reply"
+    assert records[0]["envelope"]["metadata"]["trigger"] == "scheduled_review_sweep"
+    assert set(records[0]["outcome"]["state_change_ids"]) == {"cand_1001", "cand_1002"}
+    assert set(records[0]["outcome"]["metadata"]["candidate_ids"]) == {"cand_1001", "cand_1002"}
     store.close()
 
 
@@ -2796,6 +2844,7 @@ def test_operations_review_sweep_skips_weak_gmail_backlog(tmp_path):
         store,
         delivery_service=delivery,
         household_chat_service_getter=lambda: chat_service,
+        now_getter=lambda: _REVIEW_TEST_NOW,
     )
 
     sent = operations.dispatch_due_review_sweeps(household_id="hh_123")
@@ -2866,6 +2915,7 @@ def test_operations_review_sweep_skips_when_recent_review_prompt_exists(tmp_path
         store,
         delivery_service=delivery,
         household_chat_service_getter=lambda: chat_service,
+        now_getter=lambda: _REVIEW_TEST_NOW,
     )
 
     sent = operations.dispatch_due_review_sweeps(household_id="hh_123")
@@ -2957,6 +3007,7 @@ def test_operations_review_sweep_skips_when_review_prompt_is_already_armed(tmp_p
         store,
         delivery_service=delivery,
         household_chat_service_getter=lambda: chat_service,
+        now_getter=lambda: _REVIEW_TEST_NOW,
     )
 
     sent = operations.dispatch_due_review_sweeps(household_id="hh_123")
@@ -2996,8 +3047,8 @@ def test_operations_review_sweep_groups_recurring_calendar_candidates_into_one_v
         display_name="Maya",
     )
     for candidate_id, starts_at, ends_at in (
-        ("cand_gym_june", "2026-06-04T17:30:00-07:00", "2026-06-04T18:30:00-07:00"),
-        ("cand_gym_aug", "2026-08-06T17:30:00-07:00", "2026-08-06T18:30:00-07:00"),
+        ("cand_gym_june", "2027-06-03T17:30:00-07:00", "2027-06-03T18:30:00-07:00"),
+        ("cand_gym_aug", "2027-08-05T17:30:00-07:00", "2027-08-05T18:30:00-07:00"),
     ):
         store.upsert_imported_candidate(
             ImportedCandidate(
@@ -3037,6 +3088,7 @@ def test_operations_review_sweep_groups_recurring_calendar_candidates_into_one_v
         store,
         delivery_service=delivery,
         household_chat_service_getter=lambda: chat_service,
+        now_getter=lambda: _REVIEW_TEST_NOW,
     )
 
     sent = operations.dispatch_due_review_sweeps(household_id="hh_123")
@@ -3048,7 +3100,7 @@ def test_operations_review_sweep_groups_recurring_calendar_candidates_into_one_v
     assert set(latest.metadata["pending_action_target_ids"]) == {"cand_gym_june", "cand_gym_aug"}
     assert latest.body.count("Violet Gymnastics") == 1
     assert "Thursdays at 5:30 PM" in latest.body
-    assert "Jun 4 and Aug 6" in latest.body
+    assert "Jun 3 and Aug 5" in latest.body
     assert chat_service.calls == []
     store.close()
 
@@ -3139,6 +3191,7 @@ def test_operations_sync_update_sweep_sends_proactive_summary_for_changed_sync(t
         store,
         delivery_service=delivery,
         household_chat_service_getter=lambda: chat_service,
+        now_getter=lambda: _REVIEW_TEST_NOW,
     )
 
     sent = operations.dispatch_due_sync_update_briefs(
@@ -3162,6 +3215,19 @@ def test_operations_sync_update_sweep_sends_proactive_summary_for_changed_sync(t
     assert events[0].metadata["trigger"] == "scheduled_sync_pass"
     assert updated_connection is not None
     assert updated_connection.metadata["last_sync_brief_kind"] == "update"
+    records = [
+        record
+        for record in store.list_turn_records(household_id="hh_123")
+        if record["trigger_kind"] == "sync_brief"
+    ]
+    assert len(records) == 1
+    assert records[0]["disposition"] == "reply"
+    assert records[0]["actor_member_id"] == "mem_123"
+    assert records[0]["envelope"]["message_text"] == linq.sent[0]["message"]
+    assert records[0]["envelope"]["delivery_target"]["provider_thread_id"] == "dm-thread-123"
+    assert records[0]["outcome"]["metadata"]["brief_kind"] == "update"
+    assert records[0]["outcome"]["metadata"]["trigger"] == "scheduled_sync_pass"
+    assert records[0]["outcome"]["metadata"]["candidate_ids"] == ["cand_2000"]
     store.close()
 
 
@@ -3251,6 +3317,7 @@ def test_operations_sync_update_sweep_skips_during_recent_channel_activity(tmp_p
         store,
         delivery_service=delivery,
         household_chat_service_getter=lambda: chat_service,
+        now_getter=lambda: _REVIEW_TEST_NOW,
     )
 
     sent = operations.dispatch_due_sync_update_briefs(
@@ -3352,6 +3419,7 @@ def test_operations_sync_update_brief_fallback_still_names_top_change(tmp_path):
         store,
         delivery_service=delivery,
         household_chat_service_getter=lambda: chat_service,
+        now_getter=lambda: _REVIEW_TEST_NOW,
     )
 
     sent = operations.dispatch_due_sync_update_briefs(

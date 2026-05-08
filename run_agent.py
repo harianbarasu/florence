@@ -5312,6 +5312,23 @@ class AIAgent:
         return _codex_deterministic_call_id(fn_name, arguments, index)
 
     @staticmethod
+    def _normalize_prompt_cache_key(value: Any, *, max_length: int = 64) -> Optional[str]:
+        """Return a stable prompt cache key that satisfies provider limits."""
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        if len(raw) <= max_length:
+            return raw
+
+        sanitized = re.sub(r"[^A-Za-z0-9._:-]+", "-", raw).strip("-")
+        digest = hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()[:16]
+        prefix_budget = max_length - len(digest) - 1
+        prefix = sanitized[:prefix_budget].rstrip("-_.:")
+        if not prefix:
+            prefix = "session"
+        return f"{prefix}-{digest}"
+
+    @staticmethod
     def _split_responses_tool_id(raw_id: Any) -> tuple[Optional[str], Optional[str]]:
         """Split a stored tool id into (call_id, response_item_id)."""
         return _codex_split_responses_tool_id(raw_id)
@@ -8221,14 +8238,31 @@ class AIAgent:
             )
             is_xai_responses = self.provider == "xai" or self._base_url_hostname == "api.x.ai"
             _msgs_for_codex = self._prepare_messages_for_non_vision_model(api_messages)
+            request_overrides = self.request_overrides
+            session_id_for_transport = getattr(self, "session_id", None)
+            if not is_github_responses:
+                override_cache_key = (
+                    request_overrides.get("prompt_cache_key")
+                    if isinstance(request_overrides, dict) and "prompt_cache_key" in request_overrides
+                    else None
+                )
+                cache_key_source = override_cache_key if override_cache_key is not None else session_id_for_transport
+                normalized_cache_key = self._normalize_prompt_cache_key(cache_key_source)
+                session_id_for_transport = normalized_cache_key
+                if isinstance(request_overrides, dict) and "prompt_cache_key" in request_overrides:
+                    request_overrides = dict(request_overrides)
+                    if normalized_cache_key is not None:
+                        request_overrides["prompt_cache_key"] = normalized_cache_key
+                    else:
+                        request_overrides.pop("prompt_cache_key", None)
             return _ct.build_kwargs(
                 model=self.model,
                 messages=_msgs_for_codex,
                 tools=self.tools,
                 reasoning_config=self.reasoning_config,
-                session_id=getattr(self, "session_id", None),
+                session_id=session_id_for_transport,
                 max_tokens=self.max_tokens,
-                request_overrides=self.request_overrides,
+                request_overrides=request_overrides,
                 is_github_responses=is_github_responses,
                 is_codex_backend=is_codex_backend,
                 is_xai_responses=is_xai_responses,

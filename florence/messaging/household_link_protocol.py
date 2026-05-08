@@ -5,11 +5,10 @@ from __future__ import annotations
 from florence.messaging.channel_log import FlorenceChannelLog
 from florence.messaging.protocol_types import (
     HOUSEHOLD_LINK_PROMPT_KIND,
-    HOUSEHOLD_LINK_PROMPT_ROLE_KEY,
-    PENDING_ACTION_TARGET_ID_KEY,
     build_household_link_prompt_metadata,
     FlorenceProtocolReply,
 )
+from florence.messaging.pending_actions import latest_pending_action
 
 
 _YES_RESPONSES = {
@@ -132,12 +131,6 @@ class FlorenceHouseholdLinkProtocol:
         request,
         text: str,
     ) -> FlorenceProtocolReply:
-        if request.status.value == "accepted":
-            result = self.household_link_service.accept_from_inviting_member(
-                request_id=request.id,
-                inviting_member_id=member_id,
-            )
-            return FlorenceProtocolReply(reply_text=result.reply_text, consumed=True)
         decision = _normalize_confirmation(text)
         if self._armed_request_id(channel_id=channel_id, role="inviting") != request.id or decision is None:
             return FlorenceProtocolReply(
@@ -145,6 +138,12 @@ class FlorenceHouseholdLinkProtocol:
                 reply_metadata=build_household_link_prompt_metadata(request.id, role="inviting"),
                 consumed=True,
             )
+        if request.status.value == "accepted" and decision == "yes":
+            result = self.household_link_service.accept_from_inviting_member(
+                request_id=request.id,
+                inviting_member_id=member_id,
+            )
+            return FlorenceProtocolReply(reply_text=result.reply_text, consumed=True)
         if decision == "yes":
             result = self.household_link_service.accept_from_inviting_member(
                 request_id=request.id,
@@ -158,12 +157,15 @@ class FlorenceHouseholdLinkProtocol:
         return FlorenceProtocolReply(reply_text=result.reply_text, consumed=True)
 
     def _armed_request_id(self, *, channel_id: str, role: str) -> str | None:
-        latest_assistant = self.channel_log.latest_assistant_message(channel_id=channel_id, limit=8)
-        if latest_assistant is None:
+        active = latest_pending_action(
+            self.channel_log,
+            channel_id=channel_id,
+            protocol_kind=HOUSEHOLD_LINK_PROMPT_KIND,
+            action_type="household_link_request",
+            target_kind="household_link_request",
+            role=role,
+        )
+        if active is None:
             return None
-        if latest_assistant.metadata.get("protocol_kind") != HOUSEHOLD_LINK_PROMPT_KIND:
-            return None
-        if str(latest_assistant.metadata.get(HOUSEHOLD_LINK_PROMPT_ROLE_KEY) or "").strip() != role:
-            return None
-        request_id = str(latest_assistant.metadata.get(PENDING_ACTION_TARGET_ID_KEY) or "").strip()
+        request_id = str(active.action.target_id or "").strip()
         return request_id or None

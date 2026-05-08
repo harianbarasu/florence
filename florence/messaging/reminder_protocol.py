@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import json
 from typing import Callable
 
 from florence.messaging.channel_log import FlorenceChannelLog
+from florence.messaging.pending_actions import latest_assistant_protocol_message, latest_pending_action
 from florence.messaging.protocol_types import (
     GOOGLE_CONNECT_PROMPT_KIND,
     HOUSEHOLD_NUDGE_PROMPT_KIND,
-    PENDING_ACTION_TARGET_ID_KEY,
-    PENDING_ACTION_TYPE_KEY,
     FlorenceProtocolReply,
+    latest_active_pending_action,
+    pending_action_to_model_context,
 )
 
 
@@ -69,12 +71,22 @@ class FlorenceReminderProtocol:
             return None
         if nudge.recipient_member_id and nudge.recipient_member_id != member_id:
             return None
+        active_action = latest_active_pending_action(
+            self.channel_log.recent_messages(channel_id=channel_id, limit=8)
+        )
+        pending_action_context = (
+            pending_action_to_model_context(active_action)
+            if active_action is not None
+            else None
+        )
         return (
             "Context for this turn: there is one currently surfaced reminder/nudge in this DM.\n"
             "Only that reminder is actionable right now.\n"
             "Use household_apply_nudge_action with the exact nudge_id if the user is completing, snoozing, or otherwise updating it.\n"
+            "When calling household_apply_nudge_action, include pending_action_id from Active pending action if present.\n"
             "Interpret the whole message yourself, including short done/snooze/later replies; Florence no longer resolves those deterministically here.\n"
             "Do not mutate reminder state for vague acknowledgements unless the user clearly means this exact reminder.\n"
+            f"Active pending action: {json.dumps(pending_action_context, ensure_ascii=True)}\n"
             f"Active nudge: {self._render_nudge_context(nudge)}\n"
             f"User reply: {text}"
         )
@@ -111,10 +123,11 @@ class FlorenceReminderProtocol:
         )
 
     def _google_connect_reply_is_armed(self, *, channel_id: str) -> bool:
-        latest_assistant = self.channel_log.latest_assistant_message(channel_id=channel_id, limit=8)
-        if latest_assistant is None:
-            return False
-        return str(latest_assistant.metadata.get("protocol_kind") or "").strip() == GOOGLE_CONNECT_PROMPT_KIND
+        return latest_assistant_protocol_message(
+            self.channel_log,
+            channel_id=channel_id,
+            protocol_kind=GOOGLE_CONNECT_PROMPT_KIND,
+        ) is not None
 
     @staticmethod
     def _continue_with_household_chat(
@@ -129,15 +142,18 @@ class FlorenceReminderProtocol:
         return chat_result.reply_text, reply_messages
 
     def _active_nudge_id(self, *, channel_id: str) -> str | None:
-        latest_assistant = self.channel_log.latest_assistant_message(channel_id=channel_id, limit=8)
-        if latest_assistant is None:
+        active = latest_pending_action(
+            self.channel_log,
+            channel_id=channel_id,
+            action_type="household_nudge",
+            target_kind="household_nudge",
+        )
+        if active is None:
             return None
-        protocol_kind = str(latest_assistant.metadata.get("protocol_kind") or "").strip()
+        protocol_kind = str(active.metadata.get("protocol_kind") or "").strip()
         if protocol_kind and protocol_kind != HOUSEHOLD_NUDGE_PROMPT_KIND:
             return None
-        if latest_assistant.metadata.get(PENDING_ACTION_TYPE_KEY) != "household_nudge":
-            return None
-        nudge_id = str(latest_assistant.metadata.get(PENDING_ACTION_TARGET_ID_KEY) or "").strip()
+        nudge_id = str(active.action.target_id or "").strip()
         return nudge_id or None
 
     @staticmethod

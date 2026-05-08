@@ -25,6 +25,9 @@ from florence.contracts import (
     IdentityKind,
     MemberRole,
 )
+from florence.messaging.protocol_types import (
+    build_household_link_prompt_metadata as build_protocol_household_link_prompt_metadata,
+)
 from florence.runtime.household_merge import FlorenceHouseholdMergeService
 from florence.runtime.household_manager import FlorenceHouseholdManagerService
 from florence.runtime.resolver import normalize_identity_value
@@ -48,13 +51,7 @@ _INVITING_CONFIRM_NUDGE_KIND = "household_link_confirmation"
 
 
 def _build_household_link_prompt_metadata(request_id: str, *, role: str) -> dict[str, object]:
-    return {
-        "protocol_kind": "household_link_prompt",
-        "pending_action_type": "household_link_request",
-        "pending_action_target_kind": "household_link_request",
-        "pending_action_target_id": request_id,
-        "household_link_prompt_role": role,
-    }
+    return build_protocol_household_link_prompt_metadata(request_id, role=role)
 
 
 def _stable_id(prefix: str, *parts: str) -> str:

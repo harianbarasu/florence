@@ -2,6 +2,7 @@ import json
 import threading
 import time
 from dataclasses import replace
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
@@ -31,8 +32,11 @@ from florence.contracts import (
     MemberRole,
 )
 from florence.google import GoogleCalendarMetadata, GoogleTokenResponse
+from florence.messaging.channel_log import FlorenceChannelLog
 from florence.onboarding import build_onboarding_ready_syncing_message_sequence
 from florence.runtime import FlorenceEntrypointResult, FlorenceProductionService
+
+_REVIEW_TEST_NOW = datetime(2026, 4, 29, 19, 0, tzinfo=timezone.utc)
 from florence.runtime import FlorenceHouseholdManagerService
 from florence.state import FlorenceStateDB
 
@@ -345,6 +349,10 @@ def test_production_service_delivers_dm_reply_and_group_announcement(tmp_path, m
         "handle_linq_payload",
         lambda payload: FlorenceEntrypointResult(
             reply_text="Hi from Florence",
+            reply_metadata={
+                "florence_turn_id": "turn_123",
+                "florence_turn_scope": "private_parent_dm",
+            },
             group_announcement="Added to the family plan: Ava soccer practice",
             consumed=True,
             household_id="hh_123",
@@ -375,6 +383,17 @@ def test_production_service_delivers_dm_reply_and_group_announcement(tmp_path, m
     assert result.status_code == 200
     assert service.linq.sent[0]["chat_id"] == "dm-thread-123"
     assert service.linq.sent[1]["chat_id"] == "group-thread-123"
+    outbound_events = store.list_pilot_events(household_id="hh_123", event_type="outbound_message_sent")
+    event_metadata_by_kind = {
+        event.metadata["message_metadata"]["delivery_kind"]: event.metadata["message_metadata"]
+        for event in outbound_events
+    }
+    assert event_metadata_by_kind["reply"]["florence_turn_id"] == "turn_123"
+    assert event_metadata_by_kind["group_announcement"]["florence_turn_id"] == "turn_123"
+    group_message = FlorenceChannelLog(store).latest_assistant_message(channel_id="chan_group_123")
+    assert group_message is not None
+    assert group_message.metadata["florence_turn_id"] == "turn_123"
+    assert group_message.metadata["source_channel_id"] == "chan_dm_123"
     store.close()
 
 
@@ -466,6 +485,15 @@ def test_production_service_google_callback_sends_dm_follow_up(tmp_path, monkeyp
     assert [message["message"] for message in service.linq.sent] == list(build_onboarding_ready_syncing_message_sequence())
     onboarding_events = store.list_pilot_events(household_id="hh_123", event_type="onboarding_complete")
     assert len(onboarding_events) == 1
+    records = store.list_turn_records(household_id="hh_123")
+    assert len(records) == 1
+    assert records[0]["trigger_kind"] == "onboarding"
+    assert records[0]["disposition"] == "reply_multiple"
+    assert records[0]["outcome"]["metadata"]["operation_kind"] == "google_callback_followup"
+    assert records[0]["outcome"]["metadata"]["message_metadata"]["delivery_kind"] == "google_callback_followup"
+    latest = FlorenceChannelLog(store).latest_assistant_message(channel_id="chan_dm_123")
+    assert latest is not None
+    assert latest.metadata["florence_turn_id"] == records[0]["id"]
     assert len(launched) == 1
     assert str(launched[0]["connection_id"]).startswith("gconn_")
     assert launched[0]["thread_id"] == "dm-thread-123"
@@ -725,6 +753,16 @@ def test_production_service_google_callback_sends_shared_calendar_link_when_proj
     assert household is not None
     projection = household.settings["shared_google_calendar_projection"]
     assert projection["calendar_link_shared_member_ids"] == ["mem_123"]
+    records = store.list_turn_records(household_id="hh_123")
+    operation_kinds = {record["outcome"]["metadata"]["operation_kind"] for record in records}
+    assert {"google_callback_followup", "household_calendar_link"}.issubset(operation_kinds)
+    calendar_record = next(
+        record
+        for record in records
+        if record["outcome"]["metadata"]["operation_kind"] == "household_calendar_link"
+    )
+    assert calendar_record["trigger_kind"] == "system"
+    assert calendar_record["outcome"]["metadata"]["message_metadata"]["delivery_kind"] == "household_calendar_link"
     assert len(launched) == 1
     store.close()
 
@@ -932,6 +970,81 @@ def test_process_google_sync_job_skips_already_nudged_review_candidates(tmp_path
     )
 
     assert service.linq.sent == []
+    store.close()
+
+
+def test_process_google_sync_job_error_sends_audited_turn(tmp_path, monkeypatch):
+    settings = _build_settings(tmp_path)
+    store = FlorenceStateDB(settings.server.db_path)
+    service = FlorenceProductionService(settings, store=store)
+    service.linq = _FakeLinqClient()
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    store.upsert_google_connection(
+        GoogleConnection(
+            id="gconn_123",
+            household_id="hh_123",
+            member_id="mem_123",
+            email="parent@example.com",
+            connected_scopes=(GoogleSourceKind.GMAIL,),
+            access_token="access-token",
+            metadata={"initial_sync_state": "queued"},
+        )
+    )
+
+    class _FailingSyncWorkerService:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def sync_connection(self, connection_id, **_kwargs):
+            assert connection_id == "gconn_123"
+            raise RuntimeError("sync failed")
+
+    monkeypatch.setattr("florence.runtime.production.FlorenceGoogleSyncWorkerService", _FailingSyncWorkerService)
+
+    service.process_google_sync_job(
+        connection_id="gconn_123",
+        thread_id="dm-thread-123",
+        notify_when_finished=True,
+        raise_on_error=False,
+    )
+
+    assert service.linq.sent == [
+        {
+            "chat_id": "dm-thread-123",
+            "message": "Google connected, but the first sync hit an error. Ask me to retry if it keeps happening.",
+        }
+    ]
+    connection = store.get_google_connection("gconn_123")
+    assert connection is not None
+    assert connection.metadata["last_sync_status"] == "error"
+    assert connection.metadata["initial_sync_state"] == "attention_needed"
+    records = store.list_turn_records(household_id="hh_123")
+    assert len(records) == 1
+    assert records[0]["trigger_kind"] == "sync_brief"
+    assert records[0]["actor_member_id"] == "mem_123"
+    assert records[0]["outcome"]["metadata"]["operation_kind"] == "google_sync_error"
+    assert records[0]["outcome"]["metadata"]["message_metadata"]["delivery_kind"] == "google_sync_error"
+    latest = FlorenceChannelLog(store).latest_assistant_message(channel_id="chan_dm_123")
+    assert latest is not None
+    assert latest.metadata["florence_turn_id"] == records[0]["id"]
     store.close()
 
 
@@ -1604,7 +1717,6 @@ def test_production_service_run_sync_pass_sends_due_household_briefing(tmp_path)
             next_due_at="2026-03-24T00:00:00+00:00",
         )
     )
-
     result = service.run_sync_pass()
 
     assert result["briefings_sent"] == 1
@@ -1619,6 +1731,17 @@ def test_production_service_run_sync_pass_sends_due_household_briefing(tmp_path)
     assert updated.last_completed_at is not None
     events = store.list_pilot_events(household_id="hh_123", event_type="briefing_sent")
     assert len(events) == 1
+    records = [
+        record
+        for record in store.list_turn_records(household_id="hh_123")
+        if record["trigger_kind"] == "scheduled_brief"
+    ]
+    assert len(records) == 1
+    assert records[0]["disposition"] == "reply"
+    assert records[0]["actor_member_id"] == "mem_123"
+    assert records[0]["envelope"]["channel_type"] == "parent_dm"
+    assert records[0]["outcome"]["scheduled_work_ids"] == [morning.id]
+    assert records[0]["outcome"]["metadata"]["brief_kind"] == "morning"
     store.close()
 
 
@@ -1679,7 +1802,6 @@ def test_production_service_run_sync_pass_prefers_household_group_for_briefing(t
             next_due_at="2026-03-24T00:00:00+00:00",
         )
     )
-
     result = service.run_sync_pass()
 
     assert result["briefings_sent"] == 1
@@ -1769,6 +1891,16 @@ def test_production_service_run_automation_pass_skips_quiet_pickup_check(tmp_pat
     assert updated is not None
     assert updated.last_completed_at is not None
     assert any(call.get("brief_kind") == "pickup" for call in fake_chat.calls)
+    records = [
+        record
+        for record in store.list_turn_records(household_id="hh_123")
+        if record["trigger_kind"] == "scheduled_brief"
+    ]
+    assert len(records) == 1
+    assert records[0]["disposition"] == "no_reply"
+    assert records[0]["outcome"]["no_reply_reason"] == "heartbeat_ok"
+    assert records[0]["outcome"]["scheduled_work_ids"] == [pickup.id]
+    assert records[0]["outcome"]["metadata"]["brief_kind"] == "pickup"
     store.close()
 
 
@@ -1901,11 +2033,12 @@ def test_production_service_run_sync_pass_sends_review_sweep_for_pending_backlog
                     "anchor_hits": 2,
                     "sender_looks_school": False,
                     "reason_tags": ["household_anchor", "logistics_signal"],
-                    "temporal_evidence": {"date_match": {"date": "2026-04-01"}},
+                    "temporal_evidence": {"date_match": {"date": "2027-04-01"}},
                 },
             },
         )
     )
+    service.household_operations._now_getter = lambda: _REVIEW_TEST_NOW
 
     result = service.run_sync_pass()
 

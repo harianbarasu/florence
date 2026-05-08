@@ -17,14 +17,17 @@ from florence.messaging.ingress_types import (
 from florence.messaging.reminder_protocol import FlorenceReminderProtocol
 from florence.messaging.review_protocol import FlorenceCandidateReviewProtocol
 from florence.messaging.setup_protocol import FlorenceSetupProtocol
+from florence.ops import record_turn
 from florence.runtime.chat import FlorenceHouseholdChatService
 from florence.runtime.candidate_review import FlorenceCandidateReviewService
 from florence.runtime.group_share import FlorenceGroupShareService
 from florence.runtime.household_manager import FlorenceHouseholdManagerService
 from florence.runtime.household_link import FlorenceHouseholdLinkService
 from florence.runtime.onboarding_service import FlorenceOnboardingSessionService
+from florence.runtime.turn_router import FlorenceTurnRouter
 from florence.state import FlorenceStateDB
 from florence.text_safety import scrub_internal_ids
+from florence.turns import build_inbound_turn_envelope
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +111,10 @@ class FlorenceMessagingIngressService:
             channel_log=self.channel_log,
             chat_bridge=self.chat_bridge,
         )
+        self.turn_router = FlorenceTurnRouter(
+            dm_router=self.dm_router,
+            group_router=self.group_router,
+        )
 
     def handle_message(self, resolved: FlorenceResolvedInboundMessage) -> FlorenceMessagingIngressResult:
         if resolved.message.is_from_me:
@@ -132,8 +139,20 @@ class FlorenceMessagingIngressService:
             thread_id=resolved.thread_id,
             message=resolved.message,
         )
+        turn_envelope = build_inbound_turn_envelope(
+            self.store,
+            resolved,
+            recent_history=tuple(self.channel_log.recent_messages(channel_id=resolved.channel_id, limit=24)),
+        )
 
-        result = self.group_router.handle_message(resolved) if resolved.is_group else self.dm_router.handle_message(resolved)
+        result = self.turn_router.handle_turn(envelope=turn_envelope, resolved=resolved)
+        result.reply_metadata = {
+            **result.reply_metadata,
+            "florence_turn_id": turn_envelope.turn_id,
+            "florence_turn_trigger": turn_envelope.trigger_kind.value,
+            "florence_turn_scope": turn_envelope.visibility_scope.scope,
+        }
+        record_turn(self.store, envelope=turn_envelope, result=result)
 
         raw_reply_messages = result.reply_messages or ((result.reply_text,) if result.reply_text else ())
         reply_messages = tuple(scrub_internal_ids(message) for message in raw_reply_messages if message)

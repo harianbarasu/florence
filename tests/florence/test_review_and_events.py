@@ -23,6 +23,15 @@ def test_review_confirmation_promotes_candidate_into_household_event(tmp_path):
                 "ends_at": "2026-09-19T00:00:00+00:00",
                 "timezone": "America/Los_Angeles",
             },
+            "source_provenance": {
+                "from_address": "coach@example.org",
+                "subject": "Soccer practice update",
+            },
+            "raw_metadata": {
+                "temporal_evidence": {
+                    "date_match": {"date": "2026-09-18"},
+                },
+            },
         },
     )
     store.upsert_imported_candidate(candidate)
@@ -31,6 +40,12 @@ def test_review_confirmation_promotes_candidate_into_household_event(tmp_path):
 
     assert result.event is not None
     assert result.event.title == "Ava soccer practice"
+    assert result.event.source_candidate_id == "cand_123"
+    assert result.event.metadata["source_candidate_id"] == "cand_123"
+    assert result.event.metadata["source_identifier"] == "gmail:gmail_123"
+    assert result.event.metadata["source_provenance"]["from_address"] == "coach@example.org"
+    assert result.event.metadata["candidate_raw_metadata"]["temporal_evidence"]["date_match"]["date"] == "2026-09-18"
+    assert result.event.metadata["proposed_fields"]["starts_at"] == "2026-09-18T23:00:00+00:00"
     assert result.candidate.state == CandidateState.CONFIRMED
     assert len(store.list_household_events(household_id="hh_123")) == 1
     store.close()
@@ -299,15 +314,15 @@ def test_review_prompt_shows_household_and_source_timezone_for_calendar_candidat
             source_kind=GoogleSourceKind.GOOGLE_CALENDAR,
             source_identifier="google_calendar:zimmi",
             title="Reservation at Zimmi's",
-            summary="Family calendar · 2026-04-17T19:00:00-04:00",
+            summary="Family calendar · 2027-04-17T19:00:00-04:00",
             state=CandidateState.PENDING_REVIEW,
             metadata={
                 "confirmation_question": "Should I add this to the shared household plan?",
                 "calendar_id": "family-calendar",
                 "proposed_fields": {
                     "title": "Reservation at Zimmi's",
-                    "starts_at": "2026-04-17T19:00:00-04:00",
-                    "ends_at": "2026-04-17T21:00:00-04:00",
+                    "starts_at": "2027-04-17T19:00:00-04:00",
+                    "ends_at": "2027-04-17T21:00:00-04:00",
                     "timezone": "America/New_York",
                 },
             },
@@ -321,5 +336,5 @@ def test_review_prompt_shows_household_and_source_timezone_for_calendar_candidat
 
     assert prompt is not None
     assert "Reservation at Zimmi's" in prompt.text
-    assert "Fri, Apr 17 at 4:00 PM PDT (7:00 PM EDT)" in prompt.text
+    assert "Sat, Apr 17 at 4:00 PM PDT (7:00 PM EDT)" in prompt.text
     store.close()

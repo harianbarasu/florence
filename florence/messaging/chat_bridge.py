@@ -5,21 +5,17 @@ from __future__ import annotations
 import logging
 
 from florence.messaging.channel_log import FlorenceChannelLog
+from florence.messaging.protocol_sentinels import (
+    GROUP_INTRO_SHOW_SENTINEL,
+    ONBOARDING_CONTEXTUAL_CHAT_SENTINEL,
+    ONBOARDING_NO_REPLY_SENTINEL,
+    ONBOARDING_SYNC_WAITING_SENTINEL,
+    looks_like_protocol_sentinel,
+)
 from florence.messaging.protocol_types import FlorenceProtocolReply
 from florence.messaging.types import FlorenceInboundAttachment
 from florence.onboarding import build_google_connected_syncing_message_sequence
-from florence.runtime.chat import (
-    FlorenceHouseholdChatService,
-    _GROUP_INTRO_NO_ACTION_SENTINEL,
-    _GROUP_INTRO_SHOW_SENTINEL,
-    _GROUP_SHARE_EXECUTE_SENTINEL,
-    _GROUP_SHARE_NO_ACTION_SENTINEL,
-    _ONBOARDING_CONTEXTUAL_CHAT_SENTINEL,
-    _ONBOARDING_NO_REPLY_SENTINEL,
-    _ONBOARDING_SYNC_WAITING_SENTINEL,
-    _REVIEW_NO_ACTION_SENTINEL,
-    _REVIEW_SHOW_PROMPT_SENTINEL,
-)
+from florence.runtime.chat import FlorenceHouseholdChatService
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +57,7 @@ class FlorenceHouseholdChatBridge:
         )
         if reply is None or not reply.text.strip():
             return None
-        if self._looks_like_protocol_sentinel(reply.text):
+        if looks_like_protocol_sentinel(reply.text):
             logger.warning(
                 "Suppressing leaked Florence protocol sentinel in normal chat reply household_id=%s channel_id=%s text=%s",
                 household_id,
@@ -125,7 +121,7 @@ class FlorenceHouseholdChatBridge:
         if reply is None or not reply.strip():
             return None
         normalized = reply.strip()
-        if normalized == _GROUP_INTRO_SHOW_SENTINEL:
+        if normalized == GROUP_INTRO_SHOW_SENTINEL:
             return FlorenceProtocolReply(reply_text=_GROUP_INTRO_REPLY_TEXT, consumed=True)
         if self._looks_like_agent_failure(normalized):
             logger.warning(
@@ -141,24 +137,30 @@ class FlorenceHouseholdChatBridge:
         member_id: str,
         payload: dict[str, object],
     ) -> FlorenceProtocolReply | None:
-        if hasattr(self.household_chat_service, "compose_onboarding_turn"):
-            reply_messages = self.household_chat_service.compose_onboarding_turn(
-                household_id=household_id,
-                channel_id=channel_id,
-                actor_member_id=member_id,
-                payload=payload,
-                conversation_history=self.channel_log.conversation_history(channel_id=channel_id),
+        try:
+            if hasattr(self.household_chat_service, "compose_onboarding_turn"):
+                reply_messages = self.household_chat_service.compose_onboarding_turn(
+                    household_id=household_id,
+                    channel_id=channel_id,
+                    actor_member_id=member_id,
+                    payload=payload,
+                    conversation_history=self.channel_log.conversation_history(channel_id=channel_id),
+                )
+            else:
+                reply = self.household_chat_service.compose_operator_message(
+                    household_id=household_id,
+                    channel_id=channel_id,
+                    actor_member_id=member_id,
+                    kind="onboarding_turn",
+                    payload=payload,
+                    conversation_history=self.channel_log.conversation_history(channel_id=channel_id),
+                )
+                reply_messages = (reply.strip(),) if reply is not None and reply.strip() else None
+        except Exception:
+            logger.exception(
+                "Ignoring onboarding_turn operator failure and falling back to setup handling"
             )
-        else:
-            reply = self.household_chat_service.compose_operator_message(
-                household_id=household_id,
-                channel_id=channel_id,
-                actor_member_id=member_id,
-                kind="onboarding_turn",
-                payload=payload,
-                conversation_history=self.channel_log.conversation_history(channel_id=channel_id),
-            )
-            reply_messages = (reply.strip(),) if reply is not None and reply.strip() else None
+            return None
         if not reply_messages:
             return None
         normalized = tuple(message.strip() for message in reply_messages if message and message.strip())
@@ -194,9 +196,9 @@ class FlorenceHouseholdChatBridge:
         outcome: str,
     ) -> FlorenceProtocolReply | None:
         user_message = str(payload.get("user_message") or "").strip()
-        if outcome == _ONBOARDING_NO_REPLY_SENTINEL:
+        if outcome == ONBOARDING_NO_REPLY_SENTINEL:
             return FlorenceProtocolReply(consumed=True)
-        if outcome == _ONBOARDING_SYNC_WAITING_SENTINEL:
+        if outcome == ONBOARDING_SYNC_WAITING_SENTINEL:
             return self.handle_setup_sync_waiting_turn(
                 household_id=household_id,
                 channel_id=channel_id,
@@ -204,7 +206,7 @@ class FlorenceHouseholdChatBridge:
                 user_message=user_message,
                 data_dependent=True,
             )
-        if outcome == _ONBOARDING_CONTEXTUAL_CHAT_SENTINEL:
+        if outcome == ONBOARDING_CONTEXTUAL_CHAT_SENTINEL:
             return self.handle_setup_sync_waiting_turn(
                 household_id=household_id,
                 channel_id=channel_id,
@@ -255,18 +257,3 @@ class FlorenceHouseholdChatBridge:
     def _looks_like_agent_failure(reply_text: str) -> bool:
         normalized = " ".join(reply_text.split()).strip().lower()
         return normalized.startswith("api call failed after ")
-
-    @staticmethod
-    def _looks_like_protocol_sentinel(reply_text: str) -> bool:
-        normalized = str(reply_text or "").strip()
-        return normalized in {
-            _ONBOARDING_SYNC_WAITING_SENTINEL,
-            _ONBOARDING_CONTEXTUAL_CHAT_SENTINEL,
-            _ONBOARDING_NO_REPLY_SENTINEL,
-            _REVIEW_SHOW_PROMPT_SENTINEL,
-            _REVIEW_NO_ACTION_SENTINEL,
-            _GROUP_SHARE_EXECUTE_SENTINEL,
-            _GROUP_SHARE_NO_ACTION_SENTINEL,
-            _GROUP_INTRO_SHOW_SENTINEL,
-            _GROUP_INTRO_NO_ACTION_SENTINEL,
-        }

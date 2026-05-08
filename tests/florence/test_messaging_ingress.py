@@ -9,6 +9,9 @@ from florence.messaging import (
 )
 from florence.messaging.protocol_types import (
     CANDIDATE_REVIEW_PROMPT_KIND,
+    PENDING_ACTION_EXPIRES_AT_KEY,
+    PENDING_ACTION_ID_KEY,
+    build_household_link_prompt_metadata,
     build_google_connect_prompt_metadata,
 )
 from datetime import datetime, timedelta, timezone
@@ -24,6 +27,8 @@ from florence.contracts import (
     GoogleConnection,
     GoogleSourceKind,
     Household,
+    HouseholdLinkRequest,
+    HouseholdLinkRequestStatus,
     HouseholdSourceVisibility,
     HouseholdNudge,
     HouseholdNudgeStatus,
@@ -758,6 +763,7 @@ def test_dm_pending_household_link_request_prompts_and_auto_merges_lightweight_h
 
     assert prompt.consumed is True
     assert "Jackson wants to connect you to the same household here." in prompt.reply_text
+    assert prompt.reply_metadata[PENDING_ACTION_ID_KEY]
 
     merged = ingress.handle_message(
         FlorenceResolvedInboundMessage(
@@ -781,6 +787,80 @@ def test_dm_pending_household_link_request_prompts_and_auto_merges_lightweight_h
     assert store.get_member("mem_kendall").household_id == "hh_jackson"
     assert store.get_channel("chan_kendall_dm").household_id == "hh_jackson"
     assert store.list_channel_messages(channel_id="chan_kendall_dm")[-1].household_id == "hh_jackson"
+    store.close()
+
+
+def test_dm_pending_household_link_yes_does_not_use_expired_prompt(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_onboarding_service(store, review_service)
+    store.upsert_household(Household(id="hh_jackson", name="Jackson household", timezone="America/Los_Angeles"))
+    store.upsert_household(Household(id="hh_kendall", name="Kendall household", timezone="America/Los_Angeles"))
+    store.upsert_member(Member(id="mem_jackson", household_id="hh_jackson", display_name="Jackson", role=MemberRole.ADMIN))
+    store.upsert_member(Member(id="mem_kendall", household_id="hh_kendall", display_name="Kendall", role=MemberRole.ADMIN))
+    store.upsert_member_identity(
+        MemberIdentity(
+            id="ident_kendall",
+            member_id="mem_kendall",
+            kind=IdentityKind.PHONE,
+            value="+1 (555) 555-0124",
+            normalized_value="+15555550124",
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_kendall_dm",
+            household_id="hh_kendall",
+            provider="sendblue",
+            provider_channel_id="thread-kendall",
+            channel_type=ChannelType.PARENT_DM,
+            title="Kendall",
+            metadata={"sender_handle": "+15555550124"},
+        )
+    )
+    request = FlorenceHouseholdLinkService(store).create_phone_link_request(
+        household_id="hh_jackson",
+        inviting_member_id="mem_jackson",
+        invited_phone="+1 (555) 555-0124",
+        invited_display_name="Kendall",
+    )
+    expired_metadata = build_household_link_prompt_metadata(request.id, role="invited")
+    expired_metadata[PENDING_ACTION_EXPIRES_AT_KEY] = "2026-01-01T00:00:00+00:00"
+    store.append_channel_message(
+        ChannelMessage(
+            id="msg_expired_link_prompt",
+            household_id="hh_kendall",
+            channel_id="chan_kendall_dm",
+            sender_role=ChannelMessageRole.ASSISTANT,
+            body="Jackson wants to connect you to the same household here.",
+            metadata=expired_metadata,
+            created_at=datetime.now(timezone.utc).timestamp(),
+        )
+    )
+    ingress = _build_ingress(store, onboarding_service, review_service)
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_kendall",
+            member_id="mem_kendall",
+            channel_id="chan_kendall_dm",
+            thread_id="thread-kendall",
+            message=FlorenceInboundMessage(
+                provider="sendblue",
+                message_id="msg-kendall-expired-yes",
+                thread_id="thread-kendall",
+                sender_handle="+1 (555) 555-0124",
+                body="yes",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert result.consumed is True
+    assert "Jackson wants to connect you to the same household here." in (result.reply_text or "")
+    assert result.reply_metadata[PENDING_ACTION_ID_KEY]
+    assert store.get_member("mem_kendall").household_id == "hh_kendall"
+    assert store.get_household_link_request(request.id).status == HouseholdLinkRequestStatus.PENDING
     store.close()
 
 
@@ -850,6 +930,68 @@ def test_dm_pending_household_link_accepts_first_yes_after_outbound_invite(tmp_p
     assert merged.consumed is True
     assert "linked into the same household now" in (merged.reply_text or "").lower()
     assert store.get_member("mem_kendall").household_id == "hh_jackson"
+    store.close()
+
+
+def test_dm_inviting_household_link_confirmation_requires_active_yes_prompt(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_onboarding_service(store, review_service)
+    store.upsert_household(Household(id="hh_jackson", name="Jackson household", timezone="America/Los_Angeles"))
+    store.upsert_household(Household(id="hh_kendall", name="Kendall household", timezone="America/Los_Angeles"))
+    store.upsert_member(Member(id="mem_jackson", household_id="hh_jackson", display_name="Jackson", role=MemberRole.ADMIN))
+    store.upsert_member(Member(id="mem_kendall", household_id="hh_kendall", display_name="Kendall", role=MemberRole.ADMIN))
+    store.upsert_channel(
+        Channel(
+            id="chan_jackson_dm",
+            household_id="hh_jackson",
+            provider="sendblue",
+            provider_channel_id="thread-jackson",
+            channel_type=ChannelType.PARENT_DM,
+            title="Jackson",
+            metadata={"sender_handle": "+15555550199"},
+        )
+    )
+    request = store.upsert_household_link_request(
+        HouseholdLinkRequest(
+            id="linkreq_confirm_123",
+            household_id="hh_jackson",
+            inviting_member_id="mem_jackson",
+            invited_identity_kind=IdentityKind.PHONE,
+            invited_identity_normalized_value="+15555550124",
+            invited_identity_value="+1 (555) 555-0124",
+            invited_display_name="Kendall",
+            invited_member_id="mem_kendall",
+            source_household_id="hh_kendall",
+            requires_merge_confirmation=True,
+            status=HouseholdLinkRequestStatus.ACCEPTED,
+            metadata={"awaiting_inviting_confirmation": True},
+        )
+    )
+    ingress = _build_ingress(store, onboarding_service, review_service)
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_jackson",
+            member_id="mem_jackson",
+            channel_id="chan_jackson_dm",
+            thread_id="thread-jackson",
+            message=FlorenceInboundMessage(
+                provider="sendblue",
+                message_id="msg-jackson-thanks",
+                thread_id="thread-jackson",
+                sender_handle="+1 (555) 555-0199",
+                body="thanks",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert result.consumed is True
+    assert "reply yes if you want me to finish linking everything" in (result.reply_text or "").lower()
+    assert result.reply_metadata[PENDING_ACTION_ID_KEY]
+    assert store.get_household_link_request(request.id).status == HouseholdLinkRequestStatus.ACCEPTED
+    assert store.get_household("hh_kendall") is not None
     store.close()
 
 
@@ -991,6 +1133,18 @@ def test_dm_parent_name_reply_includes_friendly_google_link(tmp_path):
         "Once Google says you're connected, come right back here. You can also keep answering my questions while it runs.",
         "What are your kids' names? You can send them all in one message, one per line or comma-separated.",
     )
+    records = store.list_turn_records(household_id="hh_123")
+    assert len(records) == 1
+    assert records[0]["trigger_kind"] == "inbound_dm"
+    assert records[0]["disposition"] == "reply_multiple"
+    assert records[0]["envelope"]["message_text"] == "Maya"
+    assert records[0]["envelope"]["tool_scope"]["allowed_source_scopes"] == [
+        "shared_household",
+        "shared_group_memory",
+        "private_parent",
+    ]
+    assert records[0]["envelope"]["delivery_target"]["provider_thread_id"] == "dm_thread_123"
+    assert records[0]["outcome"]["reply_messages"][0] == "Hi, I'm Florence."
     store.close()
 
 
@@ -1601,6 +1755,125 @@ def test_completed_group_media_message_routes_through_household_chat(tmp_path):
     assert result.reply_text == "I can keep planning with you here."
     assert "Media context extracted from attachments" in chat_service.calls[0]["message_text"]
     assert chat_service.calls[0]["message_attachments"] == ()
+    store.close()
+
+
+def test_completed_group_low_signal_chatter_records_no_reply_without_hermes(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_onboarding_service(store, review_service)
+    _complete_hybrid_onboarding(onboarding_service)
+    chat_service = _StubHouseholdChatService("I should not be called.")
+    ingress = _build_ingress(
+        store,
+        onboarding_service,
+        review_service,
+        household_chat_service=chat_service,
+    )
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_group_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="group_thread_123",
+            channel_type=ChannelType.HOUSEHOLD_GROUP,
+            title="Parent group",
+        )
+    )
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_group_123",
+            thread_id="group_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_group_thanks",
+                thread_id="group_thread_123",
+                sender_handle="+15555550123",
+                body="thanks",
+                is_group_chat=True,
+            ),
+        )
+    )
+
+    records = store.list_turn_records(household_id="hh_123")
+    assert result.consumed is False
+    assert result.reply_text is None
+    assert result.reply_messages == ()
+    assert chat_service.calls == []
+    assert len(records) == 1
+    assert records[0]["trigger_kind"] == "inbound_group"
+    assert records[0]["disposition"] == "no_reply"
+    assert records[0]["outcome"]["reply_metadata"]["no_reply_reason"] == "group_low_signal_chatter"
+    assert records[0]["envelope"]["message_text"] == "thanks"
+    assert records[0]["envelope"]["tool_scope"]["allowed_source_scopes"] == [
+        "shared_household",
+        "shared_group_memory",
+    ]
+    assert records[0]["envelope"]["delivery_target"]["provider_thread_id"] == "group_thread_123"
+    store.close()
+
+
+def test_group_message_with_unresolved_actor_records_no_reply_without_hermes(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_onboarding_service(store, review_service)
+    chat_service = _StubHouseholdChatService("I should not be called.")
+    ingress = _build_ingress(
+        store,
+        onboarding_service,
+        review_service,
+        household_chat_service=chat_service,
+    )
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_channel(
+        Channel(
+            id="chan_group_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="group_thread_123",
+            channel_type=ChannelType.HOUSEHOLD_GROUP,
+            title="Parent group",
+        )
+    )
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id=None,
+            channel_id="chan_group_123",
+            thread_id="group_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_group_unknown_sender",
+                thread_id="group_thread_123",
+                sender_handle="+15555550199",
+                body="Can Florence add this to the calendar?",
+                is_group_chat=True,
+            ),
+        )
+    )
+
+    records = store.list_turn_records(household_id="hh_123")
+    assert result.consumed is False
+    assert result.reply_text is None
+    assert chat_service.calls == []
+    assert len(records) == 1
+    assert records[0]["trigger_kind"] == "inbound_group"
+    assert records[0]["disposition"] == "no_reply"
+    assert records[0]["outcome"]["reply_metadata"]["no_reply_reason"] == "group_actor_unresolved"
+    assert records[0]["actor_member_id"] is None
     store.close()
 
 
@@ -2763,8 +3036,7 @@ def test_incomplete_dm_can_route_multi_child_school_updates_through_hermes_onboa
     assert session.child_profiles[0]["school"] == "Roosevelt Elementary"
     assert session.child_profiles[1]["school"] == "Little Sprouts Preschool"
     assert session.stage == "collect_child_activities"
-    assert [created["enabled_toolsets"] for created in _OnboardingToolAgent.created[:2]] == [
-        ["florence_briefing"],
+    assert [created["enabled_toolsets"] for created in _OnboardingToolAgent.created[:1]] == [
         ["florence_onboarding"],
     ]
     assert "Use household_apply_onboarding_update to store only explicit setup facts" in _OnboardingToolAgent.last_run["system_message"]
@@ -2851,11 +3123,10 @@ def test_incomplete_dm_real_hermes_onboarding_handoff_can_escape_to_sync_waiting
 
     assert result.reply_text == "Still syncing, so I can’t answer from your calendar confidently yet."
     assert [run["task"] for run in _OnboardingHandoffAgent.runs] == [
-        "group_share_turn_decision",
         "handle_onboarding_turn",
         "compose_sync_waiting_reply",
     ]
-    assert "reply exactly HANDOFF_TO_SYNC_WAITING" in _OnboardingHandoffAgent.runs[1]["system_message"]
+    assert "reply exactly HANDOFF_TO_SYNC_WAITING" in _OnboardingHandoffAgent.runs[0]["system_message"]
     store.close()
 
 

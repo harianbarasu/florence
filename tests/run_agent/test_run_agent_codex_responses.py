@@ -313,6 +313,52 @@ def test_build_api_kwargs_codex(monkeypatch):
     assert "extra_body" not in kwargs
 
 
+def test_normalize_prompt_cache_key_truncates_long_values_stably():
+    long_key = "florence-channel-chan_1cf4998b47315f5038fc-internal-group_share_turn-3d1a62af"
+
+    normalized = run_agent.AIAgent._normalize_prompt_cache_key(long_key)
+
+    assert normalized is not None
+    assert len(normalized) <= 64
+    assert normalized.startswith("florence-channel-")
+    assert normalized == run_agent.AIAgent._normalize_prompt_cache_key(long_key)
+    assert normalized != run_agent.AIAgent._normalize_prompt_cache_key(f"{long_key}-other")
+
+
+def test_build_api_kwargs_codex_normalizes_long_prompt_cache_key(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    agent.session_id = "florence-channel-chan_1cf4998b47315f5038fc-internal-review_queue_turn-c6946d5f"
+
+    kwargs = agent._build_api_kwargs(
+        [
+            {"role": "system", "content": "You are Hermes."},
+            {"role": "user", "content": "Ping"},
+        ]
+    )
+
+    assert kwargs["prompt_cache_key"] == run_agent.AIAgent._normalize_prompt_cache_key(agent.session_id)
+    assert len(kwargs["prompt_cache_key"]) <= 64
+
+
+def test_build_api_kwargs_codex_normalizes_prompt_cache_key_override(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    agent.request_overrides = {
+        "prompt_cache_key": "override-" + ("x" * 80),
+    }
+
+    kwargs = agent._build_api_kwargs(
+        [
+            {"role": "system", "content": "You are Hermes."},
+            {"role": "user", "content": "Ping"},
+        ]
+    )
+
+    assert len(kwargs["prompt_cache_key"]) <= 64
+    assert kwargs["prompt_cache_key"] == run_agent.AIAgent._normalize_prompt_cache_key(
+        agent.request_overrides["prompt_cache_key"]
+    )
+
+
 def test_build_api_kwargs_codex_clamps_minimal_effort(monkeypatch):
     """'minimal' reasoning effort is clamped to 'low' on the Responses API.
 

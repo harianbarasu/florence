@@ -320,6 +320,11 @@ class TestBackwardCompat:
 
 
 class TestFlorenceToolDefinitions:
+    def setup_method(self):
+        from florence.agent import register_florence_toolsets
+
+        register_florence_toolsets()
+
     def test_florence_chat_exposes_runtime_cronjob_tool(self, monkeypatch):
         monkeypatch.setenv("HERMES_EXEC_ASK", "1")
         tools = get_tool_definitions(enabled_toolsets=["florence_chat"], quiet_mode=True)

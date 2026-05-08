@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import re
 
+from florence.messaging.protocol_sentinels import GROUP_SHARE_EXECUTE_SENTINEL
 from florence.messaging.protocol_types import FlorenceProtocolReply
-from florence.runtime.chat import _GROUP_SHARE_EXECUTE_SENTINEL
 
 
 _SCHEDULE_FEED_PATTERN = re.compile(r"(?:\bwebcal://|\bhttps?://\S+\.ics(?:\?|$)|\b\S+\.ics(?:\?|$))", re.IGNORECASE)
@@ -49,7 +49,7 @@ class FlorenceGroupShareProtocol:
         current_message_id: str,
         text: str,
     ) -> FlorenceProtocolReply | None:
-        if _looks_like_schedule_feed_link(text) and not _looks_like_explicit_group_share_request(text):
+        if not _looks_like_explicit_group_share_request(text):
             return None
 
         latest_assistant = self.group_share_service.channel_log.latest_assistant_message(channel_id=channel_id)
@@ -67,7 +67,7 @@ class FlorenceGroupShareProtocol:
                 ),
             },
         )
-        if decision != _GROUP_SHARE_EXECUTE_SENTINEL:
+        if decision != GROUP_SHARE_EXECUTE_SENTINEL:
             return None
 
         share_result = self.group_share_service.handle_explicit_share_request(

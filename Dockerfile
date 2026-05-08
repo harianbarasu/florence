@@ -95,5 +95,4 @@ RUN chmod +x /opt/hermes/docker/entrypoint.sh
 ENV HERMES_HOME=/opt/data
 ENV PATH="/opt/hermes/.venv/bin:/opt/data/.local/bin:${PATH}"
 RUN mkdir -p /opt/data
-VOLUME [ "/opt/data" ]
 ENTRYPOINT [ "/usr/bin/tini", "-g", "--", "/opt/hermes/docker/entrypoint.sh" ]

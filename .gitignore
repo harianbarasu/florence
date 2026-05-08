@@ -70,3 +70,17 @@ mini-swe-agent/
 result
 website/static/api/skills-index.json
 models-dev-upstream/
+
+# Keep ad hoc CLI deploy uploads focused on the Florence runtime.
+# Docker builds use .dockerignore; tools such as `railway up` commonly honor
+# gitignore-style rules while packaging a local upload.
+.plans/
+docs/
+website/
+vendor/hermes-agent/
+optional-skills/
+skills/
+ui-tui/
+nix/
+tinker-atropos/
+mini-swe-agent/

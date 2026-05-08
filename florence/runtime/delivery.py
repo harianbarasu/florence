@@ -5,14 +5,20 @@ from __future__ import annotations
 import logging
 import re
 import time
+from dataclasses import replace
 from typing import Any, Callable
 
 from florence.contracts import ChannelMessage, ChannelMessageRole, ChannelType, PilotEvent
 from florence.runtime.entrypoints import FlorenceEntrypointResult
+from florence.sendblue import FlorenceSendbluePermanentOptOutError
 from florence.state import FlorenceStateDB
 from florence.text_safety import scrub_internal_ids
 
 logger = logging.getLogger(__name__)
+_TRANSPORT_DISABLED_KEY = "transport_disabled"
+_TRANSPORT_DISABLED_REASON_KEY = "transport_disabled_reason"
+_TRANSPORT_DISABLED_AT_KEY = "transport_disabled_at"
+_SENDBLUE_OPT_OUT_REASON = "sendblue_opted_out"
 
 
 def _plain_text_transport_message(message: str) -> str:
@@ -134,6 +140,24 @@ class FlorenceChannelDeliveryService:
         target_store = store or self.store
         outgoing_message = _plain_text_transport_message(message)
         transport_metadata = self._transport_metadata_for_channel(channel)
+        blocked_reason = self.channel_delivery_blocked_reason(channel)
+        if blocked_reason:
+            logger.info(
+                "Skipping Florence transport delivery for blocked channel %s reason=%s",
+                channel.provider_channel_id,
+                blocked_reason,
+            )
+            self._record_outbound_audit_event(
+                store=target_store,
+                channel=channel,
+                outgoing_message=outgoing_message,
+                record_message=record_message,
+                message_metadata=message_metadata,
+                transport_metadata=transport_metadata,
+                failed=True,
+                failure_reason=blocked_reason,
+            )
+            return False
         try:
             if channel.provider == "linq":
                 self._linq_client_getter().send_text(chat_id=channel.provider_channel_id, message=outgoing_message)
@@ -173,6 +197,27 @@ class FlorenceChannelDeliveryService:
                 transport_metadata=transport_metadata,
             )
             return True
+        except FlorenceSendbluePermanentOptOutError:
+            logger.warning(
+                "Florence Sendblue recipient opted out; disabling channel %s",
+                channel.provider_channel_id,
+            )
+            self._disable_channel_delivery(
+                store=target_store,
+                channel=channel,
+                reason=_SENDBLUE_OPT_OUT_REASON,
+            )
+            self._record_outbound_audit_event(
+                store=target_store,
+                channel=channel,
+                outgoing_message=outgoing_message,
+                record_message=record_message,
+                message_metadata=message_metadata,
+                transport_metadata=transport_metadata,
+                failed=True,
+                failure_reason=_SENDBLUE_OPT_OUT_REASON,
+            )
+            return False
         except Exception:
             logger.exception("Florence transport delivery failed for channel %s", channel.provider_channel_id)
             self._record_outbound_audit_event(
@@ -183,8 +228,36 @@ class FlorenceChannelDeliveryService:
                 message_metadata=message_metadata,
                 transport_metadata=transport_metadata,
                 failed=True,
+                failure_reason="transport_error",
             )
             return False
+
+    @staticmethod
+    def channel_delivery_blocked_reason(channel: Any) -> str | None:
+        metadata = dict(getattr(channel, "metadata", {}) or {})
+        if metadata.get(_TRANSPORT_DISABLED_KEY) is True:
+            reason = str(metadata.get(_TRANSPORT_DISABLED_REASON_KEY) or "").strip()
+            return reason or "transport_disabled"
+        return None
+
+    @staticmethod
+    def _disable_channel_delivery(
+        *,
+        store: FlorenceStateDB,
+        channel: Any,
+        reason: str,
+    ) -> None:
+        metadata = dict(getattr(channel, "metadata", {}) or {})
+        metadata[_TRANSPORT_DISABLED_KEY] = True
+        metadata[_TRANSPORT_DISABLED_REASON_KEY] = reason
+        metadata[_TRANSPORT_DISABLED_AT_KEY] = time.time()
+        try:
+            store.upsert_channel(replace(channel, metadata=metadata))
+        except Exception:
+            logger.exception(
+                "Florence failed to persist disabled transport metadata for channel %s",
+                channel.provider_channel_id,
+            )
 
     @staticmethod
     def _assistant_message_id(channel_id: str) -> str:
@@ -223,6 +296,7 @@ class FlorenceChannelDeliveryService:
         message_metadata: dict[str, Any] | None,
         transport_metadata: dict[str, Any],
         failed: bool = False,
+        failure_reason: str | None = None,
     ) -> None:
         event_type = "outbound_message_failed" if failed else "outbound_message_sent"
         metadata: dict[str, Any] = {
@@ -235,6 +309,8 @@ class FlorenceChannelDeliveryService:
             "message_metadata": dict(message_metadata or {}),
             **transport_metadata,
         }
+        if failure_reason:
+            metadata["failure_reason"] = failure_reason
         try:
             store.upsert_pilot_event(
                 PilotEvent(

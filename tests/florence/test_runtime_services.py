@@ -43,6 +43,7 @@ from florence.runtime import (
 )
 from florence.runtime.delivery import FlorenceChannelDeliveryService
 from florence.runtime.operations import FlorenceHouseholdOperationsService
+from florence.sendblue import FlorenceSendbluePermanentOptOutError
 from florence.state import FlorenceStateDB
 
 
@@ -83,6 +84,15 @@ class _FakeLinqClient:
 
     def send_text(self, *, chat_id: str, message: str) -> None:
         self.sent.append({"chat_id": chat_id, "message": message})
+
+
+class _OptOutSendblueClient:
+    def __init__(self) -> None:
+        self.sent: list[dict[str, object]] = []
+
+    def send_text(self, **kwargs) -> None:
+        self.sent.append(dict(kwargs))
+        raise FlorenceSendbluePermanentOptOutError("sendblue_send_failed:400:OPTED_OUT")
 
 
 class _StubReviewPromptChatService:
@@ -428,6 +438,40 @@ def test_delivery_service_strips_leftover_markdown_emphasis_markers(tmp_path):
 
     assert sent is True
     assert linq.sent == [{"chat_id": "dm-thread-123", "message": "Done.\n\n- 1 added: Flight to CDG (DL 96) on July 1"}]
+    store.close()
+
+
+def test_delivery_service_disables_sendblue_channel_after_opt_out(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    sendblue = _OptOutSendblueClient()
+    delivery = FlorenceChannelDeliveryService(
+        store,
+        linq_client_getter=lambda: None,
+        sendblue_client_getter=lambda: sendblue,
+    )
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    channel = store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="sendblue",
+            provider_channel_id="+16452060529|+12196445540",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+
+    sent = delivery.send_channel_message(channel=channel, message="Evening check-in")
+
+    updated = store.get_channel("chan_dm_123")
+    events = store.list_pilot_events(household_id="hh_123", event_type="outbound_message_failed")
+    assert sent is False
+    assert len(sendblue.sent) == 1
+    assert updated is not None
+    assert updated.metadata["transport_disabled"] is True
+    assert updated.metadata["transport_disabled_reason"] == "sendblue_opted_out"
+    assert len(events) == 1
+    assert events[0].metadata["failure_reason"] == "sendblue_opted_out"
     store.close()
 
 
@@ -2190,6 +2234,93 @@ def test_operations_briefing_respects_explicit_household_quiet_hours(tmp_path, m
     updated = store.get_household_routine(morning.id)
     assert updated is not None
     assert updated.last_completed_at is None
+    store.close()
+
+
+def test_operations_skips_blocked_briefing_channel_without_composing(tmp_path, monkeypatch):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="sendblue",
+            provider_channel_id="+16452060529|+12196445540",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+            metadata={
+                "transport_disabled": True,
+                "transport_disabled_reason": "sendblue_opted_out",
+            },
+        )
+    )
+    onboarding_service = FlorenceOnboardingSessionService(store)
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="+16452060529|+12196445540",
+        display_name="Maya",
+    )
+    manager = FlorenceHouseholdManagerService(store)
+    routines = manager.ensure_briefing_routines(household_id="hh_123")
+    morning = next(routine for routine in routines if routine.metadata.get("brief_kind") == "morning")
+    store.upsert_household_routine(
+        replace(
+            morning,
+            status=HouseholdRoutineStatus.ACTIVE,
+            next_due_at="2026-03-24T00:00:00+00:00",
+        )
+    )
+
+    class _BriefingChat:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def compose_brief(self, *, household_id, channel_id, actor_member_id, brief_kind):  # noqa: ARG002
+            self.calls += 1
+            return "Morning brief"
+
+    chat = _BriefingChat()
+    delivery = FlorenceChannelDeliveryService(
+        store,
+        linq_client_getter=lambda: None,
+        sendblue_client_getter=lambda: _OptOutSendblueClient(),
+    )
+    operations = FlorenceHouseholdOperationsService(
+        store,
+        delivery_service=delivery,
+        household_chat_service_getter=lambda: chat,
+        now_getter=lambda: _REVIEW_TEST_NOW,
+    )
+    monkeypatch.setattr(
+        operations,
+        "_utc_now",
+        lambda: datetime(2026, 3, 24, 14, 0, tzinfo=timezone.utc),
+    )
+
+    sent = operations.dispatch_due_household_briefings(household_id="hh_123")
+
+    updated = store.get_household_routine(morning.id)
+    records = [
+        record
+        for record in store.list_turn_records(household_id="hh_123")
+        if record["trigger_kind"] == "scheduled_brief"
+    ]
+    assert sent == 0
+    assert chat.calls == 0
+    assert updated is not None
+    assert updated.last_completed_at is not None
+    assert len(records) == 1
+    assert records[0]["disposition"] == "no_reply"
+    assert records[0]["outcome"]["no_reply_reason"] == "sendblue_opted_out"
     store.close()
 
 

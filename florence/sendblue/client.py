@@ -19,6 +19,10 @@ class FlorenceSendblueSendResult:
     body: dict[str, Any] | list[Any] | str | None
 
 
+class FlorenceSendbluePermanentOptOutError(RuntimeError):
+    """Raised when Sendblue permanently refuses delivery because a recipient opted out."""
+
+
 class FlorenceSendblueClient:
     """Thin Sendblue client for sending messages and verifying webhooks."""
 
@@ -72,9 +76,13 @@ class FlorenceSendblueClient:
                 "content": message,
             }
             response = self._request("POST", "/send-message", payload)
+        body = self._decode_body(response)
         if response.status_code not in {200, 201, 202}:
-            raise RuntimeError(f"sendblue_send_failed:{response.status_code}:{response.text}")
-        return FlorenceSendblueSendResult(status_code=response.status_code, body=self._decode_body(response))
+            message = f"sendblue_send_failed:{response.status_code}:{response.text}"
+            if self._body_is_permanent_opt_out(body):
+                raise FlorenceSendbluePermanentOptOutError(message)
+            raise RuntimeError(message)
+        return FlorenceSendblueSendResult(status_code=response.status_code, body=body)
 
     def add_group_recipient(self, *, group_id: str, number: str) -> FlorenceSendblueSendResult:
         normalized_group_id = group_id.strip() if isinstance(group_id, str) and group_id.strip() else ""
@@ -132,3 +140,13 @@ class FlorenceSendblueClient:
             return parsed if isinstance(parsed, (dict, list)) else response.text
         except Exception:
             return response.text
+
+    @staticmethod
+    def _body_is_permanent_opt_out(body: dict[str, Any] | list[Any] | str | None) -> bool:
+        if not isinstance(body, dict):
+            return False
+        fields = " ".join(
+            str(body.get(key) or "")
+            for key in ("error_message", "error_reason", "error_detail", "status")
+        ).lower()
+        return body.get("error_code") == 402 or "opted out" in fields or "opted_out" in fields

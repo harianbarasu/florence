@@ -24,11 +24,13 @@ node_modules
 **/.venv
 
 # Large docs / optional assets not needed in the base image
+.plans
 tests
 website
 landingpage
 docs
 plans
+vendor/hermes-agent
 optional-skills
 skills
 tinker-atropos

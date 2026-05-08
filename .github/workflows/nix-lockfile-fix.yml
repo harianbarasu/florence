@@ -42,7 +42,7 @@ jobs:
   #   4. Uses a GitHub App token (not GITHUB_TOKEN) so the fix commit
   #      triggers downstream nix.yml verification.
   auto-fix-main:
-    if: github.event_name == 'push'
+    if: github.repository == 'NousResearch/hermes-agent' && github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     concurrency:
@@ -124,11 +124,12 @@ jobs:
   # checkbox in the sticky lockfile-check comment flips from [ ] to [x].
   fix:
     if: |
-      github.event_name == 'workflow_dispatch' ||
+      github.repository == 'NousResearch/hermes-agent' &&
+      (github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'issue_comment'
        && github.event.issue.pull_request != null
        && contains(github.event.comment.body, '[x] **Apply lockfile fix**')
-       && !contains(github.event.changes.body.from, '[x] **Apply lockfile fix**'))
+       && !contains(github.event.changes.body.from, '[x] **Apply lockfile fix**')))
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:

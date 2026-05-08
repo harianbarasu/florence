@@ -905,6 +905,27 @@ class FlorenceHouseholdOperationsService:
                 fallback_channel=channel,
                 store=target_store,
             )
+            blocked_reason = self.delivery_service.channel_delivery_blocked_reason(channel)
+            if blocked_reason:
+                manager_service.mark_briefing_routine_sent(routine_id=routine.id)
+                self._record_operation_turn(
+                    store=target_store,
+                    trigger_kind=FlorenceTurnTrigger.SCHEDULED_BRIEF,
+                    household_id=household_id,
+                    channel=channel,
+                    actor_member_id=recipient_member_id,
+                    message_text="",
+                    disposition=FlorenceTurnDisposition.NO_REPLY,
+                    metadata={
+                        "operation_kind": "scheduled_brief",
+                        "routine_id": routine.id,
+                        "brief_kind": brief_kind.value,
+                        "suppressed_reason": blocked_reason,
+                    },
+                    scheduled_work_ids=(routine.id,),
+                    no_reply_reason=blocked_reason,
+                )
+                continue
             try:
                 brief_message = self._household_chat_service_getter().compose_brief(
                     household_id=household_id,

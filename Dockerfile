@@ -3,8 +3,8 @@ FROM tianon/gosu:1.19-trixie@sha256:3b176695959c71e123eb390d427efc665eeb561b1540
 FROM debian:13.4
 
 ARG HERMES_PYTHON_EXTRAS=honcho
-ARG INSTALL_NODE_RUNTIME=1
-ARG INSTALL_BROWSER_TOOLS=1
+ARG INSTALL_NODE_RUNTIME=0
+ARG INSTALL_BROWSER_TOOLS=0
 ARG INSTALL_PLAYWRIGHT_BROWSERS=0
 ARG INSTALL_WHATSAPP_BRIDGE=0
 
@@ -93,6 +93,8 @@ USER root
 RUN chmod +x /opt/hermes/docker/entrypoint.sh
 
 ENV HERMES_HOME=/opt/data
+ENV PORT=8080
 ENV PATH="/opt/hermes/.venv/bin:/opt/data/.local/bin:${PATH}"
 RUN mkdir -p /opt/data
+EXPOSE 8080
 ENTRYPOINT [ "/usr/bin/tini", "-g", "--", "/opt/hermes/docker/entrypoint.sh" ]

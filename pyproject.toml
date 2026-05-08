@@ -17,7 +17,9 @@ dependencies = [
   "python-dotenv>=1.2.1,<2",
   "fire>=0.7.1,<1",
   "httpx[socks]>=0.28.1,<1",
-  "redis>=5.0.0,<6",
+  # redis 5.3 imports JWT/cryptography at package import time, which can crash
+  # before Florence binds its HTTP port in slim production containers.
+  "redis>=5.0.0,<5.3",
   "psycopg[binary]>=3.2,<4",
   "rich>=14.3.3,<15",
   "tenacity>=9.1.4,<10",

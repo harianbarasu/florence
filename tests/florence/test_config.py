@@ -32,6 +32,17 @@ def test_florence_settings_supports_railway_public_domain_and_port(tmp_path, mon
     assert settings.server.public_base_url == "https://florence-production.up.railway.app"
     assert settings.google.redirect_uri == "https://florence-production.up.railway.app/v1/florence/google/callback"
 
+
+def test_florence_settings_default_http_port_is_railway_friendly(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("FLORENCE_HTTP_PORT", raising=False)
+    monkeypatch.delenv("PORT", raising=False)
+
+    settings = FlorenceSettings.from_env()
+
+    assert settings.server.port == 8080
+
+
 def test_florence_settings_prefers_database_url_when_present(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("DATABASE_URL", "postgresql://postgres:secret@db.example.com:5432/florence")

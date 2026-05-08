@@ -212,7 +212,7 @@ class FlorenceSettings:
         return cls(
             server=FlorenceServerRuntimeConfig(
                 host=str(_env_or_config(("FLORENCE_HTTP_HOST",), florence_cfg, "http_host", default="0.0.0.0")),
-                port=_as_int(_env_or_config(("FLORENCE_HTTP_PORT", "PORT"), florence_cfg, "http_port", default=8081), 8081),
+                port=_as_int(_env_or_config(("FLORENCE_HTTP_PORT", "PORT"), florence_cfg, "http_port", default=8080), 8080),
                 public_base_url=public_base_url,
                 sync_interval_seconds=_as_float(
                     _env_or_config(

@@ -12,6 +12,7 @@
 # Python
 .pytest_cache
 .venv
+*.egg-info
 __pycache__
 *.pyc
 *.pyo
@@ -48,8 +49,8 @@ uv.lock
 PLAN-*.md
 
 # Runtime data (bind-mounted at /opt/data; must not leak into build context)
-data/
+/data/
 
 # Compose/profile runtime state (bind-mounted; avoid ownership/secret issues)
-hermes-config/
-runtime/
+/hermes-config/
+/runtime/

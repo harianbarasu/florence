@@ -1732,6 +1732,67 @@ def test_household_apply_candidate_review_requires_pending_action_id_for_new_pro
         store.close()
 
 
+def test_household_apply_candidate_review_denies_non_dm_channel(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_web_123",
+            household_id="hh_123",
+            provider="web",
+            provider_channel_id="web-thread-123",
+            channel_type=ChannelType.WEB_CHAT,
+            title="Web test",
+        )
+    )
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_web_denied",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:web-denied",
+            title="School calendar item",
+            summary="Imported source evidence should not mutate state from web chat.",
+            state=CandidateState.PENDING_REVIEW,
+        )
+    )
+    task_id = "task-apply-candidate-review-web-denied"
+    set_household_tool_context(
+        task_id,
+        store=store,
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_web_123",
+    )
+    try:
+        result = json.loads(
+            handle_function_call(
+                "household_apply_candidate_review",
+                {
+                    "candidate_id": "cand_web_denied",
+                    "resolution": "confirm",
+                },
+                task_id=task_id,
+            )
+        )
+
+        assert result["error"].startswith("constitution_denied:")
+        assert result["channel_type"] == "web_chat"
+        assert store.get_imported_candidate("cand_web_denied").state == CandidateState.PENDING_REVIEW
+    finally:
+        clear_household_tool_context(task_id)
+        store.close()
+
+
 def test_household_upsert_event_can_cancel_existing_event_by_id_without_losing_fields(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))

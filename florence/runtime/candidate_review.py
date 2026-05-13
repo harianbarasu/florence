@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timezone
 from typing import Any, Callable
@@ -13,6 +14,7 @@ from florence.contracts import (
     GoogleSourceKind,
     HouseholdEvent,
     HouseholdEventStatus,
+    HouseholdProfileKind,
     HouseholdWorkItem,
     HouseholdWorkItemStatus,
     HouseholdSourceRule,
@@ -20,7 +22,9 @@ from florence.contracts import (
     ImportedCandidate,
 )
 from florence.runtime.household_calendar_projection import FlorenceHouseholdCalendarProjectionService
+from florence.runtime.household_manager import FlorenceHouseholdManagerService
 from florence.runtime.services import _stable_id
+from florence.runtime.trust_policy import record_constitution_source_preference
 from florence.source_rules import (
     build_candidate_source_profile,
     build_rules_for_candidate,
@@ -33,6 +37,26 @@ logger = logging.getLogger(__name__)
 _SHARED_CANDIDATE_SCOPE = "shared_household"
 _PRIVATE_CANDIDATE_SCOPE = "private_parent"
 _EVENT_REASON_TAGS = frozenset({"schedule_signal", "activity_signal", "school_source"})
+_RELEVANCE_RULE_CATEGORY = "relevance_rule"
+_RELEVANCE_GROUP_ITEM_TYPES = frozenset({"activity", "school_admin", "travel"})
+_HIGH_IMPORTANCE_HINTS = frozenset(
+    {
+        "case",
+        "charge",
+        "deadline",
+        "dispute",
+        "due today",
+        "emergency",
+        "important",
+        "overdue",
+        "payment",
+        "refund",
+        "requires action",
+        "today",
+        "urgent",
+        "venmo",
+    }
+)
 _FINANCIAL_RECORD_HINTS = frozenset(
     {
         "receipt",
@@ -97,6 +121,10 @@ class _SourceRuleService:
             metadata["source_rule_id"] = matched_rule.id
             metadata["source_rule_label"] = matched_rule.label or matched_rule.matcher_value
             metadata.pop("source_rule_prompt", None)
+            if matched_rule.visibility == HouseholdSourceVisibility.IGNORED:
+                metadata["suppressed_reason"] = "source_rule_ignored"
+                metadata["suppressed_by_source_rule_id"] = matched_rule.id
+                return replace(candidate, state=CandidateState.REJECTED, metadata=metadata)
             return replace(candidate, metadata=metadata)
         metadata.pop("source_rule_prompt", None)
         return replace(candidate, metadata=metadata)
@@ -107,12 +135,18 @@ class _SourceRuleService:
         candidate_id: str,
         visibility: HouseholdSourceVisibility,
         created_by_member_id: str | None = None,
+        review_context: dict[str, Any] | None = None,
     ) -> ImportedCandidate:
         candidate = self.store.get_imported_candidate(candidate_id)
         if candidate is None:
             raise ValueError("unknown_candidate")
 
-        rules = self._persist_rules(candidate, visibility=visibility, created_by_member_id=created_by_member_id)
+        rules = self._persist_rules(
+            candidate,
+            visibility=visibility,
+            created_by_member_id=created_by_member_id,
+            review_context=review_context,
+        )
         metadata = dict(candidate.metadata)
         metadata["source_visibility"] = visibility.value
         metadata["source_rule_ids"] = [rule.id for rule in rules]
@@ -127,8 +161,13 @@ class _SourceRuleService:
         return profile.label if profile is not None else None
 
     def build_candidate_source_prompt(self, candidate: ImportedCandidate) -> str | None:
-        _ = candidate
-        return None
+        label = self.describe_candidate_source(candidate)
+        if not label:
+            return None
+        return (
+            f"For future items from {label}, you can say private only, "
+            "always share this source, or ignore this sender."
+        )
 
     def _match_rule(self, candidate: ImportedCandidate) -> HouseholdSourceRule | None:
         for rule in self.store.list_household_source_rules(
@@ -145,6 +184,7 @@ class _SourceRuleService:
         *,
         visibility: HouseholdSourceVisibility,
         created_by_member_id: str | None = None,
+        review_context: dict[str, Any] | None = None,
     ) -> list[HouseholdSourceRule]:
         created: list[HouseholdSourceRule] = []
         for rule in build_rules_for_candidate(
@@ -153,6 +193,28 @@ class _SourceRuleService:
             created_by_member_id=created_by_member_id,
         ):
             created.append(self.store.upsert_household_source_rule(rule))
+        if created:
+            try:
+                profile = build_candidate_source_profile(candidate)
+                record_constitution_source_preference(
+                    self.store,
+                    household_id=candidate.household_id,
+                    visibility=visibility,
+                    source_label=profile.label if profile is not None else "this source",
+                    source_kind=created[0].source_kind.value,
+                    matcher_kind=created[0].matcher_kind.value,
+                    matcher_value=created[0].matcher_value,
+                    rule_ids=[rule.id for rule in created],
+                    member_id=created_by_member_id,
+                    channel_id=str((review_context or {}).get("channel_id") or "").strip() or None,
+                    trigger=str((review_context or {}).get("resolution_source") or "source_rule_feedback"),
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to update household constitution source policy household_id=%s candidate_id=%s",
+                    candidate.household_id,
+                    candidate.id,
+                )
         return created
 
 
@@ -260,7 +322,9 @@ class FlorenceCandidateReviewService:
             if summary and summary != title:
                 line = f"{line} — {summary}"
             lines.append(line)
-        lines.append("Reply with 1 yes, 2 no, 3 skip, or ask me about one of them.")
+        lines.append(
+            "Reply with 1 yes, 2 no, 3 skip, or corrections like already handled, too late, private only, always share this source, or ignore this sender."
+        )
         return _CandidateReviewPrompt(
             candidate=candidates[0],
             candidates=tuple(candidates),
@@ -287,6 +351,7 @@ class FlorenceCandidateReviewService:
                     candidate_id=target_candidate_id,
                     visibility=source_visibility,
                     created_by_member_id=member_id,
+                    review_context=review_context,
                 )
                 for target_candidate_id in normalized_candidate_ids
             ]
@@ -299,6 +364,8 @@ class FlorenceCandidateReviewService:
             prefix = (
                 f"Understood. I’ll keep future items from {source_label} private to your review queue."
                 if source_visibility == HouseholdSourceVisibility.PRIVATE
+                else f"Understood. I’ll ignore future items from {source_label}."
+                if source_visibility == HouseholdSourceVisibility.IGNORED
                 else f"Understood. I’ll treat future items from {source_label} as shared household context."
             )
 
@@ -352,17 +419,172 @@ class FlorenceCandidateReviewService:
 
         raise ValueError("invalid_review_response")
 
+    def apply_feedback_response(
+        self,
+        *,
+        candidate_id: str,
+        member_id: str | None,
+        feedback_kind: str,
+        candidate_ids: list[str] | tuple[str, ...] | None = None,
+        source_visibility: HouseholdSourceVisibility | None = None,
+        user_text: str | None = None,
+        review_context: dict[str, Any] | None = None,
+    ) -> _CandidateReviewReply:
+        normalized_candidate_ids = self._normalize_candidate_ids(candidate_ids, fallback=candidate_id)
+        updated_candidates: list[ImportedCandidate] = []
+        if source_visibility is not None:
+            for target_candidate_id in normalized_candidate_ids:
+                try:
+                    updated_candidates.append(
+                        self.set_candidate_source_visibility(
+                            candidate_id=target_candidate_id,
+                            visibility=source_visibility,
+                            created_by_member_id=member_id,
+                            review_context=review_context,
+                        )
+                    )
+                except ValueError:
+                    continue
+
+        if feedback_kind in {"private_only", "always_share"}:
+            updated_candidate = updated_candidates[0] if updated_candidates else self.store.get_imported_candidate(candidate_id)
+            source_label = "this source"
+            if updated_candidate is not None:
+                source_label = str(
+                    updated_candidate.metadata.get("source_rule_label")
+                    or updated_candidate.metadata.get("source_visibility_label")
+                    or self.source_rule_service.describe_candidate_source(updated_candidate)
+                    or "this source"
+                )
+            reply_text = (
+                f"Got it. I’ll keep future items from {source_label} private to your review queue."
+                if feedback_kind == "private_only"
+                else f"Got it. I’ll treat future items from {source_label} as shared household context."
+            )
+            return _CandidateReviewReply(reply_text=f"{reply_text} This item is still in review if you want to add it.")
+
+        if feedback_kind == "always_surface":
+            recorded_types: list[str] = []
+            for target_candidate_id in normalized_candidate_ids:
+                candidate = self.store.get_imported_candidate(target_candidate_id)
+                if candidate is None:
+                    continue
+                item_type = self._candidate_item_type(candidate)
+                recorded_types.append(item_type)
+                self._record_relevance_feedback_rule(
+                    candidate,
+                    feedback_kind=feedback_kind,
+                    member_id=member_id,
+                    user_text=user_text,
+                    review_context=review_context,
+                    item_type=item_type,
+                )
+            item_type_label = self._item_type_label(recorded_types[0] if recorded_types else "items")
+            return _CandidateReviewReply(
+                reply_text=f"Got it. I’ll make sure {item_type_label} like this get surfaced. This item is still in review if you want to add it."
+            )
+
+        close_reasons = {
+            "ignore_source": "source_ignored_by_parent",
+            "ignore_item_type": "item_type_ignored_by_parent",
+            "already_handled": "already_handled_by_parent",
+            "stale": "stale_by_parent_feedback",
+            "wrong_details": "wrong_details_by_parent",
+            "duplicate": "duplicate_by_parent",
+            "too_noisy": "too_noisy_by_parent",
+            "wrong_timing": "wrong_timing_by_parent",
+        }
+        suppressed_reason = close_reasons.get(feedback_kind)
+        if suppressed_reason is None:
+            raise ValueError("invalid_review_feedback")
+
+        relevance_feedback_kinds = {"ignore_item_type", "too_noisy", "wrong_timing"}
+        for target_candidate_id in normalized_candidate_ids:
+            candidate = self.store.get_imported_candidate(target_candidate_id)
+            if candidate is None:
+                continue
+            item_type = self._candidate_item_type(candidate)
+            if feedback_kind in relevance_feedback_kinds:
+                self._record_relevance_feedback_rule(
+                    candidate,
+                    feedback_kind=feedback_kind,
+                    member_id=member_id,
+                    user_text=user_text,
+                    review_context=review_context,
+                    item_type=item_type,
+                )
+            metadata = dict(candidate.metadata)
+            feedback_metadata = {
+                "kind": feedback_kind,
+                "member_id": member_id,
+                "user_text": " ".join(str(user_text or "").split()).strip() or None,
+                "item_type": item_type,
+            }
+            if source_visibility is not None:
+                feedback_metadata["source_visibility"] = source_visibility.value
+            normalized_review_context = self._normalize_review_context(review_context)
+            if normalized_review_context is not None:
+                feedback_metadata["review_context"] = normalized_review_context
+            metadata["review_feedback"] = {
+                key: value
+                for key, value in feedback_metadata.items()
+                if value is not None
+            }
+            metadata["review_feedback_kind"] = feedback_kind
+            metadata["suppressed_reason"] = suppressed_reason
+            self.store.upsert_imported_candidate(
+                replace(candidate, state=CandidateState.REJECTED, metadata=metadata)
+            )
+
+        if feedback_kind == "ignore_source":
+            source_label = "that source"
+            candidate = self.store.get_imported_candidate(candidate_id)
+            if candidate is not None:
+                source_label = str(
+                    candidate.metadata.get("source_rule_label")
+                    or self.source_rule_service.describe_candidate_source(candidate)
+                    or "that source"
+                )
+            return _CandidateReviewReply(
+                reply_text=f"Got it. I’ll ignore future items from {source_label} and leave this one out."
+            )
+        if feedback_kind == "ignore_item_type":
+            candidate = self.store.get_imported_candidate(candidate_id)
+            item_type_label = self._item_type_label(self._candidate_item_type(candidate)) if candidate is not None else "items"
+            return _CandidateReviewReply(
+                reply_text=f"Got it. I’ll suppress future {item_type_label} like this and leave this one out."
+            )
+        if feedback_kind == "already_handled":
+            return _CandidateReviewReply(reply_text="Got it. I marked that as already handled and left it out.")
+        if feedback_kind == "stale":
+            return _CandidateReviewReply(reply_text="Got it. I marked that as too late and left it out.")
+        if feedback_kind == "duplicate":
+            return _CandidateReviewReply(reply_text="Got it. I marked that as a duplicate and left it out.")
+        if feedback_kind == "too_noisy":
+            return _CandidateReviewReply(
+                reply_text="Got it. I’ll be stricter about low-value items like this and leave this one out."
+            )
+        if feedback_kind == "wrong_timing":
+            return _CandidateReviewReply(
+                reply_text="Got it. I’ll adjust the timing for items like this and leave this one out."
+            )
+        return _CandidateReviewReply(
+            reply_text="Got it. I left that item out. Send the corrected details if you want me to track it."
+        )
+
     def set_candidate_source_visibility(
         self,
         *,
         candidate_id: str,
         visibility: HouseholdSourceVisibility,
         created_by_member_id: str | None = None,
+        review_context: dict[str, Any] | None = None,
     ) -> ImportedCandidate:
         return self.source_rule_service.set_candidate_visibility(
             candidate_id=candidate_id,
             visibility=visibility,
             created_by_member_id=created_by_member_id,
+            review_context=review_context,
         )
 
     def confirm_candidate(
@@ -527,7 +749,9 @@ class FlorenceCandidateReviewService:
         source_prompt = self.source_rule_service.build_candidate_source_prompt(candidate)
         if source_prompt:
             lines.append(source_prompt)
-        lines.append("Reply yes if I should keep track of it, no if it's wrong, or skip for later.")
+        lines.append(
+            "Reply yes if I should keep track of it, no if it's wrong, skip for later, or corrections like already handled, too late, private only, always share this source, or ignore this sender."
+        )
         return _CandidateReviewPrompt(
             candidate=candidate,
             candidates=(candidate,),
@@ -548,11 +772,20 @@ class FlorenceCandidateReviewService:
             member_id=member_id,
             state=CandidateState.PENDING_REVIEW,
         )
-        candidates = [
-            candidate
-            for candidate in candidates
-            if self.is_candidate_reviewable_now(candidate=candidate)
-        ]
+        reviewable_candidates: list[ImportedCandidate] = []
+        for candidate in candidates:
+            if not self.is_candidate_reviewable_now(candidate=candidate):
+                continue
+            relevance_skip_reason = self.candidate_relevance_skip_reason(candidate)
+            if relevance_skip_reason is not None:
+                self.suppress_candidate_for_relevance(
+                    candidate,
+                    reason=relevance_skip_reason,
+                    trigger="build_review_prompt",
+                )
+                continue
+            reviewable_candidates.append(candidate)
+        candidates = reviewable_candidates
         if candidate_ids is not None:
             normalized_ids = [
                 str(candidate_id).strip()
@@ -650,6 +883,214 @@ class FlorenceCandidateReviewService:
             if bit
         ).lower()
         return any(hint in text for hint in _FINANCIAL_RECORD_HINTS)
+
+    def candidate_relevance_skip_reason(self, candidate: ImportedCandidate) -> str | None:
+        """Return a durable household relevance reason for skipping this candidate."""
+
+        if getattr(candidate, "state", None) != CandidateState.PENDING_REVIEW:
+            return None
+        if self.candidate_always_surface_reason(candidate) is not None:
+            return None
+        for rule in self._matching_relevance_rules(candidate):
+            rule_kind = str(rule.metadata.get("rule_kind") or "").strip().lower()
+            if rule_kind == "ignore_item_type":
+                return "relevance_rule_ignored_item_type"
+            if rule_kind == "too_noisy" and not self._candidate_is_high_importance(candidate):
+                return "relevance_rule_too_noisy"
+        return None
+
+    def candidate_always_surface_reason(self, candidate: ImportedCandidate) -> str | None:
+        for rule in self._matching_relevance_rules(candidate):
+            if str(rule.metadata.get("rule_kind") or "").strip().lower() == "always_surface":
+                return "relevance_rule_always_surface"
+        return None
+
+    def suppress_candidate_for_relevance(
+        self,
+        candidate: ImportedCandidate,
+        *,
+        reason: str,
+        trigger: str | None = None,
+    ) -> ImportedCandidate:
+        metadata = dict(candidate.metadata) if isinstance(candidate.metadata, dict) else {}
+        metadata["suppressed_reason"] = reason
+        metadata["review_feedback_kind"] = metadata.get("review_feedback_kind") or "relevance_rule"
+        metadata["item_type"] = self._candidate_item_type(candidate)
+        if trigger:
+            metadata["relevance_policy_trigger"] = trigger
+        suppressed = replace(candidate, state=CandidateState.REJECTED, metadata=metadata)
+        self.store.upsert_imported_candidate(suppressed)
+        return suppressed
+
+    def _record_relevance_feedback_rule(
+        self,
+        candidate: ImportedCandidate,
+        *,
+        feedback_kind: str,
+        member_id: str | None,
+        user_text: str | None,
+        review_context: dict[str, Any] | None,
+        item_type: str | None = None,
+    ) -> None:
+        normalized_kind = str(feedback_kind or "").strip().lower()
+        if normalized_kind not in {"ignore_item_type", "too_noisy", "wrong_timing", "always_surface"}:
+            return
+        resolved_item_type = item_type or self._candidate_item_type(candidate)
+        item_type_label = self._item_type_label(resolved_item_type)
+        value_by_kind = {
+            "ignore_item_type": f"Suppress future {item_type_label} like this before prompting this parent.",
+            "too_noisy": f"Only surface {item_type_label} like this when they are clearly important or urgent.",
+            "wrong_timing": f"Adjust timing for {item_type_label} like this before prompting this parent.",
+            "always_surface": f"Always surface important {item_type_label} like this to this parent.",
+        }
+        metadata = dict(candidate.metadata) if isinstance(candidate.metadata, dict) else {}
+        normalized_review_context = self._normalize_review_context(review_context)
+        rule_metadata: dict[str, object] = {
+            "rule_kind": normalized_kind,
+            "item_type": resolved_item_type,
+            "source_kind": candidate.source_kind.value,
+            "candidate_scope": _candidate_scope(candidate),
+            "created_from_candidate_id": candidate.id,
+            "created_from_candidate_title": candidate.title,
+            "created_from_source_identifier": candidate.source_identifier,
+            "raw_feedback_text": " ".join(str(user_text or "").split()).strip(),
+            "review_context": normalized_review_context,
+            "source_visibility": metadata.get("source_visibility"),
+        }
+        rule_metadata = {key: value for key, value in rule_metadata.items() if value not in (None, "")}
+        FlorenceHouseholdManagerService(self.store).record_preference(
+            household_id=candidate.household_id,
+            label=f"Florence relevance rule: {normalized_kind}:{resolved_item_type}",
+            value=value_by_kind[normalized_kind],
+            category=_RELEVANCE_RULE_CATEGORY,
+            member_id=member_id,
+            recorded_by_member_id=member_id,
+            metadata=rule_metadata,
+        )
+
+    def _matching_relevance_rules(self, candidate: ImportedCandidate) -> list[Any]:
+        candidate_item_type = self._candidate_item_type(candidate)
+        candidate_source_kind = getattr(candidate.source_kind, "value", str(candidate.source_kind))
+        matched = []
+        for item in self.store.list_household_profile_items(
+            household_id=candidate.household_id,
+            kind=HouseholdProfileKind.PREFERENCE,
+        ):
+            metadata = dict(item.metadata) if isinstance(item.metadata, dict) else {}
+            if str(metadata.get("category") or "").strip().lower() != _RELEVANCE_RULE_CATEGORY:
+                continue
+            if item.member_id is not None and item.member_id != candidate.member_id:
+                continue
+            rule_item_type = str(metadata.get("item_type") or "").strip().lower()
+            if rule_item_type and rule_item_type != candidate_item_type:
+                continue
+            rule_source_kind = str(metadata.get("source_kind") or "").strip().lower()
+            if rule_source_kind and rule_source_kind != str(candidate_source_kind).strip().lower():
+                continue
+            matched.append(item)
+        return matched
+
+    def _candidate_is_high_importance(self, candidate: ImportedCandidate) -> bool:
+        if int(getattr(candidate, "confidence_bps", 0) or 0) >= 9_000:
+            return True
+        metadata = dict(candidate.metadata) if isinstance(candidate.metadata, dict) else {}
+        if str(metadata.get("source_visibility") or "").strip().lower() == HouseholdSourceVisibility.SHARED.value:
+            return True
+        raw_metadata = dict(metadata.get("raw_metadata") or {})
+        reason_tags = {
+            str(tag).strip().lower()
+            for tag in list(raw_metadata.get("reason_tags") or [])
+            if str(tag).strip()
+        }
+        if {"urgent_signal", "payment_signal", "deadline_signal"}.intersection(reason_tags):
+            return True
+        text = self._candidate_search_text(candidate)
+        return any(hint in text for hint in _HIGH_IMPORTANCE_HINTS)
+
+    def _candidate_item_type(self, candidate: ImportedCandidate | None) -> str:
+        if candidate is None:
+            return "items"
+        metadata = dict(candidate.metadata) if isinstance(candidate.metadata, dict) else {}
+        explicit_type = str(metadata.get("item_type") or "").strip().lower()
+        if explicit_type:
+            return explicit_type
+        raw_metadata = dict(metadata.get("raw_metadata") or {})
+        explicit_raw_type = str(raw_metadata.get("item_type") or "").strip().lower()
+        if explicit_raw_type:
+            return explicit_raw_type
+        reason_tags = {
+            str(tag).strip().lower()
+            for tag in list(raw_metadata.get("reason_tags") or [])
+            if str(tag).strip()
+        }
+        text = self._candidate_search_text(candidate)
+        if self._candidate_looks_financial_record(candidate) or any(
+            hint in text for hint in ("venmo", "invoice", "payment", "bill", "refund", "charge")
+        ):
+            return "financial"
+        if any(hint in text for hint in ("flight", "airport", "jfk", "lax", "travel", "trip", "boarding")):
+            return "travel"
+        if any(hint in text for hint in ("grocery", "groceries", "shopping", "meal", "dinner", "recipe")):
+            return "meals_shopping"
+        if "activity_signal" in reason_tags or any(
+            hint in text for hint in ("open gym", "practice", "sports", "soccer", "music class", "booking")
+        ):
+            return "activity"
+        if (
+            bool(raw_metadata.get("sender_looks_school"))
+            or "school_source" in reason_tags
+            or any(
+                hint in text
+                for hint in (
+                    "bloomz",
+                    "bring",
+                    "class",
+                    "library",
+                    "pack",
+                    "school",
+                    "stuffy",
+                    "teacher",
+                    "wear",
+                    "wish",
+                    "young minds",
+                )
+            )
+        ):
+            return "school_admin"
+        if "schedule_signal" in reason_tags or self._candidate_is_time_bound_event(candidate):
+            return "calendar"
+        return "general"
+
+    @staticmethod
+    def _item_type_label(item_type: str) -> str:
+        labels = {
+            "activity": "activity items",
+            "calendar": "calendar items",
+            "financial": "financial items",
+            "general": "items",
+            "items": "items",
+            "meals_shopping": "meal and shopping items",
+            "school_admin": "school/admin items",
+            "travel": "travel items",
+        }
+        return labels.get(str(item_type or "").strip().lower(), "items")
+
+    @staticmethod
+    def _candidate_search_text(candidate: ImportedCandidate) -> str:
+        metadata = dict(candidate.metadata) if isinstance(candidate.metadata, dict) else {}
+        raw_metadata = dict(metadata.get("raw_metadata") or {})
+        source_provenance = dict(metadata.get("source_provenance") or {})
+        bits = [
+            candidate.title,
+            candidate.summary,
+            metadata.get("confirmation_question"),
+            metadata.get("from_address"),
+            source_provenance.get("from_address"),
+            source_provenance.get("subject"),
+            raw_metadata.get("snippet"),
+            raw_metadata.get("sender"),
+        ]
+        return " ".join(str(bit or "").lower() for bit in bits if str(bit or "").strip())
 
     def _candidate_local_date(self, candidate: ImportedCandidate) -> date | None:
         local_start = self._candidate_local_start(candidate)
@@ -889,7 +1330,7 @@ class FlorenceCandidateReviewService:
         grouped_candidates: list[list[ImportedCandidate]] = []
         grouped_by_key: dict[tuple[object, ...], list[ImportedCandidate]] = {}
         for candidate in candidates:
-            group_key = self._calendar_review_group_key(candidate)
+            group_key = self._review_group_key(candidate)
             if group_key is None:
                 grouped_candidates.append([candidate])
                 continue
@@ -928,7 +1369,13 @@ class FlorenceCandidateReviewService:
     ) -> str:
         candidate = candidates[0]
         if getattr(candidate, "source_kind", None) != GoogleSourceKind.GOOGLE_CALENDAR:
-            return " ".join(str(candidate.summary or "").split()).strip()
+            summary = " ".join(str(candidate.summary or "").split()).strip()
+            if len(candidates) <= 1:
+                return summary
+            item_type_label = self._item_type_label(self._candidate_item_type(candidate))
+            if summary:
+                return f"{len(candidates)} matching {item_type_label}: {summary}"
+            return f"{len(candidates)} matching {item_type_label}."
         occurrences = [
             occurrence
             for occurrence in (
@@ -950,6 +1397,47 @@ class FlorenceCandidateReviewService:
         if count > 2:
             labels.append(f"{count - 2} more dates")
         return f"{count} dates: {'; '.join(label for label in labels if label)}"
+
+    def _review_group_key(self, candidate: ImportedCandidate) -> tuple[object, ...] | None:
+        calendar_group_key = self._calendar_review_group_key(candidate)
+        if calendar_group_key is not None:
+            return calendar_group_key
+        item_type = self._candidate_item_type(candidate)
+        metadata = dict(candidate.metadata) if isinstance(candidate.metadata, dict) else {}
+        explicit_key = str(metadata.get("review_duplicate_key") or "").strip().lower()
+        if item_type not in _RELEVANCE_GROUP_ITEM_TYPES and not explicit_key:
+            return None
+        normalized_text = explicit_key or self._candidate_duplicate_text(candidate)
+        if not normalized_text:
+            return None
+        candidate_date = self._candidate_local_date(candidate)
+        source_kind = getattr(candidate.source_kind, "value", str(candidate.source_kind))
+        return (
+            "candidate_duplicate",
+            _candidate_scope(candidate),
+            source_kind,
+            item_type,
+            candidate_date.isoformat() if candidate_date is not None else "",
+            normalized_text,
+        )
+
+    @staticmethod
+    def _candidate_duplicate_text(candidate: ImportedCandidate) -> str:
+        metadata = dict(candidate.metadata) if isinstance(candidate.metadata, dict) else {}
+        source_provenance = dict(metadata.get("source_provenance") or {})
+        raw_metadata = dict(metadata.get("raw_metadata") or {})
+        text = str(
+            source_provenance.get("subject")
+            or raw_metadata.get("subject")
+            or candidate.title
+            or candidate.summary
+            or ""
+        ).strip().lower()
+        text = re.sub(r"^(?:re|fw|fwd)\s*:\s*", "", text)
+        text = re.sub(r"\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b", "", text)
+        text = re.sub(r"\b(?:mon|tue|wed|thu|fri|sat|sun)(?:day)?\b", "", text)
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
 
     def _calendar_review_group_key(self, candidate: ImportedCandidate) -> tuple[object, ...] | None:
         if getattr(candidate, "source_kind", None) != GoogleSourceKind.GOOGLE_CALENDAR:

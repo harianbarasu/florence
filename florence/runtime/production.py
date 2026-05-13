@@ -51,6 +51,11 @@ from florence.runtime.chat import FlorenceHouseholdChatService
 from florence.runtime.candidate_review import FlorenceCandidateReviewService
 from florence.runtime.household_manager import FlorenceHouseholdManagerService
 from florence.runtime.operations import FlorenceHouseholdOperationsService
+from florence.runtime.reliability import (
+    FlorenceReliabilityEvent,
+    record_reliability_event,
+    transport_event_metadata,
+)
 from florence.sendblue import FlorenceSendblueClient
 from florence.sendblue.media import enrich_sendblue_payload_with_media_text
 from florence.state import FlorenceStateDB
@@ -995,6 +1000,7 @@ class FlorenceProductionService:
             provider,
             _webhook_payload_summary(provider, payload),
         )
+        self._record_webhook_received(provider=provider, payload=payload)
         if enrich is not None:
             try:
                 enrich()
@@ -1025,6 +1031,38 @@ class FlorenceProductionService:
                     _webhook_payload_summary(provider, payload),
                 )
                 return self._json_result(500, {"ok": False, "error": internal_error})
+
+    def _record_webhook_received(self, *, provider: str, payload: dict[str, Any]) -> None:
+        summary = _webhook_payload_summary(provider, payload)
+        provider_channel_id = None
+        if provider == "sendblue":
+            group_id = str(summary.get("group_id") or "").strip()
+            line = str(payload.get("sendblue_number") or payload.get("to_number") or "").strip()
+            contact = str(payload.get("number") or payload.get("from_number") or "").strip()
+            if group_id and line:
+                provider_channel_id = f"{line}|group:{group_id}"
+            elif line and contact:
+                provider_channel_id = f"{line}|{contact}"
+        elif provider == "linq":
+            provider_channel_id = str(summary.get("chat_id") or "").strip() or None
+        try:
+            record_reliability_event(
+                self.store,
+                FlorenceReliabilityEvent.INBOUND_RECEIVED,
+                metadata=transport_event_metadata(
+                    provider=provider,
+                    provider_channel_id=provider_channel_id,
+                    message_id=str(summary.get("message_id") or "").strip() or None,
+                    correlation_id=(
+                        str(payload.get("trace_id") or "").strip()
+                        or str(payload.get("event_id") or "").strip()
+                        or None
+                    ),
+                    webhook_summary=summary,
+                ),
+            )
+        except Exception:
+            logger.exception("Florence webhook reliability logging failed provider=%s", provider)
 
     def _webhook_success_result(self, result: FlorenceEntrypointResult) -> FlorenceHTTPResult:
         return self._json_result(

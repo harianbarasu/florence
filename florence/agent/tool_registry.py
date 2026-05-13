@@ -35,6 +35,7 @@ FLORENCE_HOUSEHOLD_TOOLS = [
 
 FLORENCE_ONBOARDING_TOOLS = [
     "household_apply_onboarding_update",
+    "household_record_preference",
     "household_search_google_inbox",
     "household_search_google_calendar",
 ]

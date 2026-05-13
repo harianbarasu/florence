@@ -45,6 +45,7 @@ class GoogleSourceKind(StrEnum):
 class HouseholdSourceVisibility(StrEnum):
     SHARED = "shared"
     PRIVATE = "private"
+    IGNORED = "ignored"
 
 
 class HouseholdSourceMatcherKind(StrEnum):

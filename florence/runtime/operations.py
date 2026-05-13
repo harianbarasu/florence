@@ -10,7 +10,15 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
-from florence.contracts import CandidateState, ChannelMessageRole, ChannelType, GoogleSourceKind, HouseholdBriefingKind, HouseholdProfileKind
+from florence.contracts import (
+    CandidateState,
+    ChannelMessageRole,
+    ChannelType,
+    GoogleSourceKind,
+    HouseholdBriefingKind,
+    HouseholdNudgeStatus,
+    HouseholdProfileKind,
+)
 from florence.messaging.channel_log import FlorenceChannelLog
 from florence.messaging.protocol_types import (
     CANDIDATE_REVIEW_PROMPT_KIND,
@@ -24,7 +32,20 @@ from florence.ops.turn_records import record_turn_outcome
 from florence.runtime.candidate_review import FlorenceCandidateReviewService
 from florence.runtime.delivery import FlorenceChannelDeliveryService
 from florence.runtime.household_manager import FlorenceHouseholdManagerService
+from florence.runtime.reliability import (
+    FlorenceReliabilityEvent,
+    record_reliability_event,
+    transport_event_metadata,
+)
 from florence.runtime.services import _parse_iso_datetime, _parse_local_time_spec
+from florence.runtime.trust_policy import (
+    FlorenceModule,
+    briefing_module_for_kind,
+    constitution_quiet_hours_window,
+    ensure_household_constitution,
+    module_enabled,
+    proactive_channel_allowed,
+)
 from florence.state import FlorenceStateDB
 from florence.turns import FlorenceTurnDisposition, FlorenceTurnTrigger, build_system_turn_envelope
 
@@ -248,11 +269,24 @@ class FlorenceHouseholdOperationsService:
 
         if not newly_pending:
             return False
-        proactive_candidates = [
-            candidate
-            for candidate in newly_pending
-            if self._candidate_warrants_proactive_review_prompt(candidate, store=target_store)
-        ]
+        surface_reasons: dict[str, str] = {}
+        proactive_candidates = []
+        for candidate in newly_pending:
+            surface_reason = self._candidate_proactive_review_reason(candidate, store=target_store)
+            if surface_reason is not None:
+                surface_reasons[str(getattr(candidate, "id", "") or "")] = surface_reason
+                proactive_candidates.append(candidate)
+                continue
+            self._record_proactive_review_decision(
+                store=target_store,
+                household_id=household_id,
+                member_id=member_id,
+                channel_id=None,
+                candidate=candidate,
+                decision="skipped",
+                reason=self._candidate_proactive_review_skip_reason(candidate, store=target_store),
+                trigger="new_pending_candidate",
+            )
         if not proactive_candidates:
             return False
 
@@ -262,6 +296,43 @@ class FlorenceHouseholdOperationsService:
             store=target_store,
         )
         if channel is None:
+            self._record_proactive_review_decisions(
+                store=target_store,
+                household_id=household_id,
+                member_id=member_id,
+                channel_id=None,
+                candidates=proactive_candidates,
+                decision="skipped",
+                reason="no_review_dm_channel",
+                trigger="new_pending_candidate",
+            )
+            return False
+        skipped_reason = self._proactive_policy_skip_reason(
+            household_id=household_id,
+            channel=channel,
+            module=FlorenceModule.REVIEW_PROMPTS,
+            store=target_store,
+        )
+        if skipped_reason:
+            self._record_proactive_delivery_skip(
+                store=target_store,
+                household_id=household_id,
+                channel=channel,
+                actor_member_id=member_id,
+                delivery_kind="review_prompt",
+                skipped_reason=skipped_reason,
+                trigger="new_pending_candidate",
+            )
+            self._record_proactive_review_decisions(
+                store=target_store,
+                household_id=household_id,
+                member_id=member_id,
+                channel_id=channel.id,
+                candidates=proactive_candidates,
+                decision="skipped",
+                reason=skipped_reason,
+                trigger="new_pending_candidate",
+            )
             return False
         if self._has_armed_pending_review_prompt(
             household_id=household_id,
@@ -269,19 +340,50 @@ class FlorenceHouseholdOperationsService:
             channel_id=channel.id,
             store=target_store,
         ):
+            self._record_proactive_review_decisions(
+                store=target_store,
+                household_id=household_id,
+                member_id=member_id,
+                channel_id=channel.id,
+                candidates=proactive_candidates,
+                decision="skipped",
+                reason="active_review_prompt",
+                trigger="new_pending_candidate",
+            )
             return False
         if self._is_review_quiet_hours(household_id=household_id, store=target_store):
+            self._record_proactive_review_decisions(
+                store=target_store,
+                household_id=household_id,
+                member_id=member_id,
+                channel_id=channel.id,
+                candidates=proactive_candidates,
+                decision="skipped",
+                reason="quiet_hours",
+                trigger="new_pending_candidate",
+            )
             return False
         prompt = candidate_review_service.build_dm_review_batch_prompt(
             household_id=household_id,
             member_id=member_id,
-            candidate_filter=lambda candidate: self._candidate_warrants_proactive_review_prompt(
+            candidate_filter=lambda candidate: self._candidate_proactive_review_reason(
                 candidate,
                 store=target_store,
-            ),
+            )
+            is not None,
             limit=_REVIEW_BATCH_LIMIT,
         )
         if prompt is None:
+            self._record_proactive_review_decisions(
+                store=target_store,
+                household_id=household_id,
+                member_id=member_id,
+                channel_id=channel.id,
+                candidates=proactive_candidates,
+                decision="skipped",
+                reason="review_prompt_filtered_all_candidates",
+                trigger="new_pending_candidate",
+            )
             return False
 
         sent_prompt = False
@@ -295,6 +397,16 @@ class FlorenceHouseholdOperationsService:
                     household_id,
                     member_id,
                     channel.id,
+                )
+                self._record_proactive_review_decisions(
+                    store=target_store,
+                    household_id=household_id,
+                    member_id=member_id,
+                    channel_id=channel.id,
+                    candidates=proactive_candidates,
+                    decision="skipped",
+                    reason="active_conversation",
+                    trigger="new_pending_candidate",
                 )
                 return False
             prompt_text = prompt.text
@@ -361,6 +473,14 @@ class FlorenceHouseholdOperationsService:
                     "candidate_ids": candidate_ids,
                     "batch_count": len(prompt.candidates),
                     "trigger": "new_pending_candidate",
+                    "surface_reasons": {
+                        candidate.id: surface_reasons.get(
+                            candidate.id,
+                            self._candidate_proactive_review_reason(candidate, store=target_store)
+                            or "proactive_review_policy",
+                        )
+                        for candidate in prompt.candidates
+                    },
                 }
                 self._manager_service(store).record_pilot_event(
                     household_id=household_id,
@@ -381,6 +501,16 @@ class FlorenceHouseholdOperationsService:
                 )
 
         if not sent_prompt:
+            self._record_proactive_review_decisions(
+                store=target_store,
+                household_id=household_id,
+                member_id=member_id,
+                channel_id=channel.id,
+                candidates=proactive_candidates,
+                decision="skipped",
+                reason="delivery_failed",
+                trigger="new_pending_candidate",
+            )
             return False
 
         nudged_at = self._utc_now().isoformat()
@@ -388,6 +518,20 @@ class FlorenceHouseholdOperationsService:
             metadata = dict(candidate.metadata)
             metadata["review_nudged_at"] = nudged_at
             target_store.upsert_imported_candidate(replace(candidate, metadata=metadata))
+            self._record_proactive_review_decision(
+                store=target_store,
+                household_id=household_id,
+                member_id=member_id,
+                channel_id=channel.id,
+                candidate=candidate,
+                decision="surfaced",
+                reason=surface_reasons.get(
+                    candidate.id,
+                    self._candidate_proactive_review_reason(candidate, store=target_store)
+                    or "proactive_review_policy",
+                ),
+                trigger="new_pending_candidate",
+            )
         return True
 
     def dispatch_due_review_sweeps(
@@ -428,6 +572,23 @@ class FlorenceHouseholdOperationsService:
             )
             if channel is None:
                 continue
+            skipped_reason = self._proactive_policy_skip_reason(
+                household_id=household_id,
+                channel=channel,
+                module=FlorenceModule.REVIEW_PROMPTS,
+                store=target_store,
+            )
+            if skipped_reason:
+                self._record_proactive_delivery_skip(
+                    store=target_store,
+                    household_id=household_id,
+                    channel=channel,
+                    actor_member_id=member_id,
+                    delivery_kind="review_prompt",
+                    skipped_reason=skipped_reason,
+                    trigger="scheduled_review_sweep",
+                )
+                continue
             if self._has_armed_pending_review_prompt(
                 household_id=household_id,
                 member_id=member_id,
@@ -450,23 +611,47 @@ class FlorenceHouseholdOperationsService:
                 window_seconds=_REVIEW_SWEEP_INTERVAL_SECONDS,
             ):
                 continue
-            proactive_pending = [
-                candidate
-                for candidate in member_pending
-                if self._candidate_warrants_proactive_review_prompt(candidate, store=target_store)
-            ]
+            proactive_pending = []
+            surface_reasons: dict[str, str] = {}
+            for candidate in member_pending:
+                surface_reason = self._candidate_proactive_review_reason(candidate, store=target_store)
+                if surface_reason is not None:
+                    proactive_pending.append(candidate)
+                    surface_reasons[str(getattr(candidate, "id", "") or "")] = surface_reason
+                    continue
+                self._record_proactive_review_decision(
+                    store=target_store,
+                    household_id=household_id,
+                    member_id=member_id,
+                    channel_id=channel.id,
+                    candidate=candidate,
+                    decision="skipped",
+                    reason=self._candidate_proactive_review_skip_reason(candidate, store=target_store),
+                    trigger="scheduled_review_sweep",
+                )
             if not proactive_pending:
                 continue
             prompt = candidate_review_service.build_dm_review_batch_prompt(
                 household_id=household_id,
                 member_id=member_id,
-                candidate_filter=lambda candidate: self._candidate_warrants_proactive_review_prompt(
+                candidate_filter=lambda candidate: self._candidate_proactive_review_reason(
                     candidate,
                     store=target_store,
-                ),
+                )
+                is not None,
                 limit=_REVIEW_BATCH_LIMIT,
             )
             if prompt is None:
+                self._record_proactive_review_decisions(
+                    store=target_store,
+                    household_id=household_id,
+                    member_id=member_id,
+                    channel_id=channel.id,
+                    candidates=proactive_pending,
+                    decision="skipped",
+                    reason="review_prompt_filtered_all_candidates",
+                    trigger="scheduled_review_sweep",
+                )
                 continue
             prompt_text = prompt.text
             if not self._review_prompt_should_use_raw_text(prompt):
@@ -531,6 +716,14 @@ class FlorenceHouseholdOperationsService:
                 "candidate_ids": candidate_ids,
                 "batch_count": len(prompt.candidates),
                 "trigger": "scheduled_review_sweep",
+                "surface_reasons": {
+                    candidate.id: surface_reasons.get(
+                        candidate.id,
+                        self._candidate_proactive_review_reason(candidate, store=target_store)
+                        or "proactive_review_policy",
+                    )
+                    for candidate in prompt.candidates
+                },
             }
             self._manager_service(store).record_pilot_event(
                 household_id=household_id,
@@ -549,6 +742,21 @@ class FlorenceHouseholdOperationsService:
                 metadata=turn_metadata,
                 state_change_ids=candidate_ids,
             )
+            for candidate in prompt.candidates:
+                self._record_proactive_review_decision(
+                    store=target_store,
+                    household_id=household_id,
+                    member_id=member_id,
+                    channel_id=channel.id,
+                    candidate=candidate,
+                    decision="surfaced",
+                    reason=surface_reasons.get(
+                        candidate.id,
+                        self._candidate_proactive_review_reason(candidate, store=target_store)
+                        or "proactive_review_policy",
+                    ),
+                    trigger="scheduled_review_sweep",
+                )
             sent += 1
         return sent
 
@@ -571,6 +779,79 @@ class FlorenceHouseholdOperationsService:
                 if fallback_channel_id:
                     channel = target_store.get_channel(fallback_channel_id)
             if channel is None or not nudge.message.strip():
+                continue
+            skipped_reason = self._proactive_policy_skip_reason(
+                household_id=household_id,
+                channel=channel,
+                module=FlorenceModule.BASIC_REMINDERS,
+                store=target_store,
+            )
+            if skipped_reason:
+                target_store.upsert_household_nudge(
+                    replace(
+                        nudge,
+                        status=HouseholdNudgeStatus.CANCELLED,
+                        metadata={
+                            **dict(nudge.metadata),
+                            "suppressed_reason": skipped_reason,
+                        },
+                    )
+                )
+                self._record_proactive_delivery_skip(
+                    store=target_store,
+                    household_id=household_id,
+                    channel=channel,
+                    actor_member_id=nudge.recipient_member_id,
+                    delivery_kind="scheduled_nudge",
+                    skipped_reason=skipped_reason,
+                    nudge_id=nudge.id,
+                )
+                self._record_operation_turn(
+                    store=target_store,
+                    trigger_kind=FlorenceTurnTrigger.SCHEDULED_NUDGE,
+                    household_id=household_id,
+                    channel=channel,
+                    actor_member_id=nudge.recipient_member_id,
+                    message_text="",
+                    disposition=FlorenceTurnDisposition.NO_REPLY,
+                    metadata={
+                        "operation_kind": "scheduled_nudge",
+                        "nudge_id": nudge.id,
+                        "suppressed_reason": skipped_reason,
+                    },
+                    scheduled_work_ids=(nudge.id,),
+                    no_reply_reason=skipped_reason,
+                )
+                continue
+            if self._is_household_quiet_hours(
+                household_id=household_id,
+                store=target_store,
+            ):
+                self._record_proactive_delivery_skip(
+                    store=target_store,
+                    household_id=household_id,
+                    channel=channel,
+                    actor_member_id=nudge.recipient_member_id,
+                    delivery_kind="scheduled_nudge",
+                    skipped_reason="quiet_hours",
+                    nudge_id=nudge.id,
+                )
+                self._record_operation_turn(
+                    store=target_store,
+                    trigger_kind=FlorenceTurnTrigger.SCHEDULED_NUDGE,
+                    household_id=household_id,
+                    channel=channel,
+                    actor_member_id=nudge.recipient_member_id,
+                    message_text="",
+                    disposition=FlorenceTurnDisposition.NO_REPLY,
+                    metadata={
+                        "operation_kind": "scheduled_nudge",
+                        "nudge_id": nudge.id,
+                        "suppressed_reason": "quiet_hours",
+                    },
+                    scheduled_work_ids=(nudge.id,),
+                    no_reply_reason="quiet_hours",
+                )
                 continue
             nudge_metadata = dict(nudge.metadata) if isinstance(nudge.metadata, dict) else {}
             custom_delivery_metadata = (
@@ -713,12 +994,93 @@ class FlorenceHouseholdOperationsService:
             return start_minutes <= current_minutes < end_minutes
         return current_minutes >= start_minutes or current_minutes < end_minutes
 
+    def _proactive_policy_skip_reason(
+        self,
+        *,
+        household_id: str,
+        channel: Any,
+        module: FlorenceModule,
+        store: FlorenceStateDB,
+    ) -> str | None:
+        constitution = ensure_household_constitution(store, household_id)
+        if not module_enabled(constitution, module):
+            self._record_constitution_policy_decision(
+                store=store,
+                household_id=household_id,
+                channel=channel,
+                module=module,
+                decision="denied",
+                reason=f"module_disabled:{module.value}",
+            )
+            return f"module_disabled:{module.value}"
+        if not proactive_channel_allowed(channel, constitution):
+            self._record_constitution_policy_decision(
+                store=store,
+                household_id=household_id,
+                channel=channel,
+                module=module,
+                decision="denied",
+                reason="channel_not_allowed",
+            )
+            return "channel_not_allowed"
+        self._record_constitution_policy_decision(
+            store=store,
+            household_id=household_id,
+            channel=channel,
+            module=module,
+            decision="allowed",
+            reason="module_enabled_channel_allowed",
+        )
+        return None
+
+    def _record_constitution_policy_decision(
+        self,
+        *,
+        store: FlorenceStateDB,
+        household_id: str,
+        channel: Any,
+        module: FlorenceModule,
+        decision: str,
+        reason: str,
+    ) -> None:
+        try:
+            self._manager_service(store).record_pilot_event(
+                household_id=household_id,
+                event_type="constitution_policy_decision",
+                member_id=None,
+                channel_id=channel.id,
+                metadata={
+                    "decision": decision,
+                    "reason": reason,
+                    "module": module.value,
+                    "channel_type": (
+                        channel.channel_type.value
+                        if hasattr(channel.channel_type, "value")
+                        else str(channel.channel_type)
+                    ),
+                    "provider": getattr(channel, "provider", None),
+                    "provider_channel_id": getattr(channel, "provider_channel_id", None),
+                },
+            )
+        except Exception:
+            logger.exception(
+                "Failed to record Florence constitution policy decision household_id=%s channel_id=%s reason=%s",
+                household_id,
+                getattr(channel, "id", None),
+                reason,
+            )
+
     def _quiet_hours_window(
         self,
         *,
         household_id: str,
         store: FlorenceStateDB,
     ) -> tuple[int, int] | None:
+        constitution_window = constitution_quiet_hours_window(
+            ensure_household_constitution(store, household_id)
+        )
+        if constitution_window is not None:
+            return constitution_window
         items = store.list_household_profile_items(
             household_id=household_id,
             kind=HouseholdProfileKind.PREFERENCE,
@@ -890,11 +1252,6 @@ class FlorenceHouseholdOperationsService:
         manager_service = self._manager_service(store)
         sent = 0
         for routine in manager_service.list_due_briefing_routines(household_id=household_id):
-            if self._is_household_quiet_hours(
-                household_id=household_id,
-                store=target_store,
-            ):
-                continue
             metadata = dict(routine.metadata)
             kind_raw = str(metadata.get("brief_kind") or HouseholdBriefingKind.MORNING.value).strip().lower()
             try:
@@ -916,9 +1273,67 @@ class FlorenceHouseholdOperationsService:
                 fallback_channel=channel,
                 store=target_store,
             )
+            skipped_reason = self._proactive_policy_skip_reason(
+                household_id=household_id,
+                channel=channel,
+                module=briefing_module_for_kind(brief_kind),
+                store=target_store,
+            )
+            if skipped_reason:
+                manager_service.mark_briefing_routine_sent(routine_id=routine.id)
+                self._record_scheduled_delivery_skip(
+                    store=target_store,
+                    household_id=household_id,
+                    channel=channel,
+                    actor_member_id=recipient_member_id,
+                    routine_id=routine.id,
+                    brief_kind=brief_kind,
+                    skipped_reason=skipped_reason,
+                )
+                self._record_operation_turn(
+                    store=target_store,
+                    trigger_kind=FlorenceTurnTrigger.SCHEDULED_BRIEF,
+                    household_id=household_id,
+                    channel=channel,
+                    actor_member_id=recipient_member_id,
+                    message_text="",
+                    disposition=FlorenceTurnDisposition.NO_REPLY,
+                    metadata={
+                        "operation_kind": "scheduled_brief",
+                        "routine_id": routine.id,
+                        "brief_kind": brief_kind.value,
+                        "suppressed_reason": skipped_reason,
+                    },
+                    scheduled_work_ids=(routine.id,),
+                    no_reply_reason=skipped_reason,
+                )
+                continue
+            if self._is_household_quiet_hours(
+                household_id=household_id,
+                store=target_store,
+            ):
+                self._record_scheduled_delivery_skip(
+                    store=target_store,
+                    household_id=household_id,
+                    channel=channel,
+                    actor_member_id=recipient_member_id,
+                    routine_id=routine.id,
+                    brief_kind=brief_kind,
+                    skipped_reason="quiet_hours",
+                )
+                continue
             blocked_reason = self.delivery_service.channel_delivery_blocked_reason(channel)
             if blocked_reason:
                 manager_service.mark_briefing_routine_sent(routine_id=routine.id)
+                self._record_scheduled_delivery_skip(
+                    store=target_store,
+                    household_id=household_id,
+                    channel=channel,
+                    actor_member_id=recipient_member_id,
+                    routine_id=routine.id,
+                    brief_kind=brief_kind,
+                    skipped_reason=blocked_reason,
+                )
                 self._record_operation_turn(
                     store=target_store,
                     trigger_kind=FlorenceTurnTrigger.SCHEDULED_BRIEF,
@@ -939,6 +1354,15 @@ class FlorenceHouseholdOperationsService:
                 continue
             if self._briefing_window_expired(routine=routine, brief_kind=brief_kind, store=target_store):
                 manager_service.mark_briefing_routine_sent(routine_id=routine.id)
+                self._record_scheduled_delivery_skip(
+                    store=target_store,
+                    household_id=household_id,
+                    channel=channel,
+                    actor_member_id=recipient_member_id,
+                    routine_id=routine.id,
+                    brief_kind=brief_kind,
+                    skipped_reason="briefing_window_expired",
+                )
                 self._record_operation_turn(
                     store=target_store,
                     trigger_kind=FlorenceTurnTrigger.SCHEDULED_BRIEF,
@@ -975,6 +1399,15 @@ class FlorenceHouseholdOperationsService:
                 continue
             if brief_message.strip() == HEARTBEAT_OK_SENTINEL:
                 manager_service.mark_briefing_routine_sent(routine_id=routine.id)
+                self._record_scheduled_delivery_skip(
+                    store=target_store,
+                    household_id=household_id,
+                    channel=channel,
+                    actor_member_id=recipient_member_id,
+                    routine_id=routine.id,
+                    brief_kind=brief_kind,
+                    skipped_reason="heartbeat_ok",
+                )
                 self._record_operation_turn(
                     store=target_store,
                     trigger_kind=FlorenceTurnTrigger.SCHEDULED_BRIEF,
@@ -1019,6 +1452,200 @@ class FlorenceHouseholdOperationsService:
                 )
                 sent += 1
         return sent
+
+    def _record_scheduled_delivery_skip(
+        self,
+        *,
+        store: FlorenceStateDB,
+        household_id: str,
+        channel: Any,
+        actor_member_id: str | None,
+        routine_id: str,
+        brief_kind: HouseholdBriefingKind,
+        skipped_reason: str,
+    ) -> None:
+        try:
+            record_reliability_event(
+                store,
+                FlorenceReliabilityEvent.OUTBOUND_SKIPPED,
+                household_id=household_id,
+                member_id=actor_member_id,
+                channel_id=channel.id,
+                metadata=transport_event_metadata(
+                    provider=channel.provider,
+                    provider_channel_id=channel.provider_channel_id,
+                    delivery_kind="scheduled_brief",
+                    skipped_reason=skipped_reason,
+                    routine_id=routine_id,
+                    brief_kind=brief_kind.value,
+                    channel_type=(
+                        channel.channel_type.value
+                        if hasattr(channel.channel_type, "value")
+                        else str(channel.channel_type)
+                    ),
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "Failed to record Florence scheduled delivery skip household_id=%s channel_id=%s reason=%s",
+                household_id,
+                getattr(channel, "id", None),
+                skipped_reason,
+            )
+
+    def _record_proactive_delivery_skip(
+        self,
+        *,
+        store: FlorenceStateDB,
+        household_id: str,
+        channel: Any,
+        actor_member_id: str | None,
+        delivery_kind: str,
+        skipped_reason: str,
+        **metadata: Any,
+    ) -> None:
+        try:
+            record_reliability_event(
+                store,
+                FlorenceReliabilityEvent.OUTBOUND_SKIPPED,
+                household_id=household_id,
+                member_id=actor_member_id,
+                channel_id=channel.id,
+                metadata=transport_event_metadata(
+                    provider=channel.provider,
+                    provider_channel_id=channel.provider_channel_id,
+                    delivery_kind=delivery_kind,
+                    skipped_reason=skipped_reason,
+                    channel_type=(
+                        channel.channel_type.value
+                        if hasattr(channel.channel_type, "value")
+                        else str(channel.channel_type)
+                    ),
+                    **metadata,
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "Failed to record Florence proactive delivery skip household_id=%s channel_id=%s reason=%s",
+                household_id,
+                getattr(channel, "id", None),
+                skipped_reason,
+            )
+
+    def _record_proactive_review_decisions(
+        self,
+        *,
+        store: FlorenceStateDB,
+        household_id: str,
+        member_id: str | None,
+        channel_id: str | None,
+        candidates: list[Any] | tuple[Any, ...],
+        decision: str,
+        reason: str,
+        trigger: str,
+    ) -> None:
+        for candidate in candidates:
+            self._record_proactive_review_decision(
+                store=store,
+                household_id=household_id,
+                member_id=member_id,
+                channel_id=channel_id,
+                candidate=candidate,
+                decision=decision,
+                reason=reason,
+                trigger=trigger,
+            )
+
+    def _record_proactive_review_decision(
+        self,
+        *,
+        store: FlorenceStateDB,
+        household_id: str,
+        member_id: str | None,
+        channel_id: str | None,
+        candidate: Any,
+        decision: str,
+        reason: str,
+        trigger: str,
+    ) -> None:
+        try:
+            metadata = dict(getattr(candidate, "metadata", {}) or {})
+            group_ids = [
+                str(candidate_id).strip()
+                for candidate_id in list(metadata.get("review_group_candidate_ids") or [])
+                if str(candidate_id).strip()
+            ]
+            candidate_id = str(getattr(candidate, "id", "") or "").strip()
+            if not group_ids and candidate_id:
+                group_ids = [candidate_id]
+            self._manager_service(store).record_pilot_event(
+                household_id=household_id,
+                event_type="proactive_review_decision",
+                member_id=member_id,
+                channel_id=channel_id,
+                metadata={
+                    "decision": decision,
+                    "reason": reason,
+                    "trigger": trigger,
+                    "candidate_id": candidate_id,
+                    "candidate_ids": group_ids,
+                    "candidate_title": str(getattr(candidate, "title", "") or "").strip(),
+                    "candidate_summary": str(getattr(candidate, "summary", "") or "").strip(),
+                    "source_kind": (
+                        getattr(getattr(candidate, "source_kind", None), "value", None)
+                        or str(getattr(candidate, "source_kind", "") or "")
+                    ),
+                    "source_identifier": str(getattr(candidate, "source_identifier", "") or "").strip(),
+                    "candidate_scope": str(metadata.get("candidate_scope") or "shared_household").strip(),
+                    "suppressed_reason": metadata.get("suppressed_reason"),
+                },
+            )
+        except Exception:
+            logger.exception(
+                "Failed to record Florence proactive review decision household_id=%s candidate_id=%s",
+                household_id,
+                getattr(candidate, "id", None),
+            )
+
+    def _record_sync_update_delivery_skip(
+        self,
+        *,
+        store: FlorenceStateDB,
+        household_id: str,
+        channel: Any,
+        actor_member_id: str | None,
+        connection_id: str,
+        skipped_reason: str,
+        trigger: str,
+    ) -> None:
+        try:
+            record_reliability_event(
+                store,
+                FlorenceReliabilityEvent.OUTBOUND_SKIPPED,
+                household_id=household_id,
+                member_id=actor_member_id,
+                channel_id=channel.id,
+                metadata=transport_event_metadata(
+                    provider=channel.provider,
+                    provider_channel_id=channel.provider_channel_id,
+                    delivery_kind="sync_update_brief",
+                    skipped_reason=skipped_reason,
+                    connection_id=connection_id,
+                    trigger=trigger,
+                    channel_type=(
+                        channel.channel_type.value
+                        if hasattr(channel.channel_type, "value")
+                        else str(channel.channel_type)
+                    ),
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "Failed to record Florence sync-update delivery skip household_id=%s channel_id=%s reason=%s",
+                household_id,
+                getattr(channel, "id", None),
+                skipped_reason,
+            )
 
     def _briefing_window_expired(
         self,
@@ -1068,10 +1695,36 @@ class FlorenceHouseholdOperationsService:
             )
             if channel is None:
                 continue
+            skipped_reason = self._proactive_policy_skip_reason(
+                household_id=household_id,
+                channel=channel,
+                module=FlorenceModule.REVIEW_PROMPTS,
+                store=target_store,
+            )
+            if skipped_reason:
+                self._record_sync_update_delivery_skip(
+                    store=target_store,
+                    household_id=household_id,
+                    channel=channel,
+                    actor_member_id=connection.member_id,
+                    connection_id=connection.id,
+                    skipped_reason=skipped_reason,
+                    trigger="scheduled_sync_pass",
+                )
+                continue
             if self._has_recent_channel_activity(
                 channel_id=channel.id,
                 store=target_store,
             ):
+                self._record_sync_update_delivery_skip(
+                    store=target_store,
+                    household_id=household_id,
+                    channel=channel,
+                    actor_member_id=connection.member_id,
+                    connection_id=connection.id,
+                    skipped_reason="recent_channel_activity",
+                    trigger="scheduled_sync_pass",
+                )
                 continue
             if self._sync_update_brief_sent_recently(
                 household_id=household_id,
@@ -1080,6 +1733,15 @@ class FlorenceHouseholdOperationsService:
                 store=target_store,
                 window_seconds=_SYNC_UPDATE_BRIEF_INTERVAL_SECONDS,
             ):
+                self._record_sync_update_delivery_skip(
+                    store=target_store,
+                    household_id=household_id,
+                    channel=channel,
+                    actor_member_id=connection.member_id,
+                    connection_id=connection.id,
+                    skipped_reason="sync_update_recently_sent",
+                    trigger="scheduled_sync_pass",
+                )
                 continue
             if self.deliver_sync_update_brief(
                 connection=connection,
@@ -1114,6 +1776,23 @@ class FlorenceHouseholdOperationsService:
             fallback_channel=fallback_channel,
             store=target_store,
         )
+        skipped_reason = self._proactive_policy_skip_reason(
+            household_id=connection.household_id,
+            channel=primary_channel,
+            module=FlorenceModule.REVIEW_PROMPTS,
+            store=target_store,
+        )
+        if skipped_reason:
+            self._record_sync_update_delivery_skip(
+                store=target_store,
+                household_id=connection.household_id,
+                channel=primary_channel,
+                actor_member_id=connection.member_id,
+                connection_id=connection.id,
+                skipped_reason=skipped_reason,
+                trigger="initial_sync_activation",
+            )
+            return False
         deliver_to_group = primary_channel.channel_type == ChannelType.HOUSEHOLD_GROUP
         activation_message: str | None = None
         group_message: str | None = None
@@ -1220,21 +1899,44 @@ class FlorenceHouseholdOperationsService:
         target_store = store or self.store
         if not self.sync_activation_brief_already_sent(connection=connection):
             return False
-        current_snapshot = self._sync_brief_snapshot(connection=connection, candidates=candidates)
-        if not self._sync_brief_has_meaningful_content(current_snapshot):
-            return False
-        previous_snapshot = self.last_sync_brief_snapshot(connection=connection)
-        if previous_snapshot is None and previous_connection is not None:
-            previous_snapshot = self._sync_brief_snapshot(connection=previous_connection, candidates=[])
-        if previous_snapshot == current_snapshot:
-            return False
-
         primary_channel = self._preferred_sync_brief_channel(
             connection=connection,
             fallback_channel=fallback_channel,
             store=target_store,
         )
         if primary_channel is None:
+            return False
+        candidates = self._sync_update_relevant_candidates(
+            candidates=candidates,
+            store=target_store,
+            channel_id=primary_channel.id,
+            trigger=trigger,
+        )
+        current_snapshot = self._sync_brief_snapshot(connection=connection, candidates=candidates)
+        if not self._sync_brief_has_meaningful_content(current_snapshot):
+            self._record_sync_update_delivery_skip(
+                store=target_store,
+                household_id=connection.household_id,
+                channel=primary_channel,
+                actor_member_id=connection.member_id,
+                connection_id=connection.id,
+                skipped_reason="sync_update_no_meaningful_content",
+                trigger=trigger,
+            )
+            return False
+        previous_snapshot = self.last_sync_brief_snapshot(connection=connection)
+        if previous_snapshot is None and previous_connection is not None:
+            previous_snapshot = self._sync_brief_snapshot(connection=previous_connection, candidates=[])
+        if previous_snapshot == current_snapshot:
+            self._record_sync_update_delivery_skip(
+                store=target_store,
+                household_id=connection.household_id,
+                channel=primary_channel,
+                actor_member_id=connection.member_id,
+                connection_id=connection.id,
+                skipped_reason="sync_update_unchanged",
+                trigger=trigger,
+            )
             return False
         group_channel = self.delivery_service.find_group_channel(
             connection.household_id,
@@ -1498,9 +2200,54 @@ class FlorenceHouseholdOperationsService:
         return {
             "gmail_count": int(metadata.get("last_gmail_item_count") or 0),
             "calendar_count": int(metadata.get("last_calendar_item_count") or 0),
-            "candidate_count": int(metadata.get("last_candidate_count") or len(candidates)),
+            "candidate_count": len(candidate_payloads),
             "candidates": candidate_payloads,
         }
+
+    def _sync_update_relevant_candidates(
+        self,
+        *,
+        candidates: list[Any],
+        store: FlorenceStateDB,
+        channel_id: str | None,
+        trigger: str,
+    ) -> list[Any]:
+        review_service = self._review_service(store)
+        relevant: list[Any] = []
+        for candidate in candidates:
+            if getattr(candidate, "state", None) == CandidateState.REJECTED:
+                self._record_proactive_review_decision(
+                    store=store,
+                    household_id=str(getattr(candidate, "household_id", "") or ""),
+                    member_id=str(getattr(candidate, "member_id", "") or "") or None,
+                    channel_id=channel_id,
+                    candidate=candidate,
+                    decision="skipped",
+                    reason=str(dict(getattr(candidate, "metadata", {}) or {}).get("suppressed_reason") or "candidate_rejected"),
+                    trigger=trigger,
+                )
+                continue
+            if getattr(candidate, "state", None) == CandidateState.PENDING_REVIEW:
+                relevance_skip_reason = review_service.candidate_relevance_skip_reason(candidate)
+                if relevance_skip_reason is not None:
+                    review_service.suppress_candidate_for_relevance(
+                        candidate,
+                        reason=relevance_skip_reason,
+                        trigger="sync_update_brief",
+                    )
+                    self._record_proactive_review_decision(
+                        store=store,
+                        household_id=str(getattr(candidate, "household_id", "") or ""),
+                        member_id=str(getattr(candidate, "member_id", "") or "") or None,
+                        channel_id=channel_id,
+                        candidate=candidate,
+                        decision="skipped",
+                        reason=relevance_skip_reason,
+                        trigger=trigger,
+                    )
+                    continue
+            relevant.append(candidate)
+        return relevant
 
     @staticmethod
     def _sync_brief_snapshot(
@@ -1601,10 +2348,25 @@ class FlorenceHouseholdOperationsService:
         *,
         store: FlorenceStateDB,
     ) -> bool:
+        return self._candidate_proactive_review_reason(candidate, store=store) is not None
+
+    def _candidate_proactive_review_reason(
+        self,
+        candidate: Any,
+        *,
+        store: FlorenceStateDB,
+    ) -> str | None:
         if getattr(candidate, "state", None) != CandidateState.PENDING_REVIEW:
-            return False
-        if not self._review_service(store).is_candidate_reviewable_now(candidate=candidate):
-            return False
+            return None
+        review_service = self._review_service(store)
+        if not review_service.is_candidate_reviewable_now(candidate=candidate):
+            return None
+        relevance_skip_reason = review_service.candidate_relevance_skip_reason(candidate)
+        if relevance_skip_reason is not None:
+            return None
+        always_surface_reason = review_service.candidate_always_surface_reason(candidate)
+        if always_surface_reason is not None:
+            return always_surface_reason
 
         metadata = dict(getattr(candidate, "metadata", {}) or {})
         candidate_scope = str(metadata.get("candidate_scope") or "shared_household").strip().lower()
@@ -1621,47 +2383,84 @@ class FlorenceHouseholdOperationsService:
         confidence_bps = int(getattr(candidate, "confidence_bps", 0) or 0)
         if candidate_scope == "private_parent":
             if getattr(candidate, "source_kind", None) == GoogleSourceKind.GOOGLE_CALENDAR:
-                return True
+                return "private_google_calendar_candidate"
             connection_id = str(metadata.get("google_connection_id") or "").strip()
             if connection_id:
                 connection = store.get_google_connection(connection_id)
                 connection_metadata = dict(getattr(connection, "metadata", {}) or {}) if connection is not None else {}
                 if str(connection_metadata.get("initial_sync_state") or "").strip().lower() == "running":
-                    return False
-            return confidence_bps >= 7_200 and (
+                    return None
+            if confidence_bps >= 7_200 and (
                 has_temporal_evidence
                 or "logistics_signal" in reason_tags
                 or "schedule_signal" in reason_tags
-            )
+            ):
+                return "private_temporal_or_logistics_high_confidence"
+            return None
 
         if getattr(candidate, "source_kind", None) == GoogleSourceKind.GOOGLE_CALENDAR:
-            return True
+            return "google_calendar_candidate"
 
         if str(metadata.get("source_visibility") or "").strip().lower() == "shared":
-            return True
+            return "shared_source_rule"
 
         connection_id = str(metadata.get("google_connection_id") or "").strip()
         if connection_id:
             connection = store.get_google_connection(connection_id)
             connection_metadata = dict(getattr(connection, "metadata", {}) or {}) if connection is not None else {}
             if str(connection_metadata.get("initial_sync_state") or "").strip().lower() == "running":
-                return False
+                return None
 
         anchor_hits = int(raw_metadata.get("anchor_hits") or 0)
         sender_looks_school = bool(raw_metadata.get("sender_looks_school"))
 
         if sender_looks_school and (anchor_hits > 0 or has_temporal_evidence) and confidence_bps >= 7_600:
-            return True
+            return "school_or_temporal_high_confidence"
         if anchor_hits >= 2 and has_temporal_evidence and confidence_bps >= 7_200:
-            return True
+            return "household_temporal_high_confidence"
         if (
             anchor_hits > 0
             and "activity_signal" in reason_tags
             and has_temporal_evidence
             and confidence_bps >= 8_000
         ):
-            return True
-        return False
+            return "activity_temporal_high_confidence"
+        return None
+
+    def _candidate_proactive_review_skip_reason(
+        self,
+        candidate: Any,
+        *,
+        store: FlorenceStateDB,
+    ) -> str:
+        if getattr(candidate, "state", None) != CandidateState.PENDING_REVIEW:
+            return "not_pending_review"
+        review_service = self._review_service(store)
+        if not review_service.is_candidate_reviewable_now(candidate=candidate):
+            return "candidate_not_reviewable_now"
+        relevance_skip_reason = review_service.candidate_relevance_skip_reason(candidate)
+        if relevance_skip_reason is not None:
+            try:
+                review_service.suppress_candidate_for_relevance(
+                    candidate,
+                    reason=relevance_skip_reason,
+                    trigger="proactive_review_policy",
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to suppress candidate by relevance rule household_id=%s candidate_id=%s",
+                    getattr(candidate, "household_id", None),
+                    getattr(candidate, "id", None),
+                )
+            return relevance_skip_reason
+        metadata = dict(getattr(candidate, "metadata", {}) or {})
+        connection_id = str(metadata.get("google_connection_id") or "").strip()
+        if connection_id:
+            connection = store.get_google_connection(connection_id)
+            connection_metadata = dict(getattr(connection, "metadata", {}) or {}) if connection is not None else {}
+            if str(connection_metadata.get("initial_sync_state") or "").strip().lower() == "running":
+                return "initial_sync_running"
+        return "below_proactive_threshold"
 
     def _manager_service(self, store: FlorenceStateDB | None) -> FlorenceHouseholdManagerService:
         target_store = store or self.store

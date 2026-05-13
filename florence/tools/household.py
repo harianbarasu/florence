@@ -1071,8 +1071,8 @@ APPLY_CANDIDATE_REVIEW_SCHEMA = {
             },
             "source_visibility": {
                 "type": "string",
-                "enum": ["shared", "private"],
-                "description": "Optional source-sharing rule to apply for future items from the same source.",
+                "enum": ["shared", "private", "ignored"],
+                "description": "Optional source rule to apply for future items from the same source.",
             },
             "title": {"type": "string", "description": "Optional corrected event title when confirming."},
             "starts_at": {"type": "string", "description": "Optional corrected ISO start timestamp when confirming."},
@@ -1831,6 +1831,13 @@ def _handle_search_state(args: dict, *, task_id: str | None = None, **_: Any) ->
 
 def _handle_apply_candidate_review(args: dict, *, task_id: str | None = None, **_: Any) -> str:
     context = _require_context(task_id)
+    if context.channel_type != ChannelType.PARENT_DM:
+        return json.dumps(
+            {
+                "error": "constitution_denied: candidate review state changes are allowed only from the reviewing parent DM.",
+                "channel_type": context.channel_type.value if context.channel_type is not None else None,
+            }
+        )
     candidate_id = _normalize_text(args.get("candidate_id"))
     if not candidate_id:
         return json.dumps({"error": "Missing required parameter: candidate_id"})
@@ -2879,7 +2886,38 @@ def _handle_upsert_event(args: dict, *, task_id: str | None = None, **_: Any) ->
         )
     )
     _sync_household_calendar_projection(context)
-    return json.dumps({"result": _serialize_event(event)})
+    manager = FlorenceHouseholdManagerService(context.store)
+    try:
+        reminders = manager.schedule_actionable_event_reminders(
+            household_id=context.household_id,
+            event=event,
+            actor_member_id=context.actor_member_id,
+            channel_id=context.channel_id,
+        )
+    except Exception as exc:  # pragma: no cover - defensive guard for live tool use
+        return json.dumps(
+            {
+                "error": f"event_saved_but_reminder_failed:{exc}",
+                "result": _serialize_event(event),
+                "action_integrity": {
+                    "event_persisted": True,
+                    "reminders_persisted": False,
+                },
+            }
+        )
+    return json.dumps(
+        {
+            "result": _serialize_event(event),
+            "scheduled_reminders": [_serialize_nudge(reminder) for reminder in reminders],
+            "action_integrity": {
+                "event_persisted": context.store.get_household_event(event.id) is not None,
+                "reminders_persisted": all(
+                    context.store.get_household_nudge(reminder.id) is not None for reminder in reminders
+                ),
+                "scheduled_reminder_count": len(reminders),
+            },
+        }
+    )
 
 
 def _handle_upsert_routine(args: dict, *, task_id: str | None = None, **_: Any) -> str:

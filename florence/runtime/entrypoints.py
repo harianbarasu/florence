@@ -19,6 +19,11 @@ from florence.runtime.google_services import FlorenceGoogleAccountLinkService
 from florence.runtime.household_manager import FlorenceHouseholdManagerService
 from florence.runtime.household_merge import FlorenceHouseholdMergeService
 from florence.runtime.onboarding_service import FlorenceOnboardingSessionService
+from florence.runtime.reliability import (
+    FlorenceReliabilityEvent,
+    record_reliability_event,
+    transport_event_metadata,
+)
 from florence.runtime.resolver import FlorenceIdentityResolver, normalize_identity_value
 from florence.sendblue import parse_sendblue_payload
 from florence.state import FlorenceStateDB
@@ -196,6 +201,12 @@ class FlorenceEntrypointService:
                 thread_external_id=thread_id,
             )
             if resolved is None:
+                self._record_unresolved_transport_message(
+                    provider=provider,
+                    inbound_message=inbound_message,
+                    failure_reason="unresolved_group_household",
+                    route="group",
+                )
                 return FlorenceEntrypointResult(
                     reply_text=(
                         "Hi, I’m Florence. Before I jump into a family group, one parent should message me directly first so I can set up the household."
@@ -227,6 +238,12 @@ class FlorenceEntrypointService:
                 )
             except ValueError as exc:
                 if str(exc) == "ambiguous_existing_household_for_identity":
+                    self._record_unresolved_transport_message(
+                        provider=provider,
+                        inbound_message=inbound_message,
+                        failure_reason=str(exc),
+                        route="direct",
+                    )
                     return FlorenceEntrypointResult(
                         reply_text=(
                             "I found more than one possible household for this number, so I didn't create a new one. "
@@ -236,6 +253,13 @@ class FlorenceEntrypointService:
                         error=str(exc),
                     )
                 raise
+
+        self._record_resolved_transport_message(
+            provider=provider,
+            inbound_message=inbound_message,
+            resolved=resolved,
+            route="group" if is_group_chat else "direct",
+        )
 
         member_id = resolved.member.id if resolved.member is not None else None
         result = self.ingress.handle_message(
@@ -274,3 +298,84 @@ class FlorenceEntrypointService:
             member_id=current_member.id if current_member is not None else member_id,
             channel_id=current_channel.id,
         )
+
+    def _record_unresolved_transport_message(
+        self,
+        *,
+        provider: str,
+        inbound_message: FlorenceInboundMessage,
+        failure_reason: str,
+        route: str,
+    ) -> None:
+        metadata = transport_event_metadata(
+            provider=provider,
+            provider_channel_id=inbound_message.thread_id,
+            message_id=inbound_message.message_id,
+            failure_reason=failure_reason,
+            route=route,
+            resolved=False,
+            is_group_chat=bool(inbound_message.is_group_chat),
+            sender_handle=inbound_message.sender_handle,
+        )
+        for event_type in (
+            FlorenceReliabilityEvent.IDENTITY_RESOLVED,
+            FlorenceReliabilityEvent.CHANNEL_RESOLVED,
+        ):
+            try:
+                record_reliability_event(
+                    self.store,
+                    event_type,
+                    metadata=metadata,
+                )
+            except Exception:
+                continue
+
+    def _record_resolved_transport_message(
+        self,
+        *,
+        provider: str,
+        inbound_message: FlorenceInboundMessage,
+        resolved,
+        route: str,
+    ) -> None:
+        member_id = resolved.member.id if resolved.member is not None else None
+        base = {
+            "route": route,
+            "sender_handle": inbound_message.sender_handle,
+            "channel_id": resolved.channel.id,
+            "member_id": member_id,
+        }
+        identity_metadata = transport_event_metadata(
+            provider=provider,
+            provider_channel_id=resolved.channel.provider_channel_id,
+            message_id=inbound_message.message_id,
+            resolved=resolved.member is not None,
+            **base,
+        )
+        channel_metadata = transport_event_metadata(
+            provider=provider,
+            provider_channel_id=resolved.channel.provider_channel_id,
+            message_id=inbound_message.message_id,
+            resolved=True,
+            channel_type=(
+                resolved.channel.channel_type.value
+                if hasattr(resolved.channel.channel_type, "value")
+                else str(resolved.channel.channel_type)
+            ),
+            **base,
+        )
+        for event_type, metadata in (
+            (FlorenceReliabilityEvent.IDENTITY_RESOLVED, identity_metadata),
+            (FlorenceReliabilityEvent.CHANNEL_RESOLVED, channel_metadata),
+        ):
+            try:
+                record_reliability_event(
+                    self.store,
+                    event_type,
+                    household_id=resolved.household.id,
+                    member_id=member_id,
+                    channel_id=resolved.channel.id,
+                    metadata=metadata,
+                )
+            except Exception:
+                continue

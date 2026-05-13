@@ -24,6 +24,12 @@ from florence.runtime.group_share import FlorenceGroupShareService
 from florence.runtime.household_manager import FlorenceHouseholdManagerService
 from florence.runtime.household_link import FlorenceHouseholdLinkService
 from florence.runtime.onboarding_service import FlorenceOnboardingSessionService
+from florence.runtime.reliability import (
+    FlorenceReliabilityEvent,
+    record_reliability_event,
+    reliability_context,
+    transport_event_metadata,
+)
 from florence.runtime.turn_router import FlorenceTurnRouter
 from florence.state import FlorenceStateDB
 from florence.text_safety import scrub_internal_ids
@@ -124,6 +130,14 @@ class FlorenceMessagingIngressService:
             provider=resolved.message.provider,
             message_id=resolved.message.message_id,
         ):
+            self._record_inbound_reliability_event(
+                FlorenceReliabilityEvent.INBOUND_DEDUPLICATED,
+                resolved=resolved,
+                metadata={
+                    "deduplicated": True,
+                    "skipped_reason": "duplicate_inbound_message",
+                },
+            )
             logger.info(
                 "Ignoring duplicate inbound message provider=%s message_id=%s channel_id=%s",
                 resolved.message.provider,
@@ -145,13 +159,48 @@ class FlorenceMessagingIngressService:
             recent_history=tuple(self.channel_log.recent_messages(channel_id=resolved.channel_id, limit=24)),
         )
 
-        result = self.turn_router.handle_turn(envelope=turn_envelope, resolved=resolved)
+        route = "group" if turn_envelope.is_group or resolved.is_group else "dm"
+        trace_metadata = transport_event_metadata(
+            provider=resolved.message.provider,
+            provider_channel_id=resolved.thread_id,
+            message_id=resolved.message.message_id,
+            turn_id=turn_envelope.turn_id,
+            route=route,
+            trigger_kind=turn_envelope.trigger_kind.value,
+            channel_id=resolved.channel_id,
+            member_id=resolved.member_id,
+        )
+        self._record_inbound_reliability_event(
+            FlorenceReliabilityEvent.ROUTE_SELECTED,
+            resolved=resolved,
+            metadata=trace_metadata,
+        )
+        with reliability_context(
+            household_id=resolved.household_id,
+            channel_id=resolved.channel_id,
+            member_id=resolved.member_id,
+            provider=resolved.message.provider,
+            provider_channel_id=resolved.thread_id,
+            message_id=resolved.message.message_id,
+            provider_message_id=resolved.message.message_id,
+            turn_id=turn_envelope.turn_id,
+            correlation_id=trace_metadata.get("correlation_id"),
+            route=route,
+            trigger_kind=turn_envelope.trigger_kind.value,
+        ):
+            result = self.turn_router.handle_turn(envelope=turn_envelope, resolved=resolved)
         result.reply_metadata = {
             **result.reply_metadata,
             "florence_turn_id": turn_envelope.turn_id,
             "florence_turn_trigger": turn_envelope.trigger_kind.value,
             "florence_turn_scope": turn_envelope.visibility_scope.scope,
+            "provider": resolved.message.provider,
+            "provider_channel_id": resolved.thread_id,
+            "provider_message_id": resolved.message.message_id,
+            "message_id": resolved.message.message_id,
+            "correlation_id": trace_metadata.get("correlation_id"),
         }
+        self._record_reply_generated_if_needed(resolved=resolved, result=result, trace_metadata=trace_metadata)
         record_turn(self.store, envelope=turn_envelope, result=result)
 
         raw_reply_messages = result.reply_messages or ((result.reply_text,) if result.reply_text else ())
@@ -198,3 +247,58 @@ class FlorenceMessagingIngressService:
             )
         except Exception:
             logger.exception("Failed to finalize onboarding completion hooks for household_id=%s", household_id)
+
+    def _record_inbound_reliability_event(
+        self,
+        event_type: FlorenceReliabilityEvent,
+        *,
+        resolved: FlorenceResolvedInboundMessage,
+        metadata: dict[str, object] | None = None,
+    ) -> None:
+        payload = {
+            **transport_event_metadata(
+                provider=resolved.message.provider,
+                provider_channel_id=resolved.thread_id,
+                message_id=resolved.message.message_id,
+            ),
+            **dict(metadata or {}),
+        }
+        try:
+            record_reliability_event(
+                self.store,
+                event_type,
+                household_id=resolved.household_id,
+                member_id=resolved.member_id,
+                channel_id=resolved.channel_id,
+                metadata=payload,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to record Florence inbound reliability event=%s household_id=%s channel_id=%s",
+                event_type,
+                resolved.household_id,
+                resolved.channel_id,
+            )
+
+    def _record_reply_generated_if_needed(
+        self,
+        *,
+        resolved: FlorenceResolvedInboundMessage,
+        result: FlorenceMessagingIngressResult,
+        trace_metadata: dict[str, object],
+    ) -> None:
+        reply_messages = result.reply_messages or ((result.reply_text,) if result.reply_text else ())
+        has_reply = bool(reply_messages or result.group_announcement)
+        if not has_reply:
+            return
+        self._record_inbound_reliability_event(
+            FlorenceReliabilityEvent.REPLY_GENERATED,
+            resolved=resolved,
+            metadata={
+                **trace_metadata,
+                "reply_count": len(reply_messages),
+                "group_announcement": bool(result.group_announcement),
+                "consumed": result.consumed,
+                "delivery_kind": "reply",
+            },
+        )

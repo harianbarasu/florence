@@ -8,10 +8,13 @@ import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
 from florence.contracts import (
     ChannelType,
     HouseholdBriefingKind,
+    HouseholdEvent,
+    HouseholdEventStatus,
     HouseholdMeal,
     HouseholdNudge,
     HouseholdNudgeStatus,
@@ -36,6 +39,12 @@ from florence.runtime.services import (
     _stable_id,
     _utc_now,
 )
+from florence.runtime.trust_policy import (
+    ensure_household_constitution,
+    mark_constitution_interview_collected,
+    record_household_constitution_preference,
+    store_household_constitution,
+)
 from florence.state import FlorenceStateDB
 
 logger = logging.getLogger(__name__)
@@ -47,6 +56,13 @@ _AUTOMATIC_BRIEFING_KINDS = (
     HouseholdBriefingKind.WEEKLY,
     HouseholdBriefingKind.MEAL,
 )
+_SCHOOL_ACTION_EVENT_RE = re.compile(
+    r"\b(bring|wear|pack|stuffy|stuffie|tie[-\s]?dye|sports day|theme day|pajama|pyjama|costume|"
+    r"show and tell|library books?)\b",
+    flags=re.IGNORECASE,
+)
+_SCHOOL_ACTION_REMINDER_HOUR = 7
+_SCHOOL_ACTION_REMINDER_MINUTE = 0
 
 
 @dataclass(slots=True)
@@ -89,6 +105,9 @@ class FlorenceHouseholdManagerService:
 
     def upsert_shopping_item(self, item: HouseholdShoppingItem) -> HouseholdShoppingItem:
         return self.store.upsert_household_shopping_item(item)
+
+    def ensure_household_constitution(self, *, household_id: str) -> dict[str, Any]:
+        return ensure_household_constitution(self.store, household_id)
 
     @staticmethod
     def _preference_category(item: HouseholdProfileItem) -> str:
@@ -190,6 +209,24 @@ class FlorenceHouseholdManagerService:
             kind=HouseholdProfileKind.PREFERENCE,
             items=updated_items,
         )
+        try:
+            record_household_constitution_preference(
+                self.store,
+                household_id=household_id,
+                category=lowered_category,
+                label=cleaned_label,
+                value=cleaned_value,
+                preference_id=preference_id,
+                member_id=recorded_by_member_id or member_id,
+                channel_id=channel_id,
+                metadata=item_metadata,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to update household constitution from preference household_id=%s preference_id=%s",
+                household_id,
+                preference_id,
+            )
         self.record_pilot_event(
             household_id=household_id,
             event_type="preference_recorded",
@@ -235,6 +272,25 @@ class FlorenceHouseholdManagerService:
         member_id: str,
         channel_id: str,
     ) -> None:
+        constitution = self.ensure_household_constitution(household_id=household_id)
+        constitution = mark_constitution_interview_collected(
+            constitution,
+            "parents_and_roles",
+            "children_schools_activities",
+            "enabled_modules",
+        )
+        store_household_constitution(
+            self.store,
+            household_id=household_id,
+            constitution=constitution,
+            provenance={
+                "mutation_type": "onboarding_complete",
+                "trigger": "finalize_onboarding_completion",
+                "member_id": member_id,
+                "channel_id": channel_id,
+                "source": "onboarding",
+            },
+        )
         self.ensure_briefing_routines(household_id=household_id)
         self.record_pilot_event(
             household_id=household_id,
@@ -737,6 +793,103 @@ class FlorenceHouseholdManagerService:
                 metadata=dict(metadata or {}),
             )
         )
+
+    def schedule_actionable_event_reminders(
+        self,
+        *,
+        household_id: str,
+        event: HouseholdEvent,
+        actor_member_id: str | None = None,
+        channel_id: str | None = None,
+        now: datetime | None = None,
+    ) -> list[HouseholdNudge]:
+        household = self.store.get_household(household_id)
+        if household is None:
+            return []
+        if event.household_id != household_id or event.status == HouseholdEventStatus.CANCELLED:
+            return []
+        if not self._event_needs_school_action_reminder(event):
+            return []
+        local_start = self._event_start_local(event, timezone_name=household.timezone)
+        if local_start is None:
+            return []
+        zone = self._household_zone(household.timezone)
+        current = now or _utc_now()
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        local_now = current.astimezone(zone)
+        if local_start.date() < local_now.date():
+            return []
+        if not event.all_day and local_start <= local_now:
+            return []
+
+        morning_local = datetime(
+            local_start.year,
+            local_start.month,
+            local_start.day,
+            _SCHOOL_ACTION_REMINDER_HOUR,
+            _SCHOOL_ACTION_REMINDER_MINUTE,
+            tzinfo=zone,
+        )
+        if local_start.date() == local_now.date() and morning_local <= local_now:
+            scheduled_local = local_now + timedelta(minutes=5)
+        else:
+            scheduled_local = morning_local
+
+        scheduled_for = scheduled_local.astimezone(timezone.utc).isoformat()
+        message = self._school_action_reminder_message(event=event, local_start=local_start)
+        nudge = self.schedule_nudge(
+            household_id=household_id,
+            message=message,
+            scheduled_for=scheduled_for,
+            target_kind=HouseholdNudgeTargetKind.EVENT,
+            target_id=event.id,
+            recipient_member_id=actor_member_id,
+            channel_id=channel_id,
+            metadata={
+                "automation_kind": "event_action_reminder",
+                "source": "school_theme_day_default",
+                "event_id": event.id,
+                "event_title": event.title,
+                "event_local_date": local_start.date().isoformat(),
+                "reminder_local_time": f"{_SCHOOL_ACTION_REMINDER_HOUR:02d}:{_SCHOOL_ACTION_REMINDER_MINUTE:02d}",
+            },
+        )
+        return [nudge]
+
+    @staticmethod
+    def _event_needs_school_action_reminder(event: HouseholdEvent) -> bool:
+        text = " ".join(
+            part
+            for part in (event.title, event.description, str(event.metadata.get("category") or ""))
+            if part
+        )
+        return bool(_SCHOOL_ACTION_EVENT_RE.search(text))
+
+    @staticmethod
+    def _household_zone(timezone_name: str | None) -> ZoneInfo:
+        try:
+            return ZoneInfo(str(timezone_name or "America/Los_Angeles"))
+        except Exception:
+            return ZoneInfo("America/Los_Angeles")
+
+    @classmethod
+    def _event_start_local(cls, event: HouseholdEvent, *, timezone_name: str | None) -> datetime | None:
+        if not event.starts_at:
+            return None
+        zone = cls._household_zone(event.timezone or timezone_name)
+        parsed = _parse_iso_datetime(event.starts_at)
+        if parsed is None:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=zone)
+        return parsed.astimezone(zone)
+
+    @staticmethod
+    def _school_action_reminder_message(*, event: HouseholdEvent, local_start: datetime) -> str:
+        title = " ".join(str(event.title or "").split()).strip() or "School item"
+        when = local_start.strftime("%a %m/%d")
+        return f"Reminder: {title} {when}."
 
     def list_due_nudges(
         self,

@@ -283,6 +283,7 @@ class TestToolsetConsistency:
         tools = set(resolve_toolset("florence_onboarding"))
         assert tools == {
             "household_apply_onboarding_update",
+            "household_record_preference",
             "household_search_google_inbox",
             "household_search_google_calendar",
         }

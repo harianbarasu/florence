@@ -11,6 +11,8 @@ from florence.messaging.ingress_types import (
 )
 from florence.messaging.protocol_types import FlorenceProtocolReply
 from florence.runtime.group_policy import FlorenceGroupTurnPolicy
+from florence.runtime.household_manager import FlorenceHouseholdManagerService
+from florence.runtime.review_feedback import ParsedReviewFeedback, ReviewFeedbackKind, parse_review_feedback
 from florence.state import FlorenceStateDB
 from florence.turns import (
     FlorenceTurnDisposition,
@@ -56,6 +58,12 @@ class FlorenceGroupRouter:
         chatter_outcome = self.group_policy.obvious_chatter_outcome(envelope)
         if chatter_outcome is not None:
             return self._result_from_turn_outcome(chatter_outcome)
+
+        shared_feedback = self._handle_shared_feedback(resolved)
+        if shared_feedback is not None:
+            return self._result_from_turn_outcome(
+                self._outcome_from_protocol_reply(envelope, shared_feedback)
+            )
 
         onboarding_sessions = self.store.list_member_onboarding_sessions(
             household_id=resolved.household_id,
@@ -123,4 +131,65 @@ class FlorenceGroupRouter:
             reply_metadata=metadata,
             group_announcement=outcome.group_announcement,
             consumed=outcome.consumed,
+        )
+
+    def _handle_shared_feedback(self, resolved: FlorenceResolvedInboundMessage) -> FlorenceProtocolReply | None:
+        feedback = parse_review_feedback(resolved.message.body)
+        if feedback is None or feedback.kind not in {
+            ReviewFeedbackKind.LESS_PROACTIVE,
+            ReviewFeedbackKind.MORE_PROACTIVE,
+            ReviewFeedbackKind.DISABLE_MODULE,
+        }:
+            return None
+        preference = self._record_shared_feedback_preference(resolved=resolved, feedback=feedback)
+        reply = (
+            "Got it. I’ll keep shared Florence updates shorter and more action-focused."
+            if feedback.kind == ReviewFeedbackKind.LESS_PROACTIVE
+            else "Got it. I’ll be more proactive in the family chat when something is clearly useful."
+            if feedback.kind == ReviewFeedbackKind.MORE_PROACTIVE
+            else "Got it. I’ll keep that module off for shared household prompts."
+        )
+        return FlorenceProtocolReply(
+            reply_text=reply,
+            reply_metadata={
+                "review_feedback_kind": feedback.kind.value,
+                "recorded_preference_id": preference.id,
+                "feedback_scope": "shared_household",
+            },
+            consumed=True,
+        )
+
+    def _record_shared_feedback_preference(
+        self,
+        *,
+        resolved: FlorenceResolvedInboundMessage,
+        feedback: ParsedReviewFeedback,
+    ):
+        if feedback.kind == ReviewFeedbackKind.LESS_PROACTIVE:
+            label = "Florence shared update style"
+            value = "Keep shared household updates shorter and action-focused."
+            category = "operating_preference"
+        elif feedback.kind == ReviewFeedbackKind.MORE_PROACTIVE:
+            label = "Florence shared proactivity"
+            value = "Be more proactive in the family group when an item is clearly useful, timely, and safe."
+            category = "operating_preference"
+        else:
+            module = feedback.module_hint or "requested module"
+            label = f"Disabled shared module: {module}"
+            value = f"Do not proactively run or suggest the {module} module in shared household prompts unless a parent asks."
+            category = "automation_boundary"
+        return FlorenceHouseholdManagerService(self.store).record_preference(
+            household_id=resolved.household_id,
+            label=label,
+            value=value,
+            category=category,
+            member_id=None,
+            recorded_by_member_id=resolved.member_id,
+            channel_id=resolved.channel_id,
+            metadata={
+                "review_feedback_kind": feedback.kind.value,
+                "raw_feedback_text": feedback.raw_text,
+                "module_hint": feedback.module_hint,
+                "feedback_scope": "shared_household",
+            },
         )

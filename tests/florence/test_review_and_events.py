@@ -1,5 +1,19 @@
-from florence.contracts import CandidateState, GoogleSourceKind, Household, HouseholdSourceVisibility, ImportedCandidate
+from datetime import datetime, timezone
+
+from florence.contracts import (
+    CandidateState,
+    GoogleConnection,
+    GoogleSourceKind,
+    Household,
+    HouseholdContext,
+    HouseholdProfileKind,
+    HouseholdSourceVisibility,
+    ImportedCandidate,
+)
+from florence.google import FlorenceGoogleSyncBatch
+from florence.google.types import GmailSyncItem
 from florence.runtime import FlorenceCandidateReviewService
+from florence.runtime.google_services import FlorenceGoogleSyncPersistenceService
 from florence.state import FlorenceStateDB
 
 
@@ -232,6 +246,538 @@ def test_review_response_can_classify_source_without_confirming_candidate(tmp_pa
     assert persisted is not None
     assert persisted.state == CandidateState.PENDING_REVIEW
     assert any(rule.matcher_value == "billing@camp-example.com" for rule in rules)
+    store.close()
+
+
+def test_review_feedback_ignore_sender_creates_ignored_source_rule_and_suppresses_future_candidates(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    candidate = ImportedCandidate(
+        id="cand_ignore_123",
+        household_id="hh_123",
+        member_id="mem_123",
+        source_kind=GoogleSourceKind.GMAIL,
+        source_identifier="gmail:spam-1",
+        title="Open gym booking",
+        summary="Booking for earlier today.",
+        state=CandidateState.PENDING_REVIEW,
+        metadata={"from_address": "Bookings <booking@example-gym.com>"},
+    )
+    store.upsert_imported_candidate(candidate)
+
+    reply = review_service.apply_feedback_response(
+        candidate_id="cand_ignore_123",
+        member_id="mem_123",
+        feedback_kind="ignore_source",
+        source_visibility=HouseholdSourceVisibility.IGNORED,
+        user_text="ignore this sender",
+    )
+
+    persisted = store.get_imported_candidate("cand_ignore_123")
+    rules = store.list_household_source_rules(
+        household_id="hh_123",
+        source_kind=GoogleSourceKind.GMAIL,
+        visibility=HouseholdSourceVisibility.IGNORED,
+    )
+    assert "ignore future items" in reply.reply_text
+    assert persisted is not None
+    assert persisted.state == CandidateState.REJECTED
+    assert persisted.metadata["review_feedback_kind"] == "ignore_source"
+    assert persisted.metadata["suppressed_reason"] == "source_ignored_by_parent"
+    assert any(rule.matcher_value == "booking@example-gym.com" for rule in rules)
+
+    future = ImportedCandidate(
+        id="cand_ignore_456",
+        household_id="hh_123",
+        member_id="mem_123",
+        source_kind=GoogleSourceKind.GMAIL,
+        source_identifier="gmail:spam-2",
+        title="Another open gym booking",
+        summary="Another booking.",
+        state=CandidateState.PENDING_REVIEW,
+        metadata={"from_address": "Bookings <booking@example-gym.com>"},
+    )
+    suppressed = review_service.source_rule_service.apply_candidate_policy(future)
+    assert suppressed.state == CandidateState.REJECTED
+    assert suppressed.metadata["source_visibility"] == "ignored"
+    assert suppressed.metadata["suppressed_reason"] == "source_rule_ignored"
+    store.close()
+
+
+def test_review_feedback_already_handled_closes_candidate_without_creating_household_state(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_handled_123",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:handled-1",
+            title="School form reminder",
+            summary="A form reminder that the parent already handled.",
+            state=CandidateState.PENDING_REVIEW,
+        )
+    )
+
+    reply = review_service.apply_feedback_response(
+        candidate_id="cand_handled_123",
+        member_id="mem_123",
+        feedback_kind="already_handled",
+        user_text="already handled",
+    )
+
+    persisted = store.get_imported_candidate("cand_handled_123")
+    assert reply.reply_text == "Got it. I marked that as already handled and left it out."
+    assert persisted is not None
+    assert persisted.state == CandidateState.REJECTED
+    assert persisted.metadata["review_feedback"]["kind"] == "already_handled"
+    assert persisted.metadata["suppressed_reason"] == "already_handled_by_parent"
+    assert store.list_household_events(household_id="hh_123") == []
+    store.close()
+
+
+def test_review_feedback_too_late_closes_past_time_bound_candidate(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_stale_123",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:stale-1",
+            title="Open gym booking",
+            summary="Open gym booking for earlier today.",
+            state=CandidateState.PENDING_REVIEW,
+            metadata={
+                "from_address": "Bookings <booking@example-gym.com>",
+                "proposed_fields": {
+                    "title": "Open gym booking",
+                    "starts_at": "2026-05-08T09:00:00-07:00",
+                    "timezone": "America/Los_Angeles",
+                },
+            },
+        )
+    )
+
+    reply = review_service.apply_feedback_response(
+        candidate_id="cand_stale_123",
+        member_id="mem_123",
+        feedback_kind="stale",
+        user_text="too late",
+    )
+
+    persisted = store.get_imported_candidate("cand_stale_123")
+    assert reply.reply_text == "Got it. I marked that as too late and left it out."
+    assert persisted is not None
+    assert persisted.state == CandidateState.REJECTED
+    assert persisted.metadata["review_feedback"]["kind"] == "stale"
+    assert persisted.metadata["suppressed_reason"] == "stale_by_parent_feedback"
+    assert store.list_household_events(household_id="hh_123") == []
+    store.close()
+
+
+def test_review_feedback_already_responded_keeps_same_gmail_candidate_suppressed_on_resync(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    google_service = FlorenceGoogleSyncPersistenceService(store)
+    review_service = FlorenceCandidateReviewService(store)
+    store.upsert_household(Household(id="hh_123", name="Maya household", timezone="America/Los_Angeles"))
+    connection = GoogleConnection(
+        id="gconn_123",
+        household_id="hh_123",
+        member_id="mem_123",
+        email="parent@example.com",
+        connected_scopes=(GoogleSourceKind.GMAIL,),
+        metadata={"primary_calendar_timezone": "America/Los_Angeles"},
+    )
+    store.upsert_google_connection(connection)
+    context = HouseholdContext(
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_dm_123",
+        visible_child_names=["Ava"],
+        school_labels=["Roosevelt Elementary"],
+        activity_labels=["Soccer"],
+    )
+    gmail_item = GmailSyncItem(
+        gmail_message_id="gmail_handled_123",
+        thread_id="thread_handled_123",
+        from_address="Ms. Kim <teacher@roosevelt.k12.ca.us>",
+        subject="Roosevelt Elementary soccer form",
+        snippet="Please sign the soccer form.",
+        body_text="Ava needs her soccer form signed by Friday.",
+        attachment_text=None,
+        attachment_count=0,
+        received_at=datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc),
+        label_ids=("INBOX", "UNREAD", "CATEGORY_UPDATES"),
+    )
+    first = google_service.persist_sync_batch(
+        FlorenceGoogleSyncBatch(connection=connection, context=context, gmail_items=[gmail_item])
+    )
+    assert len(first.candidates) == 1
+    candidate_id = first.candidates[0].id
+
+    review_service.apply_feedback_response(
+        candidate_id=candidate_id,
+        member_id="mem_123",
+        feedback_kind="already_handled",
+        user_text="read and responded",
+    )
+    second = google_service.persist_sync_batch(
+        FlorenceGoogleSyncBatch(connection=connection, context=context, gmail_items=[gmail_item])
+    )
+
+    persisted = store.get_imported_candidate(candidate_id)
+    assert second.candidates
+    assert persisted is not None
+    assert persisted.state == CandidateState.REJECTED
+    assert persisted.metadata["review_feedback"]["user_text"] == "read and responded"
+    assert persisted.metadata["suppressed_reason"] == "already_handled_by_parent"
+    store.close()
+
+
+def test_review_feedback_private_only_and_always_share_create_source_rules_without_closing_candidate(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_private_source",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:private-source",
+            title="Medical bill",
+            summary="A private medical bill.",
+            state=CandidateState.PENDING_REVIEW,
+            metadata={"from_address": "Billing <billing@clinic.example>"},
+        )
+    )
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_shared_source",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:shared-source",
+            title="Music class update",
+            summary="A music class update.",
+            state=CandidateState.PENDING_REVIEW,
+            metadata={"from_address": "Linda <linda@musicalbeginnings.com>"},
+        )
+    )
+
+    private_reply = review_service.apply_feedback_response(
+        candidate_id="cand_private_source",
+        member_id="mem_123",
+        feedback_kind="private_only",
+        source_visibility=HouseholdSourceVisibility.PRIVATE,
+        user_text="private only",
+    )
+    shared_reply = review_service.apply_feedback_response(
+        candidate_id="cand_shared_source",
+        member_id="mem_123",
+        feedback_kind="always_share",
+        source_visibility=HouseholdSourceVisibility.SHARED,
+        user_text="always share this source",
+    )
+
+    private_rules = store.list_household_source_rules(
+        household_id="hh_123",
+        source_kind=GoogleSourceKind.GMAIL,
+        visibility=HouseholdSourceVisibility.PRIVATE,
+    )
+    shared_rules = store.list_household_source_rules(
+        household_id="hh_123",
+        source_kind=GoogleSourceKind.GMAIL,
+        visibility=HouseholdSourceVisibility.SHARED,
+    )
+    assert "private to your review queue" in private_reply.reply_text
+    assert "shared household context" in shared_reply.reply_text
+    assert store.get_imported_candidate("cand_private_source").state == CandidateState.PENDING_REVIEW
+    assert store.get_imported_candidate("cand_shared_source").state == CandidateState.PENDING_REVIEW
+    assert any(rule.matcher_value == "billing@clinic.example" for rule in private_rules)
+    assert any(rule.matcher_value == "musicalbeginnings.com" for rule in shared_rules)
+    store.close()
+
+
+def test_review_feedback_ignore_item_type_records_rule_and_suppresses_future_candidates(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya household", timezone="America/Los_Angeles"))
+    review_service = FlorenceCandidateReviewService(store)
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_gym_old",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:gym-old",
+            title="4 Star open gym booking",
+            summary="Booking reminder for open gym.",
+            state=CandidateState.PENDING_REVIEW,
+            confidence_bps=8_300,
+            metadata={
+                "raw_metadata": {
+                    "reason_tags": ["activity_signal", "schedule_signal"],
+                    "temporal_evidence": {"date_match": {"date": "2026-10-10"}},
+                }
+            },
+        )
+    )
+
+    reply = review_service.apply_feedback_response(
+        candidate_id="cand_gym_old",
+        member_id="mem_123",
+        feedback_kind="ignore_item_type",
+        user_text="ignore this type",
+    )
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_gym_new",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:gym-new",
+            title="4 Star open gym booking",
+            summary="Booking reminder for another open gym.",
+            state=CandidateState.PENDING_REVIEW,
+            confidence_bps=8_300,
+            metadata={
+                "raw_metadata": {
+                    "reason_tags": ["activity_signal", "schedule_signal"],
+                    "temporal_evidence": {"date_match": {"date": "2026-10-17"}},
+                }
+            },
+        )
+    )
+
+    prompt = review_service.build_next_review_prompt(household_id="hh_123", member_id="mem_123")
+    preferences = store.list_household_profile_items(
+        household_id="hh_123",
+        kind=HouseholdProfileKind.PREFERENCE,
+    )
+    persisted = store.get_imported_candidate("cand_gym_new")
+    assert "suppress future activity items" in reply.reply_text.lower()
+    assert prompt is None
+    assert any(item.metadata.get("rule_kind") == "ignore_item_type" for item in preferences)
+    assert persisted is not None
+    assert persisted.state == CandidateState.REJECTED
+    assert persisted.metadata["suppressed_reason"] == "relevance_rule_ignored_item_type"
+    store.close()
+
+
+def test_review_feedback_too_noisy_suppresses_low_confidence_future_but_preserves_important_items(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya household", timezone="America/Los_Angeles"))
+    review_service = FlorenceCandidateReviewService(store)
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_school_noise",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:school-noise",
+            title="WISH weekly update",
+            summary="Routine weekly school update.",
+            state=CandidateState.PENDING_REVIEW,
+            confidence_bps=7_800,
+            metadata={"raw_metadata": {"sender_looks_school": True, "reason_tags": ["school_source"]}},
+        )
+    )
+
+    review_service.apply_feedback_response(
+        candidate_id="cand_school_noise",
+        member_id="mem_123",
+        feedback_kind="too_noisy",
+        user_text="not worth a text unless important",
+    )
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_school_future_noise",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:school-future-noise",
+            title="WISH weekly update",
+            summary="Routine weekly school update.",
+            state=CandidateState.PENDING_REVIEW,
+            confidence_bps=7_600,
+            metadata={"raw_metadata": {"sender_looks_school": True, "reason_tags": ["school_source"]}},
+        )
+    )
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_school_urgent",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:school-urgent",
+            title="Urgent school form due today",
+            summary="Please return Violet's form today.",
+            state=CandidateState.PENDING_REVIEW,
+            confidence_bps=9_300,
+            metadata={"raw_metadata": {"sender_looks_school": True, "reason_tags": ["school_source"]}},
+        )
+    )
+
+    prompt = review_service.build_review_batch_prompt(household_id="hh_123", member_id="mem_123", limit=3)
+    low_value = store.get_imported_candidate("cand_school_future_noise")
+
+    assert prompt is not None
+    assert [candidate.id for candidate in prompt.candidates] == ["cand_school_urgent"]
+    assert low_value is not None
+    assert low_value.state == CandidateState.REJECTED
+    assert low_value.metadata["suppressed_reason"] == "relevance_rule_too_noisy"
+    store.close()
+
+
+def test_review_feedback_always_surface_overrides_noisy_rule_for_same_item_type(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya household", timezone="America/Los_Angeles"))
+    review_service = FlorenceCandidateReviewService(store)
+    for candidate_id, title in (
+        ("cand_school_noise", "WISH weekly update"),
+        ("cand_school_matters", "Young Minds classroom reminder"),
+    ):
+        store.upsert_imported_candidate(
+            ImportedCandidate(
+                id=candidate_id,
+                household_id="hh_123",
+                member_id="mem_123",
+                source_kind=GoogleSourceKind.GMAIL,
+                source_identifier=f"gmail:{candidate_id}",
+                title=title,
+                summary="Routine school update.",
+                state=CandidateState.PENDING_REVIEW,
+                confidence_bps=7_500,
+                metadata={"raw_metadata": {"sender_looks_school": True, "reason_tags": ["school_source"]}},
+            )
+        )
+
+    review_service.apply_feedback_response(
+        candidate_id="cand_school_noise",
+        member_id="mem_123",
+        feedback_kind="too_noisy",
+        user_text="too noisy",
+    )
+    review_service.apply_feedback_response(
+        candidate_id="cand_school_matters",
+        member_id="mem_123",
+        feedback_kind="always_surface",
+        user_text="this matters",
+    )
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_school_future",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:school-future",
+            title="Young Minds classroom reminder",
+            summary="Routine school update.",
+            state=CandidateState.PENDING_REVIEW,
+            confidence_bps=7_300,
+            metadata={"raw_metadata": {"sender_looks_school": True, "reason_tags": ["school_source"]}},
+        )
+    )
+
+    prompt = review_service.build_review_batch_prompt(household_id="hh_123", member_id="mem_123", limit=3)
+
+    assert prompt is not None
+    assert len(prompt.candidates) == 1
+    assert set(prompt.candidate.metadata["review_group_candidate_ids"]) == {"cand_school_future", "cand_school_matters"}
+    assert store.get_imported_candidate("cand_school_future").state == CandidateState.PENDING_REVIEW
+    store.close()
+
+
+def test_review_feedback_duplicate_and_wrong_timing_close_candidate_with_reasons(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_duplicate",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:duplicate",
+            title="Family meeting",
+            summary="Duplicate family meeting candidate.",
+            state=CandidateState.PENDING_REVIEW,
+        )
+    )
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_wrong_timing",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:wrong-timing",
+            title="Bloomz reminder",
+            summary="Please pack library books.",
+            state=CandidateState.PENDING_REVIEW,
+            metadata={"raw_metadata": {"sender_looks_school": True, "reason_tags": ["school_source"]}},
+        )
+    )
+
+    duplicate_reply = review_service.apply_feedback_response(
+        candidate_id="cand_duplicate",
+        member_id="mem_123",
+        feedback_kind="duplicate",
+        user_text="duplicate",
+    )
+    timing_reply = review_service.apply_feedback_response(
+        candidate_id="cand_wrong_timing",
+        member_id="mem_123",
+        feedback_kind="wrong_timing",
+        user_text="tell me sooner",
+    )
+
+    duplicate = store.get_imported_candidate("cand_duplicate")
+    wrong_timing = store.get_imported_candidate("cand_wrong_timing")
+    preferences = store.list_household_profile_items(household_id="hh_123", kind=HouseholdProfileKind.PREFERENCE)
+    assert "duplicate" in duplicate_reply.reply_text
+    assert "adjust the timing" in timing_reply.reply_text
+    assert duplicate is not None
+    assert wrong_timing is not None
+    assert duplicate.metadata["suppressed_reason"] == "duplicate_by_parent"
+    assert wrong_timing.metadata["suppressed_reason"] == "wrong_timing_by_parent"
+    assert any(item.metadata.get("rule_kind") == "wrong_timing" for item in preferences)
+    store.close()
+
+
+def test_review_prompt_collapses_duplicate_school_admin_candidates(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya household", timezone="America/Los_Angeles"))
+    review_service = FlorenceCandidateReviewService(store)
+    for candidate_id, source_identifier in (
+        ("cand_wish_a", "gmail:wish-a"),
+        ("cand_wish_b", "gmail:wish-b"),
+    ):
+        store.upsert_imported_candidate(
+            ImportedCandidate(
+                id=candidate_id,
+                household_id="hh_123",
+                member_id="mem_123",
+                source_kind=GoogleSourceKind.GMAIL,
+                source_identifier=source_identifier,
+                title="WISH weekly update",
+                summary="Routine WISH school update.",
+                state=CandidateState.PENDING_REVIEW,
+                confidence_bps=8_400,
+                metadata={
+                    "source_provenance": {"subject": "WISH weekly update"},
+                    "raw_metadata": {"sender_looks_school": True, "reason_tags": ["school_source"]},
+                },
+            )
+        )
+
+    prompt = review_service.build_review_batch_prompt(household_id="hh_123", member_id="mem_123", limit=3)
+
+    assert prompt is not None
+    assert len(prompt.candidates) == 1
+    assert prompt.candidate.metadata["review_group_size"] == 2
+    assert set(prompt.candidate.metadata["review_group_candidate_ids"]) == {"cand_wish_a", "cand_wish_b"}
+    assert "2 matching school/admin items" in prompt.text
     store.close()
 
 

@@ -10,6 +10,11 @@ from typing import Any, Callable
 
 from florence.contracts import ChannelMessage, ChannelMessageRole, ChannelType, PilotEvent
 from florence.runtime.entrypoints import FlorenceEntrypointResult
+from florence.runtime.reliability import (
+    FlorenceReliabilityEvent,
+    record_reliability_event,
+    transport_event_metadata,
+)
 from florence.sendblue import FlorenceSendbluePermanentOptOutError
 from florence.state import FlorenceStateDB
 from florence.text_safety import scrub_internal_ids
@@ -147,6 +152,16 @@ class FlorenceChannelDeliveryService:
                 channel.provider_channel_id,
                 blocked_reason,
             )
+            self._record_outbound_reliability_event(
+                store=target_store,
+                channel=channel,
+                outgoing_message=outgoing_message,
+                record_message=record_message,
+                message_metadata=message_metadata,
+                transport_metadata=transport_metadata,
+                event_type=FlorenceReliabilityEvent.OUTBOUND_SKIPPED,
+                skipped_reason=blocked_reason,
+            )
             self._record_outbound_audit_event(
                 store=target_store,
                 channel=channel,
@@ -159,6 +174,15 @@ class FlorenceChannelDeliveryService:
             )
             return False
         try:
+            self._record_outbound_reliability_event(
+                store=target_store,
+                channel=channel,
+                outgoing_message=outgoing_message,
+                record_message=record_message,
+                message_metadata=message_metadata,
+                transport_metadata=transport_metadata,
+                event_type=FlorenceReliabilityEvent.OUTBOUND_ATTEMPTED,
+            )
             if channel.provider == "linq":
                 self._linq_client_getter().send_text(chat_id=channel.provider_channel_id, message=outgoing_message)
             elif channel.provider == "sendblue":
@@ -171,6 +195,16 @@ class FlorenceChannelDeliveryService:
                     numbers=numbers,
                 )
             else:
+                self._record_outbound_reliability_event(
+                    store=target_store,
+                    channel=channel,
+                    outgoing_message=outgoing_message,
+                    record_message=record_message,
+                    message_metadata=message_metadata,
+                    transport_metadata=transport_metadata,
+                    event_type=FlorenceReliabilityEvent.OUTBOUND_SKIPPED,
+                    skipped_reason="unsupported_provider",
+                )
                 return False
             if record_message:
                 target_store.append_channel_message(
@@ -188,6 +222,15 @@ class FlorenceChannelDeliveryService:
                         created_at=time.time(),
                     )
                 )
+            self._record_outbound_reliability_event(
+                store=target_store,
+                channel=channel,
+                outgoing_message=outgoing_message,
+                record_message=record_message,
+                message_metadata=message_metadata,
+                transport_metadata=transport_metadata,
+                event_type=FlorenceReliabilityEvent.OUTBOUND_SENT,
+            )
             self._record_outbound_audit_event(
                 store=target_store,
                 channel=channel,
@@ -207,6 +250,16 @@ class FlorenceChannelDeliveryService:
                 channel=channel,
                 reason=_SENDBLUE_OPT_OUT_REASON,
             )
+            self._record_outbound_reliability_event(
+                store=target_store,
+                channel=channel,
+                outgoing_message=outgoing_message,
+                record_message=record_message,
+                message_metadata=message_metadata,
+                transport_metadata=transport_metadata,
+                event_type=FlorenceReliabilityEvent.OUTBOUND_FAILED,
+                failure_reason=_SENDBLUE_OPT_OUT_REASON,
+            )
             self._record_outbound_audit_event(
                 store=target_store,
                 channel=channel,
@@ -220,6 +273,16 @@ class FlorenceChannelDeliveryService:
             return False
         except Exception:
             logger.exception("Florence transport delivery failed for channel %s", channel.provider_channel_id)
+            self._record_outbound_reliability_event(
+                store=target_store,
+                channel=channel,
+                outgoing_message=outgoing_message,
+                record_message=record_message,
+                message_metadata=message_metadata,
+                transport_metadata=transport_metadata,
+                event_type=FlorenceReliabilityEvent.OUTBOUND_FAILED,
+                failure_reason="transport_error",
+            )
             self._record_outbound_audit_event(
                 store=target_store,
                 channel=channel,
@@ -253,6 +316,22 @@ class FlorenceChannelDeliveryService:
         metadata[_TRANSPORT_DISABLED_AT_KEY] = time.time()
         try:
             store.upsert_channel(replace(channel, metadata=metadata))
+            record_reliability_event(
+                store,
+                FlorenceReliabilityEvent.CHANNEL_DISABLED,
+                household_id=channel.household_id,
+                channel_id=channel.id,
+                metadata=transport_event_metadata(
+                    provider=channel.provider,
+                    provider_channel_id=channel.provider_channel_id,
+                    failure_reason=reason,
+                    channel_type=(
+                        channel.channel_type.value
+                        if hasattr(channel.channel_type, "value")
+                        else str(channel.channel_type)
+                    ),
+                ),
+            )
         except Exception:
             logger.exception(
                 "Florence failed to persist disabled transport metadata for channel %s",
@@ -285,6 +364,61 @@ class FlorenceChannelDeliveryService:
             "numbers": numbers,
             "sendblue_number": sendblue_number or None,
         }
+
+    def _record_outbound_reliability_event(
+        self,
+        *,
+        store: FlorenceStateDB,
+        channel: Any,
+        outgoing_message: str,
+        record_message: bool,
+        message_metadata: dict[str, Any] | None,
+        transport_metadata: dict[str, Any],
+        event_type: FlorenceReliabilityEvent,
+        failure_reason: str | None = None,
+        skipped_reason: str | None = None,
+    ) -> None:
+        raw_message_metadata = dict(message_metadata or {})
+        turn_id = str(raw_message_metadata.get("florence_turn_id") or raw_message_metadata.get("turn_id") or "").strip()
+        delivery_kind = str(raw_message_metadata.get("delivery_kind") or "").strip()
+        provider_message_id = str(
+            raw_message_metadata.get("provider_message_id")
+            or raw_message_metadata.get("message_id")
+            or raw_message_metadata.get("transport_reply_to")
+            or ""
+        ).strip()
+        metadata = transport_event_metadata(
+            provider=channel.provider,
+            provider_channel_id=channel.provider_channel_id,
+            message_id=provider_message_id or None,
+            turn_id=turn_id or None,
+            delivery_kind=delivery_kind or None,
+            failure_reason=failure_reason,
+            skipped_reason=skipped_reason,
+            channel_type=(
+                channel.channel_type.value
+                if hasattr(channel.channel_type, "value")
+                else str(channel.channel_type)
+            ),
+            channel_title=getattr(channel, "title", None),
+            record_message=record_message,
+            message_length=len(outgoing_message),
+            message_metadata=raw_message_metadata,
+            **transport_metadata,
+        )
+        try:
+            record_reliability_event(
+                store,
+                event_type,
+                household_id=channel.household_id,
+                channel_id=channel.id,
+                metadata=metadata,
+            )
+        except Exception:
+            logger.exception(
+                "Florence outbound reliability logging failed for channel %s",
+                channel.provider_channel_id,
+            )
 
     def _record_outbound_audit_event(
         self,

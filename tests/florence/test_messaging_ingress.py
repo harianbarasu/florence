@@ -50,6 +50,7 @@ from florence.runtime import (
     FlorenceOnboardingSessionService,
 )
 from florence.runtime.chat import FlorenceHouseholdChatService
+from florence.runtime.trust_policy import CONSTITUTION_SETTINGS_KEY
 from florence.state import FlorenceStateDB
 from hermes_state import SessionDB
 from model_tools import handle_function_call
@@ -274,7 +275,10 @@ class _StubHouseholdChatService:
             lines = [title or "This looks worth double-checking."]
             if source_prompt:
                 lines.append(str(source_prompt).strip())
-            lines.append("Reply yes if I should add it, no if it's wrong, or skip for later.")
+            lines.append(
+                "Reply yes if I should add it, no if it's wrong, or skip for later. "
+                "You can also say already handled, too late, private only, always share this source, or ignore this sender."
+            )
             return " ".join(line for line in lines if line)
         if kind == "review_queue_turn":
             self.review_queue_turn_calls.append(
@@ -706,6 +710,54 @@ def _complete_hybrid_onboarding(onboarding_service):
         member_id="mem_123",
         thread_id="dm_thread_123",
     )
+
+
+def test_group_feedback_records_shared_household_update_style(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_onboarding_service(store, review_service)
+    store.upsert_household(Household(id="hh_123", name="Maya household", timezone="America/Los_Angeles"))
+    store.upsert_member(Member(id="mem_123", household_id="hh_123", display_name="Maya", role=MemberRole.ADMIN))
+    store.upsert_channel(
+        Channel(
+            id="chan_group_123",
+            household_id="hh_123",
+            provider="sendblue",
+            provider_channel_id="group-thread-123",
+            channel_type=ChannelType.HOUSEHOLD_GROUP,
+            title="Family group",
+        )
+    )
+    ingress = _build_ingress(store, onboarding_service, review_service)
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_group_123",
+            thread_id="group-thread-123",
+            message=FlorenceInboundMessage(
+                provider="sendblue",
+                message_id="msg_group_feedback",
+                thread_id="group-thread-123",
+                sender_handle="+15555550123",
+                body="Florence, these updates are too wordy",
+                is_group_chat=True,
+                participant_handles=("+15555550123", "+15555550124"),
+            ),
+        )
+    )
+
+    preferences = store.list_household_profile_items(household_id="hh_123", kind=HouseholdProfileKind.PREFERENCE)
+    assert result.consumed is True
+    assert "shorter" in result.reply_text
+    assert any(
+        item.member_id is None
+        and item.metadata.get("feedback_scope") == "shared_household"
+        and item.metadata.get("review_feedback_kind") == "less_proactive"
+        for item in preferences
+    )
+    store.close()
 
 
 def test_dm_pending_household_link_request_prompts_and_auto_merges_lightweight_household(tmp_path):
@@ -1145,6 +1197,46 @@ def test_dm_parent_name_reply_includes_friendly_google_link(tmp_path):
     ]
     assert records[0]["envelope"]["delivery_target"]["provider_thread_id"] == "dm_thread_123"
     assert records[0]["outcome"]["reply_messages"][0] == "Hi, I'm Florence."
+    route_events = store.list_pilot_events(household_id="hh_123", event_type="route_selected")
+    reply_events = store.list_pilot_events(household_id="hh_123", event_type="reply_generated")
+    assert route_events[0].metadata["route"] == "dm"
+    assert route_events[0].metadata["turn_id"] == records[0]["id"]
+    assert reply_events[0].metadata["reply_count"] == len(result.reply_messages)
+    assert reply_events[0].metadata["message_id"] == "msg_123"
+    store.close()
+
+
+def test_ingress_records_duplicate_inbound_message_as_deduplicated(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_onboarding_service(store, review_service)
+    ingress = _build_ingress(store, onboarding_service, review_service)
+    resolved = FlorenceResolvedInboundMessage(
+        household_id="hh_123",
+        member_id="mem_123",
+        channel_id="chan_dm_123",
+        thread_id="dm_thread_123",
+        message=FlorenceInboundMessage(
+            provider="linq",
+            message_id="msg_duplicate_123",
+            thread_id="dm_thread_123",
+            sender_handle="+15555550123",
+            body="Maya",
+            is_group_chat=False,
+        ),
+    )
+
+    first = ingress.handle_message(resolved)
+    duplicate = ingress.handle_message(resolved)
+
+    events = store.list_pilot_events(household_id="hh_123", event_type="inbound_deduplicated")
+    assert first.consumed is True
+    assert duplicate.consumed is True
+    assert len(events) == 1
+    assert events[0].channel_id == "chan_dm_123"
+    assert events[0].metadata["message_id"] == "msg_duplicate_123"
+    assert events[0].metadata["skipped_reason"] == "duplicate_inbound_message"
+    assert len(store.list_turn_records(household_id="hh_123")) == 1
     store.close()
 
 
@@ -2372,7 +2464,9 @@ def test_review_prompt_then_yes_routes_single_item_context_to_chat(tmp_path):
     assert chat_service.calls
     contextual_message = chat_service.calls[-1]["message_text"]
     assert '"candidate_id": "cand_124"' in contextual_message
-    assert "Interpret the whole message yourself, including short yes/no/share/private replies" in contextual_message
+    assert "Review mini-playbook: suppress stale, already-handled, duplicate, and noisy email/import items; surface only actionable household items." in contextual_message
+    assert "Obvious feedback like already handled, too late, private only, always share this source, or ignore this sender is handled deterministically" in contextual_message
+    assert "Interpret the whole remaining message yourself, including short yes/no replies and corrections." in contextual_message
     assert "User reply: yes" in contextual_message
     candidate = store.get_imported_candidate("cand_124")
     assert candidate is not None
@@ -2540,6 +2634,7 @@ def test_review_batch_reply_context_includes_numbered_active_items(tmp_path):
     assert '"index": 2' in contextual_message
     assert '"candidate_id": "cand_batch_2"' in contextual_message
     assert "If the user replies with numbered decisions like 1 yes, 2 no, 3 skip" in contextual_message
+    assert "Review mini-playbook: suppress stale, already-handled, duplicate, and noisy email/import items; surface only actionable household items." in contextual_message
     assert "clearly refers to exactly one listed item by title, sender, place, child, or date" in contextual_message
     assert "Zimmi is correct but it's at 7 PM EST" in contextual_message
     assert "User reply: 2 no" in contextual_message
@@ -2696,12 +2791,14 @@ def test_review_prompt_then_corrective_no_does_not_reject_candidate(tmp_path):
     assert candidate is not None
     assert candidate.state == CandidateState.PENDING_REVIEW
     assert store.list_household_events(household_id="hh_123") == []
-    assert "Interpret the whole message yourself, including short yes/no/share/private replies" in chat_service.calls[-1]["message_text"]
+    assert "Obvious feedback like already handled, too late, private only, always share this source, or ignore this sender is handled deterministically" in chat_service.calls[-1]["message_text"]
+    assert "Interpret the whole remaining message yourself, including short yes/no replies and corrections." in chat_service.calls[-1]["message_text"]
     store.close()
 
 
-def test_review_prompt_then_share_routes_to_chat_for_explicit_source_decision(tmp_path):
+def test_review_prompt_then_share_persists_source_rule_without_hermes(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya household", timezone="America/Los_Angeles"))
     review_service = FlorenceCandidateReviewService(store)
     onboarding_service = _build_onboarding_service(store, review_service)
     chat_service = _StubHouseholdChatService("Got it — I’ll treat this source as shared household context.")
@@ -2766,18 +2863,186 @@ def test_review_prompt_then_share_routes_to_chat_for_explicit_source_decision(tm
     )
 
     assert classification.reply_text is not None
-    assert classification.reply_text == "Got it — I’ll treat this source as shared household context."
-    assert chat_service.calls
-    contextual_message = chat_service.calls[-1]["message_text"]
-    assert '"candidate_id": "cand_125"' in contextual_message
-    assert "set source_visibility" in contextual_message
-    assert "User reply: share" in contextual_message
+    assert classification.reply_text == (
+        "Got it. I’ll treat future items from Linda / musicalbeginnings.com as shared household context. "
+        "This item is still in review if you want to add it."
+    )
+    assert chat_service.calls == []
+    assert classification.reply_metadata["review_feedback_kind"] == "always_share"
+    assert classification.reply_metadata["source_visibility"] == "shared"
     rules = store.list_household_source_rules(
         household_id="hh_123",
         source_kind=GoogleSourceKind.GMAIL,
         visibility=HouseholdSourceVisibility.SHARED,
     )
-    assert rules == []
+    assert any(rule.matcher_value == "musicalbeginnings.com" for rule in rules)
+    household = store.get_household("hh_123")
+    assert household is not None
+    constitution = household.settings[CONSTITUTION_SETTINGS_KEY]
+    trusted_sources = constitution["source_policy"]["trusted_sources"]
+    trusted_source = next(
+        source for source in trusted_sources if source.get("matcher_value") == "linda@musicalbeginnings.com"
+    )
+    assert trusted_source["channel_id"] == "chan_dm_123"
+    assert constitution["provenance"][-1]["mutation_type"] == "source_policy"
+    assert constitution["provenance"][-1]["channel_id"] == "chan_dm_123"
+    candidate = store.get_imported_candidate("cand_125")
+    assert candidate is not None
+    assert candidate.state == CandidateState.PENDING_REVIEW
+    store.close()
+
+
+def test_review_prompt_then_already_handled_closes_candidate_without_hermes(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_onboarding_service(store, review_service)
+    chat_service = _StubHouseholdChatService("Hermes should not handle obvious feedback.")
+    ingress = _build_ingress(
+        store,
+        onboarding_service,
+        review_service,
+        household_chat_service=chat_service,
+    )
+    _complete_hybrid_onboarding(onboarding_service)
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_handled_ingress",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:handled-ingress",
+            title="DRALL form reminder",
+            summary="A form reminder the parent already handled.",
+            state=CandidateState.PENDING_REVIEW,
+            metadata={
+                "from_address": "DRALL <forms@drall.org>",
+                "confirmation_question": "Should I add this to the household plan?",
+            },
+        )
+    )
+
+    review = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_307",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="review imports",
+                is_group_chat=False,
+            ),
+        )
+    )
+    assert review.reply_text is not None
+
+    handled = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_308",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="already handled",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert handled.reply_text == "Got it. I marked that as already handled and left it out."
+    assert chat_service.calls == []
+    assert handled.reply_metadata["review_feedback_kind"] == "already_handled"
+    candidate = store.get_imported_candidate("cand_handled_ingress")
+    assert candidate is not None
+    assert candidate.state == CandidateState.REJECTED
+    assert candidate.metadata["suppressed_reason"] == "already_handled_by_parent"
+    assert store.list_household_events(household_id="hh_123") == []
+    store.close()
+
+
+def test_review_prompt_then_less_proactive_records_operating_preference_without_hermes(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_onboarding_service(store, review_service)
+    chat_service = _StubHouseholdChatService("Hermes should not handle obvious feedback.")
+    ingress = _build_ingress(
+        store,
+        onboarding_service,
+        review_service,
+        household_chat_service=chat_service,
+    )
+    _complete_hybrid_onboarding(onboarding_service)
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_less_proactive",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:less-proactive",
+            title="Newsletter item",
+            summary="A low-value newsletter item.",
+            state=CandidateState.PENDING_REVIEW,
+        )
+    )
+
+    review = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_309",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="review imports",
+                is_group_chat=False,
+            ),
+        )
+    )
+    assert review.reply_text is not None
+
+    feedback = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_310",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="less proactive please",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    preferences = store.list_household_profile_items(
+        household_id="hh_123",
+        kind=HouseholdProfileKind.PREFERENCE,
+    )
+    assert feedback.reply_text == "Got it. I’ll remember that preference for future Florence prompts."
+    assert chat_service.calls == []
+    assert feedback.reply_metadata["review_feedback_kind"] == "less_proactive"
+    assert any(
+        item.label == "Florence proactivity"
+        and item.metadata.get("category") == "operating_preference"
+        and "less proactive" in str(item.metadata.get("value") or "")
+        for item in preferences
+    )
+    candidate = store.get_imported_candidate("cand_less_proactive")
+    assert candidate is not None
+    assert candidate.state == CandidateState.PENDING_REVIEW
     store.close()
 
 

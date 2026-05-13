@@ -155,7 +155,7 @@ def build_rules_for_candidate(
 
     rules: list[HouseholdSourceRule] = []
     for matcher in profile.matchers:
-        if visibility == HouseholdSourceVisibility.PRIVATE and matcher.matcher_kind in {
+        if visibility in {HouseholdSourceVisibility.PRIVATE, HouseholdSourceVisibility.IGNORED} and matcher.matcher_kind in {
             HouseholdSourceMatcherKind.GMAIL_FROM_DOMAIN,
             HouseholdSourceMatcherKind.GMAIL_SENDER_NAME,
         }:

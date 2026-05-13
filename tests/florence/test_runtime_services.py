@@ -12,6 +12,8 @@ from florence.contracts import (
     GoogleSourceKind,
     Household,
     HouseholdContext,
+    HouseholdEvent,
+    HouseholdEventStatus,
     HouseholdNudge,
     HouseholdNudgeStatus,
     HouseholdNudgeTargetKind,
@@ -33,6 +35,7 @@ from florence.messaging.protocol_types import (
     build_candidate_review_prompt_metadata,
     build_household_link_prompt_metadata,
 )
+from florence.messaging.protocol_sentinels import HEARTBEAT_OK_SENTINEL
 from florence.onboarding import OnboardingStage
 from florence.runtime import (
     FlorenceCandidateReviewService,
@@ -43,6 +46,12 @@ from florence.runtime import (
 )
 from florence.runtime.delivery import FlorenceChannelDeliveryService
 from florence.runtime.operations import FlorenceHouseholdOperationsService
+from florence.runtime.trust_policy import (
+    CONSTITUTION_SETTINGS_KEY,
+    FlorenceModule,
+    ensure_household_constitution,
+    module_enabled,
+)
 from florence.sendblue import FlorenceSendbluePermanentOptOutError
 from florence.state import FlorenceStateDB
 
@@ -423,6 +432,9 @@ def test_candidate_review_prompt_asks_once_for_unknown_source_classification(tmp
 
     assert prompt is not None
     assert "Reply share" not in prompt.text
+    assert "already handled" in prompt.text
+    assert "always share this source" in prompt.text
+    assert "ignore this sender" in prompt.text
     store.close()
 
 
@@ -453,14 +465,18 @@ def test_delivery_service_records_outbound_audit_event(tmp_path):
     )
 
     events = store.list_pilot_events(household_id="hh_123", event_type="outbound_message_sent")
+    reliability_events = store.list_pilot_events(household_id="hh_123", event_type="outbound_sent")
     assert sent is True
     assert linq.sent == [{"chat_id": "dm-thread-123", "message": "Hello there"}]
     assert len(events) == 1
+    assert len(reliability_events) == 1
     assert events[0].channel_id == "chan_dm_123"
     assert events[0].metadata["provider"] == "linq"
     assert events[0].metadata["provider_channel_id"] == "dm-thread-123"
     assert events[0].metadata["message"] == "Hello there"
     assert events[0].metadata["message_metadata"]["protocol_kind"] == "candidate_review_prompt"
+    assert reliability_events[0].metadata.get("delivery_kind") is None
+    assert reliability_events[0].metadata["message_length"] == len("Hello there")
     store.close()
 
 
@@ -518,13 +534,56 @@ def test_delivery_service_disables_sendblue_channel_after_opt_out(tmp_path):
 
     updated = store.get_channel("chan_dm_123")
     events = store.list_pilot_events(household_id="hh_123", event_type="outbound_message_failed")
+    failed_events = store.list_pilot_events(household_id="hh_123", event_type="outbound_failed")
+    disabled_events = store.list_pilot_events(household_id="hh_123", event_type="channel_disabled")
     assert sent is False
     assert len(sendblue.sent) == 1
     assert updated is not None
     assert updated.metadata["transport_disabled"] is True
     assert updated.metadata["transport_disabled_reason"] == "sendblue_opted_out"
     assert len(events) == 1
+    assert len(failed_events) == 1
+    assert len(disabled_events) == 1
     assert events[0].metadata["failure_reason"] == "sendblue_opted_out"
+    assert failed_events[0].metadata["failure_reason"] == "sendblue_opted_out"
+    assert disabled_events[0].metadata["failure_reason"] == "sendblue_opted_out"
+    store.close()
+
+
+def test_delivery_service_records_blocked_channel_send_as_skipped(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    linq = _FakeLinqClient()
+    delivery = FlorenceChannelDeliveryService(
+        store,
+        linq_client_getter=lambda: linq,
+        sendblue_client_getter=lambda: None,
+    )
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    channel = store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+            metadata={
+                "transport_disabled": True,
+                "transport_disabled_reason": "manual_block",
+            },
+        )
+    )
+
+    sent = delivery.send_channel_message(channel=channel, message="Do not send this")
+
+    skipped = store.list_pilot_events(household_id="hh_123", event_type="outbound_skipped")
+    attempted = store.list_pilot_events(household_id="hh_123", event_type="outbound_attempted")
+    assert sent is False
+    assert linq.sent == []
+    assert len(skipped) == 1
+    assert skipped[0].channel_id == "chan_dm_123"
+    assert skipped[0].metadata["skipped_reason"] == "manual_block"
+    assert attempted == []
     store.close()
 
 
@@ -1564,6 +1623,170 @@ def test_household_manager_service_schedules_due_nudge_with_default_dm_context(t
     store.close()
 
 
+def test_household_manager_young_minds_theme_days_create_action_reminders(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(Member(id="mem_123", household_id="hh_123", display_name="Maya", role=MemberRole.ADMIN))
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    manager = FlorenceHouseholdManagerService(store)
+    events = [
+        HouseholdEvent(
+            id="evt_stuffy_1",
+            household_id="hh_123",
+            title="Bring a Stuffie Day",
+            starts_at="2026-05-11T00:00:00-07:00",
+            timezone="America/Los_Angeles",
+            all_day=True,
+            status=HouseholdEventStatus.CONFIRMED,
+        ),
+        HouseholdEvent(
+            id="evt_sports",
+            household_id="hh_123",
+            title="Sports Day",
+            starts_at="2026-05-14T00:00:00-07:00",
+            timezone="America/Los_Angeles",
+            all_day=True,
+            status=HouseholdEventStatus.CONFIRMED,
+        ),
+        HouseholdEvent(
+            id="evt_stuffy_2",
+            household_id="hh_123",
+            title="Bring a Stuffie Day",
+            starts_at="2026-05-19T00:00:00-07:00",
+            timezone="America/Los_Angeles",
+            all_day=True,
+            status=HouseholdEventStatus.CONFIRMED,
+        ),
+        HouseholdEvent(
+            id="evt_tie_dye",
+            household_id="hh_123",
+            title="Tie Dye Day",
+            starts_at="2026-05-29T00:00:00-07:00",
+            timezone="America/Los_Angeles",
+            all_day=True,
+            status=HouseholdEventStatus.CONFIRMED,
+        ),
+    ]
+
+    reminders = []
+    for event in events:
+        store.upsert_household_event(event)
+        reminders.extend(
+            manager.schedule_actionable_event_reminders(
+                household_id="hh_123",
+                event=event,
+                actor_member_id="mem_123",
+                channel_id="chan_dm_123",
+                now=datetime(2026, 5, 10, 16, 0, tzinfo=timezone.utc),
+            )
+        )
+
+    assert len(reminders) == 4
+    assert {nudge.target_id for nudge in reminders} == {event.id for event in events}
+    assert all(store.get_household_nudge(nudge.id) is not None for nudge in reminders)
+    assert all(nudge.recipient_member_id == "mem_123" for nudge in reminders)
+    assert all(nudge.channel_id == "chan_dm_123" for nudge in reminders)
+    assert "Bring a Stuffie Day" in reminders[0].message
+    assert reminders[0].scheduled_for == "2026-05-11T14:00:00+00:00"
+    store.close()
+
+
+def test_household_manager_bring_stuffy_day_gets_morning_reminder_before_school(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    manager = FlorenceHouseholdManagerService(store)
+    event = store.upsert_household_event(
+        HouseholdEvent(
+            id="evt_stuffy",
+            household_id="hh_123",
+            title="Bring a Stuffie Day",
+            starts_at="2026-05-11T00:00:00-07:00",
+            timezone="America/Los_Angeles",
+            all_day=True,
+            status=HouseholdEventStatus.CONFIRMED,
+        )
+    )
+
+    reminders = manager.schedule_actionable_event_reminders(
+        household_id="hh_123",
+        event=event,
+        now=datetime(2026, 5, 10, 20, 0, tzinfo=timezone.utc),
+    )
+
+    assert len(reminders) == 1
+    reminder = reminders[0]
+    assert reminder.target_kind == HouseholdNudgeTargetKind.EVENT
+    assert reminder.target_id == "evt_stuffy"
+    assert reminder.scheduled_for == "2026-05-11T14:00:00+00:00"
+    assert reminder.metadata["source"] == "school_theme_day_default"
+    assert store.get_household_nudge(reminder.id) is not None
+    store.close()
+
+
+def test_household_manager_past_theme_day_does_not_create_reminder(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    manager = FlorenceHouseholdManagerService(store)
+    event = store.upsert_household_event(
+        HouseholdEvent(
+            id="evt_past",
+            household_id="hh_123",
+            title="Bring a Stuffie Day",
+            starts_at="2026-05-10T00:00:00-07:00",
+            timezone="America/Los_Angeles",
+            all_day=True,
+            status=HouseholdEventStatus.CONFIRMED,
+        )
+    )
+
+    reminders = manager.schedule_actionable_event_reminders(
+        household_id="hh_123",
+        event=event,
+        now=datetime(2026, 5, 11, 16, 0, tzinfo=timezone.utc),
+    )
+
+    assert reminders == []
+    assert store.list_household_nudges(household_id="hh_123") == []
+    store.close()
+
+
+def test_household_manager_same_day_theme_day_after_morning_gets_immediate_reminder(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    manager = FlorenceHouseholdManagerService(store)
+    event = store.upsert_household_event(
+        HouseholdEvent(
+            id="evt_same_day",
+            household_id="hh_123",
+            title="Wear green for Sports Day",
+            starts_at="2026-05-11T00:00:00-07:00",
+            timezone="America/Los_Angeles",
+            all_day=True,
+            status=HouseholdEventStatus.CONFIRMED,
+        )
+    )
+
+    reminders = manager.schedule_actionable_event_reminders(
+        household_id="hh_123",
+        event=event,
+        now=datetime(2026, 5, 11, 16, 0, tzinfo=timezone.utc),
+    )
+
+    assert len(reminders) == 1
+    assert reminders[0].scheduled_for == "2026-05-11T16:05:00+00:00"
+    assert reminders[0].metadata["automation_kind"] == "event_action_reminder"
+    store.close()
+
+
 def test_household_manager_service_completes_actionable_nudge_and_work_item(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
@@ -1831,9 +2054,46 @@ def test_household_manager_service_records_reminder_feedback_and_event(tmp_path)
     assert profile.metadata["category"] == "reminder_style"
     assert profile.metadata["value"] == "Too many reminders too early. Morning-of is enough for practice."
     assert profile.metadata["recorded_by_member_id"] == "mem_123"
+    household = store.get_household("hh_123")
+    assert household is not None
+    feedback_rules = household.settings[CONSTITUTION_SETTINGS_KEY]["feedback_rules"]
+    assert any(
+        rule["category"] == "reminder_style"
+        and rule["value"] == "Too many reminders too early. Morning-of is enough for practice."
+        for rule in feedback_rules
+    )
+    provenance = household.settings[CONSTITUTION_SETTINGS_KEY]["provenance"][-1]
+    assert provenance["mutation_type"] == "preference"
+    assert provenance["trigger"] == "reminder_feedback"
+    assert provenance["member_id"] == "mem_123"
+    assert provenance["channel_id"] == "chan_dm_123"
     events = store.list_pilot_events(household_id="hh_123", event_type="reminder_feedback_received")
     assert len(events) == 1
     assert events[0].metadata["text"] == "Too many reminders too early. Morning-of is enough for practice."
+    store.close()
+
+
+def test_household_manager_finalizes_constitution_from_onboarding(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    manager = FlorenceHouseholdManagerService(store)
+
+    manager.finalize_onboarding_completion(
+        household_id="hh_123",
+        member_id="mem_123",
+        channel_id="chan_dm_123",
+    )
+
+    household = store.get_household("hh_123")
+    assert household is not None
+    constitution = household.settings[CONSTITUTION_SETTINGS_KEY]
+    collected = set(constitution["interview"]["collected"])
+    assert {"parents_and_roles", "children_schools_activities", "enabled_modules"}.issubset(collected)
+    assert constitution["provenance"][-1]["mutation_type"] == "onboarding_complete"
+    assert constitution["provenance"][-1]["source"] == "onboarding"
+    assert constitution["provenance"][-1]["channel_id"] == "chan_dm_123"
+    events = store.list_pilot_events(household_id="hh_123", event_type="onboarding_complete")
+    assert len(events) == 1
     store.close()
 
 
@@ -2030,6 +2290,8 @@ def test_operations_review_nudge_records_candidate_review_prompt_metadata(tmp_pa
     latest = FlorenceChannelLog(store).latest_assistant_message(channel_id="chan_dm_123")
     persisted = store.get_imported_candidate("cand_999")
     events = store.list_pilot_events(household_id="hh_123", event_type="review_prompt_sent")
+    decision_events = store.list_pilot_events(household_id="hh_123", event_type="proactive_review_decision")
+    policy_decisions = store.list_pilot_events(household_id="hh_123", event_type="constitution_policy_decision")
     assert nudged is True
     assert linq.sent
     assert latest is not None
@@ -2049,6 +2311,14 @@ def test_operations_review_nudge_records_candidate_review_prompt_metadata(tmp_pa
     assert events[0].metadata["confirmation_question"] == "Should I add this?"
     assert events[0].metadata["newly_pending_count"] == 1
     assert events[0].metadata["trigger"] == "new_pending_candidate"
+    assert events[0].metadata["surface_reasons"] == {"cand_999": "household_temporal_high_confidence"}
+    assert len(decision_events) == 1
+    assert decision_events[0].metadata["decision"] == "surfaced"
+    assert decision_events[0].metadata["reason"] == "household_temporal_high_confidence"
+    assert len(policy_decisions) == 1
+    assert policy_decisions[0].metadata["decision"] == "allowed"
+    assert policy_decisions[0].metadata["module"] == "review_prompts"
+    assert policy_decisions[0].channel_id == "chan_dm_123"
     records = [
         record
         for record in store.list_turn_records(household_id="hh_123")
@@ -2138,11 +2408,15 @@ def test_operations_review_nudge_skips_same_day_past_timed_calendar_candidate(tm
     )
 
     persisted = store.get_imported_candidate("cand_past_open_gym")
+    decision_events = store.list_pilot_events(household_id="hh_123", event_type="proactive_review_decision")
     assert nudged is False
     assert linq.sent == []
     assert chat_service.calls == []
     assert persisted is not None
     assert persisted.metadata.get("review_nudged_at") is None
+    assert len(decision_events) == 1
+    assert decision_events[0].metadata["decision"] == "skipped"
+    assert decision_events[0].metadata["reason"] == "candidate_not_reviewable_now"
     store.close()
 
 
@@ -2445,6 +2719,14 @@ def test_operations_briefing_respects_explicit_household_quiet_hours(tmp_path, m
         recorded_by_member_id="mem_123",
         channel_id="chan_dm_123",
     )
+    household = store.get_household("hh_123")
+    assert household is not None
+    constitution = household.settings[CONSTITUTION_SETTINGS_KEY]
+    assert constitution["quiet_hours"]["enabled"] is True
+    assert constitution["quiet_hours"]["start"] == "21:00"
+    assert constitution["quiet_hours"]["end"] == "08:00"
+    assert constitution["provenance"][-1]["mutation_type"] == "preference"
+    assert constitution["provenance"][-1]["channel_id"] == "chan_dm_123"
     routines = manager.ensure_briefing_routines(household_id="hh_123")
     morning = next(routine for routine in routines if routine.metadata.get("brief_kind") == "morning")
     for routine in routines:
@@ -2485,8 +2767,110 @@ def test_operations_briefing_respects_explicit_household_quiet_hours(tmp_path, m
     assert sent == 0
     assert linq.sent == []
     updated = store.get_household_routine(morning.id)
+    skipped = store.list_pilot_events(household_id="hh_123", event_type="outbound_skipped")
+    policy_decisions = store.list_pilot_events(household_id="hh_123", event_type="constitution_policy_decision")
     assert updated is not None
     assert updated.last_completed_at is None
+    assert len(skipped) == 1
+    assert skipped[0].metadata["delivery_kind"] == "scheduled_brief"
+    assert skipped[0].metadata["skipped_reason"] == "quiet_hours"
+    assert policy_decisions[0].metadata["decision"] == "allowed"
+    assert policy_decisions[0].metadata["reason"] == "module_enabled_channel_allowed"
+    store.close()
+
+
+def test_operations_briefing_respects_disabled_constitution_module(tmp_path, monkeypatch):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    onboarding_service = FlorenceOnboardingSessionService(store)
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        display_name="Maya",
+    )
+    manager = FlorenceHouseholdManagerService(store)
+    routines = manager.ensure_briefing_routines(household_id="hh_123")
+    meal = next(routine for routine in routines if routine.metadata.get("brief_kind") == "meal")
+    for routine in routines:
+        if routine.id != meal.id:
+            store.upsert_household_routine(replace(routine, status=HouseholdRoutineStatus.PAUSED, next_due_at=None))
+    store.upsert_household_routine(
+        replace(
+            meal,
+            status=HouseholdRoutineStatus.ACTIVE,
+            next_due_at="2026-03-24T00:00:00+00:00",
+        )
+    )
+    constitution = ensure_household_constitution(store, "hh_123")
+    assert not module_enabled(constitution, FlorenceModule.MEALS_AND_SHOPPING)
+
+    class _BriefingChat:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def compose_brief(self, *, household_id, channel_id, actor_member_id, brief_kind):  # noqa: ARG002
+            self.calls += 1
+            return "Meal pulse: pasta and groceries."
+
+    chat = _BriefingChat()
+    linq = _FakeLinqClient()
+    delivery = FlorenceChannelDeliveryService(
+        store,
+        linq_client_getter=lambda: linq,
+        sendblue_client_getter=lambda: None,
+    )
+    operations = FlorenceHouseholdOperationsService(
+        store,
+        delivery_service=delivery,
+        household_chat_service_getter=lambda: chat,
+        now_getter=lambda: _REVIEW_TEST_NOW,
+    )
+    monkeypatch.setattr(
+        operations,
+        "_utc_now",
+        lambda: datetime(2026, 3, 24, 18, 0, tzinfo=timezone.utc),
+    )
+
+    sent = operations.dispatch_due_household_briefings(household_id="hh_123")
+
+    assert sent == 0
+    assert chat.calls == 0
+    assert linq.sent == []
+    updated = store.get_household_routine(meal.id)
+    assert updated is not None
+    assert updated.last_completed_at is not None
+    skipped = store.list_pilot_events(household_id="hh_123", event_type="outbound_skipped")
+    policy_decisions = store.list_pilot_events(household_id="hh_123", event_type="constitution_policy_decision")
+    assert len(skipped) == 1
+    assert skipped[0].metadata["delivery_kind"] == "scheduled_brief"
+    assert skipped[0].metadata["skipped_reason"] == "module_disabled:meals_and_shopping"
+    assert policy_decisions[0].metadata["decision"] == "denied"
+    assert policy_decisions[0].metadata["reason"] == "module_disabled:meals_and_shopping"
+    records = [
+        record
+        for record in store.list_turn_records(household_id="hh_123")
+        if record["trigger_kind"] == "scheduled_brief"
+    ]
+    assert records[0]["outcome"]["no_reply_reason"] == "module_disabled:meals_and_shopping"
     store.close()
 
 
@@ -2571,12 +2955,101 @@ def test_operations_skips_stale_morning_briefing_in_afternoon(tmp_path, monkeypa
     updated = store.get_household_routine(morning.id)
     assert updated is not None
     assert updated.last_completed_at is not None
+    skipped = store.list_pilot_events(household_id="hh_123", event_type="outbound_skipped")
+    assert len(skipped) == 1
+    assert skipped[0].metadata["delivery_kind"] == "scheduled_brief"
+    assert skipped[0].metadata["skipped_reason"] == "briefing_window_expired"
     records = [
         record
         for record in store.list_turn_records(household_id="hh_123")
         if record["trigger_kind"] == "scheduled_brief"
     ]
     assert records[0]["outcome"]["no_reply_reason"] == "briefing_window_expired"
+    store.close()
+
+
+def test_operations_records_heartbeat_ok_briefing_as_quiet_skip(tmp_path, monkeypatch):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    onboarding_service = FlorenceOnboardingSessionService(store)
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        display_name="Maya",
+    )
+    manager = FlorenceHouseholdManagerService(store)
+    routines = manager.ensure_briefing_routines(
+        household_id="hh_123",
+        now=datetime(2026, 3, 24, 12, 0, tzinfo=timezone.utc),
+    )
+    pickup = next(routine for routine in routines if routine.metadata.get("brief_kind") == "pickup")
+    for routine in routines:
+        if routine.id != pickup.id:
+            store.upsert_household_routine(replace(routine, status=HouseholdRoutineStatus.PAUSED, next_due_at=None))
+    store.upsert_household_routine(
+        replace(
+            pickup,
+            status=HouseholdRoutineStatus.ACTIVE,
+            next_due_at="2026-03-24T21:30:00+00:00",
+            last_completed_at=None,
+        )
+    )
+
+    class _BriefingChat:
+        def compose_brief(self, *, household_id, channel_id, actor_member_id, brief_kind):  # noqa: ARG002
+            return HEARTBEAT_OK_SENTINEL
+
+    linq = _FakeLinqClient()
+    delivery = FlorenceChannelDeliveryService(
+        store,
+        linq_client_getter=lambda: linq,
+        sendblue_client_getter=lambda: None,
+    )
+    operations = FlorenceHouseholdOperationsService(
+        store,
+        delivery_service=delivery,
+        household_chat_service_getter=lambda: _BriefingChat(),
+        now_getter=lambda: datetime(2026, 3, 24, 21, 30, tzinfo=timezone.utc),
+    )
+    monkeypatch.setattr(
+        operations,
+        "_utc_now",
+        lambda: datetime(2026, 3, 24, 21, 30, tzinfo=timezone.utc),
+    )
+
+    sent = operations.dispatch_due_household_briefings(household_id="hh_123")
+
+    skipped = store.list_pilot_events(household_id="hh_123", event_type="outbound_skipped")
+    records = [
+        record
+        for record in store.list_turn_records(household_id="hh_123")
+        if record["trigger_kind"] == "scheduled_brief"
+    ]
+    assert sent == 0
+    assert linq.sent == []
+    assert len(skipped) == 1
+    assert skipped[0].metadata["delivery_kind"] == "scheduled_brief"
+    assert skipped[0].metadata["skipped_reason"] == "heartbeat_ok"
+    assert records[0]["outcome"]["no_reply_reason"] == "heartbeat_ok"
     store.close()
 
 
@@ -2652,6 +3125,7 @@ def test_operations_skips_blocked_briefing_channel_without_composing(tmp_path, m
     sent = operations.dispatch_due_household_briefings(household_id="hh_123")
 
     updated = store.get_household_routine(morning.id)
+    skipped = store.list_pilot_events(household_id="hh_123", event_type="outbound_skipped")
     records = [
         record
         for record in store.list_turn_records(household_id="hh_123")
@@ -2661,6 +3135,9 @@ def test_operations_skips_blocked_briefing_channel_without_composing(tmp_path, m
     assert chat.calls == 0
     assert updated is not None
     assert updated.last_completed_at is not None
+    assert len(skipped) == 1
+    assert skipped[0].metadata["delivery_kind"] == "scheduled_brief"
+    assert skipped[0].metadata["skipped_reason"] == "sendblue_opted_out"
     assert len(records) == 1
     assert records[0]["disposition"] == "no_reply"
     assert records[0]["outcome"]["no_reply_reason"] == "sendblue_opted_out"
@@ -3105,6 +3582,10 @@ def test_operations_due_nudge_can_deliver_household_link_prompt_metadata(tmp_pat
     assert latest.metadata["protocol_kind"] == HOUSEHOLD_LINK_PROMPT_KIND
     assert latest.metadata["pending_action_type"] == "household_link_request"
     assert latest.metadata["pending_action_target_id"] == "linkreq_123"
+    policy_decisions = store.list_pilot_events(household_id="hh_123", event_type="constitution_policy_decision")
+    assert len(policy_decisions) == 1
+    assert policy_decisions[0].metadata["decision"] == "allowed"
+    assert policy_decisions[0].metadata["module"] == "basic_reminders"
     records = [
         record
         for record in store.list_turn_records(household_id="hh_123")
@@ -3116,6 +3597,146 @@ def test_operations_due_nudge_can_deliver_household_link_prompt_metadata(tmp_pat
     assert records[0]["envelope"]["delivery_target"]["provider_thread_id"] == "dm-thread-123"
     assert records[0]["outcome"]["scheduled_work_ids"] == ["nudge_link_123"]
     assert records[0]["outcome"]["metadata"]["message_metadata"]["protocol_kind"] == HOUSEHOLD_LINK_PROMPT_KIND
+    store.close()
+
+
+def test_operations_due_nudge_records_quiet_hours_delivery_skip(tmp_path, monkeypatch):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(Member(id="mem_123", household_id="hh_123", display_name="Maya", role=MemberRole.ADMIN))
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    manager = FlorenceHouseholdManagerService(store)
+    manager.record_preference(
+        household_id="hh_123",
+        label="Quiet hours",
+        value="Quiet hours are 9pm to 8am.",
+        category="quiet_hours",
+        recorded_by_member_id="mem_123",
+        channel_id="chan_dm_123",
+    )
+    store.upsert_household_nudge(
+        HouseholdNudge(
+            id="nudge_stuffy",
+            household_id="hh_123",
+            target_kind=HouseholdNudgeTargetKind.EVENT,
+            target_id="evt_stuffy",
+            message="Reminder: Bring a Stuffie Day Mon 05/11.",
+            status=HouseholdNudgeStatus.SCHEDULED,
+            recipient_member_id="mem_123",
+            channel_id="chan_dm_123",
+            scheduled_for="2026-05-11T13:30:00+00:00",
+        )
+    )
+    linq = _FakeLinqClient()
+    delivery = FlorenceChannelDeliveryService(
+        store,
+        linq_client_getter=lambda: linq,
+        sendblue_client_getter=lambda: None,
+    )
+    operations = FlorenceHouseholdOperationsService(
+        store,
+        delivery_service=delivery,
+        household_chat_service_getter=lambda: _StubReviewPromptChatService(),
+        now_getter=lambda: datetime(2026, 5, 11, 14, 0, tzinfo=timezone.utc),
+    )
+    monkeypatch.setattr(
+        operations,
+        "_utc_now",
+        lambda: datetime(2026, 5, 11, 14, 0, tzinfo=timezone.utc),
+    )
+
+    sent = operations.dispatch_due_household_nudges(household_id="hh_123")
+
+    assert sent == 0
+    assert linq.sent == []
+    updated = store.get_household_nudge("nudge_stuffy")
+    assert updated is not None
+    assert updated.status == HouseholdNudgeStatus.SCHEDULED
+    skipped = store.list_pilot_events(household_id="hh_123", event_type="outbound_skipped")
+    policy_decisions = store.list_pilot_events(household_id="hh_123", event_type="constitution_policy_decision")
+    assert len(skipped) == 1
+    assert skipped[0].metadata["delivery_kind"] == "scheduled_nudge"
+    assert skipped[0].metadata["skipped_reason"] == "quiet_hours"
+    assert len(policy_decisions) == 1
+    assert policy_decisions[0].metadata["decision"] == "allowed"
+    assert policy_decisions[0].metadata["module"] == "basic_reminders"
+    records = [
+        record
+        for record in store.list_turn_records(household_id="hh_123")
+        if record["trigger_kind"] == "scheduled_nudge"
+    ]
+    assert len(records) == 1
+    assert records[0]["disposition"] == "no_reply"
+    assert records[0]["outcome"]["no_reply_reason"] == "quiet_hours"
+    assert records[0]["outcome"]["scheduled_work_ids"] == ["nudge_stuffy"]
+    store.close()
+
+
+def test_operations_due_nudge_denies_unapproved_channel_by_constitution(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(Member(id="mem_123", household_id="hh_123", display_name="Maya", role=MemberRole.ADMIN))
+    store.upsert_channel(
+        Channel(
+            id="chan_web_123",
+            household_id="hh_123",
+            provider="web",
+            provider_channel_id="web-thread-123",
+            channel_type=ChannelType.WEB_CHAT,
+            title="Web test",
+        )
+    )
+    store.upsert_household_nudge(
+        HouseholdNudge(
+            id="nudge_web_denied",
+            household_id="hh_123",
+            target_kind=HouseholdNudgeTargetKind.GENERAL,
+            target_id="nudge_web_denied",
+            message="Reminder: bring the library books.",
+            status=HouseholdNudgeStatus.SCHEDULED,
+            recipient_member_id="mem_123",
+            channel_id="chan_web_123",
+            scheduled_for="2026-05-11T13:30:00+00:00",
+        )
+    )
+    linq = _FakeLinqClient()
+    delivery = FlorenceChannelDeliveryService(
+        store,
+        linq_client_getter=lambda: linq,
+        sendblue_client_getter=lambda: None,
+    )
+    operations = FlorenceHouseholdOperationsService(
+        store,
+        delivery_service=delivery,
+        household_chat_service_getter=lambda: _StubReviewPromptChatService(),
+        now_getter=lambda: datetime(2026, 5, 11, 14, 0, tzinfo=timezone.utc),
+    )
+
+    sent = operations.dispatch_due_household_nudges(household_id="hh_123")
+
+    assert sent == 0
+    assert linq.sent == []
+    updated = store.get_household_nudge("nudge_web_denied")
+    assert updated is not None
+    assert updated.status == HouseholdNudgeStatus.CANCELLED
+    skipped = store.list_pilot_events(household_id="hh_123", event_type="outbound_skipped")
+    policy_decisions = store.list_pilot_events(household_id="hh_123", event_type="constitution_policy_decision")
+    assert len(skipped) == 1
+    assert skipped[0].metadata["delivery_kind"] == "scheduled_nudge"
+    assert skipped[0].metadata["skipped_reason"] == "channel_not_allowed"
+    assert len(policy_decisions) == 1
+    assert policy_decisions[0].metadata["decision"] == "denied"
+    assert policy_decisions[0].metadata["reason"] == "channel_not_allowed"
+    assert policy_decisions[0].metadata["channel_type"] == "web_chat"
     store.close()
 
 
@@ -3211,6 +3832,7 @@ def test_operations_review_sweep_sends_proactive_prompt_for_pending_backlog(tmp_
 
     latest = FlorenceChannelLog(store).latest_assistant_message(channel_id="chan_dm_123")
     events = store.list_pilot_events(household_id="hh_123", event_type="review_prompt_sent")
+    decision_events = store.list_pilot_events(household_id="hh_123", event_type="proactive_review_decision")
     prompted = store.get_imported_candidate("cand_1002")
     assert sent == 1
     assert linq.sent
@@ -3231,6 +3853,10 @@ def test_operations_review_sweep_sends_proactive_prompt_for_pending_backlog(tmp_
     assert events[0].metadata["pending_review_count"] == 2
     assert set(events[0].metadata["candidate_ids"]) == {"cand_1001", "cand_1002"}
     assert events[0].metadata["batch_count"] == 2
+    assert events[0].metadata["surface_reasons"]
+    surfaced = [event for event in decision_events if event.metadata["decision"] == "surfaced"]
+    assert len(surfaced) == 2
+    assert {event.metadata["reason"] for event in surfaced} == {"household_temporal_high_confidence"}
     records = [
         record
         for record in store.list_turn_records(household_id="hh_123")
@@ -3323,9 +3949,13 @@ def test_operations_review_sweep_skips_weak_gmail_backlog(tmp_path):
 
     sent = operations.dispatch_due_review_sweeps(household_id="hh_123")
 
+    decision_events = store.list_pilot_events(household_id="hh_123", event_type="proactive_review_decision")
     assert sent == 0
     assert linq.sent == []
     assert chat_service.calls == []
+    assert len(decision_events) == 2
+    assert {event.metadata["decision"] for event in decision_events} == {"skipped"}
+    assert {event.metadata["reason"] for event in decision_events} == {"below_proactive_threshold"}
     store.close()
 
 
@@ -3675,6 +4305,7 @@ def test_operations_sync_update_sweep_sends_proactive_summary_for_changed_sync(t
     )
 
     events = store.list_pilot_events(household_id="hh_123", event_type="sync_update_brief_sent")
+    policy_decisions = store.list_pilot_events(household_id="hh_123", event_type="constitution_policy_decision")
     updated_connection = store.get_google_connection("gconn_123")
     assert sent == 1
     assert linq.sent == [
@@ -3687,6 +4318,9 @@ def test_operations_sync_update_sweep_sends_proactive_summary_for_changed_sync(t
     assert chat_service.calls[0]["payload"]["current_sync"]["candidate_count"] == 1
     assert len(events) == 1
     assert events[0].metadata["trigger"] == "scheduled_sync_pass"
+    assert len(policy_decisions) == 1
+    assert policy_decisions[0].metadata["decision"] == "allowed"
+    assert policy_decisions[0].metadata["module"] == "review_prompts"
     assert updated_connection is not None
     assert updated_connection.metadata["last_sync_brief_kind"] == "update"
     records = [
@@ -3702,6 +4336,101 @@ def test_operations_sync_update_sweep_sends_proactive_summary_for_changed_sync(t
     assert records[0]["outcome"]["metadata"]["brief_kind"] == "update"
     assert records[0]["outcome"]["metadata"]["trigger"] == "scheduled_sync_pass"
     assert records[0]["outcome"]["metadata"]["candidate_ids"] == ["cand_2000"]
+    store.close()
+
+
+def test_operations_sync_update_filters_suppressed_candidates_before_briefing(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    onboarding_service = FlorenceOnboardingSessionService(store)
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        display_name="Maya",
+    )
+    connection = store.upsert_google_connection(
+        GoogleConnection(
+            id="gconn_123",
+            household_id="hh_123",
+            member_id="mem_123",
+            email="parent@example.com",
+            connected_scopes=(GoogleSourceKind.GMAIL,),
+            metadata={
+                "initial_sync_activation_brief_sent_at": "2026-03-20T08:00:00+00:00",
+                "initial_sync_activation_brief_channel_id": "chan_dm_123",
+                "last_sync_brief_channel_id": "chan_dm_123",
+                "last_sync_brief_kind": "activation",
+                "last_sync_brief_snapshot": {"candidate_count": 1, "candidate_titles": ["Previous"], "candidate_ids": ["old"], "signature": "previous"},
+                "last_gmail_item_count": 3,
+                "last_calendar_item_count": 0,
+                "last_candidate_count": 1,
+            },
+        )
+    )
+    rejected = ImportedCandidate(
+        id="cand_rejected",
+        household_id="hh_123",
+        member_id="mem_123",
+        source_kind=GoogleSourceKind.GMAIL,
+        source_identifier="gmail:rejected",
+        title="Ignored weekly update",
+        summary="Routine ignored update.",
+        state=CandidateState.REJECTED,
+        metadata={"suppressed_reason": "source_rule_ignored"},
+    )
+    linq = _FakeLinqClient()
+    delivery = FlorenceChannelDeliveryService(
+        store,
+        linq_client_getter=lambda: linq,
+        sendblue_client_getter=lambda: None,
+    )
+    chat_service = _StubSyncUpdateChatService()
+    operations = FlorenceHouseholdOperationsService(
+        store,
+        delivery_service=delivery,
+        household_chat_service_getter=lambda: chat_service,
+        now_getter=lambda: _REVIEW_TEST_NOW,
+    )
+
+    sent = operations.dispatch_due_sync_update_briefs(
+        household_id="hh_123",
+        sync_results=[SimpleNamespace(connection=connection, sync_result=SimpleNamespace(candidates=[rejected]))],
+        previous_connections={},
+    )
+
+    decision_events = store.list_pilot_events(household_id="hh_123", event_type="proactive_review_decision")
+    skipped = store.list_pilot_events(household_id="hh_123", event_type="outbound_skipped")
+    policy_decisions = store.list_pilot_events(household_id="hh_123", event_type="constitution_policy_decision")
+    assert sent == 0
+    assert linq.sent == []
+    assert chat_service.calls == []
+    assert len(decision_events) == 1
+    assert decision_events[0].metadata["decision"] == "skipped"
+    assert decision_events[0].metadata["reason"] == "source_rule_ignored"
+    assert len(policy_decisions) == 1
+    assert policy_decisions[0].metadata["decision"] == "allowed"
+    assert policy_decisions[0].metadata["module"] == "review_prompts"
+    assert skipped[0].metadata["delivery_kind"] == "sync_update_brief"
+    assert skipped[0].metadata["skipped_reason"] == "sync_update_no_meaningful_content"
     store.close()
 
 
@@ -3804,6 +4533,10 @@ def test_operations_sync_update_sweep_skips_during_recent_channel_activity(tmp_p
     assert linq.sent == []
     assert chat_service.calls == []
     assert store.list_pilot_events(household_id="hh_123", event_type="sync_update_brief_sent") == []
+    skipped = store.list_pilot_events(household_id="hh_123", event_type="outbound_skipped")
+    assert len(skipped) == 1
+    assert skipped[0].metadata["delivery_kind"] == "sync_update_brief"
+    assert skipped[0].metadata["skipped_reason"] == "recent_channel_activity"
     store.close()
 
 

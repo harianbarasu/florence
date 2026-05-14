@@ -1548,7 +1548,13 @@ SCHEDULE_NUDGE_SCHEMA = {
             "recipient_member_id": {"type": "string", "description": "Optional recipient member id."},
             "recipient_member_name": {"type": "string", "description": "Optional recipient member name, e.g. 'Maya' or 'me'."},
             "channel_id": {"type": "string", "description": "Optional explicit Florence channel id."},
-            "metadata": {"type": "object", "description": "Optional structured metadata."},
+            "metadata": {
+                "type": "object",
+                "description": (
+                    "Optional structured metadata. For time-sensitive school, pickup, or leave-time nudges, include "
+                    "latest_send_at as an ISO timestamp so Florence can skip stale delivery."
+                ),
+            },
         },
         "required": ["message", "scheduled_for"],
     },

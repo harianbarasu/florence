@@ -67,6 +67,8 @@ class _FakeWebChatService:
         self.snapshot_proxy_secret = None
         self.message_auth_email = None
         self.message_proxy_secret = None
+        self.settings_auth_email = None
+        self.settings_payload = None
 
     def handle_web_chat_snapshot(self, *, auth_email, proxy_secret):
         self.snapshot_auth_email = auth_email
@@ -85,6 +87,25 @@ class _FakeWebChatService:
             status_code=200,
             content_type="application/json; charset=utf-8",
             body=json.dumps({"ok": True, "reply": "hello"}),
+        )
+
+    def handle_web_settings_snapshot(self, *, auth_email, proxy_secret):
+        self.settings_auth_email = auth_email
+        self.snapshot_proxy_secret = proxy_secret
+        return FlorenceHTTPResult(
+            status_code=200,
+            content_type="application/json; charset=utf-8",
+            body=json.dumps({"ok": True, "sourceGovernance": {"sourceRules": []}}),
+        )
+
+    def handle_web_settings_update(self, *, payload, auth_email, proxy_secret):
+        self.settings_payload = payload
+        self.settings_auth_email = auth_email
+        self.message_proxy_secret = proxy_secret
+        return FlorenceHTTPResult(
+            status_code=200,
+            content_type="application/json; charset=utf-8",
+            body=json.dumps({"ok": True, "sourceGovernance": {"sourceRules": payload.get("sourceRuleUpdates", [])}}),
         )
 
 
@@ -124,6 +145,36 @@ def test_server_routes_web_chat_get_and_post():
         assert service.payload == {"message": "hi"}
         assert service.message_auth_email == "jackson@example.com"
         assert service.message_proxy_secret == "proxy-secret"
+
+        request = urllib.request.Request(
+            f"{base_url}/v1/web/settings",
+            headers={
+                "x-florence-auth-email": "jackson@example.com",
+                "x-florence-web-secret": "proxy-secret",
+            },
+        )
+        with urllib.request.urlopen(request, timeout=2) as response:
+            assert response.status == 200
+            assert json.loads(response.read().decode("utf-8")) == {"ok": True, "sourceGovernance": {"sourceRules": []}}
+        assert service.settings_auth_email == "jackson@example.com"
+
+        request = urllib.request.Request(
+            f"{base_url}/v1/web/settings",
+            data=json.dumps({"sourceRuleUpdates": [{"id": "rule_1", "visibility": "ignored"}]}).encode("utf-8"),
+            headers={
+                "content-type": "application/json",
+                "x-florence-auth-email": "jackson@example.com",
+                "x-florence-web-secret": "proxy-secret",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=2) as response:
+            assert response.status == 200
+            assert json.loads(response.read().decode("utf-8")) == {
+                "ok": True,
+                "sourceGovernance": {"sourceRules": [{"id": "rule_1", "visibility": "ignored"}]},
+            }
+        assert service.settings_payload == {"sourceRuleUpdates": [{"id": "rule_1", "visibility": "ignored"}]}
     finally:
         httpd.shutdown()
         httpd.server_close()

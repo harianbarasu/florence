@@ -26,6 +26,8 @@ from florence.contracts import (
     HouseholdEvent,
     HouseholdProfileItem,
     HouseholdProfileKind,
+    HouseholdSourceMatcherKind,
+    HouseholdSourceVisibility,
     HouseholdRoutine,
     HouseholdRoutineStatus,
     ImportedCandidate,
@@ -39,6 +41,7 @@ from florence.runtime import FlorenceEntrypointResult, FlorenceProductionService
 
 _REVIEW_TEST_NOW = datetime(2026, 4, 29, 19, 0, tzinfo=timezone.utc)
 from florence.runtime import FlorenceHouseholdManagerService
+from florence.source_rules import build_account_source_rule
 from florence.state import FlorenceStateDB
 
 
@@ -500,6 +503,93 @@ def test_production_service_web_chat_rejects_unknown_google_identity(tmp_path):
 
     assert result.status_code == 403
     assert json.loads(result.body)["error"] == "unknown_web_google_identity"
+    store.close()
+
+
+def test_production_service_web_settings_exposes_source_governance(tmp_path):
+    settings = replace(
+        _build_settings(tmp_path),
+        web_chat=FlorenceWebChatRuntimeConfig(enabled=True, proxy_secret="test-secret"),
+    )
+    store = FlorenceStateDB(settings.server.db_path)
+    auth_email = _seed_web_chat_identity(store, email="jackson@creatorsinc.com")
+    rule = build_account_source_rule(
+        household_id="hh_web_family",
+        source_kind=GoogleSourceKind.GMAIL,
+        email="jackson@creatorsinc.com",
+        visibility=HouseholdSourceVisibility.PRIVATE,
+        created_by_member_id="mem_jackson",
+        label="jackson@creatorsinc.com",
+    )
+    assert rule is not None
+    store.upsert_household_source_rule(rule)
+    service = FlorenceProductionService(settings, store=store)
+
+    result = service.handle_web_settings_snapshot(auth_email=auth_email, proxy_secret="test-secret")
+
+    assert result.status_code == 200
+    payload = json.loads(result.body)
+    assert payload["ok"] is True
+    assert payload["household"]["id"] == "hh_web_family"
+    assert payload["member"]["id"] == "mem_jackson"
+    assert payload["sourceGovernance"]["sourceRules"][0]["id"] == rule.id
+    assert payload["sourceGovernance"]["sourceRules"][0]["visibility"] == "private"
+    account = payload["sourceGovernance"]["accounts"][0]
+    assert account["email"] == "jackson@creatorsinc.com"
+    assert account["gmailPolicy"]["matcherKind"] == HouseholdSourceMatcherKind.GMAIL_CONNECTED_ACCOUNT.value
+    store.close()
+
+
+def test_production_service_web_settings_source_rule_update_suppresses_pending_candidates(tmp_path):
+    settings = replace(
+        _build_settings(tmp_path),
+        web_chat=FlorenceWebChatRuntimeConfig(enabled=True, proxy_secret="test-secret"),
+    )
+    store = FlorenceStateDB(settings.server.db_path)
+    auth_email = _seed_web_chat_identity(store, email="jackson@creatorsinc.com")
+    rule = build_account_source_rule(
+        household_id="hh_web_family",
+        source_kind=GoogleSourceKind.GMAIL,
+        email="jackson@creatorsinc.com",
+        visibility=HouseholdSourceVisibility.PRIVATE,
+        created_by_member_id="mem_jackson",
+        label="jackson@creatorsinc.com",
+    )
+    assert rule is not None
+    store.upsert_household_source_rule(rule)
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_web_work",
+            household_id="hh_web_family",
+            member_id="mem_jackson",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:web-work",
+            title="Company Team Meeting",
+            summary="Work email that should stop resurfacing.",
+            state=CandidateState.PENDING_REVIEW,
+            metadata={
+                "connected_email": "jackson@creatorsinc.com",
+                "from_address": "Calendar Bot <calendar-bot@example.com>",
+            },
+        )
+    )
+    service = FlorenceProductionService(settings, store=store)
+
+    result = service.handle_web_settings_update(
+        payload={"sourceRuleUpdates": [{"id": rule.id, "visibility": "ignored"}]},
+        auth_email=auth_email,
+        proxy_secret="test-secret",
+    )
+
+    assert result.status_code == 200
+    payload = json.loads(result.body)
+    updated_rule = next(item for item in payload["sourceGovernance"]["sourceRules"] if item["id"] == rule.id)
+    assert updated_rule["visibility"] == "ignored"
+    candidate = store.get_imported_candidate("cand_web_work")
+    assert candidate is not None
+    assert candidate.state == CandidateState.REJECTED
+    assert candidate.metadata["source_visibility"] == "ignored"
+    assert candidate.metadata["suppressed_reason"] == "source_rule_ignored"
     store.close()
 
 
@@ -1921,6 +2011,53 @@ def test_production_service_run_automation_pass_sends_due_household_nudges_witho
     assert stored_nudge.status.value == "sent"
     assert stored_nudge.sent_at is not None
     store.close()
+
+
+def test_production_service_run_automation_pass_prioritizes_nudges_before_briefings():
+    service = object.__new__(FlorenceProductionService)
+    households = [
+        Household(id="hh_a", name="Household A", timezone="America/Los_Angeles"),
+        Household(id="hh_b", name="Household B", timezone="America/Los_Angeles"),
+    ]
+    calls = []
+    service.store = SimpleNamespace(list_households=lambda: households)
+
+    class _Manager:
+        def ensure_briefing_routines(self, *, household_id):
+            calls.append(("ensure", household_id))
+
+    class _Operations:
+        def dispatch_due_household_nudges(self, *, household_id):
+            calls.append(("nudge", household_id))
+            return 1 if household_id == "hh_b" else 0
+
+        def dispatch_due_household_briefings(self, *, household_id):
+            calls.append(("brief", household_id))
+            assert ("nudge", "hh_b") in calls
+            return 1 if household_id == "hh_a" else 0
+
+        def dispatch_due_review_sweeps(self, *, household_id):
+            calls.append(("review", household_id))
+            return 0
+
+    service.household_manager_service = _Manager()
+    service.household_operations = _Operations()
+
+    result = service.run_automation_pass()
+
+    assert result["households"] == 2
+    assert result["nudges_sent"] == 1
+    assert result["briefings_sent"] == 1
+    assert calls == [
+        ("ensure", "hh_a"),
+        ("ensure", "hh_b"),
+        ("nudge", "hh_a"),
+        ("nudge", "hh_b"),
+        ("brief", "hh_a"),
+        ("brief", "hh_b"),
+        ("review", "hh_a"),
+        ("review", "hh_b"),
+    ]
 
 
 def test_production_service_run_sync_pass_sends_due_household_briefing(tmp_path):

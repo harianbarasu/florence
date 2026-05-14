@@ -6,7 +6,7 @@ import json
 import logging
 import re
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
@@ -63,6 +63,25 @@ _BRIEFING_STALE_GRACE_MINUTES = {
     HouseholdBriefingKind.EVENING: 180,
     HouseholdBriefingKind.WEEKLY: 360,
     HouseholdBriefingKind.MEAL: 300,
+}
+_TIME_SENSITIVE_NUDGE_GRACE = timedelta(minutes=15)
+_TIME_SENSITIVE_NUDGE_RE = re.compile(
+    r"\b(school check|pickup check|drop[-\s]?off check|logistics check|before you leave|leave at)\b",
+    flags=re.IGNORECASE,
+)
+_LEAVE_AT_RE = re.compile(
+    r"\bleave(?:\s+\w+){0,4}\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b",
+    flags=re.IGNORECASE,
+)
+_LATEST_SEND_AT_METADATA_KEYS = ("latest_send_at", "expires_at", "delivery_deadline_at")
+_TIME_SENSITIVE_METADATA_VALUES = {
+    "time_sensitive",
+    "school_morning",
+    "school_morning_logistics",
+    "school_logistics",
+    "pickup_logistics",
+    "dropoff_logistics",
+    "leave_check",
 }
 
 
@@ -768,8 +787,9 @@ class FlorenceHouseholdOperationsService:
     ) -> int:
         target_store = store or self.store
         manager_service = self._manager_service(store)
+        current = self._utc_now()
         sent = 0
-        for nudge in manager_service.list_due_nudges(household_id=household_id):
+        for nudge in manager_service.list_due_nudges(household_id=household_id, now=current):
             channel = target_store.get_channel(nudge.channel_id) if nudge.channel_id else None
             if channel is None and nudge.recipient_member_id:
                 fallback_channel_id = manager_service.default_dm_channel_id(
@@ -823,6 +843,52 @@ class FlorenceHouseholdOperationsService:
                     no_reply_reason=skipped_reason,
                 )
                 continue
+            stale_reason = self._stale_scheduled_nudge_skip_reason(
+                household_id=household_id,
+                nudge=nudge,
+                current=current,
+                store=target_store,
+            )
+            if stale_reason:
+                target_store.upsert_household_nudge(
+                    replace(
+                        nudge,
+                        status=HouseholdNudgeStatus.CANCELLED,
+                        metadata={
+                            **dict(nudge.metadata),
+                            "suppressed_reason": stale_reason,
+                            "stale_checked_at": current.isoformat(),
+                        },
+                    )
+                )
+                self._record_proactive_delivery_skip(
+                    store=target_store,
+                    household_id=household_id,
+                    channel=channel,
+                    actor_member_id=nudge.recipient_member_id,
+                    delivery_kind="scheduled_nudge",
+                    skipped_reason=stale_reason,
+                    nudge_id=nudge.id,
+                    scheduled_for=nudge.scheduled_for,
+                )
+                self._record_operation_turn(
+                    store=target_store,
+                    trigger_kind=FlorenceTurnTrigger.SCHEDULED_NUDGE,
+                    household_id=household_id,
+                    channel=channel,
+                    actor_member_id=nudge.recipient_member_id,
+                    message_text="",
+                    disposition=FlorenceTurnDisposition.NO_REPLY,
+                    metadata={
+                        "operation_kind": "scheduled_nudge",
+                        "nudge_id": nudge.id,
+                        "suppressed_reason": stale_reason,
+                        "scheduled_for": nudge.scheduled_for,
+                    },
+                    scheduled_work_ids=(nudge.id,),
+                    no_reply_reason=stale_reason,
+                )
+                continue
             if self._is_household_quiet_hours(
                 household_id=household_id,
                 store=target_store,
@@ -869,7 +935,7 @@ class FlorenceHouseholdOperationsService:
                 store=target_store,
                 message_metadata=message_metadata,
             ):
-                manager_service.mark_nudge_sent(nudge_id=nudge.id)
+                manager_service.mark_nudge_sent(nudge_id=nudge.id, sent_at=current)
                 turn_metadata = {
                     "operation_kind": "scheduled_nudge",
                     "nudge_id": nudge.id,
@@ -896,6 +962,111 @@ class FlorenceHouseholdOperationsService:
                 )
                 sent += 1
         return sent
+
+    def _stale_scheduled_nudge_skip_reason(
+        self,
+        *,
+        household_id: str,
+        nudge: Any,
+        current: datetime,
+        store: FlorenceStateDB,
+    ) -> str | None:
+        metadata = dict(nudge.metadata) if isinstance(nudge.metadata, dict) else {}
+        current_utc = (
+            current.replace(tzinfo=timezone.utc)
+            if current.tzinfo is None
+            else current.astimezone(timezone.utc)
+        )
+        for key in _LATEST_SEND_AT_METADATA_KEYS:
+            latest = _parse_iso_datetime(str(metadata.get(key) or "").strip())
+            if latest is None:
+                continue
+            if latest.tzinfo is None:
+                latest = latest.replace(tzinfo=timezone.utc)
+            if current_utc >= latest.astimezone(timezone.utc):
+                return "stale_time_sensitive_nudge"
+
+        zone = self._household_zone_for_store(household_id=household_id, store=store)
+        scheduled_at = _parse_iso_datetime(nudge.scheduled_for)
+        if scheduled_at is not None and scheduled_at.tzinfo is None:
+            scheduled_at = scheduled_at.replace(tzinfo=timezone.utc)
+        current_local = current_utc.astimezone(zone)
+        scheduled_local = scheduled_at.astimezone(zone) if scheduled_at is not None else current_local
+        raw_event_date = str(metadata.get("event_local_date") or "").strip()
+        if raw_event_date:
+            try:
+                event_date = date.fromisoformat(raw_event_date)
+            except ValueError:
+                event_date = None
+            if event_date is not None and current_local.date() > event_date:
+                return "stale_time_sensitive_nudge"
+
+        if not self._nudge_is_time_sensitive(nudge, metadata):
+            return None
+
+        leave_deadline = self._message_leave_deadline_local(
+            message=str(nudge.message or ""),
+            scheduled_local=scheduled_local,
+            zone=zone,
+        )
+        if leave_deadline is not None:
+            if current_local >= leave_deadline:
+                return "stale_time_sensitive_nudge"
+            return None
+
+        if scheduled_at is not None and current_utc - scheduled_at.astimezone(timezone.utc) >= _TIME_SENSITIVE_NUDGE_GRACE:
+            return "stale_time_sensitive_nudge"
+        return None
+
+    @staticmethod
+    def _nudge_is_time_sensitive(nudge: Any, metadata: dict[str, Any]) -> bool:
+        values = {
+            str(metadata.get("timing_sensitivity") or "").strip().lower(),
+            str(metadata.get("automation_kind") or "").strip().lower(),
+            str(metadata.get("source") or "").strip().lower(),
+        }
+        if values & _TIME_SENSITIVE_METADATA_VALUES:
+            return True
+        return bool(_TIME_SENSITIVE_NUDGE_RE.search(str(nudge.message or "")))
+
+    @staticmethod
+    def _message_leave_deadline_local(
+        *,
+        message: str,
+        scheduled_local: datetime,
+        zone: ZoneInfo,
+    ) -> datetime | None:
+        match = _LEAVE_AT_RE.search(message)
+        if not match:
+            return None
+        hour = int(match.group(1))
+        minute = int(match.group(2) or 0)
+        meridiem = (match.group(3) or "").lower()
+        if meridiem == "pm" and hour < 12:
+            hour += 12
+        elif meridiem == "am" and hour == 12:
+            hour = 0
+        elif not meridiem and scheduled_local.hour >= 12 and hour < 12:
+            hour += 12
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            return None
+        return datetime(
+            scheduled_local.year,
+            scheduled_local.month,
+            scheduled_local.day,
+            hour,
+            minute,
+            tzinfo=zone,
+        )
+
+    @staticmethod
+    def _household_zone_for_store(*, household_id: str, store: FlorenceStateDB) -> ZoneInfo:
+        household = store.get_household(household_id)
+        timezone_name = getattr(household, "timezone", None) if household is not None else None
+        try:
+            return ZoneInfo(str(timezone_name or "America/Los_Angeles"))
+        except Exception:
+            return ZoneInfo("America/Los_Angeles")
 
     def _should_defer_review_nudge_for_active_conversation(
         self,
@@ -2371,7 +2542,12 @@ class FlorenceHouseholdOperationsService:
             return always_surface_reason
 
         metadata = dict(getattr(candidate, "metadata", {}) or {})
+        source_visibility = str(metadata.get("source_visibility") or "").strip().lower()
+        if source_visibility == "ignored":
+            return None
         candidate_scope = str(metadata.get("candidate_scope") or "shared_household").strip().lower()
+        if source_visibility == "private":
+            candidate_scope = "private_parent"
         raw_metadata = dict(metadata.get("raw_metadata") or {})
         temporal_evidence = dict(raw_metadata.get("temporal_evidence") or {})
         has_temporal_evidence = any(
@@ -2385,7 +2561,7 @@ class FlorenceHouseholdOperationsService:
         confidence_bps = int(getattr(candidate, "confidence_bps", 0) or 0)
         if candidate_scope == "private_parent":
             if getattr(candidate, "source_kind", None) == GoogleSourceKind.GOOGLE_CALENDAR:
-                return "private_google_calendar_candidate"
+                return None
             connection_id = str(metadata.get("google_connection_id") or "").strip()
             if connection_id:
                 connection = store.get_google_connection(connection_id)
@@ -2403,7 +2579,7 @@ class FlorenceHouseholdOperationsService:
         if getattr(candidate, "source_kind", None) == GoogleSourceKind.GOOGLE_CALENDAR:
             return "google_calendar_candidate"
 
-        if str(metadata.get("source_visibility") or "").strip().lower() == "shared":
+        if source_visibility == "shared":
             return "shared_source_rule"
 
         connection_id = str(metadata.get("google_connection_id") or "").strip()
@@ -2456,6 +2632,11 @@ class FlorenceHouseholdOperationsService:
                 )
             return relevance_skip_reason
         metadata = dict(getattr(candidate, "metadata", {}) or {})
+        source_visibility = str(metadata.get("source_visibility") or "").strip().lower()
+        if source_visibility == "ignored":
+            return "source_rule_ignored"
+        if source_visibility == "private" and getattr(candidate, "source_kind", None) == GoogleSourceKind.GOOGLE_CALENDAR:
+            return "private_calendar_source"
         connection_id = str(metadata.get("google_connection_id") or "").strip()
         if connection_id:
             connection = store.get_google_connection(connection_id)

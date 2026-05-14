@@ -200,6 +200,7 @@ class FlorenceServerRuntimeConfig:
     port: int
     public_base_url: str | None
     sync_interval_seconds: float
+    automation_interval_seconds: float = 15.0
     db_path: Path | None = None
     database_url: str | None = None
 
@@ -267,6 +268,15 @@ class FlorenceSettings:
                         default=300,
                     ),
                     300.0,
+                ),
+                automation_interval_seconds=_as_float(
+                    _env_or_config(
+                        ("FLORENCE_AUTOMATION_INTERVAL_SECONDS",),
+                        florence_cfg,
+                        "automation_interval_seconds",
+                        default=15,
+                    ),
+                    15.0,
                 ),
                 db_path=None if database_url else Path(str(db_path_raw)).expanduser(),
                 database_url=str(database_url).strip() if database_url else None,

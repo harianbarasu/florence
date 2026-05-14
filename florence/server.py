@@ -203,6 +203,14 @@ class _FlorenceRequestHandler(BaseHTTPRequestHandler):
                 )
             )
             return
+        if parsed.path == "/v1/web/settings":
+            self._write_response(
+                self._service().handle_web_settings_snapshot(
+                    auth_email=self.headers.get("x-florence-auth-email"),
+                    proxy_secret=self.headers.get("x-florence-web-secret"),
+                )
+            )
+            return
         self.send_error(404, "not_found")
 
     def do_POST(self) -> None:  # noqa: N802
@@ -261,6 +269,26 @@ class _FlorenceRequestHandler(BaseHTTPRequestHandler):
                 return
             self._write_response(
                 self._service().handle_web_chat_message(
+                    payload=payload,
+                    auth_email=self.headers.get("x-florence-auth-email"),
+                    proxy_secret=self.headers.get("x-florence-web-secret"),
+                )
+            )
+            return
+        if parsed.path == "/v1/web/settings":
+            try:
+                payload = self._parse_json_body(self._read_raw_body())
+            except ValueError as exc:
+                self._write_response(
+                    FlorenceHTTPResult(
+                        status_code=400,
+                        content_type="application/json; charset=utf-8",
+                        body=json.dumps({"ok": False, "error": str(exc)}),
+                    )
+                )
+                return
+            self._write_response(
+                self._service().handle_web_settings_update(
                     payload=payload,
                     auth_email=self.headers.get("x-florence-auth-email"),
                     proxy_secret=self.headers.get("x-florence-web-secret"),

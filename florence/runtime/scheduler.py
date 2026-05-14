@@ -19,7 +19,7 @@ class FlorenceSyncScheduler:
         service: FlorenceProductionService,
         *,
         interval_seconds: float,
-        automation_interval_seconds: float = 30.0,
+        automation_interval_seconds: float = 15.0,
     ):
         self.service = service
         self.interval_seconds = max(interval_seconds, 0.1)
@@ -83,8 +83,17 @@ class FlorenceSyncScheduler:
 
     def _run_automation_loop(self) -> None:
         while not self._stop_event.is_set():
+            started_at = time.monotonic()
             try:
                 result = self.run_automation_once()
+                duration = time.monotonic() - started_at
+                if duration > self.automation_interval_seconds:
+                    logger.warning(
+                        "Florence automation pass exceeded interval duration_seconds=%.2f interval_seconds=%.2f result=%s",
+                        duration,
+                        self.automation_interval_seconds,
+                        result,
+                    )
                 if any(value for value in result.values()):
                     logger.info("Florence automation pass complete: %s", result)
                 else:

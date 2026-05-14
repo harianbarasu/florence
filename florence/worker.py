@@ -40,9 +40,14 @@ def main() -> None:
         scheduler = FlorenceSyncScheduler(
             service,
             interval_seconds=settings.server.sync_interval_seconds,
+            automation_interval_seconds=settings.server.automation_interval_seconds,
         )
         scheduler.start()
-        logger.info("Florence worker started with interval %ss", settings.server.sync_interval_seconds)
+        logger.info(
+            "Florence worker started with sync interval %ss and automation interval %ss",
+            settings.server.sync_interval_seconds,
+            settings.server.automation_interval_seconds,
+        )
         try:
             if service.google_sync_queue.configured:
                 requeued = service.google_sync_queue.requeue_inflight_jobs()

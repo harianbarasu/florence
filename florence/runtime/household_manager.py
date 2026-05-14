@@ -837,6 +837,7 @@ class FlorenceHouseholdManagerService:
             scheduled_local = morning_local
 
         scheduled_for = scheduled_local.astimezone(timezone.utc).isoformat()
+        latest_send_at = (scheduled_local + timedelta(hours=2)).astimezone(timezone.utc).isoformat()
         message = self._school_action_reminder_message(event=event, local_start=local_start)
         nudge = self.schedule_nudge(
             household_id=household_id,
@@ -853,6 +854,7 @@ class FlorenceHouseholdManagerService:
                 "event_title": event.title,
                 "event_local_date": local_start.date().isoformat(),
                 "reminder_local_time": f"{_SCHOOL_ACTION_REMINDER_HOUR:02d}:{_SCHOOL_ACTION_REMINDER_MINUTE:02d}",
+                "latest_send_at": latest_send_at,
             },
         )
         return [nudge]

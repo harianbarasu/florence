@@ -3053,8 +3053,128 @@ def test_complete_dm_records_work_account_privacy_and_calendar_blocker_policy(tm
     assert calendar_candidate is not None
     assert email_candidate.state == CandidateState.PENDING_REVIEW
     assert email_candidate.metadata["source_visibility"] == "private"
+    assert email_candidate.metadata["candidate_scope"] == "private_parent"
     assert calendar_candidate.state == CandidateState.REJECTED
     assert calendar_candidate.metadata["suppressed_reason"] == "calendar_account_conflicts_only"
+    store.close()
+
+
+def test_complete_dm_ignore_work_emails_creates_account_rule_and_suppresses_existing_candidates(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm_thread_123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Jackson",
+        )
+    )
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_onboarding_service(store, review_service)
+    chat_service = _StubHouseholdChatService("Hermes should not handle explicit source policy.")
+    ingress = _build_ingress(
+        store,
+        onboarding_service,
+        review_service,
+        household_chat_service=chat_service,
+    )
+    _complete_hybrid_onboarding(onboarding_service)
+    store.upsert_google_connection(
+        GoogleConnection(
+            id="gconn_creators",
+            household_id="hh_123",
+            member_id="mem_123",
+            email="jackson@creatorsinc.com",
+            connected_scopes=(GoogleSourceKind.GMAIL,),
+            access_token="token-creators",
+        )
+    )
+    store.upsert_google_connection(
+        GoogleConnection(
+            id="gconn_personal",
+            household_id="hh_123",
+            member_id="mem_123",
+            email="jackson@gmail.com",
+            connected_scopes=(GoogleSourceKind.GMAIL,),
+            access_token="token-personal",
+        )
+    )
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_work_email",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:work-email",
+            title="Company Team Meeting",
+            summary="Work account email that keeps resurfacing.",
+            state=CandidateState.PENDING_REVIEW,
+            metadata={
+                "google_connection_id": "gconn_creators",
+                "connected_email": "jackson@creatorsinc.com",
+            },
+        )
+    )
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_personal_email",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:personal-email",
+            title="School reminder",
+            summary="Personal account email that should still be reviewable.",
+            state=CandidateState.PENDING_REVIEW,
+            metadata={
+                "google_connection_id": "gconn_personal",
+                "connected_email": "jackson@gmail.com",
+            },
+        )
+    )
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_ignore_work",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="Please ignore my work emails. They are too noisy for Florence.",
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert result.consumed is True
+    assert result.reply_text is not None
+    assert "ignored" in result.reply_text
+    assert chat_service.calls == []
+    ignored_rules = store.list_household_source_rules(
+        household_id="hh_123",
+        source_kind=GoogleSourceKind.GMAIL,
+        visibility=HouseholdSourceVisibility.IGNORED,
+    )
+    assert {
+        (rule.matcher_kind, rule.matcher_value)
+        for rule in ignored_rules
+    } == {
+        (HouseholdSourceMatcherKind.GMAIL_CONNECTED_ACCOUNT, "jackson@creatorsinc.com"),
+    }
+    work_candidate = store.get_imported_candidate("cand_work_email")
+    personal_candidate = store.get_imported_candidate("cand_personal_email")
+    assert work_candidate is not None
+    assert personal_candidate is not None
+    assert work_candidate.state == CandidateState.REJECTED
+    assert work_candidate.metadata["source_visibility"] == "ignored"
+    assert work_candidate.metadata["suppressed_reason"] == "source_rule_ignored"
+    assert personal_candidate.state == CandidateState.PENDING_REVIEW
+    assert "source_visibility" not in personal_candidate.metadata
     store.close()
 
 

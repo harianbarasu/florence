@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from "react";
-import { Button } from "@nous-research/ui/ui/components/button";
+import { Button } from "@/components/ui/button";
 import { Typography } from "@/components/NouiTypography";
 import { useI18n } from "@/i18n/context";
 import { LOCALE_META } from "@/i18n";
@@ -46,7 +46,7 @@ export function LanguageSwitcher() {
   return (
     <div ref={containerRef} className="relative inline-flex">
       <Button
-        ghost
+        variant="ghost"
         onClick={() => setOpen((v) => !v)}
         title={t.language.switchTo}
         aria-label={t.language.switchTo}

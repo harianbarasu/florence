@@ -1728,6 +1728,7 @@ def test_household_manager_bring_stuffy_day_gets_morning_reminder_before_school(
     assert reminder.target_id == "evt_stuffy"
     assert reminder.scheduled_for == "2026-05-11T14:00:00+00:00"
     assert reminder.metadata["source"] == "school_theme_day_default"
+    assert reminder.metadata["latest_send_at"] == "2026-05-11T16:00:00+00:00"
     assert store.get_household_nudge(reminder.id) is not None
     store.close()
 
@@ -3523,6 +3524,86 @@ def test_operations_review_nudge_surfaces_private_parent_candidate_in_parent_dm(
     store.close()
 
 
+def test_operations_review_nudge_suppresses_private_calendar_source(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Maya",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    onboarding_service = FlorenceOnboardingSessionService(store)
+    onboarding_service.record_parent_name(
+        household_id="hh_123",
+        member_id="mem_123",
+        thread_id="dm-thread-123",
+        display_name="Maya",
+    )
+    candidate = store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_private_calendar_1",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GOOGLE_CALENDAR,
+            source_identifier="google_calendar:work:event",
+            title="Company Team Meeting",
+            summary="Work calendar meeting.",
+            state=CandidateState.PENDING_REVIEW,
+            confidence_bps=9000,
+            requires_confirmation=True,
+            metadata={
+                "source_visibility": "private",
+                "candidate_scope": "private_parent",
+                "confirmation_question": "Should this go on the shared household plan?",
+                "raw_metadata": {
+                    "anchor_hits": 2,
+                    "sender_looks_school": False,
+                    "reason_tags": ["schedule_signal"],
+                    "temporal_evidence": {"date_match": {"date": "2027-06-10"}},
+                },
+            },
+        )
+    )
+    linq = _FakeLinqClient()
+    delivery = FlorenceChannelDeliveryService(
+        store,
+        linq_client_getter=lambda: linq,
+        sendblue_client_getter=lambda: None,
+    )
+    operations = FlorenceHouseholdOperationsService(
+        store,
+        delivery_service=delivery,
+        household_chat_service_getter=lambda: _StubReviewPromptChatService(),
+        now_getter=lambda: _REVIEW_TEST_NOW,
+    )
+
+    nudged = operations.nudge_for_new_pending_candidates(
+        household_id="hh_123",
+        member_id="mem_123",
+        candidates=[candidate],
+    )
+
+    assert nudged is False
+    assert linq.sent == []
+    decision_events = store.list_pilot_events(household_id="hh_123", event_type="proactive_review_decision")
+    assert decision_events[0].metadata["decision"] == "skipped"
+    assert decision_events[0].metadata["reason"] == "private_calendar_source"
+    store.close()
+
+
 def test_operations_due_nudge_can_deliver_household_link_prompt_metadata(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
@@ -3678,6 +3759,176 @@ def test_operations_due_nudge_records_quiet_hours_delivery_skip(tmp_path, monkey
     assert records[0]["disposition"] == "no_reply"
     assert records[0]["outcome"]["no_reply_reason"] == "quiet_hours"
     assert records[0]["outcome"]["scheduled_work_ids"] == ["nudge_stuffy"]
+    store.close()
+
+
+def test_operations_due_nudge_skips_stale_school_check_after_leave_time(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(Member(id="mem_123", household_id="hh_123", display_name="Maya", role=MemberRole.ADMIN))
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    store.upsert_household_nudge(
+        HouseholdNudge(
+            id="nudge_school_check",
+            household_id="hh_123",
+            target_kind=HouseholdNudgeTargetKind.EVENT,
+            target_id="evt_sports_day",
+            message="7:30 school check: Sports Day today. Anything needed for school before you leave at 7:50?",
+            status=HouseholdNudgeStatus.SCHEDULED,
+            recipient_member_id="mem_123",
+            channel_id="chan_dm_123",
+            scheduled_for="2026-05-14T14:30:00+00:00",
+        )
+    )
+    linq = _FakeLinqClient()
+    delivery = FlorenceChannelDeliveryService(
+        store,
+        linq_client_getter=lambda: linq,
+        sendblue_client_getter=lambda: None,
+    )
+    operations = FlorenceHouseholdOperationsService(
+        store,
+        delivery_service=delivery,
+        household_chat_service_getter=lambda: _StubReviewPromptChatService(),
+        now_getter=lambda: datetime(2026, 5, 14, 14, 50, tzinfo=timezone.utc),
+    )
+
+    sent = operations.dispatch_due_household_nudges(household_id="hh_123")
+
+    assert sent == 0
+    assert linq.sent == []
+    updated = store.get_household_nudge("nudge_school_check")
+    assert updated is not None
+    assert updated.status == HouseholdNudgeStatus.CANCELLED
+    assert updated.metadata["suppressed_reason"] == "stale_time_sensitive_nudge"
+    skipped = store.list_pilot_events(household_id="hh_123", event_type="outbound_skipped")
+    assert len(skipped) == 1
+    assert skipped[0].metadata["delivery_kind"] == "scheduled_nudge"
+    assert skipped[0].metadata["skipped_reason"] == "stale_time_sensitive_nudge"
+    records = [
+        record
+        for record in store.list_turn_records(household_id="hh_123")
+        if record["trigger_kind"] == "scheduled_nudge"
+    ]
+    assert len(records) == 1
+    assert records[0]["disposition"] == "no_reply"
+    assert records[0]["outcome"]["no_reply_reason"] == "stale_time_sensitive_nudge"
+    assert records[0]["outcome"]["scheduled_work_ids"] == ["nudge_school_check"]
+    store.close()
+
+
+def test_operations_due_nudge_sends_late_school_check_before_leave_time(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(Member(id="mem_123", household_id="hh_123", display_name="Maya", role=MemberRole.ADMIN))
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    store.upsert_household_nudge(
+        HouseholdNudge(
+            id="nudge_school_check",
+            household_id="hh_123",
+            target_kind=HouseholdNudgeTargetKind.EVENT,
+            target_id="evt_sports_day",
+            message="7:30 school check: Sports Day today. Anything needed for school before you leave at 7:50?",
+            status=HouseholdNudgeStatus.SCHEDULED,
+            recipient_member_id="mem_123",
+            channel_id="chan_dm_123",
+            scheduled_for="2026-05-14T14:30:00+00:00",
+        )
+    )
+    linq = _FakeLinqClient()
+    delivery = FlorenceChannelDeliveryService(
+        store,
+        linq_client_getter=lambda: linq,
+        sendblue_client_getter=lambda: None,
+    )
+    operations = FlorenceHouseholdOperationsService(
+        store,
+        delivery_service=delivery,
+        household_chat_service_getter=lambda: _StubReviewPromptChatService(),
+        now_getter=lambda: datetime(2026, 5, 14, 14, 46, tzinfo=timezone.utc),
+    )
+
+    sent = operations.dispatch_due_household_nudges(household_id="hh_123")
+
+    assert sent == 1
+    assert linq.sent == [
+        {
+            "chat_id": "dm-thread-123",
+            "message": "7:30 school check: Sports Day today. Anything needed for school before you leave at 7:50?",
+        }
+    ]
+    updated = store.get_household_nudge("nudge_school_check")
+    assert updated is not None
+    assert updated.status == HouseholdNudgeStatus.SENT
+    store.close()
+
+
+def test_operations_due_nudge_skips_expired_latest_send_at_metadata(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    store.upsert_member(Member(id="mem_123", household_id="hh_123", display_name="Maya", role=MemberRole.ADMIN))
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Maya",
+        )
+    )
+    store.upsert_household_nudge(
+        HouseholdNudge(
+            id="nudge_latest_send",
+            household_id="hh_123",
+            target_kind=HouseholdNudgeTargetKind.GENERAL,
+            message="Check whether the sports-day shirt made it into the backpack.",
+            status=HouseholdNudgeStatus.SCHEDULED,
+            recipient_member_id="mem_123",
+            channel_id="chan_dm_123",
+            scheduled_for="2026-05-14T14:30:00+00:00",
+            metadata={"latest_send_at": "2026-05-14T14:45:00+00:00"},
+        )
+    )
+    linq = _FakeLinqClient()
+    delivery = FlorenceChannelDeliveryService(
+        store,
+        linq_client_getter=lambda: linq,
+        sendblue_client_getter=lambda: None,
+    )
+    operations = FlorenceHouseholdOperationsService(
+        store,
+        delivery_service=delivery,
+        household_chat_service_getter=lambda: _StubReviewPromptChatService(),
+        now_getter=lambda: datetime(2026, 5, 14, 14, 50, tzinfo=timezone.utc),
+    )
+
+    sent = operations.dispatch_due_household_nudges(household_id="hh_123")
+
+    assert sent == 0
+    assert linq.sent == []
+    updated = store.get_household_nudge("nudge_latest_send")
+    assert updated is not None
+    assert updated.status == HouseholdNudgeStatus.CANCELLED
+    assert updated.metadata["suppressed_reason"] == "stale_time_sensitive_nudge"
     store.close()
 
 

@@ -48,9 +48,10 @@ class FlorenceSourcePolicyProtocol:
         normalized = _normalize_policy_text(text)
         if not normalized:
             return None
+        email_ignore = _wants_email_ignore(normalized)
         email_private = _wants_email_private(normalized)
         calendar_blockers = _wants_calendar_blockers(normalized)
-        if not email_private and not calendar_blockers:
+        if not email_ignore and not email_private and not calendar_blockers:
             return None
 
         connections = [
@@ -66,7 +67,7 @@ class FlorenceSourcePolicyProtocol:
             for connection in connections
             if _connection_matches_text(connection, normalized)
         ]
-        if not matched_connections and "work account" in normalized:
+        if not matched_connections and _matches_work_account_reference(normalized):
             matched_connections = [
                 connection
                 for connection in connections
@@ -76,23 +77,32 @@ class FlorenceSourcePolicyProtocol:
             return None
 
         private_email_accounts: list[str] = []
+        ignored_email_accounts: list[str] = []
         blocker_calendar_accounts: list[str] = []
+        email_visibility = (
+            HouseholdSourceVisibility.IGNORED
+            if email_ignore
+            else HouseholdSourceVisibility.PRIVATE
+        )
         for connection in matched_connections:
-            if email_private and GoogleSourceKind.GMAIL in connection.connected_scopes:
+            if (email_ignore or email_private) and GoogleSourceKind.GMAIL in connection.connected_scopes:
                 self._record_account_rule(
                     household_id=household_id,
                     member_id=member_id,
                     channel_id=channel_id,
                     connection=connection,
                     source_kind=GoogleSourceKind.GMAIL,
-                    visibility=HouseholdSourceVisibility.PRIVATE,
+                    visibility=email_visibility,
                 )
                 self._apply_existing_candidate_account_policy(
                     connection=connection,
                     source_kind=GoogleSourceKind.GMAIL,
-                    visibility=HouseholdSourceVisibility.PRIVATE,
+                    visibility=email_visibility,
                 )
-                private_email_accounts.append(connection.email)
+                if email_visibility == HouseholdSourceVisibility.IGNORED:
+                    ignored_email_accounts.append(connection.email)
+                else:
+                    private_email_accounts.append(connection.email)
             if calendar_blockers and GoogleSourceKind.GOOGLE_CALENDAR in connection.connected_scopes:
                 self._record_account_rule(
                     household_id=household_id,
@@ -101,14 +111,20 @@ class FlorenceSourcePolicyProtocol:
                     connection=connection,
                     source_kind=GoogleSourceKind.GOOGLE_CALENDAR,
                     visibility=HouseholdSourceVisibility.PRIVATE,
+                    rule_metadata={
+                        "calendar_usage_mode": "conflicts_only",
+                        "calendar_detail_visibility": "busy_only",
+                    },
                 )
                 self._set_calendar_blocker_preferences(connection)
                 self._suppress_existing_calendar_candidates(connection=connection)
                 blocker_calendar_accounts.append(connection.email)
 
-        if not private_email_accounts and not blocker_calendar_accounts:
+        if not private_email_accounts and not ignored_email_accounts and not blocker_calendar_accounts:
             return None
         reply_bits = []
+        if ignored_email_accounts:
+            reply_bits.append(f"email from {_account_list(ignored_email_accounts)} ignored")
         if private_email_accounts:
             reply_bits.append(f"email from {_account_list(private_email_accounts)} private to this Florence thread")
         if blocker_calendar_accounts:
@@ -117,6 +133,7 @@ class FlorenceSourcePolicyProtocol:
             reply_text=f"Got it. I’ll keep {' and '.join(reply_bits)}.",
             reply_metadata={
                 "source_policy_kind": "google_account_policy",
+                "ignored_email_accounts": ignored_email_accounts,
                 "private_email_accounts": private_email_accounts,
                 "blocker_calendar_accounts": blocker_calendar_accounts,
             },
@@ -132,6 +149,7 @@ class FlorenceSourcePolicyProtocol:
         connection: GoogleConnection,
         source_kind: GoogleSourceKind,
         visibility: HouseholdSourceVisibility,
+        rule_metadata: dict[str, object] | None = None,
     ) -> None:
         rule = build_account_source_rule(
             household_id=household_id,
@@ -144,6 +162,7 @@ class FlorenceSourcePolicyProtocol:
                 "google_connection_id": connection.id,
                 "channel_id": channel_id,
                 "created_from": "explicit_parent_account_policy",
+                **(rule_metadata or {}),
             },
         )
         if rule is not None:
@@ -177,6 +196,18 @@ class FlorenceSourcePolicyProtocol:
             if rule is not None:
                 metadata["source_rule_id"] = rule.id
                 metadata["source_rule_label"] = rule.label
+            if visibility == HouseholdSourceVisibility.PRIVATE:
+                metadata["candidate_scope"] = "private_parent"
+                self.store.upsert_imported_candidate(replace(candidate, metadata=metadata))
+                continue
+            if visibility == HouseholdSourceVisibility.IGNORED:
+                metadata["suppressed_reason"] = "source_rule_ignored"
+                if rule is not None:
+                    metadata["suppressed_by_source_rule_id"] = rule.id
+                self.store.upsert_imported_candidate(
+                    replace(candidate, state=CandidateState.REJECTED, metadata=metadata)
+                )
+                continue
             self.store.upsert_imported_candidate(replace(candidate, metadata=metadata))
 
     def _set_calendar_blocker_preferences(self, connection: GoogleConnection) -> None:
@@ -224,6 +255,29 @@ def _wants_email_private(text: str) -> bool:
     )
 
 
+def _wants_email_ignore(text: str) -> bool:
+    if not ("email" in text or "mail" in text or "inbox" in text or "account" in text):
+        return False
+    return any(
+        phrase in text
+        for phrase in (
+            "ignore",
+            "stop sending",
+            "stop surfacing",
+            "stop flagging",
+            "dont surface",
+            "do not surface",
+            "dont flag",
+            "do not flag",
+            "never flag",
+            "never surface",
+            "no need to review",
+            "dont ask",
+            "do not ask",
+        )
+    )
+
+
 def _wants_calendar_blockers(text: str) -> bool:
     if "calendar" not in text:
         return False
@@ -242,6 +296,12 @@ def _wants_calendar_blockers(text: str) -> bool:
             "do not share",
         )
     )
+
+
+def _matches_work_account_reference(text: str) -> bool:
+    if "work account" in text or "work accounts" in text:
+        return True
+    return "work" in text and any(term in text for term in ("email", "emails", "mail", "inbox"))
 
 
 def _email_domain(email: str | None) -> str:

@@ -16,12 +16,18 @@ from urllib.parse import urlencode
 
 from florence.config import FlorenceSettings
 from florence.contracts import (
+    CandidateState,
     Channel,
     ChannelMessage,
     ChannelMessageRole,
     ChannelType,
+    GoogleConnection,
+    GoogleSourceKind,
     Household,
     HouseholdStatus,
+    HouseholdSourceMatcherKind,
+    HouseholdSourceRule,
+    HouseholdSourceVisibility,
     Member,
 )
 from florence.linq import FlorenceLinqClient
@@ -109,6 +115,43 @@ def _webhook_payload_summary(provider: str, payload: dict[str, Any]) -> dict[str
 def _stable_web_id(prefix: str, *parts: str) -> str:
     digest = hashlib.sha256(":".join(parts).encode("utf-8")).hexdigest()[:20]
     return f"{prefix}_{digest}"
+
+
+def _clean_optional_text(value: Any) -> str | None:
+    text = " ".join(str(value or "").split()).strip()
+    return text or None
+
+
+def _parse_source_visibility(value: Any) -> HouseholdSourceVisibility | None:
+    text = _clean_optional_text(value)
+    if text is None:
+        return None
+    try:
+        return HouseholdSourceVisibility(text.lower())
+    except ValueError:
+        return None
+
+
+def _account_source_rule_for_connection(
+    *,
+    connection: GoogleConnection,
+    source_kind: GoogleSourceKind,
+    source_rules: list[HouseholdSourceRule],
+) -> HouseholdSourceRule | None:
+    matcher_kind = (
+        HouseholdSourceMatcherKind.GMAIL_CONNECTED_ACCOUNT
+        if source_kind == GoogleSourceKind.GMAIL
+        else HouseholdSourceMatcherKind.GOOGLE_CALENDAR_CONNECTED_ACCOUNT
+    )
+    email = str(connection.email or "").strip().lower()
+    for rule in source_rules:
+        if (
+            rule.source_kind == source_kind
+            and rule.matcher_kind == matcher_kind
+            and rule.matcher_value == email
+        ):
+            return rule
+    return None
 
 
 class _StaleGoogleSyncJobError(RuntimeError):
@@ -289,6 +332,66 @@ class FlorenceProductionService:
             logger.exception("Florence web chat turn failed")
             return self._json_result(500, {"ok": False, "error": "internal_web_chat_error"})
 
+    def handle_web_settings_snapshot(
+        self,
+        *,
+        auth_email: str | None = None,
+        proxy_secret: str | None = None,
+    ) -> FlorenceHTTPResult:
+        access_error = self._authorize_web_chat_request(auth_email=auth_email, proxy_secret=proxy_secret)
+        if access_error is not None:
+            return access_error
+        try:
+            household, member, _channel = self._ensure_web_chat_context(auth_email=auth_email)
+            return self._json_result(200, self._web_settings_payload(household=household, member=member))
+        except PermissionError as exc:
+            return self._json_result(403, {"ok": False, "error": str(exc)})
+        except ValueError as exc:
+            return self._json_result(400, {"ok": False, "error": str(exc)})
+        except Exception:
+            logger.exception("Florence web settings snapshot failed")
+            return self._json_result(500, {"ok": False, "error": "internal_web_settings_error"})
+
+    def handle_web_settings_update(
+        self,
+        *,
+        payload: dict[str, Any],
+        auth_email: str | None = None,
+        proxy_secret: str | None = None,
+    ) -> FlorenceHTTPResult:
+        access_error = self._authorize_web_chat_request(auth_email=auth_email, proxy_secret=proxy_secret)
+        if access_error is not None:
+            return access_error
+        try:
+            household, member, _channel = self._ensure_web_chat_context(auth_email=auth_email)
+            household_name = _clean_optional_text(payload.get("householdName"))
+            timezone_name = _clean_optional_text(payload.get("timezone"))
+            member_display_name = _clean_optional_text(payload.get("memberDisplayName"))
+            if household_name or timezone_name:
+                household = self.store.upsert_household(
+                    replace(
+                        household,
+                        name=household_name or household.name,
+                        timezone=timezone_name or household.timezone,
+                    )
+                )
+            if member_display_name:
+                member = self.store.upsert_member(replace(member, display_name=member_display_name))
+
+            self._apply_web_source_rule_updates(
+                household_id=household.id,
+                member_id=member.id,
+                updates=payload.get("sourceRuleUpdates"),
+            )
+            return self._json_result(200, self._web_settings_payload(household=household, member=member))
+        except PermissionError as exc:
+            return self._json_result(403, {"ok": False, "error": str(exc)})
+        except ValueError as exc:
+            return self._json_result(400, {"ok": False, "error": str(exc)})
+        except Exception:
+            logger.exception("Florence web settings update failed")
+            return self._json_result(500, {"ok": False, "error": "internal_web_settings_error"})
+
     def _authorize_web_chat_request(
         self,
         *,
@@ -465,6 +568,135 @@ class FlorenceProductionService:
         if reply is not None:
             payload["reply"] = reply
         return payload
+
+    def _web_settings_payload(self, *, household: Household, member: Member) -> dict[str, Any]:
+        source_rules = self.store.list_household_source_rules(household_id=household.id)
+        connections = self.store.list_google_connections(household_id=household.id, active_only=True)
+        return {
+            "ok": True,
+            "household": {
+                "id": household.id,
+                "name": household.name,
+                "timezone": household.timezone,
+                "settings": household.settings,
+            },
+            "member": {
+                "id": member.id,
+                "householdId": member.household_id,
+                "displayName": member.display_name,
+                "role": member.role.value,
+                "metadata": {},
+            },
+            "managerProfile": {},
+            "sourceGovernance": {
+                "sourceRules": [self._source_rule_payload(rule) for rule in source_rules],
+                "accounts": [
+                    self._google_connection_source_policy_payload(
+                        connection=connection,
+                        source_rules=source_rules,
+                    )
+                    for connection in connections
+                ],
+            },
+        }
+
+    @staticmethod
+    def _source_rule_payload(rule: HouseholdSourceRule) -> dict[str, Any]:
+        return {
+            "id": rule.id,
+            "householdId": rule.household_id,
+            "sourceKind": rule.source_kind.value,
+            "matcherKind": rule.matcher_kind.value,
+            "matcherValue": rule.matcher_value,
+            "visibility": rule.visibility.value,
+            "label": rule.label,
+            "createdByMemberId": rule.created_by_member_id,
+            "metadata": rule.metadata,
+        }
+
+    def _google_connection_source_policy_payload(
+        self,
+        *,
+        connection: GoogleConnection,
+        source_rules: list[HouseholdSourceRule],
+    ) -> dict[str, Any]:
+        metadata = dict(connection.metadata) if isinstance(connection.metadata, dict) else {}
+        gmail_rule = _account_source_rule_for_connection(
+            connection=connection,
+            source_kind=GoogleSourceKind.GMAIL,
+            source_rules=source_rules,
+        )
+        calendar_rule = _account_source_rule_for_connection(
+            connection=connection,
+            source_kind=GoogleSourceKind.GOOGLE_CALENDAR,
+            source_rules=source_rules,
+        )
+        return {
+            "connectionId": connection.id,
+            "householdId": connection.household_id,
+            "memberId": connection.member_id,
+            "email": connection.email,
+            "connectedScopes": [scope.value for scope in connection.connected_scopes],
+            "active": connection.active,
+            "gmailPolicy": self._source_rule_payload(gmail_rule) if gmail_rule is not None else None,
+            "calendarPolicy": self._source_rule_payload(calendar_rule) if calendar_rule is not None else None,
+            "calendarPreferences": metadata.get("calendar_preferences") if isinstance(metadata.get("calendar_preferences"), dict) else {},
+        }
+
+    def _apply_web_source_rule_updates(
+        self,
+        *,
+        household_id: str,
+        member_id: str,
+        updates: Any,
+    ) -> None:
+        if updates is None:
+            return
+        if not isinstance(updates, list):
+            raise ValueError("sourceRuleUpdates_must_be_list")
+        existing_rules = {
+            rule.id: rule
+            for rule in self.store.list_household_source_rules(household_id=household_id)
+        }
+        for raw_update in updates:
+            if not isinstance(raw_update, dict):
+                raise ValueError("sourceRuleUpdate_must_be_object")
+            rule_id = _clean_optional_text(raw_update.get("id"))
+            visibility = _parse_source_visibility(raw_update.get("visibility"))
+            if not rule_id or visibility is None:
+                raise ValueError("sourceRuleUpdate_requires_id_and_visibility")
+            rule = existing_rules.get(rule_id)
+            if rule is None:
+                raise ValueError("unknown_source_rule")
+            metadata = dict(rule.metadata) if isinstance(rule.metadata, dict) else {}
+            metadata["updated_from"] = "web_settings"
+            metadata["updated_by_member_id"] = member_id
+            updated_rule = self.store.upsert_household_source_rule(
+                replace(rule, visibility=visibility, created_by_member_id=member_id, metadata=metadata)
+            )
+            existing_rules[updated_rule.id] = updated_rule
+            self._apply_source_policy_to_existing_pending_candidates(
+                household_id=household_id,
+                source_kind=updated_rule.source_kind,
+            )
+
+    def _apply_source_policy_to_existing_pending_candidates(
+        self,
+        *,
+        household_id: str,
+        source_kind: GoogleSourceKind,
+    ) -> None:
+        for household_member in self.store.list_members(household_id):
+            for candidate in self.store.list_imported_candidates(
+                household_id=household_id,
+                member_id=household_member.id,
+                state=CandidateState.PENDING_REVIEW,
+            ):
+                if candidate.source_kind != source_kind:
+                    continue
+                updated = self.candidate_review_service.source_rule_service.apply_candidate_policy(candidate)
+                if updated != candidate:
+                    self.store.upsert_imported_candidate(updated)
 
     def _build_household_calendar_link_message(self, *, calendar_web_url: str) -> str:
         return (
@@ -949,6 +1181,7 @@ class FlorenceProductionService:
 
     def run_automation_pass(self) -> dict[str, int]:
         households = self.store.list_households()
+        touched_household_ids: set[str] = set()
         counters = {
             "households": 0,
             "review_sweeps": 0,
@@ -957,23 +1190,30 @@ class FlorenceProductionService:
             "nudges": 0,
         }
         for household in households:
-            household_touched = False
             self.household_manager_service.ensure_briefing_routines(household_id=household.id)
+
+        # Exact scheduled reminders are the time-critical path. Run all due
+        # nudges before any Hermes-composed briefings or review sweeps so one
+        # slow household cannot make another household's leave-time check late.
+        for household in households:
             sent_nudges = self.household_operations.dispatch_due_household_nudges(household_id=household.id)
             counters["nudges_sent"] += sent_nudges
             counters["nudges"] += sent_nudges
             if sent_nudges:
-                household_touched = True
+                touched_household_ids.add(household.id)
+
+        for household in households:
             sent_briefings = self.household_operations.dispatch_due_household_briefings(household_id=household.id)
             counters["briefings_sent"] += sent_briefings
             if sent_briefings:
-                household_touched = True
+                touched_household_ids.add(household.id)
+
+        for household in households:
             sent_review_sweeps = self.household_operations.dispatch_due_review_sweeps(household_id=household.id)
             counters["review_sweeps"] += sent_review_sweeps
             if sent_review_sweeps:
-                household_touched = True
-            if household_touched:
-                counters["households"] += 1
+                touched_household_ids.add(household.id)
+        counters["households"] = len(touched_household_ids)
         return counters
 
     def _handle_webhook(

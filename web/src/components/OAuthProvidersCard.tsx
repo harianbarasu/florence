@@ -9,9 +9,7 @@ import {
   LogIn,
 } from "lucide-react";
 import { api, type OAuthProvider } from "@/lib/api";
-import { Button } from "@nous-research/ui/ui/components/button";
-import { CopyButton } from "@nous-research/ui/ui/components/command-block";
-import { Spinner } from "@nous-research/ui/ui/components/spinner";
+import { Button } from "@/components/ui/button";
 import {
   Card,
   CardContent,
@@ -19,7 +17,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { Badge } from "@nous-research/ui/ui/components/badge";
+import { Badge } from "@/components/ui/badge";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { OAuthLoginModal } from "@/components/OAuthLoginModal";
 import { useI18n } from "@/i18n";
@@ -49,6 +47,35 @@ function formatExpiresAt(
   } catch {
     return null;
   }
+}
+
+function Spinner({ className = "" }: { className?: string }) {
+  return <RefreshCw className={`h-4 w-4 animate-spin ${className}`} />;
+}
+
+function CopyButton({
+  text,
+  label,
+  copiedLabel,
+}: {
+  text: string;
+  label: string;
+  copiedLabel: string;
+}) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <Button
+      size="sm"
+      variant="outline"
+      onClick={async () => {
+        await navigator.clipboard.writeText(text);
+        setCopied(true);
+        window.setTimeout(() => setCopied(false), 1600);
+      }}
+    >
+      {copied ? copiedLabel : label}
+    </Button>
+  );
 }
 
 export function OAuthProvidersCard({ onError, onSuccess }: Props) {
@@ -106,11 +133,11 @@ export function OAuthProvidersCard({ onError, onSuccess }: Props) {
           </div>
           <Button
             size="sm"
-            outlined
+            variant="outline"
             onClick={refresh}
             disabled={loading}
-            prefix={loading ? <Spinner /> : <RefreshCw />}
           >
+            {loading ? <Spinner /> : <RefreshCw className="h-4 w-4" />}
             {t.common.refresh}
           </Button>
         </div>
@@ -153,23 +180,23 @@ export function OAuthProvidersCard({ onError, onSuccess }: Props) {
                     <div className="flex items-center gap-2 flex-wrap">
                       <span className="font-medium text-sm">{p.name}</span>
                       <Badge
-                        tone="outline"
+                        variant="outline"
                         className="text-[11px] uppercase tracking-wide"
                       >
                         {t.oauth.flowLabels[p.flow]}
                       </Badge>
                       {p.status.logged_in && (
-                        <Badge tone="success" className="text-[11px]">
+                        <Badge variant="success" className="text-[11px]">
                           {t.oauth.connected}
                         </Badge>
                       )}
                       {expiresLabel === "expired" && (
-                        <Badge tone="destructive" className="text-[11px]">
+                        <Badge variant="destructive" className="text-[11px]">
                           {t.oauth.expired}
                         </Badge>
                       )}
                       {expiresLabel && expiresLabel !== "expired" && (
-                        <Badge tone="outline" className="text-[11px]">
+                        <Badge variant="outline" className="text-[11px]">
                           {expiresLabel}
                         </Badge>
                       )}
@@ -212,7 +239,7 @@ export function OAuthProvidersCard({ onError, onSuccess }: Props) {
                       className="inline-flex"
                       title={`Open ${p.name} docs`}
                     >
-                      <Button ghost size="icon">
+                      <Button variant="ghost" size="icon">
                         <ExternalLink />
                       </Button>
                     </a>
@@ -221,8 +248,8 @@ export function OAuthProvidersCard({ onError, onSuccess }: Props) {
                     <Button
                       size="sm"
                       onClick={() => setLoginFor(p)}
-                      prefix={<LogIn />}
                     >
+                      <LogIn className="h-4 w-4" />
                       {t.oauth.login}
                     </Button>
                   )}
@@ -236,11 +263,11 @@ export function OAuthProvidersCard({ onError, onSuccess }: Props) {
                   {p.status.logged_in && p.flow !== "external" && (
                     <Button
                       size="sm"
-                      outlined
+                      variant="outline"
                       onClick={() => setDisconnectTarget(p)}
                       disabled={isBusy}
-                      prefix={isBusy ? <Spinner /> : <LogOut />}
                     >
+                      {isBusy ? <Spinner /> : <LogOut className="h-4 w-4" />}
                       {t.oauth.disconnect}
                     </Button>
                   )}

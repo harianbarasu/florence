@@ -535,9 +535,52 @@ def test_account_level_source_rule_keeps_future_work_email_candidates_private(tm
     updated = review_service.source_rule_service.apply_candidate_policy(candidate)
 
     assert updated.metadata["source_visibility"] == "private"
+    assert updated.metadata["candidate_scope"] == "private_parent"
     assert updated.metadata["source_rule_id"] == rule.id
     assert updated.metadata["source_rule_label"] == "jackson@creatorsinc.com"
     assert rule.matcher_kind == HouseholdSourceMatcherKind.GMAIL_CONNECTED_ACCOUNT
+    store.close()
+
+
+def test_account_level_calendar_blocker_rule_suppresses_future_calendar_candidates(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    rule = build_account_source_rule(
+        household_id="hh_123",
+        source_kind=GoogleSourceKind.GOOGLE_CALENDAR,
+        email="jackson@creatorsinc.com",
+        visibility=HouseholdSourceVisibility.PRIVATE,
+        created_by_member_id="mem_123",
+        label="jackson@creatorsinc.com",
+        metadata={
+            "calendar_usage_mode": "conflicts_only",
+            "calendar_detail_visibility": "busy_only",
+        },
+    )
+    assert rule is not None
+    store.upsert_household_source_rule(rule)
+    candidate = ImportedCandidate(
+        id="cand_work_calendar",
+        household_id="hh_123",
+        member_id="mem_123",
+        source_kind=GoogleSourceKind.GOOGLE_CALENDAR,
+        source_identifier="google_calendar:creators:event",
+        title="Company Team Meeting",
+        summary="Work calendar meeting.",
+        state=CandidateState.PENDING_REVIEW,
+        metadata={
+            "connected_email": "jackson@creatorsinc.com",
+            "calendar_summary": "CreatorsInc",
+        },
+    )
+
+    updated = review_service.source_rule_service.apply_candidate_policy(candidate)
+
+    assert updated.state == CandidateState.REJECTED
+    assert updated.metadata["source_visibility"] == "private"
+    assert updated.metadata["candidate_scope"] == "private_parent"
+    assert updated.metadata["suppressed_reason"] == "calendar_account_conflicts_only"
+    assert updated.metadata["suppressed_by_source_rule_id"] == rule.id
     store.close()
 
 

@@ -37,7 +37,7 @@ async function forwardRequest(
   }
 
   const session = await auth();
-  if (joinedPath === "chat" && !session?.user?.email) {
+  if ((joinedPath === "chat" || joinedPath === "settings") && !session?.user?.email) {
     return Response.json({ ok: false, error: "web_chat_auth_required" }, { status: 401 });
   }
 
@@ -55,7 +55,7 @@ async function forwardRequest(
   if (session?.user?.email) {
     headers.set("x-florence-auth-email", session.user.email);
   }
-  if (joinedPath === "chat") {
+  if (joinedPath === "chat" || joinedPath === "settings") {
     const secret = webChatProxySecret();
     if (!secret) {
       return Response.json({ ok: false, error: "missing_web_chat_proxy_secret" }, { status: 500 });

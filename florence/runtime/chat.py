@@ -102,6 +102,7 @@ _OPERATOR_MINI_PLAYBOOK_LINES = (
     "Mini-playbook: email triage -> suppress stale, already-handled, duplicate, and noisy items; surface only actionable household items.",
     "Multimodal polish: inspect every image in multi-image turns; do not stop after the first readable photo.",
     "School image polish: extract date, child, prep item, and reminder timing before claiming Florence added it.",
+    "Reminder timing polish: for school, pickup, leave-time, or other time-sensitive nudges, include latest_send_at in household_schedule_nudge metadata so Florence skips stale sends instead of interrupting late.",
     "Calendar image date polish: rank visible source image and explicit parent correction above extracted_text summaries; do not invent OCR date-conversion explanations.",
     "Recipe image polish: consolidate one grouped grocery list, remove duplicates, and preserve amounts when visible.",
 )

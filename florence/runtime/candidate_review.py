@@ -76,6 +76,14 @@ _FINANCIAL_RECORD_HINTS = frozenset(
 )
 
 
+def _rule_is_calendar_conflicts_only(rule: HouseholdSourceRule) -> bool:
+    metadata = dict(rule.metadata) if isinstance(rule.metadata, dict) else {}
+    return (
+        str(metadata.get("calendar_usage_mode") or "").strip().lower() == "conflicts_only"
+        or str(metadata.get("calendar_detail_visibility") or "").strip().lower() == "busy_only"
+    )
+
+
 def _candidate_scope(candidate: ImportedCandidate) -> str:
     metadata = dict(candidate.metadata) if isinstance(candidate.metadata, dict) else {}
     if str(metadata.get("source_visibility") or "").strip().lower() == HouseholdSourceVisibility.PRIVATE.value:
@@ -128,6 +136,15 @@ class _SourceRuleService:
                 metadata["suppressed_reason"] = "source_rule_ignored"
                 metadata["suppressed_by_source_rule_id"] = matched_rule.id
                 return replace(candidate, state=CandidateState.REJECTED, metadata=metadata)
+            if matched_rule.visibility == HouseholdSourceVisibility.PRIVATE:
+                metadata["candidate_scope"] = _PRIVATE_CANDIDATE_SCOPE
+                if (
+                    candidate.source_kind == GoogleSourceKind.GOOGLE_CALENDAR
+                    and _rule_is_calendar_conflicts_only(matched_rule)
+                ):
+                    metadata["suppressed_reason"] = "calendar_account_conflicts_only"
+                    metadata["suppressed_by_source_rule_id"] = matched_rule.id
+                    return replace(candidate, state=CandidateState.REJECTED, metadata=metadata)
             return replace(candidate, metadata=metadata)
         metadata.pop("source_rule_prompt", None)
         return replace(candidate, metadata=metadata)
@@ -155,6 +172,8 @@ class _SourceRuleService:
         metadata["source_rule_ids"] = [rule.id for rule in rules]
         metadata["source_rule_label"] = self.describe_candidate_source(candidate) or metadata.get("source_rule_label")
         metadata.pop("source_rule_prompt", None)
+        if visibility == HouseholdSourceVisibility.PRIVATE:
+            metadata["candidate_scope"] = _PRIVATE_CANDIDATE_SCOPE
         updated = replace(candidate, metadata=metadata)
         self.store.upsert_imported_candidate(updated)
         return updated

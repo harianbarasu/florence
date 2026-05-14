@@ -216,6 +216,34 @@ export type FlorenceSettingsResponse = {
   household: FlorenceSetupResponse["household"];
   member: FlorenceSetupResponse["member"];
   managerProfile: Record<string, unknown>;
+  sourceGovernance?: {
+    sourceRules: FlorenceSourceRule[];
+    accounts: FlorenceSourceAccountPolicy[];
+  };
+};
+
+export type FlorenceSourceRule = {
+  id: string;
+  householdId: string;
+  sourceKind: string;
+  matcherKind: string;
+  matcherValue: string;
+  visibility: "shared" | "private" | "ignored";
+  label: string | null;
+  createdByMemberId: string | null;
+  metadata: Record<string, unknown>;
+};
+
+export type FlorenceSourceAccountPolicy = {
+  connectionId: string;
+  householdId: string;
+  memberId: string;
+  email: string;
+  connectedScopes: string[];
+  active: boolean;
+  gmailPolicy: FlorenceSourceRule | null;
+  calendarPolicy: FlorenceSourceRule | null;
+  calendarPreferences: Record<string, unknown>;
 };
 
 export type FlorenceConnectUrlResponse = {

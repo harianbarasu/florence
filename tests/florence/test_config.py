@@ -66,6 +66,19 @@ def test_florence_settings_default_http_port_is_railway_friendly(tmp_path, monke
     assert settings.server.port == 8080
 
 
+def test_florence_settings_reads_automation_interval(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    default_settings = FlorenceSettings.from_env()
+    assert default_settings.server.automation_interval_seconds == 15.0
+
+    monkeypatch.setenv("FLORENCE_AUTOMATION_INTERVAL_SECONDS", "10")
+
+    settings = FlorenceSettings.from_env()
+
+    assert settings.server.automation_interval_seconds == 10.0
+
+
 def test_florence_settings_prefers_database_url_when_present(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("DATABASE_URL", "postgresql://postgres:secret@db.example.com:5432/florence")

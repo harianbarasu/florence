@@ -54,6 +54,21 @@ export function SettingsScreen({ token }: { token?: string }) {
     },
   });
 
+  const sourceRuleMutation = useMutation({
+    mutationFn: ({ id, visibility }: { id: string; visibility: "shared" | "private" | "ignored" }) =>
+      saveSettings({
+        ...(token ? { token } : {}),
+        sourceRuleUpdates: [{ id, visibility }],
+      }),
+    onSuccess: (payload) => {
+      queryClient.setQueryData(["florence", "settings", token], payload);
+      toast.success("Source policy saved.");
+    },
+    onError: (error) => {
+      toast.error(error instanceof Error ? error.message : "Unable to save source policy");
+    },
+  });
+
   if (settingsQuery.isLoading) {
     return (
       <Card>
@@ -150,6 +165,42 @@ export function SettingsScreen({ token }: { token?: string }) {
             <div>Household planning and normal Florence use</div>
             <div>Quick reviews and share/private confirmations</div>
             <div>Shared family coordination</div>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>Source policy</CardTitle>
+            <CardDescription>Current account and sender rules.</CardDescription>
+          </CardHeader>
+          <CardContent className="grid gap-4">
+            {(data.sourceGovernance?.sourceRules || []).length === 0 ? (
+              <div className="text-sm text-muted-foreground">No source rules yet.</div>
+            ) : (
+              (data.sourceGovernance?.sourceRules || []).map((rule) => (
+                <div key={rule.id} className="grid gap-3 rounded-md border p-3">
+                  <div className="grid gap-1 text-sm">
+                    <div className="font-medium text-foreground">{rule.label || rule.matcherValue}</div>
+                    <div className="text-muted-foreground">
+                      {rule.sourceKind} · {rule.visibility}
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    {(["shared", "private", "ignored"] as const).map((visibility) => (
+                      <Button
+                        key={visibility}
+                        size="sm"
+                        variant={rule.visibility === visibility ? "default" : "outline"}
+                        disabled={sourceRuleMutation.isPending}
+                        onClick={() => sourceRuleMutation.mutate({ id: rule.id, visibility })}
+                      >
+                        {visibility}
+                      </Button>
+                    ))}
+                  </div>
+                </div>
+              ))
+            )}
           </CardContent>
         </Card>
       </div>

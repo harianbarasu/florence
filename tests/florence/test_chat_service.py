@@ -539,6 +539,7 @@ def test_household_chat_service_uses_hermes_agent_with_confirmed_state(tmp_path)
     assert "Mini-playbook: school calendar/image -> extract actionable school days and create morning reminders for bring, wear, or pack items." in _FakeAgent.last_run["system_message"]
     assert "School image polish: extract date, child, prep item, and reminder timing before claiming Florence added it." in _FakeAgent.last_run["system_message"]
     assert "Mini-playbook: email triage -> suppress stale, already-handled, duplicate, and noisy items; surface only actionable household items." in _FakeAgent.last_run["system_message"]
+    assert "Calendar image date polish: rank visible source image and explicit parent correction above extracted_text summaries" in _FakeAgent.last_run["system_message"]
     assert "Your memory stack is: authoritative Florence household state, Florence session history, and Florence-scoped Honcho memory." in _FakeAgent.last_run["system_message"]
     assert "use household_request_parent_link with their phone number instead of telling them to wait for the family group chat" in _FakeAgent.last_run["system_message"]
     assert "keep the reply privacy-safe" in _FakeAgent.last_run["system_message"]
@@ -565,6 +566,9 @@ def test_household_chat_service_uses_hermes_agent_with_confirmed_state(tmp_path)
     assert "Use recent_google_context proactively when its freshness and matches likely answer the parent's question" in _FakeAgent.last_run["system_message"]
     assert "Do not make the parent restate where something came from if recent_google_context already contains the relevant synced evidence." in _FakeAgent.last_run["system_message"]
     assert "For school, pickup, travel, and schedule questions tied to a specific date, answer from explicit dated evidence" in _FakeAgent.last_run["system_message"]
+    assert "rank source evidence this way: live visible image or PDF page, explicit parent correction, literal extracted text" in _FakeAgent.last_run["system_message"]
+    assert "Do not treat extracted_text summary headings like month-by-month logistics or important milestones as authoritative date evidence" in _FakeAgent.last_run["system_message"]
+    assert "Do not diagnose OCR/date conversion errors or say the image shifted dates unless the original image/PDF page is present" in _FakeAgent.last_run["system_message"]
     assert "If a specific date is blank, missing, or conflicting in current calendar coverage" in _FakeAgent.last_run["system_message"]
     assert "If household_search_state says date_coverage is unverified, conflicting, or still needs target_date" in _FakeAgent.last_run["system_message"]
     assert "include the exact weekday and month/day whenever it reduces ambiguity" in _FakeAgent.last_run["system_message"]
@@ -1072,6 +1076,14 @@ def test_household_chat_service_passes_image_attachments_into_current_turn(tmp_p
     assert payload["user_message"] == "Can you read the exact closure dates from this image?"
     assert payload["attachment_count"] == 1
     assert payload["image_count"] == 1
+    assert payload["media_evidence_policy"]["source_ranking"] == [
+        "live visible image or PDF page",
+        "explicit parent correction",
+        "literal extracted_text",
+        "Florence-generated summaries",
+    ]
+    assert "Do not shift dates from weekday math" in payload["media_evidence_policy"]["calendar_date_rule"]
+    assert "diagnose OCR/date conversion" in payload["media_evidence_policy"]["calendar_date_rule"]
     assert payload["attachments"][0]["filename"] == "studio-closures.png"
     assert payload["attachments"][0]["image_index"] == 1
     assert _FakeAgent.last_run["user_message"][1:] == [
@@ -1158,6 +1170,7 @@ def test_household_chat_service_passes_multiple_image_attachments_with_ordered_m
         "recipe-3.jpg",
     ]
     assert [item["image_index"] for item in payload["attachments"]] == [1, 2, 3]
+    assert payload["media_evidence_policy"]["source_ranking"][0] == "live visible image or PDF page"
     assert [part["image_url"]["url"] for part in user_message[1:]] == [
         "data:image/jpeg;base64,QUFBQQ==",
         "data:image/jpeg;base64,QkJCQg==",

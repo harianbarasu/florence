@@ -102,6 +102,7 @@ _OPERATOR_MINI_PLAYBOOK_LINES = (
     "Mini-playbook: email triage -> suppress stale, already-handled, duplicate, and noisy items; surface only actionable household items.",
     "Multimodal polish: inspect every image in multi-image turns; do not stop after the first readable photo.",
     "School image polish: extract date, child, prep item, and reminder timing before claiming Florence added it.",
+    "Calendar image date polish: rank visible source image and explicit parent correction above extracted_text summaries; do not invent OCR date-conversion explanations.",
     "Recipe image polish: consolidate one grouped grocery list, remove duplicates, and preserve amounts when visible.",
 )
 
@@ -1289,6 +1290,20 @@ class FlorenceHouseholdChatService:
             "attachment_count": len(attachment_context),
             "image_count": len(image_parts),
         }
+        if attachment_context:
+            payload["media_evidence_policy"] = {
+                "source_ranking": [
+                    "live visible image or PDF page",
+                    "explicit parent correction",
+                    "literal extracted_text",
+                    "Florence-generated summaries",
+                ],
+                "calendar_date_rule": (
+                    "For calendar/table/schedule images, prefer the visible source cell or line over "
+                    "extracted_text summaries. Do not shift dates from weekday math or diagnose OCR/date "
+                    "conversion unless the image is present and you can point to the exact visible source."
+                ),
+            }
         if not image_parts:
             return json.dumps(payload, ensure_ascii=True)
         return [
@@ -2053,6 +2068,10 @@ class FlorenceHouseholdChatService:
             "Use recent_google_context proactively when its freshness and matches likely answer the parent's question or resolve a vague reference like that invite, that schedule, or those school emails.",
             "Do not make the parent restate where something came from if recent_google_context already contains the relevant synced evidence.",
             "For school, pickup, travel, and schedule questions tied to a specific date, answer from explicit dated evidence in confirmed household state, mirrored inbox/calendar results, or current web research.",
+            "For calendar, table, schedule, and flyer images, rank source evidence this way: live visible image or PDF page, explicit parent correction, literal extracted text, then Florence-generated summaries.",
+            "Do not treat extracted_text summary headings like month-by-month logistics or important milestones as authoritative date evidence unless those headings are visibly present in the source.",
+            "Do not diagnose OCR/date conversion errors or say the image shifted dates unless the original image/PDF page is present in the live turn and you can point to the exact visible cell or line.",
+            "If image-derived date evidence conflicts and the visible source is unavailable or still ambiguous, say the conflict plainly and use the parent's explicit correction as the working source.",
             "Do not infer that a specific future date is a normal school day, holiday-free, or covered just because nearby weekdays follow a pattern.",
             "If a specific date is blank, missing, or conflicting in current calendar coverage, say Florence cannot verify that exact date yet instead of filling the gap from the default routine.",
             "If household_search_state says date_coverage is unverified, conflicting, or still needs target_date, Florence must not give a firm exact-date answer from tracked state alone.",

@@ -17,6 +17,7 @@ from florence.messaging.ingress_types import (
 from florence.messaging.reminder_protocol import FlorenceReminderProtocol
 from florence.messaging.review_protocol import FlorenceCandidateReviewProtocol
 from florence.messaging.setup_protocol import FlorenceSetupProtocol
+from florence.messaging.source_policy_protocol import FlorenceSourcePolicyProtocol
 from florence.ops import record_turn
 from florence.runtime.chat import FlorenceHouseholdChatService
 from florence.runtime.candidate_review import FlorenceCandidateReviewService
@@ -98,6 +99,7 @@ class FlorenceMessagingIngressService:
             channel_log=self.channel_log,
             household_link_service=self.household_link_service,
         )
+        self.source_policy_protocol = FlorenceSourcePolicyProtocol(store=self.store)
         self.reminder_protocol = FlorenceReminderProtocol(
             channel_log=self.channel_log,
             household_manager_service=self.household_manager_service,
@@ -107,6 +109,7 @@ class FlorenceMessagingIngressService:
             onboarding_service=self.onboarding_service,
             group_share_protocol=self.group_share_protocol,
             household_link_protocol=self.household_link_protocol,
+            source_policy_protocol=self.source_policy_protocol,
             review_protocol=self.review_protocol,
             setup_protocol=self.setup_protocol,
             reminder_protocol=self.reminder_protocol,

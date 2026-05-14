@@ -8,8 +8,10 @@ from florence.contracts import (
     HouseholdContext,
     HouseholdProfileKind,
     HouseholdSourceVisibility,
+    HouseholdSourceMatcherKind,
     ImportedCandidate,
 )
+from florence.source_rules import build_account_source_rule
 from florence.google import FlorenceGoogleSyncBatch
 from florence.google.types import GmailSyncItem
 from florence.runtime import FlorenceCandidateReviewService
@@ -498,6 +500,77 @@ def test_review_feedback_private_only_and_always_share_create_source_rules_witho
     assert store.get_imported_candidate("cand_shared_source").state == CandidateState.PENDING_REVIEW
     assert any(rule.matcher_value == "billing@clinic.example" for rule in private_rules)
     assert any(rule.matcher_value == "musicalbeginnings.com" for rule in shared_rules)
+    store.close()
+
+
+def test_account_level_source_rule_keeps_future_work_email_candidates_private(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    review_service = FlorenceCandidateReviewService(store)
+    rule = build_account_source_rule(
+        household_id="hh_123",
+        source_kind=GoogleSourceKind.GMAIL,
+        email="jackson@creatorsinc.com",
+        visibility=HouseholdSourceVisibility.PRIVATE,
+        created_by_member_id="mem_123",
+        label="jackson@creatorsinc.com",
+    )
+    assert rule is not None
+    store.upsert_household_source_rule(rule)
+    candidate = ImportedCandidate(
+        id="cand_work",
+        household_id="hh_123",
+        member_id="mem_123",
+        source_kind=GoogleSourceKind.GMAIL,
+        source_identifier="gmail:work",
+        title="Company Team Meeting",
+        summary="Work account email that mentions a schedule.",
+        state=CandidateState.PENDING_REVIEW,
+        metadata={
+            "connected_email": "jackson@creatorsinc.com",
+            "from_address": "Calendar Bot <calendar-bot@example.com>",
+            "candidate_scope": "shared_household",
+        },
+    )
+
+    updated = review_service.source_rule_service.apply_candidate_policy(candidate)
+
+    assert updated.metadata["source_visibility"] == "private"
+    assert updated.metadata["source_rule_id"] == rule.id
+    assert updated.metadata["source_rule_label"] == "jackson@creatorsinc.com"
+    assert rule.matcher_kind == HouseholdSourceMatcherKind.GMAIL_CONNECTED_ACCOUNT
+    store.close()
+
+
+def test_old_private_gmail_candidates_do_not_surface_as_fresh_review_items(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya household", timezone="America/Los_Angeles"))
+    review_service = FlorenceCandidateReviewService(
+        store,
+        now_getter=lambda: datetime(2026, 5, 13, 16, 0, tzinfo=timezone.utc),
+    )
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_old_private_work",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:old-private-work",
+            title="Company Team Meeting",
+            summary="Old work email from mid-April.",
+            state=CandidateState.PENDING_REVIEW,
+            confidence_bps=7_500,
+            metadata={
+                "candidate_scope": "private_parent",
+                "received_at": "2026-04-14T15:00:00+00:00",
+                "raw_metadata": {"reason_tags": ["private_parent", "schedule_signal"]},
+            },
+        )
+    )
+
+    prompt = review_service.build_next_review_prompt(household_id="hh_123", member_id="mem_123")
+
+    assert prompt is None
+    assert store.get_imported_candidate("cand_old_private_work").state == CandidateState.PENDING_REVIEW
     store.close()
 
 

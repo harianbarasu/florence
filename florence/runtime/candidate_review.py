@@ -39,6 +39,7 @@ _PRIVATE_CANDIDATE_SCOPE = "private_parent"
 _EVENT_REASON_TAGS = frozenset({"schedule_signal", "activity_signal", "school_source"})
 _RELEVANCE_RULE_CATEGORY = "relevance_rule"
 _RELEVANCE_GROUP_ITEM_TYPES = frozenset({"activity", "school_admin", "travel"})
+_PRIVATE_GMAIL_REVIEW_MAX_AGE_DAYS = 21
 _HIGH_IMPORTANCE_HINTS = frozenset(
     {
         "case",
@@ -77,6 +78,8 @@ _FINANCIAL_RECORD_HINTS = frozenset(
 
 def _candidate_scope(candidate: ImportedCandidate) -> str:
     metadata = dict(candidate.metadata) if isinstance(candidate.metadata, dict) else {}
+    if str(metadata.get("source_visibility") or "").strip().lower() == HouseholdSourceVisibility.PRIVATE.value:
+        return _PRIVATE_CANDIDATE_SCOPE
     scope = str(metadata.get("candidate_scope") or "").strip().lower()
     if scope == _PRIVATE_CANDIDATE_SCOPE:
         return _PRIVATE_CANDIDATE_SCOPE
@@ -745,7 +748,7 @@ class FlorenceCandidateReviewService:
             lines.append(summary)
         lines.append(question)
         if _candidate_scope(candidate) == _PRIVATE_CANDIDATE_SCOPE:
-            lines.append("This would stay private to your own Florence thread.")
+            lines.append("This will stay private to your own Florence thread.")
         source_prompt = self.source_rule_service.build_candidate_source_prompt(candidate)
         if source_prompt:
             lines.append(source_prompt)
@@ -830,18 +833,41 @@ class FlorenceCandidateReviewService:
         return not self._candidate_is_stale_review_item(candidate)
 
     def _candidate_is_stale_review_item(self, candidate: ImportedCandidate) -> bool:
+        household = self.store.get_household(candidate.household_id)
+        timezone_name = str(getattr(household, "timezone", "") or "").strip()
+        local_now = self._utc_now().astimezone(self._tzinfo(timezone_name))
+        if self._candidate_is_old_private_gmail_import(candidate, local_now=local_now):
+            return True
         if not self._candidate_is_time_bound_event(candidate):
             return False
         local_start = self._candidate_local_start(candidate)
         if local_start is None:
             return False
         start_at, has_clock_time, all_day = local_start
-        household = self.store.get_household(candidate.household_id)
-        timezone_name = str(getattr(household, "timezone", "") or "").strip()
-        local_now = self._utc_now().astimezone(self._tzinfo(timezone_name))
         if has_clock_time and not all_day:
             return start_at <= local_now
         return start_at.date() < local_now.date()
+
+    def _candidate_is_old_private_gmail_import(
+        self,
+        candidate: ImportedCandidate,
+        *,
+        local_now: datetime,
+    ) -> bool:
+        if getattr(candidate, "source_kind", None) != GoogleSourceKind.GMAIL:
+            return False
+        if _candidate_scope(candidate) != _PRIVATE_CANDIDATE_SCOPE:
+            return False
+        if self._candidate_is_high_importance(candidate):
+            return False
+        metadata = dict(candidate.metadata) if isinstance(candidate.metadata, dict) else {}
+        received_at = self._parse_datetime(
+            metadata.get("received_at"),
+            timezone_name=str(local_now.tzinfo) if local_now.tzinfo is not None else "UTC",
+        )
+        if received_at is None:
+            return False
+        return (local_now - received_at.astimezone(local_now.tzinfo)).days > _PRIVATE_GMAIL_REVIEW_MAX_AGE_DAYS
 
     def _candidate_is_time_bound_event(self, candidate: ImportedCandidate) -> bool:
         if self._candidate_looks_financial_record(candidate):

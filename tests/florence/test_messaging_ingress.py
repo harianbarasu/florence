@@ -29,6 +29,7 @@ from florence.contracts import (
     Household,
     HouseholdLinkRequest,
     HouseholdLinkRequestStatus,
+    HouseholdSourceMatcherKind,
     HouseholdSourceVisibility,
     HouseholdNudge,
     HouseholdNudgeStatus,
@@ -2889,6 +2890,171 @@ def test_review_prompt_then_share_persists_source_rule_without_hermes(tmp_path):
     candidate = store.get_imported_candidate("cand_125")
     assert candidate is not None
     assert candidate.state == CandidateState.PENDING_REVIEW
+    store.close()
+
+
+def test_complete_dm_records_work_account_privacy_and_calendar_blocker_policy(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Maya household", timezone="America/Los_Angeles"))
+    store.upsert_member(Member(id="mem_123", household_id="hh_123", display_name="Jackson", role=MemberRole.ADMIN))
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm_thread_123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Jackson",
+        )
+    )
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_onboarding_service(store, review_service)
+    chat_service = _StubHouseholdChatService("I can help.")
+    ingress = _build_ingress(
+        store,
+        onboarding_service,
+        review_service,
+        household_chat_service=chat_service,
+    )
+    _complete_hybrid_onboarding(onboarding_service)
+    store.upsert_google_connection(
+        GoogleConnection(
+            id="gconn_creators",
+            household_id="hh_123",
+            member_id="mem_123",
+            email="jackson@creatorsinc.com",
+            connected_scopes=(GoogleSourceKind.GMAIL, GoogleSourceKind.GOOGLE_CALENDAR),
+            access_token="token-creators",
+            metadata={
+                "available_calendars": [
+                    {"id": "creators_primary", "summary": "CreatorsInc", "timezone": "America/Los_Angeles", "primary": True},
+                    {"id": "florence_shared", "summary": "Florence Family Plan", "timezone": "America/Los_Angeles"},
+                ],
+                "florence_managed_calendar_ids": ["florence_shared"],
+            },
+        )
+    )
+    store.upsert_google_connection(
+        GoogleConnection(
+            id="gconn_melon",
+            household_id="hh_123",
+            member_id="mem_123",
+            email="jackson@melon.work",
+            connected_scopes=(GoogleSourceKind.GMAIL, GoogleSourceKind.GOOGLE_CALENDAR),
+            access_token="token-melon",
+            metadata={
+                "primary_calendar_id": "melon_primary",
+                "primary_calendar_summary": "Melon",
+                "primary_calendar_timezone": "America/Los_Angeles",
+            },
+        )
+    )
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_work_email",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:work-email",
+            title="Company Team Meeting",
+            summary="Company Team Meeting on Tuesday.",
+            state=CandidateState.PENDING_REVIEW,
+            metadata={
+                "google_connection_id": "gconn_creators",
+                "connected_email": "jackson@creatorsinc.com",
+                "candidate_scope": "shared_household",
+            },
+        )
+    )
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_work_calendar",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GOOGLE_CALENDAR,
+            source_identifier="google_calendar:creators_primary:event_1",
+            title="Performance & Improvement Meeting",
+            summary="Work calendar meeting.",
+            state=CandidateState.PENDING_REVIEW,
+            metadata={
+                "google_connection_id": "gconn_creators",
+                "connected_email": "jackson@creatorsinc.com",
+                "calendar_id": "creators_primary",
+                "candidate_scope": "shared_household",
+            },
+        )
+    )
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_work_policy",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body=(
+                    "Emails to CreatorsInc and melon work accounts can always be private. "
+                    "Use calendar events as blockers if other things need to be scheduled but no need to share details."
+                ),
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert result.consumed is True
+    assert result.reply_text is not None
+    assert "private" in result.reply_text
+    assert "busy blockers" in result.reply_text
+    assert chat_service.calls == []
+    gmail_rules = store.list_household_source_rules(
+        household_id="hh_123",
+        source_kind=GoogleSourceKind.GMAIL,
+        visibility=HouseholdSourceVisibility.PRIVATE,
+    )
+    calendar_rules = store.list_household_source_rules(
+        household_id="hh_123",
+        source_kind=GoogleSourceKind.GOOGLE_CALENDAR,
+        visibility=HouseholdSourceVisibility.PRIVATE,
+    )
+    assert {
+        (rule.matcher_kind, rule.matcher_value)
+        for rule in gmail_rules
+    } == {
+        (HouseholdSourceMatcherKind.GMAIL_CONNECTED_ACCOUNT, "jackson@creatorsinc.com"),
+        (HouseholdSourceMatcherKind.GMAIL_CONNECTED_ACCOUNT, "jackson@melon.work"),
+    }
+    assert {
+        (rule.matcher_kind, rule.matcher_value)
+        for rule in calendar_rules
+    } == {
+        (HouseholdSourceMatcherKind.GOOGLE_CALENDAR_CONNECTED_ACCOUNT, "jackson@creatorsinc.com"),
+        (HouseholdSourceMatcherKind.GOOGLE_CALENDAR_CONNECTED_ACCOUNT, "jackson@melon.work"),
+    }
+    creators = store.get_google_connection("gconn_creators")
+    melon = store.get_google_connection("gconn_melon")
+    assert creators is not None
+    assert melon is not None
+    assert creators.metadata["calendar_preferences"]["creators_primary"] == {
+        "usage_mode": "conflicts_only",
+        "detail_visibility": "busy_only",
+    }
+    assert "florence_shared" not in creators.metadata["calendar_preferences"]
+    assert melon.metadata["calendar_preferences"]["melon_primary"] == {
+        "usage_mode": "conflicts_only",
+        "detail_visibility": "busy_only",
+    }
+    email_candidate = store.get_imported_candidate("cand_work_email")
+    calendar_candidate = store.get_imported_candidate("cand_work_calendar")
+    assert email_candidate is not None
+    assert calendar_candidate is not None
+    assert email_candidate.state == CandidateState.PENDING_REVIEW
+    assert email_candidate.metadata["source_visibility"] == "private"
+    assert calendar_candidate.state == CandidateState.REJECTED
+    assert calendar_candidate.metadata["suppressed_reason"] == "calendar_account_conflicts_only"
     store.close()
 
 

@@ -108,6 +108,50 @@ def _gmail_profile_from_address(from_address: str) -> CandidateSourceProfile | N
     )
 
 
+def _account_matcher(
+    *,
+    email: str | None,
+    matcher_kind: HouseholdSourceMatcherKind,
+) -> SourceMatcherSpec | None:
+    clean_email = _normalize_match_value(email)
+    if clean_email is None or "@" not in clean_email:
+        return None
+    return SourceMatcherSpec(
+        matcher_kind=matcher_kind,
+        matcher_value=clean_email,
+        label=clean_email,
+    )
+
+
+def _with_account_matcher(
+    profile: CandidateSourceProfile | None,
+    *,
+    email: str | None,
+    matcher_kind: HouseholdSourceMatcherKind,
+) -> CandidateSourceProfile | None:
+    account_matcher = _account_matcher(email=email, matcher_kind=matcher_kind)
+    if profile is None:
+        if account_matcher is None:
+            return None
+        source_kind = (
+            GoogleSourceKind.GMAIL
+            if matcher_kind == HouseholdSourceMatcherKind.GMAIL_CONNECTED_ACCOUNT
+            else GoogleSourceKind.GOOGLE_CALENDAR
+        )
+        return CandidateSourceProfile(
+            source_kind=source_kind,
+            label=account_matcher.label,
+            matchers=(account_matcher,),
+        )
+    if account_matcher is None:
+        return profile
+    return CandidateSourceProfile(
+        source_kind=profile.source_kind,
+        label=profile.label,
+        matchers=(*profile.matchers, account_matcher),
+    )
+
+
 def _calendar_profile(summary: str | None) -> CandidateSourceProfile | None:
     clean_summary = _clean_text(summary)
     if clean_summary is None:
@@ -127,9 +171,17 @@ def _calendar_profile(summary: str | None) -> CandidateSourceProfile | None:
 
 def build_candidate_source_profile(candidate: ImportedCandidate) -> CandidateSourceProfile | None:
     if candidate.source_kind == GoogleSourceKind.GMAIL:
-        return _gmail_profile_from_address(str(candidate.metadata.get("from_address") or ""))
+        return _with_account_matcher(
+            _gmail_profile_from_address(str(candidate.metadata.get("from_address") or "")),
+            email=str(candidate.metadata.get("connected_email") or ""),
+            matcher_kind=HouseholdSourceMatcherKind.GMAIL_CONNECTED_ACCOUNT,
+        )
     if candidate.source_kind == GoogleSourceKind.GOOGLE_CALENDAR:
-        return _calendar_profile(str(candidate.metadata.get("calendar_summary") or ""))
+        return _with_account_matcher(
+            _calendar_profile(str(candidate.metadata.get("calendar_summary") or "")),
+            email=str(candidate.metadata.get("connected_email") or ""),
+            matcher_kind=HouseholdSourceMatcherKind.GOOGLE_CALENDAR_CONNECTED_ACCOUNT,
+        )
     return None
 
 
@@ -155,6 +207,11 @@ def build_rules_for_candidate(
 
     rules: list[HouseholdSourceRule] = []
     for matcher in profile.matchers:
+        if matcher.matcher_kind in {
+            HouseholdSourceMatcherKind.GMAIL_CONNECTED_ACCOUNT,
+            HouseholdSourceMatcherKind.GOOGLE_CALENDAR_CONNECTED_ACCOUNT,
+        }:
+            continue
         if visibility in {HouseholdSourceVisibility.PRIVATE, HouseholdSourceVisibility.IGNORED} and matcher.matcher_kind in {
             HouseholdSourceMatcherKind.GMAIL_FROM_DOMAIN,
             HouseholdSourceMatcherKind.GMAIL_SENDER_NAME,
@@ -182,6 +239,43 @@ def build_rules_for_candidate(
             )
         )
     return tuple(rules)
+
+
+def build_account_source_rule(
+    *,
+    household_id: str,
+    source_kind: GoogleSourceKind,
+    email: str,
+    visibility: HouseholdSourceVisibility,
+    created_by_member_id: str | None = None,
+    label: str | None = None,
+    metadata: dict[str, object] | None = None,
+) -> HouseholdSourceRule | None:
+    clean_email = _normalize_match_value(email)
+    if clean_email is None or "@" not in clean_email:
+        return None
+    matcher_kind = (
+        HouseholdSourceMatcherKind.GMAIL_CONNECTED_ACCOUNT
+        if source_kind == GoogleSourceKind.GMAIL
+        else HouseholdSourceMatcherKind.GOOGLE_CALENDAR_CONNECTED_ACCOUNT
+    )
+    return HouseholdSourceRule(
+        id=_source_rule_id(household_id, source_kind, matcher_kind, clean_email),
+        household_id=household_id,
+        source_kind=source_kind,
+        matcher_kind=matcher_kind,
+        matcher_value=clean_email,
+        visibility=visibility,
+        label=label or clean_email,
+        created_by_member_id=created_by_member_id,
+        metadata={
+            "source_label": label or clean_email,
+            "policy_scope": "connected_google_account",
+            **(metadata or {}),
+        },
+    )
+
+
 def request_matches_shared_gmail_rule(
     rules: list[HouseholdSourceRule],
     *,

@@ -1131,6 +1131,8 @@ class FlorenceHouseholdOperationsService:
                 "summary": str(getattr(candidate, "summary", "") or "").strip(),
                 "confirmation_question": str(getattr(candidate, "metadata", {}).get("confirmation_question") or "").strip(),
                 "candidate_scope": str(getattr(candidate, "metadata", {}).get("candidate_scope") or "").strip(),
+                "source_visibility": str(getattr(candidate, "metadata", {}).get("source_visibility") or "").strip(),
+                "source_rule_label": str(getattr(candidate, "metadata", {}).get("source_rule_label") or "").strip(),
             }
             for index, candidate in enumerate(tuple(getattr(prompt, "candidates", ()) or ()), start=1)
         ]

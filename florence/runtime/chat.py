@@ -504,6 +504,7 @@ class FlorenceHouseholdChatService:
                     "Use one light semantic emoji per item when helpful, like 🗓️ for schedule items, 👤 for private items, 💳 for receipts, or 🗞️ for likely noise.",
                     "Keep each batch line compact and scannable.",
                     "If candidate_scope is private_parent, make it clear that item would stay in the parent's private Florence thread.",
+                    "If source_visibility is private, privacy is already decided: do not ask whether to keep it private, and do not ask whether to add it to the shared household plan.",
                     "If candidate_scope is shared_household, make it clear Florence is deciding whether to add or update a shared household item.",
                     "If trigger is scheduled_review_sweep and pending_review_count is greater than 1, you may briefly note that Florence grouped a few things together.",
                     "If an item is uncertain, frame it as something Florence wants to double-check before adding.",

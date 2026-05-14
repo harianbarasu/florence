@@ -52,7 +52,9 @@ class HouseholdSourceMatcherKind(StrEnum):
     GMAIL_FROM_ADDRESS = "gmail_from_address"
     GMAIL_FROM_DOMAIN = "gmail_from_domain"
     GMAIL_SENDER_NAME = "gmail_sender_name"
+    GMAIL_CONNECTED_ACCOUNT = "gmail_connected_account"
     GOOGLE_CALENDAR_SUMMARY = "google_calendar_summary"
+    GOOGLE_CALENDAR_CONNECTED_ACCOUNT = "google_calendar_connected_account"
 
 
 class CandidateState(StrEnum):

@@ -141,6 +141,8 @@ class FlorenceCandidateReviewProtocol:
                         "summary": getattr(candidate, "summary", ""),
                         "confirmation_question": (getattr(candidate, "metadata", {}) or {}).get("confirmation_question"),
                         "candidate_scope": (getattr(candidate, "metadata", {}) or {}).get("candidate_scope"),
+                        "source_visibility": (getattr(candidate, "metadata", {}) or {}).get("source_visibility"),
+                        "source_rule_label": (getattr(candidate, "metadata", {}) or {}).get("source_rule_label"),
                     }
                     for candidate in (getattr(prompt, "candidates", ()) or (getattr(prompt, "candidate", None),))
                     if candidate is not None
@@ -151,6 +153,8 @@ class FlorenceCandidateReviewProtocol:
                     "summary": getattr(prompt.candidate, "summary", ""),
                     "confirmation_question": (getattr(prompt.candidate, "metadata", {}) or {}).get("confirmation_question"),
                     "candidate_scope": (getattr(prompt.candidate, "metadata", {}) or {}).get("candidate_scope"),
+                    "source_visibility": (getattr(prompt.candidate, "metadata", {}) or {}).get("source_visibility"),
+                    "source_rule_label": (getattr(prompt.candidate, "metadata", {}) or {}).get("source_rule_label"),
                 },
             },
         )
@@ -460,6 +464,8 @@ class FlorenceCandidateReviewProtocol:
                         "state": str(getattr(prompt.candidate, "state", "") or "").strip(),
                         "confirmation_question": str(getattr(prompt.candidate, "metadata", {}).get("confirmation_question") or "").strip(),
                         "candidate_scope": str(getattr(prompt.candidate, "metadata", {}).get("candidate_scope") or "").strip(),
+                        "source_visibility": str(getattr(prompt.candidate, "metadata", {}).get("source_visibility") or "").strip(),
+                        "source_rule_label": str(getattr(prompt.candidate, "metadata", {}).get("source_rule_label") or "").strip(),
                     },
                     "items": [
                         {
@@ -467,6 +473,8 @@ class FlorenceCandidateReviewProtocol:
                             "summary": str(getattr(candidate, "summary", "") or "").strip(),
                             "confirmation_question": str(getattr(candidate, "metadata", {}).get("confirmation_question") or "").strip(),
                             "candidate_scope": str(getattr(candidate, "metadata", {}).get("candidate_scope") or "").strip(),
+                            "source_visibility": str(getattr(candidate, "metadata", {}).get("source_visibility") or "").strip(),
+                            "source_rule_label": str(getattr(candidate, "metadata", {}).get("source_rule_label") or "").strip(),
                         }
                         for candidate in tuple(getattr(prompt, "candidates", ()) or ())
                     ],

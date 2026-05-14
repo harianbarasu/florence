@@ -235,7 +235,7 @@ def build_onboarding_ready_syncing_message_sequence() -> tuple[str, ...]:
     return (
         (
             "You're set up. Florence is your house manager now, and I’m syncing up to the last year of your email "
-            "and calendar in the background. I’ll text you here when the first pass is ready."
+            "and calendar in the background. The first pass can take several minutes, and I’ll text you here when it’s ready."
         ),
         (
             "Start with a real task like: what's on the kids' schedule next week, check my email for a school or camp update, "
@@ -247,7 +247,7 @@ def build_onboarding_ready_syncing_message_sequence() -> tuple[str, ...]:
 def build_google_connected_syncing_message_sequence(link_url: str | None = None) -> tuple[str, ...]:
     _ = link_url
     return (
-        "Google is connected. I’m syncing up to the last year of your email and calendar in the background now, and I’ll text you here when the first pass is ready.",
+        "Google is connected. I’m syncing up to the last year of your email and calendar in the background now. The first pass can take several minutes, and I’ll text you here when it’s ready.",
     )
 
 

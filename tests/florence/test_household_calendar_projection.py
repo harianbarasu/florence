@@ -37,11 +37,15 @@ def test_household_calendar_projection_ensures_shared_calendar_and_marks_connect
     )
 
     monkeypatch.setattr(
+        "florence.runtime.household_calendar_projection.list_google_calendars",
+        lambda **_: [],
+    )
+    monkeypatch.setattr(
         "florence.runtime.household_calendar_projection.create_google_calendar",
-        lambda **_: GoogleCalendarMetadata(
+        lambda **kwargs: GoogleCalendarMetadata(
             id="cal_shared_123",
-            summary="Florence - Maya household",
-            timezone="America/Los_Angeles",
+            summary=kwargs["summary"],
+            timezone=kwargs["timezone"],
         ),
     )
 
@@ -53,12 +57,124 @@ def test_household_calendar_projection_ensures_shared_calendar_and_marks_connect
     assert projection is not None
     assert projection["calendar_id"] == "cal_shared_123"
     assert projection["host_email"] == "maya@example.com"
+    assert projection["calendar_summary"] == "Florence Family Plan - maya@example.com"
     assert projection["calendar_web_url"] == "https://calendar.google.com/calendar/u/0/r?cid=cal_shared_123"
     assert household is not None
     assert household.settings[HOUSEHOLD_CALENDAR_PROJECTION_SETTINGS_KEY]["calendar_id"] == "cal_shared_123"
     assert connection is not None
     assert connection.metadata["florence_projection_calendar_id"] == "cal_shared_123"
     assert connection.metadata[HOUSEHOLD_CALENDAR_MANAGED_IDS_METADATA_KEY] == ["cal_shared_123"]
+    store.close()
+
+
+def test_household_calendar_projection_reuses_clear_calendar_after_database_reset(monkeypatch, tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="18043899369's household", timezone="America/Los_Angeles"))
+    store.upsert_google_connection(
+        GoogleConnection(
+            id="gconn_123",
+            household_id="hh_123",
+            member_id="mem_123",
+            email="maya@example.com",
+            connected_scopes=(GoogleSourceKind.GMAIL, GoogleSourceKind.GOOGLE_CALENDAR),
+            access_token="access-token",
+            metadata={},
+        )
+    )
+
+    monkeypatch.setattr(
+        "florence.runtime.household_calendar_projection.list_google_calendars",
+        lambda **_: [
+            GoogleCalendarMetadata(
+                id="cal_existing_123",
+                summary="Florence Family Plan - maya@example.com",
+                timezone="America/Los_Angeles",
+                access_role="owner",
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        "florence.runtime.household_calendar_projection.create_google_calendar",
+        lambda **_: (_ for _ in ()).throw(AssertionError("should reuse existing Florence calendar")),
+    )
+
+    service = FlorenceHouseholdCalendarProjectionService(store)
+    projection = service.ensure_projection(household_id="hh_123", preferred_connection_id="gconn_123")
+
+    household = store.get_household("hh_123")
+    assert projection is not None
+    assert projection["calendar_id"] == "cal_existing_123"
+    assert projection["calendar_summary"] == "Florence Family Plan - maya@example.com"
+    assert household is not None
+    assert (
+        household.settings[HOUSEHOLD_CALENDAR_PROJECTION_SETTINGS_KEY]["calendar_id"]
+        == "cal_existing_123"
+    )
+    store.close()
+
+
+def test_household_calendar_projection_migrates_ambiguous_phone_named_calendar(monkeypatch, tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(
+        Household(
+            id="hh_123",
+            name="18043899369's household",
+            timezone="America/Los_Angeles",
+            settings={
+                HOUSEHOLD_CALENDAR_PROJECTION_SETTINGS_KEY: {
+                    "host_connection_id": "gconn_123",
+                    "host_email": "maya@example.com",
+                    "calendar_id": "cal_phone_123",
+                    "calendar_summary": "Florence - 18043899369's household",
+                    "calendar_web_url": "https://calendar.google.com/calendar/u/0/r?cid=cal_phone_123",
+                    "timezone": "America/Los_Angeles",
+                    "status": "active",
+                    "shared_with_connection_ids": [],
+                    "shared_with_emails": [],
+                }
+            },
+        )
+    )
+    store.upsert_google_connection(
+        GoogleConnection(
+            id="gconn_123",
+            household_id="hh_123",
+            member_id="mem_123",
+            email="maya@example.com",
+            connected_scopes=(GoogleSourceKind.GMAIL, GoogleSourceKind.GOOGLE_CALENDAR),
+            access_token="access-token",
+            metadata={"florence_projection_calendar_id": "cal_phone_123"},
+        )
+    )
+
+    monkeypatch.setattr(
+        "florence.runtime.household_calendar_projection.list_google_calendars",
+        lambda **_: [],
+    )
+    monkeypatch.setattr(
+        "florence.runtime.household_calendar_projection.create_google_calendar",
+        lambda **kwargs: GoogleCalendarMetadata(
+            id="cal_clear_123",
+            summary=kwargs["summary"],
+            timezone=kwargs["timezone"],
+            access_role="owner",
+        ),
+    )
+
+    service = FlorenceHouseholdCalendarProjectionService(store)
+    projection = service.ensure_projection(household_id="hh_123", preferred_connection_id="gconn_123")
+
+    household = store.get_household("hh_123")
+    connection = store.get_google_connection("gconn_123")
+    assert projection is not None
+    assert projection["calendar_id"] == "cal_clear_123"
+    assert projection["calendar_summary"] == "Florence Family Plan - maya@example.com"
+    assert projection["previous_calendar_ids"] == ["cal_phone_123"]
+    assert household is not None
+    assert household.settings[HOUSEHOLD_CALENDAR_PROJECTION_SETTINGS_KEY]["calendar_id"] == "cal_clear_123"
+    assert connection is not None
+    assert connection.metadata["florence_projection_calendar_id"] == "cal_clear_123"
+    assert connection.metadata[HOUSEHOLD_CALENDAR_MANAGED_IDS_METADATA_KEY] == ["cal_clear_123", "cal_phone_123"]
     store.close()
 
 
@@ -186,11 +302,15 @@ def test_household_calendar_projection_refreshes_missing_token_expiry(monkeypatc
         ),
     )
     monkeypatch.setattr(
+        "florence.runtime.household_calendar_projection.list_google_calendars",
+        lambda **_: [],
+    )
+    monkeypatch.setattr(
         "florence.runtime.household_calendar_projection.create_google_calendar",
-        lambda **_: GoogleCalendarMetadata(
+        lambda **kwargs: GoogleCalendarMetadata(
             id="cal_shared_123",
-            summary="Florence - Maya household",
-            timezone="America/Los_Angeles",
+            summary=kwargs["summary"],
+            timezone=kwargs["timezone"],
         ),
     )
 
@@ -203,6 +323,7 @@ def test_household_calendar_projection_refreshes_missing_token_expiry(monkeypatc
 
     connection = store.get_google_connection("gconn_123")
     assert projection is not None
+    assert projection["calendar_summary"] == "Florence Family Plan - maya@example.com"
     assert connection is not None
     assert connection.access_token == "fresh-access-token"
     assert datetime.fromisoformat(connection.access_token_expires_at).tzinfo == timezone.utc

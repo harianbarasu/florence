@@ -69,7 +69,7 @@ def test_build_google_oauth_connect_url_contains_google_oauth_parameters():
     assert "client_id=client-id" in url
     assert "redirect_uri=https%3A%2F%2Fexample.com%2Fcallback" in url
     assert "access_type=offline" in url
-    assert "prompt=consent" in url
+    assert "prompt=consent+select_account" in url
     assert "https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcalendar" in url
     assert "calendar.readonly" not in url
     assert "state=" in url

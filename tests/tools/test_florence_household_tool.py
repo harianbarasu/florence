@@ -327,6 +327,107 @@ def test_household_google_inbox_search_uses_shared_source_rules_across_connected
         store.close()
 
 
+def test_household_google_inbox_search_uses_all_private_parent_accounts(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Jackson's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Jackson",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Jackson",
+        )
+    )
+    personal_connection = GoogleConnection(
+        id="gconn_personal",
+        household_id="hh_123",
+        member_id="mem_123",
+        email="jackson.personal@example.com",
+        connected_scopes=(GoogleSourceKind.GMAIL,),
+        access_token="access-token-personal",
+    )
+    family_connection = GoogleConnection(
+        id="gconn_family",
+        household_id="hh_123",
+        member_id="mem_123",
+        email="jackson.family@example.com",
+        connected_scopes=(GoogleSourceKind.GMAIL,),
+        access_token="access-token-family",
+    )
+    store.upsert_google_connection(personal_connection)
+    store.upsert_google_connection(family_connection)
+    store.upsert_google_gmail_messages(
+        connection=personal_connection,
+        items=[
+            GmailSyncItem(
+                gmail_message_id="gmail_personal",
+                thread_id="thread_personal",
+                from_address="Coach <coach@example.com>",
+                subject="Baseball practice",
+                snippet="Bring glove.",
+                body_text="Theo has baseball practice and should bring his glove.",
+                attachment_text=None,
+                attachment_count=0,
+                received_at=datetime.now(timezone.utc),
+            )
+        ],
+    )
+    store.upsert_google_gmail_messages(
+        connection=family_connection,
+        items=[
+            GmailSyncItem(
+                gmail_message_id="gmail_family",
+                thread_id="thread_family",
+                from_address="Young Minds <school@example.com>",
+                subject="Bring a stuffy day",
+                snippet="Violet should bring a stuffy.",
+                body_text="Monday is Bring a Stuffie Day for Violet.",
+                attachment_text=None,
+                attachment_count=0,
+                received_at=datetime.now(timezone.utc),
+            )
+        ],
+    )
+    task_id = "task-private-multi-inbox-search"
+    set_household_tool_context(
+        task_id,
+        store=store,
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_dm_123",
+    )
+    try:
+        result = json.loads(
+            handle_function_call(
+                "household_search_google_inbox",
+                {"query": "bring stuffy"},
+                task_id=task_id,
+            )
+        )
+
+        assert result["search_scope"] == "private_parent"
+        assert result["scope_reason"] == "current_parent_dm"
+        assert set(result["searched_connection_emails"]) == {
+            "jackson.personal@example.com",
+            "jackson.family@example.com",
+        }
+        assert result["results"][0]["gmail_message_id"] == "gmail_family"
+        assert result["results"][0]["connection_email"] == "jackson.family@example.com"
+    finally:
+        clear_household_tool_context(task_id)
+        store.close()
+
+
 def test_household_google_inbox_search_matches_human_query_terms_without_exact_phrase(tmp_path):
     store = FlorenceStateDB(tmp_path / "florence.db")
     store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
@@ -617,6 +718,119 @@ def test_household_google_calendar_search_matches_human_query_terms_without_exac
         assert result["results"][0]["google_event_id"] == "gcal_drall_123"
         assert result["results"][0]["calendar_summary"] == "GameChanger - DRALL Baseball"
         assert result["results"][0]["family_member_names"] == ["Theo"]
+    finally:
+        clear_household_tool_context(task_id)
+        store.close()
+
+
+def test_household_google_calendar_search_uses_all_private_parent_accounts(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Jackson's household", timezone="America/Los_Angeles"))
+    store.upsert_member(
+        Member(
+            id="mem_123",
+            household_id="hh_123",
+            display_name="Jackson",
+            role=MemberRole.ADMIN,
+        )
+    )
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm-thread-123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Jackson",
+        )
+    )
+    personal_connection = GoogleConnection(
+        id="gconn_personal_cal",
+        household_id="hh_123",
+        member_id="mem_123",
+        email="jackson.personal@example.com",
+        connected_scopes=(GoogleSourceKind.GOOGLE_CALENDAR,),
+        access_token="access-token-personal",
+        metadata={"calendar_last_synced_at": "2026-04-08T10:00:00+00:00", "last_sync_status": "ok"},
+    )
+    family_connection = GoogleConnection(
+        id="gconn_family_cal",
+        household_id="hh_123",
+        member_id="mem_123",
+        email="jackson.family@example.com",
+        connected_scopes=(GoogleSourceKind.GOOGLE_CALENDAR,),
+        access_token="access-token-family",
+        metadata={"calendar_last_synced_at": "2026-04-08T10:00:00+00:00", "last_sync_status": "ok"},
+    )
+    store.upsert_google_connection(personal_connection)
+    store.upsert_google_connection(family_connection)
+    store.upsert_google_calendar_events(
+        connection=personal_connection,
+        items=[
+            ParentCalendarSyncItem(
+                google_event_id="gcal_personal",
+                title="Dentist appointment",
+                description="Personal calendar appointment",
+                location="Clinic",
+                html_link=None,
+                starts_at=datetime(2026, 4, 12, 16, 0, tzinfo=timezone.utc),
+                ends_at=datetime(2026, 4, 12, 17, 0, tzinfo=timezone.utc),
+                timezone="America/Los_Angeles",
+                all_day=False,
+                updated_at=datetime(2026, 4, 8, 9, 0, tzinfo=timezone.utc),
+                calendar_summary="Personal",
+                family_member_names=[],
+                calendar_id="cal_personal",
+                calendar_primary=True,
+            )
+        ],
+    )
+    store.upsert_google_calendar_events(
+        connection=family_connection,
+        items=[
+            ParentCalendarSyncItem(
+                google_event_id="gcal_family",
+                title="Theo DRALL Baseball Practice",
+                description="Bring glove.",
+                location="North Field",
+                html_link=None,
+                starts_at=datetime(2026, 4, 12, 18, 0, tzinfo=timezone.utc),
+                ends_at=datetime(2026, 4, 12, 19, 30, tzinfo=timezone.utc),
+                timezone="America/Los_Angeles",
+                all_day=False,
+                updated_at=datetime(2026, 4, 8, 9, 0, tzinfo=timezone.utc),
+                calendar_summary="Family Sports",
+                family_member_names=["Theo"],
+                calendar_id="cal_family",
+                calendar_primary=False,
+            )
+        ],
+    )
+    task_id = "task-private-multi-calendar-search"
+    set_household_tool_context(
+        task_id,
+        store=store,
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_dm_123",
+    )
+    try:
+        result = json.loads(
+            handle_function_call(
+                "household_search_google_calendar",
+                {"query": "Theo baseball"},
+                task_id=task_id,
+            )
+        )
+
+        assert result["search_scope"] == "private_parent"
+        assert result["scope_reason"] == "current_parent_dm"
+        assert set(result["searched_connection_emails"]) == {
+            "jackson.personal@example.com",
+            "jackson.family@example.com",
+        }
+        assert result["results"][0]["google_event_id"] == "gcal_family"
+        assert result["results"][0]["connection_email"] == "jackson.family@example.com"
     finally:
         clear_household_tool_context(task_id)
         store.close()

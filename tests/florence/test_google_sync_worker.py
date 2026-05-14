@@ -310,6 +310,67 @@ def test_google_sync_worker_bootstrap_walks_multiple_gmail_pages_and_persists_ro
     store.close()
 
 
+def test_google_sync_worker_bootstrap_respects_gmail_max_results_across_pages(tmp_path, monkeypatch):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_google_connection(
+        GoogleConnection(
+            id="gconn_capped",
+            household_id="hh_123",
+            member_id="mem_123",
+            email="parent@example.com",
+            connected_scopes=(GoogleSourceKind.GMAIL,),
+            access_token="access-token",
+            metadata={
+                "primary_calendar_id": "family",
+                "primary_calendar_summary": "Family calendar",
+                "primary_calendar_timezone": "America/Los_Angeles",
+            },
+        )
+    )
+    observed: list[tuple[str | None, int]] = []
+
+    def _gmail_item(index: int) -> GmailSyncItem:
+        return GmailSyncItem(
+            gmail_message_id=f"gmail_{index}",
+            thread_id=f"thread_{index}",
+            from_address="school@example.com",
+            subject=f"School note {index}",
+            snippet=f"School note {index}",
+            body_text=f"School note {index}",
+            attachment_text=None,
+            attachment_count=0,
+            received_at=datetime(2026, 9, 10 + index, 12, 0, tzinfo=timezone.utc),
+        )
+
+    def _fake_gmail_page(**kwargs):
+        observed.append((kwargs.get("page_token"), kwargs["max_results"]))
+        token = kwargs.get("page_token")
+        if token == "page-2":
+            return GmailSyncPage(items=[_gmail_item(2)], next_page_token="page-3")
+        if token == "page-3":
+            return GmailSyncPage(items=[_gmail_item(3)], next_page_token=None)
+        return GmailSyncPage(items=[_gmail_item(1)], next_page_token="page-2")
+
+    monkeypatch.setenv("FLORENCE_GMAIL_BOOTSTRAP_MAX_RESULTS", "2")
+    monkeypatch.setattr("florence.runtime.google_services.list_recent_gmail_sync_page", _fake_gmail_page)
+    monkeypatch.setattr("florence.runtime.google_services.list_recent_parent_calendar_sync_items", lambda **_: [])
+
+    worker = FlorenceGoogleSyncWorkerService(store, FlorenceGoogleSyncPersistenceService(store))
+    result = worker.sync_connection("gconn_capped")
+
+    assert observed == [(None, 2), ("page-2", 1)]
+    mirrored_messages = store.search_google_gmail_messages(
+        household_id="hh_123",
+        connection_ids=["gconn_capped"],
+        newer_than_days=400,
+        limit=10,
+    )
+    assert [item.gmail_message_id for item in mirrored_messages] == ["gmail_2", "gmail_1"]
+    assert result.connection.metadata["last_gmail_item_count"] == 2
+    assert result.connection.metadata["gmail_bootstrap_hit_max_results"] is True
+    store.close()
+
+
 def test_google_sync_worker_honors_calendar_preferences_and_keeps_non_primary_ids_distinct(tmp_path, monkeypatch):
     store = FlorenceStateDB(tmp_path / "florence.db")
     store.upsert_google_connection(

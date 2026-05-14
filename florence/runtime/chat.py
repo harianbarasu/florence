@@ -555,6 +555,7 @@ class FlorenceHouseholdChatService:
                     "Do not mention candidate queues, scan counts, pipeline phases, or tool internals.",
                     "Do not sound like a background job log or admin console.",
                     "Keep it to one short text-sized reply.",
+                    "Mention that the first pass can take several minutes when the user sounds worried about sync timing.",
                     (
                         "The user is asking for inbox or calendar-dependent information, so explain that Florence is still syncing before it can answer confidently from that data."
                         if data_dependent
@@ -581,7 +582,7 @@ class FlorenceHouseholdChatService:
                     "Do not sound like a background job log or admin console.",
                     "Keep it to one short text-sized reply.",
                     "Google just connected successfully. Florence is sending a quiet background-status update into the DM thread.",
-                    "Acknowledge that sync is running in the background and say Florence will text when the first pass is ready.",
+                    "Acknowledge that sync is running in the background, say the first pass can take several minutes, and say Florence will text when it is ready.",
                 ]
             )
             user_message = json.dumps(

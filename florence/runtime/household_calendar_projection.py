@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from florence.contracts import GoogleConnection, HouseholdEventStatus, MemberRole
-from florence.google import refresh_google_access_token
+from florence.google import list_google_calendars, refresh_google_access_token
 from florence.google.fetch import (
     add_google_calendar_to_calendar_list,
     build_google_calendar_web_url,
@@ -23,6 +24,7 @@ from florence.state import FlorenceStateDB
 HOUSEHOLD_CALENDAR_PROJECTION_SETTINGS_KEY = "shared_google_calendar_projection"
 HOUSEHOLD_CALENDAR_PROJECTION_EVENT_ID_KEY = "shared_google_calendar_event_id"
 HOUSEHOLD_CALENDAR_MANAGED_IDS_METADATA_KEY = "florence_managed_calendar_ids"
+HOUSEHOLD_CALENDAR_SUMMARY_PREFIX = "Florence Family Plan"
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +86,10 @@ class FlorenceHouseholdCalendarProjectionService:
             return None
         existing = self.get_projection_config(household_id=household_id)
         if existing and str(existing.get("calendar_id") or "").strip():
+            existing = self._migrate_ambiguous_projection_if_needed(
+                household_id=household_id,
+                config=existing,
+            )
             return self._ensure_projection_access(
                 household_id=household_id,
                 config=existing,
@@ -99,12 +105,18 @@ class FlorenceHouseholdCalendarProjectionService:
         if not connection.access_token:
             return None
 
-        calendar_summary = f"Florence - {household.name}"
-        created = create_google_calendar(
-            access_token=connection.access_token,
-            summary=calendar_summary,
-            timezone=household.timezone,
+        calendar_summary = self._projection_calendar_summary(connection=connection)
+        created = self._find_existing_projection_calendar(
+            connection=connection,
+            desired_summary=calendar_summary,
+            fallback_timezone=household.timezone,
         )
+        if created is None:
+            created = create_google_calendar(
+                access_token=connection.access_token,
+                summary=calendar_summary,
+                timezone=household.timezone,
+            )
         config = {
             "host_connection_id": connection.id,
             "host_email": connection.email,
@@ -383,3 +395,129 @@ class FlorenceHouseholdCalendarProjectionService:
         )
         self.store.upsert_google_connection(updated)
         return updated
+
+    @staticmethod
+    def _projection_calendar_summary(*, connection: GoogleConnection) -> str:
+        email = " ".join(connection.email.split()).strip().lower()
+        return f"{HOUSEHOLD_CALENDAR_SUMMARY_PREFIX} - {email}" if email else HOUSEHOLD_CALENDAR_SUMMARY_PREFIX
+
+    @staticmethod
+    def _projection_summary_is_ambiguous(summary: str | None) -> bool:
+        value = " ".join(str(summary or "").split()).strip()
+        if not value.startswith("Florence - "):
+            return False
+        return bool(re.search(r"\d{7,}", value))
+
+    def _find_existing_projection_calendar(
+        self,
+        *,
+        connection: GoogleConnection,
+        desired_summary: str,
+        fallback_timezone: str,
+    ):
+        if not connection.access_token:
+            return None
+        try:
+            calendars = list_google_calendars(
+                access_token=connection.access_token,
+                fallback_timezone=fallback_timezone,
+            )
+        except Exception:
+            logger.exception(
+                "Florence household calendar projection lookup failed connection_id=%s",
+                connection.id,
+            )
+            return None
+
+        desired = " ".join(desired_summary.split()).strip().lower()
+        for calendar in calendars:
+            summary = " ".join(calendar.summary.split()).strip().lower()
+            access_role = (calendar.access_role or "").strip().lower()
+            if summary != desired:
+                continue
+            if calendar.hidden:
+                continue
+            if access_role and access_role not in {"owner", "writer"}:
+                continue
+            return calendar
+        return None
+
+    def _migrate_ambiguous_projection_if_needed(
+        self,
+        *,
+        household_id: str,
+        config: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not self._projection_summary_is_ambiguous(str(config.get("calendar_summary") or "")):
+            return config
+
+        household = self.store.get_household(household_id)
+        host_connection_id = str(config.get("host_connection_id") or "").strip()
+        if household is None or not host_connection_id:
+            return config
+
+        connection = self.store.get_google_connection(host_connection_id)
+        if connection is None:
+            return config
+        connection = self._ensure_fresh_access_token(connection)
+        if not connection.access_token:
+            return config
+
+        calendar_summary = self._projection_calendar_summary(connection=connection)
+        if calendar_summary == str(config.get("calendar_summary") or "").strip():
+            return config
+
+        try:
+            replacement = self._find_existing_projection_calendar(
+                connection=connection,
+                desired_summary=calendar_summary,
+                fallback_timezone=household.timezone,
+            )
+            if replacement is None:
+                replacement = create_google_calendar(
+                    access_token=connection.access_token,
+                    summary=calendar_summary,
+                    timezone=household.timezone,
+                )
+        except Exception:
+            logger.exception(
+                "Florence household calendar projection migration failed household_id=%s host_connection_id=%s",
+                household_id,
+                host_connection_id,
+            )
+            return config
+
+        previous_calendar_ids = {
+            str(item).strip()
+            for item in (
+                config.get("previous_calendar_ids")
+                if isinstance(config.get("previous_calendar_ids"), list)
+                else []
+            )
+            if str(item).strip()
+        }
+        old_calendar_id = str(config.get("calendar_id") or "").strip()
+        if old_calendar_id:
+            previous_calendar_ids.add(old_calendar_id)
+
+        updated_config = dict(config)
+        updated_config.update(
+            {
+                "calendar_id": replacement.id,
+                "calendar_summary": replacement.summary,
+                "calendar_web_url": build_google_calendar_web_url(calendar_id=replacement.id),
+                "timezone": replacement.timezone,
+                "renamed_at": datetime.now(timezone.utc).isoformat(),
+                "previous_calendar_ids": sorted(previous_calendar_ids),
+            }
+        )
+
+        settings = dict(household.settings)
+        settings[HOUSEHOLD_CALENDAR_PROJECTION_SETTINGS_KEY] = updated_config
+        self.store.upsert_household(replace(household, settings=settings))
+        self._mark_connection_managed_calendar(
+            connection=connection,
+            calendar_id=replacement.id,
+            is_host=True,
+        )
+        return updated_config

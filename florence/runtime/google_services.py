@@ -525,7 +525,12 @@ class FlorenceGoogleSyncWorkerService:
         else:
             gmail_items = []
             next_page_token: str | None = None
+            gmail_bootstrap_hit_max_results = False
             while True:
+                remaining_gmail_results = max(0, resolved_max_gmail_results - len(gmail_items))
+                if remaining_gmail_results <= 0:
+                    gmail_bootstrap_hit_max_results = bool(next_page_token)
+                    break
                 gmail_page, hydrated_connection = self._run_google_fetch_with_refresh_retry(
                     hydrated_connection,
                     now=now,
@@ -534,20 +539,24 @@ class FlorenceGoogleSyncWorkerService:
                     operation="gmail sync",
                     fetch=lambda refreshed_access_token, page_token=next_page_token: list_recent_gmail_sync_page(
                         access_token=refreshed_access_token,
-                        max_results=resolved_max_gmail_results,
+                        max_results=remaining_gmail_results,
                         gmail_query=gmail_query,
                         page_token=page_token,
                     ),
                 )
-                if gmail_page.items:
+                page_items = list(gmail_page.items)[:remaining_gmail_results]
+                if page_items:
                     # Mirror Gmail rows incrementally during the first bootstrap so Florence can
                     # search partial inbox state before the full year-long scan completes.
                     self.store.upsert_google_gmail_messages(
                         connection=hydrated_connection,
-                        items=list(gmail_page.items),
+                        items=page_items,
                     )
-                    gmail_items.extend(gmail_page.items)
+                    gmail_items.extend(page_items)
                 next_page_token = gmail_page.next_page_token
+                if len(gmail_items) >= resolved_max_gmail_results:
+                    gmail_bootstrap_hit_max_results = bool(next_page_token)
+                    break
                 if not next_page_token:
                     break
         access_token = hydrated_connection.access_token
@@ -641,15 +650,17 @@ class FlorenceGoogleSyncWorkerService:
         metadata["calendar_last_past_window_days"] = calendar_past_window_days
         metadata["calendar_last_future_window_days"] = calendar_future_window_days
         metadata["last_candidate_count"] = len(sync_result.candidates)
-        metadata["last_sync_completed_at"] = current_time.isoformat()
+        completed_time = now or _utc_now()
+        metadata["last_sync_completed_at"] = completed_time.isoformat()
         metadata["last_sync_status"] = "ok"
         metadata["sync_phase"] = "ready"
         if not bootstrap_complete:
-            metadata["gmail_bootstrap_completed_at"] = current_time.isoformat()
+            metadata["gmail_bootstrap_completed_at"] = completed_time.isoformat()
+            metadata["gmail_bootstrap_hit_max_results"] = gmail_bootstrap_hit_max_results
         if not calendar_bootstrap_complete:
-            metadata["calendar_bootstrap_completed_at"] = current_time.isoformat()
+            metadata["calendar_bootstrap_completed_at"] = completed_time.isoformat()
         if not metadata.get("initial_sync_completed_at"):
-            metadata["initial_sync_completed_at"] = current_time.isoformat()
+            metadata["initial_sync_completed_at"] = completed_time.isoformat()
         metadata["initial_sync_state"] = "ready"
         synced_connection = self.store.upsert_google_connection(replace(hydrated_connection, metadata=metadata))
         logger.info(

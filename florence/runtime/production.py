@@ -185,6 +185,7 @@ class FlorenceProductionService:
             FlorenceGoogleSyncPersistenceService(self.store),
         )
         self.google_sync_queue = FlorenceRedisGoogleSyncQueue(settings.redis)
+        self._google_sync_execution_guard = threading.Lock()
         # Threaded webhook handling can race onboarding stage updates when
         # parents send multiple messages quickly. Serialize by Linq chat.
         self._linq_chat_locks_guard = threading.Lock()
@@ -777,11 +778,12 @@ class FlorenceProductionService:
                 store,
                 FlorenceGoogleSyncPersistenceService(store),
             )
-            result = sync_worker.sync_connection(
-                connection_id,
-                client_id=self.settings.google.client_id,
-                client_secret=self.settings.google.client_secret,
-            )
+            with self._google_sync_execution_guard:
+                result = sync_worker.sync_connection(
+                    connection_id,
+                    client_id=self.settings.google.client_id,
+                    client_secret=self.settings.google.client_secret,
+                )
             if not thread_id:
                 return
 
@@ -915,11 +917,12 @@ class FlorenceProductionService:
                 connection.id: connection
                 for connection in self.store.list_google_connections(household_id=household.id)
             }
-            results = self.sync_worker.sync_household(
-                household_id=household.id,
-                client_id=self.settings.google.client_id,
-                client_secret=self.settings.google.client_secret,
-            )
+            with self._google_sync_execution_guard:
+                results = self.sync_worker.sync_household(
+                    household_id=household.id,
+                    client_id=self.settings.google.client_id,
+                    client_secret=self.settings.google.client_secret,
+                )
             household_touched = bool(results)
             counters["connections"] += len(results)
             for result in results:

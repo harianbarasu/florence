@@ -733,6 +733,73 @@ def test_production_service_run_google_sync_queue_once_acknowledges_stale_delete
     store.close()
 
 
+def test_production_service_process_google_sync_job_uses_sync_execution_guard(tmp_path, monkeypatch):
+    settings = _build_settings(tmp_path)
+    store = FlorenceStateDB(settings.server.db_path)
+    service = FlorenceProductionService(settings, store=store)
+    called = threading.Event()
+
+    class _FakeSyncWorker:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def sync_connection(self, *_args, **_kwargs):
+            called.set()
+            return SimpleNamespace(
+                connection=SimpleNamespace(id="gconn_123", household_id="hh_123", member_id="mem_123"),
+                sync_result=SimpleNamespace(candidates=[]),
+            )
+
+    monkeypatch.setattr(production_module, "FlorenceGoogleSyncWorkerService", _FakeSyncWorker)
+
+    service._google_sync_execution_guard.acquire()
+    worker = threading.Thread(
+        target=service.process_google_sync_job,
+        kwargs={
+            "connection_id": "gconn_123",
+            "thread_id": None,
+            "notify_when_finished": True,
+        },
+    )
+    worker.start()
+    try:
+        assert not called.wait(0.05)
+    finally:
+        service._google_sync_execution_guard.release()
+    worker.join(timeout=1.0)
+
+    assert called.is_set()
+    assert not worker.is_alive()
+    store.close()
+
+
+def test_production_service_run_sync_pass_uses_sync_execution_guard(tmp_path):
+    settings = _build_settings(tmp_path)
+    store = FlorenceStateDB(settings.server.db_path)
+    service = FlorenceProductionService(settings, store=store)
+    store.upsert_household(Household(id="hh_123", name="Maya's household", timezone="America/Los_Angeles"))
+    called = threading.Event()
+
+    def _sync_household(**_kwargs):
+        called.set()
+        return []
+
+    service.sync_worker = SimpleNamespace(sync_household=_sync_household)
+
+    service._google_sync_execution_guard.acquire()
+    worker = threading.Thread(target=service.run_sync_pass)
+    worker.start()
+    try:
+        assert not called.wait(0.05)
+    finally:
+        service._google_sync_execution_guard.release()
+    worker.join(timeout=1.0)
+
+    assert called.is_set()
+    assert not worker.is_alive()
+    store.close()
+
+
 def test_production_service_google_callback_keeps_onboarding_prompt_separate_from_review(tmp_path, monkeypatch):
     settings = _build_settings(tmp_path)
     store = FlorenceStateDB(settings.server.db_path)

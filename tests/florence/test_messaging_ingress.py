@@ -156,7 +156,7 @@ class _StubHouseholdChatService:
         self.promotion_text = promotion_text
         self.review_prompt_text = review_prompt_text
         self.sync_waiting_text = sync_waiting_text or (
-            "Google is connected. I’m syncing up to the last year of your email and calendar in the background now, and I’ll text you here when the first pass is ready."
+            "Google is connected. I’m syncing up to the last year of your email and calendar in the background now. The first pass can take several minutes, and I’ll text you here when it’s ready."
         )
         self.calls = []
         self.onboarding_turn_calls = []
@@ -1447,7 +1447,7 @@ def test_dm_status_question_after_google_connect_falls_back_to_stock_sync_update
     )
 
     assert result.reply_text == (
-        "Google is connected. I’m syncing up to the last year of your email and calendar in the background now, and I’ll text you here when the first pass is ready."
+        "Google is connected. I’m syncing up to the last year of your email and calendar in the background now. The first pass can take several minutes, and I’ll text you here when it’s ready."
     )
     assert chat_service.calls
     assert chat_service.sync_waiting_calls == []

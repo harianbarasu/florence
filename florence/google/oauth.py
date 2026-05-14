@@ -103,7 +103,7 @@ def build_google_oauth_connect_url(
             "redirect_uri": redirect_uri,
             "response_type": "code",
             "access_type": "offline",
-            "prompt": "consent",
+            "prompt": "consent select_account",
             "scope": " ".join(scopes),
             "state": state,
         }

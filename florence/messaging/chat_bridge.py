@@ -246,7 +246,7 @@ class FlorenceHouseholdChatBridge:
     def _sync_contextual_message(user_message: str) -> str:
         return (
             "Context for this turn: the first Gmail and Calendar sync is still running. "
-            "If the user asks for sync status, answer briefly that it is still running and Florence will text when the first pass is ready. "
+            "If the user asks for sync status, answer briefly that it is still running, the first pass can take several minutes, and Florence will text when it is ready. "
             "If the user asks for information that depends on synced inbox or calendar data, say that it is still syncing. "
             "If the user seems to be continuing onboarding, keep the answer concise so they can finish setup in this thread. "
             "For everything else, help normally.\n\n"

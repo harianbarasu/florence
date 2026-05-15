@@ -34,13 +34,16 @@ def latest_assistant_protocol_message(
     protocol_kind: str | None = None,
     limit: int = 8,
 ) -> ChannelMessage | None:
-    message = channel_log.latest_assistant_message(channel_id=channel_id, limit=limit)
-    if message is None:
-        return None
-    metadata = message.metadata if isinstance(message.metadata, dict) else {}
-    if protocol_kind is not None and metadata.get("protocol_kind") != protocol_kind:
-        return None
-    return message
+    for message in reversed(channel_log.recent_messages(channel_id=channel_id, limit=limit)):
+        sender_role = getattr(message, "sender_role", None)
+        role_value = getattr(sender_role, "value", sender_role)
+        if role_value is not None and str(role_value) != "assistant":
+            continue
+        metadata = message.metadata if isinstance(message.metadata, dict) else {}
+        if protocol_kind is not None and metadata.get("protocol_kind") != protocol_kind:
+            continue
+        return message
+    return None
 
 
 def latest_pending_action(

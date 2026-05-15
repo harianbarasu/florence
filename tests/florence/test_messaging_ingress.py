@@ -11,6 +11,7 @@ from florence.messaging.protocol_types import (
     CANDIDATE_REVIEW_PROMPT_KIND,
     PENDING_ACTION_EXPIRES_AT_KEY,
     PENDING_ACTION_ID_KEY,
+    build_candidate_review_prompt_metadata,
     build_household_link_prompt_metadata,
     build_google_connect_prompt_metadata,
 )
@@ -52,6 +53,7 @@ from florence.runtime import (
 )
 from florence.runtime.chat import FlorenceHouseholdChatService
 from florence.runtime.trust_policy import CONSTITUTION_SETTINGS_KEY
+from florence.tools.household import clear_household_tool_context, set_household_tool_context
 from florence.state import FlorenceStateDB
 from hermes_state import SessionDB
 from model_tools import handle_function_call
@@ -3175,6 +3177,448 @@ def test_complete_dm_ignore_work_emails_creates_account_rule_and_suppresses_exis
     assert work_candidate.metadata["suppressed_reason"] == "source_rule_ignored"
     assert personal_candidate.state == CandidateState.PENDING_REVIEW
     assert "source_visibility" not in personal_candidate.metadata
+    store.close()
+
+
+def test_complete_dm_ignores_work_email_but_keeps_work_calendars_as_private_blockers(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm_thread_123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Jackson",
+        )
+    )
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_onboarding_service(store, review_service)
+    chat_service = _StubHouseholdChatService("Hermes should not handle explicit source policy.")
+    ingress = _build_ingress(
+        store,
+        onboarding_service,
+        review_service,
+        household_chat_service=chat_service,
+    )
+    _complete_hybrid_onboarding(onboarding_service)
+    for connection_id, email, calendar_id in (
+        ("gconn_creators", "jackson@creatorsinc.com", "creators_primary"),
+        ("gconn_melon", "jackson@getmelon.com", "melon_primary"),
+    ):
+        store.upsert_google_connection(
+            GoogleConnection(
+                id=connection_id,
+                household_id="hh_123",
+                member_id="mem_123",
+                email=email,
+                connected_scopes=(GoogleSourceKind.GMAIL, GoogleSourceKind.GOOGLE_CALENDAR),
+                access_token=f"token-{connection_id}",
+                metadata={"primary_calendar_id": calendar_id},
+            )
+        )
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_creators_email",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GMAIL,
+            source_identifier="gmail:creators-email",
+            title="Company Team Meeting",
+            summary="Work account email that should stop resurfacing.",
+            state=CandidateState.PENDING_REVIEW,
+            metadata={
+                "google_connection_id": "gconn_creators",
+                "connected_email": "jackson@creatorsinc.com",
+            },
+        )
+    )
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_creators_calendar",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GOOGLE_CALENDAR,
+            source_identifier="google_calendar:creators:event",
+            title="Company Team Meeting",
+            summary="Work calendar meeting.",
+            state=CandidateState.PENDING_REVIEW,
+            metadata={
+                "google_connection_id": "gconn_creators",
+                "connected_email": "jackson@creatorsinc.com",
+                "calendar_id": "creators_primary",
+            },
+        )
+    )
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_ignore_work_with_blockers",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body=(
+                    "Reminder - anything related to @creatorsinc and @getmelon emails can be ignored "
+                    "except for knowing when I have meetings in case there is a conflict."
+                ),
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert result.consumed is True
+    assert chat_service.calls == []
+    assert set(result.reply_metadata["ignored_email_accounts"]) == {
+        "jackson@creatorsinc.com",
+        "jackson@getmelon.com",
+    }
+    assert set(result.reply_metadata["blocker_calendar_accounts"]) == {
+        "jackson@creatorsinc.com",
+        "jackson@getmelon.com",
+    }
+    gmail_rules = store.list_household_source_rules(
+        household_id="hh_123",
+        source_kind=GoogleSourceKind.GMAIL,
+        visibility=HouseholdSourceVisibility.IGNORED,
+    )
+    calendar_rules = store.list_household_source_rules(
+        household_id="hh_123",
+        source_kind=GoogleSourceKind.GOOGLE_CALENDAR,
+        visibility=HouseholdSourceVisibility.PRIVATE,
+    )
+    assert {
+        (rule.matcher_kind, rule.matcher_value)
+        for rule in gmail_rules
+    } == {
+        (HouseholdSourceMatcherKind.GMAIL_CONNECTED_ACCOUNT, "jackson@creatorsinc.com"),
+        (HouseholdSourceMatcherKind.GMAIL_CONNECTED_ACCOUNT, "jackson@getmelon.com"),
+    }
+    assert {
+        (rule.matcher_kind, rule.matcher_value, rule.metadata["calendar_usage_mode"])
+        for rule in calendar_rules
+    } == {
+        (HouseholdSourceMatcherKind.GOOGLE_CALENDAR_CONNECTED_ACCOUNT, "jackson@creatorsinc.com", "conflicts_only"),
+        (HouseholdSourceMatcherKind.GOOGLE_CALENDAR_CONNECTED_ACCOUNT, "jackson@getmelon.com", "conflicts_only"),
+    }
+    assert store.get_imported_candidate("cand_creators_email").state == CandidateState.REJECTED
+    assert store.get_imported_candidate("cand_creators_calendar").state == CandidateState.REJECTED
+    store.close()
+
+
+def test_complete_dm_records_primary_household_planning_account_as_shared(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm_thread_123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Jackson",
+        )
+    )
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_onboarding_service(store, review_service)
+    chat_service = _StubHouseholdChatService("Hermes should not handle explicit source policy.")
+    ingress = _build_ingress(
+        store,
+        onboarding_service,
+        review_service,
+        household_chat_service=chat_service,
+    )
+    _complete_hybrid_onboarding(onboarding_service)
+    store.upsert_google_connection(
+        GoogleConnection(
+            id="gconn_personal",
+            household_id="hh_123",
+            member_id="mem_123",
+            email="jacksonwilliams@gmail.com",
+            connected_scopes=(GoogleSourceKind.GMAIL, GoogleSourceKind.GOOGLE_CALENDAR),
+            access_token="token-personal",
+            metadata={"primary_calendar_id": "personal_primary"},
+        )
+    )
+    store.upsert_google_connection(
+        GoogleConnection(
+            id="gconn_other_gmail",
+            household_id="hh_123",
+            member_id="mem_123",
+            email="kendall@gmail.com",
+            connected_scopes=(GoogleSourceKind.GMAIL, GoogleSourceKind.GOOGLE_CALENDAR),
+            access_token="token-other-gmail",
+            metadata={"primary_calendar_id": "kendall_primary"},
+        )
+    )
+    store.upsert_imported_candidate(
+        ImportedCandidate(
+            id="cand_personal_calendar",
+            household_id="hh_123",
+            member_id="mem_123",
+            source_kind=GoogleSourceKind.GOOGLE_CALENDAR,
+            source_identifier="google_calendar:personal:event",
+            title="School concert",
+            summary="Family calendar event.",
+            state=CandidateState.PENDING_REVIEW,
+            metadata={
+                "google_connection_id": "gconn_personal",
+                "connected_email": "jacksonwilliams@gmail.com",
+            },
+        )
+    )
+
+    result = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_shared_personal",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body=(
+                    "For household planning jacksonwilliams@gmail is the one that matters. "
+                    "Anything there can be shared with Kendall."
+                ),
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert result.consumed is True
+    assert chat_service.calls == []
+    assert result.reply_metadata["shared_email_accounts"] == ["jacksonwilliams@gmail.com"]
+    assert result.reply_metadata["shared_calendar_accounts"] == ["jacksonwilliams@gmail.com"]
+    shared_rules = store.list_household_source_rules(
+        household_id="hh_123",
+        visibility=HouseholdSourceVisibility.SHARED,
+    )
+    assert {
+        (rule.source_kind, rule.matcher_kind, rule.matcher_value)
+        for rule in shared_rules
+    } == {
+        (GoogleSourceKind.GMAIL, HouseholdSourceMatcherKind.GMAIL_CONNECTED_ACCOUNT, "jacksonwilliams@gmail.com"),
+        (
+            GoogleSourceKind.GOOGLE_CALENDAR,
+            HouseholdSourceMatcherKind.GOOGLE_CALENDAR_CONNECTED_ACCOUNT,
+            "jacksonwilliams@gmail.com",
+        ),
+    }
+    candidate = store.get_imported_candidate("cand_personal_calendar")
+    assert candidate is not None
+    assert candidate.state == CandidateState.PENDING_REVIEW
+    assert candidate.metadata["source_visibility"] == "shared"
+    store.close()
+
+
+def test_complete_dm_suppresses_repeated_source_policy_receipts_but_saves_rules(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm_thread_123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Jackson",
+        )
+    )
+    review_service = FlorenceCandidateReviewService(store)
+    onboarding_service = _build_onboarding_service(store, review_service)
+    chat_service = _StubHouseholdChatService("Hermes should not handle explicit source policy.")
+    ingress = _build_ingress(
+        store,
+        onboarding_service,
+        review_service,
+        household_chat_service=chat_service,
+    )
+    _complete_hybrid_onboarding(onboarding_service)
+    for connection_id, email, calendar_id in (
+        ("gconn_creators", "jackson@creatorsinc.com", "creators_primary"),
+        ("gconn_personal", "jacksonwilliams@gmail.com", "personal_primary"),
+    ):
+        store.upsert_google_connection(
+            GoogleConnection(
+                id=connection_id,
+                household_id="hh_123",
+                member_id="mem_123",
+                email=email,
+                connected_scopes=(GoogleSourceKind.GMAIL, GoogleSourceKind.GOOGLE_CALENDAR),
+                access_token=f"token-{connection_id}",
+                metadata={"primary_calendar_id": calendar_id},
+            )
+        )
+
+    first = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_private_creators",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body="Private always from creators email.",
+                is_group_chat=False,
+            ),
+        )
+    )
+    second = ingress.handle_message(
+        FlorenceResolvedInboundMessage(
+            household_id="hh_123",
+            member_id="mem_123",
+            channel_id="chan_dm_123",
+            thread_id="dm_thread_123",
+            message=FlorenceInboundMessage(
+                provider="linq",
+                message_id="msg_shared_personal_fast_follow",
+                thread_id="dm_thread_123",
+                sender_handle="+15555550123",
+                body=(
+                    "For household planning jacksonwilliams@gmail is the one that matters. "
+                    "Anything there can be shared with Kendall."
+                ),
+                is_group_chat=False,
+            ),
+        )
+    )
+
+    assert first.consumed is True
+    assert first.reply_text is not None
+    assert second.consumed is True
+    assert second.reply_text is None
+    assert second.reply_metadata["source_policy_reply_suppressed"] is True
+    assert chat_service.calls == []
+    assistant_messages = [
+        message
+        for message in store.list_channel_messages(channel_id="chan_dm_123", limit=10)
+        if message.sender_role == ChannelMessageRole.ASSISTANT
+    ]
+    assert len(assistant_messages) == 1
+    rules = store.list_household_source_rules(household_id="hh_123")
+    assert {
+        (rule.source_kind, rule.matcher_kind, rule.matcher_value, rule.visibility)
+        for rule in rules
+    } >= {
+        (
+            GoogleSourceKind.GMAIL,
+            HouseholdSourceMatcherKind.GMAIL_CONNECTED_ACCOUNT,
+            "jackson@creatorsinc.com",
+            HouseholdSourceVisibility.PRIVATE,
+        ),
+        (
+            GoogleSourceKind.GMAIL,
+            HouseholdSourceMatcherKind.GMAIL_CONNECTED_ACCOUNT,
+            "jacksonwilliams@gmail.com",
+            HouseholdSourceVisibility.SHARED,
+        ),
+        (
+            GoogleSourceKind.GOOGLE_CALENDAR,
+            HouseholdSourceMatcherKind.GOOGLE_CALENDAR_CONNECTED_ACCOUNT,
+            "jacksonwilliams@gmail.com",
+            HouseholdSourceVisibility.SHARED,
+        ),
+    }
+    store.close()
+
+
+def test_candidate_review_tool_keeps_visible_batch_active_after_done_receipt(tmp_path):
+    store = FlorenceStateDB(tmp_path / "florence.db")
+    store.upsert_household(Household(id="hh_123", name="Jackson household", timezone="America/Los_Angeles"))
+    store.upsert_member(Member(id="mem_123", household_id="hh_123", display_name="Jackson", role=MemberRole.ADMIN))
+    store.upsert_channel(
+        Channel(
+            id="chan_dm_123",
+            household_id="hh_123",
+            provider="linq",
+            provider_channel_id="dm_thread_123",
+            channel_type=ChannelType.PARENT_DM,
+            title="Jackson",
+        )
+    )
+    for candidate_id, title in (
+        ("cand_batch_1", "Company Team Meeting"),
+        ("cand_batch_2", "Stay at Shinola Hotel"),
+    ):
+        store.upsert_imported_candidate(
+            ImportedCandidate(
+                id=candidate_id,
+                household_id="hh_123",
+                member_id="mem_123",
+                source_kind=GoogleSourceKind.GOOGLE_CALENDAR,
+                source_identifier=f"google_calendar:{candidate_id}",
+                title=title,
+                summary=title,
+                state=CandidateState.PENDING_REVIEW,
+                metadata={
+                    "proposed_fields": {
+                        "title": title,
+                        "starts_at": "2026-06-28T00:00:00-07:00",
+                        "timezone": "America/Los_Angeles",
+                    },
+                },
+            )
+        )
+    review_metadata = build_candidate_review_prompt_metadata(
+        "cand_batch_1",
+        candidate_ids=["cand_batch_1", "cand_batch_2"],
+    )
+    store.append_channel_message(
+        ChannelMessage(
+            id="msg_review_batch",
+            household_id="hh_123",
+            channel_id="chan_dm_123",
+            sender_role=ChannelMessageRole.ASSISTANT,
+            body="A few things I want to double-check before I add them:\n1. Company Team Meeting\n2. Stay at Shinola Hotel",
+            metadata=review_metadata,
+            created_at=datetime.now(timezone.utc).timestamp(),
+        )
+    )
+    store.append_channel_message(
+        ChannelMessage(
+            id="msg_done_receipt",
+            household_id="hh_123",
+            channel_id="chan_dm_123",
+            sender_role=ChannelMessageRole.ASSISTANT,
+            body="Done - I saved that source policy.",
+            metadata={},
+            created_at=datetime.now(timezone.utc).timestamp(),
+        )
+    )
+    task_id = "task_review_after_done"
+    set_household_tool_context(
+        task_id,
+        store=store,
+        household_id="hh_123",
+        actor_member_id="mem_123",
+        channel_id="chan_dm_123",
+    )
+    try:
+        result = json.loads(
+            handle_function_call(
+                "household_apply_candidate_review",
+                {
+                    "candidate_id": "cand_batch_2",
+                    "pending_action_id": review_metadata[PENDING_ACTION_ID_KEY],
+                    "resolution": "confirm",
+                },
+                task_id=task_id,
+            )
+        )
+    finally:
+        clear_household_tool_context(task_id)
+
+    assert "error" not in result
+    assert result["result"]["candidate_id"] == "cand_batch_2"
+    assert store.get_imported_candidate("cand_batch_2").state == CandidateState.CONFIRMED
     store.close()
 
 

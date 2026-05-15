@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import replace
 from typing import Any
 
 from florence.contracts import (
     CandidateState,
+    ChannelMessageRole,
     GoogleConnection,
     GoogleSourceKind,
     HouseholdSourceVisibility,
@@ -29,6 +31,7 @@ _CONSUMER_DOMAINS = {
     "msn.com",
     "aol.com",
 }
+_SOURCE_POLICY_ACK_SUPPRESSION_SECONDS = 90.0
 
 
 class FlorenceSourcePolicyProtocol:
@@ -48,10 +51,11 @@ class FlorenceSourcePolicyProtocol:
         normalized = _normalize_policy_text(text)
         if not normalized:
             return None
-        email_ignore = _wants_email_ignore(normalized)
-        email_private = _wants_email_private(normalized)
+        source_ignore = _wants_source_ignore(normalized)
+        source_private = _wants_source_private(normalized)
+        source_shared = _wants_source_shared(normalized)
         calendar_blockers = _wants_calendar_blockers(normalized)
-        if not email_ignore and not email_private and not calendar_blockers:
+        if not source_ignore and not source_private and not source_shared and not calendar_blockers:
             return None
 
         connections = [
@@ -78,14 +82,17 @@ class FlorenceSourcePolicyProtocol:
 
         private_email_accounts: list[str] = []
         ignored_email_accounts: list[str] = []
+        shared_email_accounts: list[str] = []
         blocker_calendar_accounts: list[str] = []
-        email_visibility = (
-            HouseholdSourceVisibility.IGNORED
-            if email_ignore
-            else HouseholdSourceVisibility.PRIVATE
+        private_calendar_accounts: list[str] = []
+        shared_calendar_accounts: list[str] = []
+        email_visibility = _source_email_visibility(
+            source_ignore=source_ignore,
+            source_private=source_private,
+            source_shared=source_shared,
         )
         for connection in matched_connections:
-            if (email_ignore or email_private) and GoogleSourceKind.GMAIL in connection.connected_scopes:
+            if email_visibility is not None and GoogleSourceKind.GMAIL in connection.connected_scopes:
                 self._record_account_rule(
                     household_id=household_id,
                     member_id=member_id,
@@ -101,44 +108,105 @@ class FlorenceSourcePolicyProtocol:
                 )
                 if email_visibility == HouseholdSourceVisibility.IGNORED:
                     ignored_email_accounts.append(connection.email)
-                else:
+                elif email_visibility == HouseholdSourceVisibility.PRIVATE:
                     private_email_accounts.append(connection.email)
-            if calendar_blockers and GoogleSourceKind.GOOGLE_CALENDAR in connection.connected_scopes:
+                elif email_visibility == HouseholdSourceVisibility.SHARED:
+                    shared_email_accounts.append(connection.email)
+
+            calendar_visibility = _source_calendar_visibility(
+                source_private=source_private,
+                source_shared=source_shared,
+                calendar_blockers=calendar_blockers,
+            )
+            if calendar_visibility is not None and GoogleSourceKind.GOOGLE_CALENDAR in connection.connected_scopes:
                 self._record_account_rule(
                     household_id=household_id,
                     member_id=member_id,
                     channel_id=channel_id,
                     connection=connection,
                     source_kind=GoogleSourceKind.GOOGLE_CALENDAR,
-                    visibility=HouseholdSourceVisibility.PRIVATE,
-                    rule_metadata={
-                        "calendar_usage_mode": "conflicts_only",
-                        "calendar_detail_visibility": "busy_only",
-                    },
+                    visibility=calendar_visibility,
+                    rule_metadata=(
+                        {
+                            "calendar_usage_mode": "conflicts_only",
+                            "calendar_detail_visibility": "busy_only",
+                        }
+                        if calendar_blockers
+                        else None
+                    ),
                 )
-                self._set_calendar_blocker_preferences(connection)
-                self._suppress_existing_calendar_candidates(connection=connection)
-                blocker_calendar_accounts.append(connection.email)
+                self._apply_existing_candidate_account_policy(
+                    connection=connection,
+                    source_kind=GoogleSourceKind.GOOGLE_CALENDAR,
+                    visibility=calendar_visibility,
+                )
+                if calendar_blockers:
+                    self._set_calendar_blocker_preferences(connection)
+                    self._suppress_existing_calendar_candidates(connection=connection)
+                    blocker_calendar_accounts.append(connection.email)
+                elif calendar_visibility == HouseholdSourceVisibility.PRIVATE:
+                    private_calendar_accounts.append(connection.email)
+                elif calendar_visibility == HouseholdSourceVisibility.SHARED:
+                    shared_calendar_accounts.append(connection.email)
 
-        if not private_email_accounts and not ignored_email_accounts and not blocker_calendar_accounts:
+        if (
+            not private_email_accounts
+            and not ignored_email_accounts
+            and not shared_email_accounts
+            and not blocker_calendar_accounts
+            and not private_calendar_accounts
+            and not shared_calendar_accounts
+        ):
             return None
         reply_bits = []
         if ignored_email_accounts:
             reply_bits.append(f"email from {_account_list(ignored_email_accounts)} ignored")
         if private_email_accounts:
             reply_bits.append(f"email from {_account_list(private_email_accounts)} private to this Florence thread")
+        if shared_email_accounts:
+            reply_bits.append(f"email from {_account_list(shared_email_accounts)} shared with the household")
         if blocker_calendar_accounts:
             reply_bits.append(f"calendar events from {_account_list(blocker_calendar_accounts)} as busy blockers only")
+        if private_calendar_accounts:
+            reply_bits.append(f"calendar events from {_account_list(private_calendar_accounts)} private to this Florence thread")
+        if shared_calendar_accounts:
+            reply_bits.append(f"calendar events from {_account_list(shared_calendar_accounts)} shared with the household")
+        reply_metadata = {
+            "source_policy_kind": "google_account_policy",
+            "ignored_email_accounts": ignored_email_accounts,
+            "private_email_accounts": private_email_accounts,
+            "shared_email_accounts": shared_email_accounts,
+            "blocker_calendar_accounts": blocker_calendar_accounts,
+            "private_calendar_accounts": private_calendar_accounts,
+            "shared_calendar_accounts": shared_calendar_accounts,
+        }
+        if self._recent_source_policy_ack_exists(channel_id=channel_id):
+            return FlorenceProtocolReply(
+                reply_text=None,
+                reply_metadata={
+                    **reply_metadata,
+                    "source_policy_reply_suppressed": True,
+                    "source_policy_reply_suppressed_reason": "recent_source_policy_ack",
+                },
+                consumed=True,
+            )
         return FlorenceProtocolReply(
             reply_text=f"Got it. I’ll keep {' and '.join(reply_bits)}.",
-            reply_metadata={
-                "source_policy_kind": "google_account_policy",
-                "ignored_email_accounts": ignored_email_accounts,
-                "private_email_accounts": private_email_accounts,
-                "blocker_calendar_accounts": blocker_calendar_accounts,
-            },
+            reply_metadata=reply_metadata,
             consumed=True,
         )
+
+    def _recent_source_policy_ack_exists(self, *, channel_id: str) -> bool:
+        cutoff = time.time() - _SOURCE_POLICY_ACK_SUPPRESSION_SECONDS
+        for message in reversed(self.store.list_channel_messages(channel_id=channel_id, limit=12)):
+            if message.created_at < cutoff:
+                return False
+            if message.sender_role != ChannelMessageRole.ASSISTANT:
+                continue
+            metadata = message.metadata if isinstance(message.metadata, dict) else {}
+            if metadata.get("source_policy_kind") == "google_account_policy":
+                return True
+        return False
 
     def _record_account_rule(
         self,
@@ -248,15 +316,78 @@ def _normalize_policy_text(text: str | None) -> str:
     return " ".join(normalized.split()).strip()
 
 
-def _wants_email_private(text: str) -> bool:
-    return (
-        ("email" in text or "mail" in text or "inbox" in text or "account" in text)
-        and ("private" in text or "dont share" in text or "do not share" in text)
+def _source_email_visibility(
+    *,
+    source_ignore: bool,
+    source_private: bool,
+    source_shared: bool,
+) -> HouseholdSourceVisibility | None:
+    if source_ignore:
+        return HouseholdSourceVisibility.IGNORED
+    if source_private:
+        return HouseholdSourceVisibility.PRIVATE
+    if source_shared:
+        return HouseholdSourceVisibility.SHARED
+    return None
+
+
+def _source_calendar_visibility(
+    *,
+    source_private: bool,
+    source_shared: bool,
+    calendar_blockers: bool,
+) -> HouseholdSourceVisibility | None:
+    if calendar_blockers or source_private:
+        return HouseholdSourceVisibility.PRIVATE
+    if source_shared:
+        return HouseholdSourceVisibility.SHARED
+    return None
+
+
+def _mentions_source_surface(text: str) -> bool:
+    return any(
+        term in text
+        for term in (
+            "email",
+            "emails",
+            "mail",
+            "inbox",
+            "account",
+            "accounts",
+            "source",
+            "sender",
+            "senders",
+            "calendar",
+            "meeting",
+            "meetings",
+            "household planning",
+            "@",
+        )
     )
 
 
-def _wants_email_ignore(text: str) -> bool:
-    if not ("email" in text or "mail" in text or "inbox" in text or "account" in text):
+def _wants_source_private(text: str) -> bool:
+    if not _mentions_source_surface(text):
+        return False
+    return any(
+        phrase in text
+        for phrase in (
+            "private",
+            "private always",
+            "always private",
+            "private only",
+            "keep private",
+            "dont share",
+            "do not share",
+            "no need to share",
+            "out of the household plan",
+            "not on the household plan",
+        )
+    )
+
+
+def _wants_source_ignore(text: str) -> bool:
+    if not _mentions_source_surface(text):
         return False
     return any(
         phrase in text
@@ -278,10 +409,33 @@ def _wants_email_ignore(text: str) -> bool:
     )
 
 
-def _wants_calendar_blockers(text: str) -> bool:
-    if "calendar" not in text:
+def _wants_source_shared(text: str) -> bool:
+    if not _mentions_source_surface(text):
         return False
     return any(
+        phrase in text
+        for phrase in (
+            "can be shared",
+            "always share",
+            "share this source",
+            "shared with",
+            "household planning",
+            "one that matters",
+            "main source",
+            "trusted source",
+        )
+    )
+
+
+def _wants_calendar_blockers(text: str) -> bool:
+    calendar_terms = "calendar" in text
+    meeting_conflict_terms = (
+        ("meeting" in text or "meetings" in text or "time block" in text or "time blocks" in text)
+        and ("conflict" in text or "conflicts" in text or "blocker" in text or "blockers" in text)
+    )
+    if not calendar_terms and not meeting_conflict_terms:
+        return False
+    blocker_phrases = any(
         phrase in text
         for phrase in (
             "blocker",
@@ -296,6 +450,7 @@ def _wants_calendar_blockers(text: str) -> bool:
             "do not share",
         )
     )
+    return blocker_phrases or meeting_conflict_terms
 
 
 def _matches_work_account_reference(text: str) -> bool:
@@ -307,6 +462,11 @@ def _matches_work_account_reference(text: str) -> bool:
 def _email_domain(email: str | None) -> str:
     cleaned = str(email or "").strip().lower()
     return cleaned.split("@", 1)[1] if "@" in cleaned else ""
+
+
+def _email_local_part(email: str | None) -> str:
+    cleaned = str(email or "").strip().lower()
+    return cleaned.split("@", 1)[0] if "@" in cleaned else ""
 
 
 def _domain_tokens(email: str | None) -> set[str]:
@@ -323,7 +483,28 @@ def _connection_matches_text(connection: GoogleConnection, text: str) -> bool:
     email = str(connection.email or "").strip().lower()
     if email and email in text:
         return True
-    return any(token in text for token in _domain_tokens(email))
+    local_part = _email_local_part(email)
+    domain = _email_domain(email)
+    domain_base = domain.rsplit(".", 1)[0] if domain else ""
+    if local_part and domain_base and f"{local_part}@{domain_base}" in text:
+        return True
+    if domain in _CONSUMER_DOMAINS:
+        return False
+    text_terms = {
+        term
+        for term in re.split(r"[^a-z0-9]+", text.replace("@", " "))
+        if len(term) >= 5
+    }
+    for token in _domain_tokens(email):
+        if token in text:
+            return True
+        if any(term in token or token in term for term in text_terms):
+            return True
+        if token.startswith("get") and token[3:] in text_terms:
+            return True
+        if any(term.startswith("get") and term[3:] == token for term in text_terms):
+            return True
+    return False
 
 
 def _calendar_ids_for_connection(metadata: dict[str, Any]) -> list[str]:

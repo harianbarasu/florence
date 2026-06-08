@@ -12,7 +12,7 @@ from typing import Protocol
 from florence.actions import run_approved_actions
 from florence.config import Settings
 from florence.linq import LinqClient
-from florence.models import OutboundMessage
+from florence.models import IncomingMessage, OutboundMessage
 from florence.source_providers import (
     SourceProvider,
     SourceSyncRunResult,
@@ -26,6 +26,18 @@ logger = logging.getLogger(__name__)
 
 class Sender(Protocol):
     def send_text(self, *, chat_id: str, text: str, idempotency_key: str) -> object:
+        ...
+
+
+class LinqReconciler(Sender, Protocol):
+    def recent_incoming_messages(
+        self,
+        *,
+        now_utc: datetime,
+        chat_limit: int = 25,
+        messages_per_chat: int = 20,
+        since_utc: datetime | None = None,
+    ) -> list[IncomingMessage]:
         ...
 
 
@@ -48,8 +60,17 @@ class SendBatchResult:
 
 
 @dataclass(slots=True)
+class LinqReconciliationResult:
+    checked: int
+    inbound: int
+    sent: int
+    delivery_failed: int
+
+
+@dataclass(slots=True)
 class WorkerTickResult:
     routine: RoutineTickResult
+    linq_reconciliation: LinqReconciliationResult | None
     source_sync: SourceSyncRunResult | None
     source_messages: int
     source_delivery_failed: int
@@ -130,6 +151,63 @@ def run_source_sync_tick(
     return result
 
 
+def run_linq_reconciliation_tick(
+    service: FlorenceService,
+    linq: LinqReconciler,
+    *,
+    now_utc: datetime | None = None,
+    chat_limit: int = 25,
+    messages_per_chat: int = 20,
+    since_utc: datetime | None = None,
+) -> LinqReconciliationResult:
+    now = now_utc or datetime.now(timezone.utc)
+    incoming_messages = linq.recent_incoming_messages(
+        now_utc=now,
+        chat_limit=chat_limit,
+        messages_per_chat=messages_per_chat,
+        since_utc=since_utc,
+    )
+    sent = 0
+    failed = 0
+    processed = 0
+    for incoming in incoming_messages:
+        outbound = service.handle_incoming(incoming, now_utc=incoming.received_at)
+        household = service.store.get_household_by_chat(incoming.chat_id)
+        if household is not None:
+            if outbound:
+                service.store.record_outbound_deliveries_for_source(
+                    household_id=household.id,
+                    source_message_id=incoming.message_id,
+                    messages=outbound,
+                    now_utc=now,
+                )
+            else:
+                outbound = service.store.retryable_outbound_deliveries_for_source(
+                    household_id=household.id,
+                    source_message_id=incoming.message_id,
+                )
+        if outbound:
+            processed += 1
+        result = _send_all(
+            linq,
+            outbound,
+            on_sent=lambda message: _mark_reconciled_outbound_sent(service, message, now),
+            on_failed=lambda message, error: service.store.mark_outbound_delivery_failed(
+                idempotency_key=message.idempotency_key,
+                error=error,
+                now_utc=now,
+            ),
+        )
+        sent += result.sent
+        failed += result.failed
+    return LinqReconciliationResult(
+        checked=len(incoming_messages),
+        inbound=processed,
+        sent=sent,
+        delivery_failed=failed,
+    )
+
+
 def run_worker_tick(
     service: FlorenceService,
     sender: Sender,
@@ -137,10 +215,17 @@ def run_worker_tick(
     providers: dict[str, SourceProvider] | None = None,
     now_utc: datetime | None = None,
     run_sources: bool = True,
+    run_linq_reconciliation: bool = True,
     source_limit: int = 100,
 ) -> WorkerTickResult:
     now = now_utc or datetime.now(timezone.utc)
     routine = run_routine_tick(service, sender, now_utc=now)
+    linq_reconciliation = None
+    if run_linq_reconciliation and isinstance(sender, LinqClient):
+        try:
+            linq_reconciliation = run_linq_reconciliation_tick(service, sender, now_utc=now)
+        except Exception:
+            logger.exception("Florence Linq reconciliation failed; continuing")
     source_sync = None
     source_messages = 0
     source_delivery_failed = 0
@@ -156,6 +241,7 @@ def run_worker_tick(
         source_delivery_failed = source_sync.delivery_failed
     return WorkerTickResult(
         routine=routine,
+        linq_reconciliation=linq_reconciliation,
         source_sync=source_sync,
         source_messages=source_messages,
         source_delivery_failed=source_delivery_failed,
@@ -244,6 +330,18 @@ def _send_all(
             on_sent(message)
         sent += 1
     return SendBatchResult(attempted=len(outbound), sent=sent, failed=failed)
+
+
+def _mark_reconciled_outbound_sent(
+    service: FlorenceService,
+    message: OutboundMessage,
+    now_utc: datetime,
+) -> None:
+    service.store.mark_outbound_delivery_sent(
+        idempotency_key=message.idempotency_key,
+        now_utc=now_utc,
+    )
+    service.mark_outbound_delivered(message, now_utc=now_utc)
 
 
 def _maybe_record_google_live_verification(

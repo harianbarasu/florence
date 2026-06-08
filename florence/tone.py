@@ -149,8 +149,10 @@ def help_text(topic: str | None = None) -> str:
         )
     if normalized in {"memory", "memories"}:
         return (
-            "Memory help: parents can text 'remember that Maya likes pasta', "
-            "'what do you remember?', 'forget Maya likes pasta', or 'pause memory'."
+            "Memory help: the household book is the context Florence keeps. Parents can text "
+            "'remember that Maya likes pasta', "
+            "'show household book', 'what do you remember?', 'forget Maya likes pasta', "
+            "or 'pause memory'."
         )
     if normalized in {"privacy", "controls"}:
         return (
@@ -523,9 +525,12 @@ def tomorrow_prep(
 
 def memory_snapshot(snapshot: MemorySnapshot) -> str:
     if not snapshot.memories:
-        return "I do not have durable household memories yet. Text 'remember that ...' when there is something you want me to keep."
+        return (
+            "The household book is empty right now. Text 'remember that ...' "
+            "when there is something you want me to keep."
+        )
 
-    lines = ["Here is what I remember for this household:"]
+    lines = ["Here is what I remember for this household book:"]
     for memory in snapshot.memories[:10]:
         source = f" (from {memory.asserted_by_label})" if memory.asserted_by_label else ""
         lines.append(f"- {memory.text}{source}")
@@ -536,57 +541,57 @@ def memory_snapshot(snapshot: MemorySnapshot) -> str:
 
 
 def memory_paused() -> str:
-    return "Household memory is paused. I will not save new durable memories until a parent turns it back on."
+    return "Household memory is paused. I will not add to the household book until a parent turns it back on."
 
 
 def memory_resumed() -> str:
-    return "Household memory is back on. I will keep using it only for this household."
+    return "Household memory is back on. I will use the household book only for this household."
 
 
 def memory_disabled() -> str:
-    return "Household memory is paused, so I did not save that."
+    return "Household memory is paused, so I did not save that to the household book."
 
 
 def memory_parent_only() -> str:
-    return "I need one of the parents in this household to change durable memory."
+    return "I need one of the parents in this household to change the household book."
 
 
 def memory_view_parent_only() -> str:
-    return "I need one of the parents in this household to view durable memory."
+    return "I need one of the parents in this household to view the household book."
 
 
 def memory_needs_text() -> str:
-    return "What should I remember for this household?"
+    return "What should I add to the household book?"
 
 
 def memory_too_long(limit: int) -> str:
-    return f"That is a bit long for durable memory. Send the short version in {limit} characters or fewer."
+    return f"That is a bit long for the household book. Send the short version in {limit} characters or fewer."
 
 
 def forget_needs_text() -> str:
-    return "What should I forget from household memory?"
+    return "What should I remove from the household book?"
 
 
 def memory_saved(text: str) -> str:
-    return f"Got it. I will remember: {text}."
+    return f"Got it. I added this to the household book: {text}."
 
 
 def memory_removed() -> str:
-    return "Done. I removed that from household memory."
+    return "Done. I removed that from the household book."
 
 
 def memory_cleared(count: int) -> str:
     if count == 1:
-        return "Done. I cleared 1 household memory."
-    return f"Done. I cleared {count} household memories."
+        return "Done. I cleared 1 household memory from the household book."
+    return f"Done. I cleared {count} household memories from the household book."
 
 
 def memory_clear_empty() -> str:
-    return "There are no active household memories to clear."
+    return "There are no active household book items to clear."
 
 
 def memory_not_found() -> str:
-    return "I could not find that in household memory."
+    return "I could not find that in the household book."
 
 
 def privacy_parent_only() -> str:
@@ -607,7 +612,7 @@ def privacy_status(privacy: HouseholdPrivacy) -> str:
     return (
         "Privacy for this household:\n"
         f"- Mode: {privacy.mode.value}\n"
-        f"- Household memory: {memory}\n"
+        f"- Household book memory: {memory}\n"
         f"- Product analytics: {analytics}\n"
         "- Cross-family memory sharing: off"
     )

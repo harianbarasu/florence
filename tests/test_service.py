@@ -3513,6 +3513,23 @@ def test_memory_status_shows_household_memory_with_provenance(tmp_path):
     assert "Maya likes pasta (from Sam)" in outbound[0].text
 
 
+def test_household_book_alias_shows_curated_memory(tmp_path):
+    service, _agent = _service(tmp_path)
+    now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
+
+    service.handle_incoming(
+        _incoming("remember that Maya likes pasta", message_id="book-remember"),
+        now_utc=now,
+    )
+    outbound = service.handle_incoming(
+        _incoming("show household book", message_id="book-show"),
+        now_utc=now,
+    )
+
+    assert "household book" in outbound[0].text.lower()
+    assert "Maya likes pasta" in outbound[0].text
+
+
 def test_duplicate_explicit_memory_updates_existing_record(tmp_path):
     service, _agent = _service(tmp_path)
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)

@@ -224,6 +224,84 @@ class LinqClient:
         except ValueError:
             return {"response": response.text}
 
+    def recent_incoming_messages(
+        self,
+        *,
+        now_utc: datetime,
+        chat_limit: int = 25,
+        messages_per_chat: int = 20,
+        since_utc: datetime | None = None,
+    ) -> list[IncomingMessage]:
+        """Fetch recent inbound Linq messages as a webhook backstop.
+
+        Webhooks remain the real-time path. This is intentionally conservative:
+        it only walks chats that include Florence's configured sending line and
+        only returns messages Linq marks as not from us.
+        """
+        if not self.settings.linq_api_key or not self.settings.linq_from_phone:
+            return []
+        since = ensure_utc(since_utc) if since_utc is not None else None
+        inbound: list[IncomingMessage] = []
+        for chat in self._list_chats(limit=chat_limit):
+            if not _chat_has_handle(chat, self.settings.linq_from_phone):
+                continue
+            chat_id = _text_value(chat.get("id"))
+            if not chat_id:
+                continue
+            for message in self._list_chat_messages(
+                chat_id=chat_id,
+                limit=messages_per_chat,
+                order="desc",
+            ):
+                if not _linq_message_is_inbound(message):
+                    continue
+                incoming = parse_linq_event(message, {}, now_utc=now_utc)
+                if incoming is not None:
+                    if since is not None and incoming.received_at < since:
+                        continue
+                    inbound.append(incoming)
+        return sorted(inbound, key=lambda message: (message.received_at, message.message_id))
+
+    def _list_chats(self, *, limit: int) -> list[Mapping[str, Any]]:
+        url = urljoin(self.settings.linq_base_url.rstrip("/") + "/", "chats")
+        response = self._client.get(
+            url,
+            params={"limit": max(1, min(limit, 100))},
+            headers={"Authorization": f"Bearer {self.settings.linq_api_key}"},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        chats = payload.get("chats") if isinstance(payload, Mapping) else payload
+        if not isinstance(chats, list):
+            return []
+        return [chat for chat in chats if isinstance(chat, Mapping)]
+
+    def _list_chat_messages(
+        self,
+        *,
+        chat_id: str,
+        limit: int,
+        order: str,
+    ) -> list[Mapping[str, Any]]:
+        url = urljoin(
+            self.settings.linq_base_url.rstrip("/") + "/",
+            f"chats/{chat_id}/messages",
+        )
+        response = self._client.get(
+            url,
+            params={
+                "limit": max(1, min(limit, 100)),
+                "order": order,
+            },
+            headers={"Authorization": f"Bearer {self.settings.linq_api_key}"},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        messages = payload.get("messages") if isinstance(payload, Mapping) else payload
+        if not isinstance(messages, list):
+            return []
+        return [message for message in messages if isinstance(message, Mapping)]
+
     def create_chat(
         self,
         *,
@@ -365,6 +443,40 @@ def _sender_value(*values: object) -> str | None:
         if text:
             return text
     return None
+
+
+def _chat_has_handle(chat: Mapping[str, Any], handle: str) -> bool:
+    normalized = _normalize_phoneish(handle)
+    handles = chat.get("handles")
+    if not isinstance(handles, list):
+        return False
+    for item in handles:
+        if isinstance(item, Mapping) and _normalize_phoneish(_text_value(item.get("handle"))) == normalized:
+            return True
+    return False
+
+
+def _linq_message_is_inbound(message: Mapping[str, Any]) -> bool:
+    if message.get("is_from_me") is True:
+        return False
+    if message.get("is_from_me") is False:
+        return True
+    for key in ("from_handle", "sender_handle", "handle"):
+        value = message.get(key)
+        if isinstance(value, Mapping) and value.get("is_me") is True:
+            return False
+        if isinstance(value, Mapping) and value.get("is_me") is False:
+            return True
+    direction = _text_value(message.get("direction"))
+    if direction:
+        return direction.lower() in {"inbound", "received"}
+    return False
+
+
+def _normalize_phoneish(value: str | None) -> str:
+    if value is None:
+        return ""
+    return "".join(ch for ch in value if ch.isdigit()) or value.strip()
 
 
 def _text_value(value: object) -> str | None:

@@ -1,14 +1,17 @@
 # SaaS Memory Model
 
-Florence memory is household-scoped. A memory can never be read without a
+Florence memory is the household's Butler's Book: a visible, editable, curated
+set of household context that parents can inspect and correct. It is not a
+mysterious model-owned memory layer. A memory can never be read without a
 `household_id`, and the store does not expose global semantic recall.
 
 ## Layers
 
 - Transcript: recent messages used for immediate conversational continuity.
-- Durable household memory: explicit facts, preferences, routines, and
-  constraints that should survive across turns. Each record tracks which
-  household member asserted it when that provenance is available.
+- Durable household memory: the parent-visible household book. It contains
+  explicit facts, preferences, routines, and constraints that should survive
+  across turns. Each record tracks which household member asserted it when that
+  provenance is available.
 - Source memory: emails, calendar items, flyers, and other imported signals.
   These are stored with provenance but only surfaced through Need-to-Know.
 - Agent memory: Hermes native memory, stable Hermes household sessions, and
@@ -38,6 +41,9 @@ data-sharing boundaries before production use.
 ## Rules
 
 - Default scope is `household`.
+- Parent-facing UX should call durable memory the household book when possible.
+  Existing commands such as `what do you remember?` continue to work, but
+  `show household book` and `household book status` are the preferred language.
 - Future member-level memory should still belong to a household and include a
   `subject`, not a free-floating user profile.
 - The first sender in a household is the founding parent. Later unknown senders
@@ -68,6 +74,7 @@ data-sharing boundaries before production use.
   explicitly manage household memory through local commands, but Hermes does not
   get to persist contact details from a model proposal.
 - Parents can ask "what do you remember?" to see durable household memory.
+  They can also ask `show household book`.
   Durable memory is injected into Hermes only on parent turns; helper turns omit
   it even when household memory is enabled.
 - Parents can say "pause memory" to stop new durable memory writes and exclude

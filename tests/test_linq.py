@@ -278,6 +278,86 @@ def test_linq_send_text_posts_existing_chat_message():
     assert payload["message"]["idempotency_key"] == "reminder:abc"
 
 
+def test_linq_recent_incoming_messages_filters_to_configured_line_and_inbound_messages():
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/api/partner/v3/chats":
+            return httpx.Response(
+                200,
+                json={
+                    "chats": [
+                        {
+                            "id": "chat-1",
+                            "handles": [
+                                {"handle": "+15555550000", "is_me": True},
+                                {"handle": "+15555550100", "is_me": False},
+                            ],
+                        },
+                        {
+                            "id": "old-line-chat",
+                            "handles": [
+                                {"handle": "+15555559999", "is_me": True},
+                                {"handle": "+15555550100", "is_me": False},
+                            ],
+                        },
+                    ]
+                },
+            )
+        if request.url.path == "/api/partner/v3/chats/chat-1/messages":
+            return httpx.Response(
+                200,
+                json={
+                    "messages": [
+                        {
+                            "id": "outbound-message",
+                            "chat_id": "chat-1",
+                            "from": "+15555550000",
+                            "from_handle": {"handle": "+15555550000", "is_me": True},
+                            "is_from_me": True,
+                            "parts": [{"type": "text", "value": "Florence reply"}],
+                            "sent_at": "2026-06-05T16:02:00Z",
+                        },
+                        {
+                            "id": "missed-inbound",
+                            "chat_id": "chat-1",
+                            "from": "+15555550100",
+                            "from_handle": {"handle": "+15555550100", "is_me": False},
+                            "is_from_me": False,
+                            "parts": [{"type": "text", "value": "hi"}],
+                            "sent_at": "2026-06-05T16:01:00Z",
+                        },
+                    ]
+                },
+            )
+        raise AssertionError(f"unexpected request path {request.url.path}")
+
+    client = LinqClient(
+        Settings(linq_api_key="linq-api-key", linq_from_phone="+15555550000"),
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    messages = client.recent_incoming_messages(
+        now_utc=datetime(2026, 6, 5, 16, 5, tzinfo=timezone.utc),
+    )
+
+    assert [request.url.path for request in requests] == [
+        "/api/partner/v3/chats",
+        "/api/partner/v3/chats/chat-1/messages",
+    ]
+    assert len(messages) == 1
+    assert messages[0].chat_id == "chat-1"
+    assert messages[0].message_id == "missed-inbound"
+    assert messages[0].sender == "+15555550100"
+    assert messages[0].text == "hi"
+
+    assert client.recent_incoming_messages(
+        now_utc=datetime(2026, 6, 5, 16, 5, tzinfo=timezone.utc),
+        since_utc=datetime(2026, 6, 5, 16, 1, 30, tzinfo=timezone.utc),
+    ) == []
+
+
 def test_linq_create_chat_posts_group_initial_message():
     requests: list[httpx.Request] = []
 

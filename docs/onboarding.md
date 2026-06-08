@@ -1,7 +1,9 @@
 # Household Onboarding
 
 Florence should feel useful from the iMessage thread, not from an admin wizard.
-The setup flow is therefore text-native and derived from household state.
+The setup flow is therefore text-native and derived from household state. The
+state parents are building is the household book: a shared, curated set of
+family context that Florence can use and parents can inspect.
 
 ## Commands
 
@@ -11,13 +13,14 @@ The setup flow is therefore text-native and derived from household state.
 - `help sources`
 - `help calendar`
 - `help memory`
+- `show household book`
 - `help privacy`
 - `help reminders`
 - `my name is Sam`
 - `invite partner +15555550101` (parent-only)
 - `confirm partner +15555550101` (parent-only)
 - `our child is Maya` (parent-only)
-- `our kids are Maya and Leo` (parent-only)
+- `our kids are Maya and Leo` (parent-only; writes child profiles to the household book)
 - `set timezone America/New_York` (parent-only)
 - `remind Alex tomorrow at 8am to pack cleats`
 - `add soccer practice tomorrow at 5pm to calendar` (parent-only; household calendar)
@@ -39,6 +42,8 @@ A household is marked ready for a pilot when Florence has:
 - At least one child profile.
 - At least one connected or imported email/calendar source.
 - At least one source preference.
+- A household book with enough stable family context to avoid starting from
+  scratch every turn.
 
 Readiness is intentionally derived, not manually toggled. If a parent pauses
 memory or removes source rules later, the checklist can reflect that current
@@ -67,6 +72,10 @@ with one command-like action such as:
 
 This is the Florence version of a recipe-led setup flow: parents can complete
 setup entirely from iMessage, one small text at a time.
+
+Parents can also text `show household book` at any point to see the curated
+context Florence is allowed to use. This keeps memory collaborative instead of
+hidden.
 
 `support`, `human`, and `talk to a human` are always available as transport
 commands. They return the configured Florence support contact without invoking

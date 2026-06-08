@@ -14,6 +14,9 @@ The product shape is intentionally small:
   senders treated as helpers.
 - Household-scoped memory with member provenance, text-native review, and scoped
   deletion/export controls for SaaS isolation.
+- A parent-visible household book: Florence's durable memory is curated
+  household context that parents can inspect and correct, not hidden model-owned
+  memory.
 - Per-household privacy controls: maximum privacy by default, parent-only memory
   pause/resume, and analytics opt-in off by default.
 - A parent-approval rail for risky external actions, scoped to the household and
@@ -38,8 +41,8 @@ The product shape is intentionally small:
 - A warm but concise tone policy that avoids nagging or guilt.
 - A Hermes adapter boundary so production can use Hermes Agent directly while
   tests use deterministic fakes.
-- A Hermes proposal protocol so Hermes can suggest reminders or household memory
-  while Florence still validates and owns all state changes.
+- A Hermes proposal protocol so Hermes can suggest reminders or household-book
+  additions while Florence still validates and owns all state changes.
 
 ## Run
 
@@ -426,7 +429,8 @@ OAuth token, and stop Gmail/Calendar polling.
 - `remember that Maya likes pasta` writes a household-scoped memory; parent-only.
 - `forget Maya likes pasta` deletes matching household memories; parent-only.
 - `clear household memory` deletes all active household memories; parent-only.
-- `what do you remember?` lists active household memory and provenance; parent-only.
+- `what do you remember?` or `show household book` lists active household memory
+  and provenance; parent-only.
 - `privacy status` shows household memory and analytics settings.
 - `data summary` shows a parent-only count summary of stored household data
   without raw message or email bodies.

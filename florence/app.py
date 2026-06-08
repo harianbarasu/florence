@@ -54,7 +54,7 @@ from florence.source_ingest import (
 )
 from florence.store import DatabaseSchemaError, Store
 from florence.timekeeper import ensure_utc
-from florence.worker import run_routine_tick
+from florence.worker import run_linq_reconciliation_tick, run_routine_tick
 
 
 logger = logging.getLogger(__name__)
@@ -1024,6 +1024,25 @@ def create_app(
             "action_failed": result.action_failed,
         }
 
+    @app.post("/dev/linq/reconcile", dependencies=[Depends(dev_guard)])
+    async def dev_linq_reconcile(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload = payload or {}
+        now = _parse_dt(payload.get("now_utc")) or app_now()
+        result = run_linq_reconciliation_tick(
+            service,
+            linq,
+            now_utc=now,
+            chat_limit=_bounded_int(payload.get("chat_limit"), default=25, minimum=1, maximum=100),
+            messages_per_chat=_bounded_int(
+                payload.get("messages_per_chat"),
+                default=20,
+                minimum=1,
+                maximum=100,
+            ),
+            since_utc=_parse_dt(payload.get("since_utc")),
+        )
+        return {"ok": True, "result": asdict(result)}
+
     return app
 
 
@@ -1037,6 +1056,16 @@ async def _request_data(request: Request) -> dict[str, object]:
     raw = await request.body()
     parsed = parse_qs(raw.decode("utf-8"), keep_blank_values=True)
     return {key: values[-1] if values else "" for key, values in parsed.items()}
+
+
+def _bounded_int(value: object, *, default: int, minimum: int, maximum: int) -> int:
+    if value in (None, ""):
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="invalid_integer") from None
+    return max(minimum, min(maximum, parsed))
 
 
 def _render_onboarding_form(
@@ -1141,8 +1170,8 @@ def _render_onboarding_form(
             </label>
           </div>
           <label>
-            Extra household context
-            <textarea name="family_context" rows="4" placeholder="Anything Florence should keep in mind."></textarea>
+              Household book notes
+            <textarea name="family_context" rows="4" placeholder="Stable context Florence should keep visible for this household."></textarea>
           </label>
         </section>
         {current_context}
@@ -1199,7 +1228,7 @@ def _render_onboarding_done(
       </header>
       <section class="band">
         <h2>Status</h2>
-        <p>{_e(str(result.get("saved_memory_count", 0)))} details saved. {_e(str(result.get("saved_source_preference_count", 0)))} source rules saved.</p>
+        <p>{_e(str(result.get("saved_memory_count", 0)))} household book details saved. {_e(str(result.get("saved_source_preference_count", 0)))} source rules saved.</p>
         <p>Parents: {readiness.parent_count}/2. Children: {readiness.child_count}. Connected sources: {readiness.connected_account_count}.</p>
         {missing_block}
       </section>
@@ -1291,7 +1320,7 @@ def _render_current_context(memory_texts: list[str]) -> str:
     items = "".join(f"<li>{_e(text)}</li>" for text in memory_texts)
     return f"""
       <section class="band">
-        <h2>Current Context</h2>
+        <h2>Household Book</h2>
         <ul>{items}</ul>
       </section>
     """
@@ -1299,8 +1328,8 @@ def _render_current_context(memory_texts: list[str]) -> str:
 
 def _onboarding_lede(role: str) -> str:
     if role == "partner":
-        return "Connect your sources, confirm the household details, and set how Florence should talk to you."
-    return "Set up the household once so Florence can be useful without dumping noisy email or calendar backfill into iMessage."
+        return "Connect your sources, confirm the household book, and set how Florence should talk to you."
+    return "Build the household book once so Florence can be useful without dumping noisy email or calendar backfill into iMessage."
 
 
 def _onboarding_css() -> str:

@@ -246,9 +246,14 @@ GOOGLE_DISCONNECT_COMMANDS = {
 MEMORY_CLEAR_COMMANDS = {
     "clear household memory",
     "clear all household memory",
+    "clear household book",
+    "clear all household book",
     "delete household memory",
     "delete all household memory",
+    "delete household book",
+    "delete all household book",
     "forget all household memory",
+    "forget all household book",
 }
 SUPPORT_COMMANDS = {
     "support",
@@ -2386,11 +2391,18 @@ class FlorenceService:
     ) -> str | None:
         if lower.strip(" ?") not in {
             "what do you remember",
+            "what is in the household book",
+            "what's in the household book",
+            "household book",
+            "household book status",
+            "book status",
             "memory status",
             "list memory",
             "list memories",
+            "list household book",
             "show memory",
             "show memories",
+            "show household book",
         }:
             return None
         if actor.role != MemberRole.PARENT:

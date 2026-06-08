@@ -1,515 +1,184 @@
-"""Runtime configuration for Florence production surfaces."""
+"""Runtime configuration for Florence."""
 
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any
-
-from dotenv import load_dotenv
-
-try:
-    import yaml
-except Exception:  # pragma: no cover - optional at import time
-    yaml = None
+from dataclasses import dataclass
 
 
-def _hermes_home() -> Path:
-    return Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+def _bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def load_florence_environment() -> None:
-    """Load Florence/Hermes env vars from HERMES_HOME and local .env files."""
-    hermes_home = _hermes_home()
-    env_path = hermes_home / ".env"
-    if env_path.exists():
-        try:
-            load_dotenv(env_path, override=False, encoding="utf-8")
-        except UnicodeDecodeError:
-            load_dotenv(env_path, override=False, encoding="latin-1")
-    load_dotenv(override=False)
+def _csv_env(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    return tuple(item.strip() for item in raw.split(",") if item.strip())
 
 
-def _load_config_yaml() -> dict[str, Any]:
-    config_path = _hermes_home() / "config.yaml"
-    if not config_path.exists() or yaml is None:
-        return {}
+def _int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
     try:
-        with open(config_path, encoding="utf-8") as handle:
-            loaded = yaml.safe_load(handle) or {}
-        return loaded if isinstance(loaded, dict) else {}
-    except Exception:
-        return {}
-
-
-def _env_or_config(env_names: tuple[str, ...], config: dict[str, Any], *path: str, default: Any = None) -> Any:
-    for env_name in env_names:
-        value = os.getenv(env_name)
-        if value is not None and str(value).strip():
-            return value
-
-    cursor: Any = config
-    for key in path:
-        if not isinstance(cursor, dict) or key not in cursor:
-            return default
-        cursor = cursor[key]
-    return cursor if cursor is not None else default
-
-
-def _as_int(value: Any, default: int) -> int:
-    try:
-        return int(value)
-    except Exception:
+        return int(raw)
+    except ValueError:
         return default
 
 
-def _as_float(value: Any, default: float) -> float:
-    try:
-        return float(value)
-    except Exception:
-        return default
+DEFAULT_GOOGLE_OAUTH_SCOPES = (
+    "openid",
+    "email",
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/calendar.readonly",
+)
+DEFAULT_HERMES_TOOLSETS: tuple[str, ...] = ()
 
 
-def _as_bool(value: Any, default: bool = False) -> bool:
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    normalized = str(value).strip().lower()
-    if normalized in {"1", "true", "yes", "on", "enabled"}:
-        return True
-    if normalized in {"0", "false", "no", "off", "disabled"}:
-        return False
-    return default
-
-
-def _as_optional_string(value: Any) -> str | None:
-    if value is None:
-        return None
-    normalized = str(value).strip()
-    return normalized or None
-
-
-def _normalize_public_base_url(value: Any) -> str | None:
-    if value is None:
-        return None
-    normalized = str(value).strip().rstrip("/")
-    if not normalized:
-        return None
-    if "://" not in normalized:
-        normalized = f"https://{normalized}"
-    return normalized
-
-
-def _normalize_choice(value: Any, *, allowed: set[str], default: str) -> str:
-    normalized = str(value or "").strip().lower()
-    return normalized if normalized in allowed else default
-
-
-def _as_string_tuple(value: Any) -> tuple[str, ...]:
-    if value is None:
-        return ()
-    if isinstance(value, str):
-        values = value.split(",")
-    elif isinstance(value, (list, tuple, set)):
-        values = list(value)
-    else:
-        values = [value]
-    normalized = tuple(
-        str(item).strip()
-        for item in values
-        if str(item).strip()
-    )
-    return tuple(dict.fromkeys(normalized))
-
-
-@dataclass(slots=True)
-class FlorenceGoogleRuntimeConfig:
-    client_id: str | None
-    client_secret: str | None
-    redirect_uri: str | None
-    state_secret: str | None
-
-    @property
-    def configured(self) -> bool:
-        return bool(self.client_id and self.client_secret and self.redirect_uri and self.state_secret)
-
-
-@dataclass(slots=True)
-class FlorenceLinqRuntimeConfig:
-    api_key: str | None
-    webhook_secret: str | None
-    base_url: str = "https://api.linqapp.com/api/partner/v3"
-
-    @property
-    def configured(self) -> bool:
-        return bool(self.api_key)
-
-
-@dataclass(slots=True)
-class FlorenceSendblueRuntimeConfig:
-    api_key_id: str | None = None
-    api_secret_key: str | None = None
-    from_number: str | None = None
-    webhook_secret: str | None = None
-    base_url: str = "https://api.sendblue.co/api"
-    blocked_numbers: tuple[str, ...] = ()
-
-    @property
-    def configured(self) -> bool:
-        return bool(self.api_key_id and self.api_secret_key and self.from_number)
-
-
-@dataclass(slots=True)
-class FlorenceHermesRuntimeConfig:
-    model: str
-    max_iterations: int
-    provider: str = "auto"
-
-
-@dataclass(slots=True)
-class FlorenceBriefingRuntimeConfig:
-    style: str = "plain"
-    emoji_mode: str = "none"
-
-
-@dataclass(slots=True)
-class FlorenceWebChatRuntimeConfig:
-    enabled: bool = False
-    proxy_secret: str | None = None
-
-
-@dataclass(slots=True)
-class FlorenceRedisRuntimeConfig:
-    url: str | None
-    google_sync_queue_name: str = "florence-google-sync"
-    google_sync_queue_processing_name: str = "florence-google-sync-processing"
-    google_sync_queue_block_seconds: int = 5
-    google_sync_job_dedupe_ttl_seconds: int = 1800
-    google_sync_max_attempts: int = 3
-
-    @property
-    def configured(self) -> bool:
-        return bool(self.url)
-
-
-@dataclass(slots=True)
-class FlorenceServerRuntimeConfig:
-    host: str
-    port: int
-    public_base_url: str | None
-    sync_interval_seconds: float
-    automation_interval_seconds: float = 15.0
-    db_path: Path | None = None
+@dataclass(frozen=True)
+class Settings:
+    db_path: str = "./florence.db"
     database_url: str | None = None
+    default_timezone: str = "America/Los_Angeles"
 
+    linq_api_key: str | None = None
+    linq_base_url: str = "https://api.linqapp.com/api/partner/v3"
+    linq_webhook_secret: str | None = None
+    linq_from_phone: str | None = None
 
-@dataclass(slots=True)
-class FlorenceSettings:
-    server: FlorenceServerRuntimeConfig
-    google: FlorenceGoogleRuntimeConfig
-    linq: FlorenceLinqRuntimeConfig
-    hermes: FlorenceHermesRuntimeConfig
-    redis: FlorenceRedisRuntimeConfig
-    sendblue: FlorenceSendblueRuntimeConfig = field(default_factory=FlorenceSendblueRuntimeConfig)
-    briefing: FlorenceBriefingRuntimeConfig = field(default_factory=FlorenceBriefingRuntimeConfig)
-    web_chat: FlorenceWebChatRuntimeConfig = field(default_factory=FlorenceWebChatRuntimeConfig)
+    dev_endpoints_enabled: bool = True
+    admin_api_key: str | None = None
+    source_ingest_api_key: str | None = None
+    support_contact: str | None = None
+    web_base_url: str | None = None
+    onboarding_state_secret: str | None = None
+    onboarding_token_ttl_hours: int = 14 * 24
+
+    google_client_id: str | None = None
+    google_client_secret: str | None = None
+    google_redirect_uri: str | None = None
+    google_oauth_scopes: tuple[str, ...] = DEFAULT_GOOGLE_OAUTH_SCOPES
+    google_oauth_state_ttl_minutes: int = 15
+    google_fetch_since_days: int = 7
+    google_fetch_calendar_days: int = 14
+    google_fetch_max_emails: int = 25
+    google_fetch_max_calendar_events: int = 50
+    source_sync_interval_seconds: int = 5 * 60
+
+    token_encryption_key: str | None = None
+
+    linq_live_verified: bool = False
+    linq_live_verified_at: str | None = None
+    linq_live_verification_proof: str | None = None
+    google_live_verified: bool = False
+    google_live_verified_at: str | None = None
+    google_live_verification_proof: str | None = None
+    hermes_live_verified: bool = False
+    hermes_live_verified_at: str | None = None
+    hermes_live_verification_proof: str | None = None
+
+    hermes_agent_path: str | None = None
+    hermes_agent_ref: str | None = None
+    hermes_provider: str | None = None
+    hermes_model: str = ""
+    hermes_api_key: str | None = None
+    hermes_base_url: str | None = None
+    hermes_enabled_toolsets: tuple[str, ...] = DEFAULT_HERMES_TOOLSETS
+    hermes_runtime_home: str = "/tmp/florence-hermes-home"
+    hermes_strict: bool = False
+
+    daily_briefing_hour: int = 7
+    daily_briefing_minute: int = 15
+    daily_briefing_delivery_grace_minutes: int = 4 * 60
+    reminder_delivery_grace_minutes: int = 24 * 60
+    pending_action_ttl_minutes: int = 24 * 60
+    data_deletion_confirmation_ttl_minutes: int = 30
+
+    @property
+    def database_dsn(self) -> str:
+        return self.database_url or self.db_path
+
+    @property
+    def database_backend(self) -> str:
+        if not self.database_url:
+            return "sqlite"
+        normalized = self.database_url.strip().lower()
+        if normalized.startswith(("postgres://", "postgresql://")):
+            return "postgres"
+        return "unsupported"
 
     @classmethod
-    def from_env(cls) -> "FlorenceSettings":
-        load_florence_environment()
-        config = _load_config_yaml()
-        florence_cfg = config.get("florence", {}) if isinstance(config.get("florence"), dict) else {}
-
-        public_base_url = _normalize_public_base_url(
-            _env_or_config(
-                ("FLORENCE_PUBLIC_BASE_URL", "PUBLIC_API_BASE_URL", "RAILWAY_PUBLIC_DOMAIN"),
-                florence_cfg,
-                "public_base_url",
-                default=None,
-            )
-        )
-        google_redirect_uri = _normalize_public_base_url(
-            _env_or_config(
-                ("FLORENCE_GOOGLE_REDIRECT_URI",),
-                florence_cfg,
-                "google",
-                "redirect_uri",
-                default=None,
-            )
-        )
-        if not google_redirect_uri and public_base_url:
-            google_redirect_uri = f"{public_base_url}/v1/florence/google/callback"
-
-        db_path_raw = _env_or_config(
-            ("FLORENCE_DB_PATH",),
-            florence_cfg,
-            "db_path",
-            default=str(_hermes_home() / "florence.db"),
-        )
-        database_url = _env_or_config(
-            ("FLORENCE_DATABASE_URL", "DATABASE_URL"),
-            florence_cfg,
-            "database_url",
-            default=None,
-        )
-
+    def from_env(cls) -> "Settings":
         return cls(
-            server=FlorenceServerRuntimeConfig(
-                host=str(_env_or_config(("FLORENCE_HTTP_HOST",), florence_cfg, "http_host", default="0.0.0.0")),
-                port=_as_int(_env_or_config(("FLORENCE_HTTP_PORT", "PORT"), florence_cfg, "http_port", default=8080), 8080),
-                public_base_url=public_base_url,
-                sync_interval_seconds=_as_float(
-                    _env_or_config(
-                        ("FLORENCE_SYNC_INTERVAL_SECONDS",),
-                        florence_cfg,
-                        "sync_interval_seconds",
-                        default=300,
-                    ),
-                    300.0,
-                ),
-                automation_interval_seconds=_as_float(
-                    _env_or_config(
-                        ("FLORENCE_AUTOMATION_INTERVAL_SECONDS",),
-                        florence_cfg,
-                        "automation_interval_seconds",
-                        default=15,
-                    ),
-                    15.0,
-                ),
-                db_path=None if database_url else Path(str(db_path_raw)).expanduser(),
-                database_url=str(database_url).strip() if database_url else None,
+            db_path=os.getenv("FLORENCE_DB_PATH", "./florence.db"),
+            database_url=os.getenv("FLORENCE_DATABASE_URL"),
+            default_timezone=os.getenv("FLORENCE_DEFAULT_TIMEZONE", "America/Los_Angeles"),
+            linq_api_key=os.getenv("LINQ_API_KEY"),
+            linq_base_url=os.getenv(
+                "LINQ_BASE_URL",
+                "https://api.linqapp.com/api/partner/v3",
             ),
-            google=FlorenceGoogleRuntimeConfig(
-                client_id=_env_or_config(
-                    ("FLORENCE_GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_ID"),
-                    florence_cfg,
-                    "google",
-                    "client_id",
-                    default=None,
-                ),
-                client_secret=_env_or_config(
-                    ("FLORENCE_GOOGLE_CLIENT_SECRET", "GOOGLE_CLIENT_SECRET"),
-                    florence_cfg,
-                    "google",
-                    "client_secret",
-                    default=None,
-                ),
-                redirect_uri=str(google_redirect_uri).strip() if google_redirect_uri else None,
-                state_secret=_env_or_config(
-                    ("FLORENCE_GOOGLE_OAUTH_STATE_SECRET", "GOOGLE_OAUTH_STATE_SECRET"),
-                    florence_cfg,
-                    "google",
-                    "state_secret",
-                    default=None,
-                ),
+            linq_webhook_secret=os.getenv("LINQ_WEBHOOK_SECRET"),
+            linq_from_phone=os.getenv("LINQ_FROM_PHONE"),
+            dev_endpoints_enabled=_bool_env("FLORENCE_DEV_ENDPOINTS_ENABLED", True),
+            admin_api_key=os.getenv("FLORENCE_ADMIN_API_KEY"),
+            source_ingest_api_key=os.getenv("FLORENCE_SOURCE_INGEST_API_KEY"),
+            support_contact=os.getenv("FLORENCE_SUPPORT_CONTACT"),
+            web_base_url=os.getenv("FLORENCE_WEB_BASE_URL"),
+            onboarding_state_secret=os.getenv("FLORENCE_ONBOARDING_STATE_SECRET"),
+            onboarding_token_ttl_hours=_int_env("FLORENCE_ONBOARDING_TOKEN_TTL_HOURS", 14 * 24),
+            google_client_id=os.getenv("GOOGLE_CLIENT_ID"),
+            google_client_secret=os.getenv("GOOGLE_CLIENT_SECRET"),
+            google_redirect_uri=os.getenv("GOOGLE_REDIRECT_URI"),
+            google_oauth_scopes=_csv_env("GOOGLE_OAUTH_SCOPES", DEFAULT_GOOGLE_OAUTH_SCOPES),
+            google_oauth_state_ttl_minutes=_int_env("GOOGLE_OAUTH_STATE_TTL_MINUTES", 15),
+            google_fetch_since_days=_int_env("GOOGLE_FETCH_SINCE_DAYS", 7),
+            google_fetch_calendar_days=_int_env("GOOGLE_FETCH_CALENDAR_DAYS", 14),
+            google_fetch_max_emails=_int_env("GOOGLE_FETCH_MAX_EMAILS", 25),
+            google_fetch_max_calendar_events=_int_env("GOOGLE_FETCH_MAX_CALENDAR_EVENTS", 50),
+            source_sync_interval_seconds=_int_env("FLORENCE_SOURCE_SYNC_INTERVAL_SECONDS", 5 * 60),
+            token_encryption_key=os.getenv("FLORENCE_TOKEN_ENCRYPTION_KEY"),
+            linq_live_verified=_bool_env("FLORENCE_LINQ_LIVE_VERIFIED", False),
+            linq_live_verified_at=os.getenv("FLORENCE_LINQ_LIVE_VERIFIED_AT"),
+            linq_live_verification_proof=os.getenv("FLORENCE_LINQ_LIVE_VERIFICATION_PROOF"),
+            google_live_verified=_bool_env("FLORENCE_GOOGLE_LIVE_VERIFIED", False),
+            google_live_verified_at=os.getenv("FLORENCE_GOOGLE_LIVE_VERIFIED_AT"),
+            google_live_verification_proof=os.getenv("FLORENCE_GOOGLE_LIVE_VERIFICATION_PROOF"),
+            hermes_live_verified=_bool_env("FLORENCE_HERMES_LIVE_VERIFIED", False),
+            hermes_live_verified_at=os.getenv("FLORENCE_HERMES_LIVE_VERIFIED_AT"),
+            hermes_live_verification_proof=os.getenv("FLORENCE_HERMES_LIVE_VERIFICATION_PROOF"),
+            hermes_agent_path=os.getenv("FLORENCE_HERMES_AGENT_PATH"),
+            hermes_agent_ref=os.getenv("HERMES_AGENT_REF") or os.getenv("FLORENCE_HERMES_AGENT_REF"),
+            hermes_provider=os.getenv("FLORENCE_HERMES_PROVIDER"),
+            hermes_model=os.getenv("FLORENCE_HERMES_MODEL", ""),
+            hermes_api_key=os.getenv("FLORENCE_HERMES_API_KEY") or os.getenv("OPENAI_API_KEY"),
+            hermes_base_url=os.getenv("FLORENCE_HERMES_BASE_URL") or os.getenv("OPENAI_BASE_URL"),
+            hermes_enabled_toolsets=_csv_env(
+                "FLORENCE_HERMES_TOOLSETS",
+                DEFAULT_HERMES_TOOLSETS,
             ),
-            linq=FlorenceLinqRuntimeConfig(
-                api_key=_env_or_config(
-                    ("FLORENCE_LINQ_API_KEY", "LINQ_API_KEY"),
-                    florence_cfg,
-                    "linq",
-                    "api_key",
-                    default=None,
-                ),
-                webhook_secret=_env_or_config(
-                    ("FLORENCE_LINQ_WEBHOOK_SECRET", "LINQ_WEBHOOK_SECRET"),
-                    florence_cfg,
-                    "linq",
-                    "webhook_secret",
-                    default=None,
-                ),
-                base_url=str(
-                    _env_or_config(
-                        ("FLORENCE_LINQ_BASE_URL", "LINQ_BASE_URL"),
-                        florence_cfg,
-                        "linq",
-                        "base_url",
-                        default="https://api.linqapp.com/api/partner/v3",
-                    )
-                ).rstrip("/"),
+            hermes_runtime_home=os.getenv(
+                "FLORENCE_HERMES_RUNTIME_HOME",
+                "/tmp/florence-hermes-home",
             ),
-            sendblue=FlorenceSendblueRuntimeConfig(
-                api_key_id=_env_or_config(
-                    ("FLORENCE_SENDBLUE_API_KEY_ID", "SENDBLUE_API_KEY_ID", "SENDBLUE_API_KEY"),
-                    florence_cfg,
-                    "sendblue",
-                    "api_key_id",
-                    default=None,
-                ),
-                api_secret_key=_env_or_config(
-                    ("FLORENCE_SENDBLUE_API_SECRET_KEY", "SENDBLUE_API_SECRET_KEY", "SENDBLUE_API_SECRET"),
-                    florence_cfg,
-                    "sendblue",
-                    "api_secret_key",
-                    default=None,
-                ),
-                from_number=_env_or_config(
-                    ("FLORENCE_SENDBLUE_FROM_NUMBER", "SENDBLUE_FROM_NUMBER"),
-                    florence_cfg,
-                    "sendblue",
-                    "from_number",
-                    default=None,
-                ),
-                webhook_secret=_env_or_config(
-                    ("FLORENCE_SENDBLUE_WEBHOOK_SECRET", "SENDBLUE_WEBHOOK_SECRET"),
-                    florence_cfg,
-                    "sendblue",
-                    "webhook_secret",
-                    default=None,
-                ),
-                base_url=str(
-                    _env_or_config(
-                        ("FLORENCE_SENDBLUE_BASE_URL", "SENDBLUE_BASE_URL"),
-                        florence_cfg,
-                        "sendblue",
-                        "base_url",
-                        default="https://api.sendblue.co/api",
-                    )
-                ).rstrip("/"),
-                blocked_numbers=_as_string_tuple(
-                    _env_or_config(
-                        ("FLORENCE_SENDBLUE_BLOCKED_NUMBERS", "SENDBLUE_BLOCKED_NUMBERS"),
-                        florence_cfg,
-                        "sendblue",
-                        "blocked_numbers",
-                        default=(),
-                    )
-                ),
+            hermes_strict=_bool_env("FLORENCE_HERMES_STRICT", False),
+            daily_briefing_hour=_int_env("FLORENCE_DAILY_BRIEFING_HOUR", 7),
+            daily_briefing_minute=_int_env("FLORENCE_DAILY_BRIEFING_MINUTE", 15),
+            daily_briefing_delivery_grace_minutes=_int_env(
+                "FLORENCE_DAILY_BRIEFING_DELIVERY_GRACE_MINUTES",
+                4 * 60,
             ),
-            hermes=FlorenceHermesRuntimeConfig(
-                model=str(
-                    _env_or_config(
-                        ("FLORENCE_HERMES_MODEL", "HERMES_MODEL"),
-                        florence_cfg,
-                        "hermes",
-                        "model",
-                        default="anthropic/claude-opus-4.6",
-                    )
-                ),
-                max_iterations=_as_int(
-                    _env_or_config(
-                        ("FLORENCE_HERMES_MAX_ITERATIONS",),
-                        florence_cfg,
-                        "hermes",
-                        "max_iterations",
-                        default=6,
-                    ),
-                    6,
-                ),
-                provider=str(
-                    _env_or_config(
-                        ("FLORENCE_HERMES_PROVIDER", "HERMES_PROVIDER"),
-                        florence_cfg,
-                        "hermes",
-                        "provider",
-                        default="auto",
-                    )
-                ).strip()
-                or "auto",
+            reminder_delivery_grace_minutes=_int_env(
+                "FLORENCE_REMINDER_DELIVERY_GRACE_MINUTES",
+                24 * 60,
             ),
-            briefing=FlorenceBriefingRuntimeConfig(
-                style=_normalize_choice(
-                    _env_or_config(
-                        ("FLORENCE_BRIEFING_STYLE",),
-                        florence_cfg,
-                        "briefing",
-                        "style",
-                        default="plain",
-                    ),
-                    allowed={"plain", "neutral", "warm"},
-                    default="plain",
-                ),
-                emoji_mode=_normalize_choice(
-                    _env_or_config(
-                        ("FLORENCE_BRIEFING_EMOJI_MODE",),
-                        florence_cfg,
-                        "briefing",
-                        "emoji_mode",
-                        default="none",
-                    ),
-                    allowed={"none", "minimal"},
-                    default="none",
-                ),
-            ),
-            web_chat=FlorenceWebChatRuntimeConfig(
-                enabled=_as_bool(
-                    _env_or_config(
-                        ("FLORENCE_WEB_CHAT_ENABLED",),
-                        florence_cfg,
-                        "web_chat",
-                        "enabled",
-                        default=False,
-                    )
-                ),
-                proxy_secret=_as_optional_string(
-                    _env_or_config(
-                        ("FLORENCE_WEB_CHAT_PROXY_SECRET",),
-                        florence_cfg,
-                        "web_chat",
-                        "proxy_secret",
-                        default=None,
-                    )
-                ),
-            ),
-            redis=FlorenceRedisRuntimeConfig(
-                url=_env_or_config(
-                    ("FLORENCE_REDIS_URL", "REDIS_URL"),
-                    florence_cfg,
-                    "redis",
-                    "url",
-                    default=None,
-                ),
-                google_sync_queue_name=str(
-                    _env_or_config(
-                        ("FLORENCE_GOOGLE_SYNC_QUEUE_NAME",),
-                        florence_cfg,
-                        "redis",
-                        "google_sync_queue_name",
-                        default="florence-google-sync",
-                    )
-                ).strip()
-                or "florence-google-sync",
-                google_sync_queue_processing_name=str(
-                    _env_or_config(
-                        ("FLORENCE_GOOGLE_SYNC_QUEUE_PROCESSING_NAME",),
-                        florence_cfg,
-                        "redis",
-                        "google_sync_queue_processing_name",
-                        default="florence-google-sync-processing",
-                    )
-                ).strip()
-                or "florence-google-sync-processing",
-                google_sync_queue_block_seconds=_as_int(
-                    _env_or_config(
-                        ("FLORENCE_GOOGLE_SYNC_QUEUE_BLOCK_SECONDS",),
-                        florence_cfg,
-                        "redis",
-                        "google_sync_queue_block_seconds",
-                        default=5,
-                    ),
-                    5,
-                ),
-                google_sync_job_dedupe_ttl_seconds=_as_int(
-                    _env_or_config(
-                        ("FLORENCE_GOOGLE_SYNC_JOB_DEDUPE_TTL_SECONDS",),
-                        florence_cfg,
-                        "redis",
-                        "google_sync_job_dedupe_ttl_seconds",
-                        default=1800,
-                    ),
-                    1800,
-                ),
-                google_sync_max_attempts=_as_int(
-                    _env_or_config(
-                        ("FLORENCE_GOOGLE_SYNC_MAX_ATTEMPTS",),
-                        florence_cfg,
-                        "redis",
-                        "google_sync_max_attempts",
-                        default=3,
-                    ),
-                    3,
-                ),
+            pending_action_ttl_minutes=_int_env("FLORENCE_PENDING_ACTION_TTL_MINUTES", 24 * 60),
+            data_deletion_confirmation_ttl_minutes=_int_env(
+                "FLORENCE_DATA_DELETION_CONFIRMATION_TTL_MINUTES",
+                30,
             ),
         )

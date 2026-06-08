@@ -1,56 +1,15 @@
-# Git
 .git
-.gitignore
-.gitmodules
-.github
-
-# Environment files
+.venv
+venv
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
 .env
 .env.*
 !.env.example
-
-# Python
-.pytest_cache
-.venv
-*.egg-info
-__pycache__
-*.pyc
-*.pyo
-*.pyd
-
-# Dependencies
-node_modules
-**/node_modules
-.venv
-**/.venv
-
-# Large docs / optional assets not needed in the base image
-.plans
-tests
-website
-landingpage
-web
-docs
-plans
-vendor/hermes-agent
-optional-skills
-skills
-tinker-atropos
-mini-swe-agent
-
-# Built artifacts that are regenerated inside the image.  Excluded so local
-# rebuilds on the developer's machine don't invalidate the npm-install layer
-# that now depends on the full ui-tui/packages/hermes-ink/ tree being present.
-ui-tui/dist/
-ui-tui/packages/hermes-ink/dist/
-
-# Lockfiles / local plans
-uv.lock
-PLAN-*.md
-
-# Runtime data (bind-mounted at /opt/data; must not leak into build context)
-/data/
-
-# Compose/profile runtime state (bind-mounted; avoid ownership/secret issues)
-/hermes-config/
-/runtime/
+*.sqlite
+*.sqlite3
+*.db
+data
+htmlcov

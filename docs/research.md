@@ -172,6 +172,11 @@ Current public pages reviewed:
 ## Florence Product Implications
 
 - The primary household surface is a shared iMessage thread.
+- Reconstructed Poke-style prompt writeups point to the same implementation
+  shape: one personable assistant face, hidden orchestration, direct answers
+  before proactive offers, plain text, and a high interruption bar. Florence
+  implements that in `florence/prompts.py` instead of scattering model behavior
+  across transport and tone code.
 - The backend must model people in that thread, not just messages. Florence now
   treats the first sender as the founding parent, requires an invite or
   confirmation for the second parent, and keeps later unconfirmed senders as

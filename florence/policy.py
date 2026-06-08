@@ -51,6 +51,8 @@ HIGH_SIGNAL_NO_TIME_KEYWORDS = {
 }
 
 LOW_SIGNAL_KEYWORDS = {
+    "account alert",
+    "backup complete",
     "newsletter",
     "weekly update",
     "promotion",
@@ -58,6 +60,14 @@ LOW_SIGNAL_KEYWORDS = {
     "coupon",
     "digest",
     "recap",
+    "receipt",
+    "order confirmation",
+    "shipping confirmation",
+    "password changed",
+    "new device",
+    "new sign-in",
+    "login alert",
+    "security alert",
     "spirit wear",
     "fundraiser",
 }
@@ -121,6 +131,17 @@ class NeedToKnowPolicy:
         low_signal_score = _keyword_score(text, LOW_SIGNAL_KEYWORDS)
         support_score = _keyword_score(text, EMOTIONAL_SUPPORT_KEYWORDS)
         high_signal_no_time_score = _keyword_score(text, HIGH_SIGNAL_NO_TIME_KEYWORDS)
+        if (
+            _looks_like_automated_background_notice(item.sender, text)
+            and not requested_surface
+            and action_score == 0
+            and high_signal_no_time_score == 0
+        ):
+            return SourceTriage(
+                decision=SourceDecision.STORE_ONLY,
+                reason="automated_background_notice",
+                priority=3,
+            )
 
         if event_at is None:
             if observed_at < now - self.no_time_recency_window:
@@ -204,6 +225,26 @@ def _keyword_score(text: str, keywords: set[str]) -> int:
         if re.search(rf"\b{re.escape(keyword)}\b", text):
             score += 1
     return score
+
+
+def _looks_like_automated_background_notice(sender: str | None, text: str) -> bool:
+    sender_text = (sender or "").lower()
+    if any(marker in sender_text for marker in ("no-reply", "noreply", "do-not-reply", "donotreply")):
+        return True
+    background_markers = (
+        "new sign-in",
+        "new login",
+        "login alert",
+        "new device",
+        "password changed",
+        "backup complete",
+        "order confirmation",
+        "shipping confirmation",
+        "receipt",
+        "weekly summary",
+        "monthly summary",
+    )
+    return any(marker in text for marker in background_markers)
 
 
 def _clean_title(title: str) -> str:

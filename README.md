@@ -39,6 +39,9 @@ The product shape is intentionally small:
 - Parent-controlled household source preferences so parents can say what to
   always surface or keep quiet after connecting email/calendar.
 - A warm but concise tone policy that avoids nagging or guilt.
+- A model-facing prompt contract in `florence/prompts.py`, shaped around one
+  personable text-native assistant face, hidden orchestration, sparse
+  proactivity, and no magic command requirements.
 - A Hermes adapter boundary so production can use Hermes Agent directly while
   tests use deterministic fakes.
 - A Hermes proposal protocol so Hermes can suggest reminders or household-book
@@ -416,8 +419,9 @@ OAuth token, and stop Gmail/Calendar polling.
 - `cancel reminder pack lunch` cancels a matching active reminder; parent-only.
 - `remind Alex tomorrow at 8am to pack cleats` assigns the reminder to a known
   household member named Alex and labels it in the shared thread.
-- `setup` or `setup status` shows the household readiness checklist plus one
-  concrete next text action.
+- `setup` shows the household readiness checklist plus one concrete next text
+  action. Natural replies like names, kids, and partner phone numbers continue
+  the flow without special commands.
 - `invite partner +15555550101` starts a shared iMessage household thread; parent-only.
 - `confirm partner +15555550101` marks an already-seen sender as the second parent; parent-only.
 - `set timezone America/New_York` changes the household timezone; parent-only.

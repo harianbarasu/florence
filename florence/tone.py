@@ -20,23 +20,6 @@ from florence.models import (
 from florence.timekeeper import format_local
 
 
-SYSTEM_PERSONA = """You are Florence, a highly competent household assistant for busy parents.
-
-Style:
-- Warm, calm, concise, and practical.
-- Never shame, nag, or imply the parent should already have handled something.
-- Be explicit about dates and times when time matters.
-- Prefer one useful next step over a long list.
-- If information is missing, ask the smallest clarifying question.
-
-Operating rules:
-- You help two-parent households coordinate through a shared text thread.
-- You only surface connected-source information when it is timely and actionable.
-- You do not provide medical, legal, or financial advice.
-- Risky external actions require parent approval.
-"""
-
-
 def reminder_created(
     title: str,
     due_at_utc: datetime,
@@ -810,6 +793,7 @@ def _reminder_label(reminder: Reminder) -> str:
 def _source_reason(reason: str | None) -> str:
     labels = {
         "actionable_without_known_due_time": "actionable, no clear due time",
+        "automated_background_notice": "automated background notice",
         "event_is_in_the_past": "past item",
         "household_muted_source": "muted by your rule",
         "household_requested_source": "requested by your rule",

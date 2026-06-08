@@ -15,6 +15,7 @@ from florence.models import (
     ActionExecution,
     ConnectedAccount,
     ConnectedAccountStatus,
+    Household,
     HouseholdReadiness,
     HouseholdPrivacy,
     HouseholdMember,
@@ -662,6 +663,21 @@ class FlorenceService:
         if bare_name_reply is not None:
             return [self._out(household.id, incoming.chat_id, bare_name_reply, now)]
 
+        return self._agent_turn(
+            household=household,
+            actor=actor,
+            incoming=incoming,
+            now=now,
+        )
+
+    def _agent_turn(
+        self,
+        *,
+        household: Household,
+        actor: HouseholdMember,
+        incoming: IncomingMessage,
+        now: datetime,
+    ) -> list[OutboundMessage]:
         helper_context_since = (
             min(ensure_utc(actor.created_at_utc), ensure_utc(incoming.received_at))
             if actor.role != MemberRole.PARENT

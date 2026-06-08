@@ -8,7 +8,6 @@ family context that Florence can use and parents can inspect.
 ## Commands
 
 - `setup`
-- `setup status`
 - `help setup`
 - `help sources`
 - `help calendar`
@@ -59,9 +58,9 @@ parent-only.
 
 ## Guided Next Action
 
-`setup`, `setup status`, and `household status` should always make the next
-useful text obvious. Florence still shows the readiness checklist, then ends
-with one command-like action such as:
+`setup`, `household status`, and natural onboarding replies should always make
+the next useful text obvious. Florence still shows the readiness checklist when
+asked, then ends with one concrete action such as:
 
 - `Text 'my name is Sam' so I know what to call you.`
 - `Text 'invite partner +15555550101' with your partner's number.`

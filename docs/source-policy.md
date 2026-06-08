@@ -5,6 +5,10 @@ household only when the item is timely and actionable. Household preferences add
 a correction loop on top of the default policy without turning the product into
 a rules dashboard.
 
+The default is quiet. A text notification spends parent attention, so an item
+should earn the interruption. If Florence is on the fence, it stores the item
+for review or briefing instead of buzzing the thread.
+
 ## Default Flow
 
 - Normalize each connected item into a `SourceItem`.
@@ -15,7 +19,9 @@ a rules dashboard.
 - Surface high-signal school schedule changes, such as no-school days or early
   dismissal, even when the importer did not extract a reliable event time, as
   long as the source itself was observed recently.
-- Store low-signal newsletters, promotions, recaps, and similar items quietly.
+- Store low-signal newsletters, promotions, recaps, routine receipts,
+  confirmation emails, login/security notices, password-change notices, and
+  similar automated background items quietly.
 - Include surfaced items in daily briefings once when still relevant.
 - For actionable future items, offer to add a reminder through the parent
   approval rail.

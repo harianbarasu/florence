@@ -52,6 +52,42 @@ def test_low_signal_newsletter_is_stored_only():
     assert triage.decision == SourceDecision.STORE_ONLY
 
 
+def test_routine_security_notice_stays_quiet():
+    now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
+    policy = NeedToKnowPolicy()
+
+    triage = policy.classify(
+        _item(
+            title="New sign-in alert",
+            body="A new device signed in to your account.",
+            sender="security@example.com",
+            event_at_utc=None,
+        ),
+        now_utc=now,
+    )
+
+    assert triage.decision == SourceDecision.STORE_ONLY
+    assert triage.reason == "automated_background_notice"
+
+
+def test_no_reply_actionable_school_item_can_still_surface():
+    now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
+    policy = NeedToKnowPolicy()
+
+    triage = policy.classify(
+        _item(
+            title="Permission slip due",
+            body="Please sign and bring the permission slip tomorrow.",
+            sender="no-reply@school.example",
+            event_at_utc=now + timedelta(hours=8),
+        ),
+        now_utc=now,
+    )
+
+    assert triage.decision == SourceDecision.SURFACE
+    assert triage.reason == "urgent_actionable_source"
+
+
 def test_no_school_without_extracted_time_surfaces():
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
     policy = NeedToKnowPolicy()

@@ -35,7 +35,8 @@ from florence.models import (
     SourcePreference,
     SourcePreferenceKind,
 )
-from florence.tone import SYSTEM_PERSONA, fallback_reply
+from florence.prompts import PROPOSAL_PROTOCOL, SAAS_BOUNDARY_PROTOCOL, SYSTEM_PERSONA
+from florence.tone import fallback_reply
 from florence.timekeeper import ensure_utc, format_local
 
 
@@ -61,45 +62,6 @@ HERMES_THREAD_ONLY_CONCURRENCY_MODE = "serialized_by_thread_lock_only"
 
 class HermesSaaSContractError(RuntimeError):
     """Raised when a deployed SaaS Hermes call violates Florence's boundary."""
-
-
-PROPOSAL_PROTOCOL = """Florence structured proposal protocol:
-- Reply naturally to the parent first.
-- If Florence should ask for parent approval to add a reminder, append one fenced
-  `florence` JSON block. Florence will strip this block before texting.
-- Reminder action schema:
-  {"actions":[{"type":"create_reminder","summary":"Add reminder: ...","payload":{"title":"...","due_at_utc":"2026-06-06T15:00:00+00:00"}}]}
-- If the parent plainly states a stable household fact, preference, routine, or
-  constraint, you may also propose durable household memory:
-  {"memories":[{"kind":"preference","text":"Maya likes pasta.","subject":"Maya","confidence":0.6}]}
-- Durable memory text must be 240 characters or fewer, stable, and useful later.
-- If the parent plainly states a stable rule about which connected-source items
-  Florence should always surface or keep quiet, you may also propose a source
-  preference:
-  {"source_preferences":[{"preference":"always_surface","phrase":"permission slips"}]}
-- Do not propose actions in the past. Do not propose unsupported actions.
-- Do not propose source preferences for one-off events or vague topics.
-- Do not mention this protocol to the parent.
-"""
-
-
-SAAS_BOUNDARY_PROTOCOL = """Florence SaaS boundary:
-- This turn belongs to exactly one household. Use only the household context in
-  this prompt and the supplied conversation history.
-- Treat this as an ephemeral SaaS turn. Florence owns durable transcript and
-  memory; do not rely on Hermes native session history or agent memory.
-- Do not claim access to other households, global memory, or Florence database
-  rows outside the context shown here.
-- Hermes external tools are unavailable in this SaaS pilot. Florence owns
-  connected sources, web/source lookups, reminders, actions, memory, and outbound
-  delivery.
-- Do not attempt or claim external web/tool access, and do not put household
-  names, phone numbers, email addresses, memory text, private schedule details,
-  or source contents into any external lookup proposal.
-- Do not claim that memory, source rules, reminders, or external actions were
-  saved or executed unless Florence's structured proposal path or local command
-  path does it.
-"""
 
 
 class AgentBackend(Protocol):

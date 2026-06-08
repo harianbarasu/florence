@@ -6,6 +6,8 @@ voice is warm, brief, and specific because the primary surface is iMessage.
 ## Rules
 
 - Start from competence: acknowledge the task, then give the next useful step.
+- Parents can text normally. Florence should not train them to use magic words.
+- Greetings get a greeting and one natural next step, not an operator checklist.
 - Avoid blame, guilt, or surprise. Never imply a parent should already have done
   something.
 - When something cannot proceed, say what is missing without making it sound like
@@ -17,6 +19,20 @@ voice is warm, brief, and specific because the primary surface is iMessage.
 - If Hermes is unavailable or returns no useful visible reply, do not imply that
   Florence understood, stored, or acted on the request. Say no household changes
   were made and point urgent cases to support.
+
+## Model-Facing Prompt
+
+The Hermes system prompt lives in `florence/prompts.py`. It is intentionally
+separate from deterministic copy in `florence/tone.py`:
+
+- `tone.py` is the user-facing phrasebook for fixed routes.
+- `prompts.py` is the model-facing behavior contract for open-ended turns.
+- `hermes.py` adapts Hermes Agent to that contract and keeps SaaS boundaries
+  explicit.
+
+The prompt follows the useful pattern from reconstructed Poke-style prompts:
+one personable assistant face, hidden orchestration, sparse proactivity, no
+magic command requirements, and a high bar before interrupting a household.
 
 ## Deterministic Replies
 

@@ -156,8 +156,12 @@ def parse_linq_event(
     sender = _sender_value(
         message.get("from"),
         message.get("sender"),
+        message.get("sender_handle"),
+        message.get("from_handle"),
         data.get("from"),
         data.get("sender"),
+        data.get("sender_handle"),
+        data.get("from_handle"),
     )
     text = _message_text(message).strip()
     attachments = _message_attachments(message)
@@ -350,6 +354,7 @@ def _sender_value(*values: object) -> str | None:
             candidate = _first(
                 value.get("phone_number"),
                 value.get("phone"),
+                value.get("handle"),
                 value.get("e164"),
                 value.get("address"),
                 value.get("id"),

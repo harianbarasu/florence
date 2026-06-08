@@ -105,6 +105,41 @@ def test_parse_linq_message_received_event():
     assert incoming.text == "hello"
 
 
+def test_parse_linq_2026_message_received_sender_handle_payload():
+    incoming = parse_linq_event(
+        {
+            "api_version": "v3",
+            "webhook_version": "2026-02-03",
+            "event_type": "message.received",
+            "event_id": "event-1",
+            "created_at": "2026-02-05T19:31:13.736444Z",
+            "data": {
+                "chat": {"id": "chat-2026", "is_group": False},
+                "id": "message-2026",
+                "direction": "inbound",
+                "sender_handle": {
+                    "handle": "+15555550100",
+                    "id": "sender-handle-1",
+                    "is_me": False,
+                    "service": "iMessage",
+                    "status": "active",
+                },
+                "parts": [{"type": "text", "value": "hello from the current payload"}],
+                "sent_at": "2026-02-05T19:31:13.074Z",
+                "service": "iMessage",
+            },
+        },
+        {},
+        now_utc=datetime(2026, 2, 5, 19, 31, tzinfo=timezone.utc),
+    )
+
+    assert incoming is not None
+    assert incoming.chat_id == "chat-2026"
+    assert incoming.message_id == "message-2026"
+    assert incoming.sender == "+15555550100"
+    assert incoming.text == "hello from the current payload"
+
+
 def test_parse_linq_combines_text_parts_and_sender_objects():
     incoming = parse_linq_event(
         {

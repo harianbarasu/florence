@@ -6,7 +6,7 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Protocol
 
 from florence.actions import run_approved_actions
@@ -22,6 +22,7 @@ from florence.service import FlorenceService
 
 
 logger = logging.getLogger(__name__)
+LINQ_RECONCILIATION_LOOKBACK = timedelta(minutes=15)
 
 
 class Sender(Protocol):
@@ -223,7 +224,12 @@ def run_worker_tick(
     linq_reconciliation = None
     if run_linq_reconciliation and isinstance(sender, LinqClient):
         try:
-            linq_reconciliation = run_linq_reconciliation_tick(service, sender, now_utc=now)
+            linq_reconciliation = run_linq_reconciliation_tick(
+                service,
+                sender,
+                now_utc=now,
+                since_utc=now - LINQ_RECONCILIATION_LOOKBACK,
+            )
         except Exception:
             logger.exception("Florence Linq reconciliation failed; continuing")
     source_sync = None

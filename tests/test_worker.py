@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 from florence import worker
 from florence.config import Settings
+from florence.linq import LinqClient
 from florence.models import IncomingMessage
 from florence.service import FlorenceService
 
@@ -91,3 +92,29 @@ def test_linq_reconciliation_replies_to_missed_inbound_once(tmp_path):
     assert service.store.message_transport_summary(household_id=household.id)["inbound"] == 1
     assert service.store.message_transport_summary(household_id=household.id)["outbound"] == 1
     assert service.store.outbound_delivery_summary(household_id=household.id)["sent"] == 1
+
+
+def test_worker_linq_reconciliation_only_scans_recent_window(tmp_path, monkeypatch):
+    now = datetime(2026, 6, 8, 15, 0, tzinfo=timezone.utc)
+    service = FlorenceService(settings=Settings(db_path=str(tmp_path / "worker.db")))
+    linq = LinqClient(Settings(db_path=str(tmp_path / "worker.db")))
+    seen_since: list[datetime | None] = []
+
+    def fake_recent_incoming_messages(
+        self,
+        *,
+        now_utc: datetime,
+        chat_limit: int = 25,
+        messages_per_chat: int = 20,
+        since_utc: datetime | None = None,
+    ) -> list[IncomingMessage]:
+        seen_since.append(since_utc)
+        return []
+
+    monkeypatch.setattr(LinqClient, "recent_incoming_messages", fake_recent_incoming_messages)
+
+    result = worker.run_worker_tick(service, linq, now_utc=now, run_sources=False)
+
+    assert result.linq_reconciliation is not None
+    assert result.linq_reconciliation.checked == 0
+    assert seen_since == [now - worker.LINQ_RECONCILIATION_LOOKBACK]

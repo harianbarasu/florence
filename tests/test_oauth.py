@@ -155,6 +155,56 @@ def test_google_oauth_callback_stores_encrypted_token_and_connected_account(tmp_
     assert decrypted["refresh_token"] == "refresh-token"
 
 
+def test_google_oauth_callback_returns_to_onboarding_flow(tmp_path):
+    now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
+    settings = _settings(
+        tmp_path,
+        web_base_url="https://florence.example.com",
+        onboarding_state_secret="setup-secret",
+    )
+    store = Store(settings.db_path)
+    household = store.get_or_create_household(
+        chat_id="onboarding-chat",
+        timezone_name="America/Los_Angeles",
+        now_utc=now,
+    )
+    actor = store.get_or_create_member(
+        household_id=household.id,
+        phone="+15555550100",
+        now_utc=now,
+    )
+    service = FlorenceService(settings=settings, store=store)
+    token = service.onboarding_url(
+        chat_id=household.chat_id,
+        member_id=actor.id,
+        role="primary",
+        now_utc=now,
+    ).rsplit("/", 1)[1]
+    fake_oauth = FakeGoogleOAuthClient()
+    client = TestClient(
+        create_app(
+            settings,
+            store=store,
+            google_oauth_client=fake_oauth,
+            now_fn=lambda: now,
+        )
+    )
+
+    start = client.get(f"/onboarding/{token}/google", follow_redirects=False)
+    parsed = urlparse(start.headers["location"])
+    state = parse_qs(parsed.query)["state"][0]
+    callback = client.get(f"/oauth/google/callback?state={state}&code=auth-code", follow_redirects=False)
+    returned = client.get(callback.headers["location"])
+
+    assert start.status_code == 303
+    assert callback.status_code == 303
+    assert callback.headers["location"] == f"/onboarding/{token}?google=connected"
+    assert returned.status_code == 200
+    assert 'data-initial-step="household"' in returned.text
+    assert "Google is connected. Continue with the household details." in returned.text
+    assert fake_oauth.codes == ["auth-code"]
+
+
 def test_google_oauth_callback_does_not_recreate_deleted_household(tmp_path):
     settings = _settings(tmp_path)
     fake_oauth = FakeGoogleOAuthClient()

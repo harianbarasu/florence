@@ -261,7 +261,7 @@ def create_app(
         return {"ok": True}
 
     @app.get("/onboarding/{token}")
-    async def web_onboarding(token: str) -> HTMLResponse:
+    async def web_onboarding(token: str, request: Request) -> HTMLResponse:
         claims, household, actor = require_onboarding_access(token)
         now = app_now()
         readiness = service.readiness_snapshot(chat_id=claims.chat_id, now_utc=now)
@@ -279,6 +279,7 @@ def create_app(
                 connected_account_count=len(connected_accounts),
                 google_configured=not google_missing,
                 google_missing=google_missing,
+                google_status=request.query_params.get("google"),
             )
         )
 
@@ -321,6 +322,7 @@ def create_app(
             start = service.start_google_oauth(
                 chat_id=claims.chat_id,
                 account_label=actor.display_name or actor.phone,
+                return_path=f"/onboarding/{token}?google=connected",
                 now_utc=app_now(),
             )
         except OAuthConfigurationError:
@@ -528,7 +530,7 @@ def create_app(
         }
 
     @app.get("/oauth/google/callback")
-    async def google_oauth_callback(request: Request) -> HTMLResponse:
+    async def google_oauth_callback(request: Request):
         error = request.query_params.get("error")
         if error:
             raise HTTPException(status_code=400, detail="google_oauth_error")
@@ -589,6 +591,9 @@ def create_app(
                 _send_all(linq, [confirmation], service=service, now_utc=now)
             except Exception:
                 confirmation_failed = True
+        return_path = _safe_return_path(oauth_state.return_path)
+        if return_path is not None:
+            return RedirectResponse(return_path, status_code=303)
         return HTMLResponse(
             f"""
             <!doctype html>
@@ -1079,8 +1084,13 @@ def _render_onboarding_form(
     connected_account_count: int,
     google_configured: bool,
     google_missing: list[str],
+    google_status: str | None,
 ) -> str:
     title = "Partner Setup" if claims.role == "partner" else "Household Setup"
+    initial_step = _onboarding_initial_step(
+        connected_account_count=connected_account_count,
+        google_status=google_status,
+    )
     partner_field = ""
     if claims.role == "primary":
         partner_field = """
@@ -1102,27 +1112,41 @@ def _render_onboarding_form(
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Florence {title}</title>
-    {_onboarding_css()}
-  </head>
-  <body>
-    <main>
-      <header>
-        <p class="eyebrow">Florence</p>
-        <h1>{_e(title)}</h1>
-        <p class="lede">{_e(_onboarding_lede(claims.role))}</p>
-      </header>
-      <section class="band">
-        <h2>1. Connect sources</h2>
-        {google_block}
-      </section>
-      <form method="post" action="/onboarding/{_e(token)}">
-        <section class="band">
-          <h2>2. Household</h2>
-          <div class="grid">
-            <label>
-              Your name
-              <input name="parent_name" autocomplete="name" value="{_e(actor.display_name or "")}">
+	    <title>Florence {title}</title>
+	    {_onboarding_css()}
+	  </head>
+	  <body>
+	    <main data-initial-step="{_e(initial_step)}">
+	      <header>
+	        <p class="eyebrow">Florence</p>
+	        <h1>{_e(title)}</h1>
+	        <p class="lede">{_e(_onboarding_lede(claims.role))}</p>
+	      </header>
+	      {_render_google_connected_notice(google_status)}
+	      <nav class="stepper" aria-label="Setup progress">
+	        <button type="button" data-step-target="sources">Sources</button>
+	        <button type="button" data-step-target="household">Household</button>
+	        <button type="button" data-step-target="kids">Kids</button>
+	        <button type="button" data-step-target="care">Care</button>
+	        <button type="button" data-step-target="preferences">Preferences</button>
+	        <button type="button" data-step-target="review">Review</button>
+	      </nav>
+	      <form method="post" action="/onboarding/{_e(token)}">
+	        <section {_step_attrs("sources", initial_step)}>
+	          <p class="step-count">Step 1 of 6</p>
+	          <h2>Connect sources</h2>
+	          {google_block}
+	          <div class="actions">
+	            <button type="button" data-next>Continue</button>
+	          </div>
+	        </section>
+	        <section {_step_attrs("household", initial_step)}>
+	          <p class="step-count">Step 2 of 6</p>
+	          <h2>Household</h2>
+	          <div class="grid">
+	            <label>
+	              Your name
+	              <input name="parent_name" autocomplete="name" value="{_e(actor.display_name or "")}">
             </label>
             <label>
               Family or household name
@@ -1132,32 +1156,47 @@ def _render_onboarding_form(
             <label>
               Location
               <input name="location" placeholder="City, neighborhood, or school area">
-            </label>
-          </div>
-        </section>
-        <section class="band">
-          <h2>3. Kids</h2>
-          {child_rows}
-        </section>
-        <section class="band">
-          <h2>4. Support System</h2>
-          <div class="grid">
-            <label>
-              Pets
-              <textarea name="pets" rows="4" placeholder="One per line"></textarea>
+	            </label>
+	          </div>
+	          <div class="actions">
+	            <button type="button" class="secondary" data-back>Back</button>
+	            <button type="button" data-next>Continue</button>
+	          </div>
+	        </section>
+	        <section {_step_attrs("kids", initial_step)}>
+	          <p class="step-count">Step 3 of 6</p>
+	          <h2>Kids</h2>
+	          {child_rows}
+	          <div class="actions">
+	            <button type="button" class="secondary" data-back>Back</button>
+	            <button type="button" data-next>Continue</button>
+	          </div>
+	        </section>
+	        <section {_step_attrs("care", initial_step)}>
+	          <p class="step-count">Step 4 of 6</p>
+	          <h2>Support system</h2>
+	          <div class="grid">
+	            <label>
+	              Pets
+	              <textarea name="pets" rows="4" placeholder="One per line"></textarea>
             </label>
             <label>
               Other caretakers
               <textarea name="caretakers" rows="4" placeholder="Nanny, grandparent, neighbor, etc. One per line."></textarea>
-            </label>
-          </div>
-        </section>
-        <section class="band">
-          <h2>5. Florence Preferences</h2>
-          <div class="grid">
-            <label>
-              Tone
-              <select name="tone_preference">
+	            </label>
+	          </div>
+	          <div class="actions">
+	            <button type="button" class="secondary" data-back>Back</button>
+	            <button type="button" data-next>Continue</button>
+	          </div>
+	        </section>
+	        <section {_step_attrs("preferences", initial_step)}>
+	          <p class="step-count">Step 5 of 6</p>
+	          <h2>Florence preferences</h2>
+	          <div class="grid">
+	            <label>
+	              Tone
+	              <select name="tone_preference">
                 <option value="Warm, concise, and practical">Warm, concise, practical</option>
                 <option value="Very brief and direct">Very brief</option>
                 <option value="Extra warm and reassuring">Extra warm</option>
@@ -1170,21 +1209,32 @@ def _render_onboarding_form(
             </label>
           </div>
           <label>
-              Household book notes
-            <textarea name="family_context" rows="4" placeholder="Stable context Florence should keep visible for this household."></textarea>
-          </label>
-        </section>
-        {current_context}
-        <div class="actions">
-          <button type="submit">Save Setup</button>
-        </div>
-      </form>
-      <footer>
-        <p>Household {readiness.parent_count}/2 parents, {readiness.child_count} children, {connected_account_count} connected sources.</p>
-      </footer>
-    </main>
-  </body>
-</html>"""
+	              Household book notes
+	            <textarea name="family_context" rows="4" placeholder="Stable context Florence should keep visible for this household."></textarea>
+	          </label>
+	          <div class="actions">
+	            <button type="button" class="secondary" data-back>Back</button>
+	            <button type="button" data-next>Continue</button>
+	          </div>
+	        </section>
+	        <section {_step_attrs("review", initial_step)}>
+	          <p class="step-count">Step 6 of 6</p>
+	          <h2>Review</h2>
+	          <p>Household {readiness.parent_count}/2 parents, {readiness.child_count} children, {connected_account_count} connected sources.</p>
+	          {current_context}
+	          <div class="actions">
+	            <button type="button" class="secondary" data-back>Back</button>
+	            <button type="submit">Save Setup</button>
+	          </div>
+	        </section>
+	      </form>
+	      <footer>
+	        <p>Household {readiness.parent_count}/2 parents, {readiness.child_count} children, {connected_account_count} connected sources.</p>
+	      </footer>
+	    </main>
+	    {_onboarding_script()}
+	  </body>
+	</html>"""
 
 
 def _render_onboarding_done(
@@ -1275,12 +1325,47 @@ def _render_google_block(
     connected_account_count: int,
 ) -> str:
     if google_configured:
+        status = (
+            f"{connected_account_count} Google account(s) connected for this household."
+            if connected_account_count
+            else "No Google accounts connected yet."
+        )
         return (
-            f'<p>{connected_account_count} Google account(s) connected for this household.</p>'
+            f"<p>{_e(status)}</p>"
             f'<a class="primary" href="/onboarding/{_e(token)}/google">Connect Google Calendar and Gmail</a>'
         )
     missing = ", ".join(google_missing)
     return f"<p>Google connection is not configured for this deployment yet. Missing: {_e(missing)}.</p>"
+
+
+def _render_google_connected_notice(google_status: str | None) -> str:
+    if google_status != "connected":
+        return ""
+    return '<p class="notice">Google is connected. Continue with the household details.</p>'
+
+
+def _onboarding_initial_step(*, connected_account_count: int, google_status: str | None) -> str:
+    if google_status == "connected":
+        return "household"
+    if connected_account_count <= 0:
+        return "sources"
+    return "household"
+
+
+def _step_attrs(step: str, initial_step: str) -> str:
+    hidden = "" if step == initial_step else " hidden"
+    return f'class="band step" data-step="{_e(step)}"{hidden}'
+
+
+def _safe_return_path(path: str | None) -> str | None:
+    if path is None:
+        return None
+    stripped = path.strip()
+    if not stripped or "\r" in stripped or "\n" in stripped:
+        return None
+    if not stripped.startswith("/") or stripped.startswith("//"):
+        return None
+    return stripped
 
 
 def _render_child_row(index: int) -> str:
@@ -1319,10 +1404,10 @@ def _render_current_context(memory_texts: list[str]) -> str:
         return ""
     items = "".join(f"<li>{_e(text)}</li>" for text in memory_texts)
     return f"""
-      <section class="band">
-        <h2>Household Book</h2>
+      <div class="review-block">
+        <h3>Household Book</h3>
         <ul>{items}</ul>
-      </section>
+      </div>
     """
 
 
@@ -1336,31 +1421,84 @@ def _onboarding_css() -> str:
     return """
     <style>
       :root { color-scheme: light; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-      body { margin: 0; background: #f6f4ef; color: #1f2933; }
-      main { max-width: 980px; margin: 0 auto; padding: 32px 20px 48px; }
+      body { margin: 0; background: #f7f8fb; color: #172033; }
+      main { max-width: 920px; margin: 0 auto; padding: 32px 20px 48px; }
       header { padding: 24px 0 16px; }
-      h1 { font-size: clamp(2rem, 4vw, 3.4rem); line-height: 1.02; margin: 0; letter-spacing: 0; }
+      h1 { font-size: 2.7rem; line-height: 1.04; margin: 0; letter-spacing: 0; }
       h2 { font-size: 1rem; margin: 0 0 16px; letter-spacing: 0; }
+      h3 { font-size: .95rem; margin: 18px 0 8px; letter-spacing: 0; }
       p { line-height: 1.5; }
       .eyebrow { text-transform: uppercase; font-size: .78rem; letter-spacing: .08em; color: #6b7280; margin: 0 0 8px; }
       .lede { max-width: 720px; color: #4b5563; font-size: 1.05rem; }
-      .band { border-top: 1px solid #d9d4ca; padding: 22px 0; }
+      .notice { border-left: 4px solid #168a56; background: #eefaf3; border-radius: 6px; padding: 12px 14px; margin: 0 0 18px; color: #0f5132; font-weight: 650; }
+      .stepper { display: flex; gap: 8px; overflow-x: auto; padding: 8px 0 18px; margin-bottom: 4px; }
+      .stepper button { flex: 0 0 auto; border: 1px solid #cfd7e3; background: #fff; color: #475569; border-radius: 6px; padding: 8px 10px; font: inherit; font-size: .88rem; font-weight: 750; }
+      .stepper button.is-active { background: #111827; border-color: #111827; color: #fff; }
+      .band { border-top: 1px solid #d8dee8; padding: 24px 0; }
+      .step[hidden] { display: none; }
+      .step-count { color: #64748b; font-size: .82rem; font-weight: 750; margin: 0 0 8px; }
       .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
       .child-row { display: grid; grid-template-columns: 1.2fr .6fr .7fr 1.1fr 1.2fr 1.2fr; gap: 12px; margin-bottom: 12px; }
       label { display: grid; gap: 7px; color: #374151; font-size: .92rem; font-weight: 650; }
-      input, textarea, select { width: 100%; box-sizing: border-box; border: 1px solid #c9c2b5; border-radius: 6px; padding: 11px 12px; background: #fffdf8; color: #111827; font: inherit; font-weight: 450; }
+      input, textarea, select { width: 100%; box-sizing: border-box; border: 1px solid #cfd7e3; border-radius: 6px; padding: 11px 12px; background: #fff; color: #111827; font: inherit; font-weight: 450; }
+      input:focus, textarea:focus, select:focus { outline: 2px solid #94a3b8; outline-offset: 1px; }
       textarea { resize: vertical; }
       ul { padding-left: 20px; color: #4b5563; }
       .actions { display: flex; gap: 12px; flex-wrap: wrap; padding-top: 18px; }
-      button, .primary, .secondary { border-radius: 6px; padding: 11px 16px; font-weight: 750; text-decoration: none; border: 1px solid #111827; display: inline-flex; align-items: center; justify-content: center; }
-      button, .primary { background: #111827; color: #fff; }
+      .actions button, .primary, .secondary { border-radius: 6px; padding: 11px 16px; font: inherit; font-weight: 750; text-decoration: none; border: 1px solid #111827; display: inline-flex; align-items: center; justify-content: center; min-height: 44px; }
+      .actions button, .primary { background: #111827; color: #fff; }
       .secondary { background: transparent; color: #111827; }
+      .review-block { margin-top: 18px; }
       footer { color: #6b7280; font-size: .9rem; padding-top: 24px; }
       @media (max-width: 760px) {
         main { padding: 22px 14px 36px; }
+        h1 { font-size: 2rem; }
         .grid, .child-row { grid-template-columns: 1fr; }
+        .actions button, .primary, .secondary { width: 100%; }
       }
     </style>
+    """
+
+
+def _onboarding_script() -> str:
+    return """
+    <script>
+      (() => {
+        const root = document.querySelector("main[data-initial-step]");
+        if (!root) return;
+        const steps = Array.from(document.querySelectorAll("[data-step]"));
+        const tabs = Array.from(document.querySelectorAll("[data-step-target]"));
+        const order = steps.map((step) => step.dataset.step);
+
+        const show = (stepId, shouldScroll = true) => {
+          if (!order.includes(stepId)) stepId = order[0];
+          steps.forEach((step) => {
+            step.hidden = step.dataset.step !== stepId;
+          });
+          tabs.forEach((tab) => {
+            const active = tab.dataset.stepTarget === stepId;
+            tab.classList.toggle("is-active", active);
+            tab.setAttribute("aria-current", active ? "step" : "false");
+          });
+          root.dataset.currentStep = stepId;
+          if (shouldScroll) window.scrollTo({ top: 0, behavior: "smooth" });
+        };
+
+        document.addEventListener("click", (event) => {
+          const target = event.target.closest("[data-next], [data-back], [data-step-target]");
+          if (!target) return;
+          if (target.dataset.stepTarget) {
+            show(target.dataset.stepTarget);
+            return;
+          }
+          const index = order.indexOf(root.dataset.currentStep);
+          if (target.hasAttribute("data-next")) show(order[Math.min(index + 1, order.length - 1)]);
+          if (target.hasAttribute("data-back")) show(order[Math.max(index - 1, 0)]);
+        });
+
+        show(root.dataset.initialStep, false);
+      })();
+    </script>
     """
 
 

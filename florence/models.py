@@ -235,6 +235,7 @@ class OAuthState:
     expires_at_utc: datetime
     account_label: str | None = None
     used_at_utc: datetime | None = None
+    return_path: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

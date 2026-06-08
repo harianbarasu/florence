@@ -978,6 +978,7 @@ class FlorenceService:
         *,
         chat_id: str,
         account_label: str | None = None,
+        return_path: str | None = None,
         now_utc: datetime | None = None,
     ) -> OAuthStart:
         now = ensure_utc(now_utc or utc_now())
@@ -992,6 +993,7 @@ class FlorenceService:
             provider="google",
             chat_id=chat_id,
             account_label=account_label,
+            return_path=return_path,
             expires_at_utc=start.expires_at_utc,
             now_utc=now,
         )

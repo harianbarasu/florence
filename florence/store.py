@@ -178,6 +178,7 @@ _SCHEMA_REQUIRED_COLUMNS: dict[str, set[str]] = {
         "provider",
         "chat_id",
         "account_label",
+        "return_path",
         "created_at_utc",
         "expires_at_utc",
         "used_at_utc",
@@ -477,6 +478,7 @@ class Store:
                     provider TEXT NOT NULL,
                     chat_id TEXT NOT NULL,
                     account_label TEXT,
+                    return_path TEXT,
                     created_at_utc TEXT NOT NULL,
                     expires_at_utc TEXT NOT NULL,
                     used_at_utc TEXT
@@ -600,6 +602,7 @@ class Store:
             self._ensure_column(conn, "source_items", "connected_account_id", "TEXT")
             self._ensure_column(conn, "source_items", "briefed_at_utc", "TEXT")
             self._ensure_column(conn, "reminders", "assignee_member_id", "TEXT")
+            self._ensure_column(conn, "oauth_states", "return_path", "TEXT")
             self._raise_for_schema_status(self._schema_status(conn))
 
     def schema_status(self) -> dict[str, Any]:
@@ -2217,19 +2220,21 @@ class Store:
         expires_at_utc: datetime,
         now_utc: datetime,
         account_label: str | None = None,
+        return_path: str | None = None,
     ) -> OAuthState:
         with self.connect() as conn:
             conn.execute(
                 """
                 INSERT INTO oauth_states
-                    (state, provider, chat_id, account_label, created_at_utc, expires_at_utc)
-                VALUES (?, ?, ?, ?, ?, ?)
+                    (state, provider, chat_id, account_label, return_path, created_at_utc, expires_at_utc)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     state,
                     _normalize_key(provider),
                     chat_id,
                     _empty_to_none(account_label),
+                    _empty_to_none(return_path),
                     _iso(now_utc),
                     _iso(expires_at_utc),
                 ),
@@ -3480,6 +3485,7 @@ def _oauth_state(row: sqlite3.Row) -> OAuthState:
         created_at_utc=_dt(row["created_at_utc"]),
         expires_at_utc=_dt(row["expires_at_utc"]),
         used_at_utc=_dt(row["used_at_utc"]) if row["used_at_utc"] else None,
+        return_path=row["return_path"],
     )
 
 

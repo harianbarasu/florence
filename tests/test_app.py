@@ -398,6 +398,8 @@ def test_web_onboarding_saves_primary_profile_and_partner_invite(tmp_path):
 
     assert form.status_code == 200
     assert "Connect Google Calendar and Gmail" in form.text
+    assert 'data-initial-step="sources"' in form.text
+    assert 'data-step="household" hidden' in form.text
     assert response.status_code == 200
     assert "Partner Invite" in response.text
     assert "https://florence.example.com/onboarding/" in response.text
@@ -455,6 +457,7 @@ def test_web_onboarding_google_route_starts_oauth_state(tmp_path):
     assert parsed.netloc == "accounts.google.com"
     assert oauth_state is not None
     assert oauth_state.chat_id == "onboarding-google"
+    assert oauth_state.return_path == f"/onboarding/{token}?google=connected"
 
 
 def test_postgres_linq_webhook_requires_configured_secret(tmp_path):

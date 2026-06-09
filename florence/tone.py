@@ -79,12 +79,17 @@ def source_surface(
     due_at_utc: datetime | None,
     timezone_name: str,
     *,
+    sender: str | None = None,
+    context: str | None = None,
     suggested_action: PendingAction | None = None,
 ) -> str:
+    source = f" from {sender}" if sender else ""
     if due_at_utc is None:
-        text = f"This looks worth your attention: {title}"
+        text = f"I found something that may matter{source}: {title}."
     else:
-        text = f"This looks worth your attention: {title} ({format_local(due_at_utc, timezone_name)})."
+        text = f"I found something that may matter{source}: {title} ({format_local(due_at_utc, timezone_name)})."
+    if context:
+        text = f"{text}\n{context}"
     if suggested_action is None:
         return text
     code = suggested_action.id[:8]
@@ -820,6 +825,7 @@ def _source_reason(reason: str | None) -> str:
         "initial_sync_backfill": "first sync backfill",
         "low_signal_source": "low signal",
         "no_due_time_and_not_actionable": "no clear action",
+        "requested_source_low_signal": "requested but low signal",
         "upcoming_actionable_source": "upcoming action",
         "urgent_actionable_source": "urgent action",
         "useful_context_not_interrupt_worthy": "useful, not interrupt-worthy",

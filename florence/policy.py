@@ -52,13 +52,19 @@ HIGH_SIGNAL_NO_TIME_KEYWORDS = {
 
 LOW_SIGNAL_KEYWORDS = {
     "account alert",
+    "add more",
+    "all-access",
     "backup complete",
+    "content coming your way",
     "newsletter",
     "weekly update",
     "promotion",
     "sale",
     "coupon",
     "digest",
+    "facebook",
+    "father's day",
+    "gift ideas",
     "recap",
     "receipt",
     "order confirmation",
@@ -70,6 +76,43 @@ LOW_SIGNAL_KEYWORDS = {
     "security alert",
     "spirit wear",
     "fundraiser",
+    "instagram",
+    "marketing",
+    "manage preferences",
+    "not too late",
+    "sponsored",
+    "stay tuned",
+    "tiktok",
+    "unsubscribe",
+    "view online",
+    "youtube",
+}
+
+BROAD_SOURCE_PREFERENCES = {
+    "activities",
+    "activity",
+    "after school",
+    "camp",
+    "camp schedule",
+    "camp schedules",
+    "camps",
+    "drop off",
+    "dropoff",
+    "dropoffs",
+    "events",
+    "pickup",
+    "pick up",
+    "pickups",
+    "school",
+    "school activities",
+    "school activity",
+    "school schedule",
+    "school schedules",
+    "schedule",
+    "schedule changes",
+    "schedules",
+    "summer camp",
+    "summer camps",
 }
 
 EMOTIONAL_SUPPORT_KEYWORDS = {
@@ -164,6 +207,17 @@ class NeedToKnowPolicy:
                     priority=60 + action_score,
                     suggested_title=_clean_title(item.title),
                 )
+            if _requested_source_is_low_signal(
+                preference=preference,
+                low_signal_score=low_signal_score,
+                action_score=action_score,
+                high_signal_no_time_score=high_signal_no_time_score,
+            ):
+                return SourceTriage(
+                    decision=SourceDecision.STORE_ONLY,
+                    reason="requested_source_low_signal",
+                    priority=5,
+                )
             if requested_surface:
                 return SourceTriage(
                     decision=SourceDecision.SURFACE,
@@ -194,6 +248,18 @@ class NeedToKnowPolicy:
                 priority=70 + action_score,
                 suggested_title=_clean_title(item.title),
                 suggested_due_at_utc=event_at,
+            )
+
+        if _requested_source_is_low_signal(
+            preference=preference,
+            low_signal_score=low_signal_score,
+            action_score=action_score,
+            high_signal_no_time_score=high_signal_no_time_score,
+        ):
+            return SourceTriage(
+                decision=SourceDecision.STORE_ONLY,
+                reason="requested_source_low_signal",
+                priority=5,
             )
 
         if requested_surface:
@@ -258,6 +324,27 @@ def _matching_preference(text: str, preferences: list[SourcePreference]) -> Sour
             if phrase and re.search(rf"\b{re.escape(phrase)}\b", text):
                 return preference
     return None
+
+
+def _requested_source_is_low_signal(
+    *,
+    preference: SourcePreference | None,
+    low_signal_score: int,
+    action_score: int,
+    high_signal_no_time_score: int,
+) -> bool:
+    return (
+        preference is not None
+        and _preference_needs_concrete_signal(preference.phrase)
+        and low_signal_score > 0
+        and action_score == 0
+        and high_signal_no_time_score == 0
+    )
+
+
+def _preference_needs_concrete_signal(phrase: str) -> bool:
+    normalized = " ".join(phrase.strip().lower().split())
+    return normalized in BROAD_SOURCE_PREFERENCES
 
 
 def _phrase_variants(phrase: str) -> set[str]:

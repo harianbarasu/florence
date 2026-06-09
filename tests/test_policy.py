@@ -213,6 +213,51 @@ def test_source_preference_matches_natural_singular_plural_variants():
     assert triage.reason == "household_requested_source"
 
 
+def test_broad_requested_source_does_not_surface_promotional_newsletter():
+    now = datetime(2026, 6, 9, 16, 0, tzinfo=timezone.utc)
+    policy = NeedToKnowPolicy()
+    preference = _preference("camp", SourcePreferenceKind.ALWAYS_SURFACE, now)
+
+    triage = policy.classify(
+        _item(
+            title="Unique Belgian Camps + NYC Theater + Father's Day Gift Ideas",
+            body=(
+                "Hey there! Stay tuned for family-friendly travel content coming your way. "
+                "4 Unique Belgian Summer Camps."
+            ),
+            sender="Maddy Novich <maddy@cargobikemomma.com>",
+            observed_at_utc=now,
+            event_at_utc=None,
+        ),
+        now_utc=now,
+        preferences=[preference],
+    )
+
+    assert triage.decision == SourceDecision.STORE_ONLY
+    assert triage.reason == "requested_source_low_signal"
+
+
+def test_broad_requested_source_does_not_surface_promotional_event():
+    now = datetime(2026, 6, 9, 16, 0, tzinfo=timezone.utc)
+    policy = NeedToKnowPolicy()
+    preference = _preference("camp", SourcePreferenceKind.ALWAYS_SURFACE, now)
+
+    triage = policy.classify(
+        _item(
+            title="Barong but Make it Dodgers - 6/15",
+            body="View Online. Instagram Facebook YouTube Dodgers Youth Camps All-Access Events.",
+            sender="Los Angeles Dodgers <dodgers@marketing.mlbemail.com>",
+            observed_at_utc=now,
+            event_at_utc=now + timedelta(days=6),
+        ),
+        now_utc=now,
+        preferences=[preference],
+    )
+
+    assert triage.decision == SourceDecision.STORE_ONLY
+    assert triage.reason == "requested_source_low_signal"
+
+
 def test_mute_preference_matches_plural_of_parent_phrase():
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
     policy = NeedToKnowPolicy()

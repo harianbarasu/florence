@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import re
 import uuid
 from dataclasses import dataclass, replace
@@ -1547,6 +1548,8 @@ class FlorenceService:
                 title,
                 triage.suggested_due_at_utc,
                 timezone_name,
+                sender=_source_sender_label(item.sender),
+                context=_source_surface_context(item, title),
                 suggested_action=suggested_action,
             )
         return inserted, [
@@ -3356,6 +3359,89 @@ def _source_feedback_kind(text: str) -> SourceFeedbackKind | None:
 def _feedback_phrase(item: SourceItem) -> str:
     title = " ".join(item.title.strip(" .").lower().split())
     return title[:120] or item.source_type
+
+
+def _source_sender_label(sender: str | None) -> str | None:
+    normalized = normalize_source_sender(sender)
+    if not normalized:
+        return None
+    name, address = parseaddr(normalized)
+    label = name or (address if "@" in address else normalized)
+    return normalize_source_sender(label.strip().strip('"')) or None
+
+
+def _source_surface_context(item: SourceItem, title: str) -> str | None:
+    body = normalize_source_body(html.unescape(item.body))
+    if not body:
+        return None
+    title_key = _source_context_key(title)
+    for candidate in _source_context_candidates(body):
+        cleaned = _clean_source_context(candidate)
+        if _source_context_is_useful(cleaned, title_key):
+            return f"Context: {cleaned}"
+    fallback = _clean_source_context(body)
+    if _source_context_is_useful(fallback, title_key):
+        return f"Context: {fallback}"
+    return None
+
+
+def _source_context_candidates(body: str) -> list[str]:
+    return [
+        part
+        for part in re.split(r"(?<=[.!?])\s+|\s+[\u2022|]\s+|\s+-\s+", body)
+        if part.strip()
+    ]
+
+
+def _clean_source_context(candidate: str) -> str:
+    compact = " ".join(candidate.strip(" -").split())
+    compact = re.sub(r"https?://\S+", "", compact).strip()
+    compact = re.sub(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b", "", compact).strip()
+    compact = " ".join(compact.split())
+    return _truncate_source_context(compact)
+
+
+def _truncate_source_context(value: str, *, limit: int = 180) -> str:
+    if len(value) <= limit:
+        return value
+    truncated = value[: limit + 1].rsplit(" ", 1)[0].rstrip(" ,;:-")
+    return f"{truncated}..."
+
+
+def _source_context_is_useful(candidate: str, title_key: str) -> bool:
+    if len(candidate) < 12:
+        return False
+    candidate_key = _source_context_key(candidate)
+    if not candidate_key:
+        return False
+    if candidate_key == title_key:
+        return False
+    if title_key and title_key in candidate_key and len(candidate_key) <= len(title_key) + 24:
+        return False
+    boilerplate = (
+        "all-access",
+        "click here",
+        "content coming your way",
+        "facebook",
+        "follow us",
+        "instagram",
+        "manage preferences",
+        "privacy policy",
+        "snapchat",
+        "stay tuned",
+        "tiktok",
+        "unsubscribe",
+        "view in browser",
+        "view online",
+        "youtube",
+    )
+    return not any(marker in candidate_key for marker in boilerplate)
+
+
+def _source_context_key(value: str) -> str:
+    normalized = html.unescape(value).lower()
+    normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
+    return " ".join(normalized.split())
 
 
 def _source_item_id(*, household_id: str, source_type: str, external_id: str | None) -> str:

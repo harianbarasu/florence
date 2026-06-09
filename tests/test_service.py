@@ -2312,7 +2312,8 @@ def test_actionable_source_is_surfaced(tmp_path):
     )
 
     assert len(outbound) == 1
-    assert "worth your attention" in outbound[0].text
+    assert outbound[0].text.startswith("I found something that may matter: Permission slip due")
+    assert "Context: Please sign and bring the permission slip" in outbound[0].text
     assert "add a reminder" in outbound[0].text
 
 
@@ -3030,6 +3031,39 @@ def test_household_can_request_low_signal_source_pattern(tmp_path):
     assert service.pending_actions(chat_id="source-always", now_utc=now) == []
     assert snapshot.surfaced == 1
     assert snapshot.by_reason["household_requested_source"] == 1
+
+
+def test_broad_source_preference_keeps_promotional_newsletter_quiet(tmp_path):
+    service, _agent = _service(tmp_path)
+    now = datetime(2026, 6, 9, 16, 0, tzinfo=timezone.utc)
+
+    service.handle_incoming(
+        _incoming(
+            "always tell me about camp",
+            chat_id="source-broad-camp",
+            message_id="source-broad-camp-rule",
+        ),
+        now_utc=now,
+    )
+    outbound = service.ingest_source_item(
+        chat_id="source-broad-camp",
+        source_type="email",
+        title="Unique Belgian Camps + NYC Theater + Father's Day Gift Ideas",
+        body=(
+            "Hey there! Stay tuned for family-friendly travel content coming your way. "
+            "4 Unique Belgian Summer Camps."
+        ),
+        sender="Maddy Novich <maddy@cargobikemomma.com>",
+        observed_at_utc=now,
+        event_at_utc=None,
+        now_utc=now,
+    )
+    snapshot = service.source_review_snapshot(chat_id="source-broad-camp", now_utc=now)
+
+    assert outbound == []
+    assert snapshot.surfaced == 0
+    assert snapshot.stored_only == 1
+    assert snapshot.by_reason["requested_source_low_signal"] == 1
 
 
 def test_source_preferences_are_household_scoped(tmp_path):

@@ -4549,7 +4549,10 @@ def test_pilot_smoke_path_from_linq_to_source_approval_worker_and_reminder(tmp_p
     assert child.status_code == 200
     assert source.status_code == 200
     assert source.json()["sent"] == 1
-    assert "This looks worth your attention: Field trip permission slip due" in source_text
+    assert source_text.startswith(
+        "I found something that may matter from teacher@example.edu: Field trip permission slip due"
+    )
+    assert "Context: Please sign and bring the permission slip" in source_text
     assert "approve" in source_text
     assert actions.status_code == 200
     assert actions.json()["actions"][0]["action_type"] == "create_reminder"
@@ -4692,9 +4695,11 @@ def test_pilot_smoke_path_from_linq_to_connected_source_worker_and_reminder(tmp_
     assert provider.seen_accounts[0].cursor == "cursor-1"
     assert account.provider == "google"
     assert account.cursor == "cursor-2"
-    assert source_text.startswith("This looks worth your attention: Field trip permission slip due")
+    assert source_text.startswith(
+        "I found something that may matter from teacher@example.edu: Field trip permission slip due"
+    )
     assert "approve" in source_text
-    assert "Please sign and bring the permission slip" not in source_text
+    assert "Context: Please sign and bring the permission slip" in source_text
     assert actions.status_code == 200
     assert action["action_type"] == "create_reminder"
     assert action["payload"]["title"] == "Field trip permission slip due"

@@ -98,6 +98,26 @@ def attachment_saved() -> str:
     return "Got it. I will keep that with the household context and surface it only if it needs action."
 
 
+def attachment_actionable_saved(
+    title: str,
+    due_at_utc: datetime | None,
+    timezone_name: str,
+    *,
+    suggested_action: PendingAction | None = None,
+) -> str:
+    if due_at_utc is None:
+        text = f"Got it. I will keep this with the household context: {title}."
+    else:
+        text = f"Got it. I will keep this with the household context: {title} ({format_local(due_at_utc, timezone_name)})."
+    if suggested_action is None:
+        return text
+    code = suggested_action.id[:8]
+    return (
+        f"{text}\n"
+        f"I can also add a reminder for this. Reply 'approve {code}' or 'cancel {code}'."
+    )
+
+
 def attachment_needs_context(count: int) -> str:
     noun = "attachment" if count == 1 else "attachments"
     return (

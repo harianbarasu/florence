@@ -1959,9 +1959,58 @@ def test_captioned_attachment_uses_need_to_know_policy(tmp_path):
     snapshot = service.source_review_snapshot(chat_id="captioned-media")
 
     assert len(outbound) == 1
-    assert "This looks worth your attention: Field trip permission slip due tomorrow" in outbound[0].text
+    assert "Got it. I will keep this with the household context: Field trip permission slip due tomorrow" in outbound[0].text
     assert snapshot.total == 1
     assert snapshot.surfaced == 1
+    assert agent.calls == []
+
+
+def test_captioned_attachment_matching_source_rule_is_acknowledged_not_echoed(tmp_path):
+    service, agent = _service(tmp_path)
+    now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
+    household = service.store.get_or_create_household(
+        chat_id="camp-media",
+        timezone_name=service.settings.default_timezone,
+        now_utc=now,
+    )
+    parent = service.store.get_or_create_member(
+        household_id=household.id,
+        phone="+15555550100",
+        now_utc=now,
+    )
+    service.store.upsert_source_preference(
+        household_id=household.id,
+        phrase="camp",
+        preference=SourcePreferenceKind.ALWAYS_SURFACE,
+        created_by_member_id=parent.id,
+        now_utc=now,
+    )
+
+    outbound = service.handle_incoming(
+        IncomingMessage(
+            chat_id="camp-media",
+            message_id="camp-media-message",
+            sender="+15555550100",
+            text="Both kids are doing this camp",
+            received_at=now,
+            attachments=(
+                MessageAttachment(
+                    kind="image",
+                    content_type="image/png",
+                    filename="Summer Camp - Connolly Ranch.png",
+                ),
+            ),
+        ),
+        now_utc=now,
+    )
+    snapshot = service.source_review_snapshot(chat_id="camp-media")
+
+    assert len(outbound) == 1
+    assert outbound[0].text == "Got it. I will keep that with the household context and surface it only if it needs action."
+    assert "This looks worth your attention" not in outbound[0].text
+    assert snapshot.total == 1
+    assert snapshot.stored_only == 1
+    assert snapshot.by_reason["parent_submitted_context"] == 1
     assert agent.calls == []
 
 
@@ -1992,7 +2041,7 @@ def test_extracted_attachment_text_surfaces_and_suggests_reminder(tmp_path):
     actions = service.pending_actions(chat_id="extracted-media", now_utc=now)
 
     assert len(outbound) == 1
-    assert "This looks worth your attention: Field trip permission slip due tomorrow at 5pm." in outbound[0].text
+    assert "Got it. I will keep this with the household context: Field trip permission slip due tomorrow at 5pm." in outbound[0].text
     assert "Sat, Jun 6 at 5:00 PM" in outbound[0].text
     assert "approve" in outbound[0].text
     assert snapshot.total == 1

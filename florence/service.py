@@ -1420,6 +1420,7 @@ class FlorenceService:
         now: datetime,
         initial_sync: bool = False,
         mark_surfaced: bool = True,
+        parent_submitted: bool = False,
     ) -> tuple[bool, list[OutboundMessage]]:
         triage = self._classify_source_item(household_id=household_id, item=item, now=now)
         should_surface = triage.decision == SourceDecision.SURFACE
@@ -1438,6 +1439,10 @@ class FlorenceService:
             if decision == SourceDecision.SURFACE:
                 decision = SourceDecision.STORE_ONLY
                 reason = "household_stopped"
+        if parent_submitted and decision == SourceDecision.SURFACE and reason == "household_requested_source":
+            should_surface = False
+            decision = SourceDecision.STORE_ONLY
+            reason = "parent_submitted_context"
         surfaced_at = now if should_surface and mark_surfaced else None
         inserted = self.store.add_source_item(
             item,
@@ -1461,12 +1466,22 @@ class FlorenceService:
             reason=triage.reason,
             now=now,
         )
-        text = tone.source_surface(
-            triage.suggested_title or item.title,
-            triage.suggested_due_at_utc,
-            self._household_by_id(household_id).timezone,
-            suggested_action=suggested_action,
-        )
+        title = triage.suggested_title or item.title
+        timezone_name = self._household_by_id(household_id).timezone
+        if parent_submitted:
+            text = tone.attachment_actionable_saved(
+                title,
+                triage.suggested_due_at_utc,
+                timezone_name,
+                suggested_action=suggested_action,
+            )
+        else:
+            text = tone.source_surface(
+                title,
+                triage.suggested_due_at_utc,
+                timezone_name,
+                suggested_action=suggested_action,
+            )
         return inserted, [
             self._out(
                 household_id,
@@ -1592,6 +1607,7 @@ class FlorenceService:
                 chat_id=incoming.chat_id,
                 item=item,
                 now=now,
+                parent_submitted=True,
             )
             if inserted:
                 inserted_count += 1

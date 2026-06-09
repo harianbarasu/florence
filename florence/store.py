@@ -737,6 +737,25 @@ class Store:
                 ).fetchone()
         return _household(row) if row else None
 
+    def get_unique_household_by_member_phone(self, phone: str) -> Household | None:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM households
+                WHERE id IN (
+                    SELECT DISTINCT household_id
+                    FROM household_members
+                    WHERE phone = ?
+                )
+                ORDER BY created_at_utc ASC
+                LIMIT 2
+                """,
+                (phone,),
+            ).fetchall()
+        if len(rows) != 1:
+            return None
+        return _household(rows[0])
+
     def get_household_by_id(self, household_id: str) -> Household | None:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM households WHERE id = ?", (household_id,)).fetchone()

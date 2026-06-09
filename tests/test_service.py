@@ -165,6 +165,148 @@ def test_household_creation_is_idempotent_under_first_message_race(tmp_path):
     assert len([household for household in store.list_households() if household.chat_id == "race-chat"]) == 1
 
 
+def test_manual_group_chat_from_known_parent_reuses_household(tmp_path):
+    service, agent = _service(tmp_path)
+    now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
+    household = service.store.get_or_create_household(
+        chat_id="direct-chat",
+        timezone_name=service.settings.default_timezone,
+        now_utc=now,
+    )
+    jackson = service.store.get_or_create_member(
+        household_id=household.id,
+        phone="+15555550100",
+        now_utc=now,
+    )
+    service.store.set_member_name(jackson.id, "Jackson", now_utc=now)
+    kendall = service.store.ensure_parent_member(
+        household_id=household.id,
+        phone="+15555550101",
+        now_utc=now,
+    )
+    assert kendall is not None
+    service.store.set_member_name(kendall.id, "Kendall", now_utc=now)
+    service.store.upsert_memory(
+        household_id=household.id,
+        kind=MemoryKind.FACT,
+        subject="children",
+        text="Jackson's children are Theo, age 7, and Violet, age 4.",
+        now_utc=now,
+    )
+    service.store.upsert_connected_account(
+        household_id=household.id,
+        provider="google",
+        external_account_id="google-account",
+        account_label="Jackson",
+        now_utc=now,
+    )
+    service.store.upsert_source_preference(
+        household_id=household.id,
+        phrase="school logistics",
+        preference=SourcePreferenceKind.ALWAYS_SURFACE,
+        created_by_member_id=jackson.id,
+        now_utc=now,
+    )
+
+    outbound = service.handle_incoming(
+        _incoming(
+            "Ok here is the new group with Florence and Kendall",
+            chat_id="manual-group-chat",
+            message_id="manual-group-message",
+            sender="+15555550100",
+            received_at=now + timedelta(minutes=1),
+        ),
+        now_utc=now + timedelta(minutes=1),
+    )
+
+    group_household = service.store.get_household_by_chat("manual-group-chat")
+    direct_household = service.store.get_household_by_chat("direct-chat")
+    assert group_household is not None
+    assert direct_household is not None
+    assert group_household.id == household.id
+    assert direct_household.id == household.id
+    assert group_household.chat_id == "manual-group-chat"
+    assert len(service.store.list_households()) == 1
+    assert len(agent.calls) == 1
+    assert outbound[0].text == "Fake agent reply."
+    assert "what should I call each parent" not in outbound[0].text.lower()
+
+
+def test_manual_group_chat_does_not_guess_when_phone_is_in_multiple_households(tmp_path):
+    service, agent = _service(tmp_path)
+    now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
+    first = service.store.get_or_create_household(
+        chat_id="first-chat",
+        timezone_name=service.settings.default_timezone,
+        now_utc=now,
+    )
+    second = service.store.get_or_create_household(
+        chat_id="second-chat",
+        timezone_name=service.settings.default_timezone,
+        now_utc=now,
+    )
+    service.store.get_or_create_member(
+        household_id=first.id,
+        phone="+15555550100",
+        now_utc=now,
+    )
+    service.store.get_or_create_member(
+        household_id=second.id,
+        phone="+15555550100",
+        now_utc=now,
+    )
+
+    outbound = service.handle_incoming(
+        _incoming(
+            "Hi",
+            chat_id="ambiguous-manual-group",
+            message_id="ambiguous-manual-message",
+            sender="+15555550100",
+            received_at=now + timedelta(minutes=1),
+        ),
+        now_utc=now + timedelta(minutes=1),
+    )
+
+    new_household = service.store.get_household_by_chat("ambiguous-manual-group")
+    assert new_household is not None
+    assert new_household.id not in {first.id, second.id}
+    assert len(agent.calls) == 0
+    assert outbound[0].text.startswith("Hi, I'm Florence.")
+
+
+def test_unknown_chat_from_known_single_parent_does_not_reuse_household_without_handoff(tmp_path):
+    service, agent = _service(tmp_path)
+    now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
+    existing = service.store.get_or_create_household(
+        chat_id="existing-chat",
+        timezone_name=service.settings.default_timezone,
+        now_utc=now,
+    )
+    service.store.get_or_create_member(
+        household_id=existing.id,
+        phone="+15555550100",
+        now_utc=now,
+    )
+
+    outbound = service.handle_incoming(
+        _incoming(
+            "remember that Maya likes noodles",
+            chat_id="ordinary-new-chat",
+            message_id="ordinary-new-message",
+            sender="+15555550100",
+            received_at=now + timedelta(minutes=1),
+        ),
+        now_utc=now + timedelta(minutes=1),
+    )
+
+    new_household = service.store.get_household_by_chat("ordinary-new-chat")
+    assert new_household is not None
+    assert new_household.id != existing.id
+    assert service.store.get_household_by_chat("existing-chat").id == existing.id
+    assert len(agent.calls) == 0
+    assert "Got it" in outbound[0].text
+
+
 def _store_google_connected_account(service, *, chat_id: str, now: datetime):
     household = service.store.get_or_create_household(
         chat_id=chat_id,

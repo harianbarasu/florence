@@ -455,6 +455,17 @@ class FlorenceService:
         ):
             return []
         existing_household = self.store.get_household_by_chat(incoming.chat_id)
+        if existing_household is None:
+            known_household = self.store.get_unique_household_by_member_phone(incoming.sender)
+            if known_household is not None and self._should_attach_unknown_chat(
+                known_household,
+                incoming.text,
+            ):
+                existing_household = self.store.migrate_household_chat(
+                    household_id=known_household.id,
+                    new_chat_id=incoming.chat_id,
+                    now_utc=now,
+                )
         household = existing_household or self.store.get_or_create_household(
             chat_id=incoming.chat_id,
             timezone_name=self.settings.default_timezone,
@@ -674,6 +685,14 @@ class FlorenceService:
             incoming=incoming,
             now=now,
         )
+
+    def _should_attach_unknown_chat(self, household: Household, text: str) -> bool:
+        members = self.store.list_members(household.id)
+        parent_count = sum(1 for member in members if member.role == MemberRole.PARENT)
+        if parent_count >= 2:
+            return True
+        lower = " ".join(text.strip().lower().split())
+        return _manual_household_thread_handoff(lower)
 
     def _agent_turn(
         self,
@@ -2997,6 +3016,32 @@ def _google_connection_request(text: str) -> bool:
 def _simple_greeting(text: str) -> bool:
     normalized = " ".join(text.strip(" .!?").lower().split())
     return normalized in SIMPLE_GREETING_COMMANDS
+
+
+def _manual_household_thread_handoff(lower: str) -> bool:
+    if not lower:
+        return False
+    thread_terms = ("group", "thread", "chat", "text")
+    household_terms = (
+        "partner",
+        "coparent",
+        "co-parent",
+        "spouse",
+        "wife",
+        "husband",
+        "family",
+        "household",
+        "everyone",
+        "both",
+        "together",
+    )
+    if any(term in lower for term in thread_terms) and any(term in lower for term in household_terms):
+        return True
+    if any(name in lower for name in ("florence", "flornece")) and any(
+        term in lower for term in household_terms
+    ):
+        return True
+    return False
 
 
 def _natural_onboarding_continuation(text: str, lower: str) -> bool:

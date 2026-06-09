@@ -623,14 +623,6 @@ class FlorenceService:
         if reminder_resolution_reply is not None:
             return [self._out(household.id, incoming.chat_id, reminder_resolution_reply, now)]
 
-        memory_reply = self._maybe_update_memory(household.id, actor, incoming, now)
-        if memory_reply is not None:
-            return [self._out(household.id, incoming.chat_id, memory_reply, now)]
-
-        memory_status = self._maybe_show_memory(household.id, actor, lower, now)
-        if memory_status is not None:
-            return [self._out(household.id, incoming.chat_id, memory_status, now)]
-
         source_feedback_reply = self._maybe_handle_source_feedback(
             household.id,
             actor,
@@ -639,6 +631,48 @@ class FlorenceService:
         )
         if source_feedback_reply is not None:
             return [self._out(household.id, incoming.chat_id, source_feedback_reply, now)]
+
+        if self._agent_should_lead_active_conversation(
+            household.id,
+            actor,
+            incoming,
+            lower,
+        ):
+            attachment_reply = self._maybe_handle_attachments(household.id, incoming, now)
+            if attachment_reply is not None:
+                return attachment_reply
+            memory_reply = self._maybe_update_memory(
+                household.id,
+                actor,
+                incoming,
+                now,
+                acknowledge_success=False,
+            )
+            if memory_reply not in {None, ""}:
+                return [self._out(household.id, incoming.chat_id, memory_reply, now)]
+            source_preference_reply = self._maybe_update_source_preference(
+                household.id,
+                actor,
+                incoming.text,
+                now,
+                acknowledge_success=False,
+            )
+            if source_preference_reply not in {None, ""}:
+                return [self._out(household.id, incoming.chat_id, source_preference_reply, now)]
+            return self._agent_turn(
+                household=household,
+                actor=actor,
+                incoming=incoming,
+                now=now,
+            )
+
+        memory_reply = self._maybe_update_memory(household.id, actor, incoming, now)
+        if memory_reply is not None:
+            return [self._out(household.id, incoming.chat_id, memory_reply, now)]
+
+        memory_status = self._maybe_show_memory(household.id, actor, lower, now)
+        if memory_status is not None:
+            return [self._out(household.id, incoming.chat_id, memory_status, now)]
 
         source_preference_reply = self._maybe_update_source_preference(
             household.id,
@@ -693,6 +727,36 @@ class FlorenceService:
             return True
         lower = " ".join(text.strip().lower().split())
         return _manual_household_thread_handoff(lower)
+
+    def _agent_should_lead_active_conversation(
+        self,
+        household_id: str,
+        actor: HouseholdMember,
+        incoming: IncomingMessage,
+        lower: str,
+    ) -> bool:
+        if actor.role != MemberRole.PARENT:
+            return False
+        if _active_conversation_rail_command(incoming.text, lower):
+            return False
+        history = self.store.recent_messages(
+            household_id,
+            limit=6,
+            exclude_message_id=incoming.message_id,
+        )
+        last_assistant = next(
+            (
+                message["content"]
+                for message in reversed(history)
+                if message["role"] == "assistant"
+            ),
+            "",
+        )
+        if not _assistant_prompt_expects_reply(last_assistant):
+            return False
+        if incoming.attachments and incoming.text.strip():
+            return True
+        return _looks_like_active_conversation_reply(incoming.text)
 
     def _agent_turn(
         self,
@@ -2416,6 +2480,8 @@ class FlorenceService:
         actor: HouseholdMember,
         incoming: IncomingMessage,
         now: datetime,
+        *,
+        acknowledge_success: bool = True,
     ) -> str | None:
         text = incoming.text.strip()
         lower = text.lower()
@@ -2453,6 +2519,8 @@ class FlorenceService:
                     source_message_id=incoming.message_id,
                     confidence=0.9,
                 )
+                if not acknowledge_success:
+                    return ""
                 return tone.memory_saved(fact)
 
         forget_match = re.match(r"forget (?:that )?(.*)", text, flags=re.IGNORECASE)
@@ -2506,6 +2574,8 @@ class FlorenceService:
         actor: HouseholdMember,
         text: str,
         now: datetime,
+        *,
+        acknowledge_success: bool = True,
     ) -> str | None:
         always_match = SOURCE_ALWAYS.match(text.strip())
         if always_match:
@@ -2523,6 +2593,8 @@ class FlorenceService:
                 now_utc=now,
                 created_by_member_id=actor.id,
             )
+            if not acknowledge_success:
+                return ""
             return tone.source_preference_saved(preference)
 
         mute_match = SOURCE_MUTE.match(text.strip())
@@ -2541,6 +2613,8 @@ class FlorenceService:
                 now_utc=now,
                 created_by_member_id=actor.id,
             )
+            if not acknowledge_success:
+                return ""
             return tone.source_preference_saved(preference)
 
         prompted_phrase = _bare_source_preference_phrase(text)
@@ -2559,6 +2633,8 @@ class FlorenceService:
                 now_utc=now,
                 created_by_member_id=actor.id,
             )
+            if not acknowledge_success:
+                return ""
             return tone.source_preference_saved(preference)
         return None
 
@@ -3414,6 +3490,164 @@ def _assistant_prompt_invited_attachment_reply(text: str) -> bool:
     if any(term in normalized for term in requested_media_terms):
         return True
     return normalized.endswith("?") and any(term in normalized for term in follow_up_terms)
+
+
+def _assistant_prompt_expects_reply(text: str) -> bool:
+    normalized = " ".join(text.strip().lower().split())
+    if not normalized:
+        return False
+    if _assistant_prompt_requires_deterministic_reply(normalized):
+        return False
+    if _assistant_prompt_invited_attachment_reply(text):
+        return True
+    if "?" in normalized:
+        return True
+    reply_markers = (
+        "tell me",
+        "send me",
+        "send over",
+        "reply",
+        "what should",
+        "what do you",
+        "who should",
+        "which",
+        "when should",
+        "where should",
+        "first,",
+        "next,",
+    )
+    return any(marker in normalized for marker in reply_markers)
+
+
+def _assistant_prompt_requires_deterministic_reply(normalized: str) -> bool:
+    deterministic_markers = (
+        "what should i call you",
+        "send your partner's phone number",
+        "ask your partner to send their name",
+        "next setup step",
+        "next useful setup step",
+        "next helpful step",
+        "last setup step",
+        "setup next action",
+        "setup link:",
+        "use this setup link",
+        "to finish getting set up",
+        "to finish setup",
+        "this looks worth your attention",
+        "reply 'approve",
+        "reply approve",
+        "i can also add a reminder for this",
+    )
+    if any(marker in normalized for marker in deterministic_markers):
+        return True
+    if normalized.startswith(("nice to meet you", "got it", "thanks")) and "next" in normalized:
+        return True
+    return False
+
+
+def _active_conversation_rail_command(text: str, lower: str) -> bool:
+    normalized = " ".join(text.strip(" .!?").lower().split())
+    if not normalized:
+        return False
+    if (
+        normalized in SIMPLE_GREETING_COMMANDS
+        or normalized in SUPPORT_COMMANDS
+        or normalized in DATA_DELETE_CONFIRM_COMMANDS
+        or normalized in DATA_DELETE_REQUEST_COMMANDS
+        or normalized in DATA_SUMMARY_COMMANDS
+        or normalized in GOOGLE_DISCONNECT_COMMANDS
+        or normalized in MEMORY_CLEAR_COMMANDS
+        or normalized in {
+            "help",
+            "?",
+            "stop",
+            "stop household",
+            "pause florence",
+            "start",
+            "restart",
+            "resume",
+            "resume florence",
+            "privacy status",
+            "privacy settings",
+            "memory controls",
+            "pause memory",
+            "turn off memory",
+            "disable memory",
+            "resume memory",
+            "turn on memory",
+            "enable memory",
+            "opt in to product analytics",
+            "turn on product analytics",
+            "opt out of product analytics",
+            "turn off product analytics",
+            "source review",
+            "source summary",
+            "email review",
+            "email summary",
+            "source preferences",
+            "source rules",
+            "email preferences",
+            "email rules",
+            "handoff",
+            "household handoff",
+            "open items",
+            "pending items",
+            "pending approvals",
+        }
+    ):
+        return True
+    if (
+        _setup_command(normalized)
+        or _google_connection_request(text)
+        or APPROVAL_REPLY.match(text.strip())
+        or PARTNER_INVITE.match(text.strip())
+        or PARTNER_CONFIRM.match(text.strip())
+        or REMINDER_PREFIX.search(text)
+        or _calendar_event_text(text) is not None
+        or _reminder_resolution(text) is not None
+        or _source_feedback_kind(text) is not None
+    ):
+        return True
+    return lower.strip(" ?") in {
+        "what did you keep quiet",
+        "what have you kept quiet",
+        "what is open",
+        "what's open",
+        "what needs approval",
+    }
+
+
+def _looks_like_active_conversation_reply(text: str) -> bool:
+    normalized = " ".join(text.strip(" .!").lower().split())
+    if not normalized or normalized.endswith("?"):
+        return False
+    if SOURCE_ALWAYS.match(text.strip()) or SOURCE_MUTE.match(text.strip()):
+        return True
+    if normalized.startswith(("remember that ", "please remember that ", "remember ", "please remember ")):
+        return True
+    words = normalized.split()
+    if len(words) <= 10:
+        return True
+    if len(words) <= 20 and any(
+        word in words
+        for word in (
+            "yes",
+            "yep",
+            "yeah",
+            "no",
+            "nope",
+            "both",
+            "either",
+            "same",
+            "this",
+            "that",
+            "there",
+            "tomorrow",
+            "today",
+        )
+    ):
+        return True
+    return False
 
 
 def _incoming_agent_text(incoming: IncomingMessage) -> str:

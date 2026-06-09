@@ -2083,6 +2083,141 @@ def test_captioned_attachment_after_agent_prompt_continues_conversation(tmp_path
     assert snapshot.by_reason["parent_submitted_context"] == 1
 
 
+def test_active_source_preference_reply_saves_but_lets_agent_answer(tmp_path):
+    service, agent = _service(tmp_path)
+    now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
+    chat_id = "active-source-pref"
+    agent.response = "What should always be worth a text?"
+    service.handle_incoming(
+        _incoming(
+            "Let's tune what you text me about",
+            chat_id=chat_id,
+            message_id="active-source-pref-start",
+            received_at=now,
+        ),
+        now_utc=now,
+    )
+    agent.response = "Got it. I will treat camp as high-priority household context."
+
+    outbound = service.handle_incoming(
+        _incoming(
+            "always tell me about camp",
+            chat_id=chat_id,
+            message_id="active-source-pref-answer",
+            received_at=now + timedelta(minutes=1),
+        ),
+        now_utc=now + timedelta(minutes=1),
+    )
+    household = service.store.get_household_by_chat(chat_id)
+    assert household is not None
+    preferences = service.store.list_source_preferences(household.id)
+
+    assert outbound[0].text == "Got it. I will treat camp as high-priority household context."
+    assert len(agent.calls) == 2
+    assert agent.calls[-1]["user_text"] == "always tell me about camp"
+    assert [(preference.phrase, preference.preference) for preference in preferences] == [
+        ("camp", SourcePreferenceKind.ALWAYS_SURFACE)
+    ]
+
+
+def test_active_memory_reply_saves_but_lets_agent_answer(tmp_path):
+    service, agent = _service(tmp_path)
+    now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
+    chat_id = "active-memory"
+    agent.response = "What should I remember about Maya?"
+    service.handle_incoming(
+        _incoming(
+            "Let's add a kid preference",
+            chat_id=chat_id,
+            message_id="active-memory-start",
+            received_at=now,
+        ),
+        now_utc=now,
+    )
+    agent.response = "Noted. I will keep Maya's preference in mind."
+
+    outbound = service.handle_incoming(
+        _incoming(
+            "remember that Maya hates peas",
+            chat_id=chat_id,
+            message_id="active-memory-answer",
+            received_at=now + timedelta(minutes=1),
+        ),
+        now_utc=now + timedelta(minutes=1),
+    )
+    snapshot = service.memory_snapshot(chat_id=chat_id, now_utc=now + timedelta(minutes=1))
+
+    assert outbound[0].text == "Noted. I will keep Maya's preference in mind."
+    assert len(agent.calls) == 2
+    assert agent.calls[-1]["user_text"] == "remember that Maya hates peas"
+    assert [memory.text for memory in snapshot.memories] == ["Maya hates peas"]
+
+
+def test_short_active_followup_lets_agent_answer(tmp_path):
+    service, agent = _service(tmp_path)
+    now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
+    chat_id = "active-short-followup"
+    agent.response = "Are we doing this for Theo, Violet, or both?"
+    service.handle_incoming(
+        _incoming(
+            "Let's lock camp schedules",
+            chat_id=chat_id,
+            message_id="active-short-start",
+            received_at=now,
+        ),
+        now_utc=now,
+    )
+    agent.response = "Perfect, I will handle this for both kids."
+
+    outbound = service.handle_incoming(
+        _incoming(
+            "both",
+            chat_id=chat_id,
+            message_id="active-short-answer",
+            received_at=now + timedelta(minutes=1),
+        ),
+        now_utc=now + timedelta(minutes=1),
+    )
+
+    assert outbound[0].text == "Perfect, I will handle this for both kids."
+    assert len(agent.calls) == 2
+    assert agent.calls[-1]["user_text"] == "both"
+
+
+def test_explicit_reminder_command_stays_deterministic_during_active_conversation(tmp_path):
+    service, agent = _service(tmp_path)
+    now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
+    chat_id = "active-explicit-reminder"
+    agent.response = "When should I remind you?"
+    service.handle_incoming(
+        _incoming(
+            "We need a lunch reminder",
+            chat_id=chat_id,
+            message_id="active-reminder-start",
+            received_at=now,
+        ),
+        now_utc=now,
+    )
+
+    outbound = service.handle_incoming(
+        _incoming(
+            "remind me tomorrow at 8am to pack lunch",
+            chat_id=chat_id,
+            message_id="active-reminder-command",
+            received_at=now + timedelta(minutes=1),
+        ),
+        now_utc=now + timedelta(minutes=1),
+    )
+    reminders = service.store.upcoming_reminders(
+        household_id=service.store.get_household_by_chat(chat_id).id,
+        now_utc=now,
+    )
+
+    assert len(agent.calls) == 1
+    assert "will remind you" in outbound[0].text
+    assert [reminder.title for reminder in reminders] == ["pack lunch"]
+
+
 def test_extracted_attachment_text_surfaces_and_suggests_reminder(tmp_path):
     service, agent = _service(tmp_path)
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)

@@ -428,6 +428,54 @@ def test_web_onboarding_saves_primary_profile_and_partner_invite(tmp_path):
     assert preferences[0].phrase == "permission slips"
 
 
+def test_web_onboarding_prefills_natural_child_memory(tmp_path):
+    now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
+    settings = _settings(
+        tmp_path,
+        web_base_url="https://florence.example.com",
+        onboarding_state_secret="setup-secret",
+    )
+    store = Store(settings.db_path)
+    household = store.get_or_create_household(
+        chat_id="natural-child-memory",
+        timezone_name="America/Los_Angeles",
+        now_utc=now,
+    )
+    actor = store.get_or_create_member(
+        household_id=household.id,
+        phone="+15555550100",
+        now_utc=now,
+    )
+    store.set_member_name(actor.id, "Jackson", now_utc=now)
+    store.upsert_memory(
+        household_id=household.id,
+        kind=MemoryKind.FACT,
+        subject="household",
+        text="Jackson's children are Theo, age 7, and Violet, age 4.",
+        confidence=0.9,
+        asserted_by_member_id=actor.id,
+        now_utc=now,
+    )
+    service = FlorenceService(settings=settings, store=store, agent=FakeAgent("unused"))
+    token = service.onboarding_url(
+        chat_id=household.chat_id,
+        member_id=actor.id,
+        role="primary",
+        now_utc=now,
+    ).rsplit("/", 1)[1]
+    client = TestClient(create_app(settings, store=store, linq_client=FakeLinqClient(), now_fn=lambda: now))
+
+    form = client.get(f"/onboarding/{token}")
+    readiness = service.readiness_snapshot(chat_id=household.chat_id, now_utc=now)
+
+    assert form.status_code == 200
+    assert readiness.child_count == 2
+    assert 'value="Theo"' in form.text
+    assert 'value="7"' in form.text
+    assert 'value="Violet"' in form.text
+    assert 'value="4"' in form.text
+
+
 def test_web_onboarding_google_route_starts_oauth_state(tmp_path):
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
     settings = _settings(

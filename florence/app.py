@@ -1402,6 +1402,8 @@ def _onboarding_form_values(
             values["tone_preference"] = _strip_prefixed_sentence(text.partition(":")[2], "")
         elif text.startswith("Child profile:"):
             children.append(_parse_child_memory(text=text, subject=getattr(memory, "subject", None)))
+        else:
+            children.extend(_parse_natural_children_memory(text))
     values["pets"] = "\n".join(item for item in pets if item)
     values["caretakers"] = "\n".join(item for item in caretakers if item)
     values["children"] = children[:4]
@@ -1445,6 +1447,32 @@ def _parse_child_memory(*, text: str, subject: object) -> dict[str, str]:
         elif part.startswith("age "):
             child["age"] = part.removeprefix("age ").strip()
     return child
+
+
+def _parse_natural_children_memory(text: str) -> list[dict[str, str]]:
+    match = re.match(r"^(?:.+?['’]s\s+)?(?:children|kids)\s+are\s+(.+)$", text.strip(" ."), flags=re.IGNORECASE)
+    if match is None:
+        return []
+    children: list[dict[str, str]] = []
+    for entry in re.finditer(
+        r"(?P<name>[A-Z][A-Za-z' -]*?)(?:,?\s*age\s+(?P<age>\d{1,2}|[A-Za-z]+))?"
+        r"(?=(?:,\s*(?:and\s+)?[A-Z])|(?:\s+and\s+[A-Z])|$)",
+        match.group(1).strip(" ."),
+    ):
+        name = " ".join(entry.group("name").strip(" ,").split())
+        if not name:
+            continue
+        children.append(
+            {
+                "name": name,
+                "age": entry.group("age") or "",
+                "grade": "",
+                "school": "",
+                "activities": "",
+                "location": "",
+            }
+        )
+    return children
 
 
 def _form_text(values: dict[str, object], key: str) -> str:

@@ -132,6 +132,11 @@ CHILDREN_NATURAL = re.compile(
     r"(?:kids?|children|child)\b\s*[:,-]?\s*(?:named\s+|called\s+)?(.+)$",
     re.IGNORECASE,
 )
+CHILDREN_MEMORY = re.compile(r"^(?:.+?['’]s\s+)?(?:children|kids)\s+are\s+(.+)$", re.IGNORECASE)
+CHILD_ENTRY = re.compile(
+    r"(?P<name>[A-Z][A-Za-z' -]*?)(?:,?\s*age\s+(?P<age>\d{1,2}|[A-Za-z]+))?"
+    r"(?=(?:,\s*(?:and\s+)?[A-Z])|(?:\s+and\s+[A-Z])|$)"
+)
 PARTNER_INVITE = re.compile(
     r"^(?:invite|add|bring in)\s+(?:my\s+|our\s+)?(?:partner|coparent|co-parent|spouse)\s*(.*)$"
     r"|^(?:my|our)\s+(?:partner|coparent|co-parent|spouse)\s+(?:is|number is)\s+(.+)$",
@@ -3468,15 +3473,35 @@ def _child_names_from_memories(memories) -> list[str]:
     names: list[str] = []
     seen: set[str] = set()
     for memory in memories:
-        if not memory.text.startswith("Child profile:"):
-            continue
-        name = memory.subject or memory.text.removeprefix("Child profile:").strip(" .")
-        key = name.casefold()
-        if not name or key in seen:
-            continue
-        seen.add(key)
-        names.append(name)
+        for name in _child_names_from_memory(memory):
+            key = name.casefold()
+            if not name or key in seen:
+                continue
+            seen.add(key)
+            names.append(name)
     return names
+
+
+def _child_names_from_memory(memory) -> list[str]:
+    text = str(getattr(memory, "text", "") or "")
+    if text.startswith("Child profile:"):
+        raw = str(getattr(memory, "subject", "") or "")
+        if not raw:
+            raw = text.removeprefix("Child profile:").split(";", 1)[0].strip(" .")
+        return [raw] if raw else []
+    match = CHILDREN_MEMORY.match(text.strip(" ."))
+    if match is None:
+        return []
+    return [name for name, _age in _child_entries(match.group(1))]
+
+
+def _child_entries(text: str) -> list[tuple[str, str | None]]:
+    entries: list[tuple[str, str | None]] = []
+    for match in CHILD_ENTRY.finditer(text.strip(" .")):
+        name = " ".join(match.group("name").strip(" ,").split())
+        if name:
+            entries.append((name, match.group("age")))
+    return entries
 
 
 def _preference_phrase(text: str) -> str:

@@ -266,6 +266,7 @@ def create_app(
         now = app_now()
         readiness = service.readiness_snapshot(chat_id=claims.chat_id, now_utc=now)
         memory = service.memory_snapshot(chat_id=claims.chat_id, now_utc=now)
+        source_preferences = service.source_preferences(chat_id=claims.chat_id)
         connected_accounts = service.connected_accounts(chat_id=claims.chat_id)
         google_missing = missing_google_oauth_settings(resolved)
         return HTMLResponse(
@@ -276,6 +277,12 @@ def create_app(
                 actor=actor,
                 readiness=readiness,
                 memory_texts=[item.text for item in memory.memories[:10]],
+                form_values=_onboarding_form_values(
+                    actor=actor,
+                    members=service.store.list_members(household.id),
+                    memories=memory.memories,
+                    source_preferences=source_preferences,
+                ),
                 connected_account_count=len(connected_accounts),
                 google_configured=not google_missing,
                 google_missing=google_missing,
@@ -299,6 +306,8 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         readiness = service.readiness_snapshot(chat_id=claims.chat_id, now_utc=now)
+        memory = service.memory_snapshot(chat_id=claims.chat_id, now_utc=now)
+        source_preferences = service.source_preferences(chat_id=claims.chat_id)
         google_missing = missing_google_oauth_settings(resolved)
         return HTMLResponse(
             _render_onboarding_done(
@@ -308,6 +317,8 @@ def create_app(
                 actor=actor,
                 result=asdict(result),
                 readiness=readiness,
+                memory_texts=[item.text for item in memory.memories[:10]],
+                source_preferences=[item.phrase for item in source_preferences],
                 google_configured=not google_missing,
             )
         )
@@ -1081,6 +1092,7 @@ def _render_onboarding_form(
     actor: HouseholdMember,
     readiness,
     memory_texts: list[str],
+    form_values: dict[str, object],
     connected_account_count: int,
     google_configured: bool,
     google_missing: list[str],
@@ -1096,9 +1108,9 @@ def _render_onboarding_form(
         partner_field = """
           <label>
             Partner phone
-            <input name="partner_phone" autocomplete="tel" placeholder="+1 555 555 0101">
+            <input name="partner_phone" autocomplete="tel" placeholder="+1 555 555 0101" value="{partner_phone}">
           </label>
-        """
+        """.format(partner_phone=_e(_form_text(form_values, "partner_phone")))
     current_context = _render_current_context(memory_texts)
     google_block = _render_google_block(
         token=token,
@@ -1106,7 +1118,10 @@ def _render_onboarding_form(
         google_missing=google_missing,
         connected_account_count=connected_account_count,
     )
-    child_rows = "\n".join(_render_child_row(index) for index in range(1, 5))
+    child_values = _form_children(form_values)
+    child_rows = "\n".join(_render_child_row(index, child_values[index - 1]) for index in range(1, 5))
+    tone_value = _form_text(form_values, "tone_preference")
+    tone_options = _render_tone_options(tone_value)
     return f"""<!doctype html>
 <html lang="en">
   <head>
@@ -1146,16 +1161,16 @@ def _render_onboarding_form(
 	          <div class="grid">
 	            <label>
 	              Your name
-	              <input name="parent_name" autocomplete="name" value="{_e(actor.display_name or "")}">
+	              <input name="parent_name" autocomplete="name" value="{_e(_form_text(form_values, "parent_name") or actor.display_name or "")}">
             </label>
             <label>
               Family or household name
-              <input name="household_name" placeholder="Barasu household">
+              <input name="household_name" placeholder="Barasu household" value="{_e(_form_text(form_values, "household_name"))}">
             </label>
             {partner_field}
             <label>
               Location
-              <input name="location" placeholder="City, neighborhood, or school area">
+              <input name="location" placeholder="City, neighborhood, or school area" value="{_e(_form_text(form_values, "location"))}">
 	            </label>
 	          </div>
 	          <div class="actions">
@@ -1178,11 +1193,11 @@ def _render_onboarding_form(
 	          <div class="grid">
 	            <label>
 	              Pets
-	              <textarea name="pets" rows="4" placeholder="One per line"></textarea>
+	              <textarea name="pets" rows="4" placeholder="One per line">{_e(_form_text(form_values, "pets"))}</textarea>
             </label>
             <label>
               Other caretakers
-              <textarea name="caretakers" rows="4" placeholder="Nanny, grandparent, neighbor, etc. One per line."></textarea>
+              <textarea name="caretakers" rows="4" placeholder="Nanny, grandparent, neighbor, etc. One per line.">{_e(_form_text(form_values, "caretakers"))}</textarea>
 	            </label>
 	          </div>
 	          <div class="actions">
@@ -1197,20 +1212,17 @@ def _render_onboarding_form(
 	            <label>
 	              Tone
 	              <select name="tone_preference">
-                <option value="Warm, concise, and practical">Warm, concise, practical</option>
-                <option value="Very brief and direct">Very brief</option>
-                <option value="Extra warm and reassuring">Extra warm</option>
-                <option value="Detailed when something affects schedule or logistics">More detailed for logistics</option>
+                {tone_options}
               </select>
             </label>
             <label>
               Always worth a text
-              <textarea name="source_rule" rows="4" placeholder="Permission slips&#10;Schedule changes&#10;Medicine forms"></textarea>
+              <textarea name="source_rule" rows="4" placeholder="Permission slips&#10;Schedule changes&#10;Medicine forms">{_e(_form_text(form_values, "source_rule"))}</textarea>
             </label>
           </div>
           <label>
 	              Household book notes
-	            <textarea name="family_context" rows="4" placeholder="Stable context Florence should keep visible for this household."></textarea>
+	            <textarea name="family_context" rows="4" placeholder="Stable context Florence should keep visible for this household.">{_e(_form_text(form_values, "family_context"))}</textarea>
 	          </label>
 	          <div class="actions">
 	            <button type="button" class="secondary" data-back>Back</button>
@@ -1245,6 +1257,8 @@ def _render_onboarding_done(
     actor: HouseholdMember,
     result: dict[str, object],
     readiness,
+    memory_texts: list[str],
+    source_preferences: list[str],
     google_configured: bool,
 ) -> str:
     invite = str(result.get("invite_text") or "")
@@ -1261,6 +1275,17 @@ def _render_onboarding_done(
         google_block = f"""<a class="secondary" href="/onboarding/{_e(token)}/google">Connect Google</a>"""
     missing = "" if readiness.ready else "".join(f"<li>{_e(item)}</li>" for item in readiness.missing[:4])
     missing_block = "" if readiness.ready else f"<ul>{missing}</ul>"
+    saved_context = _render_current_context(memory_texts)
+    saved_rules = _render_source_preference_review(source_preferences)
+    saved_details = ""
+    if saved_context or saved_rules:
+        saved_details = f"""
+        <section class="band">
+          <h2>Saved Details</h2>
+          {saved_context}
+          {saved_rules}
+        </section>
+        """
     return f"""<!doctype html>
 <html lang="en">
   <head>
@@ -1282,6 +1307,7 @@ def _render_onboarding_done(
         <p>Parents: {readiness.parent_count}/2. Children: {readiness.child_count}. Connected sources: {readiness.connected_account_count}.</p>
         {missing_block}
       </section>
+      {saved_details}
       {invite_block}
       <div class="actions">
         {google_block}
@@ -1338,6 +1364,138 @@ def _render_google_block(
     return f"<p>Google connection is not configured for this deployment yet. Missing: {_e(missing)}.</p>"
 
 
+def _onboarding_form_values(
+    *,
+    actor: HouseholdMember,
+    members: list[HouseholdMember],
+    memories: list[Any],
+    source_preferences: list[Any],
+) -> dict[str, object]:
+    values: dict[str, object] = {
+        "parent_name": actor.display_name or "",
+        "partner_phone": _partner_phone_for_form(actor=actor, members=members),
+        "household_name": "",
+        "location": "",
+        "pets": "",
+        "caretakers": "",
+        "tone_preference": "",
+        "source_rule": "\n".join(str(item.phrase) for item in source_preferences if str(item.phrase).strip()),
+        "family_context": "",
+        "children": [],
+    }
+    pets: list[str] = []
+    caretakers: list[str] = []
+    children: list[dict[str, str]] = []
+    for memory in memories:
+        text = str(getattr(memory, "text", "") or "")
+        if text.startswith("Household name:"):
+            values["household_name"] = _strip_prefixed_sentence(text, "Household name:")
+        elif text.startswith("Household location:"):
+            values["location"] = _strip_prefixed_sentence(text, "Household location:")
+        elif text.startswith("Pet:"):
+            pets.append(_strip_prefixed_sentence(text, "Pet:"))
+        elif text.startswith("Caretaker:"):
+            caretakers.append(_strip_prefixed_sentence(text, "Caretaker:"))
+        elif text.startswith("Household context:"):
+            values["family_context"] = _strip_prefixed_sentence(text, "Household context:")
+        elif text.startswith("Tone preference for "):
+            values["tone_preference"] = _strip_prefixed_sentence(text.partition(":")[2], "")
+        elif text.startswith("Child profile:"):
+            children.append(_parse_child_memory(text=text, subject=getattr(memory, "subject", None)))
+    values["pets"] = "\n".join(item for item in pets if item)
+    values["caretakers"] = "\n".join(item for item in caretakers if item)
+    values["children"] = children[:4]
+    return values
+
+
+def _partner_phone_for_form(*, actor: HouseholdMember, members: list[HouseholdMember]) -> str:
+    for member in members:
+        if member.id != actor.id and member.role == MemberRole.PARENT:
+            return member.phone
+    return ""
+
+
+def _strip_prefixed_sentence(text: str, prefix: str) -> str:
+    stripped = text.removeprefix(prefix).strip()
+    return stripped[:-1].strip() if stripped.endswith(".") else stripped
+
+
+def _parse_child_memory(*, text: str, subject: object) -> dict[str, str]:
+    child = {
+        "name": str(subject or "").strip(),
+        "age": "",
+        "grade": "",
+        "school": "",
+        "activities": "",
+        "location": "",
+    }
+    body = _strip_prefixed_sentence(text, "Child profile:")
+    parts = [part.strip() for part in body.split(";") if part.strip()]
+    if parts and not child["name"]:
+        child["name"] = parts[0]
+    for part in parts[1:]:
+        if part.startswith("school/activity location "):
+            child["location"] = part.removeprefix("school/activity location ").strip()
+        elif part.startswith("activities "):
+            child["activities"] = part.removeprefix("activities ").strip()
+        elif part.startswith("school "):
+            child["school"] = part.removeprefix("school ").strip()
+        elif part.startswith("grade "):
+            child["grade"] = part.removeprefix("grade ").strip()
+        elif part.startswith("age "):
+            child["age"] = part.removeprefix("age ").strip()
+    return child
+
+
+def _form_text(values: dict[str, object], key: str) -> str:
+    value = values.get(key)
+    return value if isinstance(value, str) else ""
+
+
+def _form_children(values: dict[str, object]) -> list[dict[str, str]]:
+    raw = values.get("children")
+    children = raw if isinstance(raw, list) else []
+    normalized: list[dict[str, str]] = []
+    for child in children[:4]:
+        if not isinstance(child, dict):
+            continue
+        normalized.append({key: str(child.get(key) or "") for key in ("name", "age", "grade", "school", "activities", "location")})
+    while len(normalized) < 4:
+        normalized.append({"name": "", "age": "", "grade": "", "school": "", "activities": "", "location": ""})
+    return normalized
+
+
+def _render_tone_options(current: str) -> str:
+    options = (
+        ("Warm, concise, and practical", "Warm, concise, practical"),
+        ("Very brief and direct", "Very brief"),
+        ("Extra warm and reassuring", "Extra warm"),
+        ("Detailed when something affects schedule or logistics", "More detailed for logistics"),
+    )
+    rendered: list[str] = []
+    matched = False
+    for value, label in options:
+        selected = " selected" if current == value else ""
+        matched = matched or bool(selected)
+        rendered.append(f'<option value="{_e(value)}"{selected}>{_e(label)}</option>')
+    if current and not matched:
+        rendered.insert(0, f'<option value="{_e(current)}" selected>{_e(current)}</option>')
+    return "\n".join(rendered)
+
+
+def _render_source_preference_review(source_preferences: list[str]) -> str:
+    phrases = [phrase for phrase in source_preferences if phrase.strip()]
+    if not phrases:
+        return ""
+    items = "".join(f"<li>{_e(phrase)}</li>" for phrase in phrases)
+    return f"""
+      <div class="review-block">
+        <h3>Always Worth A Text</h3>
+        <ul>{items}</ul>
+      </div>
+    """
+
+
 def _render_google_connected_notice(google_status: str | None) -> str:
     if google_status != "connected":
         return ""
@@ -1368,32 +1526,32 @@ def _safe_return_path(path: str | None) -> str | None:
     return stripped
 
 
-def _render_child_row(index: int) -> str:
+def _render_child_row(index: int, child: dict[str, str]) -> str:
     return f"""
       <div class="child-row">
         <label>
           Child {index} name
-          <input name="child_{index}_name">
+          <input name="child_{index}_name" value="{_e(child.get("name", ""))}">
         </label>
         <label>
           Age
-          <input name="child_{index}_age">
+          <input name="child_{index}_age" value="{_e(child.get("age", ""))}">
         </label>
         <label>
           Grade
-          <input name="child_{index}_grade">
+          <input name="child_{index}_grade" value="{_e(child.get("grade", ""))}">
         </label>
         <label>
           School
-          <input name="child_{index}_school">
+          <input name="child_{index}_school" value="{_e(child.get("school", ""))}">
         </label>
         <label>
           Activities
-          <input name="child_{index}_activities">
+          <input name="child_{index}_activities" value="{_e(child.get("activities", ""))}">
         </label>
         <label>
           Locations
-          <input name="child_{index}_location">
+          <input name="child_{index}_location" value="{_e(child.get("location", ""))}">
         </label>
       </div>
     """
@@ -1494,6 +1652,13 @@ def _onboarding_script() -> str:
           const index = order.indexOf(root.dataset.currentStep);
           if (target.hasAttribute("data-next")) show(order[Math.min(index + 1, order.length - 1)]);
           if (target.hasAttribute("data-back")) show(order[Math.max(index - 1, 0)]);
+        });
+
+        document.addEventListener("submit", (event) => {
+          if (root.dataset.currentStep === "review") return;
+          event.preventDefault();
+          const index = order.indexOf(root.dataset.currentStep);
+          show(order[Math.min(index + 1, order.length - 1)]);
         });
 
         show(root.dataset.initialStep, false);

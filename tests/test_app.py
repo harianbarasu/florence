@@ -391,6 +391,7 @@ def test_web_onboarding_saves_primary_profile_and_partner_invite(tmp_path):
             "family_context": "Both parents travel for work sometimes",
         },
     )
+    edited_form = client.get(f"/onboarding/{token}")
     readiness = service.readiness_snapshot(chat_id=household.chat_id, now_utc=now)
     memory = service.memory_snapshot(chat_id=household.chat_id, now_utc=now)
     preferences = service.source_preferences(chat_id=household.chat_id)
@@ -402,7 +403,21 @@ def test_web_onboarding_saves_primary_profile_and_partner_invite(tmp_path):
     assert 'data-step="household" hidden' in form.text
     assert response.status_code == 200
     assert "Partner Invite" in response.text
+    assert "Saved Details" in response.text
+    assert "Child profile: Maya; age 6" in response.text
+    assert "permission slips" in response.text
     assert "https://florence.example.com/onboarding/" in response.text
+    assert edited_form.status_code == 200
+    assert 'value="Hari"' in edited_form.text
+    assert 'value="Barasu household"' in edited_form.text
+    assert 'value="Cambridge"' in edited_form.text
+    assert 'value="+15555550101"' in edited_form.text
+    assert 'value="Maya"' in edited_form.text
+    assert 'value="Lincoln"' in edited_form.text
+    assert "Rio the dog" in edited_form.text
+    assert "Nina, nanny, Tuesdays" in edited_form.text
+    assert "Both parents travel for work sometimes" in edited_form.text
+    assert "permission slips" in edited_form.text
     assert readiness.parent_count == 2
     assert readiness.child_count == 1
     assert readiness.source_preference_count == 1

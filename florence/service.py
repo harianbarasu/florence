@@ -734,7 +734,7 @@ class FlorenceService:
         readiness = self._readiness(household.id, now)
         reply = self.agent.complete(
             household=household,
-            user_text=incoming.text,
+            user_text=_incoming_agent_text(incoming),
             conversation_history=self.store.recent_messages(
                 household.id,
                 since_utc=helper_context_since,
@@ -1421,6 +1421,7 @@ class FlorenceService:
         initial_sync: bool = False,
         mark_surfaced: bool = True,
         parent_submitted: bool = False,
+        suppress_parent_submitted_surface: bool = False,
     ) -> tuple[bool, list[OutboundMessage]]:
         triage = self._classify_source_item(household_id=household_id, item=item, now=now)
         should_surface = triage.decision == SourceDecision.SURFACE
@@ -1439,7 +1440,9 @@ class FlorenceService:
             if decision == SourceDecision.SURFACE:
                 decision = SourceDecision.STORE_ONLY
                 reason = "household_stopped"
-        if parent_submitted and decision == SourceDecision.SURFACE and reason == "household_requested_source":
+        if parent_submitted and decision == SourceDecision.SURFACE and (
+            suppress_parent_submitted_surface or reason == "household_requested_source"
+        ):
             should_surface = False
             decision = SourceDecision.STORE_ONLY
             reason = "parent_submitted_context"
@@ -1593,6 +1596,10 @@ class FlorenceService:
         outbound: list[OutboundMessage] = []
         inserted_count = 0
         household = self._household_by_id(household_id)
+        continue_agent_turn = self._attachment_answers_recent_assistant_prompt(
+            household_id,
+            incoming,
+        )
         for index, attachment in enumerate(incoming.attachments, start=1):
             item = _attachment_source_item(
                 household_id=household_id,
@@ -1608,11 +1615,14 @@ class FlorenceService:
                 item=item,
                 now=now,
                 parent_submitted=True,
+                suppress_parent_submitted_surface=continue_agent_turn,
             )
             if inserted:
                 inserted_count += 1
-            if surfaced and not outbound:
+            if surfaced and not continue_agent_turn and not outbound:
                 outbound.extend(surfaced)
+        if continue_agent_turn:
+            return None
         if outbound:
             return outbound
         if incoming.text.strip() or any(attachment.extracted_text for attachment in incoming.attachments):
@@ -1627,6 +1637,28 @@ class FlorenceService:
                 )
             ]
         return []
+
+    def _attachment_answers_recent_assistant_prompt(
+        self,
+        household_id: str,
+        incoming: IncomingMessage,
+    ) -> bool:
+        if not incoming.attachments or not incoming.text.strip():
+            return False
+        history = self.store.recent_messages(
+            household_id,
+            limit=6,
+            exclude_message_id=incoming.message_id,
+        )
+        last_assistant = next(
+            (
+                message["content"]
+                for message in reversed(history)
+                if message["role"] == "assistant"
+            ),
+            "",
+        )
+        return _assistant_prompt_invited_attachment_reply(last_assistant)
 
     def _with_reminder_assignee_labels(self, reminders: list[Reminder]) -> list[Reminder]:
         member_cache: dict[str, dict[str, HouseholdMember]] = {}
@@ -3348,6 +3380,60 @@ def _attachment_label(attachment: MessageAttachment) -> str:
     if attachment.content_type:
         return attachment.content_type
     return attachment.kind or "attachment"
+
+
+def _assistant_prompt_invited_attachment_reply(text: str) -> bool:
+    normalized = " ".join(text.strip().lower().split())
+    if not normalized:
+        return False
+    requested_media_terms = (
+        "send me",
+        "send over",
+        "share",
+        "screenshots",
+        "screenshot",
+        "pdfs",
+        "pdf",
+        "emails",
+        "email",
+        "camp names",
+        "camp schedules",
+        "schedule",
+    )
+    follow_up_terms = (
+        "first,",
+        "are we",
+        "which kid",
+        "which child",
+        "which kids",
+        "theo",
+        "violet",
+        "both",
+        "locking down",
+    )
+    if any(term in normalized for term in requested_media_terms):
+        return True
+    return normalized.endswith("?") and any(term in normalized for term in follow_up_terms)
+
+
+def _incoming_agent_text(incoming: IncomingMessage) -> str:
+    if not incoming.attachments:
+        return incoming.text
+    text = incoming.text.strip()
+    attachment_lines = []
+    for index, attachment in enumerate(incoming.attachments[:3], start=1):
+        label = _attachment_label(attachment)
+        extracted = normalize_source_body(attachment.extracted_text)
+        if extracted:
+            attachment_lines.append(f"Attachment {index}: {label}. Extracted text: {extracted}")
+        else:
+            attachment_lines.append(f"Attachment {index}: {label}. Text extraction is not available.")
+    if len(incoming.attachments) > 3:
+        attachment_lines.append(f"{len(incoming.attachments) - 3} more attachments were included.")
+    attachment_context = "\n".join(attachment_lines)
+    if not text:
+        return attachment_context
+    return f"{text}\n\n{attachment_context}"
 
 
 def _incoming_message_body(incoming: IncomingMessage) -> str:

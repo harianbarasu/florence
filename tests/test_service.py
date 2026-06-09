@@ -2014,6 +2014,75 @@ def test_captioned_attachment_matching_source_rule_is_acknowledged_not_echoed(tm
     assert agent.calls == []
 
 
+def test_captioned_attachment_after_agent_prompt_continues_conversation(tmp_path):
+    service, agent = _service(tmp_path)
+    now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
+    chat_id = "camp-agent-continuation"
+    agent.response = (
+        "Absolutely. Send me the camp emails, PDFs, screenshots, or just the camp names and weeks, "
+        "and I'll turn them into a clear schedule.\n\n"
+        "First, are we locking down Theo, Violet, or both?"
+    )
+    household = service.store.get_or_create_household(
+        chat_id=chat_id,
+        timezone_name=service.settings.default_timezone,
+        now_utc=now,
+    )
+    parent = service.store.get_or_create_member(
+        household_id=household.id,
+        phone="+15555550100",
+        now_utc=now,
+    )
+    service.store.upsert_source_preference(
+        household_id=household.id,
+        phrase="camp",
+        preference=SourcePreferenceKind.ALWAYS_SURFACE,
+        created_by_member_id=parent.id,
+        now_utc=now,
+    )
+    first = service.handle_incoming(
+        _incoming(
+            "Let's get the kids' camp schedules locked",
+            chat_id=chat_id,
+            message_id="camp-agent-start",
+            sender="+15555550100",
+            received_at=now,
+        ),
+        now_utc=now,
+    )
+    agent.response = "Got it - I'll track this camp for both Theo and Violet."
+
+    second = service.handle_incoming(
+        IncomingMessage(
+            chat_id=chat_id,
+            message_id="camp-agent-screenshot",
+            sender="+15555550100",
+            text="Both kids are doing this camp",
+            received_at=now + timedelta(minutes=1),
+            attachments=(
+                MessageAttachment(
+                    kind="image",
+                    content_type="image/png",
+                    filename="Summer Camp - Connolly Ranch.png",
+                ),
+            ),
+        ),
+        now_utc=now + timedelta(minutes=1),
+    )
+    snapshot = service.source_review_snapshot(chat_id=chat_id)
+
+    assert first[0].text.startswith("Absolutely.")
+    assert second[0].text == "Got it - I'll track this camp for both Theo and Violet."
+    assert len(agent.calls) == 2
+    assert agent.calls[-1]["user_text"] == (
+        "Both kids are doing this camp\n\n"
+        "Attachment 1: Summer Camp - Connolly Ranch.png. Text extraction is not available."
+    )
+    assert snapshot.total == 1
+    assert snapshot.stored_only == 1
+    assert snapshot.by_reason["parent_submitted_context"] == 1
+
+
 def test_extracted_attachment_text_surfaces_and_suggests_reminder(tmp_path):
     service, agent = _service(tmp_path)
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)

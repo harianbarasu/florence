@@ -617,7 +617,8 @@ def test_hermes_backend_sets_runtime_home_before_importing_aiagent(tmp_path):
     recorded_home = Path(marker.read_text())
     assert recorded_home.parent == runtime_home.resolve()
     assert recorded_home.name.startswith("florence-turn-")
-    assert not recorded_home.exists()
+    assert recorded_home.exists()
+    assert recorded_home.joinpath("logs").is_dir()
 
 
 def test_hermes_backend_cleans_runtime_home_after_strict_runtime_error(tmp_path, monkeypatch):
@@ -654,7 +655,8 @@ def test_hermes_backend_cleans_runtime_home_after_strict_runtime_error(tmp_path,
     recorded_home = Path(marker.read_text())
     assert recorded_home.parent == runtime_home.resolve()
     assert recorded_home.name.startswith("florence-turn-")
-    assert not recorded_home.exists()
+    assert recorded_home.exists()
+    assert recorded_home.joinpath("logs").is_dir()
     assert os.environ["HERMES_HOME"] == str(tmp_path / "operator-hermes-home")
 
 
@@ -857,8 +859,24 @@ def test_hermes_runtime_home_context_serializes_process_global_home(tmp_path):
 
     assert errors == []
     assert contender_entered.is_set()
-    assert not (runtime_home / "holder").exists()
-    assert not (runtime_home / "contender").exists()
+    assert (runtime_home / "holder").exists()
+    assert (runtime_home / "contender").exists()
+
+
+def test_hermes_runtime_home_context_prunes_stale_scopes(tmp_path):
+    runtime_home = tmp_path / "hermes-runtime-home"
+    settings = Settings(db_path=":memory:", hermes_runtime_home=str(runtime_home))
+    stale = runtime_home / "florence-turn-stale"
+    stale.mkdir(parents=True)
+    stale_time = time.time() - hermes_module.HERMES_RUNTIME_PRUNE_AFTER_SECONDS - 60
+    os.utime(stale, (stale_time, stale_time))
+
+    with hermes_runtime_home_context(settings, scope="current", cleanup=True) as current:
+        current.joinpath("marker").write_text("ok")
+
+    assert current.exists()
+    assert current.joinpath("logs").is_dir()
+    assert not stale.exists()
 
 
 def test_hermes_runtime_home_context_serializes_across_processes(tmp_path):
@@ -944,8 +962,8 @@ def test_hermes_runtime_home_context_serializes_across_processes(tmp_path):
     assert holder_stdout == ""
     assert contender_stdout == ""
     assert contender_entered.exists()
-    assert not (runtime_home / "holder").exists()
-    assert not (runtime_home / "contender").exists()
+    assert (runtime_home / "holder").exists()
+    assert (runtime_home / "contender").exists()
 
 
 def test_hermes_preflight_scope_is_unique_path_segment():

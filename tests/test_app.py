@@ -1745,7 +1745,7 @@ def test_pilot_check_passes_when_household_and_deployment_are_ready(tmp_path):
     assert payload["deployment"]["hermes_failure_cleanup"] == (
         "runtime_home_restored_and_checkout_modules_cleared_on_error"
     )
-    assert payload["deployment"]["hermes_runtime_cleanup"] == "enabled"
+    assert payload["deployment"]["hermes_runtime_cleanup"] == "stale_scope_pruning"
     assert payload["deployment"]["hermes_runtime_concurrency"] == "serialized_by_thread_and_file_lock"
     assert payload["deployment"]["hermes_runtime_lock"] == "thread_lock_plus_interprocess_file_lock"
     assert payload["deployment"]["hermes_preflight_scope"] == "ephemeral_per_check_under_runtime_home"
@@ -2645,7 +2645,7 @@ def test_dev_hermes_status_reports_local_checkout_without_claiming_saas_ready(tm
     assert preflight_runtime_home.name.startswith("florence-preflight-")
     assert payload["preflight_runtime_home_scope"] == "ephemeral_per_check_under_runtime_home"
     assert payload["turn_runtime_home_scope"] == "per_turn_under_runtime_home"
-    assert payload["turn_runtime_cleanup"] == "enabled"
+    assert payload["turn_runtime_cleanup"] == "stale_scope_pruning"
     assert payload["turn_failure_cleanup"] == (
         "runtime_home_restored_and_checkout_modules_cleared_on_error"
     )
@@ -2655,7 +2655,7 @@ def test_dev_hermes_status_reports_local_checkout_without_claiming_saas_ready(tm
     assert payload["runtime_home_writable"] is True
     assert payload["python_path_scope"] == "temporary_during_hermes_call"
     assert payload["module_cache_scope"] == "shadowed_and_cleared_during_hermes_import_or_call"
-    assert not preflight_runtime_home.exists()
+    assert preflight_runtime_home.exists()
     assert payload["memory_owner"] == "florence"
     assert payload["session_scope"] == "ephemeral_per_turn"
     assert payload["durable_hermes_memory"] == "disabled"

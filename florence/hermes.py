@@ -13,6 +13,7 @@ import re
 import shutil
 import sys
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -58,6 +59,9 @@ HERMES_INTERPROCESS_LOCK_MODE = "thread_lock_plus_interprocess_file_lock"
 HERMES_THREAD_ONLY_LOCK_MODE = "thread_lock_only_no_interprocess_lock"
 HERMES_INTERPROCESS_CONCURRENCY_MODE = "serialized_by_thread_and_file_lock"
 HERMES_THREAD_ONLY_CONCURRENCY_MODE = "serialized_by_thread_lock_only"
+HERMES_RUNTIME_PRUNE_AFTER_SECONDS = 6 * 60 * 60
+HERMES_RUNTIME_MIN_PRUNE_AGE_SECONDS = 10 * 60
+HERMES_RUNTIME_MAX_SCOPES = 500
 
 
 class HermesSaaSContractError(RuntimeError):
@@ -326,6 +330,7 @@ def _redact_private_text_for_hermes(text: str) -> str:
 def configure_hermes_runtime_home(settings: Settings, *, scope: str = "preflight") -> str:
     path = _scoped_hermes_runtime_home(settings.hermes_runtime_home, scope=scope)
     path.mkdir(parents=True, exist_ok=True)
+    path.joinpath("logs").mkdir(parents=True, exist_ok=True)
     probe = path / ".florence-write-test"
     probe.write_text("ok")
     probe.unlink(missing_ok=True)
@@ -353,7 +358,44 @@ def hermes_runtime_home_context(
                 else:
                     os.environ["HERMES_HOME"] = previous_home
                 if cleanup:
-                    shutil.rmtree(path, ignore_errors=True)
+                    _prune_hermes_runtime_home(path.parent, preserve=path)
+
+
+def _prune_hermes_runtime_home(root: Path, *, preserve: Path) -> None:
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return
+    now = time.time()
+    candidates: list[tuple[float, Path]] = []
+    preserve_resolved = preserve.resolve()
+    for child in entries:
+        if child.name == HERMES_RUNTIME_LOCK_FILE:
+            continue
+        if not (child.name.startswith("florence-turn-") or child.name.startswith("florence-preflight-")):
+            continue
+        try:
+            if not child.is_dir() or child.resolve() == preserve_resolved:
+                continue
+            mtime = child.stat().st_mtime
+        except OSError:
+            continue
+        candidates.append((mtime, child))
+
+    survivors: list[tuple[float, Path]] = []
+    for mtime, child in candidates:
+        if now - mtime >= HERMES_RUNTIME_PRUNE_AFTER_SECONDS:
+            shutil.rmtree(child, ignore_errors=True)
+        else:
+            survivors.append((mtime, child))
+
+    survivors.sort(key=lambda item: item[0])
+    excess = len(survivors) - HERMES_RUNTIME_MAX_SCOPES
+    if excess <= 0:
+        return
+    for mtime, child in survivors[:excess]:
+        if now - mtime >= HERMES_RUNTIME_MIN_PRUNE_AGE_SECONDS:
+            shutil.rmtree(child, ignore_errors=True)
 
 
 @contextmanager

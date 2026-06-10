@@ -567,7 +567,7 @@ def test_linq_webhook_records_live_verification_after_real_linq_send(tmp_path):
         settings,
         http_client=httpx.Client(transport=httpx.MockTransport(handler)),
     )
-    client = TestClient(create_app(settings, store=store, linq_client=linq))
+    client = TestClient(create_app(settings, store=store, agent=FakeAgent("Fake agent reply."), linq_client=linq))
     sent_at = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
 
     response = _post_signed_linq(
@@ -602,7 +602,9 @@ def test_linq_webhook_does_not_record_live_verification_from_fake_sender(tmp_pat
         linq_from_phone="+15555550000",
     )
     store = _production_like_store(settings)
-    client = TestClient(create_app(settings, store=store, linq_client=FakeLinqClient()))
+    client = TestClient(
+        create_app(settings, store=store, agent=FakeAgent("Fake agent reply."), linq_client=FakeLinqClient())
+    )
 
     response = _post_signed_linq(
         client,
@@ -2871,6 +2873,7 @@ def test_dev_hermes_smoke_uses_agent_without_persisting_turn(tmp_path):
     assert setup.status_code == 200
     assert household is not None
     before_messages = store.recent_messages(household.id)
+    agent.calls.clear()
 
     response = client.post(
         f"/dev/hermes-smoke/{chat_id}",
@@ -3084,20 +3087,21 @@ def test_dev_hermes_smoke_reports_contract_error_without_server_error(tmp_path):
         hermes_model="nousresearch/hermes-test",
     )
     store = _production_like_store(settings)
-    client = TestClient(create_app(settings, store=store, linq_client=FakeLinqClient()))
     chat_id = "hermes-contract-smoke-chat"
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
-    headers = {"x-florence-admin-key": "secret-admin-key"}
-    client.post(
-        "/dev/messages",
-        json={
-            "chat_id": chat_id,
-            "message_id": "smoke-name",
-            "text": "my name is Sam",
-            "now_utc": now.isoformat(),
-        },
-        headers=headers,
+    household = store.get_or_create_household(
+        chat_id=chat_id,
+        timezone_name="America/Los_Angeles",
+        now_utc=now,
     )
+    parent = store.get_or_create_member(
+        household_id=household.id,
+        phone="+15555550100",
+        now_utc=now,
+    )
+    store.set_member_name(parent.id, "Sam", now_utc=now)
+    client = TestClient(create_app(settings, store=store, linq_client=FakeLinqClient()))
+    headers = {"x-florence-admin-key": "secret-admin-key"}
 
     response = client.post(
         f"/dev/hermes-smoke/{chat_id}",
@@ -3144,20 +3148,21 @@ def test_dev_hermes_smoke_uses_generic_error_for_provider_failure(tmp_path):
         hermes_model="nousresearch/hermes-test",
     )
     store = _production_like_store(settings)
-    client = TestClient(create_app(settings, store=store, linq_client=FakeLinqClient()))
     chat_id = "hermes-provider-failure-smoke-chat"
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
-    headers = {"x-florence-admin-key": "secret-admin-key"}
-    client.post(
-        "/dev/messages",
-        json={
-            "chat_id": chat_id,
-            "message_id": "smoke-name",
-            "text": "my name is Sam",
-            "now_utc": now.isoformat(),
-        },
-        headers=headers,
+    household = store.get_or_create_household(
+        chat_id=chat_id,
+        timezone_name="America/Los_Angeles",
+        now_utc=now,
     )
+    parent = store.get_or_create_member(
+        household_id=household.id,
+        phone="+15555550100",
+        now_utc=now,
+    )
+    store.set_member_name(parent.id, "Sam", now_utc=now)
+    client = TestClient(create_app(settings, store=store, linq_client=FakeLinqClient()))
+    headers = {"x-florence-admin-key": "secret-admin-key"}
 
     response = client.post(
         f"/dev/hermes-smoke/{chat_id}",
@@ -5102,7 +5107,9 @@ def test_linq_webhook_missing_message_id_is_ignored_without_state(tmp_path):
 def test_linq_webhook_media_only_message_gets_acknowledged(tmp_path):
     settings = _settings(tmp_path)
     fake_linq = FakeLinqClient()
-    client = TestClient(create_app(settings, linq_client=fake_linq))
+    client = TestClient(
+        create_app(settings, agent=FakeAgent("I got the attachment."), linq_client=fake_linq)
+    )
 
     response = client.post(
         "/webhooks/linq",

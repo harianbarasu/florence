@@ -270,8 +270,9 @@ def test_manual_group_chat_does_not_guess_when_phone_is_in_multiple_households(t
     new_household = service.store.get_household_by_chat("ambiguous-manual-group")
     assert new_household is not None
     assert new_household.id not in {first.id, second.id}
-    assert len(agent.calls) == 0
-    assert outbound[0].text.startswith("Hi, I'm Florence.")
+    assert outbound[0].text == "Fake agent reply."
+    assert len(agent.calls) == 1
+    assert "Florence computed this onboarding greeting" in agent.calls[0]["user_text"]
 
 
 def test_unknown_chat_from_known_single_parent_does_not_reuse_household_without_handoff(tmp_path):
@@ -441,9 +442,10 @@ def test_named_household_member_reminder_keeps_owner_label(tmp_path):
     )[0]
 
     assert created[0].text == "Fake agent reply."
-    assert "Florence created the requested reminder" in agent.calls[-1]["user_text"]
-    assert "remind Alex today at 5pm to pack cleats" in agent.calls[-1]["user_text"]
-    assert "Alex: pack cleats" in agenda[0].text
+    assert "Florence created the requested reminder" in agent.calls[-2]["user_text"]
+    assert "remind Alex today at 5pm to pack cleats" in agent.calls[-2]["user_text"]
+    assert agenda[0].text == "Fake agent reply."
+    assert "Alex: pack cleats" in agent.calls[-1]["user_text"]
     assert due[0].text == "Quick reminder for Alex: pack cleats"
     assert reminder.title == "pack cleats"
     assert reminder.assignee_member_id is not None
@@ -516,7 +518,7 @@ def test_reminder_mentions_member_without_assigning_when_name_is_not_target(tmp_
 
 
 def test_parent_can_mark_reminder_done_before_it_sends(tmp_path):
-    service, _agent = _service(tmp_path)
+    service, agent = _service(tmp_path)
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
 
     service.handle_incoming(
@@ -529,12 +531,14 @@ def test_parent_can_mark_reminder_done_before_it_sends(tmp_path):
     )
     due = service.due_reminder_messages(now_utc=datetime(2026, 6, 6, 15, 0, tzinfo=timezone.utc))
 
-    assert "marked pack lunch as handled" in done[0].text
+    assert done[0].text == "Fake agent reply."
+    assert "Florence resolved the requested reminder update" in agent.calls[-1]["user_text"]
+    assert "marked pack lunch as handled" in agent.calls[-1]["user_text"]
     assert due == []
 
 
 def test_parent_can_reply_done_after_due_reminder_sends(tmp_path):
-    service, _agent = _service(tmp_path)
+    service, agent = _service(tmp_path)
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
     due_at = datetime(2026, 6, 6, 15, 0, tzinfo=timezone.utc)
 
@@ -556,7 +560,9 @@ def test_parent_can_reply_done_after_due_reminder_sends(tmp_path):
         ).fetchone()
 
     assert sent[0].text == "Quick reminder: pack lunch"
-    assert "marked pack lunch as handled" in done[0].text
+    assert done[0].text == "Fake agent reply."
+    assert "Florence resolved the requested reminder update" in agent.calls[-1]["user_text"]
+    assert "marked pack lunch as handled" in agent.calls[-1]["user_text"]
     assert row["status"] == ReminderStatus.COMPLETED.value
 
 
@@ -592,7 +598,7 @@ def test_done_after_multiple_sent_reminders_asks_for_specificity(tmp_path):
 
 
 def test_parent_can_cancel_reminder_before_it_sends(tmp_path):
-    service, _agent = _service(tmp_path)
+    service, agent = _service(tmp_path)
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
 
     service.handle_incoming(
@@ -609,7 +615,9 @@ def test_parent_can_cancel_reminder_before_it_sends(tmp_path):
     )
     due = service.due_reminder_messages(now_utc=datetime(2026, 6, 6, 15, 0, tzinfo=timezone.utc))
 
-    assert "canceled the reminder for bring permission slip" in canceled[0].text
+    assert canceled[0].text == "Fake agent reply."
+    assert "Florence resolved the requested reminder update" in agent.calls[-1]["user_text"]
+    assert "canceled the reminder for bring permission slip" in agent.calls[-1]["user_text"]
     assert due == []
 
 
@@ -665,7 +673,7 @@ def test_ambiguous_reminder_completion_keeps_reminders_active(tmp_path):
 
 
 def test_agenda_request_is_limited_to_household_local_day(tmp_path):
-    service, _agent = _service(tmp_path)
+    service, agent = _service(tmp_path)
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
 
     service.handle_incoming(
@@ -686,13 +694,15 @@ def test_agenda_request_is_limited_to_household_local_day(tmp_path):
         now_utc=now,
     )
 
-    assert "Here is what I have for today:" in outbound[0].text
-    assert "pick up cleats" in outbound[0].text
-    assert "pack lunch" not in outbound[0].text
+    assert outbound[0].text == "Fake agent reply."
+    assert "Florence computed today's household agenda" in agent.calls[-1]["user_text"]
+    assert "Here is what I have for today:" in agent.calls[-1]["user_text"]
+    assert "pick up cleats" in agent.calls[-1]["user_text"]
+    assert "pack lunch" not in agent.calls[-1]["user_text"]
 
 
 def test_agenda_request_includes_today_source_items_without_email_body(tmp_path):
-    service, _agent = _service(tmp_path)
+    service, agent = _service(tmp_path)
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
 
     service.ingest_source_item(
@@ -709,8 +719,9 @@ def test_agenda_request_includes_today_source_items_without_email_body(tmp_path)
         now_utc=now + timedelta(minutes=1),
     )
 
-    assert "Permission slip due" in outbound[0].text
-    assert "Full email body" not in outbound[0].text
+    assert outbound[0].text == "Fake agent reply."
+    assert "Permission slip due" in agent.calls[-1]["user_text"]
+    assert "Full email body" not in agent.calls[-1]["user_text"]
 
 
 def test_agenda_request_keeps_source_items_visible_after_daily_briefing(tmp_path):
@@ -719,7 +730,8 @@ def test_agenda_request_keeps_source_items_visible_after_daily_briefing(tmp_path
         daily_briefing_hour=7,
         daily_briefing_minute=15,
     )
-    service = FlorenceService(settings=settings, agent=FakeAgent())
+    agent = FakeAgent()
+    service = FlorenceService(settings=settings, agent=agent)
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
 
     service.ingest_source_item(
@@ -738,11 +750,12 @@ def test_agenda_request_keeps_source_items_visible_after_daily_briefing(tmp_path
     )
 
     assert "Permission slip due" in briefing[0].text
-    assert "Permission slip due" in outbound[0].text
+    assert outbound[0].text == "Fake agent reply."
+    assert "Permission slip due" in agent.calls[-1]["user_text"]
 
 
 def test_tomorrow_prep_uses_next_local_day_without_source_body(tmp_path):
-    service, _agent = _service(tmp_path)
+    service, agent = _service(tmp_path)
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
 
     service.handle_incoming(
@@ -779,23 +792,26 @@ def test_tomorrow_prep_uses_next_local_day_without_source_body(tmp_path):
         now_utc=now,
     )
 
-    assert "Tomorrow prep:" in outbound[0].text
-    assert "pack lunch" in outbound[0].text
-    assert "Field trip permission slip due" in outbound[0].text
-    assert "pick up cleats" not in outbound[0].text
-    assert "library books" not in outbound[0].text
-    assert "Full email body" not in outbound[0].text
+    assert outbound[0].text == "Fake agent reply."
+    assert "Florence computed tomorrow's prep list" in agent.calls[-1]["user_text"]
+    assert "Tomorrow prep:" in agent.calls[-1]["user_text"]
+    assert "pack lunch" in agent.calls[-1]["user_text"]
+    assert "Field trip permission slip due" in agent.calls[-1]["user_text"]
+    assert "pick up cleats" not in agent.calls[-1]["user_text"]
+    assert "library books" not in agent.calls[-1]["user_text"]
+    assert "Full email body" not in agent.calls[-1]["user_text"]
 
 
 def test_tomorrow_prep_is_clear_when_empty(tmp_path):
-    service, _agent = _service(tmp_path)
+    service, agent = _service(tmp_path)
 
     outbound = service.handle_incoming(
         _incoming("tomorrow prep", chat_id="prep-empty", message_id="prep-empty"),
         now_utc=datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc),
     )
 
-    assert outbound[0].text == "I do not see anything specific to prep for tomorrow."
+    assert outbound[0].text == "Fake agent reply."
+    assert "I do not see anything specific to prep for tomorrow." in agent.calls[-1]["user_text"]
 
 
 def test_duplicate_inbound_message_is_ignored_without_side_effects(tmp_path):
@@ -848,11 +864,11 @@ def test_first_greeting_is_natural_without_setup_command_or_hermes(tmp_path):
     household = service.store.get_household_by_chat("natural-hi")
 
     assert len(outbound) == 1
-    assert "I'm Florence" in outbound[0].text
-    assert "You can just text me normally" in outbound[0].text
-    assert "What should I call you?" in outbound[0].text
-    assert "setup status" not in outbound[0].text.lower()
-    assert agent.calls == []
+    assert outbound[0].text == "Fake agent reply."
+    assert "I'm Florence" in agent.calls[-1]["user_text"]
+    assert "You can just text me normally" in agent.calls[-1]["user_text"]
+    assert "What should I call you?" in agent.calls[-1]["user_text"]
+    assert "setup status" not in agent.calls[-1]["user_text"].lower()
     assert household is not None
     assert service.store.list_members(household.id)[0].role.value == "parent"
 
@@ -928,10 +944,10 @@ def test_bare_name_reply_after_first_greeting_updates_member_name(tmp_path):
     assert household is not None
     members = service.store.list_members(household.id)
 
-    assert "Nice to meet you, Hari. I will use that in this household." in outbound[0].text
-    assert "Send your partner's phone number" in outbound[0].text
+    assert outbound[0].text == "Fake agent reply."
+    assert "Nice to meet you, Hari. I will use that in this household." in agent.calls[-1]["user_text"]
+    assert "Send your partner's phone number" in agent.calls[-1]["user_text"]
     assert members[0].display_name == "Hari"
-    assert agent.calls == []
 
 
 def test_bare_name_reply_includes_web_onboarding_link_when_configured(tmp_path):
@@ -953,9 +969,9 @@ def test_bare_name_reply_includes_web_onboarding_link_when_configured(tmp_path):
         now_utc=now + timedelta(minutes=1),
     )
 
-    assert "https://florence.example.com/onboarding/" in outbound[0].text
-    assert "partner, kids, location, caretakers, tone, and Google" in outbound[0].text
-    assert agent.calls == []
+    assert outbound[0].text == "Fake agent reply."
+    assert "https://florence.example.com/onboarding/" in agent.calls[-1]["user_text"]
+    assert "partner, kids, location, caretakers, tone, and Google" in agent.calls[-1]["user_text"]
 
 
 def test_setup_status_includes_web_onboarding_link_when_configured(tmp_path):
@@ -977,8 +993,9 @@ def test_setup_status_includes_web_onboarding_link_when_configured(tmp_path):
         now_utc=now + timedelta(minutes=1),
     )
 
-    assert "Household setup:" in outbound[0].text
-    assert "Setup link: https://florence.example.com/onboarding/" in outbound[0].text
+    assert outbound[0].text == "Fake agent reply."
+    assert "Household setup:" in agent.calls[-1]["user_text"]
+    assert "Setup link: https://florence.example.com/onboarding/" in agent.calls[-1]["user_text"]
 
 
 def test_existing_incomplete_household_greeting_resumes_onboarding_naturally(tmp_path):
@@ -1000,10 +1017,10 @@ def test_existing_incomplete_household_greeting_resumes_onboarding_naturally(tmp
         now_utc=now + timedelta(minutes=1),
     )
 
-    assert "Hi Hari. I can keep going from here." in outbound[0].text
-    assert "https://florence.example.com/onboarding/" in outbound[0].text
-    assert "setup status" not in outbound[0].text.lower()
-    assert agent.calls == []
+    assert outbound[0].text == "Fake agent reply."
+    assert "Hi Hari. I can keep going from here." in agent.calls[-1]["user_text"]
+    assert "https://florence.example.com/onboarding/" in agent.calls[-1]["user_text"]
+    assert "setup status" not in agent.calls[-1]["user_text"].lower()
 
 
 def test_existing_incomplete_household_low_content_reply_resumes_onboarding_naturally(tmp_path):
@@ -1025,10 +1042,10 @@ def test_existing_incomplete_household_low_content_reply_resumes_onboarding_natu
         now_utc=now + timedelta(minutes=1),
     )
 
-    assert "I can keep going from here" in outbound[0].text
-    assert "https://florence.example.com/onboarding/" in outbound[0].text
-    assert "setup status" not in outbound[0].text.lower()
-    assert agent.calls == []
+    assert outbound[0].text == "Fake agent reply."
+    assert "I can keep going from here" in agent.calls[-1]["user_text"]
+    assert "https://florence.example.com/onboarding/" in agent.calls[-1]["user_text"]
+    assert "setup status" not in agent.calls[-1]["user_text"].lower()
 
 
 def test_existing_incomplete_household_link_request_resumes_onboarding_naturally(tmp_path):
@@ -1050,10 +1067,10 @@ def test_existing_incomplete_household_link_request_resumes_onboarding_naturally
         now_utc=now + timedelta(minutes=1),
     )
 
-    assert "I can keep going from here" in outbound[0].text
-    assert "https://florence.example.com/onboarding/" in outbound[0].text
-    assert "setup status" not in outbound[0].text.lower()
-    assert agent.calls == []
+    assert outbound[0].text == "Fake agent reply."
+    assert "I can keep going from here" in agent.calls[-1]["user_text"]
+    assert "https://florence.example.com/onboarding/" in agent.calls[-1]["user_text"]
+    assert "setup status" not in agent.calls[-1]["user_text"].lower()
 
 
 def test_incomplete_household_real_task_is_not_swallowed_by_onboarding(tmp_path):
@@ -1104,10 +1121,10 @@ def test_incomplete_household_natural_child_fact_is_not_swallowed_by_onboarding(
     )
     memory = service.memory_snapshot(chat_id="natural-onboarding-kids", now_utc=now)
 
-    assert "Maya and Leo" in outbound[0].text
-    assert "onboarding" not in outbound[0].text.lower()
+    assert outbound[0].text == "Fake agent reply."
+    assert "Maya and Leo" in agent.calls[-1]["user_text"]
+    assert "onboarding" not in agent.calls[-1]["user_text"].lower()
     assert {item.subject for item in memory.memories} == {"Maya", "Leo"}
-    assert agent.calls == []
 
 
 def test_bare_name_reply_only_applies_after_name_prompt(tmp_path):
@@ -1148,11 +1165,11 @@ def test_prompted_partner_phone_starts_invite_flow(tmp_path):
         now_utc=now + timedelta(minutes=2),
     )
 
-    assert "Send your partner's phone number" in name_reply[0].text
+    assert name_reply[0].text == "Fake agent reply."
+    assert "Send your partner's phone number" in agent.calls[-1]["user_text"]
     assert len(outbound) == 2
     assert "start a shared household thread with +15555550101" in outbound[0].text
     assert outbound[1].new_chat_to == ("+15555550100", "+15555550101")
-    assert agent.calls == []
 
 
 def test_natural_partner_phone_starts_invite_flow(tmp_path):
@@ -1175,7 +1192,7 @@ def test_natural_partner_phone_starts_invite_flow(tmp_path):
     assert len(outbound) == 2
     assert "start a shared household thread with +15555550101" in outbound[0].text
     assert outbound[1].new_chat_to == ("+15555550100", "+15555550101")
-    assert agent.calls == []
+    assert "Florence applied or looked up this household setup result" in agent.calls[-1]["user_text"]
 
 
 def test_support_contact_is_reachable_without_hermes(tmp_path):
@@ -1408,6 +1425,7 @@ def test_parent_cannot_confirm_household_data_deletion_without_recent_request(tm
         _incoming("my name is Sam", chat_id=chat_id, message_id="delete-no-request-name"),
         now_utc=now,
     )
+    agent.calls.clear()
 
     outbound = service.handle_incoming(
         _incoming(
@@ -1456,6 +1474,7 @@ def test_household_data_deletion_request_spacing_is_normalized(tmp_path):
         _incoming("my name is Sam", chat_id=chat_id, message_id="delete-spaced-name"),
         now_utc=now,
     )
+    agent.calls.clear()
     prompt = service.handle_incoming(
         _incoming("  delete    my   data  ", chat_id=chat_id, message_id="delete-spaced-request"),
         now_utc=now + timedelta(minutes=1),
@@ -1490,6 +1509,7 @@ def test_household_data_deletion_confirmation_expires(tmp_path):
         _incoming("my name is Sam", chat_id=chat_id, message_id="delete-expired-name"),
         now_utc=now,
     )
+    agent.calls.clear()
     prompt = service.handle_incoming(
         _incoming("delete my data", chat_id=chat_id, message_id="delete-expired-request"),
         now_utc=now,
@@ -1635,6 +1655,7 @@ def test_helper_cannot_stop_household_thread(tmp_path):
         _incoming("hello", chat_id=chat_id, message_id="parent-seen"),
         now_utc=now,
     )
+    agent.calls.clear()
     helper_stop = service.handle_incoming(
         _incoming(
             "stop",
@@ -1927,11 +1948,12 @@ def test_media_only_message_is_acknowledged_and_stored_as_source(tmp_path):
     snapshot = service.source_review_snapshot(chat_id="media-only")
 
     assert len(outbound) == 1
-    assert "I got the attachment" in outbound[0].text
-    assert "permission slip due Friday" in outbound[0].text
+    assert outbound[0].text == "Fake agent reply."
+    assert "I got the attachment" in agent.calls[-1]["user_text"]
+    assert "permission slip due Friday" in agent.calls[-1]["user_text"]
     assert snapshot.total == 1
     assert snapshot.stored_only == 1
-    assert agent.calls == []
+    assert len(agent.calls) == 1
     household = service.store.get_household_by_chat("media-only")
     assert household is not None
     with service.store.connect() as conn:
@@ -1969,10 +1991,11 @@ def test_captioned_attachment_uses_need_to_know_policy(tmp_path):
     snapshot = service.source_review_snapshot(chat_id="captioned-media")
 
     assert len(outbound) == 1
-    assert "Got it. I will keep this with the household context: Field trip permission slip due tomorrow" in outbound[0].text
+    assert outbound[0].text == "Fake agent reply."
+    assert "Got it. I will keep this with the household context: Field trip permission slip due tomorrow" in agent.calls[-1]["user_text"]
     assert snapshot.total == 1
     assert snapshot.surfaced == 1
-    assert agent.calls == []
+    assert len(agent.calls) == 1
 
 
 def test_captioned_attachment_matching_source_rule_is_acknowledged_not_echoed(tmp_path):
@@ -2016,12 +2039,13 @@ def test_captioned_attachment_matching_source_rule_is_acknowledged_not_echoed(tm
     snapshot = service.source_review_snapshot(chat_id="camp-media")
 
     assert len(outbound) == 1
-    assert outbound[0].text == "Got it. I will keep that with the household context and surface it only if it needs action."
-    assert "This looks worth your attention" not in outbound[0].text
+    assert outbound[0].text == "Fake agent reply."
+    assert "Got it. I will keep that with the household context and surface it only if it needs action." in agent.calls[-1]["user_text"]
+    assert "This looks worth your attention" not in agent.calls[-1]["user_text"]
     assert snapshot.total == 1
     assert snapshot.stored_only == 1
     assert snapshot.by_reason["parent_submitted_context"] == 1
-    assert agent.calls == []
+    assert len(agent.calls) == 1
 
 
 def test_captioned_attachment_after_agent_prompt_continues_conversation(tmp_path):
@@ -2259,14 +2283,15 @@ def test_extracted_attachment_text_surfaces_and_suggests_reminder(tmp_path):
     actions = service.pending_actions(chat_id="extracted-media", now_utc=now)
 
     assert len(outbound) == 1
-    assert "Got it. I will keep this with the household context: Field trip permission slip due tomorrow at 5pm." in outbound[0].text
-    assert "Sat, Jun 6 at 5:00 PM" in outbound[0].text
-    assert "approve" in outbound[0].text
+    assert outbound[0].text == "Fake agent reply."
+    assert "Got it. I will keep this with the household context: Field trip permission slip due tomorrow at 5pm." in agent.calls[-1]["user_text"]
+    assert "Sat, Jun 6 at 5:00 PM" in agent.calls[-1]["user_text"]
+    assert "approve" in agent.calls[-1]["user_text"]
     assert snapshot.total == 1
     assert snapshot.surfaced == 1
     assert len(actions) == 1
     assert actions[0].payload["title"] == "Field trip permission slip due tomorrow at 5pm."
-    assert agent.calls == []
+    assert len(agent.calls) == 1
 
     household = service.store.get_household_by_chat("extracted-media")
     assert household is not None
@@ -3153,7 +3178,7 @@ def test_source_preferences_are_household_scoped(tmp_path):
 
 
 def test_source_preferences_status_lists_rules(tmp_path):
-    service, _agent = _service(tmp_path)
+    service, agent = _service(tmp_path)
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
 
     service.handle_incoming(
@@ -3169,12 +3194,14 @@ def test_source_preferences_status_lists_rules(tmp_path):
         now_utc=now,
     )
 
-    assert "Tell me about: dentist" in outbound[0].text
-    assert "Keep quiet about: newsletters" in outbound[0].text
+    context = agent.calls[-1]["user_text"]
+    assert outbound[0].text == "Fake agent reply."
+    assert "Tell me about: dentist" in context
+    assert "Keep quiet about: newsletters" in context
 
 
 def test_source_review_command_summarizes_texted_and_quiet_items(tmp_path):
-    service, _agent = _service(tmp_path)
+    service, agent = _service(tmp_path)
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
 
     service.ingest_source_item(
@@ -3199,13 +3226,15 @@ def test_source_review_command_summarizes_texted_and_quiet_items(tmp_path):
         now_utc=now + timedelta(minutes=1),
     )
 
-    assert "Source review:" in outbound[0].text
-    assert "Texted: 1" in outbound[0].text
-    assert "Kept quiet: 1" in outbound[0].text
-    assert "Maya dentist appointment" in outbound[0].text
-    assert "Weekly school newsletter" in outbound[0].text
-    assert "low signal" in outbound[0].text
-    assert "spirit wear sale" not in outbound[0].text
+    context = agent.calls[-1]["user_text"]
+    assert outbound[0].text == "Fake agent reply."
+    assert "Source review:" in context
+    assert "Texted: 1" in context
+    assert "Kept quiet: 1" in context
+    assert "Maya dentist appointment" in context
+    assert "Weekly school newsletter" in context
+    assert "low signal" in context
+    assert "spirit wear sale" not in context
 
 
 def test_source_review_command_is_parent_only(tmp_path):
@@ -4087,7 +4116,7 @@ def test_explicit_memory_reaches_agent_context(tmp_path):
 
 
 def test_memory_status_shows_household_memory_with_provenance(tmp_path):
-    service, _agent = _service(tmp_path)
+    service, agent = _service(tmp_path)
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
 
     service.handle_incoming(_incoming("my name is Sam", message_id="memory-name"), now_utc=now)
@@ -4100,12 +4129,14 @@ def test_memory_status_shows_household_memory_with_provenance(tmp_path):
         now_utc=now,
     )
 
-    assert "Here is what I remember for this household" in outbound[0].text
-    assert "Maya likes pasta (from Sam)" in outbound[0].text
+    context = agent.calls[-1]["user_text"]
+    assert outbound[0].text == "Fake agent reply."
+    assert "Here is what I remember for this household" in context
+    assert "Maya likes pasta (from Sam)" in context
 
 
 def test_household_book_alias_shows_curated_memory(tmp_path):
-    service, _agent = _service(tmp_path)
+    service, agent = _service(tmp_path)
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
 
     service.handle_incoming(
@@ -4117,8 +4148,10 @@ def test_household_book_alias_shows_curated_memory(tmp_path):
         now_utc=now,
     )
 
-    assert "household book" in outbound[0].text.lower()
-    assert "Maya likes pasta" in outbound[0].text
+    context = agent.calls[-1]["user_text"]
+    assert outbound[0].text == "Fake agent reply."
+    assert "household book" in context.lower()
+    assert "Maya likes pasta" in context
 
 
 def test_duplicate_explicit_memory_updates_existing_record(tmp_path):
@@ -4376,7 +4409,7 @@ def test_helper_cannot_change_household_setup_details(tmp_path):
 
 
 def test_household_status_and_timezone_commands(tmp_path):
-    service, _agent = _service(tmp_path)
+    service, agent = _service(tmp_path)
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
 
     name_reply = service.handle_incoming(_incoming("my name is Sam", message_id="name"), now_utc=now)
@@ -4389,14 +4422,17 @@ def test_household_status_and_timezone_commands(tmp_path):
         now_utc=now,
     )
 
-    assert "Nice to meet you, Sam" in name_reply[0].text
-    assert "America/New_York" in tz_reply[0].text
-    assert "Household timezone: America/New_York" in status_reply[0].text
-    assert "Sam (parent)" in status_reply[0].text
+    assert name_reply[0].text == "Fake agent reply."
+    assert tz_reply[0].text == "Fake agent reply."
+    assert status_reply[0].text == "Fake agent reply."
+    assert "Nice to meet you, Sam" in agent.calls[-3]["user_text"]
+    assert "America/New_York" in agent.calls[-2]["user_text"]
+    assert "Household timezone: America/New_York" in agent.calls[-1]["user_text"]
+    assert "Sam (parent)" in agent.calls[-1]["user_text"]
 
 
 def test_household_status_uses_role_label_for_unnamed_member(tmp_path):
-    service, _agent = _service(tmp_path)
+    service, agent = _service(tmp_path)
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
 
     service.handle_incoming(
@@ -4413,8 +4449,10 @@ def test_household_status_uses_role_label_for_unnamed_member(tmp_path):
         now_utc=now + timedelta(minutes=1),
     )
 
-    assert "unnamed parent (parent)" in status_reply[0].text
-    assert "+15555550998" not in status_reply[0].text
+    context = agent.calls[-1]["user_text"]
+    assert status_reply[0].text == "Fake agent reply."
+    assert "unnamed parent (parent)" in context
+    assert "+15555550998" not in context
 
 
 def test_parent_invite_creates_group_chat_delivery_instruction(tmp_path):
@@ -4813,14 +4851,16 @@ def test_household_handoff_lists_pending_approvals_and_upcoming_reminders(tmp_pa
         now_utc=now + timedelta(minutes=1),
     )
 
-    assert "Household handoff:" in outbound[0].text
-    assert "Needs parent approval:" in outbound[0].text
-    assert f"approve {action.id[:8]}" in outbound[0].text
-    assert "Email the teacher about pickup." in outbound[0].text
-    assert "Coming up:" in outbound[0].text
-    assert "pack lunch" in outbound[0].text
-    assert "camp deposit" not in outbound[0].text
-    assert agent.calls == []
+    context = agent.calls[-1]["user_text"]
+    assert outbound[0].text == "Fake agent reply."
+    assert "Household handoff:" in context
+    assert "Needs parent approval:" in context
+    assert f"approve {action.id[:8]}" in context
+    assert "Email the teacher about pickup." in context
+    assert "Coming up:" in context
+    assert "pack lunch" in context
+    assert "camp deposit" not in context
+    assert len(agent.calls) == 1
 
 
 def test_household_handoff_is_clear_when_empty(tmp_path):
@@ -4831,10 +4871,12 @@ def test_household_handoff_is_clear_when_empty(tmp_path):
         now_utc=datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc),
     )
 
-    assert outbound[0].text == (
+    assert outbound[0].text == "Fake agent reply."
+    assert (
         "Household handoff is clear. I do not see pending approvals or upcoming reminders."
+        in agent.calls[-1]["user_text"]
     )
-    assert agent.calls == []
+    assert len(agent.calls) == 1
 
 
 def test_helper_cannot_view_household_handoff(tmp_path):
@@ -5401,7 +5443,7 @@ def test_privacy_status_and_analytics_opt_in_are_household_scoped(tmp_path):
 
 
 def test_setup_status_lists_missing_household_readiness_steps(tmp_path):
-    service, _agent = _service(tmp_path)
+    service, agent = _service(tmp_path)
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
 
     outbound = service.handle_incoming(
@@ -5409,15 +5451,17 @@ def test_setup_status_lists_missing_household_readiness_steps(tmp_path):
         now_utc=now,
     )
 
-    assert "Household setup:" in outbound[0].text
-    assert "Parents seen: 1/2" in outbound[0].text
-    assert "Tell me what each parent wants to be called." in outbound[0].text
-    assert "Invite or confirm your partner as the second parent." in outbound[0].text
-    assert "Next action: Tell me what I should call you." in outbound[0].text
+    context = agent.calls[-1]["user_text"]
+    assert outbound[0].text == "Fake agent reply."
+    assert "Household setup:" in context
+    assert "Parents seen: 1/2" in context
+    assert "Tell me what each parent wants to be called." in context
+    assert "Invite or confirm your partner as the second parent." in context
+    assert "Next action: Tell me what I should call you." in context
 
 
 def test_setup_status_suggests_inviting_partner_after_first_parent_is_named(tmp_path):
-    service, _agent = _service(tmp_path)
+    service, agent = _service(tmp_path)
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
 
     service.handle_incoming(
@@ -5429,11 +5473,12 @@ def test_setup_status_suggests_inviting_partner_after_first_parent_is_named(tmp_
         now_utc=now + timedelta(minutes=1),
     )
 
-    assert "Next action: Send your partner's phone number" in outbound[0].text
+    assert outbound[0].text == "Fake agent reply."
+    assert "Next action: Send your partner's phone number" in agent.calls[-1]["user_text"]
 
 
 def test_setup_status_suggests_google_after_family_context_is_present(tmp_path):
-    service, _agent = _service(tmp_path)
+    service, agent = _service(tmp_path)
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
 
     service.handle_incoming(
@@ -5467,11 +5512,12 @@ def test_setup_status_suggests_google_after_family_context_is_present(tmp_path):
         now_utc=now + timedelta(minutes=1),
     )
 
-    assert "Next action: Say you want to connect Google Calendar and Gmail." in outbound[0].text
+    assert outbound[0].text == "Fake agent reply."
+    assert "Next action: Say you want to connect Google Calendar and Gmail." in agent.calls[-1]["user_text"]
 
 
 def test_setup_status_suggests_source_rule_after_connected_source(tmp_path):
-    service, _agent = _service(tmp_path)
+    service, agent = _service(tmp_path)
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
 
     service.handle_incoming(
@@ -5512,10 +5558,11 @@ def test_setup_status_suggests_source_rule_after_connected_source(tmp_path):
         now_utc=now + timedelta(minutes=1),
     )
 
+    assert outbound[0].text == "Fake agent reply."
     assert (
         "Setup next action: Tell me one thing that is always worth a text, "
         "like permission slips."
-    ) in outbound[0].text
+    ) in agent.calls[-1]["user_text"]
 
 
 def test_prompted_bare_source_rule_updates_preferences(tmp_path):
@@ -5574,7 +5621,7 @@ def test_prompted_bare_source_rule_updates_preferences(tmp_path):
 
 
 def test_child_names_update_readiness_and_memory(tmp_path):
-    service, _agent = _service(tmp_path)
+    service, agent = _service(tmp_path)
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
 
     reply = service.handle_incoming(
@@ -5584,13 +5631,14 @@ def test_child_names_update_readiness_and_memory(tmp_path):
     readiness = service.readiness_snapshot(chat_id="setup-kids", now_utc=now)
     memory = service.memory_snapshot(chat_id="setup-kids", now_utc=now)
 
-    assert "Maya and Leo" in reply[0].text
+    assert reply[0].text == "Fake agent reply."
+    assert "Maya and Leo" in agent.calls[-1]["user_text"]
     assert readiness.child_count == 2
     assert {item.subject for item in memory.memories} == {"Maya", "Leo"}
 
 
 def test_natural_child_names_update_readiness_and_memory(tmp_path):
-    service, _agent = _service(tmp_path)
+    service, agent = _service(tmp_path)
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
 
     reply = service.handle_incoming(
@@ -5600,13 +5648,14 @@ def test_natural_child_names_update_readiness_and_memory(tmp_path):
     readiness = service.readiness_snapshot(chat_id="natural-kids", now_utc=now)
     memory = service.memory_snapshot(chat_id="natural-kids", now_utc=now)
 
-    assert "Maya and Leo" in reply[0].text
+    assert reply[0].text == "Fake agent reply."
+    assert "Maya and Leo" in agent.calls[-1]["user_text"]
     assert readiness.child_count == 2
     assert {item.subject for item in memory.memories} == {"Maya", "Leo"}
 
 
 def test_prompted_bare_child_names_update_readiness_and_memory(tmp_path):
-    service, _agent = _service(tmp_path)
+    service, agent = _service(tmp_path)
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
     service.handle_incoming(
         _incoming("my name is Sam", chat_id="prompted-kids", message_id="parent-one-name"),
@@ -5632,7 +5681,8 @@ def test_prompted_bare_child_names_update_readiness_and_memory(tmp_path):
     readiness = service.readiness_snapshot(chat_id="prompted-kids", now_utc=now)
     memory = service.memory_snapshot(chat_id="prompted-kids", now_utc=now)
 
-    assert "Maya and Leo" in reply[0].text
+    assert reply[0].text == "Fake agent reply."
+    assert "Maya and Leo" in agent.calls[-1]["user_text"]
     assert readiness.child_count == 2
     assert {item.subject for item in memory.memories} == {"Maya", "Leo"}
 
@@ -6040,7 +6090,7 @@ def test_duplicate_source_retry_respects_stopped_household(tmp_path):
 
 
 def test_household_readiness_becomes_ready_when_core_setup_is_done(tmp_path):
-    service, _agent = _service(tmp_path)
+    service, agent = _service(tmp_path)
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
 
     service.handle_incoming(
@@ -6096,7 +6146,8 @@ def test_household_readiness_becomes_ready_when_core_setup_is_done(tmp_path):
     assert readiness.child_count == 1
     assert readiness.connected_account_count == 1
     assert readiness.source_preference_count == 1
-    assert "Ready for a pilot" in status[0].text
+    assert status[0].text == "Fake agent reply."
+    assert "Ready for a pilot" in agent.calls[-1]["user_text"]
 
 
 def test_agent_reminder_proposal_becomes_pending_action(tmp_path):

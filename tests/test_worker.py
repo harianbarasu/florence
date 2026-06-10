@@ -60,9 +60,20 @@ class FakeLinqReconciler:
         return {"message": {"id": idempotency_key}}
 
 
+class FakeAgent:
+    def __init__(self, response: str):
+        self.response = response
+
+    def complete(self, **kwargs):
+        return self.response
+
+
 def test_linq_reconciliation_replies_to_missed_inbound_once(tmp_path):
     now = datetime(2026, 6, 8, 15, 0, tzinfo=timezone.utc)
-    service = FlorenceService(settings=Settings(db_path=str(tmp_path / "worker.db")))
+    service = FlorenceService(
+        settings=Settings(db_path=str(tmp_path / "worker.db")),
+        agent=FakeAgent("Hi, I'm Florence."),
+    )
     linq = FakeLinqReconciler(
         [
             IncomingMessage(

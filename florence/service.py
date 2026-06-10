@@ -132,6 +132,12 @@ LOCAL_ACTION_AGENT_FOCUS = (
     "Florence already applied this validated household action before this response. "
     "Acknowledge naturally and do not propose or duplicate the same action."
 )
+LOCAL_RESULT_AGENT_FOCUS = (
+    "Florence already handled any validation, state work, or local lookup before this response. "
+    "Reply naturally using the local result. Preserve every URL, phone number, date/time, "
+    "reminder title, source rule, and approval code exactly. Do not mention internal routing, "
+    "handlers, or database rules."
+)
 MAX_EXPLICIT_MEMORY_CHARS = 240
 MEMORY_STATUS_COMMANDS = {
     "what do you remember",
@@ -528,7 +534,16 @@ class FlorenceService:
 
         lower = " ".join(incoming.text.strip().lower().split())
         if existing_household is None and _simple_greeting(lower):
-            return [self._out(household.id, incoming.chat_id, tone.first_greeting(), now)]
+            return self._agent_turn_with_context(
+                household=household,
+                actor=actor,
+                incoming=incoming,
+                now=now,
+                context=(
+                    "Florence computed this onboarding greeting for a new household:\n"
+                    f"{tone.first_greeting()}\n\n{LOCAL_RESULT_AGENT_FOCUS}"
+                ),
+            )
         if lower in {"help", "?"}:
             return [self._out(household.id, incoming.chat_id, tone.help_text(), now)]
         if lower in SUPPORT_COMMANDS:
@@ -610,7 +625,16 @@ class FlorenceService:
             now,
         )
         if onboarding_continuation is not None:
-            return [self._out(household.id, incoming.chat_id, onboarding_continuation, now)]
+            return self._agent_turn_with_context(
+                household=household,
+                actor=actor,
+                incoming=incoming,
+                now=now,
+                context=(
+                    "Florence computed this onboarding continuation:\n"
+                    f"{onboarding_continuation}\n\n{LOCAL_RESULT_AGENT_FOCUS}"
+                ),
+            )
 
         partner_invite = self._maybe_handle_partner_invite(household, actor, incoming.text, now)
         if partner_invite is not None:
@@ -627,6 +651,17 @@ class FlorenceService:
 
         setup_reply = self._maybe_handle_household_setup(household.id, actor, incoming.text, now)
         if setup_reply is not None:
+            if _setup_reply_should_use_agent(setup_reply):
+                return self._agent_turn_with_context(
+                    household=household,
+                    actor=actor,
+                    incoming=incoming,
+                    now=now,
+                    context=(
+                        "Florence applied or looked up this household setup result:\n"
+                        f"{setup_reply}\n\n{LOCAL_RESULT_AGENT_FOCUS}"
+                    ),
+                )
             return [self._out(household.id, incoming.chat_id, setup_reply, now)]
 
         approval_reply = self._maybe_handle_pending_action(household.id, actor, incoming.text, now)
@@ -635,7 +670,18 @@ class FlorenceService:
 
         handoff_reply = self._maybe_show_handoff(household, actor, lower, now)
         if handoff_reply is not None:
-            return [self._out(household.id, incoming.chat_id, handoff_reply, now)]
+            if _parent_only_reply(handoff_reply):
+                return [self._out(household.id, incoming.chat_id, handoff_reply, now)]
+            return self._agent_turn_with_context(
+                household=household,
+                actor=actor,
+                incoming=incoming,
+                now=now,
+                context=(
+                    "Florence computed this household handoff/open-items result:\n"
+                    f"{handoff_reply}\n\n{LOCAL_RESULT_AGENT_FOCUS}"
+                ),
+            )
 
         privacy_reply = self._maybe_handle_privacy(household.id, actor, incoming.text, now)
         if privacy_reply is not None:
@@ -658,6 +704,17 @@ class FlorenceService:
             now,
         )
         if reminder_resolution_reply is not None:
+            if reminder_resolution_reply.startswith("Done."):
+                return self._agent_turn_with_context(
+                    household=household,
+                    actor=actor,
+                    incoming=incoming,
+                    now=now,
+                    context=(
+                        "Florence resolved the requested reminder update:\n"
+                        f"{reminder_resolution_reply}\n\n{LOCAL_ACTION_AGENT_FOCUS}"
+                    ),
+                )
             return [self._out(household.id, incoming.chat_id, reminder_resolution_reply, now)]
 
         source_feedback = self._maybe_handle_source_feedback(
@@ -668,11 +725,12 @@ class FlorenceService:
         )
         if source_feedback is not None:
             if source_feedback.agent_context:
-                return self._agent_turn(
+                return self._agent_turn_with_context(
                     household=household,
                     actor=actor,
-                    incoming=replace(incoming, text=f"{incoming.text}\n\n{source_feedback.agent_context}"),
+                    incoming=incoming,
                     now=now,
+                    context=source_feedback.agent_context,
                 )
             if source_feedback.reply_text:
                 return [self._out(household.id, incoming.chat_id, source_feedback.reply_text, now)]
@@ -690,7 +748,18 @@ class FlorenceService:
         ):
             attachment_reply = self._maybe_handle_attachments(household.id, incoming, now)
             if attachment_reply is not None:
-                return attachment_reply
+                if not attachment_reply:
+                    return []
+                return self._agent_turn_with_context(
+                    household=household,
+                    actor=actor,
+                    incoming=incoming,
+                    now=now,
+                    context=(
+                        "Florence saved or reviewed the attachment and computed this local result:\n"
+                        f"{_local_outbound_context(attachment_reply)}\n\n{LOCAL_RESULT_AGENT_FOCUS}"
+                    ),
+                )
             memory_reply = self._maybe_update_memory(
                 household.id,
                 actor,
@@ -699,14 +768,12 @@ class FlorenceService:
                 acknowledge_success=False,
             )
             if memory_reply == "":
-                return self._agent_turn(
+                return self._agent_turn_with_context(
                     household=household,
                     actor=actor,
-                    incoming=replace(
-                        incoming,
-                        text=f"{incoming.text}\n\nFlorence saved the requested household memory.\n{LOCAL_ACTION_AGENT_FOCUS}",
-                    ),
+                    incoming=incoming,
                     now=now,
+                    context=f"Florence saved the requested household memory.\n{LOCAL_ACTION_AGENT_FOCUS}",
                 )
             if memory_reply is not None:
                 return [self._out(household.id, incoming.chat_id, memory_reply, now)]
@@ -718,14 +785,12 @@ class FlorenceService:
                 acknowledge_success=False,
             )
             if source_preference_reply == "":
-                return self._agent_turn(
+                return self._agent_turn_with_context(
                     household=household,
                     actor=actor,
-                    incoming=replace(
-                        incoming,
-                        text=f"{incoming.text}\n\nFlorence applied the requested connected-source rule.\n{LOCAL_ACTION_AGENT_FOCUS}",
-                    ),
+                    incoming=incoming,
                     now=now,
+                    context=f"Florence applied the requested connected-source rule.\n{LOCAL_ACTION_AGENT_FOCUS}",
                 )
             if source_preference_reply is not None:
                 return [self._out(household.id, incoming.chat_id, source_preference_reply, now)]
@@ -745,20 +810,29 @@ class FlorenceService:
         )
         if memory_reply is not None:
             if memory_reply == "":
-                return self._agent_turn(
+                return self._agent_turn_with_context(
                     household=household,
                     actor=actor,
-                    incoming=replace(
-                        incoming,
-                        text=f"{incoming.text}\n\nFlorence saved the requested household memory.\n{LOCAL_ACTION_AGENT_FOCUS}",
-                    ),
+                    incoming=incoming,
                     now=now,
+                    context=f"Florence saved the requested household memory.\n{LOCAL_ACTION_AGENT_FOCUS}",
                 )
             return [self._out(household.id, incoming.chat_id, memory_reply, now)]
 
         memory_status = self._maybe_show_memory(household.id, actor, lower, now)
         if memory_status is not None:
-            return [self._out(household.id, incoming.chat_id, memory_status, now)]
+            if _parent_only_reply(memory_status):
+                return [self._out(household.id, incoming.chat_id, memory_status, now)]
+            return self._agent_turn_with_context(
+                household=household,
+                actor=actor,
+                incoming=incoming,
+                now=now,
+                context=(
+                    "Florence computed this household-book result:\n"
+                    f"{memory_status}\n\n{LOCAL_RESULT_AGENT_FOCUS}"
+                ),
+            )
 
         source_preference_reply = self._maybe_update_source_preference(
             household.id,
@@ -769,66 +843,126 @@ class FlorenceService:
         )
         if source_preference_reply is not None:
             if source_preference_reply == "":
-                return self._agent_turn(
+                return self._agent_turn_with_context(
                     household=household,
                     actor=actor,
-                    incoming=replace(
-                        incoming,
-                        text=f"{incoming.text}\n\nFlorence applied the requested connected-source rule.\n{LOCAL_ACTION_AGENT_FOCUS}",
-                    ),
+                    incoming=incoming,
                     now=now,
+                    context=f"Florence applied the requested connected-source rule.\n{LOCAL_ACTION_AGENT_FOCUS}",
                 )
             return [self._out(household.id, incoming.chat_id, source_preference_reply, now)]
 
         source_review_reply = self._maybe_show_source_review(household, actor, lower)
         if source_review_reply is not None:
-            return [self._out(household.id, incoming.chat_id, source_review_reply, now)]
+            if _parent_only_reply(source_review_reply):
+                return [self._out(household.id, incoming.chat_id, source_review_reply, now)]
+            return self._agent_turn_with_context(
+                household=household,
+                actor=actor,
+                incoming=incoming,
+                now=now,
+                context=(
+                    "Florence computed this connected-source review:\n"
+                    f"{source_review_reply}\n\n{LOCAL_RESULT_AGENT_FOCUS}"
+                ),
+            )
 
         source_preference_status = self._maybe_show_source_preferences(household.id, actor, lower)
         if source_preference_status is not None:
-            return [self._out(household.id, incoming.chat_id, source_preference_status, now)]
+            if _parent_only_reply(source_preference_status):
+                return [self._out(household.id, incoming.chat_id, source_preference_status, now)]
+            return self._agent_turn_with_context(
+                household=household,
+                actor=actor,
+                incoming=incoming,
+                now=now,
+                context=(
+                    "Florence computed this connected-source rules result:\n"
+                    f"{source_preference_status}\n\n{LOCAL_RESULT_AGENT_FOCUS}"
+                ),
+            )
 
         calendar_event_reply = self._maybe_add_calendar_event(household, actor, incoming, now)
         if calendar_event_reply is not None:
             if calendar_event_reply.startswith("Done."):
-                return self._agent_turn(
+                return self._agent_turn_with_context(
                     household=household,
                     actor=actor,
-                    incoming=replace(
-                        incoming,
-                        text=f"{incoming.text}\n\nFlorence added the requested household calendar note.\n{LOCAL_ACTION_AGENT_FOCUS}",
-                    ),
+                    incoming=incoming,
                     now=now,
+                    context=(
+                        "Florence added the requested household calendar note.\n"
+                        f"Local confirmation: {calendar_event_reply}\n{LOCAL_ACTION_AGENT_FOCUS}"
+                    ),
                 )
             return [self._out(household.id, incoming.chat_id, calendar_event_reply, now)]
 
         reminder_reply = self._maybe_create_reminder(household, incoming.text, now)
         if reminder_reply is not None:
             if reminder_reply.startswith("Done."):
-                return self._agent_turn(
+                return self._agent_turn_with_context(
                     household=household,
                     actor=actor,
-                    incoming=replace(
-                        incoming,
-                        text=f"{incoming.text}\n\nFlorence created the requested reminder.\n{LOCAL_ACTION_AGENT_FOCUS}",
-                    ),
+                    incoming=incoming,
                     now=now,
+                    context=(
+                        "Florence created the requested reminder.\n"
+                        f"Local confirmation: {reminder_reply}\n{LOCAL_ACTION_AGENT_FOCUS}"
+                    ),
                 )
             return [self._out(household.id, incoming.chat_id, reminder_reply, now)]
 
         attachment_reply = self._maybe_handle_attachments(household.id, incoming, now)
         if attachment_reply is not None:
-            return attachment_reply
+            if not attachment_reply:
+                return []
+            return self._agent_turn_with_context(
+                household=household,
+                actor=actor,
+                incoming=incoming,
+                now=now,
+                context=(
+                    "Florence saved or reviewed the attachment and computed this local result:\n"
+                    f"{_local_outbound_context(attachment_reply)}\n\n{LOCAL_RESULT_AGENT_FOCUS}"
+                ),
+            )
 
         if self._is_agenda_request(lower):
-            return [self._out(household.id, incoming.chat_id, self._agenda(household.id, now), now)]
+            return self._agent_turn_with_context(
+                household=household,
+                actor=actor,
+                incoming=incoming,
+                now=now,
+                context=(
+                    "Florence computed today's household agenda:\n"
+                    f"{self._agenda(household.id, now)}\n\n{LOCAL_RESULT_AGENT_FOCUS}"
+                ),
+            )
 
         if self._is_tomorrow_prep_request(lower):
-            return [self._out(household.id, incoming.chat_id, self._tomorrow_prep(household.id, now), now)]
+            return self._agent_turn_with_context(
+                household=household,
+                actor=actor,
+                incoming=incoming,
+                now=now,
+                context=(
+                    "Florence computed tomorrow's prep list:\n"
+                    f"{self._tomorrow_prep(household.id, now)}\n\n{LOCAL_RESULT_AGENT_FOCUS}"
+                ),
+            )
 
         bare_name_reply = self._maybe_handle_bare_name_reply(household.id, actor, incoming.text, now)
         if bare_name_reply is not None:
-            return [self._out(household.id, incoming.chat_id, bare_name_reply, now)]
+            return self._agent_turn_with_context(
+                household=household,
+                actor=actor,
+                incoming=incoming,
+                now=now,
+                context=(
+                    "Florence saved this onboarding name result:\n"
+                    f"{bare_name_reply}\n\n{LOCAL_RESULT_AGENT_FOCUS}"
+                ),
+            )
 
         return self._agent_turn(
             household=household,
@@ -882,6 +1016,7 @@ class FlorenceService:
         actor: HouseholdMember,
         incoming: IncomingMessage,
         now: datetime,
+        process_agent_proposals: bool = True,
     ) -> list[OutboundMessage]:
         helper_context_since = (
             min(ensure_utc(actor.created_at_utc), ensure_utc(incoming.received_at))
@@ -937,6 +1072,24 @@ class FlorenceService:
             source_message_id=incoming.message_id,
             reply=reply,
             now=now,
+            process_agent_proposals=process_agent_proposals,
+        )
+
+    def _agent_turn_with_context(
+        self,
+        *,
+        household: Household,
+        actor: HouseholdMember,
+        incoming: IncomingMessage,
+        now: datetime,
+        context: str,
+    ) -> list[OutboundMessage]:
+        return self._agent_turn(
+            household=household,
+            actor=actor,
+            incoming=replace(incoming, text=f"{incoming.text}\n\n{context}"),
+            now=now,
+            process_agent_proposals=False,
         )
 
     def ingest_source_item(
@@ -1896,11 +2049,12 @@ class FlorenceService:
         source_message_id: str,
         reply: str,
         now: datetime,
+        process_agent_proposals: bool = True,
     ) -> list[OutboundMessage]:
         bundle = extract_agent_proposals(reply)
         privacy = self.store.household_privacy(household_id)
         saved_memory_count = 0
-        if privacy.memory_enabled and actor.role == MemberRole.PARENT:
+        if process_agent_proposals and privacy.memory_enabled and actor.role == MemberRole.PARENT:
             for memory in bundle.memories:
                 self.store.upsert_memory(
                     household_id=household_id,
@@ -1915,7 +2069,7 @@ class FlorenceService:
                 saved_memory_count += 1
 
         saved_source_preference_count = 0
-        if actor.role == MemberRole.PARENT:
+        if process_agent_proposals and actor.role == MemberRole.PARENT:
             for preference in bundle.source_preferences:
                 self.store.upsert_source_preference(
                     household_id=household_id,
@@ -1927,16 +2081,17 @@ class FlorenceService:
                 saved_source_preference_count += 1
 
         pending_actions: list[PendingAction] = []
-        for proposal in bundle.actions:
-            action = self._pending_action_from_agent_proposal(
-                household_id=household_id,
-                chat_id=chat_id,
-                actor_member_id=actor.id,
-                proposal=proposal,
-                now=now,
-            )
-            if action is not None:
-                pending_actions.append(action)
+        if process_agent_proposals:
+            for proposal in bundle.actions:
+                action = self._pending_action_from_agent_proposal(
+                    household_id=household_id,
+                    chat_id=chat_id,
+                    actor_member_id=actor.id,
+                    proposal=proposal,
+                    now=now,
+                )
+                if action is not None:
+                    pending_actions.append(action)
 
         reply_text = _guard_agent_reply_text(
             bundle,
@@ -2182,7 +2337,12 @@ class FlorenceService:
         text: str,
         now: datetime,
     ) -> list[OutboundMessage] | None:
-        if not self._recently_asked_for_partner_phone(household.id):
+        readiness = self._readiness(household.id, now)
+        if not self._recently_asked_for_partner_phone(household.id) and not (
+            actor.role == MemberRole.PARENT
+            and readiness.named_parent_count >= 1
+            and readiness.parent_count < 2
+        ):
             return None
         phone = _phone_from_text(text)
         if phone is None:
@@ -2295,8 +2455,15 @@ class FlorenceService:
             )
 
         child_names = _child_names_from_text(text)
-        if not child_names and self._recently_asked_for_children(household_id):
-            child_names = _bare_child_names_from_text(text)
+        readiness = self._readiness(household_id, now)
+        if not child_names:
+            bare_child_names = _bare_child_names_from_text(text)
+            if self._recently_asked_for_children(household_id) or (
+                readiness.child_count == 0
+                and readiness.named_parent_count >= 1
+                and _bare_names_are_title_like(bare_child_names)
+            ):
+                child_names = bare_child_names
         if child_names:
             if actor.role != MemberRole.PARENT:
                 return tone.household_setup_parent_only()
@@ -2365,7 +2532,10 @@ class FlorenceService:
         if (
             actor.display_name is None
             and bare_name is not None
-            and self._recently_asked_actor_for_name(household_id)
+            and (
+                self._recently_asked_actor_for_name(household_id)
+                or self._recently_started_unnamed_household(household_id)
+            )
         ):
             self.store.set_member_name(actor.id, bare_name, now_utc=now)
             return tone.member_named(
@@ -2373,6 +2543,13 @@ class FlorenceService:
                 next_prompt=self._onboarding_next_prompt(household_id, actor, now),
             )
         return None
+
+    def _recently_started_unnamed_household(self, household_id: str) -> bool:
+        history = self.store.recent_messages(household_id, limit=4)
+        return any(
+            message["role"] == "user" and _simple_greeting(message["content"])
+            for message in history
+        )
 
     def _recently_asked_for_partner_phone(self, household_id: str) -> bool:
         history = self.store.recent_messages(household_id, limit=4)
@@ -2739,7 +2916,14 @@ class FlorenceService:
             return tone.source_preference_saved(preference)
 
         prompted_phrase = _bare_source_preference_phrase(text)
-        if prompted_phrase and self._recently_asked_for_source_preference(household_id):
+        readiness = self._readiness(household_id, now)
+        if prompted_phrase and (
+            self._recently_asked_for_source_preference(household_id)
+            or (
+                readiness.connected_account_count > 0
+                and readiness.source_preference_count == 0
+            )
+        ):
             if actor.role != MemberRole.PARENT:
                 return tone.source_preference_parent_only()
             phrase, error = self._source_preference_phrase(household_id, prompted_phrase)
@@ -4200,6 +4384,8 @@ def _active_conversation_rail_command(text: str, lower: str) -> bool:
         or _reminder_resolution(text) is not None
         or _source_feedback_kind(text) is not None
         or _email_search_requested(text)
+        or _bare_name_reply(text) is not None
+        or _bare_child_names_from_text(text)
     ):
         return True
     return lower.strip(" ?") in {
@@ -4209,6 +4395,41 @@ def _active_conversation_rail_command(text: str, lower: str) -> bool:
         "what's open",
         "what needs approval",
     }
+
+
+def _parent_only_reply(reply: str) -> bool:
+    return "need one of the parents" in reply.lower()
+
+
+def _setup_reply_should_use_agent(reply: str) -> bool:
+    normalized = reply.strip().lower()
+    if _parent_only_reply(reply):
+        return False
+    if normalized.startswith(
+        (
+            "what name should i use",
+            "use a shorter name",
+            "i do not recognize that timezone",
+        )
+    ):
+        return False
+    return True
+
+
+def _local_outbound_context(messages: list[OutboundMessage]) -> str:
+    if len(messages) == 1:
+        return messages[0].text
+    return "\n".join(f"Message {index}: {message.text}" for index, message in enumerate(messages, start=1))
+
+
+def _bare_names_are_title_like(names: list[str]) -> bool:
+    if not names:
+        return False
+    for name in names:
+        parts = [part for part in re.split(r"[\s'-]+", name) if part]
+        if not parts or not all(part[0].isupper() for part in parts):
+            return False
+    return True
 
 
 def _looks_like_active_conversation_reply(text: str) -> bool:

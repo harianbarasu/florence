@@ -120,6 +120,10 @@ SOURCE_DOMAIN_REFERENCES = {
 INITIAL_SYNC_SURFACE_REASONS = {"urgent_actionable_source", "high_signal_without_known_due_time"}
 CONNECTED_SOURCE_DUPLICATE_WINDOW = timedelta(days=1)
 EMAIL_SEARCH_MAX_RESULTS = 5
+EMAIL_SEARCH_AGENT_FOCUS = (
+    "Answer only the current email-search request. Do not continue unrelated prior topics "
+    "from conversation history unless the parent asks."
+)
 MAX_EXPLICIT_MEMORY_CHARS = 240
 EMAIL_LIKE = re.compile(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}")
 CHILD_IS = re.compile(
@@ -2780,7 +2784,7 @@ class FlorenceService:
             return self._agent_turn(
                 household=household,
                 actor=actor,
-                incoming=replace(incoming, text=f"{incoming.text}\n\n{search_note}"),
+                incoming=replace(incoming, text=f"{incoming.text}\n\n{search_note}\n{EMAIL_SEARCH_AGENT_FOCUS}"),
                 now=now,
             )
         items = self._store_email_search_results(
@@ -3652,6 +3656,7 @@ def _email_search_context_for_agent(
     lines = [
         f"Florence searched connected Gmail for '{query}' and found {len(items)} likely matches.",
         "Use these results to answer the parent naturally. Do not ask them to forward emails that are already shown here.",
+        EMAIL_SEARCH_AGENT_FOCUS,
     ]
     for index, item in enumerate(items[:EMAIL_SEARCH_MAX_RESULTS], start=1):
         sender = _source_sender_label(item.sender) or "unknown sender"

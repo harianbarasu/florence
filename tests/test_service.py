@@ -5621,9 +5621,49 @@ def test_parent_can_search_connected_email_from_natural_request(tmp_path, monkey
     assert "Florence searched connected Gmail for 'american flight'" in agent.calls[0]["user_text"]
     assert "American Airlines trip confirmation" in agent.calls[0]["user_text"]
     assert "LAX to Cleveland" in agent.calls[0]["user_text"]
+    assert "Answer only the current email-search request" in agent.calls[0]["user_text"]
     assert outbound[0].text == "I found the American Airlines itinerary in connected Gmail."
     assert snapshot.stored_only == 1
     assert snapshot.by_reason["parent_requested_email_search"] == 1
+
+
+def test_email_search_no_results_focuses_hermes_on_current_request(tmp_path, monkeypatch):
+    service, agent = _google_service(tmp_path)
+    agent.response = "I searched Gmail and did not find a clear American itinerary match."
+    now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
+    chat_id = "search-connected-email-no-results"
+    _store_google_connected_account(service, chat_id=chat_id, now=now)
+
+    class FakeSearchProvider:
+        def __init__(self, **_kwargs):
+            pass
+
+        def search_gmail(self, account, *, query, now_utc, max_results):
+            return []
+
+    monkeypatch.setattr("florence.service.GoogleSourceProvider", FakeSearchProvider)
+    service.handle_incoming(
+        _incoming(
+            "Both kids are doing this camp",
+            chat_id=chat_id,
+            message_id="camp-context",
+        ),
+        now_utc=now,
+    )
+    outbound = service.handle_incoming(
+        _incoming(
+            "Do you see flights in my email on American from LA to Cleveland?",
+            chat_id=chat_id,
+            message_id="flight-search-no-results",
+        ),
+        now_utc=now + timedelta(minutes=1),
+    )
+
+    assert len(agent.calls) == 2
+    assert "Florence searched connected Gmail for 'american flight'" in agent.calls[1]["user_text"]
+    assert "found no clear matches" in agent.calls[1]["user_text"]
+    assert "Answer only the current email-search request" in agent.calls[1]["user_text"]
+    assert outbound[0].text == "I searched Gmail and did not find a clear American itinerary match."
 
 
 def test_short_email_search_followup_uses_previous_parent_message(tmp_path, monkeypatch):
@@ -5673,6 +5713,7 @@ def test_short_email_search_followup_uses_previous_parent_message(tmp_path, monk
     assert len(agent.calls) == 2
     assert "Florence searched connected Gmail for 'american flight'" in agent.calls[1]["user_text"]
     assert "American Airlines trip confirmation" in agent.calls[1]["user_text"]
+    assert "Answer only the current email-search request" in agent.calls[1]["user_text"]
     assert outbound[0].text == "I found the American Airlines itinerary from the earlier flight context."
 
 

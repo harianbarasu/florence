@@ -2694,6 +2694,24 @@ class FlorenceService:
             return None
         if actor.role != MemberRole.PARENT:
             return tone.source_preference_parent_only()
+        explicit_phrases = _explicit_source_feedback_phrases(text, feedback)
+        if explicit_phrases:
+            preference_kind = (
+                SourcePreferenceKind.MUTE
+                if feedback == SourceFeedbackKind.NOT_USEFUL
+                else SourcePreferenceKind.ALWAYS_SURFACE
+            )
+            preferences = [
+                self.store.upsert_source_preference(
+                    household_id=household_id,
+                    phrase=phrase,
+                    preference=preference_kind,
+                    now_utc=now,
+                    created_by_member_id=actor.id,
+                )
+                for phrase in explicit_phrases
+            ]
+            return tone.source_feedback_saved_many(feedback, preferences)
         item = self.store.last_surfaced_source_item(household_id)
         if item is None:
             return tone.source_feedback_without_recent_item()
@@ -3525,6 +3543,62 @@ def _source_feedback_kind(text: str) -> SourceFeedbackKind | None:
     }:
         return SourceFeedbackKind.USEFUL
     return None
+
+
+def _explicit_source_feedback_phrases(text: str, feedback: SourceFeedbackKind) -> list[str]:
+    if feedback != SourceFeedbackKind.NOT_USEFUL:
+        return []
+    normalized = text.replace("’", "'").replace("‘", "'")
+    phrases: list[str] = []
+    for pattern in (
+        r"\b(?:we|i)\s+(?:are\s+not|aren't|arent|won't|wont|will\s+not|not)\s+"
+        r"(?:doing|using|attending|going\s+to|signed\s+up\s+for)\s+"
+        r"(?P<phrase>[^.!?;\n,]+?)(?:\s+so\b|\s+because\b|$)",
+        r"\b(?:any|all|future|the)?\s*(?P<phrase>[A-Za-z0-9\"'“”][^.!?;\n]{1,80}?)\s+"
+        r"(?:emails?|messages?|notices?|alerts?)\s+(?:can|could|should)\s+be\s+ignored\b",
+        r"\bignore\s+(?:any|all|future|the)?\s*(?P<phrase>[^.!?;\n]{2,80}?)"
+        r"(?:\s+emails?|\s+messages?|\s+notices?|\s+alerts?|$)",
+    ):
+        for match in re.finditer(pattern, normalized, flags=re.IGNORECASE):
+            phrase = _clean_explicit_source_feedback_phrase(match.group("phrase"))
+            if phrase and phrase not in phrases:
+                phrases.append(phrase)
+    return phrases[:4]
+
+
+def _clean_explicit_source_feedback_phrase(raw_phrase: str) -> str:
+    phrase = html.unescape(raw_phrase)
+    phrase = phrase.replace("“", '"').replace("”", '"').replace("’", "'").replace("‘", "'")
+    phrase = re.sub(r"\s+", " ", phrase).strip(" \"'.,;:!?()[]{}")
+    phrase = re.sub(r"^(?:any|all|future|the|these|those|this|that)\s+", "", phrase, flags=re.IGNORECASE)
+    phrase = re.sub(
+        r"\s+(?:emails?|messages?|notices?|alerts?|as well|too|please|for now)$",
+        "",
+        phrase,
+        flags=re.IGNORECASE,
+    ).strip(" \"'.,;:!?()[]{}")
+    normalized = _preference_phrase(phrase)
+    if normalized in {
+        "it",
+        "that",
+        "this",
+        "these",
+        "those",
+        "email",
+        "emails",
+        "message",
+        "messages",
+        "stuff",
+        "things",
+        "anything",
+        "everything",
+    }:
+        return ""
+    if not normalized or len(normalized) < 3 or len(normalized.split()) > 8:
+        return ""
+    if PHONE_LIKE.search(phrase) or EMAIL_LIKE.search(phrase):
+        return ""
+    return normalized
 
 
 def _feedback_phrase(item: SourceItem, feedback: SourceFeedbackKind | None = None) -> str:

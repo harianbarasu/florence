@@ -362,6 +362,9 @@ def _phrase_variants(phrase: str) -> set[str]:
     variants = {normalized}
     if not normalized:
         return set()
+    if "-" in normalized:
+        variants.add(normalized.replace("-", " "))
+        variants.add(normalized.replace("-", ""))
     if normalized.endswith("ies") and len(normalized) > 4:
         variants.add(normalized[:-3] + "y")
     elif _can_singularize(normalized):

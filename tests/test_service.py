@@ -3454,6 +3454,64 @@ def test_natural_source_feedback_learns_noisy_promo_phrase(tmp_path):
     assert preferences[0].preference == SourcePreferenceKind.MUTE
 
 
+def test_natural_source_feedback_mutes_named_items_not_latest_source(tmp_path):
+    service, _agent = _service(tmp_path)
+    now = datetime(2026, 6, 10, 14, 15, tzinfo=timezone.utc)
+    chat_id = "source-feedback-named-items"
+
+    service.ingest_source_item(
+        chat_id=chat_id,
+        source_type="email",
+        title="AYSO 7 -- Summer Camp with Link",
+        body="AYSO camp registration is due tomorrow.",
+        event_at_utc=now + timedelta(hours=8),
+        now_utc=now,
+    )
+    latest = service.ingest_source_item(
+        chat_id=chat_id,
+        source_type="email",
+        title="New invoice posted to your account at Young Minds Westchester",
+        body="Payment is due tomorrow.",
+        event_at_utc=now + timedelta(hours=9),
+        now_utc=now + timedelta(minutes=1),
+    )
+
+    feedback = service.handle_incoming(
+        _incoming(
+            "We aren’t doing AYSO camp so that can be ignored. "
+            "Any “amazon drop-off” emails can be ignored as well",
+            chat_id=chat_id,
+            message_id="named-feedback",
+        ),
+        now_utc=now + timedelta(minutes=2),
+    )
+    preferences = service.source_preferences(chat_id=chat_id)
+    future_ayso = service.ingest_source_item(
+        chat_id=chat_id,
+        source_type="email",
+        title="AYSO camp schedule update",
+        body="AYSO camp paperwork is due tomorrow.",
+        event_at_utc=now + timedelta(hours=12),
+        now_utc=now + timedelta(minutes=3),
+    )
+    future_amazon = service.ingest_source_item(
+        chat_id=chat_id,
+        source_type="email",
+        title="Amazon dropoff confirmed",
+        body="Amazon package dropoff is confirmed for tomorrow.",
+        event_at_utc=now + timedelta(hours=13),
+        now_utc=now + timedelta(minutes=4),
+    )
+    phrases = sorted(preference.phrase for preference in preferences)
+
+    assert len(latest) == 1
+    assert "keep ayso camp and amazon drop-off quieter" in feedback[0].text
+    assert "new invoice posted" not in feedback[0].text
+    assert phrases == ["amazon drop-off", "ayso camp"]
+    assert future_ayso == []
+    assert future_amazon == []
+
+
 def test_positive_source_feedback_surfaces_future_similar_items(tmp_path):
     service, _agent = _service(tmp_path)
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)

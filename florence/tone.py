@@ -803,6 +803,26 @@ def source_feedback_saved(feedback: SourceFeedbackKind, preference: SourcePrefer
     return f"Got it. I will watch more closely for {preference.phrase}."
 
 
+def source_feedback_saved_many(feedback: SourceFeedbackKind, preferences: list[SourcePreference]) -> str:
+    if not preferences:
+        return source_feedback_without_recent_item()
+    if len(preferences) == 1:
+        return source_feedback_saved(feedback, preferences[0])
+    phrases = _phrase_list([preference.phrase for preference in preferences])
+    if feedback == SourceFeedbackKind.NOT_USEFUL:
+        return f"Got it. I will keep {phrases} quieter."
+    return f"Got it. I will watch more closely for {phrases}."
+
+
+def _phrase_list(phrases: list[str]) -> str:
+    compact = [phrase for phrase in phrases if phrase]
+    if len(compact) <= 1:
+        return compact[0] if compact else "that"
+    if len(compact) == 2:
+        return f"{compact[0]} and {compact[1]}"
+    return f"{', '.join(compact[:-1])}, and {compact[-1]}"
+
+
 def email_search_parent_only() -> str:
     return "I need one of the parents in this household to search connected email."
 

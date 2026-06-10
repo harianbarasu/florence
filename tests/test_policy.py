@@ -298,6 +298,25 @@ def test_mute_preference_matches_plural_of_parent_phrase():
     assert triage.reason == "household_muted_source"
 
 
+def test_mute_preference_matches_hyphenated_phrase_variants():
+    now = datetime(2026, 6, 10, 16, 0, tzinfo=timezone.utc)
+    policy = NeedToKnowPolicy()
+    preference = _preference("amazon drop-off", SourcePreferenceKind.MUTE, now)
+
+    triage = policy.classify(
+        _item(
+            title="Amazon dropoff confirmed",
+            body="Your package dropoff is confirmed.",
+            event_at_utc=now + timedelta(hours=12),
+        ),
+        now_utc=now,
+        preferences=[preference],
+    )
+
+    assert triage.decision == SourceDecision.STORE_ONLY
+    assert triage.reason == "household_muted_source"
+
+
 def _preference(
     phrase: str,
     kind: SourcePreferenceKind,

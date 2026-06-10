@@ -1,3 +1,4 @@
+import base64
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
@@ -936,6 +937,68 @@ def test_google_provider_fetches_recent_gmail_and_calendar_items(tmp_path):
     assert batch.calendar_events[0]["title"] == "Pediatrician"
     assert batch.calendar_events[0]["starts_at_utc"] == event_start.isoformat()
     assert batch.calendar_events[0]["location"] == "Clinic"
+
+
+def test_google_provider_searches_gmail_with_full_body(tmp_path):
+    service = _google_service(tmp_path)
+    now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
+    account = _store_google_token(
+        service,
+        chat_id="google-search-family",
+        now=now,
+        payload={
+            "access_token": "access-token",
+            "refresh_token": "refresh-token",
+            "scope": "openid email",
+            "expires_at_utc": (now + timedelta(hours=1)).isoformat(),
+        },
+    )
+    message_time = int(now.timestamp() * 1000)
+    body = base64.urlsafe_b64encode(b"LAX to Cleveland. Cleveland to Paris.").decode()
+    queries = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["authorization"] == "Bearer access-token"
+        if request.url.host == "gmail.googleapis.com" and request.url.path.endswith("/messages"):
+            queries.append(request.url.params.get("q"))
+            return httpx.Response(200, json={"messages": [{"id": "message-1"}]})
+        if request.url.host == "gmail.googleapis.com" and request.url.path.endswith("/message-1"):
+            return httpx.Response(
+                200,
+                json={
+                    "id": "message-1",
+                    "internalDate": str(message_time),
+                    "payload": {
+                        "mimeType": "text/plain",
+                        "body": {"data": body},
+                        "headers": [
+                            {"name": "Subject", "value": "American Airlines trip confirmation"},
+                            {"name": "From", "value": "American Airlines <no-reply@aa.com>"},
+                        ],
+                    },
+                },
+            )
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    provider = GoogleSourceProvider(
+        settings=service.settings,
+        store=service.store,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    results = provider.search_gmail(account, query="american flight", now_utc=now)
+
+    assert queries == ["american flight"]
+    assert results == [
+        {
+            "external_id": "search:message-1",
+            "subject": "American Airlines trip confirmation",
+            "sender": "American Airlines <no-reply@aa.com>",
+            "body": "LAX to Cleveland. Cleveland to Paris.",
+            "received_at_utc": now.isoformat(),
+            "connected_account_id": account.id,
+        }
+    ]
 
 
 def test_google_provider_interprets_all_day_events_in_household_timezone(tmp_path):

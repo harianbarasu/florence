@@ -50,8 +50,9 @@ from florence.source_ingest import (
     normalize_source_sender,
     normalize_source_title,
 )
+from florence.source_providers import GoogleSourceProvider
 from florence.store import Store
-from florence.timekeeper import ensure_utc, parse_due_time, utc_now
+from florence.timekeeper import ensure_utc, format_local, parse_due_time, utc_now
 from florence.timekeeper import resolve_timezone
 from florence import tone
 
@@ -117,6 +118,8 @@ SOURCE_DOMAIN_REFERENCES = {
     "that email domain",
 }
 INITIAL_SYNC_SURFACE_REASONS = {"urgent_actionable_source", "high_signal_without_known_due_time"}
+CONNECTED_SOURCE_DUPLICATE_WINDOW = timedelta(days=1)
+EMAIL_SEARCH_MAX_RESULTS = 5
 MAX_EXPLICIT_MEMORY_CHARS = 240
 EMAIL_LIKE = re.compile(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}")
 CHILD_IS = re.compile(
@@ -632,6 +635,10 @@ class FlorenceService:
         )
         if source_feedback_reply is not None:
             return [self._out(household.id, incoming.chat_id, source_feedback_reply, now)]
+
+        email_search_reply = self._maybe_search_connected_email(household, actor, incoming, now)
+        if email_search_reply is not None:
+            return email_search_reply
 
         if self._agent_should_lead_active_conversation(
             household.id,
@@ -1511,6 +1518,10 @@ class FlorenceService:
             should_surface = False
             decision = SourceDecision.STORE_ONLY
             reason = "parent_submitted_context"
+        if should_surface and self._is_recent_duplicate_connected_source(item, now):
+            should_surface = False
+            decision = SourceDecision.STORE_ONLY
+            reason = "duplicate_connected_source"
         surfaced_at = now if should_surface and mark_surfaced else None
         inserted = self.store.add_source_item(
             item,
@@ -1563,6 +1574,18 @@ class FlorenceService:
                 save_message=mark_surfaced,
             )
         ]
+
+    def _is_recent_duplicate_connected_source(self, item: SourceItem, now: datetime) -> bool:
+        if item.connected_account_id is None:
+            return False
+        return self.store.has_recent_similar_source_item(
+            household_id=item.household_id,
+            source_type=item.source_type,
+            sender=item.sender,
+            title=item.title,
+            since_utc=ensure_utc(now) - CONNECTED_SOURCE_DUPLICATE_WINDOW,
+            exclude_id=item.id,
+        )
 
     def daily_briefing_messages(
         self,
@@ -2670,7 +2693,7 @@ class FlorenceService:
         item = self.store.last_surfaced_source_item(household_id)
         if item is None:
             return tone.source_feedback_without_recent_item()
-        phrase = _feedback_phrase(item)
+        phrase = _feedback_phrase(item, feedback)
         preference_kind = (
             SourcePreferenceKind.MUTE
             if feedback == SourceFeedbackKind.NOT_USEFUL
@@ -2692,6 +2715,135 @@ class FlorenceService:
             created_at_utc=now,
         )
         return tone.source_feedback_saved(feedback, preference)
+
+    def _maybe_search_connected_email(
+        self,
+        household: Household,
+        actor: HouseholdMember,
+        incoming: IncomingMessage,
+        now: datetime,
+    ) -> list[OutboundMessage] | None:
+        if not _email_search_requested(incoming.text):
+            return None
+        if actor.role != MemberRole.PARENT:
+            return [self._out(household.id, incoming.chat_id, tone.email_search_parent_only(), now)]
+        accounts = [
+            account
+            for account in self.store.list_connected_accounts(household.id)
+            if account.provider == "google"
+            and account.status == ConnectedAccountStatus.ACTIVE
+            and self.store.get_connected_account_token(account.id) is not None
+        ]
+        if not accounts:
+            return [self._out(household.id, incoming.chat_id, tone.email_search_no_connected_email(), now)]
+        query_source = self._email_search_context(household.id, incoming)
+        queries = _gmail_search_queries(query_source)
+        if not queries:
+            return [self._out(household.id, incoming.chat_id, tone.email_search_no_results("that"), now)]
+        provider = GoogleSourceProvider(settings=self.settings, store=self.store)
+        results: list[dict[str, object]] = []
+        seen: set[tuple[str, str]] = set()
+        failed = 0
+        for account in accounts:
+            for query in queries:
+                if len(results) >= EMAIL_SEARCH_MAX_RESULTS:
+                    break
+                try:
+                    matches = provider.search_gmail(
+                        account,
+                        query=query,
+                        now_utc=now,
+                        max_results=EMAIL_SEARCH_MAX_RESULTS - len(results),
+                    )
+                except Exception:
+                    failed += 1
+                    continue
+                for match in matches:
+                    key = (
+                        str(match.get("sender") or "").lower(),
+                        str(match.get("subject") or "").lower(),
+                    )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    results.append(match)
+                    if len(results) >= EMAIL_SEARCH_MAX_RESULTS:
+                        break
+            if len(results) >= EMAIL_SEARCH_MAX_RESULTS:
+                break
+        if not results:
+            search_note = (
+                f"Florence searched connected Gmail for '{queries[0]}' but the provider failed."
+                if failed
+                else f"Florence searched connected Gmail for '{queries[0]}' and found no clear matches."
+            )
+            return self._agent_turn(
+                household=household,
+                actor=actor,
+                incoming=replace(incoming, text=f"{incoming.text}\n\n{search_note}"),
+                now=now,
+            )
+        items = self._store_email_search_results(
+            household=household,
+            results=results,
+            now=now,
+        )
+        search_context = _email_search_context_for_agent(
+            query=queries[0],
+            items=items,
+            timezone_name=household.timezone,
+        )
+        return self._agent_turn(
+            household=household,
+            actor=actor,
+            incoming=replace(incoming, text=f"{incoming.text}\n\n{search_context}"),
+            now=now,
+        )
+
+    def _email_search_context(self, household_id: str, incoming: IncomingMessage) -> str:
+        if len(_email_search_keywords(incoming.text)) >= 2:
+            return incoming.text
+        history = self.store.recent_messages(
+            household_id,
+            limit=6,
+            exclude_message_id=incoming.message_id,
+        )
+        for message in reversed(history):
+            content = message.get("content") or ""
+            if message.get("role") == "user" and not _email_search_requested(content):
+                return content
+        return incoming.text
+
+    def _store_email_search_results(
+        self,
+        *,
+        household: Household,
+        results: list[dict[str, object]],
+        now: datetime,
+    ) -> list[SourceItem]:
+        items: list[SourceItem] = []
+        for result in results:
+            received_at = _coerce_dt(result.get("received_at_utc"), now)
+            item = email_to_source_item(
+                EmailCandidate(
+                    household_id=household.id,
+                    subject=str(result.get("subject") or ""),
+                    body=str(result.get("body") or ""),
+                    sender=str(result.get("sender") or ""),
+                    received_at_utc=received_at,
+                    external_id=_optional_str(result.get("external_id")),
+                    connected_account_id=_optional_str(result.get("connected_account_id")),
+                )
+            )
+            self.store.add_source_item(
+                item,
+                decision=SourceDecision.STORE_ONLY.value,
+                reason="parent_requested_email_search",
+                priority=30,
+                surfaced_at_utc=None,
+            )
+            items.append(item)
+        return items
 
     def _maybe_show_source_preferences(
         self,
@@ -3334,14 +3486,29 @@ def _help_topic(lower: str) -> str | None:
 def _source_feedback_kind(text: str) -> SourceFeedbackKind | None:
     normalized = " ".join(text.strip(" .!?").lower().split())
     if normalized in {
+        "can be ignored",
+        "definitely ignore this",
+        "ignore emails like this",
+        "ignore this",
+        "ignore these",
         "not important",
         "not useful",
+        "spammy",
         "too noisy",
         "dont show this",
         "don't show this",
         "keep this quiet",
         "mute this",
+        "these can be ignored",
+        "this can be ignored",
     }:
+        return SourceFeedbackKind.NOT_USEFUL
+    if (
+        ("ignore" in normalized or "ignored" in normalized)
+        and any(marker in normalized for marker in ("email", "emails", "this", "these", "like this"))
+    ):
+        return SourceFeedbackKind.NOT_USEFUL
+    if any(marker in normalized for marker in ("too promotional", "marketing email", "marketing emails")):
         return SourceFeedbackKind.NOT_USEFUL
     if normalized in {
         "important",
@@ -3356,9 +3523,151 @@ def _source_feedback_kind(text: str) -> SourceFeedbackKind | None:
     return None
 
 
-def _feedback_phrase(item: SourceItem) -> str:
+def _feedback_phrase(item: SourceItem, feedback: SourceFeedbackKind | None = None) -> str:
+    if feedback == SourceFeedbackKind.NOT_USEFUL:
+        noisy_phrase = _noisy_feedback_phrase(item)
+        if noisy_phrase:
+            return noisy_phrase
     title = " ".join(item.title.strip(" .").lower().split())
     return title[:120] or item.source_type
+
+
+def _noisy_feedback_phrase(item: SourceItem) -> str | None:
+    text = f"{item.title}\n{item.body}".lower()
+    for phrase in (
+        "final few spots",
+        "few spots",
+        "limited space",
+        "spots left",
+        "register now",
+        "enroll now",
+        "enrollment open",
+        "starts next week",
+        "summer camp starts",
+        "gift ideas",
+        "view online",
+    ):
+        if phrase in text:
+            return phrase
+    return None
+
+
+def _email_search_requested(text: str) -> bool:
+    normalized = " ".join(text.strip(" .!?").lower().split())
+    if not normalized:
+        return False
+    if any(
+        marker in normalized
+        for marker in (
+            "search my email",
+            "search our email",
+            "search email",
+            "search gmail",
+            "look in my email",
+            "look through my email",
+            "check my email",
+            "check gmail",
+            "find in my email",
+            "find it in my email",
+        )
+    ):
+        return True
+    return "in my email" in normalized and normalized.startswith(("do you see", "can you find", "find"))
+
+
+def _gmail_search_queries(text: str) -> list[str]:
+    keywords = _email_search_keywords(text)
+    if not keywords:
+        return []
+    queries: list[str] = []
+    airline = next((word for word in keywords if word in {"american", "delta", "united", "jetblue", "southwest"}), "")
+    if airline:
+        queries.append(f"{airline} flight")
+        queries.append(airline)
+    if len(keywords) >= 2:
+        queries.append(" ".join(keywords[:5]))
+    queries.append(keywords[0])
+    deduped: list[str] = []
+    for query in queries:
+        if query and query not in deduped:
+            deduped.append(query)
+    return deduped[:4]
+
+
+def _email_search_keywords(text: str) -> list[str]:
+    stopwords = {
+        "add",
+        "also",
+        "and",
+        "are",
+        "back",
+        "can",
+        "check",
+        "connected",
+        "details",
+        "email",
+        "find",
+        "flight",
+        "flights",
+        "from",
+        "have",
+        "here",
+        "into",
+        "look",
+        "mail",
+        "my",
+        "our",
+        "search",
+        "see",
+        "the",
+        "then",
+        "there",
+        "these",
+        "they",
+        "those",
+        "through",
+        "to",
+        "trip",
+        "with",
+        "you",
+    }
+    keywords: list[str] = []
+    for raw in re.findall(r"[A-Za-z][A-Za-z0-9']*", text):
+        word = raw.lower().strip("'")
+        if len(word) <= 2 and word not in {"la"}:
+            continue
+        if word in stopwords:
+            continue
+        if word not in keywords:
+            keywords.append(word)
+    return keywords[:8]
+
+
+def _email_search_context_for_agent(
+    *,
+    query: str,
+    items: list[SourceItem],
+    timezone_name: str,
+) -> str:
+    lines = [
+        f"Florence searched connected Gmail for '{query}' and found {len(items)} likely matches.",
+        "Use these results to answer the parent naturally. Do not ask them to forward emails that are already shown here.",
+    ]
+    for index, item in enumerate(items[:EMAIL_SEARCH_MAX_RESULTS], start=1):
+        sender = _source_sender_label(item.sender) or "unknown sender"
+        observed = format_local(item.observed_at_utc, timezone_name)
+        snippet = _email_search_snippet(item.body)
+        lines.append(f"{index}. {item.title} from {sender} ({observed})")
+        if snippet:
+            lines.append(f"   Snippet: {snippet}")
+    return "\n".join(lines)
+
+
+def _email_search_snippet(body: str) -> str:
+    compact = " ".join(html.unescape(body).split())
+    if len(compact) <= 500:
+        return compact
+    return compact[:501].rsplit(" ", 1)[0].rstrip(" ,;:-") + "..."
 
 
 def _source_sender_label(sender: str | None) -> str | None:
@@ -3692,6 +4001,7 @@ def _active_conversation_rail_command(text: str, lower: str) -> bool:
         or _calendar_event_text(text) is not None
         or _reminder_resolution(text) is not None
         or _source_feedback_kind(text) is not None
+        or _email_search_requested(text)
     ):
         return True
     return lower.strip(" ?") in {

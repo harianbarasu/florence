@@ -64,7 +64,11 @@ LOW_SIGNAL_KEYWORDS = {
     "digest",
     "facebook",
     "father's day",
+    "few spots",
+    "final few spots",
     "gift ideas",
+    "last chance",
+    "limited space",
     "recap",
     "receipt",
     "order confirmation",
@@ -80,8 +84,14 @@ LOW_SIGNAL_KEYWORDS = {
     "marketing",
     "manage preferences",
     "not too late",
+    "register now",
+    "enroll now",
+    "enrollment open",
     "sponsored",
+    "spots left",
     "stay tuned",
+    "starts next week",
+    "summer camp starts",
     "tiktok",
     "unsubscribe",
     "view online",
@@ -337,7 +347,7 @@ def _requested_source_is_low_signal(
         preference is not None
         and _preference_needs_concrete_signal(preference.phrase)
         and low_signal_score > 0
-        and action_score == 0
+        and (action_score == 0 or low_signal_score > action_score)
         and high_signal_no_time_score == 0
     )
 

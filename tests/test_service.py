@@ -2775,6 +2775,45 @@ def test_connected_source_sync_scopes_external_ids_by_account(tmp_path):
     assert snapshot.total == 2
 
 
+def test_connected_source_duplicate_across_accounts_surfaces_once(tmp_path):
+    service, _agent = _service(tmp_path)
+    now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
+    payload = {
+        "subject": "Permission slip due",
+        "body": "Please sign and bring the permission slip for tomorrow's field trip.",
+        "sender": "teacher@example.com",
+        "received_at_utc": now.isoformat(),
+        "event_at_utc": (now + timedelta(hours=8)).isoformat(),
+    }
+
+    one = service.sync_connected_sources(
+        chat_id="sync-two-account-action",
+        provider="google",
+        external_account_id="one@example.com",
+        now_utc=now,
+        emails=[{**payload, "external_id": "one-message"}],
+    )
+    two = service.sync_connected_sources(
+        chat_id="sync-two-account-action",
+        provider="google",
+        external_account_id="two@example.com",
+        now_utc=now,
+        emails=[{**payload, "external_id": "two-message"}],
+    )
+    snapshot = service.source_review_snapshot(chat_id="sync-two-account-action", now_utc=now)
+
+    assert one.imported == 1
+    assert one.surfaced == 1
+    assert len(one.messages) == 1
+    assert two.imported == 1
+    assert two.surfaced == 0
+    assert two.messages == []
+    assert snapshot.total == 2
+    assert snapshot.surfaced == 1
+    assert snapshot.stored_only == 1
+    assert snapshot.by_reason["duplicate_connected_source"] == 1
+
+
 def test_actionable_email_import_surfaces_once(tmp_path):
     service, _agent = _service(tmp_path)
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
@@ -3384,6 +3423,35 @@ def test_negative_source_feedback_mutes_future_similar_items(tmp_path):
     assert snapshot.surfaced == 1
     assert snapshot.stored_only == 1
     assert snapshot.by_reason["household_muted_source"] == 1
+
+
+def test_natural_source_feedback_learns_noisy_promo_phrase(tmp_path):
+    service, _agent = _service(tmp_path)
+    now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
+
+    first = service.ingest_source_item(
+        chat_id="source-feedback-promo",
+        source_type="email",
+        title="Final Few Spots! SUMMER CAMP starts NEXT WEEK!",
+        body="Registration due tomorrow. Limited space at Runway, Playa Vista.",
+        sender="So Fly Kids Camp <hello@soflykidscamp.example>",
+        event_at_utc=now + timedelta(hours=8),
+        now_utc=now,
+    )
+    feedback = service.handle_incoming(
+        _incoming(
+            "these can be ignored",
+            chat_id="source-feedback-promo",
+            message_id="promo-feedback",
+        ),
+        now_utc=now + timedelta(minutes=1),
+    )
+    preferences = service.source_preferences(chat_id="source-feedback-promo")
+
+    assert len(first) == 1
+    assert "keep final few spots quieter" in feedback[0].text
+    assert preferences[0].phrase == "final few spots"
+    assert preferences[0].preference == SourcePreferenceKind.MUTE
 
 
 def test_positive_source_feedback_surfaces_future_similar_items(tmp_path):
@@ -5507,6 +5575,105 @@ def test_parent_can_start_google_connection_with_natural_text(tmp_path):
 
     assert "Use this link to connect Google Calendar and Gmail" in outbound[0].text
     assert "accounts.google.com" in outbound[0].text
+
+
+def test_parent_can_search_connected_email_from_natural_request(tmp_path, monkeypatch):
+    service, agent = _google_service(tmp_path)
+    agent.response = "I found the American Airlines itinerary in connected Gmail."
+    now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
+    chat_id = "search-connected-email"
+    _store_google_connected_account(service, chat_id=chat_id, now=now)
+    calls = []
+
+    class FakeSearchProvider:
+        def __init__(self, **_kwargs):
+            pass
+
+        def search_gmail(self, account, *, query, now_utc, max_results):
+            calls.append(query)
+            if query != "american flight":
+                return []
+            return [
+                {
+                    "external_id": "american-flight-email",
+                    "subject": "American Airlines trip confirmation",
+                    "sender": "American Airlines <no-reply@aa.com>",
+                    "body": "LAX to Cleveland. Cleveland to Paris. Paris to LAX.",
+                    "received_at_utc": now_utc.isoformat(),
+                    "connected_account_id": account.id,
+                }
+            ]
+
+    monkeypatch.setattr("florence.service.GoogleSourceProvider", FakeSearchProvider)
+    outbound = service.handle_incoming(
+        _incoming(
+            "Do you see flights in my email on American from LA to Cleveland, "
+            "and then flights from Cleveland to Paris and back to LA?",
+            chat_id=chat_id,
+            message_id="flight-question",
+        ),
+        now_utc=now,
+    )
+    snapshot = service.source_review_snapshot(chat_id=chat_id, now_utc=now)
+
+    assert calls[0] == "american flight"
+    assert len(agent.calls) == 1
+    assert "Florence searched connected Gmail for 'american flight'" in agent.calls[0]["user_text"]
+    assert "American Airlines trip confirmation" in agent.calls[0]["user_text"]
+    assert "LAX to Cleveland" in agent.calls[0]["user_text"]
+    assert outbound[0].text == "I found the American Airlines itinerary in connected Gmail."
+    assert snapshot.stored_only == 1
+    assert snapshot.by_reason["parent_requested_email_search"] == 1
+
+
+def test_short_email_search_followup_uses_previous_parent_message(tmp_path, monkeypatch):
+    service, agent = _google_service(tmp_path)
+    agent.response = "I found the American Airlines itinerary from the earlier flight context."
+    now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
+    chat_id = "search-connected-email-followup"
+    _store_google_connected_account(service, chat_id=chat_id, now=now)
+    calls = []
+
+    class FakeSearchProvider:
+        def __init__(self, **_kwargs):
+            pass
+
+        def search_gmail(self, account, *, query, now_utc, max_results):
+            calls.append(query)
+            return [
+                {
+                    "external_id": "american-flight-email",
+                    "subject": "American Airlines trip confirmation",
+                    "sender": "American Airlines <no-reply@aa.com>",
+                    "body": "LAX to Cleveland. Cleveland to Paris. Paris to LAX.",
+                    "received_at_utc": now_utc.isoformat(),
+                    "connected_account_id": account.id,
+                }
+            ]
+
+    monkeypatch.setattr("florence.service.GoogleSourceProvider", FakeSearchProvider)
+    service.handle_incoming(
+        _incoming(
+            "The France flights are on American: LA to Cleveland, Cleveland to Paris, Paris to LA.",
+            chat_id=chat_id,
+            message_id="flight-context",
+        ),
+        now_utc=now,
+    )
+    outbound = service.handle_incoming(
+        _incoming(
+            "Search my email they are there",
+            chat_id=chat_id,
+            message_id="flight-search",
+        ),
+        now_utc=now + timedelta(minutes=1),
+    )
+
+    assert calls[0] == "american flight"
+    assert len(agent.calls) == 2
+    assert "Florence searched connected Gmail for 'american flight'" in agent.calls[1]["user_text"]
+    assert "American Airlines trip confirmation" in agent.calls[1]["user_text"]
+    assert outbound[0].text == "I found the American Airlines itinerary from the earlier flight context."
 
 
 def test_google_connection_command_is_parent_only(tmp_path):

@@ -2099,6 +2099,45 @@ class Store:
             )
         return cur.rowcount > 0
 
+    def has_recent_similar_source_item(
+        self,
+        *,
+        household_id: str,
+        source_type: str,
+        sender: str | None,
+        title: str,
+        since_utc: datetime,
+        exclude_id: str | None = None,
+    ) -> bool:
+        filters = [
+            "household_id = ?",
+            "source_type = ?",
+            "LOWER(title) = LOWER(?)",
+            "LOWER(COALESCE(sender, '')) = LOWER(?)",
+            "observed_at_utc >= ?",
+        ]
+        params: list[object] = [
+            household_id,
+            source_type,
+            title,
+            sender or "",
+            _iso(since_utc),
+        ]
+        if exclude_id is not None:
+            filters.append("id != ?")
+            params.append(exclude_id)
+        with self.connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT 1
+                FROM source_items
+                WHERE {' AND '.join(filters)}
+                LIMIT 1
+                """,
+                params,
+            ).fetchone()
+        return row is not None
+
     def upsert_connected_account(
         self,
         *,

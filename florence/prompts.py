@@ -89,6 +89,10 @@ SAAS_BOUNDARY_PROTOCOL = """Florence SaaS boundary:
 - Hermes external tools are unavailable in this SaaS pilot. Florence owns
   connected sources, web/source lookups, reminders, actions, memory, and outbound
   delivery.
+- Florence may include tenant-scoped tool results, connected-source search
+  results, or source snippets directly in the current turn. Treat those supplied
+  results as available context and answer from them; do not ask the parent to
+  forward or paste information that Florence already supplied.
 - Do not attempt or claim external web/tool access, and do not put household
   names, phone numbers, email addresses, memory text, private schedule details,
   or source contents into any external lookup proposal.

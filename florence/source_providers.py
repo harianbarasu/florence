@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import base64
+import html
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
@@ -13,8 +16,10 @@ import httpx
 from florence.config import Settings
 from florence.models import ConnectedAccount, OutboundMessage
 from florence.oauth import GOOGLE_TOKEN_ENDPOINT, TokenVault, TokenVaultError
-from florence.service import FlorenceService
 from florence.timekeeper import ensure_utc
+
+if TYPE_CHECKING:
+    from florence.service import FlorenceService
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +91,35 @@ class GoogleSourceProvider:
         if expires_at is None:
             expires_at = token_record.expires_at_utc
         return ProviderBatch(emails=emails, calendar_events=calendar_events, cursor=cursor)
+
+    def search_gmail(
+        self,
+        account: ConnectedAccount,
+        *,
+        query: str,
+        now_utc: datetime,
+        max_results: int = 5,
+    ) -> list[dict[str, object]]:
+        if self.settings is None or self.store is None or not self.settings.token_encryption_key:
+            return []
+        token_record = self.store.get_connected_account_token(account.id)
+        if token_record is None:
+            return []
+        vault = TokenVault.from_settings(self.settings)
+        token_payload = vault.decrypt(token_record.token_ciphertext)
+        access_token, _expires_at = self._access_token(
+            account=account,
+            token_payload=token_payload,
+            vault=vault,
+            now_utc=ensure_utc(now_utc),
+        )
+        return self._search_gmail(
+            account=account,
+            access_token=access_token,
+            query=query,
+            now_utc=now_utc,
+            max_results=max_results,
+        )
 
     def _access_token(
         self,
@@ -195,6 +229,58 @@ class GoogleSourceProvider:
                 ("metadataHeaders", "From"),
                 ("metadataHeaders", "Date"),
             ],
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data if isinstance(data, dict) else {}
+
+    def _search_gmail(
+        self,
+        *,
+        account: ConnectedAccount,
+        access_token: str,
+        query: str,
+        now_utc: datetime,
+        max_results: int,
+    ) -> list[dict[str, object]]:
+        response = self._client.get(
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+            params={
+                "maxResults": max(1, min(10, max_results)),
+                "q": query,
+            },
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        messages = payload.get("messages") if isinstance(payload, dict) else None
+        if not isinstance(messages, list):
+            return []
+        emails: list[dict[str, object]] = []
+        for message in messages:
+            if not isinstance(message, dict) or not message.get("id"):
+                continue
+            detail = self._gmail_full_message(str(message["id"]), access_token)
+            received_at = _gmail_internal_date(detail) or ensure_utc(now_utc)
+            headers = _gmail_headers(detail)
+            body = _gmail_body(detail) or str(detail.get("snippet") or "")
+            emails.append(
+                {
+                    "external_id": f"search:{detail.get('id') or message['id']}",
+                    "subject": headers.get("subject") or "(No subject)",
+                    "sender": headers.get("from") or "",
+                    "body": body,
+                    "received_at_utc": received_at.isoformat(),
+                    "connected_account_id": account.id,
+                }
+            )
+        return emails
+
+    def _gmail_full_message(self, message_id: str, access_token: str) -> dict[str, Any]:
+        response = self._client.get(
+            f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}",
+            params=[("format", "full")],
             headers={"Authorization": f"Bearer {access_token}"},
         )
         response.raise_for_status()
@@ -392,6 +478,57 @@ def _gmail_headers(message: dict[str, Any]) -> dict[str, str]:
         if name and value:
             result[name] = value
     return result
+
+
+def _gmail_body(message: dict[str, Any]) -> str:
+    payload = message.get("payload")
+    if not isinstance(payload, dict):
+        return ""
+    parts = _gmail_text_parts(payload)
+    plain = [text for mime_type, text in parts if mime_type == "text/plain" and text.strip()]
+    html_parts = [text for mime_type, text in parts if mime_type == "text/html" and text.strip()]
+    if plain:
+        return _clean_email_text("\n".join(plain))
+    if html_parts:
+        return _clean_email_text("\n".join(_strip_html(part) for part in html_parts))
+    return _clean_email_text(_decode_gmail_body(payload.get("body")))
+
+
+def _gmail_text_parts(payload: dict[str, Any]) -> list[tuple[str, str]]:
+    results: list[tuple[str, str]] = []
+    mime_type = str(payload.get("mimeType") or "")
+    decoded = _decode_gmail_body(payload.get("body"))
+    if decoded:
+        results.append((mime_type, decoded))
+    parts = payload.get("parts")
+    if isinstance(parts, list):
+        for part in parts:
+            if isinstance(part, dict):
+                results.extend(_gmail_text_parts(part))
+    return results
+
+
+def _decode_gmail_body(body: object) -> str:
+    if not isinstance(body, dict):
+        return ""
+    data = body.get("data")
+    if not isinstance(data, str) or not data:
+        return ""
+    padded = data + ("=" * (-len(data) % 4))
+    try:
+        return base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8", errors="replace")
+    except (ValueError, TypeError):
+        return ""
+
+
+def _strip_html(value: str) -> str:
+    without_tags = re.sub(r"<[^>]+>", " ", value)
+    return html.unescape(without_tags)
+
+
+def _clean_email_text(value: str) -> str:
+    compact = " ".join(html.unescape(value).split())
+    return compact[:2000]
 
 
 def _calendar_start(item: dict[str, Any], calendar_zone: ZoneInfo) -> datetime | None:

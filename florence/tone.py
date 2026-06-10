@@ -803,6 +803,18 @@ def source_feedback_saved(feedback: SourceFeedbackKind, preference: SourcePrefer
     return f"Got it. I will watch more closely for {preference.phrase}."
 
 
+def email_search_parent_only() -> str:
+    return "I need one of the parents in this household to search connected email."
+
+
+def email_search_no_connected_email() -> str:
+    return "I do not have a connected Gmail account for this household yet."
+
+
+def email_search_no_results(query: str) -> str:
+    return f"I searched connected Gmail for {query} and did not find a clear match."
+
+
 def _source_review_item(item: BriefingSourceItem, timezone_name: str) -> str:
     if item.event_at_utc is None:
         return item.title
@@ -819,12 +831,14 @@ def _source_reason(reason: str | None) -> str:
     labels = {
         "actionable_without_known_due_time": "actionable, no clear due time",
         "automated_background_notice": "automated background notice",
+        "duplicate_connected_source": "duplicate connected source",
         "event_is_in_the_past": "past item",
         "household_muted_source": "muted by your rule",
         "household_requested_source": "requested by your rule",
         "initial_sync_backfill": "first sync backfill",
         "low_signal_source": "low signal",
         "no_due_time_and_not_actionable": "no clear action",
+        "parent_requested_email_search": "found during email search",
         "requested_source_low_signal": "requested but low signal",
         "upcoming_actionable_source": "upcoming action",
         "urgent_actionable_source": "urgent action",

@@ -299,6 +299,7 @@ def test_hermes_system_message_uses_saas_boundary_and_redacts_unnamed_member_pho
     assert "Florence SaaS boundary:" in system_message
     assert "Treat this as an ephemeral SaaS turn." in system_message
     assert "Hermes external tools are unavailable in this SaaS pilot." in system_message
+    assert "results as available context" in system_message
     assert "Do not attempt or claim external web/tool access" in system_message
     assert "Current sender: unnamed parent (parent)" in system_message
     assert "- unnamed parent: parent" in system_message

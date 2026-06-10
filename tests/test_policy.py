@@ -258,6 +258,27 @@ def test_broad_requested_source_does_not_surface_promotional_event():
     assert triage.reason == "requested_source_low_signal"
 
 
+def test_broad_requested_source_does_not_surface_scarcity_camp_marketing():
+    now = datetime(2026, 6, 9, 16, 0, tzinfo=timezone.utc)
+    policy = NeedToKnowPolicy()
+    preference = _preference("camp", SourcePreferenceKind.ALWAYS_SURFACE, now)
+
+    triage = policy.classify(
+        _item(
+            title="Final Few Spots! SUMMER CAMP starts NEXT WEEK!",
+            body="Register now for limited space at Runway, Playa Vista on June 15.",
+            sender="So Fly Kids Camp <hello@soflykidscamp.example>",
+            observed_at_utc=now,
+            event_at_utc=now + timedelta(days=6),
+        ),
+        now_utc=now,
+        preferences=[preference],
+    )
+
+    assert triage.decision == SourceDecision.STORE_ONLY
+    assert triage.reason == "requested_source_low_signal"
+
+
 def test_mute_preference_matches_plural_of_parent_phrase():
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
     policy = NeedToKnowPolicy()

@@ -495,7 +495,7 @@ def test_worker_source_sync_retries_failed_surface_after_cursor_advances(tmp_pat
     assert failed_delivery["attempts"] == 1
     assert source_count_after_failure == 1
     assert failed_source["surfaced_at_utc"] is None
-    assert "recent source item" in feedback_before_retry[0].text
+    assert feedback_before_retry[0].text == "Fake agent reply."
     assert retry_result.surfaced == 0
     assert retry_sender.sent[0]["idempotency_key"] == failed_delivery["idempotency_key"]
     assert "Permission slip due" in retry_sender.sent[0]["text"]

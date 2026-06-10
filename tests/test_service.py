@@ -272,7 +272,7 @@ def test_manual_group_chat_does_not_guess_when_phone_is_in_multiple_households(t
     assert new_household.id not in {first.id, second.id}
     assert outbound[0].text == "Fake agent reply."
     assert len(agent.calls) == 1
-    assert "Florence computed this onboarding greeting" in agent.calls[0]["user_text"]
+    assert agent.calls[0]["user_text"] == "Hi"
 
 
 def test_unknown_chat_from_known_single_parent_does_not_reuse_household_without_handoff(tmp_path):
@@ -865,9 +865,7 @@ def test_first_greeting_is_natural_without_setup_command_or_hermes(tmp_path):
 
     assert len(outbound) == 1
     assert outbound[0].text == "Fake agent reply."
-    assert "I'm Florence" in agent.calls[-1]["user_text"]
-    assert "You can just text me normally" in agent.calls[-1]["user_text"]
-    assert "What should I call you?" in agent.calls[-1]["user_text"]
+    assert agent.calls[-1]["user_text"] == "hi!"
     assert "setup status" not in agent.calls[-1]["user_text"].lower()
     assert household is not None
     assert service.store.list_members(household.id)[0].role.value == "parent"
@@ -1018,8 +1016,7 @@ def test_existing_incomplete_household_greeting_resumes_onboarding_naturally(tmp
     )
 
     assert outbound[0].text == "Fake agent reply."
-    assert "Hi Hari. I can keep going from here." in agent.calls[-1]["user_text"]
-    assert "https://florence.example.com/onboarding/" in agent.calls[-1]["user_text"]
+    assert agent.calls[-1]["user_text"] == "hi"
     assert "setup status" not in agent.calls[-1]["user_text"].lower()
 
 
@@ -1043,8 +1040,7 @@ def test_existing_incomplete_household_low_content_reply_resumes_onboarding_natu
     )
 
     assert outbound[0].text == "Fake agent reply."
-    assert "I can keep going from here" in agent.calls[-1]["user_text"]
-    assert "https://florence.example.com/onboarding/" in agent.calls[-1]["user_text"]
+    assert agent.calls[-1]["user_text"] == "sounds good"
     assert "setup status" not in agent.calls[-1]["user_text"].lower()
 
 
@@ -1142,6 +1138,27 @@ def test_bare_name_reply_only_applies_after_name_prompt(tmp_path):
     assert outbound[0].text == "Fake agent reply."
     assert members[0].display_name is None
     assert len(agent.calls) == 1
+
+
+def test_low_content_reply_after_greeting_does_not_become_name(tmp_path):
+    service, agent = _service(tmp_path)
+    now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
+
+    service.handle_incoming(
+        _incoming("hi", chat_id="low-content-name", message_id="hello"),
+        now_utc=now,
+    )
+    outbound = service.handle_incoming(
+        _incoming("sounds good", chat_id="low-content-name", message_id="sounds-good"),
+        now_utc=now + timedelta(minutes=1),
+    )
+    household = service.store.get_household_by_chat("low-content-name")
+    assert household is not None
+    members = service.store.list_members(household.id)
+
+    assert outbound[0].text == "Fake agent reply."
+    assert agent.calls[-1]["user_text"] == "sounds good"
+    assert members[0].display_name is None
 
 
 def test_prompted_partner_phone_starts_invite_flow(tmp_path):
@@ -3321,7 +3338,7 @@ def test_source_preferences_are_parent_only(tmp_path):
 
 
 def test_source_feedback_without_recent_item_is_clear(tmp_path):
-    service, _agent = _service(tmp_path)
+    service, agent = _service(tmp_path)
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
 
     outbound = service.handle_incoming(
@@ -3329,7 +3346,9 @@ def test_source_feedback_without_recent_item_is_clear(tmp_path):
         now_utc=now,
     )
 
-    assert "do not have a recent source item" in outbound[0].text
+    assert outbound[0].text == "Fake agent reply."
+    assert agent.calls[-1]["user_text"] == "not useful"
+    assert service.source_preferences(chat_id="source-feedback-empty") == []
 
 
 def test_mute_this_sender_requires_recent_source_item(tmp_path):
@@ -3432,7 +3451,12 @@ def test_parent_can_mute_last_surfaced_sender_domain(tmp_path):
 
 def test_negative_source_feedback_mutes_future_similar_items(tmp_path):
     service, agent = _service(tmp_path)
-    agent.response = "Got it. I will keep those quieter."
+    agent.response = (
+        "Got it. I will keep those quieter.\n"
+        "```florence\n"
+        '{"source_preferences":[{"preference":"mute","phrase":"weekly school newsletter"}]}\n'
+        "```"
+    )
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
 
     service.handle_incoming(
@@ -3471,8 +3495,7 @@ def test_negative_source_feedback_mutes_future_similar_items(tmp_path):
 
     assert len(first) == 1
     assert feedback[0].text == "Got it. I will keep those quieter."
-    assert "Florence applied connected-source feedback" in agent.calls[-1]["user_text"]
-    assert "mute: weekly school newsletter" in agent.calls[-1]["user_text"]
+    assert agent.calls[-1]["user_text"] == "not useful"
     assert second == []
     assert snapshot.surfaced == 1
     assert snapshot.stored_only == 1
@@ -3481,7 +3504,12 @@ def test_negative_source_feedback_mutes_future_similar_items(tmp_path):
 
 def test_natural_source_feedback_learns_noisy_promo_phrase(tmp_path):
     service, agent = _service(tmp_path)
-    agent.response = "Got it. I will keep that kind of camp promo quieter."
+    agent.response = (
+        "Got it. I will keep that kind of camp promo quieter.\n"
+        "```florence\n"
+        '{"source_preferences":[{"preference":"mute","phrase":"final few spots"}]}\n'
+        "```"
+    )
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
 
     first = service.ingest_source_item(
@@ -3505,15 +3533,22 @@ def test_natural_source_feedback_learns_noisy_promo_phrase(tmp_path):
 
     assert len(first) == 1
     assert feedback[0].text == "Got it. I will keep that kind of camp promo quieter."
-    assert "Florence applied connected-source feedback" in agent.calls[-1]["user_text"]
-    assert "mute: final few spots" in agent.calls[-1]["user_text"]
+    assert agent.calls[-1]["user_text"] == "these can be ignored"
     assert preferences[0].phrase == "final few spots"
     assert preferences[0].preference == SourcePreferenceKind.MUTE
 
 
 def test_natural_source_feedback_mutes_named_items_not_latest_source(tmp_path):
     service, agent = _service(tmp_path)
-    agent.response = "Got it. I will ignore AYSO camp and Amazon drop-off emails."
+    agent.response = (
+        "Got it. I will ignore AYSO camp and Amazon drop-off emails.\n"
+        "```florence\n"
+        '{"source_preferences":['
+        '{"preference":"mute","phrase":"ayso camp"},'
+        '{"preference":"mute","phrase":"amazon drop-off"}'
+        "]}\n"
+        "```"
+    )
     now = datetime(2026, 6, 10, 14, 15, tzinfo=timezone.utc)
     chat_id = "source-feedback-named-items"
 
@@ -3564,9 +3599,7 @@ def test_natural_source_feedback_mutes_named_items_not_latest_source(tmp_path):
 
     assert len(latest) == 1
     assert feedback[0].text == "Got it. I will ignore AYSO camp and Amazon drop-off emails."
-    assert "Florence applied connected-source feedback" in agent.calls[-1]["user_text"]
-    assert "mute: ayso camp" in agent.calls[-1]["user_text"]
-    assert "mute: amazon drop-off" in agent.calls[-1]["user_text"]
+    assert agent.calls[-1]["user_text"].startswith("We aren’t doing AYSO camp")
     assert "new invoice posted" not in feedback[0].text
     assert "new invoice posted" not in agent.calls[-1]["user_text"].lower()
     assert phrases == ["amazon drop-off", "ayso camp"]
@@ -3574,9 +3607,43 @@ def test_natural_source_feedback_mutes_named_items_not_latest_source(tmp_path):
     assert future_amazon == []
 
 
+def test_freeform_source_feedback_does_not_mutate_rules_without_agent_proposal(tmp_path):
+    service, agent = _service(tmp_path)
+    now = datetime(2026, 6, 10, 14, 15, tzinfo=timezone.utc)
+    chat_id = "source-feedback-hermes-first"
+
+    service.ingest_source_item(
+        chat_id=chat_id,
+        source_type="email",
+        title="New invoice posted to your account at Young Minds Westchester",
+        body="Payment is due tomorrow.",
+        event_at_utc=now + timedelta(hours=9),
+        now_utc=now,
+    )
+    outbound = service.handle_incoming(
+        _incoming(
+            "We aren't doing AYSO camp so that can be ignored. "
+            "Any amazon drop-off emails can be ignored too",
+            chat_id=chat_id,
+            message_id="freeform-feedback",
+        ),
+        now_utc=now + timedelta(minutes=1),
+    )
+    preferences = service.source_preferences(chat_id=chat_id)
+
+    assert outbound[0].text == "Fake agent reply."
+    assert agent.calls[-1]["user_text"].startswith("We aren't doing AYSO camp")
+    assert preferences == []
+
+
 def test_positive_source_feedback_surfaces_future_similar_items(tmp_path):
     service, agent = _service(tmp_path)
-    agent.response = "Got it. I will watch for more like that."
+    agent.response = (
+        "Got it. I will watch for more like that.\n"
+        "```florence\n"
+        '{"source_preferences":[{"preference":"always_surface","phrase":"maya dentist appointment"}]}\n'
+        "```"
+    )
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
 
     first = service.ingest_source_item(
@@ -3607,8 +3674,7 @@ def test_positive_source_feedback_surfaces_future_similar_items(tmp_path):
 
     assert len(first) == 1
     assert feedback[0].text == "Got it. I will watch for more like that."
-    assert "Florence applied connected-source feedback" in agent.calls[-1]["user_text"]
-    assert "watch more closely: maya dentist appointment" in agent.calls[-1]["user_text"]
+    assert agent.calls[-1]["user_text"] == "more like this"
     assert len(second) == 1
     assert snapshot.surfaced == 2
     assert snapshot.by_reason["household_requested_source"] == 1
@@ -3655,7 +3721,7 @@ def test_source_feedback_is_parent_only(tmp_path):
     )
     preferences = service.source_preferences(chat_id="source-feedback-parent-only")
 
-    assert "need one of the parents" in outbound[0].text
+    assert outbound[0].text == "Fake agent reply."
     assert [preference.phrase for preference in preferences] == ["spirit wear"]
 
 
@@ -5605,6 +5671,12 @@ def test_prompted_bare_source_rule_updates_preferences(tmp_path):
         _incoming("household status", chat_id="prompted-source-rule", message_id="status"),
         now_utc=now + timedelta(minutes=1),
     )
+    agent.response = (
+        "Got it. I will watch for permission slips.\n"
+        "```florence\n"
+        '{"source_preferences":[{"preference":"always_surface","phrase":"permission slips"}]}\n'
+        "```"
+    )
 
     outbound = service.handle_incoming(
         _incoming("permission slips", chat_id="prompted-source-rule", message_id="rule"),
@@ -5612,9 +5684,8 @@ def test_prompted_bare_source_rule_updates_preferences(tmp_path):
     )
     preferences = service.source_preferences(chat_id="prompted-source-rule")
 
-    assert outbound[0].text == "Fake agent reply."
-    assert "Florence applied the requested connected-source rule" in agent.calls[-1]["user_text"]
-    assert "permission slips" in agent.calls[-1]["user_text"]
+    assert outbound[0].text == "Got it. I will watch for permission slips."
+    assert agent.calls[-1]["user_text"] == "permission slips"
     assert [(item.preference.value, item.phrase) for item in preferences] == [
         ("always_surface", "permission slips")
     ]

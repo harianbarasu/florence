@@ -534,16 +534,7 @@ class FlorenceService:
 
         lower = " ".join(incoming.text.strip().lower().split())
         if existing_household is None and _simple_greeting(lower):
-            return self._agent_turn_with_context(
-                household=household,
-                actor=actor,
-                incoming=incoming,
-                now=now,
-                context=(
-                    "Florence computed this onboarding greeting for a new household:\n"
-                    f"{tone.first_greeting()}\n\n{LOCAL_RESULT_AGENT_FOCUS}"
-                ),
-            )
+            return self._agent_turn(household=household, actor=actor, incoming=incoming, now=now)
         if lower in {"help", "?"}:
             return [self._out(household.id, incoming.chat_id, tone.help_text(), now)]
         if lower in SUPPORT_COMMANDS:
@@ -616,6 +607,9 @@ class FlorenceService:
             return [self._out(household.id, incoming.chat_id, source_disconnect, now)]
         if self.store.is_stopped(household.id):
             return []
+
+        if self._should_agent_handle_before_local(incoming, lower):
+            return self._agent_turn(household=household, actor=actor, incoming=incoming, now=now)
 
         onboarding_continuation = self._maybe_resume_onboarding_naturally(
             household.id,
@@ -1008,6 +1002,13 @@ class FlorenceService:
         if incoming.attachments and incoming.text.strip():
             return True
         return _looks_like_active_conversation_reply(incoming.text)
+
+    def _should_agent_handle_before_local(self, incoming: IncomingMessage, lower: str) -> bool:
+        if incoming.attachments or not incoming.text.strip():
+            return False
+        if self._is_agenda_request(lower) or self._is_tomorrow_prep_request(lower):
+            return False
+        return not _explicit_pre_hermes_local_command(incoming.text, lower)
 
     def _agent_turn(
         self,
@@ -3703,6 +3704,9 @@ def _bare_name_reply(text: str) -> str | None:
         return None
     if len(name.split()) > 3:
         return None
+    parts = [part for part in re.split(r"[\s'-]+", name) if part]
+    if not parts or not all(part[0].isupper() for part in parts):
+        return None
     normalized = name.lower()
     if normalized in {
         "hi",
@@ -3736,7 +3740,8 @@ def _bare_child_names_from_text(text: str) -> list[str]:
     names = _split_names(candidate)
     if not names:
         return []
-    return [name for name in names if re.fullmatch(r"[A-Za-z][A-Za-z' -]{0,59}", name)]
+    names = [name for name in names if re.fullmatch(r"[A-Za-z][A-Za-z' -]{0,59}", name)]
+    return names if _bare_names_are_title_like(names) else []
 
 
 def _bare_source_preference_phrase(text: str) -> str:
@@ -4395,6 +4400,91 @@ def _active_conversation_rail_command(text: str, lower: str) -> bool:
         "what's open",
         "what needs approval",
     }
+
+
+def _explicit_pre_hermes_local_command(text: str, lower: str) -> bool:
+    stripped = text.strip()
+    normalized = lower.strip(" ?")
+    if not stripped:
+        return True
+    if _setup_command(normalized):
+        return True
+    if (
+        lower.startswith("my name is")
+        or lower.startswith("set timezone ")
+        or lower.startswith("timezone ")
+        or normalized
+        in {
+            "send me the link",
+            "send the link",
+            "where is the link",
+            "where's the link",
+            "setup link",
+            "onboarding link",
+        }
+        or CHILD_IS.match(stripped)
+        or CHILDREN_ARE.match(stripped)
+        or CHILDREN_NATURAL.match(stripped)
+        or _bare_name_reply(stripped) is not None
+        or _bare_child_names_from_text(stripped)
+        or PHONE_LIKE.search(stripped)
+    ):
+        return True
+    if PARTNER_INVITE.match(stripped) or PARTNER_CONFIRM.match(stripped):
+        return True
+    if APPROVAL_REPLY.match(stripped):
+        return True
+    if REMINDER_PREFIX.search(stripped) or _reminder_resolution(stripped) is not None:
+        return True
+    if _calendar_event_text(stripped) is not None:
+        return True
+    if SOURCE_ALWAYS.match(stripped) or SOURCE_MUTE.match(stripped):
+        return True
+    if normalized in MEMORY_STATUS_COMMANDS or normalized in MEMORY_CLEAR_COMMANDS:
+        return True
+    if lower.startswith("remember ") or lower.startswith("forget "):
+        return True
+    if normalized in GOOGLE_DISCONNECT_COMMANDS or _google_connection_request(stripped):
+        return True
+    if _email_search_requested(stripped):
+        return True
+    if normalized in {
+        "privacy status",
+        "privacy settings",
+        "memory controls",
+        "household status",
+        "household setup",
+        "pause memory",
+        "turn off memory",
+        "disable memory",
+        "resume memory",
+        "turn on memory",
+        "enable memory",
+        "opt in to product analytics",
+        "turn on product analytics",
+        "opt out of product analytics",
+        "turn off product analytics",
+        "source preferences",
+        "source rules",
+        "email preferences",
+        "email rules",
+        "source review",
+        "source summary",
+        "email review",
+        "email summary",
+        "what did you keep quiet",
+        "what have you kept quiet",
+        "handoff",
+        "household handoff",
+        "what is open",
+        "what's open",
+        "open items",
+        "pending items",
+        "what needs approval",
+        "pending approvals",
+    }:
+        return True
+    return False
 
 
 def _parent_only_reply(reply: str) -> bool:

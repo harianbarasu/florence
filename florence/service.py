@@ -124,6 +124,10 @@ EMAIL_SEARCH_AGENT_FOCUS = (
     "Answer only the current email-search request. Do not continue unrelated prior topics "
     "from conversation history unless the parent asks."
 )
+SOURCE_FEEDBACK_AGENT_FOCUS = (
+    "Answer only the current connected-source feedback. Be brief and natural. "
+    "Do not mention internal routing, handlers, or database rules."
+)
 MAX_EXPLICIT_MEMORY_CHARS = 240
 EMAIL_LIKE = re.compile(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}")
 CHILD_IS = re.compile(
@@ -385,6 +389,12 @@ class WebOnboardingResult:
     invite_text: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class SourceFeedbackHandling:
+    reply_text: str | None = None
+    agent_context: str | None = None
+
+
 class FlorenceService:
     def __init__(
         self,
@@ -631,14 +641,23 @@ class FlorenceService:
         if reminder_resolution_reply is not None:
             return [self._out(household.id, incoming.chat_id, reminder_resolution_reply, now)]
 
-        source_feedback_reply = self._maybe_handle_source_feedback(
+        source_feedback = self._maybe_handle_source_feedback(
             household.id,
             actor,
             incoming.text,
             now,
         )
-        if source_feedback_reply is not None:
-            return [self._out(household.id, incoming.chat_id, source_feedback_reply, now)]
+        if source_feedback is not None:
+            if source_feedback.agent_context:
+                return self._agent_turn(
+                    household=household,
+                    actor=actor,
+                    incoming=replace(incoming, text=f"{incoming.text}\n\n{source_feedback.agent_context}"),
+                    now=now,
+                )
+            if source_feedback.reply_text:
+                return [self._out(household.id, incoming.chat_id, source_feedback.reply_text, now)]
+            return []
 
         email_search_reply = self._maybe_search_connected_email(household, actor, incoming, now)
         if email_search_reply is not None:
@@ -2688,12 +2707,12 @@ class FlorenceService:
         actor: HouseholdMember,
         text: str,
         now: datetime,
-    ) -> str | None:
+    ) -> SourceFeedbackHandling | None:
         feedback = _source_feedback_kind(text)
         if feedback is None:
             return None
         if actor.role != MemberRole.PARENT:
-            return tone.source_preference_parent_only()
+            return SourceFeedbackHandling(reply_text=tone.source_preference_parent_only())
         explicit_phrases = _explicit_source_feedback_phrases(text, feedback)
         if explicit_phrases:
             preference_kind = (
@@ -2711,10 +2730,15 @@ class FlorenceService:
                 )
                 for phrase in explicit_phrases
             ]
-            return tone.source_feedback_saved_many(feedback, preferences)
+            return SourceFeedbackHandling(
+                agent_context=_source_feedback_context_for_agent(
+                    feedback=feedback,
+                    preferences=preferences,
+                )
+            )
         item = self.store.last_surfaced_source_item(household_id)
         if item is None:
-            return tone.source_feedback_without_recent_item()
+            return SourceFeedbackHandling(reply_text=tone.source_feedback_without_recent_item())
         phrase = _feedback_phrase(item, feedback)
         preference_kind = (
             SourcePreferenceKind.MUTE
@@ -2736,7 +2760,12 @@ class FlorenceService:
             created_by_member_id=actor.id,
             created_at_utc=now,
         )
-        return tone.source_feedback_saved(feedback, preference)
+        return SourceFeedbackHandling(
+            agent_context=_source_feedback_context_for_agent(
+                feedback=feedback,
+                preferences=[preference],
+            )
+        )
 
     def _maybe_search_connected_email(
         self,
@@ -3564,6 +3593,23 @@ def _explicit_source_feedback_phrases(text: str, feedback: SourceFeedbackKind) -
             if phrase and phrase not in phrases:
                 phrases.append(phrase)
     return phrases[:4]
+
+
+def _source_feedback_context_for_agent(
+    *,
+    feedback: SourceFeedbackKind,
+    preferences: list[SourcePreference],
+) -> str:
+    lines = ["Florence applied connected-source feedback before this response:"]
+    for preference in preferences[:5]:
+        action = "mute" if preference.preference == SourcePreferenceKind.MUTE else "watch more closely"
+        lines.append(f"- {action}: {preference.phrase}")
+    if feedback == SourceFeedbackKind.NOT_USEFUL:
+        lines.append("The parent is saying these source items should be kept quieter going forward.")
+    else:
+        lines.append("The parent is saying these source items should be watched more closely going forward.")
+    lines.append(SOURCE_FEEDBACK_AGENT_FOCUS)
+    return "\n".join(lines)
 
 
 def _clean_explicit_source_feedback_phrase(raw_phrase: str) -> str:

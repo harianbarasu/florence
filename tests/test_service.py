@@ -3380,7 +3380,8 @@ def test_parent_can_mute_last_surfaced_sender_domain(tmp_path):
 
 
 def test_negative_source_feedback_mutes_future_similar_items(tmp_path):
-    service, _agent = _service(tmp_path)
+    service, agent = _service(tmp_path)
+    agent.response = "Got it. I will keep those quieter."
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
 
     service.handle_incoming(
@@ -3418,7 +3419,9 @@ def test_negative_source_feedback_mutes_future_similar_items(tmp_path):
     snapshot = service.source_review_snapshot(chat_id="source-feedback-negative", now_utc=now)
 
     assert len(first) == 1
-    assert "keep weekly school newsletter quieter" in feedback[0].text
+    assert feedback[0].text == "Got it. I will keep those quieter."
+    assert "Florence applied connected-source feedback" in agent.calls[-1]["user_text"]
+    assert "mute: weekly school newsletter" in agent.calls[-1]["user_text"]
     assert second == []
     assert snapshot.surfaced == 1
     assert snapshot.stored_only == 1
@@ -3426,7 +3429,8 @@ def test_negative_source_feedback_mutes_future_similar_items(tmp_path):
 
 
 def test_natural_source_feedback_learns_noisy_promo_phrase(tmp_path):
-    service, _agent = _service(tmp_path)
+    service, agent = _service(tmp_path)
+    agent.response = "Got it. I will keep that kind of camp promo quieter."
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
 
     first = service.ingest_source_item(
@@ -3449,13 +3453,16 @@ def test_natural_source_feedback_learns_noisy_promo_phrase(tmp_path):
     preferences = service.source_preferences(chat_id="source-feedback-promo")
 
     assert len(first) == 1
-    assert "keep final few spots quieter" in feedback[0].text
+    assert feedback[0].text == "Got it. I will keep that kind of camp promo quieter."
+    assert "Florence applied connected-source feedback" in agent.calls[-1]["user_text"]
+    assert "mute: final few spots" in agent.calls[-1]["user_text"]
     assert preferences[0].phrase == "final few spots"
     assert preferences[0].preference == SourcePreferenceKind.MUTE
 
 
 def test_natural_source_feedback_mutes_named_items_not_latest_source(tmp_path):
-    service, _agent = _service(tmp_path)
+    service, agent = _service(tmp_path)
+    agent.response = "Got it. I will ignore AYSO camp and Amazon drop-off emails."
     now = datetime(2026, 6, 10, 14, 15, tzinfo=timezone.utc)
     chat_id = "source-feedback-named-items"
 
@@ -3505,15 +3512,20 @@ def test_natural_source_feedback_mutes_named_items_not_latest_source(tmp_path):
     phrases = sorted(preference.phrase for preference in preferences)
 
     assert len(latest) == 1
-    assert "keep ayso camp and amazon drop-off quieter" in feedback[0].text
+    assert feedback[0].text == "Got it. I will ignore AYSO camp and Amazon drop-off emails."
+    assert "Florence applied connected-source feedback" in agent.calls[-1]["user_text"]
+    assert "mute: ayso camp" in agent.calls[-1]["user_text"]
+    assert "mute: amazon drop-off" in agent.calls[-1]["user_text"]
     assert "new invoice posted" not in feedback[0].text
+    assert "new invoice posted" not in agent.calls[-1]["user_text"].lower()
     assert phrases == ["amazon drop-off", "ayso camp"]
     assert future_ayso == []
     assert future_amazon == []
 
 
 def test_positive_source_feedback_surfaces_future_similar_items(tmp_path):
-    service, _agent = _service(tmp_path)
+    service, agent = _service(tmp_path)
+    agent.response = "Got it. I will watch for more like that."
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
 
     first = service.ingest_source_item(
@@ -3543,7 +3555,9 @@ def test_positive_source_feedback_surfaces_future_similar_items(tmp_path):
     snapshot = service.source_review_snapshot(chat_id="source-feedback-positive", now_utc=now)
 
     assert len(first) == 1
-    assert "watch more closely for maya dentist appointment" in feedback[0].text
+    assert feedback[0].text == "Got it. I will watch for more like that."
+    assert "Florence applied connected-source feedback" in agent.calls[-1]["user_text"]
+    assert "watch more closely: maya dentist appointment" in agent.calls[-1]["user_text"]
     assert len(second) == 1
     assert snapshot.surfaced == 2
     assert snapshot.by_reason["household_requested_source"] == 1

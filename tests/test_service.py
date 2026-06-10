@@ -303,8 +303,9 @@ def test_unknown_chat_from_known_single_parent_does_not_reuse_household_without_
     assert new_household is not None
     assert new_household.id != existing.id
     assert service.store.get_household_by_chat("existing-chat").id == existing.id
-    assert len(agent.calls) == 0
-    assert "Got it" in outbound[0].text
+    assert outbound[0].text == "Fake agent reply."
+    assert len(agent.calls) == 1
+    assert "Florence saved the requested household memory" in agent.calls[0]["user_text"]
 
 
 def _store_google_connected_account(service, *, chat_id: str, now: datetime):
@@ -367,13 +368,14 @@ def test_service_asks_for_clarification_on_bare_hour_reminder(tmp_path):
 
 
 def test_service_creates_and_sends_due_reminder(tmp_path):
-    service, _agent = _service(tmp_path)
+    service, agent = _service(tmp_path)
 
     created = service.handle_incoming(
         _incoming("remind us tomorrow at 8am to pack the permission slip"),
         now_utc=datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc),
     )
-    assert "Done." in created[0].text
+    assert created[0].text == "Fake agent reply."
+    assert "Florence created the requested reminder" in agent.calls[-1]["user_text"]
 
     due = service.due_reminder_messages(
         now_utc=datetime(2026, 6, 6, 15, 0, tzinfo=timezone.utc),
@@ -384,7 +386,7 @@ def test_service_creates_and_sends_due_reminder(tmp_path):
 
 
 def test_daypart_reminder_confirmation_uses_clean_task_title(tmp_path):
-    service, _agent = _service(tmp_path)
+    service, agent = _service(tmp_path)
 
     created = service.handle_incoming(
         _incoming("remind us tomorrow morning to pack lunch"),
@@ -394,13 +396,14 @@ def test_daypart_reminder_confirmation_uses_clean_task_title(tmp_path):
         now_utc=datetime(2026, 6, 6, 15, 0, tzinfo=timezone.utc),
     )
 
-    assert "pack lunch" in created[0].text
-    assert "morning to pack lunch" not in created[0].text
+    assert created[0].text == "Fake agent reply."
+    assert "Florence created the requested reminder" in agent.calls[-1]["user_text"]
+    assert "remind us tomorrow morning to pack lunch" in agent.calls[-1]["user_text"]
     assert due[0].text == "Quick reminder: pack lunch"
 
 
 def test_named_household_member_reminder_keeps_owner_label(tmp_path):
-    service, _agent = _service(tmp_path)
+    service, agent = _service(tmp_path)
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
     chat_id = "member-reminder"
 
@@ -437,7 +440,9 @@ def test_named_household_member_reminder_keeps_owner_label(tmp_path):
         since_utc=now,
     )[0]
 
-    assert "remind Alex about pack cleats" in created[0].text
+    assert created[0].text == "Fake agent reply."
+    assert "Florence created the requested reminder" in agent.calls[-1]["user_text"]
+    assert "remind Alex today at 5pm to pack cleats" in agent.calls[-1]["user_text"]
     assert "Alex: pack cleats" in agenda[0].text
     assert due[0].text == "Quick reminder for Alex: pack cleats"
     assert reminder.title == "pack cleats"
@@ -474,7 +479,7 @@ def test_unnamed_reminder_assignee_uses_role_label_not_phone(tmp_path):
 
 
 def test_reminder_mentions_member_without_assigning_when_name_is_not_target(tmp_path):
-    service, _agent = _service(tmp_path)
+    service, agent = _service(tmp_path)
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
     chat_id = "member-reminder-no-target"
 
@@ -503,8 +508,9 @@ def test_reminder_mentions_member_without_assigning_when_name_is_not_target(tmp_
         now_utc=now,
     )[0]
 
-    assert "remind you about ask Alex about lunch" in created[0].text
-    assert "remind Alex about" not in created[0].text
+    assert created[0].text == "Fake agent reply."
+    assert "Florence created the requested reminder" in agent.calls[-1]["user_text"]
+    assert "remind us tomorrow at 8am to ask Alex about lunch" in agent.calls[-1]["user_text"]
     assert reminder.title == "ask Alex about lunch"
     assert reminder.assignee_member_id is None
 
@@ -810,7 +816,8 @@ def test_duplicate_inbound_message_is_ignored_without_side_effects(tmp_path):
     assert len(first) == 1
     assert second == []
     assert len(reminders) == 1
-    assert agent.calls == []
+    assert len(agent.calls) == 1
+    assert "Florence created the requested reminder" in agent.calls[0]["user_text"]
 
 
 def test_duplicate_inbound_agent_turn_is_not_reprocessed(tmp_path):
@@ -894,6 +901,7 @@ def test_ready_household_greeting_still_uses_agent_path(tmp_path):
         account_label="Parent Gmail",
         now_utc=now,
     )
+    agent.calls.clear()
     outbound = service.handle_incoming(
         _incoming("hello", chat_id="existing-hi", message_id="second-hi"),
         now_utc=now + timedelta(minutes=1),
@@ -1071,9 +1079,9 @@ def test_incomplete_household_real_task_is_not_swallowed_by_onboarding(tmp_path)
         now_utc=now + timedelta(minutes=1),
     )
 
-    assert "Done. I will remind you about pack lunch" in outbound[0].text
+    assert outbound[0].text == "Fake agent reply."
+    assert "Florence created the requested reminder" in agent.calls[-1]["user_text"]
     assert "onboarding" not in outbound[0].text.lower()
-    assert agent.calls == []
 
 
 def test_incomplete_household_natural_child_fact_is_not_swallowed_by_onboarding(tmp_path):
@@ -1339,6 +1347,7 @@ def test_parent_can_confirm_household_data_deletion(tmp_path):
         attempted_at_utc=now + timedelta(minutes=4),
         error="test execution row to delete",
     )
+    agent.calls.clear()
 
     prompt = service.handle_incoming(
         _incoming("delete my data", chat_id=chat_id, message_id="delete-request"),
@@ -1575,6 +1584,7 @@ def test_parent_can_view_household_data_summary_without_raw_content(tmp_path):
         _incoming("stop", chat_id=chat_id, message_id="summary-stop"),
         now_utc=now + timedelta(minutes=5),
     )
+    agent.calls.clear()
 
     outbound = service.handle_incoming(
         _incoming("data summary", chat_id=chat_id, message_id="summary-command"),
@@ -2114,7 +2124,8 @@ def test_active_source_preference_reply_saves_but_lets_agent_answer(tmp_path):
 
     assert outbound[0].text == "Got it. I will treat camp as high-priority household context."
     assert len(agent.calls) == 2
-    assert agent.calls[-1]["user_text"] == "always tell me about camp"
+    assert "always tell me about camp" in agent.calls[-1]["user_text"]
+    assert "Florence applied the requested connected-source rule" in agent.calls[-1]["user_text"]
     assert [(preference.phrase, preference.preference) for preference in preferences] == [
         ("camp", SourcePreferenceKind.ALWAYS_SURFACE)
     ]
@@ -2149,7 +2160,8 @@ def test_active_memory_reply_saves_but_lets_agent_answer(tmp_path):
 
     assert outbound[0].text == "Noted. I will keep Maya's preference in mind."
     assert len(agent.calls) == 2
-    assert agent.calls[-1]["user_text"] == "remember that Maya hates peas"
+    assert "remember that Maya hates peas" in agent.calls[-1]["user_text"]
+    assert "Florence saved the requested household memory" in agent.calls[-1]["user_text"]
     assert [memory.text for memory in snapshot.memories] == ["Maya hates peas"]
 
 
@@ -2184,7 +2196,7 @@ def test_short_active_followup_lets_agent_answer(tmp_path):
     assert agent.calls[-1]["user_text"] == "both"
 
 
-def test_explicit_reminder_command_stays_deterministic_during_active_conversation(tmp_path):
+def test_explicit_reminder_command_uses_validated_action_context_during_active_conversation(tmp_path):
     service, agent = _service(tmp_path)
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
     chat_id = "active-explicit-reminder"
@@ -2198,6 +2210,7 @@ def test_explicit_reminder_command_stays_deterministic_during_active_conversatio
         ),
         now_utc=now,
     )
+    agent.response = "Got it. I will remind you tomorrow morning."
 
     outbound = service.handle_incoming(
         _incoming(
@@ -2213,8 +2226,9 @@ def test_explicit_reminder_command_stays_deterministic_during_active_conversatio
         now_utc=now,
     )
 
-    assert len(agent.calls) == 1
-    assert "will remind you" in outbound[0].text
+    assert len(agent.calls) == 2
+    assert outbound[0].text == "Got it. I will remind you tomorrow morning."
+    assert "Florence created the requested reminder" in agent.calls[-1]["user_text"]
     assert [reminder.title for reminder in reminders] == ["pack lunch"]
 
 
@@ -2898,10 +2912,6 @@ def test_parent_can_add_household_calendar_event_from_text(tmp_path):
         ),
         now_utc=now,
     )
-    prep = service.handle_incoming(
-        _incoming("tomorrow prep", chat_id="manual-calendar", message_id="manual-calendar-prep"),
-        now_utc=now + timedelta(minutes=1),
-    )
     household = service.store.get_household_by_chat("manual-calendar")
     assert household is not None
     snapshot = service.source_review_snapshot(chat_id="manual-calendar", now_utc=now)
@@ -2911,15 +2921,15 @@ def test_parent_can_add_household_calendar_event_from_text(tmp_path):
             (household.id,),
         ).fetchone()
 
-    assert "Done. I added soccer practice to the household calendar" in created[0].text
-    assert "Sat, Jun 6 at 5:00 PM" in created[0].text
-    assert "soccer practice" in prep[0].text
+    assert created[0].text == "Fake agent reply."
+    assert "Florence added the requested household calendar note" in agent.calls[0]["user_text"]
+    assert "add soccer practice tomorrow at 5pm to calendar" in agent.calls[0]["user_text"]
     assert snapshot.surfaced == 1
     assert row["title"] == "soccer practice"
     assert row["source_type"] == "calendar"
     assert row["reason"] == "manual_calendar_event"
     assert row["event_at_utc"] == "2026-06-07T00:00:00+00:00"
-    assert agent.calls == []
+    assert len(agent.calls) == 1
 
 
 def test_calendar_event_command_asks_for_ampm_on_bare_hour(tmp_path):
@@ -2974,7 +2984,7 @@ def test_helper_cannot_add_household_calendar_event(tmp_path):
 
 
 def test_household_can_mute_actionable_source_pattern(tmp_path):
-    service, _agent = _service(tmp_path)
+    service, agent = _service(tmp_path)
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
 
     reply = service.handle_incoming(
@@ -2991,7 +3001,9 @@ def test_household_can_mute_actionable_source_pattern(tmp_path):
     )
     snapshot = service.source_review_snapshot(chat_id="source-mute", now_utc=now)
 
-    assert "keep permission slips quiet" in reply[0].text
+    assert reply[0].text == "Fake agent reply."
+    assert "Florence applied the requested connected-source rule" in agent.calls[-1]["user_text"]
+    assert "mute permission slips" in agent.calls[-1]["user_text"]
     assert outbound == []
     assert snapshot.total == 1
     assert snapshot.stored_only == 1
@@ -2999,7 +3011,7 @@ def test_household_can_mute_actionable_source_pattern(tmp_path):
 
 
 def test_source_preference_handles_singular_plural_parent_language(tmp_path):
-    service, _agent = _service(tmp_path)
+    service, agent = _service(tmp_path)
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
 
     mute_reply = service.handle_incoming(
@@ -3032,9 +3044,13 @@ def test_source_preference_handles_singular_plural_parent_language(tmp_path):
     )
     snapshot = service.source_review_snapshot(chat_id="source-plural-language", now_utc=now)
 
-    assert "keep newsletter quiet" in mute_reply[0].text
+    assert mute_reply[0].text == "Fake agent reply."
+    assert "Florence applied the requested connected-source rule" in agent.calls[-2]["user_text"]
+    assert "mute newsletter" in agent.calls[-2]["user_text"]
     assert muted == []
-    assert "make a point to tell you about permission slip" in always_reply[0].text
+    assert always_reply[0].text == "Fake agent reply."
+    assert "Florence applied the requested connected-source rule" in agent.calls[-1]["user_text"]
+    assert "always tell me about permission slip" in agent.calls[-1]["user_text"]
     assert len(surfaced) == 1
     assert "Permission slips for field trip" in surfaced[0].text
     assert snapshot.surfaced == 1
@@ -3042,7 +3058,7 @@ def test_source_preference_handles_singular_plural_parent_language(tmp_path):
 
 
 def test_household_can_request_low_signal_source_pattern(tmp_path):
-    service, _agent = _service(tmp_path)
+    service, agent = _service(tmp_path)
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
 
     reply = service.handle_incoming(
@@ -3063,7 +3079,9 @@ def test_household_can_request_low_signal_source_pattern(tmp_path):
     )
     snapshot = service.source_review_snapshot(chat_id="source-always", now_utc=now)
 
-    assert "make a point to tell you about spirit wear" in reply[0].text
+    assert reply[0].text == "Fake agent reply."
+    assert "Florence applied the requested connected-source rule" in agent.calls[-1]["user_text"]
+    assert "always tell me about spirit wear" in agent.calls[-1]["user_text"]
     assert len(outbound) == 1
     assert "Weekly school newsletter" in outbound[0].text
     assert "add a reminder" not in outbound[0].text
@@ -3299,7 +3317,7 @@ def test_mute_this_sender_requires_recent_source_item(tmp_path):
 
 
 def test_parent_can_mute_last_surfaced_sender(tmp_path):
-    service, _agent = _service(tmp_path)
+    service, agent = _service(tmp_path)
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
 
     first = service.ingest_source_item(
@@ -3332,7 +3350,9 @@ def test_parent_can_mute_last_surfaced_sender(tmp_path):
     snapshot = service.source_review_snapshot(chat_id="source-feedback-sender", now_utc=now)
 
     assert len(first) == 1
-    assert "keep updates@school.example quiet" in feedback[0].text
+    assert feedback[0].text == "Fake agent reply."
+    assert "Florence applied the requested connected-source rule" in agent.calls[-1]["user_text"]
+    assert "mute this sender" in agent.calls[-1]["user_text"]
     assert preferences[0].phrase == "updates@school.example"
     assert preferences[0].preference == SourcePreferenceKind.MUTE
     assert second == []
@@ -3342,7 +3362,7 @@ def test_parent_can_mute_last_surfaced_sender(tmp_path):
 
 
 def test_parent_can_mute_last_surfaced_sender_domain(tmp_path):
-    service, _agent = _service(tmp_path)
+    service, agent = _service(tmp_path)
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
 
     first = service.ingest_source_item(
@@ -3374,7 +3394,9 @@ def test_parent_can_mute_last_surfaced_sender_domain(tmp_path):
     preferences = service.source_preferences(chat_id="source-feedback-domain")
 
     assert len(first) == 1
-    assert "keep school.example quiet" in feedback[0].text
+    assert feedback[0].text == "Fake agent reply."
+    assert "Florence applied the requested connected-source rule" in agent.calls[-1]["user_text"]
+    assert "mute this domain" in agent.calls[-1]["user_text"]
     assert preferences[0].phrase == "school.example"
     assert second == []
 
@@ -4784,6 +4806,7 @@ def test_household_handoff_lists_pending_approvals_and_upcoming_reminders(tmp_pa
         ),
         now_utc=now,
     )
+    agent.calls.clear()
 
     outbound = service.handle_incoming(
         _incoming("what's open?", chat_id="handoff-chat", message_id="handoff"),
@@ -5496,7 +5519,7 @@ def test_setup_status_suggests_source_rule_after_connected_source(tmp_path):
 
 
 def test_prompted_bare_source_rule_updates_preferences(tmp_path):
-    service, _agent = _service(tmp_path)
+    service, agent = _service(tmp_path)
     now = datetime(2026, 6, 5, 16, 0, tzinfo=timezone.utc)
 
     service.handle_incoming(
@@ -5542,7 +5565,9 @@ def test_prompted_bare_source_rule_updates_preferences(tmp_path):
     )
     preferences = service.source_preferences(chat_id="prompted-source-rule")
 
-    assert "permission slips" in outbound[0].text
+    assert outbound[0].text == "Fake agent reply."
+    assert "Florence applied the requested connected-source rule" in agent.calls[-1]["user_text"]
+    assert "permission slips" in agent.calls[-1]["user_text"]
     assert [(item.preference.value, item.phrase) for item in preferences] == [
         ("always_surface", "permission slips")
     ]

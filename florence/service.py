@@ -128,7 +128,26 @@ SOURCE_FEEDBACK_AGENT_FOCUS = (
     "Answer only the current connected-source feedback. Be brief and natural. "
     "Do not mention internal routing, handlers, or database rules."
 )
+LOCAL_ACTION_AGENT_FOCUS = (
+    "Florence already applied this validated household action before this response. "
+    "Acknowledge naturally and do not propose or duplicate the same action."
+)
 MAX_EXPLICIT_MEMORY_CHARS = 240
+MEMORY_STATUS_COMMANDS = {
+    "what do you remember",
+    "what is in the household book",
+    "what's in the household book",
+    "household book",
+    "household book status",
+    "book status",
+    "memory status",
+    "list memory",
+    "list memories",
+    "list household book",
+    "show memory",
+    "show memories",
+    "show household book",
+}
 EMAIL_LIKE = re.compile(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}")
 CHILD_IS = re.compile(
     r"^(?:our child is|my child is|kid is|child is|our son is|my son is|our daughter is|my daughter is)\s+(.+)",
@@ -679,7 +698,17 @@ class FlorenceService:
                 now,
                 acknowledge_success=False,
             )
-            if memory_reply not in {None, ""}:
+            if memory_reply == "":
+                return self._agent_turn(
+                    household=household,
+                    actor=actor,
+                    incoming=replace(
+                        incoming,
+                        text=f"{incoming.text}\n\nFlorence saved the requested household memory.\n{LOCAL_ACTION_AGENT_FOCUS}",
+                    ),
+                    now=now,
+                )
+            if memory_reply is not None:
                 return [self._out(household.id, incoming.chat_id, memory_reply, now)]
             source_preference_reply = self._maybe_update_source_preference(
                 household.id,
@@ -688,7 +717,17 @@ class FlorenceService:
                 now,
                 acknowledge_success=False,
             )
-            if source_preference_reply not in {None, ""}:
+            if source_preference_reply == "":
+                return self._agent_turn(
+                    household=household,
+                    actor=actor,
+                    incoming=replace(
+                        incoming,
+                        text=f"{incoming.text}\n\nFlorence applied the requested connected-source rule.\n{LOCAL_ACTION_AGENT_FOCUS}",
+                    ),
+                    now=now,
+                )
+            if source_preference_reply is not None:
                 return [self._out(household.id, incoming.chat_id, source_preference_reply, now)]
             return self._agent_turn(
                 household=household,
@@ -697,8 +736,24 @@ class FlorenceService:
                 now=now,
             )
 
-        memory_reply = self._maybe_update_memory(household.id, actor, incoming, now)
+        memory_reply = self._maybe_update_memory(
+            household.id,
+            actor,
+            incoming,
+            now,
+            acknowledge_success=False,
+        )
         if memory_reply is not None:
+            if memory_reply == "":
+                return self._agent_turn(
+                    household=household,
+                    actor=actor,
+                    incoming=replace(
+                        incoming,
+                        text=f"{incoming.text}\n\nFlorence saved the requested household memory.\n{LOCAL_ACTION_AGENT_FOCUS}",
+                    ),
+                    now=now,
+                )
             return [self._out(household.id, incoming.chat_id, memory_reply, now)]
 
         memory_status = self._maybe_show_memory(household.id, actor, lower, now)
@@ -710,8 +765,19 @@ class FlorenceService:
             actor,
             incoming.text,
             now,
+            acknowledge_success=False,
         )
         if source_preference_reply is not None:
+            if source_preference_reply == "":
+                return self._agent_turn(
+                    household=household,
+                    actor=actor,
+                    incoming=replace(
+                        incoming,
+                        text=f"{incoming.text}\n\nFlorence applied the requested connected-source rule.\n{LOCAL_ACTION_AGENT_FOCUS}",
+                    ),
+                    now=now,
+                )
             return [self._out(household.id, incoming.chat_id, source_preference_reply, now)]
 
         source_review_reply = self._maybe_show_source_review(household, actor, lower)
@@ -724,10 +790,30 @@ class FlorenceService:
 
         calendar_event_reply = self._maybe_add_calendar_event(household, actor, incoming, now)
         if calendar_event_reply is not None:
+            if calendar_event_reply.startswith("Done."):
+                return self._agent_turn(
+                    household=household,
+                    actor=actor,
+                    incoming=replace(
+                        incoming,
+                        text=f"{incoming.text}\n\nFlorence added the requested household calendar note.\n{LOCAL_ACTION_AGENT_FOCUS}",
+                    ),
+                    now=now,
+                )
             return [self._out(household.id, incoming.chat_id, calendar_event_reply, now)]
 
         reminder_reply = self._maybe_create_reminder(household, incoming.text, now)
         if reminder_reply is not None:
+            if reminder_reply.startswith("Done."):
+                return self._agent_turn(
+                    household=household,
+                    actor=actor,
+                    incoming=replace(
+                        incoming,
+                        text=f"{incoming.text}\n\nFlorence created the requested reminder.\n{LOCAL_ACTION_AGENT_FOCUS}",
+                    ),
+                    now=now,
+                )
             return [self._out(household.id, incoming.chat_id, reminder_reply, now)]
 
         attachment_reply = self._maybe_handle_attachments(household.id, incoming, now)
@@ -2596,21 +2682,7 @@ class FlorenceService:
         lower: str,
         now: datetime,
     ) -> str | None:
-        if lower.strip(" ?") not in {
-            "what do you remember",
-            "what is in the household book",
-            "what's in the household book",
-            "household book",
-            "household book status",
-            "book status",
-            "memory status",
-            "list memory",
-            "list memories",
-            "list household book",
-            "show memory",
-            "show memories",
-            "show household book",
-        }:
+        if lower.strip(" ?") not in MEMORY_STATUS_COMMANDS:
             return None
         if actor.role != MemberRole.PARENT:
             return tone.memory_view_parent_only()
@@ -4113,6 +4185,7 @@ def _active_conversation_rail_command(text: str, lower: str) -> bool:
             "open items",
             "pending items",
             "pending approvals",
+            *MEMORY_STATUS_COMMANDS,
         }
     ):
         return True

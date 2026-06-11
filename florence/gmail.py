@@ -12,7 +12,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlencode
 
@@ -36,6 +36,7 @@ OAUTH_SCOPES = (
     "email",
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/calendar.readonly",
+    "https://www.googleapis.com/auth/calendar.events",
 )
 
 
@@ -276,6 +277,48 @@ class GoogleService:
         }
 
     # -- Calendar ----------------------------------------------------------------
+
+    async def create_event(
+        self,
+        account: GmailAccount,
+        *,
+        title: str,
+        start: datetime | None,
+        end: datetime | None,
+        tz_name: str,
+        location: str | None = None,
+        description: str | None = None,
+        all_day_start: str | None = None,
+        all_day_end: str | None = None,
+    ) -> dict[str, Any]:
+        """Create an event on the account's primary calendar. Timed events take
+        aware datetimes; all-day events take ISO dates (end inclusive)."""
+        token = await self._access_token(account)
+        body: dict[str, Any] = {"summary": title}
+        if location:
+            body["location"] = location
+        if description:
+            body["description"] = description
+        if all_day_start:
+            first = date.fromisoformat(all_day_start)
+            last = date.fromisoformat(all_day_end) if all_day_end else first
+            body["start"] = {"date": first.isoformat()}
+            body["end"] = {"date": (last + timedelta(days=1)).isoformat()}  # exclusive end
+        else:
+            if start is None:
+                raise GoogleError("a start time is required")
+            finish = end or start + timedelta(hours=1)
+            body["start"] = {"dateTime": ensure_utc(start).isoformat(), "timeZone": tz_name}
+            body["end"] = {"dateTime": ensure_utc(finish).isoformat(), "timeZone": tz_name}
+        try:
+            response = await self._client.post(
+                CALENDAR_API, json=body, headers={"Authorization": f"Bearer {token}"}
+            )
+            response.raise_for_status()
+            data = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise GoogleError(f"calendar event creation failed: {exc}") from exc
+        return data if isinstance(data, dict) else {}
 
     async def calendar_events(
         self, account: GmailAccount, *, days_ahead: int, tz_name: str

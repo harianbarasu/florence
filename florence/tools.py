@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
+from datetime import date
 from typing import Any, Awaitable, Callable
 
 from florence.config import Settings
@@ -169,6 +170,31 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "parameters": {
                 "type": "object",
                 "properties": {"days_ahead": {"type": "integer", "minimum": 1, "maximum": 30}},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_calendar_event",
+            "description": (
+                "Create an event on the family's Google Calendar — camps, appointments, games, school "
+                "events. Use this when something has real dates the family should see on their calendar "
+                "(a reminder is for nudging; a calendar event is for the schedule — often you want both). "
+                "Requires a connected Google account."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "start_local": {"type": "string", "description": "'YYYY-MM-DD HH:MM' local time, or 'YYYY-MM-DD' for all-day events"},
+                    "end_local": {"type": "string", "description": "Same format. For multi-day all-day events (like camps), the LAST day. Defaults to 1 hour after start."},
+                    "all_day": {"type": "boolean"},
+                    "location": {"type": "string"},
+                    "notes": {"type": "string"},
+                    "account_email": {"type": "string", "description": "Which connected calendar; defaults to the requester's"},
+                },
+                "required": ["title", "start_local"],
             },
         },
     },
@@ -438,6 +464,54 @@ async def _get_calendar(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any
     return {"events": events[:40]}
 
 
+async def _add_calendar_event(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
+    title = str(args.get("title") or "").strip()
+    start_raw = str(args.get("start_local") or "").strip()
+    if not title or not start_raw:
+        raise ValueError("title and start_local are required")
+    accounts = await _accounts_for(ctx, str(args.get("account_email") or "").strip() or None)
+    account = accounts[0]
+    if ctx.member and not args.get("account_email"):
+        for a in accounts:
+            if a.member_phone == ctx.member.phone:
+                account = a
+                break
+    tz = ctx.household.timezone
+    end_raw = str(args.get("end_local") or "").strip() or None
+    all_day = bool(args.get("all_day")) or (len(start_raw) == 10 and "-" in start_raw)
+    if all_day:
+        try:
+            date.fromisoformat(start_raw[:10])
+        except ValueError as exc:
+            raise ValueError("all-day start_local must be 'YYYY-MM-DD'") from exc
+        data = await ctx.gmail.create_event(
+            account,
+            title=title,
+            start=None,
+            end=None,
+            tz_name=tz,
+            location=str(args.get("location") or "").strip() or None,
+            description=str(args.get("notes") or "").strip() or None,
+            all_day_start=start_raw[:10],
+            all_day_end=end_raw[:10] if end_raw else None,
+        )
+        when = start_raw[:10] + (f" through {end_raw[:10]}" if end_raw else "") + " (all day)"
+    else:
+        start = parse_local(start_raw, tz)
+        end = parse_local(end_raw, tz) if end_raw else None
+        data = await ctx.gmail.create_event(
+            account,
+            title=title,
+            start=start,
+            end=end,
+            tz_name=tz,
+            location=str(args.get("location") or "").strip() or None,
+            description=str(args.get("notes") or "").strip() or None,
+        )
+        when = format_local(start, tz)
+    return {"created": True, "calendar": account.email, "when": when, "link": data.get("htmlLink")}
+
+
 async def _gmail_connect_link(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
     if not ctx.gmail.configured:
         raise ValueError("Gmail connection isn't configured on the server yet")
@@ -509,6 +583,7 @@ _HANDLERS: dict[str, Callable[[ToolContext, dict[str, Any]], Awaitable[dict[str,
     "search_email": _search_email,
     "read_email": _read_email,
     "get_calendar": _get_calendar,
+    "add_calendar_event": _add_calendar_event,
     "gmail_connect_link": _gmail_connect_link,
     "message_chat": _message_chat,
     "set_household": _set_household,

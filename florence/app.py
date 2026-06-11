@@ -14,10 +14,10 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
-from florence import db
+from florence import db, prompts
 from florence.agent import Deps, run_turn
 from florence.config import Settings
-from florence.gmail import GoogleService, authorization_url
+from florence.gmail import EmailSummary, GoogleService, authorization_url
 from florence.linq import (
     LinqClient,
     chat_handles_from_info,
@@ -335,5 +335,48 @@ def create_app() -> FastAPI:
         _require_admin(request)
         await runtime()._gmail_tick()  # noqa: SLF001 - deliberate admin poke
         return {"ok": True}
+
+    @app.post("/admin/test-email")
+    async def admin_test_email(request: Request) -> JSONResponse:
+        """Replay an email-triage turn in a sandbox household (no real texts)."""
+        _require_admin(request)
+        body = await request.json()
+        raw_items = body.get("emails")
+        if not isinstance(raw_items, list) or not raw_items:
+            raise HTTPException(status_code=400, detail="emails: [{from, subject, snippet, account}] required")
+        suffix = str(body.get("sandbox") or "admin")
+        d = deps()
+        household, chat, _, _, _ = await d.store.attach_inbound(
+            chat_id=f"sandbox-{suffix}",
+            chat_kind="direct",
+            sender_phone=str(body.get("phone") or "+19999999999"),
+            default_timezone=settings.default_timezone,
+        )
+        items = [
+            EmailSummary(
+                account_email=str(i.get("account") or "parent@gmail.com"),
+                gmail_id=str(i.get("id") or f"test-{n}"),
+                sender=str(i.get("from") or "unknown"),
+                subject=str(i.get("subject") or "(no subject)"),
+                snippet=str(i.get("snippet") or ""),
+                received_at=now_utc(),
+            )
+            for n, i in enumerate(raw_items)
+            if isinstance(i, dict)
+        ]
+        result = await run_turn(
+            d,
+            household=household,
+            chat=chat,
+            directive=prompts.email_directive(items, household.timezone),
+        )
+        return JSONResponse(
+            {
+                "replies": [s["text"] for s in result.sent],
+                "trace": result.trace,
+                "steps": result.steps,
+                "error": result.error,
+            }
+        )
 
     return app

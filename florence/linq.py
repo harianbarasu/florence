@@ -1,26 +1,68 @@
-"""Linq webhook parsing and outbound client."""
+"""Linq iMessage transport: webhook verification/parsing and the outbound client.
+
+The parsing and signature code is carried over from the previous Florence and
+tolerates both the standard (svix-style) and legacy webhook header formats,
+plus several payload shapes Linq has used over time.
+"""
 
 from __future__ import annotations
 
-import hashlib
-import hmac
-import json
 import base64
 import binascii
+import hashlib
+import hmac
+import logging
+from dataclasses import dataclass, field
 from datetime import datetime
 from time import time
 from typing import Any, Mapping
-from urllib.parse import urljoin
 
 import httpx
 
 from florence.config import Settings
-from florence.models import IncomingMessage, MessageAttachment
-from florence.timekeeper import ensure_utc
+from florence.timeutil import ensure_utc
 
+log = logging.getLogger("florence.linq")
 
 MESSAGE_RECEIVED_EVENTS = {"message.received", "message.inbound", "chat.message.received"}
-MAX_ATTACHMENT_EXTRACTED_TEXT_CHARS = 2000
+MAX_MEDIA_BYTES = 12 * 1024 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class MessageAttachment:
+    kind: str
+    url: str | None = None
+    content_type: str | None = None
+    filename: str | None = None
+    extracted_text: str | None = None
+    external_id: str | None = None
+    size_bytes: int | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "url": self.url,
+            "content_type": self.content_type,
+            "filename": self.filename,
+            "extracted_text": self.extracted_text,
+            "external_id": self.external_id,
+            "size_bytes": self.size_bytes,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class IncomingMessage:
+    chat_id: str
+    message_id: str
+    sender: str
+    text: str
+    received_at: datetime
+    attachments: tuple[MessageAttachment, ...] = ()
+    is_group: bool | None = None
+    chat_handles: tuple[str, ...] = field(default=())
+
+
+# -- signature verification ----------------------------------------------------
 
 
 def verify_linq_signature(
@@ -37,7 +79,7 @@ def verify_linq_signature(
     if not secret:
         return True
     if webhook_id and webhook_timestamp and webhook_signature:
-        if _verify_standard_webhook_signature(
+        if _verify_standard(
             secret=secret,
             raw_body=raw_body,
             webhook_id=webhook_id,
@@ -48,51 +90,36 @@ def verify_linq_signature(
             return True
     if not timestamp or not signature:
         return False
-    return _verify_legacy_webhook_signature(
-        secret=secret,
-        raw_body=raw_body,
-        timestamp=timestamp,
-        signature=signature,
-        now_epoch=now_epoch,
+    return _verify_legacy(
+        secret=secret, raw_body=raw_body, timestamp=timestamp, signature=signature, now_epoch=now_epoch
     )
 
 
-def _verify_standard_webhook_signature(
-    *,
-    secret: str,
-    raw_body: bytes,
-    webhook_id: str,
-    timestamp: str,
-    signature: str,
-    now_epoch: int | None,
+def _verify_standard(
+    *, secret: str, raw_body: bytes, webhook_id: str, timestamp: str, signature: str, now_epoch: int | None
 ) -> bool:
     if not _timestamp_is_fresh(timestamp, now_epoch=now_epoch):
         return False
-    signed_content = webhook_id.encode("utf-8") + b"." + timestamp.encode("utf-8") + b"." + raw_body
-    for key in _webhook_secret_keys(secret):
-        expected = base64.b64encode(hmac.new(key, signed_content, hashlib.sha256).digest()).decode(
-            "ascii"
-        )
+    signed = webhook_id.encode() + b"." + timestamp.encode() + b"." + raw_body
+    for key in _secret_keys(secret):
+        expected = base64.b64encode(hmac.new(key, signed, hashlib.sha256).digest()).decode("ascii")
         for provided in signature.split():
             if provided.startswith("v1,") and hmac.compare_digest(expected, provided[3:]):
                 return True
     return False
 
 
-def _verify_legacy_webhook_signature(
-    *,
-    secret: str,
-    raw_body: bytes,
-    timestamp: str,
-    signature: str,
-    now_epoch: int | None,
+def _verify_legacy(
+    *, secret: str, raw_body: bytes, timestamp: str, signature: str, now_epoch: int | None
 ) -> bool:
     if not _timestamp_is_fresh(timestamp, now_epoch=now_epoch):
         return False
-    signed_content = timestamp.encode("utf-8") + b"." + raw_body
-    provided = _normalize_signature(signature)
-    for key in _webhook_secret_keys(secret):
-        expected = hmac.new(key, signed_content, hashlib.sha256).hexdigest()
+    signed = timestamp.encode() + b"." + raw_body
+    provided = signature.strip()
+    if provided.lower().startswith("sha256="):
+        provided = provided.split("=", 1)[1].strip()
+    for key in _secret_keys(secret):
+        expected = hmac.new(key, signed, hashlib.sha256).hexdigest()
         if hmac.compare_digest(expected, provided):
             return True
     return False
@@ -107,24 +134,24 @@ def _timestamp_is_fresh(timestamp: str, *, now_epoch: int | None) -> bool:
     return abs(now - ts) <= 300
 
 
-def _webhook_secret_keys(secret: str) -> tuple[bytes, ...]:
+def _secret_keys(secret: str) -> tuple[bytes, ...]:
     keys: list[bytes] = []
     if secret.startswith("whsec_"):
         try:
             keys.append(base64.b64decode(secret.removeprefix("whsec_"), validate=True))
         except (binascii.Error, ValueError):
             pass
-    raw = secret.encode("utf-8")
+    raw = secret.encode()
     if raw not in keys:
         keys.append(raw)
     return tuple(keys)
 
 
+# -- webhook parsing -------------------------------------------------------------
+
+
 def parse_linq_event(
-    payload: Mapping[str, Any],
-    headers: Mapping[str, str],
-    *,
-    now_utc: datetime,
+    payload: Mapping[str, Any], headers: Mapping[str, str], *, now_utc: datetime
 ) -> IncomingMessage | None:
     event_type = _first(
         _header(headers, "x-webhook-event"),
@@ -139,20 +166,14 @@ def parse_linq_event(
     chat = data.get("chat") if isinstance(data.get("chat"), Mapping) else {}
     message = data.get("message") if isinstance(data.get("message"), Mapping) else data
 
-    chat_id = _text_value(
+    chat_id = _text(
         _first(
             data.get("chat_id"),
             chat.get("id") if isinstance(chat, Mapping) else None,
             message.get("chat_id") if isinstance(message, Mapping) else None,
         )
     )
-    message_id = _text_value(
-        _first(
-            message.get("id"),
-            message.get("message_id"),
-            data.get("message_id"),
-        )
-    )
+    message_id = _text(_first(message.get("id"), message.get("message_id"), data.get("message_id")))
     sender = _sender_value(
         message.get("from"),
         message.get("sender"),
@@ -172,6 +193,12 @@ def parse_linq_event(
         _first(message.get("received_at"), message.get("sent_at"), data.get("created_at")),
         default=now_utc,
     )
+    is_group: bool | None = None
+    if isinstance(chat, Mapping) and isinstance(chat.get("is_group"), bool):
+        is_group = chat["is_group"]
+    handles = _chat_handles(chat)
+    if is_group is None and handles:
+        is_group = len(handles) > 2
     return IncomingMessage(
         chat_id=chat_id,
         message_id=message_id,
@@ -179,173 +206,26 @@ def parse_linq_event(
         text=text,
         received_at=received_at,
         attachments=tuple(attachments),
+        is_group=is_group,
+        chat_handles=handles,
     )
 
 
-class LinqClient:
-    def __init__(
-        self,
-        settings: Settings,
-        *,
-        timeout_seconds: float = 20.0,
-        http_client: httpx.Client | None = None,
-    ) -> None:
-        self.settings = settings
-        self.timeout_seconds = timeout_seconds
-        self._client = http_client or httpx.Client(timeout=timeout_seconds)
-
-    def send_text(self, *, chat_id: str, text: str, idempotency_key: str) -> dict[str, Any]:
-        if not self.settings.linq_api_key:
-            return {"dry_run": True, "chat_id": chat_id, "text": text}
-        payload = {
-            "message": {
-                "parts": [{"type": "text", "value": text}],
-                "idempotency_key": idempotency_key,
-            }
-        }
-        url = urljoin(
-            self.settings.linq_base_url.rstrip("/") + "/",
-            f"chats/{chat_id}/messages",
-        )
-        response = self._client.post(
-            url,
-            headers={
-                "Authorization": f"Bearer {self.settings.linq_api_key}",
-                "Content-Type": "application/json",
-            },
-            content=json.dumps(payload).encode("utf-8"),
-        )
-        response.raise_for_status()
-        if not response.text:
-            return {}
-        try:
-            parsed = response.json()
-            return parsed if isinstance(parsed, dict) else {"response": parsed}
-        except ValueError:
-            return {"response": response.text}
-
-    def recent_incoming_messages(
-        self,
-        *,
-        now_utc: datetime,
-        chat_limit: int = 25,
-        messages_per_chat: int = 20,
-        since_utc: datetime | None = None,
-    ) -> list[IncomingMessage]:
-        """Fetch recent inbound Linq messages as a webhook backstop.
-
-        Webhooks remain the real-time path. This is intentionally conservative:
-        it only walks chats that include Florence's configured sending line and
-        only returns messages Linq marks as not from us.
-        """
-        if not self.settings.linq_api_key or not self.settings.linq_from_phone:
-            return []
-        since = ensure_utc(since_utc) if since_utc is not None else None
-        inbound: list[IncomingMessage] = []
-        for chat in self._list_chats(limit=chat_limit):
-            if not _chat_has_handle(chat, self.settings.linq_from_phone):
-                continue
-            chat_id = _text_value(chat.get("id"))
-            if not chat_id:
-                continue
-            for message in self._list_chat_messages(
-                chat_id=chat_id,
-                limit=messages_per_chat,
-                order="desc",
-            ):
-                if not _linq_message_is_inbound(message):
-                    continue
-                incoming = parse_linq_event(message, {}, now_utc=now_utc)
-                if incoming is not None:
-                    if since is not None and incoming.received_at < since:
-                        continue
-                    inbound.append(incoming)
-        return sorted(inbound, key=lambda message: (message.received_at, message.message_id))
-
-    def _list_chats(self, *, limit: int) -> list[Mapping[str, Any]]:
-        url = urljoin(self.settings.linq_base_url.rstrip("/") + "/", "chats")
-        response = self._client.get(
-            url,
-            params={"limit": max(1, min(limit, 100))},
-            headers={"Authorization": f"Bearer {self.settings.linq_api_key}"},
-        )
-        response.raise_for_status()
-        payload = response.json()
-        chats = payload.get("chats") if isinstance(payload, Mapping) else payload
-        if not isinstance(chats, list):
-            return []
-        return [chat for chat in chats if isinstance(chat, Mapping)]
-
-    def _list_chat_messages(
-        self,
-        *,
-        chat_id: str,
-        limit: int,
-        order: str,
-    ) -> list[Mapping[str, Any]]:
-        url = urljoin(
-            self.settings.linq_base_url.rstrip("/") + "/",
-            f"chats/{chat_id}/messages",
-        )
-        response = self._client.get(
-            url,
-            params={
-                "limit": max(1, min(limit, 100)),
-                "order": order,
-            },
-            headers={"Authorization": f"Bearer {self.settings.linq_api_key}"},
-        )
-        response.raise_for_status()
-        payload = response.json()
-        messages = payload.get("messages") if isinstance(payload, Mapping) else payload
-        if not isinstance(messages, list):
-            return []
-        return [message for message in messages if isinstance(message, Mapping)]
-
-    def create_chat(
-        self,
-        *,
-        from_phone: str,
-        to: tuple[str, ...],
-        text: str,
-        idempotency_key: str,
-    ) -> dict[str, Any]:
-        recipients = [recipient for recipient in to if recipient]
-        if not recipients:
-            raise ValueError("create_chat requires at least one recipient")
-        if not self.settings.linq_api_key:
-            return {
-                "dry_run": True,
-                "from": from_phone,
-                "to": recipients,
-                "text": text,
-            }
-        payload = {
-            "from": from_phone,
-            "to": recipients,
-            "message": {
-                "parts": [{"type": "text", "value": text}],
-                "idempotency_key": idempotency_key,
-                "preferred_service": "iMessage",
-            },
-        }
-        url = urljoin(self.settings.linq_base_url.rstrip("/") + "/", "chats")
-        response = self._client.post(
-            url,
-            headers={
-                "Authorization": f"Bearer {self.settings.linq_api_key}",
-                "Content-Type": "application/json",
-            },
-            content=json.dumps(payload).encode("utf-8"),
-        )
-        response.raise_for_status()
-        if not response.text:
-            return {}
-        try:
-            parsed = response.json()
-            return parsed if isinstance(parsed, dict) else {"response": parsed}
-        except ValueError:
-            return {"response": response.text}
+def _chat_handles(chat: Mapping[str, Any] | Any) -> tuple[str, ...]:
+    if not isinstance(chat, Mapping):
+        return ()
+    raw = chat.get("handles") or chat.get("participants")
+    if not isinstance(raw, list):
+        return ()
+    out: list[str] = []
+    for item in raw:
+        if isinstance(item, Mapping):
+            value = _text(_first(item.get("handle"), item.get("phone_number"), item.get("address"), item.get("id")))
+        else:
+            value = _text(item)
+        if value and value not in out:
+            out.append(value)
+    return tuple(out)
 
 
 def _message_text(message: Mapping[str, Any]) -> str:
@@ -362,8 +242,8 @@ def _message_text(message: Mapping[str, Any]) -> str:
     if isinstance(parts, list):
         for part in parts:
             if isinstance(part, Mapping) and part.get("type") == "text":
-                values.append(str(part.get("value") or ""))
-    return "\n".join(value for value in values if value)
+                values.append(str(_first(part.get("value"), part.get("body")) or ""))
+    return "\n".join(v for v in values if v)
 
 
 def _message_attachments(message: Mapping[str, Any]) -> list[MessageAttachment]:
@@ -378,10 +258,10 @@ def _message_attachments(message: Mapping[str, Any]) -> list[MessageAttachment]:
     for part in parts:
         if not isinstance(part, Mapping):
             continue
-        kind = _text_value(part.get("type")) or "attachment"
-        if kind.lower() == "text":
+        kind = (_text(part.get("type")) or "attachment").lower()
+        if kind == "text":
             continue
-        url = _text_value(
+        url = _text(
             _first(
                 part.get("url"),
                 part.get("media_url"),
@@ -390,37 +270,15 @@ def _message_attachments(message: Mapping[str, Any]) -> list[MessageAttachment]:
                 part.get("href"),
             )
         )
-        external_id = _text_value(
-            _first(
-                part.get("id"),
-                part.get("media_id"),
-                part.get("attachment_id"),
-                url,
-            )
-        )
-        content_type = _text_value(
-            _first(
-                part.get("content_type"),
-                part.get("mime_type"),
-                part.get("mime"),
-            )
-        )
-        filename = _text_value(
-            _first(
-                part.get("filename"),
-                part.get("file_name"),
-                part.get("name"),
-            )
-        )
         attachments.append(
             MessageAttachment(
                 kind=kind,
                 url=url,
-                content_type=content_type,
-                filename=filename,
-                extracted_text=_attachment_extracted_text(part),
-                external_id=external_id,
-                size_bytes=_int_value(_first(part.get("size_bytes"), part.get("size"))),
+                content_type=_text(_first(part.get("content_type"), part.get("mime_type"), part.get("mime"))),
+                filename=_text(_first(part.get("filename"), part.get("file_name"), part.get("name"))),
+                extracted_text=_extracted_text(part),
+                external_id=_text(_first(part.get("id"), part.get("media_id"), part.get("attachment_id"), url)),
+                size_bytes=_int(_first(part.get("size_bytes"), part.get("size"))),
             )
         )
     return attachments
@@ -439,85 +297,43 @@ def _sender_value(*values: object) -> str | None:
             )
         else:
             candidate = value
-        text = _text_value(candidate)
+        text = _text(candidate)
         if text:
             return text
     return None
 
 
-def _chat_has_handle(chat: Mapping[str, Any], handle: str) -> bool:
-    normalized = _normalize_phoneish(handle)
-    handles = chat.get("handles")
-    if not isinstance(handles, list):
-        return False
-    for item in handles:
-        if isinstance(item, Mapping) and _normalize_phoneish(_text_value(item.get("handle"))) == normalized:
-            return True
-    return False
-
-
-def _linq_message_is_inbound(message: Mapping[str, Any]) -> bool:
-    if message.get("is_from_me") is True:
-        return False
-    if message.get("is_from_me") is False:
-        return True
-    for key in ("from_handle", "sender_handle", "handle"):
-        value = message.get(key)
-        if isinstance(value, Mapping) and value.get("is_me") is True:
-            return False
-        if isinstance(value, Mapping) and value.get("is_me") is False:
-            return True
-    direction = _text_value(message.get("direction"))
-    if direction:
-        return direction.lower() in {"inbound", "received"}
-    return False
-
-
-def _normalize_phoneish(value: str | None) -> str:
-    if value is None:
+def normalize_phone(value: str | None) -> str:
+    if not value:
         return ""
-    return "".join(ch for ch in value if ch.isdigit()) or value.strip()
+    digits = "".join(ch for ch in value if ch.isdigit())
+    return digits or value.strip().lower()
 
 
-def _text_value(value: object) -> str | None:
+def _extracted_text(part: Mapping[str, Any]) -> str | None:
+    values: list[str] = []
+    for key in ("extracted_text", "ocr_text", "text", "description", "summary", "transcript", "alt_text", "caption"):
+        value = _text(part.get(key))
+        if value and value not in values:
+            values.append(value)
+    if not values:
+        return None
+    compacted = " ".join("\n".join(values).split())
+    return compacted[:2000]
+
+
+def _text(value: object) -> str | None:
     if value in (None, "") or isinstance(value, Mapping):
         return None
     text = str(value).strip()
     return text or None
 
 
-def _attachment_extracted_text(part: Mapping[str, Any]) -> str | None:
-    values = []
-    for key in (
-        "extracted_text",
-        "ocr_text",
-        "text",
-        "description",
-        "summary",
-        "transcript",
-        "alt_text",
-        "caption",
-    ):
-        value = _text_value(part.get(key))
-        if value and value not in values:
-            values.append(value)
-    if not values:
-        return None
-    return _compact_text("\n".join(values), limit=MAX_ATTACHMENT_EXTRACTED_TEXT_CHARS)
-
-
-def _compact_text(value: str, *, limit: int) -> str:
-    compacted = " ".join(value.split())
-    if len(compacted) <= limit:
-        return compacted
-    return compacted[:limit].rstrip()
-
-
-def _int_value(value: object) -> int | None:
+def _int(value: object) -> int | None:
     if value in (None, ""):
         return None
     try:
-        parsed = int(value)
+        parsed = int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
     return parsed if parsed >= 0 else None
@@ -527,8 +343,7 @@ def _parse_dt(value: object, *, default: datetime) -> datetime:
     if not value:
         return ensure_utc(default)
     try:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        return ensure_utc(parsed)
+        return ensure_utc(datetime.fromisoformat(str(value).replace("Z", "+00:00")))
     except ValueError:
         return ensure_utc(default)
 
@@ -548,8 +363,132 @@ def _first(*values: object) -> object | None:
     return None
 
 
-def _normalize_signature(signature: str) -> str:
-    compact = signature.strip()
-    if compact.lower().startswith("sha256="):
-        return compact.split("=", 1)[1].strip()
-    return compact
+# -- outbound client -------------------------------------------------------------
+
+
+class LinqClient:
+    def __init__(self, settings: Settings, *, http_client: httpx.AsyncClient | None = None) -> None:
+        self.settings = settings
+        self._client = http_client or httpx.AsyncClient(timeout=20.0)
+
+    @property
+    def live(self) -> bool:
+        return bool(self.settings.linq_api_key)
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.settings.linq_api_key}",
+            "Content-Type": "application/json",
+        }
+
+    def _url(self, path: str) -> str:
+        return self.settings.linq_base_url.rstrip("/") + "/" + path.lstrip("/")
+
+    async def send_text(self, *, chat_id: str, text: str, idempotency_key: str) -> dict[str, Any]:
+        if not self.live:
+            log.info("DRY-RUN send to %s: %s", chat_id, text)
+            return {"dry_run": True, "chat_id": chat_id, "text": text}
+        # Current docs spell the text part {"type": "text", "body": ...}; older
+        # deployments used "value". If the primary shape is rejected, retry once
+        # with the legacy key so a docs drift can't take messaging down.
+        for attempt, part_key in enumerate(("body", "value")):
+            payload = {
+                "message": {
+                    "parts": [{"type": "text", part_key: text}],
+                    "idempotency_key": idempotency_key,
+                }
+            }
+            response = await self._client.post(
+                self._url(f"chats/{chat_id}/messages"), headers=self._headers(), json=payload
+            )
+            if attempt == 0 and response.status_code in (400, 422):
+                log.warning(
+                    "send_text rejected with %s using part key %r; retrying with legacy key: %s",
+                    response.status_code,
+                    part_key,
+                    response.text[:200],
+                )
+                continue
+            response.raise_for_status()
+            return _json_or_empty(response)
+        response.raise_for_status()
+        return _json_or_empty(response)
+
+    async def create_chat(self, *, to: list[str], text: str, idempotency_key: str) -> dict[str, Any]:
+        if not self.settings.linq_from_phone:
+            raise RuntimeError("LINQ_FROM_PHONE is not configured")
+        if not self.live:
+            return {"dry_run": True, "to": to, "text": text}
+        payload = {
+            "from": self.settings.linq_from_phone,
+            "to": to,
+            "message": {
+                "parts": [{"type": "text", "body": text}],
+                "idempotency_key": idempotency_key,
+                "preferred_service": "iMessage",
+            },
+        }
+        response = await self._client.post(self._url("chats"), headers=self._headers(), json=payload)
+        response.raise_for_status()
+        return _json_or_empty(response)
+
+    async def get_chat(self, chat_id: str) -> dict[str, Any]:
+        if not self.live:
+            return {}
+        response = await self._client.get(self._url(f"chats/{chat_id}"), headers=self._headers())
+        response.raise_for_status()
+        return _json_or_empty(response)
+
+    async def start_typing(self, chat_id: str) -> None:
+        if not self.live:
+            return
+        try:
+            await self._client.post(self._url(f"chats/{chat_id}/typing"), headers=self._headers())
+        except httpx.HTTPError:
+            pass
+
+    async def stop_typing(self, chat_id: str) -> None:
+        if not self.live:
+            return
+        try:
+            await self._client.delete(self._url(f"chats/{chat_id}/typing"), headers=self._headers())
+        except httpx.HTTPError:
+            pass
+
+    async def download_media(self, url: str) -> tuple[bytes, str | None]:
+        """Fetch inbound media. CDN URLs are usually presigned; fall back to API auth."""
+        response = await self._client.get(url, follow_redirects=True)
+        if response.status_code in (401, 403) and self.live:
+            response = await self._client.get(
+                url, headers={"Authorization": f"Bearer {self.settings.linq_api_key}"}, follow_redirects=True
+            )
+        response.raise_for_status()
+        content = response.content
+        if len(content) > MAX_MEDIA_BYTES:
+            raise ValueError(f"attachment too large ({len(content)} bytes)")
+        return content, response.headers.get("content-type")
+
+
+def _json_or_empty(response: httpx.Response) -> dict[str, Any]:
+    if not response.text:
+        return {}
+    try:
+        parsed = response.json()
+        return parsed if isinstance(parsed, dict) else {"response": parsed}
+    except ValueError:
+        return {"response": response.text}
+
+
+def chat_handles_from_info(info: Mapping[str, Any]) -> tuple[str, ...]:
+    chat = info.get("chat") if isinstance(info.get("chat"), Mapping) else info
+    return _chat_handles(chat)
+
+
+def chat_is_group_from_info(info: Mapping[str, Any]) -> bool | None:
+    chat = info.get("chat") if isinstance(info.get("chat"), Mapping) else info
+    if isinstance(chat, Mapping) and isinstance(chat.get("is_group"), bool):
+        return chat["is_group"]
+    handles = _chat_handles(chat)
+    if handles:
+        return len(handles) > 2
+    return None

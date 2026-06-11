@@ -1,98 +1,32 @@
-x-florence-runtime-env: &florence-runtime-env
-  FLORENCE_DATABASE_URL: ${FLORENCE_DATABASE_URL:-postgresql://florence:florence@db:5432/florence}
-  FLORENCE_DB_PATH: ${FLORENCE_DB_PATH:-./data/florence.sqlite}
-  FLORENCE_DEFAULT_TIMEZONE: ${FLORENCE_DEFAULT_TIMEZONE:-America/Los_Angeles}
-  FLORENCE_DAILY_BRIEFING_HOUR: ${FLORENCE_DAILY_BRIEFING_HOUR:-7}
-  FLORENCE_DAILY_BRIEFING_MINUTE: ${FLORENCE_DAILY_BRIEFING_MINUTE:-15}
-  FLORENCE_DAILY_BRIEFING_DELIVERY_GRACE_MINUTES: ${FLORENCE_DAILY_BRIEFING_DELIVERY_GRACE_MINUTES:-240}
-  FLORENCE_REMINDER_DELIVERY_GRACE_MINUTES: ${FLORENCE_REMINDER_DELIVERY_GRACE_MINUTES:-1440}
-  FLORENCE_PENDING_ACTION_TTL_MINUTES: ${FLORENCE_PENDING_ACTION_TTL_MINUTES:-1440}
-  FLORENCE_DATA_DELETION_CONFIRMATION_TTL_MINUTES: ${FLORENCE_DATA_DELETION_CONFIRMATION_TTL_MINUTES:-30}
-  FLORENCE_DEV_ENDPOINTS_ENABLED: ${FLORENCE_DEV_ENDPOINTS_ENABLED:-1}
-  FLORENCE_ADMIN_API_KEY: ${FLORENCE_ADMIN_API_KEY:-}
-  FLORENCE_SOURCE_INGEST_API_KEY: ${FLORENCE_SOURCE_INGEST_API_KEY:-}
-  FLORENCE_TOKEN_ENCRYPTION_KEY: ${FLORENCE_TOKEN_ENCRYPTION_KEY:-}
-  FLORENCE_SUPPORT_CONTACT: ${FLORENCE_SUPPORT_CONTACT:-support@example.com}
-  FLORENCE_LINQ_LIVE_VERIFIED: ${FLORENCE_LINQ_LIVE_VERIFIED:-0}
-  FLORENCE_LINQ_LIVE_VERIFIED_AT: ${FLORENCE_LINQ_LIVE_VERIFIED_AT:-}
-  FLORENCE_LINQ_LIVE_VERIFICATION_PROOF: ${FLORENCE_LINQ_LIVE_VERIFICATION_PROOF:-}
-  FLORENCE_GOOGLE_LIVE_VERIFIED: ${FLORENCE_GOOGLE_LIVE_VERIFIED:-0}
-  FLORENCE_GOOGLE_LIVE_VERIFIED_AT: ${FLORENCE_GOOGLE_LIVE_VERIFIED_AT:-}
-  FLORENCE_GOOGLE_LIVE_VERIFICATION_PROOF: ${FLORENCE_GOOGLE_LIVE_VERIFICATION_PROOF:-}
-  FLORENCE_HERMES_LIVE_VERIFIED: ${FLORENCE_HERMES_LIVE_VERIFIED:-0}
-  FLORENCE_HERMES_LIVE_VERIFIED_AT: ${FLORENCE_HERMES_LIVE_VERIFIED_AT:-}
-  FLORENCE_HERMES_LIVE_VERIFICATION_PROOF: ${FLORENCE_HERMES_LIVE_VERIFICATION_PROOF:-}
-  LINQ_API_KEY: ${LINQ_API_KEY:-}
-  LINQ_WEBHOOK_SECRET: ${LINQ_WEBHOOK_SECRET:-}
-  LINQ_BASE_URL: ${LINQ_BASE_URL:-https://api.linqapp.com/api/partner/v3}
-  LINQ_FROM_PHONE: ${LINQ_FROM_PHONE:-}
-  GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
-  GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
-  GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-http://localhost:8000/oauth/google/callback}
-  GOOGLE_OAUTH_SCOPES: ${GOOGLE_OAUTH_SCOPES:-openid,email,https://www.googleapis.com/auth/gmail.readonly,https://www.googleapis.com/auth/calendar.readonly}
-  GOOGLE_OAUTH_STATE_TTL_MINUTES: ${GOOGLE_OAUTH_STATE_TTL_MINUTES:-15}
-  GOOGLE_FETCH_SINCE_DAYS: ${GOOGLE_FETCH_SINCE_DAYS:-7}
-  GOOGLE_FETCH_CALENDAR_DAYS: ${GOOGLE_FETCH_CALENDAR_DAYS:-14}
-  GOOGLE_FETCH_MAX_EMAILS: ${GOOGLE_FETCH_MAX_EMAILS:-25}
-  GOOGLE_FETCH_MAX_CALENDAR_EVENTS: ${GOOGLE_FETCH_MAX_CALENDAR_EVENTS:-50}
-  FLORENCE_SOURCE_SYNC_INTERVAL_SECONDS: ${FLORENCE_SOURCE_SYNC_INTERVAL_SECONDS:-300}
-  HERMES_AGENT_REF: ${HERMES_AGENT_REF:-}
-  FLORENCE_HERMES_AGENT_PATH: ${FLORENCE_HERMES_AGENT_PATH:-/opt/hermes-agent}
-  FLORENCE_HERMES_PROVIDER: ${FLORENCE_HERMES_PROVIDER:-openrouter}
-  FLORENCE_HERMES_MODEL: ${FLORENCE_HERMES_MODEL:-}
-  FLORENCE_HERMES_TOOLSETS: ${FLORENCE_HERMES_TOOLSETS:-}
-  FLORENCE_HERMES_RUNTIME_HOME: ${FLORENCE_HERMES_RUNTIME_HOME:-/tmp/florence-hermes-home}
-  FLORENCE_HERMES_STRICT: ${FLORENCE_HERMES_STRICT:-1}
-
 services:
   db:
     image: postgres:16-alpine
     environment:
-      POSTGRES_DB: florence
       POSTGRES_USER: florence
       POSTGRES_PASSWORD: florence
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U florence -d florence"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
+      POSTGRES_DB: florence
+    ports:
+      - "5433:5432"
     volumes:
-      - postgres-data:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U florence"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
 
   app:
-    build:
-      context: .
-      args:
-        INSTALL_HERMES_AGENT: ${INSTALL_HERMES_AGENT:-0}
-        HERMES_AGENT_REPO: ${HERMES_AGENT_REPO:-https://github.com/NousResearch/hermes-agent.git}
-        HERMES_AGENT_REF: ${HERMES_AGENT_REF:-}
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
     env_file:
       - path: .env
         required: false
     environment:
-      <<: *florence-runtime-env
-    depends_on:
-      db:
-        condition: service_healthy
+      FLORENCE_DATABASE_URL: postgresql://florence:florence@db:5432/florence
     ports:
       - "8000:8000"
 
-  worker:
-    build:
-      context: .
-      args:
-        INSTALL_HERMES_AGENT: ${INSTALL_HERMES_AGENT:-0}
-        HERMES_AGENT_REPO: ${HERMES_AGENT_REPO:-https://github.com/NousResearch/hermes-agent.git}
-        HERMES_AGENT_REF: ${HERMES_AGENT_REF:-}
-    command: ["florence-worker"]
-    env_file:
-      - path: .env
-        required: false
-    environment:
-      <<: *florence-runtime-env
-    depends_on:
-      db:
-        condition: service_healthy
-
 volumes:
-  postgres-data:
+  pgdata:

@@ -41,15 +41,22 @@ class LLMClient:
         )
 
     async def chat(
-        self, messages: list[dict[str, Any]], *, tools: list[dict[str, Any]] | None = None
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        response_format: dict[str, Any] | None = None,
     ) -> LLMReply:
         if not self.settings.model_api_key:
             raise LLMError("no model API key configured (FLORENCE_MODEL_API_KEY / OPENAI_API_KEY)")
-        payload: dict[str, Any] = {"model": self.settings.model, "messages": messages}
+        payload: dict[str, Any] = {"model": model or self.settings.model, "messages": messages}
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
-        if self.settings.reasoning_effort:
+        if response_format:
+            payload["response_format"] = response_format
+        if self.settings.reasoning_effort and model is None:
             payload["reasoning_effort"] = self.settings.reasoning_effort
 
         last_error = "unknown error"

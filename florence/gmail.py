@@ -52,6 +52,7 @@ class EmailSummary:
     subject: str
     snippet: str
     received_at: datetime
+    body: str = ""
 
 
 @dataclass(frozen=True, slots=True)

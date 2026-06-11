@@ -74,6 +74,23 @@ class FakeStore:
         self.tasks.append(kwargs)
         return kwargs["id"]
 
+    async def list_tasks(self, household_id, include_inactive=False, limit=50):
+        return [
+            TaskItem(
+                id=t["id"],
+                household_id=household_id,
+                chat_id=t.get("chat_id"),
+                kind=t.get("kind", "reminder"),
+                title=t["title"],
+                notes=t.get("notes"),
+                due_at=t["due_at"],
+                recurrence=t.get("recurrence"),
+                status="pending",
+                attempts=0,
+            )
+            for t in self.tasks
+        ]
+
     async def get_task(self, household_id, task_id):
         for t in self.tasks:
             if t["id"] == task_id:
@@ -180,6 +197,29 @@ async def test_past_time_tool_error_lets_model_recover():
     assert result.error is None
 
 
+async def test_duplicate_reminder_is_rejected():
+    tomorrow = (now_utc() + timedelta(days=1)).astimezone(
+        timezone(timedelta(hours=-7))
+    ).strftime("%Y-%m-%d") + " 19:00"
+    first = tool_call("schedule_reminder", {"title": "Prep for Connolly Ranch camp", "when_local": tomorrow})
+    second = tool_call(
+        "schedule_reminder", {"title": "Prep Connolly Ranch camp stuff for the kids", "when_local": tomorrow}, "call_2"
+    )
+    llm = FakeLLM(
+        [
+            LLMReply(content="", tool_calls=[first]),
+            LLMReply(content="", tool_calls=[second]),
+            LLMReply(content="You're covered already."),
+        ]
+    )
+    deps = make_deps(llm)
+    await run_turn(deps, household=HOUSEHOLD, chat=CHAT, member=SARAH)
+    assert len(deps.store.tasks) == 1
+    rejection = llm.calls[2][-1]
+    assert rejection["role"] == "tool"
+    assert "similar reminder already exists" in rejection["content"]
+
+
 async def test_empty_reply_means_silence():
     llm = FakeLLM([LLMReply(content="")])
     deps = make_deps(llm)
@@ -211,6 +251,42 @@ async def test_system_prompt_contains_context():
     assert "It is " in system["content"]
     # Conversation history is present with sender attribution.
     assert any("Sarah:" in str(m.get("content", "")) for m in llm.calls[0])
+
+
+async def test_setup_checklist_drives_onboarding():
+    llm = FakeLLM([LLMReply(content="hi")])
+    deps = make_deps(llm)
+    await run_turn(deps, household=HOUSEHOLD, chat=CHAT, member=SARAH)
+    system = llm.calls[0][0]["content"]
+    # Sarah is named and the chat is a group, but no kids/gmail yet: setup section shows.
+    assert "Getting set up" in system
+    assert "[x] Know the parents' names" in system
+    assert "[ ] Email connected" in system
+    assert "brain dump" in system
+
+
+async def test_setup_checklist_disappears_when_complete():
+    from florence.prompts import _setup_section
+    from florence.store import GmailAccount, Memory
+
+    section = _setup_section(
+        members=[SARAH],
+        memories=[Memory(id="m", content="Maya is 7", category="kids", created_at=now_utc())],
+        accounts=[
+            GmailAccount(
+                id="g",
+                household_id="h1",
+                member_phone=SARAH.phone,
+                email="s@gmail.com",
+                token_ciphertext="x",
+                status="active",
+                last_synced_at=None,
+                failure_count=0,
+            )
+        ],
+        chats=[CHAT],
+    )
+    assert section is None
 
 
 async def test_unknown_tool_returns_error_to_model():

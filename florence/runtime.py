@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import defaultdict
+from dataclasses import replace
 from datetime import timedelta
 from typing import Any
 
@@ -18,6 +19,7 @@ from florence.gmail import EmailSummary
 from florence import prompts
 from florence.store import TaskItem
 from florence.timeutil import next_local_time, next_occurrence, now_utc
+from florence.triage import gate_email
 
 log = logging.getLogger("florence.runtime")
 
@@ -179,8 +181,23 @@ class Runtime:
             kind="routine",
             title=MORNING_BRIEF_TITLE,
             due_at=first,
-            notes="Daily family rundown. Parents can change the time or cancel it by asking Florence.",
+            notes=prompts.MORNING_BRIEF_NOTES,
             recurrence="daily",
+            created_by="florence",
+        )
+        # One-time follow-up so Florence drives setup even if the first
+        # conversation fizzles before email is connected.
+        checkin = next_local_time(17, 0, household.timezone)
+        if checkin - now_utc() < timedelta(hours=14):
+            checkin = next_occurrence(checkin, "daily", household.timezone)
+        await self.deps.store.create_task(
+            household_id=household_id,
+            chat_id=household.primary_chat_id,
+            kind="routine",
+            title="Setup check-in",
+            due_at=checkin,
+            notes=prompts.SETUP_CHECKIN_NOTES,
+            recurrence=None,
             created_by="florence",
         )
 
@@ -223,19 +240,57 @@ class Runtime:
         household = await self.deps.store.household_by_id(household_id)
         if household is None or household.stopped or not household.primary_chat_id:
             return
+        items = sorted(items, key=lambda e: e.received_at)[-EMAIL_ITEMS_PER_TURN:]
+        survivors = await self._gate_and_enrich(household_id, items)
+        if not survivors:
+            return
         resolved = await self.deps.store.household_for_chat(household.primary_chat_id)
         chat = resolved[1] if resolved else None
-        items = sorted(items, key=lambda e: e.received_at)[-EMAIL_ITEMS_PER_TURN:]
         async with self._turn_semaphore:
             try:
                 await run_turn(
                     self.deps,
                     household=household,
                     chat=chat,
-                    directive=prompts.email_directive(items, household.timezone),
+                    directive=prompts.email_directive(survivors, household.timezone),
                 )
             except Exception:  # noqa: BLE001
                 log.exception("email turn crashed for household %s", household_id)
+
+    async def _gate_and_enrich(
+        self, household_id: str, items: list[EmailSummary]
+    ) -> list[EmailSummary]:
+        """Run each email past the gatekeeper; fetch full bodies for survivors
+        so the family turn acts on substance, not snippets."""
+        memories = await self.deps.store.list_memories(household_id)
+        accounts = {a.email: a for a in await self.deps.store.gmail_accounts(household_id)}
+        survivors: list[EmailSummary] = []
+        skipped: list[dict[str, str]] = []
+        for item in items:
+            decision = await gate_email(
+                self.deps.llm,
+                item=item,
+                memories=memories,
+                triage_model=self.deps.settings.triage_model,
+            )
+            if not decision.notify:
+                skipped.append({"subject": item.subject, "why": decision.justification})
+                continue
+            body = decision.summary
+            account = accounts.get(item.account_email)
+            if account is not None:
+                try:
+                    full = await self.deps.gmail.read_full(account, item.gmail_id)
+                    body = str(full.get("body") or "")[:1500] or body
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("read_full failed for %s: %s", item.gmail_id, exc)
+            survivors.append(replace(item, body=body))
+        await self.deps.store.log_event(
+            "email_triage",
+            household_id=household_id,
+            payload={"total": len(items), "passed": len(survivors), "skipped": skipped},
+        )
+        return survivors
 
     async def gmail_connected_turn(
         self, household_id: str, chat_id: str | None, email: str, by_name: str | None

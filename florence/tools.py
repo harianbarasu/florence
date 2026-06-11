@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, Awaitable, Callable
@@ -94,6 +95,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "repeat": {"type": "string", "enum": ["none", *RECURRENCES]},
                     "notes": {"type": "string", "description": "Context to include when delivering it"},
                     "deliver_to_chat_id": {"type": "string", "description": "Defaults to the current chat"},
+                    "allow_duplicate": {"type": "boolean", "description": "Only set true after confirming a similar-looking reminder is genuinely separate"},
                 },
                 "required": ["title", "when_local"],
             },
@@ -318,6 +320,23 @@ def _default_chat_id(ctx: ToolContext) -> str | None:
     return ctx.household.primary_chat_id
 
 
+_TITLE_STOPWORDS = frozenset(
+    "a an the for to of and or in on at with your my our s stuff prep get pack bring".split()
+)
+
+
+def _similar_titles(a: str, b: str) -> bool:
+    def tokens(value: str) -> set[str]:
+        words = re.findall(r"[a-z0-9']+", value.lower())
+        return {w for w in words if w not in _TITLE_STOPWORDS}
+
+    ta, tb = tokens(a), tokens(b)
+    if not ta or not tb:
+        return a.strip().lower() == b.strip().lower()
+    overlap = len(ta & tb) / len(ta | tb)
+    return overlap >= 0.6
+
+
 async def _schedule_reminder(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
     title = str(args.get("title") or "").strip()
     when_raw = str(args.get("when_local") or "").strip()
@@ -334,6 +353,19 @@ async def _schedule_reminder(ctx: ToolContext, args: dict[str, Any]) -> dict[str
     repeat = str(args.get("repeat") or "none").strip().lower()
     if repeat not in ("none", *RECURRENCES):
         raise ValueError(f"repeat must be one of none, {', '.join(RECURRENCES)}")
+    if not args.get("allow_duplicate"):
+        for existing in await ctx.store.list_tasks(ctx.household.id):
+            if (
+                existing.status in ("pending", "firing")
+                and _similar_titles(existing.title, title)
+                and abs((existing.due_at - due_at).total_seconds()) < 24 * 3600
+            ):
+                raise ValueError(
+                    f'a very similar reminder already exists: "{existing.title}" at '
+                    f"{format_local(existing.due_at, tz)}. The family is probably covered — "
+                    "update that one with update_reminder if needed, or pass "
+                    "allow_duplicate=true only if this is genuinely a separate reminder."
+                )
     deliver_to = str(args.get("deliver_to_chat_id") or "").strip() or _default_chat_id(ctx)
     if deliver_to and deliver_to not in {c.chat_id for c in ctx.household_chats}:
         raise ValueError("deliver_to_chat_id is not one of this family's chats")

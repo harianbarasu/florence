@@ -49,6 +49,7 @@ class Settings:
     model: str = "gpt-5.5"
     model_base_url: str = "https://api.openai.com/v1"
     model_api_key: str | None = None
+    triage_model: str = "gpt-5.4-mini"
     reasoning_effort: str | None = None
     max_turn_steps: int = 10
     max_sends_per_turn: int = 5
@@ -82,6 +83,7 @@ class Settings:
             google_redirect_uri=os.getenv("GOOGLE_REDIRECT_URI") or None,
             token_encryption_key=os.getenv("FLORENCE_TOKEN_ENCRYPTION_KEY") or None,
             model=os.getenv("FLORENCE_MODEL", "gpt-5.5"),
+            triage_model=os.getenv("FLORENCE_TRIAGE_MODEL", "gpt-5.4-mini"),
             model_base_url=(
                 os.getenv("FLORENCE_MODEL_BASE_URL")
                 or os.getenv("OPENAI_BASE_URL")

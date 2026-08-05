@@ -18,6 +18,7 @@ function model(): ApplicationInterpreterPort {
   return {
     interpretConversation: vi.fn(async () => MODEL_RESULT),
     triageGmail: vi.fn(async () => ({ decision: "ignore" })),
+    triageCalendar: vi.fn(async () => ({ decision: "ignore" })),
   };
 }
 

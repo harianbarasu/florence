@@ -74,6 +74,8 @@ function snapshot(overrides: Partial<HouseholdApplicationSnapshot["projection"][
       },
       sharedProfile: { facts: [] },
       gmailTriage: [],
+      calendarTriage: [],
+      calendarSources: [],
       pendingPromotions: [],
       workers: [],
     },

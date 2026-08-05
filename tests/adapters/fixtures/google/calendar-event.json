@@ -1,0 +1,29 @@
+{
+  "id": "calendar-event-001",
+  "etag": "etag-calendar-event-001",
+  "iCalUID": "calendar-event-001@example.test",
+  "status": "confirmed",
+  "created": "2026-08-01T10:00:00.000Z",
+  "updated": "2026-08-05T10:00:00.000Z",
+  "sequence": 2,
+  "summary": "School orientation",
+  "description": "Bring the signed packet.",
+  "location": "Main office",
+  "start": { "dateTime": "2026-08-10T09:00:00-07:00", "timeZone": "America/Los_Angeles" },
+  "end": { "dateTime": "2026-08-10T10:00:00-07:00", "timeZone": "America/Los_Angeles" },
+  "organizer": { "email": "parent@example.test", "self": true },
+  "creator": { "email": "parent@example.test", "self": true },
+  "attendees": [
+    {
+      "email": "partner@example.test",
+      "displayName": "Partner",
+      "responseStatus": "accepted",
+      "optional": false,
+      "organizer": false,
+      "resource": false
+    }
+  ],
+  "transparency": "opaque",
+  "visibility": "private",
+  "htmlLink": "https://calendar.google.com/calendar/event?eid=fixture"
+}

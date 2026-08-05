@@ -1,0 +1,44 @@
+{
+  "id": "gmail-message-001",
+  "threadId": "gmail-thread-001",
+  "historyId": "9001",
+  "internalDate": "1785942000000",
+  "labelIds": ["INBOX", "UNREAD", "INBOX"],
+  "snippet": "Field trip form due Friday",
+  "payload": {
+    "mimeType": "multipart/mixed",
+    "headers": [
+      { "name": "From", "value": "School Office <office@school.example>" },
+      { "name": "To", "value": "Parent <parent@example.test>" },
+      { "name": "Subject", "value": "Field trip form" },
+      { "name": "Message-ID", "value": "<fixture-001@school.example>" },
+      { "name": "X-Repeat", "value": "one" },
+      { "name": "X-Repeat", "value": "two" }
+    ],
+    "parts": [
+      {
+        "partId": "0",
+        "mimeType": "multipart/alternative",
+        "parts": [
+          {
+            "partId": "0.0",
+            "mimeType": "text/plain",
+            "body": { "size": 32, "data": "RmllbGQgdHJpcCBmb3JtIGR1ZSBGcmlkYXku" }
+          },
+          {
+            "partId": "0.1",
+            "mimeType": "text/html",
+            "body": { "size": 39, "data": "PHA-RmllbGQgdHJpcCBmb3JtIGR1ZSBGcmlkYXkuPC9wPg" }
+          }
+        ]
+      },
+      {
+        "partId": "1",
+        "mimeType": "application/pdf",
+        "filename": "permission-slip.pdf",
+        "headers": [{ "name": "Content-Disposition", "value": "attachment" }],
+        "body": { "attachmentId": "gmail-attachment-001", "size": 8192 }
+      }
+    ]
+  }
+}

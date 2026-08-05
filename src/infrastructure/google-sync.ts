@@ -33,6 +33,11 @@ export const gmailSyncPhaseSchema = z.enum([
 ]);
 export type GmailSyncPhase = z.infer<typeof gmailSyncPhaseSchema>;
 
+export const GMAIL_DISCOVERY_MESSAGE_COUNT_MAX = 1_000_000;
+const GMAIL_RECOVERY_PAGE_SIZE = 20;
+const GMAIL_LIVE_WINDOW_MS = 24 * 60 * 60_000;
+const GMAIL_LIVE_FUTURE_TOLERANCE_MS = 5 * 60_000;
+
 const gmailHistoryCursorSchema = z.strictObject({
   cursorId: z.string().regex(/^\d+$/).nullable(),
   startId: z.string().regex(/^\d+$/).nullable(),
@@ -46,16 +51,29 @@ const gmailWatchStateSchema = z.strictObject({
   subscription: z.string().min(1).max(1_000),
 });
 
+export const gmailDiscoveryRunSchema = z.strictObject({
+  runId: z.string().min(1).max(500),
+  messageCount: z.number().int().nonnegative().max(GMAIL_DISCOVERY_MESSAGE_COUNT_MAX),
+  status: z.enum(["collecting", "pending", "published"]),
+});
+
+export type GmailDiscoveryRun = z.infer<typeof gmailDiscoveryRunSchema>;
+
 export const gmailSyncStateSchema = z.strictObject({
-  schemaVersion: z.literal(1),
+  schemaVersion: z.literal(2),
   revision: z.number().int().nonnegative(),
   phase: gmailSyncPhaseSchema,
   requestedDepth: gmailSyncDepthSchema,
   boundaryAt: instantSchema,
   scanPageToken: z.string().min(1).nullable(),
+  scanProcessedMessageIds: z
+    .array(z.string().min(1).max(500))
+    .max(500)
+    .refine((ids) => new Set(ids).size === ids.length, "Processed Gmail message IDs must be unique"),
   history: gmailHistoryCursorSchema,
   watch: gmailWatchStateSchema.nullable(),
   lastSuccessfulSyncAt: instantSchema.nullable(),
+  discovery: gmailDiscoveryRunSchema.nullable(),
   cancellation: z
     .strictObject({
       requestedAt: instantSchema,
@@ -207,6 +225,19 @@ export interface GoogleSyncRepositoryPort {
   }): Promise<"revoked" | "not_found">;
 }
 
+export interface PublishGmailDiscoveryCompletionInput {
+  householdId: string;
+  adultId: string;
+  connectionId: string;
+  expectedRevision: number;
+  state: GmailSyncState;
+}
+
+/** Publishes the one private discovery status atomically with its cursor transition. */
+export interface GmailDiscoveryCompletionPort {
+  publish(input: PublishGmailDiscoveryCompletionInput): Promise<ScopedMutationResult>;
+}
+
 export interface GmailProviderPort {
   getMessage(input: {
     accessToken: string;
@@ -242,6 +273,7 @@ export interface GoogleSyncServiceOptions {
   gmail: GmailProviderPort;
   oauth: GoogleCredentialLifecyclePort;
   application: Pick<FlorenceApplication, "process">;
+  completionDigest: GmailDiscoveryCompletionPort;
   secretBox: Pick<SecretBox, "open" | "seal">;
   gmailTopicName: string;
   gmailPubSubSubscription: string;
@@ -279,6 +311,7 @@ export class GoogleSyncService {
   readonly #gmail: GmailProviderPort;
   readonly #oauth: GoogleCredentialLifecyclePort;
   readonly #application: Pick<FlorenceApplication, "process">;
+  readonly #completionDigest: GmailDiscoveryCompletionPort;
   readonly #secretBox: Pick<SecretBox, "open" | "seal">;
   readonly #gmailTopicName: string;
   readonly #gmailPubSubSubscription: string;
@@ -292,6 +325,7 @@ export class GoogleSyncService {
     this.#gmail = options.gmail;
     this.#oauth = options.oauth;
     this.#application = options.application;
+    this.#completionDigest = options.completionDigest;
     this.#secretBox = options.secretBox;
     this.#gmailTopicName = z
       .string()
@@ -393,11 +427,18 @@ export class GoogleSyncService {
 
     const targetId = maxHistoryId(state.history.targetId, event.historyId);
     if (
-      state.phase === "live" &&
       state.history.pageToken === null &&
       state.history.cursorId !== null &&
-      compareHistoryIds(event.historyId, state.history.cursorId) <= 0
+      targetId !== null &&
+      compareHistoryIds(targetId, state.history.cursorId) <= 0
     ) {
+      if (isScanPhase(state.phase)) {
+        return result(connection, state, "continuation_required", EMPTY_COUNTS);
+      }
+      if (state.discovery?.status === "pending") {
+        const published = await this.#publishPendingDiscovery(connection, state);
+        return result(connection, published, "processed", EMPTY_COUNTS);
+      }
       return result(connection, state, "noop", EMPTY_COUNTS);
     }
 
@@ -405,15 +446,8 @@ export class GoogleSyncService {
       ...state,
       history: { ...state.history, targetId },
     };
-    if (targetedState.phase !== "live") {
-      return this.#processScanPage(connection, targetedState, signal);
-    }
     if (targetedState.history.cursorId === null) {
-      return this.#processScanPage(
-        connection,
-        restartRecentScan(targetedState, this.#now().toISOString()),
-        signal,
-      );
+      return this.#recoverExpiredHistoryCursor(connection, targetedState, signal);
     }
     return this.#processHistoryPage(connection, targetedState, event.publishedAt, signal);
   }
@@ -424,6 +458,17 @@ export class GoogleSyncService {
   ): Promise<GmailSyncResult> {
     const connection = await this.#ownedActiveConnection(work);
     const current = stateFromConnection(connection, this.#now());
+    if (current.discovery?.status === "pending") {
+      const published = await this.#publishPendingDiscovery(connection, current);
+      return result(connection, published, "processed", EMPTY_COUNTS);
+    }
+    if (current.discovery?.status === "collecting" || isScanPhase(current.phase)) {
+      return result(connection, current, "continuation_required", EMPTY_COUNTS);
+    }
+    if (current.discovery?.status === "published") {
+      return result(connection, current, "noop", EMPTY_COUNTS);
+    }
+    const boundaryAt = this.#now().toISOString();
     const watch = await this.#withCredentials(connection, signal, (accessToken) =>
       this.#gmail.startWatch({ accessToken, topicName: this.#gmailTopicName }),
     );
@@ -431,8 +476,9 @@ export class GoogleSyncService {
       ...current,
       phase: "recent_90_days",
       requestedDepth: work.depth,
-      boundaryAt: this.#now().toISOString(),
+      boundaryAt,
       scanPageToken: null,
+      scanProcessedMessageIds: [],
       history: {
         cursorId: current.history.cursorId ?? watch.historyId,
         startId: null,
@@ -443,6 +489,11 @@ export class GoogleSyncService {
         historyId: watch.historyId,
         expiresAt: watch.expiresAt,
         subscription: this.#gmailPubSubSubscription,
+      },
+      discovery: {
+        runId: gmailDiscoveryRunId(connection.id, boundaryAt),
+        messageCount: 0,
+        status: "collecting",
       },
       cancellation: null,
     });
@@ -466,12 +517,19 @@ export class GoogleSyncService {
       throw new GoogleSyncError("Google connection is not active", "not_authorized", false);
     }
     if (state.phase === "cancelled") return result(connection, state, "cancelled", EMPTY_COUNTS);
-    if (state.phase !== "live") return this.#processScanPage(connection, state, signal);
-    if (state.history.pageToken !== null || state.history.targetId !== null) {
+    if (hasPendingHistory(state)) {
       if (state.history.cursorId === null) {
-        return this.#processScanPage(connection, restartRecentScan(state, this.#now().toISOString()), signal);
+        return this.#recoverExpiredHistoryCursor(connection, state, signal);
       }
       return this.#processHistoryPage(connection, state, this.#now().toISOString(), signal);
+    }
+    if (state.discovery?.status === "pending") {
+      const published = await this.#publishPendingDiscovery(connection, state);
+      return result(connection, published, "processed", EMPTY_COUNTS);
+    }
+    if (isScanPhase(state.phase)) return this.#processScanPage(connection, state, signal);
+    if (state.phase !== "live") {
+      throw new GoogleSyncError("Gmail sync phase cannot continue", "invalid_state", false);
     }
     return result(connection, state, "noop", EMPTY_COUNTS);
   }
@@ -485,7 +543,7 @@ export class GoogleSyncService {
     const watch = await this.#withCredentials(connection, signal, (accessToken) =>
       this.#gmail.startWatch({ accessToken, topicName: this.#gmailTopicName }),
     );
-    const saved = await this.#saveState(connection, {
+    let saved = await this.#saveState(connection, {
       ...state,
       history: {
         ...state.history,
@@ -497,10 +555,13 @@ export class GoogleSyncService {
         subscription: this.#gmailPubSubSubscription,
       },
     });
+    if (saved.discovery?.status === "pending" && !hasPendingHistory(saved)) {
+      saved = await this.#publishPendingDiscovery(connection, saved);
+    }
     return result(
       connection,
       saved,
-      saved.phase === "live" ? "processed" : "continuation_required",
+      requiresContinuation(saved) ? "continuation_required" : "processed",
       EMPTY_COUNTS,
     );
   }
@@ -516,7 +577,9 @@ export class GoogleSyncService {
       ...state,
       phase: "cancelled",
       scanPageToken: null,
+      scanProcessedMessageIds: [],
       history: { ...state.history, startId: null, pageToken: null, targetId: null },
+      discovery: null,
       cancellation: {
         requestedAt: this.#now().toISOString(),
         requestedByAdultId: work.adultId,
@@ -532,7 +595,12 @@ export class GoogleSyncService {
     const connection = await this.#ownedConnection(work);
     const state = stateFromConnection(connection, this.#now());
     if (connection.status === "revoked")
-      return result(connection, { ...state, phase: "revoked" }, "revoked", EMPTY_COUNTS);
+      return result(
+        connection,
+        { ...state, phase: "revoked", scanProcessedMessageIds: [], discovery: null },
+        "revoked",
+        EMPTY_COUNTS,
+      );
 
     if (connection.encryptedCredentials !== null) {
       try {
@@ -564,7 +632,12 @@ export class GoogleSyncService {
         throw new GoogleSyncError("Google connection revocation was not scoped", "not_authorized", false);
       }
     }
-    return result(connection, { ...state, phase: "revoked" }, "revoked", EMPTY_COUNTS);
+    return result(
+      connection,
+      { ...state, phase: "revoked", scanProcessedMessageIds: [], discovery: null },
+      "revoked",
+      EMPTY_COUNTS,
+    );
   }
 
   async #processScanPage(
@@ -586,9 +659,12 @@ export class GoogleSyncService {
       }),
     );
     let processedMessages = 0;
+    let workingState = state;
+    const alreadyProcessed = new Set(state.scanProcessedMessageIds);
     for (const item of page.messages) {
       assertNotAborted(signal);
-      await this.#fetchPersistAndProcess(
+      if (alreadyProcessed.has(item.messageId)) continue;
+      await this.#fetchAndPersist(
         connection,
         item.messageId,
         {
@@ -598,18 +674,28 @@ export class GoogleSyncService {
         signal,
       );
       processedMessages += 1;
+      alreadyProcessed.add(item.messageId);
+      workingState = await this.#saveState(connection, {
+        ...workingState,
+        scanProcessedMessageIds: [...alreadyProcessed],
+        discovery:
+          workingState.discovery?.status === "collecting"
+            ? {
+                ...workingState.discovery,
+                messageCount: saturatingDiscoveryCount(workingState.discovery.messageCount, 1),
+              }
+            : workingState.discovery,
+      });
     }
 
     const nextState = page.nextPageToken
-      ? { ...state, scanPageToken: page.nextPageToken }
-      : advanceScanPhase(state, this.#now().toISOString());
-    const saved = await this.#saveState(connection, nextState);
-    const historyCatchUpRequired =
-      saved.phase === "live" &&
-      saved.history.cursorId !== null &&
-      saved.history.targetId !== null &&
-      compareHistoryIds(saved.history.targetId, saved.history.cursorId) > 0;
-    const status = saved.phase === "live" && !historyCatchUpRequired ? "processed" : "continuation_required";
+      ? { ...workingState, scanPageToken: page.nextPageToken, scanProcessedMessageIds: [] }
+      : advanceScanPhase(workingState, this.#now().toISOString());
+    let saved = await this.#saveState(connection, nextState);
+    if (saved.discovery?.status === "pending" && !hasPendingHistory(saved)) {
+      saved = await this.#publishPendingDiscovery(connection, saved);
+    }
+    const status = requiresContinuation(saved) ? "continuation_required" : "processed";
     return result(connection, saved, status, { processedMessages, processedDeletions: 0 });
   }
 
@@ -649,7 +735,7 @@ export class GoogleSyncService {
           );
           processedDeletions += 1;
         } else {
-          await this.#fetchPersistAndProcess(
+          const fetched = await this.#fetchAndPersist(
             connection,
             decision.messageId,
             {
@@ -659,6 +745,9 @@ export class GoogleSyncService {
             },
             signal,
           );
+          if (decision.added && isWithinLiveTriageWindow(fetched.message, this.#now())) {
+            await this.#processLiveMessage(connection, fetched.message, fetched.persisted.revision);
+          }
           processedMessages += 1;
         }
       }
@@ -680,26 +769,72 @@ export class GoogleSyncService {
         history: nextHistory,
         lastSuccessfulSyncAt: this.#now().toISOString(),
       });
-      return result(connection, saved, page.nextPageToken ? "continuation_required" : "processed", {
+      return result(connection, saved, requiresContinuation(saved) ? "continuation_required" : "processed", {
         processedMessages,
         processedDeletions,
       });
     } catch (error) {
       if (!(error instanceof GoogleSyncTokenExpiredError)) throw error;
-      return this.#processScanPage(connection, restartRecentScan(state, this.#now().toISOString()), signal);
+      return this.#recoverExpiredHistoryCursor(connection, state, signal);
     }
   }
 
-  async #fetchPersistAndProcess(
+  async #recoverExpiredHistoryCursor(
+    connection: GoogleSyncConnection,
+    state: GmailSyncState,
+    signal?: AbortSignal,
+  ): Promise<GmailSyncResult> {
+    const now = this.#now();
+    const recoveryAfter = Math.max(
+      now.getTime() - GMAIL_LIVE_WINDOW_MS,
+      state.lastSuccessfulSyncAt === null
+        ? Number.NEGATIVE_INFINITY
+        : new Date(state.lastSuccessfulSyncAt).getTime(),
+    );
+    const page = await this.#withCredentials(connection, signal, (accessToken) =>
+      this.#gmail.listMessageIdsPage({
+        accessToken,
+        maxResults: GMAIL_RECOVERY_PAGE_SIZE,
+        query: `after:${Math.floor(recoveryAfter / 1_000)}`,
+        includeSpamTrash: false,
+      }),
+    );
+    let processedMessages = 0;
+    for (const item of page.messages) {
+      assertNotAborted(signal);
+      await this.#fetchAndPersist(
+        connection,
+        item.messageId,
+        { mode: "recovery", providerEventIds: [] },
+        signal,
+      );
+      processedMessages += 1;
+    }
+    const rebasedCursor = maxHistoryId(
+      maxHistoryId(state.history.targetId, state.watch?.historyId ?? null),
+      state.history.cursorId,
+    );
+    const saved = await this.#saveState(connection, {
+      ...state,
+      history: { cursorId: rebasedCursor, startId: null, pageToken: null, targetId: null },
+      lastSuccessfulSyncAt: now.toISOString(),
+    });
+    return result(connection, saved, requiresContinuation(saved) ? "continuation_required" : "processed", {
+      processedMessages,
+      processedDeletions: 0,
+    });
+  }
+
+  async #fetchAndPersist(
     connection: GoogleSyncConnection,
     messageId: string,
     discovery: {
-      mode: "recent_90_days" | "one_year_backfill" | "full_history_backfill" | "history";
+      mode: "recent_90_days" | "one_year_backfill" | "full_history_backfill" | "history" | "recovery";
       historyId?: string;
       providerEventIds: readonly string[];
     },
     signal?: AbortSignal,
-  ): Promise<void> {
+  ): Promise<{ message: GmailMessage; persisted: PersistPersonalGmailSourceResult }> {
     const message = await this.#withCredentials(connection, signal, (accessToken) =>
       this.#gmail.getMessage({
         accessToken,
@@ -727,7 +862,15 @@ export class GoogleSyncService {
       metadata: sourceMetadata(connection, message, discovery),
     });
 
-    const inboxItem = toGmailInboxItem(connection, message, persisted.revision, this.#now());
+    return { message, persisted };
+  }
+
+  async #processLiveMessage(
+    connection: GoogleSyncConnection,
+    message: GmailMessage,
+    revision: number,
+  ): Promise<void> {
+    const inboxItem = toGmailInboxItem(connection, message, revision, this.#now());
     const applicationResult = await this.#application.process(inboxItem);
     if (applicationResult.outcome.status !== "processed") {
       throw new GoogleSyncError(
@@ -736,6 +879,35 @@ export class GoogleSyncService {
         false,
       );
     }
+  }
+
+  async #publishPendingDiscovery(
+    connection: GoogleSyncConnection,
+    state: GmailSyncState,
+  ): Promise<GmailSyncState> {
+    if (state.discovery?.status !== "pending") {
+      throw new GoogleSyncError("Gmail discovery completion is not pending", "invalid_state", false);
+    }
+    const published = gmailSyncStateSchema.parse({
+      ...state,
+      revision: state.revision + 1,
+      discovery: { ...state.discovery, status: "published" },
+    });
+    const outcome = await this.#completionDigest.publish({
+      householdId: connection.householdId,
+      adultId: connection.adultId,
+      connectionId: connection.id,
+      expectedRevision: state.revision,
+      state: published,
+    });
+    if (outcome !== "updated") {
+      throw new GoogleSyncError(
+        "Gmail discovery completion changed concurrently or became inactive",
+        outcome === "conflict" ? "conflict" : "not_authorized",
+        outcome === "conflict",
+      );
+    }
+    return published;
   }
 
   async #persistDeletion(
@@ -900,15 +1072,17 @@ export class GoogleSyncService {
 
 function initialState(now: Date): GmailSyncState {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     revision: 0,
     phase: "live",
     requestedDepth: "full_history",
     boundaryAt: now.toISOString(),
     scanPageToken: null,
+    scanProcessedMessageIds: [],
     history: { cursorId: null, startId: null, pageToken: null, targetId: null },
     watch: null,
     lastSuccessfulSyncAt: null,
+    discovery: null,
     cancellation: null,
   };
 }
@@ -1004,15 +1178,26 @@ function queryForPhase(
 
 function advanceScanPhase(state: GmailSyncState, completedAt: string): GmailSyncState {
   if (state.phase === "recent_90_days" && state.requestedDepth !== "recent_90_days") {
-    return { ...state, phase: "one_year_backfill", scanPageToken: null };
+    return {
+      ...state,
+      phase: "one_year_backfill",
+      scanPageToken: null,
+      scanProcessedMessageIds: [],
+    };
   }
   if (state.phase === "one_year_backfill" && state.requestedDepth === "full_history") {
-    return { ...state, phase: "full_history_backfill", scanPageToken: null };
+    return {
+      ...state,
+      phase: "full_history_backfill",
+      scanPageToken: null,
+      scanProcessedMessageIds: [],
+    };
   }
   return {
     ...state,
     phase: "live",
     scanPageToken: null,
+    scanProcessedMessageIds: [],
     history: {
       cursorId: state.history.cursorId ?? state.watch?.historyId ?? null,
       startId: null,
@@ -1025,18 +1210,8 @@ function advanceScanPhase(state: GmailSyncState, completedAt: string): GmailSync
           : state.history.targetId,
     },
     lastSuccessfulSyncAt: completedAt,
-  };
-}
-
-function restartRecentScan(state: GmailSyncState, boundaryAt: string): GmailSyncState {
-  const rebasedCursor = state.history.targetId ?? state.watch?.historyId ?? state.history.cursorId;
-  return {
-    ...state,
-    phase: "recent_90_days",
-    requestedDepth: "recent_90_days",
-    boundaryAt,
-    scanPageToken: null,
-    history: { cursorId: rebasedCursor, startId: null, pageToken: null, targetId: null },
+    discovery:
+      state.discovery?.status === "collecting" ? { ...state.discovery, status: "pending" } : state.discovery,
   };
 }
 
@@ -1044,11 +1219,18 @@ function finalHistoryDecisions(changes: readonly GmailHistoryChange[]): Array<{
   messageId: string;
   historyId: string;
   deleted: boolean;
+  added: boolean;
   providerEventIds: string[];
 }> {
   const decisions = new Map<
     string,
-    { messageId: string; historyId: string; deleted: boolean; providerEventIds: string[] }
+    {
+      messageId: string;
+      historyId: string;
+      deleted: boolean;
+      added: boolean;
+      providerEventIds: string[];
+    }
   >();
   const ordered = [...changes].sort((left, right) => compareHistoryIds(left.historyId, right.historyId));
   for (const change of ordered) {
@@ -1056,11 +1238,52 @@ function finalHistoryDecisions(changes: readonly GmailHistoryChange[]): Array<{
     decisions.set(change.messageId, {
       messageId: change.messageId,
       historyId: change.historyId,
-      deleted: change.changeType === "message.deleted",
+      deleted:
+        change.changeType === "message.deleted"
+          ? true
+          : change.changeType === "message.added"
+            ? false
+            : (existing?.deleted ?? false),
+      added:
+        change.changeType === "message.added"
+          ? true
+          : change.changeType === "message.deleted"
+            ? false
+            : (existing?.added ?? false),
       providerEventIds: [...(existing?.providerEventIds ?? []), change.providerEventId],
     });
   }
   return [...decisions.values()];
+}
+
+function hasPendingHistory(state: GmailSyncState): boolean {
+  if (state.history.pageToken !== null) return true;
+  if (state.history.targetId === null) return false;
+  return (
+    state.history.cursorId === null || compareHistoryIds(state.history.targetId, state.history.cursorId) > 0
+  );
+}
+
+function requiresContinuation(state: GmailSyncState): boolean {
+  return isScanPhase(state.phase) || hasPendingHistory(state) || state.discovery?.status === "pending";
+}
+
+function isWithinLiveTriageWindow(message: GmailMessage, now: Date): boolean {
+  if (message.internalDate === null) return false;
+  const occurredAt = new Date(message.internalDate).getTime();
+  if (!Number.isFinite(occurredAt)) return false;
+  return (
+    occurredAt >= now.getTime() - GMAIL_LIVE_WINDOW_MS &&
+    occurredAt <= now.getTime() + GMAIL_LIVE_FUTURE_TOLERANCE_MS
+  );
+}
+
+function saturatingDiscoveryCount(current: number, increment: number): number {
+  return Math.min(GMAIL_DISCOVERY_MESSAGE_COUNT_MAX, current + increment);
+}
+
+function gmailDiscoveryRunId(connectionId: string, boundaryAt: string): string {
+  return `gmail-discovery:${connectionId}:${boundaryAt}`;
 }
 
 function sourceMetadata(

@@ -37,6 +37,7 @@ import {
   productionHttpLoggerOptions,
 } from "./http/index.js";
 import { createPostgresDailyBriefHost } from "./infrastructure/daily-brief-host.js";
+import { GmailPrivateCompletionDigestAdapter } from "./infrastructure/gmail-completion-digest.js";
 import { GoogleCalendarActions } from "./infrastructure/google-calendar-actions.js";
 import {
   type CalendarSyncWork,
@@ -509,6 +510,7 @@ function createGoogleComposition(input: {
       gmail: new GmailAdapter(adapterConfig),
       oauth: oauthAdapter,
       application: input.application,
+      completionDigest: new GmailPrivateCompletionDigestAdapter(input.runtimeStore),
       secretBox: input.secretBox,
       gmailTopicName: config.GOOGLE_GMAIL_TOPIC_NAME,
       gmailPubSubSubscription: config.GOOGLE_GMAIL_PUBSUB_SUBSCRIPTION,

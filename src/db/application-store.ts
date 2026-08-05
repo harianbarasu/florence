@@ -1712,16 +1712,26 @@ export class ApplicationStore implements ApplicationRepositoryPort {
   }
 
   public async enqueueApplicationIntent(rawIntent: unknown): Promise<{ rowId: string }> {
+    const rowId = await this.database.begin(async (transaction) => {
+      const inserted = await this.insertApplicationIntent(transaction, rawIntent);
+      return inserted.rowId;
+    });
+    return { rowId };
+  }
+
+  /** Allows an infrastructure state transition and its outbox effect to share one transaction. */
+  public async insertApplicationIntent(
+    transaction: TransactionSql<Record<string, never>>,
+    rawIntent: unknown,
+  ): Promise<{ rowId: string }> {
     const intent = ApplicationOutboxIntentSchema.parse(rawIntent);
-    const rowId = await this.database.begin((transaction) =>
-      insertOutboxIntent(transaction, this.database, intent.householdId, {
-        intentKey: intent.intentId,
-        effectKind: intent.kind,
-        idempotencyKey: intent.idempotencyKey,
-        payload: intent,
-        maxAttempts: 8,
-      }),
-    );
+    const rowId = await insertOutboxIntent(transaction, this.database, intent.householdId, {
+      intentKey: intent.intentId,
+      effectKind: intent.kind,
+      idempotencyKey: intent.idempotencyKey,
+      payload: intent,
+      maxAttempts: 8,
+    });
     return { rowId };
   }
 

@@ -4,6 +4,7 @@ import { ApplicationStore } from "../../src/db/application-store.js";
 import { closeDatabase, createDatabase, type Database } from "../../src/db/client.js";
 import { migrateDatabase } from "../../src/db/migrate.js";
 import { AdultIdSchema } from "../../src/domain/index.js";
+import { GmailPrivateCompletionDigestAdapter } from "../../src/infrastructure/gmail-completion-digest.js";
 import { FlorenceRuntimeStore } from "../../src/infrastructure/runtime-store.js";
 
 const GOOGLE_CALENDAR_READONLY_SCOPE = "https://www.googleapis.com/auth/calendar.readonly";
@@ -228,12 +229,13 @@ describe.skipIf(!databaseUrl)("FlorenceRuntimeStore PostgreSQL integration", () 
       metadata: { credentialAadVersion: 1 },
     });
     const state = {
-      schemaVersion: 1 as const,
+      schemaVersion: 2 as const,
       revision: 1,
       phase: "live" as const,
       requestedDepth: "full_history" as const,
       boundaryAt: "2026-08-05T19:00:00Z",
       scanPageToken: null,
+      scanProcessedMessageIds: [],
       history: { cursorId: "100", startId: null, pageToken: null, targetId: null },
       watch: {
         historyId: "100",
@@ -241,6 +243,7 @@ describe.skipIf(!databaseUrl)("FlorenceRuntimeStore PostgreSQL integration", () 
         subscription: "projects/test/subscriptions/florence",
       },
       lastSuccessfulSyncAt: "2026-08-05T19:00:00Z",
+      discovery: null,
       cancellation: null,
     };
     await expect(
@@ -313,6 +316,91 @@ describe.skipIf(!databaseUrl)("FlorenceRuntimeStore PostgreSQL integration", () 
     ).resolves.toHaveLength(0);
   });
 
+  it("publishes a Gmail discovery completion atomically to only the owning adult", async () => {
+    const founded = await provisionConsentedFounder({
+      externalChatId: `dm-gmail-digest-${randomUUID()}`,
+      externalHandle: "+12025550219",
+      timeZone: "America/Los_Angeles",
+      occurredAt: "2027-01-01T08:00:00Z",
+    });
+    if (!founded.adultId) throw new Error("Expected a founding adult");
+    const connection = await applicationStore.upsertExternalConnection({
+      householdId: founded.householdId,
+      adultId: founded.adultId,
+      provider: "google",
+      label: "Sensitive Work Label",
+      externalAccountId: `gmail-digest-${randomUUID()}`,
+      email: `gmail-digest-${randomUUID()}@example.test`,
+      encryptedCredentials: "encrypted",
+      grantedScopes: ["https://www.googleapis.com/auth/gmail.readonly"],
+      cursor: {},
+      metadata: { credentialAadVersion: 1 },
+    });
+    const pending = {
+      schemaVersion: 2 as const,
+      revision: 1,
+      phase: "live" as const,
+      requestedDepth: "full_history" as const,
+      boundaryAt: "2027-01-01T08:00:00Z",
+      scanPageToken: null,
+      scanProcessedMessageIds: [],
+      history: { cursorId: "200", startId: null, pageToken: null, targetId: null },
+      watch: {
+        historyId: "100",
+        expiresAt: "2027-01-08T08:00:00Z",
+        subscription: "projects/test/subscriptions/florence",
+      },
+      lastSuccessfulSyncAt: "2027-01-01T08:00:00Z",
+      discovery: { runId: "durable-private-run", messageCount: 42, status: "pending" as const },
+      cancellation: null,
+    };
+    await expect(
+      store.saveGmailSyncState({
+        householdId: founded.householdId,
+        adultId: founded.adultId,
+        connectionId: connection.connectionId,
+        expectedRevision: 0,
+        state: pending,
+      }),
+    ).resolves.toBe("updated");
+    const adapter = new GmailPrivateCompletionDigestAdapter(store);
+    const publication = {
+      householdId: founded.householdId,
+      adultId: founded.adultId,
+      connectionId: connection.connectionId,
+      expectedRevision: 1,
+      state: {
+        ...pending,
+        revision: 2,
+        discovery: { ...pending.discovery, status: "published" as const },
+      },
+    };
+
+    await expect(adapter.publish(publication)).resolves.toBe("updated");
+    await expect(adapter.publish(publication)).resolves.toBe("conflict");
+    const stored = await database<{ cursor: Record<string, unknown> }[]>`
+      select cursor from external_connections where id = ${connection.connectionId}
+    `;
+    expect(stored[0]?.cursor.gmail).toMatchObject({
+      revision: 2,
+      discovery: { runId: "durable-private-run", messageCount: 42, status: "published" },
+    });
+    const outbox = await database<{ payload: Record<string, unknown> }[]>`
+      select payload from outbox
+      where household_id = ${founded.householdId}
+        and payload->>'kind' = 'conversation.send'
+        and payload->>'messageClass' = 'status'
+        and payload->'targetScope'->>'adultId' = ${founded.adultId}
+        and payload->>'body' like 'Private Gmail discovery is complete%'
+    `;
+    expect(outbox).toHaveLength(1);
+    expect(outbox[0]?.payload).toMatchObject({
+      targetScope: { kind: "personal", adultId: founded.adultId },
+      body: expect.stringContaining("42 messages"),
+    });
+    expect(JSON.stringify(outbox)).not.toMatch(/Sensitive Work Label|example\.test|subject|snippet/iu);
+  });
+
   it("reconciles and leases idempotent Gmail continuation work", async () => {
     const founded = await provisionConsentedFounder({
       externalChatId: `dm-sync-${randomUUID()}`,
@@ -341,12 +429,13 @@ describe.skipIf(!databaseUrl)("FlorenceRuntimeStore PostgreSQL integration", () 
         connectionId: connection.connectionId,
         expectedRevision: 0,
         state: {
-          schemaVersion: 1,
+          schemaVersion: 2,
           revision: 1,
           phase: "recent_90_days",
           requestedDepth: "full_history",
           boundaryAt: current,
           scanPageToken: null,
+          scanProcessedMessageIds: [],
           history: { cursorId: "100", startId: null, pageToken: null, targetId: null },
           watch: {
             historyId: "100",
@@ -354,6 +443,7 @@ describe.skipIf(!databaseUrl)("FlorenceRuntimeStore PostgreSQL integration", () 
             subscription: "projects/test/subscriptions/florence",
           },
           lastSuccessfulSyncAt: null,
+          discovery: null,
           cancellation: null,
         },
       }),

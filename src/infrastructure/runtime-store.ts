@@ -2,6 +2,8 @@ import { createHmac, randomUUID } from "node:crypto";
 import { z } from "zod";
 import { GOOGLE_CALENDAR_EVENTS_SCOPE, GOOGLE_CALENDAR_READONLY_SCOPE } from "../adapters/google/index.js";
 import {
+  type ApplicationOutboxIntent,
+  ApplicationOutboxIntentSchema,
   createApplicationProjection,
   createOnboardingProjection,
   type HouseholdApplicationSnapshot,
@@ -821,7 +823,7 @@ export class FlorenceRuntimeStore {
         adultId: z.uuid(),
         connectionId: z.uuid(),
         expectedRevision: z.number().int().nonnegative(),
-        state: z.record(z.string(), z.unknown()),
+        state: gmailSyncStateSchema,
       })
       .parse(input);
     const stateJson = JSON.parse(JSON.stringify(parsed.state));
@@ -835,6 +837,62 @@ export class FlorenceRuntimeStore {
       returning id
     `;
     if (rows[0]) return "updated";
+    return this.googleMutationFailure(parsed);
+  }
+
+  public async publishGmailDiscoveryCompletion(input: {
+    householdId: string;
+    adultId: string;
+    connectionId: string;
+    expectedRevision: number;
+    state: GmailSyncState;
+    intent: ApplicationOutboxIntent;
+  }): Promise<ScopedMutationResult> {
+    const parsed = z
+      .strictObject({
+        householdId: z.uuid(),
+        adultId: z.uuid(),
+        connectionId: z.uuid(),
+        expectedRevision: z.number().int().nonnegative(),
+        state: gmailSyncStateSchema,
+        intent: ApplicationOutboxIntentSchema,
+      })
+      .parse(input);
+    if (
+      parsed.state.revision !== parsed.expectedRevision + 1 ||
+      parsed.state.discovery?.status !== "published"
+    ) {
+      throw new ApplicationStoreError("invalid_state", "Gmail discovery publication state is invalid");
+    }
+    if (
+      parsed.intent.kind !== "conversation.send" ||
+      parsed.intent.householdId !== parsed.householdId ||
+      parsed.intent.targetScope.kind !== "personal" ||
+      parsed.intent.targetScope.adultId !== parsed.adultId ||
+      parsed.intent.messageClass !== "status"
+    ) {
+      throw new ApplicationStoreError("not_authorized", "Gmail completion status is not owner-private");
+    }
+
+    const discovery = parsed.state.discovery;
+    const stateJson = JSON.parse(JSON.stringify(parsed.state));
+    const updated = await this.database.begin(async (transaction) => {
+      const rows = await transaction<{ id: string }[]>`
+        update external_connections
+        set cursor = jsonb_set(cursor, '{gmail}', ${this.database.json(stateJson)}, true),
+          last_synced_at = now(), updated_at = now()
+        where id = ${parsed.connectionId} and household_id = ${parsed.householdId}
+          and adult_id = ${parsed.adultId} and provider = 'google' and status = 'active'
+          and coalesce((cursor->'gmail'->>'revision')::integer, 0) = ${parsed.expectedRevision}
+          and cursor->'gmail'->'discovery'->>'runId' = ${discovery.runId}
+          and cursor->'gmail'->'discovery'->>'status' = 'pending'
+        returning id
+      `;
+      if (!rows[0]) return false;
+      await this.applicationStore.insertApplicationIntent(transaction, parsed.intent);
+      return true;
+    });
+    if (updated) return "updated";
     return this.googleMutationFailure(parsed);
   }
 
@@ -2043,7 +2101,12 @@ function googleWorkForState(
   };
   if (
     ["recent_90_days", "one_year_backfill", "full_history_backfill"].includes(state.phase) ||
-    (state.phase === "live" && (state.history.pageToken !== null || state.history.targetId !== null))
+    state.discovery?.status === "pending" ||
+    (state.phase === "live" &&
+      (state.history.pageToken !== null ||
+        (state.history.targetId !== null &&
+          (state.history.cursorId === null ||
+            BigInt(state.history.targetId) > BigInt(state.history.cursorId)))))
   ) {
     return gmailSyncWorkSchema.parse({ kind: "continue", ...identity });
   }

@@ -11,6 +11,8 @@ import {
 import type { ApplicationResult } from "../../src/application/index.js";
 import { HouseholdIdSchema } from "../../src/domain/index.js";
 import {
+  GMAIL_DISCOVERY_MESSAGE_COUNT_MAX,
+  type GmailDiscoveryCompletionPort,
   type GmailProviderPort,
   type GmailSyncState,
   type GoogleConnectionDirectoryPort,
@@ -37,12 +39,13 @@ const TOPIC = "projects/florence/topics/gmail";
 
 function syncState(overrides: Partial<GmailSyncState> = {}): GmailSyncState {
   return gmailSyncStateSchema.parse({
-    schemaVersion: 1,
+    schemaVersion: 2,
     revision: 0,
     phase: "live",
     requestedDepth: "full_history",
     boundaryAt: NOW.toISOString(),
     scanPageToken: null,
+    scanProcessedMessageIds: [],
     history: { cursorId: "100", startId: null, pageToken: null, targetId: null },
     watch: {
       historyId: "100",
@@ -50,6 +53,7 @@ function syncState(overrides: Partial<GmailSyncState> = {}): GmailSyncState {
       subscription: SUBSCRIPTION,
     },
     lastSuccessfulSyncAt: null,
+    discovery: null,
     cancellation: null,
     ...overrides,
   });
@@ -227,7 +231,10 @@ function createHarness(options: FakeGmailOptions = {}) {
   const secretBox = new SecretBox(randomBytes(32).toString("base64url"));
   const store = new MemoryGoogleStore(connection(secretBox));
   const queries: string[] = [];
+  const listInputs: Parameters<GmailProviderPort["listMessageIdsPage"]>[0][] = [];
   const applicationItems: unknown[] = [];
+  const completionPublishes: Parameters<GmailDiscoveryCompletionPort["publish"]>[0][] = [];
+  const completionControl = { fail: false };
   const stopWatch = vi.fn(async () => undefined);
   const revoke = vi.fn(async () => undefined);
   const gmail: GmailProviderPort = {
@@ -240,6 +247,7 @@ function createHarness(options: FakeGmailOptions = {}) {
         nextPageToken: null,
       })),
     async listMessageIdsPage(input) {
+      listInputs.push(structuredClone(input));
       if (input.query) queries.push(input.query);
       return options.list?.(input) ?? { messages: [], nextPageToken: null, resultSizeEstimate: 0 };
     },
@@ -253,6 +261,13 @@ function createHarness(options: FakeGmailOptions = {}) {
       return { ...tokens, accessToken: "refreshed-access", expiresAt: "2027-01-02T08:00:00.000Z" };
     },
     revoke,
+  };
+  const completionDigest: GmailDiscoveryCompletionPort = {
+    async publish(input) {
+      completionPublishes.push(structuredClone(input));
+      if (completionControl.fail) throw new Error("completion publication failed");
+      return store.saveGmailSyncState(input);
+    },
   };
   const service = new GoogleSyncService({
     directory: store,
@@ -277,13 +292,25 @@ function createHarness(options: FakeGmailOptions = {}) {
         };
       },
     },
+    completionDigest,
     secretBox,
     gmailTopicName: TOPIC,
     gmailPubSubSubscription: SUBSCRIPTION,
     now: () => NOW,
     pageSize: 25,
   });
-  return { service, store, secretBox, queries, applicationItems, stopWatch, revoke };
+  return {
+    service,
+    store,
+    secretBox,
+    queries,
+    listInputs,
+    applicationItems,
+    completionPublishes,
+    completionControl,
+    stopWatch,
+    revoke,
+  };
 }
 
 function historyNotice(historyId: string) {
@@ -300,6 +327,25 @@ function historyNotice(historyId: string) {
       publishedAt: NOW.toISOString(),
       deliveryAttempt: 1,
     },
+  };
+}
+
+function historyChange(
+  messageId: string,
+  historyId: string,
+  changeType: "message.added" | "message.deleted" | "labels.added" | "labels.removed",
+) {
+  return {
+    schemaVersion: 1 as const,
+    source: "gmail" as const,
+    sourceScope: "personal" as const,
+    googleSubject: "google-subject-parent",
+    providerEventId: `history-${historyId}-${changeType}-${messageId}`,
+    historyId,
+    changeType,
+    messageId,
+    threadId: `thread-${messageId}`,
+    labelIds: changeType.startsWith("labels.") ? ["STARRED"] : [],
   };
 }
 
@@ -335,6 +381,7 @@ describe("GoogleSyncService", () => {
         revoke: async () => undefined,
       },
       application: { process: async () => Promise.reject(new Error("must not process")) },
+      completionDigest: { publish: async () => Promise.reject(new Error("must not publish")) },
       secretBox: harness.secretBox,
       gmailTopicName: TOPIC,
       gmailPubSubSubscription: SUBSCRIPTION,
@@ -352,7 +399,7 @@ describe("GoogleSyncService", () => {
     expect(harness.store.sources.size).toBe(0);
   });
 
-  it("persists encrypted personal revisions before application processing and checkpoints history", async () => {
+  it("triages only a recent message.added while persisting later label-only revisions", async () => {
     let page = 0;
     let fetchedVersion = 0;
     const harness = createHarness({
@@ -419,7 +466,6 @@ describe("GoogleSyncService", () => {
 
     expect(harness.applicationItems).toMatchObject([
       { ownerAdultId: ADULT_ID, revision: 1, idempotencyKey: expect.stringContaining("revision:1") },
-      { ownerAdultId: ADULT_ID, revision: 2, idempotencyKey: expect.stringContaining("revision:2") },
     ]);
     const stored = harness.store.sources.get("message-1");
     expect(stored).toMatchObject({ adultId: ADULT_ID, kind: "gmail_message", revision: 2 });
@@ -437,10 +483,84 @@ describe("GoogleSyncService", () => {
       targetId: null,
     });
     await expect(harness.service.execute(historyNotice("102"))).resolves.toMatchObject({ status: "noop" });
-    expect(harness.applicationItems).toHaveLength(2);
+    expect(harness.applicationItems).toHaveLength(1);
   });
 
-  it("falls back to a recent scan when the Gmail history cursor has expired", async () => {
+  it("persists old, label-only, unknown-date, far-future, and deleted history without live triage", async () => {
+    const internalDates = new Map<string, string | null>([
+      ["recent", "2027-01-01T07:00:00.000Z"],
+      ["future-tolerated", "2027-01-01T08:04:00.000Z"],
+      ["old", "2026-12-31T07:59:59.999Z"],
+      ["future-rejected", "2027-01-01T08:06:00.000Z"],
+      ["unknown", null],
+      ["label-only", "2027-01-01T07:30:00.000Z"],
+    ]);
+    const harness = createHarness({
+      async history() {
+        return {
+          changes: [
+            historyChange("recent", "101", "message.added"),
+            historyChange("future-tolerated", "102", "message.added"),
+            historyChange("old", "103", "message.added"),
+            historyChange("future-rejected", "104", "message.added"),
+            historyChange("unknown", "105", "message.added"),
+            historyChange("label-only", "106", "labels.added"),
+            historyChange("deleted", "107", "message.deleted"),
+          ],
+          mailboxHistoryId: "107",
+          nextPageToken: null,
+        };
+      },
+      async get({ messageId }) {
+        return { ...message(1, messageId), internalDate: internalDates.get(messageId) ?? null };
+      },
+    });
+
+    await expect(harness.service.execute(historyNotice("107"))).resolves.toMatchObject({
+      status: "processed",
+      processedMessages: 6,
+      processedDeletions: 1,
+    });
+    expect(harness.applicationItems.map((item) => (item as { messageRef: string }).messageRef)).toEqual([
+      `gmail:${CONNECTION_ID}:recent`,
+      `gmail:${CONNECTION_ID}:future-tolerated`,
+    ]);
+    expect(harness.store.sources.size).toBe(7);
+  });
+
+  it("drains pushed history before scanning and preserves every scan checkpoint", async () => {
+    const harness = createHarness({
+      async history() {
+        return { changes: [], mailboxHistoryId: "101", nextPageToken: null };
+      },
+      async list() {
+        throw new Error("scan must not run before pushed history");
+      },
+    });
+    harness.store.connection.cursor = {
+      gmail: syncState({
+        phase: "recent_90_days",
+        scanPageToken: "scan-page-2",
+        scanProcessedMessageIds: ["already-persisted"],
+        discovery: { runId: "run-1", messageCount: 7, status: "collecting" },
+      }),
+    };
+
+    await expect(harness.service.execute(historyNotice("101"))).resolves.toMatchObject({
+      status: "continuation_required",
+      phase: "recent_90_days",
+    });
+    expect(harness.listInputs).toHaveLength(0);
+    expect(harness.store.connection.cursor.gmail).toMatchObject({
+      phase: "recent_90_days",
+      scanPageToken: "scan-page-2",
+      scanProcessedMessageIds: ["already-persisted"],
+      discovery: { runId: "run-1", messageCount: 7, status: "collecting" },
+      history: { cursorId: "101", startId: null, pageToken: null, targetId: null },
+    });
+  });
+
+  it("rebases an expired history cursor with exactly one capped 24-hour recovery page", async () => {
     const harness = createHarness({
       async history() {
         throw new GoogleSyncTokenExpiredError("gmail");
@@ -451,13 +571,69 @@ describe("GoogleSyncService", () => {
       status: "processed",
       phase: "live",
     });
-    const ninetyDaysAgo = Math.floor((NOW.getTime() - 90 * 24 * 60 * 60 * 1_000) / 1_000);
-    expect(harness.queries).toEqual([`after:${ninetyDaysAgo}`]);
+    const oneDayAgo = Math.floor((NOW.getTime() - 24 * 60 * 60 * 1_000) / 1_000);
+    expect(harness.queries).toEqual([`after:${oneDayAgo}`]);
+    expect(harness.listInputs).toMatchObject([
+      { maxResults: 20, includeSpamTrash: false, query: `after:${oneDayAgo}` },
+    ]);
     expect((harness.store.connection.cursor.gmail as GmailSyncState).history.cursorId).toBe("150");
+    expect(harness.applicationItems).toHaveLength(0);
+    expect(harness.completionPublishes).toHaveLength(0);
+  });
+
+  it("uses the newer successful-sync boundary for recovery and resumes the current scan", async () => {
+    const harness = createHarness({
+      async history() {
+        throw new GoogleSyncTokenExpiredError("gmail");
+      },
+      async list() {
+        return {
+          messages: [{ messageId: "recovered", threadId: "thread-recovered" }],
+          nextPageToken: "ignored-page",
+          resultSizeEstimate: 40,
+        };
+      },
+    });
+    harness.store.connection.cursor = {
+      gmail: syncState({
+        phase: "one_year_backfill",
+        scanPageToken: "year-page-4",
+        scanProcessedMessageIds: ["year-item"],
+        lastSuccessfulSyncAt: "2027-01-01T07:00:00.000Z",
+        discovery: { runId: "run-recovery", messageCount: 12, status: "collecting" },
+      }),
+    };
+
+    await expect(harness.service.execute(historyNotice("150"))).resolves.toMatchObject({
+      status: "continuation_required",
+      phase: "one_year_backfill",
+      processedMessages: 1,
+    });
+    expect(harness.queries).toEqual([`after:${Date.parse("2027-01-01T07:00:00.000Z") / 1_000}`]);
+    expect(harness.listInputs).toHaveLength(1);
+    expect(harness.store.connection.cursor.gmail).toMatchObject({
+      phase: "one_year_backfill",
+      scanPageToken: "year-page-4",
+      scanProcessedMessageIds: ["year-item"],
+      discovery: { runId: "run-recovery", messageCount: 12, status: "collecting" },
+      history: { cursorId: "150", startId: null, pageToken: null, targetId: null },
+    });
+    expect(harness.applicationItems).toHaveLength(0);
+    expect(harness.completionPublishes).toHaveLength(0);
   });
 
   it("imports the recent 90 days before the one-year and progressive full-history phases", async () => {
-    const harness = createHarness();
+    let scan = 0;
+    const harness = createHarness({
+      async list() {
+        scan += 1;
+        return {
+          messages: [{ messageId: `historical-${scan}`, threadId: `thread-${scan}` }],
+          nextPageToken: null,
+          resultSizeEstimate: 1,
+        };
+      },
+    });
     await expect(
       harness.service.execute({
         kind: "start",
@@ -486,10 +662,84 @@ describe("GoogleSyncService", () => {
       `after:${oneYearAgo} before:${ninetyDaysAgo}`,
       `before:${oneYearAgo}`,
     ]);
+    expect(harness.applicationItems).toHaveLength(0);
+    expect(harness.store.sources.size).toBe(3);
+    expect(harness.completionPublishes).toHaveLength(1);
+    expect(harness.completionPublishes[0]?.state.discovery).toEqual({
+      runId: expect.stringContaining(`gmail-discovery:${CONNECTION_ID}:`),
+      messageCount: 3,
+      status: "published",
+    });
+  });
+
+  it("saturates the durable discovery count and recovers pending publication idempotently", async () => {
+    const harness = createHarness({
+      async list() {
+        return {
+          messages: [{ messageId: "at-cap", threadId: "thread-cap" }],
+          nextPageToken: null,
+          resultSizeEstimate: 1,
+        };
+      },
+    });
+    harness.store.connection.cursor = {
+      gmail: syncState({
+        phase: "recent_90_days",
+        requestedDepth: "recent_90_days",
+        discovery: {
+          runId: "run-at-cap",
+          messageCount: GMAIL_DISCOVERY_MESSAGE_COUNT_MAX,
+          status: "collecting",
+        },
+      }),
+    };
+    harness.completionControl.fail = true;
+
+    await expect(
+      harness.service.execute({
+        kind: "continue",
+        householdId: HOUSEHOLD_ID,
+        adultId: ADULT_ID,
+        connectionId: CONNECTION_ID,
+      }),
+    ).rejects.toMatchObject({ code: "invalid_state" } satisfies Partial<GoogleSyncError>);
+    expect(harness.store.connection.cursor.gmail).toMatchObject({
+      phase: "live",
+      discovery: {
+        runId: "run-at-cap",
+        messageCount: GMAIL_DISCOVERY_MESSAGE_COUNT_MAX,
+        status: "pending",
+      },
+    });
+
+    harness.completionControl.fail = false;
+    await expect(
+      harness.service.execute({
+        kind: "continue",
+        householdId: HOUSEHOLD_ID,
+        adultId: ADULT_ID,
+        connectionId: CONNECTION_ID,
+      }),
+    ).resolves.toMatchObject({ status: "processed", phase: "live" });
+    expect(harness.store.connection.cursor.gmail).toMatchObject({
+      discovery: {
+        runId: "run-at-cap",
+        messageCount: GMAIL_DISCOVERY_MESSAGE_COUNT_MAX,
+        status: "published",
+      },
+    });
+    expect(harness.applicationItems).toHaveLength(0);
+    expect(harness.completionPublishes).toHaveLength(2);
   });
 
   it("durably cancels without touching Google and revokes both provider and local credentials", async () => {
     const cancelled = createHarness();
+    cancelled.store.connection.cursor = {
+      gmail: syncState({
+        phase: "recent_90_days",
+        discovery: { runId: "cancelled-run", messageCount: 9, status: "collecting" },
+      }),
+    };
     await expect(
       cancelled.service.execute({
         kind: "cancel",
@@ -498,6 +748,7 @@ describe("GoogleSyncService", () => {
         connectionId: CONNECTION_ID,
       }),
     ).resolves.toMatchObject({ status: "cancelled", phase: "cancelled" });
+    expect((cancelled.store.connection.cursor.gmail as GmailSyncState).discovery).toBeNull();
     await expect(
       cancelled.service.execute({
         kind: "continue",

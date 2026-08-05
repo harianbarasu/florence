@@ -23,6 +23,7 @@ export {
   linqConfigSchema,
   parseLinqConfig,
 } from "./config.js";
+export { classifyLinqReaction, linqReactionFeedbackRef } from "./conversation.js";
 export {
   type LinqAttachment,
   type LinqConsentCommand,

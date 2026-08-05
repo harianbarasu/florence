@@ -1,10 +1,14 @@
 import { randomBytes } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import {
+  type GmailAttachment,
+  GmailAttachmentContentError,
   type GmailHistoryPage,
   type GmailMessage,
   type GmailMessageIdPage,
+  type GmailRetrievedAttachment,
   GOOGLE_GMAIL_READONLY_SCOPE,
+  GoogleAdapterError,
   GoogleSyncTokenExpiredError,
   type GoogleTokenSet,
 } from "../../src/adapters/google/index.js";
@@ -22,6 +26,7 @@ import {
   type GoogleSyncRepositoryPort,
   GoogleSyncService,
   gmailSourceContentAad,
+  gmailStoredSourceEnvelopeSchema,
   gmailSyncStateSchema,
   googleConnectionCredentialsAad,
   type PersistPersonalGmailSourceInput,
@@ -91,7 +96,7 @@ function connection(secretBox: SecretBox, state = syncState()): GoogleSyncConnec
   };
 }
 
-function message(version: number, id = "message-1"): GmailMessage {
+function message(version: number, id = "message-1", overrides: Partial<GmailMessage> = {}): GmailMessage {
   return {
     schemaVersion: 1,
     source: "gmail",
@@ -119,6 +124,21 @@ function message(version: number, id = "message-1"): GmailMessage {
     rawHeaders: { subject: [`Schedule version ${version}`] },
     body: { text: `Pickup is at ${2 + version}:00.`, html: null },
     attachments: [],
+    ...overrides,
+  };
+}
+
+function attachment(index: number, overrides: Partial<GmailAttachment> = {}): GmailAttachment {
+  return {
+    partId: `part-${index}`,
+    providerAttachmentId: `attachment-${index}`,
+    filename: `attachment-${index}.txt`,
+    mimeType: "text/plain",
+    sizeBytes: 4,
+    contentId: null,
+    inline: false,
+    embeddedDataBase64Url: null,
+    ...overrides,
   };
 }
 
@@ -187,6 +207,61 @@ class MemoryGoogleStore implements GoogleConnectionDirectoryPort, GoogleSyncRepo
       this.sources.set(input.externalId, { ...input, revision: 1 });
       return { sourceItemId: `source-${input.externalId}`, disposition: "inserted", revision: 1 };
     }
+    if (
+      previous.kind === "gmail_message" &&
+      input.kind === "gmail_message" &&
+      previous.metadata.contentCompleteness === "full" &&
+      input.metadata.contentCompleteness === "full"
+    ) {
+      const previousHistoryId = previous.metadata.messageHistoryId;
+      const incomingHistoryId = input.metadata.messageHistoryId;
+      if (
+        typeof previousHistoryId === "string" &&
+        typeof incomingHistoryId === "string" &&
+        BigInt(incomingHistoryId) < BigInt(previousHistoryId)
+      ) {
+        return {
+          sourceItemId: `source-${input.externalId}`,
+          disposition: "unchanged",
+          revision: previous.revision,
+          retainedExisting: "stale",
+        };
+      }
+      if (
+        previous.contentHash !== input.contentHash &&
+        (typeof previousHistoryId !== "string" ||
+          typeof incomingHistoryId !== "string" ||
+          incomingHistoryId === previousHistoryId)
+      ) {
+        throw new Error("conflicting Gmail full content");
+      }
+    }
+    if (
+      input.kind === "gmail_message" &&
+      (previous.kind === "gmail_message_deleted" ||
+        (previous.metadata.contentCompleteness === "full" &&
+          input.metadata.contentCompleteness === "metadata"))
+    ) {
+      if (previous.kind !== "gmail_message_deleted") {
+        this.sources.set(input.externalId, {
+          ...previous,
+          metadata: {
+            ...previous.metadata,
+            discoveryMode: input.metadata.discoveryMode,
+            discoveryHistoryId: input.metadata.discoveryHistoryId,
+            providerEventIds: input.metadata.providerEventIds,
+            contentCompleteness: "full",
+          },
+        });
+      }
+      return {
+        sourceItemId: `source-${input.externalId}`,
+        disposition: "unchanged",
+        revision: previous.revision,
+        retainedExisting:
+          previous.kind === "gmail_message_deleted" ? ("deleted" as const) : ("full" as const),
+      };
+    }
     if (previous.contentHash === input.contentHash) {
       return {
         sourceItemId: `source-${input.externalId}`,
@@ -225,6 +300,9 @@ type FakeGmailOptions = {
   history?: (input: Parameters<GmailProviderPort["listHistoryPage"]>[0]) => Promise<GmailHistoryPage>;
   list?: (input: Parameters<GmailProviderPort["listMessageIdsPage"]>[0]) => Promise<GmailMessageIdPage>;
   get?: (input: Parameters<GmailProviderPort["getMessage"]>[0]) => Promise<GmailMessage>;
+  retrieve?: (
+    input: Parameters<GmailProviderPort["retrieveAttachment"]>[0],
+  ) => Promise<GmailRetrievedAttachment>;
 };
 
 function createHarness(options: FakeGmailOptions = {}) {
@@ -232,13 +310,24 @@ function createHarness(options: FakeGmailOptions = {}) {
   const store = new MemoryGoogleStore(connection(secretBox));
   const queries: string[] = [];
   const listInputs: Parameters<GmailProviderPort["listMessageIdsPage"]>[0][] = [];
+  const getInputs: Parameters<GmailProviderPort["getMessage"]>[0][] = [];
+  const retrieveInputs: Parameters<GmailProviderPort["retrieveAttachment"]>[0][] = [];
   const applicationItems: unknown[] = [];
   const completionPublishes: Parameters<GmailDiscoveryCompletionPort["publish"]>[0][] = [];
   const completionControl = { fail: false };
+  const applicationControl = { fail: false };
   const stopWatch = vi.fn(async () => undefined);
   const revoke = vi.fn(async () => undefined);
   const gmail: GmailProviderPort = {
-    getMessage: options.get ?? (async ({ messageId }) => message(1, messageId)),
+    async getMessage(input) {
+      getInputs.push(structuredClone(input));
+      return options.get?.(input) ?? message(1, input.messageId);
+    },
+    async retrieveAttachment(input) {
+      retrieveInputs.push(structuredClone(input));
+      if (!options.retrieve) throw new Error("unexpected attachment retrieval");
+      return options.retrieve(input);
+    },
     listHistoryPage:
       options.history ??
       (async ({ startHistoryId }) => ({
@@ -278,6 +367,7 @@ function createHarness(options: FakeGmailOptions = {}) {
       async process(input): Promise<ApplicationResult> {
         const item = input as { householdId: typeof HOUSEHOLD_ID; idempotencyKey: string };
         applicationItems.push(structuredClone(input));
+        if (applicationControl.fail) throw new Error("application processing failed");
         return {
           householdId: item.householdId,
           idempotencyKey: item.idempotencyKey,
@@ -305,9 +395,12 @@ function createHarness(options: FakeGmailOptions = {}) {
     secretBox,
     queries,
     listInputs,
+    getInputs,
+    retrieveInputs,
     applicationItems,
     completionPublishes,
     completionControl,
+    applicationControl,
     stopWatch,
     revoke,
   };
@@ -365,6 +458,9 @@ describe("GoogleSyncService", () => {
         getMessage: async () => {
           throw new Error("must not fetch");
         },
+        retrieveAttachment: async () => {
+          throw new Error("must not retrieve");
+        },
         listHistoryPage: async () => {
           throw new Error("must not list");
         },
@@ -397,6 +493,29 @@ describe("GoogleSyncService", () => {
       }),
     ).rejects.toMatchObject({ code: "not_authorized" } satisfies Partial<GoogleSyncError>);
     expect(harness.store.sources.size).toBe(0);
+  });
+
+  it("rejects cross-account history before an unfetched deletion can become authoritative", async () => {
+    const harness = createHarness({
+      async history() {
+        return {
+          changes: [
+            {
+              ...historyChange("foreign-deletion", "101", "message.deleted"),
+              googleSubject: "different-google-subject",
+            },
+          ],
+          mailboxHistoryId: "101",
+          nextPageToken: null,
+        };
+      },
+    });
+
+    await expect(harness.service.execute(historyNotice("101"))).rejects.toMatchObject({
+      code: "not_authorized",
+    } satisfies Partial<GoogleSyncError>);
+    expect(harness.store.sources.size).toBe(0);
+    expect(harness.getInputs).toHaveLength(0);
   });
 
   it("triages only a recent message.added while persisting later label-only revisions", async () => {
@@ -465,7 +584,7 @@ describe("GoogleSyncService", () => {
     ).resolves.toMatchObject({ status: "processed", processedMessages: 1 });
 
     expect(harness.applicationItems).toMatchObject([
-      { ownerAdultId: ADULT_ID, revision: 1, idempotencyKey: expect.stringContaining("revision:1") },
+      { ownerAdultId: ADULT_ID, revision: 2, idempotencyKey: expect.stringContaining("revision:2") },
     ]);
     const stored = harness.store.sources.get("message-1");
     expect(stored).toMatchObject({ adultId: ADULT_ID, kind: "gmail_message", revision: 2 });
@@ -484,6 +603,339 @@ describe("GoogleSyncService", () => {
     });
     await expect(harness.service.execute(historyNotice("102"))).resolves.toMatchObject({ status: "noop" });
     expect(harness.applicationItems).toHaveLength(1);
+    expect(stored?.metadata).toMatchObject({ schemaVersion: 2, contentCompleteness: "full" });
+    expect(harness.getInputs.map((input) => input.format)).toEqual(["metadata", "full", "metadata"]);
+  });
+
+  it("stores historical scans as stripped metadata envelopes without attachment or application work", async () => {
+    const embeddedData = Buffer.from("historical-private-bytes").toString("base64url");
+    const harness = createHarness({
+      async list() {
+        return {
+          messages: [{ messageId: "historical-with-attachment", threadId: "thread-1" }],
+          nextPageToken: null,
+          resultSizeEstimate: 1,
+        };
+      },
+      async get({ messageId }) {
+        return message(1, messageId, {
+          attachments: [attachment(1, { embeddedDataBase64Url: embeddedData, providerAttachmentId: null })],
+        });
+      },
+    });
+    harness.store.connection.cursor = {
+      gmail: syncState({
+        phase: "recent_90_days",
+        requestedDepth: "recent_90_days",
+        discovery: { runId: "metadata-only-run", messageCount: 0, status: "collecting" },
+      }),
+    };
+
+    await expect(
+      harness.service.execute({
+        kind: "continue",
+        householdId: HOUSEHOLD_ID,
+        adultId: ADULT_ID,
+        connectionId: CONNECTION_ID,
+      }),
+    ).resolves.toMatchObject({ processedMessages: 1, phase: "live" });
+
+    expect(harness.getInputs.map((input) => input.format)).toEqual(["metadata"]);
+    expect(harness.retrieveInputs).toHaveLength(0);
+    expect(harness.applicationItems).toHaveLength(0);
+    const stored = harness.store.sources.get("historical-with-attachment");
+    expect(stored?.metadata).toMatchObject({ schemaVersion: 2, contentCompleteness: "metadata" });
+    expect(JSON.stringify(stored?.metadata)).not.toContain(embeddedData);
+    const cleartext = harness.secretBox.open(
+      stored?.encryptedContent ?? "",
+      gmailSourceContentAad(harness.store.connection, "historical-with-attachment"),
+    );
+    expect(cleartext).not.toContain(embeddedData);
+    expect(gmailStoredSourceEnvelopeSchema.parse(JSON.parse(cleartext))).toMatchObject({
+      schemaVersion: 2,
+      contentCompleteness: "metadata",
+      message: { attachments: [{ embeddedDataBase64Url: null }] },
+    });
+  });
+
+  it("hydrates recent additions in descriptor order and persists attachment bytes only in the full envelope", async () => {
+    const descriptors = [
+      attachment(1, {
+        providerAttachmentId: null,
+        embeddedDataBase64Url: Buffer.from("safe").toString("base64url"),
+      }),
+      attachment(2),
+      attachment(3),
+      attachment(4),
+    ];
+    let sourceWasMetadataBeforeRetrieval = false;
+    let harness: ReturnType<typeof createHarness>;
+    harness = createHarness({
+      async history() {
+        return {
+          changes: [historyChange("message-with-attachments", "101", "message.added")],
+          mailboxHistoryId: "101",
+          nextPageToken: null,
+        };
+      },
+      async get({ messageId, format }) {
+        return message(1, messageId, { attachments: format === "full" ? descriptors : [] });
+      },
+      async retrieve({ attachment: descriptor }) {
+        sourceWasMetadataBeforeRetrieval =
+          harness.store.sources.get("message-with-attachments")?.metadata.contentCompleteness === "metadata";
+        if (descriptor.providerAttachmentId === "attachment-2") {
+          throw new GmailAttachmentContentError("unsupported_type");
+        }
+        if (descriptor.providerAttachmentId === "attachment-3") {
+          throw new GoogleAdapterError("redacted", "not_found", 404, false);
+        }
+        if (descriptor.providerAttachmentId === "attachment-4") {
+          throw new GmailAttachmentContentError("invalid_content");
+        }
+        const bytes = Uint8Array.from(Buffer.from("safe"));
+        return {
+          kind: "file",
+          mediaType: "text/plain",
+          filename: descriptor.filename,
+          sizeBytes: bytes.byteLength,
+          bytes,
+        };
+      },
+    });
+
+    await expect(harness.service.execute(historyNotice("101"))).resolves.toMatchObject({
+      processedMessages: 1,
+      status: "processed",
+    });
+
+    expect(sourceWasMetadataBeforeRetrieval).toBe(true);
+    expect(harness.getInputs.map((input) => input.format)).toEqual(["metadata", "full"]);
+    expect(harness.retrieveInputs.map((input) => input.attachment.providerAttachmentId)).toEqual([
+      null,
+      "attachment-2",
+      "attachment-3",
+      "attachment-4",
+    ]);
+    const item = harness.applicationItems[0] as {
+      attachmentRefs: string[];
+      attachmentContents: Array<{
+        reference: string;
+        kind: string;
+        reason?: string;
+        contentDigest: string;
+        dataBase64?: string;
+      }>;
+    };
+    expect(item.attachmentRefs).toEqual(item.attachmentContents.map((content) => content.reference));
+    expect(new Set(item.attachmentRefs)).toHaveLength(4);
+    expect(item.attachmentContents).toMatchObject([
+      {
+        kind: "file",
+        dataBase64: Buffer.from("safe").toString("base64"),
+        contentDigest: `sha256:${"8b3369944dd2a3fab39e32d1aeb1f763946a458ae3e6368a46432adc8f3a0860"}`,
+      },
+      { kind: "unavailable", reason: "unsupported_type" },
+      { kind: "unavailable", reason: "not_found" },
+      { kind: "unavailable", reason: "invalid_content" },
+    ]);
+
+    const stored = harness.store.sources.get("message-with-attachments");
+    expect(stored?.metadata).toMatchObject({ schemaVersion: 2, contentCompleteness: "full" });
+    expect(JSON.stringify(stored?.metadata)).not.toContain(Buffer.from("safe").toString("base64"));
+    const cleartext = harness.secretBox.open(
+      stored?.encryptedContent ?? "",
+      gmailSourceContentAad(harness.store.connection, "message-with-attachments"),
+    );
+    expect(cleartext.match(/"dataBase64":/gu)).toHaveLength(1);
+    const envelope = gmailStoredSourceEnvelopeSchema.parse(JSON.parse(cleartext));
+    expect(envelope.contentCompleteness).toBe("full");
+    if (envelope.contentCompleteness !== "full") throw new Error("Expected a full Gmail envelope");
+    expect(
+      envelope.message.attachments.every((descriptor) => descriptor.embeddedDataBase64Url === null),
+    ).toBe(true);
+    expect(envelope.attachmentContents).toEqual(item.attachmentContents);
+  });
+
+  it("bounds live hydration to twenty descriptors, ten MiB per file, and fifteen MiB total", async () => {
+    const eightMiB = 8 * 1024 * 1024;
+    const descriptors = [
+      attachment(1, { sizeBytes: eightMiB }),
+      attachment(2, { sizeBytes: eightMiB }),
+      attachment(3, { sizeBytes: 11 * 1024 * 1024 }),
+      ...Array.from({ length: 19 }, (_, index) => attachment(index + 4, { sizeBytes: 1 })),
+    ];
+    const harness = createHarness({
+      async history() {
+        return {
+          changes: [historyChange("bounded-attachments", "101", "message.added")],
+          mailboxHistoryId: "101",
+          nextPageToken: null,
+        };
+      },
+      async get({ messageId, format }) {
+        return message(1, messageId, { attachments: format === "full" ? descriptors : [] });
+      },
+      async retrieve({ attachment: descriptor }) {
+        const bytes = new Uint8Array(descriptor.sizeBytes);
+        return {
+          kind: "file",
+          mediaType: "text/plain",
+          filename: descriptor.filename,
+          sizeBytes: bytes.byteLength,
+          bytes,
+        };
+      },
+    });
+
+    await expect(harness.service.execute(historyNotice("101"))).resolves.toMatchObject({
+      processedMessages: 1,
+    });
+
+    expect(harness.retrieveInputs).toHaveLength(18);
+    expect(harness.retrieveInputs[0]?.attachment.providerAttachmentId).toBe("attachment-1");
+    expect(
+      harness.retrieveInputs.some((input) => input.attachment.providerAttachmentId === "attachment-2"),
+    ).toBe(false);
+    expect(
+      harness.retrieveInputs.some((input) => input.attachment.providerAttachmentId === "attachment-3"),
+    ).toBe(false);
+    expect(
+      harness.retrieveInputs.some((input) => input.attachment.providerAttachmentId === "attachment-21"),
+    ).toBe(false);
+    const item = harness.applicationItems[0] as {
+      attachmentRefs: string[];
+      attachmentContents: Array<{ kind: string; reason?: string }>;
+    };
+    expect(item.attachmentRefs).toHaveLength(20);
+    expect(item.attachmentContents).toHaveLength(20);
+    expect(item.attachmentContents.slice(0, 3)).toMatchObject([
+      { kind: "file" },
+      { kind: "unavailable", reason: "too_large" },
+      { kind: "unavailable", reason: "too_large" },
+    ]);
+  });
+
+  it("retries a crash after full persistence without downgrading or changing the app idempotency key", async () => {
+    const harness = createHarness({
+      async history() {
+        return {
+          changes: [historyChange("crash-safe", "101", "message.added")],
+          mailboxHistoryId: "101",
+          nextPageToken: null,
+        };
+      },
+    });
+    harness.applicationControl.fail = true;
+
+    await expect(harness.service.execute(historyNotice("101"))).rejects.toMatchObject({
+      code: "invalid_state",
+    } satisfies Partial<GoogleSyncError>);
+    expect(harness.store.sources.get("crash-safe")).toMatchObject({
+      revision: 2,
+      metadata: { contentCompleteness: "full" },
+    });
+
+    harness.applicationControl.fail = false;
+    await expect(harness.service.execute(historyNotice("101"))).resolves.toMatchObject({
+      status: "processed",
+    });
+    expect(harness.store.sources.get("crash-safe")).toMatchObject({
+      revision: 2,
+      metadata: { contentCompleteness: "full" },
+    });
+    expect(
+      harness.applicationItems.map((item) => (item as { idempotencyKey: string }).idempotencyKey),
+    ).toEqual([
+      `gmail:${CONNECTION_ID}:crash-safe:revision:2`,
+      `gmail:${CONNECTION_ID}:crash-safe:revision:2`,
+    ]);
+    expect(harness.getInputs.map((input) => input.format)).toEqual(["metadata", "full", "metadata", "full"]);
+  });
+
+  it("keeps a deletion tombstone authoritative over stale live hydration", async () => {
+    const harness = createHarness({
+      async history() {
+        return {
+          changes: [historyChange("deleted-sticky", "101", "message.added")],
+          mailboxHistoryId: "101",
+          nextPageToken: null,
+        };
+      },
+    });
+    harness.store.sources.set("deleted-sticky", {
+      householdId: HOUSEHOLD_ID,
+      adultId: ADULT_ID,
+      connectionId: CONNECTION_ID,
+      externalId: "deleted-sticky",
+      kind: "gmail_message_deleted",
+      occurredAt: NOW.toISOString(),
+      contentHash: `sha256:${"d".repeat(64)}`,
+      encryptedContent: "deleted-ciphertext",
+      metadata: {
+        schemaVersion: 2,
+        provider: "gmail",
+        sourceScope: "personal",
+        contentCompleteness: "metadata",
+        deleted: true,
+      },
+      revision: 3,
+    });
+
+    await expect(harness.service.execute(historyNotice("101"))).resolves.toMatchObject({
+      status: "processed",
+      processedMessages: 1,
+    });
+    expect(harness.getInputs.map((input) => input.format)).toEqual(["metadata"]);
+    expect(harness.retrieveInputs).toHaveLength(0);
+    expect(harness.applicationItems).toHaveLength(0);
+    expect(harness.store.sources.get("deleted-sticky")).toMatchObject({
+      kind: "gmail_message_deleted",
+      encryptedContent: "deleted-ciphertext",
+      revision: 3,
+    });
+  });
+
+  it("does not send a rejected lower provider revision to the application", async () => {
+    const harness = createHarness({
+      async history() {
+        return {
+          changes: [historyChange("stale-live", "103", "message.added")],
+          mailboxHistoryId: "103",
+          nextPageToken: null,
+        };
+      },
+    });
+    harness.store.sources.set("stale-live", {
+      householdId: HOUSEHOLD_ID,
+      adultId: ADULT_ID,
+      connectionId: CONNECTION_ID,
+      externalId: "stale-live",
+      kind: "gmail_message",
+      occurredAt: NOW.toISOString(),
+      contentHash: `sha256:${"f".repeat(64)}`,
+      encryptedContent: "newer-full-ciphertext",
+      metadata: {
+        schemaVersion: 2,
+        provider: "gmail",
+        sourceScope: "personal",
+        contentCompleteness: "full",
+        messageHistoryId: "102",
+      },
+      revision: 2,
+    });
+
+    await expect(harness.service.execute(historyNotice("103"))).resolves.toMatchObject({
+      status: "processed",
+      processedMessages: 1,
+    });
+    expect(harness.getInputs.map((input) => input.format)).toEqual(["metadata", "full"]);
+    expect(harness.applicationItems).toHaveLength(0);
+    expect(harness.store.sources.get("stale-live")).toMatchObject({
+      encryptedContent: "newer-full-ciphertext",
+      revision: 2,
+      metadata: { contentCompleteness: "full", messageHistoryId: "102" },
+    });
   });
 
   it("persists old, label-only, unknown-date, far-future, and deleted history without live triage", async () => {
@@ -512,7 +964,10 @@ describe("GoogleSyncService", () => {
         };
       },
       async get({ messageId }) {
-        return { ...message(1, messageId), internalDate: internalDates.get(messageId) ?? null };
+        return message(1, messageId, {
+          internalDate: internalDates.get(messageId) ?? null,
+          attachments: messageId === "recent" || messageId === "future-tolerated" ? [] : [attachment(1)],
+        });
       },
     });
 
@@ -526,6 +981,17 @@ describe("GoogleSyncService", () => {
       `gmail:${CONNECTION_ID}:future-tolerated`,
     ]);
     expect(harness.store.sources.size).toBe(7);
+    expect(harness.retrieveInputs).toHaveLength(0);
+    expect(harness.getInputs.map((input) => `${input.messageId}:${input.format}`)).toEqual([
+      "recent:metadata",
+      "recent:full",
+      "future-tolerated:metadata",
+      "future-tolerated:full",
+      "old:metadata",
+      "future-rejected:metadata",
+      "unknown:metadata",
+      "label-only:metadata",
+    ]);
   });
 
   it("drains pushed history before scanning and preserves every scan checkpoint", async () => {
@@ -578,6 +1044,7 @@ describe("GoogleSyncService", () => {
     ]);
     expect((harness.store.connection.cursor.gmail as GmailSyncState).history.cursorId).toBe("150");
     expect(harness.applicationItems).toHaveLength(0);
+    expect(harness.getInputs).toHaveLength(0);
     expect(harness.completionPublishes).toHaveLength(0);
   });
 
@@ -618,7 +1085,8 @@ describe("GoogleSyncService", () => {
       discovery: { runId: "run-recovery", messageCount: 12, status: "collecting" },
       history: { cursorId: "150", startId: null, pageToken: null, targetId: null },
     });
-    expect(harness.applicationItems).toHaveLength(0);
+    expect(harness.applicationItems).toHaveLength(1);
+    expect(harness.getInputs.map((input) => input.format)).toEqual(["metadata", "full"]);
     expect(harness.completionPublishes).toHaveLength(0);
   });
 
@@ -664,6 +1132,8 @@ describe("GoogleSyncService", () => {
     ]);
     expect(harness.applicationItems).toHaveLength(0);
     expect(harness.store.sources.size).toBe(3);
+    expect(harness.getInputs.map((input) => input.format)).toEqual(["metadata", "metadata", "metadata"]);
+    expect(harness.retrieveInputs).toHaveLength(0);
     expect(harness.completionPublishes).toHaveLength(1);
     expect(harness.completionPublishes[0]?.state.discovery).toEqual({
       runId: expect.stringContaining(`gmail-discovery:${CONNECTION_ID}:`),

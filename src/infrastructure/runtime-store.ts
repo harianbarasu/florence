@@ -38,7 +38,12 @@ import type {
   PersistPersonalGmailSourceResult,
   ScopedMutationResult,
 } from "./google-sync.js";
-import { type GmailSyncWork, gmailSyncStateSchema, gmailSyncWorkSchema } from "./google-sync.js";
+import {
+  type GmailSyncWork,
+  gmailSourceMetadataSchema,
+  gmailSyncStateSchema,
+  gmailSyncWorkSchema,
+} from "./google-sync.js";
 
 const instantSchema = z.iso.datetime({ offset: true });
 const handleSchema = z.string().trim().min(3).max(320);
@@ -1435,6 +1440,14 @@ export class FlorenceRuntimeStore {
   public async persistPersonalGmailSource(
     input: PersistPersonalGmailSourceInput,
   ): Promise<PersistPersonalGmailSourceResult> {
+    const metadata = gmailSourceMetadataSchema.parse(input.metadata);
+    if (
+      (input.kind === "gmail_message_deleted" &&
+        (metadata.contentCompleteness !== "metadata" || metadata.deleted !== true)) ||
+      (input.kind === "gmail_message" && metadata.deleted === true)
+    ) {
+      throw new ApplicationStoreError("invalid_state", "Gmail source completeness is inconsistent");
+    }
     return this.applicationStore.persistSourceItem({
       householdId: input.householdId,
       connectionId: input.connectionId,
@@ -1446,7 +1459,7 @@ export class FlorenceRuntimeStore {
       occurredAt: input.occurredAt,
       contentHash: input.contentHash,
       encryptedContent: input.encryptedContent,
-      metadata: input.metadata,
+      metadata,
     });
   }
 

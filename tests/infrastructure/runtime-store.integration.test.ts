@@ -297,7 +297,13 @@ describe.skipIf(!databaseUrl)("FlorenceRuntimeStore PostgreSQL integration", () 
         occurredAt: "2026-08-05T19:01:00Z",
         contentHash: `sha256:${"a".repeat(64)}`,
         encryptedContent: "encrypted-message",
-        metadata: { sourceScope: "personal" },
+        metadata: {
+          schemaVersion: 2,
+          provider: "gmail",
+          sourceScope: "personal",
+          contentCompleteness: "metadata",
+          messageHistoryId: "101",
+        },
       }),
     ).resolves.toMatchObject({ disposition: "inserted", revision: 1 });
     await expect(
@@ -314,6 +320,183 @@ describe.skipIf(!databaseUrl)("FlorenceRuntimeStore PostgreSQL integration", () 
         subscription: "projects/test/subscriptions/florence",
       }),
     ).resolves.toHaveLength(0);
+  });
+
+  it("keeps Gmail source completeness monotonic under the source row lock and lets deletion win", async () => {
+    const founded = await provisionConsentedFounder({
+      externalChatId: `dm-gmail-source-${randomUUID()}`,
+      externalHandle: "+12025550218",
+      timeZone: "America/Los_Angeles",
+      occurredAt: "2027-01-01T08:00:00Z",
+    });
+    if (!founded.adultId) throw new Error("Expected a founding adult");
+    const connection = await applicationStore.upsertExternalConnection({
+      householdId: founded.householdId,
+      adultId: founded.adultId,
+      provider: "google",
+      label: "Personal Gmail",
+      externalAccountId: `gmail-source-${randomUUID()}`,
+      email: `gmail-source-${randomUUID()}@example.test`,
+      encryptedCredentials: "encrypted",
+      grantedScopes: ["https://www.googleapis.com/auth/gmail.readonly"],
+      cursor: {},
+      metadata: { credentialAadVersion: 1 },
+    });
+    const base = {
+      householdId: founded.householdId,
+      adultId: founded.adultId,
+      connectionId: connection.connectionId,
+      externalId: `gmail-message-${randomUUID()}`,
+      occurredAt: "2027-01-01T07:00:00Z",
+    };
+
+    await expect(
+      store.persistPersonalGmailSource({
+        ...base,
+        kind: "gmail_message",
+        contentHash: `sha256:${"a".repeat(64)}`,
+        encryptedContent: "encrypted-metadata",
+        metadata: {
+          schemaVersion: 2,
+          provider: "gmail",
+          sourceScope: "personal",
+          contentCompleteness: "metadata",
+          messageHistoryId: "101",
+        },
+      }),
+    ).resolves.toMatchObject({ disposition: "inserted", revision: 1 });
+    await expect(
+      store.persistPersonalGmailSource({
+        ...base,
+        kind: "gmail_message",
+        contentHash: `sha256:${"a".repeat(64)}`,
+        encryptedContent: "encrypted-full-with-private-bytes",
+        metadata: {
+          schemaVersion: 2,
+          provider: "gmail",
+          sourceScope: "personal",
+          contentCompleteness: "full",
+          messageHistoryId: "102",
+        },
+      }),
+    ).resolves.toMatchObject({ disposition: "revised", revision: 2 });
+    await expect(
+      store.persistPersonalGmailSource({
+        ...base,
+        kind: "gmail_message",
+        contentHash: `sha256:${"c".repeat(64)}`,
+        encryptedContent: "encrypted-metadata-downgrade",
+        metadata: {
+          schemaVersion: 2,
+          provider: "gmail",
+          sourceScope: "personal",
+          contentCompleteness: "metadata",
+          messageHistoryId: "103",
+          discoveryMode: "history",
+          providerEventIds: ["label-event-103"],
+        },
+      }),
+    ).resolves.toMatchObject({ disposition: "unchanged", revision: 2, retainedExisting: "full" });
+
+    await expect(database<
+      {
+        kind: string;
+        content_hash: string;
+        encrypted_content: string;
+        metadata: Record<string, unknown>;
+        revision: string;
+      }[]
+    >`
+      select kind, content_hash, encrypted_content, metadata, revision::text
+      from source_items
+      where household_id = ${base.householdId} and connection_id = ${base.connectionId}
+        and provider = 'gmail' and external_id = ${base.externalId}
+    `).resolves.toEqual([
+      {
+        kind: "gmail_message",
+        content_hash: `sha256:${"a".repeat(64)}`,
+        encrypted_content: "encrypted-full-with-private-bytes",
+        metadata: {
+          schemaVersion: 2,
+          provider: "gmail",
+          sourceScope: "personal",
+          contentCompleteness: "full",
+          messageHistoryId: "102",
+          discoveryMode: "history",
+          providerEventIds: ["label-event-103"],
+        },
+        revision: "2",
+      },
+    ]);
+
+    await expect(
+      store.persistPersonalGmailSource({
+        ...base,
+        kind: "gmail_message",
+        contentHash: `sha256:${"f".repeat(64)}`,
+        encryptedContent: "encrypted-stale-full",
+        metadata: {
+          schemaVersion: 2,
+          provider: "gmail",
+          sourceScope: "personal",
+          contentCompleteness: "full",
+          messageHistoryId: "101",
+        },
+      }),
+    ).resolves.toMatchObject({ disposition: "unchanged", revision: 2, retainedExisting: "stale" });
+    await expect(
+      store.persistPersonalGmailSource({
+        ...base,
+        kind: "gmail_message",
+        contentHash: `sha256:${"f".repeat(64)}`,
+        encryptedContent: "encrypted-conflicting-full",
+        metadata: {
+          schemaVersion: 2,
+          provider: "gmail",
+          sourceScope: "personal",
+          contentCompleteness: "full",
+          messageHistoryId: "102",
+        },
+      }),
+    ).rejects.toMatchObject({ code: "invalid_state" });
+
+    await expect(
+      store.persistPersonalGmailSource({
+        ...base,
+        kind: "gmail_message_deleted",
+        contentHash: `sha256:${"a".repeat(64)}`,
+        encryptedContent: "encrypted-deletion",
+        metadata: {
+          schemaVersion: 2,
+          provider: "gmail",
+          sourceScope: "personal",
+          contentCompleteness: "metadata",
+          deleted: true,
+        },
+      }),
+    ).resolves.toMatchObject({ disposition: "revised", revision: 3 });
+    await expect(
+      store.persistPersonalGmailSource({
+        ...base,
+        kind: "gmail_message",
+        contentHash: `sha256:${"e".repeat(64)}`,
+        encryptedContent: "encrypted-late-full",
+        metadata: {
+          schemaVersion: 2,
+          provider: "gmail",
+          sourceScope: "personal",
+          contentCompleteness: "full",
+        },
+      }),
+    ).resolves.toMatchObject({ disposition: "unchanged", revision: 3, retainedExisting: "deleted" });
+    await expect(database<{ kind: string; encrypted_content: string; revision: string }[]>`
+      select kind, encrypted_content, revision::text
+      from source_items
+      where household_id = ${base.householdId} and connection_id = ${base.connectionId}
+        and provider = 'gmail' and external_id = ${base.externalId}
+    `).resolves.toEqual([
+      { kind: "gmail_message_deleted", encrypted_content: "encrypted-deletion", revision: "3" },
+    ]);
   });
 
   it("publishes a Gmail discovery completion atomically to only the owning adult", async () => {

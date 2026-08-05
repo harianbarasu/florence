@@ -504,6 +504,33 @@ const sourceItemSchema = z
     }
   });
 
+function gmailContentCompleteness(metadata: Record<string, unknown>): "metadata" | "full" | null {
+  const parsed = z
+    .object({
+      schemaVersion: z.literal(2),
+      contentCompleteness: z.enum(["metadata", "full"]),
+    })
+    .passthrough()
+    .safeParse(metadata);
+  return parsed.success ? parsed.data.contentCompleteness : null;
+}
+
+function gmailMessageHistoryId(metadata: Record<string, unknown>): bigint | null {
+  const value = metadata.messageHistoryId;
+  return typeof value === "string" && /^\d+$/u.test(value) ? BigInt(value) : null;
+}
+
+function mergedGmailDiscoveryMetadata(
+  existing: Record<string, unknown>,
+  incoming: Record<string, unknown>,
+): Record<string, unknown> {
+  const merged: Record<string, unknown> = { ...existing, contentCompleteness: "full" };
+  for (const key of ["discoveryMode", "discoveryHistoryId", "providerEventIds"] as const) {
+    if (incoming[key] !== undefined) merged[key] = incoming[key];
+  }
+  return merged;
+}
+
 export class ApplicationStore implements ApplicationRepositoryPort {
   public constructor(private readonly database: Database) {}
 
@@ -1451,9 +1478,12 @@ export class ApplicationStore implements ApplicationRepositoryPort {
     return rows.length === 1;
   }
 
-  public async persistSourceItem(
-    rawInput: z.input<typeof sourceItemSchema>,
-  ): Promise<{ sourceItemId: string; disposition: "inserted" | "unchanged" | "revised"; revision: number }> {
+  public async persistSourceItem(rawInput: z.input<typeof sourceItemSchema>): Promise<{
+    sourceItemId: string;
+    disposition: "inserted" | "unchanged" | "revised";
+    revision: number;
+    retainedExisting?: "full" | "deleted" | "stale";
+  }> {
     const input = sourceItemSchema.parse(rawInput);
     if (input.ownerAdultId) {
       await this.assertActiveMember(input.householdId, input.ownerAdultId);
@@ -1484,11 +1514,13 @@ export class ApplicationStore implements ApplicationRepositoryPort {
           id: string;
           owner_adult_id: string | null;
           visibility: SourceItemRecord["visibility"];
+          kind: string;
           content_hash: string;
+          metadata: Record<string, unknown>;
           revision: string;
         }[]
       >`
-        select id, owner_adult_id, visibility, content_hash, revision
+        select id, owner_adult_id, visibility, kind, content_hash, metadata, revision
         from source_items
         where household_id = ${input.householdId}
           and provider = ${input.provider} and external_id = ${input.externalId}
@@ -1523,7 +1555,79 @@ export class ApplicationStore implements ApplicationRepositoryPort {
         );
       }
 
-      if (existing.content_hash === input.contentHash) {
+      const existingGmailCompleteness = gmailContentCompleteness(existing.metadata);
+      const incomingGmailCompleteness = gmailContentCompleteness(input.metadata);
+      if (
+        input.provider === "gmail" &&
+        input.kind === "gmail_message" &&
+        existing.kind === "gmail_message" &&
+        existingGmailCompleteness === "full" &&
+        incomingGmailCompleteness === "full"
+      ) {
+        const existingHistoryId = gmailMessageHistoryId(existing.metadata);
+        const incomingHistoryId = gmailMessageHistoryId(input.metadata);
+        if (
+          existingHistoryId !== null &&
+          incomingHistoryId !== null &&
+          incomingHistoryId < existingHistoryId
+        ) {
+          return {
+            sourceItemId: existing.id,
+            disposition: "unchanged" as const,
+            revision: Number(existing.revision),
+            retainedExisting: "stale" as const,
+          };
+        }
+        if (
+          existing.content_hash !== input.contentHash &&
+          (existingHistoryId === null ||
+            incomingHistoryId === null ||
+            incomingHistoryId === existingHistoryId)
+        ) {
+          throw new ApplicationStoreError(
+            "invalid_state",
+            "Gmail full content conflicts at an unordered provider revision",
+          );
+        }
+      }
+      const retainedExistingGmailSource =
+        input.provider === "gmail" && input.kind === "gmail_message"
+          ? existing.kind === "gmail_message_deleted"
+            ? ("deleted" as const)
+            : existing.kind === "gmail_message" &&
+                existingGmailCompleteness === "full" &&
+                incomingGmailCompleteness === "metadata"
+              ? ("full" as const)
+              : null
+          : null;
+      if (retainedExistingGmailSource !== null) {
+        if (retainedExistingGmailSource === "full") {
+          await transaction`
+            update source_items
+            set retention_until = ${input.retentionUntil ?? null},
+                metadata = ${json(this.database, {
+                  ...mergedGmailDiscoveryMetadata(existing.metadata, input.metadata),
+                })},
+                updated_at = now()
+            where id = ${existing.id}
+          `;
+        }
+        return {
+          sourceItemId: existing.id,
+          disposition: "unchanged" as const,
+          revision: Number(existing.revision),
+          retainedExisting: retainedExistingGmailSource,
+        };
+      }
+
+      const forcesGmailSourceReplacement =
+        input.provider === "gmail" &&
+        ((input.kind === "gmail_message_deleted" && existing.kind !== "gmail_message_deleted") ||
+          (input.kind === "gmail_message" &&
+            existing.kind === "gmail_message" &&
+            existingGmailCompleteness === "metadata" &&
+            incomingGmailCompleteness === "full"));
+      if (existing.content_hash === input.contentHash && !forcesGmailSourceReplacement) {
         await transaction`
           update source_items
           set retention_until = ${input.retentionUntil ?? null}, metadata = ${json(this.database, input.metadata)},

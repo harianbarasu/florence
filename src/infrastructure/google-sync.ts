@@ -1,17 +1,30 @@
 import { z } from "zod";
 import {
   type GmailAdapter,
+  type GmailAttachment,
+  GmailAttachmentContentError,
   type GmailHistoryChange,
   type GmailMessage,
+  type GmailMessageFormat,
+  type GmailRetrievedAttachment,
   GOOGLE_GMAIL_READONLY_SCOPE,
   GoogleAdapterError,
   type GoogleOAuthAdapter,
   GoogleSyncTokenExpiredError,
   type GoogleTokenSet,
+  gmailAttachmentSchema,
+  gmailMessageSchema,
   gmailPubSubEventSchema,
   googleTokenSetSchema,
+  type RetrieveGmailAttachmentInput,
 } from "../adapters/google/index.js";
-import { type FlorenceApplication, type GmailInboxItem, GmailInboxItemSchema } from "../application/index.js";
+import {
+  type FlorenceApplication,
+  type GmailAttachmentContent,
+  GmailAttachmentContentSchema,
+  type GmailInboxItem,
+  GmailInboxItemSchema,
+} from "../application/index.js";
 import { canonicalJson, sha256 } from "../security/canonical-json.js";
 import type { SecretBox } from "../security/secret-box.js";
 
@@ -37,6 +50,53 @@ export const GMAIL_DISCOVERY_MESSAGE_COUNT_MAX = 1_000_000;
 const GMAIL_RECOVERY_PAGE_SIZE = 20;
 const GMAIL_LIVE_WINDOW_MS = 24 * 60 * 60_000;
 const GMAIL_LIVE_FUTURE_TOLERANCE_MS = 5 * 60_000;
+const GMAIL_MAX_ATTACHMENT_COUNT = 20;
+const GMAIL_MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+const GMAIL_MAX_TOTAL_ATTACHMENT_BYTES = 15 * 1024 * 1024;
+
+const storedGmailAttachmentSchema = gmailAttachmentSchema.extend({
+  embeddedDataBase64Url: z.null(),
+});
+
+const storedGmailMessageSchema = gmailMessageSchema.extend({
+  attachments: z.array(storedGmailAttachmentSchema),
+});
+
+export const gmailStoredSourceEnvelopeSchema = z.discriminatedUnion("contentCompleteness", [
+  z.strictObject({
+    schemaVersion: z.literal(2),
+    contentCompleteness: z.literal("metadata"),
+    message: storedGmailMessageSchema,
+  }),
+  z.strictObject({
+    schemaVersion: z.literal(2),
+    contentCompleteness: z.literal("full"),
+    message: storedGmailMessageSchema,
+    attachmentContents: z.array(GmailAttachmentContentSchema).max(GMAIL_MAX_ATTACHMENT_COUNT),
+  }),
+]);
+
+export type GmailStoredSourceEnvelope = z.infer<typeof gmailStoredSourceEnvelopeSchema>;
+
+export const gmailSourceMetadataSchema = z.strictObject({
+  schemaVersion: z.literal(2),
+  provider: z.literal("gmail"),
+  sourceScope: z.literal("personal"),
+  contentCompleteness: z.enum(["metadata", "full"]),
+  googleSubject: z.string().min(1).max(500).optional(),
+  threadId: z.string().min(1).max(1_000).optional(),
+  messageHistoryId: z.string().regex(/^\d+$/).max(100).nullable().optional(),
+  discoveryMode: z
+    .enum(["recent_90_days", "one_year_backfill", "full_history_backfill", "history", "recovery"])
+    .optional(),
+  discoveryHistoryId: z.string().min(1).max(100).optional(),
+  historyId: z.string().min(1).max(100).optional(),
+  providerEventIds: z.array(z.string().min(1).max(1_000)).max(1_000).optional(),
+  contentAadVersion: z.literal(1).optional(),
+  deleted: z.literal(true).optional(),
+});
+
+export type GmailSourceMetadata = z.infer<typeof gmailSourceMetadataSchema>;
 
 const gmailHistoryCursorSchema = z.strictObject({
   cursorId: z.string().regex(/^\d+$/).nullable(),
@@ -176,13 +236,14 @@ export interface PersistPersonalGmailSourceInput {
   occurredAt: string;
   contentHash: string;
   encryptedContent: string;
-  metadata: Record<string, unknown>;
+  metadata: GmailSourceMetadata;
 }
 
 export type PersistPersonalGmailSourceResult = {
   sourceItemId: string;
   disposition: "inserted" | "unchanged" | "revised";
   revision: number;
+  retainedExisting?: "full" | "deleted" | "stale";
 };
 
 export type ScopedMutationResult = "updated" | "conflict" | "inactive" | "not_found";
@@ -243,7 +304,9 @@ export interface GmailProviderPort {
     accessToken: string;
     googleSubject: string;
     messageId: string;
+    format: GmailMessageFormat;
   }): ReturnType<GmailAdapter["getMessage"]>;
+  retrieveAttachment(input: RetrieveGmailAttachmentInput): Promise<GmailRetrievedAttachment>;
   listHistoryPage(input: {
     accessToken: string;
     googleSubject: string;
@@ -664,7 +727,7 @@ export class GoogleSyncService {
     for (const item of page.messages) {
       assertNotAborted(signal);
       if (alreadyProcessed.has(item.messageId)) continue;
-      await this.#fetchAndPersist(
+      await this.#fetchMetadataAndPersist(
         connection,
         item.messageId,
         {
@@ -720,6 +783,7 @@ export class GoogleSyncService {
           ...(state.history.pageToken ? { pageToken: state.history.pageToken } : {}),
         }),
       );
+      assertOwnedGmailHistoryChanges(connection, page.changes);
       const decisions = finalHistoryDecisions(page.changes);
       let processedMessages = 0;
       let processedDeletions = 0;
@@ -735,18 +799,15 @@ export class GoogleSyncService {
           );
           processedDeletions += 1;
         } else {
-          const fetched = await this.#fetchAndPersist(
-            connection,
-            decision.messageId,
-            {
-              mode: "history",
-              historyId: decision.historyId,
-              providerEventIds: decision.providerEventIds,
-            },
-            signal,
-          );
-          if (decision.added && isWithinLiveTriageWindow(fetched.message, this.#now())) {
-            await this.#processLiveMessage(connection, fetched.message, fetched.persisted.revision);
+          const discovery = {
+            mode: "history" as const,
+            historyId: decision.historyId,
+            providerEventIds: decision.providerEventIds,
+          };
+          if (decision.added) {
+            await this.#fetchPersistAndMaybeProcessLive(connection, decision.messageId, discovery, signal);
+          } else {
+            await this.#fetchMetadataAndPersist(connection, decision.messageId, discovery, signal);
           }
           processedMessages += 1;
         }
@@ -802,7 +863,7 @@ export class GoogleSyncService {
     let processedMessages = 0;
     for (const item of page.messages) {
       assertNotAborted(signal);
-      await this.#fetchAndPersist(
+      await this.#fetchPersistAndMaybeProcessLive(
         connection,
         item.messageId,
         { mode: "recovery", providerEventIds: [] },
@@ -825,7 +886,7 @@ export class GoogleSyncService {
     });
   }
 
-  async #fetchAndPersist(
+  async #fetchMetadataAndPersist(
     connection: GoogleSyncConnection,
     messageId: string,
     discovery: {
@@ -835,19 +896,161 @@ export class GoogleSyncService {
     },
     signal?: AbortSignal,
   ): Promise<{ message: GmailMessage; persisted: PersistPersonalGmailSourceResult }> {
+    const message = await this.#fetchMessage(connection, messageId, "metadata", signal);
+    const persisted = await this.#persistMessage(connection, message, "metadata", [], discovery);
+    return { message, persisted };
+  }
+
+  async #fetchPersistAndMaybeProcessLive(
+    connection: GoogleSyncConnection,
+    messageId: string,
+    discovery: {
+      mode: "history" | "recovery";
+      historyId?: string;
+      providerEventIds: readonly string[];
+    },
+    signal?: AbortSignal,
+  ): Promise<{ message: GmailMessage; persisted: PersistPersonalGmailSourceResult }> {
+    const metadata = await this.#fetchMetadataAndPersist(connection, messageId, discovery, signal);
+    const eligibilityAt = this.#now();
+    if (
+      metadata.persisted.retainedExisting === "deleted" ||
+      !isWithinLiveTriageWindow(metadata.message, eligibilityAt)
+    ) {
+      return metadata;
+    }
+
+    const full = await this.#fetchFullMessageWithAttachments(connection, messageId, signal);
+    assertStableMessageIdentity(metadata.message, full.message);
+    const persisted = await this.#persistMessage(
+      connection,
+      full.message,
+      "full",
+      full.attachmentContents,
+      discovery,
+    );
+    if (persisted.retainedExisting === "deleted" || persisted.retainedExisting === "stale") {
+      return { message: full.message, persisted };
+    }
+    await this.#processLiveMessage(connection, full.message, full.attachmentContents, persisted.revision);
+    return { message: full.message, persisted };
+  }
+
+  async #fetchMessage(
+    connection: GoogleSyncConnection,
+    messageId: string,
+    format: GmailMessageFormat,
+    signal?: AbortSignal,
+  ): Promise<GmailMessage> {
     const message = await this.#withCredentials(connection, signal, (accessToken) =>
       this.#gmail.getMessage({
         accessToken,
         googleSubject: connection.externalAccountId,
         messageId,
+        format,
       }),
     );
-    if (message.googleSubject !== connection.externalAccountId || message.messageId !== messageId) {
-      throw new GoogleSyncError("Gmail returned data outside the requested account", "not_authorized", false);
-    }
+    assertOwnedGmailMessage(connection, messageId, message);
+    return message;
+  }
 
-    const serialized = canonicalJson(message);
-    const persisted = await this.#repository.persistPersonalGmailSource({
+  async #fetchFullMessageWithAttachments(
+    connection: GoogleSyncConnection,
+    messageId: string,
+    signal?: AbortSignal,
+  ): Promise<{ message: GmailMessage; attachmentContents: GmailAttachmentContent[] }> {
+    return this.#withCredentials(connection, signal, async (accessToken) => {
+      const message = await this.#gmail.getMessage({
+        accessToken,
+        googleSubject: connection.externalAccountId,
+        messageId,
+        format: "full",
+      });
+      assertOwnedGmailMessage(connection, messageId, message);
+      const attachmentContents = await this.#retrieveAttachmentContents(
+        connection,
+        accessToken,
+        message,
+        signal,
+      );
+      return { message, attachmentContents };
+    });
+  }
+
+  async #retrieveAttachmentContents(
+    connection: GoogleSyncConnection,
+    accessToken: string,
+    message: GmailMessage,
+    signal?: AbortSignal,
+  ): Promise<GmailAttachmentContent[]> {
+    const contents: GmailAttachmentContent[] = [];
+    let remainingBytes = GMAIL_MAX_TOTAL_ATTACHMENT_BYTES;
+    const attachments = message.attachments.slice(0, GMAIL_MAX_ATTACHMENT_COUNT);
+    for (const [index, attachment] of attachments.entries()) {
+      assertNotAborted(signal);
+      const reference = gmailAttachmentReference(connection, message, attachment, index);
+      const unavailableBase = safeAttachmentMetadata(reference, attachment);
+      if (attachment.sizeBytes === 0) {
+        contents.push(unavailableGmailAttachment(unavailableBase, "invalid_content"));
+        continue;
+      }
+      if (attachment.sizeBytes > GMAIL_MAX_ATTACHMENT_BYTES || attachment.sizeBytes > remainingBytes) {
+        contents.push(unavailableGmailAttachment(unavailableBase, "too_large"));
+        continue;
+      }
+
+      try {
+        const retrieved = await this.#gmail.retrieveAttachment({
+          accessToken,
+          messageId: message.messageId,
+          attachment,
+        });
+        assertNotAborted(signal);
+        if (retrieved.sizeBytes !== retrieved.bytes.byteLength || retrieved.sizeBytes === 0) {
+          contents.push(unavailableGmailAttachment(unavailableBase, "invalid_content"));
+          continue;
+        }
+        if (retrieved.sizeBytes > GMAIL_MAX_ATTACHMENT_BYTES || retrieved.sizeBytes > remainingBytes) {
+          contents.push(unavailableGmailAttachment(unavailableBase, "too_large"));
+          continue;
+        }
+        remainingBytes -= retrieved.sizeBytes;
+        const bytes = Buffer.from(retrieved.bytes);
+        contents.push({
+          reference,
+          kind: retrieved.kind,
+          mediaType: retrieved.mediaType,
+          filename: safeAttachmentFilename(retrieved.filename),
+          sizeBytes: retrieved.sizeBytes,
+          dataBase64: bytes.toString("base64"),
+          contentDigest: `sha256:${sha256(bytes)}`,
+        });
+      } catch (error) {
+        const reason = unavailableReasonForAttachmentError(error);
+        if (reason !== null) {
+          contents.push(unavailableGmailAttachment(unavailableBase, reason));
+          continue;
+        }
+        throw error;
+      }
+    }
+    return contents;
+  }
+
+  async #persistMessage(
+    connection: GoogleSyncConnection,
+    message: GmailMessage,
+    contentCompleteness: "metadata" | "full",
+    attachmentContents: readonly GmailAttachmentContent[],
+    discovery: {
+      mode: "recent_90_days" | "one_year_backfill" | "full_history_backfill" | "history" | "recovery";
+      historyId?: string;
+      providerEventIds: readonly string[];
+    },
+  ): Promise<PersistPersonalGmailSourceResult> {
+    const envelope = gmailSourceEnvelope(message, contentCompleteness, attachmentContents);
+    const serialized = canonicalJson(envelope);
+    return this.#repository.persistPersonalGmailSource({
       householdId: connection.householdId,
       adultId: connection.adultId,
       connectionId: connection.id,
@@ -859,18 +1062,17 @@ export class GoogleSyncService {
         serialized,
         gmailSourceContentAad(connection, message.messageId),
       ),
-      metadata: sourceMetadata(connection, message, discovery),
+      metadata: sourceMetadata(connection, message, discovery, contentCompleteness),
     });
-
-    return { message, persisted };
   }
 
   async #processLiveMessage(
     connection: GoogleSyncConnection,
     message: GmailMessage,
+    attachmentContents: readonly GmailAttachmentContent[],
     revision: number,
   ): Promise<void> {
-    const inboxItem = toGmailInboxItem(connection, message, revision, this.#now());
+    const inboxItem = toGmailInboxItem(connection, message, attachmentContents, revision, this.#now());
     const applicationResult = await this.#application.process(inboxItem);
     if (applicationResult.outcome.status !== "processed") {
       throw new GoogleSyncError(
@@ -918,9 +1120,10 @@ export class GoogleSyncService {
     occurredAt: string,
   ): Promise<void> {
     const tombstone = canonicalJson({
-      schemaVersion: 1,
+      schemaVersion: 2,
       source: "gmail",
       sourceScope: "personal",
+      contentCompleteness: "metadata",
       googleSubject: connection.externalAccountId,
       messageId,
       deleted: true,
@@ -936,9 +1139,10 @@ export class GoogleSyncService {
       contentHash: `sha256:${sha256(tombstone)}`,
       encryptedContent: this.#secretBox.seal(tombstone, gmailSourceContentAad(connection, messageId)),
       metadata: {
-        schemaVersion: 1,
+        schemaVersion: 2,
         provider: "gmail",
         sourceScope: "personal",
+        contentCompleteness: "metadata",
         googleSubject: connection.externalAccountId,
         discoveryMode: "history",
         historyId,
@@ -1286,6 +1490,133 @@ function gmailDiscoveryRunId(connectionId: string, boundaryAt: string): string {
   return `gmail-discovery:${connectionId}:${boundaryAt}`;
 }
 
+function gmailSourceEnvelope(
+  message: GmailMessage,
+  contentCompleteness: "metadata" | "full",
+  attachmentContents: readonly GmailAttachmentContent[],
+): GmailStoredSourceEnvelope {
+  const storedMessage = storedGmailMessageSchema.parse({
+    ...message,
+    attachments: message.attachments.map((attachment) => ({
+      ...attachment,
+      embeddedDataBase64Url: null,
+    })),
+  });
+  return gmailStoredSourceEnvelopeSchema.parse(
+    contentCompleteness === "metadata"
+      ? { schemaVersion: 2, contentCompleteness, message: storedMessage }
+      : {
+          schemaVersion: 2,
+          contentCompleteness,
+          message: storedMessage,
+          attachmentContents: [...attachmentContents],
+        },
+  );
+}
+
+function assertOwnedGmailMessage(
+  connection: GoogleSyncConnection,
+  requestedMessageId: string,
+  message: GmailMessage,
+): void {
+  if (
+    message.googleSubject !== connection.externalAccountId ||
+    message.messageId !== requestedMessageId ||
+    message.sourceKey !== `${connection.externalAccountId}:${requestedMessageId}`
+  ) {
+    throw new GoogleSyncError("Gmail returned data outside the requested account", "not_authorized", false);
+  }
+}
+
+function assertOwnedGmailHistoryChanges(
+  connection: GoogleSyncConnection,
+  changes: readonly GmailHistoryChange[],
+): void {
+  if (changes.some((change) => change.googleSubject !== connection.externalAccountId)) {
+    throw new GoogleSyncError(
+      "Gmail returned history outside the requested account",
+      "not_authorized",
+      false,
+    );
+  }
+}
+
+function assertStableMessageIdentity(metadata: GmailMessage, full: GmailMessage): void {
+  if (
+    metadata.googleSubject !== full.googleSubject ||
+    metadata.messageId !== full.messageId ||
+    metadata.sourceKey !== full.sourceKey ||
+    metadata.threadId !== full.threadId ||
+    metadata.internalDate !== full.internalDate
+  ) {
+    throw new GoogleSyncError("Gmail changed immutable message identity", "invalid_state", false);
+  }
+}
+
+function gmailAttachmentReference(
+  connection: GoogleSyncConnection,
+  message: GmailMessage,
+  attachment: GmailAttachment,
+  index: number,
+): string {
+  const descriptorIdentity = canonicalJson({
+    googleSubject: connection.externalAccountId,
+    messageId: message.messageId,
+    index,
+    partId: attachment.partId,
+    providerAttachmentId: attachment.providerAttachmentId,
+    contentId: attachment.contentId,
+    filename: attachment.filename,
+    mimeType: attachment.mimeType,
+    sizeBytes: attachment.sizeBytes,
+    inline: attachment.inline,
+  });
+  return `gmail:${connection.id}:attachment:${sha256(descriptorIdentity)}`;
+}
+
+type GmailUnavailableAttachment = Extract<GmailAttachmentContent, { kind: "unavailable" }>;
+type GmailUnavailableReason = GmailUnavailableAttachment["reason"];
+
+function safeAttachmentMetadata(
+  reference: string,
+  attachment: GmailAttachment,
+): Pick<GmailUnavailableAttachment, "reference" | "mediaType" | "filename" | "sizeBytes"> {
+  const mediaType = attachment.mimeType.trim();
+  return {
+    reference,
+    mediaType: mediaType.length > 0 && mediaType.length <= 255 ? mediaType : null,
+    filename: safeAttachmentFilename(attachment.filename),
+    sizeBytes: attachment.sizeBytes <= 100 * 1024 * 1024 ? attachment.sizeBytes : null,
+  };
+}
+
+function safeAttachmentFilename(filename: string): string | null {
+  const trimmed = filename.trim();
+  return trimmed.length === 0 ? null : bounded(trimmed, 500);
+}
+
+function unavailableGmailAttachment(
+  base: Pick<GmailUnavailableAttachment, "reference" | "mediaType" | "filename" | "sizeBytes">,
+  reason: GmailUnavailableReason,
+): GmailUnavailableAttachment {
+  return {
+    ...base,
+    kind: "unavailable",
+    reason,
+    contentDigest: `sha256:${sha256(canonicalJson({ ...base, reason }))}`,
+  };
+}
+
+function unavailableReasonForAttachmentError(error: unknown): GmailUnavailableReason | null {
+  if (error instanceof GmailAttachmentContentError) {
+    return error.reason;
+  }
+  if (error instanceof GoogleAdapterError && error.code === "not_found") {
+    return "not_found";
+  }
+  return null;
+}
+
 function sourceMetadata(
   connection: GoogleSyncConnection,
   message: GmailMessage,
@@ -1294,11 +1625,13 @@ function sourceMetadata(
     historyId?: string;
     providerEventIds: readonly string[];
   },
-): Record<string, unknown> {
-  return {
-    schemaVersion: 1,
+  contentCompleteness: "metadata" | "full",
+): GmailSourceMetadata {
+  return gmailSourceMetadataSchema.parse({
+    schemaVersion: 2,
     provider: "gmail",
     sourceScope: "personal",
+    contentCompleteness,
     googleSubject: connection.externalAccountId,
     threadId: message.threadId,
     messageHistoryId: message.historyId,
@@ -1306,12 +1639,13 @@ function sourceMetadata(
     ...(discovery.historyId ? { discoveryHistoryId: discovery.historyId } : {}),
     providerEventIds: [...discovery.providerEventIds],
     contentAadVersion: 1,
-  };
+  });
 }
 
 function toGmailInboxItem(
   connection: GoogleSyncConnection,
   message: GmailMessage,
+  attachmentContents: readonly GmailAttachmentContent[],
   revision: number,
   now: Date,
 ): GmailInboxItem {
@@ -1331,14 +1665,8 @@ function toGmailInboxItem(
     ...(message.headers.subject ? { subject: bounded(message.headers.subject, 2_000) } : {}),
     ...(message.snippet ? { snippet: bounded(message.snippet, 10_000) } : {}),
     ...(bodyText ? { bodyText: bounded(bodyText, 1_000_000) } : {}),
-    attachmentRefs: message.attachments
-      .slice(0, 100)
-      .map((attachment) =>
-        bounded(
-          `gmail:${connection.id}:${message.messageId}:attachment:${attachment.providerAttachmentId ?? attachment.partId ?? sha256(attachment.filename).slice(0, 24)}`,
-          500,
-        ),
-      ),
+    attachmentRefs: attachmentContents.map((attachment) => attachment.reference),
+    attachmentContents: [...attachmentContents],
   });
 }
 

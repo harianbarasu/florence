@@ -37,6 +37,8 @@ export interface OperatorOwnerDirectory {
 }
 
 export interface OperatorHouseholdStore {
+  countDeadSemanticTimers?(): Promise<number>;
+
   exportHouseholdData(input: {
     readonly householdId: string;
     readonly requestedByAdultId: string;
@@ -103,11 +105,14 @@ export class ProductionHouseholdOperations implements HouseholdOperations {
   }
 
   async status(): Promise<OperatorStatus> {
-    const results = await Promise.all(
-      STATUS_CHECK_NAMES.map(
-        async (name) => [name, await safeHealthCheck(this.#healthChecks[name])] as const,
+    const [results, semanticTimers] = await Promise.all([
+      Promise.all(
+        STATUS_CHECK_NAMES.map(
+          async (name) => [name, await safeHealthCheck(this.#healthChecks[name])] as const,
+        ),
       ),
-    );
+      semanticTimerStatus(this.#store.countDeadSemanticTimers?.bind(this.#store)),
+    ]);
     const checks: Record<StatusCheckName, "ok" | "degraded" | "unavailable"> = {
       database: "unavailable",
       model: "unavailable",
@@ -117,8 +122,12 @@ export class ProductionHouseholdOperations implements HouseholdOperations {
     };
     for (const [name, status] of results) checks[name] = status;
     return {
-      status: Object.values(checks).every((value) => value === "ok") ? "ok" : "degraded",
+      status:
+        Object.values(checks).every((value) => value === "ok") && semanticTimers.status === "ok"
+          ? "ok"
+          : "degraded",
       checks,
+      semanticTimers,
     };
   }
 
@@ -260,6 +269,18 @@ async function safeHealthCheck(probe: OperatorHealthProbe): Promise<"ok" | "degr
   }
 }
 
+async function semanticTimerStatus(
+  countDeadTimers: (() => Promise<number>) | undefined,
+): Promise<NonNullable<OperatorStatus["semanticTimers"]>> {
+  if (!countDeadTimers) return { status: "unavailable", deadCount: null };
+  try {
+    const deadCount = NonNegativeCountSchema.parse(await countDeadTimers());
+    return { status: deadCount === 0 ? "ok" : "degraded", deadCount };
+  } catch {
+    return { status: "unavailable", deadCount: null };
+  }
+}
+
 function parseHouseholdId(rawHouseholdId: string): string {
   const parsed = HouseholdIdSchema.safeParse(rawHouseholdId);
   if (!parsed.success) throw new OperatorServiceError("invalid_input");
@@ -366,6 +387,19 @@ const EXPORT_FIELDS = {
     "created_at",
     "updated_at",
   ],
+  privateReview: [
+    "id",
+    "adult_id",
+    "item_key",
+    "source",
+    "summary",
+    "observed_at",
+    "digest_run_id",
+    "reviewed_at",
+    "retention_until",
+    "created_at",
+    "updated_at",
+  ],
   projection: [
     "schema_version",
     "version",
@@ -402,6 +436,7 @@ function sanitizeHouseholdExport(raw: Record<string, unknown>, exportedAt: strin
     channels: sanitizeSelectedArray(raw.channels, EXPORT_FIELDS.channel),
     connections: sanitizeSelectedArray(raw.connections, EXPORT_FIELDS.connection),
     sources: sanitizeSelectedArray(raw.sources, EXPORT_FIELDS.source),
+    privateReviews: sanitizeSelectedArray(raw.privateReviews, EXPORT_FIELDS.privateReview),
     projection: sanitizeNullableObject(raw.projection, EXPORT_FIELDS.projection),
     applicationSnapshot: sanitizeNullableObject(raw.applicationSnapshot, EXPORT_FIELDS.projection),
     applicationCommits: sanitizeSelectedArray(raw.applicationCommits, EXPORT_FIELDS.commit),

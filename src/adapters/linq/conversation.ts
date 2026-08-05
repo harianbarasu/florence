@@ -22,3 +22,8 @@ export function linqReactionFeedbackRef(event: LinqReactionEvent): string {
   });
   return `sha256:${createHash("sha256").update(value).digest("hex")}`;
 }
+
+/** Stable across webhook and Partner API recovery transports without persisting a raw provider ID. */
+export function linqMessageBusinessDedupeKey(messageId: string): string {
+  return `linq:message:sha256:${createHash("sha256").update(messageId).digest("hex")}`;
+}

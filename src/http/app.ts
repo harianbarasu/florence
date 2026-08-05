@@ -14,7 +14,7 @@ import { Counter, collectDefaultMetrics, Histogram, Registry } from "prom-client
 import { z } from "zod";
 import { type GmailPubSubEvent, GoogleAdapterError, parseGmailPubSubPush } from "../adapters/google/index.js";
 import {
-  type LinqInboundEvent,
+  type LinqWebhookEvent,
   LinqWebhookPayloadError,
   LinqWebhookVerificationError,
   parseVerifiedLinqWebhook,
@@ -116,6 +116,13 @@ const operatorStatusSchema = z
         .regex(/^[a-z0-9_.-]+$/u),
       z.enum(["ok", "degraded", "unavailable"]),
     ),
+    semanticTimers: z
+      .object({
+        status: z.enum(["ok", "degraded", "unavailable"]),
+        deadCount: z.number().int().nonnegative().nullable(),
+      })
+      .strict()
+      .optional(),
   })
   .strict();
 
@@ -314,7 +321,7 @@ export async function createFlorenceHttpServer(
         return reply.code(400).send({ error: "invalid_request" });
       }
 
-      let event: LinqInboundEvent | null;
+      let event: LinqWebhookEvent | null;
       try {
         event = parseVerifiedLinqWebhook({
           rawBody: request.rawBody,

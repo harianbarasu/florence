@@ -19,6 +19,7 @@ import type {
   GmailInboxItem,
   GmailTriageResult,
   HouseholdApplicationSnapshot,
+  PrivateReviewItem,
   WorkerRoutes,
 } from "./contracts.js";
 
@@ -114,6 +115,7 @@ export interface ApplicationCommit {
   readonly changes: readonly DomainChange[];
   readonly outbox: readonly ApplicationOutboxIntent[];
   readonly audit: readonly ApplicationAuditEntry[];
+  readonly privateReviewItems: readonly PrivateReviewItem[];
   readonly outcome: ApplicationOutcome;
 }
 
@@ -135,7 +137,8 @@ export type ApplicationCommitResult =
 
 /**
  * The implementation must atomically persist the aggregate, application projection,
- * audit entries, and all outbox intents, guarded by expectedRevision and idempotencyKey.
+ * audit entries, private-review items, and all outbox intents, guarded by expectedRevision
+ * and idempotencyKey.
  */
 export interface ApplicationRepositoryPort {
   load(householdId: string): Promise<HouseholdApplicationSnapshot | null>;
@@ -155,13 +158,18 @@ export type CalendarCreatePreparation =
   | {
       readonly status: "ready";
       readonly targetConnectionId: string;
-      readonly calendarId: "primary";
+      readonly calendarId: string;
       readonly relevantDataDigest: string;
       readonly hasConflict: boolean;
     }
   | {
       readonly status: "unavailable";
-      readonly reason: "no_write_connection" | "ambiguous_write_connection" | "projection_incomplete";
+      readonly reason:
+        | "no_write_connection"
+        | "ambiguous_write_connection"
+        | "no_write_calendar"
+        | "ambiguous_write_calendar"
+        | "projection_incomplete";
     };
 
 /** Trusted, model-free Calendar preflight. It exposes no personal event details. */
@@ -174,7 +182,9 @@ export interface HouseholdCalendarActionsPort {
     readonly startsAt: string;
     readonly endsAt: string;
     readonly accountLabel?: string;
+    readonly calendarName?: string;
     readonly targetConnectionId?: string;
+    readonly calendarId?: string;
   }): Promise<CalendarCreatePreparation>;
 
   createApprovedEvent(input: {
@@ -202,6 +212,7 @@ export interface FlorenceApplication {
   executeOutbox(
     intent: unknown,
     executedAt: string,
+    signal?: AbortSignal,
   ): Promise<{
     intentId: string;
     status: "succeeded" | "retryable_failure" | "permanent_failure";

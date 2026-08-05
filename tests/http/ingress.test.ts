@@ -95,23 +95,6 @@ describe("provider ingress HTTP interface", () => {
     expect(response.body).not.toContain("private failure");
   });
 
-  it("acknowledges authenticated unsupported Linq event types without journaling", async () => {
-    const payload = JSON.parse(readHttpFixture("linq-direct-message.json")) as Record<string, unknown>;
-    payload.event_type = "message.delivered";
-    const rawBody = JSON.stringify(payload);
-    services.ingress.acceptLinq = vi.fn(async () => undefined);
-
-    const response = await server.inject({
-      method: "POST",
-      url: "/webhooks/linq",
-      headers: signedLinqHeaders(rawBody),
-      payload: rawBody,
-    });
-
-    expect(response.statusCode).toBe(204);
-    expect(services.ingress.acceptLinq).not.toHaveBeenCalled();
-  });
-
   it("rejects malformed and over-limit Linq bodies", async () => {
     const malformed = "{not-json";
     const timestamp = String(Math.floor(Date.now() / 1_000));

@@ -14,7 +14,7 @@ import {
   HouseholdAggregateSchema,
   HouseholdIdSchema,
 } from "../../src/domain/index.js";
-import { FakeWorkerRuntime, type WorkerResultPayload } from "../../src/runtime/index.js";
+import { FakeWorkerRuntime, type WorkerJob, type WorkerResultPayload } from "../../src/runtime/index.js";
 
 export const HOUSEHOLD_ID = HouseholdIdSchema.parse("household_family");
 export const ADULT_A = AdultIdSchema.parse("adult_alex");
@@ -87,16 +87,18 @@ export function setup(input?: {
     projection: createApplicationProjection(onboarding),
   });
   const interpreter = new FakeApplicationInterpreter();
-  const workerRuntime = new FakeWorkerRuntime(
-    input?.workerResponse ?? {
-      summary: "No changes proposed.",
-      evidenceRefs: [],
-      questions: [],
-      warnings: [],
-      proposedCommands: [],
-      confidence: 1,
+  const defaultWorkerResponse = (job: WorkerJob): WorkerResultPayload => ({
+    purpose: job.scopeGrant.purpose === "meal_plan" ? "meal_plan" : "family_research",
+    summary: "More information is required before this project can be completed.",
+    completion: {
+      status: "needs_input",
+      questions: ["What additional detail should Florence use?"],
     },
-  );
+    warnings: [],
+    proposedCommands: [],
+    confidence: 1,
+  });
+  const workerRuntime = new FakeWorkerRuntime(input?.workerResponse ?? defaultWorkerResponse);
   const workerContext = new FakeWorkerContext();
   const effectExecutor = new FakeApplicationEffectExecutor();
   const calendarActions = new FakeHouseholdCalendarActions();

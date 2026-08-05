@@ -30,11 +30,14 @@ import {
 } from "../domain/index.js";
 import {
   asWorkerRuntimeError,
+  verifyWorkerResultCompletion,
   type WorkerJob,
   WorkerJobSchema,
   type WorkerResult,
   WorkerResultSchema,
+  type WorkerToolReceipt,
 } from "../runtime/index.js";
+import { ActiveWorkerAttempts } from "./active-worker-attempts.js";
 import {
   type ApplicationAuditEntry,
   ApplicationAuditEntrySchema,
@@ -62,6 +65,8 @@ import {
   HouseholdApplicationSnapshotSchema,
   OutboxExecutionResultSchema,
   type PendingPromotion,
+  type PrivateReviewItem,
+  PrivateReviewItemSchema,
   type ProjectDeliveryGuard,
   SharedProfileFactSchema,
   type WorkerCommand,
@@ -121,6 +126,7 @@ interface Work {
   readonly changes: DomainChange[];
   readonly outbox: ApplicationOutboxIntent[];
   readonly audit: ApplicationAuditEntry[];
+  readonly privateReviewItems: PrivateReviewItem[];
   readonly receipts: AcceptanceReceipt[];
 }
 
@@ -415,6 +421,28 @@ function queueMessage(
   );
 }
 
+function queuePrivateReviewItem(
+  work: Work,
+  input: {
+    source: PrivateReviewItem["source"];
+    sourceKey: string;
+    revision: number;
+    adultId: string;
+    summary: string;
+    observedAt: string;
+  },
+): void {
+  work.privateReviewItems.push(
+    PrivateReviewItemSchema.parse({
+      itemKey: stableId("private_review", input.source, input.sourceKey, String(input.revision)),
+      adultId: input.adultId,
+      source: input.source,
+      summary: input.summary,
+      observedAt: input.observedAt,
+    }),
+  );
+}
+
 function wrapDomainEffect(effect: OutboxIntent): ApplicationOutboxIntent {
   return ApplicationOutboxIntentSchema.parse({
     intentId: stableId("app_domain", effect.intentId),
@@ -438,6 +466,7 @@ function createWork(
     changes: [],
     outbox: [],
     audit: [],
+    privateReviewItems: [],
     receipts: [],
   };
 }
@@ -503,6 +532,34 @@ function workerObjective(
   return objective;
 }
 
+function capabilityGrantsForAttempt(input: {
+  jobId: string;
+  attemptId: string;
+  householdId: string;
+  scopeGrantId: string;
+  scope: DurableScope;
+  purpose: WorkerPurpose;
+  capabilities: readonly string[];
+  issuedAt: string;
+  expiresAt: string;
+}) {
+  return input.capabilities.map((capability) => ({
+    grantId: stableId("capability_grant", input.jobId, input.attemptId, capability),
+    capability,
+    householdId: input.householdId,
+    jobId: input.jobId,
+    attemptId: input.attemptId,
+    scopeGrantId: input.scopeGrantId,
+    scope: {
+      visibility: input.scope.kind,
+      ...(input.scope.kind === "personal" ? { adultId: input.scope.adultId } : {}),
+    },
+    purpose: input.purpose,
+    issuedAt: input.issuedAt,
+    expiresAt: input.expiresAt,
+  }));
+}
+
 function buildWorkerJob(input: {
   jobId?: string;
   attemptNumber?: number;
@@ -521,22 +578,35 @@ function buildWorkerJob(input: {
   const jobId = input.jobId ?? stableId("job", input.work.input.idempotencyKey, input.purpose);
   const attemptNumber = input.attemptNumber ?? 1;
   const attemptId = `${jobId}.attempt.${attemptNumber}`;
+  const householdId = input.work.aggregate.householdId;
+  const scopeGrantId = stableId("context_grant", jobId, attemptId);
+  const deadline = plusMilliseconds(input.occurredAt, 15 * 60_000);
   return WorkerJobSchema.parse({
     jobId,
     attemptId,
-    householdId: input.work.aggregate.householdId,
+    householdId,
     baseHouseholdVersion: input.work.aggregate.version,
     policyVersion: input.work.aggregate.policyVersion,
     objective: workerObjective(input.purpose, input.title, input.requiredOutcome, input.details),
     scopeGrant: {
-      grantId: stableId("context_grant", jobId, attemptId),
+      grantId: scopeGrantId,
       visibility: input.scope.kind,
       ...(input.scope.kind === "personal" ? { adultId: input.scope.adultId } : {}),
       purpose: input.purpose,
       expiresAt: plusMilliseconds(input.occurredAt, 20 * 60_000),
     },
     evidenceRefs: [input.evidenceId],
-    capabilityIds: route.capabilityIds,
+    capabilityGrants: capabilityGrantsForAttempt({
+      jobId,
+      attemptId,
+      householdId,
+      scopeGrantId,
+      scope: input.scope,
+      purpose: input.purpose,
+      capabilities: route.capabilityIds,
+      issuedAt: input.occurredAt,
+      expiresAt: deadline,
+    }),
     modelRouteId: route.modelRouteId,
     modelCapabilityProfile: route.modelCapabilityProfile,
     budget: {
@@ -544,7 +614,7 @@ function buildWorkerJob(input: {
       maxModelCalls: route.maxModelCalls,
       maxToolCalls: route.maxToolCalls,
     },
-    deadline: plusMilliseconds(input.occurredAt, 15 * 60_000),
+    deadline,
     outputContractRef: route.outputContractRef,
     allowedToolNames: route.allowedToolNames,
   });
@@ -1686,14 +1756,27 @@ function processProjectFollowUp(
 function queueCalendarUnavailable(
   work: Work,
   item: ConversationInboxItem,
-  reason: "no_write_connection" | "ambiguous_write_connection" | "projection_incomplete",
+  reason:
+    | "no_write_connection"
+    | "ambiguous_write_connection"
+    | "no_write_calendar"
+    | "ambiguous_write_calendar"
+    | "projection_incomplete",
 ): void {
-  const body =
-    reason === "no_write_connection"
-      ? "I need the requesting adult to connect a Google account with Calendar access in a private DM before I can prepare this event."
-      : reason === "ambiguous_write_connection"
-        ? "More than one writable calendar account matches. Name the linked account in the event request so I can prepare one exact action."
-        : "I’m still synchronizing private calendar availability, so I won’t ask for approval yet. Try the request again after synchronization finishes.";
+  const body = (
+    {
+      no_write_connection:
+        "I need the requesting adult to connect a Google account with Calendar access in a private DM before I can prepare this event.",
+      ambiguous_write_connection:
+        "More than one writable Google account matches. Name the exact linked account and calendar in the event request.",
+      no_write_calendar:
+        "I couldn’t find an active writable calendar matching that request. Say the exact “account / calendar” name from “show my calendars.”",
+      ambiguous_write_calendar:
+        "More than one writable calendar matches. Say the exact “account / calendar” name from “show my calendars.”",
+      projection_incomplete:
+        "I’m still synchronizing private calendar availability, so I won’t ask for approval yet. Try the request again after synchronization finishes.",
+    } satisfies Record<typeof reason, string>
+  )[reason];
   queueMessage(work, `calendar-unavailable:${reason}`, targetScope(item), "status", body);
 }
 
@@ -1725,6 +1808,7 @@ async function proposeCalendarEvent(
     ...(classification.calendarAccountLabel === undefined
       ? {}
       : { accountLabel: classification.calendarAccountLabel }),
+    ...(classification.calendarName === undefined ? {} : { calendarName: classification.calendarName }),
   });
   if (preparation.status === "unavailable") {
     queueCalendarUnavailable(work, item, preparation.reason);
@@ -1839,12 +1923,15 @@ async function approveCalendarEvent(
     startsAt: pending.action.startsAt,
     endsAt: pending.action.endsAt,
     targetConnectionId: pending.action.targetConnectionId,
+    calendarId: pending.action.calendarId,
   });
   if (preparation.status === "unavailable") {
     queueCalendarUnavailable(work, item, preparation.reason);
     return "rejected";
   }
   if (
+    preparation.targetConnectionId !== pending.action.targetConnectionId ||
+    preparation.calendarId !== pending.action.calendarId ||
     preparation.relevantDataDigest !== pending.action.relevantDataDigest ||
     preparation.hasConflict !== pending.action.hasConflict
   ) {
@@ -1853,7 +1940,7 @@ async function approveCalendarEvent(
       "calendar-approval-invalidated",
       { kind: "household" },
       "status",
-      "Household calendar availability changed after this proposal, so I did not create the event. Send the event request again for an updated conflict check and approval.",
+      "The selected calendar or household availability changed after this proposal, so I did not create the event. Send the event request again for an updated conflict check and approval.",
     );
     return "rejected";
   }
@@ -2768,13 +2855,14 @@ async function processGmail(
     case "retain_private":
       return { status: "processed", classification: `gmail:${triage.decision}` };
     case "private_review":
-      queueMessage(
-        work,
-        "gmail-private-review",
-        personal(item.ownerAdultId),
-        "private_review",
-        triage.privateSummary,
-      );
+      queuePrivateReviewItem(work, {
+        source: "gmail",
+        sourceKey: revision.sourceKey,
+        revision: item.revision,
+        adultId: item.ownerAdultId,
+        summary: triage.privateSummary,
+        observedAt: item.occurredAt,
+      });
       return { status: "processed", classification: "gmail:private_review" };
     case "private_interrupt":
       queueMessage(
@@ -3337,13 +3425,14 @@ async function processCalendar(
       return { status: "processed", classification: `calendar:${triage.decision}` };
     case "private_review":
       saveCalendarSource(work, revision.index, sourceRecord);
-      queueMessage(
-        work,
-        "calendar-private-review",
-        personal(item.ownerAdultId),
-        "private_review",
-        triage.privateSummary,
-      );
+      queuePrivateReviewItem(work, {
+        source: "calendar",
+        sourceKey: revision.sourceKey,
+        revision: item.revision,
+        adultId: item.ownerAdultId,
+        summary: triage.privateSummary,
+        observedAt: item.occurredAt,
+      });
       return { status: "processed", classification: "calendar:private_review" };
     case "private_interrupt":
       saveCalendarSource(work, revision.index, sourceRecord);
@@ -3577,13 +3666,14 @@ function workerIdentityMatches(result: WorkerResult, job: WorkerJob): boolean {
     result.policyVersion === job.policyVersion &&
     result.modelRouteId === job.modelRouteId &&
     result.modelCapabilityProfile === job.modelCapabilityProfile &&
-    result.outputContractRef === job.outputContractRef
+    result.outputContractRef === job.outputContractRef &&
+    result.purpose === job.scopeGrant.purpose
   );
 }
 
 function parseWorkerCommands(result: WorkerResult, job: WorkerJob): WorkerCommand[] | null {
   const commands: WorkerCommand[] = [];
-  const evidenceRefs = new Set([...job.evidenceRefs, ...result.evidenceRefs]);
+  const evidenceRefs = new Set(job.evidenceRefs);
   for (const proposed of result.proposedCommands) {
     const parsed = WorkerCommandSchema.safeParse(proposed);
     if (!parsed.success || !scopeFitsJob(commandScope(parsed.data), job)) {
@@ -3631,7 +3721,7 @@ function workerProposalFromCommands(
     policyCandidates: commands.flatMap((command) =>
       command.kind === "policy.candidate" ? [command.payload] : [],
     ),
-    unresolvedQuestions: result.questions,
+    unresolvedQuestions: workerQuestions(result),
     diagnostics: { warnings: result.warnings },
   });
 }
@@ -3724,6 +3814,8 @@ function requeueWorkerForCurrentContext(
 
   const attemptNumber = worker.attemptNumber + 1;
   const attemptId = `${worker.job.jobId}.attempt.${attemptNumber}`;
+  const scopeGrantId = stableId("context_grant", worker.job.jobId, attemptId);
+  const deadline = plusMilliseconds(receivedAt, 15 * 60_000);
   const job = WorkerJobSchema.parse({
     ...worker.job,
     attemptId,
@@ -3731,10 +3823,21 @@ function requeueWorkerForCurrentContext(
     policyVersion: work.aggregate.policyVersion,
     scopeGrant: {
       ...worker.job.scopeGrant,
-      grantId: stableId("context_grant", worker.job.jobId, attemptId),
+      grantId: scopeGrantId,
       expiresAt: plusMilliseconds(receivedAt, 20 * 60_000),
     },
-    deadline: plusMilliseconds(receivedAt, 15 * 60_000),
+    capabilityGrants: capabilityGrantsForAttempt({
+      jobId: worker.job.jobId,
+      attemptId,
+      householdId: worker.job.householdId,
+      scopeGrantId,
+      scope: episode.scope,
+      purpose: worker.purpose,
+      capabilities: worker.job.capabilityGrants.map((grant) => grant.capability),
+      issuedAt: receivedAt,
+      expiresAt: deadline,
+    }),
+    deadline,
   });
   const { resultRef: _resultRef, ...record } = worker;
   work.projection.workers[workerIndex] = {
@@ -3782,15 +3885,86 @@ function truncateMessagePart(value: string, maximumLength: number): string {
 }
 
 function workerResultMessage(result: WorkerResult): string {
-  return truncateMessagePart(result.summary.trim(), 4_000);
+  if (result.completion.status !== "complete") {
+    return truncateMessagePart(result.summary.trim(), 4_000);
+  }
+  if (result.purpose === "meal_plan") {
+    const artifact = result.completion.artifact;
+    const mealLines = artifact.meals.map(
+      (meal) => `• ${meal.when}: ${meal.meal} — ${meal.scheduleRationale}`,
+    );
+    const substitutionLines = artifact.substitutions.map(
+      (substitution) =>
+        `• Instead of ${substitution.insteadOf}, use ${substitution.use}: ${substitution.reason}`,
+    );
+    const groceryLines = artifact.groceryGroups.map((group) => `• ${group.group}: ${group.items.join(", ")}`);
+    return truncateMessagePart(
+      [
+        result.summary.trim(),
+        `Plan horizon: ${artifact.horizon} (schedule checked ${artifact.asOf})`,
+        "Meals:",
+        ...mealLines,
+        ...(substitutionLines.length === 0 ? [] : ["Substitutions:", ...substitutionLines]),
+        "Grocery list:",
+        ...groceryLines,
+        ...(artifact.assumptions.length === 0
+          ? []
+          : ["Assumptions:", ...artifact.assumptions.map((item) => `• ${item}`)]),
+        ...(artifact.uncertainties.length === 0
+          ? []
+          : ["Uncertainties:", ...artifact.uncertainties.map((item) => `• ${item}`)]),
+      ].join("\n"),
+      4_000,
+    );
+  }
+
+  const artifact = result.completion.artifact;
+  const receipts = new Map(result.toolReceipts.map((receipt) => [receipt.receiptId, receipt]));
+  const sourceUrls = (receiptIds: readonly string[]) =>
+    unique(
+      receiptIds.flatMap((receiptId) => {
+        const receipt = receipts.get(receiptId);
+        return receipt?.kind === "research_sources" ? receipt.sources.map((source) => source.url) : [];
+      }),
+    );
+  const cited = (statement: string, receiptIds: readonly string[]) => {
+    const urls = sourceUrls(receiptIds);
+    return `${statement}${urls.length === 0 ? "" : ` [Sources: ${urls.join(", ")}]`}`;
+  };
+  return truncateMessagePart(
+    [
+      result.summary.trim(),
+      `As of ${artifact.asOf}`,
+      ...(artifact.comparison.length === 0
+        ? []
+        : [
+            "Comparison:",
+            ...artifact.comparison.map(
+              (item) => `• ${item.option}: ${cited(item.assessment, item.sourceReceiptIds)}`,
+            ),
+          ]),
+      "Findings:",
+      ...artifact.findings.map((item) => `• ${cited(item.statement, item.sourceReceiptIds)}`),
+      `Recommendation: ${cited(artifact.recommendation.statement, artifact.recommendation.sourceReceiptIds)}`,
+      ...(artifact.uncertainties.length === 0
+        ? []
+        : ["Uncertainties:", ...artifact.uncertainties.map((item) => `• ${item}`)]),
+    ].join("\n"),
+    4_000,
+  );
+}
+
+function workerQuestions(result: WorkerResult): readonly string[] {
+  return result.completion.status === "needs_input" ? result.completion.questions : [];
 }
 
 function workerQuestionMessage(result: WorkerResult): string {
-  const blockingQuestion = result.questions[0]?.trim();
+  const questions = workerQuestions(result);
+  const blockingQuestion = questions[0]?.trim();
   if (blockingQuestion === undefined || blockingQuestion.length === 0) {
     throw new Error("An awaiting-input worker result must contain a blocking question");
   }
-  const remaining = result.questions.length - 1;
+  const remaining = questions.length - 1;
   const questionBlock = [
     "Florence still needs:",
     `• ${blockingQuestion}`,
@@ -3808,19 +3982,18 @@ function workerQuestionMessage(result: WorkerResult): string {
 }
 
 function workerCompletionEvidence(
-  result: WorkerResult,
+  receipt: WorkerToolReceipt,
   worker: ApplicationProjection["workers"][number],
   scope: DurableScope,
-  receivedAt: string,
 ) {
   return EvidenceRefSchema.parse({
-    evidenceId: stableId("evidence", result.jobId, result.attemptId, "completion"),
+    evidenceId: stableId("evidence", worker.job.jobId, worker.job.attemptId, receipt.receiptId),
     source: "worker",
     sourceRef: worker.job.jobId,
     scope,
-    observedAt: receivedAt,
+    observedAt: receipt.issuedAt,
     revision: 1,
-    contentDigest: `sha256:${createHash("sha256").update(result.summary).digest("hex")}`,
+    contentDigest: receipt.outputDigest,
   });
 }
 
@@ -3927,7 +4100,18 @@ function processWorkerResult(
     return requeueWorkerForCurrentContext(work, workerIndex, input.receivedAt, "worker_context_changed");
   }
 
-  if (result.questions.length > 0) {
+  const verification = verifyWorkerResultCompletion(result, input.receivedAt);
+  if (verification.status === "invalid") {
+    return requeueWorkerForCurrentContext(
+      work,
+      workerIndex,
+      input.receivedAt,
+      `worker_result_unverified_${verification.reason}`,
+    );
+  }
+
+  if (verification.status === "needs_input") {
+    const questions = workerQuestions(result);
     const message = workerQuestionMessage(result);
     const { lastErrorCode: _lastErrorCode, ...current } = worker;
     work.projection.workers[workerIndex] = {
@@ -3935,7 +4119,7 @@ function processWorkerResult(
       status: "awaiting_input",
       deliveryGeneration: worker.deliveryGeneration + 1,
       latestSummary: message,
-      outstandingQuestions: result.questions,
+      outstandingQuestions: [...questions],
       updatedAt: input.receivedAt,
       resultRef: stableId("worker_result", result.jobId, result.attemptId),
     };
@@ -4007,7 +4191,14 @@ function processWorkerResult(
     throw new Error("Reconciled worker episode is missing from the household aggregate");
   }
   const message = workerResultMessage(result);
-  const evidence = workerCompletionEvidence(result, worker, episode.scope, input.receivedAt);
+  const receipts = new Map(result.toolReceipts.map((receipt) => [receipt.receiptId, receipt]));
+  const evidence = verification.proofReceiptIds.map((receiptId) => {
+    const receipt = receipts.get(receiptId);
+    if (receipt === undefined) {
+      throw new Error("Verified worker proof receipt is missing");
+    }
+    return workerCompletionEvidence(receipt, worker, episode.scope);
+  });
   const closure = acceptDomain(
     work,
     "worker-project-completed",
@@ -4023,7 +4214,7 @@ function processWorkerResult(
           worker.purpose === "meal_plan"
             ? "Florence completed the requested meal plan and grocery list."
             : "Florence completed the requested household research.",
-        evidence: [evidence],
+        evidence,
         recordedAt: input.receivedAt,
       },
     } as Omit<HouseholdSignal, "householdId" | "signalId" | "sequence" | "occurredAt" | "actor">,
@@ -4169,6 +4360,48 @@ function processDailyBrief(
     }),
   );
   return { status: "processed", classification: `daily_brief:${input.reason}` };
+}
+
+function compactPrivateReviewSummary(value: string): string {
+  const limit = 55;
+  return value.length <= limit ? value : `${value.slice(0, limit - 1).trimEnd()}…`;
+}
+
+function privateReviewDigestBody(
+  input: Extract<ApplicationInput, { kind: "private_review_digest" }>,
+): string {
+  const localDate = Temporal.PlainDate.from(input.localDate);
+  const findings = input.items.map(
+    (item) =>
+      `- ${item.source === "gmail" ? "Gmail" : "Calendar"}: ${compactPrivateReviewSummary(item.summary)}`,
+  );
+  return `Private daily review for ${localDate.month}/${localDate.day}:\n\n${findings.join("\n")}\n\nThese findings stayed private to you and were not included in the household brief.`;
+}
+
+function processPrivateReviewDigest(
+  work: Work,
+  input: Extract<ApplicationInput, { kind: "private_review_digest" }>,
+): { status: "processed" | "rejected"; classification: string } {
+  if (!work.aggregate.verifiedAdultIds.includes(input.adultId)) {
+    return { status: "rejected", classification: "private_review_digest:unknown_adult" };
+  }
+  queueMessage(
+    work,
+    `private-review-digest:${input.adultId}:${input.localDate}`,
+    personal(input.adultId),
+    "private_review",
+    privateReviewDigestBody(input),
+  );
+  work.audit.push(
+    ApplicationAuditEntrySchema.parse({
+      kind: "private_review_digest_built",
+      occurredAt: input.occurredAt,
+      decision: "scheduled",
+      adultId: input.adultId,
+      containsPrivateData: true,
+    }),
+  );
+  return { status: "processed", classification: "private_review_digest:scheduled" };
 }
 
 function processGoogleConnected(
@@ -4321,6 +4554,7 @@ async function commitWork(
     changes: work.changes,
     outbox: work.outbox,
     audit: work.audit,
+    privateReviewItems: work.privateReviewItems,
     outcome,
   };
   const result = await dependencies.repository.commit(commit);
@@ -4354,6 +4588,8 @@ async function loadSnapshot(
 async function runWorker(
   dependencies: FlorenceApplicationDependencies,
   input: Extract<ApplicationInput, { kind: "run_worker" }>,
+  activeAttempts: ActiveWorkerAttempts,
+  upstreamSignal?: AbortSignal,
 ): Promise<ApplicationResult> {
   const duplicate = await dependencies.repository.findProcessed(input.householdId, input.idempotencyKey);
   if (duplicate !== null) {
@@ -4381,6 +4617,7 @@ async function runWorker(
     processApplicationInput(
       dependencies,
       routes,
+      activeAttempts,
       ApplicationInputSchema.parse({
         kind: "worker_failure",
         householdId: input.householdId,
@@ -4413,10 +4650,26 @@ async function runWorker(
   ) {
     return failAttempt("worker_context_stale", true);
   }
+  const activeAttempt = activeAttempts.begin(record.job, {
+    ...(upstreamSignal === undefined ? {} : { upstream: upstreamSignal }),
+    isStillQueued: async () => {
+      const current = await dependencies.repository.load(input.householdId);
+      const currentRecord = current?.projection.workers.find(
+        (candidate) => candidate.job.jobId === input.jobId && candidate.job.attemptId === input.attemptId,
+      );
+      return currentRecord?.status === "queued";
+    },
+  });
   let result: WorkerResult;
   try {
     const options = await dependencies.workerContext.contextFor(record.job, snapshot);
-    result = await dependencies.workerRuntime.run(record.job, options);
+    result = await dependencies.workerRuntime.run(record.job, {
+      ...options,
+      signal:
+        options.signal === undefined
+          ? activeAttempt.signal
+          : AbortSignal.any([activeAttempt.signal, options.signal]),
+    });
     if (options.validateBeforeAccept !== undefined && !(await options.validateBeforeAccept())) {
       return failAttempt("worker_context_stale", true);
     }
@@ -4424,14 +4677,22 @@ async function runWorker(
     const runtimeError = asWorkerRuntimeError(error);
     const retryable =
       runtimeError.retryable ||
-      ["invalid_output", "deadline_exceeded", "budget_exceeded", "tool_failed", "cleanup_failed"].includes(
-        runtimeError.code,
-      );
+      [
+        "cancelled",
+        "invalid_output",
+        "deadline_exceeded",
+        "budget_exceeded",
+        "tool_failed",
+        "cleanup_failed",
+      ].includes(runtimeError.code);
     return failAttempt(`worker_${runtimeError.code}`, retryable);
+  } finally {
+    activeAttempt.finish();
   }
   return processApplicationInput(
     dependencies,
     routes,
+    activeAttempts,
     ApplicationInputSchema.parse({
       kind: "worker_result",
       householdId: input.householdId,
@@ -4445,10 +4706,12 @@ async function runWorker(
 async function processApplicationInput(
   dependencies: FlorenceApplicationDependencies,
   routes: WorkerRoutes,
+  activeAttempts: ActiveWorkerAttempts,
   input: ApplicationInput,
+  signal?: AbortSignal,
 ): Promise<ApplicationResult> {
   if (input.kind === "run_worker") {
-    return runWorker(dependencies, input);
+    return runWorker(dependencies, input, activeAttempts, signal);
   }
   const duplicate = await dependencies.repository.findProcessed(input.householdId, input.idempotencyKey);
   if (duplicate !== null) {
@@ -4487,6 +4750,9 @@ async function processApplicationInput(
       break;
     case "daily_brief":
       processed = processDailyBrief(work, input);
+      break;
+    case "private_review_digest":
+      processed = processPrivateReviewDigest(work, input);
       break;
     case "google_connected":
       processed = processGoogleConnected(work, input);
@@ -4553,19 +4819,30 @@ export function createFlorenceApplication(
   dependencies: FlorenceApplicationDependencies,
 ): FlorenceApplication {
   const routes = WorkerRoutesSchema.parse(dependencies.workerRoutes ?? DEFAULT_WORKER_ROUTES);
+  const activeAttempts = new ActiveWorkerAttempts();
   return Object.freeze({
     async process(rawInput: unknown) {
       const input = ApplicationInputSchema.parse(rawInput);
-      return processApplicationInput(dependencies, routes, input);
+      const result = await processApplicationInput(dependencies, routes, activeAttempts, input);
+      if (input.kind === "conversation_message") {
+        try {
+          const latest = await dependencies.repository.load(input.householdId);
+          if (latest !== null) activeAttempts.reconcile(input.householdId, latest.projection.workers);
+        } catch {
+          // Durable polling still observes cancellation if this best-effort fast path cannot reread.
+        }
+      }
+      return result;
     },
 
-    async executeOutbox(rawIntent: unknown, executedAt: string) {
+    async executeOutbox(rawIntent: unknown, executedAt: string, signal?: AbortSignal) {
       const intent = ApplicationOutboxIntentSchema.parse(rawIntent);
       const recordedAt = InstantStringSchema.parse(executedAt);
       if (intent.kind === "worker.run") {
         const applicationResult = await processApplicationInput(
           dependencies,
           routes,
+          activeAttempts,
           ApplicationInputSchema.parse({
             kind: "run_worker",
             householdId: intent.householdId,
@@ -4574,6 +4851,7 @@ export function createFlorenceApplication(
             attemptId: intent.job.attemptId,
             requestedAt: recordedAt,
           }),
+          signal,
         );
         return OutboxExecutionResultSchema.parse({
           intentId: intent.intentId,
@@ -4588,6 +4866,7 @@ export function createFlorenceApplication(
         applicationResult = await processApplicationInput(
           dependencies,
           routes,
+          activeAttempts,
           ApplicationInputSchema.parse({
             kind: "effect_receipt",
             householdId: intent.householdId,

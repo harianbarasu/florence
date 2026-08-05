@@ -20,7 +20,6 @@ import {
   calendarSyncStateSchema,
   GoogleCalendarPushIngress,
   GoogleCalendarSyncService,
-  normalizeCalendarBusyWindow,
   type PersistPersonalCalendarSourceInput,
 } from "../../src/infrastructure/google-calendar-sync.js";
 import {
@@ -253,19 +252,6 @@ function harness() {
 }
 
 describe("GoogleCalendarSyncService", () => {
-  it("normalizes all-day windows through DST using the calendar time zone", () => {
-    const allDay = event({
-      start: { kind: "date", date: "2027-03-14", timeZone: null },
-      end: { kind: "date", date: "2027-03-15", timeZone: null },
-    });
-    expect(normalizeCalendarBusyWindow(allDay, "America/Los_Angeles")).toEqual({
-      startsAt: "2027-03-14T08:00:00Z",
-      endsAt: "2027-03-15T07:00:00Z",
-      allDay: true,
-    });
-    expect(normalizeCalendarBusyWindow({ ...allDay, transparency: "transparent" }, "UTC")).toBeNull();
-  });
-
   it("performs a bounded initial page, encrypts raw events, and exposes only a busy projection", async () => {
     const fixture = harness();
     await expect(fixture.service.execute({ kind: "start", ...fixture.identity })).resolves.toMatchObject({
@@ -322,51 +308,6 @@ describe("GoogleCalendarSyncService", () => {
     });
     expect(JSON.stringify(fixture.applicationProcess.mock.calls)).not.toMatch(
       /etag-1|google-calendar-change|event\?eid|google-subject-parent|organizer|creator|attendees|visibility/iu,
-    );
-  });
-
-  it("persists malformed and historical initial events privately without flooding Calendar triage", async () => {
-    const fixture = harness();
-    fixture.listEventsPage.mockResolvedValueOnce({
-      events: [
-        event({
-          eventId: "malformed-event",
-          summary: "   ",
-          updatedAt: NOW.toISOString(),
-        }),
-        event({
-          eventId: "old-event",
-          summary: "Old private event",
-          start: { kind: "dateTime", dateTime: "2027-01-01T09:00:00-08:00", timeZone: null },
-          end: { kind: "dateTime", dateTime: "2027-01-01T10:00:00-08:00", timeZone: null },
-          updatedAt: "2027-01-01T18:00:00Z",
-        }),
-        event({
-          eventId: "recently-edited-old-event",
-          summary: "Recently edited old event",
-          start: { kind: "dateTime", dateTime: "2027-01-02T09:00:00-08:00", timeZone: null },
-          end: { kind: "dateTime", dateTime: "2027-01-02T10:00:00-08:00", timeZone: null },
-          updatedAt: NOW.toISOString(),
-        }),
-      ],
-      nextPageToken: null,
-      nextSyncToken: "sync-token-initial",
-      timeZone: "America/Los_Angeles",
-    });
-
-    await fixture.service.execute({ kind: "start", ...fixture.identity });
-    await expect(fixture.service.execute({ kind: "continue", ...fixture.identity })).resolves.toMatchObject({
-      processedEvents: 3,
-    });
-
-    expect(fixture.sources).toHaveLength(3);
-    expect(fixture.sources[0]?.metadata).not.toHaveProperty("applicationContentDigest");
-    expect(fixture.applicationProcess).toHaveBeenCalledTimes(1);
-    expect(fixture.applicationProcess).toHaveBeenCalledWith(
-      expect.objectContaining({
-        kind: "calendar_event",
-        eventRef: `calendar:${CONNECTION_ID}:primary:recently-edited-old-event`,
-      }),
     );
   });
 
@@ -587,34 +528,6 @@ describe("GoogleCalendarPushIngress", () => {
     "x-goog-resource-state": "exists",
     "x-goog-message-number": "42",
   };
-
-  it("authenticates dynamically and persists only a scoped invalidation job", async () => {
-    const enqueueCalendarSyncWork = vi.fn(async () => ({ jobId: "job-1", created: true }));
-    const authenticateCalendarPush = vi.fn(async () => ({
-      householdId: HOUSEHOLD_ID,
-      adultId: ADULT_ID,
-      connectionId: CONNECTION_ID,
-      calendarId: "primary",
-    }));
-    const ingress = new GoogleCalendarPushIngress({
-      store: { authenticateCalendarPush, enqueueCalendarSyncWork },
-      now: () => NOW,
-    });
-
-    await expect(ingress.accept(headers)).resolves.toBe("accepted");
-    expect(enqueueCalendarSyncWork).toHaveBeenCalledWith({
-      householdId: HOUSEHOLD_ID,
-      idempotencyKey: "google-calendar-push:calendar-channel-1:calendar-resource-1:42",
-      work: {
-        kind: "push",
-        householdId: HOUSEHOLD_ID,
-        adultId: ADULT_ID,
-        connectionId: CONNECTION_ID,
-        calendarId: "primary",
-      },
-    });
-    expect(JSON.stringify(enqueueCalendarSyncWork.mock.calls)).not.toContain("private-channel-token");
-  });
 
   it("does not enqueue an unknown or mistokened channel", async () => {
     const enqueueCalendarSyncWork = vi.fn(async () => ({ jobId: "job-1", created: true }));

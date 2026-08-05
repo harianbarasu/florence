@@ -1,8 +1,9 @@
-import { createHash, createHmac, randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { JSONValue, TransactionSql } from "postgres";
 import { z } from "zod";
 import { ApplicationOutboxIntentSchema } from "../application/contracts.js";
 import type { Database } from "../db/client.js";
+import type { BlindIndex } from "../security/blind-index.js";
 
 const instantSchema = z.iso.datetime({ offset: true });
 const uuidSchema = z.uuid();
@@ -97,14 +98,11 @@ type DeletionRequestRow = {
 
 export class PostgresCustomerDataControlStore {
   readonly #database: Database;
-  readonly #identitySecret: string;
+  readonly #blindIndex: BlindIndex;
 
-  public constructor(database: Database, identitySecret: string) {
-    if (Buffer.byteLength(identitySecret, "utf8") < 32) {
-      throw new Error("Customer data-control identity secret must contain at least 32 bytes");
-    }
+  public constructor(database: Database, blindIndex: BlindIndex) {
     this.#database = database;
-    this.#identitySecret = identitySecret;
+    this.#blindIndex = blindIndex;
   }
 
   public async issueExportHandoff(input: {
@@ -842,10 +840,11 @@ export class PostgresCustomerDataControlStore {
       `;
       if (bindings.length > 0) {
         const chatIds = bindings.map((binding) => binding.external_chat_id);
+        const chatDigests = chatIds.map((chatId) => this.#identityDigest("linq-chat", chatId));
         await transaction`
           delete from provider_inbox
           where status in ('pending', 'leased', 'quarantined', 'dead')
-            and payload #>> '{conversation,id}' = any(${chatIds})
+            and routing_digests && ${chatDigests}::text[]
         `;
         await transaction`
           delete from channel_suppressions where external_chat_id = any(${chatIds})
@@ -996,6 +995,20 @@ export class PostgresCustomerDataControlStore {
       where household_id = ${input.householdId} and status in ('scheduled', 'claimed')
     `;
     await transaction`
+      update daily_brief_runs set status = 'dead', dead_at = ${input.fencedAt},
+        last_error_code = 'customer_deletion_fenced', lease_owner = null,
+        lease_token = null, lease_expires_at = null, updated_at = now()
+      where household_id = ${input.householdId} and status in ('pending', 'retry', 'leased')
+    `;
+    await transaction`
+      update private_review_items review
+      set digest_run_id = null, updated_at = now()
+      from daily_brief_runs run
+      where review.digest_run_id = run.id and run.household_id = ${input.householdId}
+        and run.status = 'dead' and run.kind = 'private_review'
+        and review.reviewed_at is null
+    `;
+    await transaction`
       update outbox set status = 'cancelled', lease_owner = null, lease_token = null,
         lease_expires_at = null, updated_at = now()
       where household_id = ${input.householdId}
@@ -1016,10 +1029,14 @@ export class PostgresCustomerDataControlStore {
         updated_at = now()
       where household_id = ${input.householdId} and status <> 'revoked'
     `;
+    const currentInboxDigest = this.#blindIndex.digest(
+      "provider-idempotency",
+      `linq\0${input.currentInboxIdempotencyKey}`,
+    );
     await transaction`
       delete from provider_inbox
       where household_id = ${input.householdId}
-        and idempotency_key <> ${input.currentInboxIdempotencyKey}
+        and idempotency_digest <> ${currentInboxDigest}
         and status in ('pending', 'leased', 'quarantined', 'dead')
     `;
     await transaction`
@@ -1036,10 +1053,7 @@ export class PostgresCustomerDataControlStore {
   }
 
   #identityDigest(kind: string, value: string): string {
-    return createHmac("sha256", this.#identitySecret)
-      .update(`florence:customer-deletion:${kind}:v1\0`)
-      .update(value.normalize("NFKC"))
-      .digest("hex");
+    return this.#blindIndex.digest(kind, value);
   }
 }
 

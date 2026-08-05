@@ -474,6 +474,7 @@ const CalendarEventCreateRequestClassificationSchema = z
     endsAt: InstantStringSchema,
     timeZone: TimeZoneSchema,
     calendarAccountLabel: z.string().trim().min(1).max(200).optional(),
+    calendarName: z.string().trim().min(1).max(1_024).optional(),
   })
   .superRefine((classification, context) => {
     if (Date.parse(classification.startsAt) >= Date.parse(classification.endsAt)) {
@@ -649,6 +650,17 @@ export const CalendarTriageResultSchema = z.discriminatedUnion("decision", [
 ]);
 
 export type CalendarTriageResult = z.infer<typeof CalendarTriageResultSchema>;
+
+/** Private connector finding retained outside the household projection until its owner's digest. */
+export const PrivateReviewItemSchema = z.strictObject({
+  itemKey: StableReferenceSchema,
+  adultId: AdultIdSchema,
+  source: z.enum(["gmail", "calendar"]),
+  summary: NeutralFactualTextSchema,
+  observedAt: InstantStringSchema,
+});
+
+export type PrivateReviewItem = z.infer<typeof PrivateReviewItemSchema>;
 
 export const OnboardingProjectionSchema = z
   .strictObject({
@@ -1050,6 +1062,7 @@ export const ApplicationAuditEntrySchema = z.strictObject({
     "domain_accepted",
     "worker_reconciled",
     "daily_brief_built",
+    "private_review_digest_built",
     "external_action_reconciled",
   ]),
   occurredAt: InstantStringSchema,
@@ -1130,6 +1143,39 @@ export const DailyBriefInputSchema = z
     }
   });
 
+export const PrivateReviewDigestInputSchema = z
+  .strictObject({
+    kind: z.literal("private_review_digest"),
+    householdId: HouseholdIdSchema,
+    idempotencyKey: IdempotencyKeySchema,
+    occurredAt: InstantStringSchema,
+    localDate: z.iso.date(),
+    adultId: AdultIdSchema,
+    items: z.array(PrivateReviewItemSchema).min(1).max(5),
+  })
+  .superRefine((input, context) => {
+    const itemKeys = new Set<string>();
+    input.items.forEach((item, index) => {
+      if (item.adultId !== input.adultId) {
+        context.addIssue({
+          code: "custom",
+          path: ["items", index, "adultId"],
+          message: "A private review digest may contain only its owning adult's items",
+        });
+      }
+      if (itemKeys.has(item.itemKey)) {
+        context.addIssue({
+          code: "custom",
+          path: ["items", index, "itemKey"],
+          message: "A private review digest cannot repeat an item",
+        });
+      }
+      itemKeys.add(item.itemKey);
+    });
+  });
+
+export type PrivateReviewDigestInput = z.infer<typeof PrivateReviewDigestInputSchema>;
+
 export const EffectReceiptInputSchema = z.strictObject({
   kind: z.literal("effect_receipt"),
   householdId: HouseholdIdSchema,
@@ -1186,6 +1232,7 @@ export const ApplicationInputSchema = z.discriminatedUnion("kind", [
   GoogleConnectedInputSchema,
   WorkerRunInputSchema,
   DailyBriefInputSchema,
+  PrivateReviewDigestInputSchema,
   EffectReceiptInputSchema,
   PrivateControlInputSchema,
 ]);

@@ -16,7 +16,6 @@ import {
   createApplicationProjection,
   createOnboardingProjection,
   type HouseholdApplicationSnapshot,
-  HouseholdApplicationSnapshotSchema,
   type ProjectDeliveryGuard,
   ProjectDeliveryGuardSchema,
 } from "../application/index.js";
@@ -67,6 +66,7 @@ import type { LinqChannelTarget, SerializedLinqSendResult } from "./worker-servi
 
 const instantSchema = z.iso.datetime({ offset: true });
 const handleSchema = z.string().trim().min(3).max(320);
+const GMAIL_RECOVERY_PROVIDER_PAGE_LIMIT = 100;
 const groupBindingMetadataSchema = z
   .object({
     participantHandleDigests: z.array(z.string().min(1)).length(2),
@@ -148,13 +148,18 @@ export type HouseholdCalendarCreatePreparation =
   | {
       status: "ready";
       targetConnectionId: string;
-      calendarId: "primary";
+      calendarId: string;
       relevantDataDigest: string;
       hasConflict: boolean;
     }
   | {
       status: "unavailable";
-      reason: "no_write_connection" | "ambiguous_write_connection" | "projection_incomplete";
+      reason:
+        | "no_write_connection"
+        | "ambiguous_write_connection"
+        | "no_write_calendar"
+        | "ambiguous_write_calendar"
+        | "projection_incomplete";
     };
 
 type InvitationRow = {
@@ -743,30 +748,18 @@ export class FlorenceRuntimeStore {
     ) {
       return { status: "unavailable", reason: "source_identity_changed" };
     }
-    const snapshots = await transaction<{ revision: string; aggregate: unknown; projection: unknown }[]>`
-      select revision, aggregate, projection
-      from application_snapshots
-      where household_id = ${invitation.household_id}
-      for update
-    `;
-    const snapshotRow = snapshots[0];
-    const snapshot = HouseholdApplicationSnapshotSchema.safeParse(
-      snapshotRow === undefined
-        ? null
-        : {
-            revision: Number(snapshotRow.revision),
-            aggregate: snapshotRow.aggregate,
-            projection: snapshotRow.projection,
-          },
+    const snapshot = await this.applicationStore.loadInTransaction(
+      transaction,
+      invitation.household_id,
+      "update",
     );
     if (
-      !snapshot.success ||
-      !snapshot.data.aggregate.verifiedAdultIds.includes(inviteeAdultId) ||
-      snapshot.data.projection.onboarding.invitedAdultId !== inviteeAdultId
+      !snapshot?.aggregate.verifiedAdultIds.includes(inviteeAdultId) ||
+      snapshot.projection.onboarding.invitedAdultId !== inviteeAdultId
     ) {
       return { status: "unavailable", reason: "target_state_changed" };
     }
-    const onboarding = snapshot.data.projection.onboarding;
+    const onboarding = snapshot.projection.onboarding;
     const alreadyConsented = onboarding.consentedAdultIds.includes(inviteeAdultId);
     let requiresApplicationAcceptance: boolean;
     if (onboarding.phase === "awaiting_invitee_consent" && !alreadyConsented) {
@@ -1115,24 +1108,11 @@ export class FlorenceRuntimeStore {
       const hasEpisodeResponseContext =
         responseContext?.kind === "episode_ownership" || responseContext?.kind === "episode_follow_up";
       if (hasEpisodeResponseContext || deliveryGuard !== undefined) {
-        const snapshots = await transaction<{ revision: string; aggregate: unknown; projection: unknown }[]>`
-          select revision, aggregate, projection
-          from application_snapshots where household_id = ${householdId}
-          limit 1
-        `;
-        const snapshotRow = snapshots[0];
-        if (!snapshotRow) return { status: "obsolete" };
-        const snapshot = HouseholdApplicationSnapshotSchema.safeParse({
-          revision: Number(snapshotRow.revision),
-          aggregate: snapshotRow.aggregate,
-          projection: snapshotRow.projection,
-        });
-        if (!snapshot.success) {
-          return { status: "obsolete" };
-        }
+        const snapshot = await this.applicationStore.loadInTransaction(transaction, householdId, "none");
+        if (!snapshot) return { status: "obsolete" };
 
         if (hasEpisodeResponseContext) {
-          const episode = snapshot.data.aggregate.episodes.find(
+          const episode = snapshot.aggregate.episodes.find(
             (candidate) => candidate.episodeId === responseContext.episodeId,
           );
           if (
@@ -1151,7 +1131,7 @@ export class FlorenceRuntimeStore {
           ) {
             return { status: "obsolete" };
           }
-          const worker = snapshot.data.projection.workers.find(
+          const worker = snapshot.projection.workers.find(
             (candidate) =>
               candidate.episodeId === deliveryGuard.episodeId && candidate.job.jobId === deliveryGuard.jobId,
           );
@@ -2461,7 +2441,9 @@ export class FlorenceRuntimeStore {
     startsAt: string;
     endsAt: string;
     accountLabel?: string;
+    calendarName?: string;
     targetConnectionId?: string;
+    calendarId?: string;
   }): Promise<HouseholdCalendarCreatePreparation> {
     const parsed = z
       .strictObject({
@@ -2472,7 +2454,18 @@ export class FlorenceRuntimeStore {
         startsAt: instantSchema,
         endsAt: instantSchema,
         accountLabel: z.string().trim().min(1).max(200).optional(),
+        calendarName: z.string().trim().min(1).max(1_024).optional(),
         targetConnectionId: z.uuid().optional(),
+        calendarId: z.string().min(1).max(1_000).optional(),
+      })
+      .superRefine((value, context) => {
+        if (value.calendarId !== undefined && value.targetConnectionId === undefined) {
+          context.addIssue({
+            code: "custom",
+            path: ["targetConnectionId"],
+            message: "An exact Calendar target requires its owning connection",
+          });
+        }
       })
       .parse(input);
     if (Date.parse(parsed.startsAt) >= Date.parse(parsed.endsAt)) {
@@ -2505,21 +2498,14 @@ export class FlorenceRuntimeStore {
         and granted_scopes && ${[GOOGLE_CALENDAR_EVENTS_SCOPE]}::text[]
       order by created_at, id
     `;
-    const normalizedLabel = parsed.accountLabel?.toLocaleLowerCase("en-US");
-    const candidates = writeTargets.filter((target) => {
+    const normalizedLabel =
+      parsed.accountLabel === undefined ? undefined : normalizeCalendarSelection(parsed.accountLabel);
+    const accountCandidates = writeTargets.filter((target) => {
       if (parsed.targetConnectionId !== undefined) return target.id === parsed.targetConnectionId;
       if (normalizedLabel === undefined) return true;
-      const label = String(target.metadata.accountLabel ?? target.label)
-        .trim()
-        .toLocaleLowerCase("en-US");
-      return label === normalizedLabel;
+      return normalizeCalendarSelection(calendarConnectionLabel(target)) === normalizedLabel;
     });
-    if (candidates.length === 0) return { status: "unavailable", reason: "no_write_connection" };
-    if (candidates.length !== 1) {
-      return { status: "unavailable", reason: "ambiguous_write_connection" };
-    }
-    const target = candidates[0];
-    if (target === undefined) return { status: "unavailable", reason: "no_write_connection" };
+    if (accountCandidates.length === 0) return { status: "unavailable", reason: "no_write_connection" };
 
     const connections = await this.database<
       { id: string; adult_id: string; cursor: Record<string, unknown> }[]
@@ -2555,9 +2541,19 @@ export class FlorenceRuntimeStore {
     }
     const connectionIds = connections.map((connection) => connection.id);
     const calendarRows = await this.database<
-      { connection_id: string; adult_id: string; calendar_id: string; sync_state: unknown }[]
+      {
+        connection_id: string;
+        adult_id: string;
+        calendar_id: string;
+        provider_calendar_id: string;
+        display_name_ciphertext: string;
+        access_role: string | null;
+        is_primary: boolean;
+        sync_state: unknown;
+      }[]
     >`
-      select connection_id, adult_id, calendar_id, sync_state
+      select connection_id, adult_id, calendar_id, provider_calendar_id,
+        display_name_ciphertext, access_role, is_primary, sync_state
       from google_calendar_sync_states
       where household_id = ${parsed.householdId} and adult_id = any(${expectedAdults}::uuid[])
         and connection_id = any(${connectionIds}::uuid[]) and status = 'active'
@@ -2600,10 +2596,84 @@ export class FlorenceRuntimeStore {
         coverage.some((item) => item.connectionId === connection.id && item.adultId === connection.adult_id),
       ) ||
       !expectedAdults.every((adultId) => coverage.some((item) => item.adultId === adultId)) ||
-      !coverage.some((item) => item.connectionId === target.id)
+      !accountCandidates.every((target) => coverage.some((item) => item.connectionId === target.id))
     ) {
       return { status: "unavailable", reason: "projection_incomplete" };
     }
+    const accountByConnection = new Map(accountCandidates.map((target) => [target.id, target] as const));
+    const writableCalendars: Array<{
+      connectionId: string;
+      calendarId: string;
+      accountLabel: string;
+      displayName: string;
+      primary: boolean;
+    }> = [];
+    const secretBox = new SecretBox(this.identityKey);
+    for (const row of calendarRows) {
+      const account = accountByConnection.get(row.connection_id);
+      if (account === undefined) continue;
+      const accessRole =
+        row.access_role === null ? null : googleCalendarAccessRoleSchema.parse(row.access_role);
+      if (!isWritableCalendarAccessRole(accessRole)) continue;
+      let displayName: string;
+      try {
+        displayName = secretBox.open(
+          row.display_name_ciphertext,
+          calendarCatalogNameAad(
+            {
+              householdId: parsed.householdId,
+              adultId: row.adult_id,
+              id: row.connection_id,
+            },
+            row.provider_calendar_id,
+          ),
+        );
+      } catch {
+        return { status: "unavailable", reason: "projection_incomplete" };
+      }
+      writableCalendars.push({
+        connectionId: row.connection_id,
+        calendarId: row.calendar_id,
+        accountLabel: calendarConnectionLabel(account),
+        displayName,
+        primary: row.is_primary,
+      });
+    }
+    let calendarCandidates = writableCalendars;
+    if (parsed.calendarId !== undefined) {
+      calendarCandidates = calendarCandidates.filter(
+        (calendar) =>
+          calendar.connectionId === parsed.targetConnectionId && calendar.calendarId === parsed.calendarId,
+      );
+    } else if (parsed.calendarName !== undefined) {
+      const requestedName = normalizeCalendarSelection(parsed.calendarName);
+      calendarCandidates = calendarCandidates.filter((calendar) => {
+        const displayName = normalizeCalendarSelection(calendar.displayName);
+        const qualifiedName = normalizeCalendarSelection(
+          `${calendar.accountLabel} / ${calendar.displayName}`,
+        );
+        const primaryName = normalizeCalendarSelection(`${calendar.accountLabel} / primary`);
+        return (
+          requestedName === displayName ||
+          requestedName === qualifiedName ||
+          (calendar.primary && (requestedName === "primary" || requestedName === primaryName))
+        );
+      });
+    }
+    if (calendarCandidates.length === 0) {
+      return { status: "unavailable", reason: "no_write_calendar" };
+    }
+    if (calendarCandidates.length !== 1) {
+      return {
+        status: "unavailable",
+        reason:
+          new Set(calendarCandidates.map((calendar) => calendar.connectionId)).size > 1
+            ? "ambiguous_write_connection"
+            : "ambiguous_write_calendar",
+      };
+    }
+    const target = calendarCandidates[0];
+    if (target === undefined) return { status: "unavailable", reason: "no_write_calendar" };
     const coveredConnectionIds = [...new Set(coverage.map((item) => item.connectionId))];
 
     const overlaps = await this.database<
@@ -2640,11 +2710,11 @@ export class FlorenceRuntimeStore {
         busy.external_event_id, busy.source_revision
     `;
     const digestMaterial = canonicalJson({
-      schemaVersion: 1,
+      schemaVersion: 2,
       householdId: parsed.householdId,
       verifiedAdultIds: expectedAdults,
-      targetConnectionId: target.id,
-      calendarId: "primary",
+      targetConnectionId: target.connectionId,
+      calendarId: target.calendarId,
       startsAt: parsed.startsAt,
       endsAt: parsed.endsAt,
       coverage,
@@ -2660,8 +2730,8 @@ export class FlorenceRuntimeStore {
     });
     return {
       status: "ready",
-      targetConnectionId: target.id,
-      calendarId: "primary",
+      targetConnectionId: target.connectionId,
+      calendarId: target.calendarId,
       relevantDataDigest: `sha256:${createHmac("sha256", this.identityKey)
         .update(digestMaterial)
         .digest("hex")}`,
@@ -2693,6 +2763,261 @@ export class FlorenceRuntimeStore {
       encryptedContent: input.encryptedContent,
       metadata,
     });
+  }
+
+  public async beginGmailRecovery(input: {
+    householdId: string;
+    adultId: string;
+    connectionId: string;
+    targetHistoryId: string;
+  }): Promise<{ generationId: string }> {
+    const parsed = z
+      .strictObject({
+        householdId: z.uuid(),
+        adultId: z.uuid(),
+        connectionId: z.uuid(),
+        targetHistoryId: z.string().regex(/^\d+$/u).max(100),
+      })
+      .parse(input);
+    return this.database.begin(async (transaction) => {
+      const connections = await transaction<{ id: string }[]>`
+        select id from external_connections
+        where id = ${parsed.connectionId} and household_id = ${parsed.householdId}
+          and adult_id = ${parsed.adultId} and provider = 'google' and status = 'active'
+        for update
+      `;
+      if (connections.length !== 1) {
+        throw new ApplicationStoreError("not_authorized", "Gmail recovery connection is unavailable");
+      }
+      const existing = await transaction<{ generation_id: string; target_history_id: string }[]>`
+        select generation_id, target_history_id from gmail_recovery_runs
+        where connection_id = ${parsed.connectionId}
+        for update
+      `;
+      if (existing[0]?.target_history_id === parsed.targetHistoryId) {
+        return { generationId: existing[0].generation_id };
+      }
+      await transaction`
+        delete from gmail_recovery_runs where connection_id = ${parsed.connectionId}
+      `;
+      const generationId = randomUUID();
+      await transaction`
+        insert into gmail_recovery_runs (
+          connection_id, household_id, adult_id, generation_id, target_history_id
+        ) values (
+          ${parsed.connectionId}, ${parsed.householdId}, ${parsed.adultId}, ${generationId},
+          ${parsed.targetHistoryId}
+        )
+      `;
+      return { generationId };
+    });
+  }
+
+  public async recordGmailRecoveryPage(input: {
+    householdId: string;
+    adultId: string;
+    connectionId: string;
+    generationId: string;
+    externalIds: readonly string[];
+  }): Promise<{ pendingExternalIds: readonly string[] }> {
+    const parsed = z
+      .strictObject({
+        householdId: z.uuid(),
+        adultId: z.uuid(),
+        connectionId: z.uuid(),
+        generationId: z.uuid(),
+        externalIds: z.array(z.string().min(1).max(500)).max(GMAIL_RECOVERY_PROVIDER_PAGE_LIMIT),
+      })
+      .parse(input);
+    const externalIds = [...new Set(parsed.externalIds)];
+    return this.database.begin(async (transaction) => {
+      await requireOwnedGmailRecoveryRun(transaction, parsed);
+      if (externalIds.length > 0) {
+        await transaction`
+          insert into gmail_recovery_seen_messages (
+            connection_id, generation_id, external_id, disposition
+          )
+          select ${parsed.connectionId}, ${parsed.generationId}, candidate.external_id, 'present'
+          from unnest(${externalIds}::text[]) as candidate(external_id)
+          on conflict (connection_id, generation_id, external_id) do nothing
+        `;
+      }
+      await transaction`
+        update gmail_recovery_runs set updated_at = now()
+        where connection_id = ${parsed.connectionId} and generation_id = ${parsed.generationId}
+      `;
+      const pending =
+        externalIds.length === 0
+          ? []
+          : await transaction<{ external_id: string }[]>`
+              select candidate.external_id
+              from unnest(${externalIds}::text[]) with ordinality as candidate(external_id, position)
+              join gmail_recovery_seen_messages seen
+                on seen.connection_id = ${parsed.connectionId}
+                and seen.generation_id = ${parsed.generationId}
+                and seen.external_id = candidate.external_id
+              where seen.processed_at is null
+              order by candidate.position
+            `;
+      return { pendingExternalIds: pending.map((row) => row.external_id) };
+    });
+  }
+
+  public async markGmailRecoveryWorkProcessed(input: {
+    householdId: string;
+    adultId: string;
+    connectionId: string;
+    generationId: string;
+    externalId: string;
+  }): Promise<void> {
+    const parsed = z
+      .strictObject({
+        householdId: z.uuid(),
+        adultId: z.uuid(),
+        connectionId: z.uuid(),
+        generationId: z.uuid(),
+        externalId: z.string().min(1).max(500),
+      })
+      .parse(input);
+    await this.database.begin(async (transaction) => {
+      await requireOwnedGmailRecoveryRun(transaction, parsed);
+      const rows = await transaction<{ external_id: string }[]>`
+        update gmail_recovery_seen_messages set processed_at = coalesce(processed_at, now())
+        where connection_id = ${parsed.connectionId} and generation_id = ${parsed.generationId}
+          and external_id = ${parsed.externalId}
+        returning external_id
+      `;
+      if (rows.length !== 1) {
+        throw new ApplicationStoreError("invalid_state", "Gmail recovery message was not recorded");
+      }
+    });
+  }
+
+  public async listMissingGmailRecoverySources(input: {
+    householdId: string;
+    adultId: string;
+    connectionId: string;
+    generationId: string;
+    limit: number;
+  }): Promise<readonly string[]> {
+    const parsed = z
+      .strictObject({
+        householdId: z.uuid(),
+        adultId: z.uuid(),
+        connectionId: z.uuid(),
+        generationId: z.uuid(),
+        limit: z.number().int().positive().max(GMAIL_RECOVERY_PROVIDER_PAGE_LIMIT),
+      })
+      .parse(input);
+    return this.database.begin(async (transaction) => {
+      await requireOwnedGmailRecoveryRun(transaction, parsed);
+      const pending = await transaction<{ external_id: string }[]>`
+        select external_id
+        from gmail_recovery_seen_messages
+        where connection_id = ${parsed.connectionId} and generation_id = ${parsed.generationId}
+          and disposition = 'missing' and processed_at is null
+        order by external_id
+        limit ${parsed.limit}
+      `;
+      if (pending.length > 0) return pending.map((row) => row.external_id);
+
+      await transaction`
+        insert into gmail_recovery_seen_messages (
+          connection_id, generation_id, external_id, disposition
+        )
+        select candidate.connection_id, candidate.generation_id, candidate.external_id, 'missing'
+        from (
+          select run.connection_id, run.generation_id, source.external_id
+          from source_items source
+          join gmail_recovery_runs run
+            on run.connection_id = source.connection_id
+            and run.generation_id = ${parsed.generationId}
+          left join gmail_recovery_seen_messages seen
+            on seen.connection_id = run.connection_id
+            and seen.generation_id = run.generation_id
+            and seen.external_id = source.external_id
+          where source.household_id = ${parsed.householdId}
+            and source.owner_adult_id = ${parsed.adultId}
+            and source.connection_id = ${parsed.connectionId}
+            and source.provider = 'gmail' and source.kind = 'gmail_message'
+            and source.created_at <= run.started_at and seen.external_id is null
+          order by source.external_id
+          limit ${parsed.limit}
+        ) candidate
+        on conflict (connection_id, generation_id, external_id) do nothing
+      `;
+      const materialized = await transaction<{ external_id: string }[]>`
+        select external_id
+        from gmail_recovery_seen_messages
+        where connection_id = ${parsed.connectionId} and generation_id = ${parsed.generationId}
+          and disposition = 'missing' and processed_at is null
+        order by external_id
+        limit ${parsed.limit}
+      `;
+      return materialized.map((row) => row.external_id);
+    });
+  }
+
+  public async finishGmailRecovery(input: {
+    householdId: string;
+    adultId: string;
+    connectionId: string;
+    generationId: string;
+    expectedRevision: number;
+    state: GmailSyncState;
+  }): Promise<ScopedMutationResult> {
+    const parsed = z
+      .strictObject({
+        householdId: z.uuid(),
+        adultId: z.uuid(),
+        connectionId: z.uuid(),
+        generationId: z.uuid(),
+        expectedRevision: z.number().int().nonnegative(),
+        state: gmailSyncStateSchema,
+      })
+      .parse(input);
+    if (parsed.state.revision !== parsed.expectedRevision + 1 || parsed.state.recovery !== null) {
+      throw new ApplicationStoreError("invalid_state", "Gmail recovery completion state is invalid");
+    }
+    const stateJson = JSON.parse(JSON.stringify(parsed.state));
+    const updated = await this.database.begin(async (transaction) => {
+      const ownedConnections = await transaction<{ id: string }[]>`
+        select id from external_connections
+        where id = ${parsed.connectionId} and household_id = ${parsed.householdId}
+          and adult_id = ${parsed.adultId} and provider = 'google' and status = 'active'
+        for update
+      `;
+      if (ownedConnections.length !== 1) return false;
+      const runs = await transaction<{ generation_id: string }[]>`
+        select generation_id from gmail_recovery_runs
+        where connection_id = ${parsed.connectionId} and generation_id = ${parsed.generationId}
+          and household_id = ${parsed.householdId} and adult_id = ${parsed.adultId}
+        for update
+      `;
+      if (runs.length !== 1) return false;
+      const connections = await transaction<{ id: string }[]>`
+        update external_connections
+        set cursor = jsonb_set(cursor, '{gmail}', ${this.database.json(stateJson)}, true),
+          last_synced_at = now(), updated_at = now()
+        where id = ${parsed.connectionId} and household_id = ${parsed.householdId}
+          and adult_id = ${parsed.adultId} and provider = 'google' and status = 'active'
+          and coalesce((cursor->'gmail'->>'revision')::integer, 0) = ${parsed.expectedRevision}
+        returning id
+      `;
+      if (connections.length !== 1) return false;
+      const deleted = await transaction<{ generation_id: string }[]>`
+        delete from gmail_recovery_runs
+        where connection_id = ${parsed.connectionId} and generation_id = ${parsed.generationId}
+          and household_id = ${parsed.householdId} and adult_id = ${parsed.adultId}
+        returning generation_id
+      `;
+      if (deleted.length !== 1) {
+        throw new ApplicationStoreError("invalid_state", "Gmail recovery run could not be completed");
+      }
+      return true;
+    });
+    if (updated) return "updated";
+    return this.googleMutationFailure(parsed);
   }
 
   public async markConnectionStatus(input: {
@@ -2744,6 +3069,9 @@ export class FlorenceRuntimeStore {
         returning id
       `;
       if (!rows[0]) return "not_found" as const;
+      await transaction`
+        delete from gmail_recovery_runs where connection_id = ${parsed.connectionId}
+      `;
       await transaction`
         update google_calendar_channels set status = 'stopped', updated_at = now()
         where connection_id = ${parsed.connectionId} and household_id = ${parsed.householdId}
@@ -2838,7 +3166,10 @@ export class FlorenceRuntimeStore {
     ) {
       throw new ApplicationStoreError("invalid_state", "Calendar sync idempotency key conflict");
     }
-    return { jobId: row.id, created: false };
+    return {
+      jobId: row.id,
+      created: await rearmDeadGoogleMaintenanceJob(this.database, row.id),
+    };
   }
 
   public async reconcileCalendarSyncWork(asOf: string): Promise<number> {
@@ -3090,7 +3421,25 @@ export class FlorenceRuntimeStore {
     ) {
       throw new ApplicationStoreError("invalid_state", "Google sync idempotency key conflict");
     }
-    return { jobId: row.id, created: false };
+    return {
+      jobId: row.id,
+      created: await rearmDeadGoogleMaintenanceJob(this.database, row.id),
+    };
+  }
+
+  public async countDeadGoogleMaintenanceJobs(): Promise<number> {
+    const rows = await this.database<{ count: string }[]>`
+      select count(*)::text as count
+      from jobs job
+      join external_connections connection
+        on connection.id::text = job.payload->>'connectionId'
+        and connection.household_id = job.household_id
+      join households household on household.id = connection.household_id
+      where job.kind in ('google.sync', 'google.calendar.sync') and job.status = 'dead'
+        and connection.provider = 'google' and connection.status = 'active'
+        and household.status <> 'deleting'
+    `;
+    return Number(rows[0]?.count ?? 0);
   }
 
   public async reconcileGoogleSyncWork(asOf: string): Promise<number> {
@@ -3133,7 +3482,13 @@ export class FlorenceRuntimeStore {
             connectionId: row.id,
             depth: "full_history",
           });
-      if (!work) continue;
+      if (!work) {
+        await this.resolveDeadGmailActivationJobs({
+          householdId: row.household_id,
+          connectionId: row.id,
+        });
+        continue;
+      }
       const revision = state.success ? state.data.revision : 0;
       const receipt = await this.enqueueGoogleSyncWork({
         householdId: row.household_id,
@@ -3209,14 +3564,29 @@ export class FlorenceRuntimeStore {
 
   public async completeGoogleSyncWork(input: { rowId: string; leaseToken: string }): Promise<boolean> {
     const parsed = z.strictObject({ rowId: z.uuid(), leaseToken: z.uuid() }).parse(input);
-    const rows = await this.database<{ id: string }[]>`
-      update jobs set status = 'succeeded', lease_owner = null, lease_token = null,
-        lease_expires_at = null, updated_at = now()
-      where id = ${parsed.rowId} and kind = 'google.sync' and status = 'leased'
-        and lease_token = ${parsed.leaseToken}
-      returning id
-    `;
-    return rows.length === 1;
+    return this.database.begin(async (transaction) => {
+      const rows = await transaction<{ id: string; household_id: string; payload: unknown }[]>`
+        update jobs set status = 'succeeded', lease_owner = null, lease_token = null,
+          lease_expires_at = null, updated_at = now()
+        where id = ${parsed.rowId} and kind = 'google.sync' and status = 'leased'
+          and lease_token = ${parsed.leaseToken}
+        returning id, household_id, payload
+      `;
+      const row = rows[0];
+      if (!row) return false;
+      const work = gmailSyncWorkSchema.parse(row.payload);
+      if (work.kind === "start" || work.kind === "continue") {
+        await transaction`
+          update jobs set status = 'cancelled', lease_owner = null, lease_token = null,
+            lease_expires_at = null, updated_at = now()
+          where household_id = ${row.household_id} and kind = 'google.sync' and status = 'dead'
+            and payload->>'connectionId' = ${work.connectionId}
+            and payload->>'kind' in ('start', 'continue')
+            and idempotency_key like ${`google:${work.connectionId}:activation:%`}
+        `;
+      }
+      return true;
+    });
   }
 
   public async retryGoogleSyncWork(input: {
@@ -3307,6 +3677,23 @@ export class FlorenceRuntimeStore {
       returning id
     `;
     return rows.length === 1;
+  }
+
+  private async resolveDeadGmailActivationJobs(input: {
+    householdId: string;
+    connectionId: string;
+  }): Promise<number> {
+    const parsed = z.strictObject({ householdId: z.uuid(), connectionId: z.uuid() }).parse(input);
+    const rows = await this.database<{ id: string }[]>`
+      update jobs set status = 'cancelled', lease_owner = null, lease_token = null,
+        lease_expires_at = null, updated_at = now()
+      where household_id = ${parsed.householdId} and kind = 'google.sync' and status = 'dead'
+        and payload->>'connectionId' = ${parsed.connectionId}
+        and payload->>'kind' in ('start', 'continue')
+        and idempotency_key like ${`google:${parsed.connectionId}:activation:%`}
+      returning id
+    `;
+    return rows.length;
   }
 
   private async googleMutationFailure(input: {
@@ -3433,6 +3820,21 @@ function sameStrings(left: readonly string[], right: readonly string[]): boolean
   return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
+function normalizeCalendarSelection(value: string): string {
+  return value.normalize("NFKC").trim().toLocaleLowerCase("en-US");
+}
+
+function calendarConnectionLabel(target: { label: string; metadata: Record<string, unknown> }): string {
+  const metadataLabel = target.metadata.accountLabel;
+  return typeof metadataLabel === "string" && metadataLabel.trim().length > 0
+    ? metadataLabel.trim()
+    : target.label.trim();
+}
+
+function isWritableCalendarAccessRole(role: string | null): boolean {
+  return role === "writerWithoutPrivateAccess" || role === "writer" || role === "owner";
+}
+
 function calendarWorkForState(
   row: { id: string; household_id: string; adult_id: string },
   calendarId: string,
@@ -3554,6 +3956,53 @@ function calendarWorkIdempotencyKey(
     return `google-calendar:${connectionId}:${calendarDigest}:scheduled:${bucket}`;
   }
   return `google-calendar:${connectionId}:${calendarDigest}:${work.kind}:revision:${revision}`;
+}
+
+/**
+ * Maintenance reconciliation reuses stable work keys. A transient outage must not leave one
+ * exhausted row blocking that key forever, but recovery is deliberately bounded so a persistent
+ * provider or data fault still becomes operator-visible.
+ */
+async function rearmDeadGoogleMaintenanceJob(database: Database, jobId: string): Promise<boolean> {
+  const rows = await database<{ id: string }[]>`
+    update jobs
+    set status = 'pending', attempt = 0, available_at = now(),
+      lease_owner = null, lease_token = null, lease_expires_at = null,
+      last_error_code = null, last_error_detail = null,
+      recovery_generation = recovery_generation + 1,
+      last_rearmed_at = now(), updated_at = now()
+    where id = ${jobId} and status = 'dead'
+      and last_error_code in ('google_sync.max_attempts', 'lease_expired_after_max_attempts')
+      and recovery_generation < 3
+      and updated_at <= now() - interval '5 minutes'
+    returning id
+  `;
+  return rows.length === 1;
+}
+
+async function requireOwnedGmailRecoveryRun(
+  transaction: TransactionSql<Record<string, never>>,
+  input: {
+    householdId: string;
+    adultId: string;
+    connectionId: string;
+    generationId: string;
+  },
+): Promise<void> {
+  const rows = await transaction<{ generation_id: string }[]>`
+    select run.generation_id
+    from gmail_recovery_runs run
+    join external_connections connection on connection.id = run.connection_id
+    where run.connection_id = ${input.connectionId}
+      and run.generation_id = ${input.generationId}
+      and run.household_id = ${input.householdId} and run.adult_id = ${input.adultId}
+      and connection.household_id = run.household_id and connection.adult_id = run.adult_id
+      and connection.provider = 'google' and connection.status = 'active'
+    for update of run
+  `;
+  if (rows.length !== 1) {
+    throw new ApplicationStoreError("not_authorized", "Gmail recovery run is unavailable");
+  }
 }
 
 export function canonicalizeLinqHandle(raw: string): string {

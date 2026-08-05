@@ -134,6 +134,7 @@ export class GoogleCalendarActions implements HouseholdCalendarActionsPort {
         startsAt: action.startsAt,
         endsAt: action.endsAt,
         targetConnectionId: action.targetConnectionId,
+        calendarId: action.calendarId,
       });
     } catch {
       throw new GoogleCalendarActionError("invalid_state", true);

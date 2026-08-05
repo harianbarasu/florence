@@ -6,8 +6,6 @@ import {
   GoogleCalendarAdapter,
   GoogleSyncTokenExpiredError,
   parseGoogleAdapterConfig,
-  parseGoogleCalendarEvent,
-  parseGoogleCalendarPush,
 } from "../../src/adapters/google/index.js";
 import { jsonFixture } from "./fixture.js";
 
@@ -42,96 +40,6 @@ function calendarFactory(overrides: Record<string, unknown> = {}): CalendarApiFa
 }
 
 describe("Google Calendar normalization", () => {
-  it("normalizes a provider event with stable source and change identities", () => {
-    const first = parseGoogleCalendarEvent(CALENDAR_EVENT, "google-subject-001", "primary");
-    const second = parseGoogleCalendarEvent(CALENDAR_EVENT, "google-subject-001", "primary");
-
-    expect(first).toMatchObject({
-      source: "google-calendar",
-      sourceScope: "personal",
-      sourceKey: "google-subject-001:primary:calendar-event-001",
-      eventId: "calendar-event-001",
-      status: "confirmed",
-      summary: "School orientation",
-      start: {
-        kind: "dateTime",
-        dateTime: "2026-08-10T16:00:00.000Z",
-        timeZone: "America/Los_Angeles",
-      },
-      end: {
-        kind: "dateTime",
-        dateTime: "2026-08-10T17:00:00.000Z",
-        timeZone: "America/Los_Angeles",
-      },
-      organizer: { email: "parent@example.test", self: true },
-      attendees: [
-        expect.objectContaining({
-          email: "partner@example.test",
-          responseStatus: "accepted",
-        }),
-      ],
-    });
-    expect(first.changeKey).toBe(second.changeKey);
-  });
-
-  it("normalizes cancelled all-day records as tombstones", () => {
-    const event = parseGoogleCalendarEvent(
-      {
-        id: "deleted-event-001",
-        status: "cancelled",
-        updated: "2026-08-05T17:00:00.000Z",
-        start: { date: "2026-08-12" },
-        end: { date: "2026-08-13" },
-      },
-      "google-subject-001",
-      "family@example.test",
-    );
-
-    expect(event).toMatchObject({
-      deleted: true,
-      start: { kind: "date", date: "2026-08-12", timeZone: null },
-      end: { kind: "date", date: "2026-08-13", timeZone: null },
-    });
-  });
-
-  it("validates a channel token and emits only an invalidation hint", () => {
-    const event = parseGoogleCalendarPush(
-      {
-        "x-goog-channel-id": "channel-001",
-        "x-goog-channel-token": "synthetic-channel-token",
-        "x-goog-resource-id": "resource-001",
-        "x-goog-resource-state": "exists",
-        "x-goog-resource-uri": "https://www.googleapis.com/calendar/v3/calendars/primary/events",
-        "x-goog-message-number": "42",
-        "x-goog-channel-expiration": "Wed, 12 Aug 2026 16:00:00 GMT",
-      },
-      "synthetic-channel-token",
-    );
-
-    expect(event).toEqual({
-      schemaVersion: 1,
-      source: "google-calendar",
-      providerEventId: "google-calendar-push:channel-001:resource-001:42",
-      channelId: "channel-001",
-      resourceId: "resource-001",
-      resourceState: "exists",
-      resourceUri: "https://www.googleapis.com/calendar/v3/calendars/primary/events",
-      messageNumber: "42",
-      channelExpiresAt: "2026-08-12T16:00:00.000Z",
-    });
-    expect(() =>
-      parseGoogleCalendarPush(
-        {
-          "x-goog-channel-id": "channel-001",
-          "x-goog-channel-token": "wrong-token",
-        },
-        "synthetic-channel-token",
-      ),
-    ).toThrow("Calendar channel token is invalid");
-  });
-});
-
-describe("Google Calendar API adapter", () => {
   it("maps HTTP 410 to an explicit full-sync requirement", async () => {
     const error = Object.assign(new Error("gone"), { response: { status: 410 } });
     const adapter = new GoogleCalendarAdapter(

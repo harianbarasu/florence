@@ -43,6 +43,7 @@ const TimerLeaseSchema = z.strictObject({
   dueAt: InstantStringSchema,
   payload: JsonObjectSchema,
   attempt: z.number().int().positive(),
+  maxAttempts: z.number().int().positive(),
   leaseToken: z.uuid(),
   leaseExpiresAt: InstantStringSchema,
 });
@@ -121,7 +122,7 @@ export interface QueueStore {
     readonly leaseToken: string;
     readonly retryAt: string;
     readonly errorCode: string;
-  }): Promise<boolean>;
+  }): Promise<"scheduled" | "dead" | "lost_lease">;
 
   claimOutbox(input: z.input<typeof LeaseRequestSchema>): Promise<unknown[]>;
   recordOutboxSuccess(input: {
@@ -173,6 +174,7 @@ export interface WorkerCycleReport {
     readonly claimed: number;
     readonly fired: number;
     readonly released: number;
+    readonly dead: number;
     readonly superseded: number;
     readonly lostLease: number;
     readonly failed: number;
@@ -202,6 +204,7 @@ type MutableCycleReport = {
     claimed: number;
     fired: number;
     released: number;
+    dead: number;
     superseded: number;
     lostLease: number;
     failed: number;
@@ -529,13 +532,14 @@ export class DurableWorkerHost implements ApplicationWorkerHost {
     const retryAt = new Date(
       Date.parse(this.#instantNow()) + this.#retryDelaySeconds(item.attempt) * 1_000,
     ).toISOString();
-    const settled = await this.#queueStore.releaseTimer({
+    const outcome = await this.#queueStore.releaseTimer({
       rowId: item.rowId,
       leaseToken: item.leaseToken,
       retryAt,
       errorCode: ErrorCodeSchema.parse(errorCode),
     });
-    if (settled) report.timers.released += 1;
+    if (outcome === "scheduled") report.timers.released += 1;
+    else if (outcome === "dead") report.timers.dead += 1;
     else report.timers.lostLease += 1;
   }
 
@@ -570,7 +574,7 @@ export class DurableWorkerHost implements ApplicationWorkerHost {
     let result: z.infer<typeof OutboxExecutionResultSchema>;
     try {
       result = OutboxExecutionResultSchema.parse(
-        await application.executeOutbox(intent.data, this.#instantNow()),
+        await application.executeOutbox(intent.data, this.#instantNow(), signal),
       );
       if (result.intentId !== intent.data.intentId) {
         throw new QueueExecutionError("outbox_result_identity_mismatch", false, false);
@@ -659,7 +663,15 @@ export class DurableWorkerHost implements ApplicationWorkerHost {
 function emptyReport(): MutableCycleReport {
   return {
     providerInbox: { claimed: 0, resolved: 0, retried: 0, discarded: 0, lostLease: 0, failed: 0 },
-    timers: { claimed: 0, fired: 0, released: 0, superseded: 0, lostLease: 0, failed: 0 },
+    timers: {
+      claimed: 0,
+      fired: 0,
+      released: 0,
+      dead: 0,
+      superseded: 0,
+      lostLease: 0,
+      failed: 0,
+    },
     outbox: {
       claimed: 0,
       succeeded: 0,

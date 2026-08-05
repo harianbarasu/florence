@@ -466,6 +466,13 @@ export class GoogleCalendarSyncService {
     assertNotAborted(signal);
     try {
       const connection = await this.#ownedConnection(work);
+      // Revocation is the escape hatch from every non-revoked state. Provider
+      // cleanup is best-effort; the scoped local revoke remains authoritative.
+      if (work.kind === "revoke") {
+        return connection.status === "revoked"
+          ? connectionCalendarResult(connection, "revoked")
+          : await this.#revoke(connection, signal);
+      }
       if (connection.status === "revoked") return connectionCalendarResult(connection, "revoked");
       if (connection.status === "reauth_required") {
         return connectionCalendarResult(connection, "reauth_required");
@@ -478,8 +485,6 @@ export class GoogleCalendarSyncService {
           return await this.#processCatalog(connection, signal);
         case "catalog_refresh":
           return await this.#refreshCatalog(connection);
-        case "revoke":
-          return await this.#revoke(connection, signal);
         case "start":
           return await this.#withActiveCalendar(connection, work.calendarId, (record) =>
             this.#start(connection, record),

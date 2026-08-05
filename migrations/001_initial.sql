@@ -119,22 +119,17 @@ CREATE TABLE household_signals (
   id uuid PRIMARY KEY,
   household_id uuid NOT NULL REFERENCES households(id) ON DELETE CASCADE,
   sequence bigint NOT NULL,
-  idempotency_key text NOT NULL UNIQUE,
-  payload_hash text NOT NULL,
-  kind text NOT NULL,
-  actor_kind text NOT NULL,
-  actor_id text,
-  visibility text NOT NULL CHECK (visibility IN ('personal', 'household')),
-  owner_adult_id uuid REFERENCES adults(id),
-  occurred_at timestamptz NOT NULL,
+  idempotency_digest text NOT NULL UNIQUE,
+  content_digest text NOT NULL,
   received_at timestamptz NOT NULL DEFAULT now(),
-  payload jsonb NOT NULL,
+  body_key_id text NOT NULL,
+  body_ciphertext text NOT NULL,
   processing_status text NOT NULL DEFAULT 'pending' CHECK (processing_status IN ('pending', 'processing', 'processed', 'quarantined')),
-  UNIQUE (household_id, sequence),
-  CHECK ((visibility = 'personal' AND owner_adult_id IS NOT NULL) OR visibility = 'household')
+  UNIQUE (household_id, sequence)
 );
 
 CREATE INDEX household_signals_pending_idx ON household_signals (household_id, processing_status, sequence);
+CREATE INDEX household_signals_body_key_idx ON household_signals (body_key_id);
 
 CREATE TABLE jobs (
   id uuid PRIMARY KEY,

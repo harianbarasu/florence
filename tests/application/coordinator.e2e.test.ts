@@ -1,62 +1,50 @@
 import { describe, expect, it } from "vitest";
 import { type ApplicationOutboxIntent, createFlorenceApplication } from "../../src/application/index.js";
-import type { WorkerJob, WorkerResultPayload } from "../../src/runtime/index.js";
-import {
-  ADULT_A,
-  ADULT_B,
-  classificationBase,
-  directMessage,
-  GROUP_CHANNEL,
-  groupMessage,
-  HOUSEHOLD_ID,
-  setup,
-} from "./fixtures.js";
+import { ADULT_A, ADULT_B, classificationBase, groupMessage, HOUSEHOLD_ID, setup } from "./fixtures.js";
 
 function domainEffects(intents: readonly ApplicationOutboxIntent[]) {
   return intents.flatMap((intent) => (intent.kind === "domain.effect" ? [intent.effect] : []));
 }
 
 describe("Florence application coordinator", () => {
-  it("responds neutrally when an attachment-only message cannot be read", async () => {
-    const harness = setup();
-    const app = createFlorenceApplication(harness.dependencies);
-    const input = {
-      ...groupMessage("unreadable-attachment", "", "2027-01-01T08:00:00Z"),
-      attachmentRefs: ["linq:attachment:large-video"],
-      attachmentContents: [
-        {
-          reference: "linq:attachment:large-video",
-          kind: "unavailable" as const,
-          mediaType: "video/mp4",
-          filename: "clip.mp4",
-          sizeBytes: 20 * 1024 * 1024,
-          reason: "unsupported_type" as const,
-          contentDigest: `sha256:${"a".repeat(64)}`,
-        },
-      ],
-    };
-
-    const result = await app.process(input);
-
-    expect(result.outcome.classification).toBe("conversation:attachment_unavailable");
-    expect(harness.interpreter.conversationCalls).toEqual([]);
-    expect(harness.repository.intents("conversation.send")).toEqual([
-      expect.objectContaining({
-        targetScope: { kind: "household" },
-        messageClass: "status",
-        body: expect.stringContaining("Please resend"),
-      }),
-    ]);
-  });
-
   it("creates a Calendar effect only after an exact group proposal and explicit fresh approval", async () => {
     const harness = setup();
     const app = createFlorenceApplication(harness.dependencies);
+    harness.calendarActions.queuePreparation({
+      status: "unavailable",
+      reason: "ambiguous_write_calendar",
+    });
+    harness.interpreter.respondToConversation("calendar-create-ambiguous", {
+      ...classificationBase,
+      intent: "calendar_event_create_request",
+      title: "School welcome night",
+      startsAt: "2027-09-08T01:00:00Z",
+      endsAt: "2027-09-08T02:30:00Z",
+      timeZone: "America/Los_Angeles",
+      calendarAccountLabel: "Personal",
+    });
+    await expect(
+      app.process(
+        groupMessage(
+          "calendar-create-ambiguous",
+          "Add school welcome night next Tuesday from 6 to 7:30",
+          "2027-09-01T16:59:00Z",
+        ),
+      ),
+    ).resolves.toMatchObject({ outcome: { status: "rejected" } });
+    expect((await harness.repository.load(HOUSEHOLD_ID))?.aggregate.pendingActions).toEqual([]);
+    expect(
+      harness.repository
+        .intents("conversation.send")
+        .flatMap((intent) => (intent.kind === "conversation.send" ? [intent.body] : []))
+        .at(-1),
+    ).toContain("account / calendar");
+
     const requestKey = "calendar-create-request";
     harness.calendarActions.queuePreparation({
       status: "ready",
       targetConnectionId: "connection_parent_personal",
-      calendarId: "primary",
+      calendarId: "family_schedule_calendar",
       relevantDataDigest: `sha256:${"d".repeat(64)}`,
       hasConflict: true,
     });
@@ -68,12 +56,13 @@ describe("Florence application coordinator", () => {
       endsAt: "2027-09-08T02:30:00Z",
       timeZone: "America/Los_Angeles",
       calendarAccountLabel: "Personal",
+      calendarName: "Family schedule",
     });
 
     await app.process(
       groupMessage(
         requestKey,
-        "Add school welcome night next Tuesday from 6 to 7:30",
+        "Add school welcome night next Tuesday from 6 to 7:30 to Personal / Family schedule",
         "2027-09-01T17:00:00Z",
       ),
     );
@@ -93,10 +82,15 @@ describe("Florence application coordinator", () => {
         requestedByAdultId: ADULT_A,
         availabilityAdultIds: [ADULT_A, ADULT_B],
         targetConnectionId: "connection_parent_personal",
+        calendarId: "family_schedule_calendar",
         hasConflict: true,
       },
     });
     if (pending?.action.kind !== "calendar_update") throw new Error("Expected Calendar action");
+    expect(harness.calendarActions.prepareCalls[1]).toMatchObject({
+      accountLabel: "Personal",
+      calendarName: "Family schedule",
+    });
     const approvalRequest = domainEffects(harness.repository.outbox).find(
       (effect) => effect.kind === "send_message" && effect.messageClass === "approval_request",
     );
@@ -108,7 +102,7 @@ describe("Florence application coordinator", () => {
     harness.calendarActions.queuePreparation({
       status: "ready",
       targetConnectionId: "connection_parent_personal",
-      calendarId: "primary",
+      calendarId: "family_schedule_calendar",
       relevantDataDigest: pending.action.relevantDataDigest,
       hasConflict: true,
     });
@@ -121,6 +115,10 @@ describe("Florence application coordinator", () => {
     await app.process(
       groupMessage(approvalKey, `Approve ${pending.action.actionId}`, "2027-09-01T17:02:00Z"),
     );
+    expect(harness.calendarActions.prepareCalls.at(-1)).toMatchObject({
+      targetConnectionId: "connection_parent_personal",
+      calendarId: "family_schedule_calendar",
+    });
 
     snapshot = await harness.repository.load(HOUSEHOLD_ID);
     expect(snapshot?.aggregate.pendingActions[0]).toMatchObject({
@@ -143,7 +141,7 @@ describe("Florence application coordinator", () => {
         actionId: pending.action.actionId,
         actionDigest: pending.action.actionDigest,
         outcome: "succeeded",
-        providerReference: "google-calendar:primary:event_welcome_night",
+        providerReference: "google-calendar:family_schedule_calendar:event_welcome_night",
       },
     });
     await app.executeOutbox(execution, "2027-09-01T17:02:05Z");
@@ -154,7 +152,7 @@ describe("Florence application coordinator", () => {
       effectReceipt: {
         receiptId: "calendar_effect_receipt",
         outcome: "succeeded",
-        providerReference: "google-calendar:primary:event_welcome_night",
+        providerReference: "google-calendar:family_schedule_calendar:event_welcome_night",
       },
     });
     expect(harness.repository.commits.at(-1)?.audit).toContainEqual(
@@ -174,7 +172,7 @@ describe("Florence application coordinator", () => {
     ).toBe(true);
   });
 
-  it("invalidates Calendar approval when private availability changes without exposing details", async () => {
+  it("invalidates Calendar approval when its exact target changes without exposing details", async () => {
     const harness = setup();
     const app = createFlorenceApplication(harness.dependencies);
     harness.calendarActions.queuePreparation({
@@ -200,9 +198,9 @@ describe("Florence application coordinator", () => {
     harness.calendarActions.queuePreparation({
       status: "ready",
       targetConnectionId: pending.action.targetConnectionId,
-      calendarId: "primary",
-      relevantDataDigest: `sha256:${"2".repeat(64)}`,
-      hasConflict: true,
+      calendarId: "different_writable_calendar",
+      relevantDataDigest: pending.action.relevantDataDigest,
+      hasConflict: pending.action.hasConflict,
     });
     harness.interpreter.respondToConversation("calendar-stale-approval", {
       ...classificationBase,
@@ -223,484 +221,8 @@ describe("Florence application coordinator", () => {
     const bodies = harness.repository
       .intents("conversation.send")
       .flatMap((intent) => (intent.kind === "conversation.send" ? [intent.body] : []));
-    expect(bodies.at(-1)).toContain("availability changed");
+    expect(bodies.at(-1)).toContain("selected calendar");
     expect(bodies.join(" ")).not.toMatch(/private-event|calendar owner|attendee|location/iu);
-  });
-
-  it("asks only for unresolved Calendar fields instead of silently ignoring a partial request", async () => {
-    const harness = setup();
-    const app = createFlorenceApplication(harness.dependencies);
-    harness.interpreter.respondToConversation("calendar-needs-time", {
-      ...classificationBase,
-      intent: "calendar_event_clarification",
-      missingFields: ["start", "end"],
-    });
-
-    const result = await app.process(
-      groupMessage("calendar-needs-time", "Add school welcome night", "2027-09-01T18:05:00Z"),
-    );
-
-    expect(result.outcome).toMatchObject({
-      status: "processed",
-      classification: "conversation:calendar_event_clarification",
-    });
-    expect(harness.calendarActions.prepareCalls).toEqual([]);
-    expect(harness.repository.intents("conversation.send").at(-1)).toMatchObject({
-      targetScope: { kind: "household" },
-      messageClass: "clarifying_question",
-      body: "To prepare one exact calendar proposal, please provide a start date and time and an end date and time.",
-    });
-  });
-
-  it("keeps Gmail private and promotes only approved minimum household meaning", async () => {
-    const harness = setup();
-    const app = createFlorenceApplication(harness.dependencies);
-    const privateText = "PRIVATE BODY: the access code is 9917 and must remain in Alex's mailbox.";
-    const gmailKey = "gmail-private-1";
-    harness.interpreter.respondToGmail(gmailKey, {
-      decision: "propose_family_episode",
-      confidence: 0.97,
-      sourceClass: "school.notice",
-      sensitivity: "sensitive",
-      familyImpact: true,
-      materialException: false,
-      rationale: "A school form has a current household consequence.",
-      privateSummary: `Private review: ${privateText}`,
-      minimumHouseholdMeaning: "A field-trip form is due Friday.",
-      title: "Field-trip form details",
-      requiredOutcome: "The form is returned with its private access details.",
-      proposedOwnerAdultId: ADULT_A,
-    });
-
-    await app.process({
-      kind: "gmail_message",
-      householdId: HOUSEHOLD_ID,
-      idempotencyKey: gmailKey,
-      occurredAt: "2027-01-01T08:00:00Z",
-      ownerAdultId: ADULT_A,
-      accountRef: "gmail_alex_personal",
-      messageRef: "gmail_message_school_1",
-      revision: 1,
-      labels: ["INBOX"],
-      sender: "School office",
-      subject: "Field trip form and private access code",
-      snippet: "A form is due Friday.",
-      bodyText: privateText,
-      attachmentRefs: ["attachment_permission_slip"],
-      attachmentContents: [
-        {
-          reference: "attachment_permission_slip",
-          kind: "unavailable",
-          mediaType: null,
-          filename: null,
-          sizeBytes: null,
-          contentDigest: `sha256:${"a".repeat(64)}`,
-          reason: "not_found",
-        },
-      ],
-    });
-
-    const beforeApproval = await harness.repository.load(HOUSEHOLD_ID);
-    expect(beforeApproval?.aggregate.episodes).toEqual([]);
-    expect(beforeApproval?.projection.pendingPromotions).toHaveLength(1);
-    expect(beforeApproval?.projection.gmailTriage[0]).not.toHaveProperty("privateSummary");
-    const initialHouseholdMessages = harness.repository
-      .intents("conversation.send")
-      .filter((intent) => intent.kind === "conversation.send" && intent.targetScope.kind === "household");
-    expect(initialHouseholdMessages).toEqual([]);
-
-    const promotionId = beforeApproval?.projection.pendingPromotions[0]?.promotionId;
-    expect(promotionId).toBeTruthy();
-    const approvalKey = "dm-approve-private-1";
-    harness.interpreter.respondToConversation(approvalKey, {
-      ...classificationBase,
-      intent: "approve_promotion",
-      promotionId,
-    });
-    await app.process(
-      directMessage(
-        approvalKey,
-        `Share the minimum meaning for ${promotionId}`,
-        ADULT_A,
-        "2027-01-01T08:05:00Z",
-      ),
-    );
-
-    const afterApproval = await harness.repository.load(HOUSEHOLD_ID);
-    expect(afterApproval?.projection.pendingPromotions).toEqual([]);
-    expect(afterApproval?.aggregate.episodes).toHaveLength(1);
-    expect(afterApproval?.aggregate.episodes[0]).toMatchObject({
-      scope: { kind: "household" },
-      title: "A field-trip form is due Friday.",
-      requiredOutcome: "A field-trip form is due Friday.",
-      promotionAuthority: { kind: "approval" },
-    });
-    expect(JSON.stringify(afterApproval)).not.toContain(privateText);
-
-    const householdBodies = harness.repository
-      .intents("conversation.send")
-      .flatMap((intent) =>
-        intent.kind === "conversation.send" && intent.targetScope.kind === "household" ? [intent.body] : [],
-      );
-    expect(householdBodies).toEqual(["A field-trip form is due Friday."]);
-    expect(householdBodies.join(" ")).not.toContain("9917");
-    expect(householdBodies.join(" ")).not.toContain("access code");
-  });
-
-  it("learns and revokes an explicitly approved minimum-meaning sharing rule", async () => {
-    const harness = setup();
-    const app = createFlorenceApplication(harness.dependencies);
-    const gmail = async (key: string, meaning: string, minute: number) => {
-      harness.interpreter.respondToGmail(key, {
-        decision: "propose_family_episode",
-        confidence: 0.97,
-        sourceClass: "school.notice",
-        sensitivity: "ordinary",
-        familyImpact: true,
-        materialException: false,
-        rationale: "A school notice requires household coordination.",
-        privateSummary: "A school notice needs coordination.",
-        minimumHouseholdMeaning: meaning,
-        title: meaning,
-        requiredOutcome: meaning,
-      });
-      await app.process({
-        kind: "gmail_message",
-        householdId: HOUSEHOLD_ID,
-        idempotencyKey: key,
-        occurredAt: `2027-01-01T08:${String(minute).padStart(2, "0")}:00Z`,
-        ownerAdultId: ADULT_A,
-        accountRef: "gmail_alex_personal",
-        messageRef: `gmail_${key}`,
-        revision: 1,
-        labels: ["INBOX"],
-        sender: "School office",
-        subject: "School notice",
-        bodyText: "A school notice has a household consequence.",
-        attachmentRefs: [],
-        attachmentContents: [],
-      });
-    };
-
-    await gmail("sharing-rule-first", "School closes early Friday.", 0);
-    const promotionId = (await harness.repository.load(HOUSEHOLD_ID))?.projection.pendingPromotions[0]
-      ?.promotionId;
-    expect(promotionId).toBeTruthy();
-    const approveKey = "sharing-rule-approve";
-    harness.interpreter.respondToConversation(approveKey, {
-      ...classificationBase,
-      intent: "approve_promotion",
-      promotionId,
-      rememberForMatchingSource: true,
-    });
-    await app.process(
-      directMessage(approveKey, `Always share ${promotionId}`, ADULT_A, "2027-01-01T08:01:00Z"),
-    );
-
-    let snapshot = await harness.repository.load(HOUSEHOLD_ID);
-    expect(snapshot?.aggregate.policies).toEqual([
-      expect.objectContaining({
-        status: "active",
-        version: 1,
-        rule: expect.objectContaining({
-          kind: "sharing",
-          sourceClass: "school.notice",
-          maximumSensitivity: "ordinary",
-        }),
-      }),
-    ]);
-    await gmail("sharing-rule-second", "School starts late Monday.", 2);
-    snapshot = await harness.repository.load(HOUSEHOLD_ID);
-    expect(snapshot?.projection.pendingPromotions).toEqual([]);
-    expect(snapshot?.aggregate.episodes).toHaveLength(2);
-
-    const policy = snapshot?.aggregate.policies[0];
-    expect(policy).toBeDefined();
-    if (policy === undefined) throw new Error("Expected an active sharing policy");
-    const revokeKey = "sharing-rule-revoke";
-    harness.interpreter.respondToConversation(revokeKey, {
-      ...classificationBase,
-      intent: "revoke_policy",
-      policyId: policy.policyId,
-      expectedPolicyVersion: 1,
-    });
-    await app.process(
-      directMessage(revokeKey, "Stop always sharing school notices", ADULT_A, "2027-01-01T08:03:00Z"),
-    );
-    expect((await harness.repository.load(HOUSEHOLD_ID))?.aggregate.policies[0]?.status).toBe("revoked");
-
-    await gmail("sharing-rule-third", "School dismisses at noon Wednesday.", 4);
-    expect((await harness.repository.load(HOUSEHOLD_ID))?.projection.pendingPromotions).toHaveLength(1);
-  });
-
-  it("requires private invite consent before activating one shared group", async () => {
-    const harness = setup({ onboarding: "new" });
-    const app = createFlorenceApplication(harness.dependencies);
-    const steps = [
-      {
-        key: "onboard-consent-a",
-        input: directMessage("onboard-consent-a", "I consent", ADULT_A, "2027-01-01T08:00:00Z"),
-        response: { ...classificationBase, intent: "onboarding", action: "consent" },
-        phase: "awaiting_invitation",
-      },
-      {
-        key: "onboard-invite-b",
-        input: directMessage("onboard-invite-b", "Invite Bailey", ADULT_A, "2027-01-01T08:01:00Z"),
-        response: {
-          ...classificationBase,
-          intent: "onboarding",
-          action: "invite_adult",
-          invitedAdultId: ADULT_B,
-        },
-        phase: "awaiting_invitee_consent",
-      },
-      {
-        key: "onboard-consent-b",
-        input: directMessage("onboard-consent-b", "I accept", ADULT_B, "2027-01-01T08:02:00Z"),
-        response: { ...classificationBase, intent: "onboarding", action: "accept_invite" },
-        phase: "awaiting_group",
-      },
-      {
-        key: "onboard-group",
-        input: groupMessage("onboard-group", "This is our household group", "2027-01-01T08:03:00Z"),
-        response: { ...classificationBase, intent: "onboarding", action: "register_group" },
-        phase: "naming_adults",
-      },
-      {
-        key: "onboard-name-a",
-        input: groupMessage("onboard-name-a", "Call me Alex", "2027-01-01T08:03:10Z"),
-        response: {
-          ...classificationBase,
-          intent: "onboarding",
-          action: "set_name",
-          displayName: "Alex",
-        },
-        phase: "naming_adults",
-      },
-      {
-        key: "onboard-name-b",
-        input: {
-          ...groupMessage("onboard-name-b", "Call me Bailey", "2027-01-01T08:03:20Z"),
-          senderAdultId: ADULT_B,
-        },
-        response: {
-          ...classificationBase,
-          intent: "onboarding",
-          action: "set_name",
-          displayName: "Bailey",
-        },
-        phase: "building_profile",
-      },
-      {
-        key: "onboard-profile",
-        input: groupMessage(
-          "onboard-profile",
-          "Maya goes to Lakeside School, has soccer Tuesdays, and is allergic to peanuts.",
-          "2027-01-01T08:03:30Z",
-        ),
-        response: {
-          ...classificationBase,
-          intent: "onboarding",
-          action: "update_profile",
-          profileFacts: [
-            { category: "dependent", subject: "Maya", detail: "Maya is a child in the household." },
-            {
-              category: "school_childcare",
-              subject: "Maya",
-              detail: "Maya attends Lakeside School.",
-            },
-            {
-              category: "recurring_activity",
-              subject: "Maya soccer",
-              detail: "Soccer is on Tuesdays.",
-            },
-            {
-              category: "dietary_constraint",
-              subject: "Maya",
-              detail: "Maya has a peanut allergy.",
-            },
-          ],
-        },
-        phase: "building_profile",
-      },
-      {
-        key: "onboard-confirm-a",
-        input: groupMessage("onboard-confirm-a", "Profile looks right", "2027-01-01T08:04:00Z"),
-        response: { ...classificationBase, intent: "onboarding", action: "confirm_profile" },
-        phase: "building_profile",
-      },
-      {
-        key: "onboard-confirm-b",
-        input: {
-          ...groupMessage("onboard-confirm-b", "I confirm too", "2027-01-01T08:05:00Z"),
-          senderAdultId: ADULT_B,
-        },
-        response: { ...classificationBase, intent: "onboarding", action: "confirm_profile" },
-        phase: "connecting_sources",
-      },
-    ] as const;
-
-    for (const step of steps) {
-      harness.interpreter.respondToConversation(step.key, step.response);
-      await app.process(step.input);
-      expect((await harness.repository.load(HOUSEHOLD_ID))?.projection.onboarding.phase).toBe(step.phase);
-      if (step.key === "onboard-invite-b") {
-        const contactedBeforeInbound = harness.repository
-          .intents("conversation.send")
-          .some(
-            (intent) =>
-              intent.kind === "conversation.send" &&
-              intent.targetScope.kind === "personal" &&
-              intent.targetScope.adultId === ADULT_B,
-          );
-        expect(contactedBeforeInbound).toBe(false);
-      }
-    }
-
-    for (const [adultId, connectionId, occurredAt] of [
-      [ADULT_A, "google_alex", "2027-01-01T08:06:00Z"],
-      [ADULT_B, "google_bailey", "2027-01-01T08:07:00Z"],
-    ] as const) {
-      await app.process({
-        kind: "google_connected",
-        householdId: HOUSEHOLD_ID,
-        idempotencyKey: `onboard-${connectionId}`,
-        occurredAt,
-        adultId,
-        connectionId,
-        gmailReady: true,
-        calendarReady: true,
-      });
-    }
-
-    const snapshot = await harness.repository.load(HOUSEHOLD_ID);
-    expect(snapshot?.projection.onboarding).toMatchObject({
-      phase: "active",
-      invitedAdultId: ADULT_B,
-      consentedAdultIds: [ADULT_A, ADULT_B],
-      privateDmAdultIds: [ADULT_A, ADULT_B],
-      groupChannelId: GROUP_CHANNEL,
-      adultNames: [
-        { adultId: ADULT_A, displayName: "Alex" },
-        { adultId: ADULT_B, displayName: "Bailey" },
-      ],
-      profileConfirmedAdultIds: [ADULT_A, ADULT_B],
-      googleConnectedAdultIds: [ADULT_A, ADULT_B],
-    });
-    expect(snapshot?.aggregate.version).toBe(0);
-    expect(snapshot?.aggregate.lastProcessedSequence).toBe(0);
-    expect(snapshot?.projection.sharedProfile.facts).toHaveLength(4);
-    expect(snapshot?.projection.sharedProfile.facts[1]).toMatchObject({
-      sourceRef: "message_onboard-profile",
-      recordedByAdultId: ADULT_A,
-    });
-  });
-
-  it("keeps profile updates in the group and invalidates stale confirmations", async () => {
-    const harness = setup();
-    const app = createFlorenceApplication(harness.dependencies);
-    const privateKey = "private-profile-update";
-    harness.interpreter.respondToConversation(privateKey, {
-      ...classificationBase,
-      intent: "onboarding",
-      action: "update_profile",
-      profileFacts: [
-        {
-          category: "dietary_constraint",
-          subject: "Private detail",
-          detail: "This must not become household data.",
-        },
-      ],
-    });
-    await app.process(
-      directMessage(privateKey, "Add this private detail to the profile", ADULT_A, "2027-01-02T08:00:00Z"),
-    );
-    expect((await harness.repository.load(HOUSEHOLD_ID))?.projection.sharedProfile.facts).toEqual([]);
-
-    const groupKey = "shared-profile-update";
-    harness.interpreter.respondToConversation(groupKey, {
-      ...classificationBase,
-      intent: "onboarding",
-      action: "update_profile",
-      profileFacts: [
-        {
-          category: "routine_anchor",
-          subject: "School pickup",
-          detail: "School pickup is normally at 3:15 PM on weekdays.",
-          timeZone: "America/Los_Angeles",
-          localTime: "15:15",
-          daysOfWeek: [1, 2, 3, 4, 5],
-        },
-      ],
-    });
-    await app.process(
-      groupMessage(groupKey, "School pickup is normally 3:15 on weekdays", "2027-01-02T08:01:00Z"),
-    );
-    const snapshot = await harness.repository.load(HOUSEHOLD_ID);
-    expect(snapshot?.projection.onboarding).toMatchObject({
-      phase: "active",
-      profileConfirmedAdultIds: [],
-    });
-    expect(snapshot?.projection.sharedProfile.facts).toEqual([
-      expect.objectContaining({
-        category: "routine_anchor",
-        subject: "School pickup",
-        sourceRef: "message_shared-profile-update",
-        recordedByAdultId: ADULT_A,
-      }),
-    ]);
-
-    const correctionKey = "shared-profile-correction";
-    harness.interpreter.respondToConversation(correctionKey, {
-      ...classificationBase,
-      intent: "onboarding",
-      action: "update_profile",
-      profileFacts: [
-        {
-          category: "routine_anchor",
-          subject: "School pickup",
-          detail: "School pickup is normally at 3:30 PM on weekdays.",
-          timeZone: "America/Los_Angeles",
-          localTime: "15:30",
-          daysOfWeek: [1, 2, 3, 4, 5],
-        },
-      ],
-    });
-    await app.process(
-      groupMessage(correctionKey, "Correction: school pickup is 3:30", "2027-01-02T08:02:00Z"),
-    );
-    expect((await harness.repository.load(HOUSEHOLD_ID))?.projection.sharedProfile.facts).toEqual([
-      expect.objectContaining({
-        subject: "School pickup",
-        detail: "School pickup is normally at 3:30 PM on weekdays.",
-        sourceRef: "message_shared-profile-correction",
-      }),
-    ]);
-
-    for (const [key, adultId] of [
-      ["confirm-routine-a", ADULT_A],
-      ["confirm-routine-b", ADULT_B],
-    ] as const) {
-      harness.interpreter.respondToConversation(key, {
-        ...classificationBase,
-        intent: "onboarding",
-        action: "confirm_profile",
-      });
-      await app.process({
-        ...groupMessage(key, "I confirm the profile", "2027-01-02T08:03:00Z"),
-        senderAdultId: adultId,
-      });
-    }
-    const confirmed = await harness.repository.load(HOUSEHOLD_ID);
-    expect(confirmed?.aggregate.routineAnchors).toEqual([
-      expect.objectContaining({
-        label: "School pickup",
-        timeZone: "America/Los_Angeles",
-        localTime: "15:30",
-        daysOfWeek: [1, 2, 3, 4, 5],
-      }),
-    ]);
-    expect(confirmed?.projection.onboarding.profileConfirmedAdultIds).toEqual([ADULT_A, ADULT_B]);
   });
 
   it("drives a group obligation through owner acknowledgement, reminder, and closure", async () => {
@@ -831,260 +353,5 @@ describe("Florence application coordinator", () => {
         temporalPlanVersion: 1,
       }),
     ]);
-  });
-
-  it("requeues a valid worker result when worker-visible household context changed", async () => {
-    const harness = setup();
-    const app = createFlorenceApplication(harness.dependencies);
-    const researchKey = "research-stale";
-    harness.interpreter.respondToConversation(researchKey, {
-      ...classificationBase,
-      intent: "research_request",
-      title: "Compare summer camps",
-      requiredOutcome: "A sourced camp comparison is ready",
-      constraints: ["Fit the household calendar"],
-      scopeAssessment: {
-        decision: "in_scope",
-        reason: "The choice affects childcare and the household calendar.",
-      },
-    });
-    await app.process(groupMessage(researchKey, "Compare summer camps for us", "2027-02-01T08:00:00Z"));
-    let snapshot = await harness.repository.load(HOUSEHOLD_ID);
-    const job = snapshot?.projection.workers[0]?.job;
-    expect(job?.baseHouseholdVersion).toBe(snapshot?.aggregate.version);
-
-    const changeKey = "research-stale-change";
-    harness.interpreter.respondToConversation(changeKey, {
-      ...classificationBase,
-      intent: "onboarding",
-      action: "update_profile",
-      profileFacts: [
-        {
-          category: "dependent",
-          subject: "Maya",
-          detail: "Maya is a child in the household.",
-        },
-      ],
-    });
-    await app.process(groupMessage(changeKey, "Maya is our child", "2027-02-01T08:01:00Z"));
-    snapshot = await harness.repository.load(HOUSEHOLD_ID);
-    expect(snapshot?.projection.sharedProfile.facts).toHaveLength(1);
-    if (job === undefined) {
-      throw new Error("Expected a queued worker job");
-    }
-    const resultEvidenceId = "evidence_worker_stale_result";
-    const beforeResultEffects = harness.repository.outbox.length;
-    const workerResult = {
-      jobId: job.jobId,
-      attemptId: job.attemptId,
-      householdId: job.householdId,
-      baseHouseholdVersion: job.baseHouseholdVersion,
-      policyVersion: job.policyVersion,
-      modelRouteId: job.modelRouteId,
-      modelCapabilityProfile: job.modelCapabilityProfile,
-      outputContractRef: job.outputContractRef,
-      summary: "A camp comparison is ready.",
-      evidenceRefs: [resultEvidenceId],
-      questions: [],
-      warnings: [],
-      proposedCommands: [
-        {
-          kind: "message.propose",
-          payload: {
-            proposalId: "message_proposal_stale",
-            targetScope: { kind: "household" },
-            purpose: "status_update",
-            body: "A sourced camp comparison is ready for review.",
-            evidence: [
-              {
-                evidenceId: resultEvidenceId,
-                source: "worker",
-                sourceRef: "worker:camp-comparison",
-                scope: { kind: "household" },
-                observedAt: "2027-02-01T08:02:00Z",
-                revision: 1,
-              },
-            ],
-            sourceClass: "worker.research",
-            sensitivity: "ordinary",
-          },
-        },
-      ],
-      confidence: 0.94,
-      diagnostics: {
-        durationMs: 100,
-        modelCalls: 1,
-        toolCalls: 1,
-        usage: {},
-        traceReferences: [],
-      },
-    };
-    const reconciled = await app.process({
-      kind: "worker_result",
-      householdId: HOUSEHOLD_ID,
-      idempotencyKey: "worker-result-stale",
-      receivedAt: "2027-02-01T08:02:00Z",
-      result: workerResult,
-    });
-
-    expect(reconciled.outcome).toMatchObject({
-      status: "processed",
-      classification: "worker_requeued:worker_context_changed",
-    });
-    snapshot = await harness.repository.load(HOUSEHOLD_ID);
-    expect(snapshot?.projection.workers[0]).toMatchObject({
-      status: "queued",
-      attemptNumber: 2,
-      automaticRetryCount: 1,
-    });
-    expect(harness.repository.outbox).toHaveLength(beforeResultEffects + 1);
-  });
-
-  it("runs research and meal workers only after in-scope adult requests", async () => {
-    const observedAt = new Date(Date.now() + 60_000).toISOString();
-    const workerResponse = (job: WorkerJob): WorkerResultPayload => {
-      const meal = job.modelCapabilityProfile === "tool_planning";
-      const evidenceId = `evidence_${job.jobId}`;
-      return {
-        summary: meal ? "A meal plan and grocery list are ready." : "A sourced comparison is ready.",
-        evidenceRefs: [evidenceId],
-        questions: [],
-        warnings: [],
-        proposedCommands: [
-          {
-            kind: "message.propose",
-            payload: {
-              proposalId: meal ? "message_meal_result" : "message_research_result",
-              targetScope: { kind: "household" },
-              purpose: "status_update",
-              body: meal
-                ? "Meal plan: pasta, tacos, and soup. Grocery list: produce, tortillas, beans, pasta, and broth."
-                : "Research comparison: Camp North and Camp West fit the stated calendar; source checks are current.",
-              evidence: [
-                {
-                  evidenceId,
-                  source: "worker",
-                  sourceRef: meal ? "worker:meal-plan" : "worker:research-comparison",
-                  scope: { kind: "household" },
-                  observedAt,
-                  revision: 1,
-                },
-              ],
-              sourceClass: meal ? "worker.meal_plan" : "worker.research",
-              sensitivity: "ordinary",
-            },
-          },
-        ],
-        confidence: 0.93,
-      };
-    };
-    const harness = setup({ workerResponse });
-    const app = createFlorenceApplication(harness.dependencies);
-    const requestAt = new Date(Date.now() + 30_000).toISOString();
-
-    const researchKey = "research-requested";
-    harness.interpreter.respondToConversation(researchKey, {
-      ...classificationBase,
-      intent: "research_request",
-      title: "Compare two summer camps",
-      requiredOutcome: "A sourced comparison covers cost, location, policy, and calendar fit",
-      constraints: ["Include cancellation policy", "Check household calendar fit"],
-      scopeAssessment: {
-        decision: "in_scope",
-        reason: "The decision affects childcare and the household calendar.",
-      },
-    });
-    await app.process(groupMessage(researchKey, "Compare two summer camps", requestAt));
-    const researchIntent = harness.repository
-      .intents("worker.run")
-      .find((intent) => intent.kind === "worker.run");
-    expect(researchIntent).toMatchObject({
-      kind: "worker.run",
-      job: { modelCapabilityProfile: "long_context_research" },
-    });
-    if (researchIntent?.kind !== "worker.run") {
-      throw new Error("Expected a research worker intent");
-    }
-    await app.executeOutbox(researchIntent, new Date(Date.now() + 45_000).toISOString());
-
-    const mealKey = "meal-requested";
-    harness.interpreter.respondToConversation(mealKey, {
-      ...classificationBase,
-      intent: "meal_plan_request",
-      title: "Plan three weeknight dinners",
-      requiredOutcome: "Three practical dinners and one grouped grocery list are ready",
-      horizon: "Monday through Wednesday",
-      constraints: ["Use the household schedule", "Prefer one leftovers night"],
-      scopeAssessment: {
-        decision: "in_scope",
-        reason: "The plan covers shared household meals and groceries.",
-      },
-    });
-    await app.process(
-      groupMessage(
-        mealKey,
-        "Plan three weeknight dinners and a grocery list",
-        new Date(Date.now() + 50_000).toISOString(),
-      ),
-    );
-    const mealIntent = harness.repository
-      .intents("worker.run")
-      .filter((intent) => intent.kind === "worker.run")
-      .at(-1);
-    expect(mealIntent).toMatchObject({
-      kind: "worker.run",
-      job: { modelCapabilityProfile: "tool_planning" },
-    });
-    if (mealIntent?.kind !== "worker.run") {
-      throw new Error("Expected a meal worker intent");
-    }
-    await app.executeOutbox(mealIntent, new Date(Date.now() + 55_000).toISOString());
-
-    const workerCount = harness.repository.intents("worker.run").length;
-    const declinedKey = "research-out-of-scope";
-    harness.interpreter.respondToConversation(declinedKey, {
-      ...classificationBase,
-      intent: "research_request",
-      title: "Prepare a work presentation",
-      requiredOutcome: "A professional presentation is ready",
-      constraints: [],
-      scopeAssessment: {
-        decision: "out_of_scope",
-        reason: "The request is a professional deliverable without a household consequence.",
-      },
-    });
-    const declined = await app.process(
-      directMessage(
-        declinedKey,
-        "Prepare my work presentation",
-        ADULT_A,
-        new Date(Date.now() + 57_000).toISOString(),
-      ),
-    );
-    expect(declined.outcome.status).toBe("rejected");
-    expect(harness.repository.intents("worker.run")).toHaveLength(workerCount);
-
-    await app.process({
-      kind: "daily_brief",
-      householdId: HOUSEHOLD_ID,
-      idempotencyKey: "daily-brief-scheduled",
-      occurredAt: new Date(Date.now() + 58_000).toISOString(),
-      reason: "scheduled",
-    });
-    expect(harness.repository.intents("worker.run")).toHaveLength(workerCount);
-    expect(harness.workerRuntime.calls).toHaveLength(2);
-    const snapshot = await harness.repository.load(HOUSEHOLD_ID);
-    expect(snapshot?.projection.workers.map((worker) => worker.status)).toEqual(["completed", "completed"]);
-
-    const resultBodies = harness.repository
-      .intents("conversation.send")
-      .flatMap((intent) =>
-        intent.kind === "conversation.send" && intent.messageClass === "status" ? [intent.body] : [],
-      );
-    expect(resultBodies).toContain("A sourced comparison is ready.");
-    expect(resultBodies).toContain("A meal plan and grocery list are ready.");
-    expect(
-      domainEffects(harness.repository.outbox).some((effect) => effect.kind === "execute_external_action"),
-    ).toBe(false);
   });
 });

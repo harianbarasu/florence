@@ -1,7 +1,8 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 import type { CalendarPushHeaders, GmailPubSubEvent, GoogleOAuthGrant } from "../adapters/google/index.js";
-import type { LinqInboundEvent } from "../adapters/linq/index.js";
+import type { LinqRecoveredMessageEvent, LinqWebhookEvent } from "../adapters/linq/index.js";
+import { ApplicationStoreError } from "../db/application-store.js";
 import type {
   DurableIngress,
   GoogleOAuthCompletionResult,
@@ -61,28 +62,20 @@ export interface AuthenticatedLinqSuppressionStore {
   }): Promise<unknown>;
 }
 
+export interface AuthenticatedLinqIngressObserver {
+  recordWebhookIngress(): Promise<void>;
+}
+
 export class DurableProviderIngress implements DurableIngress {
   public constructor(
     private readonly store: ProviderIngressStore,
     private readonly calendarPush?: CalendarPushAcceptor,
     private readonly linqSuppressions?: AuthenticatedLinqSuppressionStore,
+    private readonly linqObserver?: AuthenticatedLinqIngressObserver,
   ) {}
 
-  public async acceptLinq(event: LinqInboundEvent): Promise<void> {
-    if (event.eventType === "message.received" && event.message.consentCommand === "stop") {
-      if (!this.linqSuppressions) {
-        throw new Error("Authenticated Linq STOP persistence is unavailable");
-      }
-      await this.linqSuppressions.setSuppression({
-        externalChatId: event.conversation.id,
-        ...(event.scope === "direct" ? { externalHandle: event.sender.handle } : {}),
-        scope: event.scope === "direct" ? "private" : "group",
-        suppressed: true,
-        occurredAt: event.occurredAt,
-        sourceEventId: event.dedupeKey,
-        reason: "stop_command",
-      });
-    }
+  public async acceptLinq(event: LinqWebhookEvent): Promise<void> {
+    await this.#persistAuthenticatedStop(event);
     const receipt = await this.store.ingestProviderEvent({
       provider: "linq",
       idempotencyKey: event.dedupeKey,
@@ -97,6 +90,26 @@ export class DurableProviderIngress implements DurableIngress {
     });
     if (receipt.disposition === "quarantined") {
       throw new Error("Linq delivery conflicted with a previously authenticated event");
+    }
+    await this.linqObserver?.recordWebhookIngress();
+  }
+
+  public async acceptLinqRecovered(event: LinqRecoveredMessageEvent): Promise<void> {
+    await this.#persistAuthenticatedStop(event);
+    const receipt = await this.store.ingestProviderEvent({
+      provider: "linq",
+      idempotencyKey: event.dedupeKey,
+      authentication: {
+        verified: true,
+        source: "partner_api_reconciliation",
+        integrationId: event.integrationId,
+      },
+      eventKind: event.eventType,
+      occurredAt: event.occurredAt,
+      payload: jsonObject(event),
+    });
+    if (receipt.disposition === "quarantined") {
+      throw new Error("Recovered Linq message conflicted with an authenticated snapshot");
     }
   }
 
@@ -116,6 +129,22 @@ export class DurableProviderIngress implements DurableIngress {
 
   public async acceptCalendarPush(headers: CalendarPushHeaders): Promise<"accepted" | "unauthorized"> {
     return this.calendarPush?.accept(headers) ?? "unauthorized";
+  }
+
+  async #persistAuthenticatedStop(event: LinqWebhookEvent | LinqRecoveredMessageEvent): Promise<void> {
+    if (event.eventType !== "message.received" || event.message.consentCommand !== "stop") return;
+    if (!this.linqSuppressions) {
+      throw new Error("Authenticated Linq STOP persistence is unavailable");
+    }
+    await this.linqSuppressions.setSuppression({
+      externalChatId: event.conversation.id,
+      ...(event.scope === "direct" ? { externalHandle: event.sender.handle } : {}),
+      scope: event.scope === "direct" ? "private" : "group",
+      suppressed: true,
+      occurredAt: event.occurredAt,
+      sourceEventId: event.dedupeKey,
+      reason: "stop_command",
+    });
   }
 }
 
@@ -161,7 +190,7 @@ export interface GoogleOAuthStore {
     grantedScopes: string[];
     cursor: Record<string, unknown>;
     metadata: Record<string, unknown>;
-  }): Promise<{ connectionId: string }>;
+  }): Promise<{ connectionId: string; hadPriorGmailState: boolean }>;
 }
 
 export interface GoogleOAuthConnectedEvent {
@@ -169,6 +198,8 @@ export interface GoogleOAuthConnectedEvent {
   adultId: string;
   returnConversationId: string;
   connectionId: string;
+  activationId: string;
+  hadPriorGmailState: boolean;
   accountLabel: string;
   email: string | null;
   grantedScopes: readonly string[];
@@ -342,24 +373,56 @@ export class GoogleOAuthHandoffService implements GoogleOAuthHandoff {
       });
       return { kind: "invalid" };
     }
+    if (grant.tokens.refreshToken === null) {
+      await this.#notifyFailed({
+        householdId: context.householdId,
+        adultId: context.adultId,
+        returnConversationId: context.returnConversationId,
+        accountLabel: context.accountLabel,
+        failureRef: stateHash,
+        reason: "invalid",
+      });
+      return { kind: "invalid" };
+    }
     const credentialsAad = `google-connection:${context.householdId}:${context.adultId}:${grant.identity.subject}`;
-    const connection = await this.#store.upsertExternalConnection({
-      householdId: context.householdId,
-      adultId: context.adultId,
-      provider: "google",
-      label: context.accountLabel,
-      externalAccountId: grant.identity.subject,
-      ...(grant.identity.email ? { email: grant.identity.email } : {}),
-      encryptedCredentials: this.#secretBox.seal(JSON.stringify(grant.tokens), credentialsAad),
-      grantedScopes: grant.tokens.scope,
-      cursor: {},
-      metadata: { credentialAadVersion: 1, accountLabel: context.accountLabel },
-    });
+    let connection: { connectionId: string; hadPriorGmailState: boolean };
+    try {
+      connection = await this.#store.upsertExternalConnection({
+        householdId: context.householdId,
+        adultId: context.adultId,
+        provider: "google",
+        label: context.accountLabel,
+        externalAccountId: grant.identity.subject,
+        ...(grant.identity.email ? { email: grant.identity.email } : {}),
+        encryptedCredentials: this.#secretBox.seal(JSON.stringify(grant.tokens), credentialsAad),
+        grantedScopes: grant.tokens.scope,
+        cursor: {},
+        metadata: { credentialAadVersion: 1, accountLabel: context.accountLabel },
+      });
+    } catch (error) {
+      if (
+        !(error instanceof ApplicationStoreError) ||
+        (error.code !== "external_account_in_use" && error.code !== "invalid_state")
+      ) {
+        throw error;
+      }
+      await this.#notifyFailed({
+        householdId: context.householdId,
+        adultId: context.adultId,
+        returnConversationId: context.returnConversationId,
+        accountLabel: context.accountLabel,
+        failureRef: stateHash,
+        reason: "invalid",
+      });
+      return { kind: "invalid" };
+    }
     await this.#onConnected?.({
       householdId: context.householdId,
       adultId: context.adultId,
       returnConversationId: context.returnConversationId,
       connectionId: connection.connectionId,
+      activationId: consumed.stateId,
+      hadPriorGmailState: connection.hadPriorGmailState,
       accountLabel: context.accountLabel,
       email: grant.identity.email,
       grantedScopes: [...grant.tokens.scope],

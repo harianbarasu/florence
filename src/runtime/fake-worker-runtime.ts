@@ -136,8 +136,14 @@ function validContext(options: WorkerAttemptOptions, job: WorkerJob): boolean {
     toolNames.every((name) => job.allowedToolNames.includes(name)) &&
     job.allowedToolNames.every((name) => toolNames.includes(name)) &&
     (options.tools ?? []).every((tool) =>
-      (tool.requiredCapabilityIds ?? []).every((capability) => job.capabilityIds.includes(capability)),
-    )
+      (tool.requiredCapabilityIds ?? []).every((capability) =>
+        job.capabilityGrants.some(
+          (grant) => grant.capability === capability && grant.revokedAt === undefined,
+        ),
+      ),
+    ) &&
+    ((options.tools ?? []).every((tool) => (tool.requiredCapabilityIds?.length ?? 0) === 0) ||
+      options.capabilityAuthorizer !== undefined)
   );
 }
 

@@ -22,6 +22,7 @@ import {
 } from "../application/contracts.js";
 import type {
   ApplicationEffectExecutorPort,
+  ApplicationRepositoryPort,
   HouseholdCalendarActionsPort,
   WorkerContextPort,
 } from "../application/ports.js";
@@ -31,6 +32,9 @@ import { type DurableScope, DurableScopeSchema, type FamilyEpisode } from "../do
 import { JsonValueSchema } from "../models/contracts.js";
 import {
   type WorkerAttemptOptions,
+  type WorkerCapabilityAuthorizationRequest,
+  type WorkerCapabilityAuthorizer,
+  type WorkerCapabilityGrant,
   type WorkerJob,
   WorkerJobSchema,
   type WorkerTool,
@@ -503,6 +507,7 @@ const DEFAULT_RESEARCH_LIMITS: ResearchLimits = Object.freeze({
 });
 
 export interface ScopedWorkerContextOptions {
+  readonly repository: Pick<ApplicationRepositoryPort, "load">;
   readonly now?: () => Date;
   readonly researchNetwork?: ResearchNetworkPort;
   readonly researchLimits?: Partial<ResearchLimits>;
@@ -583,12 +588,14 @@ interface ResearchFailure {
 
 /** Builds minimum-necessary context and only the two bounded, read-only tools. */
 export class ScopedWorkerContext implements WorkerContextPort {
+  readonly #repository: Pick<ApplicationRepositoryPort, "load">;
   readonly #now: () => Date;
   readonly #researchNetwork: ResearchNetworkPort;
   readonly #researchLimits: ResearchLimits;
   readonly #calendarSchedule: CalendarScheduleProjectionPort | undefined;
 
-  constructor(options: ScopedWorkerContextOptions = {}) {
+  constructor(options: ScopedWorkerContextOptions) {
+    this.#repository = options.repository;
     this.#now = options.now ?? (() => new Date());
     this.#researchNetwork = options.researchNetwork ?? new PinnedHttpsResearchNetwork();
     this.#researchLimits = parseResearchLimits({
@@ -711,7 +718,7 @@ export class ScopedWorkerContext implements WorkerContextPort {
     for (const toolName of job.allowedToolNames) {
       switch (toolName) {
         case "household_schedule":
-          requireCapability(job, HOUSEHOLD_SCHEDULE_CAPABILITY);
+          requireCapability(job, HOUSEHOLD_SCHEDULE_CAPABILITY, now);
           tools.push(
             createHouseholdScheduleTool(
               job,
@@ -726,7 +733,7 @@ export class ScopedWorkerContext implements WorkerContextPort {
           );
           break;
         case "research_sources":
-          requireCapability(job, RESEARCH_CAPABILITY);
+          requireCapability(job, RESEARCH_CAPABILITY, now);
           tools.push(createResearchSourcesTool(job, this.#researchNetwork, this.#researchLimits));
           break;
         default:
@@ -762,10 +769,56 @@ export class ScopedWorkerContext implements WorkerContextPort {
         }
       : undefined;
 
+    const capabilityAuthorizer = this.#capabilityAuthorizer(job);
+
     return {
       context,
       tools,
+      capabilityAuthorizer,
       ...(validateBeforeAccept === undefined ? {} : { validateBeforeAccept }),
+    };
+  }
+
+  #capabilityAuthorizer(job: WorkerJob): WorkerCapabilityAuthorizer {
+    return {
+      authorize: async (request) => {
+        let current: HouseholdApplicationSnapshot | null;
+        try {
+          current = await this.#repository.load(job.householdId);
+        } catch {
+          throw new WorkerServiceError("invalid_context");
+        }
+        if (current === null) throw new WorkerServiceError("invalid_context");
+        const snapshot = HouseholdApplicationSnapshotSchema.parse(current);
+        const worker = snapshot.projection.workers.find(
+          (candidate) => candidate.job.jobId === job.jobId && candidate.job.attemptId === job.attemptId,
+        );
+        if (
+          worker?.status !== "queued" ||
+          worker.purpose !== job.scopeGrant.purpose ||
+          snapshot.aggregate.householdId !== job.householdId ||
+          snapshot.aggregate.policyVersion !== job.policyVersion ||
+          !isDeepStrictEqual(worker.job, job)
+        ) {
+          throw new WorkerServiceError("invalid_context");
+        }
+        const grant = worker.job.capabilityGrants.find((candidate) => candidate.grantId === request.grantId);
+        const episode = snapshot.aggregate.episodes.find(
+          (candidate) => candidate.episodeId === worker.episodeId,
+        );
+        const now = this.#now().getTime();
+        if (
+          grant === undefined ||
+          episode === undefined ||
+          !authorizationMatchesGrant(request, grant) ||
+          !grantMatchesJobAndEpisode(grant, worker.job, worker.purpose, episode.scope) ||
+          grant.revokedAt !== undefined ||
+          Date.parse(grant.issuedAt) > now ||
+          Date.parse(grant.expiresAt) <= now
+        ) {
+          throw new WorkerServiceError("invalid_context");
+        }
+      },
     };
   }
 }
@@ -794,10 +847,54 @@ function parseResearchLimits(input: ResearchLimits): ResearchLimits {
     .parse(input);
 }
 
-function requireCapability(job: WorkerJob, capability: string): void {
-  if (!job.capabilityIds.includes(capability)) {
+function requireCapability(job: WorkerJob, capability: string, now: number): void {
+  if (
+    !job.capabilityGrants.some(
+      (grant) =>
+        grant.capability === capability &&
+        grant.revokedAt === undefined &&
+        Date.parse(grant.issuedAt) <= now &&
+        Date.parse(grant.expiresAt) > now,
+    )
+  ) {
     throw new WorkerServiceError("invalid_context");
   }
+}
+
+function authorizationMatchesGrant(
+  request: WorkerCapabilityAuthorizationRequest,
+  grant: WorkerCapabilityGrant,
+): boolean {
+  return (
+    request.grantId === grant.grantId &&
+    request.capability === grant.capability &&
+    request.householdId === grant.householdId &&
+    request.jobId === grant.jobId &&
+    request.attemptId === grant.attemptId &&
+    request.scopeGrantId === grant.scopeGrantId &&
+    request.scope.visibility === grant.scope.visibility &&
+    request.scope.adultId === grant.scope.adultId &&
+    request.purpose === grant.purpose
+  );
+}
+
+function grantMatchesJobAndEpisode(
+  grant: WorkerCapabilityGrant,
+  job: WorkerJob,
+  purpose: string,
+  episodeScope: DurableScope,
+): boolean {
+  return (
+    grant.householdId === job.householdId &&
+    grant.jobId === job.jobId &&
+    grant.attemptId === job.attemptId &&
+    grant.scopeGrantId === job.scopeGrant.grantId &&
+    grant.scope.visibility === job.scopeGrant.visibility &&
+    grant.scope.adultId === job.scopeGrant.adultId &&
+    grant.purpose === job.scopeGrant.purpose &&
+    grant.purpose === purpose &&
+    scopeCanRead(job, episodeScope)
+  );
 }
 
 function scopeCanRead(job: WorkerJob, scope: DurableScope): boolean {
@@ -805,19 +902,22 @@ function scopeCanRead(job: WorkerJob, scope: DurableScope): boolean {
   return scope.kind === "household" || scope.adultId === job.scopeGrant.adultId;
 }
 
-function assertExecutionContext(
+async function assertExecutionContext(
   job: WorkerJob,
   requiredCapability: string,
   context: WorkerToolExecutionContext,
-): void {
+): Promise<void> {
   if (
     context.signal.aborted ||
     context.jobId !== job.jobId ||
     context.attemptId !== job.attemptId ||
-    context.householdId !== job.householdId ||
-    !context.capabilityIds.includes(requiredCapability) ||
-    !job.capabilityIds.includes(requiredCapability)
+    context.householdId !== job.householdId
   ) {
+    throw new WorkerServiceError(context.signal.aborted ? "aborted" : "invalid_context");
+  }
+  try {
+    await context.authorizeCapability(requiredCapability);
+  } catch {
     throw new WorkerServiceError(context.signal.aborted ? "aborted" : "invalid_context");
   }
 }
@@ -840,7 +940,7 @@ function createHouseholdScheduleTool(
     inputSchema,
     requiredCapabilityIds: [HOUSEHOLD_SCHEDULE_CAPABILITY],
     async execute(rawInput, context) {
-      assertExecutionContext(job, HOUSEHOLD_SCHEDULE_CAPABILITY, context);
+      await assertExecutionContext(job, HOUSEHOLD_SCHEDULE_CAPABILITY, context);
       const input = inputSchema.parse(rawInput);
       const visible = snapshot.aggregate.episodes.filter(
         (episode) =>
@@ -965,7 +1065,7 @@ function createResearchSourcesTool(
     requiredCapabilityIds: [RESEARCH_CAPABILITY],
     execute(rawInput, context) {
       const operation = tail.then(async () => {
-        assertExecutionContext(job, RESEARCH_CAPABILITY, context);
+        await assertExecutionContext(job, RESEARCH_CAPABILITY, context);
         const input = inputSchema.parse(rawInput);
         let query: string | null = null;
         let candidates: readonly { url: string; title?: string }[];

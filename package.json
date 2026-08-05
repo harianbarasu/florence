@@ -12,6 +12,7 @@
     "build": "tsc -p tsconfig.build.json",
     "check": "pnpm lint && pnpm typecheck && pnpm test && pnpm build",
     "db:migrate": "tsx --env-file-if-exists=.env src/cli/migrate.ts",
+    "data:rotate-key": "tsx --env-file-if-exists=.env src/cli/rotate-encryption.ts",
     "dev": "tsx --env-file-if-exists=.env watch src/server.ts",
     "dev:worker": "tsx --env-file-if-exists=.env watch src/worker.ts",
     "format": "biome format --write .",

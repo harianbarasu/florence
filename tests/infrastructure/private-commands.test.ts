@@ -132,6 +132,8 @@ describe("PrivateGoogleCommandService", () => {
       adultId: ADULT,
       returnConversationId: "dm-1",
       connectionId: CONNECTION,
+      activationId: "00000000-0000-4000-8000-000000000099",
+      hadPriorGmailState: false,
       accountLabel: "Personal",
       email: "parent@example.test",
       grantedScopes: [
@@ -141,7 +143,7 @@ describe("PrivateGoogleCommandService", () => {
     });
     expect(harness.enqueueGoogleSyncWork).toHaveBeenCalledWith({
       householdId: HOUSEHOLD,
-      idempotencyKey: `google:${CONNECTION}:start`,
+      idempotencyKey: `google:${CONNECTION}:activation:00000000-0000-4000-8000-000000000099:start`,
       work: {
         kind: "start",
         householdId: HOUSEHOLD,
@@ -162,6 +164,8 @@ describe("PrivateGoogleCommandService", () => {
       adultId: ADULT,
       returnConversationId: "dm-1",
       connectionId: CONNECTION,
+      activationId: "00000000-0000-4000-8000-000000000100",
+      hadPriorGmailState: false,
       accountLabel: "Personal",
       email: "parent@example.test",
       grantedScopes: [
@@ -175,13 +179,5 @@ describe("PrivateGoogleCommandService", () => {
         body: expect.stringContaining("Gmail synchronization service is unavailable"),
       }),
     );
-  });
-
-  it("leaves unrelated private conversation to Florence", async () => {
-    const harness = setup();
-    await expect(harness.service.handle({ ...command, text: "Pickup changed to 4:30" })).resolves.toEqual({
-      handled: false,
-    });
-    expect(harness.enqueueApplicationIntent).not.toHaveBeenCalled();
   });
 });

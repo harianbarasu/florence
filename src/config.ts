@@ -4,69 +4,94 @@ const emptyStringAsUndefined = (value: unknown): unknown =>
   typeof value === "string" && value.trim() === "" ? undefined : value;
 const optionalSecret = z.preprocess(emptyStringAsUndefined, z.string().min(1).optional());
 const optionalUrl = z.preprocess(emptyStringAsUndefined, z.string().url().optional());
+const encryptionKeyIdSchema = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/u);
+const encryptionKeyringSchema = z.preprocess(
+  (value) => {
+    if (typeof value !== "string") return value;
+    try {
+      return JSON.parse(value) as unknown;
+    } catch {
+      return value;
+    }
+  },
+  z.record(encryptionKeyIdSchema, z.string().min(43)).refine((keys) => Object.keys(keys).length > 0),
+);
 
-const environmentSchema = z.object({
-  NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
-  FLORENCE_PROCESS_ROLE: z.enum(["all", "web", "worker"]).default("all"),
-  PORT: z.coerce.number().int().min(1).max(65_535).default(3000),
-  LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"]).default("info"),
-  FLORENCE_DATABASE_URL: z.string().url(),
-  FLORENCE_POSTGRES_SCHEMA: z
-    .string()
-    .regex(/^[a-z][a-z0-9_]{0,62}$/u)
-    .default("florence"),
-  FLORENCE_WEB_BASE_URL: z.string().url(),
-  FLORENCE_TOKEN_ENCRYPTION_KEY: z.string().min(43),
-  FLORENCE_ADMIN_API_KEY: z.string().min(24),
-  FLORENCE_DEFAULT_TIMEZONE: z.string().min(1).default("America/Los_Angeles"),
-  LINQ_API_KEY: optionalSecret,
-  LINQ_BASE_URL: z.string().url().default("https://api.linqapp.com/api/partner/v3"),
-  LINQ_FROM_PHONE: optionalSecret,
-  LINQ_WEBHOOK_SECRET: optionalSecret,
-  GOOGLE_CLIENT_ID: optionalSecret,
-  GOOGLE_CLIENT_SECRET: optionalSecret,
-  GOOGLE_OAUTH_STATE_SECRET: optionalSecret,
-  GOOGLE_REDIRECT_URI: optionalUrl,
-  GOOGLE_PUBSUB_VERIFICATION_TOKEN: optionalSecret,
-  GOOGLE_PUBSUB_OIDC_AUDIENCE: optionalUrl,
-  GOOGLE_PUBSUB_SERVICE_ACCOUNT_EMAIL: z.preprocess(
-    emptyStringAsUndefined,
-    z
-      .email()
-      .transform((value) => value.toLowerCase())
-      .optional(),
-  ),
-  GOOGLE_GMAIL_TOPIC_NAME: z.preprocess(
-    emptyStringAsUndefined,
-    z
+const environmentSchema = z
+  .object({
+    NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
+    FLORENCE_PROCESS_ROLE: z.enum(["all", "web", "worker"]).default("all"),
+    PORT: z.coerce.number().int().min(1).max(65_535).default(3000),
+    LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"]).default("info"),
+    FLORENCE_DATABASE_URL: z.string().url(),
+    FLORENCE_POSTGRES_SCHEMA: z
       .string()
-      .regex(/^projects\/[^/]+\/topics\/[^/]+$/u)
-      .optional(),
-  ),
-  GOOGLE_GMAIL_PUBSUB_SUBSCRIPTION: z.preprocess(
-    emptyStringAsUndefined,
-    z
+      .regex(/^[a-z][a-z0-9_]{0,62}$/u)
+      .default("florence"),
+    FLORENCE_WEB_BASE_URL: z.string().url(),
+    FLORENCE_TOKEN_ENCRYPTION_KEY: z.string().min(43),
+    FLORENCE_DATA_ACTIVE_KEY_ID: encryptionKeyIdSchema,
+    FLORENCE_DATA_KEYRING_JSON: encryptionKeyringSchema,
+    FLORENCE_BLIND_INDEX_KEY: z.string().min(43),
+    FLORENCE_ADMIN_API_KEY: z.string().min(24),
+    FLORENCE_DEFAULT_TIMEZONE: z.string().min(1).default("America/Los_Angeles"),
+    LINQ_API_KEY: optionalSecret,
+    LINQ_BASE_URL: z.string().url().default("https://api.linqapp.com/api/partner/v3"),
+    LINQ_FROM_PHONE: optionalSecret,
+    LINQ_WEBHOOK_SECRET: optionalSecret,
+    GOOGLE_CLIENT_ID: optionalSecret,
+    GOOGLE_CLIENT_SECRET: optionalSecret,
+    GOOGLE_OAUTH_STATE_SECRET: optionalSecret,
+    GOOGLE_REDIRECT_URI: optionalUrl,
+    GOOGLE_PUBSUB_VERIFICATION_TOKEN: optionalSecret,
+    GOOGLE_PUBSUB_OIDC_AUDIENCE: optionalUrl,
+    GOOGLE_PUBSUB_SERVICE_ACCOUNT_EMAIL: z.preprocess(
+      emptyStringAsUndefined,
+      z
+        .email()
+        .transform((value) => value.toLowerCase())
+        .optional(),
+    ),
+    GOOGLE_GMAIL_TOPIC_NAME: z.preprocess(
+      emptyStringAsUndefined,
+      z
+        .string()
+        .regex(/^projects\/[^/]+\/topics\/[^/]+$/u)
+        .optional(),
+    ),
+    GOOGLE_GMAIL_PUBSUB_SUBSCRIPTION: z.preprocess(
+      emptyStringAsUndefined,
+      z
+        .string()
+        .max(1_000)
+        .regex(/^projects\/[^/]+\/subscriptions\/[^/]+$/u)
+        .optional(),
+    ),
+    MODEL_PROVIDER: z.enum(["openai", "anthropic", "open-weight"]).default("openai"),
+    OPENAI_API_KEY: optionalSecret,
+    OPENAI_BASE_URL: z.string().url().default("https://api.openai.com/v1"),
+    OPENAI_MODEL: z.string().min(1).default("gpt-5.6-terra"),
+    ANTHROPIC_API_KEY: optionalSecret,
+    ANTHROPIC_MODEL: z.string().min(1).default("claude-sonnet-4-6"),
+    OPEN_WEIGHT_BASE_URL: optionalUrl,
+    OPEN_WEIGHT_API_KEY: optionalSecret,
+    OPEN_WEIGHT_MODEL: optionalSecret,
+    WORKER_POLL_INTERVAL_MS: z.coerce.number().int().min(100).max(60_000).default(1_000),
+    WORKER_LEASE_SECONDS: z.coerce.number().int().min(10).max(3_600).default(60),
+    DAILY_BRIEF_LOCAL_TIME: z
       .string()
-      .max(1_000)
-      .regex(/^projects\/[^/]+\/subscriptions\/[^/]+$/u)
-      .optional(),
-  ),
-  MODEL_PROVIDER: z.enum(["openai", "anthropic", "open-weight"]).default("openai"),
-  OPENAI_API_KEY: optionalSecret,
-  OPENAI_BASE_URL: z.string().url().default("https://api.openai.com/v1"),
-  OPENAI_MODEL: z.string().min(1).default("gpt-5.6-terra"),
-  ANTHROPIC_API_KEY: optionalSecret,
-  ANTHROPIC_MODEL: z.string().min(1).default("claude-sonnet-4-6"),
-  OPEN_WEIGHT_BASE_URL: optionalUrl,
-  OPEN_WEIGHT_API_KEY: optionalSecret,
-  OPEN_WEIGHT_MODEL: optionalSecret,
-  WORKER_POLL_INTERVAL_MS: z.coerce.number().int().min(100).max(60_000).default(1_000),
-  WORKER_LEASE_SECONDS: z.coerce.number().int().min(10).max(3_600).default(60),
-  DAILY_BRIEF_LOCAL_TIME: z
-    .string()
-    .regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/u)
-    .default("06:30"),
-});
+      .regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/u)
+      .default("06:30"),
+  })
+  .superRefine((value, context) => {
+    if (!Object.hasOwn(value.FLORENCE_DATA_KEYRING_JSON, value.FLORENCE_DATA_ACTIVE_KEY_ID)) {
+      context.addIssue({
+        code: "custom",
+        path: ["FLORENCE_DATA_ACTIVE_KEY_ID"],
+        message: "Active Florence data-encryption key is absent from the keyring",
+      });
+    }
+  });
 
 export type FlorenceConfig = z.infer<typeof environmentSchema>;
 

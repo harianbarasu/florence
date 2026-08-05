@@ -29,6 +29,7 @@ export function fakeHttpServices(): FlorenceHttpServices {
   return {
     ingress: {
       acceptLinq: async () => undefined,
+      acceptLinqRecovered: async () => undefined,
       acceptGmailPush: async () => undefined,
       acceptCalendarPush: async () => "accepted",
     },

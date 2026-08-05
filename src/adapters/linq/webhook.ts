@@ -1,10 +1,12 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 import { LINQ_WEBHOOK_VERSION, type LinqConfig } from "./config.js";
+import { linqMessageBusinessDedupeKey } from "./conversation.js";
 import {
   type LinqAttachment,
   type LinqConsentCommand,
   type LinqInboundEvent,
+  type LinqWebhookEvent,
   linqInboundEventSchema,
 } from "./schemas.js";
 
@@ -81,7 +83,7 @@ export function verifyLinqWebhookSignature(input: ParseLinqWebhookInput): Verifi
   return { webhookId, timestamp };
 }
 
-export function parseVerifiedLinqWebhook(input: ParseLinqWebhookInput): LinqInboundEvent | null {
+export function parseVerifiedLinqWebhook(input: ParseLinqWebhookInput): LinqWebhookEvent | null {
   const verified = verifyLinqWebhookSignature(input);
   let rawPayload: unknown;
   try {
@@ -119,7 +121,7 @@ export function parseVerifiedLinqWebhook(input: ParseLinqWebhookInput): LinqInbo
   if (!normalized.success) {
     throw new LinqWebhookPayloadError("could not normalize Linq webhook payload");
   }
-  return normalized.data;
+  return normalized.data as LinqWebhookEvent;
 }
 
 export function normalizeLinqConsentCommand(text: string): LinqConsentCommand {
@@ -176,8 +178,10 @@ function parseMessageReceived(envelope: z.infer<typeof linqEnvelopeSchema>): Lin
   return linqInboundEventSchema.parse({
     schemaVersion: 1,
     source: "linq",
+    transport: "webhook",
     providerEventId: envelope.event_id,
     dedupeKey: `linq:${envelope.partner_id}:${envelope.event_id}`,
+    businessDedupeKey: linqMessageBusinessDedupeKey(messageId),
     occurredAt,
     webhookVersion: LINQ_WEBHOOK_VERSION,
     partnerId: envelope.partner_id,
@@ -221,6 +225,7 @@ function parseReaction(envelope: z.infer<typeof linqEnvelopeSchema>): LinqInboun
   return {
     schemaVersion: 1,
     source: "linq",
+    transport: "webhook",
     providerEventId: envelope.event_id,
     dedupeKey: `linq:${envelope.partner_id}:${envelope.event_id}`,
     occurredAt: normalizeTimestamp(data.reacted_at ?? envelope.created_at),

@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
 import type { JSONValue } from "postgres";
 import { z } from "zod";
-import { payloadDigest } from "../security/canonical-json.js";
+import type { BlindIndex } from "../security/blind-index.js";
+import { canonicalJson } from "../security/canonical-json.js";
+import type { TenantJsonCipher } from "../security/tenant-json-cipher.js";
 import type { Database } from "./client.js";
 
 const jsonObjectSchema = z.record(z.string(), z.unknown());
@@ -150,7 +152,7 @@ type ExistingSignal = {
   id: string;
   household_id: string;
   sequence: string;
-  payload_hash: string;
+  content_digest: string;
 };
 
 type JobRow = {
@@ -167,10 +169,10 @@ type JobRow = {
 
 function receiptFromExisting(
   existing: ExistingSignal,
-  payloadHash: string,
+  contentDigest: string,
   idempotencyKey: string,
 ): AcceptanceReceipt {
-  if (existing.payload_hash !== payloadHash) {
+  if (existing.content_digest !== contentDigest) {
     throw new IdempotencyConflictError(idempotencyKey);
   }
   return {
@@ -187,7 +189,11 @@ function isUniqueViolation(error: unknown): boolean {
 }
 
 export class FlorenceStore {
-  constructor(private readonly database: Database) {}
+  constructor(
+    private readonly database: Database,
+    private readonly sensitiveJson: TenantJsonCipher,
+    private readonly blindIndex: BlindIndex,
+  ) {}
 
   async createFoundingHousehold(input: {
     householdId?: string;
@@ -219,24 +225,49 @@ export class FlorenceStore {
     const input = acceptSignalInputSchema.parse(rawInput);
     const signalId = input.id ?? randomUUID();
     const jobId = randomUUID();
-    const hash = payloadDigest({
-      householdId: input.householdId,
-      kind: input.kind,
-      actorKind: input.actorKind,
-      actorId: input.actorId,
-      visibility: input.visibility,
-      ownerAdultId: input.ownerAdultId,
-      occurredAt: input.occurredAt,
-      payload: input.payload,
-    });
+    const idempotencyDigest = this.blindIndex.digest(
+      "signal-idempotency",
+      `${input.householdId}\0${input.idempotencyKey}`,
+    );
+    const contentDigest = this.blindIndex.digest(
+      "signal-content",
+      canonicalJson({
+        householdId: input.householdId,
+        kind: input.kind,
+        actorKind: input.actorKind,
+        actorId: input.actorId,
+        visibility: input.visibility,
+        ownerAdultId: input.ownerAdultId,
+        occurredAt: input.occurredAt,
+        payload: input.payload,
+      }),
+    );
+    const sealed = this.sensitiveJson.seal(
+      {
+        idempotencyKey: input.idempotencyKey,
+        kind: input.kind,
+        actorKind: input.actorKind,
+        ...(input.actorId ? { actorId: input.actorId } : {}),
+        visibility: input.visibility,
+        ...(input.ownerAdultId ? { ownerAdultId: input.ownerAdultId } : {}),
+        occurredAt: input.occurredAt,
+        payload: input.payload,
+      },
+      {
+        tenant: { kind: "household", id: input.householdId },
+        table: "household_signals",
+        rowId: signalId,
+        field: "body",
+      },
+    );
 
     const existing = await this.database<ExistingSignal[]>`
-      select id, household_id, sequence, payload_hash
+      select id, household_id, sequence, content_digest
       from household_signals
-      where idempotency_key = ${input.idempotencyKey}
+      where idempotency_digest = ${idempotencyDigest}
     `;
     if (existing[0]) {
-      return receiptFromExisting(existing[0], hash, input.idempotencyKey);
+      return receiptFromExisting(existing[0], contentDigest, input.idempotencyKey);
     }
 
     try {
@@ -262,12 +293,11 @@ export class FlorenceStore {
         `;
         await transaction`
           insert into household_signals (
-            id, household_id, sequence, idempotency_key, payload_hash, kind,
-            actor_kind, actor_id, visibility, owner_adult_id, occurred_at, payload
+            id, household_id, sequence, idempotency_digest, content_digest,
+            body_key_id, body_ciphertext
           ) values (
-            ${signalId}, ${input.householdId}, ${sequence}, ${input.idempotencyKey}, ${hash}, ${input.kind},
-            ${input.actorKind}, ${input.actorId ?? null}, ${input.visibility},
-            ${input.ownerAdultId ?? null}, ${input.occurredAt}, ${json(this.database, input.payload)}
+            ${signalId}, ${input.householdId}, ${sequence}, ${idempotencyDigest},
+            ${contentDigest}, ${sealed.keyId}, ${sealed.ciphertext}
           )
         `;
         await transaction`
@@ -292,14 +322,14 @@ export class FlorenceStore {
         throw error;
       }
       const raced = await this.database<ExistingSignal[]>`
-        select id, household_id, sequence, payload_hash
+        select id, household_id, sequence, content_digest
         from household_signals
-        where idempotency_key = ${input.idempotencyKey}
+        where idempotency_digest = ${idempotencyDigest}
       `;
       if (!raced[0]) {
         throw error;
       }
-      return receiptFromExisting(raced[0], hash, input.idempotencyKey);
+      return receiptFromExisting(raced[0], contentDigest, input.idempotencyKey);
     }
   }
 

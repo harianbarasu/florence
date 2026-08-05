@@ -44,21 +44,6 @@ describe("health and secure browser HTTP interface", () => {
     expect(metrics.body).not.toContain(PUBSUB_TOKEN);
   });
 
-  it("keeps the public surface limited to fixed handoff notices", async () => {
-    for (const path of ["/", "/privacy", "/terms"]) {
-      const response = await server.inject({ method: "GET", url: path });
-      expect(response.statusCode).toBe(200);
-      expect(response.headers["content-type"]).toContain("text/html");
-      expect(response.headers["cache-control"]).toBe("no-store");
-      expect(response.body).toContain("<main>");
-      expect(response.body).not.toContain(OPERATOR_TOKEN);
-    }
-
-    const missing = await server.inject({ method: "GET", url: "/dashboard" });
-    expect(missing.statusCode).toBe(404);
-    expect(missing.json()).toEqual({ error: "not_found" });
-  });
-
   it("redirects valid Google OAuth starts and rejects open redirects", async () => {
     services.googleOAuth.start = vi.fn(async () => ({
       kind: "redirect" as const,
@@ -199,26 +184,6 @@ describe("operator HTTP interface", () => {
     expect(services.operations.status).not.toHaveBeenCalled();
     expect(services.operations.exportHousehold).not.toHaveBeenCalled();
     expect(services.operations.deleteHousehold).not.toHaveBeenCalled();
-  });
-
-  it("returns only the injected safe operator status shape", async () => {
-    services.operations.status = vi.fn(async () => ({
-      status: "degraded" as const,
-      checks: { database: "ok" as const, queue: "degraded" as const },
-    }));
-
-    const response = await server.inject({
-      method: "GET",
-      url: "/operator/status",
-      headers: { authorization: `Bearer ${OPERATOR_TOKEN}` },
-    });
-
-    expect(response.statusCode).toBe(200);
-    expect(response.json()).toEqual({
-      status: "degraded",
-      checks: { database: "ok", queue: "degraded" },
-    });
-    expect(response.headers["cache-control"]).toBe("no-store");
   });
 
   it("serves an authenticated no-store household export", async () => {

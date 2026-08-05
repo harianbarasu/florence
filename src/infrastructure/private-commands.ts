@@ -290,14 +290,23 @@ export class PrivateGoogleCommandService implements PrivateCommandHandler {
     if (gmailReady) {
       await this.options.googleQueue.enqueueGoogleSyncWork({
         householdId: event.householdId,
-        idempotencyKey: `google:${event.connectionId}:start`,
-        work: {
-          kind: "start",
-          householdId: event.householdId,
-          adultId: event.adultId,
-          connectionId: event.connectionId,
-          depth: "full_history",
-        },
+        idempotencyKey: `google:${event.connectionId}:activation:${event.activationId}:${
+          event.hadPriorGmailState ? "continue" : "start"
+        }`,
+        work: event.hadPriorGmailState
+          ? {
+              kind: "continue",
+              householdId: event.householdId,
+              adultId: event.adultId,
+              connectionId: event.connectionId,
+            }
+          : {
+              kind: "start",
+              householdId: event.householdId,
+              adultId: event.adultId,
+              connectionId: event.connectionId,
+              depth: "full_history",
+            },
       });
     }
     if (!gmailReady || !calendarReady) {
@@ -317,7 +326,7 @@ export class PrivateGoogleCommandService implements PrivateCommandHandler {
         {
           householdId: event.householdId,
           adultId: event.adultId,
-          idempotencyKey: `google:${event.connectionId}:connected-incomplete`,
+          idempotencyKey: `google:${event.connectionId}:activation:${event.activationId}:connected-incomplete`,
         },
         "google-connected-incomplete",
         `${event.accountLabel} connected${event.email ? ` as ${event.email}` : ""}, but setup is not complete because ${missing.join(" and ")} ${missing.length === 1 ? "is" : "are"} unavailable. I have not marked your household onboarding complete. Reconnect after that is resolved.`,
@@ -328,10 +337,14 @@ export class PrivateGoogleCommandService implements PrivateCommandHandler {
       {
         householdId: event.householdId,
         adultId: event.adultId,
-        idempotencyKey: `google:${event.connectionId}:connected`,
+        idempotencyKey: `google:${event.connectionId}:activation:${event.activationId}:connected`,
       },
       "google-connected",
-      `${event.accountLabel} is connected${event.email ? ` as ${event.email}` : ""}. Florence is starting mail with the most recent 90 days, then will work backward through one year and older history without delaying new mail. I’m also privately discovering your primary and selected Google calendars, including shared calendars you show in Google. Say “show my calendars” after synchronization to review coverage. Raw mail and calendar details stay private unless you approve a minimum household meaning or a sharing rule.`,
+      `${event.accountLabel} is connected${event.email ? ` as ${event.email}` : ""}. Florence is ${
+        event.hadPriorGmailState
+          ? "resuming mail from its durable cursor"
+          : "starting mail with the most recent 90 days, then working backward through one year and older history without delaying new mail"
+      }. I’m also privately discovering your primary and selected Google calendars, including shared calendars you show in Google. Say “show my calendars” after synchronization to review coverage. Raw mail and calendar details stay private unless you approve a minimum household meaning or a sharing rule.`,
     );
   }
 

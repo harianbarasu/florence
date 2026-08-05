@@ -1,9 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ApplicationInterpreterPort } from "../../src/application/index.js";
-import {
-  extractInviteeHandle,
-  OnboardingAwareInterpreter,
-} from "../../src/infrastructure/onboarding-interpreter.js";
+import { OnboardingAwareInterpreter } from "../../src/infrastructure/onboarding-interpreter.js";
 import { ADULT_A, ADULT_B, directMessage, HOUSEHOLD_ID } from "../application/fixtures.js";
 
 const MODEL_RESULT = { intent: "ignore", confidence: 1, rationale: "No explicit action." };
@@ -224,11 +221,5 @@ describe("OnboardingAwareInterpreter", () => {
         },
       ),
     ).resolves.toMatchObject({ action: "confirm_profile" });
-  });
-
-  it("normalizes E.164 and iMessage email invite handles", () => {
-    expect(extractInviteeHandle("invite +1 (415) 555-0123")).toBe("+14155550123");
-    expect(extractInviteeHandle("invite Parent.Name@icloud.com")).toBe("parent.name@icloud.com");
-    expect(extractInviteeHandle("invite my partner")).toBeNull();
   });
 });

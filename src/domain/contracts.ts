@@ -549,7 +549,7 @@ export const CalendarEventCreateActionSchema = z
     requestedByAdultId: AdultIdSchema,
     availabilityAdultIds: z.array(AdultIdSchema).min(1).max(20),
     targetConnectionId: appIdSchema("ExternalConnectionId"),
-    calendarId: z.literal("primary"),
+    calendarId: z.string().min(1).max(1_000),
     hasConflict: z.boolean(),
   })
   .superRefine((action, context) => {
@@ -603,7 +603,7 @@ export function calendarEventCreateActionDigest(action: {
   requestedByAdultId: string;
   availabilityAdultIds: readonly string[];
   targetConnectionId: string;
-  calendarId: "primary";
+  calendarId: string;
   hasConflict: boolean;
 }): z.infer<typeof ActionDigestSchema> {
   return ActionDigestSchema.parse(

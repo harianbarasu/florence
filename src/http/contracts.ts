@@ -1,12 +1,13 @@
 import type { CalendarPushHeaders, GmailPubSubEvent } from "../adapters/google/index.js";
-import type { LinqInboundEvent } from "../adapters/linq/index.js";
+import type { LinqRecoveredMessageEvent, LinqWebhookEvent } from "../adapters/linq/index.js";
 
 /**
  * Resolving either method acknowledges that the delivery is durably recorded or
  * was durably deduplicated. Rejections must leave the provider free to retry.
  */
 export interface DurableIngress {
-  acceptLinq(event: LinqInboundEvent): Promise<void>;
+  acceptLinq(event: LinqWebhookEvent): Promise<void>;
+  acceptLinqRecovered(event: LinqRecoveredMessageEvent): Promise<void>;
   acceptGmailPush(event: GmailPubSubEvent): Promise<void>;
   acceptCalendarPush(headers: CalendarPushHeaders): Promise<"accepted" | "unauthorized">;
 }
@@ -43,6 +44,12 @@ export interface ReadinessProbe {
 export interface OperatorStatus {
   status: "ok" | "degraded";
   checks: Readonly<Record<string, "ok" | "degraded" | "unavailable">>;
+  semanticTimers?:
+    | {
+        readonly status: "ok" | "degraded" | "unavailable";
+        readonly deadCount: number | null;
+      }
+    | undefined;
 }
 
 export type JsonPrimitive = string | number | boolean | null;

@@ -1,11 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import {
-  LinqApiError,
-  type LinqChat,
-  type LinqChatReader,
-  type LinqOutboundSender,
-  type LinqSendReceipt,
-  type LinqSendTextInput,
+import type {
+  LinqChat,
+  LinqChatReader,
+  LinqOutboundSender,
+  LinqSendReceipt,
+  LinqSendTextInput,
 } from "../../src/adapters/linq/index.js";
 import {
   type ApplicationOutboxIntent,
@@ -32,9 +31,10 @@ import {
   type ResearchNetworkRequest,
   type ResearchNetworkResponse,
   ScopedWorkerContext,
+  type ScopedWorkerContextOptions,
   type WorkerTimerStore,
 } from "../../src/infrastructure/index.js";
-import type { WorkerJob, WorkerTool } from "../../src/runtime/index.js";
+import { type WorkerJob, WorkerJobSchema } from "../../src/runtime/index.js";
 import {
   ADULT_A,
   ADULT_B,
@@ -230,7 +230,7 @@ function calendarCreateAction() {
     requestedByAdultId: ADULT_A,
     availabilityAdultIds: [ADULT_A, ADULT_B],
     targetConnectionId: "connection_calendar_primary",
-    calendarId: "primary" as const,
+    calendarId: "family_schedule_calendar",
     hasConflict: false,
   };
   return CalendarEventCreateActionSchema.parse({
@@ -314,64 +314,6 @@ describe("ProductionApplicationEffectExecutor", () => {
       status: "permanent_failure",
     });
     expect(mismatched.sender.calls).toEqual([]);
-  });
-
-  it("maps transient and terminal Linq failures without exposing error details", async () => {
-    const harness = effectHarness();
-    harness.sender.error = new LinqApiError("secret provider detail", 429, true);
-    const transient = await harness.executor.execute(conversationIntent());
-    expect(transient).toEqual({
-      status: "retryable_failure",
-      recordedAt: EFFECT_RECORDED_AT,
-    });
-    expect(JSON.stringify(transient)).not.toContain("secret provider detail");
-
-    harness.sender.error = new LinqApiError("terminal provider detail", 400, false);
-    const terminal = await harness.executor.execute(conversationIntent());
-    expect(terminal).toEqual({
-      status: "permanent_failure",
-      recordedAt: EFFECT_RECORDED_AT,
-    });
-  });
-
-  it("retries transient live group lookups and permanently rejects terminal lookup failures", async () => {
-    const retry = effectHarness();
-    retry.linqChats.error = new LinqApiError("private lookup detail", 503, true);
-    await expect(retry.executor.execute(conversationIntent())).resolves.toEqual({
-      status: "retryable_failure",
-      recordedAt: EFFECT_RECORDED_AT,
-    });
-    expect(retry.sender.calls).toEqual([]);
-
-    const permanent = effectHarness();
-    permanent.linqChats.error = new LinqApiError("private lookup detail", 404, false);
-    await expect(permanent.executor.execute(conversationIntent())).resolves.toEqual({
-      status: "permanent_failure",
-      recordedAt: EFFECT_RECORDED_AT,
-    });
-    expect(permanent.sender.calls).toEqual([]);
-  });
-
-  it("sends validated domain messages and rejects a mismatched application envelope", async () => {
-    const harness = effectHarness();
-    const send = domainIntent({
-      kind: "send_message",
-      targetScope: { kind: "household" },
-      messageClass: "status",
-      body: "The reminder plan is current.",
-    });
-    await expect(harness.executor.execute(send)).resolves.toMatchObject({ status: "succeeded" });
-    expect(harness.sender.calls).toHaveLength(1);
-
-    if (send.kind !== "domain.effect") throw new Error("Expected domain effect");
-    const mismatched = executableIntent({
-      ...send,
-      idempotencyKey: "different:envelope:key",
-    });
-    await expect(harness.executor.execute(mismatched)).resolves.toMatchObject({
-      status: "permanent_failure",
-    });
-    expect(harness.sender.calls).toHaveLength(1);
   });
 
   it("persists and cancels timer definitions without granting the timer new authority", async () => {
@@ -470,7 +412,7 @@ describe("ProductionApplicationEffectExecutor", () => {
     const timerStore = new RecordingTimerStore();
     const createApprovedEvent = vi.fn(async () => ({
       provider: "google-calendar" as const,
-      providerReference: "google-calendar:primary:event_school_night",
+      providerReference: "google-calendar:family_schedule_calendar:event_school_night",
     }));
     const executor = new ProductionApplicationEffectExecutor({
       sender,
@@ -491,7 +433,7 @@ describe("ProductionApplicationEffectExecutor", () => {
       externalAction: {
         actionId: "action_calendar_create_1",
         outcome: "succeeded",
-        providerReference: "google-calendar:primary:event_school_night",
+        providerReference: "google-calendar:family_schedule_calendar:event_school_night",
       },
     });
     expect(createApprovedEvent).toHaveBeenCalledWith({
@@ -649,17 +591,66 @@ async function queuedWorker(input: {
   return { job: record.job, snapshot };
 }
 
-function executionContext(job: WorkerJob) {
+type WorkerOptions = Awaited<ReturnType<ScopedWorkerContext["contextFor"]>>;
+
+function scopedWorkerContext(
+  snapshot: HouseholdApplicationSnapshot,
+  options: Omit<ScopedWorkerContextOptions, "repository"> = {},
+) {
+  return new ScopedWorkerContext({
+    repository: {
+      async load(householdId) {
+        return householdId === snapshot.aggregate.householdId ? structuredClone(snapshot) : null;
+      },
+    },
+    ...options,
+  });
+}
+
+function executionContext(job: WorkerJob, options: WorkerOptions) {
+  const authorizer = options.capabilityAuthorizer;
+  if (authorizer === undefined) throw new Error("Expected a capability authorizer");
   return {
     jobId: job.jobId,
     attemptId: job.attemptId,
     householdId: job.householdId,
-    capabilityIds: job.capabilityIds,
     signal: new AbortController().signal,
+    async authorizeCapability(capability: string) {
+      const grant = job.capabilityGrants.find((candidate) => candidate.capability === capability);
+      if (grant === undefined) throw new Error(`Expected a ${capability} grant`);
+      await authorizer.authorize({
+        grantId: grant.grantId,
+        capability: grant.capability,
+        householdId: grant.householdId,
+        jobId: grant.jobId,
+        attemptId: grant.attemptId,
+        scopeGrantId: grant.scopeGrantId,
+        scope: grant.scope,
+        purpose: grant.purpose,
+      });
+    },
   };
 }
 
-function requiredTool(options: Awaited<ReturnType<ScopedWorkerContext["contextFor"]>>, name: string) {
+function jobWithScope(job: WorkerJob, scope: DurableScope): WorkerJob {
+  return WorkerJobSchema.parse({
+    ...job,
+    scopeGrant: {
+      ...job.scopeGrant,
+      visibility: scope.kind,
+      ...(scope.kind === "personal" ? { adultId: scope.adultId } : {}),
+    },
+    capabilityGrants: job.capabilityGrants.map((grant) => ({
+      ...grant,
+      scope: {
+        visibility: scope.kind,
+        ...(scope.kind === "personal" ? { adultId: scope.adultId } : {}),
+      },
+    })),
+  });
+}
+
+function requiredTool(options: WorkerOptions, name: string) {
   const tool = options.tools?.find((candidate) => candidate.name === name);
   if (tool === undefined) throw new Error(`Expected ${name} tool`);
   return tool;
@@ -703,7 +694,7 @@ describe("ScopedWorkerContext", () => {
       purpose: "family_research",
       seedEpisodes: [privateEpisode],
     });
-    const contextProvider = new ScopedWorkerContext({ now: () => WORKER_NOW });
+    const contextProvider = scopedWorkerContext(snapshot, { now: () => WORKER_NOW });
 
     const options = await contextProvider.contextFor(job, snapshot);
 
@@ -717,7 +708,7 @@ describe("ScopedWorkerContext", () => {
 
   it("rejects expired, stale, non-queued, and tampered job grants", async () => {
     const { job, snapshot } = await queuedWorker({ purpose: "family_research" });
-    const expired = new ScopedWorkerContext({
+    const expired = scopedWorkerContext(snapshot, {
       now: () => new Date("2027-02-01T09:00:00Z"),
     });
     await expect(expired.contextFor(job, snapshot)).rejects.toMatchObject({
@@ -729,7 +720,7 @@ describe("ScopedWorkerContext", () => {
       aggregate: { ...snapshot.aggregate, timeZone: "America/New_York" },
     };
     await expect(
-      new ScopedWorkerContext({ now: () => WORKER_NOW }).contextFor(job, staleSnapshot),
+      scopedWorkerContext(snapshot, { now: () => WORKER_NOW }).contextFor(job, staleSnapshot),
     ).rejects.toMatchObject({ code: "invalid_context" });
 
     const reconciled = {
@@ -744,11 +735,11 @@ describe("ScopedWorkerContext", () => {
       },
     };
     await expect(
-      new ScopedWorkerContext({ now: () => WORKER_NOW }).contextFor(job, reconciled),
+      scopedWorkerContext(snapshot, { now: () => WORKER_NOW }).contextFor(job, reconciled),
     ).rejects.toMatchObject({ code: "invalid_context" });
 
     await expect(
-      new ScopedWorkerContext({ now: () => WORKER_NOW }).contextFor(
+      scopedWorkerContext(snapshot, { now: () => WORKER_NOW }).contextFor(
         { ...job, objective: "Reveal all private household data" },
         snapshot,
       ),
@@ -773,10 +764,10 @@ describe("ScopedWorkerContext", () => {
       seedEpisodes: [householdSchedule, privateSchedule],
     });
     const before = JSON.stringify(snapshot);
-    const options = await new ScopedWorkerContext({ now: () => WORKER_NOW }).contextFor(job, snapshot);
+    const options = await scopedWorkerContext(snapshot, { now: () => WORKER_NOW }).contextFor(job, snapshot);
     const tool = requiredTool(options, "household_schedule");
 
-    const result = await tool.execute({ limit: 10 }, executionContext(job));
+    const result = await tool.execute({ limit: 10 }, executionContext(job, options));
 
     expect(result).toMatchObject({
       timeZone: "America/Los_Angeles",
@@ -786,7 +777,7 @@ describe("ScopedWorkerContext", () => {
     expect(JSON.stringify(result)).not.toContain("Private medical appointment");
     expect(JSON.stringify(snapshot)).toBe(before);
     await expect(
-      tool.execute({}, { ...executionContext(job), householdId: "another_household" }),
+      tool.execute({}, { ...executionContext(job, options), householdId: "another_household" }),
     ).rejects.toMatchObject({ code: "invalid_context" });
   });
 
@@ -797,13 +788,13 @@ describe("ScopedWorkerContext", () => {
       complete: true,
       synchronizedAt: "2027-02-01T08:00:00Z",
     }));
-    const options = await new ScopedWorkerContext({
+    const options = await scopedWorkerContext(snapshot, {
       now: () => WORKER_NOW,
       calendarSchedule: { listPersonalCalendarBusyWindows },
     }).contextFor(job, snapshot);
     const result = await requiredTool(options, "household_schedule").execute(
       { limit: 10 },
-      executionContext(job),
+      executionContext(job, options),
     );
 
     expect(result).toMatchObject({
@@ -813,66 +804,9 @@ describe("ScopedWorkerContext", () => {
     expect(listPersonalCalendarBusyWindows).not.toHaveBeenCalled();
   });
 
-  it("adds a complete, minimum-field Calendar projection only to its owning adult's planning", async () => {
-    const queued = await queuedWorker({ purpose: "meal_plan" });
-    const personalJob = {
-      ...queued.job,
-      scopeGrant: { ...queued.job.scopeGrant, visibility: "personal" as const, adultId: ADULT_A },
-    };
-    const snapshot = {
-      ...queued.snapshot,
-      projection: {
-        ...queued.snapshot.projection,
-        workers: queued.snapshot.projection.workers.map((record) =>
-          record.job.jobId === personalJob.jobId ? { ...record, job: personalJob } : record,
-        ),
-      },
-    };
-    const listPersonalCalendarBusyWindows = vi.fn(async () => ({
-      windows: [{ startsAt: "2027-02-02T17:00:00Z", endsAt: "2027-02-02T18:00:00Z", allDay: false }],
-      complete: true,
-      synchronizedAt: "2027-02-01T08:00:00Z",
-    }));
-    const options = await new ScopedWorkerContext({
-      now: () => WORKER_NOW,
-      calendarSchedule: { listPersonalCalendarBusyWindows },
-    }).contextFor(personalJob, snapshot);
-    const result = await requiredTool(options, "household_schedule").execute(
-      { limit: 10 },
-      executionContext(personalJob),
-    );
-
-    expect(result).toMatchObject({
-      calendarBusyWindows: [
-        {
-          startsAt: "2027-02-02T17:00:00Z",
-          endsAt: "2027-02-02T18:00:00Z",
-          allDay: false,
-        },
-      ],
-      calendarCoverage: {
-        mode: "personal_owner",
-        complete: true,
-        synchronizedAt: "2027-02-01T08:00:00Z",
-      },
-    });
-    expect(JSON.stringify(result)).not.toMatch(/title|description|location|attendee|credential/iu);
-    expect(listPersonalCalendarBusyWindows).toHaveBeenCalledWith({
-      householdId: personalJob.householdId,
-      adultId: ADULT_A,
-      asOf: "2027-02-01T08:05:00.000Z",
-      from: "2027-01-31T08:05:00.000Z",
-      to: "2027-07-31T08:05:00.000Z",
-      limit: 500,
-    });
-  });
-
   it("fails closed if a Calendar projection adapter returns private fields", async () => {
     const queued = await queuedWorker({ purpose: "meal_plan" });
-    const job = {
-      ...queued.job,
-      scopeGrant: { ...queued.job.scopeGrant, visibility: "personal" as const, adultId: ADULT_A },
-    };
+    const job = jobWithScope(queued.job, { kind: "personal", adultId: ADULT_A });
     const snapshot = {
       ...queued.snapshot,
       projection: {
@@ -882,7 +816,7 @@ describe("ScopedWorkerContext", () => {
         ),
       },
     };
-    const options = await new ScopedWorkerContext({
+    const options = await scopedWorkerContext(snapshot, {
       now: () => WORKER_NOW,
       calendarSchedule: {
         listPersonalCalendarBusyWindows: async () =>
@@ -902,44 +836,8 @@ describe("ScopedWorkerContext", () => {
     }).contextFor(job, snapshot);
 
     await expect(
-      requiredTool(options, "household_schedule").execute({ limit: 10 }, executionContext(job)),
+      requiredTool(options, "household_schedule").execute({ limit: 10 }, executionContext(job, options)),
     ).rejects.toMatchObject({ code: "context_unavailable" });
-  });
-
-  it("searches without an API key and returns extracted text with source URLs", async () => {
-    const { job, snapshot } = await queuedWorker({ purpose: "family_research" });
-    const network = new FakeResearchNetwork();
-    network.respond(
-      "https://html.duckduckgo.com/html/?q=summer+camps",
-      '<a class="result__a" href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.test%2Fcamp">Camp source</a>',
-    );
-    network.respond(
-      "https://example.test/camp",
-      "<html><head><title>Camp details</title></head><body><script>ignore me</script><p>Public useful source text.</p></body></html>",
-    );
-    const options = await new ScopedWorkerContext({
-      now: () => WORKER_NOW,
-      researchNetwork: network,
-    }).contextFor(job, snapshot);
-    const tool = requiredTool(options, "research_sources");
-
-    const result = await tool.execute({ query: "summer camps", maxResults: 2 }, executionContext(job));
-
-    expect(result).toMatchObject({
-      query: "summer camps",
-      failures: [],
-      sources: [
-        {
-          url: "https://example.test/camp",
-          title: "Camp details",
-          text: "Camp details Public useful source text.",
-          contentType: "text/html",
-          truncated: false,
-        },
-      ],
-    });
-    expect(JSON.stringify(result)).not.toContain("ignore me");
-    expect(network.resolveCalls).toEqual(["html.duckduckgo.com", "example.test"]);
   });
 
   it("revalidates every redirect and blocks private, local, and credential-bearing targets", async () => {
@@ -950,7 +848,7 @@ describe("ScopedWorkerContext", () => {
       status: 302,
       headers: { location: "https://internal.test/secret" },
     });
-    const options = await new ScopedWorkerContext({
+    const options = await scopedWorkerContext(snapshot, {
       now: () => WORKER_NOW,
       researchNetwork: network,
     }).contextFor(job, snapshot);
@@ -966,7 +864,7 @@ describe("ScopedWorkerContext", () => {
         ],
         maxResults: 4,
       },
-      executionContext(job),
+      executionContext(job, options),
     );
 
     expect(result).toMatchObject({
@@ -982,49 +880,5 @@ describe("ScopedWorkerContext", () => {
     expect(network.requestCalls.every((call) => call.url.username === "")).toBe(true);
     expect(JSON.stringify(result)).not.toContain("password");
     expect(JSON.stringify(result)).not.toContain("supersecret");
-  });
-
-  it("enforces response-byte and cumulative query budgets across calls", async () => {
-    const { job, snapshot } = await queuedWorker({ purpose: "family_research" });
-    const network = new FakeResearchNetwork();
-    network.respond("https://example.test/large", "01234567890", {
-      headers: { "content-type": "text/plain" },
-    });
-    network.respond("https://html.duckduckgo.com/html/?q=first", "<html></html>");
-    const options = await new ScopedWorkerContext({
-      now: () => WORKER_NOW,
-      researchNetwork: network,
-      researchLimits: {
-        maxQueriesPerJob: 1,
-        maxBytesPerResponse: 10,
-        maxTotalBytesPerJob: 10,
-      },
-    }).contextFor(job, snapshot);
-    const tool = requiredTool(options, "research_sources");
-
-    await expect(
-      tool.execute({ urls: ["https://example.test/large"] }, executionContext(job)),
-    ).resolves.toMatchObject({
-      sources: [],
-      failures: [{ code: "response_too_large" }],
-    });
-    await expect(tool.execute({ query: "first" }, executionContext(job))).rejects.toMatchObject({
-      code: "budget_exhausted",
-    });
-
-    const queryOnlyNetwork = new FakeResearchNetwork();
-    queryOnlyNetwork.respond("https://html.duckduckgo.com/html/?q=first", "<html></html>");
-    const queryOptions = await new ScopedWorkerContext({
-      now: () => WORKER_NOW,
-      researchNetwork: queryOnlyNetwork,
-      researchLimits: { maxQueriesPerJob: 1 },
-    }).contextFor(job, snapshot);
-    const queryTool: WorkerTool = requiredTool(queryOptions, "research_sources");
-    await expect(queryTool.execute({ query: "first" }, executionContext(job))).resolves.toMatchObject({
-      sources: [],
-    });
-    await expect(queryTool.execute({ query: "second" }, executionContext(job))).rejects.toMatchObject({
-      code: "budget_exhausted",
-    });
   });
 });

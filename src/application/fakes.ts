@@ -10,6 +10,7 @@ import {
   type GmailTriageResult,
   type HouseholdApplicationSnapshot,
   HouseholdApplicationSnapshotSchema,
+  type PrivateReviewItem,
 } from "./contracts.js";
 import type {
   ApplicationCommit,
@@ -36,6 +37,7 @@ function repositoryKey(householdId: string, idempotencyKey: string): string {
 export class InMemoryApplicationRepository implements ApplicationRepositoryPort {
   readonly commits: ApplicationCommit[] = [];
   readonly outbox: ApplicationOutboxIntent[] = [];
+  readonly privateReviewItems: PrivateReviewItem[] = [];
   readonly snapshots = new Map<string, HouseholdApplicationSnapshot>();
   readonly #processed = new Map<string, ApplicationResult>();
 
@@ -88,6 +90,7 @@ export class InMemoryApplicationRepository implements ApplicationRepositoryPort 
     this.#processed.set(key, clone(result));
     this.commits.push(clone(input));
     this.outbox.push(...clone(input.outbox));
+    this.privateReviewItems.push(...clone(input.privateReviewItems));
     return { disposition: "committed", revision, outcome: clone(input.outcome) };
   }
 

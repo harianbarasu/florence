@@ -52,11 +52,11 @@ export function workerJob(overrides: Partial<WorkerJob> = {}): WorkerJob {
     scopeGrant: {
       grantId: "grant-1",
       visibility: "household",
-      purpose: "obligation interpretation",
+      purpose: "family_research",
       expiresAt: new Date(now + 60_000).toISOString(),
     },
     evidenceRefs: ["evidence-1"],
-    capabilityIds: [],
+    capabilityGrants: [],
     modelRouteId: fakeRoute.routeId,
     modelCapabilityProfile: "tool_planning",
     budget: {
@@ -73,9 +73,12 @@ export function workerJob(overrides: Partial<WorkerJob> = {}): WorkerJob {
 }
 
 export const workerPayload: WorkerResultPayload = {
+  purpose: "family_research",
   summary: "A signed form is due Friday.",
-  evidenceRefs: ["evidence-1"],
-  questions: [],
+  completion: {
+    status: "needs_input",
+    questions: ["Who should return the signed form?"],
+  },
   warnings: [],
   proposedCommands: [
     {

@@ -30,10 +30,18 @@ export interface CustomerExportReader {
   }): Promise<Record<string, unknown>>;
 }
 
+export interface PersonalAttentionExportReader {
+  exportForAdult(input: { householdId: string; adultId: string; asOf: string }): Promise<{
+    revisions: readonly Record<string, unknown>[];
+    applications: readonly Record<string, unknown>[];
+  }>;
+}
+
 export interface CustomerDataControlCommandServiceOptions {
   readonly store: PostgresCustomerDataControlStore;
   readonly outbox: CustomerDataControlOutbox;
   readonly exportReader: CustomerExportReader;
+  readonly personalAttention?: PersonalAttentionExportReader;
   readonly publicBaseUrl: string;
   readonly signingSecret: string;
   readonly now?: () => Date;
@@ -46,6 +54,7 @@ export class CustomerDataControlCommandService implements PrivateCommandHandler 
   readonly #store: PostgresCustomerDataControlStore;
   readonly #outbox: CustomerDataControlOutbox;
   readonly #exportReader: CustomerExportReader;
+  readonly #personalAttention: PersonalAttentionExportReader | undefined;
   readonly #publicBaseUrl: string;
   readonly #signingSecret: string;
   readonly #now: () => Date;
@@ -59,6 +68,7 @@ export class CustomerDataControlCommandService implements PrivateCommandHandler 
     this.#store = options.store;
     this.#outbox = options.outbox;
     this.#exportReader = options.exportReader;
+    this.#personalAttention = options.personalAttention;
     this.#publicBaseUrl = z.url().parse(options.publicBaseUrl);
     this.#signingSecret = options.signingSecret;
     this.#now = options.now ?? (() => new Date());
@@ -144,10 +154,17 @@ export class CustomerDataControlCommandService implements PrivateCommandHandler 
         requestedByAdultId: consumed.adultId,
         exportedAt: consumedAt,
       });
+      const personalAttention = this.#personalAttention
+        ? await this.#personalAttention.exportForAdult({
+            householdId: consumed.householdId,
+            adultId: consumed.adultId,
+            asOf: consumedAt,
+          })
+        : { revisions: [], applications: [] };
       return {
         status: "download",
         filename: `florence-export-${consumedAt.slice(0, 10)}.json`,
-        artifact: sanitizeCustomerExport(raw, consumed.adultId, consumedAt),
+        artifact: sanitizeCustomerExport({ ...raw, personalAttention }, consumed.adultId, consumedAt),
       };
     } catch {
       return { status: "unavailable" };
@@ -487,6 +504,9 @@ function sanitizeCustomerExport(
   requestedByAdultId: string,
   exportedAt: string,
 ): JsonObject {
+  const personalAttention = isRecord(raw.personalAttention)
+    ? raw.personalAttention
+    : { revisions: [], applications: [] };
   assertScopedRows(raw.connections, (row) => row.adult_id === requestedByAdultId);
   assertScopedRows(
     raw.sources,
@@ -496,8 +516,11 @@ function sanitizeCustomerExport(
     raw.audits,
     (row) => row.visibility === "household" || row.owner_adult_id === requestedByAdultId,
   );
+  assertScopedRows(raw.privateReviews, (row) => row.adult_id === requestedByAdultId);
+  assertScopedRows(personalAttention.revisions, (row) => row.adult_id === requestedByAdultId);
+  assertScopedRows(personalAttention.applications, (row) => row.adult_id === requestedByAdultId);
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     exportedAt,
     requestedByAdultId,
     household: selectObject(raw.household, [
@@ -553,6 +576,19 @@ function sanitizeCustomerExport(
       "created_at",
       "updated_at",
     ]),
+    privateReviews: selectArray(raw.privateReviews, [
+      "id",
+      "adult_id",
+      "item_key",
+      "source",
+      "summary",
+      "observed_at",
+      "digest_run_id",
+      "reviewed_at",
+      "retention_until",
+      "created_at",
+      "updated_at",
+    ]),
     projection:
       raw.projection === null ? null : selectObject(raw.projection, ["schema_version", "version", "state"]),
     applicationSnapshot:
@@ -571,6 +607,36 @@ function sanitizeCustomerExport(
       "details",
       "created_at",
     ]),
+    personalAttention: {
+      revisions: selectArray(personalAttention.revisions, [
+        "id",
+        "adult_id",
+        "rule_key",
+        "revision",
+        "supersedes_revision_id",
+        "status",
+        "rule",
+        "statement",
+        "sensitivity",
+        "source_message_ref",
+        "source_content_digest",
+        "evaluator_release_id",
+        "occurred_at",
+        "created_at",
+      ]),
+      applications: selectArray(personalAttention.applications, [
+        "id",
+        "adult_id",
+        "rule_revision_id",
+        "provider",
+        "source_ref",
+        "source_digest",
+        "baseline_decision",
+        "applied_decision",
+        "applied_at",
+        "created_at",
+      ]),
+    },
   };
 }
 

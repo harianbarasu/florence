@@ -33,7 +33,7 @@ export interface CustomerDeletionRemoteCleanup {
 export class GoogleCustomerDeletionCleanup implements CustomerDeletionRemoteCleanup {
   public constructor(
     private readonly options: {
-      store: PostgresCustomerDataControlStore;
+      store: Pick<PostgresCustomerDataControlStore, "loadCleanupConnection" | "loadCleanupCalendarChannel">;
       gmail: CustomerDeletionGmailPort;
       calendar: CustomerDeletionCalendarPort;
       oauth: CustomerDeletionGoogleCredentialPort;
@@ -88,19 +88,33 @@ export class GoogleCustomerDeletionCleanup implements CustomerDeletionRemoteClea
           return { status: "succeeded" };
         }
         if (!(error instanceof GoogleAdapterError) || error.code !== "unauthorized") throw error;
-        tokens = await this.options.oauth.refresh(tokens);
+        try {
+          tokens = await this.options.oauth.refresh(tokens);
+        } catch (refreshError) {
+          if (isPermanentlyInvalidGrant(refreshError)) return { status: "succeeded" };
+          throw refreshError;
+        }
         if (signal?.aborted) return { status: "retry", safeErrorCode: "cleanup_aborted" };
-        await operation(tokens.accessToken);
+        try {
+          await operation(tokens.accessToken);
+        } catch (retryError) {
+          if (
+            retryError instanceof GoogleAdapterError &&
+            (retryError.code === "not_found" || retryError.code === "unauthorized")
+          ) {
+            return { status: "succeeded" };
+          }
+          throw retryError;
+        }
       }
       return { status: "succeeded" };
     } catch (error) {
       if (
-        lease.attempt > 1 &&
         error instanceof GoogleAdapterError &&
         (error.code === "not_found" ||
-          (lease.kind === "google.oauth.revoke" && ["invalid_request", "unauthorized"].includes(error.code)))
+          (lease.kind === "google.oauth.revoke" && isPermanentlyInvalidGrant(error)))
       ) {
-        // A crash can lose the local receipt after Google completed an idempotent stop/revoke.
+        // Missing remote state or a permanently invalid grant leaves no live authority to clean up.
         return { status: "succeeded" };
       }
       return {
@@ -112,6 +126,14 @@ export class GoogleCustomerDeletionCleanup implements CustomerDeletionRemoteClea
       };
     }
   }
+}
+
+function isPermanentlyInvalidGrant(error: unknown): error is GoogleAdapterError {
+  return (
+    error instanceof GoogleAdapterError &&
+    !error.retryable &&
+    (error.code === "invalid_request" || error.code === "unauthorized")
+  );
 }
 
 export interface CustomerDeletionHostReport {

@@ -7,6 +7,7 @@ import {
   type LinqAttachmentReader,
   type LinqChatReader,
   type LinqInboundEvent,
+  type LinqMessageEvent,
   type LinqReactionEvent,
   linqInboundEventSchema,
   linqReactionFeedbackRef,
@@ -171,7 +172,7 @@ export class ProductionProviderProcessor {
   public async process(item: ClaimedProviderInboxItem): Promise<ProviderProcessingResult> {
     switch (item.provider) {
       case "linq":
-        return this.processLinq(item, linqInboundEventSchema.parse(item.payload));
+        return this.processLinq(linqInboundEventSchema.parse(item.payload));
       case "gmail": {
         const push = gmailPubSubEventSchema.parse(item.payload);
         const result = await this.options.google.processPush(push);
@@ -188,11 +189,19 @@ export class ProductionProviderProcessor {
     }
   }
 
-  private async processLinq(
-    item: ClaimedProviderInboxItem,
-    event: LinqInboundEvent,
-  ): Promise<ProviderProcessingResult> {
+  private async processLinq(event: LinqInboundEvent): Promise<ProviderProcessingResult> {
     if (event.eventType !== "message.received") return this.processLinqReaction(event);
+
+    const isHistoricalRecovery =
+      event.transport === "partner_api_reconciliation" && event.recoveryDisposition === "history";
+    if (isHistoricalRecovery && event.message.consentCommand === null) {
+      return {
+        resolution: {
+          classification: "linq:reconciliation:history_observed",
+          messageRef: event.businessDedupeKey,
+        },
+      };
+    }
 
     const handle = canonicalizeLinqHandle(event.sender.handle);
     const knownBeforeConsent = await this.resolveKnownChannel(event, handle);
@@ -207,12 +216,12 @@ export class ProductionProviderProcessor {
       return {
         resolution: {
           classification: "linq:deleted_identity:ignored",
-          providerEventId: event.providerEventId,
+          messageRef: event.businessDedupeKey,
         },
       };
     }
     if (event.message.consentCommand === "stop") {
-      await this.options.runtimeStore.setSuppression({
+      const suppression = await this.options.runtimeStore.setSuppression({
         externalChatId: event.conversation.id,
         ...(event.scope === "direct" ? { externalHandle: handle } : {}),
         scope: event.scope === "direct" ? "private" : "group",
@@ -221,13 +230,23 @@ export class ProductionProviderProcessor {
         sourceEventId: event.dedupeKey,
         reason: "stop_command",
       });
+      if (isHistoricalRecovery) {
+        return {
+          ...(knownBeforeConsent ? { householdId: knownBeforeConsent.householdId } : {}),
+          resolution: {
+            classification: "linq:reconciliation:history_observed",
+            messageRef: event.businessDedupeKey,
+            consentState: suppression.suppressed ? "suppressed" : "released",
+          },
+        };
+      }
       return {
         ...(knownBeforeConsent ? { householdId: knownBeforeConsent.householdId } : {}),
         resolution: { classification: "linq:stop:suppressed" },
       };
     }
     if (event.scope === "direct" && event.message.consentCommand === "start") {
-      await this.options.runtimeStore.setSuppression({
+      const release = await this.options.runtimeStore.setSuppression({
         externalChatId: event.conversation.id,
         externalHandle: handle,
         scope: "private",
@@ -236,6 +255,43 @@ export class ProductionProviderProcessor {
         sourceEventId: event.dedupeKey,
         reason: "start_command",
       });
+      if (isHistoricalRecovery) {
+        return {
+          ...(knownBeforeConsent ? { householdId: knownBeforeConsent.householdId } : {}),
+          resolution: {
+            classification: "linq:reconciliation:history_observed",
+            messageRef: event.businessDedupeKey,
+            consentState: release.suppressed ? "suppressed" : "released",
+          },
+        };
+      }
+    }
+    if (isHistoricalRecovery) {
+      if (event.scope === "group" && event.message.consentCommand === "start") {
+        if (knownBeforeConsent?.channelType === "group") {
+          await this.routeVerifiedGroup(event, handle, knownBeforeConsent);
+        } else {
+          // Reconstruct consent for an as-yet unbound chat without activating a
+          // channel. A known household group still requires live verification.
+          await this.options.runtimeStore.setSuppression({
+            externalChatId: event.conversation.id,
+            scope: "group",
+            suppressed: false,
+            occurredAt: event.occurredAt,
+            sourceEventId: event.dedupeKey,
+            reason: "start_command",
+          });
+        }
+      }
+      const suppressed = await this.options.runtimeStore.isSuppressed(event.conversation.id);
+      return {
+        ...(knownBeforeConsent ? { householdId: knownBeforeConsent.householdId } : {}),
+        resolution: {
+          classification: "linq:reconciliation:history_observed",
+          messageRef: event.businessDedupeKey,
+          consentState: suppressed ? "suppressed" : "released",
+        },
+      };
     }
     if (
       event.scope === "direct" &&
@@ -305,7 +361,6 @@ export class ProductionProviderProcessor {
       });
       if (transfer.status === "ready") {
         return this.processConfirmedInvitationTransfer(
-          item,
           event,
           handle,
           route,
@@ -331,7 +386,7 @@ export class ProductionProviderProcessor {
         ...(event.message.replyTo === null ? {} : { replyToMessageId: event.message.replyTo.messageId }),
         ...(replyTo === null ? {} : { replyTo }),
         occurredAt: event.occurredAt,
-        idempotencyKey: item.idempotencyKey,
+        idempotencyKey: event.businessDedupeKey,
       });
       if (command.handled) {
         return {
@@ -345,7 +400,7 @@ export class ProductionProviderProcessor {
     const applicationResult = await this.options.application.process({
       kind: "conversation_message",
       householdId: route.resolution.householdId,
-      idempotencyKey: item.idempotencyKey,
+      idempotencyKey: event.businessDedupeKey,
       occurredAt: event.occurredAt,
       channel:
         event.scope === "direct"
@@ -407,8 +462,7 @@ export class ProductionProviderProcessor {
   }
 
   private async processConfirmedInvitationTransfer(
-    item: ClaimedProviderInboxItem,
-    event: Extract<LinqInboundEvent, { eventType: "message.received"; scope: "direct" }>,
+    event: Extract<LinqMessageEvent, { scope: "direct" }>,
     handle: string,
     sourceRoute: { resolution: ChannelResolution; senderAdultId: string },
     replyTo: ReferencedConversationMessage,
@@ -427,7 +481,7 @@ export class ProductionProviderProcessor {
       ? await this.options.application.process({
           kind: "conversation_message",
           householdId: transfer.householdId,
-          idempotencyKey: item.idempotencyKey,
+          idempotencyKey: event.businessDedupeKey,
           occurredAt: event.occurredAt,
           channel: { channelId: event.conversation.id, scope: "personal", adultId: transfer.adultId },
           senderAdultId: transfer.adultId,
@@ -466,7 +520,7 @@ export class ProductionProviderProcessor {
           ...(event.message.replyTo === null ? {} : { replyToMessageId: event.message.replyTo.messageId }),
           replyTo,
           occurredAt: event.occurredAt,
-          idempotencyKey: item.idempotencyKey,
+          idempotencyKey: event.businessDedupeKey,
         });
       }
       return {
@@ -583,9 +637,7 @@ export class ProductionProviderProcessor {
     return adultId === undefined ? null : { householdId: known.householdId, adultId };
   }
 
-  private async resolveAttachmentContents(
-    event: Extract<LinqInboundEvent, { eventType: "message.received" }>,
-  ): Promise<ConversationAttachmentContent[]> {
+  private async resolveAttachmentContents(event: LinqMessageEvent): Promise<ConversationAttachmentContent[]> {
     const resolved: ConversationAttachmentContent[] = [];
     let remainingBytes = 15 * 1024 * 1024;
     for (const attachment of event.message.attachments) {
@@ -664,7 +716,7 @@ export class ProductionProviderProcessor {
   }
 
   private async resolveKnownChannel(
-    event: Extract<LinqInboundEvent, { eventType: "message.received" }>,
+    event: LinqMessageEvent,
     handle: string,
   ): Promise<ChannelResolution | null> {
     return this.options.applicationStore.resolveChannel({
@@ -675,7 +727,7 @@ export class ProductionProviderProcessor {
   }
 
   private async routeDirect(
-    event: Extract<LinqInboundEvent, { eventType: "message.received"; scope: "direct" }>,
+    event: Extract<LinqMessageEvent, { scope: "direct" }>,
     handle: string,
     known: ChannelResolution | null,
   ): Promise<{ resolution: ChannelResolution; senderAdultId: string }> {
@@ -709,7 +761,7 @@ export class ProductionProviderProcessor {
   }
 
   private async routeVerifiedGroup(
-    event: Extract<LinqInboundEvent, { eventType: "message.received"; scope: "group" }>,
+    event: Extract<LinqMessageEvent, { scope: "group" }>,
     handle: string,
     known: ChannelResolution | null,
   ): Promise<{ resolution: ChannelResolution; senderAdultId: string } | null> {

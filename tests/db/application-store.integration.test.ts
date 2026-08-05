@@ -18,8 +18,11 @@ import {
 } from "../../src/db/application-store.js";
 import { closeDatabase, createDatabase, type Database } from "../../src/db/client.js";
 import { migrateDatabase } from "../../src/db/migrate.js";
-import { HouseholdAggregateSchema } from "../../src/domain/index.js";
+import { AdultIdSchema, HouseholdAggregateSchema } from "../../src/domain/index.js";
 import { FakeWorkerRuntime } from "../../src/runtime/index.js";
+import { BlindIndex } from "../../src/security/blind-index.js";
+import { SecretBox } from "../../src/security/secret-box.js";
+import { TenantJsonCipher } from "../../src/security/tenant-json-cipher.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 
@@ -31,7 +34,13 @@ describe.skipIf(!databaseUrl)("ApplicationStore PostgreSQL integration", () => {
   beforeAll(async () => {
     database = createDatabase(databaseUrl as string, { max: 16, schema });
     await migrateDatabase(database, schema);
-    store = new ApplicationStore(database);
+    const encryptionKey = randomUUID().replaceAll("-", "").padEnd(64, "0");
+    store = new ApplicationStore(
+      database,
+      new SecretBox(encryptionKey),
+      new TenantJsonCipher({ activeKeyId: "integration", keys: { integration: encryptionKey } }),
+      new BlindIndex(encryptionKey),
+    );
   });
 
   afterAll(async () => {
@@ -77,9 +86,10 @@ describe.skipIf(!databaseUrl)("ApplicationStore PostgreSQL integration", () => {
       status: "quarantined",
     });
 
+    const queuedIdempotencyKey = `linq:${randomUUID()}`;
     const queued = await store.ingestProviderEvent({
       ...input,
-      idempotencyKey: `linq:${randomUUID()}`,
+      idempotencyKey: queuedIdempotencyKey,
       payload: { text: "Ordinary event" },
       maxAttempts: 1,
     });
@@ -87,6 +97,12 @@ describe.skipIf(!databaseUrl)("ApplicationStore PostgreSQL integration", () => {
     expect(claimed.map((item) => item.id)).toEqual([queued.inboxId]);
     const item = claimed[0];
     if (!item) throw new Error("Expected a provider inbox lease");
+    expect(item).toMatchObject({
+      idempotencyKey: queuedIdempotencyKey,
+      authentication: input.authentication,
+      eventKind: input.eventKind,
+      payload: { text: "Ordinary event" },
+    });
     await expect(
       store.failProviderInbox({
         inboxId: item.id,
@@ -104,12 +120,31 @@ describe.skipIf(!databaseUrl)("ApplicationStore PostgreSQL integration", () => {
       }),
     ).resolves.toBe("dead");
 
-    const state = await database<{ status: string; household_id: string | null; conflicts: string }[]>`
-      select pi.status, pi.household_id,
-        (select count(*)::text from provider_inbox_conflicts pic where pic.inbox_id = pi.id) as conflicts
+    const state = await database<
+      {
+        status: string;
+        household_id: string | null;
+        body_key_id: string;
+        body_ciphertext: string;
+        conflict_ciphertext: string;
+        conflicts: string;
+      }[]
+    >`
+      select pi.status, pi.household_id, pi.body_key_id, pi.body_ciphertext,
+        (select body_ciphertext from provider_inbox_conflicts pic
+          where pic.inbox_id = pi.id limit 1) as conflict_ciphertext,
+        (select count(*)::text from provider_inbox_conflicts pic
+          where pic.inbox_id = pi.id) as conflicts
       from provider_inbox pi where pi.id = ${conflict.inboxId}
     `;
-    expect(state[0]).toEqual({ status: "quarantined", household_id: null, conflicts: "1" });
+    expect(state[0]).toMatchObject({
+      status: "quarantined",
+      household_id: null,
+      body_key_id: "integration",
+      conflicts: "1",
+    });
+    expect(state[0]?.body_ciphertext).not.toContain("Pickup moved to five");
+    expect(state[0]?.conflict_ciphertext).not.toContain("Pickup moved to six");
 
     await Promise.all(
       Array.from({ length: 8 }, (_, index) =>
@@ -229,7 +264,7 @@ describe.skipIf(!databaseUrl)("ApplicationStore PostgreSQL integration", () => {
     const projection = createApplicationProjection(createOnboardingProjection({ initiatorAdultId: adultId }));
     await store.onboardFoundingAdult({
       householdId,
-      adultId,
+      adultId: AdultIdSchema.parse(adultId),
       householdName: "Application repository family",
       adultDisplayName: "Owner",
       timeZone: "America/Los_Angeles",
@@ -248,6 +283,13 @@ describe.skipIf(!databaseUrl)("ApplicationStore PostgreSQL integration", () => {
 
     const intentId = `app_outbox_${randomUUID()}`;
     const idempotencyKey = `app-input:${randomUUID()}`;
+    const privateReviewItem = {
+      itemKey: `private_review_${randomUUID()}`,
+      adultId: AdultIdSchema.parse(adultId),
+      source: "gmail" as const,
+      summary: "A private school message needs review.",
+      observedAt: new Date().toISOString(),
+    };
     const commit: ApplicationCommit = {
       householdId,
       idempotencyKey,
@@ -275,6 +317,7 @@ describe.skipIf(!databaseUrl)("ApplicationStore PostgreSQL integration", () => {
           containsPrivateData: false,
         },
       ],
+      privateReviewItems: [privateReviewItem],
       outcome: {
         status: "processed",
         classification: "integration_fixture",
@@ -311,20 +354,40 @@ describe.skipIf(!databaseUrl)("ApplicationStore PostgreSQL integration", () => {
     await expect(store.load(householdId)).resolves.toMatchObject({ revision: 1, aggregate, projection });
 
     const persisted = await database<
-      { commits: string; effects: string; audits: string; payload: Record<string, unknown> }[]
+      {
+        commits: string;
+        effects: string;
+        audits: string;
+        private_reviews: string;
+        summary_ciphertext: string;
+        payload: Record<string, unknown>;
+      }[]
     >`
       select
         (select count(*)::text from application_commits where household_id = ${householdId}) as commits,
         (select count(*)::text from outbox where household_id = ${householdId}) as effects,
         (select count(*)::text from audit_log where household_id = ${householdId}) as audits,
+        (select count(*)::text from private_review_items
+          where household_id = ${householdId}) as private_reviews,
+        (select summary_ciphertext from private_review_items
+          where household_id = ${householdId} limit 1) as summary_ciphertext,
         (select payload from outbox where household_id = ${householdId} limit 1) as payload
     `;
     expect(persisted[0]).toMatchObject({
       commits: "1",
       effects: "1",
       audits: "1",
+      private_reviews: "1",
       payload: { intentId, kind: "conversation.send" },
     });
+    expect(persisted[0]?.summary_ciphertext).not.toContain(privateReviewItem.summary);
+    await expect(
+      store.exportHouseholdData({
+        householdId,
+        requestedByAdultId: adultId,
+        exportedAt: new Date().toISOString(),
+      }),
+    ).resolves.toMatchObject({ privateReviews: [{ summary: privateReviewItem.summary }] });
     const applicationEffects = await store.claimOutbox({
       owner: "application-sender",
       limit: 10,
@@ -404,9 +467,12 @@ describe.skipIf(!databaseUrl)("ApplicationStore PostgreSQL integration", () => {
       effectExecutor,
       workerContext: new FakeWorkerContext(),
       workerRuntime: new FakeWorkerRuntime({
+        purpose: "family_research",
         summary: "No worker action",
-        evidenceRefs: [],
-        questions: [],
+        completion: {
+          status: "needs_input",
+          questions: ["What additional detail should Florence use?"],
+        },
         warnings: [],
         proposedCommands: [],
         confidence: 1,
@@ -497,12 +563,17 @@ describe.skipIf(!databaseUrl)("ApplicationStore PostgreSQL integration", () => {
       select action, visibility from audit_log
       where household_id = ${householdId} and action = 'external_action_reconciled'
     `).resolves.toEqual([{ action: "external_action_reconciled", visibility: "household" }]);
-    const receiptCommits = await database<{ signals: unknown }[]>`
-      select signals from application_commits
-      where household_id = ${householdId} and idempotency_key like '%db-calendar-effect-receipt%'
+    const receiptCommits = await database<{ body_key_id: string; body_ciphertext: string }[]>`
+      select body_key_id, body_ciphertext from application_commits
+      where household_id = ${householdId}
     `;
-    expect(JSON.stringify(receiptCommits)).toContain("effect.receipt_received");
-    expect(JSON.stringify(receiptCommits)).toContain("db-calendar-effect-receipt");
+    expect(receiptCommits).not.toHaveLength(0);
+    expect(receiptCommits.every((row) => row.body_key_id === "integration")).toBe(true);
+    expect(JSON.stringify(receiptCommits)).not.toContain("effect.receipt_received");
+    expect(JSON.stringify(receiptCommits)).not.toContain("db-calendar-effect-receipt");
+    await expect(
+      store.findProcessed(householdId, `${execution.idempotencyKey}:db-calendar-effect-receipt`),
+    ).resolves.toMatchObject({ disposition: "committed" });
   });
 
   it("dead-letters permanent outbox failures only under the current lease fence", async () => {
@@ -742,7 +813,7 @@ describe.skipIf(!databaseUrl)("ApplicationStore PostgreSQL integration", () => {
         retryAt: new Date(Date.now() - 1_000).toISOString(),
         errorCode: "fixture_retry",
       }),
-    ).resolves.toBe(true);
+    ).resolves.toBe("scheduled");
     const reclaimedTimers = await store.claimDueTimers({
       owner: "timer-b",
       limit: 10,
@@ -892,27 +963,135 @@ describe.skipIf(!databaseUrl)("ApplicationStore PostgreSQL integration", () => {
     ).resolves.toBeNull();
 
     const ciphertext = "sealed:v1:opaque-fixture";
+    const replacementCiphertext = "sealed:v1:opaque-reauthorized-fixture";
+    const lastSyncedAt = new Date().toISOString();
+    const externalAccountId = `account-${randomUUID()}`;
     const connection = await store.upsertExternalConnection({
       householdId,
       adultId,
       provider: "google",
       label: "Family calendar",
-      externalAccountId: `account-${randomUUID()}`,
+      externalAccountId,
       email: "fixture@example.invalid",
       encryptedCredentials: ciphertext,
       grantedScopes: ["calendar.readonly"],
-      cursor: { sync: "fixture" },
+      cursor: { gmail: { revision: 4 }, sync: "fixture" },
       metadata: { calendar: "primary" },
+      lastSyncedAt,
     });
+    expect(connection.hadPriorGmailState).toBe(false);
+    await database`
+      update external_connections set status = 'reauth_required'
+      where id = ${connection.connectionId}
+    `;
+    const reauthorized = await store.upsertExternalConnection({
+      householdId,
+      adultId,
+      provider: "google",
+      label: "Family calendar reauthorized",
+      externalAccountId,
+      email: "reauthorized@example.invalid",
+      encryptedCredentials: replacementCiphertext,
+      grantedScopes: ["calendar.readonly", "gmail.readonly"],
+      cursor: {},
+      metadata: { replaced: true },
+    });
+    expect(reauthorized).toEqual({ connectionId: connection.connectionId, hadPriorGmailState: true });
     await expect(
       store.getExternalConnection({ connectionId: connection.connectionId, householdId, adultId }),
-    ).resolves.toMatchObject({ encryptedCredentials: ciphertext, status: "active" });
+    ).resolves.toMatchObject({
+      encryptedCredentials: replacementCiphertext,
+      status: "active",
+      cursor: { gmail: { revision: 4 }, sync: "fixture" },
+      metadata: { calendar: "primary" },
+      lastSyncedAt,
+    });
     await expect(
       store.revokeExternalConnection({ connectionId: connection.connectionId, householdId, adultId }),
     ).resolves.toBe(true);
     await expect(
       store.getExternalConnection({ connectionId: connection.connectionId, householdId, adultId }),
     ).resolves.toMatchObject({ encryptedCredentials: null, grantedScopes: [], status: "revoked" });
+  });
+
+  it("allows only one non-revoked owner for a Google subject under concurrent activation", async () => {
+    const [left, right] = await Promise.all([household(), household()]);
+    const subject = `subject-${randomUUID()}`;
+    const owners = [left, right] as const;
+    const results = await Promise.allSettled(
+      owners.map((owner, index) =>
+        store.upsertExternalConnection({
+          householdId: owner.householdId,
+          adultId: owner.adultId,
+          provider: "google",
+          label: `Google account ${index + 1}`,
+          externalAccountId: subject,
+          encryptedCredentials: `sealed:v1:owner-${index + 1}`,
+          grantedScopes: ["gmail.readonly"],
+        }),
+      ),
+    );
+
+    const winnerIndex = results.findIndex((result) => result.status === "fulfilled");
+    const rejection = results.find((result) => result.status === "rejected");
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(rejection).toMatchObject({ reason: { code: "external_account_in_use" } });
+
+    const rows = await database<{ household_id: string; adult_id: string; encrypted_credentials: string }[]>`
+      select household_id, adult_id, encrypted_credentials from external_connections
+      where provider = 'google' and external_account_id = ${subject} and status = 'active'
+    `;
+    expect(rows).toEqual([
+      {
+        household_id: owners[winnerIndex]?.householdId,
+        adult_id: owners[winnerIndex]?.adultId,
+        encrypted_credentials: `sealed:v1:owner-${winnerIndex + 1}`,
+      },
+    ]);
+
+    const loserIndex = winnerIndex === 0 ? 1 : 0;
+    const losingOwner = owners[loserIndex];
+    if (!losingOwner) throw new Error("Expected a losing Google owner");
+    for (const status of ["reauth_required", "error"] as const) {
+      await database`
+        update external_connections set status = ${status}
+        where provider = 'google' and external_account_id = ${subject}
+      `;
+      await expect(
+        store.upsertExternalConnection({
+          householdId: losingOwner.householdId,
+          adultId: losingOwner.adultId,
+          provider: "google",
+          label: "Attempted transfer",
+          externalAccountId: subject,
+          encryptedCredentials: "sealed:v1:attempted-transfer",
+          grantedScopes: ["gmail.readonly"],
+        }),
+      ).rejects.toMatchObject({ code: "external_account_in_use" });
+    }
+    const winner = results[winnerIndex];
+    const winningOwner = owners[winnerIndex];
+    if (winner?.status !== "fulfilled" || !winningOwner) {
+      throw new Error("Expected a winning Google owner");
+    }
+    await expect(
+      store.revokeExternalConnection({
+        connectionId: winner.value.connectionId,
+        householdId: winningOwner.householdId,
+        adultId: winningOwner.adultId,
+      }),
+    ).resolves.toBe(true);
+    await expect(
+      store.upsertExternalConnection({
+        householdId: losingOwner.householdId,
+        adultId: losingOwner.adultId,
+        provider: "google",
+        label: "Transferred after revocation",
+        externalAccountId: subject,
+        encryptedCredentials: "sealed:v1:transferred",
+        grantedScopes: ["gmail.readonly"],
+      }),
+    ).resolves.toMatchObject({ hadPriorGmailState: false });
   });
 
   it("enforces source visibility, connection scope, revision, and retention", async () => {

@@ -7,6 +7,22 @@ setup, Railway's application/PostgreSQL topology, Linq, Google OAuth and Gmail P
 `harianbarasu.com`, credential rotation, and the morning acceptance test. It contains no live
 credential values.
 
+## Legacy recovery point
+
+The retired Python/Hermes repository is preserved in two independent forms and must not be used as
+a compatibility layer for the TypeScript product:
+
+- local complete bundle: `/Users/harianbarasu/Projects/_archives/florence-pre-rebuild-2026-08-05.bundle`;
+- remote recovery branch: `legacy/python-main-2026-08-05` at commit
+  `f1ddcc345955c8fce242a3f081a462b1bc135916`.
+
+Verify either recovery point without checking it out over the production worktree:
+
+```bash
+git bundle verify /Users/harianbarasu/Projects/_archives/florence-pre-rebuild-2026-08-05.bundle
+git ls-remote --heads origin legacy/python-main-2026-08-05
+```
+
 ## Release topology
 
 One Git commit and one Docker image support two production topologies. Use exactly one of them:
@@ -66,8 +82,8 @@ docker compose up -d postgres
 pnpm install --frozen-lockfile
 ```
 
-Generate independent random values for `FLORENCE_TOKEN_ENCRYPTION_KEY`,
-`FLORENCE_ADMIN_API_KEY`, `GOOGLE_OAUTH_STATE_SECRET`, and
+Generate independent random values for `FLORENCE_TOKEN_ENCRYPTION_KEY`, the data-keyring key,
+`FLORENCE_BLIND_INDEX_KEY`, `FLORENCE_ADMIN_API_KEY`, `GOOGLE_OAUTH_STATE_SECRET`, and
 `GOOGLE_PUBSUB_VERIFICATION_TOKEN`. This command emits one 32-byte base64url value; run it once per
 secret and paste the results only into `.env` or Railway's variable UI:
 
@@ -132,6 +148,9 @@ references](https://docs.railway.com/variables/reference)
 | `FLORENCE_POSTGRES_SCHEMA` | `florence`; this name is canonical and intentionally distinct from the retired Python deployment's schema setting |
 | `FLORENCE_WEB_BASE_URL` | `https://harianbarasu.com` after domain cutover |
 | `FLORENCE_TOKEN_ENCRYPTION_KEY` | One 32-byte base64url/hex key, identical on every application service |
+| `FLORENCE_DATA_ACTIVE_KEY_ID` | Non-secret identifier for the key used for new tenant JSON ciphertext, for example `data-2026-08` |
+| `FLORENCE_DATA_KEYRING_JSON` | JSON object mapping key IDs to independent 32-byte base64url/hex keys; identical on every application service |
+| `FLORENCE_BLIND_INDEX_KEY` | Independent 32-byte base64url/hex key for deterministic routing and idempotency digests |
 | `FLORENCE_ADMIN_API_KEY` | Independent random operator bearer token |
 | `FLORENCE_DEFAULT_TIMEZONE` | `America/Los_Angeles` for the founding family |
 | `GOOGLE_CLIENT_ID` | Web OAuth client ID |
@@ -141,6 +160,12 @@ references](https://docs.railway.com/variables/reference)
 The config loader requires the core Florence values in every process. Duplicate secrets as
 service-scoped variables when Railway cannot reference a shared value; do not place the values in
 GitHub Actions or build-time variables.
+
+The TypeScript product must start in the new `florence` schema. Do not point
+`FLORENCE_POSTGRES_SCHEMA` at a schema used by the retired Python service or an earlier plaintext
+TypeScript build. Migration 019 validates the canonical ciphertext-only shape and fails closed with
+a fresh-schema instruction if obsolete sensitive columns are present; it never converts or retains
+the plaintext layout.
 
 ### Provider variables
 
@@ -278,6 +303,15 @@ Linq recommends pinning a dated webhook version. Its webhooks use Standard Webho
 the raw body, deliver at least once, and retry eligible failures; Florence verifies the signature,
 stores the delivery durably, and acknowledges before background processing. [Linq webhook
 guide](https://docs.linqapp.com/guides/webhooks/)
+
+The background owner also performs an exhaustive Partner API sweep every five minutes because Linq
+does not document a delivery-log or replay endpoint. Sweep cursors and chat/message IDs are durable,
+lease-fenced scratch state; message content is never stored there. Webhook and recovered copies use
+one app-owned message identity while retaining distinct transport provenance. The first sweep is
+history-only, provider-reconciled late messages remain history-only, and only messages newer than
+the last completed sweep may enter the live response path. `/operator/status` reports Linq degraded
+when the configured line is absent, its exact subscription is inactive or misconfigured, or a full
+sweep has not completed recently.
 
 Never paste the signing secret into a test request, issue, or log. A request without a valid
 signature should fail; that negative check is included in the smoke test.
@@ -488,12 +522,22 @@ Per-credential notes:
 
 ### Encryption-key warning
 
-`FLORENCE_TOKEN_ENCRYPTION_KEY` encrypts durable OAuth grants and private source content. Florence
-does not yet have an online key-ring/rewrap command, so blindly replacing this value makes existing
-ciphertext unreadable. For the pre-pilot deployment, rotate it **before the first real OAuth
-connection or email import**. If encrypted data already exists, stop and implement/test a versioned
-rewrap migration or deliberately reset the non-production data and reconnect accounts. Never rotate
-this key by simply changing the Railway variable on a live household.
+`FLORENCE_TOKEN_ENCRYPTION_KEY` still protects durable OAuth grants and separately sealed private
+content; replacing it makes those values unreadable. `FLORENCE_BLIND_INDEX_KEY` protects stable
+routing and idempotency lookups and must not be changed without an explicit digest-reindex design.
+
+Tenant JSON ciphertext uses `FLORENCE_DATA_KEYRING_JSON`. Rotate it in a maintenance window:
+
+1. Add an independent new key to the keyring on every service, make its ID
+   `FLORENCE_DATA_ACTIVE_KEY_ID`, and drain old writers.
+2. Deploy the same complete keyring and active ID everywhere. Startup and readiness fail closed if
+   any stored ciphertext references a missing key.
+3. Run `pnpm data:rotate-key -- --batch-size 100`. The command records progress in PostgreSQL and is
+   safe to rerun after interruption.
+4. After the run reports completion and every service is ready, remove the retired key from the
+   keyring and redeploy.
+
+Never replace or remove an encryption key merely by changing a live service variable.
 
 ## 11. Failure, rollback, and recovery
 
@@ -504,8 +548,9 @@ this key by simply changing the Railway variable on a live household.
   accepted, then restore the worker. In combined mode, provider retries bridge the outage. Lease
   expiry permits safe recovery in either mode.
 - **Expired Gmail cursor:** Florence falls back to a recent scan and continues the durable backfill.
-- **Lost Linq delivery:** reconcile known chats or request provider replay; never manufacture an
-  event ID.
+- **Lost Linq delivery:** inspect the durable reconciliation status and let the Partner API sweep
+  recover the message with reconciliation provenance. Linq does not document provider replay; never
+  manufacture webhook identifiers or signatures.
 - **Schema change:** Florence uses forward-only migrations and does not maintain backward
   compatibility layers. Prefer a forward fix. Redeploying an older image is safe only when it is
   known to understand the current schema.

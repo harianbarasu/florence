@@ -1,16 +1,17 @@
 CREATE TABLE provider_inbox (
   id uuid PRIMARY KEY,
   provider text NOT NULL,
-  idempotency_key text NOT NULL,
-  payload_hash text NOT NULL,
-  authentication jsonb NOT NULL,
-  event_kind text NOT NULL,
-  occurred_at timestamptz NOT NULL,
-  payload jsonb NOT NULL,
+  idempotency_digest text NOT NULL,
+  content_digest text NOT NULL,
   status text NOT NULL DEFAULT 'pending'
     CHECK (status IN ('pending', 'leased', 'resolved', 'quarantined', 'dead')),
   household_id uuid REFERENCES households(id) ON DELETE SET NULL,
-  resolution jsonb,
+  routing_digests text[] NOT NULL CHECK (cardinality(routing_digests) > 0),
+  encryption_tenant_kind text NOT NULL
+    CHECK (encryption_tenant_kind IN ('household', 'provider_ingress')),
+  encryption_tenant_id text NOT NULL,
+  body_key_id text NOT NULL,
+  body_ciphertext text NOT NULL,
   available_at timestamptz NOT NULL DEFAULT now(),
   attempt integer NOT NULL DEFAULT 0,
   max_attempts integer NOT NULL DEFAULT 8 CHECK (max_attempts > 0),
@@ -23,7 +24,7 @@ CREATE TABLE provider_inbox (
   received_at timestamptz NOT NULL DEFAULT now(),
   resolved_at timestamptz,
   updated_at timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (provider, idempotency_key)
+  UNIQUE (provider, idempotency_digest)
 );
 
 CREATE INDEX provider_inbox_claim_idx
@@ -34,51 +35,99 @@ CREATE INDEX provider_inbox_household_idx
   ON provider_inbox (household_id, received_at DESC)
   WHERE household_id IS NOT NULL;
 
+CREATE INDEX provider_inbox_routing_idx
+  ON provider_inbox USING gin (routing_digests);
+
+CREATE INDEX provider_inbox_body_key_idx
+  ON provider_inbox (body_key_id);
+
 CREATE TABLE provider_inbox_conflicts (
   id uuid PRIMARY KEY,
   inbox_id uuid NOT NULL REFERENCES provider_inbox(id) ON DELETE CASCADE,
-  payload_hash text NOT NULL,
-  payload jsonb NOT NULL,
+  content_digest text NOT NULL,
+  encryption_tenant_kind text NOT NULL
+    CHECK (encryption_tenant_kind IN ('household', 'provider_ingress')),
+  encryption_tenant_id text NOT NULL,
+  body_key_id text NOT NULL,
+  body_ciphertext text NOT NULL,
   received_at timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (inbox_id, payload_hash)
+  UNIQUE (inbox_id, content_digest)
 );
+
+CREATE INDEX provider_inbox_conflicts_body_key_idx
+  ON provider_inbox_conflicts (body_key_id);
 
 CREATE TABLE household_projections (
   household_id uuid PRIMARY KEY REFERENCES households(id) ON DELETE CASCADE,
   schema_version integer NOT NULL CHECK (schema_version > 0),
   version bigint NOT NULL CHECK (version >= 0),
-  state jsonb NOT NULL,
+  state_key_id text NOT NULL,
+  state_ciphertext text NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
 );
+
+CREATE INDEX household_projections_state_key_idx
+  ON household_projections (state_key_id);
 
 CREATE TABLE application_snapshots (
   household_id uuid PRIMARY KEY REFERENCES households(id) ON DELETE CASCADE,
   schema_version integer NOT NULL DEFAULT 1 CHECK (schema_version > 0),
   revision bigint NOT NULL CHECK (revision >= 0),
-  aggregate jsonb NOT NULL,
-  projection jsonb NOT NULL,
+  application_phase text NOT NULL CHECK (
+    application_phase IN (
+      'awaiting_initiator_consent', 'awaiting_invitation', 'awaiting_invitee_consent',
+      'awaiting_group', 'naming_adults', 'building_profile', 'connecting_sources', 'active'
+    )
+  ),
+  snapshot_key_id text NOT NULL,
+  snapshot_ciphertext text NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE INDEX application_snapshots_active_idx
+  ON application_snapshots (household_id)
+  WHERE application_phase = 'active';
+
+CREATE INDEX application_snapshots_snapshot_key_idx
+  ON application_snapshots (snapshot_key_id);
+
 CREATE TABLE application_commits (
   id uuid PRIMARY KEY,
   household_id uuid NOT NULL REFERENCES households(id) ON DELETE CASCADE,
-  idempotency_key text NOT NULL,
-  commit_hash text NOT NULL,
+  idempotency_digest text NOT NULL,
+  content_digest text NOT NULL,
   base_revision bigint NOT NULL CHECK (base_revision >= 0),
   revision bigint NOT NULL CHECK (revision = base_revision + 1),
-  signals jsonb NOT NULL,
-  changes jsonb NOT NULL,
-  outcome jsonb NOT NULL,
+  body_key_id text NOT NULL,
+  body_ciphertext text NOT NULL,
   committed_at timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (household_id, idempotency_key),
+  UNIQUE (household_id, idempotency_digest),
   UNIQUE (household_id, revision)
 );
 
 CREATE INDEX application_commits_household_idx
   ON application_commits (household_id, committed_at, revision);
+
+CREATE INDEX application_commits_body_key_idx
+  ON application_commits (body_key_id);
+
+CREATE TABLE encryption_rotation_runs (
+  id uuid PRIMARY KEY,
+  target_key_id text NOT NULL,
+  status text NOT NULL CHECK (status IN ('running', 'completed', 'failed')),
+  rows_rewrapped bigint NOT NULL DEFAULT 0 CHECK (rows_rewrapped >= 0),
+  last_error_code text,
+  started_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  completed_at timestamptz,
+  CHECK ((status = 'completed') = (completed_at IS NOT NULL))
+);
+
+CREATE UNIQUE INDEX encryption_rotation_runs_active_idx
+  ON encryption_rotation_runs (status)
+  WHERE status = 'running';
 
 CREATE UNIQUE INDEX channel_bindings_group_identity_idx
   ON channel_bindings (provider, external_chat_id)

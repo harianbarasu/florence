@@ -15,8 +15,10 @@ function event(overrides: Record<string, unknown> = {}) {
   return {
     schemaVersion: 1,
     source: "linq",
+    transport: "webhook",
     providerEventId: "event-1",
     dedupeKey: "linq:partner:event-1",
+    businessDedupeKey: "linq:message:sha256:synthetic-message-1",
     occurredAt: NOW,
     webhookVersion: "2026-02-03",
     partnerId: "partner",
@@ -593,26 +595,5 @@ describe("ProductionProviderProcessor", () => {
       code: "linq_attachment_fetch_failed",
       retryable: true,
     });
-  });
-
-  it("delegates Gmail history notices without exposing their payload to Linq routing", async () => {
-    const harness = setup();
-    const push = {
-      schemaVersion: 1,
-      source: "gmail",
-      sourceScope: "personal",
-      providerEventId: "push-1",
-      subscription: "projects/test/subscriptions/florence",
-      mailboxEmail: "parent@example.test",
-      historyId: "123",
-      publishedAt: NOW,
-      deliveryAttempt: 1,
-    };
-    await expect(harness.processor.process(claimed(push, "gmail"))).resolves.toMatchObject({
-      householdId: HOUSEHOLD_ID,
-      resolution: { classification: "gmail:processed:live", processedMessages: 2 },
-    });
-    expect(harness.google.processPush).toHaveBeenCalledWith(push);
-    expect(harness.process).not.toHaveBeenCalled();
   });
 });

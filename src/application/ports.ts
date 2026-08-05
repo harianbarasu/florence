@@ -25,7 +25,7 @@ export interface ConversationInterpretationContext {
   readonly householdTimeZone: string;
   readonly onboarding: ApplicationProjection["onboarding"];
   readonly sharedProfile: ApplicationProjection["sharedProfile"];
-  readonly confirmedRoutineAnchors: HouseholdAggregate["routineAnchors"];
+  readonly confirmedRoutineAnchors: ReadonlyArray<HouseholdAggregate["routineAnchors"][number]>;
   readonly openEpisodes: readonly {
     readonly episodeId: string;
     readonly type: "commitment" | "research" | "meal_plan";
@@ -52,7 +52,7 @@ export interface ConversationInterpretationContext {
 }
 
 export interface GmailTriageContext {
-  readonly confirmedRoutineAnchors: HouseholdAggregate["routineAnchors"];
+  readonly confirmedRoutineAnchors: ReadonlyArray<HouseholdAggregate["routineAnchors"][number]>;
   readonly activeSharingRules: readonly {
     readonly policyId: string;
     readonly policyVersion: number;

@@ -675,7 +675,7 @@ describe("HouseholdChiefOfStaff interface", () => {
       timeZone: "America/Los_Angeles",
       localTime: "15:15",
       daysOfWeek: [1, 2, 3, 4, 5],
-    } as const;
+    };
     const proposed = accept(
       aggregate({ routineAnchors: [anchor] }),
       signal({
@@ -759,7 +759,7 @@ describe("HouseholdChiefOfStaff interface", () => {
       timeZone: "America/Los_Angeles",
       localTime: "15:15",
       daysOfWeek: [1, 2, 3, 4, 5],
-    } as const;
+    };
     const proposed = accept(
       aggregate({ routineAnchors: [anchor] }),
       signal({

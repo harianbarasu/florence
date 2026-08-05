@@ -1,9 +1,13 @@
 import { z } from "zod";
 
-const optionalSecret = z.string().min(1).optional();
+const emptyStringAsUndefined = (value: unknown): unknown =>
+  typeof value === "string" && value.trim() === "" ? undefined : value;
+const optionalSecret = z.preprocess(emptyStringAsUndefined, z.string().min(1).optional());
+const optionalUrl = z.preprocess(emptyStringAsUndefined, z.string().url().optional());
 
 const environmentSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
+  FLORENCE_PROCESS_ROLE: z.enum(["all", "web", "worker"]).default("all"),
   PORT: z.coerce.number().int().min(1).max(65_535).default(3000),
   LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"]).default("info"),
   FLORENCE_DATABASE_URL: z.string().url(),
@@ -22,20 +26,26 @@ const environmentSchema = z.object({
   GOOGLE_CLIENT_ID: optionalSecret,
   GOOGLE_CLIENT_SECRET: optionalSecret,
   GOOGLE_OAUTH_STATE_SECRET: optionalSecret,
-  GOOGLE_REDIRECT_URI: z.string().url().optional(),
+  GOOGLE_REDIRECT_URI: optionalUrl,
   GOOGLE_PUBSUB_VERIFICATION_TOKEN: optionalSecret,
-  GOOGLE_GMAIL_TOPIC_NAME: z
-    .string()
-    .regex(/^projects\/[^/]+\/topics\/[^/]+$/u)
-    .optional(),
-  GOOGLE_GMAIL_PUBSUB_SUBSCRIPTION: z.string().min(1).max(1_000).optional(),
+  GOOGLE_GMAIL_TOPIC_NAME: z.preprocess(
+    emptyStringAsUndefined,
+    z
+      .string()
+      .regex(/^projects\/[^/]+\/topics\/[^/]+$/u)
+      .optional(),
+  ),
+  GOOGLE_GMAIL_PUBSUB_SUBSCRIPTION: z.preprocess(
+    emptyStringAsUndefined,
+    z.string().min(1).max(1_000).optional(),
+  ),
   MODEL_PROVIDER: z.enum(["openai", "anthropic", "open-weight"]).default("openai"),
   OPENAI_API_KEY: optionalSecret,
   OPENAI_BASE_URL: z.string().url().default("https://api.openai.com/v1"),
   OPENAI_MODEL: z.string().min(1).default("gpt-5.6-terra"),
   ANTHROPIC_API_KEY: optionalSecret,
   ANTHROPIC_MODEL: z.string().min(1).default("claude-sonnet-4-6"),
-  OPEN_WEIGHT_BASE_URL: z.string().url().optional(),
+  OPEN_WEIGHT_BASE_URL: optionalUrl,
   OPEN_WEIGHT_API_KEY: optionalSecret,
   OPEN_WEIGHT_MODEL: optionalSecret,
   WORKER_POLL_INTERVAL_MS: z.coerce.number().int().min(100).max(60_000).default(1_000),
@@ -79,7 +89,7 @@ export function availableIntegrations(config: FlorenceConfig): {
   openWeight: boolean;
 } {
   return {
-    linq: Boolean(config.LINQ_API_KEY && config.LINQ_FROM_PHONE),
+    linq: Boolean(config.LINQ_API_KEY && config.LINQ_FROM_PHONE && config.LINQ_WEBHOOK_SECRET),
     google: Boolean(
       config.GOOGLE_CLIENT_ID &&
         config.GOOGLE_CLIENT_SECRET &&

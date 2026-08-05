@@ -22,6 +22,7 @@ describe("configuration", () => {
       openWeight: false,
     });
     expect(config.FLORENCE_DB_SCHEMA).toBe("florence");
+    expect(config.FLORENCE_PROCESS_ROLE).toBe("all");
   });
 
   it("reports only invalid field names", () => {
@@ -30,7 +31,13 @@ describe("configuration", () => {
     );
   });
 
-  it("reports Google available only when OAuth and durable Gmail push are fully configured", () => {
+  it("keeps partial Google configuration degraded and enables only the complete connector", () => {
+    const tokenOnly = loadConfig({
+      ...validEnvironment(),
+      GOOGLE_PUBSUB_VERIFICATION_TOKEN: "verification-token",
+    });
+    expect(availableIntegrations(tokenOnly).google).toBe(false);
+
     const partial = loadConfig({
       ...validEnvironment(),
       GOOGLE_CLIENT_ID: "client-id",
@@ -39,7 +46,6 @@ describe("configuration", () => {
       GOOGLE_REDIRECT_URI: "https://florence.example.com/oauth/google/callback",
     });
     expect(availableIntegrations(partial).google).toBe(false);
-
     const complete = loadConfig({
       ...validEnvironment(),
       GOOGLE_CLIENT_ID: "client-id",
@@ -51,5 +57,48 @@ describe("configuration", () => {
       GOOGLE_GMAIL_PUBSUB_SUBSCRIPTION: "projects/florence/subscriptions/gmail",
     });
     expect(availableIntegrations(complete).google).toBe(true);
+  });
+
+  it("keeps partial Linq configuration degraded and enables only the complete connector", () => {
+    const partial = loadConfig({
+      ...validEnvironment(),
+      LINQ_API_KEY: "linq-key",
+      LINQ_FROM_PHONE: "+16465550100",
+    });
+    expect(availableIntegrations(partial).linq).toBe(false);
+
+    const complete = loadConfig({
+      ...validEnvironment(),
+      LINQ_API_KEY: "linq-key",
+      LINQ_FROM_PHONE: "+16465550100",
+      LINQ_WEBHOOK_SECRET: "linq-webhook-secret",
+    });
+    expect(availableIntegrations(complete).linq).toBe(true);
+  });
+
+  it("treats blank optional integration settings from dotenv files as unset", () => {
+    const config = loadConfig({
+      ...validEnvironment(),
+      LINQ_API_KEY: "",
+      GOOGLE_REDIRECT_URI: "",
+      GOOGLE_GMAIL_TOPIC_NAME: "",
+      OPEN_WEIGHT_BASE_URL: "",
+    });
+    expect(config.LINQ_API_KEY).toBeUndefined();
+    expect(config.GOOGLE_REDIRECT_URI).toBeUndefined();
+    expect(config.GOOGLE_GMAIL_TOPIC_NAME).toBeUndefined();
+    expect(config.OPEN_WEIGHT_BASE_URL).toBeUndefined();
+  });
+
+  it.each(["all", "web", "worker"] as const)("accepts the %s process role", (role) => {
+    expect(loadConfig({ ...validEnvironment(), FLORENCE_PROCESS_ROLE: role }).FLORENCE_PROCESS_ROLE).toBe(
+      role,
+    );
+  });
+
+  it("rejects unknown process roles", () => {
+    expect(() => loadConfig({ ...validEnvironment(), FLORENCE_PROCESS_ROLE: "background" })).toThrow(
+      "Invalid Florence configuration: FLORENCE_PROCESS_ROLE",
+    );
   });
 });

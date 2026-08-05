@@ -12,7 +12,11 @@ import {
   type HouseholdApplicationSnapshot,
   HouseholdApplicationSnapshotSchema,
 } from "../application/contracts.js";
-import type { ApplicationEffectExecutorPort, WorkerContextPort } from "../application/ports.js";
+import type {
+  ApplicationEffectExecutorPort,
+  HouseholdCalendarActionsPort,
+  WorkerContextPort,
+} from "../application/ports.js";
 import type { ProjectionTimerIntent } from "../db/application-store.js";
 import { type DurableScope, DurableScopeSchema, type FamilyEpisode } from "../domain/index.js";
 import { JsonValueSchema } from "../models/contracts.js";
@@ -23,6 +27,7 @@ import {
   type WorkerTool,
   type WorkerToolExecutionContext,
 } from "../runtime/index.js";
+import { GoogleCalendarActionError } from "./google-calendar-actions.js";
 
 const HOUSEHOLD_SCHEDULE_CAPABILITY = "capability.household_schedule.read";
 const RESEARCH_CAPABILITY = "capability.research.read";
@@ -57,6 +62,7 @@ export interface ProductionApplicationEffectExecutorOptions {
   readonly sender: LinqOutboundSender;
   readonly channelDirectory: LinqChannelDirectory;
   readonly timerStore: WorkerTimerStore;
+  readonly calendarActions?: Pick<HouseholdCalendarActionsPort, "createApprovedEvent">;
   readonly now?: () => Date;
 }
 
@@ -78,12 +84,14 @@ export class ProductionApplicationEffectExecutor implements ApplicationEffectExe
   readonly #sender: LinqOutboundSender;
   readonly #channelDirectory: LinqChannelDirectory;
   readonly #timerStore: WorkerTimerStore;
+  readonly #calendarActions: Pick<HouseholdCalendarActionsPort, "createApprovedEvent"> | undefined;
   readonly #now: () => Date;
 
   constructor(options: ProductionApplicationEffectExecutorOptions) {
     this.#sender = options.sender;
     this.#channelDirectory = options.channelDirectory;
     this.#timerStore = options.timerStore;
+    this.#calendarActions = options.calendarActions;
     this.#now = options.now ?? (() => new Date());
   }
 
@@ -139,6 +147,47 @@ export class ProductionApplicationEffectExecutor implements ApplicationEffectExe
           return this.#receipt("retryable_failure");
         }
       case "execute_external_action":
+        if (
+          effect.action.kind === "calendar_update" &&
+          effect.action.householdId === effect.householdId &&
+          this.#calendarActions !== undefined
+        ) {
+          try {
+            const recordedAt = this.#now().toISOString();
+            const created = await this.#calendarActions.createApprovedEvent({
+              action: effect.action,
+              idempotencyKey: effect.idempotencyKey,
+              asOf: recordedAt,
+            });
+            return EffectExecutionReceiptSchema.parse({
+              status: "succeeded",
+              receiptRef: stableReceipt("calendar_create", effect.intentId, created.providerReference),
+              recordedAt,
+              externalAction: {
+                receiptId: stableReceipt("action_receipt", effect.intentId, effect.approvalId),
+                actionId: effect.action.actionId,
+                actionDigest: effect.action.actionDigest,
+                outcome: "succeeded",
+                providerReference: created.providerReference,
+              },
+            });
+          } catch (error) {
+            if (error instanceof GoogleCalendarActionError && error.retryable) {
+              return this.#receipt("retryable_failure");
+            }
+            return EffectExecutionReceiptSchema.parse({
+              status: "permanent_failure",
+              receiptRef: stableReceipt("calendar_create_failed", effect.intentId),
+              recordedAt: this.#now().toISOString(),
+              externalAction: {
+                receiptId: stableReceipt("action_receipt", effect.intentId, effect.approvalId),
+                actionId: effect.action.actionId,
+                actionDigest: effect.action.actionDigest,
+                outcome: "failed",
+              },
+            });
+          }
+        }
         return EffectExecutionReceiptSchema.parse({
           status: "permanent_failure",
           receiptRef: stableReceipt("unsupported_action", effect.intentId, effect.action.actionId),

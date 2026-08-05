@@ -49,6 +49,209 @@ describe("Florence application coordinator", () => {
     ]);
   });
 
+  it("creates a Calendar effect only after an exact group proposal and explicit fresh approval", async () => {
+    const harness = setup();
+    const app = createFlorenceApplication(harness.dependencies);
+    const requestKey = "calendar-create-request";
+    harness.calendarActions.queuePreparation({
+      status: "ready",
+      targetConnectionId: "connection_parent_personal",
+      calendarId: "primary",
+      relevantDataDigest: `sha256:${"d".repeat(64)}`,
+      hasConflict: true,
+    });
+    harness.interpreter.respondToConversation(requestKey, {
+      ...classificationBase,
+      intent: "calendar_event_create_request",
+      title: "School welcome night",
+      startsAt: "2027-09-08T01:00:00Z",
+      endsAt: "2027-09-08T02:30:00Z",
+      timeZone: "America/Los_Angeles",
+      calendarAccountLabel: "Personal",
+    });
+
+    await app.process(
+      groupMessage(
+        requestKey,
+        "Add school welcome night next Tuesday from 6 to 7:30",
+        "2027-09-01T17:00:00Z",
+      ),
+    );
+
+    let snapshot = await harness.repository.load(HOUSEHOLD_ID);
+    const pending = snapshot?.aggregate.pendingActions[0];
+    expect(pending).toMatchObject({
+      state: "awaiting_approval",
+      action: {
+        kind: "calendar_update",
+        operation: "create",
+        householdId: HOUSEHOLD_ID,
+        title: "School welcome night",
+        startsAt: "2027-09-08T01:00:00Z",
+        endsAt: "2027-09-08T02:30:00Z",
+        timeZone: "America/Los_Angeles",
+        requestedByAdultId: ADULT_A,
+        availabilityAdultIds: [ADULT_A, ADULT_B],
+        targetConnectionId: "connection_parent_personal",
+        hasConflict: true,
+      },
+    });
+    if (pending?.action.kind !== "calendar_update") throw new Error("Expected Calendar action");
+    const approvalRequest = domainEffects(harness.repository.outbox).find(
+      (effect) => effect.kind === "send_message" && effect.messageClass === "approval_request",
+    );
+    expect(approvalRequest).toMatchObject({ targetScope: { kind: "household" } });
+    if (approvalRequest?.kind !== "send_message") throw new Error("Expected approval message");
+    expect(approvalRequest.body).toContain("One or more private household calendars are busy");
+    expect(approvalRequest.body).not.toMatch(/owner|attendee|location|description/iu);
+
+    harness.calendarActions.queuePreparation({
+      status: "ready",
+      targetConnectionId: "connection_parent_personal",
+      calendarId: "primary",
+      relevantDataDigest: pending.action.relevantDataDigest,
+      hasConflict: true,
+    });
+    const approvalKey = "calendar-create-approve";
+    harness.interpreter.respondToConversation(approvalKey, {
+      ...classificationBase,
+      intent: "approve_calendar_event",
+      actionId: pending.action.actionId,
+    });
+    await app.process(
+      groupMessage(approvalKey, `Approve ${pending.action.actionId}`, "2027-09-01T17:02:00Z"),
+    );
+
+    snapshot = await harness.repository.load(HOUSEHOLD_ID);
+    expect(snapshot?.aggregate.pendingActions[0]).toMatchObject({
+      state: "executing",
+      approvalId: expect.any(String),
+    });
+    expect(snapshot?.aggregate.approvals[0]?.status).toBe("consumed");
+    const execution = harness.repository
+      .intents("domain.effect")
+      .find((intent) => intent.kind === "domain.effect" && intent.effect.kind === "execute_external_action");
+    if (execution?.kind !== "domain.effect" || execution.effect.kind !== "execute_external_action") {
+      throw new Error("Expected approved Calendar effect");
+    }
+    harness.effectExecutor.respond(execution.intentId, {
+      status: "succeeded",
+      receiptRef: "calendar_receipt_ref",
+      recordedAt: "2027-09-01T17:02:05Z",
+      externalAction: {
+        receiptId: "calendar_effect_receipt",
+        actionId: pending.action.actionId,
+        actionDigest: pending.action.actionDigest,
+        outcome: "succeeded",
+        providerReference: "google-calendar:primary:event_welcome_night",
+      },
+    });
+    await app.executeOutbox(execution, "2027-09-01T17:02:05Z");
+
+    snapshot = await harness.repository.load(HOUSEHOLD_ID);
+    expect(snapshot?.aggregate.pendingActions[0]).toMatchObject({
+      state: "succeeded",
+      effectReceipt: {
+        receiptId: "calendar_effect_receipt",
+        outcome: "succeeded",
+        providerReference: "google-calendar:primary:event_welcome_night",
+      },
+    });
+    expect(harness.repository.commits.at(-1)?.audit).toContainEqual(
+      expect.objectContaining({
+        kind: "external_action_reconciled",
+        decision: "succeeded",
+        containsPrivateData: false,
+      }),
+    );
+    expect(
+      domainEffects(harness.repository.outbox).some(
+        (effect) =>
+          effect.kind === "send_message" &&
+          effect.messageClass === "status" &&
+          effect.body.includes("Added “School welcome night”"),
+      ),
+    ).toBe(true);
+  });
+
+  it("invalidates Calendar approval when private availability changes without exposing details", async () => {
+    const harness = setup();
+    const app = createFlorenceApplication(harness.dependencies);
+    harness.calendarActions.queuePreparation({
+      status: "ready",
+      targetConnectionId: "connection_calendar_primary",
+      calendarId: "primary",
+      relevantDataDigest: `sha256:${"1".repeat(64)}`,
+      hasConflict: false,
+    });
+    harness.interpreter.respondToConversation("calendar-stale-request", {
+      ...classificationBase,
+      intent: "calendar_event_create_request",
+      title: "Family dinner",
+      startsAt: "2027-09-10T01:00:00Z",
+      endsAt: "2027-09-10T02:00:00Z",
+      timeZone: "America/Los_Angeles",
+    });
+    await app.process(
+      groupMessage("calendar-stale-request", "Add family dinner Friday at 6", "2027-09-01T18:00:00Z"),
+    );
+    const pending = (await harness.repository.load(HOUSEHOLD_ID))?.aggregate.pendingActions[0];
+    if (pending?.action.kind !== "calendar_update") throw new Error("Expected Calendar action");
+    harness.calendarActions.queuePreparation({
+      status: "ready",
+      targetConnectionId: pending.action.targetConnectionId,
+      calendarId: "primary",
+      relevantDataDigest: `sha256:${"2".repeat(64)}`,
+      hasConflict: true,
+    });
+    harness.interpreter.respondToConversation("calendar-stale-approval", {
+      ...classificationBase,
+      intent: "approve_calendar_event",
+      actionId: pending.action.actionId,
+    });
+    const result = await app.process(
+      groupMessage("calendar-stale-approval", "Approve it", "2027-09-01T18:01:00Z"),
+    );
+
+    expect(result.outcome.status).toBe("rejected");
+    expect((await harness.repository.load(HOUSEHOLD_ID))?.aggregate.pendingActions[0]?.state).toBe(
+      "awaiting_approval",
+    );
+    expect(
+      domainEffects(harness.repository.outbox).filter((effect) => effect.kind === "execute_external_action"),
+    ).toEqual([]);
+    const bodies = harness.repository
+      .intents("conversation.send")
+      .flatMap((intent) => (intent.kind === "conversation.send" ? [intent.body] : []));
+    expect(bodies.at(-1)).toContain("availability changed");
+    expect(bodies.join(" ")).not.toMatch(/private-event|calendar owner|attendee|location/iu);
+  });
+
+  it("asks only for unresolved Calendar fields instead of silently ignoring a partial request", async () => {
+    const harness = setup();
+    const app = createFlorenceApplication(harness.dependencies);
+    harness.interpreter.respondToConversation("calendar-needs-time", {
+      ...classificationBase,
+      intent: "calendar_event_clarification",
+      missingFields: ["start", "end"],
+    });
+
+    const result = await app.process(
+      groupMessage("calendar-needs-time", "Add school welcome night", "2027-09-01T18:05:00Z"),
+    );
+
+    expect(result.outcome).toMatchObject({
+      status: "processed",
+      classification: "conversation:calendar_event_clarification",
+    });
+    expect(harness.calendarActions.prepareCalls).toEqual([]);
+    expect(harness.repository.intents("conversation.send").at(-1)).toMatchObject({
+      targetScope: { kind: "household" },
+      messageClass: "clarifying_question",
+      body: "To prepare one exact calendar proposal, please provide a start date and time and an end date and time.",
+    });
+  });
+
   it("keeps Gmail private and promotes only approved minimum household meaning", async () => {
     const harness = setup();
     const app = createFlorenceApplication(harness.dependencies);

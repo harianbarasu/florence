@@ -2,8 +2,14 @@ import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   type ApplicationCommit,
+  type ApplicationOutboxIntent,
   createApplicationProjection,
+  createFlorenceApplication,
   createOnboardingProjection,
+  FakeApplicationEffectExecutor,
+  FakeApplicationInterpreter,
+  FakeHouseholdCalendarActions,
+  FakeWorkerContext,
 } from "../../src/application/index.js";
 import {
   ApplicationStore,
@@ -13,6 +19,7 @@ import {
 import { closeDatabase, createDatabase, type Database } from "../../src/db/client.js";
 import { migrateDatabase } from "../../src/db/migrate.js";
 import { HouseholdAggregateSchema } from "../../src/domain/index.js";
+import { FakeWorkerRuntime } from "../../src/runtime/index.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 
@@ -332,6 +339,170 @@ describe.skipIf(!databaseUrl)("ApplicationStore PostgreSQL integration", () => {
         providerReceipt: { fixture: true },
       }),
     ).resolves.toBe(true);
+  });
+
+  it("durably reconciles an explicitly approved Calendar creation through the real application store", async () => {
+    const householdId = randomUUID();
+    const adultId = randomUUID();
+    const partnerId = randomUUID();
+    await store.onboardFoundingAdult({
+      householdId,
+      adultId,
+      householdName: "Calendar action family",
+      adultDisplayName: "Requesting adult",
+      timeZone: "America/Los_Angeles",
+      consent: { status: "consented", consentedAt: "2027-09-01T17:00:00Z" },
+      projectionSchemaVersion: 1,
+      initialProjection: { legacyProjection: true },
+    });
+    await store.addAdultMembership({
+      householdId,
+      adultId: partnerId,
+      displayName: "Partner",
+      timeZone: "America/Los_Angeles",
+      status: "active",
+      consentedAt: "2027-09-01T17:00:00Z",
+    });
+    const aggregate = HouseholdAggregateSchema.parse({
+      schemaVersion: 1,
+      householdId,
+      version: 0,
+      policyVersion: 0,
+      lastProcessedSequence: 0,
+      timeZone: "America/Los_Angeles",
+      verifiedAdultIds: [adultId, partnerId].sort(),
+      routineAnchors: [],
+      episodes: [],
+      policies: [],
+      policyCandidates: [],
+      approvals: [],
+      memoryCandidates: [],
+      memories: [],
+      pendingActions: [],
+    });
+    await store.initializeApplicationSnapshot({
+      snapshot: {
+        revision: 0,
+        aggregate,
+        projection: createApplicationProjection(
+          createOnboardingProjection({
+            initiatorAdultId: adultId,
+            invitedAdultId: partnerId,
+            groupChannelId: "linq-family-group",
+            phase: "active",
+          }),
+        ),
+      },
+    });
+    const interpreter = new FakeApplicationInterpreter();
+    const calendarActions = new FakeHouseholdCalendarActions();
+    const effectExecutor = new FakeApplicationEffectExecutor();
+    const app = createFlorenceApplication({
+      repository: store,
+      interpreter,
+      calendarActions,
+      effectExecutor,
+      workerContext: new FakeWorkerContext(),
+      workerRuntime: new FakeWorkerRuntime({
+        summary: "No worker action",
+        evidenceRefs: [],
+        questions: [],
+        warnings: [],
+        proposedCommands: [],
+        confidence: 1,
+      }),
+    });
+    interpreter.respondToConversation("db-calendar-request", {
+      confidence: 1,
+      rationale: "An adult explicitly requested a household event.",
+      intent: "calendar_event_create_request",
+      title: "School welcome night",
+      startsAt: "2027-09-08T01:00:00Z",
+      endsAt: "2027-09-08T02:30:00Z",
+      timeZone: "America/Los_Angeles",
+    });
+    await app.process({
+      kind: "conversation_message",
+      householdId,
+      idempotencyKey: "db-calendar-request",
+      occurredAt: "2027-09-01T17:00:00Z",
+      channel: { channelId: "linq-family-group", scope: "household" },
+      senderAdultId: adultId,
+      messageRef: "linq-db-calendar-request",
+      text: "Add school welcome night next Tuesday from 6 to 7:30",
+      attachmentRefs: [],
+      attachmentContents: [],
+    });
+    const proposed = await store.load(householdId);
+    const pending = proposed?.aggregate.pendingActions[0];
+    if (pending?.action.kind !== "calendar_update") throw new Error("Expected persisted Calendar action");
+    interpreter.respondToConversation("db-calendar-approve", {
+      confidence: 1,
+      rationale: "An adult explicitly approved the exact pending event.",
+      intent: "approve_calendar_event",
+      actionId: pending.action.actionId,
+    });
+    await app.process({
+      kind: "conversation_message",
+      householdId,
+      idempotencyKey: "db-calendar-approve",
+      occurredAt: "2027-09-01T17:01:00Z",
+      channel: { channelId: "linq-family-group", scope: "household" },
+      senderAdultId: partnerId,
+      messageRef: "linq-db-calendar-approve",
+      text: `Approve ${pending.action.actionId}`,
+      attachmentRefs: [],
+      attachmentContents: [],
+    });
+    const executionRows = await database<{ payload: ApplicationOutboxIntent }[]>`
+      select payload from outbox
+      where household_id = ${householdId}
+        and payload->>'kind' = 'domain.effect'
+        and payload->'effect'->>'kind' = 'execute_external_action'
+    `;
+    const execution = executionRows[0]?.payload;
+    if (execution?.kind !== "domain.effect" || execution.effect.kind !== "execute_external_action") {
+      throw new Error("Expected durable Calendar execution intent");
+    }
+    effectExecutor.respond(execution.intentId, {
+      status: "succeeded",
+      receiptRef: "db-calendar-provider-receipt",
+      recordedAt: "2027-09-01T17:01:05Z",
+      externalAction: {
+        receiptId: "db-calendar-effect-receipt",
+        actionId: pending.action.actionId,
+        actionDigest: pending.action.actionDigest,
+        outcome: "succeeded",
+        providerReference: "google-calendar:primary:db-event-1",
+      },
+    });
+    await app.executeOutbox(execution, "2027-09-01T17:01:05Z");
+
+    await expect(store.load(householdId)).resolves.toMatchObject({
+      aggregate: {
+        pendingActions: [
+          {
+            state: "succeeded",
+            approvalId: expect.any(String),
+            effectReceipt: {
+              receiptId: "db-calendar-effect-receipt",
+              outcome: "succeeded",
+              providerReference: "google-calendar:primary:db-event-1",
+            },
+          },
+        ],
+      },
+    });
+    await expect(database<{ action: string; visibility: string }[]>`
+      select action, visibility from audit_log
+      where household_id = ${householdId} and action = 'external_action_reconciled'
+    `).resolves.toEqual([{ action: "external_action_reconciled", visibility: "household" }]);
+    const receiptCommits = await database<{ signals: unknown }[]>`
+      select signals from application_commits
+      where household_id = ${householdId} and idempotency_key like '%db-calendar-effect-receipt%'
+    `;
+    expect(JSON.stringify(receiptCommits)).toContain("effect.receipt_received");
+    expect(JSON.stringify(receiptCommits)).toContain("db-calendar-effect-receipt");
   });
 
   it("dead-letters permanent outbox failures only under the current lease fence", async () => {

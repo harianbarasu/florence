@@ -37,6 +37,7 @@ import {
   productionHttpLoggerOptions,
 } from "./http/index.js";
 import { createPostgresDailyBriefHost } from "./infrastructure/daily-brief-host.js";
+import { GoogleCalendarActions } from "./infrastructure/google-calendar-actions.js";
 import {
   type CalendarSyncWork,
   GoogleCalendarPushIngress,
@@ -225,6 +226,12 @@ export async function createProductionComposition(
     const linq = createLinqClient(config);
     const modelInterpreter = new ModelApplicationInterpreter(modelGateway);
     const interpreter = new OnboardingAwareInterpreter(modelInterpreter, runtimeStore);
+    const calendarActions = createGoogleCalendarActions({
+      config,
+      enabled: integrations.googleCalendar,
+      runtimeStore,
+      secretBox,
+    });
     const workerRuntime = new DeepAgentsWorkerRuntime({
       modelGateway,
       systemPrompt: WORKER_SYSTEM_PROMPT,
@@ -257,7 +264,9 @@ export async function createProductionComposition(
         sender: linq,
         channelDirectory: runtimeStore,
         timerStore: applicationStore,
+        ...(calendarActions === undefined ? {} : { calendarActions }),
       }),
+      ...(calendarActions === undefined ? {} : { calendarActions }),
     };
     const application = createFlorenceApplication(applicationDependencies);
 
@@ -384,6 +393,34 @@ export async function createProductionComposition(
     await close();
     throw error;
   }
+}
+
+function createGoogleCalendarActions(input: {
+  config: FlorenceConfig;
+  enabled: boolean;
+  runtimeStore: FlorenceRuntimeStore;
+  secretBox: SecretBox;
+}): GoogleCalendarActions | undefined {
+  const { config } = input;
+  if (
+    !input.enabled ||
+    !config.GOOGLE_CLIENT_ID ||
+    !config.GOOGLE_CLIENT_SECRET ||
+    !config.GOOGLE_REDIRECT_URI
+  ) {
+    return undefined;
+  }
+  const adapterConfig = parseGoogleAdapterConfig({
+    clientId: config.GOOGLE_CLIENT_ID,
+    clientSecret: config.GOOGLE_CLIENT_SECRET,
+    redirectUri: config.GOOGLE_REDIRECT_URI,
+  });
+  return new GoogleCalendarActions({
+    store: input.runtimeStore,
+    calendar: new GoogleCalendarAdapter(adapterConfig),
+    oauth: new GoogleOAuthAdapter(adapterConfig),
+    secretBox: input.secretBox,
+  });
 }
 
 function createLinqClient(

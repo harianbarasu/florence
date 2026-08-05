@@ -1071,15 +1071,61 @@ function approvalRequestEffect(
   action: ExternalAction,
   promotionAuthority: PromotionAuthority | undefined,
 ): OutboxIntent {
+  const body =
+    action.kind === "calendar_update"
+      ? `I’m ready to add “${action.title}” from ${action.startsAt} to ${action.endsAt} (${action.timeZone}) on the requesting adult’s primary calendar. ${
+          action.hasConflict
+            ? "One or more private household calendars are busy then; no private calendar details were shared. "
+            : "The current private household availability projection is clear. "
+        }Reply “approve ${action.actionId}” to create this exact event.`
+      : `Approval is required before Florence can ${action.summary}.`;
   return OutboxIntentSchema.parse({
     ...outboxBase(signal, `approval-request:${action.actionId}`),
     kind: "send_message",
     targetScope: action.requestedFor,
     messageClass: "approval_request",
-    body: `Approval is required before Florence can ${action.summary}.`,
+    body,
     evidenceIds: action.evidence.map((item) => item.evidenceId),
     ...(promotionAuthority === undefined ? {} : { promotionAuthority }),
   });
+}
+
+function handleExternalActionProposed(context: HandlerContext): MutationResult {
+  const { signal, draft } = context;
+  if (signal.kind !== "external_action.proposed") {
+    throw new Error("wrong handler");
+  }
+  if (
+    !isAdultActor(draft, signal.actor) ||
+    signal.action.kind !== "calendar_update" ||
+    signal.action.householdId !== draft.householdId ||
+    signal.action.requestedByAdultId !== signal.actor.adultId ||
+    !sameStrings(signal.action.availabilityAdultIds, draft.verifiedAdultIds) ||
+    signal.action.requestedFor.kind !== "household" ||
+    !checkScopeWithoutPromotion(signal.action.evidence, signal.action.requestedFor)
+  ) {
+    return rejected("unauthorized_actor");
+  }
+  if (draft.pendingActions.some((pending) => pending.action.actionId === signal.action.actionId)) {
+    return rejected("duplicate_entity");
+  }
+  draft.pendingActions.push({
+    action: signal.action,
+    state: "awaiting_approval",
+    proposedAt: signal.occurredAt,
+    updatedAt: signal.occurredAt,
+  });
+  return accepted(
+    draft,
+    [
+      DomainChangeSchema.parse({
+        kind: "action_state_changed",
+        actionId: signal.action.actionId,
+        state: "awaiting_approval",
+      }),
+    ],
+    [approvalRequestEffect(signal, signal.action, undefined)],
+  );
 }
 
 function handleWorkerProposal(context: HandlerContext): MutationResult {
@@ -1152,6 +1198,9 @@ function handleWorkerProposal(context: HandlerContext): MutationResult {
   }
 
   for (const proposed of proposal.actionProposals) {
+    if (proposed.action.kind === "calendar_update") {
+      return rejected("unauthorized_actor");
+    }
     if (draft.pendingActions.some((pending) => pending.action.actionId === proposed.action.actionId)) {
       return rejected("duplicate_entity");
     }
@@ -1359,7 +1408,32 @@ function handleEffectReceipt(context: HandlerContext): MutationResult {
     ...pending,
     state: signal.outcome,
     updatedAt: signal.recordedAt,
+    effectReceipt: {
+      receiptId: signal.receiptId,
+      outcome: signal.outcome,
+      recordedAt: signal.recordedAt,
+      ...(signal.providerReference === undefined ? {} : { providerReference: signal.providerReference }),
+    },
   };
+  const effects: OutboxIntent[] = [];
+  if (pending.action.kind === "calendar_update") {
+    const body =
+      signal.outcome === "succeeded"
+        ? `Added “${pending.action.title}” to the calendar from ${pending.action.startsAt} to ${pending.action.endsAt} (${pending.action.timeZone}).`
+        : signal.outcome === "failed"
+          ? `I couldn’t add “${pending.action.title}” to the calendar. No calendar event was confirmed.`
+          : `I couldn’t confirm whether “${pending.action.title}” was added to the calendar. Please check before trying again.`;
+    effects.push(
+      OutboxIntentSchema.parse({
+        ...outboxBase(signal, `action-status:${pending.action.actionId}:${signal.outcome}`),
+        kind: "send_message",
+        targetScope: pending.action.requestedFor,
+        messageClass: "status",
+        body,
+        evidenceIds: pending.action.evidence.map((item) => item.evidenceId),
+      }),
+    );
+  }
   return accepted(
     draft,
     [
@@ -1369,7 +1443,7 @@ function handleEffectReceipt(context: HandlerContext): MutationResult {
         state: signal.outcome,
       }),
     ],
-    [],
+    effects,
   );
 }
 
@@ -1391,6 +1465,8 @@ function dispatch(context: HandlerContext): MutationResult {
       return handleEpisodeBlocked(context);
     case "episode.resumed":
       return handleEpisodeResumed(context);
+    case "external_action.proposed":
+      return handleExternalActionProposed(context);
     case "approval.granted":
       return handleApprovalGranted(context);
     case "approval.revoked":

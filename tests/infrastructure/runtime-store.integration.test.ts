@@ -7,6 +7,7 @@ import { AdultIdSchema } from "../../src/domain/index.js";
 import { FlorenceRuntimeStore } from "../../src/infrastructure/runtime-store.js";
 
 const GOOGLE_CALENDAR_READONLY_SCOPE = "https://www.googleapis.com/auth/calendar.readonly";
+const GOOGLE_CALENDAR_EVENTS_SCOPE = "https://www.googleapis.com/auth/calendar.events";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 
@@ -690,5 +691,153 @@ describe.skipIf(!databaseUrl)("FlorenceRuntimeStore PostgreSQL integration", () 
         connectionId: second.connectionId,
       }),
     ).resolves.toMatchObject({ status: "active" });
+  });
+
+  it("prepares one write target from complete household availability without exposing private events", async () => {
+    const founded = await provisionConsentedFounder({
+      externalChatId: `dm-calendar-write-${randomUUID()}`,
+      externalHandle: "+12025550214",
+      timeZone: "America/Los_Angeles",
+      occurredAt: "2027-09-01T17:00:00Z",
+    });
+    if (!founded.adultId) throw new Error("Expected a founding adult");
+    const partner = await applicationStore.addAdultMembership({
+      householdId: founded.householdId,
+      displayName: "Partner",
+      timeZone: "America/Los_Angeles",
+      status: "active",
+      consentedAt: "2027-09-01T17:00:00Z",
+    });
+    const requesterConnection = await applicationStore.upsertExternalConnection({
+      householdId: founded.householdId,
+      adultId: founded.adultId,
+      provider: "google",
+      label: "Personal",
+      externalAccountId: `google-calendar-writer-${randomUUID()}`,
+      email: `writer-${randomUUID()}@example.test`,
+      encryptedCredentials: "encrypted-writer",
+      grantedScopes: [GOOGLE_CALENDAR_EVENTS_SCOPE],
+      cursor: {},
+      metadata: { credentialAadVersion: 1, accountLabel: "Personal" },
+    });
+    const partnerConnection = await applicationStore.upsertExternalConnection({
+      householdId: founded.householdId,
+      adultId: partner.adultId,
+      provider: "google",
+      label: "Partner",
+      externalAccountId: `google-calendar-partner-${randomUUID()}`,
+      email: `partner-${randomUUID()}@example.test`,
+      encryptedCredentials: "encrypted-partner",
+      grantedScopes: [GOOGLE_CALENDAR_READONLY_SCOPE],
+      cursor: {},
+      metadata: { credentialAadVersion: 1, accountLabel: "Partner" },
+    });
+    const liveState = {
+      schemaVersion: 1 as const,
+      revision: 1,
+      phase: "live" as const,
+      calendarId: "primary",
+      initialTimeMin: "2027-01-01T00:00:00Z",
+      initialTimeMax: "2028-01-01T00:00:00Z",
+      pageToken: null,
+      syncToken: "sync-token",
+      timeZone: "America/Los_Angeles",
+      projectionReady: true,
+      watch: null,
+      lastSuccessfulSyncAt: "2027-09-01T16:59:00Z",
+    };
+    await expect(
+      store.saveCalendarSyncState({
+        householdId: founded.householdId,
+        adultId: founded.adultId,
+        connectionId: requesterConnection.connectionId,
+        expectedRevision: 0,
+        state: { ...liveState, syncToken: "requester-sync" },
+      }),
+    ).resolves.toBe("updated");
+    await expect(
+      store.saveCalendarSyncState({
+        householdId: founded.householdId,
+        adultId: partner.adultId,
+        connectionId: partnerConnection.connectionId,
+        expectedRevision: 0,
+        state: { ...liveState, syncToken: "partner-sync" },
+      }),
+    ).resolves.toBe("updated");
+    await store.persistPersonalCalendarSource({
+      householdId: founded.householdId,
+      adultId: partner.adultId,
+      connectionId: partnerConnection.connectionId,
+      calendarId: "primary",
+      externalId: "private-partner-event-secret-id",
+      kind: "calendar_event",
+      occurredAt: "2027-09-08T01:15:00Z",
+      contentHash: `sha256:${"9".repeat(64)}`,
+      encryptedContent: "encrypted-private-partner-event-with-sensitive-title",
+      metadata: { provider: "google-calendar", sourceScope: "personal" },
+      busyWindow: {
+        startsAt: "2027-09-08T01:15:00Z",
+        endsAt: "2027-09-08T01:45:00Z",
+        allDay: false,
+      },
+    });
+    const input = {
+      householdId: founded.householdId,
+      verifiedAdultIds: [founded.adultId, partner.adultId].sort(),
+      requestedByAdultId: founded.adultId,
+      asOf: "2027-09-01T17:00:00Z",
+      startsAt: "2027-09-08T01:00:00Z",
+      endsAt: "2027-09-08T02:00:00Z",
+      accountLabel: "Personal",
+    };
+    const prepared = await store.prepareCreate(input);
+    expect(prepared).toMatchObject({
+      status: "ready",
+      targetConnectionId: requesterConnection.connectionId,
+      calendarId: "primary",
+      hasConflict: true,
+      relevantDataDigest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/u),
+    });
+    expect(JSON.stringify(prepared)).not.toMatch(
+      /private-partner-event-secret-id|sensitive-title|startsAt|endsAt|ownerAdultId/iu,
+    );
+
+    await store.persistPersonalCalendarSource({
+      householdId: founded.householdId,
+      adultId: partner.adultId,
+      connectionId: partnerConnection.connectionId,
+      calendarId: "primary",
+      externalId: "new-overlapping-private-event",
+      kind: "calendar_event",
+      occurredAt: "2027-09-08T01:30:00Z",
+      contentHash: `sha256:${"8".repeat(64)}`,
+      encryptedContent: "encrypted-second-private-event",
+      metadata: { provider: "google-calendar", sourceScope: "personal" },
+      busyWindow: {
+        startsAt: "2027-09-08T01:30:00Z",
+        endsAt: "2027-09-08T02:00:00Z",
+        allDay: false,
+      },
+    });
+    const changed = await store.prepareCreate(input);
+    expect(changed).toMatchObject({ status: "ready", hasConflict: true });
+    if (prepared.status !== "ready" || changed.status !== "ready") {
+      throw new Error("Expected complete Calendar preparations");
+    }
+    expect(changed.relevantDataDigest).not.toBe(prepared.relevantDataDigest);
+
+    await expect(
+      store.saveCalendarSyncState({
+        householdId: founded.householdId,
+        adultId: partner.adultId,
+        connectionId: partnerConnection.connectionId,
+        expectedRevision: 1,
+        state: { ...liveState, revision: 2, syncToken: "partner-sync", projectionReady: false },
+      }),
+    ).resolves.toBe("updated");
+    await expect(store.prepareCreate(input)).resolves.toEqual({
+      status: "unavailable",
+      reason: "projection_incomplete",
+    });
   });
 });

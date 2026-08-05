@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  CalendarEventCreateActionSchema,
+  calendarEventCreateActionDigest,
   type HouseholdAggregate,
   HouseholdChiefOfStaff,
   type HouseholdSignal,
@@ -641,6 +643,66 @@ describe("privacy and authority through the HouseholdChiefOfStaff interface", ()
         }),
       ]),
     );
+  });
+
+  it("accepts Calendar creation only from a verified adult, never from an ephemeral worker", () => {
+    const withoutDigest = {
+      actionId: "action_calendar_school_night",
+      kind: "calendar_update" as const,
+      calendarActionVersion: 1 as const,
+      operation: "create" as const,
+      householdId: HOUSEHOLD_ID,
+      summary: "create the approved household calendar event",
+      relevantDataDigest: DIGEST_B,
+      requestedFor: { kind: "household" as const },
+      evidence: [evidence()],
+      title: "School welcome night",
+      startsAt: "2026-01-03T02:00:00Z",
+      endsAt: "2026-01-03T03:00:00Z",
+      timeZone: "America/Los_Angeles",
+      requestedByAdultId: ADULT_A,
+      availabilityAdultIds: [ADULT_A, ADULT_B],
+      targetConnectionId: "connection_parent_calendar",
+      calendarId: "primary" as const,
+      hasConflict: false,
+    };
+    const action = CalendarEventCreateActionSchema.parse({
+      ...withoutDigest,
+      actionDigest: calendarEventCreateActionDigest(withoutDigest),
+    });
+    const worker = accept(
+      aggregate(),
+      signal({
+        householdId: HOUSEHOLD_ID,
+        signalId: "signal_worker_calendar_action",
+        sequence: 1,
+        occurredAt: T0,
+        actor: { kind: "worker", jobId: WORKER_JOB_ID },
+        kind: "worker.proposal_received",
+        proposal: workerProposal({ actionProposals: [{ action }] }),
+      }),
+    );
+    expect(worker.receipt).toMatchObject({ disposition: "rejected", reason: "unauthorized_actor" });
+    expect(worker.aggregate.pendingActions).toEqual([]);
+    expect(worker.effects).toEqual([]);
+
+    const adult = accept(
+      aggregate(),
+      signal({
+        householdId: HOUSEHOLD_ID,
+        signalId: "signal_adult_calendar_action",
+        sequence: 1,
+        occurredAt: T0,
+        actor: { kind: "adult", adultId: ADULT_A },
+        kind: "external_action.proposed",
+        action,
+      }),
+    );
+    expect(adult.receipt.disposition).toBe("accepted");
+    expect(adult.aggregate.pendingActions[0]).toMatchObject({ state: "awaiting_approval", action });
+    expect(adult.effects).toEqual([
+      expect.objectContaining({ kind: "send_message", messageClass: "approval_request" }),
+    ]);
   });
 
   it("invalidates approval when action data changes", () => {

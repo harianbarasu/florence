@@ -1,4 +1,9 @@
-import type { DomainChange, HouseholdAggregate, HouseholdSignal } from "../domain/index.js";
+import type {
+  CalendarEventCreateAction,
+  DomainChange,
+  HouseholdAggregate,
+  HouseholdSignal,
+} from "../domain/index.js";
 import type { WorkerAttemptOptions, WorkerJob, WorkerResult, WorkerRuntime } from "../runtime/index.js";
 import type {
   ApplicationAuditEntry,
@@ -16,6 +21,8 @@ import type {
 } from "./contracts.js";
 
 export interface ConversationInterpretationContext {
+  readonly currentTime: string;
+  readonly householdTimeZone: string;
   readonly onboarding: ApplicationProjection["onboarding"];
   readonly sharedProfile: ApplicationProjection["sharedProfile"];
   readonly openEpisodes: readonly {
@@ -32,6 +39,14 @@ export interface ConversationInterpretationContext {
     readonly policyVersion: number;
     readonly kind: "sharing" | "routing" | "timing" | "internal_action";
     readonly description: string;
+  }[];
+  readonly pendingCalendarActions: readonly {
+    readonly actionId: string;
+    readonly title: string;
+    readonly startsAt: string;
+    readonly endsAt: string;
+    readonly timeZone: string;
+    readonly hasConflict: boolean;
   }[];
 }
 
@@ -101,12 +116,49 @@ export interface ApplicationEffectExecutorPort {
   execute(intent: Exclude<ApplicationOutboxIntent, { kind: "worker.run" }>): Promise<EffectExecutionReceipt>;
 }
 
+export type CalendarCreatePreparation =
+  | {
+      readonly status: "ready";
+      readonly targetConnectionId: string;
+      readonly calendarId: "primary";
+      readonly relevantDataDigest: string;
+      readonly hasConflict: boolean;
+    }
+  | {
+      readonly status: "unavailable";
+      readonly reason: "no_write_connection" | "ambiguous_write_connection" | "projection_incomplete";
+    };
+
+/** Trusted, model-free Calendar preflight. It exposes no personal event details. */
+export interface HouseholdCalendarActionsPort {
+  prepareCreate(input: {
+    readonly householdId: string;
+    readonly verifiedAdultIds: readonly string[];
+    readonly requestedByAdultId: string;
+    readonly asOf: string;
+    readonly startsAt: string;
+    readonly endsAt: string;
+    readonly accountLabel?: string;
+    readonly targetConnectionId?: string;
+  }): Promise<CalendarCreatePreparation>;
+
+  createApprovedEvent(input: {
+    readonly action: CalendarEventCreateAction;
+    readonly idempotencyKey: string;
+    readonly asOf: string;
+  }): Promise<{
+    readonly provider: "google-calendar";
+    readonly providerReference: string;
+  }>;
+}
+
 export interface FlorenceApplicationDependencies {
   readonly repository: ApplicationRepositoryPort;
   readonly interpreter: ApplicationInterpreterPort;
   readonly workerRuntime: WorkerRuntime;
   readonly workerContext: WorkerContextPort;
   readonly effectExecutor: ApplicationEffectExecutorPort;
+  readonly calendarActions?: HouseholdCalendarActionsPort;
   readonly workerRoutes?: WorkerRoutes;
 }
 

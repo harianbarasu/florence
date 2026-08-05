@@ -3,6 +3,7 @@ import {
   createOnboardingProjection,
   FakeApplicationEffectExecutor,
   FakeApplicationInterpreter,
+  FakeHouseholdCalendarActions,
   FakeWorkerContext,
   InMemoryApplicationRepository,
   type WorkerRoutes,
@@ -98,18 +99,21 @@ export function setup(input?: {
   );
   const workerContext = new FakeWorkerContext();
   const effectExecutor = new FakeApplicationEffectExecutor();
+  const calendarActions = new FakeHouseholdCalendarActions();
   return {
     repository,
     interpreter,
     workerRuntime,
     workerContext,
     effectExecutor,
+    calendarActions,
     dependencies: {
       repository,
       interpreter,
       workerRuntime,
       workerContext,
       effectExecutor,
+      calendarActions,
       workerRoutes: TEST_WORKER_ROUTES,
     },
   };

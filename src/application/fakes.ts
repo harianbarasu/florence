@@ -16,8 +16,10 @@ import type {
   ApplicationEffectExecutorPort,
   ApplicationInterpreterPort,
   ApplicationRepositoryPort,
+  CalendarCreatePreparation,
   ConversationInterpretationContext,
   GmailTriageContext,
+  HouseholdCalendarActionsPort,
   WorkerContextPort,
 } from "./ports.js";
 
@@ -162,5 +164,40 @@ export class FakeApplicationEffectExecutor implements ApplicationEffectExecutorP
       recordedAt: "2026-01-01T00:00:00Z",
     };
     return EffectExecutionReceiptSchema.parse(clone(receipt));
+  }
+}
+
+export class FakeHouseholdCalendarActions implements HouseholdCalendarActionsPort {
+  readonly prepareCalls: Parameters<HouseholdCalendarActionsPort["prepareCreate"]>[0][] = [];
+  readonly createCalls: Parameters<HouseholdCalendarActionsPort["createApprovedEvent"]>[0][] = [];
+  readonly #preparations: CalendarCreatePreparation[] = [];
+
+  queuePreparation(preparation: CalendarCreatePreparation): void {
+    this.#preparations.push(clone(preparation));
+  }
+
+  async prepareCreate(
+    input: Parameters<HouseholdCalendarActionsPort["prepareCreate"]>[0],
+  ): Promise<CalendarCreatePreparation> {
+    this.prepareCalls.push(clone(input));
+    return clone(
+      this.#preparations.shift() ?? {
+        status: "ready",
+        targetConnectionId: "connection_calendar_primary",
+        calendarId: "primary",
+        relevantDataDigest: `sha256:${"c".repeat(64)}`,
+        hasConflict: false,
+      },
+    );
+  }
+
+  async createApprovedEvent(
+    input: Parameters<HouseholdCalendarActionsPort["createApprovedEvent"]>[0],
+  ): Promise<{ provider: "google-calendar"; providerReference: string }> {
+    this.createCalls.push(clone(input));
+    return {
+      provider: "google-calendar",
+      providerReference: "google-calendar:primary:event_test",
+    };
   }
 }

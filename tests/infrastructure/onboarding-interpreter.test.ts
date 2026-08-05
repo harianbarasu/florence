@@ -7,6 +7,11 @@ import {
 import { ADULT_A, ADULT_B, directMessage, HOUSEHOLD_ID } from "../application/fixtures.js";
 
 const MODEL_RESULT = { intent: "ignore", confidence: 1, rationale: "No explicit action." };
+const CALENDAR_CONTEXT = {
+  currentTime: "2026-08-05T16:00:00Z",
+  householdTimeZone: "America/Los_Angeles",
+  pendingCalendarActions: [],
+} as const;
 
 function model(): ApplicationInterpreterPort {
   return {
@@ -39,6 +44,7 @@ describe("OnboardingAwareInterpreter", () => {
           "2026-08-05T16:00:00Z",
         ),
         {
+          ...CALENDAR_CONTEXT,
           onboarding: {
             phase: "awaiting_invitation",
             initiatorAdultId: ADULT_A,
@@ -72,6 +78,7 @@ describe("OnboardingAwareInterpreter", () => {
       prepareInvitation: vi.fn(),
     });
     const context = {
+      ...CALENDAR_CONTEXT,
       onboarding: {
         phase: "awaiting_initiator_consent" as const,
         initiatorAdultId: ADULT_A,
@@ -111,6 +118,7 @@ describe("OnboardingAwareInterpreter", () => {
       interpreter.interpretConversation(
         directMessage("invitee-question", "What is this?", ADULT_B, "2026-08-05T16:00:00Z"),
         {
+          ...CALENDAR_CONTEXT,
           onboarding: {
             phase: "awaiting_invitee_consent",
             initiatorAdultId: ADULT_A,
@@ -132,6 +140,7 @@ describe("OnboardingAwareInterpreter", () => {
   it("recognizes invitee consent, group registration, and explicit profile confirmation", async () => {
     const interpreter = new OnboardingAwareInterpreter(model(), { prepareInvitation: vi.fn() });
     const base = {
+      ...CALENDAR_CONTEXT,
       sharedProfile: { facts: [] },
       openEpisodes: [],
       pendingPromotionIds: [],

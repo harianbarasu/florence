@@ -5,11 +5,14 @@ import {
   type AcceptanceResult,
   AdultIdSchema,
   ApprovalIdSchema,
+  CalendarEventCreateActionSchema,
+  calendarEventCreateActionDigest,
   type DomainChange,
   WorkerJobIdSchema as DomainWorkerJobIdSchema,
   type DurableScope,
   EpisodeProposalSchema,
   EvidenceRefSchema,
+  ExternalActionIdSchema,
   type HouseholdAggregate,
   HouseholdAggregateSchema,
   HouseholdChiefOfStaff,
@@ -187,6 +190,7 @@ function queueMessage(
     | "private_review"
     | "private_interrupt"
     | "promotion_request"
+    | "clarifying_question"
     | "status"
     | "daily_brief",
   body: string,
@@ -770,12 +774,215 @@ function processProjectRequest(
   return "processed";
 }
 
-function processActiveConversation(
+function queueCalendarUnavailable(
+  work: Work,
+  item: ConversationInboxItem,
+  reason: "no_write_connection" | "ambiguous_write_connection" | "projection_incomplete",
+): void {
+  const body =
+    reason === "no_write_connection"
+      ? "I need the requesting adult to connect a Google account with Calendar access in a private DM before I can prepare this event."
+      : reason === "ambiguous_write_connection"
+        ? "More than one writable calendar account matches. Name the linked account in the event request so I can prepare one exact action."
+        : "I’m still synchronizing private calendar availability, so I won’t ask for approval yet. Try the request again after synchronization finishes.";
+  queueMessage(work, `calendar-unavailable:${reason}`, targetScope(item), "status", body);
+}
+
+async function proposeCalendarEvent(
+  work: Work,
+  item: ConversationInboxItem,
+  classification: Extract<ConversationClassification, { intent: "calendar_event_create_request" }>,
+  dependencies: FlorenceApplicationDependencies,
+): Promise<"processed" | "rejected"> {
+  if (item.channel.scope !== "household" || dependencies.calendarActions === undefined) {
+    queueMessage(
+      work,
+      "calendar-household-only",
+      targetScope(item),
+      "status",
+      item.channel.scope !== "household"
+        ? "Ask for household calendar creation in the household group so the proposed event and approval stay shared."
+        : "Calendar creation is not available until Google Calendar is connected.",
+    );
+    return "rejected";
+  }
+  const preparation = await dependencies.calendarActions.prepareCreate({
+    householdId: item.householdId,
+    verifiedAdultIds: work.aggregate.verifiedAdultIds,
+    requestedByAdultId: item.senderAdultId,
+    asOf: item.occurredAt,
+    startsAt: classification.startsAt,
+    endsAt: classification.endsAt,
+    ...(classification.calendarAccountLabel === undefined
+      ? {}
+      : { accountLabel: classification.calendarAccountLabel }),
+  });
+  if (preparation.status === "unavailable") {
+    queueCalendarUnavailable(work, item, preparation.reason);
+    return "rejected";
+  }
+  const evidence = conversationEvidence(item);
+  const actionWithoutDigest = {
+    actionId: ExternalActionIdSchema.parse(stableId("action", item.idempotencyKey, "calendar-create")),
+    kind: "calendar_update" as const,
+    calendarActionVersion: 1 as const,
+    operation: "create" as const,
+    householdId: item.householdId,
+    summary: "create the approved household calendar event",
+    relevantDataDigest: preparation.relevantDataDigest,
+    requestedFor: { kind: "household" as const },
+    evidence: [evidence],
+    title: classification.title,
+    startsAt: classification.startsAt,
+    endsAt: classification.endsAt,
+    timeZone: classification.timeZone,
+    requestedByAdultId: item.senderAdultId,
+    availabilityAdultIds: [...work.aggregate.verifiedAdultIds].sort(),
+    targetConnectionId: preparation.targetConnectionId,
+    calendarId: preparation.calendarId,
+    hasConflict: preparation.hasConflict,
+  };
+  const action = CalendarEventCreateActionSchema.parse({
+    ...actionWithoutDigest,
+    actionDigest: calendarEventCreateActionDigest(actionWithoutDigest),
+  });
+  const result = acceptDomain(
+    work,
+    "calendar-action-proposed",
+    item.occurredAt,
+    { kind: "adult", adultId: item.senderAdultId },
+    { kind: "external_action.proposed", action } as Omit<
+      HouseholdSignal,
+      "householdId" | "signalId" | "sequence" | "occurredAt" | "actor"
+    >,
+  );
+  return statusForDomain(result);
+}
+
+function askForCalendarFields(
+  work: Work,
+  item: ConversationInboxItem,
+  missingFields: readonly ("title" | "start" | "end" | "timeZone")[],
+): "processed" | "rejected" {
+  if (item.channel.scope !== "household") {
+    queueMessage(
+      work,
+      "calendar-clarification-household-only",
+      targetScope(item),
+      "clarifying_question",
+      "Ask for household calendar creation in the household group so the proposed event and approval stay shared.",
+    );
+    return "rejected";
+  }
+  const labels = {
+    title: "an event title",
+    start: "a start date and time",
+    end: "an end date and time",
+    timeZone: "a time zone",
+  } as const;
+  const needed = missingFields.map((field) => labels[field]);
+  const fieldList =
+    needed.length === 1
+      ? needed[0]
+      : needed.length === 2
+        ? `${needed[0]} and ${needed[1]}`
+        : `${needed.slice(0, -1).join(", ")}, and ${needed.at(-1)}`;
+  queueMessage(
+    work,
+    "calendar-clarification",
+    { kind: "household" },
+    "clarifying_question",
+    `To prepare one exact calendar proposal, please provide ${fieldList}.`,
+  );
+  return "processed";
+}
+
+async function approveCalendarEvent(
+  work: Work,
+  item: ConversationInboxItem,
+  actionId: string,
+  dependencies: FlorenceApplicationDependencies,
+): Promise<"processed" | "rejected"> {
+  if (item.channel.scope !== "household" || dependencies.calendarActions === undefined) {
+    return "rejected";
+  }
+  const pending = work.aggregate.pendingActions.find(
+    (candidate) =>
+      candidate.action.actionId === actionId &&
+      candidate.action.kind === "calendar_update" &&
+      candidate.state === "awaiting_approval",
+  );
+  if (pending === undefined || pending.action.kind !== "calendar_update") {
+    queueMessage(
+      work,
+      "calendar-approval-missing",
+      { kind: "household" },
+      "status",
+      "That exact calendar proposal is no longer awaiting approval.",
+    );
+    return "rejected";
+  }
+  const preparation = await dependencies.calendarActions.prepareCreate({
+    householdId: item.householdId,
+    verifiedAdultIds: work.aggregate.verifiedAdultIds,
+    requestedByAdultId: pending.action.requestedByAdultId,
+    asOf: item.occurredAt,
+    startsAt: pending.action.startsAt,
+    endsAt: pending.action.endsAt,
+    targetConnectionId: pending.action.targetConnectionId,
+  });
+  if (preparation.status === "unavailable") {
+    queueCalendarUnavailable(work, item, preparation.reason);
+    return "rejected";
+  }
+  if (
+    preparation.relevantDataDigest !== pending.action.relevantDataDigest ||
+    preparation.hasConflict !== pending.action.hasConflict
+  ) {
+    queueMessage(
+      work,
+      "calendar-approval-invalidated",
+      { kind: "household" },
+      "status",
+      "Household calendar availability changed after this proposal, so I did not create the event. Send the event request again for an updated conflict check and approval.",
+    );
+    return "rejected";
+  }
+  const approvalId = ApprovalIdSchema.parse(stableId("approval", item.idempotencyKey, actionId));
+  const result = acceptDomain(
+    work,
+    "calendar-action-approved",
+    item.occurredAt,
+    { kind: "adult", adultId: item.senderAdultId },
+    {
+      kind: "approval.granted",
+      approval: {
+        approvalId,
+        householdId: item.householdId,
+        grantedByAdultId: item.senderAdultId,
+        target: {
+          kind: "external_action",
+          actionId: pending.action.actionId,
+          actionDigest: pending.action.actionDigest,
+          relevantDataDigest: pending.action.relevantDataDigest,
+        },
+        policyVersion: work.aggregate.policyVersion,
+        grantedAt: item.occurredAt,
+        expiresAt: plusMilliseconds(item.occurredAt, 15 * 60_000),
+        status: "active",
+      },
+    } as Omit<HouseholdSignal, "householdId" | "signalId" | "sequence" | "occurredAt" | "actor">,
+  );
+  return statusForDomain(result);
+}
+
+async function processActiveConversation(
   work: Work,
   item: ConversationInboxItem,
   classification: ConversationClassification,
   routes: WorkerRoutes,
-): "processed" | "rejected" {
+  dependencies: FlorenceApplicationDependencies,
+): Promise<"processed" | "rejected"> {
   switch (classification.intent) {
     case "ignore":
       return "processed";
@@ -879,6 +1086,12 @@ function processActiveConversation(
     case "research_request":
     case "meal_plan_request":
       return processProjectRequest(work, item, classification, routes);
+    case "calendar_event_create_request":
+      return proposeCalendarEvent(work, item, classification, dependencies);
+    case "calendar_event_clarification":
+      return askForCalendarFields(work, item, classification.missingFields);
+    case "approve_calendar_event":
+      return approveCalendarEvent(work, item, classification.actionId, dependencies);
     case "daily_brief_request":
       queueMessage(work, "brief-request", targetScope(item), "daily_brief", briefBody(work.aggregate));
       return "processed";
@@ -1334,13 +1547,35 @@ async function processConversation(
           ];
         })
       : [];
+  const pendingCalendarActions = work.aggregate.pendingActions.flatMap((pending) => {
+    if (
+      pending.state !== "awaiting_approval" ||
+      pending.action.kind !== "calendar_update" ||
+      item.channel.scope !== "household"
+    ) {
+      return [];
+    }
+    return [
+      {
+        actionId: pending.action.actionId,
+        title: pending.action.title,
+        startsAt: pending.action.startsAt,
+        endsAt: pending.action.endsAt,
+        timeZone: pending.action.timeZone,
+        hasConflict: pending.action.hasConflict,
+      },
+    ];
+  });
   const classification = ConversationClassificationSchema.parse(
     await dependencies.interpreter.interpretConversation(item, {
+      currentTime: item.occurredAt,
+      householdTimeZone: work.aggregate.timeZone,
       onboarding: work.projection.onboarding,
       sharedProfile: work.projection.sharedProfile,
       openEpisodes: visibleEpisodes,
       pendingPromotionIds,
       activePolicies,
+      pendingCalendarActions,
     }),
   );
   auditClassification(
@@ -1363,7 +1598,7 @@ async function processConversation(
     return { status: "rejected", classification: "onboarding_required" };
   }
   return {
-    status: processActiveConversation(work, item, classification, routes),
+    status: await processActiveConversation(work, item, classification, routes, dependencies),
     classification: `conversation:${classification.intent}`,
   };
 }
@@ -1586,7 +1821,17 @@ function processEffectReceipt(
       actionDigest: input.actionDigest,
       outcome: input.outcome,
       recordedAt: input.recordedAt,
+      ...(input.providerReference === undefined ? {} : { providerReference: input.providerReference }),
     } as Omit<HouseholdSignal, "householdId" | "signalId" | "sequence" | "occurredAt" | "actor">,
+  );
+  work.audit.push(
+    ApplicationAuditEntrySchema.parse({
+      kind: "external_action_reconciled",
+      occurredAt: input.recordedAt,
+      decision: input.outcome,
+      sourceRef: input.actionId,
+      containsPrivateData: false,
+    }),
   );
   return {
     status: statusForDomain(result),
@@ -1808,7 +2053,7 @@ export function createFlorenceApplication(
 
       const receipt = EffectExecutionReceiptSchema.parse(await dependencies.effectExecutor.execute(intent));
       let applicationResult: ApplicationResult | undefined;
-      if (receipt.status === "succeeded" && receipt.externalAction !== undefined) {
+      if (receipt.externalAction !== undefined) {
         applicationResult = await processApplicationInput(
           dependencies,
           routes,
@@ -1821,6 +2066,9 @@ export function createFlorenceApplication(
             actionDigest: receipt.externalAction.actionDigest,
             outcome: receipt.externalAction.outcome,
             recordedAt: receipt.recordedAt,
+            ...(receipt.externalAction.providerReference === undefined
+              ? {}
+              : { providerReference: receipt.externalAction.providerReference }),
           }),
         );
       }

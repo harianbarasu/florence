@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { Temporal } from "@js-temporal/polyfill";
 import { z } from "zod";
 
@@ -436,15 +437,134 @@ export const ExternalActionKindSchema = z.enum([
   "calendar_update",
 ]);
 
-export const ExternalActionSchema = z.strictObject({
+const ExternalActionBaseShape = {
   actionId: ExternalActionIdSchema,
-  kind: ExternalActionKindSchema,
   summary: NeutralDisplayTextSchema,
   actionDigest: ActionDigestSchema,
   relevantDataDigest: ContentDigestSchema,
   requestedFor: DurableScopeSchema,
   evidence: z.array(EvidenceRefSchema).min(1).max(50),
+} as const;
+
+const NonCalendarExternalActionKindSchema = z.enum([
+  "send_email",
+  "message_third_party",
+  "submit_form",
+  "book",
+  "purchase",
+  "payment",
+  "cancel",
+  "account_mutation",
+]);
+
+export const CalendarEventCreateActionSchema = z
+  .strictObject({
+    ...ExternalActionBaseShape,
+    kind: z.literal("calendar_update"),
+    calendarActionVersion: z.literal(1),
+    operation: z.literal("create"),
+    householdId: HouseholdIdSchema,
+    title: NeutralDisplayTextSchema,
+    startsAt: InstantStringSchema,
+    endsAt: InstantStringSchema,
+    timeZone: TimeZoneSchema,
+    requestedByAdultId: AdultIdSchema,
+    availabilityAdultIds: z.array(AdultIdSchema).min(1).max(20),
+    targetConnectionId: appIdSchema("ExternalConnectionId"),
+    calendarId: z.literal("primary"),
+    hasConflict: z.boolean(),
+  })
+  .superRefine((action, context) => {
+    if (Temporal.Instant.compare(action.startsAt, action.endsAt) >= 0) {
+      context.addIssue({ code: "custom", path: ["endsAt"], message: "calendar end must follow start" });
+    }
+    if (action.requestedFor.kind !== "household") {
+      context.addIssue({
+        code: "custom",
+        path: ["requestedFor"],
+        message: "calendar creation is currently household-scoped",
+      });
+    }
+    const sortedAdults = [...new Set(action.availabilityAdultIds)].sort();
+    if (
+      sortedAdults.length !== action.availabilityAdultIds.length ||
+      sortedAdults.some((adultId, index) => adultId !== action.availabilityAdultIds[index]) ||
+      !sortedAdults.includes(action.requestedByAdultId)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["availabilityAdultIds"],
+        message: "calendar availability adults must be unique, sorted, and include the requester",
+      });
+    }
+    if (action.actionDigest !== calendarEventCreateActionDigest(action)) {
+      context.addIssue({
+        code: "custom",
+        path: ["actionDigest"],
+        message: "calendar action digest does not match its exact write payload",
+      });
+    }
+  });
+
+export type CalendarEventCreateAction = z.infer<typeof CalendarEventCreateActionSchema>;
+
+export function calendarEventCreateActionDigest(action: {
+  actionId: string;
+  kind: "calendar_update";
+  calendarActionVersion: 1;
+  operation: "create";
+  householdId: string;
+  summary: string;
+  relevantDataDigest: string;
+  requestedFor: unknown;
+  evidence: readonly unknown[];
+  title: string;
+  startsAt: string;
+  endsAt: string;
+  timeZone: string;
+  requestedByAdultId: string;
+  availabilityAdultIds: readonly string[];
+  targetConnectionId: string;
+  calendarId: "primary";
+  hasConflict: boolean;
+}): z.infer<typeof ActionDigestSchema> {
+  return ActionDigestSchema.parse(
+    `sha256:${createHash("sha256")
+      .update(
+        JSON.stringify([
+          action.actionId,
+          action.kind,
+          action.calendarActionVersion,
+          action.operation,
+          action.householdId,
+          action.summary,
+          action.relevantDataDigest,
+          action.requestedFor,
+          action.evidence,
+          action.title,
+          action.startsAt,
+          action.endsAt,
+          action.timeZone,
+          action.requestedByAdultId,
+          action.availabilityAdultIds,
+          action.targetConnectionId,
+          action.calendarId,
+          action.hasConflict,
+        ]),
+      )
+      .digest("hex")}`,
+  );
+}
+
+const NonCalendarExternalActionSchema = z.strictObject({
+  ...ExternalActionBaseShape,
+  kind: NonCalendarExternalActionKindSchema,
 });
+
+export const ExternalActionSchema = z.union([
+  CalendarEventCreateActionSchema,
+  NonCalendarExternalActionSchema,
+]);
 
 export type ExternalAction = z.infer<typeof ExternalActionSchema>;
 
@@ -724,6 +844,14 @@ export const PendingExternalActionSchema = z.strictObject({
   promotionAuthority: PromotionAuthoritySchema.optional(),
   proposedAt: InstantStringSchema,
   updatedAt: InstantStringSchema,
+  effectReceipt: z
+    .strictObject({
+      receiptId: EffectReceiptIdSchema,
+      outcome: z.enum(["succeeded", "failed", "unknown"]),
+      recordedAt: InstantStringSchema,
+      providerReference: z.string().min(1).max(500).optional(),
+    })
+    .optional(),
 });
 
 export type PendingExternalAction = z.infer<typeof PendingExternalActionSchema>;
@@ -1005,6 +1133,12 @@ export const EpisodeResumedSignalSchema = z.strictObject({
   baseEpisodeVersion: z.number().int().positive(),
 });
 
+export const ExternalActionProposedSignalSchema = z.strictObject({
+  ...SignalBaseShape,
+  kind: z.literal("external_action.proposed"),
+  action: ExternalActionSchema,
+});
+
 export const ApprovalGrantedSignalSchema = z.strictObject({
   ...SignalBaseShape,
   kind: z.literal("approval.granted"),
@@ -1064,6 +1198,7 @@ export const EffectReceiptReceivedSignalSchema = z.strictObject({
   actionDigest: ActionDigestSchema,
   outcome: z.enum(["succeeded", "failed", "unknown"]),
   recordedAt: InstantStringSchema,
+  providerReference: z.string().min(1).max(500).optional(),
 });
 
 export const HouseholdSignalSchema = z.discriminatedUnion("kind", [
@@ -1075,6 +1210,7 @@ export const HouseholdSignalSchema = z.discriminatedUnion("kind", [
   EpisodeTemporalPlanReplacedSignalSchema,
   EpisodeBlockedSignalSchema,
   EpisodeResumedSignalSchema,
+  ExternalActionProposedSignalSchema,
   ApprovalGrantedSignalSchema,
   ApprovalRevokedSignalSchema,
   PolicyApprovedSignalSchema,

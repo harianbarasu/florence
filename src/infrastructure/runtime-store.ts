@@ -86,6 +86,19 @@ export type PersonalCalendarBusyWindowPage = {
   synchronizedAt: string | null;
 };
 
+export type HouseholdCalendarCreatePreparation =
+  | {
+      status: "ready";
+      targetConnectionId: string;
+      calendarId: "primary";
+      relevantDataDigest: string;
+      hasConflict: boolean;
+    }
+  | {
+      status: "unavailable";
+      reason: "no_write_connection" | "ambiguous_write_connection" | "projection_incomplete";
+    };
+
 type InvitationRow = {
   id: string;
   household_id: string;
@@ -1192,6 +1205,172 @@ export class FlorenceRuntimeStore {
       })),
       complete: rows.length <= parsed.limit,
       synchronizedAt,
+    };
+  }
+
+  /**
+   * Selects one owned write target and reduces every adult's private projection to
+   * an opaque availability version. Personal event identities never leave this store.
+   */
+  public async prepareCreate(input: {
+    householdId: string;
+    verifiedAdultIds: readonly string[];
+    requestedByAdultId: string;
+    asOf: string;
+    startsAt: string;
+    endsAt: string;
+    accountLabel?: string;
+    targetConnectionId?: string;
+  }): Promise<HouseholdCalendarCreatePreparation> {
+    const parsed = z
+      .strictObject({
+        householdId: z.uuid(),
+        verifiedAdultIds: z.array(z.uuid()).min(1).max(20),
+        requestedByAdultId: z.uuid(),
+        asOf: instantSchema,
+        startsAt: instantSchema,
+        endsAt: instantSchema,
+        accountLabel: z.string().trim().min(1).max(200).optional(),
+        targetConnectionId: z.uuid().optional(),
+      })
+      .parse(input);
+    if (Date.parse(parsed.startsAt) >= Date.parse(parsed.endsAt)) {
+      throw new ApplicationStoreError("invalid_state", "Calendar availability range is invalid");
+    }
+    if (!parsed.verifiedAdultIds.includes(parsed.requestedByAdultId)) {
+      throw new ApplicationStoreError("not_authorized", "Calendar requester is not a verified adult");
+    }
+    const activeMembers = await this.database<{ adult_id: string }[]>`
+      select adult_id from household_memberships
+      where household_id = ${parsed.householdId} and status = 'active'
+      order by adult_id
+    `;
+    const expectedAdults = [...new Set(parsed.verifiedAdultIds)].sort();
+    const storedAdults = activeMembers.map((row) => row.adult_id).sort();
+    if (
+      expectedAdults.length !== storedAdults.length ||
+      expectedAdults.some((adultId, index) => adultId !== storedAdults[index])
+    ) {
+      return { status: "unavailable", reason: "projection_incomplete" };
+    }
+
+    const writeTargets = await this.database<
+      { id: string; label: string; metadata: Record<string, unknown> }[]
+    >`
+      select id, label, metadata
+      from external_connections
+      where household_id = ${parsed.householdId} and adult_id = ${parsed.requestedByAdultId}
+        and provider = 'google' and status = 'active'
+        and granted_scopes && ${[GOOGLE_CALENDAR_EVENTS_SCOPE]}::text[]
+      order by created_at, id
+    `;
+    const normalizedLabel = parsed.accountLabel?.toLocaleLowerCase("en-US");
+    const candidates = writeTargets.filter((target) => {
+      if (parsed.targetConnectionId !== undefined) return target.id === parsed.targetConnectionId;
+      if (normalizedLabel === undefined) return true;
+      const label = String(target.metadata.accountLabel ?? target.label)
+        .trim()
+        .toLocaleLowerCase("en-US");
+      return label === normalizedLabel;
+    });
+    if (candidates.length === 0) return { status: "unavailable", reason: "no_write_connection" };
+    if (candidates.length !== 1) {
+      return { status: "unavailable", reason: "ambiguous_write_connection" };
+    }
+    const target = candidates[0];
+    if (target === undefined) return { status: "unavailable", reason: "no_write_connection" };
+
+    const connections = await this.database<
+      { id: string; adult_id: string; cursor: Record<string, unknown> }[]
+    >`
+      select id, adult_id, cursor
+      from external_connections
+      where household_id = ${parsed.householdId}
+        and adult_id = any(${expectedAdults}::uuid[])
+        and provider = 'google' and status = 'active'
+        and granted_scopes && ${[GOOGLE_CALENDAR_READONLY_SCOPE, GOOGLE_CALENDAR_EVENTS_SCOPE]}::text[]
+      order by adult_id, id
+    `;
+    const coverage: Array<{ connectionId: string; adultId: string; calendarId: string }> = [];
+    for (const connection of connections) {
+      const state = calendarSyncStateSchema.safeParse(connection.cursor.calendar);
+      if (
+        !state.success ||
+        state.data.phase !== "live" ||
+        !state.data.projectionReady ||
+        state.data.calendarId !== "primary" ||
+        state.data.lastSuccessfulSyncAt === null ||
+        Date.parse(state.data.lastSuccessfulSyncAt) < Date.parse(parsed.asOf) - 30 * 60_000 ||
+        Date.parse(state.data.initialTimeMin) > Date.parse(parsed.startsAt) ||
+        Date.parse(state.data.initialTimeMax) < Date.parse(parsed.endsAt)
+      ) {
+        return { status: "unavailable", reason: "projection_incomplete" };
+      }
+      coverage.push({
+        connectionId: connection.id,
+        adultId: connection.adult_id,
+        calendarId: state.data.calendarId,
+      });
+    }
+    if (!coverage.some((item) => item.connectionId === target.id)) {
+      return { status: "unavailable", reason: "projection_incomplete" };
+    }
+
+    const overlaps = await this.database<
+      {
+        connection_id: string;
+        owner_adult_id: string;
+        calendar_id: string;
+        external_event_id: string;
+        source_revision: number;
+        starts_at: Date;
+        ends_at: Date;
+      }[]
+    >`
+      select busy.connection_id, busy.owner_adult_id, busy.calendar_id,
+        busy.external_event_id, busy.source_revision, busy.starts_at, busy.ends_at
+      from calendar_busy_windows busy
+      join external_connections connection on connection.id = busy.connection_id
+      where busy.household_id = ${parsed.householdId}
+        and busy.owner_adult_id = any(${expectedAdults}::uuid[])
+        and connection.household_id = busy.household_id
+        and connection.adult_id = busy.owner_adult_id
+        and connection.provider = 'google' and connection.status = 'active'
+        and connection.granted_scopes && ${[
+          GOOGLE_CALENDAR_READONLY_SCOPE,
+          GOOGLE_CALENDAR_EVENTS_SCOPE,
+        ]}::text[]
+        and busy.starts_at < ${parsed.endsAt} and busy.ends_at > ${parsed.startsAt}
+      order by busy.owner_adult_id, busy.connection_id, busy.calendar_id,
+        busy.external_event_id, busy.source_revision
+    `;
+    const digestMaterial = canonicalJson({
+      schemaVersion: 1,
+      householdId: parsed.householdId,
+      verifiedAdultIds: expectedAdults,
+      targetConnectionId: target.id,
+      calendarId: "primary",
+      startsAt: parsed.startsAt,
+      endsAt: parsed.endsAt,
+      coverage,
+      overlaps: overlaps.map((row) => ({
+        connectionId: row.connection_id,
+        adultId: row.owner_adult_id,
+        calendarId: row.calendar_id,
+        externalEventId: row.external_event_id,
+        sourceRevision: row.source_revision,
+        startsAt: row.starts_at.toISOString(),
+        endsAt: row.ends_at.toISOString(),
+      })),
+    });
+    return {
+      status: "ready",
+      targetConnectionId: target.id,
+      calendarId: "primary",
+      relevantDataDigest: `sha256:${createHmac("sha256", this.identityKey)
+        .update(digestMaterial)
+        .digest("hex")}`,
+      hasConflict: overlaps.length > 0,
     };
   }
 

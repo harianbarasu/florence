@@ -8,6 +8,7 @@ import {
   EpisodeIdSchema,
   EpisodeProposalSchema,
   EvidenceRefSchema,
+  ExternalActionIdSchema,
   FactualTextSchema,
   HouseholdAggregateSchema,
   HouseholdIdSchema,
@@ -22,6 +23,7 @@ import {
   SemanticTimePlanSchema,
   SensitivitySchema,
   SourceClassSchema,
+  TimeZoneSchema,
 } from "../domain/index.js";
 import {
   WorkerJobSchema as RuntimeWorkerJobSchema,
@@ -277,6 +279,37 @@ const MealPlanRequestClassificationSchema = z.strictObject({
   scopeAssessment: HouseholdScopeAssessmentSchema,
 });
 
+const CalendarEventCreateRequestClassificationSchema = z
+  .strictObject({
+    ...ClassificationBaseShape,
+    intent: z.literal("calendar_event_create_request"),
+    title: NeutralDisplayTextSchema,
+    startsAt: InstantStringSchema,
+    endsAt: InstantStringSchema,
+    timeZone: TimeZoneSchema,
+    calendarAccountLabel: z.string().trim().min(1).max(200).optional(),
+  })
+  .superRefine((classification, context) => {
+    if (Date.parse(classification.startsAt) >= Date.parse(classification.endsAt)) {
+      context.addIssue({ code: "custom", path: ["endsAt"], message: "calendar end must follow start" });
+    }
+  });
+
+const CalendarEventClarificationClassificationSchema = z
+  .strictObject({
+    ...ClassificationBaseShape,
+    intent: z.literal("calendar_event_clarification"),
+    missingFields: z
+      .array(z.enum(["title", "start", "end", "timeZone"]))
+      .min(1)
+      .max(4),
+  })
+  .superRefine((classification, context) => {
+    if (new Set(classification.missingFields).size !== classification.missingFields.length) {
+      context.addIssue({ code: "custom", path: ["missingFields"], message: "missing fields must be unique" });
+    }
+  });
+
 export const ConversationClassificationSchema = z.discriminatedUnion("intent", [
   z.strictObject({
     ...ClassificationBaseShape,
@@ -307,6 +340,13 @@ export const ConversationClassificationSchema = z.discriminatedUnion("intent", [
   }),
   ResearchRequestClassificationSchema,
   MealPlanRequestClassificationSchema,
+  CalendarEventCreateRequestClassificationSchema,
+  CalendarEventClarificationClassificationSchema,
+  z.strictObject({
+    ...ClassificationBaseShape,
+    intent: z.literal("approve_calendar_event"),
+    actionId: ExternalActionIdSchema,
+  }),
   z.strictObject({
     ...ClassificationBaseShape,
     intent: z.literal("daily_brief_request"),
@@ -512,6 +552,7 @@ export const ConversationSendIntentSchema = z.strictObject({
     "private_review",
     "private_interrupt",
     "promotion_request",
+    "clarifying_question",
     "status",
     "daily_brief",
   ]),
@@ -562,6 +603,7 @@ export const ApplicationAuditEntrySchema = z.strictObject({
     "domain_accepted",
     "worker_reconciled",
     "daily_brief_built",
+    "external_action_reconciled",
   ]),
   occurredAt: InstantStringSchema,
   decision: z.string().trim().min(1).max(100),
@@ -627,6 +669,7 @@ export const EffectReceiptInputSchema = z.strictObject({
   actionDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
   outcome: z.enum(["succeeded", "failed", "unknown"]),
   recordedAt: InstantStringSchema,
+  providerReference: StableReferenceSchema.optional(),
 });
 
 export const ApplicationInputSchema = z.discriminatedUnion("kind", [
@@ -693,6 +736,7 @@ export const EffectExecutionReceiptSchema = z.strictObject({
       actionId: StableReferenceSchema,
       actionDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
       outcome: z.enum(["succeeded", "failed", "unknown"]),
+      providerReference: StableReferenceSchema.optional(),
     })
     .optional(),
 });

@@ -13,12 +13,15 @@ import {
   type WorkerRoutes,
 } from "../../src/application/index.js";
 import {
+  CalendarEventCreateActionSchema,
+  calendarEventCreateActionDigest,
   type DurableScope,
   type FamilyEpisode,
   FamilyEpisodeSchema,
   RoutineAnchorSchema,
 } from "../../src/domain/index.js";
 import {
+  GoogleCalendarActionError,
   type LinqChannelDirectory,
   type LinqChannelTarget,
   ProductionApplicationEffectExecutor,
@@ -152,6 +155,42 @@ function activeHouseholdTarget(): LinqChannelTarget {
     chatId: "linq_household_chat",
     status: "active",
   };
+}
+
+function calendarCreateAction() {
+  const withoutDigest = {
+    actionId: "action_calendar_create_1",
+    kind: "calendar_update" as const,
+    calendarActionVersion: 1 as const,
+    operation: "create" as const,
+    householdId: HOUSEHOLD_ID,
+    summary: "create the approved household calendar event",
+    relevantDataDigest: `sha256:${"c".repeat(64)}`,
+    requestedFor: { kind: "household" as const },
+    evidence: [
+      {
+        evidenceId: "evidence_calendar_create_1",
+        source: "linq" as const,
+        sourceRef: "message_calendar_create_1",
+        scope: { kind: "household" as const },
+        observedAt: "2027-03-01T00:00:00Z",
+        revision: 1,
+      },
+    ],
+    title: "School welcome night",
+    startsAt: "2027-03-04T02:00:00Z",
+    endsAt: "2027-03-04T03:00:00Z",
+    timeZone: "America/Los_Angeles",
+    requestedByAdultId: ADULT_A,
+    availabilityAdultIds: [ADULT_A, ADULT_B],
+    targetConnectionId: "connection_calendar_primary",
+    calendarId: "primary" as const,
+    hasConflict: false,
+  };
+  return CalendarEventCreateActionSchema.parse({
+    ...withoutDigest,
+    actionDigest: calendarEventCreateActionDigest(withoutDigest),
+  });
 }
 
 describe("ProductionApplicationEffectExecutor", () => {
@@ -327,6 +366,54 @@ describe("ProductionApplicationEffectExecutor", () => {
     });
     expect(harness.sender.calls).toEqual([]);
     expect(harness.timerStore.scheduled).toEqual([]);
+  });
+
+  it("executes only a validated approved Calendar effect and distinguishes retryable from final failure", async () => {
+    const sender = new RecordingSender();
+    const channelDirectory = new StaticChannelDirectory(activeHouseholdTarget());
+    const timerStore = new RecordingTimerStore();
+    const createApprovedEvent = vi.fn(async () => ({
+      provider: "google-calendar" as const,
+      providerReference: "google-calendar:primary:event_school_night",
+    }));
+    const executor = new ProductionApplicationEffectExecutor({
+      sender,
+      channelDirectory,
+      timerStore,
+      calendarActions: { createApprovedEvent },
+      now: () => EFFECT_NOW,
+    });
+    const intent = domainIntent({
+      kind: "execute_external_action",
+      approvalId: "approval_calendar_create_1",
+      action: calendarCreateAction(),
+    });
+
+    await expect(executor.execute(intent)).resolves.toMatchObject({
+      status: "succeeded",
+      externalAction: {
+        actionId: "action_calendar_create_1",
+        outcome: "succeeded",
+        providerReference: "google-calendar:primary:event_school_night",
+      },
+    });
+    expect(createApprovedEvent).toHaveBeenCalledWith({
+      action: calendarCreateAction(),
+      idempotencyKey: "domain:effect:1",
+      asOf: EFFECT_NOW.toISOString(),
+    });
+
+    createApprovedEvent.mockRejectedValueOnce(new GoogleCalendarActionError("projection_incomplete", true));
+    await expect(executor.execute(intent)).resolves.toEqual({
+      status: "retryable_failure",
+      recordedAt: EFFECT_RECORDED_AT,
+    });
+
+    createApprovedEvent.mockRejectedValueOnce(new GoogleCalendarActionError("approval_invalidated", false));
+    await expect(executor.execute(intent)).resolves.toMatchObject({
+      status: "permanent_failure",
+      externalAction: { actionId: "action_calendar_create_1", outcome: "failed" },
+    });
   });
 });
 

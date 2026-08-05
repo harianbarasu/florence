@@ -420,7 +420,10 @@ const onboardingSchema = z.strictObject({
   householdName: z.string().trim().min(1).max(200),
   adultDisplayName: z.string().trim().min(1).max(200),
   timeZone: z.string().min(1).max(100),
-  consentedAt: instantSchema,
+  consent: z.discriminatedUnion("status", [
+    z.strictObject({ status: z.literal("pending") }),
+    z.strictObject({ status: z.literal("consented"), consentedAt: instantSchema }),
+  ]),
   projectionSchemaVersion: z.number().int().positive(),
   initialProjection: jsonObjectSchema,
   privateChannel: z
@@ -875,6 +878,9 @@ export class ApplicationStore implements ApplicationRepositoryPort {
     const householdId = input.householdId ?? randomUUID();
     const adultId = input.adultId ?? randomUUID();
     const channelBindingId = input.privateChannel ? (input.channelBindingId ?? randomUUID()) : null;
+    const membershipStatus = input.consent.status === "consented" ? "active" : "invited";
+    const consentedAt = input.consent.status === "consented" ? input.consent.consentedAt : null;
+    const channelStatus = input.consent.status === "consented" ? "active" : "pending";
 
     await this.database.begin(async (transaction) => {
       await transaction`
@@ -887,7 +893,9 @@ export class ApplicationStore implements ApplicationRepositoryPort {
       `;
       await transaction`
         insert into household_memberships (household_id, adult_id, role, status, consented_at)
-        values (${householdId}, ${adultId}, 'owner', 'active', ${input.consentedAt})
+        values (
+          ${householdId}, ${adultId}, 'owner', ${membershipStatus}, ${consentedAt}
+        )
       `;
       await transaction`
         insert into household_projections (household_id, schema_version, version, state)
@@ -904,7 +912,8 @@ export class ApplicationStore implements ApplicationRepositoryPort {
           ) values (
             ${channelBindingId}, ${householdId}, ${adultId}, 'linq', 'private',
             ${input.privateChannel.externalChatId}, ${input.privateChannel.externalHandle},
-            'active', ${json(this.database, input.privateChannel.metadata)}
+            ${channelStatus},
+            ${json(this.database, input.privateChannel.metadata)}
           )
         `;
       }

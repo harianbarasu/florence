@@ -66,7 +66,7 @@ describe("OnboardingAwareInterpreter", () => {
     expect(fallback.interpretConversation).not.toHaveBeenCalled();
   });
 
-  it("requires explicit consent and delegates ambiguous greetings to the model", async () => {
+  it("requires explicit consent without exposing pre-consent messages to the model", async () => {
     const fallback = model();
     const interpreter = new OnboardingAwareInterpreter(fallback, {
       prepareInvitation: vi.fn(),
@@ -90,13 +90,43 @@ describe("OnboardingAwareInterpreter", () => {
         directMessage("hello", "Hi Florence", ADULT_A, "2026-08-05T16:00:00Z"),
         context,
       ),
-    ).resolves.toEqual(MODEL_RESULT);
+    ).resolves.toMatchObject({
+      intent: "ignore",
+      rationale: expect.stringContaining("not explicitly consented"),
+    });
+    expect(fallback.interpretConversation).not.toHaveBeenCalled();
     await expect(
       interpreter.interpretConversation(
         directMessage("consent", "I consent", ADULT_A, "2026-08-05T16:01:00Z"),
         context,
       ),
     ).resolves.toMatchObject({ intent: "onboarding", action: "consent" });
+    expect(fallback.interpretConversation).not.toHaveBeenCalled();
+  });
+
+  it("keeps an invitee's pre-consent messages out of the model", async () => {
+    const fallback = model();
+    const interpreter = new OnboardingAwareInterpreter(fallback, { prepareInvitation: vi.fn() });
+    await expect(
+      interpreter.interpretConversation(
+        directMessage("invitee-question", "What is this?", ADULT_B, "2026-08-05T16:00:00Z"),
+        {
+          onboarding: {
+            phase: "awaiting_invitee_consent",
+            initiatorAdultId: ADULT_A,
+            invitedAdultId: ADULT_B,
+            consentedAdultIds: [ADULT_A],
+            privateDmAdultIds: [ADULT_A],
+            profileConfirmedAdultIds: [],
+          },
+          sharedProfile: { facts: [] },
+          openEpisodes: [],
+          pendingPromotionIds: [],
+          activePolicies: [],
+        },
+      ),
+    ).resolves.toMatchObject({ intent: "ignore" });
+    expect(fallback.interpretConversation).not.toHaveBeenCalled();
   });
 
   it("recognizes invitee consent, group registration, and explicit profile confirmation", async () => {

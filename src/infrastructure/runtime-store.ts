@@ -170,7 +170,10 @@ export class FlorenceRuntimeStore {
       externalChatId: input.externalChatId,
       externalHandle: handle,
     });
-    if (existing) return existing;
+    if (existing) {
+      await this.ensureFoundingSnapshot(existing, input.timeZone);
+      return existing;
+    }
     if (await this.isSuppressed(input.externalChatId, handle)) {
       throw new ApplicationStoreError("not_authorized", "This Linq identity is opted out");
     }
@@ -184,7 +187,7 @@ export class FlorenceRuntimeStore {
         householdName: "My family",
         adultDisplayName: "Founding adult",
         timeZone: input.timeZone,
-        consentedAt: occurredAt,
+        consent: { status: "pending" },
         projectionSchemaVersion: 1,
         initialProjection: { phase: "application_snapshot" },
         privateChannel: {
@@ -193,16 +196,29 @@ export class FlorenceRuntimeStore {
           metadata: { inboundFirstAt: occurredAt, service: "iMessage" },
         },
       });
-      await this.applicationStore.initializeApplicationSnapshot({
-        snapshot: this.initialSnapshot({ householdId, initiatorAdultId: adultId, timeZone: input.timeZone }),
-      });
+      await this.ensureFoundingSnapshot(
+        {
+          bindingId: "provisional",
+          provider: "linq",
+          channelType: "private",
+          householdId,
+          adultId,
+          bindingStatus: "pending",
+          membershipStatus: "invited",
+          metadata: {},
+        },
+        input.timeZone,
+      );
     } catch (error) {
       const raced = await this.applicationStore.resolveChannel({
         provider: "linq",
         externalChatId: input.externalChatId,
         externalHandle: handle,
       });
-      if (raced) return raced;
+      if (raced) {
+        await this.ensureFoundingSnapshot(raced, input.timeZone);
+        return raced;
+      }
       throw error;
     }
     const created = await this.applicationStore.resolveChannel({
@@ -212,6 +228,81 @@ export class FlorenceRuntimeStore {
     });
     if (!created) throw new ApplicationStoreError("invalid_state", "Founding channel was not created");
     return created;
+  }
+
+  public async finalizeFoundingAdult(input: {
+    householdId: string;
+    adultId: string;
+    externalChatId: string;
+    externalHandle: string;
+    consentedAt: string;
+  }): Promise<boolean> {
+    const parsed = z
+      .strictObject({
+        householdId: z.uuid(),
+        adultId: z.uuid(),
+        externalChatId: z.string().min(1).max(500),
+        externalHandle: handleSchema,
+        consentedAt: instantSchema,
+      })
+      .parse(input);
+    const handle = canonicalizeLinqHandle(parsed.externalHandle);
+    return this.database.begin(async (transaction) => {
+      const rows = await transaction<
+        { membership_status: "invited" | "active" | "revoked"; binding_status: string }[]
+      >`
+        select hm.status as membership_status, cb.status as binding_status
+        from household_memberships hm
+        join channel_bindings cb
+          on cb.household_id = hm.household_id and cb.adult_id = hm.adult_id
+        where hm.household_id = ${parsed.householdId} and hm.adult_id = ${parsed.adultId}
+          and hm.role = 'owner'
+          and cb.provider = 'linq' and cb.channel_type = 'private'
+          and cb.external_chat_id = ${parsed.externalChatId} and cb.external_handle = ${handle}
+        for update of hm, cb
+      `;
+      const identity = rows[0];
+      if (!identity) return false;
+      if (
+        !["invited", "active"].includes(identity.membership_status) ||
+        !["pending", "active"].includes(identity.binding_status)
+      ) {
+        throw new ApplicationStoreError("invalid_state", "Founding identity cannot be activated");
+      }
+      await transaction`
+        update household_memberships
+        set status = 'active', consented_at = coalesce(consented_at, ${parsed.consentedAt}),
+            updated_at = now()
+        where household_id = ${parsed.householdId} and adult_id = ${parsed.adultId}
+          and role = 'owner'
+      `;
+      await transaction`
+        update channel_bindings
+        set status = 'active', updated_at = now()
+        where household_id = ${parsed.householdId} and adult_id = ${parsed.adultId}
+          and provider = 'linq' and channel_type = 'private'
+          and external_chat_id = ${parsed.externalChatId} and external_handle = ${handle}
+      `;
+      return true;
+    });
+  }
+
+  private async ensureFoundingSnapshot(resolution: ChannelResolution, timeZone: string): Promise<void> {
+    if (!resolution.adultId) {
+      throw new ApplicationStoreError("invalid_state", "Founding channel has no adult identity");
+    }
+    if (await this.applicationStore.load(resolution.householdId)) return;
+    const snapshot = this.initialSnapshot({
+      householdId: resolution.householdId,
+      initiatorAdultId: resolution.adultId,
+      timeZone,
+    });
+    try {
+      await this.applicationStore.initializeApplicationSnapshot({ snapshot });
+    } catch (error) {
+      if (await this.applicationStore.load(resolution.householdId)) return;
+      throw error;
+    }
   }
 
   public async prepareInvitation(input: {

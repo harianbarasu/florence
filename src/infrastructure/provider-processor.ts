@@ -98,6 +98,13 @@ export interface ProviderRuntimeStore {
     timeZone: string;
     occurredAt: string;
   }): Promise<ChannelResolution>;
+  finalizeFoundingAdult(input: {
+    householdId: string;
+    adultId: string;
+    externalChatId: string;
+    externalHandle: string;
+    consentedAt: string;
+  }): Promise<boolean>;
   finalizeInvitation(input: {
     householdId: string;
     adultId: string;
@@ -206,7 +213,7 @@ export class ProductionProviderProcessor {
     if (
       event.scope === "direct" &&
       this.options.privateCommands &&
-      snapshot.projection.onboarding.phase !== "awaiting_initiator_consent"
+      route.resolution.membershipStatus === "active"
     ) {
       const command = await this.options.privateCommands.handle({
         householdId: route.resolution.householdId,
@@ -249,17 +256,33 @@ export class ProductionProviderProcessor {
     if (event.scope === "direct" && route.resolution.membershipStatus === "invited") {
       const after = await this.options.applicationStore.load(route.resolution.householdId);
       const onboarding = after?.projection.onboarding;
-      if (
-        onboarding?.invitedAdultId === route.senderAdultId &&
-        onboarding.consentedAdultIds.includes(AdultIdSchema.parse(route.senderAdultId))
-      ) {
-        await this.options.runtimeStore.finalizeInvitation({
-          householdId: route.resolution.householdId,
-          adultId: route.senderAdultId,
-          externalChatId: event.conversation.id,
-          externalHandle: handle,
-          consentedAt: event.occurredAt,
-        });
+      const adultId = AdultIdSchema.parse(route.senderAdultId);
+      if (onboarding?.consentedAdultIds.includes(adultId)) {
+        const activated =
+          onboarding.initiatorAdultId === adultId
+            ? await this.options.runtimeStore.finalizeFoundingAdult({
+                householdId: route.resolution.householdId,
+                adultId,
+                externalChatId: event.conversation.id,
+                externalHandle: handle,
+                consentedAt: event.occurredAt,
+              })
+            : onboarding.invitedAdultId === adultId
+              ? await this.options.runtimeStore.finalizeInvitation({
+                  householdId: route.resolution.householdId,
+                  adultId,
+                  externalChatId: event.conversation.id,
+                  externalHandle: handle,
+                  consentedAt: event.occurredAt,
+                })
+              : false;
+        if (!activated) {
+          throw new ProviderProcessingError(
+            "consented_identity_activation_failed",
+            false,
+            "The explicitly consented identity could not be activated",
+          );
+        }
       }
     }
 

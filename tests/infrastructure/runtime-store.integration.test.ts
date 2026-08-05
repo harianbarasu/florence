@@ -29,6 +29,26 @@ describe.skipIf(!databaseUrl)("FlorenceRuntimeStore PostgreSQL integration", () 
     await closeDatabase(database);
   });
 
+  async function provisionConsentedFounder(input: {
+    externalChatId: string;
+    externalHandle: string;
+    timeZone: string;
+    occurredAt: string;
+  }) {
+    const founded = await store.provisionFoundingAdult(input);
+    if (!founded.adultId) throw new Error("Expected a founding adult");
+    await expect(
+      store.finalizeFoundingAdult({
+        householdId: founded.householdId,
+        adultId: founded.adultId,
+        externalChatId: input.externalChatId,
+        externalHandle: input.externalHandle,
+        consentedAt: input.occurredAt,
+      }),
+    ).resolves.toBe(true);
+    return founded;
+  }
+
   it("provisions inbound-first adults and binds only an exact two-adult group", async () => {
     const now = "2026-08-05T16:00:00Z";
     const ownerHandle = "+12025550101";
@@ -41,14 +61,43 @@ describe.skipIf(!databaseUrl)("FlorenceRuntimeStore PostgreSQL integration", () 
     });
     expect(founder).toMatchObject({
       channelType: "private",
-      bindingStatus: "active",
-      membershipStatus: "active",
+      bindingStatus: "pending",
+      membershipStatus: "invited",
     });
+    await expect(database<{ status: string; consented_at: Date | null }[]>`
+      select status, consented_at from household_memberships
+      where household_id = ${founder.householdId} and adult_id = ${founder.adultId}
+    `).resolves.toEqual([{ status: "invited", consented_at: null }]);
     const snapshot = await applicationStore.load(founder.householdId);
     expect(snapshot?.projection.onboarding).toMatchObject({
       phase: "awaiting_initiator_consent",
       initiatorAdultId: founder.adultId,
     });
+    await expect(
+      store.finalizeFoundingAdult({
+        householdId: founder.householdId,
+        adultId: founder.adultId as string,
+        externalChatId: "dm-owner",
+        externalHandle: ownerHandle,
+        consentedAt: now,
+      }),
+    ).resolves.toBe(true);
+    await expect(
+      store.finalizeFoundingAdult({
+        householdId: founder.householdId,
+        adultId: founder.adultId as string,
+        externalChatId: "dm-owner",
+        externalHandle: ownerHandle,
+        consentedAt: now,
+      }),
+    ).resolves.toBe(true);
+    await expect(
+      applicationStore.resolveChannel({
+        provider: "linq",
+        externalChatId: "dm-owner",
+        externalHandle: ownerHandle,
+      }),
+    ).resolves.toMatchObject({ bindingStatus: "active", membershipStatus: "active" });
 
     const invitation = await store.prepareInvitation({
       householdId: founder.householdId,
@@ -158,7 +207,7 @@ describe.skipIf(!databaseUrl)("FlorenceRuntimeStore PostgreSQL integration", () 
   });
 
   it("keeps Gmail credentials, cursors, and sources scoped to their owning adult", async () => {
-    const founded = await store.provisionFoundingAdult({
+    const founded = await provisionConsentedFounder({
       externalChatId: `dm-google-${randomUUID()}`,
       externalHandle: "+12025550211",
       timeZone: "America/Los_Angeles",
@@ -264,7 +313,7 @@ describe.skipIf(!databaseUrl)("FlorenceRuntimeStore PostgreSQL integration", () 
   });
 
   it("reconciles and leases idempotent Gmail continuation work", async () => {
-    const founded = await store.provisionFoundingAdult({
+    const founded = await provisionConsentedFounder({
       externalChatId: `dm-sync-${randomUUID()}`,
       externalHandle: "+12025550212",
       timeZone: "America/Los_Angeles",
@@ -347,7 +396,7 @@ describe.skipIf(!databaseUrl)("FlorenceRuntimeStore PostgreSQL integration", () 
   });
 
   it("isolates Calendar cursors, channels, encrypted sources, and privacy-safe busy windows", async () => {
-    const founded = await store.provisionFoundingAdult({
+    const founded = await provisionConsentedFounder({
       externalChatId: `dm-calendar-${randomUUID()}`,
       externalHandle: "+12025550213",
       timeZone: "America/Los_Angeles",

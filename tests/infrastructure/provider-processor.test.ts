@@ -112,13 +112,17 @@ function setup(input: { known?: ChannelResolution | null; snapshots?: HouseholdA
     resolveChannel: vi.fn(async () => input.known ?? null),
     load: vi.fn(async () => snapshots.shift() ?? snapshot()),
   };
-  const provisionFoundingAdult = vi.fn(async () => privateResolution());
+  const provisionFoundingAdult = vi.fn(async () =>
+    privateResolution({ bindingStatus: "pending", membershipStatus: "invited" }),
+  );
+  const finalizeFoundingAdult = vi.fn(async () => true);
   const runtimeStore: ProviderRuntimeStore = {
     setSuppression: vi.fn(async () => undefined),
     isSuppressed: vi.fn(async () => false),
     findPendingInvitation: vi.fn(async () => null),
     bindPendingInvitee: vi.fn(async () => privateResolution()),
     provisionFoundingAdult,
+    finalizeFoundingAdult,
     finalizeInvitation: vi.fn(async () => true),
     resolveExactGroup: vi.fn(async () => null),
     bindHouseholdGroup: vi.fn(async () => ({
@@ -153,6 +157,7 @@ function setup(input: { known?: ChannelResolution | null; snapshots?: HouseholdA
     applicationStore,
     runtimeStore,
     provisionFoundingAdult,
+    finalizeFoundingAdult,
     google,
     getChat,
     retrieveAttachment,
@@ -161,7 +166,15 @@ function setup(input: { known?: ChannelResolution | null; snapshots?: HouseholdA
 
 describe("ProductionProviderProcessor", () => {
   it("provisions an unknown inbound DM and routes it as one personal application signal", async () => {
-    const harness = setup();
+    const awaitingConsent = snapshot({
+      phase: "awaiting_initiator_consent",
+      invitedAdultId: undefined,
+      consentedAdultIds: [],
+      privateDmAdultIds: [],
+      groupChannelId: undefined,
+      profileConfirmedAdultIds: [],
+    });
+    const harness = setup({ snapshots: [awaitingConsent, awaitingConsent] });
     await expect(harness.processor.process(claimed(event()))).resolves.toMatchObject({
       householdId: HOUSEHOLD_ID,
       resolution: { classification: "conversation:ignore" },
@@ -179,6 +192,48 @@ describe("ProductionProviderProcessor", () => {
         senderAdultId: ADULT_A,
       }),
     );
+    expect(harness.finalizeFoundingAdult).not.toHaveBeenCalled();
+  });
+
+  it("activates a pending founder only after the application records explicit consent", async () => {
+    const before = snapshot({
+      phase: "awaiting_initiator_consent",
+      invitedAdultId: undefined,
+      consentedAdultIds: [],
+      privateDmAdultIds: [],
+      groupChannelId: undefined,
+      profileConfirmedAdultIds: [],
+    });
+    const after = snapshot({
+      phase: "awaiting_invitation",
+      invitedAdultId: undefined,
+      consentedAdultIds: [ADULT_A],
+      privateDmAdultIds: [ADULT_A],
+      groupChannelId: undefined,
+      profileConfirmedAdultIds: [],
+    });
+    const harness = setup({ snapshots: [before, after] });
+    const consent = event({
+      message: {
+        id: "message-consent",
+        text: "I consent",
+        attachments: [],
+        replyTo: null,
+        consentCommand: null,
+      },
+    });
+
+    await expect(harness.processor.process(claimed(consent))).resolves.toMatchObject({
+      householdId: HOUSEHOLD_ID,
+    });
+    expect(harness.finalizeFoundingAdult).toHaveBeenCalledTimes(1);
+    expect(harness.finalizeFoundingAdult).toHaveBeenCalledWith({
+      householdId: HOUSEHOLD_ID,
+      adultId: ADULT_A,
+      externalChatId: "dm-1",
+      externalHandle: "+12025550101",
+      consentedAt: NOW,
+    });
   });
 
   it("applies STOP durably before any model or application work", async () => {

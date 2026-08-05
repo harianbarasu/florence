@@ -35,10 +35,11 @@ export class OnboardingAwareInterpreter implements ApplicationInterpreterPort {
     if (
       onboarding.phase === "awaiting_initiator_consent" &&
       input.channel.scope === "personal" &&
-      input.senderAdultId === onboarding.initiatorAdultId &&
-      explicitConsent(normalized)
+      input.senderAdultId === onboarding.initiatorAdultId
     ) {
-      return onboardingClassification("consent", "The initiating adult explicitly consented.");
+      return explicitConsent(normalized)
+        ? onboardingClassification("consent", "The initiating adult explicitly consented.")
+        : preConsentIgnore("The initiating adult has not explicitly consented yet.");
     }
 
     if (
@@ -68,13 +69,14 @@ export class OnboardingAwareInterpreter implements ApplicationInterpreterPort {
     if (
       onboarding.phase === "awaiting_invitee_consent" &&
       input.channel.scope === "personal" &&
-      input.senderAdultId === onboarding.invitedAdultId &&
-      explicitInviteAcceptance(normalized)
+      input.senderAdultId === onboarding.invitedAdultId
     ) {
-      return onboardingClassification(
-        "accept_invite",
-        "The invited adult explicitly accepted and consented in their own DM.",
-      );
+      return explicitInviteAcceptance(normalized)
+        ? onboardingClassification(
+            "accept_invite",
+            "The invited adult explicitly accepted and consented in their own DM.",
+          )
+        : preConsentIgnore("The invited adult has not explicitly accepted and consented yet.");
     }
 
     if (
@@ -133,4 +135,8 @@ function onboardingClassification(
   rationale: string,
 ) {
   return { intent: "onboarding" as const, action, confidence: 1, rationale };
+}
+
+function preConsentIgnore(rationale: string) {
+  return { intent: "ignore" as const, confidence: 1, rationale };
 }

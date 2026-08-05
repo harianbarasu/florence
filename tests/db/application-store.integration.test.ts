@@ -38,7 +38,7 @@ describe.skipIf(!databaseUrl)("ApplicationStore PostgreSQL integration", () => {
       householdName: "Application store family",
       adultDisplayName: "Founding adult",
       timeZone: "America/Los_Angeles",
-      consentedAt: new Date().toISOString(),
+      consent: { status: "consented", consentedAt: new Date().toISOString() },
       projectionSchemaVersion: 1,
       initialProjection: { episodes: {}, learnedPreferences: {} },
     });
@@ -129,7 +129,7 @@ describe.skipIf(!databaseUrl)("ApplicationStore PostgreSQL integration", () => {
       householdName: "Channel family",
       adultDisplayName: "Owner",
       timeZone: "America/New_York",
-      consentedAt: new Date().toISOString(),
+      consent: { status: "consented", consentedAt: new Date().toISOString() },
       projectionSchemaVersion: 1,
       initialProjection: { episodes: {} },
       privateChannel: { externalChatId, externalHandle, metadata: { route: "primary" } },
@@ -226,7 +226,7 @@ describe.skipIf(!databaseUrl)("ApplicationStore PostgreSQL integration", () => {
       householdName: "Application repository family",
       adultDisplayName: "Owner",
       timeZone: "America/Los_Angeles",
-      consentedAt: new Date().toISOString(),
+      consent: { status: "consented", consentedAt: new Date().toISOString() },
       projectionSchemaVersion: 1,
       initialProjection: { legacyProjection: true },
     });

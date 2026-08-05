@@ -3420,6 +3420,14 @@ async function upsertTimerIntent(
 ): Promise<string> {
   const rowId = randomUUID();
   const digest = payloadDigest(timer.payload);
+  const definitionDigest = payloadDigest({
+    episodeKey: timer.episodeKey ?? null,
+    triggerKind: timer.triggerKind,
+    planVersion: timer.planVersion,
+    dueAt: timer.dueAt,
+    maxAttempts: timer.maxAttempts,
+    payloadDigest: digest,
+  });
   const sealed = cipher.seal(
     timer.payload,
     encryptedJsonContext("household", householdId, "scheduled_triggers", rowId, "payload"),
@@ -3427,12 +3435,12 @@ async function upsertTimerIntent(
   const inserted = await transaction<{ id: string }[]>`
     insert into scheduled_triggers (
       id, household_id, timer_key, episode_key, trigger_kind,
-      plan_version, due_at, available_at, status, payload_digest, payload_key_id,
+      plan_version, due_at, available_at, status, definition_digest, payload_digest, payload_key_id,
       payload_ciphertext, max_attempts, control_epoch
     ) values (
       ${rowId}, ${householdId}, ${timer.timerKey}, ${timer.episodeKey ?? null},
       ${timer.triggerKind}, ${timer.planVersion}, ${timer.dueAt}, ${timer.dueAt},
-      'scheduled', ${digest}, ${sealed.keyId}, ${sealed.ciphertext}, ${timer.maxAttempts},
+      'scheduled', ${definitionDigest}, ${digest}, ${sealed.keyId}, ${sealed.ciphertext}, ${timer.maxAttempts},
       (select control_epoch from households where id = ${householdId})
     )
     on conflict (household_id, timer_key) where timer_key is not null
@@ -3443,12 +3451,7 @@ async function upsertTimerIntent(
 
   const existingRows = await transaction<{ id: string; definition_matches: boolean }[]>`
     select id,
-      episode_key is not distinct from ${timer.episodeKey ?? null}
-        and trigger_kind = ${timer.triggerKind}
-        and plan_version = ${timer.planVersion}
-        and due_at = ${timer.dueAt}
-        and max_attempts = ${timer.maxAttempts}
-        and payload_digest = ${digest} as definition_matches
+      definition_digest = ${definitionDigest} as definition_matches
     from scheduled_triggers
     where household_id = ${householdId} and timer_key = ${timer.timerKey}
     for update

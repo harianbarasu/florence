@@ -69,7 +69,7 @@ export interface LinqChannelDirectory {
     readonly targetScope: DurableScope;
     readonly responseContext?: ConversationResponseContext;
     readonly deliveryGuard?: ProjectDeliveryGuard;
-    readonly loadGroupChat: (chatId: string) => Promise<LinqChat>;
+    readonly loadChat: (chatId: string) => Promise<LinqChat>;
     readonly send: (chatId: string) => Promise<LinqSendReceipt>;
     readonly allowWhileDeleting?: boolean;
   }): Promise<SerializedLinqSendResult>;
@@ -303,7 +303,7 @@ export class ProductionApplicationEffectExecutor implements ApplicationEffectExe
         targetScope,
         ...(responseContext === undefined ? {} : { responseContext }),
         ...(deliveryGuard === undefined ? {} : { deliveryGuard }),
-        loadGroupChat: (chatId) => this.#linqChats.getChat(chatId),
+        loadChat: (chatId) => this.#linqChats.getChat(chatId),
         send: (chatId) =>
           this.#sender.sendText({
             chatId,

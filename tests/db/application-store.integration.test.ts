@@ -124,9 +124,9 @@ describe.skipIf(!databaseUrl)("ApplicationStore PostgreSQL integration", () => {
       {
         status: string;
         household_id: string | null;
-        body_key_id: string;
-        body_ciphertext: string;
-        conflict_ciphertext: string;
+        body_key_id: string | null;
+        body_ciphertext: string | null;
+        conflict_ciphertext: string | null;
         conflicts: string;
       }[]
     >`
@@ -140,11 +140,11 @@ describe.skipIf(!databaseUrl)("ApplicationStore PostgreSQL integration", () => {
     expect(state[0]).toMatchObject({
       status: "quarantined",
       household_id: null,
-      body_key_id: "integration",
+      body_key_id: null,
       conflicts: "1",
     });
-    expect(state[0]?.body_ciphertext).not.toContain("Pickup moved to five");
-    expect(state[0]?.conflict_ciphertext).not.toContain("Pickup moved to six");
+    expect(state[0]?.body_ciphertext).toBeNull();
+    expect(state[0]?.conflict_ciphertext).toBeNull();
 
     await Promise.all(
       Array.from({ length: 8 }, (_, index) =>

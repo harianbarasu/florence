@@ -838,7 +838,24 @@ export class ProductionProviderProcessor {
       return null;
     }
     if (!isExactHealthyLinqGroup(chat, event.conversation.id, this.#linqFromPhone)) {
-      await this.pauseKnownGroup(known, event.conversation.id, "live_group_identity_mismatch");
+      const recovery =
+        known?.channelType === "group" &&
+        isRecoverableLinqGroupMismatch(chat, event.conversation.id, this.#linqFromPhone, handle)
+          ? await this.options.runtimeStore.pauseGroupBindingForRecovery({
+              householdId: known.householdId,
+              externalChatId: event.conversation.id,
+              reason: "live_group_identity_mismatch",
+            })
+          : null;
+      if (recovery === null) {
+        await this.pauseKnownGroup(known, event.conversation.id, "live_group_identity_mismatch");
+      }
+      if (
+        event.transport !== "partner_api_reconciliation" &&
+        isRecoverableLinqGroupMismatch(chat, event.conversation.id, this.#linqFromPhone, handle)
+      ) {
+        await this.queueGroupRecoveryGuidance(event, handle, known, recovery?.recoveryRef ?? null);
+      }
       return null;
     }
     const identity = await this.options.runtimeStore.resolveExactGroup(chat.participantHandles);
@@ -973,6 +990,35 @@ function isExactHealthyLinqGroup(
     }
     const expectedActive = [...participants, ...self].sort();
     return expectedActive.every((value, index) => value === active[index]);
+  } catch {
+    return false;
+  }
+}
+
+function isRecoverableLinqGroupMismatch(
+  chat: Awaited<ReturnType<LinqChatReader["getChat"]>>,
+  expectedChatId: string,
+  configuredFromPhone: string | null,
+  senderHandle: string,
+): boolean {
+  if (
+    configuredFromPhone === null ||
+    chat.id !== expectedChatId ||
+    !chat.isGroup ||
+    chat.healthStatus !== "HEALTHY" ||
+    chat.service?.toLowerCase() !== "imessage"
+  ) {
+    return false;
+  }
+  try {
+    const selfHandles = uniqueCanonicalHandles(chat.selfHandles);
+    const activeHandles = uniqueCanonicalHandles(chat.activeHandles);
+    return (
+      selfHandles.length === 1 &&
+      selfHandles[0] === configuredFromPhone &&
+      activeHandles.includes(configuredFromPhone) &&
+      activeHandles.includes(canonicalizeLinqHandle(senderHandle))
+    );
   } catch {
     return false;
   }

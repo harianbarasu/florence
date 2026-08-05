@@ -222,15 +222,19 @@ type CalendarBusyWindowOverlapRow = CalendarBusyWindowRow & {
  * aggregate; pending invitation lookups use a keyed digest.
  */
 export class FlorenceRuntimeStore {
+  readonly #linqFromPhone: string | null;
+
   public constructor(
     private readonly database: Database,
     private readonly applicationStore: ApplicationStore,
     private readonly sensitiveJson: TenantJsonCipher,
     private readonly identityKey: string,
+    linqFromPhone: string | null = null,
   ) {
     if (Buffer.byteLength(identityKey, "utf8") < 32) {
       throw new Error("Florence identity key must contain at least 32 bytes");
     }
+    this.#linqFromPhone = linqFromPhone === null ? null : canonicalizeLinqHandle(linqFromPhone);
   }
 
   public initialSnapshot(input: {
@@ -1164,7 +1168,7 @@ export class FlorenceRuntimeStore {
     targetScope: DurableScope;
     responseContext?: ConversationResponseContext;
     deliveryGuard?: ProjectDeliveryGuard;
-    loadGroupChat: (chatId: string) => Promise<LinqChat>;
+    loadChat: (chatId: string) => Promise<LinqChat>;
     send: (chatId: string) => Promise<LinqSendReceipt>;
     allowWhileDeleting?: boolean;
   }): Promise<SerializedLinqSendResult> {
@@ -1292,7 +1296,7 @@ export class FlorenceRuntimeStore {
       if (targetScope.kind === "household") {
         let chat: LinqChat;
         try {
-          chat = await input.loadGroupChat(chatId);
+          chat = await input.loadChat(chatId);
         } catch (error) {
           if (!(error instanceof LinqApiError) || error.retryable) throw error;
           await transaction`
@@ -1313,6 +1317,17 @@ export class FlorenceRuntimeStore {
             where id = ${row.id} and status <> 'revoked'
           `;
           return { status: "binding_paused" };
+        }
+      } else {
+        let chat: LinqChat;
+        try {
+          chat = await input.loadChat(chatId);
+        } catch (error) {
+          if (error instanceof LinqApiError && !error.retryable) return { status: "inactive" };
+          throw error;
+        }
+        if (!isExactHealthyLinqDirectChat(chat, chatId, row.external_handle as string, this.#linqFromPhone)) {
+          return { status: "inactive" };
         }
       }
 
@@ -4165,6 +4180,40 @@ function normalizeHealthyLinqGroup(
       : null;
   } catch {
     return null;
+  }
+}
+
+function isExactHealthyLinqDirectChat(
+  chat: LinqChat,
+  expectedChatId: string,
+  expectedParticipant: string,
+  configuredFromPhone: string | null,
+): boolean {
+  if (
+    chat.id !== expectedChatId ||
+    chat.isGroup ||
+    chat.healthStatus !== "HEALTHY" ||
+    chat.service?.toLowerCase() !== "imessage"
+  ) {
+    return false;
+  }
+  try {
+    const participants = uniqueCanonicalHandles(chat.participantHandles);
+    const selfHandles = uniqueCanonicalHandles(chat.selfHandles);
+    const activeHandles = uniqueCanonicalHandles(chat.activeHandles);
+    const participant = canonicalizeLinqHandle(expectedParticipant);
+    if (
+      participants.length !== 1 ||
+      participants[0] !== participant ||
+      selfHandles.length !== 1 ||
+      (configuredFromPhone !== null && selfHandles[0] !== configuredFromPhone) ||
+      activeHandles.length !== 2
+    ) {
+      return false;
+    }
+    return sameStrings(activeHandles, [participant, selfHandles[0] as string].sort());
+  } catch {
+    return false;
   }
 }
 

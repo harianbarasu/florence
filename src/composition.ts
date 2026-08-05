@@ -268,6 +268,7 @@ export async function createProductionComposition(
       applicationStore,
       sensitiveJson,
       config.FLORENCE_TOKEN_ENCRYPTION_KEY,
+      config.LINQ_FROM_PHONE ?? null,
     );
     const customerDataControls = new PostgresCustomerDataControlStore(database, blindIndex, sensitiveJson);
     const conversationFeedback = new PostgresConversationFeedbackStore(database);
@@ -473,15 +474,6 @@ export async function createProductionComposition(
       async isReady(): Promise<boolean> {
         if (!(await databaseReadiness.isReady()) || !(await modelReadiness.isReady())) return false;
         if (linqReconciliationStore !== null && !(await linqReconciliationStore.isConfigurationReady())) {
-          return false;
-        }
-        if (
-          integrations.googleOAuth &&
-          !(await runtimeStore.isGoogleRuntimeReady({
-            gmailEnabled: integrations.gmail,
-            calendarEnabled: integrations.googleCalendar,
-          }))
-        ) {
           return false;
         }
         if (!(await runtimeStore.isWorkerHeartbeatFresh("durable-worker", 45))) return false;

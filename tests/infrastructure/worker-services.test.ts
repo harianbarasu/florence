@@ -118,7 +118,7 @@ class StaticChannelDirectory implements LinqChannelDirectory {
   async executeSerializedSend(input: {
     householdId: string;
     targetScope: DurableScope;
-    loadGroupChat: (chatId: string) => Promise<LinqChat>;
+    loadChat: (chatId: string) => Promise<LinqChat>;
     send: (chatId: string) => Promise<LinqSendReceipt>;
     allowWhileDeleting?: boolean;
   }) {
@@ -131,7 +131,7 @@ class StaticChannelDirectory implements LinqChannelDirectory {
     ) {
       return { status: "inactive" } as const;
     }
-    if (input.targetScope.kind === "household") await input.loadGroupChat(this.target.chatId);
+    if (input.targetScope.kind === "household") await input.loadChat(this.target.chatId);
     return {
       status: "sent" as const,
       target: this.target,

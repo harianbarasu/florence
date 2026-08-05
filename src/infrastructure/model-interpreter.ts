@@ -29,53 +29,52 @@ export class ModelApplicationInterpreter implements ApplicationInterpreterPort {
     const binaryAttachments = input.attachmentContents.filter(
       (attachment) => attachment.kind === "image" || attachment.kind === "file",
     );
-    const result = await this.gateway.complete(
-      binaryAttachments.length > 0 ? "vision_document" : "classification_extraction",
-      {
-        messages: [
-          { role: "system", parts: [{ type: "text", text: CONVERSATION_SYSTEM_PROMPT }] },
-          {
-            role: "user",
-            parts: [
-              {
-                type: "text",
-                text: JSON.stringify({
-                  task: "classify_household_conversation",
-                  message: {
-                    ...input,
-                    attachmentContents: input.attachmentContents.map((attachment) =>
-                      attachment.kind === "image" || attachment.kind === "file"
-                        ? { ...attachment, dataBase64: undefined }
-                        : attachment,
-                    ),
-                  },
-                  context,
-                }),
-              },
-              ...binaryAttachments.map((attachment) =>
-                attachment.kind === "image"
-                  ? ({
-                      type: "image" as const,
-                      mediaType: attachment.mediaType,
-                      data: attachment.dataBase64,
-                      ...(attachment.filename === null ? {} : { alt: attachment.filename }),
-                    } as const)
-                  : ({
-                      type: "file" as const,
-                      mediaType: attachment.mediaType,
-                      data: attachment.dataBase64,
-                      ...(attachment.filename === null ? {} : { filename: attachment.filename }),
-                    } as const),
-              ),
-            ],
-          },
-        ],
-        responseSchema: ConversationClassificationSchema,
-        responseSchemaName: "florence_conversation_classification",
-        maxOutputTokens: 4_000,
-      },
-    );
-    return structuredValue(result, "classification_extraction");
+    const profile: ModelCapabilityProfile =
+      binaryAttachments.length > 0 ? "vision_document" : "classification_extraction";
+    const result = await this.gateway.complete(profile, {
+      messages: [
+        { role: "system", parts: [{ type: "text", text: CONVERSATION_SYSTEM_PROMPT }] },
+        {
+          role: "user",
+          parts: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                task: "classify_household_conversation",
+                message: {
+                  ...input,
+                  attachmentContents: input.attachmentContents.map((attachment) =>
+                    attachment.kind === "image" || attachment.kind === "file"
+                      ? { ...attachment, dataBase64: undefined }
+                      : attachment,
+                  ),
+                },
+                context,
+              }),
+            },
+            ...binaryAttachments.map((attachment) =>
+              attachment.kind === "image"
+                ? ({
+                    type: "image" as const,
+                    mediaType: attachment.mediaType,
+                    data: attachment.dataBase64,
+                    ...(attachment.filename === null ? {} : { alt: attachment.filename }),
+                  } as const)
+                : ({
+                    type: "file" as const,
+                    mediaType: attachment.mediaType,
+                    data: attachment.dataBase64,
+                    ...(attachment.filename === null ? {} : { filename: attachment.filename }),
+                  } as const),
+            ),
+          ],
+        },
+      ],
+      responseSchema: ConversationClassificationSchema,
+      responseSchemaName: "florence_conversation_classification",
+      maxOutputTokens: 4_000,
+    });
+    return structuredValue(result, profile);
   }
 
   public async triageGmail(input: GmailInboxItem, context: GmailTriageContext): Promise<unknown> {

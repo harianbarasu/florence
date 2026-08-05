@@ -334,6 +334,141 @@ describe.skipIf(!databaseUrl)("ApplicationStore PostgreSQL integration", () => {
     ).resolves.toBe(true);
   });
 
+  it("dead-letters permanent outbox failures only under the current lease fence", async () => {
+    const { householdId } = await household();
+    const intentKey = `permanent:${randomUUID()}`;
+    await store.commitHouseholdProjection({
+      householdId,
+      expectedVersion: 0,
+      schemaVersion: 1,
+      nextState: { fixture: "permanent-outbox" },
+      outbox: [
+        {
+          intentKey,
+          effectKind: "fixture.permanent",
+          idempotencyKey: `permanent:${randomUUID()}`,
+          payload: { fixture: true },
+        },
+      ],
+    });
+    const firstClaims = await store.claimOutbox({
+      owner: "permanent-first-owner",
+      limit: 100,
+      leaseSeconds: 60,
+    });
+    const first = firstClaims.find((item) => item.intentKey === intentKey);
+    if (!first) throw new Error("Expected the permanent outbox fixture lease");
+
+    await expect(
+      store.recordOutboxPermanent({
+        rowId: first.rowId,
+        leaseToken: randomUUID(),
+        errorCode: "invalid_outbox_payload",
+      }),
+    ).resolves.toBe(false);
+    await expect(
+      store.recordOutboxPermanent({
+        rowId: first.rowId,
+        leaseToken: first.leaseToken,
+        errorCode: "Invalid Error Code",
+      }),
+    ).rejects.toThrow();
+    await expect(
+      store.recordOutboxPermanent({
+        rowId: first.rowId,
+        leaseToken: first.leaseToken,
+        errorCode: "invalid_outbox_payload",
+        safeDetail: "",
+      }),
+    ).rejects.toThrow();
+    await expect(
+      store.recordOutboxPermanent({
+        rowId: first.rowId,
+        leaseToken: first.leaseToken,
+        errorCode: "invalid_outbox_payload",
+        unexpected: true,
+      } as never),
+    ).rejects.toThrow();
+
+    await database`
+      update outbox set lease_expires_at = now() - interval '1 second'
+      where id = ${first.rowId}
+    `;
+    const reclaimedClaims = await store.claimOutbox({
+      owner: "permanent-second-owner",
+      limit: 100,
+      leaseSeconds: 60,
+    });
+    const reclaimed = reclaimedClaims.find((item) => item.intentKey === intentKey);
+    if (!reclaimed) throw new Error("Expected the reclaimed permanent outbox fixture lease");
+    expect(reclaimed.leaseToken).not.toBe(first.leaseToken);
+    expect(reclaimed.attempt).toBe(2);
+
+    await expect(
+      store.recordOutboxPermanent({
+        rowId: first.rowId,
+        leaseToken: first.leaseToken,
+        errorCode: "invalid_outbox_payload",
+      }),
+    ).resolves.toBe(false);
+    await expect(
+      store.recordOutboxPermanent({
+        rowId: reclaimed.rowId,
+        leaseToken: reclaimed.leaseToken,
+        errorCode: "invalid_outbox_payload",
+        safeDetail: "  Strict application intent parsing failed.  ",
+      }),
+    ).resolves.toBe(true);
+
+    const dead = await database<
+      {
+        status: string;
+        attempt: number;
+        dead_at: Date | null;
+        last_error_code: string | null;
+        last_error_detail: string | null;
+        lease_owner: string | null;
+        lease_token: string | null;
+        lease_expires_at: Date | null;
+      }[]
+    >`
+      select status, attempt, dead_at, last_error_code, last_error_detail,
+        lease_owner, lease_token, lease_expires_at
+      from outbox where id = ${reclaimed.rowId}
+    `;
+    expect(dead[0]).toMatchObject({
+      status: "dead",
+      attempt: 2,
+      last_error_code: "invalid_outbox_payload",
+      last_error_detail: "Strict application intent parsing failed.",
+      lease_owner: null,
+      lease_token: null,
+      lease_expires_at: null,
+    });
+    expect(dead[0]?.dead_at).toBeInstanceOf(Date);
+    const deadAt = dead[0]?.dead_at?.toISOString();
+
+    await expect(
+      store.recordOutboxPermanent({
+        rowId: reclaimed.rowId,
+        leaseToken: reclaimed.leaseToken,
+        errorCode: "different_error",
+      }),
+    ).resolves.toBe(false);
+    const settled = await database<
+      { status: string; dead_at: Date; last_error_code: string; last_error_detail: string }[]
+    >`
+      select status, dead_at, last_error_code, last_error_detail
+      from outbox where id = ${reclaimed.rowId}
+    `;
+    expect(settled[0]).toMatchObject({
+      status: "dead",
+      last_error_code: "invalid_outbox_payload",
+      last_error_detail: "Strict application intent parsing failed.",
+    });
+    expect(settled[0]?.dead_at.toISOString()).toBe(deadAt);
+  });
+
   it("commits projections, timers, outbox effects, and audits atomically", async () => {
     const { householdId, adultId } = await household();
     const dueAt = new Date(Date.now() - 10_000).toISOString();

@@ -22,6 +22,7 @@ import type { Database } from "./client.js";
 
 const jsonObjectSchema = z.record(z.string(), z.unknown());
 const instantSchema = z.iso.datetime({ offset: true });
+const queueErrorCodeSchema = z.string().regex(/^[a-z][a-z0-9_.-]{0,99}$/);
 const leaseInputSchema = z.strictObject({
   owner: z.string().min(1).max(200),
   limit: z.number().int().positive().max(500),
@@ -1753,6 +1754,31 @@ export class ApplicationStore implements ApplicationRepositoryPort {
       returning status
     `;
     return rows[0]?.status ?? "lost_lease";
+  }
+
+  public async recordOutboxPermanent(input: {
+    rowId: string;
+    leaseToken: string;
+    errorCode: string;
+    safeDetail?: string;
+  }): Promise<boolean> {
+    const parsed = z
+      .strictObject({
+        rowId: z.uuid(),
+        leaseToken: z.uuid(),
+        errorCode: queueErrorCodeSchema,
+        safeDetail: z.string().trim().min(1).max(2_000).optional(),
+      })
+      .parse(input);
+    const rows = await this.database<{ id: string }[]>`
+      update outbox
+      set status = 'dead', dead_at = now(), last_error_code = ${parsed.errorCode},
+          last_error_detail = ${parsed.safeDetail ?? null}, lease_owner = null,
+          lease_token = null, lease_expires_at = null, updated_at = now()
+      where id = ${parsed.rowId} and status = 'leased' and lease_token = ${parsed.leaseToken}
+      returning id
+    `;
+    return rows.length === 1;
   }
 
   public async resolveAmbiguousOutbox(input: {

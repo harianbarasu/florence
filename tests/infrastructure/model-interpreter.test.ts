@@ -115,7 +115,10 @@ describe("ModelApplicationInterpreter", () => {
 
     expect(gateway.calls[0]?.profile).toBe("private_processing");
     expect(gateway.calls[0]?.request.responseSchemaName).toBe("florence_private_gmail_triage");
-    expect(JSON.stringify(gateway.calls[0]?.request.messages)).toContain("Private access code 9917");
+    const serialized = JSON.stringify(gateway.calls[0]?.request.messages);
+    expect(serialized).toContain("Private access code 9917");
+    expect(serialized).toContain("materialException");
+    expect(serialized).toContain("untrusted evidence");
   });
 
   it("keeps Gmail binary evidence on the private multimodal route without duplicating bytes in JSON", async () => {
@@ -213,6 +216,7 @@ describe("ModelApplicationInterpreter", () => {
     const serialized = JSON.stringify(gateway.calls[0]?.request.messages);
     expect(serialized).toContain("triage_private_calendar_event");
     expect(serialized).toContain("untrusted evidence");
+    expect(serialized).toContain("materialException");
     expect(serialized).toContain("America/Los_Angeles");
   });
 

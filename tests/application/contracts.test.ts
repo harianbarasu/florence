@@ -9,9 +9,31 @@ import {
   GmailTriageResultSchema,
   WorkerCommandSchema,
 } from "../../src/application/index.js";
+import { PrivateSourceMatcherSchema } from "../../src/domain/index.js";
 import { ADULT_A, classificationBase, HOUSEHOLD_ID } from "./fixtures.js";
 
 describe("application-owned structured contracts", () => {
+  it("accepts only digest-based app-owned private source matchers", () => {
+    const matcher = {
+      source: "gmail" as const,
+      accountRefDigest: `sha256:${"a".repeat(64)}`,
+      senderIdentityDigest: `sha256:${"b".repeat(64)}`,
+    };
+    expect(PrivateSourceMatcherSchema.safeParse(matcher).success).toBe(true);
+    expect(
+      PrivateSourceMatcherSchema.safeParse({
+        ...matcher,
+        accountRef: "raw-private-account",
+      }).success,
+    ).toBe(false);
+    expect(
+      PrivateSourceMatcherSchema.safeParse({
+        ...matcher,
+        sender: "raw-private-sender@example.com",
+      }).success,
+    ).toBe(false);
+  });
+
   it("rejects classifier metadata that is outside the conversation contract", () => {
     expect(
       ConversationClassificationSchema.safeParse({
@@ -34,6 +56,7 @@ describe("application-owned structured contracts", () => {
         sourceClass: "school.notice",
         sensitivity: "sensitive",
         familyImpact: true,
+        materialException: false,
         rationale: "The message has a current household consequence.",
         privateSummary: "A private school notice needs review.",
         minimumHouseholdMeaning: "A school form is due Friday.",
@@ -102,12 +125,15 @@ describe("application-owned structured contracts", () => {
       sourceClass: "calendar.school",
       sensitivity: "ordinary" as const,
       familyImpact: true,
+      materialException: false,
       rationale: "The event needs household coordination.",
       privateSummary: "A private event needs coordination.",
       minimumHouseholdMeaning: "School has an evening event.",
       minimumRequiredOutcome: "The family plan accounts for the school event.",
     };
     expect(CalendarTriageResultSchema.safeParse(proposal).success).toBe(true);
+    const { materialException: _materialException, ...withoutMaterialException } = proposal;
+    expect(CalendarTriageResultSchema.safeParse(withoutMaterialException).success).toBe(false);
     expect(CalendarTriageResultSchema.safeParse({ ...proposal, rawTitle: "Private title" }).success).toBe(
       false,
     );

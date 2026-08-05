@@ -28,6 +28,7 @@ import {
   OutboxIntentSchema,
   type PendingExternalAction,
   PolicyCandidateIdSchema,
+  type PrivateSourceMatcher,
   type PromotionAuthority,
   type RejectionReason,
   type ResolvedTimePlan,
@@ -192,6 +193,7 @@ function checkPromotionAuthority(
   sourceClass: string,
   sensitivity: keyof typeof SENSITIVITY_RANK,
   authority: PromotionAuthority | undefined,
+  sourceMatcher: PrivateSourceMatcher | undefined,
   now: InstantString,
 ): AuthorityCheck {
   if (checkScopeWithoutPromotion(evidence, targetScope)) {
@@ -236,6 +238,14 @@ function checkPromotionAuthority(
   }
 
   const policy = aggregate.policies.find((candidate) => candidate.policyId === authority.policyId);
+  const matcherMatches =
+    sourceMatcher !== undefined &&
+    policy?.rule.kind === "sharing" &&
+    policy.rule.sourceMatcher.source === sourceMatcher.source &&
+    policy.rule.sourceMatcher.accountRefDigest === sourceMatcher.accountRefDigest &&
+    (sourceMatcher.source === "calendar" ||
+      (policy.rule.sourceMatcher.source === "gmail" &&
+        policy.rule.sourceMatcher.senderIdentityDigest === sourceMatcher.senderIdentityDigest));
   if (
     policy === undefined ||
     policy.status !== "active" ||
@@ -244,6 +254,8 @@ function checkPromotionAuthority(
     policy.rule.kind !== "sharing" ||
     policy.rule.from.adultId !== sourceAdultId ||
     policy.rule.sourceClass !== sourceClass ||
+    !matcherMatches ||
+    evidence.some((item) => item.scope.kind === "personal" && item.source !== sourceMatcher?.source) ||
     SENSITIVITY_RANK[sensitivity] > SENSITIVITY_RANK[policy.rule.maximumSensitivity]
   ) {
     return { ok: false, reason: "invalid_promotion_authority" };
@@ -291,6 +303,7 @@ function resolveEpisodeProposal(
     proposal.sourceClass,
     proposal.sensitivity,
     proposal.promotionAuthority,
+    proposal.sourceMatcher,
     now,
   );
   if (!authority.ok) {
@@ -334,6 +347,7 @@ function resolveEpisodeProposal(
     sourceClass: proposal.sourceClass,
     sensitivity: proposal.sensitivity,
     ...(proposal.promotionAuthority === undefined ? {} : { promotionAuthority: proposal.promotionAuthority }),
+    ...(proposal.sourceMatcher === undefined ? {} : { sourceMatcher: proposal.sourceMatcher }),
     ...(temporalPlan === undefined ? {} : { temporalPlan }),
     createdAt: now,
     updatedAt: now,
@@ -1273,6 +1287,7 @@ function handleMemoryConfirmed(context: HandlerContext): MutationResult {
     candidate.sourceClass,
     candidate.sensitivity,
     signal.promotionAuthority,
+    undefined,
     signal.occurredAt,
   );
   if (!authority.ok) {
@@ -1417,6 +1432,7 @@ function handleWorkerProposal(context: HandlerContext): MutationResult {
       message.sourceClass,
       message.sensitivity,
       message.promotionAuthority,
+      undefined,
       signal.occurredAt,
     );
     if (!authority.ok) {
@@ -1452,6 +1468,7 @@ function handleWorkerProposal(context: HandlerContext): MutationResult {
       "external_action",
       "sensitive",
       proposed.promotionAuthority,
+      undefined,
       signal.occurredAt,
     );
     if (!authority.ok) {

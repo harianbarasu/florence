@@ -21,6 +21,8 @@ import {
   InstantStringSchema,
   type OutboxIntent,
   PolicyIdSchema,
+  type PrivateSourceMatcher,
+  PrivateSourceMatcherSchema,
   RoutineAnchorIdSchema,
   RoutineAnchorSchema,
   WorkerProposalSchema,
@@ -118,6 +120,114 @@ function stableId(prefix: string, ...parts: readonly string[]): string {
 
 function contentDigest(...parts: readonly string[]): string {
   return `sha256:${createHash("sha256").update(parts.join("\u0000")).digest("hex")}`;
+}
+
+function privateAccountDigest(accountRef: string): string {
+  return contentDigest("florence.private-source-account.v1", accountRef);
+}
+
+function normalizedSenderIdentity(sender: string | undefined): string | undefined {
+  const normalized = sender?.normalize("NFKC").trim().toLocaleLowerCase("en-US").replace(/\s+/gu, " ");
+  if (normalized === undefined || normalized.length === 0) return undefined;
+  const email = normalized.match(
+    /[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+/u,
+  )?.[0];
+  return email === undefined ? `header:${normalized}` : `email:${email}`;
+}
+
+function senderDisplayName(sender: string | undefined): string | undefined {
+  const displayName = sender
+    ?.normalize("NFKC")
+    .replace(/<[^>]*>/gu, "")
+    .trim()
+    .replace(/^["']|["']$/gu, "")
+    .trim();
+  return displayName === undefined || displayName.length === 0 ? undefined : displayName;
+}
+
+function gmailSourceMatcher(item: GmailInboxItem): PrivateSourceMatcher | undefined {
+  const senderIdentity = normalizedSenderIdentity(item.sender);
+  if (senderIdentity === undefined) return undefined;
+  return PrivateSourceMatcherSchema.parse({
+    source: "gmail",
+    accountRefDigest: privateAccountDigest(item.accountRef),
+    senderIdentityDigest: contentDigest("florence.private-source-sender.v1", senderIdentity),
+  });
+}
+
+function calendarSourceMatcher(item: CalendarEventInboxItem): PrivateSourceMatcher {
+  return PrivateSourceMatcherSchema.parse({
+    source: "calendar",
+    accountRefDigest: privateAccountDigest(item.accountRef),
+  });
+}
+
+function sourceMatchersEqual(left: PrivateSourceMatcher, right: PrivateSourceMatcher): boolean {
+  if (left.source !== right.source || left.accountRefDigest !== right.accountRefDigest) return false;
+  return left.source === "calendar"
+    ? true
+    : right.source === "gmail" && left.senderIdentityDigest === right.senderIdentityDigest;
+}
+
+function normalizedLeakText(value: string): string {
+  return value
+    .normalize("NFKC")
+    .toLocaleLowerCase("en-US")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim()
+    .replace(/\s+/gu, " ");
+}
+
+const MINIMUM_MEANING_FORBIDDEN_PATTERNS = [
+  /\b(?:https?:\/\/|www\.)\S+/iu,
+  /\b(?:[a-z0-9-]+\.)+[a-z]{2,63}(?:\/\S*)?\b/iu,
+  /\b[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+\b/iu,
+  /(?:\+?\d[\d .()-]{7,}\d)/u,
+  /\b(?:access|auth(?:entication)?|confirmation|login|one[ -]?time|pass(?:code|word)?|pin|security|verification)\s+(?:code|number|token|key)?\s*[:#-]?\s*\d{3,}\b/iu,
+  /\b(?:access|auth(?:entication)?|confirmation|login|one[ -]?time|pass(?:code|word)?|security|verification)\s+(?:code|token|key)\s*[:#-]?\s*[a-z0-9-]{4,}\b/iu,
+  /\b(?:otp|2fa|mfa)\s*[:#-]?\s*\d{3,}\b/iu,
+  /(?:[$£€¥₹]\s*\d|\b\d[\d,.]*\s*(?:dollars?|usd|eur|gbp|yen|rupees?)\b)/iu,
+  /\b(?:amount|balance|bill|cost|fee|invoice|payment|price|total)\s*(?:due|is|of|:)?\s*[$£€¥₹]?\s*\d/iu,
+  /\b(?:affair|attorney|breakup|cancer|clinic|court|custody|diagnos(?:is|ed)|divorce|doctor|employer|employment|hospital|job offer|lawsuit|lawyer|layoff|laid off|legal|medical|medication|performance review|prescription|relationship counseling|salary|subpoena|surgery|terminated|termination|therapist|therapy)\b/iu,
+  /\b(?:act as|developer message|disregard (?:all |any )?(?:previous|prior)|ignore (?:all |any )?(?:previous|prior)|jailbreak|override (?:the |your )?(?:rules|instructions)|reveal (?:the |your )?(?:prompt|instructions)|system prompt|tool call)\b/iu,
+  /["“”'][^"“”'\n]{8,}["“”']/u,
+] as const;
+
+function hasMeaningfulPrivateOverlap(
+  output: string,
+  privateValues: readonly (string | null | undefined)[],
+): boolean {
+  const normalizedOutput = normalizedLeakText(output);
+  if (normalizedOutput.length === 0) return false;
+  for (const value of privateValues) {
+    if (value === null || value === undefined) continue;
+    const privateText = normalizedLeakText(value);
+    if (privateText.length < 8) continue;
+    if (normalizedOutput.includes(privateText)) return true;
+    const tokens = privateText.split(" ").filter((token) => token.length > 1);
+    for (let index = 0; index <= tokens.length - 3; index += 1) {
+      const phrase = tokens.slice(index, index + 3).join(" ");
+      if (phrase.length >= 12 && normalizedOutput.includes(phrase)) return true;
+    }
+  }
+  return false;
+}
+
+function minimumMeaningPassesLeakGuard(
+  outputValues: readonly string[],
+  privateValues: readonly (string | null | undefined)[],
+): boolean {
+  const output = outputValues.join("\n");
+  if (MINIMUM_MEANING_FORBIDDEN_PATTERNS.some((pattern) => pattern.test(output))) return false;
+  const numericGroups = output.match(/\d+/gu) ?? [];
+  if (
+    numericGroups.some((group) => group.length >= 4) ||
+    numericGroups.length >= 4 ||
+    numericGroups.reduce((total, group) => total + group.length, 0) >= 8
+  ) {
+    return false;
+  }
+  return !hasMeaningfulPrivateOverlap(output, privateValues);
 }
 
 function plusMilliseconds(instant: string, milliseconds: number): string {
@@ -1319,7 +1429,12 @@ function approvePromotion(
     calendarSource.recordedAt = item.occurredAt;
   }
   let remembered = false;
-  if (rememberForMatchingSource && pending.proposal.sensitivity !== "highly_sensitive") {
+  if (
+    rememberForMatchingSource &&
+    pending.standingRuleEligible &&
+    pending.proposal.sourceMatcher !== undefined &&
+    pending.proposal.sensitivity !== "highly_sensitive"
+  ) {
     const policy = acceptDomain(
       work,
       "promotion-sharing-policy",
@@ -1338,6 +1453,7 @@ function approvePromotion(
             to: { kind: "household" },
             sourceClass: pending.proposal.sourceClass,
             maximumSensitivity: pending.proposal.sensitivity,
+            sourceMatcher: pending.proposal.sourceMatcher,
           },
           approvedByAdultId: item.senderAdultId,
           approvedAt: item.occurredAt,
@@ -1354,9 +1470,11 @@ function approvePromotion(
     personal(item.senderAdultId),
     "status",
     remembered
-      ? `Only the approved minimum household meaning was shared. Future ${pending.proposal.sourceClass} items up to ${pending.proposal.sensitivity} sensitivity can use this rule without asking again.`
-      : rememberForMatchingSource && pending.proposal.sensitivity === "highly_sensitive"
-        ? "Only this approved minimum household meaning was shared. Florence will not create a standing rule for highly sensitive material."
+      ? pending.proposal.sourceMatcher?.source === "gmail"
+        ? `Only the approved minimum household meaning was shared. Future ${pending.proposal.sourceClass} items from this exact sender in this exact connected inbox, up to ${pending.proposal.sensitivity} sensitivity, can use this rule without asking again.`
+        : `Only the approved minimum household meaning was shared. Future ${pending.proposal.sourceClass} items from this exact connected calendar account, up to ${pending.proposal.sensitivity} sensitivity, can use this rule without asking again.`
+      : rememberForMatchingSource
+        ? "Only this approved minimum household meaning was shared once. Florence did not create a standing rule because this proposal did not meet every exact private-source safety requirement."
         : "Only the approved minimum household meaning was shared once.",
   );
   return "processed";
@@ -1435,19 +1553,44 @@ function sensitivityRank(value: "ordinary" | "sensitive" | "highly_sensitive"): 
   return { ordinary: 0, sensitive: 1, highly_sensitive: 2 }[value];
 }
 
+type HouseholdPolicy = HouseholdAggregate["policies"][number];
+type SharingPolicy = Omit<HouseholdPolicy, "rule"> & {
+  rule: Extract<HouseholdPolicy["rule"], { kind: "sharing" }>;
+};
+
 function matchingSharingPolicy(
   aggregate: HouseholdAggregate,
   adultId: string,
   sourceClass: string,
   sensitivity: "ordinary" | "sensitive" | "highly_sensitive",
+  sourceMatcher: PrivateSourceMatcher | undefined,
 ) {
+  if (sourceMatcher === undefined || sensitivity === "highly_sensitive") return undefined;
   return aggregate.policies.find(
-    (policy) =>
+    (policy): policy is SharingPolicy =>
       policy.status === "active" &&
       policy.rule.kind === "sharing" &&
       policy.rule.from.adultId === adultId &&
       policy.rule.sourceClass === sourceClass &&
+      sourceMatchersEqual(policy.rule.sourceMatcher, sourceMatcher) &&
       sensitivityRank(sensitivity) <= sensitivityRank(policy.rule.maximumSensitivity),
+  );
+}
+
+function standingRuleEligible(input: {
+  confidence: number;
+  materialException: boolean;
+  sensitivity: "ordinary" | "sensitive" | "highly_sensitive";
+  sourceMatcher: PrivateSourceMatcher | undefined;
+  outputValues: readonly string[];
+  privateValues: readonly (string | null | undefined)[];
+}): boolean {
+  return (
+    input.confidence >= 0.95 &&
+    !input.materialException &&
+    input.sensitivity !== "highly_sensitive" &&
+    input.sourceMatcher !== undefined &&
+    minimumMeaningPassesLeakGuard(input.outputValues, input.privateValues)
   );
 }
 
@@ -1457,25 +1600,36 @@ function minimumPromotion(
 ): PendingPromotion {
   const evidence = gmailEvidence(item);
   const promotionId = stableId("promotion", item.householdId, item.ownerAdultId, item.messageRef);
+  const sourceMatcher = gmailSourceMatcher(item);
+  const proposal = EpisodeProposalSchema.parse({
+    episodeId: stableId("episode", promotionId),
+    type: "commitment",
+    targetScope: { kind: "household" },
+    title: triage.minimumHouseholdMeaning,
+    requiredOutcome: triage.minimumHouseholdMeaning,
+    ...(triage.proposedOwnerAdultId === undefined
+      ? {}
+      : { proposedOwnerAdultId: triage.proposedOwnerAdultId }),
+    evidence: [evidence],
+    sourceClass: triage.sourceClass,
+    sensitivity: triage.sensitivity,
+    ...(triage.temporalPlan === undefined ? {} : { temporalPlan: triage.temporalPlan }),
+    ...(sourceMatcher === undefined ? {} : { sourceMatcher }),
+  });
   return {
     promotionId,
     ownerAdultId: item.ownerAdultId,
     evidence,
-    proposal: EpisodeProposalSchema.parse({
-      episodeId: stableId("episode", promotionId),
-      type: "commitment",
-      targetScope: { kind: "household" },
-      title: triage.minimumHouseholdMeaning,
-      requiredOutcome: triage.minimumHouseholdMeaning,
-      ...(triage.proposedOwnerAdultId === undefined
-        ? {}
-        : { proposedOwnerAdultId: triage.proposedOwnerAdultId }),
-      evidence: [evidence],
-      sourceClass: triage.sourceClass,
-      sensitivity: triage.sensitivity,
-      ...(triage.temporalPlan === undefined ? {} : { temporalPlan: triage.temporalPlan }),
-    }),
+    proposal,
     minimumHouseholdMeaning: triage.minimumHouseholdMeaning,
+    standingRuleEligible: standingRuleEligible({
+      confidence: triage.confidence,
+      materialException: triage.materialException,
+      sensitivity: triage.sensitivity,
+      sourceMatcher,
+      outputValues: [proposal.title, proposal.requiredOutcome],
+      privateValues: [item.sender, senderDisplayName(item.sender), item.subject, item.snippet, item.bodyText],
+    }),
     createdAt: item.occurredAt,
   };
 }
@@ -1486,6 +1640,13 @@ function promoteByPolicy(
   pending: PendingPromotion,
   policy: NonNullable<ReturnType<typeof matchingSharingPolicy>>,
 ): "processed" | "rejected" {
+  if (
+    !pending.standingRuleEligible ||
+    pending.proposal.sourceMatcher === undefined ||
+    !sourceMatchersEqual(policy.rule.sourceMatcher, pending.proposal.sourceMatcher)
+  ) {
+    return "rejected";
+  }
   const jobId = DomainWorkerJobIdSchema.parse(stableId("job", item.idempotencyKey, "gmail-triage"));
   const proposal = WorkerProposalSchema.parse({
     resultId: stableId("worker_result", item.idempotencyKey, "gmail-triage"),
@@ -1537,10 +1698,13 @@ async function processGmail(
   if (!work.aggregate.verifiedAdultIds.includes(item.ownerAdultId)) {
     return { status: "rejected", classification: "gmail_unknown_owner" };
   }
+  const sourceMatcher = gmailSourceMatcher(item);
   const rules = work.aggregate.policies.flatMap((policy) =>
     policy.status === "active" &&
     policy.rule.kind === "sharing" &&
-    policy.rule.from.adultId === item.ownerAdultId
+    policy.rule.from.adultId === item.ownerAdultId &&
+    sourceMatcher !== undefined &&
+    sourceMatchersEqual(policy.rule.sourceMatcher, sourceMatcher)
       ? [
           {
             policyId: policy.policyId,
@@ -1609,8 +1773,9 @@ async function processGmail(
         item.ownerAdultId,
         triage.sourceClass,
         triage.sensitivity,
+        sourceMatcher,
       );
-      if (policy !== undefined) {
+      if (policy !== undefined && pending.standingRuleEligible) {
         return {
           status: promoteByPolicy(work, item, pending, policy),
           classification: "gmail:policy_promotion",
@@ -1622,7 +1787,7 @@ async function processGmail(
         "gmail-promotion-request",
         personal(item.ownerAdultId),
         "promotion_request",
-        `${triage.privateSummary} Share only this household meaning: “${triage.minimumHouseholdMeaning}”? Reply “share once ${pending.promotionId}” or, only if you want a standing rule for matching ${triage.sourceClass} items, “always share ${pending.promotionId}”.`,
+        `${triage.privateSummary} Share only this household meaning: “${triage.minimumHouseholdMeaning}”? Reply “share once ${pending.promotionId}” or, only if you want a standing rule for this exact sender in this exact connected inbox and matching ${triage.sourceClass} items, “always share ${pending.promotionId}”.`,
       );
       return { status: "processed", classification: "gmail:promotion_pending" };
     }
@@ -1640,22 +1805,33 @@ function calendarMinimumPromotion(
   const evidence = calendarEvidence(item);
   const promotionId = stableId("promotion", sourceKey, String(item.revision));
   const temporalPlan = calendarTimingPlan(item, promotionId);
+  const sourceMatcher = calendarSourceMatcher(item);
+  const proposal = EpisodeProposalSchema.parse({
+    episodeId: stableId("episode", promotionId),
+    type: "commitment",
+    targetScope: { kind: "household" },
+    title: triage.minimumHouseholdMeaning,
+    requiredOutcome: triage.minimumRequiredOutcome,
+    evidence: [evidence],
+    sourceClass: triage.sourceClass,
+    sensitivity: triage.sensitivity,
+    temporalPlan,
+    sourceMatcher,
+  });
   return {
     promotionId,
     ownerAdultId: item.ownerAdultId,
     evidence,
-    proposal: EpisodeProposalSchema.parse({
-      episodeId: stableId("episode", promotionId),
-      type: "commitment",
-      targetScope: { kind: "household" },
-      title: triage.minimumHouseholdMeaning,
-      requiredOutcome: triage.minimumRequiredOutcome,
-      evidence: [evidence],
-      sourceClass: triage.sourceClass,
-      sensitivity: triage.sensitivity,
-      temporalPlan,
-    }),
+    proposal,
     minimumHouseholdMeaning: triage.minimumHouseholdMeaning,
+    standingRuleEligible: standingRuleEligible({
+      confidence: triage.confidence,
+      materialException: triage.materialException,
+      sensitivity: triage.sensitivity,
+      sourceMatcher,
+      outputValues: [proposal.title, proposal.requiredOutcome],
+      privateValues: [item.title, item.description, item.location],
+    }),
     createdAt: item.occurredAt,
   };
 }
@@ -1715,6 +1891,13 @@ function promoteCalendarByPolicy(
   policy: NonNullable<ReturnType<typeof matchingSharingPolicy>>,
   confidence: number,
 ): "processed" | "rejected" {
+  if (
+    !pending.standingRuleEligible ||
+    pending.proposal.sourceMatcher === undefined ||
+    !sourceMatchersEqual(policy.rule.sourceMatcher, pending.proposal.sourceMatcher)
+  ) {
+    return "rejected";
+  }
   const jobId = DomainWorkerJobIdSchema.parse(stableId("job", item.idempotencyKey, "calendar-triage"));
   const proposal = WorkerProposalSchema.parse({
     resultId: stableId("worker_result", item.idempotencyKey, "calendar-triage"),
@@ -1917,10 +2100,12 @@ async function processCalendar(
     return calendarRevisionOutcome(revision) as Exclude<ReturnType<typeof calendarRevisionOutcome>, null>;
   }
 
+  const sourceMatcher = calendarSourceMatcher(item);
   const rules = work.aggregate.policies.flatMap((policy) =>
     policy.status === "active" &&
     policy.rule.kind === "sharing" &&
-    policy.rule.from.adultId === item.ownerAdultId
+    policy.rule.from.adultId === item.ownerAdultId &&
+    sourceMatchersEqual(policy.rule.sourceMatcher, sourceMatcher)
       ? [
           {
             policyId: policy.policyId,
@@ -2003,8 +2188,9 @@ async function processCalendar(
         item.ownerAdultId,
         triage.sourceClass,
         triage.sensitivity,
+        sourceMatcher,
       );
-      if (policy !== undefined) {
+      if (policy !== undefined && pending.standingRuleEligible) {
         const status = promoteCalendarByPolicy(work, item, pending, policy, triage.confidence);
         if (status !== "processed") {
           throw new Error("Calendar policy promotion was rejected by the household domain");
@@ -2025,7 +2211,7 @@ async function processCalendar(
         "calendar-promotion-request",
         personal(item.ownerAdultId),
         "promotion_request",
-        `${triage.privateSummary} Share only this household meaning: “${triage.minimumHouseholdMeaning}” with this required outcome: “${triage.minimumRequiredOutcome}”? The event's start time will anchor follow-through; its raw title, description, and location stay private. Reply “share once ${pending.promotionId}” or, only if you want a standing rule for matching ${triage.sourceClass} items, “always share ${pending.promotionId}”.`,
+        `${triage.privateSummary} Share only this household meaning: “${triage.minimumHouseholdMeaning}” with this required outcome: “${triage.minimumRequiredOutcome}”? The event's start time will anchor follow-through; its raw title, description, and location stay private. Reply “share once ${pending.promotionId}” or, only if you want a standing rule for this exact connected calendar account and matching ${triage.sourceClass} items, “always share ${pending.promotionId}”.`,
       );
       return { status: "processed", classification: "calendar:promotion_pending" };
     }
@@ -2096,7 +2282,10 @@ async function processConversation(
               policyId: policy.policyId,
               policyVersion: policy.version,
               kind: policy.rule.kind,
-              description: `Share minimum household meaning for ${policy.rule.sourceClass} through ${policy.rule.maximumSensitivity} sensitivity.`,
+              description:
+                policy.rule.sourceMatcher.source === "gmail"
+                  ? `Share minimum household meaning for ${policy.rule.sourceClass} from one exact sender in one exact connected inbox through ${policy.rule.maximumSensitivity} sensitivity.`
+                  : `Share minimum household meaning for ${policy.rule.sourceClass} from one exact connected calendar account through ${policy.rule.maximumSensitivity} sensitivity.`,
             },
           ];
         })

@@ -311,6 +311,20 @@ export const ResolvedTimePlanSchema = z
 
 export type ResolvedTimePlan = z.infer<typeof ResolvedTimePlanSchema>;
 
+export const PrivateSourceMatcherSchema = z.discriminatedUnion("source", [
+  z.strictObject({
+    source: z.literal("gmail"),
+    accountRefDigest: ContentDigestSchema,
+    senderIdentityDigest: ContentDigestSchema,
+  }),
+  z.strictObject({
+    source: z.literal("calendar"),
+    accountRefDigest: ContentDigestSchema,
+  }),
+]);
+
+export type PrivateSourceMatcher = z.infer<typeof PrivateSourceMatcherSchema>;
+
 export const PromotionAuthoritySchema = z.discriminatedUnion("kind", [
   z.strictObject({
     kind: z.literal("approval"),
@@ -374,6 +388,7 @@ export const FamilyEpisodeSchema = z
     sourceClass: SourceClassSchema,
     sensitivity: SensitivitySchema,
     promotionAuthority: PromotionAuthoritySchema.optional(),
+    sourceMatcher: PrivateSourceMatcherSchema.optional(),
     temporalPlan: ResolvedTimePlanSchema.optional(),
     blockedReason: NeutralFactualTextSchema.optional(),
     createdAt: InstantStringSchema,
@@ -410,6 +425,12 @@ export const FamilyEpisodeSchema = z
     ) {
       context.addIssue({ code: "custom", message: "household promotion must retain its authority" });
     }
+    if (episode.promotionAuthority?.kind === "policy" && episode.sourceMatcher === undefined) {
+      context.addIssue({
+        code: "custom",
+        message: "standing-policy promotion must retain its exact private source matcher",
+      });
+    }
     if (episode.scope.kind === "personal") {
       const scopeAdultId = episode.scope.adultId;
       if ([...personalAdults].some((adultId) => adultId !== scopeAdultId)) {
@@ -435,6 +456,7 @@ export const EpisodeProposalSchema = z.strictObject({
   sensitivity: SensitivitySchema,
   temporalPlan: SemanticTimePlanSchema.optional(),
   promotionAuthority: PromotionAuthoritySchema.optional(),
+  sourceMatcher: PrivateSourceMatcherSchema.optional(),
 });
 
 export type EpisodeProposal = z.infer<typeof EpisodeProposalSchema>;
@@ -639,6 +661,7 @@ export const SharingPolicyRuleSchema = z.strictObject({
   to: HouseholdScopeSchema,
   sourceClass: SourceClassSchema,
   maximumSensitivity: z.enum(["ordinary", "sensitive"]),
+  sourceMatcher: PrivateSourceMatcherSchema,
 });
 
 export const RoutingPolicyRuleSchema = z.strictObject({
@@ -1006,11 +1029,22 @@ export const HouseholdAggregateSchema = z
       );
     };
     const sensitivityRank = { ordinary: 0, sensitive: 1, highly_sensitive: 2 } as const;
+    const sourceMatchersEqual = (
+      left: PrivateSourceMatcher | undefined,
+      right: PrivateSourceMatcher | undefined,
+    ) => {
+      if (left === undefined || right === undefined || left.source !== right.source) return false;
+      if (left.accountRefDigest !== right.accountRefDigest) return false;
+      return left.source === "calendar"
+        ? true
+        : right.source === "gmail" && left.senderIdentityDigest === right.senderIdentityDigest;
+    };
     const hasPromotionProof = (record: {
       evidence: EvidenceRef[];
       sourceClass: string;
       sensitivity: keyof typeof sensitivityRank;
       promotionAuthority?: PromotionAuthority | undefined;
+      sourceMatcher?: PrivateSourceMatcher | undefined;
     }) => {
       const personalAdults = [
         ...new Set(
@@ -1043,6 +1077,10 @@ export const HouseholdAggregateSchema = z
         policy.rule.kind === "sharing" &&
         policy.rule.from.adultId === personalAdults[0] &&
         policy.rule.sourceClass === record.sourceClass &&
+        sourceMatchersEqual(policy.rule.sourceMatcher, record.sourceMatcher) &&
+        record.evidence.every(
+          (item) => item.scope.kind !== "personal" || item.source === record.sourceMatcher?.source,
+        ) &&
         sensitivityRank[record.sensitivity] <= sensitivityRank[policy.rule.maximumSensitivity]
       );
     };

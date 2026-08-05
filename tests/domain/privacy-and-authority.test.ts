@@ -25,6 +25,12 @@ function accept(current: HouseholdAggregate, next: HouseholdSignal) {
   return HouseholdChiefOfStaff.accept({ current, signal: next });
 }
 
+const GMAIL_MATCHER = {
+  source: "gmail" as const,
+  accountRefDigest: DIGEST_A,
+  senderIdentityDigest: DIGEST_B,
+};
+
 describe("privacy and authority through the HouseholdChiefOfStaff interface", () => {
   it("does not let one adult mutate another adult's personal scope", () => {
     const personalEpisode = accept(
@@ -330,6 +336,7 @@ describe("privacy and authority through the HouseholdChiefOfStaff interface", ()
             to: { kind: "household" },
             sourceClass: "school.notice",
             maximumSensitivity: "ordinary",
+            sourceMatcher: GMAIL_MATCHER,
           },
           approvedByAdultId: ADULT_A,
           approvedAt: T0,
@@ -353,6 +360,7 @@ describe("privacy and authority through the HouseholdChiefOfStaff interface", ()
           episodeId: "episode_policy_match",
           evidence: [privateEvidence],
           temporalPlan: undefined,
+          sourceMatcher: GMAIL_MATCHER,
           promotionAuthority: {
             kind: "policy",
             policyId: "policy_school_share",
@@ -362,6 +370,30 @@ describe("privacy and authority through the HouseholdChiefOfStaff interface", ()
       }),
     );
     expect(ordinary.receipt.disposition).toBe("accepted");
+
+    const wrongPrivateSource = accept(
+      ordinary.aggregate,
+      signal({
+        householdId: HOUSEHOLD_ID,
+        signalId: "signal_policy_wrong_private_source",
+        sequence: 3,
+        occurredAt: "2026-01-01T08:02:00Z",
+        actor: { kind: "adult", adultId: ADULT_A },
+        kind: "episode.proposed",
+        proposal: episodeProposal({
+          episodeId: "episode_policy_wrong_private_source",
+          evidence: [privateEvidence],
+          temporalPlan: undefined,
+          sourceMatcher: { ...GMAIL_MATCHER, senderIdentityDigest: DIGEST_A },
+          promotionAuthority: {
+            kind: "policy",
+            policyId: "policy_school_share",
+            policyVersion: 1,
+          },
+        }),
+      }),
+    );
+    expect(wrongPrivateSource.receipt.reason).toBe("invalid_promotion_authority");
 
     const sensitive = accept(
       ordinary.aggregate,
@@ -377,6 +409,7 @@ describe("privacy and authority through the HouseholdChiefOfStaff interface", ()
           evidence: [privateEvidence],
           sensitivity: "sensitive",
           temporalPlan: undefined,
+          sourceMatcher: GMAIL_MATCHER,
           promotionAuthority: {
             kind: "policy",
             policyId: "policy_school_share",
@@ -409,6 +442,7 @@ describe("privacy and authority through the HouseholdChiefOfStaff interface", ()
             to: { kind: "household" },
             sourceClass: "school.notice",
             maximumSensitivity: "sensitive",
+            sourceMatcher: GMAIL_MATCHER,
           },
           approvedByAdultId: ADULT_A,
           approvedAt: T0,
@@ -445,6 +479,7 @@ describe("privacy and authority through the HouseholdChiefOfStaff interface", ()
           episodeId: "episode_after_revoke",
           evidence: [privateEvidence],
           temporalPlan: undefined,
+          sourceMatcher: GMAIL_MATCHER,
           promotionAuthority: {
             kind: "policy",
             policyId: "policy_revocable",

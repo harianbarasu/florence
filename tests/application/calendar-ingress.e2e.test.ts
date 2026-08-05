@@ -37,6 +37,7 @@ function calendarProposal(meaning: string, outcome: string) {
     sourceClass: "calendar.school",
     sensitivity: "ordinary" as const,
     familyImpact: true,
+    materialException: false,
     rationale: "The event requires household coordination.",
     privateSummary: "A private school event may need family coordination.",
     minimumHouseholdMeaning: meaning,
@@ -224,6 +225,28 @@ describe("private inbound Calendar lifecycle", () => {
       title: "School has an evening event Sunday.",
       promotionAuthority: { kind: "policy" },
     });
+
+    const crossAccountKey = "calendar-promotion-cross-account";
+    harness.interpreter.respondToCalendar(
+      crossAccountKey,
+      calendarProposal(
+        "School has an evening event Monday.",
+        "The family plan accounts for Monday's school event.",
+      ),
+    );
+    await app.process(
+      calendarEvent(crossAccountKey, 1, {
+        accountRef: "google-account-alex-secondary",
+        eventRef: "calendar-event-school-3",
+        providerRef: "google-calendar-event-school-3",
+        startsAt: "2027-01-05T02:00:00Z",
+        endsAt: "2027-01-05T03:00:00Z",
+      }),
+    );
+    snapshot = await harness.repository.load(HOUSEHOLD_ID);
+    expect(snapshot?.aggregate.episodes).toHaveLength(2);
+    expect(snapshot?.projection.pendingPromotions).toHaveLength(1);
+    expect(harness.interpreter.calendarCalls.at(-1)?.context.activeSharingRules).toEqual([]);
 
     const householdBodies = harness.repository
       .intents("conversation.send")

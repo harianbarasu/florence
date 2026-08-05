@@ -511,6 +511,7 @@ export const GmailTriageResultSchema = z.discriminatedUnion("decision", [
   z.strictObject({
     ...GmailTriageBaseShape,
     decision: z.literal("propose_family_episode"),
+    materialException: z.boolean(),
     privateSummary: NeutralFactualTextSchema,
     minimumHouseholdMeaning: NeutralDisplayTextSchema,
     title: NeutralDisplayTextSchema,
@@ -554,6 +555,7 @@ export const CalendarTriageResultSchema = z.discriminatedUnion("decision", [
   z.strictObject({
     ...CalendarTriageBaseShape,
     decision: z.literal("propose_family_episode"),
+    materialException: z.boolean(),
     privateSummary: NeutralFactualTextSchema,
     minimumHouseholdMeaning: NeutralDisplayTextSchema,
     minimumRequiredOutcome: NeutralFactualTextSchema,
@@ -717,6 +719,7 @@ export const PendingPromotionSchema = z.strictObject({
   evidence: EvidenceRefSchema,
   proposal: EpisodeProposalSchema,
   minimumHouseholdMeaning: NeutralDisplayTextSchema,
+  standingRuleEligible: z.boolean(),
   createdAt: InstantStringSchema,
 });
 

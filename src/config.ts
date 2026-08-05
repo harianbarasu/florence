@@ -11,7 +11,7 @@ const environmentSchema = z.object({
   PORT: z.coerce.number().int().min(1).max(65_535).default(3000),
   LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"]).default("info"),
   FLORENCE_DATABASE_URL: z.string().url(),
-  FLORENCE_DB_SCHEMA: z
+  FLORENCE_POSTGRES_SCHEMA: z
     .string()
     .regex(/^[a-z][a-z0-9_]{0,62}$/u)
     .default("florence"),

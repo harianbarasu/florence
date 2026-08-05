@@ -18,6 +18,7 @@
     "lint": "biome check .",
     "start": "node dist/server.js",
     "start:worker": "node dist/worker.js",
+    "smoke:production": "node scripts/smoke-production.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit"

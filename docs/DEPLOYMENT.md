@@ -104,6 +104,13 @@ curl --fail-with-body http://localhost:3000/healthz
 curl --fail-with-body http://localhost:3000/readyz
 ```
 
+The release smoke checks the public health, readiness, legal, cache-control, and not-found
+contracts without sending a message or mutating customer data:
+
+```bash
+pnpm smoke:production -- http://localhost:3000
+```
+
 Do not repoint the production Linq or Pub/Sub subscription at a laptop. Use a separate development
 subscription and a deliberate HTTPS tunnel, or test connector parsing with the repository fixtures.
 
@@ -122,7 +129,7 @@ references](https://docs.railway.com/variables/reference)
 | `FLORENCE_PROCESS_ROLE` | `all` for one service, or exactly one `web` plus one `worker`; never mix the modes |
 | `LOG_LEVEL` | `info` initially; never use `trace` with real family data |
 | `FLORENCE_DATABASE_URL` | Railway reference to the private PostgreSQL `DATABASE_URL` |
-| `FLORENCE_DB_SCHEMA` | `florence` |
+| `FLORENCE_POSTGRES_SCHEMA` | `florence`; this name is canonical and intentionally distinct from the retired Python deployment's schema setting |
 | `FLORENCE_WEB_BASE_URL` | `https://harianbarasu.com` after domain cutover |
 | `FLORENCE_TOKEN_ENCRYPTION_KEY` | One 32-byte base64url/hex key, identical on every application service |
 | `FLORENCE_ADMIN_API_KEY` | Independent random operator bearer token |

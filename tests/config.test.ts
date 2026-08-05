@@ -23,7 +23,7 @@ describe("configuration", () => {
       anthropic: false,
       openWeight: false,
     });
-    expect(config.FLORENCE_DB_SCHEMA).toBe("florence");
+    expect(config.FLORENCE_POSTGRES_SCHEMA).toBe("florence");
     expect(config.FLORENCE_PROCESS_ROLE).toBe("all");
   });
 

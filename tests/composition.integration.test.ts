@@ -28,7 +28,7 @@ describe.skipIf(!databaseUrl)("production composition PostgreSQL integration", (
         NODE_ENV: "test",
         FLORENCE_PROCESS_ROLE: "worker",
         FLORENCE_DATABASE_URL: databaseUrl as string,
-        FLORENCE_DB_SCHEMA: schema,
+        FLORENCE_POSTGRES_SCHEMA: schema,
         FLORENCE_WEB_BASE_URL: "https://florence.example.test",
         FLORENCE_TOKEN_ENCRYPTION_KEY: randomBytes(32).toString("base64url"),
         FLORENCE_ADMIN_API_KEY: "operator-test-key-with-enough-bytes",

@@ -100,6 +100,90 @@ describe("Florence application coordinator", () => {
     expect(householdBodies.join(" ")).not.toContain("access code");
   });
 
+  it("learns and revokes an explicitly approved minimum-meaning sharing rule", async () => {
+    const harness = setup();
+    const app = createFlorenceApplication(harness.dependencies);
+    const gmail = async (key: string, meaning: string, minute: number) => {
+      harness.interpreter.respondToGmail(key, {
+        decision: "propose_family_episode",
+        confidence: 0.97,
+        sourceClass: "school.notice",
+        sensitivity: "ordinary",
+        familyImpact: true,
+        rationale: "A school notice requires household coordination.",
+        privateSummary: "A school notice needs coordination.",
+        minimumHouseholdMeaning: meaning,
+        title: meaning,
+        requiredOutcome: meaning,
+      });
+      await app.process({
+        kind: "gmail_message",
+        householdId: HOUSEHOLD_ID,
+        idempotencyKey: key,
+        occurredAt: `2027-01-01T08:${String(minute).padStart(2, "0")}:00Z`,
+        ownerAdultId: ADULT_A,
+        accountRef: "gmail_alex_personal",
+        messageRef: `gmail_${key}`,
+        revision: 1,
+        labels: ["INBOX"],
+        sender: "School office",
+        subject: "School notice",
+        bodyText: "A school notice has a household consequence.",
+        attachmentRefs: [],
+      });
+    };
+
+    await gmail("sharing-rule-first", "School closes early Friday.", 0);
+    const promotionId = (await harness.repository.load(HOUSEHOLD_ID))?.projection.pendingPromotions[0]
+      ?.promotionId;
+    expect(promotionId).toBeTruthy();
+    const approveKey = "sharing-rule-approve";
+    harness.interpreter.respondToConversation(approveKey, {
+      ...classificationBase,
+      intent: "approve_promotion",
+      promotionId,
+      rememberForMatchingSource: true,
+    });
+    await app.process(
+      directMessage(approveKey, `Always share ${promotionId}`, ADULT_A, "2027-01-01T08:01:00Z"),
+    );
+
+    let snapshot = await harness.repository.load(HOUSEHOLD_ID);
+    expect(snapshot?.aggregate.policies).toEqual([
+      expect.objectContaining({
+        status: "active",
+        version: 1,
+        rule: expect.objectContaining({
+          kind: "sharing",
+          sourceClass: "school.notice",
+          maximumSensitivity: "ordinary",
+        }),
+      }),
+    ]);
+    await gmail("sharing-rule-second", "School starts late Monday.", 2);
+    snapshot = await harness.repository.load(HOUSEHOLD_ID);
+    expect(snapshot?.projection.pendingPromotions).toEqual([]);
+    expect(snapshot?.aggregate.episodes).toHaveLength(2);
+
+    const policy = snapshot?.aggregate.policies[0];
+    expect(policy).toBeDefined();
+    if (policy === undefined) throw new Error("Expected an active sharing policy");
+    const revokeKey = "sharing-rule-revoke";
+    harness.interpreter.respondToConversation(revokeKey, {
+      ...classificationBase,
+      intent: "revoke_policy",
+      policyId: policy.policyId,
+      expectedPolicyVersion: 1,
+    });
+    await app.process(
+      directMessage(revokeKey, "Stop always sharing school notices", ADULT_A, "2027-01-01T08:03:00Z"),
+    );
+    expect((await harness.repository.load(HOUSEHOLD_ID))?.aggregate.policies[0]?.status).toBe("revoked");
+
+    await gmail("sharing-rule-third", "School dismisses at noon Wednesday.", 4);
+    expect((await harness.repository.load(HOUSEHOLD_ID))?.projection.pendingPromotions).toHaveLength(1);
+  });
+
   it("requires private invite consent before activating one shared group", async () => {
     const harness = setup({ onboarding: "new" });
     const app = createFlorenceApplication(harness.dependencies);

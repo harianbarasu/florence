@@ -27,6 +27,12 @@ export interface ConversationInterpretationContext {
     readonly version: number;
   }[];
   readonly pendingPromotionIds: readonly string[];
+  readonly activePolicies: readonly {
+    readonly policyId: string;
+    readonly policyVersion: number;
+    readonly kind: "sharing" | "routing" | "timing" | "internal_action";
+    readonly description: string;
+  }[];
 }
 
 export interface GmailTriageContext {

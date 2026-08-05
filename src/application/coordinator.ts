@@ -17,6 +17,7 @@ import {
   HouseholdSignalSchema,
   InstantStringSchema,
   type OutboxIntent,
+  PolicyIdSchema,
   WorkerProposalSchema,
 } from "../domain/index.js";
 import { type WorkerJob, WorkerJobSchema, type WorkerResult, WorkerResultSchema } from "../runtime/index.js";
@@ -878,9 +879,16 @@ function processActiveConversation(
       queueMessage(work, "brief-request", targetScope(item), "daily_brief", briefBody(work.aggregate));
       return "processed";
     case "approve_promotion":
-      return approvePromotion(work, item, classification.promotionId);
+      return approvePromotion(
+        work,
+        item,
+        classification.promotionId,
+        classification.rememberForMatchingSource === true,
+      );
     case "decline_promotion":
       return declinePromotion(work, item, classification.promotionId);
+    case "revoke_policy":
+      return revokePolicy(work, item, classification.policyId, classification.expectedPolicyVersion);
   }
 }
 
@@ -888,6 +896,7 @@ function approvePromotion(
   work: Work,
   item: ConversationInboxItem,
   promotionId: string,
+  rememberForMatchingSource: boolean,
 ): "processed" | "rejected" {
   if (item.channel.scope !== "personal") {
     return "rejected";
@@ -951,6 +960,34 @@ function approvePromotion(
   if (promoted.receipt.disposition !== "accepted") {
     return "rejected";
   }
+  let remembered = false;
+  if (rememberForMatchingSource && pending.proposal.sensitivity !== "highly_sensitive") {
+    const policy = acceptDomain(
+      work,
+      "promotion-sharing-policy",
+      item.occurredAt,
+      { kind: "adult", adultId: item.senderAdultId },
+      {
+        kind: "policy.approved",
+        policy: {
+          policyId: PolicyIdSchema.parse(stableId("policy", promotionId, item.idempotencyKey)),
+          householdId: item.householdId,
+          version: work.aggregate.policyVersion + 1,
+          status: "active",
+          rule: {
+            kind: "sharing",
+            from: { kind: "personal", adultId: item.senderAdultId },
+            to: { kind: "household" },
+            sourceClass: pending.proposal.sourceClass,
+            maximumSensitivity: pending.proposal.sensitivity,
+          },
+          approvedByAdultId: item.senderAdultId,
+          approvedAt: item.occurredAt,
+        },
+      } as Omit<HouseholdSignal, "householdId" | "signalId" | "sequence" | "occurredAt" | "actor">,
+    );
+    remembered = policy.receipt.disposition === "accepted";
+  }
   work.projection.pendingPromotions.splice(index, 1);
   queueMessage(work, "promotion-household", { kind: "household" }, "status", pending.minimumHouseholdMeaning);
   queueMessage(
@@ -958,7 +995,11 @@ function approvePromotion(
     "promotion-confirmed",
     personal(item.senderAdultId),
     "status",
-    "Only the approved minimum household meaning was shared.",
+    remembered
+      ? `Only the approved minimum household meaning was shared. Future ${pending.proposal.sourceClass} items up to ${pending.proposal.sensitivity} sensitivity can use this rule without asking again.`
+      : rememberForMatchingSource && pending.proposal.sensitivity === "highly_sensitive"
+        ? "Only this approved minimum household meaning was shared. Florence will not create a standing rule for highly sensitive material."
+        : "Only the approved minimum household meaning was shared once.",
   );
   return "processed";
 }
@@ -984,6 +1025,43 @@ function declinePromotion(
     personal(item.senderAdultId),
     "status",
     "The private item will not be shared with the household.",
+  );
+  return "processed";
+}
+
+function revokePolicy(
+  work: Work,
+  item: ConversationInboxItem,
+  policyId: string,
+  expectedPolicyVersion: number,
+): "processed" | "rejected" {
+  if (item.channel.scope !== "personal") return "rejected";
+  const policy = work.aggregate.policies.find(
+    (candidate) =>
+      candidate.policyId === policyId &&
+      candidate.status === "active" &&
+      candidate.rule.kind === "sharing" &&
+      candidate.rule.from.adultId === item.senderAdultId,
+  );
+  if (policy === undefined) return "rejected";
+  const result = acceptDomain(
+    work,
+    "sharing-policy-revoked",
+    item.occurredAt,
+    { kind: "adult", adultId: item.senderAdultId },
+    {
+      kind: "policy.revoked",
+      policyId: PolicyIdSchema.parse(policyId),
+      expectedPolicyVersion,
+    } as Omit<HouseholdSignal, "householdId" | "signalId" | "sequence" | "occurredAt" | "actor">,
+  );
+  if (result.receipt.disposition !== "accepted") return "rejected";
+  queueMessage(
+    work,
+    "sharing-policy-revoked",
+    personal(item.senderAdultId),
+    "status",
+    "The standing sharing rule is revoked. Matching private items will require review again.",
   );
   return "processed";
 }
@@ -1176,7 +1254,7 @@ async function processGmail(
         "gmail-promotion-request",
         personal(item.ownerAdultId),
         "promotion_request",
-        `${triage.privateSummary} Share only this household meaning: “${triage.minimumHouseholdMeaning}”? Reference ${pending.promotionId}.`,
+        `${triage.privateSummary} Share only this household meaning: “${triage.minimumHouseholdMeaning}”? Reply “share once ${pending.promotionId}” or, only if you want a standing rule for matching ${triage.sourceClass} items, “always share ${pending.promotionId}”.`,
       );
       return { status: "processed", classification: "gmail:promotion_pending" };
     }
@@ -1218,12 +1296,33 @@ async function processConversation(
           .filter((candidate) => candidate.ownerAdultId === item.senderAdultId)
           .map((candidate) => candidate.promotionId)
       : [];
+  const activePolicies =
+    item.channel.scope === "personal"
+      ? work.aggregate.policies.flatMap((policy) => {
+          if (
+            policy.status !== "active" ||
+            policy.rule.kind !== "sharing" ||
+            policy.rule.from.adultId !== item.senderAdultId
+          ) {
+            return [];
+          }
+          return [
+            {
+              policyId: policy.policyId,
+              policyVersion: policy.version,
+              kind: policy.rule.kind,
+              description: `Share minimum household meaning for ${policy.rule.sourceClass} through ${policy.rule.maximumSensitivity} sensitivity.`,
+            },
+          ];
+        })
+      : [];
   const classification = ConversationClassificationSchema.parse(
     await dependencies.interpreter.interpretConversation(item, {
       onboarding: work.projection.onboarding,
       sharedProfile: work.projection.sharedProfile,
       openEpisodes: visibleEpisodes,
       pendingPromotionIds,
+      activePolicies,
     }),
   );
   auditClassification(

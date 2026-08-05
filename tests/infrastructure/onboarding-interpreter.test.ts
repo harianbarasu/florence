@@ -49,6 +49,7 @@ describe("OnboardingAwareInterpreter", () => {
           sharedProfile: { facts: [] },
           openEpisodes: [],
           pendingPromotionIds: [],
+          activePolicies: [],
         },
       ),
     ).resolves.toMatchObject({
@@ -81,6 +82,7 @@ describe("OnboardingAwareInterpreter", () => {
       sharedProfile: { facts: [] },
       openEpisodes: [],
       pendingPromotionIds: [],
+      activePolicies: [],
     };
 
     await expect(
@@ -99,7 +101,12 @@ describe("OnboardingAwareInterpreter", () => {
 
   it("recognizes invitee consent, group registration, and explicit profile confirmation", async () => {
     const interpreter = new OnboardingAwareInterpreter(model(), { prepareInvitation: vi.fn() });
-    const base = { sharedProfile: { facts: [] }, openEpisodes: [], pendingPromotionIds: [] };
+    const base = {
+      sharedProfile: { facts: [] },
+      openEpisodes: [],
+      pendingPromotionIds: [],
+      activePolicies: [],
+    };
     await expect(
       interpreter.interpretConversation(
         directMessage("accept", "I accept and consent", ADULT_B, "2026-08-05T16:00:00Z"),

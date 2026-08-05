@@ -66,6 +66,7 @@ describe("ModelApplicationInterpreter", () => {
         sharedProfile: { facts: [] },
         openEpisodes: [],
         pendingPromotionIds: [],
+        activePolicies: [],
       },
     );
 

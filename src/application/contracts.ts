@@ -16,6 +16,7 @@ import {
   NeutralDisplayTextSchema,
   NeutralFactualTextSchema,
   PolicyCandidateSchema,
+  PolicyIdSchema,
   ProposedExternalActionSchema,
   ProposedMessageSchema,
   SemanticTimePlanSchema,
@@ -246,11 +247,18 @@ export const ConversationClassificationSchema = z.discriminatedUnion("intent", [
     ...ClassificationBaseShape,
     intent: z.literal("approve_promotion"),
     promotionId: StableReferenceSchema,
+    rememberForMatchingSource: z.boolean().optional(),
   }),
   z.strictObject({
     ...ClassificationBaseShape,
     intent: z.literal("decline_promotion"),
     promotionId: StableReferenceSchema,
+  }),
+  z.strictObject({
+    ...ClassificationBaseShape,
+    intent: z.literal("revoke_policy"),
+    policyId: PolicyIdSchema,
+    expectedPolicyVersion: z.number().int().nonnegative(),
   }),
 ]);
 

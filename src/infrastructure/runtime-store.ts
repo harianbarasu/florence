@@ -1,6 +1,8 @@
 import { createHmac, randomUUID } from "node:crypto";
+import type { TransactionSql } from "postgres";
 import { z } from "zod";
 import { GOOGLE_CALENDAR_EVENTS_SCOPE, GOOGLE_CALENDAR_READONLY_SCOPE } from "../adapters/google/index.js";
+import { LinqApiError, type LinqChat, type LinqSendReceipt } from "../adapters/linq/index.js";
 import {
   type ApplicationOutboxIntent,
   ApplicationOutboxIntentSchema,
@@ -18,6 +20,7 @@ import type { Database } from "../db/client.js";
 import {
   AdultIdSchema,
   type DurableScope,
+  DurableScopeSchema,
   HouseholdAggregateSchema,
   HouseholdIdSchema,
 } from "../domain/index.js";
@@ -45,9 +48,18 @@ import {
   gmailSyncStateSchema,
   gmailSyncWorkSchema,
 } from "./google-sync.js";
+import type { LinqChannelTarget, SerializedLinqSendResult } from "./worker-services.js";
 
 const instantSchema = z.iso.datetime({ offset: true });
 const handleSchema = z.string().trim().min(3).max(320);
+const groupBindingMetadataSchema = z
+  .object({
+    participantHandleDigests: z.array(z.string().min(1)).length(2),
+    selfHandleDigests: z.array(z.string().min(1)).length(1),
+    service: z.literal("imessage"),
+    healthStatus: z.literal("HEALTHY"),
+  })
+  .passthrough();
 
 export type PreparedInvitation = {
   invitationId: string;
@@ -63,13 +75,6 @@ export type PendingInvitation = PreparedInvitation & {
 export type GroupIdentity = {
   householdId: string;
   adultsByHandle: ReadonlyMap<string, string>;
-};
-
-export type OutboundChannel = {
-  householdId: string;
-  targetScope: DurableScope;
-  chatId: string;
-  status: "active" | "inactive";
 };
 
 export type ClaimedGoogleSyncWork = {
@@ -516,7 +521,7 @@ export class FlorenceRuntimeStore {
       join household_memberships hm
         on hm.household_id = cb.household_id and hm.adult_id = cb.adult_id
       where cb.provider = 'linq' and cb.channel_type = 'private'
-        and cb.status = 'active' and hm.status = 'active'
+        and cb.status in ('active', 'paused') and hm.status = 'active'
         and cb.external_handle = any(${handles})
     `;
     if (rows.length !== handles.length || rows.some((row) => !row.adult_id || !row.external_handle)) {
@@ -543,25 +548,132 @@ export class FlorenceRuntimeStore {
     householdId: string;
     externalChatId: string;
     participantHandles: readonly string[];
+    selfHandles: readonly string[];
+    service: string;
     healthStatus: string;
-  }): Promise<ChannelResolution> {
-    await this.applicationStore.upsertChannelBinding({
-      householdId: input.householdId,
-      provider: "linq",
-      channelType: "group",
-      externalChatId: input.externalChatId,
-      status: "active",
-      metadata: {
-        participantHandleDigests: input.participantHandles.map((handle) => this.digestHandle(handle)).sort(),
-        healthStatus: input.healthStatus,
-      },
+  }): Promise<ChannelResolution | null> {
+    const parsed = z
+      .strictObject({
+        householdId: z.uuid(),
+        externalChatId: z.string().min(1).max(500),
+        participantHandles: z.array(handleSchema).length(2),
+        selfHandles: z.array(handleSchema).length(1),
+        service: z.string().min(1).max(100),
+        healthStatus: z.string().min(1).max(100),
+      })
+      .parse(input);
+    const participants = uniqueCanonicalHandles(parsed.participantHandles);
+    const selfHandles = uniqueCanonicalHandles(parsed.selfHandles);
+    if (
+      participants.length !== 2 ||
+      selfHandles.length !== 1 ||
+      parsed.service.toLowerCase() !== "imessage" ||
+      parsed.healthStatus !== "HEALTHY"
+    ) {
+      await this.pauseGroupBinding({
+        externalChatId: parsed.externalChatId,
+        reason: "live_group_identity_mismatch",
+      });
+      return null;
+    }
+    const metadata = {
+      participantHandleDigests: participants.map((handle) => this.digestHandle(handle)).sort(),
+      selfHandleDigests: selfHandles.map((handle) => this.digestHandle(handle)).sort(),
+      service: "imessage" as const,
+      healthStatus: "HEALTHY" as const,
+    };
+
+    return this.database.begin(async (transaction) => {
+      await lockLinqChat(transaction, parsed.externalChatId);
+      const bindings = await transaction<
+        { id: string; household_id: string; status: ChannelResolution["bindingStatus"]; metadata: unknown }[]
+      >`
+        select id, household_id, status, metadata
+        from channel_bindings
+        where provider = 'linq' and channel_type = 'group'
+          and external_chat_id = ${parsed.externalChatId} and external_handle is null
+        for update
+      `;
+      const binding = bindings[0];
+      if (binding && binding.household_id !== parsed.householdId) {
+        throw new ApplicationStoreError(
+          "not_authorized",
+          "External group is already bound to another household",
+        );
+      }
+      if (binding?.status === "revoked") return null;
+      if (binding && !groupMetadataMatches(binding.metadata, metadata)) {
+        await transaction`
+          update channel_bindings
+          set status = 'paused',
+            metadata = metadata || ${this.database.json({ pauseReason: "stored_group_identity_mismatch" })},
+            updated_at = now()
+          where id = ${binding.id} and status <> 'revoked'
+        `;
+        return null;
+      }
+
+      const otherBindings = await transaction<{ id: string }[]>`
+        select id from channel_bindings
+        where provider = 'linq' and channel_type = 'group'
+          and household_id = ${parsed.householdId}
+          and external_chat_id <> ${parsed.externalChatId}
+          and status in ('pending', 'active', 'paused')
+        for update
+      `;
+      if (otherBindings[0]) {
+        await transaction`
+          update channel_bindings
+          set status = 'paused',
+            metadata = metadata || ${this.database.json({ pauseReason: "competing_group_identity" })},
+            updated_at = now()
+          where id = ${otherBindings[0].id} and status <> 'revoked'
+        `;
+        return null;
+      }
+
+      if (
+        !(await activeHouseholdHandlesMatch(transaction, parsed.householdId, participants)) ||
+        (await isChatSuppressed(transaction, parsed.externalChatId, null))
+      ) {
+        if (binding) {
+          await transaction`
+            update channel_bindings set status = 'paused', updated_at = now()
+            where id = ${binding.id} and status <> 'revoked'
+          `;
+        }
+        return null;
+      }
+
+      const bindingId = binding?.id ?? randomUUID();
+      if (binding) {
+        await transaction`
+          update channel_bindings
+          set status = 'active', metadata = ${this.database.json(metadata)}, updated_at = now()
+          where id = ${bindingId}
+        `;
+      } else {
+        await transaction`
+          insert into channel_bindings (
+            id, household_id, adult_id, provider, channel_type, external_chat_id,
+            external_handle, status, metadata
+          ) values (
+            ${bindingId}, ${parsed.householdId}, null, 'linq', 'group',
+            ${parsed.externalChatId}, null, 'active', ${this.database.json(metadata)}
+          )
+        `;
+      }
+      return {
+        bindingId,
+        provider: "linq" as const,
+        channelType: "group" as const,
+        householdId: parsed.householdId,
+        adultId: null,
+        bindingStatus: "active" as const,
+        membershipStatus: null,
+        metadata,
+      };
     });
-    const resolution = await this.applicationStore.resolveChannel({
-      provider: "linq",
-      externalChatId: input.externalChatId,
-    });
-    if (!resolution) throw new ApplicationStoreError("invalid_state", "Household group was not bound");
-    return resolution;
   }
 
   public async resolveAdultForHandle(input: {
@@ -583,57 +695,160 @@ export class FlorenceRuntimeStore {
     return rows[0]?.adult_id ?? null;
   }
 
-  public async resolveTarget(input: {
+  public async executeSerializedSend(input: {
     householdId: string;
     targetScope: DurableScope;
-  }): Promise<OutboundChannel | null> {
-    const householdId = z.uuid().parse(input.householdId);
-    const rows =
-      input.targetScope.kind === "household"
-        ? await this.database<{ external_chat_id: string; status: string }[]>`
-            select external_chat_id,
-              case
-                when status = 'active'
-                  and coalesce(metadata->>'healthStatus', 'HEALTHY') not in ('CRITICAL', 'OPTED_OUT')
-                then 'active'
-                else 'inactive'
-              end as status
-            from channel_bindings
+    loadGroupChat: (chatId: string) => Promise<LinqChat>;
+    send: (chatId: string) => Promise<LinqSendReceipt>;
+  }): Promise<SerializedLinqSendResult> {
+    const householdId = HouseholdIdSchema.parse(input.householdId);
+    const targetScope = DurableScopeSchema.parse(input.targetScope);
+    const candidateRows =
+      targetScope.kind === "household"
+        ? await this.database<{ external_chat_id: string }[]>`
+            select external_chat_id from channel_bindings
             where household_id = ${householdId} and provider = 'linq' and channel_type = 'group'
             order by updated_at desc limit 1
           `
-        : await this.database<{ external_chat_id: string; status: string }[]>`
-            select cb.external_chat_id,
-              case
-                when (cb.status = 'active' and hm.status = 'active')
-                  or (
-                    cb.status = 'pending' and hm.status = 'invited'
-                    and cb.metadata ? 'inboundFirstAt'
-                  )
-                then 'active'
-                else 'inactive'
-              end as status
-            from channel_bindings cb
-            left join household_memberships hm
-              on hm.household_id = cb.household_id and hm.adult_id = cb.adult_id
-            where cb.household_id = ${householdId} and cb.adult_id = ${input.targetScope.adultId}
-              and cb.provider = 'linq' and cb.channel_type = 'private'
-            order by cb.updated_at desc limit 1
+        : await this.database<{ external_chat_id: string }[]>`
+            select external_chat_id from channel_bindings
+            where household_id = ${householdId} and adult_id = ${targetScope.adultId}
+              and provider = 'linq' and channel_type = 'private'
+            order by updated_at desc limit 1
           `;
-    const row = rows[0];
-    if (!row) return null;
-    const suppressed = await this.isSuppressed(
-      row.external_chat_id,
-      input.targetScope.kind === "personal"
-        ? await this.privateHandle(householdId, input.targetScope.adultId)
-        : undefined,
-    );
-    return {
-      householdId,
-      targetScope: input.targetScope,
-      chatId: row.external_chat_id,
-      status: row.status === "active" && !suppressed ? "active" : "inactive",
-    };
+    const chatId = candidateRows[0]?.external_chat_id;
+    if (!chatId) return { status: "inactive" };
+
+    return this.database.begin(async (transaction) => {
+      await lockLinqChat(transaction, chatId);
+      type SerializedBindingRow = {
+        id: string;
+        external_chat_id: string;
+        status: ChannelResolution["bindingStatus"];
+        metadata: unknown;
+        external_handle: string | null;
+        membership_status: ChannelResolution["membershipStatus"];
+      };
+      const rows =
+        targetScope.kind === "household"
+          ? await transaction<SerializedBindingRow[]>`
+              select id, external_chat_id, status, metadata, external_handle,
+                null::text as membership_status
+              from channel_bindings
+              where household_id = ${householdId} and provider = 'linq' and channel_type = 'group'
+              order by updated_at desc limit 1
+              for update
+            `
+          : await transaction<SerializedBindingRow[]>`
+              select cb.id, cb.external_chat_id, cb.status, cb.metadata, cb.external_handle,
+                hm.status as membership_status
+              from channel_bindings cb
+              join household_memberships hm
+                on hm.household_id = cb.household_id and hm.adult_id = cb.adult_id
+              where cb.household_id = ${householdId} and cb.adult_id = ${targetScope.adultId}
+                and cb.provider = 'linq' and cb.channel_type = 'private'
+              order by cb.updated_at desc limit 1
+              for update of cb, hm
+            `;
+      const row = rows[0];
+      if (!row || row.external_chat_id !== chatId) return { status: "inactive" };
+      const privateEligible =
+        targetScope.kind === "personal" &&
+        ((row.status === "active" && row.membership_status === "active") ||
+          (row.status === "pending" &&
+            row.membership_status === "invited" &&
+            typeof row.metadata === "object" &&
+            row.metadata !== null &&
+            "inboundFirstAt" in row.metadata));
+      if (targetScope.kind === "household" ? row.status !== "active" : !privateEligible) {
+        return { status: "inactive" };
+      }
+      if (targetScope.kind === "personal" && row.external_handle === null) {
+        return { status: "inactive" };
+      }
+      const handleHash =
+        targetScope.kind === "personal" ? this.digestHandle(row.external_handle as string) : null;
+      if (await isChatSuppressed(transaction, chatId, handleHash)) return { status: "inactive" };
+
+      if (targetScope.kind === "household") {
+        let chat: LinqChat;
+        try {
+          chat = await input.loadGroupChat(chatId);
+        } catch (error) {
+          if (!(error instanceof LinqApiError) || error.retryable) throw error;
+          await transaction`
+            update channel_bindings
+            set status = 'paused',
+              metadata = metadata || ${this.database.json({ pauseReason: "provider_group_lookup_permanent" })},
+              updated_at = now()
+            where id = ${row.id} and status <> 'revoked'
+          `;
+          return { status: "binding_paused" };
+        }
+        if (!(await this.liveGroupAuthorityMatches(transaction, householdId, row.metadata, chat, chatId))) {
+          await transaction`
+            update channel_bindings
+            set status = 'paused',
+              metadata = metadata || ${this.database.json({ pauseReason: "live_group_authority_mismatch" })},
+              updated_at = now()
+            where id = ${row.id} and status <> 'revoked'
+          `;
+          return { status: "binding_paused" };
+        }
+      }
+
+      const target: LinqChannelTarget = {
+        householdId,
+        targetScope,
+        chatId,
+        status: "active",
+      };
+      const receipt = await input.send(chatId);
+      return { status: "sent", target, receipt };
+    });
+  }
+
+  private async liveGroupAuthorityMatches(
+    transaction: TransactionSql<Record<string, never>>,
+    householdId: string,
+    storedMetadata: unknown,
+    chat: LinqChat,
+    expectedChatId: string,
+  ): Promise<boolean> {
+    const live = normalizeHealthyLinqGroup(chat, expectedChatId);
+    const stored = groupBindingMetadataSchema.safeParse(storedMetadata);
+    if (!live || !stored.success) return false;
+    const participantHandleDigests = live.participants.map((handle) => this.digestHandle(handle)).sort();
+    const selfHandleDigests = live.selfHandles.map((handle) => this.digestHandle(handle)).sort();
+    if (
+      !sameStrings(participantHandleDigests, stored.data.participantHandleDigests) ||
+      !sameStrings(selfHandleDigests, stored.data.selfHandleDigests)
+    ) {
+      return false;
+    }
+    return activeHouseholdHandlesMatch(transaction, householdId, live.participants);
+  }
+
+  public async pauseGroupBinding(input: { externalChatId: string; reason: string }): Promise<boolean> {
+    const parsed = z
+      .strictObject({
+        externalChatId: z.string().min(1).max(500),
+        reason: z.string().regex(/^[a-z][a-z0-9_]{0,99}$/u),
+      })
+      .parse(input);
+    return this.database.begin(async (transaction) => {
+      await lockLinqChat(transaction, parsed.externalChatId);
+      const rows = await transaction<{ id: string }[]>`
+        update channel_bindings
+        set status = 'paused',
+          metadata = metadata || ${this.database.json({ pauseReason: parsed.reason })},
+          updated_at = now()
+        where provider = 'linq' and channel_type = 'group'
+          and external_chat_id = ${parsed.externalChatId} and status <> 'revoked'
+        returning id
+      `;
+      return rows.length > 0;
+    });
   }
 
   public async setSuppression(input: {
@@ -642,8 +857,9 @@ export class FlorenceRuntimeStore {
     scope: "private" | "group";
     suppressed: boolean;
     occurredAt: string;
+    sourceEventId: string;
     reason: string;
-  }): Promise<void> {
+  }): Promise<{ applied: boolean; suppressed: boolean }> {
     const parsed = z
       .strictObject({
         externalChatId: z.string().min(1).max(500),
@@ -651,6 +867,7 @@ export class FlorenceRuntimeStore {
         scope: z.enum(["private", "group"]),
         suppressed: z.boolean(),
         occurredAt: instantSchema,
+        sourceEventId: z.string().min(1).max(512),
         reason: z.string().min(1).max(200),
       })
       .superRefine((value, context) => {
@@ -660,33 +877,74 @@ export class FlorenceRuntimeStore {
       })
       .parse(input);
     const hash = parsed.externalHandle ? this.digestHandle(parsed.externalHandle) : null;
-    await this.database`
-      insert into channel_suppressions (
-        id, provider, external_chat_id, external_handle_hash, scope, status, reason, changed_at
-      ) values (
-        ${randomUUID()}, 'linq', ${parsed.externalChatId}, ${hash}, ${parsed.scope},
-        ${parsed.suppressed ? "suppressed" : "released"}, ${parsed.reason}, ${parsed.occurredAt}
-      )
-      on conflict (provider, external_chat_id, external_handle_hash)
-      do update set status = excluded.status, reason = excluded.reason,
-        changed_at = excluded.changed_at, updated_at = now()
-    `;
-    await this.database`
-      update channel_bindings
-      set status = case
-        when ${parsed.suppressed} then 'paused'
-        when channel_type = 'private' and exists (
-          select 1 from household_memberships hm
-          where hm.household_id = channel_bindings.household_id
-            and hm.adult_id = channel_bindings.adult_id and hm.status = 'invited'
-        ) then 'pending'
-        else 'active'
-      end,
-      updated_at = now()
-      where provider = 'linq' and external_chat_id = ${parsed.externalChatId}
-        and (${hash}::text is null or external_handle = ${parsed.externalHandle ?? null})
-        and status <> 'revoked'
-    `;
+    return this.database.begin(async (transaction) => {
+      await lockLinqChat(transaction, parsed.externalChatId);
+      const rows = await transaction<{ status: "suppressed" | "released" }[]>`
+        insert into channel_suppressions (
+          id, provider, external_chat_id, external_handle_hash, scope, status, reason,
+          changed_at, source_event_id
+        ) values (
+          ${randomUUID()}, 'linq', ${parsed.externalChatId}, ${hash}, ${parsed.scope},
+          ${parsed.suppressed ? "suppressed" : "released"}, ${parsed.reason},
+          ${parsed.occurredAt}, ${parsed.sourceEventId}
+        )
+        on conflict (provider, external_chat_id, external_handle_hash)
+        do update set status = excluded.status, reason = excluded.reason,
+          changed_at = excluded.changed_at, source_event_id = excluded.source_event_id,
+          updated_at = now()
+        where excluded.changed_at > channel_suppressions.changed_at
+          or (
+            excluded.changed_at = channel_suppressions.changed_at
+            and (
+              (excluded.status = 'suppressed' and channel_suppressions.status <> 'suppressed')
+              or (
+                excluded.status = channel_suppressions.status
+                and excluded.source_event_id > channel_suppressions.source_event_id
+              )
+            )
+          )
+        returning status
+      `;
+      const applied = rows.length === 1;
+      if (applied) {
+        await transaction`
+          update channel_bindings
+          set status = case
+            when ${parsed.suppressed} then 'paused'
+            when channel_type = 'private' and exists (
+              select 1 from household_memberships hm
+              where hm.household_id = channel_bindings.household_id
+                and hm.adult_id = channel_bindings.adult_id and hm.status = 'invited'
+            ) then 'pending'
+            else 'active'
+          end,
+          updated_at = now()
+          where provider = 'linq' and external_chat_id = ${parsed.externalChatId}
+            and (${hash}::text is null or external_handle = ${parsed.externalHandle ?? null})
+            and status <> 'revoked'
+        `;
+      }
+      const current =
+        rows[0] ??
+        (
+          await transaction<{ status: "suppressed" | "released" }[]>`
+            select status from channel_suppressions
+            where provider = 'linq' and external_chat_id = ${parsed.externalChatId}
+              and external_handle_hash is not distinct from ${hash}
+            limit 1
+          `
+        )[0];
+      if (!current) throw new ApplicationStoreError("invalid_state", "Suppression state disappeared");
+      if (!applied && current.status === "suppressed") {
+        await transaction`
+          update channel_bindings set status = 'paused', updated_at = now()
+          where provider = 'linq' and external_chat_id = ${parsed.externalChatId}
+            and (${hash}::text is null or external_handle = ${parsed.externalHandle ?? null})
+            and status <> 'revoked'
+        `;
+      }
+      return { applied, suppressed: current.status === "suppressed" };
+    });
   }
 
   public async isSuppressed(externalChatId: string, externalHandle?: string): Promise<boolean> {
@@ -1987,16 +2245,6 @@ export class FlorenceRuntimeStore {
       .digest("hex");
   }
 
-  private async privateHandle(householdId: string, adultId: string): Promise<string | undefined> {
-    const rows = await this.database<{ external_handle: string }[]>`
-      select external_handle from channel_bindings
-      where household_id = ${householdId} and adult_id = ${adultId}
-        and provider = 'linq' and channel_type = 'private'
-      order by updated_at desc limit 1
-    `;
-    return rows[0]?.external_handle;
-  }
-
   private calendarChannelTokenDigest(channelToken: string): string {
     return createHmac("sha256", this.identityKey)
       .update(`google-calendar-channel:v1:${channelToken}`)
@@ -2032,6 +2280,114 @@ export class FlorenceRuntimeStore {
     if (!rows[0]) return "not_found";
     return rows[0].status === "active" ? "conflict" : "inactive";
   }
+}
+
+async function lockLinqChat(
+  transaction: TransactionSql<Record<string, never>>,
+  externalChatId: string,
+): Promise<void> {
+  await transaction`
+    select pg_advisory_xact_lock(
+      hashtextextended(${`linq-chat:${externalChatId}`}, 0::bigint)
+    )
+  `;
+}
+
+async function isChatSuppressed(
+  transaction: TransactionSql<Record<string, never>>,
+  externalChatId: string,
+  externalHandleHash: string | null,
+): Promise<boolean> {
+  const rows = await transaction<{ status: "suppressed" | "released" }[]>`
+    select status from channel_suppressions
+    where provider = 'linq' and external_chat_id = ${externalChatId}
+      and external_handle_hash is not distinct from ${externalHandleHash}
+    limit 1
+  `;
+  return rows[0]?.status === "suppressed";
+}
+
+async function activeHouseholdHandlesMatch(
+  transaction: TransactionSql<Record<string, never>>,
+  householdId: string,
+  expectedHandles: readonly string[],
+): Promise<boolean> {
+  const membershipCounts = await transaction<{ count: string }[]>`
+    select count(*)::text as count from household_memberships
+    where household_id = ${householdId} and status = 'active'
+  `;
+  if (Number(membershipCounts[0]?.count ?? 0) !== 2) return false;
+  const rows = await transaction<{ adult_id: string; external_handle: string }[]>`
+    select cb.adult_id, cb.external_handle
+    from channel_bindings cb
+    join household_memberships hm
+      on hm.household_id = cb.household_id and hm.adult_id = cb.adult_id
+    where cb.household_id = ${householdId} and cb.provider = 'linq'
+      and cb.channel_type = 'private' and cb.status in ('active', 'paused') and hm.status = 'active'
+    order by cb.adult_id, cb.external_handle
+  `;
+  if (
+    rows.length !== 2 ||
+    new Set(rows.map((row) => row.adult_id)).size !== 2 ||
+    rows.some((row) => !row.external_handle)
+  ) {
+    return false;
+  }
+  try {
+    return sameStrings(
+      uniqueCanonicalHandles(rows.map((row) => row.external_handle)),
+      uniqueCanonicalHandles(expectedHandles),
+    );
+  } catch {
+    return false;
+  }
+}
+
+function normalizeHealthyLinqGroup(
+  chat: LinqChat,
+  expectedChatId: string,
+): { participants: string[]; selfHandles: string[] } | null {
+  if (
+    chat.id !== expectedChatId ||
+    !chat.isGroup ||
+    chat.service?.toLowerCase() !== "imessage" ||
+    chat.healthStatus !== "HEALTHY"
+  ) {
+    return null;
+  }
+  try {
+    const participants = uniqueCanonicalHandles(chat.participantHandles);
+    const selfHandles = uniqueCanonicalHandles(chat.selfHandles);
+    const active = uniqueCanonicalHandles(chat.activeHandles);
+    if (participants.length !== 2 || selfHandles.length !== 1 || active.length !== 3) return null;
+    return sameStrings(active, [...participants, ...selfHandles].sort())
+      ? { participants, selfHandles }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function groupMetadataMatches(
+  storedMetadata: unknown,
+  expectedMetadata: z.infer<typeof groupBindingMetadataSchema>,
+): boolean {
+  const stored = groupBindingMetadataSchema.safeParse(storedMetadata);
+  return (
+    stored.success &&
+    stored.data.service === expectedMetadata.service &&
+    stored.data.healthStatus === expectedMetadata.healthStatus &&
+    sameStrings(stored.data.participantHandleDigests, expectedMetadata.participantHandleDigests) &&
+    sameStrings(stored.data.selfHandleDigests, expectedMetadata.selfHandleDigests)
+  );
+}
+
+function uniqueCanonicalHandles(handles: readonly string[]): string[] {
+  return [...new Set(handles.map(canonicalizeLinqHandle))].sort();
+}
+
+function sameStrings(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 function calendarWorkForState(

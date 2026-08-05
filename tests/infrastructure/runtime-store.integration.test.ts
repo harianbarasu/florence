@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { LinqApiError } from "../../src/adapters/linq/index.js";
 import { ApplicationStore } from "../../src/db/application-store.js";
 import { closeDatabase, createDatabase, type Database } from "../../src/db/client.js";
 import { migrateDatabase } from "../../src/db/migrate.js";
@@ -129,11 +130,20 @@ describe.skipIf(!databaseUrl)("FlorenceRuntimeStore PostgreSQL integration", () 
     });
     expect(invitee).toMatchObject({ bindingStatus: "pending", membershipStatus: "invited" });
     await expect(
-      store.resolveTarget({
+      store.executeSerializedSend({
         householdId: founder.householdId,
         targetScope: { kind: "personal", adultId: AdultIdSchema.parse(invitation.adultId) },
+        loadGroupChat: async () => {
+          throw new Error("Personal sends must not load group authority");
+        },
+        send: async (chatId) => ({
+          provider: "linq",
+          providerMessageId: "message-invitation",
+          chatId,
+          idempotencyKey: "pending-invitation-send",
+        }),
       }),
-    ).resolves.toMatchObject({ chatId: "dm-partner", status: "active" });
+    ).resolves.toMatchObject({ status: "sent", target: { chatId: "dm-partner", status: "active" } });
     await expect(
       store.finalizeInvitation({
         householdId: founder.householdId,
@@ -153,24 +163,294 @@ describe.skipIf(!databaseUrl)("FlorenceRuntimeStore PostgreSQL integration", () 
       householdId: founder.householdId,
       externalChatId: "group-family",
       participantHandles: [ownerHandle, partnerHandle],
+      selfHandles: ["+16462350806"],
+      service: "iMessage",
       healthStatus: "HEALTHY",
     });
     expect(group).toMatchObject({ channelType: "group", bindingStatus: "active" });
+
+    const healthyGroup = {
+      id: "group-family",
+      isGroup: true,
+      displayName: "Family",
+      service: "iMessage",
+      healthStatus: "HEALTHY" as const,
+      activeHandles: ["+16462350806", ownerHandle, partnerHandle],
+      selfHandles: ["+16462350806"],
+      participantHandles: [ownerHandle, partnerHandle],
+    };
+    const sentChatIds: string[] = [];
     await expect(
-      store.resolveTarget({ householdId: founder.householdId, targetScope: { kind: "household" } }),
-    ).resolves.toMatchObject({ chatId: "group-family", status: "active" });
+      store.executeSerializedSend({
+        householdId: founder.householdId,
+        targetScope: { kind: "household" },
+        loadGroupChat: async () => healthyGroup,
+        send: async (chatId) => {
+          sentChatIds.push(chatId);
+          return {
+            provider: "linq",
+            providerMessageId: "message-authorized",
+            chatId,
+            idempotencyKey: "authorized-household-send",
+          };
+        },
+      }),
+    ).resolves.toMatchObject({ status: "sent" });
+
+    await expect(
+      store.executeSerializedSend({
+        householdId: founder.householdId,
+        targetScope: { kind: "household" },
+        loadGroupChat: async () => {
+          throw new LinqApiError("private transient detail", 503, true);
+        },
+        send: async () => {
+          throw new Error("Transient lookup must not send");
+        },
+      }),
+    ).rejects.toMatchObject({ retryable: true });
+    await expect(
+      applicationStore.resolveChannel({ provider: "linq", externalChatId: "group-family" }),
+    ).resolves.toMatchObject({ bindingStatus: "active" });
+
+    await expect(
+      store.executeSerializedSend({
+        householdId: founder.householdId,
+        targetScope: { kind: "household" },
+        loadGroupChat: async () => {
+          throw new LinqApiError("private permanent detail", 404, false);
+        },
+        send: async () => {
+          throw new Error("Permanent lookup must not send");
+        },
+      }),
+    ).resolves.toEqual({ status: "binding_paused" });
+    await expect(
+      applicationStore.resolveChannel({ provider: "linq", externalChatId: "group-family" }),
+    ).resolves.toMatchObject({ bindingStatus: "paused" });
+    await store.bindHouseholdGroup({
+      householdId: founder.householdId,
+      externalChatId: "group-family",
+      participantHandles: [ownerHandle, partnerHandle],
+      selfHandles: ["+16462350806"],
+      service: "iMessage",
+      healthStatus: "HEALTHY",
+    });
+
+    await expect(
+      store.executeSerializedSend({
+        householdId: founder.householdId,
+        targetScope: { kind: "household" },
+        loadGroupChat: async () => ({
+          ...healthyGroup,
+          activeHandles: [...healthyGroup.activeHandles, "+12025550103"],
+          participantHandles: [...healthyGroup.participantHandles, "+12025550103"],
+        }),
+        send: async (chatId) => {
+          sentChatIds.push(chatId);
+          return {
+            provider: "linq",
+            providerMessageId: "must-not-send-added",
+            chatId,
+            idempotencyKey: "added-participant-send",
+          };
+        },
+      }),
+    ).resolves.toEqual({ status: "binding_paused" });
+    expect(sentChatIds).toEqual(["group-family"]);
+    await expect(
+      applicationStore.resolveChannel({ provider: "linq", externalChatId: "group-family" }),
+    ).resolves.toMatchObject({ bindingStatus: "paused" });
+
+    await expect(
+      store.bindHouseholdGroup({
+        householdId: founder.householdId,
+        externalChatId: "group-family",
+        participantHandles: [ownerHandle, partnerHandle],
+        selfHandles: ["+16462350806"],
+        service: "iMessage",
+        healthStatus: "HEALTHY",
+      }),
+    ).resolves.toMatchObject({ bindingStatus: "active" });
+    await expect(
+      store.executeSerializedSend({
+        householdId: founder.householdId,
+        targetScope: { kind: "household" },
+        loadGroupChat: async () => ({
+          ...healthyGroup,
+          activeHandles: ["+16462350806", ownerHandle],
+          participantHandles: [ownerHandle],
+        }),
+        send: async (chatId) => {
+          sentChatIds.push(chatId);
+          return {
+            provider: "linq",
+            providerMessageId: "must-not-send-removed",
+            chatId,
+            idempotencyKey: "removed-participant-send",
+          };
+        },
+      }),
+    ).resolves.toEqual({ status: "binding_paused" });
+    expect(sentChatIds).toEqual(["group-family"]);
+
+    await store.bindHouseholdGroup({
+      householdId: founder.householdId,
+      externalChatId: "group-family",
+      participantHandles: [ownerHandle, partnerHandle],
+      selfHandles: ["+16462350806"],
+      service: "iMessage",
+      healthStatus: "HEALTHY",
+    });
+    await store.setSuppression({
+      externalChatId: "dm-owner",
+      externalHandle: ownerHandle,
+      scope: "private",
+      suppressed: true,
+      occurredAt: "2026-08-05T16:07:00Z",
+      sourceEventId: "linq:test:owner-private-stop",
+      reason: "stop_command",
+    });
+    let groupSentDuringPrivateSuppression = false;
+    await expect(
+      store.executeSerializedSend({
+        householdId: founder.householdId,
+        targetScope: { kind: "household" },
+        loadGroupChat: async () => healthyGroup,
+        send: async (chatId) => {
+          groupSentDuringPrivateSuppression = true;
+          return {
+            provider: "linq",
+            providerMessageId: "message-group-private-suppression",
+            chatId,
+            idempotencyKey: "group-during-private-suppression",
+          };
+        },
+      }),
+    ).resolves.toMatchObject({ status: "sent" });
+    expect(groupSentDuringPrivateSuppression).toBe(true);
+    await store.setSuppression({
+      externalChatId: "dm-owner",
+      externalHandle: ownerHandle,
+      scope: "private",
+      suppressed: false,
+      occurredAt: "2026-08-05T16:08:00Z",
+      sourceEventId: "linq:test:owner-private-start",
+      reason: "start_command",
+    });
+    let releaseProviderSend: (() => void) | undefined;
+    let markProviderSendStarted: (() => void) | undefined;
+    const providerSendStarted = new Promise<void>((resolve) => {
+      markProviderSendStarted = resolve;
+    });
+    const providerSendGate = new Promise<void>((resolve) => {
+      releaseProviderSend = resolve;
+    });
+    const ordering: string[] = [];
+    const inFlightSend = store.executeSerializedSend({
+      householdId: founder.householdId,
+      targetScope: { kind: "household" },
+      loadGroupChat: async () => healthyGroup,
+      send: async (chatId) => {
+        ordering.push("send-started");
+        markProviderSendStarted?.();
+        await providerSendGate;
+        ordering.push("send-finished");
+        return {
+          provider: "linq",
+          providerMessageId: "message-in-flight",
+          chatId,
+          idempotencyKey: "send-before-stop",
+        };
+      },
+    });
+    await providerSendStarted;
+    const stop = store
+      .setSuppression({
+        externalChatId: "group-family",
+        scope: "group",
+        suppressed: true,
+        occurredAt: "2026-08-05T16:10:00Z",
+        sourceEventId: "linq:test:group-stop",
+        reason: "stop_command",
+      })
+      .then((result) => {
+        ordering.push("stop-committed");
+        return result;
+      });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(ordering).toEqual(["send-started"]);
+    releaseProviderSend?.();
+    await expect(inFlightSend).resolves.toMatchObject({ status: "sent" });
+    await expect(stop).resolves.toEqual({ applied: true, suppressed: true });
+    expect(ordering).toEqual(["send-started", "send-finished", "stop-committed"]);
+
+    let sentAfterStop = false;
+    await expect(
+      store.executeSerializedSend({
+        householdId: founder.householdId,
+        targetScope: { kind: "household" },
+        loadGroupChat: async () => healthyGroup,
+        send: async (chatId) => {
+          sentAfterStop = true;
+          return {
+            provider: "linq",
+            providerMessageId: "must-not-send-after-stop",
+            chatId,
+            idempotencyKey: "send-after-stop",
+          };
+        },
+      }),
+    ).resolves.toEqual({ status: "inactive" });
+    expect(sentAfterStop).toBe(false);
   });
 
   it("persists STOP before onboarding and requires an explicit release", async () => {
     const handle = "+12025550199";
-    await store.setSuppression({
-      externalChatId: "dm-opted-out",
-      externalHandle: handle,
-      scope: "private",
-      suppressed: true,
-      occurredAt: "2026-08-05T17:00:00Z",
-      reason: "stop_command",
-    });
+    await expect(
+      store.setSuppression({
+        externalChatId: "dm-opted-out",
+        externalHandle: handle,
+        scope: "private",
+        suppressed: true,
+        occurredAt: "2026-08-05T17:00:00Z",
+        sourceEventId: "linq:test:stop-1",
+        reason: "stop_command",
+      }),
+    ).resolves.toEqual({ applied: true, suppressed: true });
+    await expect(
+      store.setSuppression({
+        externalChatId: "dm-opted-out",
+        externalHandle: handle,
+        scope: "private",
+        suppressed: false,
+        occurredAt: "2026-08-05T16:59:59Z",
+        sourceEventId: "linq:test:start-older",
+        reason: "start_command",
+      }),
+    ).resolves.toEqual({ applied: false, suppressed: true });
+    await expect(
+      store.setSuppression({
+        externalChatId: "dm-opted-out",
+        externalHandle: handle,
+        scope: "private",
+        suppressed: false,
+        occurredAt: "2026-08-05T17:00:00Z",
+        sourceEventId: "linq:test:start-equal",
+        reason: "start_command",
+      }),
+    ).resolves.toEqual({ applied: false, suppressed: true });
+    await expect(
+      store.setSuppression({
+        externalChatId: "dm-opted-out",
+        externalHandle: handle,
+        scope: "private",
+        suppressed: true,
+        occurredAt: "2026-08-05T17:00:00Z",
+        sourceEventId: "linq:test:stop-1",
+        reason: "stop_command",
+      }),
+    ).resolves.toEqual({ applied: false, suppressed: true });
     await expect(store.isSuppressed("dm-opted-out", handle)).resolves.toBe(true);
     await expect(
       store.provisionFoundingAdult({
@@ -180,15 +460,61 @@ describe.skipIf(!databaseUrl)("FlorenceRuntimeStore PostgreSQL integration", () 
         occurredAt: "2026-08-05T17:01:00Z",
       }),
     ).rejects.toMatchObject({ code: "not_authorized" });
+    await expect(
+      store.setSuppression({
+        externalChatId: "dm-opted-out",
+        externalHandle: handle,
+        scope: "private",
+        suppressed: false,
+        occurredAt: "2026-08-05T17:02:00Z",
+        sourceEventId: "linq:test:start-1",
+        reason: "start_command",
+      }),
+    ).resolves.toEqual({ applied: true, suppressed: false });
+    await expect(store.isSuppressed("dm-opted-out", handle)).resolves.toBe(false);
+  });
+
+  it("keeps STOP authoritative over a personal send started afterward", async () => {
+    const now = "2026-08-05T17:10:00Z";
+    const handle = "+12025550198";
+    const founder = await provisionConsentedFounder({
+      externalChatId: "dm-personal-stop-race",
+      externalHandle: handle,
+      timeZone: "America/Los_Angeles",
+      occurredAt: now,
+    });
+    if (!founder.adultId) throw new Error("Expected a founding adult");
     await store.setSuppression({
-      externalChatId: "dm-opted-out",
+      externalChatId: "dm-personal-stop-race",
       externalHandle: handle,
       scope: "private",
-      suppressed: false,
-      occurredAt: "2026-08-05T17:02:00Z",
-      reason: "start_command",
+      suppressed: true,
+      occurredAt: "2026-08-05T17:10:01Z",
+      sourceEventId: "linq:test:personal-stop",
+      reason: "stop_command",
     });
-    await expect(store.isSuppressed("dm-opted-out", handle)).resolves.toBe(false);
+    let lookedUpGroup = false;
+    let sent = false;
+    await expect(
+      store.executeSerializedSend({
+        householdId: founder.householdId,
+        targetScope: { kind: "personal", adultId: AdultIdSchema.parse(founder.adultId) },
+        loadGroupChat: async () => {
+          lookedUpGroup = true;
+          throw new Error("Personal sends must not use group authority");
+        },
+        send: async (chatId) => {
+          sent = true;
+          return {
+            provider: "linq",
+            providerMessageId: "should-not-send",
+            chatId,
+            idempotencyKey: "personal-after-stop",
+          };
+        },
+      }),
+    ).resolves.toEqual({ status: "inactive" });
+    expect({ lookedUpGroup, sent }).toEqual({ lookedUpGroup: false, sent: false });
   });
 
   it("purges expired resolved, dead, and quarantined provider payloads", async () => {

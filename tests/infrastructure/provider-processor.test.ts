@@ -119,8 +119,9 @@ function setup(input: { known?: ChannelResolution | null; snapshots?: HouseholdA
   );
   const finalizeFoundingAdult = vi.fn(async () => true);
   const runtimeStore: ProviderRuntimeStore = {
-    setSuppression: vi.fn(async () => undefined),
+    setSuppression: vi.fn(async (input) => ({ applied: true, suppressed: input.suppressed })),
     isSuppressed: vi.fn(async () => false),
+    pauseGroupBinding: vi.fn(async () => true),
     findPendingInvitation: vi.fn(async () => null),
     bindPendingInvitee: vi.fn(async () => privateResolution()),
     provisionFoundingAdult,
@@ -253,7 +254,12 @@ describe("ProductionProviderProcessor", () => {
       resolution: { classification: "linq:stop:suppressed" },
     });
     expect(harness.runtimeStore.setSuppression).toHaveBeenCalledWith(
-      expect.objectContaining({ scope: "private", suppressed: true, reason: "stop_command" }),
+      expect.objectContaining({
+        scope: "private",
+        suppressed: true,
+        sourceEventId: "linq:partner:event-1",
+        reason: "stop_command",
+      }),
     );
     expect(harness.process).not.toHaveBeenCalled();
   });
@@ -290,13 +296,182 @@ describe("ProductionProviderProcessor", () => {
     await expect(harness.processor.process(claimed(group))).resolves.toMatchObject({
       householdId: HOUSEHOLD_ID,
     });
-    expect(harness.runtimeStore.bindHouseholdGroup).toHaveBeenCalled();
+    expect(harness.runtimeStore.bindHouseholdGroup).toHaveBeenCalledWith({
+      householdId: HOUSEHOLD_ID,
+      externalChatId: "group-1",
+      participantHandles: ["+12025550101", "+12025550102"],
+      selfHandles: ["+16462350806"],
+      service: "iMessage",
+      healthStatus: "HEALTHY",
+    });
     expect(harness.process).toHaveBeenCalledWith(
       expect.objectContaining({
         channel: { channelId: "group-1", scope: "household" },
         senderAdultId: ADULT_A,
       }),
     );
+  });
+
+  it("pauses an existing group binding when live participants or the sender do not match", async () => {
+    const knownGroup = privateResolution({
+      channelType: "group",
+      adultId: null,
+      membershipStatus: null,
+    });
+    const changedParticipants = setup({ known: knownGroup });
+    changedParticipants.getChat.mockResolvedValue({
+      id: "group-1",
+      isGroup: true,
+      displayName: "Family",
+      service: "iMessage",
+      healthStatus: "HEALTHY",
+      activeHandles: ["+16462350806", "+12025550101", "+12025550103"],
+      selfHandles: ["+16462350806"],
+      participantHandles: ["+12025550101", "+12025550103"],
+    });
+    const group = event({
+      scope: "group",
+      conversation: {
+        id: "group-1",
+        kind: "group",
+        ownerHandle: "+16462350806",
+        knownParticipantHandles: ["+16462350806", "+12025550101"],
+      },
+    });
+
+    await expect(changedParticipants.processor.process(claimed(group))).resolves.toMatchObject({
+      resolution: { classification: "linq:unverified_group" },
+    });
+    expect(changedParticipants.runtimeStore.pauseGroupBinding).toHaveBeenCalledWith({
+      externalChatId: "group-1",
+      reason: "participant_identity_mismatch",
+    });
+    expect(changedParticipants.process).not.toHaveBeenCalled();
+
+    const unknownSender = setup({ known: knownGroup });
+    unknownSender.getChat.mockResolvedValue({
+      id: "group-1",
+      isGroup: true,
+      displayName: "Family",
+      service: "iMessage",
+      healthStatus: "HEALTHY",
+      activeHandles: ["+16462350806", "+12025550101", "+12025550102"],
+      selfHandles: ["+16462350806"],
+      participantHandles: ["+12025550101", "+12025550102"],
+    });
+    vi.mocked(unknownSender.runtimeStore.resolveExactGroup).mockResolvedValue({
+      householdId: HOUSEHOLD_ID,
+      adultsByHandle: new Map([
+        ["+12025550101", ADULT_A],
+        ["+12025550102", ADULT_B],
+      ]),
+    });
+    const thirdParty = event({
+      scope: "group",
+      conversation: {
+        id: "group-1",
+        kind: "group",
+        ownerHandle: "+16462350806",
+        knownParticipantHandles: ["+16462350806", "+12025550103"],
+      },
+      sender: { id: "sender-3", handle: "+12025550103", service: "iMessage" },
+      message: {
+        id: "message-start",
+        text: "START",
+        attachments: [],
+        replyTo: null,
+        consentCommand: "start",
+      },
+    });
+
+    await expect(unknownSender.processor.process(claimed(thirdParty))).resolves.toMatchObject({
+      resolution: { classification: "linq:unverified_group" },
+    });
+    expect(unknownSender.runtimeStore.setSuppression).not.toHaveBeenCalled();
+    expect(unknownSender.runtimeStore.pauseGroupBinding).toHaveBeenCalledWith({
+      externalChatId: "group-1",
+      reason: "sender_identity_mismatch",
+    });
+  });
+
+  it("maps group chat lookup failures to explicit retryable and permanent outcomes", async () => {
+    const group = event({
+      scope: "group",
+      conversation: {
+        id: "group-1",
+        kind: "group",
+        ownerHandle: "+16462350806",
+        knownParticipantHandles: ["+16462350806", "+12025550101"],
+      },
+    });
+    const retry = setup();
+    retry.getChat.mockRejectedValue(new LinqApiError("private", 503, true));
+    await expect(retry.processor.process(claimed(group))).rejects.toMatchObject({
+      code: "linq_group_lookup_failed",
+      retryable: true,
+    });
+
+    const permanent = setup();
+    permanent.getChat.mockRejectedValue(new LinqApiError("private", 404, false));
+    await expect(permanent.processor.process(claimed(group))).rejects.toMatchObject({
+      code: "linq_group_lookup_failed",
+      retryable: false,
+    });
+  });
+
+  it("does not reactivate a group when an older START loses to durable STOP", async () => {
+    const knownGroup = privateResolution({
+      channelType: "group",
+      adultId: null,
+      membershipStatus: null,
+      bindingStatus: "paused",
+    });
+    const harness = setup({ known: knownGroup });
+    harness.getChat.mockResolvedValue({
+      id: "group-1",
+      isGroup: true,
+      displayName: "Family",
+      service: "iMessage",
+      healthStatus: "HEALTHY",
+      activeHandles: ["+16462350806", "+12025550101", "+12025550102"],
+      selfHandles: ["+16462350806"],
+      participantHandles: ["+12025550101", "+12025550102"],
+    });
+    vi.mocked(harness.runtimeStore.resolveExactGroup).mockResolvedValue({
+      householdId: HOUSEHOLD_ID,
+      adultsByHandle: new Map([
+        ["+12025550101", ADULT_A],
+        ["+12025550102", ADULT_B],
+      ]),
+    });
+    vi.mocked(harness.runtimeStore.setSuppression).mockResolvedValue({
+      applied: false,
+      suppressed: true,
+    });
+    vi.mocked(harness.runtimeStore.isSuppressed).mockResolvedValue(true);
+    const start = event({
+      scope: "group",
+      conversation: {
+        id: "group-1",
+        kind: "group",
+        ownerHandle: "+16462350806",
+        knownParticipantHandles: ["+16462350806", "+12025550101"],
+      },
+      message: {
+        id: "message-start",
+        text: "START",
+        attachments: [],
+        replyTo: null,
+        consentCommand: "start",
+      },
+    });
+
+    await expect(harness.processor.process(claimed(start))).resolves.toMatchObject({
+      householdId: HOUSEHOLD_ID,
+      resolution: { classification: "linq:suppressed" },
+    });
+    expect(harness.runtimeStore.bindHouseholdGroup).not.toHaveBeenCalled();
+    expect(harness.process).not.toHaveBeenCalled();
   });
 
   it("retrieves bounded Linq attachment bytes and supplies them only to the application input", async () => {

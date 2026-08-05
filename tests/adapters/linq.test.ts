@@ -140,6 +140,7 @@ describe("Linq v3 webhook adapter", () => {
   it("normalizes only complete consent keywords", () => {
     expect(normalizeLinqConsentCommand(" Unsubscribe ")).toBe("stop");
     expect(normalizeLinqConsentCommand("resume")).toBe("start");
+    expect(normalizeLinqConsentCommand("yes")).toBeNull();
     expect(normalizeLinqConsentCommand("please stop")).toBeNull();
   });
 });

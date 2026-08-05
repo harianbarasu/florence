@@ -82,9 +82,11 @@ export interface ProviderRuntimeStore {
     scope: "private" | "group";
     suppressed: boolean;
     occurredAt: string;
+    sourceEventId: string;
     reason: string;
-  }): Promise<void>;
+  }): Promise<{ applied: boolean; suppressed: boolean }>;
   isSuppressed(externalChatId: string, externalHandle?: string): Promise<boolean>;
+  pauseGroupBinding(input: { externalChatId: string; reason: string }): Promise<boolean>;
   findPendingInvitation(inviteeHandle: string): Promise<PendingInvitation | null>;
   bindPendingInvitee(input: {
     invitation: PendingInvitation;
@@ -117,8 +119,10 @@ export interface ProviderRuntimeStore {
     householdId: string;
     externalChatId: string;
     participantHandles: readonly string[];
+    selfHandles: readonly string[];
+    service: string;
     healthStatus: string;
-  }): Promise<ChannelResolution>;
+  }): Promise<ChannelResolution | null>;
 }
 
 export class ProductionProviderProcessor {
@@ -166,6 +170,7 @@ export class ProductionProviderProcessor {
         scope: event.scope === "direct" ? "private" : "group",
         suppressed: true,
         occurredAt: event.occurredAt,
+        sourceEventId: event.dedupeKey,
         reason: "stop_command",
       });
       return {
@@ -173,20 +178,30 @@ export class ProductionProviderProcessor {
         resolution: { classification: "linq:stop:suppressed" },
       };
     }
-    if (event.message.consentCommand === "start") {
+    if (event.scope === "direct" && event.message.consentCommand === "start") {
       await this.options.runtimeStore.setSuppression({
         externalChatId: event.conversation.id,
-        ...(event.scope === "direct" ? { externalHandle: handle } : {}),
-        scope: event.scope === "direct" ? "private" : "group",
+        externalHandle: handle,
+        scope: "private",
         suppressed: false,
         occurredAt: event.occurredAt,
+        sourceEventId: event.dedupeKey,
         reason: "start_command",
       });
-    } else if (
-      await this.options.runtimeStore.isSuppressed(
-        event.conversation.id,
-        event.scope === "direct" ? handle : undefined,
-      )
+    }
+    if (
+      event.scope === "direct" &&
+      (await this.options.runtimeStore.isSuppressed(event.conversation.id, handle))
+    ) {
+      return {
+        ...(knownBeforeConsent ? { householdId: knownBeforeConsent.householdId } : {}),
+        resolution: { classification: "linq:suppressed" },
+      };
+    }
+    if (
+      event.scope === "group" &&
+      event.message.consentCommand !== "start" &&
+      (await this.options.runtimeStore.isSuppressed(event.conversation.id))
     ) {
       return {
         ...(knownBeforeConsent ? { householdId: knownBeforeConsent.householdId } : {}),
@@ -197,9 +212,14 @@ export class ProductionProviderProcessor {
     const route =
       event.scope === "direct"
         ? await this.routeDirect(event, handle, knownBeforeConsent)
-        : await this.routeGroup(event, handle, knownBeforeConsent);
+        : await this.routeVerifiedGroup(event, handle, knownBeforeConsent);
     if (route === null) {
-      return { resolution: { classification: "linq:unverified_group" } };
+      const suppressed =
+        event.scope === "group" && (await this.options.runtimeStore.isSuppressed(event.conversation.id));
+      return {
+        ...(knownBeforeConsent ? { householdId: knownBeforeConsent.householdId } : {}),
+        resolution: { classification: suppressed ? "linq:suppressed" : "linq:unverified_group" },
+      };
     }
 
     const snapshot = await this.options.applicationStore.load(route.resolution.householdId);
@@ -421,37 +441,111 @@ export class ProductionProviderProcessor {
     return { resolution, senderAdultId: resolution.adultId };
   }
 
-  private async routeGroup(
+  private async routeVerifiedGroup(
     event: Extract<LinqInboundEvent, { eventType: "message.received"; scope: "group" }>,
     handle: string,
     known: ChannelResolution | null,
   ): Promise<{ resolution: ChannelResolution; senderAdultId: string } | null> {
-    const chat = await this.options.linqChats.getChat(event.conversation.id);
-    if (chat.id !== event.conversation.id || !chat.isGroup) {
-      throw new ProviderProcessingError("linq_group_mismatch", false, "Linq chat identity changed");
+    let chat: Awaited<ReturnType<LinqChatReader["getChat"]>>;
+    try {
+      chat = await this.options.linqChats.getChat(event.conversation.id);
+    } catch (error) {
+      if (error instanceof LinqApiError) {
+        throw new ProviderProcessingError(
+          "linq_group_lookup_failed",
+          error.retryable,
+          "Linq group identity could not be verified",
+        );
+      }
+      throw error;
     }
-    if (chat.healthStatus === "OPTED_OUT") {
+    if (chat.id === event.conversation.id && chat.isGroup && chat.healthStatus === "OPTED_OUT") {
       await this.options.runtimeStore.setSuppression({
-        externalChatId: chat.id,
+        externalChatId: event.conversation.id,
         scope: "group",
         suppressed: true,
         occurredAt: event.occurredAt,
+        sourceEventId: event.dedupeKey,
         reason: "provider_opted_out",
       });
+      await this.pauseKnownGroup(known, event.conversation.id, "provider_opted_out");
+      return null;
+    }
+    if (!isExactHealthyLinqGroup(chat, event.conversation.id)) {
+      await this.pauseKnownGroup(known, event.conversation.id, "live_group_identity_mismatch");
       return null;
     }
     const identity = await this.options.runtimeStore.resolveExactGroup(chat.participantHandles);
-    if (!identity || (known && known.householdId !== identity.householdId)) return null;
+    if (!identity || (known && known.householdId !== identity.householdId)) {
+      await this.pauseKnownGroup(known, event.conversation.id, "participant_identity_mismatch");
+      return null;
+    }
     const senderAdultId = identity.adultsByHandle.get(handle);
-    if (!senderAdultId) return null;
+    if (!senderAdultId) {
+      await this.pauseKnownGroup(known, event.conversation.id, "sender_identity_mismatch");
+      return null;
+    }
+
+    if (event.message.consentCommand === "start") {
+      const release = await this.options.runtimeStore.setSuppression({
+        externalChatId: event.conversation.id,
+        scope: "group",
+        suppressed: false,
+        occurredAt: event.occurredAt,
+        sourceEventId: event.dedupeKey,
+        reason: "start_command",
+      });
+      if (release.suppressed) return null;
+    }
+
     const resolution = await this.options.runtimeStore.bindHouseholdGroup({
       householdId: identity.householdId,
       externalChatId: chat.id,
       participantHandles: chat.participantHandles,
+      selfHandles: chat.selfHandles,
+      service: chat.service as string,
       healthStatus: chat.healthStatus,
     });
+    if (!resolution) return null;
     return { resolution, senderAdultId };
   }
+
+  private async pauseKnownGroup(
+    known: ChannelResolution | null,
+    externalChatId: string,
+    reason: string,
+  ): Promise<void> {
+    if (known?.channelType !== "group") return;
+    await this.options.runtimeStore.pauseGroupBinding({ externalChatId, reason });
+  }
+}
+
+function isExactHealthyLinqGroup(
+  chat: Awaited<ReturnType<LinqChatReader["getChat"]>>,
+  expectedChatId: string,
+): boolean {
+  if (
+    chat.id !== expectedChatId ||
+    !chat.isGroup ||
+    chat.healthStatus !== "HEALTHY" ||
+    chat.service?.toLowerCase() !== "imessage"
+  ) {
+    return false;
+  }
+  try {
+    const participants = uniqueCanonicalHandles(chat.participantHandles);
+    const self = uniqueCanonicalHandles(chat.selfHandles);
+    const active = uniqueCanonicalHandles(chat.activeHandles);
+    if (participants.length !== 2 || self.length !== 1 || active.length !== 3) return false;
+    const expectedActive = [...participants, ...self].sort();
+    return expectedActive.every((value, index) => value === active[index]);
+  } catch {
+    return false;
+  }
+}
+
+function uniqueCanonicalHandles(handles: readonly string[]): string[] {
+  return [...new Set(handles.map(canonicalizeLinqHandle))].sort();
 }
 
 function sha256(value: string | Uint8Array): string {

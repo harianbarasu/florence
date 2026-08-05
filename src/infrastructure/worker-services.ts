@@ -4,7 +4,13 @@ import { request as httpsRequest, type RequestOptions } from "node:https";
 import { isIP } from "node:net";
 import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
-import { LinqApiError, type LinqOutboundSender } from "../adapters/linq/index.js";
+import {
+  LinqApiError,
+  type LinqChat,
+  type LinqChatReader,
+  type LinqOutboundSender,
+  type LinqSendReceipt,
+} from "../adapters/linq/index.js";
 import {
   ApplicationOutboxIntentSchema,
   type EffectExecutionReceipt,
@@ -42,12 +48,18 @@ const LinqChannelTargetSchema = z.strictObject({
 
 export type LinqChannelTarget = z.infer<typeof LinqChannelTargetSchema>;
 
-/** Resolves an app-owned scope to one currently authorized Linq channel. */
+export type SerializedLinqSendResult =
+  | { status: "sent"; target: LinqChannelTarget; receipt: LinqSendReceipt }
+  | { status: "inactive" | "binding_paused" };
+
+/** Serializes final authorization and provider send under one app-owned chat boundary. */
 export interface LinqChannelDirectory {
-  resolveTarget(input: {
+  executeSerializedSend(input: {
     readonly householdId: string;
     readonly targetScope: DurableScope;
-  }): Promise<LinqChannelTarget | null>;
+    readonly loadGroupChat: (chatId: string) => Promise<LinqChat>;
+    readonly send: (chatId: string) => Promise<LinqSendReceipt>;
+  }): Promise<SerializedLinqSendResult>;
 }
 
 /** The narrow timer surface needed by domain effects. */
@@ -60,6 +72,7 @@ export interface WorkerTimerStore {
 
 export interface ProductionApplicationEffectExecutorOptions {
   readonly sender: LinqOutboundSender;
+  readonly linqChats: LinqChatReader;
   readonly channelDirectory: LinqChannelDirectory;
   readonly timerStore: WorkerTimerStore;
   readonly calendarActions?: Pick<HouseholdCalendarActionsPort, "createApprovedEvent">;
@@ -82,6 +95,7 @@ function stableReceipt(prefix: string, ...values: readonly string[]): string {
  */
 export class ProductionApplicationEffectExecutor implements ApplicationEffectExecutorPort {
   readonly #sender: LinqOutboundSender;
+  readonly #linqChats: LinqChatReader;
   readonly #channelDirectory: LinqChannelDirectory;
   readonly #timerStore: WorkerTimerStore;
   readonly #calendarActions: Pick<HouseholdCalendarActionsPort, "createApprovedEvent"> | undefined;
@@ -89,6 +103,7 @@ export class ProductionApplicationEffectExecutor implements ApplicationEffectExe
 
   constructor(options: ProductionApplicationEffectExecutorOptions) {
     this.#sender = options.sender;
+    this.#linqChats = options.linqChats;
     this.#channelDirectory = options.channelDirectory;
     this.#timerStore = options.timerStore;
     this.#calendarActions = options.calendarActions;
@@ -210,45 +225,43 @@ export class ProductionApplicationEffectExecutor implements ApplicationEffectExe
     body: string,
     idempotencyKey: string,
   ): Promise<EffectExecutionReceipt> {
-    let rawTarget: LinqChannelTarget | null;
+    let result: SerializedLinqSendResult;
     try {
-      rawTarget = await this.#channelDirectory.resolveTarget({ householdId, targetScope });
-    } catch {
-      return this.#receipt("retryable_failure");
-    }
-
-    const targetResult = LinqChannelTargetSchema.safeParse(rawTarget);
-    if (
-      !targetResult.success ||
-      targetResult.data.status !== "active" ||
-      targetResult.data.householdId !== householdId ||
-      !scopeEquals(targetResult.data.targetScope, targetScope)
-    ) {
-      return this.#receipt("permanent_failure");
-    }
-
-    try {
-      const sent = await this.#sender.sendText({
-        chatId: targetResult.data.chatId,
-        text: body,
-        idempotencyKey,
+      result = await this.#channelDirectory.executeSerializedSend({
+        householdId,
+        targetScope,
+        loadGroupChat: (chatId) => this.#linqChats.getChat(chatId),
+        send: (chatId) =>
+          this.#sender.sendText({
+            chatId,
+            text: body,
+            idempotencyKey,
+          }),
       });
-      if (
-        sent.provider !== "linq" ||
-        sent.chatId !== targetResult.data.chatId ||
-        sent.idempotencyKey !== idempotencyKey
-      ) {
-        return this.#receipt("permanent_failure");
-      }
-      return this.#receipt(
-        "succeeded",
-        stableReceipt("linq_send", sent.chatId, sent.providerMessageId, sent.idempotencyKey),
-      );
     } catch (error) {
       return this.#receipt(
         error instanceof LinqApiError && !error.retryable ? "permanent_failure" : "retryable_failure",
       );
     }
+
+    if (result.status !== "sent") return this.#receipt("permanent_failure");
+    const targetResult = LinqChannelTargetSchema.safeParse(result.target);
+    const sent = result.receipt;
+    if (
+      !targetResult.success ||
+      targetResult.data.status !== "active" ||
+      targetResult.data.householdId !== householdId ||
+      !scopeEquals(targetResult.data.targetScope, targetScope) ||
+      sent.provider !== "linq" ||
+      sent.chatId !== targetResult.data.chatId ||
+      sent.idempotencyKey !== idempotencyKey
+    ) {
+      return this.#receipt("permanent_failure");
+    }
+    return this.#receipt(
+      "succeeded",
+      stableReceipt("linq_send", sent.chatId, sent.providerMessageId, sent.idempotencyKey),
+    );
   }
 
   #receipt(status: EffectExecutionReceipt["status"], receiptRef?: string): EffectExecutionReceipt {

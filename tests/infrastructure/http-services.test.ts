@@ -74,6 +74,61 @@ describe("DurableProviderIngress", () => {
       authentication: { verified: true },
     });
   });
+
+  it("makes authenticated STOP durable before enqueueing or acknowledging it", async () => {
+    const order: string[] = [];
+    const store: ProviderIngressStore = {
+      async ingestProviderEvent() {
+        order.push("inbox");
+        return { disposition: "accepted" };
+      },
+    };
+    const setSuppression = vi.fn(async () => {
+      order.push("suppression");
+    });
+    const ingress = new DurableProviderIngress(store, undefined, { setSuppression });
+    const stop = {
+      schemaVersion: 1,
+      source: "linq",
+      providerEventId: "evt-stop",
+      dedupeKey: "linq:partner:evt-stop",
+      occurredAt: "2027-01-01T08:00:00.000Z",
+      webhookVersion: "2026-02-03",
+      partnerId: "partner",
+      eventType: "message.received",
+      scope: "direct",
+      conversation: {
+        id: "chat-1",
+        kind: "direct",
+        ownerHandle: "+15550000000",
+        knownParticipantHandles: ["+15550000001"],
+      },
+      sender: { id: "sender-1", handle: "+15550000001", service: "iMessage" },
+      message: {
+        id: "message-stop",
+        text: "STOP",
+        attachments: [],
+        replyTo: null,
+        consentCommand: "stop",
+      },
+    } satisfies LinqInboundEvent;
+
+    await expect(ingress.acceptLinq(stop)).resolves.toBeUndefined();
+    expect(order).toEqual(["suppression", "inbox"]);
+    expect(setSuppression).toHaveBeenCalledWith({
+      externalChatId: "chat-1",
+      externalHandle: "+15550000001",
+      scope: "private",
+      suppressed: true,
+      occurredAt: "2027-01-01T08:00:00.000Z",
+      sourceEventId: "linq:partner:evt-stop",
+      reason: "stop_command",
+    });
+
+    setSuppression.mockRejectedValueOnce(new Error("safe fixture failure"));
+    await expect(ingress.acceptLinq(stop)).rejects.toThrow("safe fixture failure");
+    expect(order).toEqual(["suppression", "inbox"]);
+  });
 });
 
 class MemoryOAuthStore implements GoogleOAuthStore {

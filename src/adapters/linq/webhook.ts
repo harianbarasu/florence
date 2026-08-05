@@ -127,7 +127,7 @@ export function normalizeLinqConsentCommand(text: string): LinqConsentCommand {
   if (["stop", "stopall", "unsubscribe", "cancel", "end", "quit"].includes(normalized)) {
     return "stop";
   }
-  if (["start", "resume", "unstop", "yes"].includes(normalized)) {
+  if (["start", "resume", "unstop"].includes(normalized)) {
     return "start";
   }
   return null;

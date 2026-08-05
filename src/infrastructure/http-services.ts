@@ -49,13 +49,40 @@ export interface CalendarPushAcceptor {
   accept(headers: CalendarPushHeaders): Promise<"accepted" | "unauthorized">;
 }
 
+export interface AuthenticatedLinqSuppressionStore {
+  setSuppression(input: {
+    externalChatId: string;
+    externalHandle?: string;
+    scope: "private" | "group";
+    suppressed: boolean;
+    occurredAt: string;
+    sourceEventId: string;
+    reason: string;
+  }): Promise<unknown>;
+}
+
 export class DurableProviderIngress implements DurableIngress {
   public constructor(
     private readonly store: ProviderIngressStore,
     private readonly calendarPush?: CalendarPushAcceptor,
+    private readonly linqSuppressions?: AuthenticatedLinqSuppressionStore,
   ) {}
 
   public async acceptLinq(event: LinqInboundEvent): Promise<void> {
+    if (event.eventType === "message.received" && event.message.consentCommand === "stop") {
+      if (!this.linqSuppressions) {
+        throw new Error("Authenticated Linq STOP persistence is unavailable");
+      }
+      await this.linqSuppressions.setSuppression({
+        externalChatId: event.conversation.id,
+        ...(event.scope === "direct" ? { externalHandle: event.sender.handle } : {}),
+        scope: event.scope === "direct" ? "private" : "group",
+        suppressed: true,
+        occurredAt: event.occurredAt,
+        sourceEventId: event.dedupeKey,
+        reason: "stop_command",
+      });
+    }
     const receipt = await this.store.ingestProviderEvent({
       provider: "linq",
       idempotencyKey: event.dedupeKey,

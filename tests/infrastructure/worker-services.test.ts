@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   LinqApiError,
+  type LinqChat,
+  type LinqChatReader,
   type LinqOutboundSender,
   type LinqSendReceipt,
   type LinqSendTextInput,
@@ -101,15 +103,51 @@ class RecordingSender implements LinqOutboundSender {
 
 class StaticChannelDirectory implements LinqChannelDirectory {
   readonly calls: Array<{ householdId: string; targetScope: DurableScope }> = [];
+  blocked: "inactive" | "binding_paused" | null = null;
 
   constructor(public target: LinqChannelTarget | null) {}
 
-  async resolveTarget(input: {
+  async executeSerializedSend(input: {
     householdId: string;
     targetScope: DurableScope;
-  }): Promise<LinqChannelTarget | null> {
+    loadGroupChat: (chatId: string) => Promise<LinqChat>;
+    send: (chatId: string) => Promise<LinqSendReceipt>;
+  }) {
     this.calls.push(input);
-    return this.target;
+    if (this.blocked) return { status: this.blocked };
+    if (
+      this.target?.status !== "active" ||
+      this.target.householdId !== input.householdId ||
+      JSON.stringify(this.target.targetScope) !== JSON.stringify(input.targetScope)
+    ) {
+      return { status: "inactive" } as const;
+    }
+    if (input.targetScope.kind === "household") await input.loadGroupChat(this.target.chatId);
+    return {
+      status: "sent" as const,
+      target: this.target,
+      receipt: await input.send(this.target.chatId),
+    };
+  }
+}
+
+class RecordingChatReader implements LinqChatReader {
+  readonly calls: string[] = [];
+  error: Error | undefined;
+
+  async getChat(chatId: string): Promise<LinqChat> {
+    this.calls.push(chatId);
+    if (this.error) throw this.error;
+    return {
+      id: chatId,
+      isGroup: true,
+      displayName: "Family",
+      service: "iMessage",
+      healthStatus: "HEALTHY",
+      activeHandles: ["+16462350806", "+12025550101", "+12025550102"],
+      selfHandles: ["+16462350806"],
+      participantHandles: ["+12025550101", "+12025550102"],
+    };
   }
 }
 
@@ -133,14 +171,17 @@ class RecordingTimerStore implements WorkerTimerStore {
 
 function effectHarness(target: LinqChannelTarget | null = activeHouseholdTarget()) {
   const sender = new RecordingSender();
+  const linqChats = new RecordingChatReader();
   const channelDirectory = new StaticChannelDirectory(target);
   const timerStore = new RecordingTimerStore();
   return {
     sender,
+    linqChats,
     channelDirectory,
     timerStore,
     executor: new ProductionApplicationEffectExecutor({
       sender,
+      linqChats,
       channelDirectory,
       timerStore,
       now: () => EFFECT_NOW,
@@ -205,8 +246,9 @@ describe("ProductionApplicationEffectExecutor", () => {
     });
     expect(receipt.receiptRef).toMatch(/^linq_send_[a-f0-9]{64}$/);
     expect(harness.channelDirectory.calls).toEqual([
-      { householdId: HOUSEHOLD_ID, targetScope: { kind: "household" } },
+      expect.objectContaining({ householdId: HOUSEHOLD_ID, targetScope: { kind: "household" } }),
     ]);
+    expect(harness.linqChats.calls).toEqual(["linq_household_chat"]);
     expect(harness.sender.calls).toEqual([
       {
         chatId: "linq_household_chat",
@@ -255,6 +297,24 @@ describe("ProductionApplicationEffectExecutor", () => {
       status: "permanent_failure",
       recordedAt: EFFECT_RECORDED_AT,
     });
+  });
+
+  it("retries transient live group lookups and permanently rejects terminal lookup failures", async () => {
+    const retry = effectHarness();
+    retry.linqChats.error = new LinqApiError("private lookup detail", 503, true);
+    await expect(retry.executor.execute(conversationIntent())).resolves.toEqual({
+      status: "retryable_failure",
+      recordedAt: EFFECT_RECORDED_AT,
+    });
+    expect(retry.sender.calls).toEqual([]);
+
+    const permanent = effectHarness();
+    permanent.linqChats.error = new LinqApiError("private lookup detail", 404, false);
+    await expect(permanent.executor.execute(conversationIntent())).resolves.toEqual({
+      status: "permanent_failure",
+      recordedAt: EFFECT_RECORDED_AT,
+    });
+    expect(permanent.sender.calls).toEqual([]);
   });
 
   it("sends validated domain messages and rejects a mismatched application envelope", async () => {
@@ -370,6 +430,7 @@ describe("ProductionApplicationEffectExecutor", () => {
 
   it("executes only a validated approved Calendar effect and distinguishes retryable from final failure", async () => {
     const sender = new RecordingSender();
+    const linqChats = new RecordingChatReader();
     const channelDirectory = new StaticChannelDirectory(activeHouseholdTarget());
     const timerStore = new RecordingTimerStore();
     const createApprovedEvent = vi.fn(async () => ({
@@ -378,6 +439,7 @@ describe("ProductionApplicationEffectExecutor", () => {
     }));
     const executor = new ProductionApplicationEffectExecutor({
       sender,
+      linqChats,
       channelDirectory,
       timerStore,
       calendarActions: { createApprovedEvent },

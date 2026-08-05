@@ -201,7 +201,7 @@ export async function createProductionComposition(
   const config = options.config ?? loadConfig();
   const database = createDatabase(config.FLORENCE_DATABASE_URL, {
     max: 20,
-    schema: config.FLORENCE_DB_SCHEMA,
+    schema: config.FLORENCE_POSTGRES_SCHEMA,
   });
   let closed = false;
   const close = async () => {
@@ -211,7 +211,7 @@ export async function createProductionComposition(
   };
 
   try {
-    if (options.migrate !== false) await migrateDatabase(database, config.FLORENCE_DB_SCHEMA);
+    if (options.migrate !== false) await migrateDatabase(database, config.FLORENCE_POSTGRES_SCHEMA);
 
     const integrations = availableIntegrations(config);
     const applicationStore = new ApplicationStore(database);
@@ -263,6 +263,7 @@ export async function createProductionComposition(
       workerContext: new ScopedWorkerContext({ calendarSchedule: runtimeStore }),
       effectExecutor: new ProductionApplicationEffectExecutor({
         sender: linq,
+        linqChats: linq,
         channelDirectory: runtimeStore,
         timerStore: applicationStore,
         ...(calendarActions === undefined ? {} : { calendarActions }),
@@ -368,6 +369,7 @@ export async function createProductionComposition(
         ingress: new DurableProviderIngress(
           applicationStore,
           google.calendarPush === null ? undefined : google.calendarPush,
+          runtimeStore,
         ),
         googleOAuth: google.oauth,
         readiness,

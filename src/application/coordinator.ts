@@ -446,13 +446,6 @@ function applyOnboarding(
         "onboarding",
         "The invitation is ready. For inbound-first consent, ask the second adult to text Florence from their own iMessage number and explicitly accept. Florence will not contact them first.",
       );
-      queueMessage(
-        work,
-        "onboarding-invitee",
-        personal(invitedAdultId),
-        "onboarding",
-        "You were invited to join this adult-only household. Reply privately to accept and consent.",
-      );
       break;
     }
     case "accept_invite": {

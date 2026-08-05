@@ -154,6 +154,17 @@ describe("Florence application coordinator", () => {
       harness.interpreter.respondToConversation(step.key, step.response);
       await app.process(step.input);
       expect((await harness.repository.load(HOUSEHOLD_ID))?.projection.onboarding.phase).toBe(step.phase);
+      if (step.key === "onboard-invite-b") {
+        const contactedBeforeInbound = harness.repository
+          .intents("conversation.send")
+          .some(
+            (intent) =>
+              intent.kind === "conversation.send" &&
+              intent.targetScope.kind === "personal" &&
+              intent.targetScope.adultId === ADULT_B,
+          );
+        expect(contactedBeforeInbound).toBe(false);
+      }
     }
 
     const snapshot = await harness.repository.load(HOUSEHOLD_ID);

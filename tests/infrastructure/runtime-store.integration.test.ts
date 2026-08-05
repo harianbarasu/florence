@@ -75,6 +75,12 @@ describe.skipIf(!databaseUrl)("FlorenceRuntimeStore PostgreSQL integration", () 
     });
     expect(invitee).toMatchObject({ bindingStatus: "pending", membershipStatus: "invited" });
     await expect(
+      store.resolveTarget({
+        householdId: founder.householdId,
+        targetScope: { kind: "personal", adultId: invitation.adultId },
+      }),
+    ).resolves.toMatchObject({ chatId: "dm-partner", status: "active" });
+    await expect(
       store.finalizeInvitation({
         householdId: founder.householdId,
         adultId: invitation.adultId,

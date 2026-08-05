@@ -468,7 +468,15 @@ export class FlorenceRuntimeStore {
           `
         : await this.database<{ external_chat_id: string; status: string }[]>`
             select cb.external_chat_id,
-              case when cb.status = 'active' and hm.status = 'active' then 'active' else 'inactive' end as status
+              case
+                when (cb.status = 'active' and hm.status = 'active')
+                  or (
+                    cb.status = 'pending' and hm.status = 'invited'
+                    and cb.metadata ? 'inboundFirstAt'
+                  )
+                then 'active'
+                else 'inactive'
+              end as status
             from channel_bindings cb
             left join household_memberships hm
               on hm.household_id = cb.household_id and hm.adult_id = cb.adult_id

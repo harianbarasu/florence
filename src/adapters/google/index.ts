@@ -41,11 +41,16 @@ export {
 export {
   GmailAdapter,
   type GmailApiFactory,
+  type GmailAttachment,
+  GmailAttachmentContentError,
+  type GmailAttachmentContentFailure,
   type GmailHistoryChange,
   type GmailHistoryPage,
   type GmailMessage,
+  type GmailMessageFormat,
   type GmailMessageIdPage,
   type GmailPubSubEvent,
+  type GmailRetrievedAttachment,
   type GmailWatchReceipt,
   gmailAttachmentSchema,
   gmailHistoryChangeSchema,
@@ -54,6 +59,7 @@ export {
   parseGmailHistoryPage,
   parseGmailMessage,
   parseGmailPubSubPush,
+  type RetrieveGmailAttachmentInput,
 } from "./gmail.js";
 export {
   type CompleteGoogleCallbackInput,

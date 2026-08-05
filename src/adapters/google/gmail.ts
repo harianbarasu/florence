@@ -38,6 +38,16 @@ export const gmailAttachmentSchema = z
   })
   .strict();
 
+export type GmailAttachment = z.infer<typeof gmailAttachmentSchema>;
+
+const gmailRetrievedAttachmentBodySchema = z
+  .object({
+    attachmentId: z.string().nullable().optional(),
+    size: z.number().int().nonnegative(),
+    data: z.string(),
+  })
+  .passthrough();
+
 export const gmailMessageSchema = z
   .object({
     schemaVersion: z.literal(1),
@@ -115,12 +125,72 @@ export interface GmailWatchReceipt {
   expiresAt: string;
 }
 
+export type GmailMessageFormat = "metadata" | "full";
+
+export interface RetrieveGmailAttachmentInput {
+  accessToken: string;
+  messageId: string;
+  attachment: GmailAttachment;
+}
+
+export interface GmailRetrievedAttachment {
+  kind: "image" | "file";
+  mediaType: string;
+  filename: string;
+  sizeBytes: number;
+  bytes: Uint8Array;
+}
+
+export type GmailAttachmentContentFailure =
+  | "missing_reference"
+  | "too_large"
+  | "unsupported_type"
+  | "invalid_content";
+
+export class GmailAttachmentContentError extends GoogleAdapterError {
+  override readonly name = "GmailAttachmentContentError";
+
+  constructor(readonly reason: GmailAttachmentContentFailure) {
+    super(
+      `Gmail attachment content is unavailable (${reason})`,
+      "permanent",
+      reason === "too_large" ? 413 : 422,
+      false,
+    );
+  }
+}
+
+interface GmailAttachmentRequestOptions {
+  maxContentLength: number;
+}
+
+const MAX_GMAIL_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+const MAX_GMAIL_ATTACHMENT_BASE64URL_CHARACTERS = Math.ceil((MAX_GMAIL_ATTACHMENT_BYTES * 4) / 3);
+const MAX_GMAIL_ATTACHMENT_RESPONSE_BYTES = 14_000_000;
+const GMAIL_IMAGE_MEDIA_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
+const GMAIL_TEXT_MEDIA_TYPES = new Set(["text/plain", "text/csv", "text/calendar", "text/markdown"]);
+const GMAIL_FILE_MEDIA_TYPES = new Set(["application/pdf", ...GMAIL_TEXT_MEDIA_TYPES]);
+const GMAIL_MEDIA_TYPE_ALIASES = new Map([
+  ["application/x-pdf", "application/pdf"],
+  ["image/jpg", "image/jpeg"],
+  ["image/pjpeg", "image/jpeg"],
+  ["text/x-markdown", "text/markdown"],
+]);
+
 interface GmailApiPort {
   getMessage(params: {
     userId: "me";
     id: string;
-    format: "full";
+    format: GmailMessageFormat;
   }): Promise<{ data: gmail_v1.Schema$Message }>;
+  getAttachment(
+    params: {
+      userId: "me";
+      messageId: string;
+      id: string;
+    },
+    options: GmailAttachmentRequestOptions,
+  ): Promise<{ data: gmail_v1.Schema$MessagePartBody }>;
   listHistory(params: {
     userId: "me";
     startHistoryId: string;
@@ -160,18 +230,96 @@ export class GmailAdapter {
     accessToken: string;
     googleSubject: string;
     messageId: string;
+    format?: GmailMessageFormat;
   }): Promise<GmailMessage> {
     requireAccessToken(input.accessToken);
     try {
       const response = await this.#apiFactory(input.accessToken).getMessage({
         userId: "me",
         id: input.messageId,
-        format: "full",
+        format: input.format ?? "full",
       });
       return parseGmailMessage(response.data, input.googleSubject);
     } catch (error) {
       throw mapGoogleProviderError("Gmail message fetch", error);
     }
+  }
+
+  async retrieveAttachment(input: RetrieveGmailAttachmentInput): Promise<GmailRetrievedAttachment> {
+    requireAccessToken(input.accessToken);
+    requireProviderId(input.messageId, "Gmail message ID");
+
+    const parsedAttachment = gmailAttachmentSchema.safeParse(input.attachment);
+    if (!parsedAttachment.success) {
+      throw new GmailAttachmentContentError("invalid_content");
+    }
+    const attachment = parsedAttachment.data;
+    const hasEmbeddedData = attachment.embeddedDataBase64Url !== null;
+    const hasExternalReference = attachment.providerAttachmentId !== null;
+    if (hasEmbeddedData === hasExternalReference) {
+      throw new GmailAttachmentContentError("missing_reference");
+    }
+    if (attachment.partId === null || !isProviderId(attachment.partId)) {
+      throw new GmailAttachmentContentError("missing_reference");
+    }
+    if (attachment.sizeBytes > MAX_GMAIL_ATTACHMENT_BYTES) {
+      throw new GmailAttachmentContentError("too_large");
+    }
+
+    const normalizedType = normalizeGmailAttachmentMediaType(attachment.mimeType);
+    const kind = GMAIL_IMAGE_MEDIA_TYPES.has(normalizedType) ? "image" : "file";
+    let encodedData: string;
+    let providerSize = attachment.sizeBytes;
+
+    if (attachment.embeddedDataBase64Url !== null) {
+      encodedData = attachment.embeddedDataBase64Url;
+    } else {
+      const attachmentId = attachment.providerAttachmentId;
+      if (attachmentId === null || !isProviderId(attachmentId)) {
+        throw new GmailAttachmentContentError("missing_reference");
+      }
+
+      let response: { data: gmail_v1.Schema$MessagePartBody };
+      try {
+        response = await this.#apiFactory(input.accessToken).getAttachment(
+          {
+            userId: "me",
+            messageId: input.messageId,
+            id: attachmentId,
+          },
+          { maxContentLength: MAX_GMAIL_ATTACHMENT_RESPONSE_BYTES },
+        );
+      } catch (error) {
+        throw mapGoogleProviderError("Gmail attachment fetch", error);
+      }
+
+      const parsedResponse = gmailRetrievedAttachmentBodySchema.safeParse(response.data);
+      if (
+        !parsedResponse.success ||
+        (parsedResponse.data.attachmentId !== null &&
+          parsedResponse.data.attachmentId !== undefined &&
+          parsedResponse.data.attachmentId !== attachmentId) ||
+        parsedResponse.data.size !== attachment.sizeBytes
+      ) {
+        throw new GmailAttachmentContentError("invalid_content");
+      }
+      providerSize = parsedResponse.data.size;
+      encodedData = parsedResponse.data.data;
+    }
+
+    const bytes = decodeCanonicalAttachmentBase64Url(encodedData, attachment.sizeBytes);
+    if (bytes.byteLength !== attachment.sizeBytes || bytes.byteLength !== providerSize) {
+      throw new GmailAttachmentContentError("invalid_content");
+    }
+    validateGmailAttachmentBytes(normalizedType, bytes);
+
+    return {
+      kind,
+      mediaType: normalizedType,
+      filename: attachment.filename,
+      sizeBytes: bytes.byteLength,
+      bytes,
+    };
   }
 
   async listHistoryPage(input: {
@@ -411,6 +559,7 @@ function defaultGmailApiFactory(config: GoogleAdapterConfig): GmailApiFactory {
     });
     return {
       getMessage: (params) => api.users.messages.get(params),
+      getAttachment: (params, options) => api.users.messages.attachments.get(params, options),
       listHistory: (params) => api.users.history.list(params),
       listMessages: (params) => api.users.messages.list(params),
       watch: (params) => api.users.watch(params),
@@ -486,6 +635,153 @@ function decodeBase64UrlText(data: string): string {
     throw new GoogleAdapterError("Gmail message body exceeds the parser limit", "permanent", null, false);
   }
   return bytes.toString("utf8");
+}
+
+function normalizeGmailAttachmentMediaType(value: string): string {
+  if (value.length > 255) {
+    throw new GmailAttachmentContentError("unsupported_type");
+  }
+  const [rawMediaType = "", ...parameters] = value.split(";");
+  const parsedMediaType = rawMediaType.trim().toLowerCase();
+  if (!/^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/u.test(parsedMediaType)) {
+    throw new GmailAttachmentContentError("unsupported_type");
+  }
+  const mediaType = GMAIL_MEDIA_TYPE_ALIASES.get(parsedMediaType) ?? parsedMediaType;
+  if (!GMAIL_IMAGE_MEDIA_TYPES.has(mediaType) && !GMAIL_FILE_MEDIA_TYPES.has(mediaType)) {
+    throw new GmailAttachmentContentError("unsupported_type");
+  }
+
+  if (GMAIL_TEXT_MEDIA_TYPES.has(mediaType)) {
+    for (const parameter of parameters) {
+      const trimmed = parameter.trim();
+      if (!/^charset\b/iu.test(trimmed)) {
+        continue;
+      }
+      const match = /^charset\s*=\s*(?:"([^"]*)"|([^\s"]+))$/iu.exec(trimmed);
+      const charset = (match?.[1] ?? match?.[2] ?? "").toLowerCase();
+      if (charset !== "utf-8" && charset !== "utf8") {
+        throw new GmailAttachmentContentError("unsupported_type");
+      }
+    }
+  }
+  return mediaType;
+}
+
+function decodeCanonicalAttachmentBase64Url(data: string, expectedBytes: number): Uint8Array {
+  if (data.length > MAX_GMAIL_ATTACHMENT_BASE64URL_CHARACTERS) {
+    throw new GmailAttachmentContentError("too_large");
+  }
+  const expectedCharacters = Math.floor((expectedBytes * 4 + 2) / 3);
+  if (data.length !== expectedCharacters || data.length % 4 === 1 || !/^[A-Za-z0-9_-]*$/u.test(data)) {
+    throw new GmailAttachmentContentError("invalid_content");
+  }
+
+  const decoded = Buffer.from(data, "base64url");
+  if (decoded.byteLength > MAX_GMAIL_ATTACHMENT_BYTES) {
+    throw new GmailAttachmentContentError("too_large");
+  }
+  if (decoded.toString("base64url") !== data) {
+    throw new GmailAttachmentContentError("invalid_content");
+  }
+  return Uint8Array.from(decoded);
+}
+
+function validateGmailAttachmentBytes(mediaType: string, bytes: Uint8Array): void {
+  const valid =
+    mediaType === "application/pdf"
+      ? startsWithBytes(bytes, [0x25, 0x50, 0x44, 0x46, 0x2d])
+      : mediaType === "image/jpeg"
+        ? startsWithBytes(bytes, [0xff, 0xd8, 0xff])
+        : mediaType === "image/png"
+          ? startsWithBytes(bytes, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+          : mediaType === "image/gif"
+            ? startsWithAscii(bytes, "GIF87a") || startsWithAscii(bytes, "GIF89a")
+            : mediaType === "image/webp"
+              ? startsWithAscii(bytes, "RIFF") && asciiAt(bytes, 8, "WEBP")
+              : validateUtf8TextAttachment(bytes);
+
+  if (!valid) {
+    throw new GmailAttachmentContentError("invalid_content");
+  }
+}
+
+function validateUtf8TextAttachment(bytes: Uint8Array): boolean {
+  if (hasRecognizedBinarySignature(bytes)) {
+    return false;
+  }
+
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    return false;
+  }
+  if (text.includes("\0")) {
+    return false;
+  }
+
+  const withoutBom = text.replace(/^\uFEFF/u, "");
+  if (/^\s*#!/u.test(withoutBom)) {
+    return false;
+  }
+  return !(
+    /<\s*(?:[a-z0-9_-]+:)?svg(?:\s|:|\/?>)/iu.test(withoutBom) ||
+    /<!doctype\s+html\b/iu.test(withoutBom) ||
+    /<\s*\/?(?:[a-z0-9_-]+:)?(?:html|head|body|script|style|iframe|object|embed|form|meta|link|title|base|p|div|span|table|img|a)(?:\s|\/?>)/iu.test(
+      withoutBom,
+    )
+  );
+}
+
+function hasRecognizedBinarySignature(bytes: Uint8Array): boolean {
+  return (
+    startsWithBytes(bytes, [0x25, 0x50, 0x44, 0x46, 0x2d]) ||
+    startsWithBytes(bytes, [0xff, 0xd8, 0xff]) ||
+    startsWithBytes(bytes, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) ||
+    startsWithAscii(bytes, "GIF87a") ||
+    startsWithAscii(bytes, "GIF89a") ||
+    (startsWithAscii(bytes, "RIFF") && asciiAt(bytes, 8, "WEBP")) ||
+    startsWithBytes(bytes, [0x50, 0x4b, 0x03, 0x04]) ||
+    startsWithBytes(bytes, [0x50, 0x4b, 0x05, 0x06]) ||
+    startsWithBytes(bytes, [0x50, 0x4b, 0x07, 0x08]) ||
+    startsWithBytes(bytes, [0x1f, 0x8b]) ||
+    startsWithBytes(bytes, [0x42, 0x5a, 0x68]) ||
+    startsWithBytes(bytes, [0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00]) ||
+    startsWithBytes(bytes, [0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c]) ||
+    startsWithBytes(bytes, [0x52, 0x61, 0x72, 0x21, 0x1a, 0x07]) ||
+    asciiAt(bytes, 257, "ustar") ||
+    startsWithAscii(bytes, "MZ") ||
+    startsWithBytes(bytes, [0x7f, 0x45, 0x4c, 0x46]) ||
+    startsWithBytes(bytes, [0xfe, 0xed, 0xfa, 0xce]) ||
+    startsWithBytes(bytes, [0xfe, 0xed, 0xfa, 0xcf]) ||
+    startsWithBytes(bytes, [0xce, 0xfa, 0xed, 0xfe]) ||
+    startsWithBytes(bytes, [0xcf, 0xfa, 0xed, 0xfe]) ||
+    startsWithBytes(bytes, [0xca, 0xfe, 0xba, 0xbe]) ||
+    startsWithBytes(bytes, [0x00, 0x61, 0x73, 0x6d])
+  );
+}
+
+function startsWithAscii(bytes: Uint8Array, value: string): boolean {
+  return asciiAt(bytes, 0, value);
+}
+
+function asciiAt(bytes: Uint8Array, offset: number, value: string): boolean {
+  if (bytes.byteLength < offset + value.length) {
+    return false;
+  }
+  for (let index = 0; index < value.length; index += 1) {
+    if (bytes[offset + index] !== value.charCodeAt(index)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function startsWithBytes(bytes: Uint8Array, signature: readonly number[]): boolean {
+  if (bytes.byteLength < signature.length) {
+    return false;
+  }
+  return signature.every((value, index) => bytes[index] === value);
 }
 
 function joinUnique(values: readonly string[]): string | null {
@@ -571,6 +867,25 @@ function requireAccessToken(token: string): void {
   if (!token) {
     throw new GoogleAdapterError("Google access token is required", "unauthorized", null, false);
   }
+}
+
+function requireProviderId(value: string, field: string): void {
+  if (!isProviderId(value)) {
+    throw new GoogleAdapterError(`${field} is invalid`, "invalid_request", null, false);
+  }
+}
+
+function isProviderId(value: string): boolean {
+  if (value.length === 0 || value.length > 500 || value.trim() !== value) {
+    return false;
+  }
+  for (const character of value) {
+    const codePoint = character.codePointAt(0) ?? 0;
+    if (codePoint <= 0x1f || codePoint === 0x7f) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function boundedInteger(value: number, min: number, max: number, field: string): number {

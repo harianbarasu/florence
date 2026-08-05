@@ -7,8 +7,9 @@
   "deploy": {
     "healthcheckPath": "/readyz",
     "healthcheckTimeout": 180,
+    "preDeployCommand": "node dist/cli/migrate.js",
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 10,
-    "startCommand": "node dist/cli/migrate.js && node dist/server.js"
+    "startCommand": "node dist/server.js"
   }
 }

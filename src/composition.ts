@@ -531,7 +531,7 @@ async function executeConfirmedHouseholdDeletions(
   const rows = await database<{ id: string }[]>`
     select id from deletion_requests
     where status = 'confirmed'
-    order by confirmed_at, created_at
+    order by confirmed_at, requested_at, id
     limit ${limit}
   `;
   let completed = 0;

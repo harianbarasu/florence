@@ -59,6 +59,15 @@ describe("configuration", () => {
     expect(availableIntegrations(complete).google).toBe(true);
   });
 
+  it("rejects a malformed Gmail Pub/Sub subscription name", () => {
+    expect(() =>
+      loadConfig({
+        ...validEnvironment(),
+        GOOGLE_GMAIL_PUBSUB_SUBSCRIPTION: "gmail-subscription",
+      }),
+    ).toThrow("Invalid Florence configuration: GOOGLE_GMAIL_PUBSUB_SUBSCRIPTION");
+  });
+
   it("keeps partial Linq configuration degraded and enables only the complete connector", () => {
     const partial = loadConfig({
       ...validEnvironment(),

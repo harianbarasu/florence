@@ -37,7 +37,11 @@ const environmentSchema = z.object({
   ),
   GOOGLE_GMAIL_PUBSUB_SUBSCRIPTION: z.preprocess(
     emptyStringAsUndefined,
-    z.string().min(1).max(1_000).optional(),
+    z
+      .string()
+      .max(1_000)
+      .regex(/^projects\/[^/]+\/subscriptions\/[^/]+$/u)
+      .optional(),
   ),
   MODEL_PROVIDER: z.enum(["openai", "anthropic", "open-weight"]).default("openai"),
   OPENAI_API_KEY: optionalSecret,

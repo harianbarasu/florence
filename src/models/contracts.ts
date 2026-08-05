@@ -63,14 +63,18 @@ const ImagePartSchema = z
     message: "An image must contain exactly one of data or uri.",
   });
 
-const DocumentReferencePartSchema = z
+const FilePartSchema = z
   .object({
-    type: z.literal("document_reference"),
-    reference: z.string().min(1),
-    mediaType: z.string().min(1).optional(),
-    title: z.string().optional(),
+    type: z.literal("file"),
+    mediaType: z.string().min(1),
+    data: z.string().min(1).optional(),
+    uri: z.string().min(1).optional(),
+    filename: z.string().min(1).optional(),
   })
-  .strict();
+  .strict()
+  .refine((part) => (part.data === undefined) !== (part.uri === undefined), {
+    message: "A file must contain exactly one of data or uri.",
+  });
 
 export const ModelToolRequestSchema = z
   .object({
@@ -96,7 +100,7 @@ export const ModelToolResultPartSchema = z
 export const ModelMessagePartSchema = z.union([
   TextPartSchema,
   ImagePartSchema,
-  DocumentReferencePartSchema,
+  FilePartSchema,
   ModelToolRequestSchema,
   ModelToolResultPartSchema,
 ]);

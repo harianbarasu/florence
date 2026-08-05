@@ -145,6 +145,78 @@ describe("Linq v3 webhook adapter", () => {
 });
 
 describe("Linq outbound adapter", () => {
+  it("retrieves a fresh attachment URL and streams bounded bytes from Linq's exact CDN host", async () => {
+    const bytes = Uint8Array.from([37, 80, 68, 70]);
+    const request = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            id: "attachment-001",
+            content_type: "application/pdf",
+            filename: "field-trip.pdf",
+            size_bytes: bytes.byteLength,
+            status: "complete",
+            download_url:
+              "https://cdn.linqapp.com/attachments/partners/partner/attachment-001/field-trip.pdf?signature=test",
+            created_at: "2026-08-05T15:00:00Z",
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(bytes, {
+          status: 200,
+          headers: {
+            "content-type": "application/pdf",
+            "content-length": String(bytes.byteLength),
+          },
+        }),
+      );
+    const client = new LinqClient(CONFIG, request);
+
+    await expect(client.retrieveAttachment("attachment-001")).resolves.toEqual({
+      providerAttachmentId: "attachment-001",
+      kind: "file",
+      mediaType: "application/pdf",
+      filename: "field-trip.pdf",
+      sizeBytes: bytes.byteLength,
+      bytes,
+    });
+    expect(String(request.mock.calls[0]?.[0])).toBe(
+      "https://api.linqapp.com/api/partner/v3/attachments/attachment-001",
+    );
+    expect(String(request.mock.calls[1]?.[0])).toBe(
+      "https://cdn.linqapp.com/attachments/partners/partner/attachment-001/field-trip.pdf?signature=test",
+    );
+    expect(request.mock.calls[1]?.[1]).not.toHaveProperty("headers.authorization");
+    expect(request.mock.calls[1]?.[1]).toMatchObject({ redirect: "error" });
+  });
+
+  it("rejects attachment redirects outside Linq's documented CDN before downloading", async () => {
+    const request = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            id: "attachment-001",
+            content_type: "application/pdf",
+            filename: "field-trip.pdf",
+            size_bytes: 4,
+            download_url: "https://internal.example.test/private",
+            created_at: "2026-08-05T15:00:00Z",
+          }),
+          { status: 200 },
+        ),
+    );
+    const client = new LinqClient(CONFIG, request);
+
+    await expect(client.retrieveAttachment("attachment-001")).rejects.toMatchObject({
+      name: "LinqApiError",
+      retryable: false,
+    });
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
   it("retrieves and normalizes the active participant set before binding a group", async () => {
     const request = vi.fn(async (_url: string | URL, _init?: RequestInit) => ({
       ok: true,

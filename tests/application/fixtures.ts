@@ -126,6 +126,7 @@ export function groupMessage(key: string, text: string, occurredAt: string) {
     messageRef: `message_${key}`,
     text,
     attachmentRefs: [],
+    attachmentContents: [],
   };
 }
 
@@ -145,6 +146,7 @@ export function directMessage(
     messageRef: `message_${key}`,
     text,
     attachmentRefs: [],
+    attachmentContents: [],
   };
 }
 

@@ -58,6 +58,7 @@ describe("application-owned structured contracts", () => {
         messageRef: "message-1",
         text: "hello",
         attachmentRefs: [],
+        attachmentContents: [],
       }).success,
     ).toBe(false);
   });

@@ -1,10 +1,18 @@
+import { createHash } from "node:crypto";
 import { type GmailPubSubEvent, gmailPubSubEventSchema } from "../adapters/google/index.js";
 import {
+  LinqApiError,
+  LinqAttachmentContentError,
+  type LinqAttachmentReader,
   type LinqChatReader,
   type LinqInboundEvent,
   linqInboundEventSchema,
 } from "../adapters/linq/index.js";
-import type { FlorenceApplication, HouseholdApplicationSnapshot } from "../application/index.js";
+import type {
+  ConversationAttachmentContent,
+  FlorenceApplication,
+  HouseholdApplicationSnapshot,
+} from "../application/index.js";
 import type { ChannelResolution, ClaimedProviderInboxItem } from "../db/application-store.js";
 import { AdultIdSchema } from "../domain/index.js";
 import { canonicalizeLinqHandle, type GroupIdentity, type PendingInvitation } from "./runtime-store.js";
@@ -52,6 +60,7 @@ export interface ProductionProviderProcessorOptions {
   applicationStore: ProviderApplicationStore;
   runtimeStore: ProviderRuntimeStore;
   linqChats: LinqChatReader;
+  linqAttachments: LinqAttachmentReader;
   google: GooglePushProcessor;
   privateCommands?: PrivateCommandHandler;
   defaultTimeZone: string;
@@ -216,6 +225,7 @@ export class ProductionProviderProcessor {
       }
     }
 
+    const attachmentContents = await this.resolveAttachmentContents(event);
     const applicationResult = await this.options.application.process({
       kind: "conversation_message",
       householdId: route.resolution.householdId,
@@ -233,6 +243,7 @@ export class ProductionProviderProcessor {
           ? `linq:attachment:${attachment.providerAttachmentId}`
           : `linq:message:${event.message.id}:part:${attachment.partIndex}`,
       ),
+      attachmentContents,
     });
 
     if (event.scope === "direct" && route.resolution.membershipStatus === "invited") {
@@ -260,6 +271,86 @@ export class ProductionProviderProcessor {
         revision: applicationResult.revision,
       },
     };
+  }
+
+  private async resolveAttachmentContents(
+    event: Extract<LinqInboundEvent, { eventType: "message.received" }>,
+  ): Promise<ConversationAttachmentContent[]> {
+    const resolved: ConversationAttachmentContent[] = [];
+    let remainingBytes = 15 * 1024 * 1024;
+    for (const attachment of event.message.attachments) {
+      const reference = attachment.providerAttachmentId
+        ? `linq:attachment:${attachment.providerAttachmentId}`
+        : `linq:message:${event.message.id}:part:${attachment.partIndex}`;
+      const base = {
+        reference,
+        mediaType: attachment.mimeType,
+        filename: attachment.filename,
+        sizeBytes: attachment.sizeBytes,
+      } as const;
+
+      if (attachment.kind === "link" && attachment.url) {
+        let link: URL;
+        try {
+          link = new URL(attachment.url);
+        } catch {
+          resolved.push(unavailableAttachment(base, "unsupported_type"));
+          continue;
+        }
+        if (link.protocol !== "https:") {
+          resolved.push(unavailableAttachment(base, "unsupported_type"));
+          continue;
+        }
+        resolved.push({
+          ...base,
+          kind: "link",
+          url: link.toString(),
+          contentDigest: sha256(link.toString()),
+        });
+        continue;
+      }
+
+      if (!attachment.providerAttachmentId) {
+        resolved.push(unavailableAttachment(base, "missing_reference"));
+        continue;
+      }
+      if (remainingBytes <= 0) {
+        resolved.push(unavailableAttachment(base, "too_large"));
+        continue;
+      }
+
+      try {
+        const content = await this.options.linqAttachments.retrieveAttachment(
+          attachment.providerAttachmentId,
+          Math.min(10 * 1024 * 1024, remainingBytes),
+        );
+        remainingBytes -= content.sizeBytes;
+        const bytes = Buffer.from(content.bytes);
+        resolved.push({
+          reference,
+          kind: content.kind,
+          mediaType: content.mediaType,
+          filename: content.filename,
+          sizeBytes: content.sizeBytes,
+          dataBase64: bytes.toString("base64"),
+          contentDigest: sha256(bytes),
+        });
+      } catch (error) {
+        if (error instanceof LinqAttachmentContentError) {
+          resolved.push(unavailableAttachment(base, error.reason));
+          continue;
+        }
+        if (error instanceof LinqApiError) {
+          throw new ProviderProcessingError(
+            "linq_attachment_fetch_failed",
+            error.retryable,
+            "Linq attachment content could not be retrieved",
+          );
+        }
+        throw error;
+      }
+    }
+    return resolved;
   }
 
   private async resolveKnownChannel(
@@ -338,4 +429,33 @@ export class ProductionProviderProcessor {
     });
     return { resolution, senderAdultId };
   }
+}
+
+function sha256(value: string | Uint8Array): string {
+  return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+function unavailableAttachment(
+  base: {
+    reference: string;
+    mediaType: string | null;
+    filename: string | null;
+    sizeBytes: number | null;
+  },
+  reason: "missing_reference" | "too_large" | "unsupported_type" | "not_found",
+): ConversationAttachmentContent {
+  return {
+    ...base,
+    kind: "unavailable",
+    reason,
+    contentDigest: sha256(
+      JSON.stringify({
+        reference: base.reference,
+        mediaType: base.mediaType,
+        filename: base.filename,
+        sizeBytes: base.sizeBytes,
+        reason,
+      }),
+    ),
+  };
 }

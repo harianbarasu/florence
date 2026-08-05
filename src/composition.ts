@@ -7,10 +7,12 @@ import {
 } from "./adapters/google/index.js";
 import {
   LinqApiError,
+  type LinqAttachmentReader,
   type LinqChat,
   type LinqChatReader,
   LinqClient,
   type LinqOutboundSender,
+  type LinqRetrievedAttachment,
   type LinqSendReceipt,
   type LinqSendTextInput,
 } from "./adapters/linq/index.js";
@@ -266,6 +268,7 @@ export async function createProductionComposition(
       applicationStore,
       runtimeStore,
       linqChats: linq,
+      linqAttachments: linq,
       google: google.pushProcessor,
       ...(google.privateCommands === null ? {} : { privateCommands: google.privateCommands }),
       defaultTimeZone: config.FLORENCE_DEFAULT_TIMEZONE,
@@ -364,7 +367,9 @@ export async function createProductionComposition(
   }
 }
 
-function createLinqClient(config: FlorenceConfig): LinqOutboundSender & LinqChatReader {
+function createLinqClient(
+  config: FlorenceConfig,
+): LinqOutboundSender & LinqChatReader & LinqAttachmentReader {
   if (!config.LINQ_API_KEY) return new UnavailableLinqClient();
   return new LinqClient({
     apiKey: config.LINQ_API_KEY,
@@ -373,12 +378,16 @@ function createLinqClient(config: FlorenceConfig): LinqOutboundSender & LinqChat
   });
 }
 
-class UnavailableLinqClient implements LinqOutboundSender, LinqChatReader {
+class UnavailableLinqClient implements LinqOutboundSender, LinqChatReader, LinqAttachmentReader {
   public async sendText(_input: LinqSendTextInput): Promise<LinqSendReceipt> {
     throw new LinqApiError("Linq is not configured", null, true);
   }
 
   public async getChat(_chatId: string): Promise<LinqChat> {
+    throw new LinqApiError("Linq is not configured", null, true);
+  }
+
+  public async retrieveAttachment(_attachmentId: string): Promise<LinqRetrievedAttachment> {
     throw new LinqApiError("Linq is not configured", null, true);
   }
 }

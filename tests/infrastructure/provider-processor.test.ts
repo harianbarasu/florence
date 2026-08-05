@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { LinqApiError, LinqAttachmentContentError } from "../../src/adapters/linq/index.js";
 import type { HouseholdApplicationSnapshot } from "../../src/application/index.js";
 import type { ChannelResolution, ClaimedProviderInboxItem } from "../../src/db/application-store.js";
 import {
@@ -136,11 +137,13 @@ function setup(input: { known?: ChannelResolution | null; snapshots?: HouseholdA
     })),
   };
   const getChat = vi.fn();
+  const retrieveAttachment = vi.fn();
   const processor = new ProductionProviderProcessor({
     application: { process, executeOutbox: vi.fn() },
     applicationStore,
     runtimeStore,
     linqChats: { getChat },
+    linqAttachments: { retrieveAttachment },
     google,
     defaultTimeZone: "America/Los_Angeles",
   });
@@ -152,6 +155,7 @@ function setup(input: { known?: ChannelResolution | null; snapshots?: HouseholdA
     provisionFoundingAdult,
     google,
     getChat,
+    retrieveAttachment,
   };
 }
 
@@ -236,6 +240,93 @@ describe("ProductionProviderProcessor", () => {
         senderAdultId: ADULT_A,
       }),
     );
+  });
+
+  it("retrieves bounded Linq attachment bytes and supplies them only to the application input", async () => {
+    const harness = setup({ known: privateResolution() });
+    harness.retrieveAttachment.mockResolvedValue({
+      providerAttachmentId: "attachment-1",
+      kind: "file",
+      mediaType: "application/pdf",
+      filename: "permission-slip.pdf",
+      sizeBytes: 4,
+      bytes: Uint8Array.from([1, 2, 3, 4]),
+    });
+    const withAttachment = event({
+      message: {
+        id: "message-attachment",
+        text: "What do we need to do with this?",
+        attachments: [
+          {
+            kind: "media",
+            partIndex: 0,
+            providerAttachmentId: "attachment-1",
+            url: "https://cdn.linqapp.com/attachment-1",
+            mimeType: "application/pdf",
+            filename: "permission-slip.pdf",
+            sizeBytes: 4,
+          },
+        ],
+        replyTo: null,
+        consentCommand: null,
+      },
+    });
+
+    await harness.processor.process(claimed(withAttachment));
+
+    expect(harness.retrieveAttachment).toHaveBeenCalledWith("attachment-1", 10 * 1024 * 1024);
+    expect(harness.process).toHaveBeenCalledWith(
+      expect.objectContaining({
+        attachmentRefs: ["linq:attachment:attachment-1"],
+        attachmentContents: [
+          expect.objectContaining({
+            reference: "linq:attachment:attachment-1",
+            kind: "file",
+            mediaType: "application/pdf",
+            dataBase64: "AQIDBA==",
+            contentDigest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+          }),
+        ],
+      }),
+    );
+  });
+
+  it("records terminal content limits but retries Linq transport failures", async () => {
+    const unavailable = setup({ known: privateResolution() });
+    unavailable.retrieveAttachment.mockRejectedValue(new LinqAttachmentContentError("too_large"));
+    const attachmentEvent = event({
+      message: {
+        id: "message-attachment",
+        text: "Please check this",
+        attachments: [
+          {
+            kind: "media",
+            partIndex: 0,
+            providerAttachmentId: "attachment-1",
+            url: null,
+            mimeType: "application/pdf",
+            filename: "large.pdf",
+            sizeBytes: 20 * 1024 * 1024,
+          },
+        ],
+        replyTo: null,
+        consentCommand: null,
+      },
+    });
+    await unavailable.processor.process(claimed(attachmentEvent));
+    expect(unavailable.process).toHaveBeenCalledWith(
+      expect.objectContaining({
+        attachmentContents: [expect.objectContaining({ kind: "unavailable", reason: "too_large" })],
+      }),
+    );
+
+    const retry = setup({ known: privateResolution() });
+    retry.retrieveAttachment.mockRejectedValue(new LinqApiError("redacted", 503, true));
+    await expect(retry.processor.process(claimed(attachmentEvent))).rejects.toMatchObject({
+      name: "ProviderProcessingError",
+      code: "linq_attachment_fetch_failed",
+      retryable: true,
+    });
   });
 
   it("delegates Gmail history notices without exposing their payload to Linq routing", async () => {

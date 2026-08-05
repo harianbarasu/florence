@@ -137,7 +137,11 @@ function conversationEvidence(item: ConversationInboxItem) {
     scope: targetScope(item),
     observedAt: item.occurredAt,
     revision: 1,
-    contentDigest: contentDigest(item.text, ...item.attachmentRefs),
+    contentDigest: contentDigest(
+      item.text,
+      ...item.attachmentRefs,
+      ...item.attachmentContents.map((attachment) => attachment.contentDigest),
+    ),
   });
 }
 
@@ -1269,6 +1273,20 @@ async function processConversation(
 ): Promise<{ status: "processed" | "rejected"; classification: string }> {
   if (!work.aggregate.verifiedAdultIds.includes(item.senderAdultId)) {
     return { status: "rejected", classification: "conversation_unknown_adult" };
+  }
+  if (
+    item.text.trim().length === 0 &&
+    item.attachmentContents.length > 0 &&
+    item.attachmentContents.every((attachment) => attachment.kind === "unavailable")
+  ) {
+    queueMessage(
+      work,
+      "attachment-unavailable",
+      targetScope(item),
+      "status",
+      "I couldn't securely read that attachment. Please resend it as a PDF, common image, or text document, with a short note about what you want me to do.",
+    );
+    return { status: "processed", classification: "conversation:attachment_unavailable" };
   }
   const visibleEpisodes = work.aggregate.episodes.flatMap((episode) => {
     const visible =

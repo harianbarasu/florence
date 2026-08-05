@@ -31,6 +31,61 @@ import {
 
 const StableReferenceSchema = z.string().trim().min(1).max(500);
 const IdempotencyKeySchema = z.string().trim().min(1).max(500);
+const Sha256DigestSchema = z.string().regex(/^sha256:[a-f0-9]{64}$/);
+
+const ConversationAttachmentBaseShape = {
+  reference: StableReferenceSchema,
+  mediaType: z.string().trim().min(1).max(255).nullable(),
+  filename: z.string().trim().min(1).max(500).nullable(),
+  sizeBytes: z
+    .number()
+    .int()
+    .nonnegative()
+    .max(100 * 1024 * 1024)
+    .nullable(),
+  contentDigest: Sha256DigestSchema,
+} as const;
+
+export const ConversationAttachmentContentSchema = z.discriminatedUnion("kind", [
+  z.strictObject({
+    ...ConversationAttachmentBaseShape,
+    kind: z.literal("image"),
+    mediaType: z
+      .string()
+      .trim()
+      .regex(/^image\//u)
+      .max(255),
+    sizeBytes: z
+      .number()
+      .int()
+      .nonnegative()
+      .max(10 * 1024 * 1024),
+    dataBase64: z.string().min(1).max(14_000_000),
+  }),
+  z.strictObject({
+    ...ConversationAttachmentBaseShape,
+    kind: z.literal("file"),
+    mediaType: z.string().trim().min(1).max(255),
+    sizeBytes: z
+      .number()
+      .int()
+      .nonnegative()
+      .max(10 * 1024 * 1024),
+    dataBase64: z.string().min(1).max(14_000_000),
+  }),
+  z.strictObject({
+    ...ConversationAttachmentBaseShape,
+    kind: z.literal("link"),
+    url: z.url().refine((value) => new URL(value).protocol === "https:", "Conversation links must use HTTPS"),
+  }),
+  z.strictObject({
+    ...ConversationAttachmentBaseShape,
+    kind: z.literal("unavailable"),
+    reason: z.enum(["missing_reference", "too_large", "unsupported_type", "not_found"]),
+  }),
+]);
+
+export type ConversationAttachmentContent = z.infer<typeof ConversationAttachmentContentSchema>;
 
 export const ConversationChannelSchema = z
   .strictObject({
@@ -66,6 +121,7 @@ export const ConversationInboxItemSchema = z
     messageRef: StableReferenceSchema,
     text: z.string().max(20_000),
     attachmentRefs: z.array(StableReferenceSchema).max(20),
+    attachmentContents: z.array(ConversationAttachmentContentSchema).max(20),
   })
   .superRefine((item, context) => {
     if (item.text.trim().length === 0 && item.attachmentRefs.length === 0) {
@@ -76,6 +132,18 @@ export const ConversationInboxItemSchema = z
         code: "custom",
         path: ["senderAdultId"],
         message: "A personal message must be sent by that conversation's adult",
+      });
+    }
+    const contentRefs = item.attachmentContents.map((attachment) => attachment.reference);
+    if (
+      contentRefs.length !== item.attachmentRefs.length ||
+      contentRefs.some((reference, index) => reference !== item.attachmentRefs[index]) ||
+      new Set(contentRefs).size !== contentRefs.length
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["attachmentContents"],
+        message: "Attachment content must account for each attachment reference exactly once and in order",
       });
     }
   });

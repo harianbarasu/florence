@@ -134,6 +134,7 @@ describe("OnboardingAwareInterpreter", () => {
       messageRef: "message-group-register",
       text: "Florence, connect this family group",
       attachmentRefs: [],
+      attachmentContents: [],
     };
     await expect(
       interpreter.interpretConversation(groupMessage, {

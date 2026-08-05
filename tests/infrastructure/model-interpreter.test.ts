@@ -52,6 +52,7 @@ describe("ModelApplicationInterpreter", () => {
         messageRef: "message-1",
         text: "That game was fun",
         attachmentRefs: [],
+        attachmentContents: [],
       },
       {
         onboarding: {
@@ -107,5 +108,65 @@ describe("ModelApplicationInterpreter", () => {
     expect(gateway.calls[0]?.profile).toBe("private_processing");
     expect(gateway.calls[0]?.request.responseSchemaName).toBe("florence_private_gmail_triage");
     expect(JSON.stringify(gateway.calls[0]?.request.messages)).toContain("Private access code 9917");
+  });
+
+  it("routes attachment bytes through the vision/document contract without duplicating them in JSON", async () => {
+    const gateway = new RecordingGateway({
+      intent: "ignore",
+      confidence: 0.9,
+      rationale: "The attachment does not establish a household action.",
+    });
+    const interpreter = new ModelApplicationInterpreter(gateway);
+    const dataBase64 = Buffer.from("synthetic pdf").toString("base64");
+
+    await interpreter.interpretConversation(
+      {
+        kind: "conversation_message",
+        householdId,
+        idempotencyKey: "linq:event:attachment",
+        occurredAt: "2027-01-01T08:00:00Z",
+        channel: { channelId: "chat-1", scope: "household" },
+        senderAdultId: adultId,
+        messageRef: "message-attachment",
+        text: "What is this?",
+        attachmentRefs: ["linq:attachment:1"],
+        attachmentContents: [
+          {
+            reference: "linq:attachment:1",
+            kind: "file",
+            mediaType: "application/pdf",
+            filename: "notice.pdf",
+            sizeBytes: 13,
+            dataBase64,
+            contentDigest: `sha256:${"a".repeat(64)}`,
+          },
+        ],
+      },
+      {
+        onboarding: {
+          phase: "active",
+          initiatorAdultId: adultId,
+          invitedAdultId: secondAdultId,
+          consentedAdultIds: [adultId, secondAdultId],
+          privateDmAdultIds: [adultId, secondAdultId],
+          groupChannelId: "chat-1",
+          profileConfirmedAdultIds: [adultId, secondAdultId],
+        },
+        sharedProfile: { facts: [] },
+        openEpisodes: [],
+        pendingPromotionIds: [],
+        activePolicies: [],
+      },
+    );
+
+    expect(gateway.calls[0]?.profile).toBe("vision_document");
+    const userParts = gateway.calls[0]?.request.messages[1]?.parts ?? [];
+    expect(userParts[1]).toMatchObject({
+      type: "file",
+      mediaType: "application/pdf",
+      filename: "notice.pdf",
+      data: dataBase64,
+    });
+    expect(userParts[0]?.type === "text" ? userParts[0].text : "").not.toContain(dataBase64);
   });
 });

@@ -224,7 +224,7 @@ function toBaseMessages(message: ModelMessage): BaseMessage[] {
 }
 
 function toUserContent(parts: readonly ModelMessagePart[]): string | ContentBlock.Standard[] {
-  if (parts.every((part) => part.type === "text" || part.type === "document_reference")) {
+  if (parts.every((part) => part.type === "text")) {
     return partsToText(parts);
   }
 
@@ -237,8 +237,22 @@ function toUserContent(parts: readonly ModelMessagePart[]): string | ContentBloc
         ? [{ type: "image", data: part.data ?? "", mimeType: part.mediaType }]
         : [{ type: "image", url: part.uri, mimeType: part.mediaType }];
     }
-    if (part.type === "document_reference") {
-      return [{ type: "text", text: documentReferenceText(part) }];
+    if (part.type === "file") {
+      return [
+        part.uri === undefined
+          ? {
+              type: "file",
+              data: part.data ?? "",
+              mimeType: part.mediaType,
+              ...(part.filename === undefined ? {} : { metadata: { filename: part.filename } }),
+            }
+          : {
+              type: "file",
+              url: part.uri,
+              mimeType: part.mediaType,
+              ...(part.filename === undefined ? {} : { metadata: { filename: part.filename } }),
+            },
+      ];
     }
     return [];
   });
@@ -250,21 +264,12 @@ function partsToText(parts: readonly ModelMessagePart[]): string {
       if (part.type === "text") {
         return [part.text];
       }
-      if (part.type === "document_reference") {
-        return [documentReferenceText(part)];
-      }
       if (part.type === "tool_result") {
         return [serializeJson(part.output)];
       }
       return [];
     })
     .join("\n");
-}
-
-function documentReferenceText(part: Extract<ModelMessagePart, { type: "document_reference" }>): string {
-  const label = part.title === undefined ? "Document" : `Document (${part.title})`;
-  const media = part.mediaType === undefined ? "" : ` [${part.mediaType}]`;
-  return `${label}${media}: ${part.reference}`;
 }
 
 function toLangChainTool(definition: ModelToolDefinition) {

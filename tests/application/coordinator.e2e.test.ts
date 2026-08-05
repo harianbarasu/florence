@@ -17,6 +17,38 @@ function domainEffects(intents: readonly ApplicationOutboxIntent[]) {
 }
 
 describe("Florence application coordinator", () => {
+  it("responds neutrally when an attachment-only message cannot be read", async () => {
+    const harness = setup();
+    const app = createFlorenceApplication(harness.dependencies);
+    const input = {
+      ...groupMessage("unreadable-attachment", "", "2027-01-01T08:00:00Z"),
+      attachmentRefs: ["linq:attachment:large-video"],
+      attachmentContents: [
+        {
+          reference: "linq:attachment:large-video",
+          kind: "unavailable" as const,
+          mediaType: "video/mp4",
+          filename: "clip.mp4",
+          sizeBytes: 20 * 1024 * 1024,
+          reason: "unsupported_type" as const,
+          contentDigest: `sha256:${"a".repeat(64)}`,
+        },
+      ],
+    };
+
+    const result = await app.process(input);
+
+    expect(result.outcome.classification).toBe("conversation:attachment_unavailable");
+    expect(harness.interpreter.conversationCalls).toEqual([]);
+    expect(harness.repository.intents("conversation.send")).toEqual([
+      expect.objectContaining({
+        targetScope: { kind: "household" },
+        messageClass: "status",
+        body: expect.stringContaining("Please resend"),
+      }),
+    ]);
+  });
+
   it("keeps Gmail private and promotes only approved minimum household meaning", async () => {
     const harness = setup();
     const app = createFlorenceApplication(harness.dependencies);

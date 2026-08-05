@@ -42,7 +42,12 @@ export const MODEL_CAPABILITY_REQUIREMENTS: Readonly<
     toolCalling: true,
     longContext: true,
   }),
-  private_processing: Object.freeze({ privateProcessing: true }),
+  private_processing: Object.freeze({
+    structuredOutput: true,
+    vision: true,
+    documentUnderstanding: true,
+    privateProcessing: true,
+  }),
 });
 
 export const JsonValueSchema = z.json();

@@ -39,6 +39,21 @@ describe("RoutedModelGateway", () => {
           ]),
         ),
     ).toThrowError(new ModelGatewayError("unsupported_capability"));
+
+    expect(
+      () =>
+        new RoutedModelGateway(
+          new Map([
+            [
+              "private_processing",
+              providerAdapter(async () => modelResult(), {
+                ...allCapabilities,
+                vision: false,
+              }),
+            ],
+          ]),
+        ),
+    ).toThrowError(new ModelGatewayError("unsupported_capability"));
   });
 
   it("validates structured output again with the application schema", async () => {

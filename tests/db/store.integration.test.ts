@@ -14,6 +14,10 @@ describe.skipIf(!databaseUrl)("FlorenceStore PostgreSQL integration", () => {
   beforeAll(async () => {
     database = createDatabase(databaseUrl as string, { max: 12 });
     await migrateDatabase(database);
+    const schemas = await database<{ schema: string | null }[]>`
+      select current_schema() as schema
+    `;
+    expect(schemas[0]?.schema).toBe("florence");
     store = new FlorenceStore(database);
   });
 

@@ -6,24 +6,28 @@ const environmentSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   PORT: z.coerce.number().int().min(1).max(65_535).default(3000),
   LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"]).default("info"),
-  DATABASE_URL: z.string().url(),
-  FLORENCE_PUBLIC_URL: z.string().url(),
-  FLORENCE_ENCRYPTION_KEY: z.string().min(43),
-  FLORENCE_ADMIN_TOKEN: z.string().min(24),
+  FLORENCE_DATABASE_URL: z.string().url(),
+  FLORENCE_DB_SCHEMA: z
+    .string()
+    .regex(/^[a-z][a-z0-9_]{0,62}$/u)
+    .default("florence"),
+  FLORENCE_WEB_BASE_URL: z.string().url(),
+  FLORENCE_TOKEN_ENCRYPTION_KEY: z.string().min(43),
+  FLORENCE_ADMIN_API_KEY: z.string().min(24),
   FLORENCE_DEFAULT_TIMEZONE: z.string().min(1).default("America/Los_Angeles"),
   LINQ_API_KEY: optionalSecret,
   LINQ_BASE_URL: z.string().url().default("https://api.linqapp.com/api/partner/v3"),
-  LINQ_PHONE_NUMBER: optionalSecret,
+  LINQ_FROM_PHONE: optionalSecret,
   LINQ_WEBHOOK_SECRET: optionalSecret,
   GOOGLE_CLIENT_ID: optionalSecret,
   GOOGLE_CLIENT_SECRET: optionalSecret,
   GOOGLE_OAUTH_STATE_SECRET: optionalSecret,
   GOOGLE_REDIRECT_URI: z.string().url().optional(),
   GOOGLE_PUBSUB_VERIFICATION_TOKEN: optionalSecret,
-  MODEL_DEFAULT_ROUTE: z.string().min(1).default("openai-primary"),
+  MODEL_PROVIDER: z.enum(["openai", "anthropic", "open-weight"]).default("openai"),
   OPENAI_API_KEY: optionalSecret,
   OPENAI_BASE_URL: z.string().url().default("https://api.openai.com/v1"),
-  OPENAI_MODEL: z.string().min(1).default("gpt-5.4-mini"),
+  OPENAI_MODEL: z.string().min(1).default("gpt-5.6-terra"),
   ANTHROPIC_API_KEY: optionalSecret,
   ANTHROPIC_MODEL: z.string().min(1).default("claude-sonnet-4-6"),
   OPEN_WEIGHT_BASE_URL: z.string().url().optional(),
@@ -70,7 +74,7 @@ export function availableIntegrations(config: FlorenceConfig): {
   openWeight: boolean;
 } {
   return {
-    linq: Boolean(config.LINQ_API_KEY && config.LINQ_PHONE_NUMBER),
+    linq: Boolean(config.LINQ_API_KEY && config.LINQ_FROM_PHONE),
     google: Boolean(
       config.GOOGLE_CLIENT_ID &&
         config.GOOGLE_CLIENT_SECRET &&

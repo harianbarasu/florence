@@ -131,7 +131,14 @@ class LangChainProviderAdapter implements ModelProviderAdapter {
     }
 
     if (this.#config.provider === "openai") {
-      return new ChatOpenAI({ ...common, apiKey: this.#config.apiKey });
+      return new ChatOpenAI({
+        ...common,
+        apiKey: this.#config.apiKey,
+        // Florence's workers combine reasoning, strict output contracts, and
+        // tools. The Responses API is the supported OpenAI surface for that
+        // combination and keeps the choice inside this provider adapter.
+        useResponsesApi: true,
+      });
     }
 
     // Supplying an explicit placeholder prevents the SDK from reading an

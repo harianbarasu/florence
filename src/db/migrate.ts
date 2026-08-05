@@ -1,10 +1,13 @@
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Database } from "./client.js";
+import { assertDatabaseSchemaName } from "./client.js";
 
 const migrationsDirectory = join(process.cwd(), "migrations");
 
-export async function migrateDatabase(database: Database): Promise<string[]> {
+export async function migrateDatabase(database: Database, schema = "florence"): Promise<string[]> {
+  assertDatabaseSchemaName(schema);
+  await database.unsafe(`create schema if not exists "${schema}"`);
   await database.unsafe(`
     create table if not exists schema_migrations (
       version text primary key,

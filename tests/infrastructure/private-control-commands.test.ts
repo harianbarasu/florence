@@ -172,8 +172,14 @@ describe("parsePrivateControlCommand", () => {
       kind: "forget",
       controlId: "MEM-0123456789ABCDEF",
     });
-    expect(parsePrivateControlCommand("forget MEM-0123")).toBeNull();
-    expect(parsePrivateControlCommand("stop sharing school emails")).toBeNull();
+    expect(parsePrivateControlCommand("forget MEM-0123")).toEqual({
+      kind: "forget",
+      controlId: null,
+    });
+    expect(parsePrivateControlCommand("stop sharing school emails")).toEqual({
+      kind: "stop_sharing",
+      controlId: null,
+    });
     expect(parsePrivateControlCommand("pickup changed to 4:30")).toBeNull();
   });
 });

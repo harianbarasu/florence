@@ -307,16 +307,19 @@ export function parsePrivateControlCommand(rawText: string): ParsedPrivateContro
 
   const forget = text.match(/^forget(?:\s+(MEM-[A-Fa-f0-9]{16}))?[?!.]*$/iu);
   if (forget) return { kind: "forget", controlId: forget[1]?.toUpperCase() ?? null };
+  if (/^forget\b/iu.test(text)) return { kind: "forget", controlId: null };
 
   const stopSharing = text.match(/^stop sharing(?:\s+(RULE-[A-Fa-f0-9]{16}))?[?!.]*$/iu);
   if (stopSharing) {
     return { kind: "stop_sharing", controlId: stopSharing[1]?.toUpperCase() ?? null };
   }
+  if (/^stop sharing\b/iu.test(text)) return { kind: "stop_sharing", controlId: null };
 
   const explain = text.match(/^why did you share(?: that)?(?:\s+(SHARE-[A-Fa-f0-9]{16}))?[?!.]*$/iu);
   if (explain) {
     return { kind: "explain_sharing", controlId: explain[1]?.toUpperCase() ?? null };
   }
+  if (/^why did you share\b/iu.test(text)) return { kind: "explain_sharing", controlId: null };
   return null;
 }
 

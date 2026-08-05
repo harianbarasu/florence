@@ -1228,14 +1228,13 @@ function handlePolicyRevoked(context: HandlerContext): MutationResult {
   if (!isAdultActor(draft, signal.actor)) {
     return rejected("unauthorized_actor");
   }
-  if (signal.expectedPolicyVersion !== draft.policyVersion) {
-    return rejected("stale_policy_version");
-  }
-
   const index = draft.policies.findIndex((candidate) => candidate.policyId === signal.policyId);
   const policy = draft.policies[index];
   if (policy === undefined || policy.status !== "active") {
     return rejected("policy_invalid");
+  }
+  if (signal.expectedPolicyVersion !== policy.version) {
+    return rejected("stale_policy_version");
   }
   if (!adultOwnsPersonalPolicy(policy.rule, signal.actor.adultId)) {
     return rejected("unauthorized_actor");
@@ -1318,6 +1317,40 @@ function handleMemoryConfirmed(context: HandlerContext): MutationResult {
   return accepted(
     draft,
     [DomainChangeSchema.parse({ kind: "memory_confirmed", memoryId: memory.memoryId })],
+    [],
+  );
+}
+
+function handleMemoryRevoked(context: HandlerContext): MutationResult {
+  const { signal, draft } = context;
+  if (signal.kind !== "memory.revoked") {
+    throw new Error("wrong handler");
+  }
+  if (!isAdultActor(draft, signal.actor)) {
+    return rejected("unauthorized_actor");
+  }
+
+  const index = draft.memories.findIndex((candidate) => candidate.memoryId === signal.memoryId);
+  const memory = draft.memories[index];
+  if (memory === undefined) {
+    return rejected("memory_not_found");
+  }
+  if (memory.status !== "active") {
+    return rejected("invalid_transition");
+  }
+  if (memory.scope.kind === "personal" && memory.scope.adultId !== signal.actor.adultId) {
+    return rejected("unauthorized_actor");
+  }
+
+  draft.memories[index] = DurableMemorySchema.parse({
+    ...memory,
+    status: "revoked",
+    revokedAt: signal.occurredAt,
+    revokedByAdultId: signal.actor.adultId,
+  });
+  return accepted(
+    draft,
+    [DomainChangeSchema.parse({ kind: "memory_revoked", memoryId: memory.memoryId })],
     [],
   );
 }
@@ -1739,6 +1772,8 @@ function dispatch(context: HandlerContext): MutationResult {
       return handlePolicyRevoked(context);
     case "memory.confirmed":
       return handleMemoryConfirmed(context);
+    case "memory.revoked":
+      return handleMemoryRevoked(context);
     case "worker.proposal_received":
       return handleWorkerProposal(context);
     case "timer.fired":

@@ -15,6 +15,7 @@ import {
   InstantStringSchema,
   LocalTimeSchema,
   MemoryCandidateSchema,
+  MemoryIdSchema,
   NeutralDisplayTextSchema,
   NeutralFactualTextSchema,
   PolicyCandidateSchema,
@@ -907,6 +908,38 @@ export const EffectReceiptInputSchema = z.strictObject({
   providerReference: StableReferenceSchema.optional(),
 });
 
+export const PrivateControlInputSchema = z
+  .strictObject({
+    kind: z.literal("private_control"),
+    householdId: HouseholdIdSchema,
+    idempotencyKey: IdempotencyKeySchema,
+    occurredAt: InstantStringSchema,
+    channel: ConversationChannelSchema,
+    requesterAdultId: AdultIdSchema,
+    action: z.discriminatedUnion("kind", [
+      z.strictObject({
+        kind: z.literal("revoke_memory"),
+        memoryId: MemoryIdSchema,
+      }),
+      z.strictObject({
+        kind: z.literal("revoke_sharing_policy"),
+        policyId: PolicyIdSchema,
+        expectedPolicyVersion: z.number().int().positive(),
+      }),
+    ]),
+  })
+  .superRefine((input, context) => {
+    if (input.channel.scope !== "personal" || input.channel.adultId !== input.requesterAdultId) {
+      context.addIssue({
+        code: "custom",
+        path: ["channel"],
+        message: "A private control must come from that requester's exact personal conversation",
+      });
+    }
+  });
+
+export type PrivateControlInput = z.infer<typeof PrivateControlInputSchema>;
+
 export const ApplicationInputSchema = z.discriminatedUnion("kind", [
   ConversationInboxItemSchema,
   GmailInboxItemSchema,
@@ -917,6 +950,7 @@ export const ApplicationInputSchema = z.discriminatedUnion("kind", [
   WorkerRunInputSchema,
   DailyBriefInputSchema,
   EffectReceiptInputSchema,
+  PrivateControlInputSchema,
 ]);
 
 export type ApplicationInput = z.infer<typeof ApplicationInputSchema>;

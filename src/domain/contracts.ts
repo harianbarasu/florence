@@ -785,6 +785,8 @@ export const DurableMemorySchema = z
     confirmedAt: InstantStringSchema,
     promotionAuthority: PromotionAuthoritySchema.optional(),
     status: z.enum(["active", "revoked", "superseded"]),
+    revokedAt: InstantStringSchema.optional(),
+    revokedByAdultId: AdultIdSchema.optional(),
   })
   .superRefine((memory, context) => {
     if (memory.expiresAt !== undefined && Temporal.Instant.compare(memory.expiresAt, memory.validFrom) <= 0) {
@@ -811,6 +813,13 @@ export const DurableMemorySchema = z
           message: "personal memory cannot expose another adult's data",
         });
       }
+    }
+    const hasRevocation = memory.revokedAt !== undefined || memory.revokedByAdultId !== undefined;
+    if ((memory.status === "revoked") !== hasRevocation) {
+      context.addIssue({ code: "custom", message: "revoked memory state and authority must agree" });
+    }
+    if ((memory.revokedAt === undefined) !== (memory.revokedByAdultId === undefined)) {
+      context.addIssue({ code: "custom", message: "memory revocation time and adult must both be recorded" });
     }
   });
 
@@ -1240,6 +1249,12 @@ export const MemoryConfirmedSignalSchema = z.strictObject({
   promotionAuthority: PromotionAuthoritySchema.optional(),
 });
 
+export const MemoryRevokedSignalSchema = z.strictObject({
+  ...SignalBaseShape,
+  kind: z.literal("memory.revoked"),
+  memoryId: MemoryIdSchema,
+});
+
 export const WorkerProposalReceivedSignalSchema = z.strictObject({
   ...SignalBaseShape,
   kind: z.literal("worker.proposal_received"),
@@ -1284,6 +1299,7 @@ export const HouseholdSignalSchema = z.discriminatedUnion("kind", [
   PolicyApprovedSignalSchema,
   PolicyRevokedSignalSchema,
   MemoryConfirmedSignalSchema,
+  MemoryRevokedSignalSchema,
   WorkerProposalReceivedSignalSchema,
   TimerFiredSignalSchema,
   EffectReceiptReceivedSignalSchema,
@@ -1311,6 +1327,7 @@ export const RejectionReasonSchema = z.enum([
   "approval_expired",
   "action_digest_mismatch",
   "policy_invalid",
+  "memory_not_found",
   "candidate_not_found",
   "timer_not_due",
   "timer_no_longer_relevant",
@@ -1365,6 +1382,10 @@ export const DomainChangeSchema = z.discriminatedUnion("kind", [
   }),
   z.strictObject({
     kind: z.literal("memory_confirmed"),
+    memoryId: MemoryIdSchema,
+  }),
+  z.strictObject({
+    kind: z.literal("memory_revoked"),
     memoryId: MemoryIdSchema,
   }),
   z.strictObject({

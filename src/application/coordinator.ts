@@ -2604,6 +2604,74 @@ function processDailyBrief(
   return { status: "processed", classification: `daily_brief:${input.reason}` };
 }
 
+function processPrivateControl(
+  work: Work,
+  input: Extract<ApplicationInput, { kind: "private_control" }>,
+): { status: "processed" | "rejected"; classification: string } {
+  const target: DurableScope = { kind: "personal", adultId: input.requesterAdultId };
+  if (!work.aggregate.verifiedAdultIds.some((candidate) => candidate === input.requesterAdultId)) {
+    queueMessage(
+      work,
+      "private-control-unverified",
+      target,
+      "status",
+      "I couldn't verify this private household control. Nothing was changed.",
+    );
+    return { status: "rejected", classification: "private_control:unknown_adult" };
+  }
+
+  if (input.action.kind === "revoke_memory") {
+    const result = acceptDomain(
+      work,
+      "private-control-memory-revoked",
+      input.occurredAt,
+      { kind: "adult", adultId: input.requesterAdultId },
+      {
+        kind: "memory.revoked",
+        memoryId: input.action.memoryId,
+      } as Omit<HouseholdSignal, "householdId" | "signalId" | "sequence" | "occurredAt" | "actor">,
+    );
+    queueMessage(
+      work,
+      "private-control-memory-status",
+      target,
+      "status",
+      result.receipt.disposition === "accepted"
+        ? "That learned memory is revoked. Florence will no longer treat it as active household knowledge."
+        : "That memory changed before the revocation was applied. Nothing else was changed; ask “what do you remember?” for the current list.",
+    );
+    return {
+      status: statusForDomain(result),
+      classification: `private_control:memory:${result.receipt.disposition}`,
+    };
+  }
+
+  const result = acceptDomain(
+    work,
+    "private-control-sharing-policy-revoked",
+    input.occurredAt,
+    { kind: "adult", adultId: input.requesterAdultId },
+    {
+      kind: "policy.revoked",
+      policyId: input.action.policyId,
+      expectedPolicyVersion: input.action.expectedPolicyVersion,
+    } as Omit<HouseholdSignal, "householdId" | "signalId" | "sequence" | "occurredAt" | "actor">,
+  );
+  queueMessage(
+    work,
+    "private-control-sharing-policy-status",
+    target,
+    "status",
+    result.receipt.disposition === "accepted"
+      ? "That automatic-sharing rule is revoked. Future matching private items will require review again."
+      : "That sharing rule changed before the revocation was applied. Nothing else was changed; ask “show my sharing rules” for the current list.",
+  );
+  return {
+    status: statusForDomain(result),
+    classification: `private_control:sharing_policy:${result.receipt.disposition}`,
+  };
+}
+
 async function commitWork(
   dependencies: FlorenceApplicationDependencies,
   work: Work,
@@ -2723,6 +2791,9 @@ async function processApplicationInput(
       break;
     case "daily_brief":
       processed = processDailyBrief(work, input);
+      break;
+    case "private_control":
+      processed = processPrivateControl(work, input);
       break;
   }
   return commitWork(dependencies, work, processed.status, processed.classification);

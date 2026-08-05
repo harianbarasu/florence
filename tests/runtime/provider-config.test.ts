@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { z } from "zod";
 import {
   createModelGateway,
   type ModelGatewayConfig,
@@ -8,6 +9,7 @@ import {
   RoutedModelGateway,
   validateModelGatewayConfig,
 } from "../../src/models/index.js";
+import { providerJsonSchema } from "../../src/models/provider-adapters.js";
 import { allCapabilities } from "./fixtures.js";
 
 function config(
@@ -75,5 +77,23 @@ describe("model provider configuration", () => {
     expect(() =>
       validateModelGatewayConfig(config("anthropic", { ...allCapabilities, toolCalling: false })),
     ).toThrowError(new ModelGatewayError("unsupported_capability"));
+  });
+
+  it("converts transformed discriminated contracts into provider-safe input JSON Schema", () => {
+    const contract = z.strictObject({
+      result: z.discriminatedUnion("kind", [
+        z.strictObject({ kind: z.literal("ignore"), detail: z.string().optional() }),
+        z.strictObject({
+          kind: z.literal("scheduled"),
+          at: z.string().transform((value) => new Date(value).toISOString()),
+        }),
+      ]),
+    });
+
+    const schema = providerJsonSchema(contract);
+    const serialized = JSON.stringify(schema);
+    expect(serialized).toContain('"type":"object"');
+    expect(serialized).toContain('"anyOf"');
+    expect(serialized).not.toContain('"oneOf"');
   });
 });

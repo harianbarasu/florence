@@ -11,6 +11,7 @@ import {
 import { tool } from "@langchain/core/tools";
 import type { JSONSchema } from "@langchain/core/utils/json_schema";
 import { ChatOpenAI } from "@langchain/openai";
+import { z } from "zod";
 import type { ModelRouteConfig } from "./config.js";
 import {
   type JsonValue,
@@ -69,24 +70,40 @@ class LangChainProviderAdapter implements ModelProviderAdapter {
         if (request.tools !== undefined && request.tools.length > 0) {
           throw new ModelGatewayError("unsupported_capability");
         }
-        const structured = model.withStructuredOutput(request.responseSchema, {
+        const wrappedSchema = z.strictObject({ result: request.responseSchema });
+        const structured = model.withStructuredOutput(providerJsonSchema(wrappedSchema), {
           ...(request.responseSchemaName === undefined ? {} : { name: request.responseSchemaName }),
+          strict: false,
         });
-        output = await runWithoutModelTracing(() =>
-          structured.invoke(messages, invocationOptions(options?.signal)),
-        );
-        const parsed = request.responseSchema.safeParse(output);
-        if (!parsed.success || !JsonValueSchema.safeParse(parsed.data).success) {
-          throw new ModelGatewayError("invalid_output");
-        }
+        const attempts = (this.#config.maxRetries ?? 2) + 1;
+        for (let attempt = 0; attempt < attempts; attempt += 1) {
+          const attemptMessages =
+            attempt === 0
+              ? messages
+              : [
+                  ...messages,
+                  new HumanMessage(
+                    "Return a fresh structured result that exactly satisfies the supplied schema. Omit unavailable optional fields instead of returning null, and do not invent identifiers or facts.",
+                  ),
+                ];
+          const wrappedOutput = await runWithoutModelTracing(() =>
+            structured.invoke(attemptMessages, invocationOptions(options?.signal)),
+          );
+          const wrapped = wrappedSchema.safeParse(wrappedOutput);
+          if (!wrapped.success) continue;
+          output = wrapped.data.result;
+          const parsed = request.responseSchema.safeParse(output);
+          if (!parsed.success || !JsonValueSchema.safeParse(parsed.data).success) continue;
 
-        return ModelCompletionResultSchema.parse({
-          content: [{ type: "structured_result", value: parsed.data }],
-          finishReason: "stop",
-          usage: {},
-          latencyMs: performance.now() - startedAt,
-          route: this.route,
-        });
+          return ModelCompletionResultSchema.parse({
+            content: [{ type: "structured_result", value: parsed.data }],
+            finishReason: "stop",
+            usage: {},
+            latencyMs: performance.now() - startedAt,
+            route: this.route,
+          });
+        }
+        throw new ModelGatewayError("invalid_output");
       }
 
       if (request.tools !== undefined && request.tools.length > 0) {
@@ -150,6 +167,25 @@ class LangChainProviderAdapter implements ModelProviderAdapter {
       configuration: { baseURL: this.#config.baseUrl },
     });
   }
+}
+
+/**
+ * Provider schemas describe input-shaped values because app schemas may use
+ * transforms (for example canonical instants). The app still performs the
+ * authoritative output parse after the provider returns. OpenAI accepts
+ * nested `anyOf` but not Zod's emitted `oneOf`, and a non-strict response
+ * schema preserves optional fields used by discriminated domain contracts.
+ */
+export function providerJsonSchema(schema: z.ZodType): JSONSchema {
+  return replaceOneOf(z.toJSONSchema(schema, { io: "input" })) as JSONSchema;
+}
+
+function replaceOneOf(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(replaceOneOf);
+  if (typeof value !== "object" || value === null) return value;
+  return Object.fromEntries(
+    Object.entries(value).map(([key, child]) => [key === "oneOf" ? "anyOf" : key, replaceOneOf(child)]),
+  );
 }
 
 function toBaseMessages(message: ModelMessage): BaseMessage[] {

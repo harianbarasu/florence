@@ -276,8 +276,9 @@ class GatewayChatModel extends BaseChatModel<BaseChatModelCallOptions> {
   async _generate(messages: BaseMessage[], options: this["ParsedCallOptions"]): Promise<ChatResult> {
     this.#tracker.beforeModelCall();
     const definitions = this.#boundTools.map(toModelToolDefinition);
+    const modelMessages = toModelMessages(messages);
     const request: ModelCompletionRequest = {
-      messages: toModelMessages(messages),
+      messages: modelMessages,
       ...(definitions.length === 0 ? {} : { tools: definitions }),
       ...(this.#toolChoice === undefined ? {} : { toolChoice: this.#toolChoice }),
       ...(this.#tracker.remainingOutputTokens === undefined
@@ -286,20 +287,60 @@ class GatewayChatModel extends BaseChatModel<BaseChatModelCallOptions> {
     };
 
     try {
-      const result = await this.#gateway.complete(this.#job.modelCapabilityProfile, request, {
+      let result = await this.#gateway.complete(this.#job.modelCapabilityProfile, request, {
         signal: options.signal ?? this.#tracker.signal,
       });
-      if (result.route.routeId !== this.#job.modelRouteId) {
-        throw new WorkerRuntimeError("model_failed");
-      }
-      this.#tracker.recordModelResult(
-        result,
-        new Set(
-          definitions
-            .filter((definition) => !isWorkerResultContractTool(definition))
-            .map((definition) => definition.name),
-        ),
+      const budgetedToolNames = new Set(
+        definitions
+          .filter((definition) => !isWorkerResultContractTool(definition))
+          .map((definition) => definition.name),
       );
+      this.#recordResult(result, budgetedToolNames);
+
+      const resultContractTool = definitions.find(isWorkerResultContractTool);
+      if (
+        resultContractTool !== undefined &&
+        this.#toolChoice !== "none" &&
+        result.finishReason !== "content_filter" &&
+        result.finishReason !== "length" &&
+        !result.content.some((part) => part.type === "tool_request")
+      ) {
+        this.#tracker.beforeModelCall();
+        const priorText = outputText(result).trim();
+        const retryRequest: ModelCompletionRequest = {
+          ...request,
+          messages: [
+            ...modelMessages,
+            {
+              role: "assistant",
+              parts: [
+                {
+                  type: "text",
+                  text: priorText === "" ? "I did not submit the required result contract." : priorText,
+                },
+              ],
+            },
+            {
+              role: "user",
+              parts: [
+                {
+                  type: "text",
+                  text: `Submit your final answer now by calling ${resultContractTool.name} exactly once. Do not call any other tool and do not return prose.`,
+                },
+              ],
+            },
+          ],
+          toolChoice: { name: resultContractTool.name },
+          ...(this.#tracker.remainingOutputTokens === undefined
+            ? {}
+            : { maxOutputTokens: this.#tracker.remainingOutputTokens }),
+        };
+        result = await this.#gateway.complete(this.#job.modelCapabilityProfile, retryRequest, {
+          signal: options.signal ?? this.#tracker.signal,
+        });
+        this.#recordResult(result, budgetedToolNames);
+      }
+
       const message = toAIMessage(result);
       return {
         generations: [{ text: outputText(result), message }],
@@ -313,6 +354,13 @@ class GatewayChatModel extends BaseChatModel<BaseChatModelCallOptions> {
       this.#tracker.recordError(normalized);
       throw normalized;
     }
+  }
+
+  #recordResult(result: ModelCompletionResult, budgetedToolNames: ReadonlySet<string>): void {
+    if (result.route.routeId !== this.#job.modelRouteId) {
+      throw new WorkerRuntimeError("model_failed");
+    }
+    this.#tracker.recordModelResult(result, budgetedToolNames);
   }
 }
 

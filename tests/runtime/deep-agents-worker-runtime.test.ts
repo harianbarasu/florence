@@ -91,6 +91,50 @@ class ToolThenResultGateway implements ModelGateway {
   }
 }
 
+class ProseThenResultGateway implements ModelGateway {
+  readonly requests: ModelCompletionRequest[] = [];
+
+  async complete(
+    _profile:
+      | "classification_extraction"
+      | "tool_planning"
+      | "vision_document"
+      | "long_context_research"
+      | "private_processing",
+    request: ModelCompletionRequest,
+  ): Promise<ModelCompletionResult> {
+    this.requests.push(request);
+    if (this.requests.length === 1) {
+      return {
+        content: [{ type: "text", text: "The form is due Friday." }],
+        finishReason: "stop",
+        usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+        latencyMs: 1,
+        route: fakeRoute,
+      };
+    }
+
+    const resultTool = findResultTool(request);
+    if (resultTool === undefined) {
+      throw new Error("The app-owned result tool was not bound.");
+    }
+    return {
+      content: [
+        {
+          type: "tool_request",
+          requestId: "repaired-result",
+          name: resultTool.name,
+          arguments: workerPayload as unknown as Record<string, never>,
+        },
+      ],
+      finishReason: "tool_request",
+      usage: { inputTokens: 12, outputTokens: 6, totalTokens: 18 },
+      latencyMs: 1,
+      route: fakeRoute,
+    };
+  }
+}
+
 function runtime(gateway: ModelGateway): DeepAgentsWorkerRuntime {
   return new DeepAgentsWorkerRuntime({
     modelGateway: gateway,
@@ -129,6 +173,28 @@ describe("DeepAgentsWorkerRuntime", () => {
     });
     expect(cleanup).toHaveBeenCalledOnce();
     expect(gateway.requests).toHaveLength(1);
+  });
+
+  it("repairs a premature prose answer by forcing the app-owned result contract", async () => {
+    const gateway = new ProseThenResultGateway();
+
+    const result = await runtime(gateway).run(workerJob());
+
+    expect(result.summary).toBe(workerPayload.summary);
+    expect(result.diagnostics).toMatchObject({
+      modelCalls: 2,
+      toolCalls: 0,
+      usage: { inputTokens: 22, outputTokens: 11, totalTokens: 33 },
+    });
+    expect(gateway.requests).toHaveLength(2);
+    const retryRequest = gateway.requests[1];
+    expect(retryRequest).toBeDefined();
+    if (retryRequest === undefined) throw new Error("The repair request was not recorded.");
+    expect(retryRequest.toolChoice).toEqual({ name: findResultTool(retryRequest)?.name });
+    expect(retryRequest.messages.at(-2)).toMatchObject({
+      role: "assistant",
+      parts: [{ type: "text", text: "The form is due Friday." }],
+    });
   });
 
   it("does not expose a shell or async-task tool with StateBackend", async () => {

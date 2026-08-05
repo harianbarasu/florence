@@ -3,6 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { ApplicationStore } from "../../src/db/application-store.js";
 import { closeDatabase, createDatabase, type Database } from "../../src/db/client.js";
 import { migrateDatabase } from "../../src/db/migrate.js";
+import { AdultIdSchema } from "../../src/domain/index.js";
 import { FlorenceRuntimeStore } from "../../src/infrastructure/runtime-store.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
@@ -77,7 +78,7 @@ describe.skipIf(!databaseUrl)("FlorenceRuntimeStore PostgreSQL integration", () 
     await expect(
       store.resolveTarget({
         householdId: founder.householdId,
-        targetScope: { kind: "personal", adultId: invitation.adultId },
+        targetScope: { kind: "personal", adultId: AdultIdSchema.parse(invitation.adultId) },
       }),
     ).resolves.toMatchObject({ chatId: "dm-partner", status: "active" });
     await expect(

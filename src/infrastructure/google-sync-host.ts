@@ -1,10 +1,10 @@
 import { z } from "zod";
-import { type GmailSyncWork, GoogleSyncError, type GoogleSyncService } from "./google-sync.js";
+import { type GmailSyncWork, GoogleSyncError } from "./google-sync.js";
 
-export type ClaimedGoogleSyncWork = {
+export type ClaimedGoogleSyncWork<TWork = GmailSyncWork> = {
   rowId: string;
   leaseToken: string;
-  work: GmailSyncWork;
+  work: TWork;
   attempt: number;
   maxAttempts: number;
 };
@@ -13,13 +13,13 @@ export type ClaimedGoogleSyncWork = {
  * Queue implementations own durable idempotency and lease fencing. Reconciliation
  * must derive stable work keys from connection ID, work kind, and cursor revision.
  */
-export interface GoogleSyncQueuePort {
+export interface GoogleSyncQueuePort<TWork = GmailSyncWork> {
   reconcileGoogleSyncWork(asOf: string): Promise<number>;
   claimGoogleSyncWork(input: {
     owner: string;
     limit: number;
     leaseSeconds: number;
-  }): Promise<readonly ClaimedGoogleSyncWork[]>;
+  }): Promise<readonly ClaimedGoogleSyncWork<TWork>[]>;
   completeGoogleSyncWork(input: { rowId: string; leaseToken: string }): Promise<boolean>;
   retryGoogleSyncWork(input: {
     rowId: string;
@@ -40,9 +40,13 @@ export type GoogleSyncRunSummary = {
   leaseLost: number;
 };
 
-export interface GoogleSyncBackgroundHostOptions {
-  queue: GoogleSyncQueuePort;
-  sync: Pick<GoogleSyncService, "execute">;
+export interface GoogleSyncExecutor<TWork> {
+  execute(work: TWork, signal?: AbortSignal): Promise<{ status: string }>;
+}
+
+export interface GoogleSyncBackgroundHostOptions<TWork = GmailSyncWork> {
+  queue: GoogleSyncQueuePort<TWork>;
+  sync: GoogleSyncExecutor<TWork>;
   workerId: string;
   batchSize?: number;
   leaseSeconds?: number;
@@ -62,9 +66,9 @@ const ZERO_SUMMARY: GoogleSyncRunSummary = {
   leaseLost: 0,
 };
 
-export class GoogleSyncBackgroundHost {
-  readonly #queue: GoogleSyncQueuePort;
-  readonly #sync: Pick<GoogleSyncService, "execute">;
+export class GoogleSyncBackgroundHost<TWork = GmailSyncWork> {
+  readonly #queue: GoogleSyncQueuePort<TWork>;
+  readonly #sync: GoogleSyncExecutor<TWork>;
   readonly #workerId: string;
   readonly #batchSize: number;
   readonly #leaseSeconds: number;
@@ -73,7 +77,7 @@ export class GoogleSyncBackgroundHost {
   readonly #retryMaximumMs: number;
   readonly #now: () => Date;
 
-  public constructor(options: GoogleSyncBackgroundHostOptions) {
+  public constructor(options: GoogleSyncBackgroundHostOptions<TWork>) {
     this.#queue = options.queue;
     this.#sync = options.sync;
     this.#workerId = z.string().trim().min(1).max(200).parse(options.workerId);
@@ -156,7 +160,7 @@ export class GoogleSyncBackgroundHost {
   }
 
   async #processLease(
-    lease: ClaimedGoogleSyncWork,
+    lease: ClaimedGoogleSyncWork<TWork>,
     signal?: AbortSignal,
   ): Promise<{
     settlement: "completed" | "retried" | "deadLettered" | "leaseLost";
@@ -185,7 +189,7 @@ export class GoogleSyncBackgroundHost {
   }
 
   async #settleFailure(
-    lease: ClaimedGoogleSyncWork,
+    lease: ClaimedGoogleSyncWork<TWork>,
     failure: { errorCode: string; retryable: boolean },
   ): Promise<{
     settlement: "retried" | "deadLettered" | "leaseLost";

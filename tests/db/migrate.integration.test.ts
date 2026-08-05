@@ -27,7 +27,7 @@ describe.skipIf(!databaseUrl)("database migration coordination", () => {
       migrateDatabase(second, schema),
     ]);
 
-    expect([left.length, right.length].sort((a, b) => a - b)).toEqual([0, 4]);
+    expect([left.length, right.length].sort((a, b) => a - b)).toEqual([0, 5]);
     const rows = await first<{ version: string }[]>`
       select version from schema_migrations order by version
     `;
@@ -36,6 +36,7 @@ describe.skipIf(!databaseUrl)("database migration coordination", () => {
       "002_application_runtime.sql",
       "003_runtime_operations.sql",
       "004_daily_brief_runs.sql",
+      "005_google_calendar_sync.sql",
     ]);
   });
 });

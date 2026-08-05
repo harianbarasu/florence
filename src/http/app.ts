@@ -20,6 +20,7 @@ import {
   parseVerifiedLinqWebhook,
 } from "../adapters/linq/index.js";
 import {
+  DEFAULT_CALENDAR_PUSH_BODY_LIMIT_BYTES,
   DEFAULT_GMAIL_PUSH_BODY_LIMIT_BYTES,
   DEFAULT_LINQ_BODY_LIMIT_BYTES,
   DEFAULT_OPERATOR_BODY_LIMIT_BYTES,
@@ -315,6 +316,34 @@ export async function createFlorenceHttpServer(
       }
 
       metrics.ingress.inc({ source: "gmail", outcome: "accepted" });
+      return reply.code(202).send();
+    },
+  );
+
+  app.post(
+    "/webhooks/google/calendar",
+    {
+      bodyLimit: Math.min(config.bodyLimitBytes, DEFAULT_CALENDAR_PUSH_BODY_LIMIT_BYTES),
+      config: { rateLimit: { max: 300, timeWindow: 60_000, groupId: "calendar_push" } },
+    },
+    async (request, reply) => {
+      reply.header("cache-control", "no-store");
+      if (!config.googleCalendarPushEnabled) {
+        metrics.ingress.inc({ source: "calendar", outcome: "unavailable" });
+        return reply.code(503).send({ error: "unavailable" });
+      }
+      try {
+        const outcome = await options.services.ingress.acceptCalendarPush(request.headers);
+        if (outcome === "unauthorized") {
+          metrics.ingress.inc({ source: "calendar", outcome: "rejected" });
+          return reply.code(401).send({ error: "unauthorized" });
+        }
+      } catch {
+        metrics.ingress.inc({ source: "calendar", outcome: "unavailable" });
+        request.log.warn({ event: "calendar_push_accept_failed" }, "durable ingress failed");
+        return reply.code(503).send({ error: "unavailable" });
+      }
+      metrics.ingress.inc({ source: "calendar", outcome: "accepted" });
       return reply.code(202).send();
     },
   );

@@ -6,6 +6,8 @@ import { migrateDatabase } from "../../src/db/migrate.js";
 import { AdultIdSchema } from "../../src/domain/index.js";
 import { FlorenceRuntimeStore } from "../../src/infrastructure/runtime-store.js";
 
+const GOOGLE_CALENDAR_READONLY_SCOPE = "https://www.googleapis.com/auth/calendar.readonly";
+
 const databaseUrl = process.env.TEST_DATABASE_URL;
 
 describe.skipIf(!databaseUrl)("FlorenceRuntimeStore PostgreSQL integration", () => {
@@ -342,5 +344,302 @@ describe.skipIf(!databaseUrl)("FlorenceRuntimeStore PostgreSQL integration", () 
         leaseToken: retry[0]?.leaseToken ?? "",
       }),
     ).resolves.toBe(true);
+  });
+
+  it("isolates Calendar cursors, channels, encrypted sources, and privacy-safe busy windows", async () => {
+    const founded = await store.provisionFoundingAdult({
+      externalChatId: `dm-calendar-${randomUUID()}`,
+      externalHandle: "+12025550213",
+      timeZone: "America/Los_Angeles",
+      occurredAt: "2027-02-01T08:00:00Z",
+    });
+    if (!founded.adultId) throw new Error("Expected a founding adult");
+    const first = await applicationStore.upsertExternalConnection({
+      householdId: founded.householdId,
+      adultId: founded.adultId,
+      provider: "google",
+      label: "Parent one",
+      externalAccountId: `google-calendar-${randomUUID()}`,
+      email: `calendar-${randomUUID()}@example.test`,
+      encryptedCredentials: "encrypted-calendar-one",
+      grantedScopes: [GOOGLE_CALENDAR_READONLY_SCOPE],
+      cursor: {},
+      metadata: { credentialAadVersion: 1 },
+    });
+    const second = await applicationStore.upsertExternalConnection({
+      householdId: founded.householdId,
+      adultId: founded.adultId,
+      provider: "google",
+      label: "Parent two",
+      externalAccountId: `google-calendar-${randomUUID()}`,
+      email: `calendar-${randomUUID()}@example.test`,
+      encryptedCredentials: "encrypted-calendar-two",
+      grantedScopes: [GOOGLE_CALENDAR_READONLY_SCOPE],
+      cursor: {},
+      metadata: { credentialAadVersion: 1 },
+    });
+    const liveState = {
+      schemaVersion: 1 as const,
+      revision: 1,
+      phase: "live" as const,
+      calendarId: "primary",
+      initialTimeMin: "2026-11-03T08:00:00Z",
+      initialTimeMax: "2028-07-25T08:00:00Z",
+      pageToken: null,
+      syncToken: "sync-token-one",
+      timeZone: "America/Los_Angeles",
+      projectionReady: true,
+      watch: null,
+      lastSuccessfulSyncAt: "2027-02-01T08:00:00Z",
+    };
+    await expect(
+      store.saveCalendarSyncState({
+        householdId: founded.householdId,
+        adultId: founded.adultId,
+        connectionId: first.connectionId,
+        expectedRevision: 0,
+        state: liveState,
+      }),
+    ).resolves.toBe("updated");
+    await expect(
+      store.saveCalendarSyncState({
+        householdId: founded.householdId,
+        adultId: founded.adultId,
+        connectionId: first.connectionId,
+        expectedRevision: 0,
+        state: liveState,
+      }),
+    ).resolves.toBe("conflict");
+    await expect(
+      store.saveCalendarSyncState({
+        householdId: founded.householdId,
+        adultId: founded.adultId,
+        connectionId: second.connectionId,
+        expectedRevision: 0,
+        state: { ...liveState, syncToken: "sync-token-two" },
+      }),
+    ).resolves.toBe("updated");
+
+    const persistWindow = (connectionId: string, suffix: string, startsAt: string, endsAt: string) =>
+      store.persistPersonalCalendarSource({
+        householdId: founded.householdId,
+        adultId: founded.adultId as string,
+        connectionId,
+        calendarId: "primary",
+        externalId: `private-event-${suffix}`,
+        kind: "calendar_event",
+        occurredAt: startsAt,
+        contentHash: `sha256:${suffix.repeat(64).slice(0, 64)}`,
+        encryptedContent: `encrypted-private-calendar-payload-${suffix}`,
+        metadata: { provider: "google-calendar", sourceScope: "personal" },
+        busyWindow: { startsAt, endsAt, allDay: false },
+      });
+    await persistWindow(first.connectionId, "a", "2027-02-02T17:00:00Z", "2027-02-02T18:00:00Z");
+    await persistWindow(second.connectionId, "b", "2027-02-03T17:00:00Z", "2027-02-03T18:00:00Z");
+    const page = await store.listPersonalCalendarBusyWindows({
+      householdId: founded.householdId,
+      adultId: founded.adultId,
+      asOf: "2027-02-01T08:05:00Z",
+      from: "2027-02-01T00:00:00Z",
+      to: "2027-02-05T00:00:00Z",
+      limit: 10,
+    });
+    const windows = page.windows;
+    expect(page).toMatchObject({ complete: true, synchronizedAt: "2027-02-01T08:00:00.000Z" });
+    expect(windows).toHaveLength(2);
+    expect(Object.keys(windows[0] ?? {}).sort()).toEqual(["allDay", "endsAt", "startsAt"]);
+    expect(JSON.stringify(windows)).not.toMatch(/title|summary|description|location|attendee|credential/iu);
+    await expect(
+      store.listPersonalCalendarBusyWindows({
+        householdId: founded.householdId,
+        adultId: founded.adultId,
+        asOf: "2027-02-01T08:05:00Z",
+        from: "2027-02-01T00:00:00Z",
+        to: "2027-02-05T00:00:00Z",
+        limit: 1,
+      }),
+    ).resolves.toMatchObject({ complete: false, windows: [expect.any(Object)] });
+    await expect(
+      store.saveCalendarSyncState({
+        householdId: founded.householdId,
+        adultId: founded.adultId,
+        connectionId: second.connectionId,
+        expectedRevision: 1,
+        state: { ...liveState, revision: 2, syncToken: "sync-token-two", projectionReady: false },
+      }),
+    ).resolves.toBe("updated");
+    await expect(
+      store.listPersonalCalendarBusyWindows({
+        householdId: founded.householdId,
+        adultId: founded.adultId,
+        asOf: "2027-02-01T08:05:00Z",
+        from: "2027-02-01T00:00:00Z",
+        to: "2027-02-05T00:00:00Z",
+        limit: 10,
+      }),
+    ).resolves.toMatchObject({ complete: false, windows: [] });
+    await expect(
+      store.saveCalendarSyncState({
+        householdId: founded.householdId,
+        adultId: founded.adultId,
+        connectionId: second.connectionId,
+        expectedRevision: 2,
+        state: { ...liveState, revision: 3, syncToken: "sync-token-two", projectionReady: true },
+      }),
+    ).resolves.toBe("updated");
+
+    const channelToken = "calendar-channel-token-that-is-secret";
+    const watchedState = {
+      ...liveState,
+      revision: 2,
+      watch: {
+        channelId: "channel-one",
+        resourceId: "resource-one",
+        expiresAt: "2027-02-07T08:00:00Z",
+      },
+    };
+    await expect(
+      store.replaceCalendarWatch({
+        householdId: founded.householdId,
+        adultId: founded.adultId,
+        connectionId: first.connectionId,
+        calendarId: "primary",
+        expectedRevision: 1,
+        state: watchedState,
+        channel: {
+          channelId: "channel-one",
+          resourceId: "resource-one",
+          resourceUri: "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+          channelToken,
+          expiresAt: "2027-02-07T08:00:00Z",
+        },
+      }),
+    ).resolves.toBe("updated");
+    const pushIdentity = {
+      channelId: "channel-one",
+      resourceId: "resource-one",
+      resourceUri: "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+      messageNumber: "1",
+      receivedAt: "2027-02-02T08:00:00Z",
+    };
+    await expect(
+      store.authenticateCalendarPush({ ...pushIdentity, channelToken: "wrong-channel-token" }),
+    ).resolves.toBeNull();
+    await expect(store.authenticateCalendarPush({ ...pushIdentity, channelToken })).resolves.toEqual({
+      householdId: founded.householdId,
+      adultId: founded.adultId,
+      connectionId: first.connectionId,
+      calendarId: "primary",
+    });
+    const replacementToken = "replacement-calendar-channel-token";
+    await expect(
+      store.replaceCalendarWatch({
+        householdId: founded.householdId,
+        adultId: founded.adultId,
+        connectionId: first.connectionId,
+        calendarId: "primary",
+        expectedRevision: 2,
+        state: {
+          ...watchedState,
+          revision: 3,
+          watch: {
+            channelId: "channel-two",
+            resourceId: "resource-two",
+            expiresAt: "2027-02-08T08:00:00Z",
+          },
+        },
+        channel: {
+          channelId: "channel-two",
+          resourceId: "resource-two",
+          resourceUri: "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+          channelToken: replacementToken,
+          expiresAt: "2027-02-08T08:00:00Z",
+        },
+      }),
+    ).resolves.toBe("updated");
+    await expect(
+      store.authenticateCalendarPush({
+        ...pushIdentity,
+        channelToken,
+        messageNumber: "2",
+        receivedAt: "2027-02-02T08:01:00Z",
+      }),
+    ).resolves.toMatchObject({ connectionId: first.connectionId });
+    await expect(
+      store.markCalendarWatchStopped({
+        householdId: founded.householdId,
+        adultId: founded.adultId,
+        connectionId: first.connectionId,
+        channelId: "channel-one",
+      }),
+    ).resolves.toBe("updated");
+    await expect(
+      store.authenticateCalendarPush({
+        ...pushIdentity,
+        channelToken,
+        messageNumber: "3",
+        receivedAt: "2027-02-02T08:02:00Z",
+      }),
+    ).resolves.toBeNull();
+
+    const queued = await store.enqueueCalendarSyncWork({
+      householdId: founded.householdId,
+      idempotencyKey: `calendar-push:${randomUUID()}`,
+      work: {
+        kind: "push",
+        householdId: founded.householdId,
+        adultId: founded.adultId,
+        connectionId: first.connectionId,
+        calendarId: "primary",
+      },
+    });
+    expect(queued.created).toBe(true);
+    const leases = await store.claimCalendarSyncWork({
+      owner: "calendar-worker",
+      limit: 10,
+      leaseSeconds: 60,
+    });
+    expect(leases.some((lease) => lease.rowId === queued.jobId)).toBe(true);
+    const lease = leases.find((candidate) => candidate.rowId === queued.jobId);
+    if (!lease) throw new Error("Expected Calendar sync lease");
+    await expect(
+      store.completeCalendarSyncWork({ rowId: lease.rowId, leaseToken: lease.leaseToken }),
+    ).resolves.toBe(true);
+
+    await expect(
+      store.revokeConnection({
+        householdId: founded.householdId,
+        adultId: founded.adultId,
+        connectionId: first.connectionId,
+        revokedAt: "2027-02-02T09:00:00Z",
+      }),
+    ).resolves.toBe("revoked");
+    await expect(
+      store.authenticateCalendarPush({
+        ...pushIdentity,
+        channelId: "channel-two",
+        resourceId: "resource-two",
+        channelToken: replacementToken,
+        messageNumber: "2",
+        receivedAt: "2027-02-02T09:01:00Z",
+      }),
+    ).resolves.toBeNull();
+    await expect(
+      store.listPersonalCalendarBusyWindows({
+        householdId: founded.householdId,
+        adultId: founded.adultId,
+        asOf: "2027-02-01T08:05:00Z",
+        from: "2027-02-01T00:00:00Z",
+        to: "2027-02-05T00:00:00Z",
+        limit: 10,
+      }),
+    ).resolves.toMatchObject({ windows: [{ startsAt: "2027-02-03T17:00:00.000Z" }] });
+    await expect(
+      store.getOwnedGoogleConnection({
+        householdId: founded.householdId,
+        adultId: founded.adultId,
+        connectionId: second.connectionId,
+      }),
+    ).resolves.toMatchObject({ status: "active" });
   });
 });

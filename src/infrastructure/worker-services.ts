@@ -215,6 +215,7 @@ export type WorkerServiceErrorCode =
   | "aborted"
   | "blocked_url"
   | "budget_exhausted"
+  | "context_unavailable"
   | "invalid_context"
   | "invalid_url"
   | "network_unavailable"
@@ -370,6 +371,30 @@ export interface ScopedWorkerContextOptions {
   readonly now?: () => Date;
   readonly researchNetwork?: ResearchNetworkPort;
   readonly researchLimits?: Partial<ResearchLimits>;
+  readonly calendarSchedule?: CalendarScheduleProjectionPort;
+}
+
+const CalendarBusyWindowProjectionSchema = z.strictObject({
+  startsAt: z.iso.datetime({ offset: true }),
+  endsAt: z.iso.datetime({ offset: true }),
+  allDay: z.boolean(),
+});
+
+const PersonalCalendarProjectionSchema = z.strictObject({
+  windows: z.array(CalendarBusyWindowProjectionSchema).max(1_000),
+  complete: z.boolean(),
+  synchronizedAt: z.iso.datetime({ offset: true }).nullable(),
+});
+
+export interface CalendarScheduleProjectionPort {
+  listPersonalCalendarBusyWindows(input: {
+    householdId: string;
+    adultId: string;
+    asOf: string;
+    from: string;
+    to: string;
+    limit: number;
+  }): Promise<z.input<typeof PersonalCalendarProjectionSchema>>;
 }
 
 interface ResearchBudget {
@@ -395,6 +420,7 @@ export class ScopedWorkerContext implements WorkerContextPort {
   readonly #now: () => Date;
   readonly #researchNetwork: ResearchNetworkPort;
   readonly #researchLimits: ResearchLimits;
+  readonly #calendarSchedule: CalendarScheduleProjectionPort | undefined;
 
   constructor(options: ScopedWorkerContextOptions = {}) {
     this.#now = options.now ?? (() => new Date());
@@ -403,6 +429,7 @@ export class ScopedWorkerContext implements WorkerContextPort {
       ...DEFAULT_RESEARCH_LIMITS,
       ...options.researchLimits,
     });
+    this.#calendarSchedule = options.calendarSchedule;
   }
 
   async contextFor(
@@ -487,7 +514,7 @@ export class ScopedWorkerContext implements WorkerContextPort {
       switch (toolName) {
         case "household_schedule":
           requireCapability(job, HOUSEHOLD_SCHEDULE_CAPABILITY);
-          tools.push(createHouseholdScheduleTool(job, snapshot));
+          tools.push(createHouseholdScheduleTool(job, snapshot, this.#calendarSchedule, this.#now));
           break;
         case "research_sources":
           requireCapability(job, RESEARCH_CAPABILITY);
@@ -554,7 +581,12 @@ function assertExecutionContext(
   }
 }
 
-function createHouseholdScheduleTool(job: WorkerJob, snapshot: HouseholdApplicationSnapshot): WorkerTool {
+function createHouseholdScheduleTool(
+  job: WorkerJob,
+  snapshot: HouseholdApplicationSnapshot,
+  calendarSchedule: CalendarScheduleProjectionPort | undefined,
+  now: () => Date,
+): WorkerTool {
   const inputSchema = z.strictObject({
     limit: z.number().int().min(1).max(50).default(25),
     includeCompleted: z.boolean().default(false),
@@ -574,9 +606,64 @@ function createHouseholdScheduleTool(job: WorkerJob, snapshot: HouseholdApplicat
           (input.includeCompleted || !isTerminalEpisode(episode)),
       );
       const selected = visible.slice(0, input.limit);
+      let calendarBusyWindows: z.infer<typeof CalendarBusyWindowProjectionSchema>[] = [];
+      const asOf = now();
+      const calendarFrom = new Date(asOf.getTime() - 24 * 60 * 60_000).toISOString();
+      const calendarTo = new Date(asOf.getTime() + 180 * 24 * 60 * 60_000).toISOString();
+      let calendarCoverage: {
+        mode: "personal_owner" | "household_promotions_only";
+        from: string;
+        to: string;
+        complete: boolean;
+        synchronizedAt: string | null;
+      };
+      if (job.scopeGrant.visibility === "personal") {
+        calendarCoverage = {
+          mode: "personal_owner",
+          from: calendarFrom,
+          to: calendarTo,
+          complete: false,
+          synchronizedAt: null,
+        };
+        if (calendarSchedule !== undefined) {
+          const adultId = job.scopeGrant.adultId;
+          if (adultId === undefined) throw new WorkerServiceError("invalid_context");
+          try {
+            const projected = PersonalCalendarProjectionSchema.parse(
+              await calendarSchedule.listPersonalCalendarBusyWindows({
+                householdId: job.householdId,
+                adultId,
+                asOf: asOf.toISOString(),
+                from: calendarFrom,
+                to: calendarTo,
+                limit: 500,
+              }),
+            );
+            calendarBusyWindows = projected.windows;
+            calendarCoverage = {
+              ...calendarCoverage,
+              complete: projected.complete,
+              synchronizedAt: projected.synchronizedAt,
+            };
+          } catch {
+            throw new WorkerServiceError("context_unavailable");
+          }
+        }
+      } else {
+        // Household jobs see only separately promoted episode schedules above.
+        calendarCoverage = {
+          mode: "household_promotions_only",
+          from: calendarFrom,
+          to: calendarTo,
+          complete: true,
+          synchronizedAt: null,
+        };
+      }
       return JsonValueSchema.parse({
         timeZone: snapshot.aggregate.timeZone,
         routineAnchors: snapshot.aggregate.routineAnchors,
+        calendarBusyWindows,
+        calendarCoverage,
         episodes: selected.map((episode) => ({
           episodeId: episode.episodeId,
           type: episode.type,

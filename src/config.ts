@@ -87,22 +87,29 @@ export function resetConfigForTests(): void {
 
 export function availableIntegrations(config: FlorenceConfig): {
   linq: boolean;
-  google: boolean;
+  googleOAuth: boolean;
+  gmail: boolean;
+  googleCalendar: boolean;
   openai: boolean;
   anthropic: boolean;
   openWeight: boolean;
 } {
+  const googleOAuth = Boolean(
+    config.GOOGLE_CLIENT_ID &&
+      config.GOOGLE_CLIENT_SECRET &&
+      config.GOOGLE_OAUTH_STATE_SECRET &&
+      config.GOOGLE_REDIRECT_URI,
+  );
   return {
     linq: Boolean(config.LINQ_API_KEY && config.LINQ_FROM_PHONE && config.LINQ_WEBHOOK_SECRET),
-    google: Boolean(
-      config.GOOGLE_CLIENT_ID &&
-        config.GOOGLE_CLIENT_SECRET &&
-        config.GOOGLE_OAUTH_STATE_SECRET &&
-        config.GOOGLE_REDIRECT_URI &&
+    googleOAuth,
+    gmail: Boolean(
+      googleOAuth &&
         config.GOOGLE_PUBSUB_VERIFICATION_TOKEN &&
         config.GOOGLE_GMAIL_TOPIC_NAME &&
         config.GOOGLE_GMAIL_PUBSUB_SUBSCRIPTION,
     ),
+    googleCalendar: googleOAuth,
     openai: Boolean(config.OPENAI_API_KEY),
     anthropic: Boolean(config.ANTHROPIC_API_KEY),
     openWeight: Boolean(config.OPEN_WEIGHT_BASE_URL && config.OPEN_WEIGHT_MODEL),

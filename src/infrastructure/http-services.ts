@@ -1,6 +1,6 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
-import type { GmailPubSubEvent, GoogleOAuthGrant } from "../adapters/google/index.js";
+import type { CalendarPushHeaders, GmailPubSubEvent, GoogleOAuthGrant } from "../adapters/google/index.js";
 import type { LinqInboundEvent } from "../adapters/linq/index.js";
 import type {
   DurableIngress,
@@ -45,8 +45,15 @@ export interface ProviderIngressStore {
   }): Promise<{ disposition: "accepted" | "duplicate" | "quarantined" }>;
 }
 
+export interface CalendarPushAcceptor {
+  accept(headers: CalendarPushHeaders): Promise<"accepted" | "unauthorized">;
+}
+
 export class DurableProviderIngress implements DurableIngress {
-  public constructor(private readonly store: ProviderIngressStore) {}
+  public constructor(
+    private readonly store: ProviderIngressStore,
+    private readonly calendarPush?: CalendarPushAcceptor,
+  ) {}
 
   public async acceptLinq(event: LinqInboundEvent): Promise<void> {
     const receipt = await this.store.ingestProviderEvent({
@@ -78,6 +85,10 @@ export class DurableProviderIngress implements DurableIngress {
     if (receipt.disposition === "quarantined") {
       throw new Error("Gmail delivery conflicted with a previously authenticated event");
     }
+  }
+
+  public async acceptCalendarPush(headers: CalendarPushHeaders): Promise<"accepted" | "unauthorized"> {
+    return this.calendarPush?.accept(headers) ?? "unauthorized";
   }
 }
 

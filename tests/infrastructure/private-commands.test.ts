@@ -23,17 +23,23 @@ function connection(overrides: Partial<GoogleSyncConnection> = {}): GoogleSyncCo
   };
 }
 
-function setup(connections: readonly GoogleSyncConnection[] = [connection()]) {
+function setup(
+  connections: readonly GoogleSyncConnection[] = [connection()],
+  options: { calendarQueue?: boolean; gmailSyncEnabled?: boolean } = {},
+) {
   const enqueueApplicationIntent = vi.fn(async () => ({ rowId: "outbox-1" }));
   const enqueueGoogleSyncWork = vi.fn(async () => ({ jobId: "job-1", created: true }));
+  const enqueueCalendarSyncWork = vi.fn(async () => ({ jobId: "calendar-job-1", created: true }));
   const issue = vi.fn(() => "https://florence.example.test/oauth/google/start?handoff=opaque");
   const service = new PrivateGoogleCommandService({
     outbox: { enqueueApplicationIntent },
     directory: { listOwnedGoogleConnections: vi.fn(async () => connections) },
     googleQueue: { enqueueGoogleSyncWork },
+    ...(options.calendarQueue ? { calendarQueue: { enqueueCalendarSyncWork } } : {}),
+    ...(options.gmailSyncEnabled === undefined ? {} : { gmailSyncEnabled: options.gmailSyncEnabled }),
     linkIssuer: { issue },
   });
-  return { service, enqueueApplicationIntent, enqueueGoogleSyncWork, issue };
+  return { service, enqueueApplicationIntent, enqueueGoogleSyncWork, enqueueCalendarSyncWork, issue };
 }
 
 const command = {
@@ -88,6 +94,23 @@ describe("PrivateGoogleCommandService", () => {
     );
   });
 
+  it("uses Calendar-owned revocation when Calendar is the configured Google runtime", async () => {
+    const harness = setup([connection()], { calendarQueue: true, gmailSyncEnabled: false });
+    await harness.service.handle({ ...command, text: "Disconnect parent@example.test Google account" });
+    expect(harness.enqueueGoogleSyncWork).not.toHaveBeenCalled();
+    expect(harness.enqueueCalendarSyncWork).toHaveBeenCalledWith(
+      expect.objectContaining({
+        work: {
+          kind: "revoke",
+          householdId: HOUSEHOLD,
+          adultId: ADULT,
+          connectionId: CONNECTION,
+          calendarId: "primary",
+        },
+      }),
+    );
+  });
+
   it("does not guess among multiple accounts", async () => {
     const harness = setup([
       connection(),
@@ -126,6 +149,24 @@ describe("PrivateGoogleCommandService", () => {
     });
     expect(harness.enqueueApplicationIntent).toHaveBeenCalledWith(
       expect.objectContaining({ body: expect.stringContaining("most recent 90 days") }),
+    );
+  });
+
+  it("does not strand Gmail work when only Calendar sync is configured", async () => {
+    const harness = setup([connection()], { calendarQueue: true, gmailSyncEnabled: false });
+    await harness.service.onGoogleConnected({
+      householdId: HOUSEHOLD,
+      adultId: ADULT,
+      returnConversationId: "dm-1",
+      connectionId: CONNECTION,
+      accountLabel: "Personal",
+      email: "parent@example.test",
+    });
+    expect(harness.enqueueGoogleSyncWork).not.toHaveBeenCalled();
+    expect(harness.enqueueApplicationIntent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.stringContaining("privately synchronizing your primary calendar"),
+      }),
     );
   });
 

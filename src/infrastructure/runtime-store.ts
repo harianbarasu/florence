@@ -1,5 +1,6 @@
 import { createHmac, randomUUID } from "node:crypto";
 import { z } from "zod";
+import { GOOGLE_CALENDAR_EVENTS_SCOPE, GOOGLE_CALENDAR_READONLY_SCOPE } from "../adapters/google/index.js";
 import {
   createApplicationProjection,
   createOnboardingProjection,
@@ -19,6 +20,15 @@ import {
   HouseholdIdSchema,
 } from "../domain/index.js";
 import { canonicalJson } from "../security/canonical-json.js";
+import {
+  type CalendarBusyWindow,
+  type CalendarPushTarget,
+  type CalendarSyncState,
+  type CalendarSyncWork,
+  calendarSyncStateSchema,
+  calendarSyncWorkSchema,
+  type PersistPersonalCalendarSourceInput,
+} from "./google-calendar-sync.js";
 import type {
   GmailSyncState,
   GoogleSyncConnection,
@@ -60,6 +70,20 @@ export type ClaimedGoogleSyncWork = {
   work: GmailSyncWork;
   attempt: number;
   maxAttempts: number;
+};
+
+export type ClaimedCalendarSyncWork = {
+  rowId: string;
+  leaseToken: string;
+  work: CalendarSyncWork;
+  attempt: number;
+  maxAttempts: number;
+};
+
+export type PersonalCalendarBusyWindowPage = {
+  windows: CalendarBusyWindow[];
+  complete: boolean;
+  synchronizedAt: string | null;
 };
 
 type InvitationRow = {
@@ -710,6 +734,376 @@ export class FlorenceRuntimeStore {
     return this.googleMutationFailure(parsed);
   }
 
+  public async saveCalendarSyncState(input: {
+    householdId: string;
+    adultId: string;
+    connectionId: string;
+    expectedRevision: number;
+    state: CalendarSyncState;
+  }): Promise<ScopedMutationResult> {
+    const parsed = z
+      .strictObject({
+        householdId: z.uuid(),
+        adultId: z.uuid(),
+        connectionId: z.uuid(),
+        expectedRevision: z.number().int().nonnegative(),
+        state: calendarSyncStateSchema,
+      })
+      .parse(input);
+    const rows = await this.database<{ id: string }[]>`
+      update external_connections
+      set cursor = jsonb_set(
+            cursor, '{calendar}', ${this.database.json(JSON.parse(JSON.stringify(parsed.state)))}, true
+          ),
+          last_synced_at = now(), updated_at = now()
+      where id = ${parsed.connectionId} and household_id = ${parsed.householdId}
+        and adult_id = ${parsed.adultId} and provider = 'google' and status = 'active'
+        and coalesce((cursor->'calendar'->>'revision')::integer, 0) = ${parsed.expectedRevision}
+      returning id
+    `;
+    if (rows[0]) return "updated";
+    return this.googleMutationFailure(parsed);
+  }
+
+  public async restartCalendarSync(input: {
+    householdId: string;
+    adultId: string;
+    connectionId: string;
+    expectedRevision: number;
+    state: CalendarSyncState;
+  }): Promise<ScopedMutationResult> {
+    const parsed = z
+      .strictObject({
+        householdId: z.uuid(),
+        adultId: z.uuid(),
+        connectionId: z.uuid(),
+        expectedRevision: z.number().int().nonnegative(),
+        state: calendarSyncStateSchema,
+      })
+      .parse(input);
+    const updated = await this.database.begin(async (transaction) => {
+      const rows = await transaction<{ id: string }[]>`
+        update external_connections
+        set cursor = jsonb_set(
+              cursor, '{calendar}', ${this.database.json(JSON.parse(JSON.stringify(parsed.state)))}, true
+            ),
+            last_synced_at = now(), updated_at = now()
+        where id = ${parsed.connectionId} and household_id = ${parsed.householdId}
+          and adult_id = ${parsed.adultId} and provider = 'google' and status = 'active'
+          and coalesce((cursor->'calendar'->>'revision')::integer, 0) = ${parsed.expectedRevision}
+        returning id
+      `;
+      if (!rows[0]) return false;
+      await transaction`
+        delete from calendar_busy_windows
+        where connection_id = ${parsed.connectionId} and household_id = ${parsed.householdId}
+          and owner_adult_id = ${parsed.adultId}
+      `;
+      return true;
+    });
+    if (updated) return "updated";
+    return this.googleMutationFailure(parsed);
+  }
+
+  public async replaceCalendarWatch(input: {
+    householdId: string;
+    adultId: string;
+    connectionId: string;
+    calendarId: string;
+    expectedRevision: number;
+    state: CalendarSyncState;
+    channel: {
+      channelId: string;
+      resourceId: string;
+      resourceUri: string;
+      channelToken: string;
+      expiresAt: string;
+    };
+  }): Promise<ScopedMutationResult> {
+    const parsed = z
+      .strictObject({
+        householdId: z.uuid(),
+        adultId: z.uuid(),
+        connectionId: z.uuid(),
+        calendarId: z.string().min(1).max(1_000),
+        expectedRevision: z.number().int().nonnegative(),
+        state: calendarSyncStateSchema,
+        channel: z.strictObject({
+          channelId: z.string().min(1).max(500),
+          resourceId: z.string().min(1).max(1_000),
+          resourceUri: z.string().min(1).max(4_096),
+          channelToken: z.string().min(16).max(2_048),
+          expiresAt: instantSchema,
+        }),
+      })
+      .parse(input);
+    if (parsed.state.calendarId !== parsed.calendarId) {
+      throw new ApplicationStoreError("invalid_state", "Calendar watch and cursor do not match");
+    }
+    const tokenDigest = this.calendarChannelTokenDigest(parsed.channel.channelToken);
+    const updated = await this.database.begin(async (transaction) => {
+      const rows = await transaction<{ id: string }[]>`
+        update external_connections
+        set cursor = jsonb_set(
+              cursor, '{calendar}', ${this.database.json(JSON.parse(JSON.stringify(parsed.state)))}, true
+            ),
+            updated_at = now()
+        where id = ${parsed.connectionId} and household_id = ${parsed.householdId}
+          and adult_id = ${parsed.adultId} and provider = 'google' and status = 'active'
+          and coalesce((cursor->'calendar'->>'revision')::integer, 0) = ${parsed.expectedRevision}
+        returning id
+      `;
+      if (!rows[0]) return false;
+      await transaction`
+        update google_calendar_channels
+        set status = 'retiring', updated_at = now()
+        where connection_id = ${parsed.connectionId} and calendar_id = ${parsed.calendarId}
+          and status = 'active'
+      `;
+      await transaction`
+        insert into google_calendar_channels (
+          channel_id, connection_id, household_id, adult_id, calendar_id,
+          resource_id, resource_uri, token_digest, expires_at, status
+        ) values (
+          ${parsed.channel.channelId}, ${parsed.connectionId}, ${parsed.householdId},
+          ${parsed.adultId}, ${parsed.calendarId}, ${parsed.channel.resourceId},
+          ${parsed.channel.resourceUri}, ${tokenDigest}, ${parsed.channel.expiresAt}, 'active'
+        )
+      `;
+      return true;
+    });
+    if (updated) return "updated";
+    return this.googleMutationFailure(parsed);
+  }
+
+  public async markCalendarWatchStopped(input: {
+    householdId: string;
+    adultId: string;
+    connectionId: string;
+    channelId: string;
+  }): Promise<"updated" | "not_found"> {
+    const parsed = z
+      .strictObject({
+        householdId: z.uuid(),
+        adultId: z.uuid(),
+        connectionId: z.uuid(),
+        channelId: z.string().min(1).max(500),
+      })
+      .parse(input);
+    const rows = await this.database<{ channel_id: string }[]>`
+      update google_calendar_channels set status = 'stopped', updated_at = now()
+      where channel_id = ${parsed.channelId} and connection_id = ${parsed.connectionId}
+        and household_id = ${parsed.householdId} and adult_id = ${parsed.adultId}
+        and status = 'retiring'
+      returning channel_id
+    `;
+    return rows[0] ? "updated" : "not_found";
+  }
+
+  public async authenticateCalendarPush(input: {
+    channelId: string;
+    resourceId: string;
+    resourceUri: string;
+    channelToken: string;
+    messageNumber: string;
+    receivedAt: string;
+  }): Promise<CalendarPushTarget | null> {
+    const parsed = z
+      .strictObject({
+        channelId: z.string().min(1).max(500),
+        resourceId: z.string().min(1).max(1_000),
+        resourceUri: z.string().min(1).max(4_096),
+        channelToken: z.string().min(1).max(2_048),
+        messageNumber: z.string().regex(/^\d{1,40}$/u),
+        receivedAt: instantSchema,
+      })
+      .parse(input);
+    const tokenDigest = this.calendarChannelTokenDigest(parsed.channelToken);
+    return this.database.begin(async (transaction) => {
+      const rows = await transaction<
+        {
+          household_id: string;
+          adult_id: string;
+          connection_id: string;
+          calendar_id: string;
+          last_message_number: string | null;
+        }[]
+      >`
+        select channel.household_id, channel.adult_id, channel.connection_id,
+          channel.calendar_id, channel.last_message_number::text
+        from google_calendar_channels channel
+        join external_connections connection on connection.id = channel.connection_id
+        where channel.channel_id = ${parsed.channelId}
+          and channel.resource_id = ${parsed.resourceId}
+          and channel.resource_uri = ${parsed.resourceUri}
+          and channel.token_digest = ${tokenDigest}
+          and channel.status in ('active', 'retiring') and channel.expires_at > ${parsed.receivedAt}
+          and connection.status = 'active' and connection.provider = 'google'
+          and connection.household_id = channel.household_id
+          and connection.adult_id = channel.adult_id
+        for update of channel
+      `;
+      const row = rows[0];
+      if (!row) return null;
+      if (
+        row.last_message_number === null ||
+        BigInt(parsed.messageNumber) > BigInt(row.last_message_number)
+      ) {
+        await transaction`
+          update google_calendar_channels
+          set last_message_number = ${parsed.messageNumber}::numeric, updated_at = now()
+          where channel_id = ${parsed.channelId}
+        `;
+      }
+      return {
+        householdId: row.household_id,
+        adultId: row.adult_id,
+        connectionId: row.connection_id,
+        calendarId: row.calendar_id,
+      };
+    });
+  }
+
+  public async persistPersonalCalendarSource(
+    input: PersistPersonalCalendarSourceInput,
+  ): Promise<{ sourceItemId: string; disposition: "inserted" | "unchanged" | "revised"; revision: number }> {
+    const parsed = z
+      .strictObject({
+        householdId: z.uuid(),
+        adultId: z.uuid(),
+        connectionId: z.uuid(),
+        calendarId: z.string().min(1).max(1_000),
+        externalId: z.string().min(1).max(1_000),
+        kind: z.enum(["calendar_event", "calendar_event_deleted"]),
+        occurredAt: instantSchema,
+        contentHash: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
+        encryptedContent: z.string().min(1),
+        metadata: z.record(z.string(), z.unknown()),
+        busyWindow: z
+          .strictObject({ startsAt: instantSchema, endsAt: instantSchema, allDay: z.boolean() })
+          .nullable(),
+      })
+      .parse(input);
+    const persisted = await this.applicationStore.persistSourceItem({
+      householdId: parsed.householdId,
+      connectionId: parsed.connectionId,
+      ownerAdultId: parsed.adultId,
+      visibility: "personal",
+      provider: "google-calendar",
+      externalId: `${parsed.calendarId}:${parsed.externalId}`,
+      kind: parsed.kind,
+      occurredAt: parsed.occurredAt,
+      contentHash: parsed.contentHash,
+      encryptedContent: parsed.encryptedContent,
+      metadata: parsed.metadata,
+    });
+    if (parsed.busyWindow === null) {
+      await this.database`
+        delete from calendar_busy_windows
+        where connection_id = ${parsed.connectionId} and household_id = ${parsed.householdId}
+          and owner_adult_id = ${parsed.adultId} and calendar_id = ${parsed.calendarId}
+          and external_event_id = ${parsed.externalId}
+          and source_revision <= ${persisted.revision}
+      `;
+      return persisted;
+    }
+    const rows = await this.database<{ connection_id: string }[]>`
+      insert into calendar_busy_windows (
+        connection_id, household_id, owner_adult_id, calendar_id, external_event_id,
+        source_item_id, source_revision, starts_at, ends_at, all_day
+      )
+      select connection.id, connection.household_id, connection.adult_id,
+        ${parsed.calendarId}, ${parsed.externalId}, ${persisted.sourceItemId},
+        ${persisted.revision}, ${parsed.busyWindow.startsAt}, ${parsed.busyWindow.endsAt},
+        ${parsed.busyWindow.allDay}
+      from external_connections connection
+      where connection.id = ${parsed.connectionId} and connection.household_id = ${parsed.householdId}
+        and connection.adult_id = ${parsed.adultId} and connection.provider = 'google'
+        and connection.status = 'active'
+      on conflict (connection_id, calendar_id, external_event_id)
+      do update set source_item_id = excluded.source_item_id,
+        source_revision = excluded.source_revision, starts_at = excluded.starts_at,
+        ends_at = excluded.ends_at, all_day = excluded.all_day, updated_at = now()
+      where calendar_busy_windows.source_revision <= excluded.source_revision
+      returning connection_id
+    `;
+    if (!rows[0]) {
+      throw new ApplicationStoreError("not_authorized", "Calendar projection owner is inactive");
+    }
+    return persisted;
+  }
+
+  public async listPersonalCalendarBusyWindows(input: {
+    householdId: string;
+    adultId: string;
+    asOf: string;
+    from: string;
+    to: string;
+    limit: number;
+  }): Promise<PersonalCalendarBusyWindowPage> {
+    const parsed = z
+      .strictObject({
+        householdId: z.uuid(),
+        adultId: z.uuid(),
+        asOf: instantSchema,
+        from: instantSchema,
+        to: instantSchema,
+        limit: z.number().int().min(1).max(1_000),
+      })
+      .parse(input);
+    if (Date.parse(parsed.from) >= Date.parse(parsed.to)) {
+      throw new ApplicationStoreError("invalid_state", "Calendar projection range is invalid");
+    }
+    const connections = await this.database<{ cursor: Record<string, unknown> }[]>`
+      select cursor from external_connections
+      where household_id = ${parsed.householdId} and adult_id = ${parsed.adultId}
+        and provider = 'google' and status = 'active'
+        and granted_scopes && ${[GOOGLE_CALENDAR_READONLY_SCOPE, GOOGLE_CALENDAR_EVENTS_SCOPE]}::text[]
+      order by id
+    `;
+    if (connections.length === 0) {
+      return { windows: [], complete: true, synchronizedAt: null };
+    }
+    const states = connections.map((connection) =>
+      calendarSyncStateSchema.safeParse(connection.cursor.calendar),
+    );
+    if (states.some((state) => !state.success || !state.data.projectionReady)) {
+      return { windows: [], complete: false, synchronizedAt: null };
+    }
+    const readyStates = states.flatMap((state) => (state.success ? [state.data] : []));
+    const earliestSynchronization = readyStates
+      .map((state) => state.lastSuccessfulSyncAt)
+      .filter((value): value is string => value !== null)
+      .sort()[0];
+    const synchronizedAt = earliestSynchronization ? new Date(earliestSynchronization).toISOString() : null;
+    if (synchronizedAt === null || Date.parse(synchronizedAt) < Date.parse(parsed.asOf) - 30 * 60_000) {
+      return { windows: [], complete: false, synchronizedAt };
+    }
+    const rows = await this.database<{ starts_at: Date; ends_at: Date; all_day: boolean }[]>`
+      select busy.starts_at, busy.ends_at, busy.all_day
+      from calendar_busy_windows busy
+      join external_connections connection on connection.id = busy.connection_id
+      where busy.household_id = ${parsed.householdId} and busy.owner_adult_id = ${parsed.adultId}
+        and connection.household_id = busy.household_id
+        and connection.adult_id = busy.owner_adult_id
+        and connection.status = 'active' and connection.provider = 'google'
+        and connection.cursor->'calendar'->>'phase' = 'live'
+        and coalesce((connection.cursor->'calendar'->>'projectionReady')::boolean, false)
+        and busy.starts_at < ${parsed.to} and busy.ends_at > ${parsed.from}
+      order by busy.starts_at, busy.ends_at, busy.connection_id, busy.external_event_id
+      limit ${parsed.limit + 1}
+    `;
+    return {
+      windows: rows.slice(0, parsed.limit).map((row) => ({
+        startsAt: row.starts_at.toISOString(),
+        endsAt: row.ends_at.toISOString(),
+        allDay: row.all_day,
+      })),
+      complete: rows.length <= parsed.limit,
+      synchronizedAt,
+    };
+  }
+
   public async persistPersonalGmailSource(
     input: PersistPersonalGmailSourceInput,
   ): Promise<PersistPersonalGmailSourceResult> {
@@ -765,17 +1159,30 @@ export class FlorenceRuntimeStore {
         revokedAt: instantSchema,
       })
       .parse(input);
-    const rows = await this.database<{ id: string }[]>`
-      update external_connections
-      set status = 'revoked', encrypted_credentials = null, granted_scopes = '{}',
-        cursor = '{}'::jsonb,
-        metadata = metadata || ${this.database.json({ revokedAt: parsed.revokedAt })},
-        updated_at = now()
-      where id = ${parsed.connectionId} and household_id = ${parsed.householdId}
-        and adult_id = ${parsed.adultId} and provider = 'google'
-      returning id
-    `;
-    return rows[0] ? "revoked" : "not_found";
+    return this.database.begin(async (transaction) => {
+      const rows = await transaction<{ id: string }[]>`
+        update external_connections
+        set status = 'revoked', encrypted_credentials = null, granted_scopes = '{}',
+          cursor = '{}'::jsonb,
+          metadata = metadata || ${this.database.json({ revokedAt: parsed.revokedAt })},
+          updated_at = now()
+        where id = ${parsed.connectionId} and household_id = ${parsed.householdId}
+          and adult_id = ${parsed.adultId} and provider = 'google'
+        returning id
+      `;
+      if (!rows[0]) return "not_found" as const;
+      await transaction`
+        update google_calendar_channels set status = 'stopped', updated_at = now()
+        where connection_id = ${parsed.connectionId} and household_id = ${parsed.householdId}
+          and adult_id = ${parsed.adultId} and status in ('active', 'retiring')
+      `;
+      await transaction`
+        delete from calendar_busy_windows
+        where connection_id = ${parsed.connectionId} and household_id = ${parsed.householdId}
+          and owner_adult_id = ${parsed.adultId}
+      `;
+      return "revoked" as const;
+    });
   }
 
   public async updateGoogleConnectionState(input: {
@@ -808,6 +1215,200 @@ export class FlorenceRuntimeStore {
         last_synced_at = ${parsed.lastSyncedAt}, status = ${parsed.status}, updated_at = now()
       where id = ${parsed.connectionId} and household_id = ${parsed.householdId}
         and adult_id = ${parsed.adultId} and provider = 'google' and status <> 'revoked'
+      returning id
+    `;
+    return rows.length === 1;
+  }
+
+  public async enqueueCalendarSyncWork(input: {
+    idempotencyKey: string;
+    householdId: string;
+    work: CalendarSyncWork;
+  }): Promise<{ jobId: string; created: boolean }> {
+    const parsed = z
+      .strictObject({
+        idempotencyKey: z.string().min(1).max(512),
+        householdId: z.uuid(),
+        work: calendarSyncWorkSchema,
+      })
+      .parse(input);
+    if (parsed.work.householdId !== parsed.householdId) {
+      throw new ApplicationStoreError("invalid_state", "Calendar work household does not match");
+    }
+    const id = randomUUID();
+    const rows = await this.database<{ id: string }[]>`
+      insert into jobs (id, household_id, kind, status, payload, max_attempts, idempotency_key)
+      values (
+        ${id}, ${parsed.householdId}, 'google.calendar.sync', 'pending',
+        ${this.database.json(JSON.parse(JSON.stringify(parsed.work)))}, 8, ${parsed.idempotencyKey}
+      )
+      on conflict (idempotency_key) where idempotency_key is not null do nothing
+      returning id
+    `;
+    if (rows[0]) return { jobId: rows[0].id, created: true };
+    const existing = await this.database<{ id: string; household_id: string; payload: unknown }[]>`
+      select id, household_id, payload from jobs where idempotency_key = ${parsed.idempotencyKey}
+    `;
+    const row = existing[0];
+    if (
+      !row ||
+      row.household_id !== parsed.householdId ||
+      canonicalJson(row.payload) !== canonicalJson(parsed.work)
+    ) {
+      throw new ApplicationStoreError("invalid_state", "Calendar sync idempotency key conflict");
+    }
+    return { jobId: row.id, created: false };
+  }
+
+  public async reconcileCalendarSyncWork(asOf: string): Promise<number> {
+    const now = instantSchema.parse(asOf);
+    const rows = await this.database<
+      {
+        id: string;
+        household_id: string;
+        adult_id: string;
+        cursor: Record<string, unknown>;
+        updated_at: Date;
+      }[]
+    >`
+      select id, household_id, adult_id, cursor, updated_at
+      from external_connections
+      where provider = 'google' and status = 'active'
+        and granted_scopes && ${[GOOGLE_CALENDAR_READONLY_SCOPE, GOOGLE_CALENDAR_EVENTS_SCOPE]}::text[]
+      order by updated_at
+    `;
+    let created = 0;
+    for (const row of rows) {
+      const stateResult = calendarSyncStateSchema.safeParse(row.cursor.calendar);
+      if (row.cursor.calendar !== undefined && !stateResult.success) {
+        await this.markConnectionStatus({
+          householdId: row.household_id,
+          adultId: row.adult_id,
+          connectionId: row.id,
+          status: "error",
+        });
+        continue;
+      }
+      const planned = calendarWorkForState(row, stateResult.success ? stateResult.data : null, now);
+      if (planned === null) continue;
+      const receipt = await this.enqueueCalendarSyncWork({
+        householdId: row.household_id,
+        idempotencyKey: calendarWorkIdempotencyKey(
+          row.id,
+          planned.work,
+          planned.revision,
+          now,
+          row.updated_at.toISOString(),
+        ),
+        work: planned.work,
+      });
+      if (receipt.created) created += 1;
+    }
+    return created;
+  }
+
+  public async claimCalendarSyncWork(input: {
+    owner: string;
+    limit: number;
+    leaseSeconds: number;
+  }): Promise<ClaimedCalendarSyncWork[]> {
+    const parsed = z
+      .strictObject({
+        owner: z.string().min(1).max(200),
+        limit: z.number().int().positive().max(100),
+        leaseSeconds: z.number().int().positive().max(3_600),
+      })
+      .parse(input);
+    const leaseToken = randomUUID();
+    return this.database.begin(async (transaction) => {
+      await transaction`
+        update jobs set status = 'dead', lease_owner = null, lease_token = null,
+          lease_expires_at = null, last_error_code = 'lease_expired_after_max_attempts', updated_at = now()
+        where kind = 'google.calendar.sync' and status = 'leased' and lease_expires_at < now()
+          and attempt >= max_attempts
+      `;
+      const rows = await transaction<
+        {
+          id: string;
+          payload: unknown;
+          attempt: number;
+          max_attempts: number;
+          lease_token: string;
+        }[]
+      >`
+        with candidates as (
+          select id from jobs
+          where kind = 'google.calendar.sync' and (
+            (status in ('pending', 'retry') and available_at <= now())
+            or (status = 'leased' and lease_expires_at < now())
+          )
+          order by available_at, created_at
+          for update skip locked
+          limit ${parsed.limit}
+        )
+        update jobs
+        set status = 'leased', lease_owner = ${parsed.owner}, lease_token = ${leaseToken},
+          lease_expires_at = now() + (${parsed.leaseSeconds} * interval '1 second'),
+          attempt = attempt + 1, updated_at = now()
+        from candidates where jobs.id = candidates.id
+        returning jobs.id, jobs.payload, jobs.attempt, jobs.max_attempts, jobs.lease_token
+      `;
+      return rows.map((row) => ({
+        rowId: row.id,
+        leaseToken: row.lease_token,
+        work: calendarSyncWorkSchema.parse(row.payload),
+        attempt: row.attempt,
+        maxAttempts: row.max_attempts,
+      }));
+    });
+  }
+
+  public async completeCalendarSyncWork(input: { rowId: string; leaseToken: string }): Promise<boolean> {
+    return this.settleCalendarSyncWork(input, "succeeded");
+  }
+
+  public async retryCalendarSyncWork(input: {
+    rowId: string;
+    leaseToken: string;
+    retryAt: string;
+    errorCode: string;
+  }): Promise<boolean> {
+    const parsed = z
+      .strictObject({
+        rowId: z.uuid(),
+        leaseToken: z.uuid(),
+        retryAt: instantSchema,
+        errorCode: z.string().regex(/^[a-z0-9_.-]{1,100}$/u),
+      })
+      .parse(input);
+    const rows = await this.database<{ id: string }[]>`
+      update jobs set status = case when attempt >= max_attempts then 'dead' else 'retry' end,
+        available_at = ${parsed.retryAt}, last_error_code = ${parsed.errorCode},
+        lease_owner = null, lease_token = null, lease_expires_at = null, updated_at = now()
+      where id = ${parsed.rowId} and kind = 'google.calendar.sync' and status = 'leased'
+        and lease_token = ${parsed.leaseToken}
+      returning id
+    `;
+    return rows.length === 1;
+  }
+
+  public async deadLetterCalendarSyncWork(input: {
+    rowId: string;
+    leaseToken: string;
+    errorCode: string;
+  }): Promise<boolean> {
+    const parsed = z
+      .strictObject({
+        rowId: z.uuid(),
+        leaseToken: z.uuid(),
+        errorCode: z.string().regex(/^[a-z0-9_.-]{1,100}$/u),
+      })
+      .parse(input);
+    const rows = await this.database<{ id: string }[]>`
+      update jobs set status = 'dead', last_error_code = ${parsed.errorCode},
+        lease_owner = null, lease_token = null, lease_expires_at = null, updated_at = now()
+      where id = ${parsed.rowId} and kind = 'google.calendar.sync' and status = 'leased'
+        and lease_token = ${parsed.leaseToken}
       returning id
     `;
     return rows.length === 1;
@@ -1018,6 +1619,27 @@ export class FlorenceRuntimeStore {
     return rows[0]?.external_handle;
   }
 
+  private calendarChannelTokenDigest(channelToken: string): string {
+    return createHmac("sha256", this.identityKey)
+      .update(`google-calendar-channel:v1:${channelToken}`)
+      .digest("hex");
+  }
+
+  private async settleCalendarSyncWork(
+    input: { rowId: string; leaseToken: string },
+    status: "succeeded",
+  ): Promise<boolean> {
+    const parsed = z.strictObject({ rowId: z.uuid(), leaseToken: z.uuid() }).parse(input);
+    const rows = await this.database<{ id: string }[]>`
+      update jobs set status = ${status}, lease_owner = null, lease_token = null,
+        lease_expires_at = null, updated_at = now()
+      where id = ${parsed.rowId} and kind = 'google.calendar.sync' and status = 'leased'
+        and lease_token = ${parsed.leaseToken}
+      returning id
+    `;
+    return rows.length === 1;
+  }
+
   private async googleMutationFailure(input: {
     householdId: string;
     adultId: string;
@@ -1032,6 +1654,67 @@ export class FlorenceRuntimeStore {
     if (!rows[0]) return "not_found";
     return rows[0].status === "active" ? "conflict" : "inactive";
   }
+}
+
+function calendarWorkForState(
+  row: { id: string; household_id: string; adult_id: string },
+  state: CalendarSyncState | null,
+  asOf: string,
+): { work: CalendarSyncWork; revision: number } | null {
+  const identity = {
+    householdId: row.household_id,
+    adultId: row.adult_id,
+    connectionId: row.id,
+    calendarId: state?.calendarId ?? "primary",
+  };
+  if (state === null) {
+    return { work: calendarSyncWorkSchema.parse({ kind: "start", ...identity }), revision: 0 };
+  }
+  if (state.phase === "initial" || state.pageToken !== null || !state.projectionReady) {
+    return {
+      work: calendarSyncWorkSchema.parse({ kind: "continue", ...identity }),
+      revision: state.revision,
+    };
+  }
+  const horizonRefreshThreshold = Date.parse(asOf) + 365 * 24 * 60 * 60_000;
+  if (Date.parse(state.initialTimeMax) <= horizonRefreshThreshold) {
+    return {
+      work: calendarSyncWorkSchema.parse({ kind: "refresh_horizon", ...identity }),
+      revision: state.revision,
+    };
+  }
+  const renewalThreshold = Date.parse(asOf) + 24 * 60 * 60_000;
+  if (state.watch === null || Date.parse(state.watch.expiresAt) <= renewalThreshold) {
+    return {
+      work: calendarSyncWorkSchema.parse({ kind: "renew_watch", ...identity }),
+      revision: state.revision,
+    };
+  }
+  const staleThreshold = Date.parse(asOf) - 15 * 60_000;
+  if (state.lastSuccessfulSyncAt === null || Date.parse(state.lastSuccessfulSyncAt) <= staleThreshold) {
+    return {
+      work: calendarSyncWorkSchema.parse({ kind: "scheduled", ...identity }),
+      revision: state.revision,
+    };
+  }
+  return null;
+}
+
+function calendarWorkIdempotencyKey(
+  connectionId: string,
+  work: CalendarSyncWork,
+  revision: number,
+  asOf: string,
+  connectionEpoch: string,
+): string {
+  if (work.kind === "start") {
+    return `google-calendar:${connectionId}:start:${connectionEpoch}`;
+  }
+  if (work.kind === "scheduled") {
+    const bucket = Math.floor(Date.parse(asOf) / (15 * 60_000));
+    return `google-calendar:${connectionId}:scheduled:${bucket}`;
+  }
+  return `google-calendar:${connectionId}:${work.kind}:revision:${revision}`;
 }
 
 export function canonicalizeLinqHandle(raw: string): string {

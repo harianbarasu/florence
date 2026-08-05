@@ -1,4 +1,4 @@
-import type { GmailPubSubEvent } from "../adapters/google/index.js";
+import type { CalendarPushHeaders, GmailPubSubEvent } from "../adapters/google/index.js";
 import type { LinqInboundEvent } from "../adapters/linq/index.js";
 
 /**
@@ -8,6 +8,7 @@ import type { LinqInboundEvent } from "../adapters/linq/index.js";
 export interface DurableIngress {
   acceptLinq(event: LinqInboundEvent): Promise<void>;
   acceptGmailPush(event: GmailPubSubEvent): Promise<void>;
+  acceptCalendarPush(headers: CalendarPushHeaders): Promise<"accepted" | "unauthorized">;
 }
 
 export type GoogleOAuthStartResult =

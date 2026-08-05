@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { type ApplicationOutboxIntent, ApplicationOutboxIntentSchema } from "../application/index.js";
+import type { CalendarSyncWork } from "./google-calendar-sync.js";
 import type { GmailSyncWork, GoogleSyncConnection } from "./google-sync.js";
 import type { GoogleOAuthConnectedEvent } from "./http-services.js";
 import type { PrivateCommandHandler } from "./provider-processor.js";
@@ -24,6 +25,14 @@ export interface PrivateCommandGoogleQueue {
   }): Promise<{ jobId: string; created: boolean }>;
 }
 
+export interface PrivateCommandCalendarQueue {
+  enqueueCalendarSyncWork(input: {
+    idempotencyKey: string;
+    householdId: string;
+    work: CalendarSyncWork;
+  }): Promise<{ jobId: string; created: boolean }>;
+}
+
 export interface GoogleLinkIssuer {
   issue(input: {
     householdId: string;
@@ -38,7 +47,9 @@ export interface PrivateGoogleCommandServiceOptions {
   outbox: PrivateCommandOutbox;
   directory: PrivateCommandGoogleDirectory;
   googleQueue: PrivateCommandGoogleQueue;
+  calendarQueue?: PrivateCommandCalendarQueue;
   linkIssuer: GoogleLinkIssuer;
+  gmailSyncEnabled?: boolean;
 }
 
 export class PrivateGoogleCommandService implements PrivateCommandHandler {
@@ -109,16 +120,31 @@ export class PrivateGoogleCommandService implements PrivateCommandHandler {
         return { handled: true, classification: "google:disconnect_needs_account" };
       }
       for (const connection of selected) {
-        await this.options.googleQueue.enqueueGoogleSyncWork({
-          householdId: input.householdId,
-          idempotencyKey: `google:${connection.id}:revoke:${stableId(input.idempotencyKey)}`,
-          work: {
-            kind: "revoke",
+        const idempotencyKey = `google:${connection.id}:revoke:${stableId(input.idempotencyKey)}`;
+        if (this.options.calendarQueue !== undefined) {
+          await this.options.calendarQueue.enqueueCalendarSyncWork({
             householdId: input.householdId,
-            adultId: input.adultId,
-            connectionId: connection.id,
-          },
-        });
+            idempotencyKey,
+            work: {
+              kind: "revoke",
+              householdId: input.householdId,
+              adultId: input.adultId,
+              connectionId: connection.id,
+              calendarId: "primary",
+            },
+          });
+        } else {
+          await this.options.googleQueue.enqueueGoogleSyncWork({
+            householdId: input.householdId,
+            idempotencyKey,
+            work: {
+              kind: "revoke",
+              householdId: input.householdId,
+              adultId: input.adultId,
+              connectionId: connection.id,
+            },
+          });
+        }
       }
       await this.queuePrivateMessage(
         input,
@@ -132,17 +158,19 @@ export class PrivateGoogleCommandService implements PrivateCommandHandler {
   }
 
   public async onGoogleConnected(event: GoogleOAuthConnectedEvent): Promise<void> {
-    await this.options.googleQueue.enqueueGoogleSyncWork({
-      householdId: event.householdId,
-      idempotencyKey: `google:${event.connectionId}:start`,
-      work: {
-        kind: "start",
+    if (this.options.gmailSyncEnabled !== false) {
+      await this.options.googleQueue.enqueueGoogleSyncWork({
         householdId: event.householdId,
-        adultId: event.adultId,
-        connectionId: event.connectionId,
-        depth: "full_history",
-      },
-    });
+        idempotencyKey: `google:${event.connectionId}:start`,
+        work: {
+          kind: "start",
+          householdId: event.householdId,
+          adultId: event.adultId,
+          connectionId: event.connectionId,
+          depth: "full_history",
+        },
+      });
+    }
     await this.queuePrivateMessage(
       {
         householdId: event.householdId,
@@ -150,7 +178,9 @@ export class PrivateGoogleCommandService implements PrivateCommandHandler {
         idempotencyKey: `google:${event.connectionId}:connected`,
       },
       "google-connected",
-      `${event.accountLabel} is connected${event.email ? ` as ${event.email}` : ""}. Florence is starting with the most recent 90 days, then will work backward through one year and older history without delaying new mail. Raw email stays private unless you approve a minimum household meaning or a sharing rule.`,
+      this.options.gmailSyncEnabled === false
+        ? `${event.accountLabel} is connected${event.email ? ` as ${event.email}` : ""}. Florence is privately synchronizing your primary calendar. Calendar details stay personal unless you explicitly promote family meaning.`
+        : `${event.accountLabel} is connected${event.email ? ` as ${event.email}` : ""}. Florence is starting mail with the most recent 90 days, then will work backward through one year and older history without delaying new mail, while privately synchronizing your primary calendar. Raw mail and calendar details stay private unless you approve a minimum household meaning or a sharing rule.`,
     );
   }
 

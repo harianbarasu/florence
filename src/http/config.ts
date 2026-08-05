@@ -4,6 +4,7 @@ import { LINQ_WEBHOOK_VERSION, type LinqConfig } from "../adapters/linq/index.js
 export const DEFAULT_HTTP_BODY_LIMIT_BYTES = 256 * 1_024;
 export const DEFAULT_LINQ_BODY_LIMIT_BYTES = 512 * 1_024;
 export const DEFAULT_GMAIL_PUSH_BODY_LIMIT_BYTES = 64 * 1_024;
+export const DEFAULT_CALENDAR_PUSH_BODY_LIMIT_BYTES = 4 * 1_024;
 export const DEFAULT_OPERATOR_BODY_LIMIT_BYTES = 16 * 1_024;
 
 const linqWebhookConfigSchema = z
@@ -23,6 +24,7 @@ export const florenceHttpConfigSchema = z
     publicUrl: z.string().url(),
     operatorToken: z.string().min(24),
     gmailPubSubVerificationToken: z.string().min(1).nullable(),
+    googleCalendarPushEnabled: z.boolean().default(false),
     linqWebhook: linqWebhookConfigSchema.nullable(),
     trustProxy: z.boolean().default(true),
     bodyLimitBytes: z
@@ -54,6 +56,7 @@ export interface FlorenceHttpEnvironmentConfig {
   FLORENCE_ADMIN_API_KEY: string;
   LINQ_WEBHOOK_SECRET?: string;
   GOOGLE_PUBSUB_VERIFICATION_TOKEN?: string;
+  GOOGLE_CALENDAR_PUSH_ENABLED?: boolean;
 }
 
 export function parseFlorenceHttpConfig(input: FlorenceHttpConfigInput): FlorenceHttpConfig {
@@ -74,6 +77,7 @@ export function httpConfigFromFlorenceConfig(config: FlorenceHttpEnvironmentConf
     publicUrl: config.FLORENCE_WEB_BASE_URL,
     operatorToken: config.FLORENCE_ADMIN_API_KEY,
     gmailPubSubVerificationToken: config.GOOGLE_PUBSUB_VERIFICATION_TOKEN ?? null,
+    googleCalendarPushEnabled: config.GOOGLE_CALENDAR_PUSH_ENABLED ?? false,
     linqWebhook,
   });
 }

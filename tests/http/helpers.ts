@@ -10,6 +10,7 @@ export const HTTP_CONFIG: FlorenceHttpConfigInput = {
   publicUrl: "https://florence.example.test",
   operatorToken: OPERATOR_TOKEN,
   gmailPubSubVerificationToken: PUBSUB_TOKEN,
+  googleCalendarPushEnabled: true,
   linqWebhook: {
     webhookSecret: `whsec_${LINQ_SIGNING_KEY.toString("base64")}`,
     webhookToleranceMs: 5 * 60 * 1_000,
@@ -22,6 +23,7 @@ export function fakeHttpServices(): FlorenceHttpServices {
     ingress: {
       acceptLinq: async () => undefined,
       acceptGmailPush: async () => undefined,
+      acceptCalendarPush: async () => "accepted",
     },
     googleOAuth: {
       start: async () => ({ kind: "invalid" }),

@@ -230,7 +230,7 @@ interface CalendarApiPort {
     calendarId: string;
     maxResults: number;
     showDeleted: true;
-    singleEvents: false;
+    singleEvents: boolean;
     pageToken?: string;
     syncToken?: string;
     timeMin?: string;
@@ -284,6 +284,7 @@ export class GoogleCalendarAdapter {
     timeMin?: string;
     timeMax?: string;
     maxResults?: number;
+    singleEvents?: boolean;
   }): Promise<GoogleCalendarPage> {
     requireAccessToken(input.accessToken);
     if (input.syncToken && (input.timeMin || input.timeMax)) {
@@ -300,7 +301,7 @@ export class GoogleCalendarAdapter {
         calendarId: input.calendarId,
         maxResults,
         showDeleted: true,
-        singleEvents: false,
+        singleEvents: input.singleEvents ?? false,
         ...(input.pageToken ? { pageToken: input.pageToken } : {}),
         ...(input.syncToken ? { syncToken: input.syncToken } : {}),
         ...(input.timeMin ? { timeMin: normalizeIsoTimestamp(input.timeMin, "Calendar timeMin") } : {}),

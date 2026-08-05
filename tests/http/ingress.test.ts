@@ -204,4 +204,45 @@ describe("provider ingress HTTP interface", () => {
     expect(response.json()).toEqual({ error: "unavailable" });
     expect(response.body).not.toContain("mailbox failure");
   });
+
+  it("delegates Calendar channel authentication before durable acknowledgement", async () => {
+    services.ingress.acceptCalendarPush = vi.fn(async () => "accepted" as const);
+    const headers = {
+      "x-goog-channel-id": "calendar-channel-1",
+      "x-goog-channel-token": "private-channel-token",
+      "x-goog-resource-id": "calendar-resource-1",
+      "x-goog-resource-uri": "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+      "x-goog-resource-state": "exists",
+      "x-goog-message-number": "42",
+    };
+    const response = await server.inject({
+      method: "POST",
+      url: "/webhooks/google/calendar",
+      headers,
+    });
+
+    expect(response.statusCode).toBe(202);
+    expect(services.ingress.acceptCalendarPush).toHaveBeenCalledWith(expect.objectContaining(headers));
+  });
+
+  it("rejects unknown Calendar channels and retries store failures", async () => {
+    services.ingress.acceptCalendarPush = vi.fn(async () => "unauthorized" as const);
+    const unauthorized = await server.inject({
+      method: "POST",
+      url: "/webhooks/google/calendar",
+      headers: { "x-goog-channel-id": "unknown" },
+    });
+    expect(unauthorized.statusCode).toBe(401);
+
+    services.ingress.acceptCalendarPush = vi.fn(async () => {
+      throw new Error("private store detail");
+    });
+    const unavailable = await server.inject({
+      method: "POST",
+      url: "/webhooks/google/calendar",
+      headers: { "x-goog-channel-id": "known" },
+    });
+    expect(unavailable.statusCode).toBe(503);
+    expect(unavailable.body).not.toContain("private store detail");
+  });
 });

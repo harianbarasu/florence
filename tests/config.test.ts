@@ -16,7 +16,9 @@ describe("configuration", () => {
     const config = loadConfig(validEnvironment());
     expect(availableIntegrations(config)).toEqual({
       linq: false,
-      google: false,
+      googleOAuth: false,
+      gmail: false,
+      googleCalendar: false,
       openai: false,
       anthropic: false,
       openWeight: false,
@@ -36,7 +38,11 @@ describe("configuration", () => {
       ...validEnvironment(),
       GOOGLE_PUBSUB_VERIFICATION_TOKEN: "verification-token",
     });
-    expect(availableIntegrations(tokenOnly).google).toBe(false);
+    expect(availableIntegrations(tokenOnly)).toMatchObject({
+      googleOAuth: false,
+      gmail: false,
+      googleCalendar: false,
+    });
 
     const partial = loadConfig({
       ...validEnvironment(),
@@ -45,7 +51,11 @@ describe("configuration", () => {
       GOOGLE_OAUTH_STATE_SECRET: "state-secret-that-is-at-least-thirty-two-bytes",
       GOOGLE_REDIRECT_URI: "https://florence.example.com/oauth/google/callback",
     });
-    expect(availableIntegrations(partial).google).toBe(false);
+    expect(availableIntegrations(partial)).toMatchObject({
+      googleOAuth: true,
+      gmail: false,
+      googleCalendar: true,
+    });
     const complete = loadConfig({
       ...validEnvironment(),
       GOOGLE_CLIENT_ID: "client-id",
@@ -56,7 +66,11 @@ describe("configuration", () => {
       GOOGLE_GMAIL_TOPIC_NAME: "projects/florence/topics/gmail",
       GOOGLE_GMAIL_PUBSUB_SUBSCRIPTION: "projects/florence/subscriptions/gmail",
     });
-    expect(availableIntegrations(complete).google).toBe(true);
+    expect(availableIntegrations(complete)).toMatchObject({
+      googleOAuth: true,
+      gmail: true,
+      googleCalendar: true,
+    });
   });
 
   it("rejects a malformed Gmail Pub/Sub subscription name", () => {

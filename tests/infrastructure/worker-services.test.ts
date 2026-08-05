@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   LinqApiError,
   type LinqOutboundSender,
@@ -31,6 +31,7 @@ import {
 } from "../../src/infrastructure/index.js";
 import type { WorkerJob, WorkerTool } from "../../src/runtime/index.js";
 import {
+  ADULT_A,
   ADULT_B,
   aggregate,
   classificationBase,
@@ -603,6 +604,122 @@ describe("ScopedWorkerContext", () => {
     await expect(
       tool.execute({}, { ...executionContext(job), householdId: "another_household" }),
     ).rejects.toMatchObject({ code: "invalid_context" });
+  });
+
+  it("never broadens personal Calendar windows into household planning", async () => {
+    const { job, snapshot } = await queuedWorker({ purpose: "meal_plan" });
+    const listPersonalCalendarBusyWindows = vi.fn(async () => ({
+      windows: [{ startsAt: "2027-01-02T17:00:00Z", endsAt: "2027-01-02T18:00:00Z", allDay: false }],
+      complete: true,
+      synchronizedAt: "2027-02-01T08:00:00Z",
+    }));
+    const options = await new ScopedWorkerContext({
+      now: () => WORKER_NOW,
+      calendarSchedule: { listPersonalCalendarBusyWindows },
+    }).contextFor(job, snapshot);
+    const result = await requiredTool(options, "household_schedule").execute(
+      { limit: 10 },
+      executionContext(job),
+    );
+
+    expect(result).toMatchObject({
+      calendarBusyWindows: [],
+      calendarCoverage: { mode: "household_promotions_only", complete: true },
+    });
+    expect(listPersonalCalendarBusyWindows).not.toHaveBeenCalled();
+  });
+
+  it("adds a complete, minimum-field Calendar projection only to its owning adult's planning", async () => {
+    const queued = await queuedWorker({ purpose: "meal_plan" });
+    const personalJob = {
+      ...queued.job,
+      scopeGrant: { ...queued.job.scopeGrant, visibility: "personal" as const, adultId: ADULT_A },
+    };
+    const snapshot = {
+      ...queued.snapshot,
+      projection: {
+        ...queued.snapshot.projection,
+        workers: queued.snapshot.projection.workers.map((record) =>
+          record.job.jobId === personalJob.jobId ? { ...record, job: personalJob } : record,
+        ),
+      },
+    };
+    const listPersonalCalendarBusyWindows = vi.fn(async () => ({
+      windows: [{ startsAt: "2027-02-02T17:00:00Z", endsAt: "2027-02-02T18:00:00Z", allDay: false }],
+      complete: true,
+      synchronizedAt: "2027-02-01T08:00:00Z",
+    }));
+    const options = await new ScopedWorkerContext({
+      now: () => WORKER_NOW,
+      calendarSchedule: { listPersonalCalendarBusyWindows },
+    }).contextFor(personalJob, snapshot);
+    const result = await requiredTool(options, "household_schedule").execute(
+      { limit: 10 },
+      executionContext(personalJob),
+    );
+
+    expect(result).toMatchObject({
+      calendarBusyWindows: [
+        {
+          startsAt: "2027-02-02T17:00:00Z",
+          endsAt: "2027-02-02T18:00:00Z",
+          allDay: false,
+        },
+      ],
+      calendarCoverage: {
+        mode: "personal_owner",
+        complete: true,
+        synchronizedAt: "2027-02-01T08:00:00Z",
+      },
+    });
+    expect(JSON.stringify(result)).not.toMatch(/title|description|location|attendee|credential/iu);
+    expect(listPersonalCalendarBusyWindows).toHaveBeenCalledWith({
+      householdId: personalJob.householdId,
+      adultId: ADULT_A,
+      asOf: "2027-02-01T08:05:00.000Z",
+      from: "2027-01-31T08:05:00.000Z",
+      to: "2027-07-31T08:05:00.000Z",
+      limit: 500,
+    });
+  });
+
+  it("fails closed if a Calendar projection adapter returns private fields", async () => {
+    const queued = await queuedWorker({ purpose: "meal_plan" });
+    const job = {
+      ...queued.job,
+      scopeGrant: { ...queued.job.scopeGrant, visibility: "personal" as const, adultId: ADULT_A },
+    };
+    const snapshot = {
+      ...queued.snapshot,
+      projection: {
+        ...queued.snapshot.projection,
+        workers: queued.snapshot.projection.workers.map((record) =>
+          record.job.jobId === job.jobId ? { ...record, job } : record,
+        ),
+      },
+    };
+    const options = await new ScopedWorkerContext({
+      now: () => WORKER_NOW,
+      calendarSchedule: {
+        listPersonalCalendarBusyWindows: async () =>
+          ({
+            windows: [
+              {
+                startsAt: "2027-01-02T17:00:00Z",
+                endsAt: "2027-01-02T18:00:00Z",
+                allDay: false,
+                title: "Private medical appointment",
+              },
+            ],
+            complete: true,
+            synchronizedAt: "2027-02-01T08:00:00Z",
+          }) as never,
+      },
+    }).contextFor(job, snapshot);
+
+    await expect(
+      requiredTool(options, "household_schedule").execute({ limit: 10 }, executionContext(job)),
+    ).rejects.toMatchObject({ code: "context_unavailable" });
   });
 
   it("searches without an API key and returns extracted text with source URLs", async () => {

@@ -2,6 +2,7 @@ import { hostname } from "node:os";
 import {
   GmailAdapter,
   type GmailPubSubEvent,
+  GoogleCalendarAdapter,
   GoogleOAuthAdapter,
   parseGoogleAdapterConfig,
 } from "./adapters/google/index.js";
@@ -36,8 +37,13 @@ import {
   productionHttpLoggerOptions,
 } from "./http/index.js";
 import { createPostgresDailyBriefHost } from "./infrastructure/daily-brief-host.js";
-import { GoogleSyncError, GoogleSyncService } from "./infrastructure/google-sync.js";
-import { GoogleSyncBackgroundHost } from "./infrastructure/google-sync-host.js";
+import {
+  type CalendarSyncWork,
+  GoogleCalendarPushIngress,
+  GoogleCalendarSyncService,
+} from "./infrastructure/google-calendar-sync.js";
+import { type GmailSyncWork, GoogleSyncError, GoogleSyncService } from "./infrastructure/google-sync.js";
+import { GoogleSyncBackgroundHost, type GoogleSyncQueuePort } from "./infrastructure/google-sync-host.js";
 import {
   DurableProviderIngress,
   GoogleOAuthHandoffService,
@@ -246,7 +252,7 @@ export async function createProductionComposition(
       repository: applicationStore,
       interpreter,
       workerRuntime,
-      workerContext: new ScopedWorkerContext(),
+      workerContext: new ScopedWorkerContext({ calendarSchedule: runtimeStore }),
       effectExecutor: new ProductionApplicationEffectExecutor({
         sender: linq,
         channelDirectory: runtimeStore,
@@ -257,7 +263,9 @@ export async function createProductionComposition(
 
     const google = createGoogleComposition({
       config,
-      enabled: integrations.google,
+      googleOAuthEnabled: integrations.googleOAuth,
+      gmailEnabled: integrations.gmail,
+      calendarEnabled: integrations.googleCalendar,
       application,
       applicationStore,
       runtimeStore,
@@ -299,7 +307,7 @@ export async function createProductionComposition(
       { run: (signal) => durableWorker.run(application, signal) },
       { run: (signal) => dailyBrief.run(application, signal) },
       maintenance,
-      ...(google.background === null ? [] : [google.background]),
+      ...google.backgrounds,
     ];
     const background = new ProductionBackgroundRuntime(loops);
     const linqReady = integrations.linq;
@@ -321,7 +329,7 @@ export async function createProductionComposition(
         },
         model: async () => true,
         linq: async () => linqReady,
-        google: async () => integrations.google,
+        google: async () => integrations.googleOAuth,
         worker: async () => (config.FLORENCE_PROCESS_ROLE === "web" ? false : background.isHealthy()),
       },
       ownerDirectory: runtimeStore,
@@ -334,12 +342,16 @@ export async function createProductionComposition(
         ...(!integrations.linq || config.LINQ_WEBHOOK_SECRET === undefined
           ? {}
           : { LINQ_WEBHOOK_SECRET: config.LINQ_WEBHOOK_SECRET }),
-        ...(!integrations.google || config.GOOGLE_PUBSUB_VERIFICATION_TOKEN === undefined
+        ...(!integrations.gmail || config.GOOGLE_PUBSUB_VERIFICATION_TOKEN === undefined
           ? {}
           : { GOOGLE_PUBSUB_VERIFICATION_TOKEN: config.GOOGLE_PUBSUB_VERIFICATION_TOKEN }),
+        GOOGLE_CALENDAR_PUSH_ENABLED: google.calendarPush !== null,
       }),
       services: {
-        ingress: new DurableProviderIngress(applicationStore),
+        ingress: new DurableProviderIngress(
+          applicationStore,
+          google.calendarPush === null ? undefined : google.calendarPush,
+        ),
         googleOAuth: google.oauth,
         readiness,
         operations,
@@ -403,12 +415,15 @@ type GoogleComposition = {
     }>;
   };
   privateCommands: PrivateGoogleCommandService | null;
-  background: GoogleSyncBackgroundHost | null;
+  calendarPush: GoogleCalendarPushIngress | null;
+  backgrounds: readonly BackgroundLoop[];
 };
 
 function createGoogleComposition(input: {
   config: FlorenceConfig;
-  enabled: boolean;
+  googleOAuthEnabled: boolean;
+  gmailEnabled: boolean;
+  calendarEnabled: boolean;
   application: FlorenceApplication;
   applicationStore: ApplicationStore;
   runtimeStore: FlorenceRuntimeStore;
@@ -416,19 +431,18 @@ function createGoogleComposition(input: {
 }): GoogleComposition {
   const { config } = input;
   if (
-    !input.enabled ||
+    !input.googleOAuthEnabled ||
     !config.GOOGLE_CLIENT_ID ||
     !config.GOOGLE_CLIENT_SECRET ||
     !config.GOOGLE_OAUTH_STATE_SECRET ||
-    !config.GOOGLE_REDIRECT_URI ||
-    !config.GOOGLE_GMAIL_TOPIC_NAME ||
-    !config.GOOGLE_GMAIL_PUBSUB_SUBSCRIPTION
+    !config.GOOGLE_REDIRECT_URI
   ) {
     return {
       oauth: new UnavailableGoogleOAuth(),
       pushProcessor: new UnavailableGooglePushProcessor(),
       privateCommands: null,
-      background: null,
+      calendarPush: null,
+      backgrounds: [],
     };
   }
 
@@ -438,20 +452,63 @@ function createGoogleComposition(input: {
     redirectUri: config.GOOGLE_REDIRECT_URI,
   });
   const oauthAdapter = new GoogleOAuthAdapter(adapterConfig);
-  const sync = new GoogleSyncService({
-    directory: input.runtimeStore,
-    repository: input.runtimeStore,
-    gmail: new GmailAdapter(adapterConfig),
-    oauth: oauthAdapter,
-    application: input.application,
-    secretBox: input.secretBox,
-    gmailTopicName: config.GOOGLE_GMAIL_TOPIC_NAME,
-    gmailPubSubSubscription: config.GOOGLE_GMAIL_PUBSUB_SUBSCRIPTION,
-  });
+  const backgrounds: BackgroundLoop[] = [];
+  let pushProcessor: GoogleComposition["pushProcessor"] = new UnavailableGooglePushProcessor();
+  if (
+    input.gmailEnabled &&
+    config.GOOGLE_GMAIL_TOPIC_NAME !== undefined &&
+    config.GOOGLE_GMAIL_PUBSUB_SUBSCRIPTION !== undefined
+  ) {
+    const gmailSync = new GoogleSyncService({
+      directory: input.runtimeStore,
+      repository: input.runtimeStore,
+      gmail: new GmailAdapter(adapterConfig),
+      oauth: oauthAdapter,
+      application: input.application,
+      secretBox: input.secretBox,
+      gmailTopicName: config.GOOGLE_GMAIL_TOPIC_NAME,
+      gmailPubSubSubscription: config.GOOGLE_GMAIL_PUBSUB_SUBSCRIPTION,
+    });
+    pushProcessor = gmailSync;
+    backgrounds.push(
+      new GoogleSyncBackgroundHost<GmailSyncWork>({
+        queue: input.runtimeStore,
+        sync: gmailSync,
+        workerId: workerId("google-gmail"),
+        pollIntervalMs: config.WORKER_POLL_INTERVAL_MS,
+        leaseSeconds: Math.max(300, config.WORKER_LEASE_SECONDS),
+      }),
+    );
+  }
+
+  let calendarPush: GoogleCalendarPushIngress | null = null;
+  if (input.calendarEnabled) {
+    const calendarSync = new GoogleCalendarSyncService({
+      directory: input.runtimeStore,
+      repository: input.runtimeStore,
+      calendar: new GoogleCalendarAdapter(adapterConfig),
+      oauth: oauthAdapter,
+      secretBox: input.secretBox,
+      publicBaseUrl: config.FLORENCE_WEB_BASE_URL,
+    });
+    const calendarQueue = calendarQueueAdapter(input.runtimeStore);
+    calendarPush = new GoogleCalendarPushIngress({ store: input.runtimeStore });
+    backgrounds.push(
+      new GoogleSyncBackgroundHost<CalendarSyncWork>({
+        queue: calendarQueue,
+        sync: calendarSync,
+        workerId: workerId("google-calendar"),
+        pollIntervalMs: config.WORKER_POLL_INTERVAL_MS,
+        leaseSeconds: Math.max(300, config.WORKER_LEASE_SECONDS),
+      }),
+    );
+  }
   const privateCommands = new PrivateGoogleCommandService({
     outbox: input.applicationStore,
     directory: input.runtimeStore,
     googleQueue: input.runtimeStore,
+    ...(input.calendarEnabled ? { calendarQueue: input.runtimeStore } : {}),
+    gmailSyncEnabled: input.gmailEnabled,
     linkIssuer: {
       issue(link) {
         const token = issueGoogleHandoffToken(
@@ -478,14 +535,17 @@ function createGoogleComposition(input: {
     handoffSecret: config.GOOGLE_OAUTH_STATE_SECRET,
     onConnected: (event) => privateCommands.onGoogleConnected(event),
   });
-  const background = new GoogleSyncBackgroundHost({
-    queue: input.runtimeStore,
-    sync,
-    workerId: workerId("google"),
-    pollIntervalMs: config.WORKER_POLL_INTERVAL_MS,
-    leaseSeconds: Math.max(300, config.WORKER_LEASE_SECONDS),
-  });
-  return { oauth, pushProcessor: sync, privateCommands, background };
+  return { oauth, pushProcessor, privateCommands, calendarPush, backgrounds };
+}
+
+function calendarQueueAdapter(store: FlorenceRuntimeStore): GoogleSyncQueuePort<CalendarSyncWork> {
+  return {
+    reconcileGoogleSyncWork: (asOf) => store.reconcileCalendarSyncWork(asOf),
+    claimGoogleSyncWork: (input) => store.claimCalendarSyncWork(input),
+    completeGoogleSyncWork: (input) => store.completeCalendarSyncWork(input),
+    retryGoogleSyncWork: (input) => store.retryCalendarSyncWork(input),
+    deadLetterGoogleSyncWork: (input) => store.deadLetterCalendarSyncWork(input),
+  };
 }
 
 class UnavailableGoogleOAuth implements GoogleOAuthHandoff {

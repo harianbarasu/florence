@@ -203,6 +203,17 @@ export class FlorenceRuntimeStore {
     if (await this.isSuppressed(input.externalChatId, handle)) {
       throw new ApplicationStoreError("not_authorized", "This Linq identity is opted out");
     }
+    const deletionDigests = [
+      this.deletionIdentityDigest("linq-chat", input.externalChatId),
+      this.deletionIdentityDigest("linq-handle", handle),
+    ];
+    const deleted = await this.database<{ request_id: string }[]>`
+      select request_id from customer_deletion_tombstones
+      where routing_digests && ${deletionDigests}::text[] limit 1
+    `;
+    if (deleted[0]) {
+      throw new ApplicationStoreError("not_authorized", "This Linq identity was deleted");
+    }
 
     const householdId = randomUUID();
     const adultId = randomUUID();
@@ -700,6 +711,7 @@ export class FlorenceRuntimeStore {
     targetScope: DurableScope;
     loadGroupChat: (chatId: string) => Promise<LinqChat>;
     send: (chatId: string) => Promise<LinqSendReceipt>;
+    allowWhileDeleting?: boolean;
   }): Promise<SerializedLinqSendResult> {
     const householdId = HouseholdIdSchema.parse(input.householdId);
     const targetScope = DurableScopeSchema.parse(input.targetScope);
@@ -721,6 +733,17 @@ export class FlorenceRuntimeStore {
 
     return this.database.begin(async (transaction) => {
       await lockLinqChat(transaction, chatId);
+      const households = await transaction<{ status: string }[]>`
+        select status from households where id = ${householdId} for update
+      `;
+      const household = households[0];
+      if (!household) return { status: "inactive" };
+      if (
+        household.status === "deleting" &&
+        !(input.allowWhileDeleting === true && targetScope.kind === "personal")
+      ) {
+        return { status: "inactive" };
+      }
       type SerializedBindingRow = {
         id: string;
         external_chat_id: string;
@@ -1873,11 +1896,14 @@ export class FlorenceRuntimeStore {
     }
     const id = randomUUID();
     const rows = await this.database<{ id: string }[]>`
-      insert into jobs (id, household_id, kind, status, payload, max_attempts, idempotency_key)
-      values (
-        ${id}, ${parsed.householdId}, 'google.calendar.sync', 'pending',
-        ${this.database.json(JSON.parse(JSON.stringify(parsed.work)))}, 8, ${parsed.idempotencyKey}
+      insert into jobs (
+        id, household_id, kind, status, payload, max_attempts, idempotency_key, control_epoch
       )
+      select ${id}, household.id, 'google.calendar.sync', 'pending',
+        ${this.database.json(JSON.parse(JSON.stringify(parsed.work)))}, 8,
+        ${parsed.idempotencyKey}, household.control_epoch
+      from households household
+      where household.id = ${parsed.householdId} and household.status <> 'deleting'
       on conflict (idempotency_key) where idempotency_key is not null do nothing
       returning id
     `;
@@ -1907,11 +1933,14 @@ export class FlorenceRuntimeStore {
         updated_at: Date;
       }[]
     >`
-      select id, household_id, adult_id, cursor, updated_at
-      from external_connections
-      where provider = 'google' and status = 'active'
-        and granted_scopes && ${[GOOGLE_CALENDAR_READONLY_SCOPE, GOOGLE_CALENDAR_EVENTS_SCOPE]}::text[]
-      order by updated_at
+      select connection.id, connection.household_id, connection.adult_id,
+        connection.cursor, connection.updated_at
+      from external_connections connection
+      join households household on household.id = connection.household_id
+      where connection.provider = 'google' and connection.status = 'active'
+        and household.status <> 'deleting'
+        and connection.granted_scopes && ${[GOOGLE_CALENDAR_READONLY_SCOPE, GOOGLE_CALENDAR_EVENTS_SCOPE]}::text[]
+      order by connection.updated_at
     `;
     let created = 0;
     for (const row of rows) {
@@ -1973,12 +2002,15 @@ export class FlorenceRuntimeStore {
         }[]
       >`
         with candidates as (
-          select id from jobs
-          where kind = 'google.calendar.sync' and (
-            (status in ('pending', 'retry') and available_at <= now())
-            or (status = 'leased' and lease_expires_at < now())
+          select job.id from jobs job
+          join households household on household.id = job.household_id
+          where job.kind = 'google.calendar.sync' and (
+            (job.status in ('pending', 'retry') and job.available_at <= now())
+            or (job.status = 'leased' and job.lease_expires_at < now())
           )
-          order by available_at, created_at
+            and household.status <> 'deleting'
+            and job.control_epoch = household.control_epoch
+          order by job.available_at, job.created_at
           for update skip locked
           limit ${parsed.limit}
         )
@@ -2065,12 +2097,13 @@ export class FlorenceRuntimeStore {
     const id = randomUUID();
     const rows = await this.database<{ id: string }[]>`
       insert into jobs (
-        id, household_id, kind, status, payload, max_attempts, idempotency_key
-      ) values (
-        ${id}, ${parsed.householdId}, 'google.sync', 'pending',
-        ${this.database.json(JSON.parse(JSON.stringify(parsed.work)))}, 8,
-        ${parsed.idempotencyKey}
+        id, household_id, kind, status, payload, max_attempts, idempotency_key, control_epoch
       )
+      select ${id}, household.id, 'google.sync', 'pending',
+        ${this.database.json(JSON.parse(JSON.stringify(parsed.work)))}, 8,
+        ${parsed.idempotencyKey}, household.control_epoch
+      from households household
+      where household.id = ${parsed.householdId} and household.status <> 'deleting'
       on conflict (idempotency_key) where idempotency_key is not null do nothing
       returning id
     `;
@@ -2094,10 +2127,12 @@ export class FlorenceRuntimeStore {
     const rows = await this.database<
       { id: string; household_id: string; adult_id: string; cursor: Record<string, unknown> }[]
     >`
-      select id, household_id, adult_id, cursor
-      from external_connections
-      where provider = 'google' and status = 'active' and cursor ? 'gmail'
-      order by updated_at
+      select connection.id, connection.household_id, connection.adult_id, connection.cursor
+      from external_connections connection
+      join households household on household.id = connection.household_id
+      where connection.provider = 'google' and connection.status = 'active'
+        and connection.cursor ? 'gmail' and household.status <> 'deleting'
+      order by connection.updated_at
     `;
     let created = 0;
     for (const row of rows) {
@@ -2145,12 +2180,15 @@ export class FlorenceRuntimeStore {
         }[]
       >`
         with candidates as (
-          select id from jobs
-          where kind = 'google.sync' and (
-            (status in ('pending', 'retry') and available_at <= now())
-            or (status = 'leased' and lease_expires_at < now())
+          select job.id from jobs job
+          join households household on household.id = job.household_id
+          where job.kind = 'google.sync' and (
+            (job.status in ('pending', 'retry') and job.available_at <= now())
+            or (job.status = 'leased' and job.lease_expires_at < now())
           )
-          order by available_at, created_at
+            and household.status <> 'deleting'
+            and job.control_epoch = household.control_epoch
+          order by job.available_at, job.created_at
           for update skip locked
           limit ${parsed.limit}
         )
@@ -2242,6 +2280,13 @@ export class FlorenceRuntimeStore {
   public digestHandle(handle: string): string {
     return createHmac("sha256", this.identityKey)
       .update(`linq-handle:v1:${canonicalizeLinqHandle(handle)}`)
+      .digest("hex");
+  }
+
+  private deletionIdentityDigest(kind: "linq-chat" | "linq-handle", value: string): string {
+    return createHmac("sha256", this.identityKey)
+      .update(`florence:customer-deletion:${kind}:v1\0`)
+      .update(value.normalize("NFKC"))
       .digest("hex");
   }
 

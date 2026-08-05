@@ -241,8 +241,10 @@ export class FlorenceStore {
 
     try {
       return await this.database.begin(async (transaction) => {
-        const households = await transaction<{ next_signal_sequence: string }[]>`
-          select next_signal_sequence
+        const households = await transaction<
+          { next_signal_sequence: string; status: string; control_epoch: string }[]
+        >`
+          select next_signal_sequence, status, control_epoch
           from households
           where id = ${input.householdId}
           for update
@@ -251,6 +253,7 @@ export class FlorenceStore {
         if (!household) {
           throw new Error("Unknown household");
         }
+        if (household.status === "deleting") throw new Error("Household deletion is fenced");
         const sequence = Number(household.next_signal_sequence);
         await transaction`
           update households
@@ -268,10 +271,12 @@ export class FlorenceStore {
           )
         `;
         await transaction`
-          insert into jobs (id, household_id, signal_id, kind, status, payload)
+          insert into jobs (
+            id, household_id, signal_id, kind, status, payload, control_epoch
+          )
           values (
             ${jobId}, ${input.householdId}, ${signalId}, ${input.jobKind}, 'pending',
-            ${json(this.database, { signalId, sequence })}
+            ${json(this.database, { signalId, sequence })}, ${Number(household.control_epoch)}
           )
         `;
         return {
@@ -302,13 +307,15 @@ export class FlorenceStore {
     const token = randomUUID();
     const rows = await this.database<JobRow[]>`
       with candidates as (
-        select id
-        from jobs
+        select job.id
+        from jobs job
+        join households household on household.id = job.household_id
         where (
-          (status in ('pending', 'retry') and available_at <= now())
-          or (status = 'leased' and lease_expires_at < now())
+          (job.status in ('pending', 'retry') and job.available_at <= now())
+          or (job.status = 'leased' and job.lease_expires_at < now())
         )
-        order by available_at, created_at
+          and household.status <> 'deleting' and job.control_epoch = household.control_epoch
+        order by job.available_at, job.created_at
         for update skip locked
         limit ${limit}
       )
@@ -376,9 +383,11 @@ export class FlorenceStore {
         {
           version: string;
           next_audit_sequence: string;
+          status: string;
+          control_epoch: string;
         }[]
       >`
-        select version, next_audit_sequence
+        select version, next_audit_sequence, status, control_epoch
         from households
         where id = ${input.householdId}
         for update
@@ -387,6 +396,7 @@ export class FlorenceStore {
       if (!household) {
         throw new Error("Unknown household");
       }
+      if (household.status === "deleting") throw new Error("Household deletion is fenced");
       const currentVersion = Number(household.version);
       if (currentVersion !== input.expectedHouseholdVersion) {
         throw new StaleHouseholdVersionError(input.expectedHouseholdVersion, currentVersion);
@@ -444,19 +454,23 @@ export class FlorenceStore {
       for (const trigger of input.triggers ?? []) {
         await transaction`
           insert into scheduled_triggers (
-            id, household_id, episode_id, trigger_kind, plan_version, due_at, status, payload
+            id, household_id, episode_id, trigger_kind, plan_version, due_at, status,
+            payload, control_epoch
           ) values (
             ${trigger.id}, ${input.householdId}, ${trigger.episodeId ?? null}, ${trigger.triggerKind},
-            ${trigger.planVersion}, ${trigger.dueAt}, 'scheduled', ${json(this.database, trigger.payload)}
+            ${trigger.planVersion}, ${trigger.dueAt}, 'scheduled',
+            ${json(this.database, trigger.payload)}, ${Number(household.control_epoch)}
           )
         `;
       }
       for (const effect of input.outbox ?? []) {
         await transaction`
-          insert into outbox (id, household_id, effect_kind, idempotency_key, payload, status)
+          insert into outbox (
+            id, household_id, effect_kind, idempotency_key, payload, status, control_epoch
+          )
           values (
             ${effect.id}, ${input.householdId}, ${effect.effectKind}, ${effect.idempotencyKey},
-            ${json(this.database, effect.payload)}, 'pending'
+            ${json(this.database, effect.payload)}, 'pending', ${Number(household.control_epoch)}
           )
           on conflict (idempotency_key) do nothing
         `;

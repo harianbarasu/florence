@@ -606,11 +606,14 @@ export class ApplicationStore implements ApplicationRepositoryPort {
       .parse(input);
     const householdId = z.uuid().parse(parsed.snapshot.aggregate.householdId);
     return this.database.begin(async (transaction) => {
-      const households = await transaction<{ id: string }[]>`
-        select id from households where id = ${householdId} for update
+      const households = await transaction<{ id: string; status: string }[]>`
+        select id, status from households where id = ${householdId} for update
       `;
       if (!households[0]) {
         throw new ApplicationStoreError("not_found", "Unknown household");
+      }
+      if (households[0].status === "deleting") {
+        throw new ApplicationStoreError("invalid_state", "Household deletion is fenced");
       }
       const inserted = await transaction<{ household_id: string }[]>`
         insert into application_snapshots (
@@ -684,8 +687,11 @@ export class ApplicationStore implements ApplicationRepositoryPort {
     });
 
     return this.database.begin(async (transaction) => {
-      const currentRows = await transaction<{ revision: string; next_audit_sequence: string }[]>`
-        select application_snapshots.revision, households.next_audit_sequence
+      const currentRows = await transaction<
+        { revision: string; next_audit_sequence: string; household_status: string }[]
+      >`
+        select application_snapshots.revision, households.next_audit_sequence,
+          households.status as household_status
         from application_snapshots
         join households on households.id = application_snapshots.household_id
         where application_snapshots.household_id = ${parsed.householdId}
@@ -715,6 +721,10 @@ export class ApplicationStore implements ApplicationRepositoryPort {
           revision: Number(prior.revision),
           outcome: ApplicationOutcomeSchema.parse(prior.outcome),
         };
+      }
+
+      if (current.household_status === "deleting") {
+        throw new ApplicationStoreError("invalid_state", "Household deletion is fenced");
       }
 
       const currentRevision = Number(current.revision);
@@ -865,13 +875,15 @@ export class ApplicationStore implements ApplicationRepositoryPort {
       `;
       const rows = await transaction<ProviderInboxRow[]>`
         with candidates as (
-          select id
-          from provider_inbox
+          select inbox.id
+          from provider_inbox inbox
+          left join households household on household.id = inbox.household_id
           where (
-            (status = 'pending' and available_at <= now())
-            or (status = 'leased' and lease_expires_at < now())
+            (inbox.status = 'pending' and inbox.available_at <= now())
+            or (inbox.status = 'leased' and inbox.lease_expires_at < now())
           )
-          order by available_at, received_at
+            and (inbox.household_id is null or household.status <> 'deleting')
+          order by inbox.available_at, inbox.received_at
           for update skip locked
           limit ${parsed.limit}
         )
@@ -1219,12 +1231,15 @@ export class ApplicationStore implements ApplicationRepositoryPort {
       })
       .parse(input);
     return this.database.begin(async (transaction) => {
-      const households = await transaction<{ version: string }[]>`
-        select version from households where id = ${parsed.householdId} for update
+      const households = await transaction<{ version: string; status: string }[]>`
+        select version, status from households where id = ${parsed.householdId} for update
       `;
       const household = households[0];
       if (!household) {
         throw new ApplicationStoreError("not_found", "Unknown household");
+      }
+      if (household.status === "deleting") {
+        throw new ApplicationStoreError("invalid_state", "Household deletion is fenced");
       }
       const inserted = await transaction<{ household_id: string }[]>`
         insert into household_projections (household_id, schema_version, version, state)
@@ -1279,9 +1294,15 @@ export class ApplicationStore implements ApplicationRepositoryPort {
     const parsed = projectionCommitSchema.parse(input);
     return this.database.begin(async (transaction) => {
       const rows = await transaction<
-        { version: string; household_version: string; next_audit_sequence: string }[]
+        {
+          version: string;
+          household_version: string;
+          next_audit_sequence: string;
+          household_status: string;
+        }[]
       >`
-        select hp.version, h.version as household_version, h.next_audit_sequence
+        select hp.version, h.version as household_version, h.next_audit_sequence,
+          h.status as household_status
         from household_projections hp
         join households h on h.id = hp.household_id
         where hp.household_id = ${parsed.householdId}
@@ -1290,6 +1311,9 @@ export class ApplicationStore implements ApplicationRepositoryPort {
       const current = rows[0];
       if (!current) {
         throw new ApplicationStoreError("not_found", "Household projection is not initialized");
+      }
+      if (current.household_status === "deleting") {
+        throw new ApplicationStoreError("invalid_state", "Household deletion is fenced");
       }
       const projectionVersion = Number(current.version);
       const householdVersion = Number(current.household_version);
@@ -1355,9 +1379,12 @@ export class ApplicationStore implements ApplicationRepositoryPort {
     rowId: string;
   }> {
     const parsed = z.strictObject({ householdId: z.uuid(), ...projectionTimerSchema.shape }).parse(input);
-    return this.database.begin(async (transaction) => ({
-      rowId: await upsertTimerIntent(transaction, this.database, parsed.householdId, parsed),
-    }));
+    return this.database.begin(async (transaction) => {
+      await requireWritableHousehold(transaction, parsed.householdId);
+      return {
+        rowId: await upsertTimerIntent(transaction, this.database, parsed.householdId, parsed),
+      };
+    });
   }
 
   public async cancelTimer(input: { householdId: string; timerKey: string }): Promise<boolean> {
@@ -1793,13 +1820,16 @@ export class ApplicationStore implements ApplicationRepositoryPort {
     const leaseToken = randomUUID();
     const rows = await this.database<TimerRow[]>`
       with candidates as (
-        select id
-        from scheduled_triggers
+        select trigger.id
+        from scheduled_triggers trigger
+        join households household on household.id = trigger.household_id
         where (
-          (status = 'scheduled' and due_at <= now() and available_at <= now())
-          or (status = 'claimed' and lease_expires_at < now())
+          (trigger.status = 'scheduled' and trigger.due_at <= now() and trigger.available_at <= now())
+          or (trigger.status = 'claimed' and trigger.lease_expires_at < now())
         )
-        order by due_at, created_at
+          and household.status <> 'deleting'
+          and trigger.control_epoch = household.control_epoch
+        order by trigger.due_at, trigger.created_at
         for update skip locked
         limit ${parsed.limit}
       )
@@ -1887,13 +1917,19 @@ export class ApplicationStore implements ApplicationRepositoryPort {
       `;
       const rows = await transaction<OutboxRow[]>`
         with candidates as (
-          select id
-          from outbox
+          select effect.id
+          from outbox effect
+          join households household on household.id = effect.household_id
           where (
-            (status in ('pending', 'retry') and available_at <= now())
-            or (status = 'leased' and lease_expires_at < now())
+            (effect.status in ('pending', 'retry') and effect.available_at <= now())
+            or (effect.status = 'leased' and effect.lease_expires_at < now())
           )
-          order by available_at, created_at
+            and effect.control_epoch = household.control_epoch
+            and (
+              household.status <> 'deleting'
+              or effect.intent_key like 'customer_control.deletion.fenced.%'
+            )
+          order by effect.available_at, effect.created_at
           for update skip locked
           limit ${parsed.limit}
         )
@@ -1915,6 +1951,14 @@ export class ApplicationStore implements ApplicationRepositoryPort {
 
   public async enqueueApplicationIntent(rawIntent: unknown): Promise<{ rowId: string }> {
     const rowId = await this.database.begin(async (transaction) => {
+      const intent = ApplicationOutboxIntentSchema.parse(rawIntent);
+      const households = await transaction<{ status: string }[]>`
+        select status from households where id = ${intent.householdId} for update
+      `;
+      if (!households[0]) throw new ApplicationStoreError("not_found", "Unknown household");
+      if (households[0].status === "deleting") {
+        throw new ApplicationStoreError("invalid_state", "Household deletion is fenced");
+      }
       const inserted = await this.insertApplicationIntent(transaction, rawIntent);
       return inserted.rowId;
     });
@@ -1927,6 +1971,7 @@ export class ApplicationStore implements ApplicationRepositoryPort {
     rawIntent: unknown,
   ): Promise<{ rowId: string }> {
     const intent = ApplicationOutboxIntentSchema.parse(rawIntent);
+    await requireWritableHousehold(transaction, intent.householdId);
     const rowId = await insertOutboxIntent(transaction, this.database, intent.householdId, {
       intentKey: intent.intentId,
       effectKind: intent.kind,
@@ -2055,6 +2100,7 @@ export class ApplicationStore implements ApplicationRepositoryPort {
   public async appendAudit(input: { householdId: string; audit: ProjectionAuditIntent }): Promise<number> {
     const parsed = z.strictObject({ householdId: z.uuid(), audit: projectionAuditSchema }).parse(input);
     return this.database.begin(async (transaction) => {
+      await requireWritableHousehold(transaction, parsed.householdId);
       const rows = await transaction<{ next_audit_sequence: string }[]>`
         select next_audit_sequence from households
         where id = ${parsed.householdId} for update
@@ -2608,6 +2654,19 @@ async function lockApplicationIdentity(
   `;
 }
 
+async function requireWritableHousehold(
+  transaction: TransactionSql<Record<string, never>>,
+  householdId: string,
+): Promise<void> {
+  const rows = await transaction<{ status: string }[]>`
+    select status from households where id = ${householdId} for update
+  `;
+  if (!rows[0]) throw new ApplicationStoreError("not_found", "Unknown household");
+  if (rows[0].status === "deleting") {
+    throw new ApplicationStoreError("invalid_state", "Household deletion is fenced");
+  }
+}
+
 async function upsertTimerIntent(
   transaction: TransactionSql<Record<string, never>>,
   database: Database,
@@ -2618,11 +2677,12 @@ async function upsertTimerIntent(
   const inserted = await transaction<{ id: string }[]>`
     insert into scheduled_triggers (
       id, household_id, episode_id, timer_key, episode_key, trigger_kind,
-      plan_version, due_at, available_at, status, payload
+      plan_version, due_at, available_at, status, payload, control_epoch
     ) values (
       ${rowId}, ${householdId}, null, ${timer.timerKey}, ${timer.episodeKey ?? null},
       ${timer.triggerKind}, ${timer.planVersion}, ${timer.dueAt}, ${timer.dueAt},
-      'scheduled', ${json(database, timer.payload)}
+      'scheduled', ${json(database, timer.payload)},
+      (select control_epoch from households where id = ${householdId})
     )
     on conflict (household_id, timer_key) where timer_key is not null
     do nothing
@@ -2665,11 +2725,12 @@ async function insertOutboxIntent(
   const inserted = await transaction<{ id: string }[]>`
     insert into outbox (
       id, household_id, intent_key, effect_kind, idempotency_key, payload,
-      payload_hash, status, max_attempts
+      payload_hash, status, max_attempts, control_epoch
     ) values (
       ${rowId}, ${householdId}, ${effect.intentKey}, ${effect.effectKind},
       ${effect.idempotencyKey}, ${json(database, effect.payload)}, ${hash},
-      'pending', ${effect.maxAttempts}
+      'pending', ${effect.maxAttempts},
+      (select control_epoch from households where id = ${householdId})
     )
     on conflict do nothing
     returning id

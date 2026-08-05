@@ -71,6 +71,7 @@ function snapshot(overrides: Partial<HouseholdApplicationSnapshot["projection"][
         profileConfirmedAdultIds: [ADULT_A, ADULT_B],
         ...overrides,
       },
+      sharedProfile: { facts: [] },
       gmailTriage: [],
       pendingPromotions: [],
       workers: [],

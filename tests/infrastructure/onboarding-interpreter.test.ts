@@ -46,6 +46,7 @@ describe("OnboardingAwareInterpreter", () => {
             privateDmAdultIds: [ADULT_A],
             profileConfirmedAdultIds: [],
           },
+          sharedProfile: { facts: [] },
           openEpisodes: [],
           pendingPromotionIds: [],
         },
@@ -77,6 +78,7 @@ describe("OnboardingAwareInterpreter", () => {
         privateDmAdultIds: [],
         profileConfirmedAdultIds: [],
       },
+      sharedProfile: { facts: [] },
       openEpisodes: [],
       pendingPromotionIds: [],
     };
@@ -97,7 +99,7 @@ describe("OnboardingAwareInterpreter", () => {
 
   it("recognizes invitee consent, group registration, and explicit profile confirmation", async () => {
     const interpreter = new OnboardingAwareInterpreter(model(), { prepareInvitation: vi.fn() });
-    const base = { openEpisodes: [], pendingPromotionIds: [] };
+    const base = { sharedProfile: { facts: [] }, openEpisodes: [], pendingPromotionIds: [] };
     await expect(
       interpreter.interpretConversation(
         directMessage("accept", "I accept and consent", ADULT_B, "2026-08-05T16:00:00Z"),

@@ -134,6 +134,38 @@ describe("Florence application coordinator", () => {
         phase: "building_profile",
       },
       {
+        key: "onboard-profile",
+        input: groupMessage(
+          "onboard-profile",
+          "Maya goes to Lakeside School, has soccer Tuesdays, and is allergic to peanuts.",
+          "2027-01-01T08:03:30Z",
+        ),
+        response: {
+          ...classificationBase,
+          intent: "onboarding",
+          action: "update_profile",
+          profileFacts: [
+            { category: "dependent", subject: "Maya", detail: "Maya is a child in the household." },
+            {
+              category: "school_childcare",
+              subject: "Maya",
+              detail: "Maya attends Lakeside School.",
+            },
+            {
+              category: "recurring_activity",
+              subject: "Maya soccer",
+              detail: "Soccer is on Tuesdays.",
+            },
+            {
+              category: "dietary_constraint",
+              subject: "Maya",
+              detail: "Maya has a peanut allergy.",
+            },
+          ],
+        },
+        phase: "building_profile",
+      },
+      {
         key: "onboard-confirm-a",
         input: groupMessage("onboard-confirm-a", "Profile looks right", "2027-01-01T08:04:00Z"),
         response: { ...classificationBase, intent: "onboarding", action: "confirm_profile" },
@@ -178,6 +210,87 @@ describe("Florence application coordinator", () => {
     });
     expect(snapshot?.aggregate.version).toBe(0);
     expect(snapshot?.aggregate.lastProcessedSequence).toBe(0);
+    expect(snapshot?.projection.sharedProfile.facts).toHaveLength(4);
+    expect(snapshot?.projection.sharedProfile.facts[1]).toMatchObject({
+      sourceRef: "message_onboard-profile",
+      recordedByAdultId: ADULT_A,
+    });
+  });
+
+  it("keeps profile updates in the group and invalidates stale confirmations", async () => {
+    const harness = setup();
+    const app = createFlorenceApplication(harness.dependencies);
+    const privateKey = "private-profile-update";
+    harness.interpreter.respondToConversation(privateKey, {
+      ...classificationBase,
+      intent: "onboarding",
+      action: "update_profile",
+      profileFacts: [
+        {
+          category: "dietary_constraint",
+          subject: "Private detail",
+          detail: "This must not become household data.",
+        },
+      ],
+    });
+    await app.process(
+      directMessage(privateKey, "Add this private detail to the profile", ADULT_A, "2027-01-02T08:00:00Z"),
+    );
+    expect((await harness.repository.load(HOUSEHOLD_ID))?.projection.sharedProfile.facts).toEqual([]);
+
+    const groupKey = "shared-profile-update";
+    harness.interpreter.respondToConversation(groupKey, {
+      ...classificationBase,
+      intent: "onboarding",
+      action: "update_profile",
+      profileFacts: [
+        {
+          category: "routine_anchor",
+          subject: "School pickup",
+          detail: "School pickup is normally at 3:15 PM on weekdays.",
+        },
+      ],
+    });
+    await app.process(
+      groupMessage(groupKey, "School pickup is normally 3:15 on weekdays", "2027-01-02T08:01:00Z"),
+    );
+    const snapshot = await harness.repository.load(HOUSEHOLD_ID);
+    expect(snapshot?.projection.onboarding).toMatchObject({
+      phase: "active",
+      profileConfirmedAdultIds: [],
+    });
+    expect(snapshot?.projection.sharedProfile.facts).toEqual([
+      expect.objectContaining({
+        category: "routine_anchor",
+        subject: "School pickup",
+        sourceRef: "message_shared-profile-update",
+        recordedByAdultId: ADULT_A,
+      }),
+    ]);
+
+    const correctionKey = "shared-profile-correction";
+    harness.interpreter.respondToConversation(correctionKey, {
+      ...classificationBase,
+      intent: "onboarding",
+      action: "update_profile",
+      profileFacts: [
+        {
+          category: "routine_anchor",
+          subject: "School pickup",
+          detail: "School pickup is normally at 3:30 PM on weekdays.",
+        },
+      ],
+    });
+    await app.process(
+      groupMessage(correctionKey, "Correction: school pickup is 3:30", "2027-01-02T08:02:00Z"),
+    );
+    expect((await harness.repository.load(HOUSEHOLD_ID))?.projection.sharedProfile.facts).toEqual([
+      expect.objectContaining({
+        subject: "School pickup",
+        detail: "School pickup is normally at 3:30 PM on weekdays.",
+        sourceRef: "message_shared-profile-correction",
+      }),
+    ]);
   });
 
   it("drives a group obligation through owner acknowledgement, reminder, and closure", async () => {

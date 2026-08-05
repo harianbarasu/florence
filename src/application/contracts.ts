@@ -130,12 +130,36 @@ const ClassificationBaseShape = {
   rationale: NeutralFactualTextSchema,
 } as const;
 
+export const SharedProfileCategorySchema = z.enum([
+  "dependent",
+  "school_childcare",
+  "recurring_activity",
+  "routine_anchor",
+  "dietary_constraint",
+]);
+
+export const SharedProfileFactCandidateSchema = z.strictObject({
+  category: SharedProfileCategorySchema,
+  subject: NeutralDisplayTextSchema,
+  detail: FactualTextSchema,
+});
+
+export type SharedProfileFactCandidate = z.infer<typeof SharedProfileFactCandidateSchema>;
+
 const OnboardingClassificationSchema = z
   .strictObject({
     ...ClassificationBaseShape,
     intent: z.literal("onboarding"),
-    action: z.enum(["consent", "invite_adult", "accept_invite", "register_group", "confirm_profile"]),
+    action: z.enum([
+      "consent",
+      "invite_adult",
+      "accept_invite",
+      "register_group",
+      "update_profile",
+      "confirm_profile",
+    ]),
     invitedAdultId: AdultIdSchema.optional(),
+    profileFacts: z.array(SharedProfileFactCandidateSchema).min(1).max(30).optional(),
   })
   .superRefine((classification, context) => {
     if ((classification.action === "invite_adult") !== (classification.invitedAdultId !== undefined)) {
@@ -143,6 +167,13 @@ const OnboardingClassificationSchema = z
         code: "custom",
         path: ["invitedAdultId"],
         message: "Only an invite action identifies the invited adult",
+      });
+    }
+    if ((classification.action === "update_profile") !== (classification.profileFacts !== undefined)) {
+      context.addIssue({
+        code: "custom",
+        path: ["profileFacts"],
+        message: "Only a profile update supplies shared profile facts",
       });
     }
   });
@@ -312,6 +343,24 @@ export const OnboardingProjectionSchema = z
 
 export type OnboardingProjection = z.infer<typeof OnboardingProjectionSchema>;
 
+export const SharedProfileFactSchema = z.strictObject({
+  factKey: z.string().regex(/^profile:[a-f0-9]{32}$/u),
+  category: SharedProfileCategorySchema,
+  subject: NeutralDisplayTextSchema,
+  detail: FactualTextSchema,
+  sourceRef: StableReferenceSchema,
+  recordedByAdultId: AdultIdSchema,
+  recordedAt: InstantStringSchema,
+});
+
+export type SharedProfileFact = z.infer<typeof SharedProfileFactSchema>;
+
+export const SharedHouseholdProfileSchema = z.strictObject({
+  facts: z.array(SharedProfileFactSchema).max(200),
+});
+
+export type SharedHouseholdProfile = z.infer<typeof SharedHouseholdProfileSchema>;
+
 export const GmailTriageRecordSchema = z.strictObject({
   messageRef: StableReferenceSchema,
   ownerAdultId: AdultIdSchema,
@@ -356,6 +405,7 @@ export type WorkerRecord = z.infer<typeof WorkerRecordSchema>;
 
 export const ApplicationProjectionSchema = z.strictObject({
   onboarding: OnboardingProjectionSchema,
+  sharedProfile: SharedHouseholdProfileSchema,
   gmailTriage: z.array(GmailTriageRecordSchema).max(100_000),
   pendingPromotions: z.array(PendingPromotionSchema).max(10_000),
   workers: z.array(WorkerRecordSchema).max(10_000),

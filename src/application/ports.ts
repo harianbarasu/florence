@@ -17,6 +17,7 @@ import type {
 
 export interface ConversationInterpretationContext {
   readonly onboarding: ApplicationProjection["onboarding"];
+  readonly sharedProfile: ApplicationProjection["sharedProfile"];
   readonly openEpisodes: readonly {
     readonly episodeId: string;
     readonly type: "commitment" | "research" | "meal_plan";

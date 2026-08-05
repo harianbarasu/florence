@@ -61,4 +61,34 @@ describe("application-owned structured contracts", () => {
       }).success,
     ).toBe(false);
   });
+
+  it("requires bounded facts only on an explicit shared-profile update", () => {
+    expect(
+      ConversationClassificationSchema.safeParse({
+        ...classificationBase,
+        intent: "onboarding",
+        action: "update_profile",
+      }).success,
+    ).toBe(false);
+    expect(
+      ConversationClassificationSchema.safeParse({
+        ...classificationBase,
+        intent: "onboarding",
+        action: "confirm_profile",
+        profileFacts: [
+          { category: "dependent", subject: "Maya", detail: "Maya is a child in the household." },
+        ],
+      }).success,
+    ).toBe(false);
+    expect(
+      ConversationClassificationSchema.safeParse({
+        ...classificationBase,
+        intent: "onboarding",
+        action: "update_profile",
+        profileFacts: [
+          { category: "dependent", subject: "Maya", detail: "Maya is a child in the household." },
+        ],
+      }).success,
+    ).toBe(true);
+  });
 });

@@ -492,23 +492,55 @@ function applyOnboarding(
         "onboarding-profile",
         { kind: "household" },
         "onboarding",
-        "The household group is connected. Add the shared routines and time anchors, then both adults can confirm the profile.",
+        `The household group is connected. Let's make a light shared profile—not a meticulous tracker. In one or several messages, share only what helps coordination: children or other dependents and their schools or childcare, recurring activities, normal morning/pickup/bedtime anchors, and dietary constraints. “None” or “unknown” is fine. Florence currently uses ${work.aggregate.timeZone}. I’ll summarize what I record before both adults confirm it.`,
+      );
+      break;
+    }
+    case "update_profile": {
+      if (
+        !["building_profile", "active"].includes(onboarding.phase) ||
+        item.channel.scope !== "household" ||
+        item.channel.channelId !== onboarding.groupChannelId ||
+        !onboardingParticipants(onboarding).includes(item.senderAdultId) ||
+        classification.profileFacts === undefined
+      ) {
+        return invalidOnboarding(
+          work,
+          item,
+          "Shared profile details can be added by a verified adult in the household group.",
+        );
+      }
+      const changed = mergeSharedProfileFacts(work, item, classification.profileFacts);
+      next = changed ? { ...onboarding, profileConfirmedAdultIds: [] } : onboarding;
+      queueMessage(
+        work,
+        `onboarding-profile-update-${item.messageRef}`,
+        { kind: "household" },
+        "onboarding",
+        changed
+          ? `${sharedProfileSummary(work)} Both adults can reply “I confirm the profile” after reviewing this summary.`
+          : `Those details are already in the shared profile. ${sharedProfileSummary(work)}`,
       );
       break;
     }
     case "confirm_profile": {
       if (
-        onboarding.phase !== "building_profile" ||
+        !["building_profile", "active"].includes(onboarding.phase) ||
         item.channel.scope !== "household" ||
         item.channel.channelId !== onboarding.groupChannelId ||
-        !onboardingParticipants(onboarding).includes(item.senderAdultId)
+        !onboardingParticipants(onboarding).includes(item.senderAdultId) ||
+        work.projection.sharedProfile.facts.length === 0
       ) {
-        return invalidOnboarding(work, item, "The shared profile is not ready for that confirmation.");
+        return invalidOnboarding(
+          work,
+          item,
+          "Add at least one useful shared profile detail before confirming it.",
+        );
       }
       const confirmed = unique([...onboarding.profileConfirmedAdultIds, item.senderAdultId]);
       next = {
         ...onboarding,
-        phase: confirmed.length === 2 ? "active" : "building_profile",
+        phase: onboarding.phase === "active" || confirmed.length === 2 ? "active" : "building_profile",
         profileConfirmedAdultIds: confirmed,
       };
       queueMessage(
@@ -535,6 +567,77 @@ function applyOnboarding(
     }),
   );
   return true;
+}
+
+function mergeSharedProfileFacts(
+  work: Work,
+  item: ConversationInboxItem,
+  candidates: NonNullable<Extract<ConversationClassification, { intent: "onboarding" }>["profileFacts"]>,
+): boolean {
+  const facts = new Map(work.projection.sharedProfile.facts.map((fact) => [fact.factKey, fact] as const));
+  let changed = false;
+  for (const candidate of candidates) {
+    const normalizedSubject = candidate.subject.normalize("NFKC").trim().replace(/\s+/gu, " ").toLowerCase();
+    const factKey = `profile:${createHash("sha256")
+      .update(`${candidate.category}\u0000${normalizedSubject}`)
+      .digest("hex")
+      .slice(0, 32)}`;
+    const existing = facts.get(factKey);
+    if (
+      existing?.category === candidate.category &&
+      existing.subject === candidate.subject &&
+      existing.detail === candidate.detail
+    ) {
+      continue;
+    }
+    facts.set(factKey, {
+      factKey,
+      category: candidate.category,
+      subject: candidate.subject,
+      detail: candidate.detail,
+      sourceRef: item.messageRef,
+      recordedByAdultId: item.senderAdultId,
+      recordedAt: item.occurredAt,
+    });
+    changed = true;
+  }
+  if (!changed) return false;
+  work.projection.sharedProfile = ApplicationProjectionSchema.shape.sharedProfile.parse({
+    facts: [...facts.values()].sort(
+      (left, right) =>
+        left.category.localeCompare(right.category) || left.subject.localeCompare(right.subject),
+    ),
+  });
+  work.audit.push(
+    ApplicationAuditEntrySchema.parse({
+      kind: "onboarding_transition",
+      occurredAt: item.occurredAt,
+      decision: "shared_profile:updated",
+      sourceRef: item.messageRef,
+      adultId: item.senderAdultId,
+      containsPrivateData: false,
+    }),
+  );
+  return true;
+}
+
+function sharedProfileSummary(work: Work): string {
+  const labels: Readonly<
+    Record<ApplicationProjection["sharedProfile"]["facts"][number]["category"], string>
+  > = {
+    dependent: "Dependents",
+    school_childcare: "School/childcare",
+    recurring_activity: "Activities",
+    routine_anchor: "Routine anchors",
+    dietary_constraint: "Dietary constraints",
+  };
+  const lines = work.projection.sharedProfile.facts
+    .slice(0, 30)
+    .map((fact) => `${labels[fact.category]} — ${fact.subject}: ${fact.detail}`);
+  const summary = `Shared profile (${work.aggregate.timeZone}):\n${lines
+    .map((line) => `• ${line}`)
+    .join("\n")}`;
+  return summary.length <= 3_000 ? summary : `${summary.slice(0, 2_997)}…`;
 }
 
 function briefBody(aggregate: HouseholdAggregate): string {
@@ -1118,6 +1221,7 @@ async function processConversation(
   const classification = ConversationClassificationSchema.parse(
     await dependencies.interpreter.interpretConversation(item, {
       onboarding: work.projection.onboarding,
+      sharedProfile: work.projection.sharedProfile,
       openEpisodes: visibleEpisodes,
       pendingPromotionIds,
     }),
@@ -1546,6 +1650,7 @@ export function createApplicationProjection(
 ): ApplicationProjection {
   return ApplicationProjectionSchema.parse({
     onboarding,
+    sharedProfile: { facts: [] },
     gmailTriage: [],
     pendingPromotions: [],
     workers: [],

@@ -63,6 +63,7 @@ describe("ModelApplicationInterpreter", () => {
           groupChannelId: "chat-1",
           profileConfirmedAdultIds: [adultId, secondAdultId],
         },
+        sharedProfile: { facts: [] },
         openEpisodes: [],
         pendingPromotionIds: [],
       },

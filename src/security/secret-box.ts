@@ -10,7 +10,7 @@ function decodeKey(encoded: string): Buffer {
     ? Buffer.from(encoded, "hex")
     : Buffer.from(encoded, "base64url");
   if (key.length !== KEY_BYTES) {
-    throw new Error("FLORENCE_ENCRYPTION_KEY must encode exactly 32 bytes");
+    throw new Error("FLORENCE_TOKEN_ENCRYPTION_KEY must encode exactly 32 bytes");
   }
   return key;
 }

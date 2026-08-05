@@ -24,6 +24,11 @@ const environmentSchema = z.object({
   GOOGLE_OAUTH_STATE_SECRET: optionalSecret,
   GOOGLE_REDIRECT_URI: z.string().url().optional(),
   GOOGLE_PUBSUB_VERIFICATION_TOKEN: optionalSecret,
+  GOOGLE_GMAIL_TOPIC_NAME: z
+    .string()
+    .regex(/^projects\/[^/]+\/topics\/[^/]+$/u)
+    .optional(),
+  GOOGLE_GMAIL_PUBSUB_SUBSCRIPTION: z.string().min(1).max(1_000).optional(),
   MODEL_PROVIDER: z.enum(["openai", "anthropic", "open-weight"]).default("openai"),
   OPENAI_API_KEY: optionalSecret,
   OPENAI_BASE_URL: z.string().url().default("https://api.openai.com/v1"),
@@ -79,7 +84,10 @@ export function availableIntegrations(config: FlorenceConfig): {
       config.GOOGLE_CLIENT_ID &&
         config.GOOGLE_CLIENT_SECRET &&
         config.GOOGLE_OAUTH_STATE_SECRET &&
-        config.GOOGLE_REDIRECT_URI,
+        config.GOOGLE_REDIRECT_URI &&
+        config.GOOGLE_PUBSUB_VERIFICATION_TOKEN &&
+        config.GOOGLE_GMAIL_TOPIC_NAME &&
+        config.GOOGLE_GMAIL_PUBSUB_SUBSCRIPTION,
     ),
     openai: Boolean(config.OPENAI_API_KEY),
     anthropic: Boolean(config.ANTHROPIC_API_KEY),

@@ -29,4 +29,27 @@ describe("configuration", () => {
       "Invalid Florence configuration: PORT",
     );
   });
+
+  it("reports Google available only when OAuth and durable Gmail push are fully configured", () => {
+    const partial = loadConfig({
+      ...validEnvironment(),
+      GOOGLE_CLIENT_ID: "client-id",
+      GOOGLE_CLIENT_SECRET: "client-secret",
+      GOOGLE_OAUTH_STATE_SECRET: "state-secret-that-is-at-least-thirty-two-bytes",
+      GOOGLE_REDIRECT_URI: "https://florence.example.com/oauth/google/callback",
+    });
+    expect(availableIntegrations(partial).google).toBe(false);
+
+    const complete = loadConfig({
+      ...validEnvironment(),
+      GOOGLE_CLIENT_ID: "client-id",
+      GOOGLE_CLIENT_SECRET: "client-secret",
+      GOOGLE_OAUTH_STATE_SECRET: "state-secret-that-is-at-least-thirty-two-bytes",
+      GOOGLE_REDIRECT_URI: "https://florence.example.com/oauth/google/callback",
+      GOOGLE_PUBSUB_VERIFICATION_TOKEN: "verification-token",
+      GOOGLE_GMAIL_TOPIC_NAME: "projects/florence/topics/gmail",
+      GOOGLE_GMAIL_PUBSUB_SUBSCRIPTION: "projects/florence/subscriptions/gmail",
+    });
+    expect(availableIntegrations(complete).google).toBe(true);
+  });
 });

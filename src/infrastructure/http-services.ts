@@ -250,7 +250,7 @@ export class GoogleOAuthHandoffService implements GoogleOAuthHandoff {
       encryptedCredentials: this.#secretBox.seal(JSON.stringify(grant.tokens), credentialsAad),
       grantedScopes: grant.tokens.scope,
       cursor: {},
-      metadata: { credentialAadVersion: 1 },
+      metadata: { credentialAadVersion: 1, accountLabel: context.accountLabel },
     });
     await this.#onConnected?.({
       householdId: context.householdId,

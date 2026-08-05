@@ -25,8 +25,38 @@ export interface LinqSendReceipt {
   idempotencyKey: string;
 }
 
+export const linqChatSchema = z
+  .object({
+    id: z.string().min(1),
+    isGroup: z.boolean(),
+    displayName: z.string().nullable(),
+    service: z.string().nullable(),
+    healthStatus: z.enum(["HEALTHY", "AT_RISK", "CRITICAL", "OPTED_OUT"]),
+    activeHandles: z.array(z.string().min(1)).min(2),
+    selfHandles: z.array(z.string().min(1)).min(1),
+    participantHandles: z.array(z.string().min(1)).min(1),
+  })
+  .strict()
+  .superRefine((chat, context) => {
+    const active = new Set(chat.activeHandles);
+    for (const handle of [...chat.selfHandles, ...chat.participantHandles]) {
+      if (!active.has(handle)) {
+        context.addIssue({ code: "custom", message: "A classified chat handle must be active" });
+      }
+    }
+    if (new Set(chat.activeHandles).size !== chat.activeHandles.length) {
+      context.addIssue({ code: "custom", message: "Chat handles must be unique" });
+    }
+  });
+
+export type LinqChat = z.infer<typeof linqChatSchema>;
+
 export interface LinqOutboundSender {
   sendText(input: LinqSendTextInput): Promise<LinqSendReceipt>;
+}
+
+export interface LinqChatReader {
+  getChat(chatId: string): Promise<LinqChat>;
 }
 
 export type LinqFetch = (
@@ -46,7 +76,7 @@ export class LinqApiError extends Error {
   }
 }
 
-export class LinqClient implements LinqOutboundSender {
+export class LinqClient implements LinqOutboundSender, LinqChatReader {
   readonly #fetch: LinqFetch;
 
   constructor(
@@ -122,6 +152,83 @@ export class LinqClient implements LinqOutboundSender {
       idempotencyKey: input.idempotencyKey,
     };
   }
+
+  async getChat(chatId: string): Promise<LinqChat> {
+    const parsedChatId = z.string().min(1).max(500).parse(chatId);
+    let response: Awaited<ReturnType<LinqFetch>>;
+    try {
+      response = await this.#fetch(`${this.config.apiBaseUrl}/chats/${encodeURIComponent(parsedChatId)}`, {
+        method: "GET",
+        headers: { authorization: `Bearer ${this.config.apiKey}` },
+        signal: AbortSignal.timeout(this.config.requestTimeoutMs),
+      });
+    } catch (error) {
+      throw new LinqApiError(
+        error instanceof Error && error.name === "TimeoutError"
+          ? "Linq chat lookup timed out"
+          : "Linq chat lookup failed before a response was received",
+        null,
+        true,
+      );
+    }
+
+    if (!response.ok) {
+      throw new LinqApiError(
+        `Linq rejected the chat lookup with HTTP ${response.status}`,
+        response.status,
+        response.status === 408 || response.status === 429 || response.status >= 500,
+      );
+    }
+
+    let payload: unknown;
+    try {
+      payload = await response.json();
+    } catch {
+      throw new LinqApiError("Linq returned an invalid chat response", response.status, false);
+    }
+    return normalizeChat(payload, response.status);
+  }
+}
+
+function normalizeChat(payload: unknown, status: number): LinqChat {
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+    throw new LinqApiError("Linq returned an invalid chat response", status, false);
+  }
+  const record = payload as Record<string, unknown>;
+  const rawHandles = Array.isArray(record.handles) ? record.handles : [];
+  const handles = rawHandles.flatMap((value) => {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return [];
+    const handle = value as Record<string, unknown>;
+    if (typeof handle.handle !== "string" || !handle.handle.trim()) return [];
+    const state = typeof handle.status === "string" ? handle.status : "active";
+    if (state !== "active") return [];
+    return [{ value: handle.handle.trim(), isSelf: handle.is_me === true }];
+  });
+  const activeHandles = [...new Set(handles.map((handle) => handle.value))];
+  const selfHandles = [...new Set(handles.filter((handle) => handle.isSelf).map((handle) => handle.value))];
+  const participantHandles = [
+    ...new Set(handles.filter((handle) => !handle.isSelf).map((handle) => handle.value)),
+  ];
+  const health =
+    typeof record.health_status === "object" &&
+    record.health_status !== null &&
+    !Array.isArray(record.health_status)
+      ? (record.health_status as Record<string, unknown>).status
+      : undefined;
+  const parsed = linqChatSchema.safeParse({
+    id: record.id,
+    isGroup: record.is_group,
+    displayName: typeof record.display_name === "string" ? record.display_name : null,
+    service: typeof record.service === "string" ? record.service : null,
+    healthStatus: health,
+    activeHandles,
+    selfHandles,
+    participantHandles,
+  });
+  if (!parsed.success) {
+    throw new LinqApiError("Linq chat response did not match the pinned contract", status, false);
+  }
+  return parsed.data;
 }
 
 function extractMessageId(payload: unknown): string | null {

@@ -1,10 +1,13 @@
 export {
   LinqApiError,
+  type LinqChat,
+  type LinqChatReader,
   LinqClient,
   type LinqFetch,
   type LinqOutboundSender,
   type LinqSendReceipt,
   type LinqSendTextInput,
+  linqChatSchema,
   linqSendTextInputSchema,
 } from "./client.js";
 export {

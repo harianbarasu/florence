@@ -1702,6 +1702,20 @@ export class ApplicationStore implements ApplicationRepositoryPort {
     });
   }
 
+  public async enqueueApplicationIntent(rawIntent: unknown): Promise<{ rowId: string }> {
+    const intent = ApplicationOutboxIntentSchema.parse(rawIntent);
+    const rowId = await this.database.begin((transaction) =>
+      insertOutboxIntent(transaction, this.database, intent.householdId, {
+        intentKey: intent.intentId,
+        effectKind: intent.kind,
+        idempotencyKey: intent.idempotencyKey,
+        payload: intent,
+        maxAttempts: 8,
+      }),
+    );
+    return { rowId };
+  }
+
   public async recordOutboxSuccess(input: {
     rowId: string;
     leaseToken: string;

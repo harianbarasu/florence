@@ -11,6 +11,7 @@ import {
   EpisodeProposalSchema,
   EvidenceRefSchema,
   type HouseholdAggregate,
+  HouseholdAggregateSchema,
   HouseholdChiefOfStaff,
   type HouseholdSignal,
   HouseholdSignalSchema,
@@ -429,12 +430,22 @@ function applyOnboarding(
         item.channel.scope !== "personal" ||
         item.senderAdultId !== onboarding.initiatorAdultId ||
         invitedAdultId === undefined ||
-        invitedAdultId === onboarding.initiatorAdultId ||
-        !work.aggregate.verifiedAdultIds.includes(invitedAdultId)
+        invitedAdultId === onboarding.initiatorAdultId
       ) {
         return invalidOnboarding(work, item, "That adult cannot be invited to this household.");
       }
+      work.aggregate = HouseholdAggregateSchema.parse({
+        ...work.aggregate,
+        verifiedAdultIds: unique([...work.aggregate.verifiedAdultIds, invitedAdultId]),
+      });
       next = { ...onboarding, phase: "awaiting_invitee_consent", invitedAdultId };
+      queueMessage(
+        work,
+        "onboarding-inviter",
+        personal(item.senderAdultId),
+        "onboarding",
+        "The invitation is ready. For inbound-first consent, ask the second adult to text Florence from their own iMessage number and explicitly accept. Florence will not contact them first.",
+      );
       queueMessage(
         work,
         "onboarding-invitee",
@@ -1133,7 +1144,7 @@ async function processConversation(
       "onboarding-required",
       targetScope(item),
       "onboarding",
-      "Finish the adult consent and household-group setup before starting household work.",
+      "I'm Florence, an adult-only family Chief of Staff. I can notice family obligations, keep private accounts private by default, and follow shared work through without assigning blame. I will not contact third parties, purchase, book, submit, or expose private information without the required approval. Reply “I consent” in this DM to continue; you can text STOP at any time.",
     );
     return { status: "rejected", classification: "onboarding_required" };
   }

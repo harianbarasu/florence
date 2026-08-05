@@ -145,6 +145,63 @@ describe("Linq v3 webhook adapter", () => {
 });
 
 describe("Linq outbound adapter", () => {
+  it("retrieves and normalizes the active participant set before binding a group", async () => {
+    const request = vi.fn(async (_url: string | URL, _init?: RequestInit) => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        id: "chat-group-001",
+        is_group: true,
+        display_name: "Family",
+        service: "iMessage",
+        health_status: { status: "HEALTHY" },
+        handles: [
+          { handle: "+16462350806", is_me: true, status: "active" },
+          { handle: "+12025550101", is_me: false, status: "active" },
+          { handle: "+12025550102", is_me: false, status: "active" },
+          { handle: "+12025550999", is_me: false, status: "removed" },
+        ],
+      }),
+    }));
+    const client = new LinqClient(CONFIG, request);
+
+    await expect(client.getChat("chat-group-001")).resolves.toEqual({
+      id: "chat-group-001",
+      isGroup: true,
+      displayName: "Family",
+      service: "iMessage",
+      healthStatus: "HEALTHY",
+      activeHandles: ["+16462350806", "+12025550101", "+12025550102"],
+      selfHandles: ["+16462350806"],
+      participantHandles: ["+12025550101", "+12025550102"],
+    });
+    expect(request.mock.calls[0]?.[0]).toBe("https://api.linqapp.com/api/partner/v3/chats/chat-group-001");
+  });
+
+  it("fails closed when a chat lookup does not identify Florence's own handle", async () => {
+    const client = new LinqClient(
+      CONFIG,
+      vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          id: "chat-group-001",
+          is_group: true,
+          health_status: { status: "HEALTHY" },
+          handles: [
+            { handle: "+12025550101", status: "active" },
+            { handle: "+12025550102", status: "active" },
+          ],
+        }),
+      })),
+    );
+
+    await expect(client.getChat("chat-group-001")).rejects.toMatchObject({
+      name: "LinqApiError",
+      retryable: false,
+    });
+  });
+
   it("requires an idempotency key in the provider message body", async () => {
     const request = vi.fn(async (_url: string | URL, _init?: RequestInit) => ({
       ok: true,

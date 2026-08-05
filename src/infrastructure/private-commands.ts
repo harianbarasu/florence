@@ -5,6 +5,23 @@ import type { GmailSyncWork, GoogleSyncConnection } from "./google-sync.js";
 import type { GoogleOAuthConnectedEvent } from "./http-services.js";
 import type { PrivateCommandHandler } from "./provider-processor.js";
 
+/** Integration-independent private router; optional connectors contribute handlers without owning control. */
+export class PrivateCommandRouter implements PrivateCommandHandler {
+  public constructor(private readonly handlers: readonly PrivateCommandHandler[]) {
+    if (handlers.length === 0) throw new Error("Private command routing requires a core handler");
+  }
+
+  public async handle(
+    input: Parameters<PrivateCommandHandler["handle"]>[0],
+  ): Promise<{ handled: boolean; classification?: string }> {
+    for (const handler of this.handlers) {
+      const result = await handler.handle(input);
+      if (result.handled) return result;
+    }
+    return { handled: false };
+  }
+}
+
 export interface PrivateCommandOutbox {
   enqueueApplicationIntent(intent: ApplicationOutboxIntent): Promise<{ rowId: string }>;
 }

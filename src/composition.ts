@@ -59,7 +59,11 @@ import {
   PeriodicMaintenanceCoordinator,
   ProductionHouseholdOperations,
 } from "./infrastructure/operator-services.js";
-import { PrivateGoogleCommandService } from "./infrastructure/private-commands.js";
+import { PrivateCommandRouter, PrivateGoogleCommandService } from "./infrastructure/private-commands.js";
+import {
+  ApplicationPrivateControlMutator,
+  PrivateControlCommandService,
+} from "./infrastructure/private-control-commands.js";
 import { ProductionProviderProcessor, ProviderProcessingError } from "./infrastructure/provider-processor.js";
 import { FlorenceRuntimeStore } from "./infrastructure/runtime-store.js";
 import {
@@ -282,6 +286,14 @@ export async function createProductionComposition(
       runtimeStore,
       secretBox,
     });
+    const privateCommands = new PrivateCommandRouter([
+      new PrivateControlCommandService({
+        snapshots: applicationStore,
+        outbox: applicationStore,
+        mutator: new ApplicationPrivateControlMutator(application),
+      }),
+      ...(google.privateCommands === null ? [] : [google.privateCommands]),
+    ]);
     const businessProcessor = new ProductionProviderProcessor({
       application,
       applicationStore,
@@ -289,7 +301,7 @@ export async function createProductionComposition(
       linqChats: linq,
       linqAttachments: linq,
       google: google.pushProcessor,
-      ...(google.privateCommands === null ? {} : { privateCommands: google.privateCommands }),
+      privateCommands,
       defaultTimeZone: config.FLORENCE_DEFAULT_TIMEZONE,
     });
     const durableWorker = new DurableWorkerHost({

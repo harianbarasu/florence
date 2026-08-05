@@ -10,6 +10,7 @@ import {
   HouseholdAggregateSchema,
   PolicyRecordSchema,
 } from "../../src/domain/index.js";
+import { PrivateCommandRouter } from "../../src/infrastructure/private-commands.js";
 import { privateControlId } from "../../src/infrastructure/private-control-catalog.js";
 import {
   PrivateControlCommandService,
@@ -316,5 +317,30 @@ describe("PrivateControlCommandService", () => {
       { handled: false },
     );
     expect(harness.enqueueApplicationIntent).not.toHaveBeenCalled();
+  });
+});
+
+describe("PrivateCommandRouter", () => {
+  it("keeps core private controls active when no Google handler is configured", async () => {
+    const harness = setup();
+    const router = new PrivateCommandRouter([harness.service]);
+    await expect(router.handle({ ...baseCommand, text: "show my sharing rules" })).resolves.toEqual({
+      handled: true,
+      classification: "control:sharing_rules_listed",
+    });
+    await expect(router.handle({ ...baseCommand, text: "connect my Gmail" })).resolves.toEqual({
+      handled: false,
+    });
+  });
+
+  it("stops after the first deterministic handler claims a command", async () => {
+    const first = vi.fn(async () => ({ handled: true, classification: "first" }));
+    const second = vi.fn(async () => ({ handled: true, classification: "second" }));
+    const router = new PrivateCommandRouter([{ handle: first }, { handle: second }]);
+    await expect(router.handle({ ...baseCommand, text: "what do you remember?" })).resolves.toEqual({
+      handled: true,
+      classification: "first",
+    });
+    expect(second).not.toHaveBeenCalled();
   });
 });

@@ -18,6 +18,8 @@ export {
   parseFlorenceHttpConfig,
 } from "./config.js";
 export type {
+  CustomerExportConsumption,
+  CustomerExportHandoff,
   DurableIngress,
   FlorenceHttpServices,
   GoogleOAuthCompletionResult,

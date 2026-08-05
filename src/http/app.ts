@@ -32,7 +32,7 @@ import {
   parseFlorenceHttpConfig,
 } from "./config.js";
 import type { FlorenceHttpServices, OperatorStatus } from "./contracts.js";
-import { sendHandoffPage } from "./pages.js";
+import { sendCustomerExportHandoff, sendHandoffPage } from "./pages.js";
 
 const oauthStartQuerySchema = z
   .object({
@@ -59,6 +59,22 @@ const gmailPushQuerySchema = z
     token: z.string().min(1).max(2_048),
   })
   .strict();
+
+const customerExportParamsSchema = z
+  .object({
+    token: z
+      .string()
+      .min(32)
+      .max(2_048)
+      .regex(/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/u),
+  })
+  .strict();
+
+const customerExportFilenameSchema = z
+  .string()
+  .min(1)
+  .max(128)
+  .regex(/^[A-Za-z0-9][A-Za-z0-9._-]*\.json$/u);
 
 const householdIdSchema = z
   .string()
@@ -203,6 +219,54 @@ export async function createFlorenceHttpServer(
   );
   app.get("/terms", { config: { rateLimit: false } }, async (_request, reply) =>
     sendHandoffPage(reply, "terms"),
+  );
+
+  app.get(
+    "/control/export/:token",
+    { config: { rateLimit: { max: 10, timeWindow: 60_000, groupId: "customer_export" } } },
+    async (request, reply) => {
+      reply.header("cache-control", "no-store").header("pragma", "no-cache");
+      const params = customerExportParamsSchema.safeParse(request.params);
+      if (!params.success) {
+        return reply.code(404).send({ error: "not_found" });
+      }
+      return sendCustomerExportHandoff(reply, params.data.token);
+    },
+  );
+
+  app.get(
+    "/control/export/:token/download",
+    { config: { rateLimit: { max: 10, timeWindow: 60_000, groupId: "customer_export_download" } } },
+    async (request, reply) => {
+      reply.header("cache-control", "no-store").header("pragma", "no-cache");
+      const params = customerExportParamsSchema.safeParse(request.params);
+      if (!params.success) {
+        return reply.code(404).send({ error: "not_found" });
+      }
+
+      try {
+        const result = await options.services.customerExport.consumeExportToken(params.data.token);
+        switch (result.status) {
+          case "download": {
+            const filename = customerExportFilenameSchema.parse(result.filename);
+            return reply
+              .header("content-type", "application/json; charset=utf-8")
+              .header("content-disposition", `attachment; filename="${filename}"`)
+              .send(result.artifact);
+          }
+          case "invalid":
+            return reply.code(404).send({ error: "not_found" });
+          case "expired":
+          case "consumed":
+            return reply.code(410).send({ error: "link_unavailable" });
+          case "unavailable":
+            return reply.code(503).send({ error: "unavailable" });
+        }
+      } catch {
+        request.log.warn({ event: "customer_export_failed" }, "customer export failed");
+        return reply.code(503).send({ error: "unavailable" });
+      }
+    },
   );
 
   app.get("/healthz", { config: { rateLimit: false } }, async (_request, reply) =>

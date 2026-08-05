@@ -1373,6 +1373,9 @@ function approvalRequestEffect(
     kind: "send_message",
     targetScope: action.requestedFor,
     messageClass: "approval_request",
+    ...(action.kind === "calendar_update"
+      ? { responseContext: { kind: "calendar_approval" as const, actionId: action.actionId } }
+      : {}),
     body,
     evidenceIds: action.evidence.map((item) => item.evidenceId),
     ...(promotionAuthority === undefined ? {} : { promotionAuthority }),

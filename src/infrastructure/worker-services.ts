@@ -13,6 +13,7 @@ import {
 } from "../adapters/linq/index.js";
 import {
   ApplicationOutboxIntentSchema,
+  type ConversationResponseContext,
   type EffectExecutionReceipt,
   EffectExecutionReceiptSchema,
   type HouseholdApplicationSnapshot,
@@ -33,10 +34,12 @@ import {
   type WorkerTool,
   type WorkerToolExecutionContext,
 } from "../runtime/index.js";
+import type { ConversationMessageRegistry } from "./conversation-feedback-store.js";
 import { GoogleCalendarActionError } from "./google-calendar-actions.js";
 
 const HOUSEHOLD_SCHEDULE_CAPABILITY = "capability.household_schedule.read";
 const RESEARCH_CAPABILITY = "capability.research.read";
+const CUSTOMER_DELETION_FENCED_STATUS_IDEMPOTENCY_PREFIX = "florence:customer_control.deletion.fenced.";
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
 const LinqChannelTargetSchema = z.strictObject({
@@ -59,6 +62,7 @@ export interface LinqChannelDirectory {
     readonly targetScope: DurableScope;
     readonly loadGroupChat: (chatId: string) => Promise<LinqChat>;
     readonly send: (chatId: string) => Promise<LinqSendReceipt>;
+    readonly allowWhileDeleting?: boolean;
   }): Promise<SerializedLinqSendResult>;
 }
 
@@ -75,6 +79,7 @@ export interface ProductionApplicationEffectExecutorOptions {
   readonly linqChats: LinqChatReader;
   readonly channelDirectory: LinqChannelDirectory;
   readonly timerStore: WorkerTimerStore;
+  readonly conversationMessages?: Pick<ConversationMessageRegistry, "recordSentMessage">;
   readonly calendarActions?: Pick<HouseholdCalendarActionsPort, "createApprovedEvent">;
   readonly now?: () => Date;
 }
@@ -98,6 +103,7 @@ export class ProductionApplicationEffectExecutor implements ApplicationEffectExe
   readonly #linqChats: LinqChatReader;
   readonly #channelDirectory: LinqChannelDirectory;
   readonly #timerStore: WorkerTimerStore;
+  readonly #conversationMessages: Pick<ConversationMessageRegistry, "recordSentMessage"> | undefined;
   readonly #calendarActions: Pick<HouseholdCalendarActionsPort, "createApprovedEvent"> | undefined;
   readonly #now: () => Date;
 
@@ -106,6 +112,7 @@ export class ProductionApplicationEffectExecutor implements ApplicationEffectExe
     this.#linqChats = options.linqChats;
     this.#channelDirectory = options.channelDirectory;
     this.#timerStore = options.timerStore;
+    this.#conversationMessages = options.conversationMessages;
     this.#calendarActions = options.calendarActions;
     this.#now = options.now ?? (() => new Date());
   }
@@ -120,7 +127,19 @@ export class ProductionApplicationEffectExecutor implements ApplicationEffectExe
     const intent = intentResult.data;
 
     if (intent.kind === "conversation.send") {
-      return this.#sendMessage(intent.householdId, intent.targetScope, intent.body, intent.idempotencyKey);
+      const allowWhileDeleting =
+        intent.targetScope.kind === "personal" &&
+        intent.messageClass === "status" &&
+        intent.idempotencyKey.startsWith(CUSTOMER_DELETION_FENCED_STATUS_IDEMPOTENCY_PREFIX);
+      return this.#sendMessage(
+        intent.householdId,
+        intent.targetScope,
+        intent.messageClass,
+        intent.responseContext,
+        intent.body,
+        intent.idempotencyKey,
+        allowWhileDeleting,
+      );
     }
 
     const effect = intent.effect;
@@ -130,7 +149,14 @@ export class ProductionApplicationEffectExecutor implements ApplicationEffectExe
 
     switch (effect.kind) {
       case "send_message":
-        return this.#sendMessage(effect.householdId, effect.targetScope, effect.body, effect.idempotencyKey);
+        return this.#sendMessage(
+          effect.householdId,
+          effect.targetScope,
+          effect.messageClass,
+          effect.responseContext,
+          effect.body,
+          effect.idempotencyKey,
+        );
       case "schedule_timer":
         try {
           const stored = await this.#timerStore.scheduleTimer({
@@ -222,8 +248,21 @@ export class ProductionApplicationEffectExecutor implements ApplicationEffectExe
   async #sendMessage(
     householdId: string,
     targetScope: DurableScope,
+    messageClass:
+      | "onboarding"
+      | "private_review"
+      | "private_interrupt"
+      | "promotion_request"
+      | "clarifying_question"
+      | "status"
+      | "daily_brief"
+      | "reminder"
+      | "missed_window"
+      | "approval_request",
+    responseContext: ConversationResponseContext | undefined,
     body: string,
     idempotencyKey: string,
+    allowWhileDeleting = false,
   ): Promise<EffectExecutionReceipt> {
     let result: SerializedLinqSendResult;
     try {
@@ -237,6 +276,7 @@ export class ProductionApplicationEffectExecutor implements ApplicationEffectExe
             text: body,
             idempotencyKey,
           }),
+        ...(allowWhileDeleting ? { allowWhileDeleting: true } : {}),
       });
     } catch (error) {
       return this.#receipt(
@@ -257,6 +297,24 @@ export class ProductionApplicationEffectExecutor implements ApplicationEffectExe
       sent.idempotencyKey !== idempotencyKey
     ) {
       return this.#receipt("permanent_failure");
+    }
+    if (this.#conversationMessages !== undefined) {
+      try {
+        await this.#conversationMessages.recordSentMessage({
+          messageRef: stableReceipt("conversation_message", householdId, idempotencyKey),
+          householdId,
+          targetScope,
+          provider: "linq",
+          externalChatId: sent.chatId,
+          providerMessageId: sent.providerMessageId,
+          messageClass,
+          ...(responseContext === undefined ? {} : { responseContext }),
+          appIdempotencyKey: idempotencyKey,
+          sentAt: this.#now().toISOString(),
+        });
+      } catch {
+        return this.#receipt("retryable_failure");
+      }
     }
     return this.#receipt(
       "succeeded",

@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto";
 import type { TransactionSql } from "postgres";
 import { z } from "zod";
+import {
+  ConversationResponseContextSchema,
+  type ReferencedConversationMessage,
+  ReferencedConversationMessageSchema,
+} from "../application/index.js";
 import type { Database } from "../db/client.js";
 import { AdultIdSchema, DurableScopeSchema, HouseholdIdSchema } from "../domain/index.js";
 import { canonicalJson } from "../security/canonical-json.js";
@@ -19,32 +24,6 @@ const messageClassSchema = z.enum([
   "missed_window",
   "approval_request",
 ]);
-
-export const ConversationResponseContextSchema = z.discriminatedUnion("kind", [
-  z.strictObject({ kind: z.literal("promotion_decision"), promotionId: stableReferenceSchema }),
-  z.strictObject({ kind: z.literal("calendar_approval"), actionId: stableReferenceSchema }),
-  z.strictObject({
-    kind: z.literal("episode_ownership"),
-    episodeId: stableReferenceSchema,
-    episodeVersion: z.number().int().positive(),
-  }),
-  z.strictObject({
-    kind: z.literal("episode_follow_up"),
-    episodeId: stableReferenceSchema,
-    episodeVersion: z.number().int().positive(),
-  }),
-  z.strictObject({ kind: z.literal("sharing_explanation"), sharingRef: stableReferenceSchema }),
-]);
-
-export type ConversationResponseContext = z.infer<typeof ConversationResponseContextSchema>;
-
-export const ReferencedConversationMessageSchema = z.strictObject({
-  messageRef: stableReferenceSchema,
-  messageClass: messageClassSchema,
-  responseContext: ConversationResponseContextSchema.optional(),
-});
-
-export type ReferencedConversationMessage = z.infer<typeof ReferencedConversationMessageSchema>;
 
 const sentMessageSchema = z.strictObject({
   messageRef: stableReferenceSchema,
@@ -163,7 +142,6 @@ export class PostgresConversationFeedbackStore {
         existing[0].provider_message_id !== input.providerMessageId ||
         existing[0].message_class !== input.messageClass ||
         existing[0].app_idempotency_key !== input.appIdempotencyKey ||
-        existing[0].sent_at.getTime() !== Date.parse(input.sentAt) ||
         canonicalJson(existing[0].response_context) !== canonicalJson(input.responseContext ?? null)
       ) {
         throw new ConversationMessageConflictError("Conversation message identity conflict");
@@ -177,6 +155,32 @@ export class PostgresConversationFeedbackStore {
     const input = targetSchema.parse(rawInput);
     const rows = await this.findAuthorizedTarget(this.database, input);
     return rows[0] === undefined ? null : parseReferencedMessage(rows[0]);
+  }
+
+  public async resolveSharingControlId(rawInput: {
+    householdId: string;
+    adultId: string;
+    providerMessageId: string;
+  }): Promise<string | null> {
+    const input = z
+      .strictObject({
+        householdId: HouseholdIdSchema,
+        adultId: AdultIdSchema,
+        providerMessageId: stableReferenceSchema,
+      })
+      .parse(rawInput);
+    const rows = await this.database<{ response_context: unknown }[]>`
+      select response_context
+      from conversation_messages
+      where household_id = ${input.householdId}
+        and target_scope = 'personal'
+        and target_adult_id = ${input.adultId}
+        and provider = 'linq'
+        and provider_message_id = ${input.providerMessageId}
+      limit 1
+    `;
+    const parsed = ConversationResponseContextSchema.safeParse(rows[0]?.response_context);
+    return parsed.success && parsed.data.kind === "sharing_explanation" ? parsed.data.sharingRef : null;
   }
 
   public async recordFeedback(rawInput: z.input<typeof feedbackSchema>): Promise<ConversationFeedbackResult> {
@@ -266,5 +270,5 @@ function parseReferencedMessage(row: ConversationMessageRow): ReferencedConversa
 
 export type ConversationMessageRegistry = Pick<
   PostgresConversationFeedbackStore,
-  "recordSentMessage" | "resolveReply" | "recordFeedback"
+  "recordSentMessage" | "resolveReply" | "resolveSharingControlId" | "recordFeedback"
 >;

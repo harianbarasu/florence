@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import {
   type ApplicationOutboxIntent,
   ApplicationOutboxIntentSchema,
+  type ConversationResponseContext,
   type FlorenceApplication,
   type HouseholdApplicationSnapshot,
 } from "../application/index.js";
@@ -256,7 +257,10 @@ export class PrivateControlCommandService implements PrivateCommandHandler {
           ]);
           return { handled: true, classification: "control:sharing_explanation_unresolved" };
         }
-        await this.#queueMessages(input, "sharing-explanation", [sharingExplanation(resolution.value)]);
+        await this.#queueMessages(input, "sharing-explanation", [sharingExplanation(resolution.value)], {
+          kind: "sharing_explanation",
+          sharingRef: requestedControlId,
+        });
         return { handled: true, classification: "control:sharing_explained" };
       }
     }
@@ -266,6 +270,7 @@ export class PrivateControlCommandService implements PrivateCommandHandler {
     input: Pick<PrivateCommandInput, "householdId" | "adultId" | "idempotencyKey">,
     suffix: string,
     bodies: readonly string[],
+    responseContext?: ConversationResponseContext,
   ): Promise<void> {
     for (const [index, body] of bodies.entries()) {
       const intentId = `system_${stableId(`${input.idempotencyKey}:${suffix}:${index}`)}`;
@@ -277,6 +282,7 @@ export class PrivateControlCommandService implements PrivateCommandHandler {
           kind: "conversation.send",
           targetScope: { kind: "personal", adultId: input.adultId },
           messageClass: "status",
+          ...(responseContext === undefined ? {} : { responseContext }),
           body,
         }),
       );

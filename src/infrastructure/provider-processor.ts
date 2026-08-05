@@ -1,12 +1,15 @@
 import { createHash } from "node:crypto";
 import { type GmailPubSubEvent, gmailPubSubEventSchema } from "../adapters/google/index.js";
 import {
+  classifyLinqReaction,
   LinqApiError,
   LinqAttachmentContentError,
   type LinqAttachmentReader,
   type LinqChatReader,
   type LinqInboundEvent,
+  type LinqReactionEvent,
   linqInboundEventSchema,
+  linqReactionFeedbackRef,
 } from "../adapters/linq/index.js";
 import type {
   ConversationAttachmentContent,
@@ -15,6 +18,7 @@ import type {
 } from "../application/index.js";
 import type { ChannelResolution, ClaimedProviderInboxItem } from "../db/application-store.js";
 import { AdultIdSchema } from "../domain/index.js";
+import type { ConversationMessageRegistry } from "./conversation-feedback-store.js";
 import { canonicalizeLinqHandle, type GroupIdentity, type PendingInvitation } from "./runtime-store.js";
 
 export type ProviderProcessingResult = {
@@ -38,6 +42,7 @@ export interface PrivateCommandHandler {
     channelId: string;
     messageId: string;
     text: string;
+    replyToMessageId?: string;
     occurredAt: string;
     idempotencyKey: string;
   }): Promise<{ handled: boolean; classification?: string }>;
@@ -59,11 +64,18 @@ export interface ProductionProviderProcessorOptions {
   application: FlorenceApplication;
   applicationStore: ProviderApplicationStore;
   runtimeStore: ProviderRuntimeStore;
+  deletedIdentities: DeletedLinqIdentityAuthority;
   linqChats: LinqChatReader;
   linqAttachments: LinqAttachmentReader;
   google: GooglePushProcessor;
   privateCommands?: PrivateCommandHandler;
+  conversationFeedback?: Pick<ConversationMessageRegistry, "resolveReply" | "recordFeedback">;
   defaultTimeZone: string;
+}
+
+/** Customer-erasure authority checked before an unknown Linq identity can create new state. */
+export interface DeletedLinqIdentityAuthority {
+  isDeletedLinqIdentity(input: { externalChatId: string; externalHandle: string }): Promise<boolean>;
 }
 
 export interface ProviderApplicationStore {
@@ -152,17 +164,25 @@ export class ProductionProviderProcessor {
     item: ClaimedProviderInboxItem,
     event: LinqInboundEvent,
   ): Promise<ProviderProcessingResult> {
-    if (event.eventType !== "message.received") {
+    if (event.eventType !== "message.received") return this.processLinqReaction(event);
+
+    const handle = canonicalizeLinqHandle(event.sender.handle);
+    const knownBeforeConsent = await this.resolveKnownChannel(event, handle);
+    if (
+      event.scope === "direct" &&
+      knownBeforeConsent === null &&
+      (await this.options.deletedIdentities.isDeletedLinqIdentity({
+        externalChatId: event.conversation.id,
+        externalHandle: handle,
+      }))
+    ) {
       return {
         resolution: {
-          classification: `linq:${event.eventType}:observed`,
+          classification: "linq:deleted_identity:ignored",
           providerEventId: event.providerEventId,
         },
       };
     }
-
-    const handle = canonicalizeLinqHandle(event.sender.handle);
-    const knownBeforeConsent = await this.resolveKnownChannel(event, handle);
     if (event.message.consentCommand === "stop") {
       await this.options.runtimeStore.setSuppression({
         externalChatId: event.conversation.id,
@@ -208,7 +228,6 @@ export class ProductionProviderProcessor {
         resolution: { classification: "linq:suppressed" },
       };
     }
-
     const route =
       event.scope === "direct"
         ? await this.routeDirect(event, handle, knownBeforeConsent)
@@ -230,6 +249,17 @@ export class ProductionProviderProcessor {
         "Household state is unavailable",
       );
     }
+    const replyTo =
+      event.message.replyTo === null || this.options.conversationFeedback === undefined
+        ? null
+        : await this.options.conversationFeedback.resolveReply({
+            householdId: route.resolution.householdId,
+            actorAdultId: route.senderAdultId,
+            channelScope: event.scope === "direct" ? "personal" : "household",
+            provider: "linq",
+            externalChatId: event.conversation.id,
+            providerMessageId: event.message.replyTo.messageId,
+          });
     if (
       event.scope === "direct" &&
       this.options.privateCommands &&
@@ -241,6 +271,7 @@ export class ProductionProviderProcessor {
         channelId: event.conversation.id,
         messageId: event.message.id,
         text: event.message.text,
+        ...(event.message.replyTo === null ? {} : { replyToMessageId: event.message.replyTo.messageId }),
         occurredAt: event.occurredAt,
         idempotencyKey: item.idempotencyKey,
       });
@@ -264,6 +295,7 @@ export class ProductionProviderProcessor {
           : { channelId: event.conversation.id, scope: "household" },
       senderAdultId: route.senderAdultId,
       messageRef: `linq:message:${event.message.id}`,
+      ...(replyTo === null ? {} : { replyTo }),
       text: event.message.text,
       attachmentRefs: event.message.attachments.map((attachment) =>
         attachment.providerAttachmentId
@@ -314,6 +346,95 @@ export class ProductionProviderProcessor {
         revision: applicationResult.revision,
       },
     };
+  }
+
+  private async processLinqReaction(event: LinqReactionEvent): Promise<ProviderProcessingResult> {
+    if (this.options.conversationFeedback === undefined || event.scope === "unknown") {
+      return {
+        resolution: {
+          classification: `linq:${event.eventType}:observed`,
+          providerEventId: event.providerEventId,
+        },
+      };
+    }
+
+    const handle = canonicalizeLinqHandle(event.sender.handle);
+    const actor = await this.resolveReactionActor(event, handle);
+    if (actor === null) {
+      return {
+        resolution: {
+          classification: `linq:${event.eventType}:unauthorized`,
+          providerEventId: event.providerEventId,
+        },
+      };
+    }
+    const feedback = await this.options.conversationFeedback.recordFeedback({
+      householdId: actor.householdId,
+      actorAdultId: actor.adultId,
+      channelScope: event.scope === "direct" ? "personal" : "household",
+      provider: "linq",
+      externalChatId: event.conversation.id,
+      providerMessageId: event.reaction.targetMessageId,
+      feedbackRef: linqReactionFeedbackRef(event),
+      feedbackKind: classifyLinqReaction(event.reaction),
+      operation: event.reaction.operation,
+      occurredAt: event.occurredAt,
+      sourceEventId: event.dedupeKey,
+    });
+    return {
+      householdId: actor.householdId,
+      resolution: {
+        classification: `linq:${event.eventType}:${feedback.status}`,
+        providerEventId: event.providerEventId,
+        ...(feedback.status === "recorded"
+          ? {
+              applied: feedback.applied,
+              active: feedback.active,
+              feedbackKind: feedback.feedbackKind,
+              targetMessageRef: feedback.target.messageRef,
+            }
+          : {}),
+      },
+    };
+  }
+
+  private async resolveReactionActor(
+    event: LinqReactionEvent,
+    handle: string,
+  ): Promise<{ householdId: string; adultId: string } | null> {
+    const known = await this.options.applicationStore.resolveChannel({
+      provider: "linq",
+      externalChatId: event.conversation.id,
+      ...(event.scope === "direct" ? { externalHandle: handle } : {}),
+    });
+    if (event.scope === "direct") {
+      return known?.channelType === "private" &&
+        known.bindingStatus === "active" &&
+        known.membershipStatus === "active" &&
+        known.adultId !== null
+        ? { householdId: known.householdId, adultId: known.adultId }
+        : null;
+    }
+    if (known?.channelType !== "group" || known.bindingStatus !== "active") return null;
+
+    let chat: Awaited<ReturnType<LinqChatReader["getChat"]>>;
+    try {
+      chat = await this.options.linqChats.getChat(event.conversation.id);
+    } catch (error) {
+      if (error instanceof LinqApiError) {
+        throw new ProviderProcessingError(
+          "linq_group_lookup_failed",
+          error.retryable,
+          "Linq group identity could not be verified",
+        );
+      }
+      throw error;
+    }
+    if (!isExactHealthyLinqGroup(chat, event.conversation.id)) return null;
+    const identity = await this.options.runtimeStore.resolveExactGroup(chat.participantHandles);
+    if (identity?.householdId !== known.householdId) return null;
+    const adultId = identity.adultsByHandle.get(handle);
+    return adultId === undefined ? null : { householdId: known.householdId, adultId };
   }
 
   private async resolveAttachmentContents(

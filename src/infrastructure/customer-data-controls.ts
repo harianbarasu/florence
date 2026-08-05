@@ -1,7 +1,7 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 import { type ApplicationOutboxIntent, ApplicationOutboxIntentSchema } from "../application/contracts.js";
-import type { JsonObject, JsonValue } from "../http/contracts.js";
+import type { CustomerExportConsumption, JsonObject, JsonValue } from "../http/contracts.js";
 import {
   CustomerDataControlStoreError,
   type CustomerDeletionRequestRecord,
@@ -29,10 +29,6 @@ export interface CustomerExportReader {
     exportedAt: string;
   }): Promise<Record<string, unknown>>;
 }
-
-export type CustomerExportConsumption =
-  | { readonly status: "download"; readonly filename: string; readonly artifact: JsonObject }
-  | { readonly status: "expired" | "invalid" | "consumed" | "unavailable" };
 
 export interface CustomerDataControlCommandServiceOptions {
   readonly store: PostgresCustomerDataControlStore;
@@ -93,13 +89,16 @@ export class CustomerDataControlCommandService implements PrivateCommandHandler 
     const deletion = await this.#safeCurrentDeletion(input);
 
     if (deletion && ["fenced", "cleaning", "blocked"].includes(deletion.status)) {
-      await this.#queuePrivate(
-        input,
-        "deletion-fenced-status",
-        deletion.status === "blocked"
-          ? "Household deletion is fenced and a provider cleanup is retrying. Normal sync, reminders, and messages remain stopped. Florence still retains encrypted credentials only so it can finish revocation safely."
-          : "Household deletion is fenced and cleanup is in progress. Normal sync, reminders, and messages are stopped.",
-      );
+      await this.#store.enqueueDeletionStatus({
+        householdId: input.householdId,
+        adultId: input.adultId,
+        channelId: input.channelId,
+        idempotencyKey: input.idempotencyKey,
+        body:
+          deletion.status === "blocked"
+            ? "Household deletion is fenced and a provider cleanup is retrying. Normal sync, reminders, and messages remain stopped. Florence still retains encrypted credentials only so it can finish revocation safely."
+            : "Household deletion is fenced and cleanup is in progress. Normal sync, reminders, and messages are stopped.",
+      });
       return { handled: true, classification: `customer_control:deletion_${deletion.status}` };
     }
 

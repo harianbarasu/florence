@@ -96,7 +96,13 @@ function privateResolution(overrides: Partial<ChannelResolution> = {}): ChannelR
   };
 }
 
-function setup(input: { known?: ChannelResolution | null; snapshots?: HouseholdApplicationSnapshot[] } = {}) {
+function setup(
+  input: {
+    known?: ChannelResolution | null;
+    snapshots?: HouseholdApplicationSnapshot[];
+    deletedIdentity?: boolean;
+  } = {},
+) {
   const process = vi.fn(async () => ({
     householdId: HOUSEHOLD_ID,
     idempotencyKey: "linq:partner:event-1",
@@ -118,6 +124,7 @@ function setup(input: { known?: ChannelResolution | null; snapshots?: HouseholdA
     privateResolution({ bindingStatus: "pending", membershipStatus: "invited" }),
   );
   const finalizeFoundingAdult = vi.fn(async () => true);
+  const isDeletedLinqIdentity = vi.fn(async () => input.deletedIdentity ?? false);
   const runtimeStore: ProviderRuntimeStore = {
     setSuppression: vi.fn(async (input) => ({ applied: true, suppressed: input.suppressed })),
     isSuppressed: vi.fn(async () => false),
@@ -149,6 +156,7 @@ function setup(input: { known?: ChannelResolution | null; snapshots?: HouseholdA
     application: { process, executeOutbox: vi.fn() },
     applicationStore,
     runtimeStore,
+    deletedIdentities: { isDeletedLinqIdentity },
     linqChats: { getChat },
     linqAttachments: { retrieveAttachment },
     google,
@@ -161,6 +169,7 @@ function setup(input: { known?: ChannelResolution | null; snapshots?: HouseholdA
     runtimeStore,
     provisionFoundingAdult,
     finalizeFoundingAdult,
+    isDeletedLinqIdentity,
     google,
     getChat,
     retrieveAttachment,
@@ -196,6 +205,20 @@ describe("ProductionProviderProcessor", () => {
       }),
     );
     expect(harness.finalizeFoundingAdult).not.toHaveBeenCalled();
+  });
+
+  it("does not reprovision an unknown DM identity retained by a deletion tombstone", async () => {
+    const harness = setup({ deletedIdentity: true });
+
+    await expect(harness.processor.process(claimed(event()))).resolves.toMatchObject({
+      resolution: { classification: "linq:deleted_identity:ignored" },
+    });
+    expect(harness.isDeletedLinqIdentity).toHaveBeenCalledWith({
+      externalChatId: "dm-1",
+      externalHandle: "+12025550101",
+    });
+    expect(harness.provisionFoundingAdult).not.toHaveBeenCalled();
+    expect(harness.process).not.toHaveBeenCalled();
   });
 
   it("activates a pending founder only after the application records explicit consent", async () => {

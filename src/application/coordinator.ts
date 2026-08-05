@@ -46,6 +46,7 @@ import {
   type ConversationClassification,
   ConversationClassificationSchema,
   type ConversationInboxItem,
+  type ConversationResponseContext,
   EffectExecutionReceiptSchema,
   type GmailInboxItem,
   GmailTriageResultSchema,
@@ -335,6 +336,7 @@ function queueMessage(
     | "status"
     | "daily_brief",
   body: string,
+  responseContext?: ConversationResponseContext,
 ): void {
   work.outbox.push(
     ApplicationOutboxIntentSchema.parse({
@@ -342,6 +344,7 @@ function queueMessage(
       kind: "conversation.send",
       targetScope: scope,
       messageClass,
+      ...(responseContext === undefined ? {} : { responseContext }),
       body,
     }),
   );
@@ -1788,6 +1791,7 @@ async function processGmail(
         personal(item.ownerAdultId),
         "promotion_request",
         `${triage.privateSummary} Share only this household meaning: “${triage.minimumHouseholdMeaning}”? Reply “share once ${pending.promotionId}” or, only if you want a standing rule for this exact sender in this exact connected inbox and matching ${triage.sourceClass} items, “always share ${pending.promotionId}”.`,
+        { kind: "promotion_decision", promotionId: pending.promotionId },
       );
       return { status: "processed", classification: "gmail:promotion_pending" };
     }
@@ -2212,6 +2216,7 @@ async function processCalendar(
         personal(item.ownerAdultId),
         "promotion_request",
         `${triage.privateSummary} Share only this household meaning: “${triage.minimumHouseholdMeaning}” with this required outcome: “${triage.minimumRequiredOutcome}”? The event's start time will anchor follow-through; its raw title, description, and location stay private. Reply “share once ${pending.promotionId}” or, only if you want a standing rule for this exact connected calendar account and matching ${triage.sourceClass} items, “always share ${pending.promotionId}”.`,
+        { kind: "promotion_decision", promotionId: pending.promotionId },
       );
       return { status: "processed", classification: "calendar:promotion_pending" };
     }

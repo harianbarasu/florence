@@ -909,6 +909,33 @@ const OutboxBaseShape = {
   createdFromSignalId: SignalIdSchema,
 } as const;
 
+const ConversationResponseReferenceSchema = z.string().trim().min(1).max(500);
+
+/** App-owned identity carried with a sent message so an exact reply can be authorized later. */
+export const ConversationResponseContextSchema = z.discriminatedUnion("kind", [
+  z.strictObject({
+    kind: z.literal("promotion_decision"),
+    promotionId: ConversationResponseReferenceSchema,
+  }),
+  z.strictObject({ kind: z.literal("calendar_approval"), actionId: ConversationResponseReferenceSchema }),
+  z.strictObject({
+    kind: z.literal("episode_ownership"),
+    episodeId: ConversationResponseReferenceSchema,
+    episodeVersion: z.number().int().positive(),
+  }),
+  z.strictObject({
+    kind: z.literal("episode_follow_up"),
+    episodeId: ConversationResponseReferenceSchema,
+    episodeVersion: z.number().int().positive(),
+  }),
+  z.strictObject({
+    kind: z.literal("sharing_explanation"),
+    sharingRef: ConversationResponseReferenceSchema,
+  }),
+]);
+
+export type ConversationResponseContext = z.infer<typeof ConversationResponseContextSchema>;
+
 export const ScheduleTimerIntentSchema = z.strictObject({
   ...OutboxBaseShape,
   kind: z.literal("schedule_timer"),
@@ -932,6 +959,7 @@ export const SendMessageIntentSchema = z.strictObject({
   kind: z.literal("send_message"),
   targetScope: DurableScopeSchema,
   messageClass: z.enum(["reminder", "missed_window", "approval_request", "clarifying_question", "status"]),
+  responseContext: ConversationResponseContextSchema.optional(),
   body: NeutralFactualTextSchema,
   episodeId: EpisodeIdSchema.optional(),
   evidenceIds: z.array(EvidenceIdSchema).max(50).optional(),

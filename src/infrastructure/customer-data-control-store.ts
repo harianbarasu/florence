@@ -509,6 +509,60 @@ export class PostgresCustomerDataControlStore {
     });
   }
 
+  /** The only post-fence message path: one owner-private status at the current control epoch. */
+  public async enqueueDeletionStatus(input: {
+    householdId: string;
+    adultId: string;
+    channelId: string;
+    idempotencyKey: string;
+    body: string;
+  }): Promise<void> {
+    const parsed = z
+      .strictObject({
+        householdId: uuidSchema,
+        adultId: uuidSchema,
+        channelId: z.string().min(1).max(500),
+        idempotencyKey: idempotencyKeySchema,
+        body: z.string().trim().min(1).max(4_000),
+      })
+      .parse(input);
+    await this.#database.begin(async (transaction) => {
+      const bindingId = await requireActivePrivateDm(
+        transaction,
+        parsed.householdId,
+        parsed.adultId,
+        parsed.channelId,
+        true,
+      );
+      const rows = await transaction<{ control_epoch: string; request_id: string }[]>`
+        select household.control_epoch::text as control_epoch, request.id as request_id
+        from households household
+        join customer_deletion_requests request on request.household_id = household.id
+        join customer_deletion_confirmations confirmation on confirmation.request_id = request.id
+        where household.id = ${parsed.householdId}
+          and household.status = 'deleting'
+          and request.status in ('fenced', 'cleaning', 'blocked')
+          and request.control_epoch = household.control_epoch
+          and confirmation.adult_id = ${parsed.adultId}
+          and confirmation.private_channel_binding_id = ${bindingId}
+        for update of household, request
+      `;
+      const row = rows[0];
+      if (!row) throw new CustomerDataControlStoreError("invalid_state");
+      const controlEpoch = z.coerce.number().int().nonnegative().parse(row.control_epoch);
+      const intentDigest = createHash("sha256")
+        .update(`${row.request_id}\0${parsed.adultId}\0${parsed.idempotencyKey}`)
+        .digest("hex");
+      await insertControlMessage(transaction, this.#database, {
+        householdId: parsed.householdId,
+        adultId: parsed.adultId,
+        intentId: `customer_control.deletion.fenced.status.${intentDigest}`,
+        body: parsed.body,
+        controlEpoch,
+      });
+    });
+  }
+
   public async claimCleanupSteps(input: {
     owner: string;
     limit: number;

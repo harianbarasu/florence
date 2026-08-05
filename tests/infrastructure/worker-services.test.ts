@@ -102,7 +102,11 @@ class RecordingSender implements LinqOutboundSender {
 }
 
 class StaticChannelDirectory implements LinqChannelDirectory {
-  readonly calls: Array<{ householdId: string; targetScope: DurableScope }> = [];
+  readonly calls: Array<{
+    householdId: string;
+    targetScope: DurableScope;
+    allowWhileDeleting?: boolean;
+  }> = [];
   blocked: "inactive" | "binding_paused" | null = null;
 
   constructor(public target: LinqChannelTarget | null) {}
@@ -112,6 +116,7 @@ class StaticChannelDirectory implements LinqChannelDirectory {
     targetScope: DurableScope;
     loadGroupChat: (chatId: string) => Promise<LinqChat>;
     send: (chatId: string) => Promise<LinqSendReceipt>;
+    allowWhileDeleting?: boolean;
   }) {
     this.calls.push(input);
     if (this.blocked) return { status: this.blocked };
@@ -255,6 +260,36 @@ describe("ProductionApplicationEffectExecutor", () => {
         text: "The household plan is ready for review.",
         idempotencyKey: "send:status:1",
       },
+    ]);
+  });
+
+  it("opens the deletion send fence only for the exact personal fenced-status intent", async () => {
+    const personalTarget: LinqChannelTarget = {
+      householdId: HOUSEHOLD_ID,
+      targetScope: { kind: "personal", adultId: ADULT_A },
+      chatId: "linq_private_chat",
+      status: "active",
+    };
+    const harness = effectHarness(personalTarget);
+    const deletionStatusIntent = executableIntent({
+      intentId: `customer_control.deletion.fenced.request-1.${ADULT_A}`,
+      householdId: HOUSEHOLD_ID,
+      idempotencyKey: `florence:customer_control.deletion.fenced.request-1.${ADULT_A}`,
+      kind: "conversation.send",
+      targetScope: { kind: "personal", adultId: ADULT_A },
+      messageClass: "status",
+      body: "Florence is deleting its local copy.",
+    });
+
+    await expect(harness.executor.execute(deletionStatusIntent)).resolves.toMatchObject({
+      status: "succeeded",
+    });
+    expect(harness.channelDirectory.calls).toEqual([expect.objectContaining({ allowWhileDeleting: true })]);
+
+    const ordinary = effectHarness(personalTarget);
+    await ordinary.executor.execute(conversationIntent({ kind: "personal", adultId: ADULT_A }));
+    expect(ordinary.channelDirectory.calls).toEqual([
+      expect.not.objectContaining({ allowWhileDeleting: true }),
     ]);
   });
 

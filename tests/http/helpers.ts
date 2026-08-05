@@ -36,6 +36,9 @@ export function fakeHttpServices(): FlorenceHttpServices {
       start: async () => ({ kind: "invalid" }),
       complete: async () => ({ kind: "invalid" }),
     },
+    customerExport: {
+      consumeExportToken: async () => ({ status: "invalid" }),
+    },
     readiness: {
       isReady: async () => true,
     },

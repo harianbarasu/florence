@@ -75,3 +75,28 @@ export function sendHandoffPage(reply: FastifyReply, page: HandoffPage, statusCo
 </body>
 </html>`);
 }
+
+/** A confirmation hop prevents iMessage link previews from consuming a single-use export. */
+export function sendCustomerExportHandoff(reply: FastifyReply, token: string): FastifyReply {
+  const downloadPath = `/control/export/${encodeURIComponent(token)}/download`;
+  reply
+    .code(200)
+    .header("content-type", "text/html; charset=utf-8")
+    .header("cache-control", "no-store")
+    .header("pragma", "no-cache");
+  return reply.send(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Download your Florence data</title>
+</head>
+<body>
+<main>
+<h1>Your private Florence export</h1>
+<p>This link works once. Download it only on a device you trust.</p>
+<p><a href="${downloadPath}" rel="noreferrer">Download my data</a></p>
+</main>
+</body>
+</html>`);
+}

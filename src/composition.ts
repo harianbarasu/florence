@@ -36,6 +36,17 @@ import {
   httpConfigFromFlorenceConfig,
   productionHttpLoggerOptions,
 } from "./http/index.js";
+import { PostgresConversationFeedbackStore } from "./infrastructure/conversation-feedback-store.js";
+import {
+  type CustomerDeletionCleanupLease,
+  PostgresCustomerDataControlStore,
+} from "./infrastructure/customer-data-control-store.js";
+import { CustomerDataControlCommandService } from "./infrastructure/customer-data-controls.js";
+import {
+  CustomerDeletionHost,
+  type CustomerDeletionRemoteCleanup,
+  GoogleCustomerDeletionCleanup,
+} from "./infrastructure/customer-deletion-host.js";
 import { createPostgresDailyBriefHost } from "./infrastructure/daily-brief-host.js";
 import { GmailPrivateCompletionDigestAdapter } from "./infrastructure/gmail-completion-digest.js";
 import { GoogleCalendarActions } from "./infrastructure/google-calendar-actions.js";
@@ -225,6 +236,11 @@ export async function createProductionComposition(
       config.FLORENCE_TOKEN_ENCRYPTION_KEY,
     );
     const secretBox = new SecretBox(config.FLORENCE_TOKEN_ENCRYPTION_KEY);
+    const customerDataControls = new PostgresCustomerDataControlStore(
+      database,
+      config.FLORENCE_TOKEN_ENCRYPTION_KEY,
+    );
+    const conversationFeedback = new PostgresConversationFeedbackStore(database);
     // Provider clients close over credentials at this composition boundary. Only app-owned,
     // household-scoped context and tool results can cross into model prompts or agent runtimes.
     const modelGateway = createConfiguredModelGateway(config);
@@ -270,12 +286,20 @@ export async function createProductionComposition(
         linqChats: linq,
         channelDirectory: runtimeStore,
         timerStore: applicationStore,
+        conversationMessages: conversationFeedback,
         ...(calendarActions === undefined ? {} : { calendarActions }),
       }),
       ...(calendarActions === undefined ? {} : { calendarActions }),
     };
     const application = createFlorenceApplication(applicationDependencies);
 
+    const customerDataControlCommands = new CustomerDataControlCommandService({
+      store: customerDataControls,
+      outbox: applicationStore,
+      exportReader: applicationStore,
+      publicBaseUrl: config.FLORENCE_WEB_BASE_URL,
+      signingSecret: config.FLORENCE_TOKEN_ENCRYPTION_KEY,
+    });
     const google = createGoogleComposition({
       config,
       googleOAuthEnabled: integrations.googleOAuth,
@@ -285,12 +309,15 @@ export async function createProductionComposition(
       applicationStore,
       runtimeStore,
       secretBox,
+      customerDataControls,
     });
     const privateCommands = new PrivateCommandRouter([
+      customerDataControlCommands,
       new PrivateControlCommandService({
         snapshots: applicationStore,
         outbox: applicationStore,
         mutator: new ApplicationPrivateControlMutator(application),
+        sharingReferences: conversationFeedback,
       }),
       ...(google.privateCommands === null ? [] : [google.privateCommands]),
     ]);
@@ -301,6 +328,8 @@ export async function createProductionComposition(
       linqChats: linq,
       linqAttachments: linq,
       google: google.pushProcessor,
+      deletedIdentities: customerDataControls,
+      conversationFeedback,
       privateCommands,
       defaultTimeZone: config.FLORENCE_DEFAULT_TIMEZONE,
     });
@@ -326,9 +355,17 @@ export async function createProductionComposition(
       pollIntervalMs: Math.max(30_000, config.WORKER_POLL_INTERVAL_MS),
       leaseSeconds: Math.max(300, config.WORKER_LEASE_SECONDS),
     });
+    const customerDeletion = new CustomerDeletionHost({
+      store: customerDataControls,
+      remote: google.deletionCleanup,
+      owner: workerId("customer-deletion"),
+      pollIntervalMs: Math.max(250, config.WORKER_POLL_INTERVAL_MS),
+      leaseSeconds: Math.max(120, config.WORKER_LEASE_SECONDS),
+    });
     const loops: BackgroundLoop[] = [
       { run: (signal) => durableWorker.run(application, signal) },
       { run: (signal) => dailyBrief.run(application, signal) },
+      customerDeletion,
       maintenance,
       ...google.backgrounds,
     ];
@@ -384,6 +421,7 @@ export async function createProductionComposition(
           runtimeStore,
         ),
         googleOAuth: google.oauth,
+        customerExport: customerDataControlCommands,
         readiness,
         operations,
       },
@@ -475,6 +513,7 @@ type GoogleComposition = {
   };
   privateCommands: PrivateGoogleCommandService | null;
   calendarPush: GoogleCalendarPushIngress | null;
+  deletionCleanup: CustomerDeletionRemoteCleanup;
   backgrounds: readonly BackgroundLoop[];
 };
 
@@ -487,6 +526,7 @@ function createGoogleComposition(input: {
   applicationStore: ApplicationStore;
   runtimeStore: FlorenceRuntimeStore;
   secretBox: SecretBox;
+  customerDataControls: PostgresCustomerDataControlStore;
 }): GoogleComposition {
   const { config } = input;
   if (
@@ -501,6 +541,7 @@ function createGoogleComposition(input: {
       pushProcessor: new UnavailableGooglePushProcessor(),
       privateCommands: null,
       calendarPush: null,
+      deletionCleanup: new UnconfiguredGoogleCustomerDeletionCleanup(),
       backgrounds: [],
     };
   }
@@ -511,6 +552,15 @@ function createGoogleComposition(input: {
     redirectUri: config.GOOGLE_REDIRECT_URI,
   });
   const oauthAdapter = new GoogleOAuthAdapter(adapterConfig);
+  const gmailAdapter = new GmailAdapter(adapterConfig);
+  const calendarAdapter = new GoogleCalendarAdapter(adapterConfig);
+  const deletionCleanup = new GoogleCustomerDeletionCleanup({
+    store: input.customerDataControls,
+    gmail: gmailAdapter,
+    calendar: calendarAdapter,
+    oauth: oauthAdapter,
+    secretBox: input.secretBox,
+  });
   const backgrounds: BackgroundLoop[] = [];
   let pushProcessor: GoogleComposition["pushProcessor"] = new UnavailableGooglePushProcessor();
   if (
@@ -521,7 +571,7 @@ function createGoogleComposition(input: {
     const gmailSync = new GoogleSyncService({
       directory: input.runtimeStore,
       repository: input.runtimeStore,
-      gmail: new GmailAdapter(adapterConfig),
+      gmail: gmailAdapter,
       oauth: oauthAdapter,
       application: input.application,
       completionDigest: new GmailPrivateCompletionDigestAdapter(input.runtimeStore),
@@ -546,7 +596,7 @@ function createGoogleComposition(input: {
     const calendarSync = new GoogleCalendarSyncService({
       directory: input.runtimeStore,
       repository: input.runtimeStore,
-      calendar: new GoogleCalendarAdapter(adapterConfig),
+      calendar: calendarAdapter,
       oauth: oauthAdapter,
       application: input.application,
       secretBox: input.secretBox,
@@ -596,7 +646,7 @@ function createGoogleComposition(input: {
     handoffSecret: config.GOOGLE_OAUTH_STATE_SECRET,
     onConnected: (event) => privateCommands.onGoogleConnected(event),
   });
-  return { oauth, pushProcessor, privateCommands, calendarPush, backgrounds };
+  return { oauth, pushProcessor, privateCommands, calendarPush, deletionCleanup, backgrounds };
 }
 
 function calendarQueueAdapter(store: FlorenceRuntimeStore): GoogleSyncQueuePort<CalendarSyncWork> {
@@ -626,6 +676,16 @@ class UnavailableGoogleOAuth implements GoogleOAuthHandoff {
 class UnavailableGooglePushProcessor {
   public async processPush(_event: GmailPubSubEvent): Promise<never> {
     throw new ProviderProcessingError("google_not_configured", false, "Google is not configured");
+  }
+}
+
+/** Keeps connector cleanup visibly pending when Google credentials are unavailable. */
+class UnconfiguredGoogleCustomerDeletionCleanup implements CustomerDeletionRemoteCleanup {
+  public async execute(
+    lease: CustomerDeletionCleanupLease,
+  ): Promise<{ status: "succeeded" } | { status: "retry"; safeErrorCode: "google_cleanup_unconfigured" }> {
+    if (lease.kind === "local.finalize") return { status: "succeeded" };
+    return { status: "retry", safeErrorCode: "google_cleanup_unconfigured" };
   }
 }
 

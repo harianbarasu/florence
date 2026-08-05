@@ -27,7 +27,7 @@ describe.skipIf(!databaseUrl)("database migration coordination", () => {
       migrateDatabase(second, schema),
     ]);
 
-    expect([left.length, right.length].sort((a, b) => a - b)).toEqual([0, 7]);
+    expect([left.length, right.length].sort((a, b) => a - b)).toEqual([0, 9]);
     const rows = await first<{ version: string }[]>`
       select version from schema_migrations order by version
     `;
@@ -39,6 +39,8 @@ describe.skipIf(!databaseUrl)("database migration coordination", () => {
       "005_google_calendar_sync.sql",
       "006_gmail_discovery_guard.sql",
       "007_linq_authority.sql",
+      "008_conversation_feedback.sql",
+      "009_customer_data_controls.sql",
     ]);
 
     const householdId = randomUUID();

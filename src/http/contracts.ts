@@ -51,6 +51,15 @@ export type JsonObject = { [key: string]: JsonValue };
 
 export type OperatorDeleteResult = "accepted" | "already_deleted" | "not_found";
 
+export type CustomerExportConsumption =
+  | { readonly status: "download"; readonly filename: string; readonly artifact: JsonObject }
+  | { readonly status: "expired" | "invalid" | "consumed" | "unavailable" };
+
+/** Resolves a signed, single-use customer export handoff without exposing its signing implementation. */
+export interface CustomerExportHandoff {
+  consumeExportToken(token: string): Promise<CustomerExportConsumption>;
+}
+
 /**
  * Export payloads must contain app-owned user data only; connector credentials,
  * OAuth tokens, encryption keys, and model traces are forbidden by contract.
@@ -64,6 +73,7 @@ export interface HouseholdOperations {
 export interface FlorenceHttpServices {
   ingress: DurableIngress;
   googleOAuth: GoogleOAuthHandoff;
+  customerExport: CustomerExportHandoff;
   readiness: ReadinessProbe;
   operations: HouseholdOperations;
 }

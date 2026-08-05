@@ -884,7 +884,7 @@ export class ApplicationStore implements ApplicationRepositoryPort {
           )
             and (inbox.household_id is null or household.status <> 'deleting')
           order by inbox.available_at, inbox.received_at
-          for update skip locked
+          for update of inbox skip locked
           limit ${parsed.limit}
         )
         update provider_inbox
@@ -2532,6 +2532,8 @@ function projectionForExport(
       projection: {
         ...projection,
         gmailTriage: projection.gmailTriage.filter((record) => record.ownerAdultId === viewerAdultId),
+        calendarTriage: projection.calendarTriage.filter((record) => record.ownerAdultId === viewerAdultId),
+        calendarSources: projection.calendarSources.filter((record) => record.ownerAdultId === viewerAdultId),
         pendingPromotions: projection.pendingPromotions.filter(
           (promotion) => promotion.ownerAdultId === viewerAdultId,
         ),

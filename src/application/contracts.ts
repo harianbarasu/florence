@@ -3,6 +3,8 @@ import {
   AcceptanceReceiptSchema,
   AdultIdSchema,
   ConfidenceSchema,
+  type ConversationResponseContext,
+  ConversationResponseContextSchema,
   OutboxIntentSchema as DomainOutboxIntentSchema,
   DurableScopeSchema,
   EpisodeIdSchema,
@@ -121,6 +123,28 @@ export const ConversationChannelSchema = z
     }
   });
 
+export type { ConversationResponseContext };
+export { ConversationResponseContextSchema };
+
+export const ReferencedConversationMessageSchema = z.strictObject({
+  messageRef: StableReferenceSchema,
+  messageClass: z.enum([
+    "onboarding",
+    "private_review",
+    "private_interrupt",
+    "promotion_request",
+    "clarifying_question",
+    "status",
+    "daily_brief",
+    "reminder",
+    "missed_window",
+    "approval_request",
+  ]),
+  responseContext: ConversationResponseContextSchema.optional(),
+});
+
+export type ReferencedConversationMessage = z.infer<typeof ReferencedConversationMessageSchema>;
+
 export const ConversationInboxItemSchema = z
   .strictObject({
     kind: z.literal("conversation_message"),
@@ -130,6 +154,7 @@ export const ConversationInboxItemSchema = z
     channel: ConversationChannelSchema,
     senderAdultId: AdultIdSchema,
     messageRef: StableReferenceSchema,
+    replyTo: ReferencedConversationMessageSchema.optional(),
     text: z.string().max(20_000),
     attachmentRefs: z.array(StableReferenceSchema).max(20),
     attachmentContents: z.array(ConversationAttachmentContentSchema).max(20),
@@ -790,6 +815,7 @@ export const ConversationSendIntentSchema = z.strictObject({
     "status",
     "daily_brief",
   ]),
+  responseContext: ConversationResponseContextSchema.optional(),
   body: z.string().trim().min(1).max(4_000),
 });
 

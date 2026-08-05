@@ -966,6 +966,146 @@ describe.skipIf(!databaseUrl)("FlorenceRuntimeStore PostgreSQL integration", () 
     ).resolves.toMatchObject({ status: "active" });
   });
 
+  it("retains a Calendar action echo guard only for the exact application-content digest", async () => {
+    const founded = await provisionConsentedFounder({
+      externalChatId: `dm-calendar-echo-${randomUUID()}`,
+      externalHandle: "+12025550218",
+      timeZone: "America/Los_Angeles",
+      occurredAt: "2027-02-01T08:00:00Z",
+    });
+    if (!founded.adultId) throw new Error("Expected a founding adult");
+    const connection = await applicationStore.upsertExternalConnection({
+      householdId: founded.householdId,
+      adultId: founded.adultId,
+      provider: "google",
+      label: "Personal Calendar",
+      externalAccountId: `google-calendar-echo-${randomUUID()}`,
+      encryptedCredentials: "encrypted-calendar-echo",
+      grantedScopes: [GOOGLE_CALENDAR_EVENTS_SCOPE],
+      cursor: {},
+      metadata: { credentialAadVersion: 1 },
+    });
+    const digestA = `sha256:${"a".repeat(64)}`;
+    const digestB = `sha256:${"b".repeat(64)}`;
+    const source = {
+      householdId: founded.householdId,
+      adultId: founded.adultId,
+      connectionId: connection.connectionId,
+      calendarId: "primary",
+      externalId: "florence-created-event",
+      occurredAt: "2027-02-01T08:00:00Z",
+      encryptedContent: "encrypted-private-calendar-event",
+      busyWindow: null,
+    };
+
+    const actionInsert = await store.persistPersonalCalendarSource({
+      ...source,
+      kind: "calendar_event",
+      contentHash: `sha256:${"1".repeat(64)}`,
+      metadata: {
+        provider: "google-calendar",
+        sourceScope: "personal",
+        applicationContentDigest: digestA,
+        createdByApprovedActionId: "approved-calendar-action",
+      },
+    });
+    expect(actionInsert).toMatchObject({
+      disposition: "inserted",
+      revision: 1,
+      createdByApprovedActionId: "approved-calendar-action",
+    });
+
+    const listEcho = await store.persistPersonalCalendarSource({
+      ...source,
+      kind: "calendar_event",
+      contentHash: `sha256:${"2".repeat(64)}`,
+      metadata: {
+        provider: "google-calendar",
+        sourceScope: "personal",
+        applicationContentDigest: digestA,
+      },
+    });
+    expect(listEcho).toMatchObject({
+      disposition: "revised",
+      revision: 2,
+      createdByApprovedActionId: "approved-calendar-action",
+    });
+
+    const edited = await store.persistPersonalCalendarSource({
+      ...source,
+      occurredAt: "2027-02-01T08:01:00Z",
+      kind: "calendar_event",
+      contentHash: `sha256:${"3".repeat(64)}`,
+      metadata: {
+        provider: "google-calendar",
+        sourceScope: "personal",
+        applicationContentDigest: digestB,
+      },
+    });
+    expect(edited).toMatchObject({
+      disposition: "revised",
+      revision: 3,
+      createdByApprovedActionId: null,
+    });
+
+    const staleActionResponse = await store.persistPersonalCalendarSource({
+      ...source,
+      occurredAt: "2027-02-01T08:00:30Z",
+      kind: "calendar_event",
+      contentHash: `sha256:${"5".repeat(64)}`,
+      metadata: {
+        provider: "google-calendar",
+        sourceScope: "personal",
+        applicationContentDigest: digestA,
+        createdByApprovedActionId: "stale-approved-action",
+      },
+    });
+    expect(staleActionResponse).toMatchObject({
+      disposition: "unchanged",
+      revision: 3,
+      retainedExisting: "stale",
+      createdByApprovedActionId: null,
+    });
+
+    const deleted = await store.persistPersonalCalendarSource({
+      ...source,
+      occurredAt: "2027-02-01T08:02:00Z",
+      kind: "calendar_event_deleted",
+      contentHash: `sha256:${"4".repeat(64)}`,
+      metadata: {
+        provider: "google-calendar",
+        sourceScope: "personal",
+        createdByApprovedActionId: "untrusted-marker-without-digest",
+      },
+    });
+    expect(deleted).toMatchObject({
+      disposition: "revised",
+      revision: 4,
+      createdByApprovedActionId: null,
+    });
+    await expect(
+      applicationStore.getSourceItem({
+        sourceItemId: deleted.sourceItemId,
+        householdId: founded.householdId,
+        viewerAdultId: founded.adultId,
+      }),
+    ).resolves.toMatchObject({
+      kind: "calendar_event_deleted",
+      revision: 4,
+      metadata: {
+        provider: "google-calendar",
+        sourceScope: "personal",
+      },
+    });
+    const stored = await applicationStore.getSourceItem({
+      sourceItemId: deleted.sourceItemId,
+      householdId: founded.householdId,
+      viewerAdultId: founded.adultId,
+    });
+    expect(stored?.metadata).not.toHaveProperty("createdByApprovedActionId");
+    expect(stored?.metadata).not.toHaveProperty("applicationContentDigest");
+  });
+
   it("prepares one write target from complete household availability without exposing private events", async () => {
     const founded = await provisionConsentedFounder({
       externalChatId: `dm-calendar-write-${randomUUID()}`,

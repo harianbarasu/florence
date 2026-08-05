@@ -534,6 +534,7 @@ function createGoogleComposition(input: {
       repository: input.runtimeStore,
       calendar: new GoogleCalendarAdapter(adapterConfig),
       oauth: oauthAdapter,
+      application: input.application,
       secretBox: input.secretBox,
       publicBaseUrl: config.FLORENCE_WEB_BASE_URL,
     });

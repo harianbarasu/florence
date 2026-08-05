@@ -30,6 +30,7 @@ import {
   calendarSyncStateSchema,
   calendarSyncWorkSchema,
   type PersistPersonalCalendarSourceInput,
+  type PersistPersonalCalendarSourceResult,
 } from "./google-calendar-sync.js";
 import type {
   GmailSyncState,
@@ -1133,7 +1134,7 @@ export class FlorenceRuntimeStore {
 
   public async persistPersonalCalendarSource(
     input: PersistPersonalCalendarSourceInput,
-  ): Promise<{ sourceItemId: string; disposition: "inserted" | "unchanged" | "revised"; revision: number }> {
+  ): Promise<PersistPersonalCalendarSourceResult> {
     const parsed = z
       .strictObject({
         householdId: z.uuid(),
@@ -1164,6 +1165,15 @@ export class FlorenceRuntimeStore {
       encryptedContent: parsed.encryptedContent,
       metadata: parsed.metadata,
     });
+    if (persisted.retainedExisting === "stale") {
+      return {
+        sourceItemId: persisted.sourceItemId,
+        disposition: persisted.disposition,
+        revision: persisted.revision,
+        createdByApprovedActionId: persisted.createdByApprovedActionId ?? null,
+        retainedExisting: "stale",
+      };
+    }
     if (parsed.busyWindow === null) {
       await this.database`
         delete from calendar_busy_windows
@@ -1172,7 +1182,12 @@ export class FlorenceRuntimeStore {
           and external_event_id = ${parsed.externalId}
           and source_revision <= ${persisted.revision}
       `;
-      return persisted;
+      return {
+        sourceItemId: persisted.sourceItemId,
+        disposition: persisted.disposition,
+        revision: persisted.revision,
+        createdByApprovedActionId: persisted.createdByApprovedActionId ?? null,
+      };
     }
     const rows = await this.database<{ connection_id: string }[]>`
       insert into calendar_busy_windows (
@@ -1184,6 +1199,9 @@ export class FlorenceRuntimeStore {
         ${persisted.revision}, ${parsed.busyWindow.startsAt}, ${parsed.busyWindow.endsAt},
         ${parsed.busyWindow.allDay}
       from external_connections connection
+      join source_items source on source.id = ${persisted.sourceItemId}
+        and source.household_id = connection.household_id
+        and source.connection_id = connection.id and source.revision = ${persisted.revision}
       where connection.id = ${parsed.connectionId} and connection.household_id = ${parsed.householdId}
         and connection.adult_id = ${parsed.adultId} and connection.provider = 'google'
         and connection.status = 'active'
@@ -1195,9 +1213,28 @@ export class FlorenceRuntimeStore {
       returning connection_id
     `;
     if (!rows[0]) {
+      const current = await this.database<{ revision: string }[]>`
+        select revision from source_items
+        where id = ${persisted.sourceItemId} and household_id = ${parsed.householdId}
+          and connection_id = ${parsed.connectionId} and owner_adult_id = ${parsed.adultId}
+      `;
+      if (current[0] && Number(current[0].revision) > persisted.revision) {
+        return {
+          sourceItemId: persisted.sourceItemId,
+          disposition: "unchanged",
+          revision: Number(current[0].revision),
+          createdByApprovedActionId: null,
+          retainedExisting: "stale",
+        };
+      }
       throw new ApplicationStoreError("not_authorized", "Calendar projection owner is inactive");
     }
-    return persisted;
+    return {
+      sourceItemId: persisted.sourceItemId,
+      disposition: persisted.disposition,
+      revision: persisted.revision,
+      createdByApprovedActionId: persisted.createdByApprovedActionId ?? null,
+    };
   }
 
   public async listPersonalCalendarBusyWindows(input: {

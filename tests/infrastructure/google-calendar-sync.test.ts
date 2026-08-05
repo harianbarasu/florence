@@ -7,8 +7,15 @@ import {
   googleCalendarEventSchema,
 } from "../../src/adapters/google/index.js";
 import {
+  type ApplicationResult,
+  ApplicationResultSchema,
+  type FlorenceApplication,
+} from "../../src/application/index.js";
+import {
   type CalendarProviderPort,
   type CalendarSyncRepositoryPort,
+  calendarApplicationContent,
+  calendarApplicationContentDigest,
   calendarSourceContentAad,
   GoogleCalendarPushIngress,
   GoogleCalendarSyncService,
@@ -98,10 +105,27 @@ function harness() {
   const secretBox = new SecretBox(SECRET_KEY);
   const owned = connection(secretBox);
   const sources: PersistPersonalCalendarSourceInput[] = [];
+  const sourceRecords = new Map<string, { contentHash: string; kind: string; revision: number }>();
   const restart = vi.fn(async (input: Parameters<CalendarSyncRepositoryPort["restartCalendarSync"]>[0]) => {
     owned.cursor.calendar = structuredClone(input.state);
     return "updated" as const;
   });
+  const persistPersonalCalendarSource = vi.fn<CalendarSyncRepositoryPort["persistPersonalCalendarSource"]>(
+    async (input) => {
+      sources.push(structuredClone(input));
+      const key = `${input.calendarId}:${input.externalId}`;
+      const prior = sourceRecords.get(key);
+      const unchanged = prior?.contentHash === input.contentHash && prior.kind === input.kind;
+      const revision = prior === undefined ? 1 : unchanged ? prior.revision : prior.revision + 1;
+      sourceRecords.set(key, { contentHash: input.contentHash, kind: input.kind, revision });
+      return {
+        sourceItemId: `source-${key}`,
+        disposition: prior === undefined ? "inserted" : unchanged ? "unchanged" : "revised",
+        revision,
+        createdByApprovedActionId: null,
+      };
+    },
+  );
   const repository: CalendarSyncRepositoryPort = {
     async saveCalendarSyncState(input) {
       const revision = Number((owned.cursor.calendar as { revision?: number } | undefined)?.revision ?? 0);
@@ -110,10 +134,7 @@ function harness() {
       return "updated";
     },
     restartCalendarSync: restart,
-    async persistPersonalCalendarSource(input) {
-      sources.push(structuredClone(input));
-      return { sourceItemId: `source-${sources.length}`, disposition: "inserted", revision: 1 };
-    },
+    persistPersonalCalendarSource,
     async replaceEncryptedCredentials(input) {
       owned.encryptedCredentials = input.encryptedCredentials;
       owned.grantedScopes = [...input.grantedScopes];
@@ -151,11 +172,27 @@ function harness() {
     expiresAt: "2027-02-07T08:00:00Z",
   }));
   const stopChannel = vi.fn<CalendarProviderPort["stopChannel"]>(async () => undefined);
+  const applicationProcess = vi.fn(async (input: unknown): Promise<ApplicationResult> => {
+    const identity = input as { householdId: string; idempotencyKey: string };
+    return ApplicationResultSchema.parse({
+      householdId: identity.householdId,
+      idempotencyKey: identity.idempotencyKey,
+      disposition: "committed",
+      revision: 1,
+      outcome: {
+        status: "processed",
+        classification: "calendar:test",
+        domainReceipts: [],
+        outboxIntentIds: [],
+      },
+    });
+  });
   const service = new GoogleCalendarSyncService({
     directory: { getOwnedGoogleConnection: async () => owned },
     repository,
     calendar: { listEventsPage, watchEvents, stopChannel },
     oauth: { refresh: vi.fn(async () => tokenSet()), revoke: vi.fn(async () => undefined) },
+    application: { process: applicationProcess as FlorenceApplication["process"] },
     secretBox,
     publicBaseUrl: "https://florence.example.test",
     now: () => NOW,
@@ -171,10 +208,12 @@ function harness() {
     owned,
     sources,
     repository,
+    persistPersonalCalendarSource,
     restart,
     listEventsPage,
     watchEvents,
     stopChannel,
+    applicationProcess,
     service,
     identity,
   };
@@ -209,6 +248,7 @@ describe("GoogleCalendarSyncService", () => {
     expect(fixture.listEventsPage).toHaveBeenCalledWith(
       expect.objectContaining({
         calendarId: "primary",
+        maxResults: 25,
         singleEvents: true,
         timeMin: "2026-11-03T08:00:00.000Z",
         timeMax: "2028-07-25T08:00:00.000Z",
@@ -229,6 +269,183 @@ describe("GoogleCalendarSyncService", () => {
       ),
     ).toContain("Private medical appointment");
     expect(JSON.stringify(persisted.busyWindow)).not.toMatch(/summary|description|location|attendee/iu);
+    const content = calendarApplicationContent(event(), "America/Los_Angeles");
+    if (content === null) throw new Error("Expected normalized Calendar application content");
+    expect(fixture.applicationProcess).toHaveBeenCalledWith({
+      kind: "calendar_event",
+      householdId: HOUSEHOLD_ID,
+      idempotencyKey: `calendar:${CONNECTION_ID}:primary:event-1:revision:1`,
+      occurredAt: "2027-02-01T08:00:00Z",
+      ownerAdultId: ADULT_ID,
+      accountRef: `google:${CONNECTION_ID}`,
+      eventRef: `calendar:${CONNECTION_ID}:primary:event-1`,
+      providerRef: `google-calendar:${CONNECTION_ID}:primary:event-1`,
+      revision: 1,
+      contentDigest: calendarApplicationContentDigest(content),
+      ...content,
+    });
+    expect(persisted.metadata).toMatchObject({
+      applicationContentDigest: calendarApplicationContentDigest(content),
+    });
+    expect(JSON.stringify(fixture.applicationProcess.mock.calls)).not.toMatch(
+      /etag-1|google-calendar-change|event\?eid|google-subject-parent|organizer|creator|attendees|visibility/iu,
+    );
+  });
+
+  it("persists malformed and historical initial events privately without flooding Calendar triage", async () => {
+    const fixture = harness();
+    fixture.listEventsPage.mockResolvedValueOnce({
+      events: [
+        event({
+          eventId: "malformed-event",
+          summary: "   ",
+          updatedAt: NOW.toISOString(),
+        }),
+        event({
+          eventId: "old-event",
+          summary: "Old private event",
+          start: { kind: "dateTime", dateTime: "2027-01-01T09:00:00-08:00", timeZone: null },
+          end: { kind: "dateTime", dateTime: "2027-01-01T10:00:00-08:00", timeZone: null },
+          updatedAt: "2027-01-01T18:00:00Z",
+        }),
+        event({
+          eventId: "recently-edited-old-event",
+          summary: "Recently edited old event",
+          start: { kind: "dateTime", dateTime: "2027-01-02T09:00:00-08:00", timeZone: null },
+          end: { kind: "dateTime", dateTime: "2027-01-02T10:00:00-08:00", timeZone: null },
+          updatedAt: NOW.toISOString(),
+        }),
+      ],
+      nextPageToken: null,
+      nextSyncToken: "sync-token-initial",
+      timeZone: "America/Los_Angeles",
+    });
+
+    await fixture.service.execute({ kind: "start", ...fixture.identity });
+    await expect(fixture.service.execute({ kind: "continue", ...fixture.identity })).resolves.toMatchObject({
+      processedEvents: 3,
+    });
+
+    expect(fixture.sources).toHaveLength(3);
+    expect(fixture.sources[0]?.metadata).not.toHaveProperty("applicationContentDigest");
+    expect(fixture.applicationProcess).toHaveBeenCalledTimes(1);
+    expect(fixture.applicationProcess).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: "calendar_event",
+        eventRef: `calendar:${CONNECTION_ID}:primary:recently-edited-old-event`,
+      }),
+    );
+  });
+
+  it("retries application reconciliation after source persistence committed unchanged", async () => {
+    const fixture = harness();
+    fixture.applicationProcess.mockRejectedValueOnce(new Error("application unavailable"));
+    await fixture.service.execute({ kind: "start", ...fixture.identity });
+
+    await expect(fixture.service.execute({ kind: "continue", ...fixture.identity })).rejects.toMatchObject({
+      code: "invalid_state",
+      retryable: true,
+    });
+    await expect(fixture.service.execute({ kind: "continue", ...fixture.identity })).resolves.toMatchObject({
+      status: "continuation_required",
+      processedEvents: 1,
+    });
+
+    expect(fixture.persistPersonalCalendarSource).toHaveBeenCalledTimes(2);
+    expect(fixture.applicationProcess).toHaveBeenCalledTimes(2);
+    expect(fixture.applicationProcess.mock.calls[0]?.[0]).toEqual(
+      fixture.applicationProcess.mock.calls[1]?.[0],
+    );
+    expect(fixture.applicationProcess.mock.calls[1]?.[0]).toMatchObject({
+      idempotencyKey: `calendar:${CONNECTION_ID}:primary:event-1:revision:1`,
+      revision: 1,
+    });
+  });
+
+  it("suppresses only an exact approved-action echo, then reconciles an edit and deletion", async () => {
+    const fixture = harness();
+    fixture.persistPersonalCalendarSource
+      .mockResolvedValueOnce({
+        sourceItemId: "source-action-event",
+        disposition: "revised",
+        revision: 2,
+        createdByApprovedActionId: "approved-action-1",
+      })
+      .mockResolvedValueOnce({
+        sourceItemId: "source-action-event",
+        disposition: "revised",
+        revision: 3,
+        createdByApprovedActionId: "approved-action-1",
+      })
+      .mockResolvedValueOnce({
+        sourceItemId: "source-action-event",
+        disposition: "revised",
+        revision: 4,
+        createdByApprovedActionId: null,
+      })
+      .mockResolvedValueOnce({
+        sourceItemId: "source-action-event",
+        disposition: "revised",
+        revision: 5,
+        createdByApprovedActionId: null,
+      });
+    await fixture.service.execute({ kind: "start", ...fixture.identity });
+    await fixture.service.execute({ kind: "continue", ...fixture.identity });
+    expect(fixture.applicationProcess).not.toHaveBeenCalled();
+
+    fixture.listEventsPage.mockResolvedValueOnce({
+      events: [event({ etag: '"provider-only-etag"', changeKey: "google-calendar-change:two" })],
+      nextPageToken: null,
+      nextSyncToken: "sync-token-2",
+      timeZone: "America/Los_Angeles",
+    });
+    await fixture.service.execute({ kind: "push", ...fixture.identity });
+    expect(fixture.applicationProcess).not.toHaveBeenCalled();
+
+    fixture.listEventsPage.mockResolvedValueOnce({
+      events: [event({ summary: "Meaningfully edited appointment" })],
+      nextPageToken: null,
+      nextSyncToken: "sync-token-3",
+      timeZone: "America/Los_Angeles",
+    });
+    await fixture.service.execute({ kind: "push", ...fixture.identity });
+    expect(fixture.applicationProcess).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: "calendar_event",
+        revision: 4,
+        title: "Meaningfully edited appointment",
+      }),
+    );
+
+    fixture.listEventsPage.mockResolvedValueOnce({
+      events: [
+        event({
+          status: "cancelled",
+          deleted: true,
+          summary: "",
+          description: null,
+          location: null,
+          start: null,
+          end: null,
+        }),
+      ],
+      nextPageToken: null,
+      nextSyncToken: "sync-token-4",
+      timeZone: "America/Los_Angeles",
+    });
+    await fixture.service.execute({ kind: "push", ...fixture.identity });
+    expect(fixture.applicationProcess).toHaveBeenLastCalledWith({
+      kind: "calendar_event_deleted",
+      householdId: HOUSEHOLD_ID,
+      idempotencyKey: `calendar:${CONNECTION_ID}:primary:event-1:revision:5`,
+      occurredAt: "2027-02-01T08:00:00Z",
+      ownerAdultId: ADULT_ID,
+      accountRef: `google:${CONNECTION_ID}`,
+      eventRef: `calendar:${CONNECTION_ID}:primary:event-1`,
+      providerRef: `google-calendar:${CONNECTION_ID}:primary:event-1`,
+      revision: 5,
+    });
+    expect(fixture.applicationProcess).toHaveBeenCalledTimes(2);
   });
 
   it("uses the live sync token, replaces watches, and never persists the channel token", async () => {

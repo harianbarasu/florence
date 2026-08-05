@@ -10,6 +10,8 @@ import {
   googleConnectionCredentialsAad,
 } from "../../src/infrastructure/google-sync.js";
 import {
+  calendarApplicationContent,
+  calendarApplicationContentDigest,
   calendarSourceContentAad,
   GoogleCalendarActionError,
   type GoogleCalendarActionStore,
@@ -140,7 +142,12 @@ function harness() {
     markConnectionStatus: vi.fn(async () => "updated" as const),
     async persistPersonalCalendarSource(input) {
       persisted.push(structuredClone(input));
-      return { sourceItemId: "source-calendar-created", disposition: "inserted", revision: 1 };
+      return {
+        sourceItemId: "source-calendar-created",
+        disposition: "inserted",
+        revision: 1,
+        createdByApprovedActionId: action().actionId,
+      };
     },
   };
   const insertEvent = vi.fn(async () => event());
@@ -192,6 +199,8 @@ describe("GoogleCalendarActions", () => {
       visibility: "default",
     });
     expect(fixture.persisted).toHaveLength(1);
+    const applicationContent = calendarApplicationContent(event(), action().timeZone);
+    if (applicationContent === null) throw new Error("Expected approved Calendar content");
     expect(fixture.persisted[0]).toMatchObject({
       householdId: HOUSEHOLD_ID,
       adultId: ADULT_A,
@@ -202,7 +211,11 @@ describe("GoogleCalendarActions", () => {
         endsAt: "2027-09-08T02:30:00Z",
         allDay: false,
       },
-      metadata: { sourceScope: "personal", createdByApprovedActionId: approved.actionId },
+      metadata: {
+        sourceScope: "personal",
+        createdByApprovedActionId: approved.actionId,
+        applicationContentDigest: calendarApplicationContentDigest(applicationContent),
+      },
     });
     const encrypted = fixture.persisted[0]?.encryptedContent;
     expect(encrypted).not.toContain("School welcome night");
@@ -213,6 +226,23 @@ describe("GoogleCalendarActions", () => {
       ),
     ).toContain("School welcome night");
     expect(fixture.refresh).not.toHaveBeenCalled();
+  });
+
+  it("does not trust or persist a provider response with unapproved app-visible semantics", async () => {
+    const fixture = harness();
+    fixture.insertEvent.mockResolvedValueOnce({
+      ...event(),
+      description: "Provider-injected private description",
+    });
+
+    await expect(
+      fixture.service.createApprovedEvent({
+        action: action(),
+        idempotencyKey: "florence:provider-semantic-mismatch",
+        asOf: AS_OF,
+      }),
+    ).rejects.toEqual(new GoogleCalendarActionError("invalid_state", false));
+    expect(fixture.persisted).toEqual([]);
   });
 
   it("fails before provider access when the approval's availability version changed", async () => {

@@ -10,9 +10,13 @@ import { type CalendarEventCreateAction, CalendarEventCreateActionSchema } from 
 import { canonicalJson, sha256 } from "../security/canonical-json.js";
 import type { SecretBox } from "../security/secret-box.js";
 import {
+  type CalendarApplicationContent,
+  calendarApplicationContent,
+  calendarApplicationContentDigest,
   calendarSourceContentAad,
   normalizeCalendarBusyWindow,
   type PersistPersonalCalendarSourceInput,
+  type PersistPersonalCalendarSourceResult,
 } from "./google-calendar-sync.js";
 import {
   type GoogleSyncConnection,
@@ -62,11 +66,9 @@ export interface GoogleCalendarActionStore {
     connectionId: string;
     status: "reauth_required" | "error";
   }): Promise<"updated" | "not_found">;
-  persistPersonalCalendarSource(input: PersistPersonalCalendarSourceInput): Promise<{
-    sourceItemId: string;
-    disposition: "inserted" | "unchanged" | "revised";
-    revision: number;
-  }>;
+  persistPersonalCalendarSource(
+    input: PersistPersonalCalendarSourceInput,
+  ): Promise<PersistPersonalCalendarSourceResult>;
 }
 
 export interface GoogleCalendarCreateProvider {
@@ -190,14 +192,16 @@ export class GoogleCalendarActions implements HouseholdCalendarActionsPort {
           visibility: "default",
         }),
       );
+      const applicationContent = approvedCalendarApplicationContent(event, action);
       if (
         event.googleSubject !== connection.externalAccountId ||
         event.calendarId !== action.calendarId ||
-        !calendarEventMatchesApprovedAction(event, action)
+        applicationContent === null
       ) {
         throw new GoogleCalendarActionError("invalid_state", false);
       }
       const serialized = canonicalJson(event);
+      const applicationContentDigest = calendarApplicationContentDigest(applicationContent);
       await this.#store.persistPersonalCalendarSource({
         householdId: connection.householdId,
         adultId: connection.adultId,
@@ -222,6 +226,7 @@ export class GoogleCalendarActions implements HouseholdCalendarActionsPort {
           deleted: false,
           contentAadVersion: 1,
           createdByApprovedActionId: action.actionId,
+          applicationContentDigest,
         },
         busyWindow: normalizeCalendarBusyWindow(event, action.timeZone),
       });
@@ -332,10 +337,10 @@ function tokenNeedsRefresh(tokens: GoogleTokenSet, now: Date, skewMs: number): b
   return !Number.isFinite(expiry) || expiry <= now.getTime() + skewMs;
 }
 
-function calendarEventMatchesApprovedAction(
+function approvedCalendarApplicationContent(
   event: Awaited<ReturnType<GoogleCalendarCreateProvider["insertEvent"]>>,
   action: CalendarEventCreateAction,
-): boolean {
+): CalendarApplicationContent | null {
   if (
     event.deleted ||
     event.summary !== action.title ||
@@ -344,14 +349,25 @@ function calendarEventMatchesApprovedAction(
     event.start.timeZone !== action.timeZone ||
     event.end.timeZone !== action.timeZone
   ) {
-    return false;
+    return null;
+  }
+  const content = calendarApplicationContent(event, action.timeZone);
+  if (
+    content === null ||
+    content.description !== null ||
+    content.location !== null ||
+    content.allDay ||
+    content.status !== "confirmed" ||
+    content.recurrence.length !== 0
+  ) {
+    return null;
   }
   try {
-    return (
-      Temporal.Instant.compare(event.start.dateTime, action.startsAt) === 0 &&
+    return Temporal.Instant.compare(event.start.dateTime, action.startsAt) === 0 &&
       Temporal.Instant.compare(event.end.dateTime, action.endsAt) === 0
-    );
+      ? content
+      : null;
   } catch {
-    return false;
+    return null;
   }
 }

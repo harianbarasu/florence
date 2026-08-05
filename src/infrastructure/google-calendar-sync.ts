@@ -14,6 +14,11 @@ import {
   googleTokenSetSchema,
   parseGoogleCalendarPush,
 } from "../adapters/google/index.js";
+import {
+  CalendarEventDeletedInboxItemSchema,
+  CalendarEventInboxItemSchema,
+  type FlorenceApplication,
+} from "../application/index.js";
 import { TimeZoneSchema } from "../domain/index.js";
 import { canonicalJson, sha256 } from "../security/canonical-json.js";
 import type { SecretBox } from "../security/secret-box.js";
@@ -147,6 +152,26 @@ export interface PersistPersonalCalendarSourceInput {
   busyWindow: CalendarBusyWindow | null;
 }
 
+export type PersistPersonalCalendarSourceResult = {
+  sourceItemId: string;
+  disposition: "inserted" | "unchanged" | "revised";
+  revision: number;
+  createdByApprovedActionId: string | null;
+  retainedExisting?: "stale";
+};
+
+export type CalendarApplicationContent = {
+  title: string;
+  description: string | null;
+  location: string | null;
+  startsAt: string;
+  endsAt: string;
+  timeZone: string;
+  allDay: boolean;
+  status: "confirmed" | "tentative";
+  recurrence: string[];
+};
+
 export interface CalendarPushTarget {
   householdId: string;
   adultId: string;
@@ -169,11 +194,9 @@ export interface CalendarSyncRepositoryPort {
     expectedRevision: number;
     state: CalendarSyncState;
   }): Promise<ScopedMutationResult>;
-  persistPersonalCalendarSource(input: PersistPersonalCalendarSourceInput): Promise<{
-    sourceItemId: string;
-    disposition: "inserted" | "unchanged" | "revised";
-    revision: number;
-  }>;
+  persistPersonalCalendarSource(
+    input: PersistPersonalCalendarSourceInput,
+  ): Promise<PersistPersonalCalendarSourceResult>;
   replaceEncryptedCredentials(input: {
     householdId: string;
     adultId: string;
@@ -288,6 +311,7 @@ export interface GoogleCalendarSyncServiceOptions {
   repository: CalendarSyncRepositoryPort;
   calendar: CalendarProviderPort;
   oauth: GoogleCredentialLifecyclePort;
+  application: Pick<FlorenceApplication, "process">;
   secretBox: Pick<SecretBox, "open" | "seal">;
   publicBaseUrl: string;
   now?: () => Date;
@@ -302,6 +326,7 @@ export class GoogleCalendarSyncService {
   readonly #repository: CalendarSyncRepositoryPort;
   readonly #calendar: CalendarProviderPort;
   readonly #oauth: GoogleCredentialLifecyclePort;
+  readonly #application: Pick<FlorenceApplication, "process">;
   readonly #secretBox: Pick<SecretBox, "open" | "seal">;
   readonly #pushAddress: string;
   readonly #now: () => Date;
@@ -314,6 +339,7 @@ export class GoogleCalendarSyncService {
     this.#repository = options.repository;
     this.#calendar = options.calendar;
     this.#oauth = options.oauth;
+    this.#application = options.application;
     this.#secretBox = options.secretBox;
     this.#pushAddress = new URL("/webhooks/google/calendar", z.url().parse(options.publicBaseUrl)).toString();
     this.#now = options.now ?? (() => new Date());
@@ -322,7 +348,7 @@ export class GoogleCalendarSyncService {
       .int()
       .min(1)
       .max(2_500)
-      .parse(options.pageSize ?? 250);
+      .parse(options.pageSize ?? 25);
     this.#refreshSkewMs = z
       .number()
       .int()
@@ -436,7 +462,7 @@ export class GoogleCalendarSyncService {
             false,
           );
         }
-        await this.#persistEvent(connection, event, timeZone);
+        await this.#persistEvent(connection, event, timeZone, workingState);
         processedEvents += 1;
       }
 
@@ -607,10 +633,14 @@ export class GoogleCalendarSyncService {
     connection: GoogleSyncConnection,
     event: GoogleCalendarEvent,
     timeZone: string | null,
+    state: CalendarSyncState,
   ): Promise<void> {
     const serialized = canonicalJson(event);
     const busyWindow = normalizeCalendarBusyWindow(event, timeZone);
-    await this.#repository.persistPersonalCalendarSource({
+    const applicationContent = event.deleted ? null : calendarApplicationContent(event, timeZone);
+    const applicationContentDigest =
+      applicationContent === null ? null : calendarApplicationContentDigest(applicationContent);
+    const persisted = await this.#repository.persistPersonalCalendarSource({
       householdId: connection.householdId,
       adultId: connection.adultId,
       connectionId: connection.id,
@@ -633,9 +663,57 @@ export class GoogleCalendarSyncService {
         etag: event.etag,
         deleted: event.deleted,
         contentAadVersion: 1,
+        ...(applicationContentDigest === null ? {} : { applicationContentDigest }),
       },
       busyWindow,
     });
+    if (persisted.retainedExisting === "stale") return;
+    if (!event.deleted && persisted.createdByApprovedActionId !== null) return;
+
+    const observedAt = this.#now().toISOString();
+    if (event.deleted) {
+      await this.#processApplicationItem(
+        CalendarEventDeletedInboxItemSchema.parse({
+          kind: "calendar_event_deleted",
+          ...calendarApplicationIdentity(connection, event, persisted.revision, observedAt),
+        }),
+      );
+      return;
+    }
+    if (
+      applicationContent === null ||
+      !isCalendarEventRelevantForApplication(event, applicationContent, state)
+    ) {
+      return;
+    }
+    await this.#processApplicationItem(
+      CalendarEventInboxItemSchema.parse({
+        kind: "calendar_event",
+        ...calendarApplicationIdentity(connection, event, persisted.revision, observedAt),
+        contentDigest: applicationContentDigest,
+        ...applicationContent,
+      }),
+    );
+  }
+
+  async #processApplicationItem(
+    item:
+      | ReturnType<typeof CalendarEventInboxItemSchema.parse>
+      | ReturnType<typeof CalendarEventDeletedInboxItemSchema.parse>,
+  ): Promise<void> {
+    let applicationResult: Awaited<ReturnType<FlorenceApplication["process"]>>;
+    try {
+      applicationResult = await this.#application.process(item);
+    } catch {
+      throw new GoogleSyncError("Calendar application processing did not complete", "invalid_state", true);
+    }
+    if (applicationResult.outcome.status !== "processed") {
+      throw new GoogleSyncError(
+        "Calendar item was rejected by the application boundary",
+        "invalid_state",
+        false,
+      );
+    }
   }
 
   async #stopChannelBestEffort(
@@ -762,6 +840,55 @@ export function normalizeCalendarBusyWindow(
   }
 }
 
+/**
+ * Produces the complete provider-neutral Calendar payload that may cross into
+ * the application. Provider identities, people, links, visibility, and change
+ * markers deliberately have no representation here.
+ */
+export function calendarApplicationContent(
+  event: GoogleCalendarEvent,
+  calendarTimeZone: string | null,
+): CalendarApplicationContent | null {
+  if (
+    event.deleted ||
+    (event.status !== "confirmed" && event.status !== "tentative") ||
+    event.start === null ||
+    event.end === null ||
+    event.start.kind !== event.end.kind
+  ) {
+    return null;
+  }
+  const title = boundedCalendarText(event.summary.trim(), 2_000);
+  if (title.length === 0) return null;
+  const timeZone = eventApplicationTimeZone(event, calendarTimeZone);
+  if (timeZone === null) return null;
+  try {
+    const startsAt = eventTimeToInstant(event.start, timeZone);
+    const endsAt = eventTimeToInstant(event.end, timeZone);
+    if (Temporal.Instant.compare(startsAt, endsAt) >= 0) return null;
+    const recurrence = event.recurrence.slice(0, 100).map((rule) => boundedCalendarText(rule.trim(), 2_000));
+    if (recurrence.some((rule) => rule.length === 0)) return null;
+    return {
+      title,
+      description: event.description === null ? null : boundedCalendarText(event.description, 20_000),
+      location: event.location === null ? null : boundedCalendarText(event.location, 2_000),
+      startsAt,
+      endsAt,
+      timeZone,
+      allDay: event.start.kind === "date",
+      status: event.status,
+      recurrence,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Hashes exactly the semantic fields visible to Calendar triage. */
+export function calendarApplicationContentDigest(content: CalendarApplicationContent): string {
+  return `sha256:${sha256(canonicalJson(content))}`;
+}
+
 export function calendarSourceContentAad(
   connection: Pick<GoogleSyncConnection, "householdId" | "adultId" | "id">,
   calendarId: string,
@@ -852,6 +979,66 @@ function eventTimeToInstant(
       .toInstant()
       .toString();
   }
+}
+
+function calendarApplicationIdentity(
+  connection: GoogleSyncConnection,
+  event: GoogleCalendarEvent,
+  revision: number,
+  observedAt: string,
+) {
+  const eventIdentity = `${connection.id}:${event.calendarId}:${event.eventId}`;
+  return {
+    householdId: connection.householdId,
+    idempotencyKey: `calendar:${eventIdentity}:revision:${revision}`,
+    occurredAt: observedAt,
+    ownerAdultId: connection.adultId,
+    accountRef: `google:${connection.id}`,
+    eventRef: `calendar:${eventIdentity}`,
+    providerRef: `google-calendar:${eventIdentity}`,
+    revision,
+  };
+}
+
+function isCalendarEventRelevantForApplication(
+  event: GoogleCalendarEvent,
+  content: CalendarApplicationContent,
+  state: CalendarSyncState,
+): boolean {
+  if (state.phase === "live") return true;
+  // initialTimeMin is anchored once per initial scan. Deriving the observation
+  // boundary from it keeps the decision stable across page/application retries.
+  const observationBoundary = Date.parse(state.initialTimeMin) + 90 * DAY_MS;
+  if (Date.parse(content.endsAt) >= observationBoundary) return true;
+  const providerChangedAt = Date.parse(event.updatedAt ?? event.createdAt ?? "");
+  return Number.isFinite(providerChangedAt) && providerChangedAt >= observationBoundary;
+}
+
+function eventApplicationTimeZone(
+  event: GoogleCalendarEvent,
+  calendarTimeZone: string | null,
+): string | null {
+  const requested =
+    event.start?.kind === "dateTime" && event.start.timeZone !== null
+      ? event.start.timeZone
+      : event.end?.kind === "dateTime" && event.end.timeZone !== null
+        ? event.end.timeZone
+        : calendarTimeZone;
+  if (requested === null || /^[+-]\d/u.test(requested)) return null;
+  try {
+    const canonical = new Intl.DateTimeFormat("en-US", { timeZone: requested }).resolvedOptions().timeZone;
+    if (/^[+-]\d/u.test(canonical)) return null;
+    return TimeZoneSchema.parse(canonical);
+  } catch {
+    return null;
+  }
+}
+
+function boundedCalendarText(value: string, maxLength: number): string {
+  if (value.length <= maxLength) return value;
+  const bounded = value.slice(0, maxLength);
+  const last = bounded.charCodeAt(bounded.length - 1);
+  return last >= 0xd800 && last <= 0xdbff ? bounded.slice(0, -1) : bounded;
 }
 
 function normalizedTimeZone(value: string | null): string | null {

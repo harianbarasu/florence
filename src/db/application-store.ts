@@ -531,6 +531,66 @@ function mergedGmailDiscoveryMetadata(
   return merged;
 }
 
+const calendarApplicationDigestSchema = z.string().regex(/^sha256:[a-f0-9]{64}$/u);
+const calendarApprovedActionIdSchema = z
+  .string()
+  .min(1)
+  .max(500)
+  .refine((value) => value.trim() === value);
+
+type CalendarEchoGuard = {
+  applicationContentDigest: string;
+  createdByApprovedActionId: string;
+};
+
+function calendarEchoGuard(metadata: Record<string, unknown>): CalendarEchoGuard | null {
+  const parsed = z
+    .object({
+      applicationContentDigest: calendarApplicationDigestSchema,
+      createdByApprovedActionId: calendarApprovedActionIdSchema,
+    })
+    .passthrough()
+    .safeParse(metadata);
+  return parsed.success
+    ? {
+        applicationContentDigest: parsed.data.applicationContentDigest,
+        createdByApprovedActionId: parsed.data.createdByApprovedActionId,
+      }
+    : null;
+}
+
+function calendarSourceMetadata(
+  kind: string,
+  incoming: Record<string, unknown>,
+  existing?: { kind: string; metadata: Record<string, unknown> },
+): Record<string, unknown> {
+  const metadata = { ...incoming };
+  delete metadata.createdByApprovedActionId;
+  const digest = calendarApplicationDigestSchema.safeParse(metadata.applicationContentDigest);
+  if (kind !== "calendar_event" || !digest.success) {
+    delete metadata.applicationContentDigest;
+    return metadata;
+  }
+  const requestedGuard = calendarEchoGuard(incoming);
+  const retainedGuard =
+    requestedGuard?.applicationContentDigest === digest.data
+      ? requestedGuard
+      : existing?.kind === "calendar_event"
+        ? calendarEchoGuard(existing.metadata)
+        : null;
+  if (retainedGuard?.applicationContentDigest === digest.data) {
+    metadata.createdByApprovedActionId = retainedGuard.createdByApprovedActionId;
+  }
+  return metadata;
+}
+
+function calendarEchoReceipt(provider: string, metadata: Record<string, unknown>) {
+  if (provider !== "google-calendar") return {};
+  return {
+    createdByApprovedActionId: calendarEchoGuard(metadata)?.createdByApprovedActionId ?? null,
+  };
+}
+
 export class ApplicationStore implements ApplicationRepositoryPort {
   public constructor(private readonly database: Database) {}
 
@@ -1483,6 +1543,7 @@ export class ApplicationStore implements ApplicationRepositoryPort {
     disposition: "inserted" | "unchanged" | "revised";
     revision: number;
     retainedExisting?: "full" | "deleted" | "stale";
+    createdByApprovedActionId?: string | null;
   }> {
     const input = sourceItemSchema.parse(rawInput);
     if (input.ownerAdultId) {
@@ -1515,12 +1576,13 @@ export class ApplicationStore implements ApplicationRepositoryPort {
           owner_adult_id: string | null;
           visibility: SourceItemRecord["visibility"];
           kind: string;
+          occurred_at: Date;
           content_hash: string;
           metadata: Record<string, unknown>;
           revision: string;
         }[]
       >`
-        select id, owner_adult_id, visibility, kind, content_hash, metadata, revision
+        select id, owner_adult_id, visibility, kind, occurred_at, content_hash, metadata, revision
         from source_items
         where household_id = ${input.householdId}
           and provider = ${input.provider} and external_id = ${input.externalId}
@@ -1528,6 +1590,10 @@ export class ApplicationStore implements ApplicationRepositoryPort {
         for update
       `;
       const existing = existingRows[0];
+      const persistedMetadata =
+        input.provider === "google-calendar"
+          ? calendarSourceMetadata(input.kind, input.metadata, existing)
+          : input.metadata;
       if (!existing) {
         await transaction`
           insert into source_items (
@@ -1539,10 +1605,15 @@ export class ApplicationStore implements ApplicationRepositoryPort {
             ${input.ownerAdultId ?? null}, ${input.visibility}, ${input.provider},
             ${input.externalId}, ${input.kind}, ${input.occurredAt}, ${input.subject ?? null},
             ${input.contentHash}, ${input.encryptedContent ?? null},
-            ${json(this.database, input.metadata)}, ${input.retentionUntil ?? null}, 1
+            ${json(this.database, persistedMetadata)}, ${input.retentionUntil ?? null}, 1
           )
         `;
-        return { sourceItemId, disposition: "inserted" as const, revision: 1 };
+        return {
+          sourceItemId,
+          disposition: "inserted" as const,
+          revision: 1,
+          ...calendarEchoReceipt(input.provider, persistedMetadata),
+        };
       }
 
       if (
@@ -1553,6 +1624,19 @@ export class ApplicationStore implements ApplicationRepositoryPort {
           "invalid_state",
           "A source item's ownership and visibility are immutable",
         );
+      }
+
+      if (
+        input.provider === "google-calendar" &&
+        existing.occurred_at.getTime() > Date.parse(input.occurredAt)
+      ) {
+        return {
+          sourceItemId: existing.id,
+          disposition: "unchanged" as const,
+          revision: Number(existing.revision),
+          retainedExisting: "stale" as const,
+          ...calendarEchoReceipt(input.provider, existing.metadata),
+        };
       }
 
       const existingGmailCompleteness = gmailContentCompleteness(existing.metadata);
@@ -1627,10 +1711,18 @@ export class ApplicationStore implements ApplicationRepositoryPort {
             existing.kind === "gmail_message" &&
             existingGmailCompleteness === "metadata" &&
             incomingGmailCompleteness === "full"));
-      if (existing.content_hash === input.contentHash && !forcesGmailSourceReplacement) {
+      const forcesCalendarSourceReplacement =
+        input.provider === "google-calendar" &&
+        (existing.kind !== input.kind ||
+          existing.metadata.applicationContentDigest !== persistedMetadata.applicationContentDigest);
+      if (
+        existing.content_hash === input.contentHash &&
+        !forcesGmailSourceReplacement &&
+        !forcesCalendarSourceReplacement
+      ) {
         await transaction`
           update source_items
-          set retention_until = ${input.retentionUntil ?? null}, metadata = ${json(this.database, input.metadata)},
+          set retention_until = ${input.retentionUntil ?? null}, metadata = ${json(this.database, persistedMetadata)},
               updated_at = now()
           where id = ${existing.id}
         `;
@@ -1638,6 +1730,7 @@ export class ApplicationStore implements ApplicationRepositoryPort {
           sourceItemId: existing.id,
           disposition: "unchanged" as const,
           revision: Number(existing.revision),
+          ...calendarEchoReceipt(input.provider, persistedMetadata),
         };
       }
 
@@ -1646,11 +1739,16 @@ export class ApplicationStore implements ApplicationRepositoryPort {
         update source_items
         set kind = ${input.kind}, occurred_at = ${input.occurredAt},
             subject = ${input.subject ?? null}, content_hash = ${input.contentHash},
-            encrypted_content = ${input.encryptedContent ?? null}, metadata = ${json(this.database, input.metadata)},
+            encrypted_content = ${input.encryptedContent ?? null}, metadata = ${json(this.database, persistedMetadata)},
             retention_until = ${input.retentionUntil ?? null}, revision = ${revision}, updated_at = now()
         where id = ${existing.id}
       `;
-      return { sourceItemId: existing.id, disposition: "revised" as const, revision };
+      return {
+        sourceItemId: existing.id,
+        disposition: "revised" as const,
+        revision,
+        ...calendarEchoReceipt(input.provider, persistedMetadata),
+      };
     });
   }
 

@@ -153,11 +153,11 @@ export function extractInviteeHandle(text: string): string | null {
 }
 
 function explicitConsent(text: string): boolean {
-  return /^(?:i\s+(?:consent|agree)|i\s+agree\s+and\s+consent|yes,?\s+i\s+(?:consent|agree))\b/u.test(text);
+  return /^i consent[.!]?$/u.test(text);
 }
 
 function explicitInviteAcceptance(text: string): boolean {
-  return /^(?:i\s+(?:accept|consent|agree)|accept|yes,?\s+i\s+(?:accept|consent|agree))\b/u.test(text);
+  return /^i accept[.!]?$/u.test(text);
 }
 
 function emptyProfileConfirmation(text: string): boolean {

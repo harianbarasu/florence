@@ -1,6 +1,11 @@
 import { createHash } from "node:crypto";
 import { GOOGLE_CALENDAR_READONLY_SCOPE, GOOGLE_GMAIL_READONLY_SCOPE } from "../adapters/google/index.js";
 import { type ApplicationOutboxIntent, ApplicationOutboxIntentSchema } from "../application/index.js";
+import {
+  canonicalGoogleAccountAlias,
+  googleAccountAliasKey,
+  normalizedEmail,
+} from "../security/durable-identity-privacy.js";
 import type { CalendarSyncWork } from "./google-calendar-sync.js";
 import type { GmailSyncWork, GoogleSyncConnection } from "./google-sync.js";
 import type { GoogleOAuthConnectedEvent, GoogleOAuthFailedEvent } from "./http-services.js";
@@ -27,22 +32,26 @@ export interface PrivateCommandOutbox {
   enqueueApplicationIntent(intent: ApplicationOutboxIntent): Promise<{ rowId: string }>;
 }
 
+export interface PrivateGoogleCalendar {
+  connectionId: string;
+  connectionAlias: string;
+  connectionEmail: string | null;
+  calendarId: string;
+  displayName: string;
+  status: "active" | "excluded" | "deleted";
+  primary: boolean;
+}
+
 export interface PrivateCommandGoogleDirectory {
   listOwnedGoogleConnections(input: {
     householdId: string;
     adultId: string;
     includeRevoked?: boolean;
   }): Promise<readonly GoogleSyncConnection[]>;
-  listOwnedGoogleCalendars?(input: { householdId: string; adultId: string }): Promise<
-    readonly {
-      connectionId: string;
-      connectionLabel: string;
-      calendarId: string;
-      displayName: string;
-      status: "active" | "excluded" | "deleted";
-      primary: boolean;
-    }[]
-  >;
+  listOwnedGoogleCalendars?(input: {
+    householdId: string;
+    adultId: string;
+  }): Promise<readonly PrivateGoogleCalendar[]>;
   setOwnedGoogleCalendarEnabled?(input: {
     householdId: string;
     adultId: string;
@@ -102,19 +111,52 @@ export class PrivateGoogleCommandService implements PrivateCommandHandler {
     const text = input.text.normalize("NFKC").trim();
     const normalized = text.toLowerCase();
     if (/^(?:connect|link|add)\b[\s\S]*\b(?:google|gmail|calendar)\b/u.test(normalized)) {
-      const label = accountLabel(normalized);
-      const loginHint = text.match(/[\p{L}\p{N}.!#$%&'*+/=?^_`{|}~-]+@[\p{L}\p{N}.-]+\.[\p{L}]{2,63}/iu)?.[0];
+      const parsed = parseGoogleConnectCommand(text);
+      if (parsed === null) {
+        await this.queuePrivateMessage(
+          input,
+          "google-connect-needs-alias",
+          "Give this Google account a short private alias using an exact command like “connect Google as Acme work”. Aliases can be up to 80 characters and cannot contain slashes.",
+        );
+        return { handled: true, classification: "google:connect_needs_alias" };
+      }
+      const connections = await this.options.directory.listOwnedGoogleConnections({
+        householdId: input.householdId,
+        adultId: input.adultId,
+      });
+      const loginHint = parsed.loginHint;
+      const sameEmailConnection =
+        loginHint === undefined
+          ? undefined
+          : connections.find(
+              (connection) =>
+                connection.email !== null && normalizedEmail(connection.email) === normalizedEmail(loginHint),
+            );
+      const aliasKey = googleAccountAliasKey(parsed.accountAlias);
+      const aliasCollision = connections.find(
+        (connection) =>
+          connection.id !== sameEmailConnection?.id &&
+          googleAccountAliasKey(connectionAlias(connection)) === aliasKey,
+      );
+      if (aliasCollision !== undefined) {
+        await this.queuePrivateMessage(
+          input,
+          "google-connect-alias-in-use",
+          `“${parsed.accountAlias}” is already the private alias for ${privateConnectionLabel(aliasCollision)}. No link was issued. Choose a distinct exact alias, for example “connect Google as Acme work”.${privateConnectionList(connections)}`,
+        );
+        return { handled: true, classification: "google:connect_alias_in_use" };
+      }
       const url = this.options.linkIssuer.issue({
         householdId: input.householdId,
         adultId: input.adultId,
         returnConversationId: input.channelId,
-        accountLabel: label,
-        ...(loginHint ? { loginHint: loginHint.toLowerCase() } : {}),
+        accountLabel: parsed.accountAlias,
+        ...(parsed.loginHint ? { loginHint: parsed.loginHint } : {}),
       });
       await this.queuePrivateMessage(
         input,
         "google-connect",
-        `Open this private, time-limited link to connect your ${label}: ${url}\n\nThe account remains yours and private by default. Florence will ask before sharing family meaning unless you later approve a rule.`,
+        `Open this private, time-limited link to connect “${parsed.accountAlias}”: ${url}\n\nThe account and verified email remain yours and private by default. Florence will ask before sharing family meaning unless you later approve a rule.${privateConnectionList(connections)}`,
       );
       return { handled: true, classification: "google:connect_link_issued" };
     }
@@ -128,27 +170,24 @@ export class PrivateGoogleCommandService implements PrivateCommandHandler {
       this.options.directory.setOwnedGoogleCalendarEnabled
     ) {
       const enabled = !["exclude", "ignore", "disable"].includes(calendarSelection[1] as string);
-      const requestedName = (calendarSelection[2] as string).trim().toLocaleLowerCase("en-US");
+      const requestedName = normalizePrivateSelector(calendarSelection[2] as string);
       const calendars = await this.options.directory.listOwnedGoogleCalendars({
         householdId: input.householdId,
         adultId: input.adultId,
       });
       const matches = calendars.filter((calendar) => {
-        const displayName = calendar.displayName.trim().toLocaleLowerCase("en-US");
-        const qualified = `${calendar.connectionLabel} / ${calendar.displayName}`
-          .trim()
-          .toLocaleLowerCase("en-US");
-        return requestedName === displayName || requestedName === qualified;
+        return privateCalendarSelectors(calendar).includes(requestedName);
       });
       if (matches.length !== 1) {
         const explanation =
           matches.length === 0
             ? `I could not find a calendar named “${calendarSelection[2]}”.`
             : `“${calendarSelection[2]}” matches more than one account.`;
+        const choices = matches.length === 0 ? calendars : matches;
         await this.queuePrivateMessage(
           input,
           "google-calendar-selection-ambiguous",
-          `${explanation} Say the exact “account / calendar” name from “show my calendars.”`,
+          `${explanation} Use one exact private name from “show my calendars.”${privateCalendarList(choices, 12)}`,
         );
         return { handled: true, classification: "google:calendar_selection_ambiguous" };
       }
@@ -181,8 +220,8 @@ export class PrivateGoogleCommandService implements PrivateCommandHandler {
             : result === "not_found"
               ? "That calendar changed while I was updating it. Say “show my calendars” and try again."
               : enabled
-                ? `I’ll privately include “${calendar.displayName}” from ${calendar.connectionLabel}. I’m synchronizing it now.`
-                : `I’ll stop using “${calendar.displayName}” from ${calendar.connectionLabel}. Its private availability projection has been removed.`;
+                ? `I’ll privately include “${calendar.displayName}” from ${privateCalendarAccountLabel(calendar)}. I’m synchronizing it now.`
+                : `I’ll stop using “${calendar.displayName}” from ${privateCalendarAccountLabel(calendar)}. Its private availability projection has been removed.`;
       await this.queuePrivateMessage(input, "google-calendar-selection", body);
       return { handled: true, classification: `google:calendar_${enabled ? "included" : "excluded"}` };
     }
@@ -201,11 +240,13 @@ export class PrivateGoogleCommandService implements PrivateCommandHandler {
           : `Your private calendar coverage:\n${calendars
               .map(
                 (calendar) =>
-                  `• ${calendar.connectionLabel} / ${calendar.displayName} — ${
+                  `• ${privateCalendarQualifiedName(calendar)} — ${
                     calendar.status === "active" ? "included" : calendar.status
                   }${calendar.primary ? " (primary)" : ""}`,
               )
-              .join("\n")}\n\nUse “include calendar account / name” or “exclude calendar account / name.”`;
+              .join(
+                "\n",
+              )}\n\nUse the exact private name, as in “include calendar account / name” or “exclude calendar account / name.”`;
       await this.queuePrivateMessage(input, "google-calendar-list", body);
       return { handled: true, classification: "google:calendars_listed" };
     }
@@ -219,7 +260,7 @@ export class PrivateGoogleCommandService implements PrivateCommandHandler {
         connections.length === 0
           ? "You do not have an active Google account connected."
           : `Your private Google connections:\n${connections
-              .map((connection) => `• ${connectionLabel(connection)}`)
+              .map((connection) => `• ${privateConnectionLabel(connection)}`)
               .join("\n")}`;
       await this.queuePrivateMessage(input, "google-list", body);
       return { handled: true, classification: "google:connections_listed" };
@@ -240,7 +281,7 @@ export class PrivateGoogleCommandService implements PrivateCommandHandler {
           connections.length === 0
             ? "There is no active Google account to disconnect."
             : `Name the account label or email to disconnect. Your active connections are: ${connections
-                .map(connectionLabel)
+                .map(privateConnectionLabel)
                 .join(", ")}.`,
         );
         return { handled: true, classification: "google:disconnect_needs_account" };
@@ -274,7 +315,7 @@ export class PrivateGoogleCommandService implements PrivateCommandHandler {
       await this.queuePrivateMessage(
         input,
         "google-disconnect",
-        `Disconnecting ${selected.map(connectionLabel).join(", ")}. Florence will stop access locally even if Google is temporarily unavailable.`,
+        `Disconnecting ${selected.map(privateConnectionLabel).join(", ")}. Florence will stop access locally even if Google is temporarily unavailable.`,
       );
       return { handled: true, classification: "google:disconnect_queued" };
     }
@@ -340,7 +381,7 @@ export class PrivateGoogleCommandService implements PrivateCommandHandler {
         idempotencyKey: `google:${event.connectionId}:activation:${event.activationId}:connected`,
       },
       "google-connected",
-      `${event.accountLabel} is connected${event.email ? ` as ${event.email}` : ""}. Florence is ${
+      `${event.accountLabel} is connected as ${event.email}. Florence is ${
         event.hadPriorGmailState
           ? "resuming mail from its durable cursor"
           : "starting mail with the most recent 90 days, then working backward through one year and older history without delaying new mail"
@@ -352,10 +393,12 @@ export class PrivateGoogleCommandService implements PrivateCommandHandler {
     const account = event.accountLabel ?? "Google account";
     const body =
       event.reason === "declined"
-        ? `${account} was not connected because permission was declined. Nothing was shared. When you're ready, reply “connect my Google account” here for a fresh private link.`
-        : event.reason === "invalid"
-          ? `${account} was not connected because the private handoff could not be verified. Nothing was shared. Reply “connect my Google account” here for a fresh link.`
-          : `${account} could not be connected because Google or Florence was temporarily unavailable. Nothing was shared. Reply “connect my Google account” here to try again.`;
+        ? `${account} was not connected because permission was declined. Nothing was shared. When you're ready, reply with an exact alias such as “connect Google as Acme work”.`
+        : event.reason === "alias_in_use"
+          ? `${account} was not connected because that private alias is already in use. Nothing was shared. Choose a distinct exact alias, for example “connect Google as Acme work”.`
+          : event.reason === "invalid"
+            ? `${account} was not connected because the private handoff could not be verified. Nothing was shared. Reply with an exact alias such as “connect Google as Acme work” for a fresh link.`
+            : `${account} could not be connected because Google or Florence was temporarily unavailable. Nothing was shared. Reply with an exact alias such as “connect Google as Acme work” to try again.`;
     await this.queuePrivateMessage(
       {
         householdId: event.householdId,
@@ -393,25 +436,131 @@ function selectConnections(
 ): GoogleSyncConnection[] {
   if (/\b(?:all|every)\b/u.test(normalizedCommand)) return [...connections];
   const matching = connections.filter((connection) => {
-    const label = String(connection.metadata.accountLabel ?? "").toLowerCase();
+    const label = googleAccountAliasKey(connectionAlias(connection));
     return (
       (connection.email !== null && normalizedCommand.includes(connection.email.toLowerCase())) ||
-      (label.length > 0 && normalizedCommand.includes(label))
+      normalizedCommand.includes(label)
     );
   });
   if (matching.length > 0) return matching;
   return connections.length === 1 ? [connections[0] as GoogleSyncConnection] : [];
 }
 
-function connectionLabel(connection: GoogleSyncConnection): string {
-  const label = String(connection.metadata.accountLabel ?? "Google account");
-  return connection.email ? `${label} (${connection.email})` : label;
+function parseGoogleConnectCommand(text: string): { accountAlias: string; loginHint?: string } | null {
+  const emailMatch = text.match(/[\p{L}\p{N}.!#$%&'*+/=?^_`{|}~-]+@[\p{L}\p{N}.-]+\.[\p{L}]{2,63}/iu);
+  const loginHint = emailMatch?.[0] === undefined ? undefined : normalizedEmail(emailMatch[0]);
+  const command = (emailMatch ? text.replace(emailMatch[0], " ") : text)
+    .normalize("NFKC")
+    .trim()
+    .replace(/\s+/gu, " ");
+  const explicit = command.match(
+    /^(?:connect|link|add)\s+(?:my\s+)?(?:google(?:\s+(?:account|calendar))?|gmail(?:\s+account)?|calendar)\s+as\s+(.+)$/iu,
+  );
+  const generic = command.match(
+    /^(?:connect|link|add)\s+(?:my\s+)?(?:(personal|work)\s+)?(?:google(?:\s+(?:account|calendar))?|gmail(?:\s+account)?|calendar)$/iu,
+  );
+  const rawAlias =
+    explicit?.[1] === undefined
+      ? generic?.[1] === undefined
+        ? generic
+          ? "Google account"
+          : null
+        : `${generic[1].toLocaleLowerCase("en-US")} Google account`
+      : stripMatchingQuotes(explicit[1]);
+  if (rawAlias === null) return null;
+  try {
+    return {
+      accountAlias: canonicalGoogleAccountAlias(rawAlias),
+      ...(loginHint === undefined ? {} : { loginHint }),
+    };
+  } catch {
+    return null;
+  }
 }
 
-function accountLabel(command: string): string {
-  if (/\bwork\b/u.test(command)) return "work Google account";
-  if (/\bpersonal\b/u.test(command)) return "personal Google account";
-  return "Google account";
+function connectionAlias(connection: GoogleSyncConnection): string {
+  return canonicalGoogleAccountAlias(String(connection.metadata.accountLabel ?? ""));
+}
+
+function privateConnectionLabel(connection: GoogleSyncConnection): string {
+  const alias = connectionAlias(connection);
+  return connection.email ? `${alias} (${normalizedEmail(connection.email)})` : alias;
+}
+
+function privateConnectionList(connections: readonly GoogleSyncConnection[]): string {
+  if (connections.length === 0) return "";
+  return `\n\nYour existing private connections:\n${connections
+    .map((connection) => `• ${privateConnectionLabel(connection)}`)
+    .join("\n")}`;
+}
+
+function privateCalendarAccountLabel(calendar: PrivateGoogleCalendar): string {
+  return calendar.connectionEmail
+    ? `${calendar.connectionAlias} (${normalizedEmail(calendar.connectionEmail)})`
+    : calendar.connectionAlias;
+}
+
+function privateCalendarQualifiedName(calendar: PrivateGoogleCalendar): string {
+  return `${privateCalendarAccountLabel(calendar)} / ${calendar.displayName}`;
+}
+
+function privateCalendarSelectors(calendar: PrivateGoogleCalendar): readonly string[] {
+  const alias = canonicalGoogleAccountAlias(calendar.connectionAlias);
+  const privateAccount = privateCalendarAccountLabel(calendar);
+  const selectors = new Set([
+    normalizePrivateSelector(calendar.displayName),
+    normalizePrivateSelector(`${alias} / ${calendar.displayName}`),
+    normalizePrivateSelector(`${privateAccount} / ${calendar.displayName}`),
+  ]);
+  if (calendar.connectionEmail !== null) {
+    selectors.add(normalizePrivateSelector(`${calendar.connectionEmail} / ${calendar.displayName}`));
+  }
+  if (calendar.primary) {
+    selectors.add(normalizePrivateSelector(alias));
+    selectors.add(normalizePrivateSelector(privateAccount));
+    selectors.add(normalizePrivateSelector(`${alias} / primary`));
+    selectors.add(normalizePrivateSelector(`${privateAccount} / primary`));
+    if (calendar.connectionEmail !== null) {
+      selectors.add(normalizePrivateSelector(calendar.connectionEmail));
+      selectors.add(normalizePrivateSelector(`${calendar.connectionEmail} / primary`));
+    }
+  }
+  return [...selectors];
+}
+
+function privateCalendarList(calendars: readonly PrivateGoogleCalendar[], limit: number): string {
+  if (calendars.length === 0) return "";
+  const visible = calendars.slice(0, limit);
+  const remaining = calendars.length - visible.length;
+  return `\n\nPrivate choices:\n${visible
+    .map((calendar) => `• ${privateCalendarQualifiedName(calendar)}`)
+    .join(
+      "\n",
+    )}${remaining > 0 ? `\n• …and ${remaining} more; say “show my calendars” for the full list.` : ""}`;
+}
+
+function normalizePrivateSelector(value: string): string {
+  return value
+    .normalize("NFKC")
+    .trim()
+    .replace(/\s*\/\s*/gu, " / ")
+    .replace(/\s+/gu, " ")
+    .toLocaleLowerCase("en-US");
+}
+
+function stripMatchingQuotes(value: string): string {
+  const trimmed = value.trim();
+  const pairs = [
+    ['"', '"'],
+    ["'", "'"],
+    ["“", "”"],
+  ] as const;
+  for (const [open, close] of pairs) {
+    if (trimmed.startsWith(open) && trimmed.endsWith(close)) {
+      return trimmed.slice(open.length, -close.length).trim();
+    }
+  }
+  return trimmed;
 }
 
 function stableId(value: string): string {

@@ -70,6 +70,10 @@ function conversationIntent(scope: DurableScope = { kind: "household" }): Execut
 }
 
 function domainIntent(effect: Record<string, unknown>): ExecutableIntent {
+  const preparedEffect =
+    effect.kind === "execute_external_action" && effect.executeBy === undefined
+      ? { ...effect, executeBy: "2027-03-01T00:30:00Z" }
+      : effect;
   return executableIntent({
     intentId: "intent_domain_effect",
     householdId: HOUSEHOLD_ID,
@@ -80,7 +84,7 @@ function domainIntent(effect: Record<string, unknown>): ExecutableIntent {
       householdId: HOUSEHOLD_ID,
       idempotencyKey: "domain:effect:1",
       createdFromSignalId: "signal_1",
-      ...effect,
+      ...preparedEffect,
     },
   });
 }
@@ -440,6 +444,7 @@ describe("ProductionApplicationEffectExecutor", () => {
       action: calendarCreateAction(),
       idempotencyKey: "domain:effect:1",
       asOf: EFFECT_NOW.toISOString(),
+      executeBy: "2027-03-01T00:30:00Z",
     });
 
     createApprovedEvent.mockRejectedValueOnce(new GoogleCalendarActionError("projection_incomplete", true));
@@ -472,6 +477,16 @@ const TEST_WORKER_ROUTES: WorkerRoutes = {
     outputContractRef: "contract.test.meals",
     capabilityIds: ["capability.household_schedule.read"],
     allowedToolNames: ["household_schedule"],
+    maxDurationMs: 60_000,
+    maxModelCalls: 5,
+    maxToolCalls: 5,
+    modelCapabilityProfile: "tool_planning",
+  },
+  family_project: {
+    modelRouteId: "route.test.projects",
+    outputContractRef: "contract.test.projects",
+    capabilityIds: ["capability.research.read"],
+    allowedToolNames: ["research_sources"],
     maxDurationMs: 60_000,
     maxModelCalls: 5,
     maxToolCalls: 5,
@@ -764,10 +779,22 @@ describe("ScopedWorkerContext", () => {
       seedEpisodes: [householdSchedule, privateSchedule],
     });
     const before = JSON.stringify(snapshot);
-    const options = await scopedWorkerContext(snapshot, { now: () => WORKER_NOW }).contextFor(job, snapshot);
+    const options = await scopedWorkerContext(snapshot, {
+      now: () => WORKER_NOW,
+      calendarSchedule: {
+        listPersonalCalendarBusyWindows: async () => ({
+          windows: [],
+          complete: true,
+          synchronizedAt: null,
+        }),
+      },
+    }).contextFor(job, snapshot);
     const tool = requiredTool(options, "household_schedule");
 
-    const result = await tool.execute({ limit: 10 }, executionContext(job, options));
+    const result = await tool.execute(
+      { from: "2027-02-01T08:00:00Z", to: "2027-02-08T08:00:00Z", limit: 10 },
+      executionContext(job, options),
+    );
 
     expect(result).toMatchObject({
       timeZone: "America/Los_Angeles",
@@ -781,10 +808,10 @@ describe("ScopedWorkerContext", () => {
     ).rejects.toMatchObject({ code: "invalid_context" });
   });
 
-  it("never broadens personal Calendar windows into household planning", async () => {
+  it("merges every consented adult's busy windows without exposing their identities", async () => {
     const { job, snapshot } = await queuedWorker({ purpose: "meal_plan" });
     const listPersonalCalendarBusyWindows = vi.fn(async () => ({
-      windows: [{ startsAt: "2027-01-02T17:00:00Z", endsAt: "2027-01-02T18:00:00Z", allDay: false }],
+      windows: [{ startsAt: "2027-02-02T17:00:00Z", endsAt: "2027-02-02T18:00:00Z", allDay: false }],
       complete: true,
       synchronizedAt: "2027-02-01T08:00:00Z",
     }));
@@ -793,15 +820,17 @@ describe("ScopedWorkerContext", () => {
       calendarSchedule: { listPersonalCalendarBusyWindows },
     }).contextFor(job, snapshot);
     const result = await requiredTool(options, "household_schedule").execute(
-      { limit: 10 },
+      { from: "2027-02-01T08:00:00Z", to: "2027-02-08T08:00:00Z", limit: 10 },
       executionContext(job, options),
     );
 
     expect(result).toMatchObject({
-      calendarBusyWindows: [],
-      calendarCoverage: { mode: "household_promotions_only", complete: true },
+      calendarBusyWindows: [
+        { startsAt: "2027-02-02T17:00:00Z", endsAt: "2027-02-02T18:00:00Z", allDay: false },
+      ],
+      calendarCoverage: { mode: "household_all_adults", complete: true },
     });
-    expect(listPersonalCalendarBusyWindows).not.toHaveBeenCalled();
+    expect(listPersonalCalendarBusyWindows).toHaveBeenCalledTimes(2);
   });
 
   it("fails closed if a Calendar projection adapter returns private fields", async () => {
@@ -836,7 +865,10 @@ describe("ScopedWorkerContext", () => {
     }).contextFor(job, snapshot);
 
     await expect(
-      requiredTool(options, "household_schedule").execute({ limit: 10 }, executionContext(job, options)),
+      requiredTool(options, "household_schedule").execute(
+        { from: "2027-02-01T08:00:00Z", to: "2027-02-08T08:00:00Z", limit: 10 },
+        executionContext(job, options),
+      ),
     ).rejects.toMatchObject({ code: "context_unavailable" });
   });
 

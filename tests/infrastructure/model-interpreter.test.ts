@@ -77,7 +77,13 @@ describe("ModelApplicationInterpreter", () => {
           },
         ],
       },
-      { confirmedRoutineAnchors: [], activeMemories: [], activeSharingRules: [] },
+      {
+        currentTime: "2027-01-01T00:00:00Z",
+        householdTimeZone: "America/Los_Angeles",
+        confirmedRoutineAnchors: [],
+        activeMemories: [],
+        activeSharingRules: [],
+      },
     );
 
     expect(gateway.calls[0]?.profile).toBe("private_processing");

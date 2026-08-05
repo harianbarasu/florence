@@ -19,6 +19,7 @@ export const HTTP_CONFIG: FlorenceHttpConfigInput = {
   },
   googleCalendarPushEnabled: true,
   linqWebhook: {
+    fromPhone: "+12025550100",
     webhookSecret: `whsec_${LINQ_SIGNING_KEY.toString("base64")}`,
     webhookToleranceMs: 5 * 60 * 1_000,
     webhookVersion: "2026-02-03",
@@ -45,8 +46,6 @@ export function fakeHttpServices(): FlorenceHttpServices {
     },
     operations: {
       status: async () => ({ status: "ok", checks: { database: "ok", queue: "ok" } }),
-      exportHousehold: async () => null,
-      deleteHousehold: async () => "not_found",
     },
   };
 }

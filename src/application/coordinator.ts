@@ -26,6 +26,7 @@ import {
   PrivateSourceMatcherSchema,
   RoutineAnchorIdSchema,
   RoutineAnchorSchema,
+  SemanticTimePlanSchema,
   WorkerProposalSchema,
 } from "../domain/index.js";
 import {
@@ -38,6 +39,11 @@ import {
   type WorkerToolReceipt,
 } from "../runtime/index.js";
 import { ActiveWorkerAttempts } from "./active-worker-attempts.js";
+import {
+  CONSENT_DISCLOSURE_VERSION,
+  FOUNDING_ADULT_CONSENT_DISCLOSURE,
+  INVITED_ADULT_CONSENT_DISCLOSURE,
+} from "./consent-disclosures.js";
 import {
   type ApplicationAuditEntry,
   ApplicationAuditEntrySchema,
@@ -68,6 +74,7 @@ import {
   type PrivateReviewItem,
   PrivateReviewItemSchema,
   type ProjectDeliveryGuard,
+  projectArtifactContentDigest,
   SharedProfileFactSchema,
   type WorkerCommand,
   WorkerCommandSchema,
@@ -97,6 +104,16 @@ export const DEFAULT_WORKER_ROUTES: WorkerRoutes = WorkerRoutesSchema.parse({
     maxDurationMs: 300_000,
     maxModelCalls: 16,
     maxToolCalls: 40,
+    modelCapabilityProfile: "tool_planning",
+  },
+  family_project: {
+    modelRouteId: "route.meal_plan.v1",
+    outputContractRef: "contract.family_project.v1",
+    capabilityIds: ["capability.research.read"],
+    allowedToolNames: ["research_sources"],
+    maxDurationMs: 600_000,
+    maxModelCalls: 24,
+    maxToolCalls: 80,
     modelCapabilityProfile: "tool_planning",
   },
 });
@@ -509,7 +526,12 @@ function workerObjective(
   requiredOutcome: string,
   details: readonly string[],
 ): string {
-  const label = purpose === "meal_plan" ? "Prepare the requested household meal plan" : "Research";
+  const label =
+    purpose === "meal_plan"
+      ? "Prepare the requested household meal plan"
+      : purpose === "family_project"
+        ? "Build a decision-ready plan for the requested family project"
+        : "Research";
   const fixed = [
     `${label}: ${title}.`,
     `Completion contract: ${requiredOutcome}.`,
@@ -711,11 +733,11 @@ function invalidOnboarding(work: Work, item: ConversationInboxItem, body: string
 function onboardingRecoveryBody(onboarding: ApplicationProjection["onboarding"]): string {
   switch (onboarding.phase) {
     case "awaiting_initiator_consent":
-      return "I still need the initiating adult to reply “I consent” in their private DM. You can text STOP at any time.";
+      return FOUNDING_ADULT_CONSENT_DISCLOSURE;
     case "awaiting_invitation":
       return "In the initiating adult’s private DM, reply “invite +1…” with the second adult’s full phone number, or “invite name@example.com” with their iMessage email.";
     case "awaiting_invitee_consent":
-      return "The invited adult still needs to text Florence from the invited iMessage identity and reply exactly “I accept.” If that identity already uses Florence, they should instead send exactly “join my pending Florence household” in their existing private Florence DM.";
+      return `${INVITED_ADULT_CONSENT_DISCLOSURE} If that identity already uses Florence, send exactly “join my pending Florence household” in the existing private Florence DM instead.`;
     case "awaiting_group":
       return "Create one iMessage group with both adults and Florence, then send “connect this family” in that group.";
     case "naming_adults":
@@ -727,6 +749,70 @@ function onboardingRecoveryBody(onboarding: ApplicationProjection["onboarding"])
     case "active":
       return "Florence is ready.";
   }
+}
+
+function presentRequiredConsentDisclosure(work: Work, item: ConversationInboxItem): boolean {
+  if (item.channel.scope !== "personal") return false;
+  const onboarding = work.projection.onboarding;
+  const audience =
+    onboarding.phase === "awaiting_initiator_consent" && item.senderAdultId === onboarding.initiatorAdultId
+      ? ("initiator" as const)
+      : onboarding.phase === "awaiting_invitee_consent" && item.senderAdultId === onboarding.invitedAdultId
+        ? ("invitee" as const)
+        : undefined;
+  if (audience === undefined || onboarding.privateDmAdultIds.includes(item.senderAdultId)) {
+    return false;
+  }
+  const disclosure =
+    audience === "initiator" ? FOUNDING_ADULT_CONSENT_DISCLOSURE : INVITED_ADULT_CONSENT_DISCLOSURE;
+
+  const responseContext = item.replyTo?.responseContext;
+  const boundDirectDisclosure =
+    item.replyTo?.messageClass === "onboarding" &&
+    responseContext?.kind === "consent_disclosure" &&
+    responseContext.adultId === item.senderAdultId &&
+    responseContext.audience === audience &&
+    responseContext.consentDisclosureVersion === CONSENT_DISCLOSURE_VERSION;
+  const sourceBoundTransferDisclosure =
+    audience === "invitee" &&
+    item.replyTo?.messageClass === "onboarding" &&
+    responseContext?.kind === "invitation_transfer" &&
+    responseContext.consentDisclosureVersion === CONSENT_DISCLOSURE_VERSION;
+  const delivered = boundDirectDisclosure || sourceBoundTransferDisclosure;
+
+  if (delivered) {
+    work.projection.onboarding = ApplicationProjectionSchema.shape.onboarding.parse({
+      ...onboarding,
+      privateDmAdultIds: unique([...onboarding.privateDmAdultIds, item.senderAdultId]),
+    });
+  } else {
+    queueMessage(
+      work,
+      "onboarding-consent-disclosure",
+      personal(item.senderAdultId),
+      "onboarding",
+      disclosure,
+      {
+        kind: "consent_disclosure",
+        adultId: item.senderAdultId,
+        audience,
+        consentDisclosureVersion: CONSENT_DISCLOSURE_VERSION,
+      },
+    );
+  }
+  work.audit.push(
+    ApplicationAuditEntrySchema.parse({
+      kind: "onboarding_transition",
+      occurredAt: item.occurredAt,
+      decision: `${onboarding.phase}:${onboarding.phase}:consent_disclosure_${
+        delivered ? "delivered" : "queued"
+      }${sourceBoundTransferDisclosure ? ":source_bound_transfer" : ""}`,
+      sourceRef: item.messageRef,
+      adultId: item.senderAdultId,
+      containsPrivateData: true,
+    }),
+  );
+  return !delivered;
 }
 
 function applyOnboarding(
@@ -741,7 +827,8 @@ function applyOnboarding(
       if (
         onboarding.phase !== "awaiting_initiator_consent" ||
         item.channel.scope !== "personal" ||
-        item.senderAdultId !== onboarding.initiatorAdultId
+        item.senderAdultId !== onboarding.initiatorAdultId ||
+        !onboarding.privateDmAdultIds.includes(item.senderAdultId)
       ) {
         return invalidOnboarding(work, item, "Florence still needs the initiating adult's consent.");
       }
@@ -781,7 +868,7 @@ function applyOnboarding(
         "onboarding-inviter",
         personal(item.senderAdultId),
         "onboarding",
-        "The invitation is ready. Ask the second adult to text Florence from that invited iMessage identity and reply exactly “I accept.” If they already use Florence, ask them to send exactly “join my pending Florence household” in their existing private Florence DM. Florence will not contact them first.",
+        "The invitation is ready. Ask the second adult to text Florence from that invited iMessage identity. Florence will send the full privacy and consent disclosure, then ask them to accept by replying to that exact message. If they already use Florence, ask them to send exactly “join my pending Florence household” in their existing private Florence DM. Florence will not contact them first.",
       );
       break;
     }
@@ -789,7 +876,8 @@ function applyOnboarding(
       if (
         onboarding.phase !== "awaiting_invitee_consent" ||
         item.channel.scope !== "personal" ||
-        item.senderAdultId !== onboarding.invitedAdultId
+        item.senderAdultId !== onboarding.invitedAdultId ||
+        !onboarding.privateDmAdultIds.includes(item.senderAdultId)
       ) {
         return invalidOnboarding(work, item, "The pending invite must be accepted by its invitee in a DM.");
       }
@@ -1295,10 +1383,14 @@ function briefBody(work: Work, asOf: string): string {
       Temporal.Instant.compare(Temporal.Instant.from(timing), weekEnd) < 0
     );
   });
-  const projects = select((episode) => ["research", "meal_plan"].includes(episode.type));
+  const projects = select((episode) => ["research", "meal_plan", "project"].includes(episode.type));
   const open = select(() => true).slice(0, 5);
   const pendingApprovals = aggregate.pendingActions
-    .filter((action) => action.state === "awaiting_approval")
+    .filter(
+      (action) =>
+        action.state === "awaiting_approval" &&
+        Temporal.Instant.compare(Temporal.Instant.from(action.expiresAt), now) > 0,
+    )
     .slice(0, 5)
     .map((pending) =>
       pending.action.kind === "calendar_update"
@@ -1327,13 +1419,31 @@ function statusForDomain(result: AcceptanceResult): "processed" | "rejected" {
   return result.receipt.disposition === "rejected" ? "rejected" : "processed";
 }
 
+type ModelTemporalPlan = NonNullable<
+  Extract<ConversationClassification, { intent: "propose_commitment" }>["temporalPlan"]
+>;
+
+function materializeInitialTemporalPlan(episodeId: string, candidate: ModelTemporalPlan) {
+  return SemanticTimePlanSchema.parse({
+    ...candidate,
+    planId: stableId("temporal_plan", episodeId),
+    version: 1,
+    triggers: candidate.triggers.map((trigger, index) => ({
+      ...trigger,
+      triggerId: stableId("temporal_trigger", episodeId, "1", String(index)),
+      timerId: stableId("timer", episodeId, "1", String(index)),
+    })),
+  });
+}
+
 function proposalForConversation(
   item: ConversationInboxItem,
   classification: Extract<ConversationClassification, { intent: "propose_commitment" }>,
 ) {
   const evidence = conversationEvidence(item);
+  const episodeId = stableId("episode", item.idempotencyKey, "commitment");
   return EpisodeProposalSchema.parse({
-    episodeId: stableId("episode", item.idempotencyKey, "commitment"),
+    episodeId,
     type: "commitment",
     targetScope: targetScope(item),
     title: classification.title,
@@ -1344,14 +1454,19 @@ function proposalForConversation(
     evidence: [evidence],
     sourceClass: classification.sourceClass,
     sensitivity: classification.sensitivity,
-    ...(classification.temporalPlan === undefined ? {} : { temporalPlan: classification.temporalPlan }),
+    ...(classification.temporalPlan === undefined
+      ? {}
+      : { temporalPlan: materializeInitialTemporalPlan(episodeId, classification.temporalPlan) }),
   });
 }
 
 function processProjectRequest(
   work: Work,
   item: ConversationInboxItem,
-  classification: Extract<ConversationClassification, { intent: "research_request" | "meal_plan_request" }>,
+  classification: Extract<
+    ConversationClassification,
+    { intent: "research_request" | "meal_plan_request" | "project_request" }
+  >,
   routes: WorkerRoutes,
 ): "processed" | "rejected" {
   if (classification.scopeAssessment.decision === "out_of_scope") {
@@ -1368,7 +1483,11 @@ function processProjectRequest(
   const scope = targetScope(item);
   const evidence = conversationEvidence(item);
   const purpose: WorkerPurpose =
-    classification.intent === "meal_plan_request" ? "meal_plan" : "family_research";
+    classification.intent === "meal_plan_request"
+      ? "meal_plan"
+      : classification.intent === "project_request"
+        ? "family_project"
+        : "family_research";
   const episodeId = stableId("episode", item.idempotencyKey, purpose);
   const requiredOutcome =
     classification.scopeAssessment.decision === "narrow"
@@ -1388,17 +1507,25 @@ function processProjectRequest(
       kind: "episode.proposed",
       proposal: EpisodeProposalSchema.parse({
         episodeId,
-        type: purpose === "meal_plan" ? "meal_plan" : "research",
+        type: purpose === "meal_plan" ? "meal_plan" : purpose === "family_project" ? "project" : "research",
         targetScope: scope,
         title: classification.title,
         requiredOutcome,
         evidence: [evidence],
-        sourceClass: purpose === "meal_plan" ? "household.meal_request" : "household.research_request",
+        sourceClass:
+          purpose === "meal_plan"
+            ? "household.meal_request"
+            : purpose === "family_project"
+              ? "household.project_request"
+              : "household.research_request",
         sensitivity: "ordinary",
         delegation: {
           jobId: DomainWorkerJobIdSchema.parse(jobId),
           purpose,
         },
+        ...(classification.intent === "project_request" && classification.temporalPlan !== undefined
+          ? { temporalPlan: materializeInitialTemporalPlan(episodeId, classification.temporalPlan) }
+          : {}),
       }),
     } as Omit<HouseholdSignal, "householdId" | "signalId" | "sequence" | "occurredAt" | "actor">,
   );
@@ -1427,7 +1554,9 @@ function processProjectRequest(
     "status",
     purpose === "meal_plan"
       ? "The requested meal-planning project is open. Florence will return a practical plan and grocery list."
-      : "The requested household research project is open. Florence will return a sourced comparison.",
+      : purpose === "family_project"
+        ? "The family project is open. Florence will return a decision-ready plan with phases, next actions, decisions, and risks."
+        : "The requested household research project is open. Florence will return a sourced comparison.",
     {
       kind: "episode_follow_up",
       episodeId,
@@ -1492,6 +1621,21 @@ function scopeMatchesConversation(
   );
 }
 
+function projectPurposeForEpisode(
+  type: HouseholdAggregate["episodes"][number]["type"],
+): WorkerPurpose | undefined {
+  switch (type) {
+    case "research":
+      return "family_research";
+    case "meal_plan":
+      return "meal_plan";
+    case "project":
+      return "family_project";
+    case "commitment":
+      return undefined;
+  }
+}
+
 function processProjectFollowUp(
   work: Work,
   item: ConversationInboxItem,
@@ -1508,26 +1652,14 @@ function processProjectFollowUp(
     classification.episodeId,
     classification.baseEpisodeVersion,
   );
-  const visibleOpenProjects = work.aggregate.episodes.filter(
-    (candidate) =>
-      ["research", "meal_plan"].includes(candidate.type) &&
-      !["completed", "dismissed", "superseded", "failed"].includes(candidate.state) &&
-      scopeMatchesConversation(candidate, item),
-  );
-  const soleOpenProject = visibleOpenProjects.length === 1 ? visibleOpenProjects[0] : undefined;
-  const unboundStatusProject =
-    classification.action === "status" &&
-    item.replyTo?.responseContext === undefined &&
-    soleOpenProject?.episodeId === classification.episodeId &&
-    soleOpenProject.version === classification.baseEpisodeVersion;
   if (
     episode === undefined ||
-    !["research", "meal_plan"].includes(episode.type) ||
+    projectPurposeForEpisode(episode.type) === undefined ||
     episode.version !== classification.baseEpisodeVersion ||
     episode.scope.kind !== scope.kind ||
     (episode.scope.kind === "personal" &&
       (scope.kind !== "personal" || episode.scope.adultId !== scope.adultId)) ||
-    (!boundReply && !unboundStatusProject)
+    !boundReply
   ) {
     const repliedContext = item.replyTo?.responseContext;
     const repliedEpisode =
@@ -1536,7 +1668,7 @@ function processProjectFollowUp(
         : undefined;
     const currentContext =
       repliedEpisode === undefined ||
-      !["research", "meal_plan"].includes(repliedEpisode.type) ||
+      projectPurposeForEpisode(repliedEpisode.type) === undefined ||
       !scopeMatchesConversation(repliedEpisode, item)
         ? undefined
         : ({
@@ -1573,7 +1705,7 @@ function processProjectFollowUp(
             : latestWorker.status === "completed"
               ? (latestWorker.latestSummary ?? "The latest Project Lead run completed.")
               : latestWorker.status === "cancelled"
-                ? "That project is cancelled. Reply here with a new instruction if you want to reopen it."
+                ? "That project is closed. Start a new family project if more work is needed."
                 : "The last Project Lead run did not complete safely. Reply here with a follow-up instruction and I’ll restart from the current family context.";
     const deliveryGuard = advanceProjectDeliveryGeneration(work, episode.episodeId);
     queueMessage(
@@ -1593,7 +1725,7 @@ function processProjectFollowUp(
   }
 
   const evidence = conversationEvidence(item);
-  if (classification.action === "cancel") {
+  if (classification.action === "cancel" || classification.action === "complete") {
     if (["completed", "dismissed", "superseded", "failed"].includes(episode.state)) {
       const deliveryGuard = advanceProjectDeliveryGeneration(work, episode.episodeId);
       queueMessage(
@@ -1601,7 +1733,7 @@ function processProjectFollowUp(
         "project-follow-up-already-closed",
         episode.scope,
         "status",
-        "That project is already closed. No further work will run unless you reply with a new instruction.",
+        "That project is already closed. Start a new request if more work is needed.",
         {
           kind: "episode_follow_up",
           episodeId: episode.episodeId,
@@ -1611,9 +1743,10 @@ function processProjectFollowUp(
       );
       return "processed";
     }
+    const completed = classification.action === "complete";
     const result = acceptDomain(
       work,
-      "project-cancelled",
+      completed ? "project-completed" : "project-cancelled",
       item.occurredAt,
       { kind: "adult", adultId: item.senderAdultId },
       {
@@ -1621,35 +1754,40 @@ function processProjectFollowUp(
         episodeId: episode.episodeId,
         baseEpisodeVersion: episode.version,
         outcome: {
-          kind: "dismissed",
-          summary: "An adult cancelled the delegated family project.",
+          kind: completed ? "completed" : "dismissed",
+          summary: completed
+            ? "An adult completed the delegated family project."
+            : "An adult cancelled the delegated family project.",
           evidence: [evidence],
           recordedAt: item.occurredAt,
         },
       } as Omit<HouseholdSignal, "householdId" | "signalId" | "sequence" | "occurredAt" | "actor">,
     );
     if (result.receipt.disposition === "accepted") {
-      if (latestWorker !== undefined) {
+      if (
+        latestWorker !== undefined &&
+        (!completed || ["queued", "awaiting_input"].includes(latestWorker.status))
+      ) {
         work.projection.workers[work.projection.workers.indexOf(latestWorker)] = {
           ...latestWorker,
           status: "cancelled",
           updatedAt: item.occurredAt,
         };
       }
-      const cancelledEpisode = work.aggregate.episodes.find(
+      const closedEpisode = work.aggregate.episodes.find(
         (candidate) => candidate.episodeId === episode.episodeId,
       );
       const deliveryGuard = advanceProjectDeliveryGeneration(work, episode.episodeId);
       queueMessage(
         work,
-        "project-follow-up-cancelled",
+        completed ? "project-follow-up-completed" : "project-follow-up-cancelled",
         episode.scope,
         "status",
-        "I stopped that project.",
+        completed ? "I recorded that project as complete." : "I stopped that project.",
         {
           kind: "episode_follow_up",
           episodeId: episode.episodeId,
-          episodeVersion: cancelledEpisode?.version ?? episode.version,
+          episodeVersion: closedEpisode?.version ?? episode.version,
         },
         deliveryGuard,
       );
@@ -1660,7 +1798,30 @@ function processProjectFollowUp(
   if (classification.instruction === undefined) {
     return "rejected";
   }
-  const purpose: WorkerPurpose = episode.type === "meal_plan" ? "meal_plan" : "family_research";
+  if (
+    episode.type === "project" &&
+    ["completed", "dismissed", "superseded", "failed"].includes(episode.state)
+  ) {
+    const deliveryGuard = advanceProjectDeliveryGeneration(work, episode.episodeId);
+    queueMessage(
+      work,
+      "project-follow-up-closed",
+      episode.scope,
+      "status",
+      "That project is closed. Start a new family project if more work is needed.",
+      {
+        kind: "episode_follow_up",
+        episodeId: episode.episodeId,
+        episodeVersion: episode.version,
+      },
+      deliveryGuard,
+    );
+    return "processed";
+  }
+  const purpose = projectPurposeForEpisode(episode.type);
+  if (purpose === undefined) {
+    return "rejected";
+  }
   if (latestWorker === undefined || episode.delegation === undefined) {
     return "rejected";
   }
@@ -1702,6 +1863,9 @@ function processProjectFollowUp(
       ...(latestWorker.latestSummary === undefined
         ? []
         : [`Previous Project Lead result: ${latestWorker.latestSummary}`]),
+      ...(latestWorker.artifact === undefined
+        ? []
+        : [`Current structured project artifact: ${JSON.stringify(latestWorker.artifact)}`]),
       ...latestWorker.outstandingQuestions.map((question) => `Earlier open question: ${question}`),
     ],
     scope: updatedEpisode.scope,
@@ -1900,12 +2064,13 @@ async function approveCalendarEvent(
     return "rejected";
   }
   const pending = work.aggregate.pendingActions.find(
-    (candidate) =>
-      candidate.action.actionId === actionId &&
-      candidate.action.kind === "calendar_update" &&
-      candidate.state === "awaiting_approval",
+    (candidate) => candidate.action.actionId === actionId && candidate.action.kind === "calendar_update",
   );
-  if (pending === undefined || pending.action.kind !== "calendar_update") {
+  if (
+    pending === undefined ||
+    pending.action.kind !== "calendar_update" ||
+    pending.state !== "awaiting_approval"
+  ) {
     queueMessage(
       work,
       "calendar-approval-missing",
@@ -1913,6 +2078,39 @@ async function approveCalendarEvent(
       "status",
       "That exact calendar proposal is no longer awaiting approval.",
     );
+    return "rejected";
+  }
+  const repliedContext = item.replyTo?.responseContext;
+  if (repliedContext?.kind !== "calendar_approval" || repliedContext.actionId !== actionId) {
+    queueMessage(
+      work,
+      "calendar-approval-unbound",
+      { kind: "household" },
+      "status",
+      "I couldn’t bind that approval to this exact current calendar proposal, so I changed nothing. Reply directly to its Florence approval message.",
+    );
+    return "rejected";
+  }
+  if (Temporal.Instant.compare(Temporal.Instant.from(item.occurredAt), pending.expiresAt) >= 0) {
+    const expired = acceptDomain(
+      work,
+      "calendar-action-expired",
+      item.occurredAt,
+      { kind: "adult", adultId: item.senderAdultId },
+      { kind: "external_action.expired", actionId: pending.action.actionId } as Omit<
+        HouseholdSignal,
+        "householdId" | "signalId" | "sequence" | "occurredAt" | "actor"
+      >,
+    );
+    if (expired.receipt.disposition === "accepted") {
+      queueMessage(
+        work,
+        "calendar-approval-expired",
+        { kind: "household" },
+        "status",
+        "That calendar proposal expired, so I did not write anything. Send the event request again for a fresh availability check and approval.",
+      );
+    }
     return "rejected";
   }
   const preparation = await dependencies.calendarActions.prepareCreate({
@@ -1972,6 +2170,66 @@ async function approveCalendarEvent(
   return statusForDomain(result);
 }
 
+function declineCalendarEvent(
+  work: Work,
+  item: ConversationInboxItem,
+  actionId: string,
+): "processed" | "rejected" {
+  if (item.channel.scope !== "household") {
+    return "rejected";
+  }
+  const repliedContext = item.replyTo?.responseContext;
+  if (repliedContext?.kind !== "calendar_approval" || repliedContext.actionId !== actionId) {
+    queueMessage(
+      work,
+      "calendar-decline-unbound",
+      { kind: "household" },
+      "status",
+      "I couldn’t bind that decline to one exact current calendar proposal, so I changed nothing. Reply directly to its Florence approval message.",
+    );
+    return "rejected";
+  }
+  const pending = work.aggregate.pendingActions.find(
+    (candidate) =>
+      candidate.action.actionId === actionId &&
+      candidate.action.kind === "calendar_update" &&
+      candidate.state === "awaiting_approval",
+  );
+  if (pending === undefined || pending.action.kind !== "calendar_update") {
+    queueMessage(
+      work,
+      "calendar-decline-missing",
+      { kind: "household" },
+      "status",
+      "That exact calendar proposal is no longer awaiting a decision.",
+    );
+    return "rejected";
+  }
+  const expired = Temporal.Instant.compare(Temporal.Instant.from(item.occurredAt), pending.expiresAt) >= 0;
+  const result = acceptDomain(
+    work,
+    expired ? "calendar-action-expired" : "calendar-action-declined",
+    item.occurredAt,
+    { kind: "adult", adultId: item.senderAdultId },
+    {
+      kind: expired ? "external_action.expired" : "external_action.declined",
+      actionId: pending.action.actionId,
+    } as Omit<HouseholdSignal, "householdId" | "signalId" | "sequence" | "occurredAt" | "actor">,
+  );
+  if (result.receipt.disposition === "accepted") {
+    queueMessage(
+      work,
+      expired ? "calendar-decline-expired" : "calendar-declined",
+      { kind: "household" },
+      "status",
+      expired
+        ? "That calendar proposal had already expired, so nothing was written."
+        : `Declined “${pending.action.title}.” Nothing was written to the calendar.`,
+    );
+  }
+  return statusForDomain(result);
+}
+
 function commitmentForBoundReply(
   work: Work,
   item: ConversationInboxItem,
@@ -1998,6 +2256,36 @@ function rejectUnboundCommitment(work: Work, item: ConversationInboxItem): "reje
     "I couldn’t bind that reply to one current commitment, so I changed nothing. Reply directly to the relevant Florence commitment message.",
   );
   return "rejected";
+}
+
+function correctedTemporalPlan(
+  item: ConversationInboxItem,
+  episode: HouseholdAggregate["episodes"][number],
+  correction: Extract<ConversationClassification, { intent: "replace_temporal_plan" }>["temporalPlan"],
+) {
+  const nextPlanVersion = (episode.temporalPlan?.definition.version ?? 0) + 1;
+  return SemanticTimePlanSchema.parse({
+    ...correction,
+    planId: episode.temporalPlan?.definition.planId ?? stableId("temporal_plan", episode.episodeId),
+    version: nextPlanVersion,
+    triggers: correction.triggers.map((trigger, index) => ({
+      ...trigger,
+      triggerId: stableId(
+        "temporal_trigger",
+        episode.episodeId,
+        String(nextPlanVersion),
+        item.idempotencyKey,
+        String(index),
+      ),
+      timerId: stableId(
+        "timer",
+        episode.episodeId,
+        String(nextPlanVersion),
+        item.idempotencyKey,
+        String(index),
+      ),
+    })),
+  });
 }
 
 async function processActiveConversation(
@@ -2172,8 +2460,68 @@ async function processActiveConversation(
       }
       return statusForDomain(result);
     }
+    case "replace_temporal_plan": {
+      const episode = commitmentForBoundReply(
+        work,
+        item,
+        classification.episodeId,
+        classification.baseEpisodeVersion,
+        ["episode_follow_up", "episode_ownership"],
+      );
+      if (episode === undefined) {
+        return rejectUnboundCommitment(work, item);
+      }
+      const result = acceptDomain(
+        work,
+        "commitment-temporal-plan-replaced",
+        item.occurredAt,
+        { kind: "adult", adultId: item.senderAdultId },
+        {
+          kind: "episode.temporal_plan_replaced",
+          episodeId: episode.episodeId,
+          baseEpisodeVersion: episode.version,
+          plan: correctedTemporalPlan(item, episode, classification.temporalPlan),
+        } as Omit<HouseholdSignal, "householdId" | "signalId" | "sequence" | "occurredAt" | "actor">,
+      );
+      if (result.receipt.disposition === "accepted") {
+        const updated = work.aggregate.episodes.find(
+          (candidate) => candidate.episodeId === episode.episodeId,
+        );
+        if (updated === undefined) {
+          throw new Error("Retimed commitment is missing from the household aggregate");
+        }
+        queueMessage(
+          work,
+          "commitment-temporal-plan-updated",
+          targetScope(item),
+          "status",
+          `Updated the date, time, and reminder plan for “${updated.title}.”`,
+          updated.state === "awaiting_acknowledgement"
+            ? {
+                kind: "episode_ownership",
+                episodeId: updated.episodeId,
+                episodeVersion: updated.version,
+              }
+            : {
+                kind: "episode_follow_up",
+                episodeId: updated.episodeId,
+                episodeVersion: updated.version,
+              },
+        );
+      } else {
+        queueMessage(
+          work,
+          "commitment-temporal-plan-invalid",
+          targetScope(item),
+          "status",
+          "I couldn’t safely apply that timing correction, so the existing timing and reminders are unchanged. Reply to the current commitment message with an exact date, time, and reminder request.",
+        );
+      }
+      return statusForDomain(result);
+    }
     case "research_request":
     case "meal_plan_request":
+    case "project_request":
       return processProjectRequest(work, item, classification, routes);
     case "project_follow_up":
       return processProjectFollowUp(work, item, classification, routes);
@@ -2183,6 +2531,8 @@ async function processActiveConversation(
       return askForCalendarFields(work, item, classification.missingFields);
     case "approve_calendar_event":
       return approveCalendarEvent(work, item, classification.actionId, dependencies);
+    case "decline_calendar_event":
+      return declineCalendarEvent(work, item, classification.actionId);
     case "daily_brief_request":
       queueMessage(work, "brief-request", targetScope(item), "daily_brief", briefBody(work, item.occurredAt));
       return "processed";
@@ -2263,6 +2613,26 @@ function decideMemoryCandidate(
         : "Understood. I won’t remember that suggestion.",
   );
   return statusForDomain(result);
+}
+
+function queuePromotedCommitment(work: Work, suffix: string, pending: PendingPromotion): void {
+  const episode = work.aggregate.episodes.find(
+    (candidate) => candidate.episodeId === pending.proposal.episodeId,
+  );
+  if (episode === undefined || episode.type !== "commitment") {
+    throw new Error("Accepted private-source promotion is missing its commitment episode");
+  }
+  const awaitingOwner = episode.owner.status === "proposed";
+  const body = awaitingOwner
+    ? `${pending.minimumHouseholdMeaning} The proposed owner should use iMessage’s Reply on this Florence message and say “I accept.”`
+    : episode.owner.status === "unassigned"
+      ? `${pending.minimumHouseholdMeaning} This shared commitment is unassigned. Use iMessage’s Reply on this Florence message to say who should own it.`
+      : pending.minimumHouseholdMeaning;
+  queueMessage(work, suffix, { kind: "household" }, "status", body, {
+    kind: awaitingOwner ? "episode_ownership" : "episode_follow_up",
+    episodeId: episode.episodeId,
+    episodeVersion: episode.version,
+  });
 }
 
 function approvePromotion(
@@ -2384,7 +2754,7 @@ function approvePromotion(
     remembered = policy.receipt.disposition === "accepted";
   }
   work.projection.pendingPromotions.splice(index, 1);
-  queueMessage(work, "promotion-household", { kind: "household" }, "status", pending.minimumHouseholdMeaning);
+  queuePromotedCommitment(work, "promotion-household", pending);
   queueMessage(
     work,
     "promotion-confirmed",
@@ -2535,8 +2905,9 @@ function minimumPromotion(
     String(item.revision),
   );
   const sourceMatcher = gmailSourceMatcher(item);
+  const episodeId = stableId("episode", promotionId);
   const proposal = EpisodeProposalSchema.parse({
-    episodeId: stableId("episode", promotionId),
+    episodeId,
     type: "commitment",
     targetScope: { kind: "household" },
     title: triage.minimumHouseholdMeaning,
@@ -2547,7 +2918,9 @@ function minimumPromotion(
     evidence: [evidence],
     sourceClass: triage.sourceClass,
     sensitivity: triage.sensitivity,
-    ...(triage.temporalPlan === undefined ? {} : { temporalPlan: triage.temporalPlan }),
+    ...(triage.temporalPlan === undefined
+      ? {}
+      : { temporalPlan: materializeInitialTemporalPlan(episodeId, triage.temporalPlan) }),
     ...(sourceMatcher === undefined ? {} : { sourceMatcher }),
   });
   return {
@@ -2613,20 +2986,14 @@ function promoteByPolicy(
     proposal,
   } as Omit<HouseholdSignal, "householdId" | "signalId" | "sequence" | "occurredAt" | "actor">);
   if (result.receipt.disposition === "accepted") {
-    queueMessage(
-      work,
-      "gmail-policy-household",
-      { kind: "household" },
-      "status",
-      pending.minimumHouseholdMeaning,
-    );
+    queuePromotedCommitment(work, "gmail-policy-household", pending);
   }
   return statusForDomain(result);
 }
 
 type GmailRevisionDisposition =
   | { kind: "fresh"; sourceKey: string; index: number }
-  | { kind: "duplicate" | "metadata" | "episode_preserved" | "stale" | "conflict"; sourceKey: string };
+  | { kind: "duplicate" | "metadata" | "stale" | "conflict"; sourceKey: string };
 
 function auditGmailReconciliation(
   work: Work,
@@ -2706,21 +3073,20 @@ function reconcileGmailRevision(
       throw new Error(`Gmail source references an unknown episode: ${prior.episodeId}`);
     }
     if (!["completed", "dismissed", "superseded", "failed"].includes(episode.state)) {
-      queueMessage(
+      const result = acceptDomain(
         work,
-        "gmail-shared-source-changed",
-        personal(item.ownerAdultId),
-        "private_review",
-        item.kind === "gmail_message_deleted"
-          ? `The private source email for “${episode.title}” was deleted. I kept the family item and its reminders active; update or close it in the household group if the obligation changed.`
-          : `The private source email for “${episode.title}” changed. I kept the existing family item and its reminders active; update or close it in the household group if the obligation changed.`,
+        `gmail-source-superseded:${sourceKey}:${item.revision}`,
+        item.occurredAt,
+        { kind: "source_adapter", source: "gmail" },
+        {
+          kind: "episode.source_superseded",
+          episodeId: episode.episodeId,
+          baseEpisodeVersion: episode.version,
+          supersedingEvidence: gmailEvidence(item),
+        } as Omit<HouseholdSignal, "householdId" | "signalId" | "sequence" | "occurredAt" | "actor">,
       );
-      if (item.kind === "gmail_message" && currentDigest !== undefined) {
-        prior.latestRevision = item.revision;
-        prior.contentDigest = currentDigest;
-        prior.recordedAt = item.occurredAt;
-        auditGmailReconciliation(work, item, sourceKey, "shared_episode_preserved");
-        return { kind: "episode_preserved", sourceKey };
+      if (result.receipt.disposition !== "accepted") {
+        throw new Error(`Gmail source could not supersede episode: ${result.receipt.reason}`);
       }
     }
   }
@@ -2751,8 +3117,6 @@ function gmailRevisionOutcome(disposition: GmailRevisionDisposition): {
       return { status: "processed", classification: "gmail:duplicate_revision" };
     case "metadata":
       return { status: "processed", classification: "gmail:metadata_revision" };
-    case "episode_preserved":
-      return { status: "processed", classification: "gmail:shared_episode_preserved" };
     case "stale":
       return { status: "processed", classification: "gmail:stale_revision" };
     case "conflict":
@@ -2825,6 +3189,8 @@ async function processGmail(
   );
   const triage = GmailTriageResultSchema.parse(
     await dependencies.interpreter.triageGmail(item, {
+      currentTime: item.occurredAt,
+      householdTimeZone: work.aggregate.timeZone,
       confirmedRoutineAnchors: work.aggregate.routineAnchors,
       activeMemories: activeMemoryContext(work.aggregate, personal(item.ownerAdultId), item.occurredAt),
       activeSharingRules: rules,
@@ -2927,10 +3293,11 @@ function calendarMinimumPromotion(
   const sourceKey = calendarSourceKey(item);
   const evidence = calendarEvidence(item);
   const promotionId = stableId("promotion", sourceKey, String(item.revision));
-  const temporalPlan = calendarTimingPlan(item, promotionId, routineAnchors);
+  const episodeId = stableId("episode", promotionId);
+  const temporalPlan = calendarTimingPlan(item, episodeId, routineAnchors);
   const sourceMatcher = calendarSourceMatcher(item);
   const proposal = EpisodeProposalSchema.parse({
-    episodeId: stableId("episode", promotionId),
+    episodeId,
     type: "commitment",
     targetScope: { kind: "household" },
     title: triage.minimumHouseholdMeaning,
@@ -2965,7 +3332,7 @@ const CALENDAR_MINIMUM_TIMER_DELAY_MINUTES = 5;
 
 function calendarTimingPlan(
   item: CalendarEventInboxItem,
-  promotionId: string,
+  episodeId: string,
   routineAnchors: HouseholdAggregate["routineAnchors"],
 ) {
   const eventAt = Temporal.Instant.from(item.startsAt);
@@ -3128,9 +3495,7 @@ function calendarTimingPlan(
     }
   }
 
-  return {
-    planId: stableId("plan", promotionId),
-    version: 1 as const,
+  return materializeInitialTemporalPlan(episodeId, {
     timeZone: item.timeZone,
     ...(item.allDay
       ? { deadline: deadlineMoment }
@@ -3141,12 +3506,10 @@ function calendarTimingPlan(
     preparationMinutes: 0,
     finalBufferMinutes: CALENDAR_FINAL_BUFFER_MINUTES,
     triggers: candidates.map((candidate) => ({
-      triggerId: stableId("trigger", promotionId, candidate.key),
-      timerId: stableId("timer", promotionId, candidate.key),
       kind: "reminder" as const,
       at: candidate.moment,
     })),
-  };
+  });
 }
 
 function promoteCalendarByPolicy(
@@ -3195,13 +3558,7 @@ function promoteCalendarByPolicy(
     proposal,
   } as Omit<HouseholdSignal, "householdId" | "signalId" | "sequence" | "occurredAt" | "actor">);
   if (result.receipt.disposition === "accepted") {
-    queueMessage(
-      work,
-      "calendar-policy-household",
-      { kind: "household" },
-      "status",
-      pending.minimumHouseholdMeaning,
-    );
+    queuePromotedCommitment(work, "calendar-policy-household", pending);
   }
   return statusForDomain(result);
 }
@@ -3495,6 +3852,9 @@ async function processConversation(
   if (!work.aggregate.verifiedAdultIds.includes(item.senderAdultId)) {
     return { status: "rejected", classification: "conversation_unknown_adult" };
   }
+  if (presentRequiredConsentDisclosure(work, item)) {
+    return { status: "processed", classification: "onboarding:consent_disclosed" };
+  }
   if (
     item.text.trim().length === 0 &&
     item.attachmentContents.length > 0 &&
@@ -3526,6 +3886,7 @@ async function processConversation(
         title: episode.title,
         ...(episode.owner.status === "unassigned" ? {} : { ownerAdultId: episode.owner.adultId }),
         version: episode.version,
+        ...(episode.temporalPlan === undefined ? {} : { temporalPlan: episode.temporalPlan.definition }),
       },
     ];
   });
@@ -3562,7 +3923,8 @@ async function processConversation(
     if (
       pending.state !== "awaiting_approval" ||
       pending.action.kind !== "calendar_update" ||
-      item.channel.scope !== "household"
+      item.channel.scope !== "household" ||
+      Temporal.Instant.compare(Temporal.Instant.from(pending.expiresAt), item.occurredAt) <= 0
     ) {
       return [];
     }
@@ -3574,6 +3936,7 @@ async function processConversation(
         endsAt: pending.action.endsAt,
         timeZone: pending.action.timeZone,
         hasConflict: pending.action.hasConflict,
+        expiresAt: pending.expiresAt,
       },
     ];
   });
@@ -3918,6 +4281,47 @@ function workerResultMessage(result: WorkerResult): string {
     );
   }
 
+  if (result.purpose === "family_project") {
+    const artifact = result.completion.artifact;
+    const receipts = new Map(result.toolReceipts.map((receipt) => [receipt.receiptId, receipt]));
+    const sourceUrls = unique(
+      (artifact.citationReceiptIds ?? []).flatMap((receiptId) => {
+        const receipt = receipts.get(receiptId);
+        return receipt?.kind === "research_sources" ? receipt.sources.map((source) => source.url) : [];
+      }),
+    );
+    return truncateMessagePart(
+      [
+        result.summary.trim(),
+        artifact.plan,
+        `As of ${artifact.asOf}`,
+        "Phases:",
+        ...artifact.phases.flatMap((phase) => [
+          `• ${phase.name}: ${phase.outcome}`,
+          ...phase.actions.map((action) => `  - ${action}`),
+        ]),
+        "Next actions:",
+        ...artifact.nextActions.map((action) => `• ${action}`),
+        ...(artifact.decisions.length === 0
+          ? []
+          : [
+              "Decisions:",
+              ...artifact.decisions.map(
+                (decision) => `• ${decision.decision}: ${decision.recommendation} — ${decision.rationale}`,
+              ),
+            ]),
+        ...(artifact.risks.length === 0
+          ? []
+          : ["Risks:", ...artifact.risks.map((risk) => `• ${risk.risk} — Mitigation: ${risk.mitigation}`)]),
+        ...(artifact.assumptions.length === 0
+          ? []
+          : ["Assumptions:", ...artifact.assumptions.map((assumption) => `• ${assumption}`)]),
+        ...(sourceUrls.length === 0 ? [] : [`Sources: ${sourceUrls.join(", ")}`]),
+      ].join("\n"),
+      4_000,
+    );
+  }
+
   const artifact = result.completion.artifact;
   const receipts = new Map(result.toolReceipts.map((receipt) => [receipt.receiptId, receipt]));
   const sourceUrls = (receiptIds: readonly string[]) =>
@@ -4191,36 +4595,62 @@ function processWorkerResult(
     throw new Error("Reconciled worker episode is missing from the household aggregate");
   }
   const message = workerResultMessage(result);
-  const receipts = new Map(result.toolReceipts.map((receipt) => [receipt.receiptId, receipt]));
-  const evidence = verification.proofReceiptIds.map((receiptId) => {
-    const receipt = receipts.get(receiptId);
-    if (receipt === undefined) {
-      throw new Error("Verified worker proof receipt is missing");
+  const projectArtifact =
+    result.purpose === "family_project" && result.completion.status === "complete"
+      ? result.completion.artifact
+      : undefined;
+  if (projectArtifact !== undefined) {
+    const artifactRecorded = acceptDomain(
+      work,
+      "worker-project-artifact",
+      input.receivedAt,
+      { kind: "worker", jobId: DomainWorkerJobIdSchema.parse(worker.job.jobId) },
+      {
+        kind: "episode.artifact_recorded",
+        episodeId: episode.episodeId,
+        baseEpisodeVersion: episode.version,
+        artifact: {
+          artifactRef: proposal.resultId,
+          contentDigest: projectArtifactContentDigest(projectArtifact),
+          recordedAt: input.receivedAt,
+        },
+      } as Omit<HouseholdSignal, "householdId" | "signalId" | "sequence" | "occurredAt" | "actor">,
+    );
+    if (artifactRecorded.receipt.disposition !== "accepted") {
+      return requeueWorkerForCurrentContext(work, workerIndex, input.receivedAt, "worker_artifact_rejected");
     }
-    return workerCompletionEvidence(receipt, worker, episode.scope);
-  });
-  const closure = acceptDomain(
-    work,
-    "worker-project-completed",
-    input.receivedAt,
-    { kind: "worker", jobId: DomainWorkerJobIdSchema.parse(worker.job.jobId) },
-    {
-      kind: "episode.closed",
-      episodeId: episode.episodeId,
-      baseEpisodeVersion: episode.version,
-      outcome: {
-        kind: "completed",
-        summary:
-          worker.purpose === "meal_plan"
-            ? "Florence completed the requested meal plan and grocery list."
-            : "Florence completed the requested household research.",
-        evidence,
-        recordedAt: input.receivedAt,
-      },
-    } as Omit<HouseholdSignal, "householdId" | "signalId" | "sequence" | "occurredAt" | "actor">,
-  );
-  if (closure.receipt.disposition !== "accepted") {
-    throw new Error(`Worker episode closure was rejected: ${closure.receipt.reason ?? "unknown"}`);
+  } else {
+    const receipts = new Map(result.toolReceipts.map((receipt) => [receipt.receiptId, receipt]));
+    const evidence = verification.proofReceiptIds.map((receiptId) => {
+      const receipt = receipts.get(receiptId);
+      if (receipt === undefined) {
+        throw new Error("Verified worker proof receipt is missing");
+      }
+      return workerCompletionEvidence(receipt, worker, episode.scope);
+    });
+    const closure = acceptDomain(
+      work,
+      "worker-project-completed",
+      input.receivedAt,
+      { kind: "worker", jobId: DomainWorkerJobIdSchema.parse(worker.job.jobId) },
+      {
+        kind: "episode.closed",
+        episodeId: episode.episodeId,
+        baseEpisodeVersion: episode.version,
+        outcome: {
+          kind: "completed",
+          summary:
+            worker.purpose === "meal_plan"
+              ? "Florence completed the requested meal plan and grocery list."
+              : "Florence completed the requested household research.",
+          evidence,
+          recordedAt: input.receivedAt,
+        },
+      } as Omit<HouseholdSignal, "householdId" | "signalId" | "sequence" | "occurredAt" | "actor">,
+    );
+    if (closure.receipt.disposition !== "accepted") {
+      throw new Error(`Worker episode closure was rejected: ${closure.receipt.reason ?? "unknown"}`);
+    }
   }
   const completedEpisode = work.aggregate.episodes.find(
     (candidate) => candidate.episodeId === worker.episodeId,
@@ -4235,6 +4665,7 @@ function processWorkerResult(
     status: "completed",
     deliveryGeneration: worker.deliveryGeneration + 1,
     latestSummary: message,
+    ...(projectArtifact === undefined ? {} : { artifactRef: proposal.resultId, artifact: projectArtifact }),
     outstandingQuestions: [],
     updatedAt: input.receivedAt,
     resultRef: proposal.resultId,

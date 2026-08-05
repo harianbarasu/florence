@@ -4,6 +4,8 @@ import { z } from "zod";
 import { ApplicationOutboxIntentSchema } from "../application/contracts.js";
 import type { Database } from "../db/client.js";
 import type { BlindIndex } from "../security/blind-index.js";
+import { payloadDigest } from "../security/canonical-json.js";
+import type { TenantJsonCipher } from "../security/tenant-json-cipher.js";
 
 const instantSchema = z.iso.datetime({ offset: true });
 const uuidSchema = z.uuid();
@@ -99,10 +101,12 @@ type DeletionRequestRow = {
 export class PostgresCustomerDataControlStore {
   readonly #database: Database;
   readonly #blindIndex: BlindIndex;
+  readonly #sensitiveJson: TenantJsonCipher;
 
-  public constructor(database: Database, blindIndex: BlindIndex) {
+  public constructor(database: Database, blindIndex: BlindIndex, sensitiveJson: TenantJsonCipher) {
     this.#database = database;
     this.#blindIndex = blindIndex;
+    this.#sensitiveJson = sensitiveJson;
   }
 
   public async issueExportHandoff(input: {
@@ -551,7 +555,7 @@ export class PostgresCustomerDataControlStore {
       const intentDigest = createHash("sha256")
         .update(`${row.request_id}\0${parsed.adultId}\0${parsed.idempotencyKey}`)
         .digest("hex");
-      await insertControlMessage(transaction, this.#database, {
+      await insertControlMessage(transaction, this.#sensitiveJson, {
         householdId: parsed.householdId,
         adultId: parsed.adultId,
         intentId: `customer_control.deletion.fenced.status.${intentDigest}`,
@@ -648,6 +652,34 @@ export class PostgresCustomerDataControlStore {
     }));
   }
 
+  public async renewCleanupStepLease(input: {
+    rowId: string;
+    leaseToken: string;
+    leaseSeconds: number;
+  }): Promise<boolean> {
+    const parsed = z
+      .strictObject({
+        rowId: uuidSchema,
+        leaseToken: uuidSchema,
+        leaseSeconds: z.number().int().positive().max(3_600),
+      })
+      .parse(input);
+    const rows = await this.#database<{ id: string }[]>`
+      update customer_deletion_cleanup_steps step
+      set lease_expires_at = now() + (${parsed.leaseSeconds} * interval '1 second'),
+        updated_at = now()
+      from customer_deletion_requests request, households household
+      where step.id = ${parsed.rowId} and step.status = 'leased'
+        and step.lease_token = ${parsed.leaseToken} and step.lease_expires_at > now()
+        and request.id = step.request_id
+        and request.status in ('fenced', 'cleaning', 'blocked')
+        and household.id = step.household_id and household.status = 'deleting'
+        and request.control_epoch = household.control_epoch
+      returning step.id
+    `;
+    return rows.length === 1;
+  }
+
   public async loadCleanupConnection(input: {
     requestId: string;
     householdId: string;
@@ -732,6 +764,7 @@ export class PostgresCustomerDataControlStore {
       from customer_deletion_requests request, households household
       where step.id = ${parsed.rowId} and step.status = 'leased'
         and step.lease_token = ${parsed.leaseToken} and request.id = step.request_id
+        and step.lease_expires_at > now()
         and household.id = step.household_id and household.status = 'deleting'
         and request.control_epoch = household.control_epoch
       returning step.id
@@ -760,6 +793,7 @@ export class PostgresCustomerDataControlStore {
           safe_error_code = ${parsed.safeErrorCode}, lease_owner = null, lease_token = null,
           lease_expires_at = null, updated_at = now()
         where id = ${parsed.rowId} and status = 'leased' and lease_token = ${parsed.leaseToken}
+          and lease_expires_at > now()
         returning request_id
       `;
       if (!rows[0]) return false;
@@ -791,6 +825,7 @@ export class PostgresCustomerDataControlStore {
         join households household on household.id = step.household_id
         where step.id = ${parsed.rowId} and step.kind = 'local.finalize'
           and step.status = 'leased' and step.lease_token = ${parsed.leaseToken}
+          and step.lease_expires_at > now()
           and request.status = 'cleaning' and household.status = 'deleting'
           and request.control_epoch = household.control_epoch
         for update of step, request, household
@@ -828,6 +863,7 @@ export class PostgresCustomerDataControlStore {
       await transaction`
         update external_connections
         set status = 'revoked', encrypted_credentials = null, granted_scopes = '{}',
+          email_digest = null, details_key_id = null, details_ciphertext = null,
           cursor = '{}'::jsonb, metadata = '{"deleted":true}'::jsonb, updated_at = now()
         where household_id = ${step.household_id}
       `;
@@ -975,7 +1011,7 @@ export class PostgresCustomerDataControlStore {
 
     const recipients = await activeDeletionRecipients(transaction, input.householdId);
     for (const recipient of recipients) {
-      await insertControlMessage(transaction, this.#database, {
+      await insertControlMessage(transaction, this.#sensitiveJson, {
         householdId: input.householdId,
         adultId: recipient.adultId,
         intentId: `customer_control.deletion.fenced.${input.requestId}.${recipient.adultId}`,
@@ -985,13 +1021,15 @@ export class PostgresCustomerDataControlStore {
     }
     await transaction`
       update jobs set status = 'cancelled', lease_owner = null, lease_token = null,
-        lease_expires_at = null, updated_at = now()
+        lease_expires_at = null, payload_key_id = null, payload_ciphertext = null,
+        updated_at = now()
       where household_id = ${input.householdId}
         and status in ('pending', 'retry', 'leased')
     `;
     await transaction`
       update scheduled_triggers set status = 'cancelled', lease_owner = null, lease_token = null,
-        lease_expires_at = null, updated_at = now()
+        lease_expires_at = null, due_at = null, payload_key_id = null, payload_ciphertext = null,
+        updated_at = now()
       where household_id = ${input.householdId} and status in ('scheduled', 'claimed')
     `;
     await transaction`
@@ -1010,14 +1048,11 @@ export class PostgresCustomerDataControlStore {
     `;
     await transaction`
       update outbox set status = 'cancelled', lease_owner = null, lease_token = null,
-        lease_expires_at = null, updated_at = now()
+        lease_expires_at = null, payload_key_id = null, payload_ciphertext = null,
+        updated_at = now()
       where household_id = ${input.householdId}
         and status in ('pending', 'retry', 'leased', 'ambiguous')
         and intent_key not like 'customer_control.deletion.fenced.%'
-    `;
-    await transaction`
-      update worker_attempts set status = 'cancelled', completed_at = coalesce(completed_at, now())
-      where household_id = ${input.householdId} and status = 'running'
     `;
     await transaction`
       update channel_bindings set status = 'paused', updated_at = now()
@@ -1202,7 +1237,7 @@ async function insertCleanupStep(
 
 async function insertControlMessage(
   transaction: TransactionSql<Record<string, never>>,
-  database: Database,
+  cipher: TenantJsonCipher,
   input: {
     householdId: string;
     adultId: string;
@@ -1220,15 +1255,22 @@ async function insertControlMessage(
     messageClass: "status",
     body: input.body,
   });
-  const payload = json(database, intent);
-  const payloadHash = createHash("sha256").update(JSON.stringify(intent)).digest("hex");
+  const rowId = randomUUID();
+  const payloadHash = payloadDigest({ effectKind: intent.kind, payload: intent });
+  const sealed = cipher.seal(intent, {
+    tenant: { kind: "household", id: input.householdId },
+    table: "outbox",
+    rowId,
+    field: "payload",
+  });
   await transaction`
     insert into outbox (
-      id, household_id, effect_kind, idempotency_key, payload, status, intent_key,
-      payload_hash, max_attempts, control_epoch
+      id, household_id, effect_kind, idempotency_key, payload_digest, payload_key_id,
+      payload_ciphertext, status, intent_key, max_attempts, control_epoch
     ) values (
-      ${randomUUID()}, ${input.householdId}, ${intent.kind}, ${intent.idempotencyKey},
-      ${payload}, 'pending', ${intent.intentId}, ${payloadHash}, 8, ${input.controlEpoch}
+      ${rowId}, ${input.householdId}, ${intent.kind}, ${intent.idempotencyKey},
+      ${payloadHash}, ${sealed.keyId}, ${sealed.ciphertext}, 'pending', ${intent.intentId},
+      8, ${input.controlEpoch}
     )
     on conflict (household_id, intent_key) where intent_key is not null do nothing
   `;

@@ -155,7 +155,7 @@ describe("OnboardingAwareInterpreter", () => {
     };
     await expect(
       interpreter.interpretConversation(
-        directMessage("accept", "I accept and consent", ADULT_B, "2026-08-05T16:00:00Z"),
+        directMessage("accept", "I accept", ADULT_B, "2026-08-05T16:00:00Z"),
         {
           ...base,
           onboarding: {

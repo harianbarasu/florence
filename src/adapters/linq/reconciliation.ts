@@ -34,10 +34,11 @@ export function normalizeRecoveredLinqMessage(
   if (input.message.chatId !== input.chat.id || input.message.isFromMe) return null;
 
   const activeHandles = input.chat.handles.filter((handle) => handle.status.toLowerCase() === "active");
-  const selfHandle =
-    activeHandles.find((handle) => handle.isSelf === true)?.handle ??
-    activeHandles.find((handle) => handlesEqual(handle.handle, metadata.selfHandle))?.handle ??
-    metadata.selfHandle;
+  const declaredSelfHandles = activeHandles.filter((handle) => handle.isSelf === true);
+  if (declaredSelfHandles.length !== 1 || declaredSelfHandles[0]?.handle !== metadata.selfHandle) {
+    return null;
+  }
+  const selfHandle = metadata.selfHandle;
   const senderHandle = input.message.sender?.handle ?? input.message.senderHandle;
   if (senderHandle === null || handlesEqual(senderHandle, selfHandle)) return null;
 

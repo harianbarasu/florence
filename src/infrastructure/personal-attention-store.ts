@@ -9,10 +9,12 @@ import {
   personalAttentionStatement,
 } from "../domain/index.js";
 import { canonicalJson } from "../security/canonical-json.js";
+import type { TenantJsonCipher } from "../security/tenant-json-cipher.js";
 
 const instantSchema = z.iso.datetime({ offset: true });
 const digestSchema = z.string().regex(/^sha256:[a-f0-9]{64}$/u);
 const stableReferenceSchema = z.string().trim().min(1).max(500);
+const statementSchema = z.string().min(1).max(20_000);
 const triageDecisionSchema = z.enum([
   "ignore",
   "retain_private",
@@ -34,11 +36,16 @@ export type ActivePersonalAttentionRule = {
 
 type RuleRevisionRow = {
   id: string;
+  household_id: string;
   rule_key: string;
   revision: number;
   status: "active" | "revoked";
-  rule: unknown;
-  statement: string;
+  rule_digest: string;
+  statement_digest: string;
+  rule_key_id: string;
+  rule_ciphertext: string;
+  statement_key_id: string;
+  statement_ciphertext: string;
   source_content_digest: string;
   evaluator_release_id: string;
   occurred_at: Date;
@@ -54,7 +61,10 @@ export class PersonalAttentionStoreError extends Error {
 
 /** Append-only personal procedural preferences and their deterministic applications. */
 export class PostgresPersonalAttentionStore {
-  public constructor(private readonly database: Database) {}
+  public constructor(
+    private readonly database: Database,
+    private readonly sensitiveJson: TenantJsonCipher,
+  ) {}
 
   public async recordRelease(rawInput: {
     releaseId: string;
@@ -160,8 +170,9 @@ export class PostgresPersonalAttentionStore {
         throw new PersonalAttentionStoreError("invalid_state");
       }
       const bySource = await transaction<RuleRevisionRow[]>`
-        select id, rule_key, revision, status, rule, statement, source_content_digest,
-          evaluator_release_id, occurred_at
+        select id, household_id, rule_key, revision, status, rule_digest, statement_digest,
+          rule_key_id, rule_ciphertext, statement_key_id, statement_ciphertext,
+          source_content_digest, evaluator_release_id, occurred_at
         from personal_attention_rule_revisions
         where household_id = ${input.householdId} and adult_id = ${input.adultId}
           and source_event_id = ${input.sourceEventId}
@@ -172,16 +183,18 @@ export class PostgresPersonalAttentionStore {
         if (
           row.rule_key !== ruleKey ||
           row.source_content_digest !== sourceDigest ||
-          canonicalJson(row.rule) !== canonicalJson(input.rule)
+          row.rule_digest !== digest(canonicalJson(input.rule)) ||
+          row.statement_digest !== digest(personalAttentionStatement(input.rule))
         ) {
           throw new PersonalAttentionStoreError("conflict");
         }
-        return activeRule(row);
+        return activeRule(row, this.sensitiveJson);
       }
 
       const latestRows = await transaction<RuleRevisionRow[]>`
-        select id, rule_key, revision, status, rule, statement, source_content_digest,
-          evaluator_release_id, occurred_at
+        select id, household_id, rule_key, revision, status, rule_digest, statement_digest,
+          rule_key_id, rule_ciphertext, statement_key_id, statement_ciphertext,
+          source_content_digest, evaluator_release_id, occurred_at
         from personal_attention_rule_revisions
         where household_id = ${input.householdId} and adult_id = ${input.adultId}
           and rule_key = ${ruleKey}
@@ -190,13 +203,27 @@ export class PostgresPersonalAttentionStore {
         for update
       `;
       const latest = latestRows[0];
+      const revisionId = randomUUID();
+      const statement = personalAttentionStatement(input.rule);
+      const sealed = sealRuleRevision(
+        this.sensitiveJson,
+        input.householdId,
+        revisionId,
+        input.rule,
+        statement,
+      );
       const row: RuleRevisionRow = {
-        id: randomUUID(),
+        id: revisionId,
+        household_id: input.householdId,
         rule_key: ruleKey,
         revision: (latest?.revision ?? 0) + 1,
         status: "active",
-        rule: input.rule,
-        statement: personalAttentionStatement(input.rule),
+        rule_digest: digest(canonicalJson(input.rule)),
+        statement_digest: digest(statement),
+        rule_key_id: sealed.rule.keyId,
+        rule_ciphertext: sealed.rule.ciphertext,
+        statement_key_id: sealed.statement.keyId,
+        statement_ciphertext: sealed.statement.ciphertext,
         source_content_digest: sourceDigest,
         evaluator_release_id: input.evaluatorReleaseId,
         occurred_at: new Date(input.occurredAt),
@@ -204,12 +231,14 @@ export class PostgresPersonalAttentionStore {
       await transaction`
         insert into personal_attention_rule_revisions (
           id, household_id, adult_id, rule_key, revision, supersedes_revision_id,
-          status, rule, statement, source_message_ref, source_event_id,
+          status, rule_digest, statement_digest, rule_key_id, rule_ciphertext,
+          statement_key_id, statement_ciphertext, source_message_ref, source_event_id,
           source_content_digest, evaluator_release_id, occurred_at
         ) values (
           ${row.id}, ${input.householdId}, ${input.adultId}, ${row.rule_key}, ${row.revision},
           ${latest?.id ?? null}, 'active',
-          ${this.database.json(JSON.parse(canonicalJson(input.rule)))}, ${row.statement},
+          ${row.rule_digest}, ${row.statement_digest}, ${row.rule_key_id}, ${row.rule_ciphertext},
+          ${row.statement_key_id}, ${row.statement_ciphertext},
           ${input.sourceMessageRef}, ${input.sourceEventId}, ${sourceDigest},
           ${input.evaluatorReleaseId}, ${input.occurredAt}
         )
@@ -223,13 +252,14 @@ export class PostgresPersonalAttentionStore {
         details: {
           controlId: controlId(row.rule_key, input.rule),
           revision: row.revision,
-          statement: row.statement,
+          ruleDigest: row.rule_digest,
+          statementDigest: row.statement_digest,
           supersedesRevisionId: latest?.id ?? null,
           evaluatorReleaseId: input.evaluatorReleaseId,
           occurredAt: input.occurredAt,
         },
       });
-      return activeRule(row);
+      return activeRule(row, this.sensitiveJson);
     });
   }
 
@@ -241,22 +271,27 @@ export class PostgresPersonalAttentionStore {
     const input = z
       .strictObject({ householdId: z.uuid(), adultId: z.uuid(), asOf: instantSchema })
       .parse(rawInput);
-    const rows = await this.database<RuleRevisionRow[]>`
-      select id, rule_key, revision, status, rule, statement, source_content_digest,
-        evaluator_release_id, occurred_at
-      from (
-        select distinct on (rule_key)
-          id, rule_key, revision, status, rule, statement, source_content_digest,
-          evaluator_release_id, occurred_at
-        from personal_attention_rule_revisions
-        where household_id = ${input.householdId} and adult_id = ${input.adultId}
-          and occurred_at <= ${input.asOf}
-        order by rule_key, revision desc
-      ) latest
-      where status = 'active'
-      order by rule_key
-    `;
-    return rows.map(activeRule);
+    return this.database.begin(async (transaction) => {
+      await requireActivePersonalOwner(transaction, input.householdId, input.adultId);
+      const rows = await transaction<RuleRevisionRow[]>`
+        select id, household_id, rule_key, revision, status, rule_digest, statement_digest,
+          rule_key_id, rule_ciphertext, statement_key_id, statement_ciphertext,
+          source_content_digest, evaluator_release_id, occurred_at
+        from (
+          select distinct on (rule_key)
+            id, household_id, rule_key, revision, status, rule_digest, statement_digest,
+            rule_key_id, rule_ciphertext, statement_key_id, statement_ciphertext,
+            source_content_digest, evaluator_release_id, occurred_at
+          from personal_attention_rule_revisions
+          where household_id = ${input.householdId} and adult_id = ${input.adultId}
+            and occurred_at <= ${input.asOf}
+          order by rule_key, revision desc
+        ) latest
+        where status = 'active'
+        order by rule_key
+      `;
+      return rows.map((row) => activeRule(row, this.sensitiveJson));
+    });
   }
 
   public async revokeExact(rawInput: {
@@ -282,8 +317,9 @@ export class PostgresPersonalAttentionStore {
     return this.database.begin(async (transaction) => {
       await requireActivePersonalOwner(transaction, input.householdId, input.adultId);
       const duplicate = await transaction<RuleRevisionRow[]>`
-        select id, rule_key, revision, status, rule, statement, source_content_digest,
-          evaluator_release_id, occurred_at
+        select id, household_id, rule_key, revision, status, rule_digest, statement_digest,
+          rule_key_id, rule_ciphertext, statement_key_id, statement_ciphertext,
+          source_content_digest, evaluator_release_id, occurred_at
         from personal_attention_rule_revisions
         where household_id = ${input.householdId} and adult_id = ${input.adultId}
           and source_event_id = ${input.sourceEventId}
@@ -292,12 +328,13 @@ export class PostgresPersonalAttentionStore {
       if (duplicate[0]) {
         return {
           status: duplicate[0].status === "revoked" ? "already_revoked" : "unknown",
-          rule: activeRule(duplicate[0]),
+          rule: activeRule(duplicate[0], this.sensitiveJson),
         };
       }
       const allRows = await transaction<RuleRevisionRow[]>`
-        select id, rule_key, revision, status, rule, statement, source_content_digest,
-          evaluator_release_id, occurred_at
+        select id, household_id, rule_key, revision, status, rule_digest, statement_digest,
+          rule_key_id, rule_ciphertext, statement_key_id, statement_ciphertext,
+          source_content_digest, evaluator_release_id, occurred_at
         from personal_attention_rule_revisions
         where household_id = ${input.householdId} and adult_id = ${input.adultId}
         order by rule_key, revision desc
@@ -306,24 +343,32 @@ export class PostgresPersonalAttentionStore {
       const latestRows = allRows.filter(
         (row, index) => index === 0 || allRows[index - 1]?.rule_key !== row.rule_key,
       );
-      const latest = latestRows.find(
-        (row) => controlId(row.rule_key, PersonalAttentionRuleSchema.parse(row.rule)) === input.controlId,
-      );
+      const latest = latestRows
+        .map((row) => ({ row, privateValue: openRuleRevision(row, this.sensitiveJson) }))
+        .find(({ row, privateValue }) => controlId(row.rule_key, privateValue.rule) === input.controlId);
       if (!latest) return { status: "unknown" };
-      if (latest.status === "revoked") return { status: "already_revoked" };
+      if (latest.row.status === "revoked") return { status: "already_revoked" };
       const revisionId = randomUUID();
-      const revision = latest.revision + 1;
-      const rule = PersonalAttentionRuleSchema.parse(latest.rule);
+      const revision = latest.row.revision + 1;
+      const sealed = sealRuleRevision(
+        this.sensitiveJson,
+        input.householdId,
+        revisionId,
+        latest.privateValue.rule,
+        latest.privateValue.statement,
+      );
       await transaction`
         insert into personal_attention_rule_revisions (
           id, household_id, adult_id, rule_key, revision, supersedes_revision_id,
-          status, rule, statement, source_message_ref, source_event_id,
+          status, rule_digest, statement_digest, rule_key_id, rule_ciphertext,
+          statement_key_id, statement_ciphertext, source_message_ref, source_event_id,
           source_content_digest, evaluator_release_id, occurred_at
         ) values (
-          ${revisionId}, ${input.householdId}, ${input.adultId}, ${latest.rule_key}, ${revision},
-          ${latest.id}, 'revoked', ${this.database.json(JSON.parse(canonicalJson(rule)))},
-          ${latest.statement}, ${input.sourceMessageRef}, ${input.sourceEventId},
-          ${digest(input.rawText)}, ${latest.evaluator_release_id}, ${input.occurredAt}
+          ${revisionId}, ${input.householdId}, ${input.adultId}, ${latest.row.rule_key}, ${revision},
+          ${latest.row.id}, 'revoked', ${latest.row.rule_digest}, ${latest.row.statement_digest},
+          ${sealed.rule.keyId}, ${sealed.rule.ciphertext}, ${sealed.statement.keyId},
+          ${sealed.statement.ciphertext}, ${input.sourceMessageRef}, ${input.sourceEventId},
+          ${digest(input.rawText)}, ${latest.row.evaluator_release_id}, ${input.occurredAt}
         )
       `;
       await appendPersonalAudit(transaction, this.database, {
@@ -335,20 +380,28 @@ export class PostgresPersonalAttentionStore {
         details: {
           controlId: input.controlId,
           revision,
-          statement: latest.statement,
-          supersedesRevisionId: latest.id,
+          ruleDigest: latest.row.rule_digest,
+          statementDigest: latest.row.statement_digest,
+          supersedesRevisionId: latest.row.id,
           occurredAt: input.occurredAt,
         },
       });
       return {
         status: "revoked",
-        rule: activeRule({
-          ...latest,
-          id: revisionId,
-          revision,
-          status: "revoked",
-          occurred_at: new Date(input.occurredAt),
-        }),
+        rule: activeRule(
+          {
+            ...latest.row,
+            id: revisionId,
+            revision,
+            status: "revoked",
+            occurred_at: new Date(input.occurredAt),
+            rule_key_id: sealed.rule.keyId,
+            rule_ciphertext: sealed.rule.ciphertext,
+            statement_key_id: sealed.statement.keyId,
+            statement_ciphertext: sealed.statement.ciphertext,
+          },
+          this.sensitiveJson,
+        ),
       };
     });
   }
@@ -421,10 +474,12 @@ export class PostgresPersonalAttentionStore {
     const input = z
       .strictObject({ householdId: z.uuid(), adultId: z.uuid(), asOf: instantSchema })
       .parse(rawInput);
-    return this.database.begin("isolation level repeatable read read only", async (transaction) => {
-      const revisions = await transaction<Record<string, unknown>[]>`
-        select id, adult_id, rule_key, revision, supersedes_revision_id, status, rule,
-          statement, sensitivity, source_message_ref, source_content_digest,
+    return this.database.begin("isolation level repeatable read", async (transaction) => {
+      await requireActivePersonalOwner(transaction, input.householdId, input.adultId);
+      const revisions = await transaction<(RuleRevisionRow & Record<string, unknown>)[]>`
+        select id, household_id, adult_id, rule_key, revision, supersedes_revision_id, status,
+          rule_digest, statement_digest, rule_key_id, rule_ciphertext,
+          statement_key_id, statement_ciphertext, sensitivity, source_message_ref, source_content_digest,
           evaluator_release_id, occurred_at, created_at
         from personal_attention_rule_revisions
         where household_id = ${input.householdId} and adult_id = ${input.adultId}
@@ -439,7 +494,10 @@ export class PostgresPersonalAttentionStore {
           and applied_at <= ${input.asOf}
         order by applied_at, id
       `;
-      return { revisions, applications };
+      return {
+        revisions: revisions.map((row) => exportRevision(row, this.sensitiveJson)),
+        applications,
+      };
     });
   }
 }
@@ -497,18 +555,96 @@ async function appendPersonalAudit(
   `;
 }
 
-function activeRule(row: RuleRevisionRow): ActivePersonalAttentionRule {
-  const rule = PersonalAttentionRuleSchema.parse(row.rule);
+function activeRule(row: RuleRevisionRow, sensitiveJson: TenantJsonCipher): ActivePersonalAttentionRule {
+  const { rule, statement } = openRuleRevision(row, sensitiveJson);
   return {
     revisionId: row.id,
     controlId: controlId(row.rule_key, rule),
     ruleKey: row.rule_key,
     revision: row.revision,
     rule,
-    statement: row.statement,
+    statement,
     occurredAt: row.occurred_at.toISOString(),
     evaluatorReleaseId: row.evaluator_release_id,
   };
+}
+
+function openRuleRevision(
+  row: RuleRevisionRow,
+  sensitiveJson: TenantJsonCipher,
+): { readonly rule: PersonalAttentionRule; readonly statement: string } {
+  try {
+    const rule = PersonalAttentionRuleSchema.parse(
+      sensitiveJson.open(
+        { keyId: row.rule_key_id, ciphertext: row.rule_ciphertext },
+        personalAttentionCipherContext(row.household_id, row.id, "rule"),
+      ),
+    );
+    const statement = statementSchema.parse(
+      sensitiveJson.open(
+        { keyId: row.statement_key_id, ciphertext: row.statement_ciphertext },
+        personalAttentionCipherContext(row.household_id, row.id, "statement"),
+      ),
+    );
+    if (
+      digest(canonicalJson(rule)) !== row.rule_digest ||
+      digest(statement) !== row.statement_digest ||
+      personalAttentionStatement(rule) !== statement
+    ) {
+      throw new Error("Personal attention revision metadata does not match its ciphertext");
+    }
+    return { rule, statement };
+  } catch {
+    throw new PersonalAttentionStoreError("invalid_state");
+  }
+}
+
+function sealRuleRevision(
+  sensitiveJson: TenantJsonCipher,
+  householdId: string,
+  revisionId: string,
+  rule: PersonalAttentionRule,
+  statement: string,
+) {
+  return {
+    rule: sensitiveJson.seal(
+      JSON.parse(canonicalJson(rule)),
+      personalAttentionCipherContext(householdId, revisionId, "rule"),
+    ),
+    statement: sensitiveJson.seal(
+      statement,
+      personalAttentionCipherContext(householdId, revisionId, "statement"),
+    ),
+  };
+}
+
+function personalAttentionCipherContext(
+  householdId: string,
+  revisionId: string,
+  field: "rule" | "statement",
+) {
+  return {
+    tenant: { kind: "household" as const, id: householdId },
+    table: "personal_attention_rule_revisions" as const,
+    rowId: revisionId,
+    field,
+  };
+}
+
+function exportRevision(
+  row: RuleRevisionRow & Record<string, unknown>,
+  sensitiveJson: TenantJsonCipher,
+): Record<string, unknown> {
+  const { rule, statement } = openRuleRevision(row, sensitiveJson);
+  const {
+    household_id: _householdId,
+    rule_key_id: _ruleKeyId,
+    rule_ciphertext: _ruleCiphertext,
+    statement_key_id: _statementKeyId,
+    statement_ciphertext: _statementCiphertext,
+    ...revision
+  } = row;
+  return { ...revision, rule, statement };
 }
 
 function controlId(ruleKey: string, rule: PersonalAttentionRule): string {

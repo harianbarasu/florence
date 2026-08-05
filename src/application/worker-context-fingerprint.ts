@@ -27,8 +27,12 @@ export function workerContextFingerprint(input: {
     throw new Error("Cannot fingerprint an unavailable worker episode");
   }
   const evidenceIds = new Set(input.evidenceRefs);
+  const currentProjectArtifact =
+    input.purpose === "family_project"
+      ? input.projection.workers.find((worker) => worker.episodeId === input.episodeId)?.artifact
+      : undefined;
   const context = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     householdTimeZone: input.aggregate.timeZone,
     scope: input.scope,
     householdAdults: [...input.projection.onboarding.adultNames].sort((left, right) =>
@@ -74,6 +78,8 @@ export function workerContextFingerprint(input: {
       requiredOutcome: episode.requiredOutcome,
       scope: episode.scope,
       delegation: episode.delegation,
+      artifact: episode.artifact,
+      currentProjectArtifact,
       evidence: episode.evidence
         .filter((evidence) => evidenceIds.has(evidence.evidenceId))
         .sort((left, right) => left.evidenceId.localeCompare(right.evidenceId)),

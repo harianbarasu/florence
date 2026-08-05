@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   type ApplicationCommit,
-  type ApplicationOutboxIntent,
+  ApplicationOutboxIntentSchema,
   createApplicationProjection,
   createFlorenceApplication,
   createOnboardingProjection,
@@ -360,7 +360,8 @@ describe.skipIf(!databaseUrl)("ApplicationStore PostgreSQL integration", () => {
         audits: string;
         private_reviews: string;
         summary_ciphertext: string;
-        payload: Record<string, unknown>;
+        payload_key_id: string;
+        payload_ciphertext: string;
       }[]
     >`
       select
@@ -371,16 +372,19 @@ describe.skipIf(!databaseUrl)("ApplicationStore PostgreSQL integration", () => {
           where household_id = ${householdId}) as private_reviews,
         (select summary_ciphertext from private_review_items
           where household_id = ${householdId} limit 1) as summary_ciphertext,
-        (select payload from outbox where household_id = ${householdId} limit 1) as payload
+        (select payload_key_id from outbox where household_id = ${householdId} limit 1) as payload_key_id,
+        (select payload_ciphertext from outbox
+          where household_id = ${householdId} limit 1) as payload_ciphertext
     `;
     expect(persisted[0]).toMatchObject({
       commits: "1",
       effects: "1",
       audits: "1",
       private_reviews: "1",
-      payload: { intentId, kind: "conversation.send" },
+      payload_key_id: "integration",
     });
     expect(persisted[0]?.summary_ciphertext).not.toContain(privateReviewItem.summary);
+    expect(persisted[0]?.payload_ciphertext).not.toContain(intentId);
     await expect(
       store.exportHouseholdData({
         householdId,
@@ -516,17 +520,23 @@ describe.skipIf(!databaseUrl)("ApplicationStore PostgreSQL integration", () => {
       channel: { channelId: "linq-family-group", scope: "household" },
       senderAdultId: partnerId,
       messageRef: "linq-db-calendar-approve",
+      replyTo: {
+        messageRef: "linq-db-calendar-approval-request",
+        messageClass: "approval_request",
+        responseContext: { kind: "calendar_approval", actionId: pending.action.actionId },
+      },
       text: `Approve ${pending.action.actionId}`,
       attachmentRefs: [],
       attachmentContents: [],
     });
-    const executionRows = await database<{ payload: ApplicationOutboxIntent }[]>`
-      select payload from outbox
-      where household_id = ${householdId}
-        and payload->>'kind' = 'domain.effect'
-        and payload->'effect'->>'kind' = 'execute_external_action'
-    `;
-    const execution = executionRows[0]?.payload;
+    const executionClaims = await store.claimOutbox({
+      owner: "calendar-action-sender",
+      limit: 100,
+      leaseSeconds: 60,
+    });
+    const execution = executionClaims
+      .map((claim) => ApplicationOutboxIntentSchema.parse(claim.payload))
+      .find((intent) => intent.kind === "domain.effect" && intent.effect.kind === "execute_external_action");
     if (execution?.kind !== "domain.effect" || execution.effect.kind !== "execute_external_action") {
       throw new Error("Expected durable Calendar execution intent");
     }
@@ -672,10 +682,12 @@ describe.skipIf(!databaseUrl)("ApplicationStore PostgreSQL integration", () => {
         lease_owner: string | null;
         lease_token: string | null;
         lease_expires_at: Date | null;
+        payload_key_id: string | null;
+        payload_ciphertext: string | null;
       }[]
     >`
       select status, attempt, dead_at, last_error_code, last_error_detail,
-        lease_owner, lease_token, lease_expires_at
+        lease_owner, lease_token, lease_expires_at, payload_key_id, payload_ciphertext
       from outbox where id = ${reclaimed.rowId}
     `;
     expect(dead[0]).toMatchObject({
@@ -686,6 +698,8 @@ describe.skipIf(!databaseUrl)("ApplicationStore PostgreSQL integration", () => {
       lease_owner: null,
       lease_token: null,
       lease_expires_at: null,
+      payload_key_id: null,
+      payload_ciphertext: null,
     });
     expect(dead[0]?.dead_at).toBeInstanceOf(Date);
     const deadAt = dead[0]?.dead_at?.toISOString();
@@ -1122,7 +1136,6 @@ describe.skipIf(!databaseUrl)("ApplicationStore PostgreSQL integration", () => {
       externalId: `event-${randomUUID()}`,
       kind: "calendar.event",
       occurredAt,
-      subject: "Private appointment",
       contentHash: "hash-v1",
       encryptedContent: "sealed:v1:event-fixture",
       metadata: { calendar: "primary" },
@@ -1134,9 +1147,10 @@ describe.skipIf(!databaseUrl)("ApplicationStore PostgreSQL integration", () => {
     expect(new Set(sourceReceipts.map((receipt) => receipt.sourceItemId))).toHaveLength(1);
     const inserted = sourceReceipts[0];
     if (!inserted) throw new Error("Expected a source item receipt");
-    await expect(
-      store.persistSourceItem({ ...base, contentHash: "hash-v2", subject: "Updated appointment" }),
-    ).resolves.toMatchObject({ disposition: "revised", revision: 2 });
+    await expect(store.persistSourceItem({ ...base, contentHash: "hash-v2" })).resolves.toMatchObject({
+      disposition: "revised",
+      revision: 2,
+    });
 
     await expect(
       store.getSourceItem({
@@ -1147,7 +1161,7 @@ describe.skipIf(!databaseUrl)("ApplicationStore PostgreSQL integration", () => {
     ).resolves.toBeNull();
     await expect(
       store.getSourceItem({ sourceItemId: inserted.sourceItemId, householdId, viewerAdultId: adultId }),
-    ).resolves.toMatchObject({ revision: 2, subject: "Updated appointment" });
+    ).resolves.toMatchObject({ revision: 2 });
     await expect(
       store.persistSourceItem({ ...base, ownerAdultId: secondAdult.adultId }),
     ).rejects.toMatchObject({ code: "not_authorized" });
@@ -1172,7 +1186,7 @@ describe.skipIf(!databaseUrl)("ApplicationStore PostgreSQL integration", () => {
     await expect(store.purgeExpiredSourceContent(new Date().toISOString())).resolves.toBe(1);
     await expect(
       store.getSourceItem({ sourceItemId: inserted.sourceItemId, householdId, viewerAdultId: adultId }),
-    ).resolves.toMatchObject({ subject: null, encryptedContent: null, revision: 2 });
+    ).resolves.toMatchObject({ encryptedContent: null, revision: 2 });
     await expect(
       store.revokeExternalConnection({ connectionId: connection.connectionId, householdId, adultId }),
     ).resolves.toBe(true);
@@ -1181,7 +1195,7 @@ describe.skipIf(!databaseUrl)("ApplicationStore PostgreSQL integration", () => {
     ).rejects.toMatchObject({ code: "not_authorized" });
   });
 
-  it("exports auditable household data and leaves a deletion tombstone", async () => {
+  it("exports auditable household data with private records scoped to the requester", async () => {
     const { householdId, adultId } = await household();
     const secondAdult = await store.addAdultMembership({
       householdId,
@@ -1230,57 +1244,6 @@ describe.skipIf(!databaseUrl)("ApplicationStore PostgreSQL integration", () => {
         state_redacted: true,
         redaction_reason: "unscoped_legacy_projection",
       },
-    });
-
-    const inbox = await store.ingestProviderEvent({
-      provider: "linq",
-      idempotencyKey: `deletion:${randomUUID()}`,
-      authentication: { verified: true },
-      eventKind: "message.received",
-      occurredAt: new Date().toISOString(),
-      payload: { text: "Delete this linked event too" },
-    });
-    const leased = await store.claimProviderInbox({ owner: "deletion-fixture", limit: 1, leaseSeconds: 60 });
-    expect(leased[0]?.id).toBe(inbox.inboxId);
-    if (!leased[0]) throw new Error("Expected provider inbox lease");
-    await store.resolveProviderInbox({
-      inboxId: leased[0].id,
-      leaseToken: leased[0].leaseToken,
-      householdId,
-      resolution: { routed: true },
-    });
-
-    const confirmationDigest = "c".repeat(64);
-    const deletion = await store.requestHouseholdDeletion({
-      householdId,
-      requestedByAdultId: adultId,
-      confirmationDigest,
-    });
-    await expect(
-      store.confirmHouseholdDeletion({
-        requestId: deletion.requestId,
-        confirmationDigest: "d".repeat(64),
-        confirmedAt: new Date().toISOString(),
-      }),
-    ).resolves.toBe(false);
-    await expect(
-      store.confirmHouseholdDeletion({
-        requestId: deletion.requestId,
-        confirmationDigest,
-        confirmedAt: new Date().toISOString(),
-      }),
-    ).resolves.toBe(true);
-    await expect(
-      store.executeHouseholdDeletion({
-        requestId: deletion.requestId,
-        completedAt: new Date().toISOString(),
-      }),
-    ).resolves.toEqual({ householdId, adultsDeleted: 2 });
-    await expect(store.getHouseholdProjection(householdId)).resolves.toBeNull();
-    await expect(store.getDeletionTombstone(deletion.requestId)).resolves.toMatchObject({
-      householdId,
-      requestedByAdultId: adultId,
-      report: { householdDeleted: true, providerInboxDeleted: 1 },
     });
   });
 });

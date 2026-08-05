@@ -129,6 +129,7 @@ function setup(
   const applicationStore: ProviderApplicationStore = {
     resolveChannel: vi.fn(async () => input.known ?? null),
     load: vi.fn(async () => snapshots.shift() ?? snapshot()),
+    enqueueApplicationIntent: vi.fn(async () => ({ rowId: "10000000-0000-4000-8000-000000000001" })),
   };
   const provisionFoundingAdult = vi.fn(async () =>
     privateResolution({ bindingStatus: "pending", membershipStatus: "invited" }),
@@ -139,12 +140,17 @@ function setup(
     setSuppression: vi.fn(async (input) => ({ applied: true, suppressed: input.suppressed })),
     isSuppressed: vi.fn(async () => false),
     pauseGroupBinding: vi.fn(async () => true),
+    pauseGroupBindingForRecovery: vi.fn(async () => ({
+      bindingId: "10000000-0000-4000-8000-000000000002",
+      recoveryRef: "10000000-0000-4000-8000-000000000003",
+    })),
     findPendingInvitation: vi.fn(async () => null),
     bindPendingInvitee: vi.fn(async () => privateResolution()),
     provisionFoundingAdult,
     finalizeFoundingAdult,
     finalizeInvitation: vi.fn(async () => true),
     resolveExactGroup: vi.fn(async () => null),
+    resolveActiveAdultForHandle: vi.fn(async () => null),
     bindHouseholdGroup: vi.fn(async () => ({
       ...privateResolution(),
       channelType: "group" as const,
@@ -170,6 +176,7 @@ function setup(
     linqChats: { getChat },
     linqAttachments: { retrieveAttachment },
     google,
+    linqFromPhone: "+16462350806",
     defaultTimeZone: "America/Los_Angeles",
   });
   return {
@@ -378,7 +385,8 @@ describe("ProductionProviderProcessor", () => {
     await expect(changedParticipants.processor.process(claimed(group))).resolves.toMatchObject({
       resolution: { classification: "linq:unverified_group" },
     });
-    expect(changedParticipants.runtimeStore.pauseGroupBinding).toHaveBeenCalledWith({
+    expect(changedParticipants.runtimeStore.pauseGroupBindingForRecovery).toHaveBeenCalledWith({
+      householdId: HOUSEHOLD_ID,
       externalChatId: "group-1",
       reason: "participant_identity_mismatch",
     });

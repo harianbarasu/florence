@@ -27,7 +27,6 @@ import {
   DEFAULT_CALENDAR_PUSH_BODY_LIMIT_BYTES,
   DEFAULT_GMAIL_PUSH_BODY_LIMIT_BYTES,
   DEFAULT_LINQ_BODY_LIMIT_BYTES,
-  DEFAULT_OPERATOR_BODY_LIMIT_BYTES,
   type FlorenceHttpConfigInput,
   parseFlorenceHttpConfig,
 } from "./config.js";
@@ -76,35 +75,6 @@ const customerExportFilenameSchema = z
   .max(128)
   .regex(/^[A-Za-z0-9][A-Za-z0-9._-]*\.json$/u);
 
-const householdIdSchema = z
-  .string()
-  .trim()
-  .min(1)
-  .max(128)
-  .regex(/^[A-Za-z0-9_-]+$/u);
-
-const operatorHouseholdSchema = z
-  .object({
-    householdId: householdIdSchema,
-  })
-  .strict();
-
-const operatorDeleteSchema = z
-  .object({
-    householdId: householdIdSchema,
-    confirmation: z.string().min(1).max(128),
-  })
-  .strict()
-  .superRefine((value, context) => {
-    if (value.confirmation !== value.householdId) {
-      context.addIssue({
-        code: "custom",
-        path: ["confirmation"],
-        message: "confirmation must match householdId",
-      });
-    }
-  });
-
 const operatorStatusSchema = z
   .object({
     status: z.enum(["ok", "degraded"]),
@@ -125,8 +95,6 @@ const operatorStatusSchema = z
       .optional(),
   })
   .strict();
-
-const idempotencyKeySchema = z.string().min(16).max(256);
 
 export interface CreateFlorenceHttpServerOptions {
   config: FlorenceHttpConfigInput;
@@ -527,73 +495,6 @@ export async function createFlorenceHttpServer(
         return reply.send(status satisfies OperatorStatus);
       } catch {
         request.log.warn({ event: "operator_status_failed" }, "operator status failed");
-        return reply.code(503).send({ error: "unavailable" });
-      }
-    },
-  );
-
-  app.post(
-    "/operator/export",
-    {
-      onRequest: requireOperator,
-      bodyLimit: Math.min(config.bodyLimitBytes, DEFAULT_OPERATOR_BODY_LIMIT_BYTES),
-      config: { rateLimit: { max: 10, timeWindow: 60_000, groupId: "operator_export" } },
-    },
-    async (request, reply) => {
-      reply.header("cache-control", "no-store");
-      const input = operatorHouseholdSchema.safeParse(request.body);
-      if (!input.success) {
-        return reply.code(400).send({ error: "invalid_request" });
-      }
-
-      try {
-        const artifact = await options.services.operations.exportHousehold(input.data);
-        if (artifact === null) {
-          return reply.code(404).send({ error: "not_found" });
-        }
-        return reply
-          .header("content-type", "application/json; charset=utf-8")
-          .header(
-            "content-disposition",
-            `attachment; filename="florence-export-${input.data.householdId}.json"`,
-          )
-          .send(artifact);
-      } catch {
-        request.log.warn({ event: "operator_export_failed" }, "operator export failed");
-        return reply.code(503).send({ error: "unavailable" });
-      }
-    },
-  );
-
-  app.post(
-    "/operator/delete",
-    {
-      onRequest: requireOperator,
-      bodyLimit: Math.min(config.bodyLimitBytes, DEFAULT_OPERATOR_BODY_LIMIT_BYTES),
-      config: { rateLimit: { max: 10, timeWindow: 60_000, groupId: "operator_delete" } },
-    },
-    async (request, reply) => {
-      reply.header("cache-control", "no-store");
-      const input = operatorDeleteSchema.safeParse(request.body);
-      const idempotencyKey = idempotencyKeySchema.safeParse(request.headers["idempotency-key"]);
-      if (!input.success || !idempotencyKey.success) {
-        return reply.code(400).send({ error: "invalid_request" });
-      }
-
-      try {
-        const result = await options.services.operations.deleteHousehold({
-          householdId: input.data.householdId,
-          idempotencyKey: idempotencyKey.data,
-        });
-        if (result === "not_found") {
-          return reply.code(404).send({ error: "not_found" });
-        }
-        if (result !== "accepted" && result !== "already_deleted") {
-          return reply.code(503).send({ error: "unavailable" });
-        }
-        return reply.code(202).send();
-      } catch {
-        request.log.warn({ event: "operator_delete_failed" }, "operator deletion failed");
         return reply.code(503).send({ error: "unavailable" });
       }
     },

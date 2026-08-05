@@ -28,17 +28,25 @@ import {
   SemanticTimePlanSchema,
   SensitivitySchema,
   SourceClassSchema,
+  TemporalTriggerDefinitionSchema,
   TimeZoneSchema,
 } from "../domain/index.js";
 import {
+  type ProjectArtifact,
+  ProjectArtifactSchema,
   WorkerJobSchema as RuntimeWorkerJobSchema,
   WorkerResultSchema as RuntimeWorkerResultSchema,
   WorkerContextItemSchema,
 } from "../runtime/index.js";
+import { payloadDigest } from "../security/canonical-json.js";
 
 const StableReferenceSchema = z.string().trim().min(1).max(500);
 const IdempotencyKeySchema = z.string().trim().min(1).max(500);
 const Sha256DigestSchema = z.string().regex(/^sha256:[a-f0-9]{64}$/);
+
+export function projectArtifactContentDigest(rawArtifact: ProjectArtifact): string {
+  return `sha256:${payloadDigest(ProjectArtifactSchema.parse(rawArtifact))}`;
+}
 
 const ConversationAttachmentBaseShape = {
   reference: StableReferenceSchema,
@@ -416,6 +424,33 @@ const OnboardingClassificationSchema = z
     }
   });
 
+const ModelTemporalTriggerSchema = TemporalTriggerDefinitionSchema.omit({
+  triggerId: true,
+  timerId: true,
+});
+
+const ModelTemporalPlanSchema = z
+  .strictObject({
+    timeZone: SemanticTimePlanSchema.shape.timeZone,
+    event: SemanticTimePlanSchema.shape.event,
+    deadline: SemanticTimePlanSchema.shape.deadline,
+    earliestUseful: SemanticTimePlanSchema.shape.earliestUseful,
+    lastResponsible: SemanticTimePlanSchema.shape.lastResponsible,
+    usefulLeadMinutes: SemanticTimePlanSchema.shape.usefulLeadMinutes,
+    preparationMinutes: SemanticTimePlanSchema.shape.preparationMinutes,
+    finalBufferMinutes: SemanticTimePlanSchema.shape.finalBufferMinutes,
+    triggers: z.array(ModelTemporalTriggerSchema).max(50),
+  })
+  .superRefine((plan, context) => {
+    if (plan.event === undefined && plan.deadline === undefined) {
+      context.addIssue({
+        code: "custom",
+        message: "a model-authored temporal plan needs an event or deadline",
+        path: ["event"],
+      });
+    }
+  });
+
 const ProposedCommitmentClassificationSchema = z.strictObject({
   ...ClassificationBaseShape,
   intent: z.literal("propose_commitment"),
@@ -424,7 +459,15 @@ const ProposedCommitmentClassificationSchema = z.strictObject({
   proposedOwnerAdultId: AdultIdSchema.optional(),
   sourceClass: SourceClassSchema,
   sensitivity: SensitivitySchema,
-  temporalPlan: SemanticTimePlanSchema.optional(),
+  temporalPlan: ModelTemporalPlanSchema.optional(),
+});
+
+const TemporalPlanCorrectionClassificationSchema = z.strictObject({
+  ...ClassificationBaseShape,
+  intent: z.literal("replace_temporal_plan"),
+  episodeId: EpisodeIdSchema,
+  baseEpisodeVersion: z.number().int().positive(),
+  temporalPlan: ModelTemporalPlanSchema,
 });
 
 const ResearchRequestClassificationSchema = z.strictObject({
@@ -446,13 +489,23 @@ const MealPlanRequestClassificationSchema = z.strictObject({
   scopeAssessment: HouseholdScopeAssessmentSchema,
 });
 
+const ProjectRequestClassificationSchema = z.strictObject({
+  ...ClassificationBaseShape,
+  intent: z.literal("project_request"),
+  title: NeutralDisplayTextSchema,
+  requiredOutcome: NeutralFactualTextSchema,
+  constraints: z.array(FactualTextSchema).max(20),
+  scopeAssessment: HouseholdScopeAssessmentSchema,
+  temporalPlan: ModelTemporalPlanSchema.optional(),
+});
+
 const ProjectFollowUpClassificationSchema = z
   .strictObject({
     ...ClassificationBaseShape,
     intent: z.literal("project_follow_up"),
     episodeId: EpisodeIdSchema,
     baseEpisodeVersion: z.number().int().positive(),
-    action: z.enum(["status", "continue", "cancel"]),
+    action: z.enum(["status", "continue", "complete", "cancel"]),
     instruction: NeutralFactualTextSchema.optional(),
   })
   .superRefine((classification, context) => {
@@ -525,14 +578,21 @@ export const ConversationClassificationSchema = z.discriminatedUnion("intent", [
     outcome: z.enum(["completed", "dismissed"]),
     summary: NeutralFactualTextSchema,
   }),
+  TemporalPlanCorrectionClassificationSchema,
   ResearchRequestClassificationSchema,
   MealPlanRequestClassificationSchema,
+  ProjectRequestClassificationSchema,
   ProjectFollowUpClassificationSchema,
   CalendarEventCreateRequestClassificationSchema,
   CalendarEventClarificationClassificationSchema,
   z.strictObject({
     ...ClassificationBaseShape,
     intent: z.literal("approve_calendar_event"),
+    actionId: ExternalActionIdSchema,
+  }),
+  z.strictObject({
+    ...ClassificationBaseShape,
+    intent: z.literal("decline_calendar_event"),
     actionId: ExternalActionIdSchema,
   }),
   z.strictObject({
@@ -604,7 +664,7 @@ export const GmailTriageResultSchema = z.discriminatedUnion("decision", [
     title: NeutralDisplayTextSchema,
     requiredOutcome: NeutralFactualTextSchema,
     proposedOwnerAdultId: AdultIdSchema.optional(),
-    temporalPlan: SemanticTimePlanSchema.optional(),
+    temporalPlan: ModelTemporalPlanSchema.optional(),
   }),
 ]);
 
@@ -901,7 +961,7 @@ export const PendingPromotionSchema = z.strictObject({
 
 export type PendingPromotion = z.infer<typeof PendingPromotionSchema>;
 
-export const WorkerPurposeSchema = z.enum(["family_research", "meal_plan"]);
+export const WorkerPurposeSchema = z.enum(["family_research", "meal_plan", "family_project"]);
 export type WorkerPurpose = z.infer<typeof WorkerPurposeSchema>;
 
 export const ProjectDeliveryGuardSchema = z.strictObject({
@@ -913,27 +973,57 @@ export const ProjectDeliveryGuardSchema = z.strictObject({
 
 export type ProjectDeliveryGuard = z.infer<typeof ProjectDeliveryGuardSchema>;
 
-export const WorkerRecordSchema = z.strictObject({
-  purpose: WorkerPurposeSchema,
-  episodeId: EpisodeIdSchema,
-  baseEpisodeVersion: z.number().int().positive(),
-  contextFingerprint: Sha256DigestSchema,
-  job: RuntimeWorkerJobSchema,
-  status: z.enum(["queued", "awaiting_input", "completed", "cancelled", "failed"]),
-  attemptNumber: z.number().int().positive(),
-  automaticRetryCount: z.number().int().nonnegative().max(3),
-  deliveryGeneration: z.number().int().positive(),
-  projectBrief: z.string().trim().min(1).max(20_000),
-  latestSummary: z.string().trim().min(1).max(4_000).optional(),
-  outstandingQuestions: z.array(z.string().trim().min(1).max(2_000)).max(50),
-  createdAt: InstantStringSchema,
-  updatedAt: InstantStringSchema,
-  resultRef: StableReferenceSchema.optional(),
-  lastErrorCode: z
-    .string()
-    .regex(/^[a-z][a-z0-9_.-]{0,99}$/u)
-    .optional(),
-});
+export const WorkerRecordSchema = z
+  .strictObject({
+    purpose: WorkerPurposeSchema,
+    episodeId: EpisodeIdSchema,
+    baseEpisodeVersion: z.number().int().positive(),
+    contextFingerprint: Sha256DigestSchema,
+    job: RuntimeWorkerJobSchema,
+    status: z.enum(["queued", "awaiting_input", "completed", "cancelled", "failed"]),
+    attemptNumber: z.number().int().positive(),
+    automaticRetryCount: z.number().int().nonnegative().max(3),
+    deliveryGeneration: z.number().int().positive(),
+    projectBrief: z.string().trim().min(1).max(20_000),
+    latestSummary: z.string().trim().min(1).max(4_000).optional(),
+    artifactRef: StableReferenceSchema.optional(),
+    artifact: ProjectArtifactSchema.optional(),
+    outstandingQuestions: z.array(z.string().trim().min(1).max(2_000)).max(50),
+    createdAt: InstantStringSchema,
+    updatedAt: InstantStringSchema,
+    resultRef: StableReferenceSchema.optional(),
+    lastErrorCode: z
+      .string()
+      .regex(/^[a-z][a-z0-9_.-]{0,99}$/u)
+      .optional(),
+  })
+  .superRefine((record, context) => {
+    if ((record.artifact === undefined) !== (record.artifactRef === undefined)) {
+      context.addIssue({
+        code: "custom",
+        path: ["artifactRef"],
+        message: "A structured family-project artifact and its app-owned reference must be retained together",
+      });
+    }
+    if (record.artifact !== undefined && record.purpose !== "family_project") {
+      context.addIssue({
+        code: "custom",
+        path: ["artifact"],
+        message: "Only a family project stores this artifact",
+      });
+    }
+    if (
+      record.purpose === "family_project" &&
+      record.status === "completed" &&
+      record.artifact === undefined
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["artifact"],
+        message: "A completed family-project attempt must retain its structured artifact",
+      });
+    }
+  });
 
 export type WorkerRecord = z.infer<typeof WorkerRecordSchema>;
 
@@ -969,11 +1059,32 @@ export const ApplicationProjectionSchema = z
 
 export type ApplicationProjection = z.infer<typeof ApplicationProjectionSchema>;
 
-export const HouseholdApplicationSnapshotSchema = z.strictObject({
-  revision: z.number().int().nonnegative(),
-  aggregate: HouseholdAggregateSchema,
-  projection: ApplicationProjectionSchema,
-});
+export const HouseholdApplicationSnapshotSchema = z
+  .strictObject({
+    revision: z.number().int().nonnegative(),
+    aggregate: HouseholdAggregateSchema,
+    projection: ApplicationProjectionSchema,
+  })
+  .superRefine((snapshot, context) => {
+    snapshot.aggregate.episodes.forEach((episode, index) => {
+      if (episode.artifact === undefined) return;
+      const worker = snapshot.projection.workers.find(
+        (candidate) =>
+          candidate.episodeId === episode.episodeId &&
+          candidate.artifactRef === episode.artifact?.artifactRef,
+      );
+      if (
+        worker?.artifact === undefined ||
+        projectArtifactContentDigest(worker.artifact) !== episode.artifact.contentDigest
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["aggregate", "episodes", index, "artifact"],
+          message: "A project artifact reference must resolve to the exact durable projection artifact",
+        });
+      }
+    });
+  });
 
 export type HouseholdApplicationSnapshot = z.infer<typeof HouseholdApplicationSnapshotSchema>;
 
@@ -1275,6 +1386,9 @@ export const WorkerRoutesSchema = z.strictObject({
     modelCapabilityProfile: z.literal("long_context_research"),
   }).strict(),
   meal_plan: WorkerRouteSchema.extend({
+    modelCapabilityProfile: z.literal("tool_planning"),
+  }).strict(),
+  family_project: WorkerRouteSchema.extend({
     modelCapabilityProfile: z.literal("tool_planning"),
   }).strict(),
 });

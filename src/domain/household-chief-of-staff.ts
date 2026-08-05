@@ -63,6 +63,7 @@ interface AuthorityCheck {
 }
 
 const TERMINAL_STATES = new Set(["completed", "dismissed", "superseded", "failed"]);
+const EXTERNAL_ACTION_APPROVAL_WINDOW_MINUTES = 30;
 const SENSITIVITY_RANK = {
   ordinary: 0,
   sensitive: 1,
@@ -98,6 +99,12 @@ function isAdultActor(
 
 function instantCompare(left: string, right: string): number {
   return Temporal.Instant.compare(Temporal.Instant.from(left), Temporal.Instant.from(right));
+}
+
+function externalActionProposalExpiry(proposedAt: string): string {
+  return Temporal.Instant.from(proposedAt)
+    .add({ minutes: EXTERNAL_ACTION_APPROVAL_WINDOW_MINUTES })
+    .toString();
 }
 
 function sortedUnique(values: readonly string[]): string[] {
@@ -364,7 +371,12 @@ function resolveEpisodeProposal(
     type: proposal.type,
     version: 1,
     scope: proposal.targetScope,
-    state: owner.status === "proposed" ? "awaiting_acknowledgement" : "proposed",
+    state:
+      owner.status === "proposed"
+        ? "awaiting_acknowledgement"
+        : proposal.delegation === undefined
+          ? "proposed"
+          : "active",
     title: proposal.title,
     requiredOutcome: proposal.requiredOutcome,
     owner,
@@ -560,7 +572,13 @@ function handleProjectDelegated(context: HandlerContext): MutationResult {
     return rejected("stale_episode_version");
   }
   const expectedPurpose =
-    episode.type === "research" ? "family_research" : episode.type === "meal_plan" ? "meal_plan" : undefined;
+    episode.type === "research"
+      ? "family_research"
+      : episode.type === "meal_plan"
+        ? "meal_plan"
+        : episode.type === "project"
+          ? "family_project"
+          : undefined;
   if (
     expectedPurpose === undefined ||
     signal.delegation.purpose !== expectedPurpose ||
@@ -572,7 +590,8 @@ function handleProjectDelegated(context: HandlerContext): MutationResult {
       (signal.instructionEvidence.scope.kind !== "personal" ||
         signal.instructionEvidence.scope.adultId !== episode.scope.adultId)) ||
     episode.evidence.some((evidence) => evidence.evidenceId === signal.instructionEvidence.evidenceId) ||
-    episode.evidence.length >= 50
+    episode.evidence.length >= 50 ||
+    (episode.type === "project" && TERMINAL_STATES.has(episode.state))
   ) {
     return rejected("invalid_transition");
   }
@@ -580,7 +599,7 @@ function handleProjectDelegated(context: HandlerContext): MutationResult {
   const { blockedReason: _blockedReason, outcome: _outcome, ...current } = episode;
   const nextState =
     episode.owner.status === "unassigned"
-      ? "proposed"
+      ? "active"
       : episode.owner.status === "proposed"
         ? "awaiting_acknowledgement"
         : "active";
@@ -608,6 +627,51 @@ function handleProjectDelegated(context: HandlerContext): MutationResult {
   );
 }
 
+function handleEpisodeArtifactRecorded(context: HandlerContext): MutationResult {
+  const { signal, draft } = context;
+  if (signal.kind !== "episode.artifact_recorded") {
+    throw new Error("wrong handler");
+  }
+  const found = findEpisode(draft, signal.episodeId);
+  if (found === undefined) {
+    return rejected("episode_not_found");
+  }
+  const [index, episode] = found;
+  if (episode.version !== signal.baseEpisodeVersion) {
+    return rejected("stale_episode_version");
+  }
+  if (
+    signal.actor.kind !== "worker" ||
+    episode.type !== "project" ||
+    episode.delegation?.purpose !== "family_project" ||
+    episode.delegation.jobId !== signal.actor.jobId ||
+    TERMINAL_STATES.has(episode.state) ||
+    signal.artifact.recordedAt !== signal.occurredAt
+  ) {
+    return rejected("invalid_transition");
+  }
+
+  const updated = FamilyEpisodeSchema.parse({
+    ...episode,
+    version: episode.version + 1,
+    artifact: signal.artifact,
+    updatedAt: signal.occurredAt,
+  });
+  draft.episodes[index] = updated;
+  return accepted(
+    draft,
+    [
+      DomainChangeSchema.parse({
+        kind: "episode_artifact_recorded",
+        episodeId: episode.episodeId,
+        artifactRef: signal.artifact.artifactRef,
+        episodeVersion: updated.version,
+      }),
+    ],
+    [],
+  );
+}
+
 function handleEpisodeClosed(context: HandlerContext): MutationResult {
   const { signal, draft } = context;
   if (signal.kind !== "episode.closed") {
@@ -621,6 +685,7 @@ function handleEpisodeClosed(context: HandlerContext): MutationResult {
   const workerJobId = signal.actor.kind === "worker" ? signal.actor.jobId : undefined;
   const authorizedWorker =
     workerJobId !== undefined &&
+    episode.type !== "project" &&
     episode.delegation?.jobId === workerJobId &&
     signal.outcome.kind === "completed" &&
     signal.outcome.evidence.some((item) => item.source === "worker" && item.sourceRef === workerJobId);
@@ -1135,12 +1200,14 @@ function executeActionEffect(
   signal: HouseholdSignal,
   action: ExternalAction,
   approvalId: string,
+  executeBy: string,
 ): OutboxIntent {
   return OutboxIntentSchema.parse({
     ...outboxBase(signal, `execute:${action.actionId}`),
     kind: "execute_external_action",
     action,
     approvalId: ApprovalIdSchema.parse(approvalId),
+    executeBy,
   });
 }
 
@@ -1160,57 +1227,92 @@ function handleApprovalGranted(context: HandlerContext): MutationResult {
     return rejected(invalid);
   }
 
-  const approvalIndex = draft.approvals.push(signal.approval) - 1;
-  const changes: DomainChange[] = [];
-  const effects: OutboxIntent[] = [];
-  let status: "active" | "consumed" = "active";
-
   if (signal.approval.target.kind === "external_action") {
     const target = signal.approval.target;
     const pendingIndex = draft.pendingActions.findIndex(
       (candidate) => candidate.action.actionId === target.actionId,
     );
     const pending = draft.pendingActions[pendingIndex];
-    if (pending !== undefined && pending.state === "awaiting_approval") {
-      if (
-        pending.action.requestedFor.kind === "personal" &&
-        pending.action.requestedFor.adultId !== signal.actor.adultId
-      ) {
-        return rejected("approval_invalid");
-      }
-      if (
-        pending.action.actionDigest !== target.actionDigest ||
-        pending.action.relevantDataDigest !== target.relevantDataDigest
-      ) {
-        return rejected("action_digest_mismatch");
-      }
-      draft.approvals[approvalIndex] = { ...signal.approval, status: "consumed" };
+    if (pending === undefined || pending.state !== "awaiting_approval") {
+      return rejected("approval_invalid");
+    }
+    if (
+      pending.action.requestedFor.kind === "personal" &&
+      pending.action.requestedFor.adultId !== signal.actor.adultId
+    ) {
+      return rejected("approval_invalid");
+    }
+    if (
+      pending.action.actionDigest !== target.actionDigest ||
+      pending.action.relevantDataDigest !== target.relevantDataDigest
+    ) {
+      return rejected("action_digest_mismatch");
+    }
+    if (instantCompare(signal.occurredAt, pending.expiresAt) >= 0) {
       draft.pendingActions[pendingIndex] = {
         ...pending,
-        state: "executing",
-        approvalId: signal.approval.approvalId,
+        state: "expired",
         updatedAt: signal.occurredAt,
       };
-      status = "consumed";
-      effects.push(executeActionEffect(signal, pending.action, signal.approval.approvalId));
-      changes.push(
+      return accepted(
+        draft,
+        [
+          DomainChangeSchema.parse({
+            kind: "action_state_changed",
+            actionId: pending.action.actionId,
+            state: "expired",
+          }),
+        ],
+        [],
+      );
+    }
+
+    draft.approvals.push({ ...signal.approval, status: "consumed" });
+    draft.pendingActions[pendingIndex] = {
+      ...pending,
+      state: "executing",
+      approvalId: signal.approval.approvalId,
+      updatedAt: signal.occurredAt,
+    };
+    return accepted(
+      draft,
+      [
+        DomainChangeSchema.parse({
+          kind: "approval_recorded",
+          approvalId: signal.approval.approvalId,
+          status: "consumed",
+        }),
         DomainChangeSchema.parse({
           kind: "action_state_changed",
           actionId: pending.action.actionId,
           state: "executing",
         }),
-      );
-    }
+      ],
+      [
+        executeActionEffect(
+          signal,
+          pending.action,
+          signal.approval.approvalId,
+          instantCompare(pending.expiresAt, signal.approval.expiresAt) <= 0
+            ? pending.expiresAt
+            : signal.approval.expiresAt,
+        ),
+      ],
+    );
   }
 
-  changes.unshift(
-    DomainChangeSchema.parse({
-      kind: "approval_recorded",
-      approvalId: signal.approval.approvalId,
-      status,
-    }),
+  draft.approvals.push(signal.approval);
+  return accepted(
+    draft,
+    [
+      DomainChangeSchema.parse({
+        kind: "approval_recorded",
+        approvalId: signal.approval.approvalId,
+        status: "active",
+      }),
+    ],
+    [],
   );
-  return accepted(draft, changes, effects);
 }
 
 function handleApprovalRevoked(context: HandlerContext): MutationResult {
@@ -1492,7 +1594,7 @@ function approvalRequestEffect(
           action.hasConflict
             ? "One or more private household calendars are busy then; no private calendar details were shared. "
             : "The current private household availability projection is clear. "
-        }Reply “approve ${action.actionId}” to create this exact event.`
+        }Use iMessage’s Reply on this message and say “approve” or “decline.” This exact proposal expires in ${EXTERNAL_ACTION_APPROVAL_WINDOW_MINUTES} minutes.`
       : `Approval is required before Florence can ${action.summary}.`;
   return OutboxIntentSchema.parse({
     ...outboxBase(signal, `approval-request:${action.actionId}`),
@@ -1531,6 +1633,7 @@ function handleExternalActionProposed(context: HandlerContext): MutationResult {
     action: signal.action,
     state: "awaiting_approval",
     proposedAt: signal.occurredAt,
+    expiresAt: externalActionProposalExpiry(signal.occurredAt),
     updatedAt: signal.occurredAt,
   });
   return accepted(
@@ -1543,6 +1646,47 @@ function handleExternalActionProposed(context: HandlerContext): MutationResult {
       }),
     ],
     [approvalRequestEffect(signal, signal.action, undefined)],
+  );
+}
+
+function handleExternalActionDecision(context: HandlerContext): MutationResult {
+  const { signal, draft } = context;
+  if (signal.kind !== "external_action.declined" && signal.kind !== "external_action.expired") {
+    throw new Error("wrong handler");
+  }
+  if (!isAdultActor(draft, signal.actor)) {
+    return rejected("unauthorized_actor");
+  }
+  const index = draft.pendingActions.findIndex((pending) => pending.action.actionId === signal.actionId);
+  const pending = draft.pendingActions[index];
+  if (pending === undefined || pending.state !== "awaiting_approval") {
+    return rejected("invalid_transition");
+  }
+  if (
+    pending.action.requestedFor.kind === "personal" &&
+    pending.action.requestedFor.adultId !== signal.actor.adultId
+  ) {
+    return rejected("unauthorized_actor");
+  }
+  if (signal.kind === "external_action.expired" && instantCompare(signal.occurredAt, pending.expiresAt) < 0) {
+    return rejected("invalid_transition");
+  }
+  const state = signal.kind === "external_action.declined" ? "declined" : "expired";
+  draft.pendingActions[index] = {
+    ...pending,
+    state,
+    updatedAt: signal.occurredAt,
+  };
+  return accepted(
+    draft,
+    [
+      DomainChangeSchema.parse({
+        kind: "action_state_changed",
+        actionId: pending.action.actionId,
+        state,
+      }),
+    ],
+    [],
   );
 }
 
@@ -1638,6 +1782,7 @@ function handleWorkerProposal(context: HandlerContext): MutationResult {
     }
     consumeApproval(draft, authority.approvalIndex);
 
+    const proposalExpiresAt = externalActionProposalExpiry(signal.occurredAt);
     let state: PendingExternalAction["state"] = "awaiting_approval";
     let approvalId: ApprovalRecord["approvalId"] | undefined;
     if (proposed.approvalId !== undefined) {
@@ -1650,10 +1795,21 @@ function handleWorkerProposal(context: HandlerContext): MutationResult {
       if (actionApproval.index === undefined) {
         return rejected(actionApproval.reason ?? "approval_invalid");
       }
+      const approval = draft.approvals[actionApproval.index];
+      if (approval === undefined) {
+        return rejected("approval_invalid");
+      }
       consumeApproval(draft, actionApproval.index);
       state = "executing";
       approvalId = proposed.approvalId;
-      effects.push(executeActionEffect(signal, proposed.action, proposed.approvalId));
+      effects.push(
+        executeActionEffect(
+          signal,
+          proposed.action,
+          proposed.approvalId,
+          instantCompare(proposalExpiresAt, approval.expiresAt) <= 0 ? proposalExpiresAt : approval.expiresAt,
+        ),
+      );
     } else {
       effects.push(approvalRequestEffect(signal, proposed.action, proposed.promotionAuthority));
     }
@@ -1666,6 +1822,7 @@ function handleWorkerProposal(context: HandlerContext): MutationResult {
         ? {}
         : { promotionAuthority: proposed.promotionAuthority }),
       proposedAt: signal.occurredAt,
+      expiresAt: proposalExpiresAt,
       updatedAt: signal.occurredAt,
     });
     changes.push(
@@ -1894,6 +2051,8 @@ function dispatch(context: HandlerContext): MutationResult {
       return handleDeliveryObserved(context);
     case "episode.project_delegated":
       return handleProjectDelegated(context);
+    case "episode.artifact_recorded":
+      return handleEpisodeArtifactRecorded(context);
     case "episode.closed":
       return handleEpisodeClosed(context);
     case "episode.source_superseded":
@@ -1908,6 +2067,9 @@ function dispatch(context: HandlerContext): MutationResult {
       return handleEpisodeResumed(context);
     case "external_action.proposed":
       return handleExternalActionProposed(context);
+    case "external_action.declined":
+    case "external_action.expired":
+      return handleExternalActionDecision(context);
     case "approval.granted":
       return handleApprovalGranted(context);
     case "approval.revoked":

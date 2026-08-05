@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { type GmailSyncWork, GoogleSyncError } from "./google-sync.js";
+import { startLeaseHeartbeat } from "./lease-heartbeat.js";
 
 export type ClaimedGoogleSyncWork<TWork = GmailSyncWork> = {
   rowId: string;
@@ -20,6 +21,7 @@ export interface GoogleSyncQueuePort<TWork = GmailSyncWork> {
     limit: number;
     leaseSeconds: number;
   }): Promise<readonly ClaimedGoogleSyncWork<TWork>[]>;
+  renewGoogleSyncWork(input: { rowId: string; leaseToken: string; leaseSeconds: number }): Promise<boolean>;
   completeGoogleSyncWork(input: { rowId: string; leaseToken: string }): Promise<boolean>;
   retryGoogleSyncWork(input: {
     rowId: string;
@@ -172,9 +174,33 @@ export class GoogleSyncBackgroundHost<TWork = GmailSyncWork> {
         retryable: true,
       });
     }
+    const heartbeat = await startLeaseHeartbeat({
+      leaseSeconds: this.#leaseSeconds,
+      ...(signal === undefined ? {} : { upstreamSignal: signal }),
+      renew: () =>
+        this.#queue.renewGoogleSyncWork({
+          rowId: lease.rowId,
+          leaseToken: lease.leaseToken,
+          leaseSeconds: this.#leaseSeconds,
+        }),
+    });
+    if (!heartbeat.owned) {
+      await heartbeat.stop();
+      return { settlement: "leaseLost", continuationRequired: false };
+    }
+    let execution:
+      | { readonly ok: true; readonly result: { readonly status: string } }
+      | { readonly ok: false; readonly error: unknown };
     try {
-      const result = await this.#sync.execute(lease.work, signal);
-      const continuationRequired = result.status === "continuation_required";
+      execution = { ok: true, result: await this.#sync.execute(lease.work, heartbeat.signal) };
+    } catch (error) {
+      execution = { ok: false, error };
+    }
+    if (!(await heartbeat.stop())) {
+      return { settlement: "leaseLost", continuationRequired: false };
+    }
+    if (execution.ok) {
+      const continuationRequired = execution.result.status === "continuation_required";
       const completed = await this.#queue.completeGoogleSyncWork({
         rowId: lease.rowId,
         leaseToken: lease.leaseToken,
@@ -183,9 +209,8 @@ export class GoogleSyncBackgroundHost<TWork = GmailSyncWork> {
         settlement: completed ? "completed" : "leaseLost",
         continuationRequired,
       };
-    } catch (error) {
-      return this.#settleFailure(lease, classifyFailure(error, signal));
     }
+    return this.#settleFailure(lease, classifyFailure(execution.error, heartbeat.signal));
   }
 
   async #settleFailure(

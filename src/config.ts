@@ -4,6 +4,13 @@ const emptyStringAsUndefined = (value: unknown): unknown =>
   typeof value === "string" && value.trim() === "" ? undefined : value;
 const optionalSecret = z.preprocess(emptyStringAsUndefined, z.string().min(1).optional());
 const optionalUrl = z.preprocess(emptyStringAsUndefined, z.string().url().optional());
+const optionalE164Phone = z.preprocess(
+  emptyStringAsUndefined,
+  z
+    .string()
+    .regex(/^\+[1-9]\d{1,14}$/u)
+    .optional(),
+);
 const encryptionKeyIdSchema = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/u);
 const encryptionKeyringSchema = z.preprocess(
   (value) => {
@@ -37,7 +44,7 @@ const environmentSchema = z
     FLORENCE_DEFAULT_TIMEZONE: z.string().min(1).default("America/Los_Angeles"),
     LINQ_API_KEY: optionalSecret,
     LINQ_BASE_URL: z.string().url().default("https://api.linqapp.com/api/partner/v3"),
-    LINQ_FROM_PHONE: optionalSecret,
+    LINQ_FROM_PHONE: optionalE164Phone,
     LINQ_WEBHOOK_SECRET: optionalSecret,
     GOOGLE_CLIENT_ID: optionalSecret,
     GOOGLE_CLIENT_SECRET: optionalSecret,
@@ -90,6 +97,48 @@ const environmentSchema = z
         path: ["FLORENCE_DATA_ACTIVE_KEY_ID"],
         message: "Active Florence data-encryption key is absent from the keyring",
       });
+    }
+    if (value.NODE_ENV !== "production") return;
+
+    const requireFields = <Key extends keyof typeof value>(fields: readonly Key[]): void => {
+      for (const field of fields) {
+        if (value[field] !== undefined) continue;
+        context.addIssue({
+          code: "custom",
+          path: [field],
+          message: `${field} is required for the configured production integration`,
+        });
+      }
+    };
+    const linqFields = ["LINQ_API_KEY", "LINQ_FROM_PHONE", "LINQ_WEBHOOK_SECRET"] as const;
+    requireFields(linqFields);
+
+    const googleOAuthFields = [
+      "GOOGLE_CLIENT_ID",
+      "GOOGLE_CLIENT_SECRET",
+      "GOOGLE_OAUTH_STATE_SECRET",
+      "GOOGLE_REDIRECT_URI",
+    ] as const;
+    const gmailPubSubFields = [
+      "GOOGLE_PUBSUB_VERIFICATION_TOKEN",
+      "GOOGLE_PUBSUB_OIDC_AUDIENCE",
+      "GOOGLE_PUBSUB_SERVICE_ACCOUNT_EMAIL",
+      "GOOGLE_GMAIL_TOPIC_NAME",
+      "GOOGLE_GMAIL_PUBSUB_SUBSCRIPTION",
+    ] as const;
+    requireFields(googleOAuthFields);
+    requireFields(gmailPubSubFields);
+
+    switch (value.MODEL_PROVIDER) {
+      case "openai":
+        requireFields(["OPENAI_API_KEY"]);
+        break;
+      case "anthropic":
+        requireFields(["ANTHROPIC_API_KEY"]);
+        break;
+      case "open-weight":
+        requireFields(["OPEN_WEIGHT_BASE_URL", "OPEN_WEIGHT_MODEL"]);
+        break;
     }
   });
 

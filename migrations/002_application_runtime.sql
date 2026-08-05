@@ -10,8 +10,8 @@ CREATE TABLE provider_inbox (
   encryption_tenant_kind text NOT NULL
     CHECK (encryption_tenant_kind IN ('household', 'provider_ingress')),
   encryption_tenant_id text NOT NULL,
-  body_key_id text NOT NULL,
-  body_ciphertext text NOT NULL,
+  body_key_id text,
+  body_ciphertext text,
   available_at timestamptz NOT NULL DEFAULT now(),
   attempt integer NOT NULL DEFAULT 0,
   max_attempts integer NOT NULL DEFAULT 8 CHECK (max_attempts > 0),
@@ -24,7 +24,12 @@ CREATE TABLE provider_inbox (
   received_at timestamptz NOT NULL DEFAULT now(),
   resolved_at timestamptz,
   updated_at timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (provider, idempotency_digest)
+  UNIQUE (provider, idempotency_digest),
+  CONSTRAINT provider_inbox_body_state_check CHECK (
+    (status IN ('pending', 'leased') AND body_key_id IS NOT NULL AND body_ciphertext IS NOT NULL)
+    OR
+    (status IN ('resolved', 'quarantined', 'dead') AND body_key_id IS NULL AND body_ciphertext IS NULL)
+  )
 );
 
 CREATE INDEX provider_inbox_claim_idx
@@ -39,7 +44,7 @@ CREATE INDEX provider_inbox_routing_idx
   ON provider_inbox USING gin (routing_digests);
 
 CREATE INDEX provider_inbox_body_key_idx
-  ON provider_inbox (body_key_id);
+  ON provider_inbox (body_key_id) WHERE body_key_id IS NOT NULL;
 
 CREATE TABLE provider_inbox_conflicts (
   id uuid PRIMARY KEY,
@@ -48,14 +53,14 @@ CREATE TABLE provider_inbox_conflicts (
   encryption_tenant_kind text NOT NULL
     CHECK (encryption_tenant_kind IN ('household', 'provider_ingress')),
   encryption_tenant_id text NOT NULL,
-  body_key_id text NOT NULL,
-  body_ciphertext text NOT NULL,
+  body_key_id text,
+  body_ciphertext text,
   received_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE (inbox_id, content_digest)
 );
 
 CREATE INDEX provider_inbox_conflicts_body_key_idx
-  ON provider_inbox_conflicts (body_key_id);
+  ON provider_inbox_conflicts (body_key_id) WHERE body_key_id IS NOT NULL;
 
 CREATE TABLE household_projections (
   household_id uuid PRIMARY KEY REFERENCES households(id) ON DELETE CASCADE,
@@ -198,7 +203,6 @@ CREATE UNIQUE INDEX scheduled_triggers_timer_key_idx
 
 ALTER TABLE outbox
   ADD COLUMN intent_key text,
-  ADD COLUMN payload_hash text,
   ADD COLUMN max_attempts integer NOT NULL DEFAULT 8 CHECK (max_attempts > 0),
   ADD COLUMN last_error_detail text,
   ADD COLUMN sent_at timestamptz,
@@ -217,14 +221,3 @@ ALTER TABLE audit_log
 
 CREATE INDEX audit_log_scope_idx
   ON audit_log (household_id, visibility, owner_adult_id, sequence);
-
-CREATE TABLE deletion_tombstones (
-  request_id uuid PRIMARY KEY,
-  household_id uuid NOT NULL,
-  requested_by_adult_id uuid NOT NULL,
-  completed_at timestamptz NOT NULL DEFAULT now(),
-  report jsonb NOT NULL
-);
-
-CREATE INDEX deletion_tombstones_household_idx
-  ON deletion_tombstones (household_id, completed_at DESC);

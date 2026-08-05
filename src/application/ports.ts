@@ -3,6 +3,7 @@ import type {
   DomainChange,
   HouseholdAggregate,
   HouseholdSignal,
+  SemanticTimePlan,
 } from "../domain/index.js";
 import type { WorkerAttemptOptions, WorkerJob, WorkerResult, WorkerRuntime } from "../runtime/index.js";
 import type {
@@ -44,11 +45,12 @@ export interface ConversationInterpretationContext {
   }[];
   readonly openEpisodes: readonly {
     readonly episodeId: string;
-    readonly type: "commitment" | "research" | "meal_plan";
+    readonly type: "commitment" | "research" | "meal_plan" | "project";
     readonly state: string;
     readonly title: string;
     readonly ownerAdultId?: string;
     readonly version: number;
+    readonly temporalPlan?: SemanticTimePlan;
   }[];
   readonly pendingPromotionIds: readonly string[];
   readonly activePolicies: readonly {
@@ -64,10 +66,13 @@ export interface ConversationInterpretationContext {
     readonly endsAt: string;
     readonly timeZone: string;
     readonly hasConflict: boolean;
+    readonly expiresAt: string;
   }[];
 }
 
 export interface GmailTriageContext {
+  readonly currentTime: string;
+  readonly householdTimeZone: string;
   readonly confirmedRoutineAnchors: ReadonlyArray<HouseholdAggregate["routineAnchors"][number]>;
   readonly activeMemories: ConversationInterpretationContext["activeMemories"];
   readonly activeSharingRules: readonly {
@@ -191,6 +196,7 @@ export interface HouseholdCalendarActionsPort {
     readonly action: CalendarEventCreateAction;
     readonly idempotencyKey: string;
     readonly asOf: string;
+    readonly executeBy: string;
   }): Promise<{
     readonly provider: "google-calendar";
     readonly providerReference: string;

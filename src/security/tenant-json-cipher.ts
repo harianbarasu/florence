@@ -15,7 +15,14 @@ export type SensitiveTable =
   | "household_projections"
   | "application_snapshots"
   | "application_commits"
-  | "household_signals";
+  | "household_signals"
+  | "jobs"
+  | "scheduled_triggers"
+  | "outbox"
+  | "calendar_busy_windows"
+  | "personal_attention_rule_revisions"
+  | "adult_identity_details"
+  | "external_connections";
 
 export interface EncryptionTenant {
   readonly kind: EncryptionTenantKind;
@@ -260,7 +267,14 @@ function isSensitiveTable(value: unknown): value is SensitiveTable {
     value === "household_projections" ||
     value === "application_snapshots" ||
     value === "application_commits" ||
-    value === "household_signals"
+    value === "household_signals" ||
+    value === "jobs" ||
+    value === "scheduled_triggers" ||
+    value === "outbox" ||
+    value === "calendar_busy_windows" ||
+    value === "personal_attention_rule_revisions" ||
+    value === "adult_identity_details" ||
+    value === "external_connections"
   );
 }
 

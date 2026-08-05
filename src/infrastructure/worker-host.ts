@@ -9,6 +9,7 @@ import {
 import type { FlorenceApplication } from "../application/ports.js";
 import type { ApplicationWorkerHost } from "../application/worker-entrypoint.js";
 import { HouseholdIdSchema, InstantStringSchema } from "../domain/index.js";
+import { startLeaseHeartbeat } from "./lease-heartbeat.js";
 
 const ErrorCodeSchema = z.string().regex(/^[a-z][a-z0-9_.-]{0,99}$/);
 const JsonObjectSchema = z.record(z.string(), z.json());
@@ -97,6 +98,11 @@ export interface ProviderItemProcessor {
 /** The complete durable queue seam needed by the worker; ApplicationStore satisfies it structurally. */
 export interface QueueStore {
   claimProviderInbox(input: z.input<typeof LeaseRequestSchema>): Promise<unknown[]>;
+  renewProviderInboxLease(input: {
+    readonly inboxId: string;
+    readonly leaseToken: string;
+    readonly leaseSeconds: number;
+  }): Promise<boolean>;
   resolveProviderInbox(input: {
     readonly inboxId: string;
     readonly leaseToken: string;
@@ -112,6 +118,11 @@ export interface QueueStore {
   }): Promise<"pending" | "dead" | "lost_lease">;
 
   claimDueTimers(input: z.input<typeof LeaseRequestSchema>): Promise<unknown[]>;
+  renewTimerLease(input: {
+    readonly rowId: string;
+    readonly leaseToken: string;
+    readonly leaseSeconds: number;
+  }): Promise<boolean>;
   finishTimer(input: {
     readonly rowId: string;
     readonly leaseToken: string;
@@ -125,6 +136,11 @@ export interface QueueStore {
   }): Promise<"scheduled" | "dead" | "lost_lease">;
 
   claimOutbox(input: z.input<typeof LeaseRequestSchema>): Promise<unknown[]>;
+  renewOutboxLease(input: {
+    readonly rowId: string;
+    readonly leaseToken: string;
+    readonly leaseSeconds: number;
+  }): Promise<boolean>;
   recordOutboxSuccess(input: {
     readonly rowId: string;
     readonly leaseToken: string;
@@ -391,41 +407,73 @@ export class DurableWorkerHost implements ApplicationWorkerHost {
       return;
     }
 
-    let result: ProviderItemProcessingResult;
+    const heartbeat = await startLeaseHeartbeat({
+      leaseSeconds: this.#leaseSeconds,
+      upstreamSignal: signal,
+      renew: () =>
+        this.#queueStore.renewProviderInboxLease({
+          inboxId: item.id,
+          leaseToken: item.leaseToken,
+          leaseSeconds: this.#leaseSeconds,
+        }),
+    });
+    if (!heartbeat.owned) {
+      await heartbeat.stop();
+      report.providerInbox.lostLease += 1;
+      return;
+    }
+
+    let processing:
+      | { readonly ok: true; readonly result: ProviderItemProcessingResult }
+      | { readonly ok: false; readonly error: unknown };
     try {
-      result = ProviderItemProcessingResultSchema.parse(
-        await this.#providerProcessor.process(item, application, signal),
-      );
+      processing = {
+        ok: true,
+        result: ProviderItemProcessingResultSchema.parse(
+          await this.#providerProcessor.process(item, application, heartbeat.signal),
+        ),
+      };
     } catch (error) {
-      if (error instanceof QueueExecutionError && error.permanent) {
-        await this.#discardProvider(item, error.code, undefined, report);
+      processing = { ok: false, error };
+    }
+    if (!(await heartbeat.stop())) {
+      report.providerInbox.lostLease += 1;
+      return;
+    }
+    if (!processing.ok) {
+      if (processing.error instanceof QueueExecutionError && processing.error.permanent) {
+        await this.#discardProvider(item, processing.error.code, undefined, report);
       } else {
         await this.#failProvider(
           item,
-          error instanceof QueueExecutionError ? error.code : "provider_processor_failure",
+          processing.error instanceof QueueExecutionError
+            ? processing.error.code
+            : "provider_processor_failure",
           report,
         );
       }
       return;
     }
 
-    switch (result.status) {
+    switch (processing.result.status) {
       case "resolved": {
         const settled = await this.#queueStore.resolveProviderInbox({
           inboxId: item.id,
           leaseToken: item.leaseToken,
-          ...(result.householdId === undefined ? {} : { householdId: result.householdId }),
-          resolution: result.resolution,
+          ...(processing.result.householdId === undefined
+            ? {}
+            : { householdId: processing.result.householdId }),
+          resolution: processing.result.resolution,
         });
         if (settled) report.providerInbox.resolved += 1;
         else report.providerInbox.lostLease += 1;
         break;
       }
       case "retryable_failure":
-        await this.#failProvider(item, result.errorCode, report);
+        await this.#failProvider(item, processing.result.errorCode, report);
         break;
       case "permanent_failure":
-        await this.#discardProvider(item, result.errorCode, result.householdId, report);
+        await this.#discardProvider(item, processing.result.errorCode, processing.result.householdId, report);
         break;
     }
   }
@@ -507,11 +555,40 @@ export class DurableWorkerHost implements ApplicationWorkerHost {
       triggerId: payload.data.triggerId,
       firedAt,
     });
+    const heartbeat = await startLeaseHeartbeat({
+      leaseSeconds: this.#leaseSeconds,
+      upstreamSignal: signal,
+      renew: () =>
+        this.#queueStore.renewTimerLease({
+          rowId: item.rowId,
+          leaseToken: item.leaseToken,
+          leaseSeconds: this.#leaseSeconds,
+        }),
+    });
+    if (!heartbeat.owned) {
+      await heartbeat.stop();
+      report.timers.lostLease += 1;
+      return;
+    }
+    let processing:
+      | { readonly ok: true; readonly result: z.infer<typeof ApplicationResultSchema> }
+      | { readonly ok: false; readonly error: unknown };
     try {
-      const result = ApplicationResultSchema.parse(await application.process(input));
-      if (result.householdId !== input.householdId || result.idempotencyKey !== input.idempotencyKey) {
+      processing = { ok: true, result: ApplicationResultSchema.parse(await application.process(input)) };
+      if (
+        processing.result.householdId !== input.householdId ||
+        processing.result.idempotencyKey !== input.idempotencyKey
+      ) {
         throw new QueueExecutionError("timer_result_identity_mismatch", true, false);
       }
+    } catch (error) {
+      processing = { ok: false, error };
+    }
+    if (!(await heartbeat.stop())) {
+      report.timers.lostLease += 1;
+      return;
+    }
+    if (processing.ok) {
       const settled = await this.#queueStore.finishTimer({
         rowId: item.rowId,
         leaseToken: item.leaseToken,
@@ -519,10 +596,10 @@ export class DurableWorkerHost implements ApplicationWorkerHost {
       });
       if (settled) report.timers.fired += 1;
       else report.timers.lostLease += 1;
-    } catch (error) {
+    } else {
       await this.#releaseTimer(
         item,
-        error instanceof QueueExecutionError ? error.code : "timer_processing_failure",
+        processing.error instanceof QueueExecutionError ? processing.error.code : "timer_processing_failure",
         report,
       );
     }
@@ -571,34 +648,67 @@ export class DurableWorkerHost implements ApplicationWorkerHost {
       return;
     }
 
-    let result: z.infer<typeof OutboxExecutionResultSchema>;
+    const heartbeat = await startLeaseHeartbeat({
+      leaseSeconds: this.#leaseSeconds,
+      upstreamSignal: signal,
+      renew: () =>
+        this.#queueStore.renewOutboxLease({
+          rowId: item.rowId,
+          leaseToken: item.leaseToken,
+          leaseSeconds: this.#leaseSeconds,
+        }),
+    });
+    if (!heartbeat.owned) {
+      await heartbeat.stop();
+      report.outbox.lostLease += 1;
+      return;
+    }
+    let execution:
+      | { readonly ok: true; readonly result: z.infer<typeof OutboxExecutionResultSchema> }
+      | { readonly ok: false; readonly error: unknown };
     try {
-      result = OutboxExecutionResultSchema.parse(
-        await application.executeOutbox(intent.data, this.#instantNow(), signal),
-      );
-      if (result.intentId !== intent.data.intentId) {
+      execution = {
+        ok: true,
+        result: OutboxExecutionResultSchema.parse(
+          await application.executeOutbox(intent.data, this.#instantNow(), heartbeat.signal),
+        ),
+      };
+      if (execution.result.intentId !== intent.data.intentId) {
         throw new QueueExecutionError("outbox_result_identity_mismatch", false, false);
       }
     } catch (error) {
-      if (error instanceof QueueExecutionError && error.outcomeCertain && error.permanent) {
-        await this.#permanentOutbox(item, error.code, report);
+      execution = { ok: false, error };
+    }
+    if (!(await heartbeat.stop())) {
+      report.outbox.lostLease += 1;
+      return;
+    }
+    if (!execution.ok) {
+      if (
+        execution.error instanceof QueueExecutionError &&
+        execution.error.outcomeCertain &&
+        execution.error.permanent
+      ) {
+        await this.#permanentOutbox(item, execution.error.code, report);
       } else {
         await this.#retryOutbox(
           item,
-          error instanceof QueueExecutionError ? error.code : "outbox_execution_failure",
-          error instanceof QueueExecutionError ? error.outcomeCertain : intent.data.kind === "worker.run",
+          execution.error instanceof QueueExecutionError ? execution.error.code : "outbox_execution_failure",
+          execution.error instanceof QueueExecutionError
+            ? execution.error.outcomeCertain
+            : intent.data.kind === "worker.run",
           report,
         );
       }
       return;
     }
 
-    switch (result.status) {
+    switch (execution.result.status) {
       case "succeeded": {
         const settled = await this.#queueStore.recordOutboxSuccess({
           rowId: item.rowId,
           leaseToken: item.leaseToken,
-          providerReceipt: { intentId: result.intentId, status: result.status },
+          providerReceipt: { intentId: execution.result.intentId, status: execution.result.status },
         });
         if (settled) report.outbox.succeeded += 1;
         else report.outbox.lostLease += 1;

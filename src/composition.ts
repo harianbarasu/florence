@@ -79,6 +79,7 @@ import {
 } from "./infrastructure/linq-reconciliation.js";
 import { createConfiguredModelGateway } from "./infrastructure/model-gateway-config.js";
 import { ModelApplicationInterpreter } from "./infrastructure/model-interpreter.js";
+import { CachedModelReadiness } from "./infrastructure/model-readiness.js";
 import { OnboardingAwareInterpreter } from "./infrastructure/onboarding-interpreter.js";
 import {
   PeriodicMaintenanceCoordinator,
@@ -97,6 +98,7 @@ import {
 } from "./infrastructure/private-control-commands.js";
 import { ProductionProviderProcessor, ProviderProcessingError } from "./infrastructure/provider-processor.js";
 import { FlorenceRuntimeStore } from "./infrastructure/runtime-store.js";
+import { WorkerHeartbeatHost } from "./infrastructure/worker-heartbeat.js";
 import {
   DurableWorkerHost,
   type ProviderInboxLease,
@@ -264,11 +266,12 @@ export async function createProductionComposition(
     const runtimeStore = new FlorenceRuntimeStore(
       database,
       applicationStore,
+      sensitiveJson,
       config.FLORENCE_TOKEN_ENCRYPTION_KEY,
     );
-    const customerDataControls = new PostgresCustomerDataControlStore(database, blindIndex);
+    const customerDataControls = new PostgresCustomerDataControlStore(database, blindIndex, sensitiveJson);
     const conversationFeedback = new PostgresConversationFeedbackStore(database);
-    const personalAttentionStore = new PostgresPersonalAttentionStore(database);
+    const personalAttentionStore = new PostgresPersonalAttentionStore(database, sensitiveJson);
     // Provider clients close over credentials at this composition boundary. Only app-owned,
     // household-scoped context and tool results can cross into model prompts or agent runtimes.
     const modelGateway = createConfiguredModelGateway(config);
@@ -366,10 +369,25 @@ export async function createProductionComposition(
       }),
       ...(google.privateCommands === null ? [] : [google.privateCommands]),
     ]);
-    const linqReconciliationStore =
-      config.LINQ_API_KEY && config.LINQ_FROM_PHONE
-        ? new PostgresLinqReconciliationStore(database, linqIntegrationDigest(config.LINQ_FROM_PHONE))
+    const linqConfiguration =
+      integrations.linq &&
+      config.LINQ_API_KEY !== undefined &&
+      config.LINQ_FROM_PHONE !== undefined &&
+      config.LINQ_WEBHOOK_SECRET !== undefined
+        ? (() => {
+            const expectedWebhookUrl = expectedLinqWebhookUrl(config.FLORENCE_WEB_BASE_URL);
+            return {
+              fromPhone: config.LINQ_FROM_PHONE,
+              webhookSecret: config.LINQ_WEBHOOK_SECRET,
+              expectedWebhookUrl,
+              integrationId: linqIntegrationDigest(config.LINQ_FROM_PHONE, expectedWebhookUrl),
+            };
+          })()
         : null;
+    const linqReconciliationStore =
+      linqConfiguration === null
+        ? null
+        : new PostgresLinqReconciliationStore(database, linqConfiguration.integrationId);
     const providerIngress = new DurableProviderIngress(
       applicationStore,
       google.calendarPush === null ? undefined : google.calendarPush,
@@ -386,6 +404,7 @@ export async function createProductionComposition(
       deletedIdentities: customerDataControls,
       conversationFeedback,
       privateCommands,
+      linqFromPhone: linqConfiguration?.fromPhone ?? null,
       defaultTimeZone: config.FLORENCE_DEFAULT_TIMEZONE,
     });
     const durableWorker = new DurableWorkerHost({
@@ -399,8 +418,7 @@ export async function createProductionComposition(
       maintenance: {
         purgeExpiredSourceContent: (asOf) => applicationStore.purgeExpiredSourceContent(asOf),
         purgeExpiredProviderInbox: (asOf) => runtimeStore.purgeExpiredProviderInbox(asOf),
-        executeConfirmedHouseholdDeletions: (input) =>
-          executeConfirmedHouseholdDeletions(database, applicationStore, input),
+        purgeExpiredOAuthStates: (asOf) => applicationStore.purgeExpiredOAuthStates(asOf),
       },
     });
     const dailyBrief = createPostgresDailyBriefHost({
@@ -419,20 +437,22 @@ export async function createProductionComposition(
       leaseSeconds: Math.max(120, config.WORKER_LEASE_SECONDS),
     });
     const linqReconciliation =
-      linqReconciliationStore !== null && config.LINQ_FROM_PHONE
+      linqReconciliationStore !== null && linqConfiguration !== null
         ? new LinqReconciliationHost({
             store: linqReconciliationStore,
             reader: linq,
             ingress: providerIngress,
-            integrationId: linqIntegrationDigest(config.LINQ_FROM_PHONE),
-            fromPhone: config.LINQ_FROM_PHONE,
-            expectedWebhookUrl: expectedLinqWebhookUrl(config.FLORENCE_WEB_BASE_URL),
+            integrationId: linqConfiguration.integrationId,
+            fromPhone: linqConfiguration.fromPhone,
+            expectedWebhookUrl: linqConfiguration.expectedWebhookUrl,
             owner: workerId("linq-reconciliation"),
             pollIntervalMs: Math.max(1_000, config.WORKER_POLL_INTERVAL_MS),
             leaseSeconds: Math.max(300, config.WORKER_LEASE_SECONDS),
           })
         : null;
+    const workerHeartbeat = new WorkerHeartbeatHost({ store: runtimeStore });
     const loops: BackgroundLoop[] = [
+      workerHeartbeat,
       { run: (signal) => durableWorker.run(application, signal) },
       { run: (signal) => dailyBrief.run(application, signal) },
       customerDeletion,
@@ -441,23 +461,30 @@ export async function createProductionComposition(
       ...google.backgrounds,
     ];
     const background = new ProductionBackgroundRuntime(loops);
-    const linqReady = integrations.linq;
-    const integrationReadiness = new ProductionReadiness(
+    const databaseReadiness = new ProductionReadiness(
       async () => {
         await checkDatabase(database);
         await assertEncryptionKeyringReady(database, sensitiveJson);
       },
-      {
-        model: true,
-        linq: linqReady,
-        googleOauth: integrations.googleOAuth,
-        gmail: integrations.gmail,
-        calendar: integrations.googleCalendar,
-      },
+      { database: true },
     );
+    const modelReadiness = new CachedModelReadiness(config);
     const readiness = {
       async isReady(): Promise<boolean> {
-        if (!(await integrationReadiness.isReady())) return false;
+        if (!(await databaseReadiness.isReady()) || !(await modelReadiness.isReady())) return false;
+        if (linqReconciliationStore !== null && !(await linqReconciliationStore.isConfigurationReady())) {
+          return false;
+        }
+        if (
+          integrations.googleOAuth &&
+          !(await runtimeStore.isGoogleRuntimeReady({
+            gmailEnabled: integrations.gmail,
+            calendarEnabled: integrations.googleCalendar,
+          }))
+        ) {
+          return false;
+        }
+        if (!(await runtimeStore.isWorkerHeartbeatFresh("durable-worker", 45))) return false;
         return config.FLORENCE_PROCESS_ROLE !== "all" || background.isHealthy();
       },
     };
@@ -467,25 +494,32 @@ export async function createProductionComposition(
           await checkDatabase(database);
           return true;
         },
-        model: async () => true,
+        model: () => modelReadiness.isReady(),
         linq: async () =>
-          linqReady && linqReconciliationStore !== null && (await linqReconciliationStore.isHealthy()),
-        google: async () => integrations.googleOAuth,
+          linqConfiguration === null ||
+          (linqReconciliationStore !== null && (await linqReconciliationStore.isHealthy())),
+        google: async () =>
+          !integrations.googleOAuth ||
+          runtimeStore.isGoogleRuntimeReady({
+            gmailEnabled: integrations.gmail,
+            calendarEnabled: integrations.googleCalendar,
+          }),
         worker: async () =>
-          config.FLORENCE_PROCESS_ROLE === "web"
-            ? false
-            : background.isHealthy() && (await runtimeStore.countDeadGoogleMaintenanceJobs()) === 0,
+          (await runtimeStore.isWorkerHeartbeatFresh("durable-worker", 45)) &&
+          (config.FLORENCE_PROCESS_ROLE === "web" || background.isHealthy()),
       },
-      ownerDirectory: runtimeStore,
       store: applicationStore,
     });
     const http: CreateFlorenceHttpServerOptions = {
       config: httpConfigFromFlorenceConfig({
         FLORENCE_WEB_BASE_URL: config.FLORENCE_WEB_BASE_URL,
         FLORENCE_ADMIN_API_KEY: config.FLORENCE_ADMIN_API_KEY,
-        ...(!integrations.linq || config.LINQ_WEBHOOK_SECRET === undefined
+        ...(linqConfiguration === null
           ? {}
-          : { LINQ_WEBHOOK_SECRET: config.LINQ_WEBHOOK_SECRET }),
+          : {
+              LINQ_FROM_PHONE: linqConfiguration.fromPhone,
+              LINQ_WEBHOOK_SECRET: linqConfiguration.webhookSecret,
+            }),
         ...(!integrations.gmail ||
         config.GOOGLE_PUBSUB_VERIFICATION_TOKEN === undefined ||
         config.GOOGLE_PUBSUB_OIDC_AUDIENCE === undefined ||
@@ -774,6 +808,7 @@ function calendarQueueAdapter(store: FlorenceRuntimeStore): GoogleSyncQueuePort<
   return {
     reconcileGoogleSyncWork: (asOf) => store.reconcileCalendarSyncWork(asOf),
     claimGoogleSyncWork: (input) => store.claimCalendarSyncWork(input),
+    renewGoogleSyncWork: (input) => store.renewGoogleSyncWork(input),
     completeGoogleSyncWork: (input) => store.completeCalendarSyncWork(input),
     retryGoogleSyncWork: (input) => store.retryCalendarSyncWork(input),
     deadLetterGoogleSyncWork: (input) => store.deadLetterCalendarSyncWork(input),
@@ -831,30 +866,6 @@ function jsonObject(value: Record<string, unknown>): Record<string, JsonValue> {
     throw new Error("Provider resolution must be a JSON object");
   }
   return parsed as Record<string, JsonValue>;
-}
-
-async function executeConfirmedHouseholdDeletions(
-  database: Database,
-  store: ApplicationStore,
-  input: { readonly completedAt: string; readonly limit: number },
-): Promise<number> {
-  const limit = Math.max(1, Math.min(100, Math.trunc(input.limit)));
-  const rows = await database<{ id: string }[]>`
-    select id from deletion_requests
-    where status = 'confirmed'
-    order by confirmed_at, requested_at, id
-    limit ${limit}
-  `;
-  let completed = 0;
-  for (const row of rows) {
-    try {
-      await store.executeHouseholdDeletion({ requestId: row.id, completedAt: input.completedAt });
-      completed += 1;
-    } catch {
-      // Another process may have completed the same confirmed request.
-    }
-  }
-  return completed;
 }
 
 function workerId(kind: string): string {

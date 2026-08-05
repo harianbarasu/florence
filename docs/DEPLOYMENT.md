@@ -35,8 +35,8 @@ One Git commit and one Docker image support two production topologies. Use exact
 | Both | `Postgres` | No | Railway-managed | n/a | Railway-managed | Authoritative domain, queue, source, audit, and connector state |
 
 Start the founding-family pilot in combined mode unless there is a concrete need for separate
-failure or scaling boundaries. Follow the web-first sequence in section 4 when moving to split
-mode. Never leave a process in `all` while a worker is running: both would claim background work.
+failure or scaling boundaries. Follow the coordinated cutover sequence in section 4 when moving to
+split mode. Never leave a process in `all` while a worker is running: both would claim background work.
 The runtime rejects mismatched entrypoints and roles.
 
 Every application service runs `node dist/cli/migrate.js` as a Railway pre-deploy command. The
@@ -195,7 +195,10 @@ first production system, not permission for models to access raw credentials.
 
 An integration is enabled only when its complete variable set is present. Do not configure half of
 an integration. If composition validation reports a missing variable, correct the named integration
-on every application service before exposing it to a family.
+on every application service before exposing it to a family. The parent-first production product
+requires complete Linq, Google OAuth, and Gmail Pub/Sub groups and rejects a selected model provider
+whose required fields are absent. Development and test environments may leave integrations blank or
+partial while working on one boundary in isolation.
 
 `PORT` is supplied by Railway to the web service. Do not set a public port or domain on the worker.
 
@@ -225,14 +228,17 @@ for that deployment. [Railway config as code](https://docs.railway.com/config-as
 5. Give only `florence-web` a temporary Railway domain.
 6. Deploy web and worker together. Both pre-deploy steps may run concurrently; the migrator lock
    makes this safe.
-7. Confirm web reaches `GET /readyz` before Railway's 180-second deadline.
-8. Confirm worker remains running. V1 has no worker HTTP health surface; prove liveness with the
-   canary commitment in the morning smoke test, not by assuming an idle process is healthy.
+7. Confirm the worker writes its shared PostgreSQL heartbeat and completes provider configuration
+   preflights, then confirm web reaches `GET /readyz` before Railway's 180-second deadline.
+8. Confirm the heartbeat remains fresh through `/operator/status`; the worker intentionally has no
+   public HTTP surface.
 
 To move from combined to split mode, first change and redeploy the existing service from `all` to
-`web`. Its ingress remains available while background jobs pause. Verify `/readyz` and confirm
-`/operator/status` now reports the local worker as unavailable; only then create or deploy the
-`worker` service. This sequencing preserves exactly one background owner throughout the cutover.
+`web`. Its ingress remains available while background jobs pause, but `/readyz` will become `503`
+after the former combined heartbeat expires. Immediately create or deploy the `worker` service,
+then verify that the shared heartbeat restores `/readyz` and `worker: ok` in `/operator/status`.
+This brief readiness gap preserves exactly one background owner; never start the split worker while
+the combined process is still running.
 
 Do not override the start or pre-deploy commands in the dashboard. If a deployment shows a
 dashboard override, remove it so the checked-in JSON remains authoritative. Railway's deployment
@@ -309,9 +315,16 @@ does not document a delivery-log or replay endpoint. Sweep cursors and chat/mess
 lease-fenced scratch state; message content is never stored there. Webhook and recovered copies use
 one app-owned message identity while retaining distinct transport provenance. The first sweep is
 history-only, provider-reconciled late messages remain history-only, and only messages newer than
-the last completed sweep may enter the live response path. `/operator/status` reports Linq degraded
-when the configured line is absent, its exact subscription is inactive or misconfigured, or a full
-sweep has not completed recently.
+the last completed sweep may enter the live response path.
+
+Linq has two deliberately different operational gates. The worker first performs a lease-fenced
+configuration preflight and persists whether the selected E.164 line is `HEALTHY` and whether an
+active subscription exactly matches the public URL, that one phone number, and all three required
+events. `/readyz` uses this launch gate, so it does not wait for a large account's exhaustive first
+history sweep. `/operator/status` uses reconciliation health: it remains degraded until a full sweep
+has completed and degrades again when the most recent full sweep is stale. Changing the public URL
+produces a new configuration identity, so an earlier endpoint's successful preflight cannot make a
+new endpoint ready.
 
 Never paste the signing secret into a test request, issue, or log. A request without a valid
 signature should fail; that negative check is included in the smoke test.
@@ -410,8 +423,8 @@ Expected sequence for each service:
 
 1. Docker image builds.
 2. Pre-deploy migrator reports either applied migrations or `Database is current.`
-3. Combined starts HTTP and its background loops, or web passes `/readyz` while worker starts its
-   durable polling loops.
+3. Combined starts HTTP and its background loops. In split mode, the worker starts its durable loops,
+   publishes its shared heartbeat, and persists provider preflights before web passes `/readyz`.
 4. No credential, OAuth token, message body, email content, raw query, or webhook body appears in
    logs.
 
@@ -444,10 +457,11 @@ curl --fail-with-body \
 unset FLORENCE_OPERATOR_TOKEN
 ```
 
-In combined mode, every reported check should be `ok`. In split mode, the web process truthfully
-reports `worker: unavailable` and aggregate `degraded` because v1 has no cross-process heartbeat;
-this does not fail `/readyz`. Confirm the worker is independently running, then confirm
-unauthenticated provider calls fail closed:
+In combined mode, every reported check should be `ok` after the first reconciliation sweep. In split
+mode, the web process reads the worker's shared PostgreSQL heartbeat and should report `worker: ok`;
+a stale or missing heartbeat fails `/readyz` and degrades aggregate operator status. Immediately
+after a fresh Linq launch, `/readyz` may be healthy while `linq` remains degraded until the exhaustive
+first sweep completes. Then confirm unauthenticated provider calls fail closed:
 
 ```bash
 curl --output /dev/null --write-out '%{http_code}\n' \
@@ -544,9 +558,9 @@ Never replace or remove an encryption key merely by changing a live service vari
 - **Failed pre-deploy:** do not start the new image. Fix the migration/configuration and redeploy.
 - **Web unhealthy:** keep providers pointed at the stable prior domain/deployment; Linq and Pub/Sub
   will retry eligible failures.
-- **Background owner unhealthy:** in split mode, leave web ingress running so events are durably
-  accepted, then restore the worker. In combined mode, provider retries bridge the outage. Lease
-  expiry permits safe recovery in either mode.
+- **Background owner unhealthy:** in split mode, web ingress remains available for durable accepts,
+  but `/readyz` fails after the shared heartbeat becomes stale; restore the worker. In combined mode,
+  provider retries bridge the outage. Lease expiry permits safe recovery in either mode.
 - **Expired Gmail cursor:** Florence falls back to a recent scan and continues the durable backfill.
 - **Lost Linq delivery:** inspect the durable reconciliation status and let the Partner API sweep
   recover the message with reconciliation provenance. Linq does not document provider replay; never

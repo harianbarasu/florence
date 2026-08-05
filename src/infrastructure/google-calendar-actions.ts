@@ -25,6 +25,7 @@ import {
 } from "./google-sync.js";
 
 export type GoogleCalendarActionErrorCode =
+  | "approval_expired"
   | "approval_invalidated"
   | "invalid_state"
   | "not_authorized"
@@ -122,8 +123,10 @@ export class GoogleCalendarActions implements HouseholdCalendarActionsPort {
     action: CalendarEventCreateAction;
     idempotencyKey: string;
     asOf: string;
+    executeBy: string;
   }): Promise<{ provider: "google-calendar"; providerReference: string }> {
     const action = CalendarEventCreateActionSchema.parse(input.action);
+    this.#assertExecutionWindow(input.asOf, input.executeBy);
     let preflight: CalendarCreatePreparation;
     try {
       preflight = await this.#store.prepareCreate({
@@ -139,13 +142,14 @@ export class GoogleCalendarActions implements HouseholdCalendarActionsPort {
     } catch {
       throw new GoogleCalendarActionError("invalid_state", true);
     }
-    return this.#executeAfterPreflight(action, input.idempotencyKey, input.asOf, preflight);
+    return this.#executeAfterPreflight(action, input.idempotencyKey, input.asOf, input.executeBy, preflight);
   }
 
   async #executeAfterPreflight(
     action: CalendarEventCreateAction,
     idempotencyKey: string,
     asOf: string,
+    executeBy: string,
     preflight: CalendarCreatePreparation,
   ): Promise<{ provider: "google-calendar"; providerReference: string }> {
     if (preflight.status === "unavailable") {
@@ -180,8 +184,9 @@ export class GoogleCalendarActions implements HouseholdCalendarActionsPort {
       throw new GoogleCalendarActionError("not_authorized", false);
     }
     try {
-      const event = await this.#withAccessToken(connection, async (accessToken) =>
-        this.#calendar.insertEvent({
+      const event = await this.#withAccessToken(connection, async (accessToken) => {
+        this.#assertExecutionWindow(this.#now().toISOString(), executeBy);
+        return this.#calendar.insertEvent({
           accessToken,
           googleSubject: connection.externalAccountId,
           calendarId: action.calendarId,
@@ -191,8 +196,8 @@ export class GoogleCalendarActions implements HouseholdCalendarActionsPort {
           start: { dateTime: action.startsAt, timeZone: action.timeZone },
           end: { dateTime: action.endsAt, timeZone: action.timeZone },
           visibility: "default",
-        }),
-      );
+        });
+      });
       const applicationContent = approvedCalendarApplicationContent(event, action);
       if (
         event.googleSubject !== connection.externalAccountId ||
@@ -243,6 +248,12 @@ export class GoogleCalendarActions implements HouseholdCalendarActionsPort {
       // A provider insertion may already have succeeded before a downstream
       // persistence error. Retry with the same provider idempotency key.
       throw new GoogleCalendarActionError("invalid_state", true);
+    }
+  }
+
+  #assertExecutionWindow(asOf: string, executeBy: string): void {
+    if (Temporal.Instant.compare(Temporal.Instant.from(asOf), Temporal.Instant.from(executeBy)) >= 0) {
+      throw new GoogleCalendarActionError("approval_expired", false);
     }
   }
 

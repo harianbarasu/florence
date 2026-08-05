@@ -13,11 +13,13 @@ import {
   linqReactionFeedbackRef,
 } from "../adapters/linq/index.js";
 import type {
+  ApplicationOutboxIntent,
   ConversationAttachmentContent,
   FlorenceApplication,
   HouseholdApplicationSnapshot,
   ReferencedConversationMessage,
 } from "../application/index.js";
+import { ApplicationOutboxIntentSchema } from "../application/index.js";
 import type { ChannelResolution, ClaimedProviderInboxItem } from "../db/application-store.js";
 import { AdultIdSchema } from "../domain/index.js";
 import type { ConversationMessageRegistry } from "./conversation-feedback-store.js";
@@ -82,6 +84,7 @@ export interface ProductionProviderProcessorOptions {
   google: GooglePushProcessor;
   privateCommands?: PrivateCommandHandler;
   conversationFeedback?: Pick<ConversationMessageRegistry, "resolveReply" | "recordFeedback">;
+  linqFromPhone: string | null;
   defaultTimeZone: string;
 }
 
@@ -97,6 +100,7 @@ export interface ProviderApplicationStore {
     externalHandle?: string;
   }): Promise<ChannelResolution | null>;
   load(householdId: string): Promise<HouseholdApplicationSnapshot | null>;
+  enqueueApplicationIntent(intent: ApplicationOutboxIntent): Promise<{ rowId: string }>;
 }
 
 export interface ProviderRuntimeStore {
@@ -111,6 +115,11 @@ export interface ProviderRuntimeStore {
   }): Promise<{ applied: boolean; suppressed: boolean }>;
   isSuppressed(externalChatId: string, externalHandle?: string): Promise<boolean>;
   pauseGroupBinding(input: { externalChatId: string; reason: string }): Promise<boolean>;
+  pauseGroupBindingForRecovery(input: {
+    householdId: string;
+    externalChatId: string;
+    reason: string;
+  }): Promise<{ bindingId: string; recoveryRef: string } | null>;
   findPendingInvitation(inviteeHandle: string): Promise<PendingInvitation | null>;
   bindPendingInvitee(input: {
     invitation: PendingInvitation;
@@ -156,6 +165,10 @@ export interface ProviderRuntimeStore {
     consentedAt: string;
   }): Promise<InvitationTransferFinalization>;
   resolveExactGroup(participantHandles: readonly string[]): Promise<GroupIdentity | null>;
+  resolveActiveAdultForHandle(input: {
+    householdId?: string;
+    externalHandle: string;
+  }): Promise<{ householdId: string; adultId: string } | null>;
   bindHouseholdGroup(input: {
     householdId: string;
     externalChatId: string;
@@ -167,7 +180,12 @@ export interface ProviderRuntimeStore {
 }
 
 export class ProductionProviderProcessor {
-  public constructor(private readonly options: ProductionProviderProcessorOptions) {}
+  readonly #linqFromPhone: string | null;
+
+  public constructor(private readonly options: ProductionProviderProcessorOptions) {
+    this.#linqFromPhone =
+      options.linqFromPhone === null ? null : canonicalizeLinqHandle(options.linqFromPhone);
+  }
 
   public async process(item: ClaimedProviderInboxItem): Promise<ProviderProcessingResult> {
     switch (item.provider) {
@@ -190,6 +208,16 @@ export class ProductionProviderProcessor {
   }
 
   private async processLinq(event: LinqInboundEvent): Promise<ProviderProcessingResult> {
+    if (
+      this.#linqFromPhone === null ||
+      (event.eventType === "message.received" && !isMessageOwnedByConfiguredLine(event, this.#linqFromPhone))
+    ) {
+      throw new ProviderProcessingError(
+        "linq_line_authority_mismatch",
+        false,
+        "The inbound event is not owned by the configured Linq line",
+      );
+    }
     if (event.eventType !== "message.received") return this.processLinqReaction(event);
 
     const isHistoricalRecovery =
@@ -486,6 +514,7 @@ export class ProductionProviderProcessor {
           channel: { channelId: event.conversation.id, scope: "personal", adultId: transfer.adultId },
           senderAdultId: transfer.adultId,
           messageRef: `linq:message:${event.message.id}`,
+          replyTo,
           text: event.message.text,
           attachmentRefs: [],
           attachmentContents: [],
@@ -608,10 +637,28 @@ export class ProductionProviderProcessor {
       ...(event.scope === "direct" ? { externalHandle: handle } : {}),
     });
     if (event.scope === "direct") {
-      return known?.channelType === "private" &&
-        known.bindingStatus === "active" &&
-        known.membershipStatus === "active" &&
-        known.adultId !== null
+      if (
+        known?.channelType !== "private" ||
+        known.bindingStatus !== "active" ||
+        known.membershipStatus !== "active" ||
+        known.adultId === null
+      ) {
+        return null;
+      }
+      let chat: Awaited<ReturnType<LinqChatReader["getChat"]>>;
+      try {
+        chat = await this.options.linqChats.getChat(event.conversation.id);
+      } catch (error) {
+        if (error instanceof LinqApiError) {
+          throw new ProviderProcessingError(
+            "linq_direct_lookup_failed",
+            error.retryable,
+            "Linq direct-chat identity could not be verified",
+          );
+        }
+        throw error;
+      }
+      return isExactHealthyLinqDirect(chat, event.conversation.id, this.#linqFromPhone, handle)
         ? { householdId: known.householdId, adultId: known.adultId }
         : null;
     }
@@ -630,7 +677,7 @@ export class ProductionProviderProcessor {
       }
       throw error;
     }
-    if (!isExactHealthyLinqGroup(chat, event.conversation.id)) return null;
+    if (!isExactHealthyLinqGroup(chat, event.conversation.id, this.#linqFromPhone)) return null;
     const identity = await this.options.runtimeStore.resolveExactGroup(chat.participantHandles);
     if (identity?.householdId !== known.householdId) return null;
     const adultId = identity.adultsByHandle.get(handle);
@@ -790,13 +837,23 @@ export class ProductionProviderProcessor {
       await this.pauseKnownGroup(known, event.conversation.id, "provider_opted_out");
       return null;
     }
-    if (!isExactHealthyLinqGroup(chat, event.conversation.id)) {
+    if (!isExactHealthyLinqGroup(chat, event.conversation.id, this.#linqFromPhone)) {
       await this.pauseKnownGroup(known, event.conversation.id, "live_group_identity_mismatch");
       return null;
     }
     const identity = await this.options.runtimeStore.resolveExactGroup(chat.participantHandles);
     if (!identity || (known && known.householdId !== identity.householdId)) {
-      await this.pauseKnownGroup(known, event.conversation.id, "participant_identity_mismatch");
+      const recovery =
+        known?.channelType === "group"
+          ? await this.options.runtimeStore.pauseGroupBindingForRecovery({
+              householdId: known.householdId,
+              externalChatId: event.conversation.id,
+              reason: "participant_identity_mismatch",
+            })
+          : null;
+      if (event.transport !== "partner_api_reconciliation") {
+        await this.queueGroupRecoveryGuidance(event, handle, known, recovery?.recoveryRef ?? null);
+      }
       return null;
     }
     const senderAdultId = identity.adultsByHandle.get(handle);
@@ -837,13 +894,64 @@ export class ProductionProviderProcessor {
     if (known?.channelType !== "group") return;
     await this.options.runtimeStore.pauseGroupBinding({ externalChatId, reason });
   }
+
+  private async queueGroupRecoveryGuidance(
+    event: Extract<LinqMessageEvent, { scope: "group" }>,
+    senderHandle: string,
+    known: ChannelResolution | null,
+    recoveryRef: string | null,
+  ): Promise<void> {
+    const repairingKnownGroup = known?.channelType === "group" && recoveryRef !== null;
+    const initialConnect = normalizedConnectFamilyCommand(event.message.text);
+    if (!repairingKnownGroup && !initialConnect) return;
+
+    const recipient = await this.options.runtimeStore.resolveActiveAdultForHandle({
+      ...(repairingKnownGroup ? { householdId: known.householdId } : {}),
+      externalHandle: senderHandle,
+    });
+    if (recipient === null || (repairingKnownGroup && recipient.householdId !== known.householdId)) return;
+    const recipientAdultId = AdultIdSchema.parse(recipient.adultId);
+
+    const snapshot = await this.options.applicationStore.load(recipient.householdId);
+    if (
+      snapshot === null ||
+      !snapshot.aggregate.verifiedAdultIds.includes(recipientAdultId) ||
+      !snapshot.projection.onboarding.consentedAdultIds.includes(recipientAdultId) ||
+      !snapshot.projection.onboarding.privateDmAdultIds.includes(recipientAdultId) ||
+      (!repairingKnownGroup && snapshot.projection.onboarding.phase !== "awaiting_group")
+    ) {
+      return;
+    }
+
+    const identity = recoveryIntentIdentity(
+      repairingKnownGroup ? (recoveryRef as string) : event.conversation.id,
+      recipient.householdId,
+      recipientAdultId,
+    );
+    const body = repairingKnownGroup
+      ? "I paused your family group because its live iMessage participants no longer exactly match the two adults who joined Florence. I didn’t process or answer that group message. Restore the same group to exactly those two adult iMessage identities plus Florence, make sure it is iMessage, then send START. If an adult’s iMessage identity changed, tell me here in this private chat first."
+      : "I couldn’t verify that iMessage group, so I didn’t process or answer it. In that same group, use the exact iMessage phone number or email each adult used in their private Florence DM plus Florence, make sure it is iMessage, then send “connect this family.” If an adult’s iMessage identity changed, tell me here in this private chat first.";
+    await this.options.applicationStore.enqueueApplicationIntent(
+      ApplicationOutboxIntentSchema.parse({
+        intentId: `system_group_recovery_${identity}`,
+        householdId: recipient.householdId,
+        idempotencyKey: `florence:group-recovery:${identity}`,
+        kind: "conversation.send",
+        targetScope: { kind: "personal", adultId: recipientAdultId },
+        messageClass: "status",
+        body,
+      }),
+    );
+  }
 }
 
 function isExactHealthyLinqGroup(
   chat: Awaited<ReturnType<LinqChatReader["getChat"]>>,
   expectedChatId: string,
+  configuredFromPhone: string | null,
 ): boolean {
   if (
+    configuredFromPhone === null ||
     chat.id !== expectedChatId ||
     !chat.isGroup ||
     chat.healthStatus !== "HEALTHY" ||
@@ -855,7 +963,63 @@ function isExactHealthyLinqGroup(
     const participants = uniqueCanonicalHandles(chat.participantHandles);
     const self = uniqueCanonicalHandles(chat.selfHandles);
     const active = uniqueCanonicalHandles(chat.activeHandles);
-    if (participants.length !== 2 || self.length !== 1 || active.length !== 3) return false;
+    if (
+      participants.length !== 2 ||
+      self.length !== 1 ||
+      self[0] !== configuredFromPhone ||
+      active.length !== 3
+    ) {
+      return false;
+    }
+    const expectedActive = [...participants, ...self].sort();
+    return expectedActive.every((value, index) => value === active[index]);
+  } catch {
+    return false;
+  }
+}
+
+function isMessageOwnedByConfiguredLine(
+  event: LinqMessageEvent,
+  configuredFromPhone: string | null,
+): boolean {
+  if (configuredFromPhone === null) return false;
+  try {
+    if (canonicalizeLinqHandle(event.conversation.ownerHandle) !== configuredFromPhone) return false;
+    const knownHandles = uniqueCanonicalHandles(event.conversation.knownParticipantHandles);
+    return knownHandles.includes(configuredFromPhone);
+  } catch {
+    return false;
+  }
+}
+
+function isExactHealthyLinqDirect(
+  chat: Awaited<ReturnType<LinqChatReader["getChat"]>>,
+  expectedChatId: string,
+  configuredFromPhone: string | null,
+  expectedParticipant: string,
+): boolean {
+  if (
+    configuredFromPhone === null ||
+    chat.id !== expectedChatId ||
+    chat.isGroup ||
+    chat.healthStatus !== "HEALTHY" ||
+    chat.service?.toLowerCase() !== "imessage"
+  ) {
+    return false;
+  }
+  try {
+    const participants = uniqueCanonicalHandles(chat.participantHandles);
+    const self = uniqueCanonicalHandles(chat.selfHandles);
+    const active = uniqueCanonicalHandles(chat.activeHandles);
+    if (
+      participants.length !== 1 ||
+      participants[0] !== expectedParticipant ||
+      self.length !== 1 ||
+      self[0] !== configuredFromPhone ||
+      active.length !== 2
+    ) {
+      return false;
+    }
     const expectedActive = [...participants, ...self].sort();
     return expectedActive.every((value, index) => value === active[index]);
   } catch {
@@ -869,6 +1033,14 @@ function uniqueCanonicalHandles(handles: readonly string[]): string[] {
 
 function sha256(value: string | Uint8Array): string {
   return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+function recoveryIntentIdentity(messageRef: string, householdId: string, adultId: string): string {
+  return createHash("sha256").update(`${messageRef}\0${householdId}\0${adultId}`).digest("hex");
+}
+
+function normalizedConnectFamilyCommand(text: string): boolean {
+  return text.normalize("NFKC").trim().replace(/\s+/gu, " ").toLowerCase() === "connect this family";
 }
 
 function unavailableAttachment(

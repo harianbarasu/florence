@@ -26,9 +26,9 @@ describe.skipIf(!databaseUrl)("PostgresConversationFeedbackStore", () => {
       values (${householdId}, 'Feedback family', 'America/Los_Angeles', 'active')
     `;
     await database`
-      insert into adults (id, display_name, timezone)
-      values (${adultA}, 'Adult A', 'America/Los_Angeles'),
-        (${adultB}, 'Adult B', 'America/Los_Angeles')
+      insert into adults (id, timezone)
+      values (${adultA}, 'America/Los_Angeles'),
+        (${adultB}, 'America/Los_Angeles')
     `;
   });
 

@@ -1,4 +1,8 @@
 import { createHash } from "node:crypto";
+import {
+  CONSENT_DISCLOSURE_VERSION,
+  TRANSFER_ADULT_CONSENT_DISCLOSURE,
+} from "../application/consent-disclosures.js";
 import { type ApplicationOutboxIntent, ApplicationOutboxIntentSchema } from "../application/index.js";
 import type { PrivateCommandHandler } from "./provider-processor.js";
 import type { InvitationTransferResolution } from "./runtime-store.js";
@@ -67,7 +71,9 @@ export class InvitationTransferCommandService implements PrivateCommandHandler {
         await this.queuePrivateMessage(
           input,
           "source-connections-active-saga",
-          "This Florence identity still has one or more Google accounts connected to its current household, so the transfer is paused and no identity data was moved. In this private DM, send “disconnect all Google accounts” and wait for Florence to confirm. Then use iMessage’s Reply on this message and send exactly “I accept and confirm transfer” to resume.",
+          transferDisclosureMessage(
+            "This Florence identity still has one or more Google accounts connected to its current household, so the transfer is paused and no identity data was moved. In this private DM, send “disconnect all Google accounts” and wait for Florence to confirm before accepting the transfer.",
+          ),
           transferContext,
         );
         return { handled: true, classification: "invitation_transfer:source_connections_active" };
@@ -83,9 +89,11 @@ export class InvitationTransferCommandService implements PrivateCommandHandler {
       await this.queuePrivateMessage(
         input,
         "confirmation-needed",
-        isTransferConfirmation(normalized)
-          ? "No changes have been made. Send the confirmation again as a text-only iMessage Reply on this Florence message: “I accept and confirm transfer.”"
-          : "No changes have been made. To proceed, use iMessage’s Reply on this Florence message and send exactly “I accept and confirm transfer.” To stay with the current household, reply “I decline transfer.”",
+        transferDisclosureMessage(
+          isTransferConfirmation(normalized)
+            ? "No changes have been made. The prior acceptance could not be bound to a current, fully disclosed transfer offer."
+            : "No changes have been made. Review this transfer offer before deciding.",
+        ),
         transferContext,
       );
       return { handled: true, classification: "invitation_transfer:confirmation_needed" };
@@ -127,11 +135,14 @@ export class InvitationTransferCommandService implements PrivateCommandHandler {
     await this.queuePrivateMessage(
       input,
       "offer",
-      "Florence found one current invitation for this iMessage identity to join another household. This will not merge or copy messages, mail, calendars, or history. Existing household history stays where it is, but this identity will stop accessing that household. To continue, use iMessage’s Reply on this Florence message and send exactly “I accept and confirm transfer.” Otherwise, do nothing or reply “I decline transfer.”",
+      transferDisclosureMessage(
+        "Florence found one current invitation for this iMessage identity to join another household. No changes have been made.",
+      ),
       {
         kind: "invitation_transfer",
         invitationId: transfer.invitationId,
         sourceBindingId: input.bindingId,
+        consentDisclosureVersion: CONSENT_DISCLOSURE_VERSION,
       },
     );
     return { handled: true, classification: "invitation_transfer:offered" };
@@ -160,6 +171,10 @@ export class InvitationTransferCommandService implements PrivateCommandHandler {
       }),
     );
   }
+}
+
+function transferDisclosureMessage(prefix: string): string {
+  return `${prefix}\n\n${TRANSFER_ADULT_CONSENT_DISCLOSURE}`;
 }
 
 export function isTransferConfirmation(text: string): boolean {

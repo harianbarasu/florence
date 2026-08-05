@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto";
 import type { TransactionSql } from "postgres";
 import type { Database } from "../db/client.js";
+import { calendarBusyWindowEncryptionContext } from "../security/calendar-busy-window-privacy.js";
+import {
+  adultIdentityDetailsContext,
+  googleConnectionDetailsContext,
+} from "../security/durable-identity-privacy.js";
 import {
   type EncryptionContext,
   EncryptionError,
@@ -38,12 +43,20 @@ export async function assertEncryptionKeyringReady(
   const rows = await database<{ key_id: string }[]>`
     select distinct key_id
     from (
-      select body_key_id as key_id from provider_inbox
-      union all select body_key_id from provider_inbox_conflicts
+      select body_key_id as key_id from provider_inbox where body_key_id is not null
+      union all select body_key_id from provider_inbox_conflicts where body_key_id is not null
       union all select state_key_id from household_projections
       union all select snapshot_key_id from application_snapshots
       union all select body_key_id from application_commits
       union all select body_key_id from household_signals
+      union all select payload_key_id from jobs where payload_key_id is not null
+      union all select payload_key_id from scheduled_triggers where payload_key_id is not null
+      union all select payload_key_id from outbox where payload_key_id is not null
+      union all select rule_key_id from personal_attention_rule_revisions
+      union all select statement_key_id from personal_attention_rule_revisions
+      union all select window_key_id from calendar_busy_windows
+      union all select details_key_id from adult_identity_details
+      union all select details_key_id from external_connections where details_key_id is not null
     ) referenced_keys
     order by key_id
   `;
@@ -78,6 +91,24 @@ type HouseholdCiphertextRow = {
   household_id: string;
   key_id: string;
   ciphertext: string;
+};
+
+type PersonalAttentionCiphertextRow = {
+  id: string;
+  household_id: string;
+  rule_key_id: string;
+  rule_ciphertext: string;
+  statement_key_id: string;
+  statement_ciphertext: string;
+};
+
+type CalendarBusyWindowCiphertextRow = {
+  connection_id: string;
+  household_id: string;
+  calendar_id: string;
+  external_event_id: string;
+  window_key_id: string;
+  window_ciphertext: string;
 };
 
 /** Rewraps one bounded, transactional batch and persists enough state to resume after interruption. */
@@ -306,8 +337,169 @@ export class PostgresEncryptionRotation {
           where id = ${row.id}
         `;
       }
+      return signals.length;
     }
-    return signals.length;
+
+    const personalAttention = await transaction<PersonalAttentionCiphertextRow[]>`
+      select id, household_id, rule_key_id, rule_ciphertext, statement_key_id, statement_ciphertext
+      from personal_attention_rule_revisions
+      where rule_key_id <> ${this.targetKeyId} or statement_key_id <> ${this.targetKeyId}
+      order by id limit ${batchSize} for update skip locked
+    `;
+    if (personalAttention.length > 0) {
+      for (const row of personalAttention) {
+        const rule = this.#rewrapHousehold(
+          {
+            id: row.id,
+            household_id: row.household_id,
+            key_id: row.rule_key_id,
+            ciphertext: row.rule_ciphertext,
+          },
+          "personal_attention_rule_revisions",
+          "rule",
+        );
+        const statement = this.#rewrapHousehold(
+          {
+            id: row.id,
+            household_id: row.household_id,
+            key_id: row.statement_key_id,
+            ciphertext: row.statement_ciphertext,
+          },
+          "personal_attention_rule_revisions",
+          "statement",
+        );
+        await transaction`
+          update personal_attention_rule_revisions
+          set rule_key_id = ${rule.keyId}, rule_ciphertext = ${rule.ciphertext},
+            statement_key_id = ${statement.keyId}, statement_ciphertext = ${statement.ciphertext}
+          where id = ${row.id}
+        `;
+      }
+      return personalAttention.length;
+    }
+
+    const adultDetails = await transaction<HouseholdCiphertextRow[]>`
+      select adult_id as id, household_id, details_key_id as key_id, details_ciphertext as ciphertext
+      from adult_identity_details where details_key_id <> ${this.targetKeyId}
+      order by household_id, adult_id limit ${batchSize} for update skip locked
+    `;
+    if (adultDetails.length > 0) {
+      for (const row of adultDetails) {
+        const rotated = this.#rewrap(
+          { keyId: row.key_id, ciphertext: row.ciphertext },
+          adultIdentityDetailsContext({ householdId: row.household_id, adultId: row.id }),
+        );
+        await transaction`
+          update adult_identity_details
+          set details_key_id = ${rotated.keyId}, details_ciphertext = ${rotated.ciphertext}
+          where household_id = ${row.household_id} and adult_id = ${row.id}
+        `;
+      }
+      return adultDetails.length;
+    }
+
+    const connectionDetails = await transaction<(HouseholdCiphertextRow & { adult_id: string })[]>`
+      select id, household_id, adult_id, details_key_id as key_id, details_ciphertext as ciphertext
+      from external_connections where details_key_id is not null and details_key_id <> ${this.targetKeyId}
+      order by id limit ${batchSize} for update skip locked
+    `;
+    if (connectionDetails.length > 0) {
+      for (const row of connectionDetails) {
+        const rotated = this.#rewrap(
+          { keyId: row.key_id, ciphertext: row.ciphertext },
+          googleConnectionDetailsContext({
+            householdId: row.household_id,
+            adultId: row.adult_id,
+            connectionId: row.id,
+          }),
+        );
+        await transaction`
+          update external_connections
+          set details_key_id = ${rotated.keyId}, details_ciphertext = ${rotated.ciphertext}
+          where id = ${row.id}
+        `;
+      }
+      return connectionDetails.length;
+    }
+
+    const calendarBusyWindows = await transaction<CalendarBusyWindowCiphertextRow[]>`
+      select connection_id, household_id, calendar_id, external_event_id, window_key_id, window_ciphertext
+      from calendar_busy_windows where window_key_id <> ${this.targetKeyId}
+      order by connection_id, calendar_id, external_event_id
+      limit ${batchSize} for update skip locked
+    `;
+    if (calendarBusyWindows.length > 0) {
+      for (const row of calendarBusyWindows) {
+        const rotated = this.#rewrap(
+          { keyId: row.window_key_id, ciphertext: row.window_ciphertext },
+          calendarBusyWindowEncryptionContext({
+            householdId: row.household_id,
+            connectionId: row.connection_id,
+            calendarId: row.calendar_id,
+            externalEventId: row.external_event_id,
+          }),
+        );
+        await transaction`
+          update calendar_busy_windows
+          set window_key_id = ${rotated.keyId}, window_ciphertext = ${rotated.ciphertext}
+          where connection_id = ${row.connection_id} and calendar_id = ${row.calendar_id}
+            and external_event_id = ${row.external_event_id}
+        `;
+      }
+      return calendarBusyWindows.length;
+    }
+
+    const jobs = await transaction<HouseholdCiphertextRow[]>`
+      select id, household_id, payload_key_id as key_id, payload_ciphertext as ciphertext
+      from jobs where payload_key_id is not null and payload_key_id <> ${this.targetKeyId}
+      order by id limit ${batchSize} for update skip locked
+    `;
+    if (jobs.length > 0) {
+      for (const row of jobs) {
+        const rotated = this.#rewrapHousehold(row, "jobs", "payload");
+        await transaction`
+          update jobs set payload_key_id = ${rotated.keyId},
+            payload_ciphertext = ${rotated.ciphertext}
+          where id = ${row.id}
+        `;
+      }
+      return jobs.length;
+    }
+
+    const timers = await transaction<HouseholdCiphertextRow[]>`
+      select id, household_id, payload_key_id as key_id, payload_ciphertext as ciphertext
+      from scheduled_triggers
+      where payload_key_id is not null and payload_key_id <> ${this.targetKeyId}
+      order by id limit ${batchSize} for update skip locked
+    `;
+    if (timers.length > 0) {
+      for (const row of timers) {
+        const rotated = this.#rewrapHousehold(row, "scheduled_triggers", "payload");
+        await transaction`
+          update scheduled_triggers set payload_key_id = ${rotated.keyId},
+            payload_ciphertext = ${rotated.ciphertext}
+          where id = ${row.id}
+        `;
+      }
+      return timers.length;
+    }
+
+    const outbox = await transaction<HouseholdCiphertextRow[]>`
+      select id, household_id, payload_key_id as key_id, payload_ciphertext as ciphertext
+      from outbox where payload_key_id is not null and payload_key_id <> ${this.targetKeyId}
+      order by id limit ${batchSize} for update skip locked
+    `;
+    if (outbox.length > 0) {
+      for (const row of outbox) {
+        const rotated = this.#rewrapHousehold(row, "outbox", "payload");
+        await transaction`
+          update outbox set payload_key_id = ${rotated.keyId},
+            payload_ciphertext = ${rotated.ciphertext}
+          where id = ${row.id}
+        `;
+      }
+    }
+    return outbox.length;
   }
 
   #rewrapProvider(row: ProviderCiphertextRow, table: "provider_inbox" | "provider_inbox_conflicts") {
@@ -324,8 +516,16 @@ export class PostgresEncryptionRotation {
 
   #rewrapHousehold(
     row: HouseholdCiphertextRow,
-    table: "household_projections" | "application_snapshots" | "application_commits" | "household_signals",
-    field: "state" | "snapshot" | "body",
+    table:
+      | "household_projections"
+      | "application_snapshots"
+      | "application_commits"
+      | "household_signals"
+      | "personal_attention_rule_revisions"
+      | "jobs"
+      | "scheduled_triggers"
+      | "outbox",
+    field: "state" | "snapshot" | "body" | "payload" | "rule" | "statement",
   ) {
     return this.#rewrap(
       { keyId: row.key_id, ciphertext: row.ciphertext },
@@ -359,6 +559,22 @@ async function hasPendingCiphertexts(
       or exists(select 1 from application_snapshots where snapshot_key_id <> ${targetKeyId})
       or exists(select 1 from application_commits where body_key_id <> ${targetKeyId})
       or exists(select 1 from household_signals where body_key_id <> ${targetKeyId})
+      or exists(
+        select 1 from personal_attention_rule_revisions
+        where rule_key_id <> ${targetKeyId} or statement_key_id <> ${targetKeyId}
+      )
+      or exists(select 1 from calendar_busy_windows where window_key_id <> ${targetKeyId})
+      or exists(select 1 from adult_identity_details where details_key_id <> ${targetKeyId})
+      or exists(
+        select 1 from external_connections
+        where details_key_id is not null and details_key_id <> ${targetKeyId}
+      )
+      or exists(select 1 from jobs where payload_key_id is not null and payload_key_id <> ${targetKeyId})
+      or exists(
+        select 1 from scheduled_triggers
+        where payload_key_id is not null and payload_key_id <> ${targetKeyId}
+      )
+      or exists(select 1 from outbox where payload_key_id is not null and payload_key_id <> ${targetKeyId})
       as pending
   `;
   return rows[0]?.pending === true;

@@ -33,8 +33,22 @@ import {
   HouseholdAggregateSchema,
   HouseholdIdSchema,
 } from "../domain/index.js";
-import { canonicalJson } from "../security/canonical-json.js";
+import {
+  calendarBusyWindowEncryptionContext,
+  calendarBusyWindowSchema as encryptedCalendarBusyWindowSchema,
+} from "../security/calendar-busy-window-privacy.js";
+import { canonicalJson, payloadDigest } from "../security/canonical-json.js";
+import {
+  adultIdentityDetailsContext,
+  adultIdentityDetailsSchema,
+  googleAccountAliasKey,
+  googleConnectionDetailsContext,
+  googleConnectionDetailsSchema,
+  normalizedEmail,
+  REVOKED_GOOGLE_ACCOUNT_LABEL,
+} from "../security/durable-identity-privacy.js";
 import { SecretBox } from "../security/secret-box.js";
+import type { TenantJsonCipher } from "../security/tenant-json-cipher.js";
 import {
   type CalendarBusyWindow,
   type CalendarCatalogState,
@@ -176,15 +190,30 @@ type ConnectionRow = {
   household_id: string;
   adult_id: string;
   provider: "google";
-  label: string;
   external_account_id: string;
-  email: string | null;
+  email_digest: string | null;
+  details_key_id: string | null;
+  details_ciphertext: string | null;
   encrypted_credentials: string | null;
   granted_scopes: string[];
   status: ExternalConnectionRecord["status"];
   cursor: Record<string, unknown>;
   metadata: Record<string, unknown>;
   last_synced_at: Date | null;
+};
+
+type CalendarBusyWindowRow = {
+  connection_id: string;
+  household_id: string;
+  calendar_id: string;
+  external_event_id: string;
+  window_key_id: string;
+  window_ciphertext: string;
+};
+
+type CalendarBusyWindowOverlapRow = CalendarBusyWindowRow & {
+  owner_adult_id: string;
+  source_revision: number;
 };
 
 /**
@@ -196,6 +225,7 @@ export class FlorenceRuntimeStore {
   public constructor(
     private readonly database: Database,
     private readonly applicationStore: ApplicationStore,
+    private readonly sensitiveJson: TenantJsonCipher,
     private readonly identityKey: string,
   ) {
     if (Buffer.byteLength(identityKey, "utf8") < 32) {
@@ -334,7 +364,26 @@ export class FlorenceRuntimeStore {
       })
       .parse(input);
     const handle = canonicalizeLinqHandle(parsed.externalHandle);
+    const adultId = AdultIdSchema.parse(parsed.adultId);
     return this.database.begin(async (transaction) => {
+      const snapshot = await this.applicationStore.loadInTransaction(
+        transaction,
+        parsed.householdId,
+        "update",
+      );
+      const onboarding = snapshot?.projection.onboarding;
+      if (
+        onboarding === undefined ||
+        onboarding.initiatorAdultId !== adultId ||
+        !onboarding.consentedAdultIds.includes(adultId) ||
+        !onboarding.privateDmAdultIds.includes(adultId) ||
+        onboarding.phase === "awaiting_initiator_consent"
+      ) {
+        throw new ApplicationStoreError(
+          "invalid_state",
+          "Founding identity is not authorized by the committed onboarding state",
+        );
+      }
       const rows = await transaction<
         { membership_status: "invited" | "active" | "revoked"; binding_status: string }[]
       >`
@@ -453,13 +502,18 @@ export class FlorenceRuntimeStore {
         select timezone from households where id = ${parsed.householdId} for update
       `;
       if (!household[0]) throw new ApplicationStoreError("not_found", "Unknown household");
-      await transaction`
-        insert into adults (id, display_name, timezone)
-        values (${adultId}, ${parsed.displayName ?? "Invited adult"}, ${household[0].timezone})
-      `;
+      await transaction`insert into adults (id, timezone) values (${adultId}, ${household[0].timezone})`;
       await transaction`
         insert into household_memberships (household_id, adult_id, role, status)
         values (${parsed.householdId}, ${adultId}, 'adult', 'invited')
+      `;
+      const adultDetails = this.sensitiveJson.seal(
+        adultIdentityDetailsSchema.parse({ displayName: parsed.displayName ?? "Invited adult" }),
+        adultIdentityDetailsContext({ householdId: parsed.householdId, adultId }),
+      );
+      await transaction`
+        insert into adult_identity_details (household_id, adult_id, details_key_id, details_ciphertext)
+        values (${parsed.householdId}, ${adultId}, ${adultDetails.keyId}, ${adultDetails.ciphertext})
       `;
       await transaction`
         insert into invitations (
@@ -840,7 +894,28 @@ export class FlorenceRuntimeStore {
       })
       .parse(input);
     const handleHash = this.digestHandle(parsed.externalHandle);
+    const adultId = AdultIdSchema.parse(parsed.adultId);
     return this.database.begin(async (transaction) => {
+      const snapshot = await this.applicationStore.loadInTransaction(
+        transaction,
+        parsed.householdId,
+        "update",
+      );
+      const onboarding = snapshot?.projection.onboarding;
+      if (
+        onboarding === undefined ||
+        onboarding.invitedAdultId !== adultId ||
+        !onboarding.consentedAdultIds.includes(adultId) ||
+        !onboarding.privateDmAdultIds.includes(adultId) ||
+        !["awaiting_group", "naming_adults", "building_profile", "connecting_sources", "active"].includes(
+          onboarding.phase,
+        )
+      ) {
+        throw new ApplicationStoreError(
+          "invalid_state",
+          "Invitee identity is not authorized by the committed onboarding state",
+        );
+      }
       const invitations = await transaction<{ id: string }[]>`
         update invitations
         set status = 'accepted', accepted_by_adult_id = ${parsed.adultId}, updated_at = now()
@@ -853,7 +928,7 @@ export class FlorenceRuntimeStore {
         update household_memberships
         set status = 'active', consented_at = ${parsed.consentedAt}, updated_at = now()
         where household_id = ${parsed.householdId} and adult_id = ${parsed.adultId}
-          and status = 'invited'
+          and role = 'adult' and status = 'invited'
         returning adult_id
       `;
       if (memberships.length !== 1) {
@@ -906,6 +981,31 @@ export class FlorenceRuntimeStore {
       householdId,
       adultsByHandle: new Map(rows.map((row) => [canonicalizeLinqHandle(row.external_handle), row.adult_id])),
     };
+  }
+
+  public async resolveActiveAdultForHandle(input: {
+    householdId?: string;
+    externalHandle: string;
+  }): Promise<{ householdId: string; adultId: string } | null> {
+    const parsed = z
+      .strictObject({ householdId: z.uuid().optional(), externalHandle: handleSchema })
+      .parse(input);
+    const externalHandle = canonicalizeLinqHandle(parsed.externalHandle);
+    const householdId = parsed.householdId ?? null;
+    const rows = await this.database<{ household_id: string; adult_id: string }[]>`
+      select distinct cb.household_id, cb.adult_id
+      from channel_bindings cb
+      join household_memberships hm
+        on hm.household_id = cb.household_id and hm.adult_id = cb.adult_id
+      where cb.provider = 'linq' and cb.channel_type = 'private'
+        and cb.status = 'active' and hm.status = 'active'
+        and cb.external_handle = ${externalHandle}
+        and (${householdId}::uuid is null or cb.household_id = ${householdId})
+      limit 2
+    `;
+    const row = rows[0];
+    if (row === undefined || rows.length !== 1) return null;
+    return { householdId: row.household_id, adultId: row.adult_id };
   }
 
   public async bindHouseholdGroup(input: {
@@ -1270,6 +1370,49 @@ export class FlorenceRuntimeStore {
     });
   }
 
+  public async pauseGroupBindingForRecovery(input: {
+    householdId: string;
+    externalChatId: string;
+    reason: string;
+  }): Promise<{ bindingId: string; recoveryRef: string } | null> {
+    const parsed = z
+      .strictObject({
+        householdId: z.uuid(),
+        externalChatId: z.string().min(1).max(500),
+        reason: z.string().regex(/^[a-z][a-z0-9_]{0,99}$/u),
+      })
+      .parse(input);
+    return this.database.begin(async (transaction) => {
+      await lockLinqChat(transaction, parsed.externalChatId);
+      const rows = await transaction<
+        { id: string; status: string; metadata: Record<string, unknown> | null }[]
+      >`
+        select id, status, metadata
+        from channel_bindings
+        where household_id = ${parsed.householdId} and provider = 'linq'
+          and channel_type = 'group' and external_chat_id = ${parsed.externalChatId}
+          and status <> 'revoked'
+        for update
+      `;
+      const row = rows[0];
+      if (row === undefined || rows.length !== 1) return null;
+      const storedRecoveryRef = z.uuid().safeParse(row.metadata?.recoveryRef);
+      const recoveryRef =
+        row.status === "paused" && storedRecoveryRef.success ? storedRecoveryRef.data : randomUUID();
+      await transaction`
+        update channel_bindings
+        set status = 'paused',
+          metadata = metadata || ${this.database.json({
+            pauseReason: parsed.reason,
+            recoveryRef,
+          })},
+          updated_at = now()
+        where id = ${row.id} and status <> 'revoked'
+      `;
+      return { bindingId: row.id, recoveryRef };
+    });
+  }
+
   public async setSuppression(input: {
     externalChatId: string;
     externalHandle?: string;
@@ -1389,34 +1532,38 @@ export class FlorenceRuntimeStore {
   }
 
   public async findActiveGoogleConnectionByEmail(email: string): Promise<ExternalConnectionRecord | null> {
-    const normalized = z.email().parse(email).toLowerCase();
+    const normalized = normalizedEmail(email);
+    const emailDigest = this.applicationStore.googleConnectionEmailDigest(normalized);
     const rows = await this.database<ConnectionRow[]>`
-      select id, household_id, adult_id, provider, label, external_account_id, email,
+      select id, household_id, adult_id, provider, external_account_id, email_digest,
+        details_key_id, details_ciphertext,
         encrypted_credentials, granted_scopes, status, cursor, metadata, last_synced_at
       from external_connections
-      where provider = 'google' and status = 'active' and lower(email) = ${normalized}
+      where provider = 'google' and status = 'active' and email_digest = ${emailDigest}
       limit 2
     `;
     if (rows.length !== 1) return null;
-    return mapConnection(rows[0] as ConnectionRow);
+    return mapConnection(rows[0] as ConnectionRow, this.sensitiveJson);
   }
 
   public async findActiveGmailConnections(input: {
     normalizedMailboxEmail: string;
     subscription: string;
   }): Promise<readonly GoogleSyncConnection[]> {
-    const email = z.email().parse(input.normalizedMailboxEmail).toLowerCase();
+    const email = normalizedEmail(input.normalizedMailboxEmail);
+    const emailDigest = this.applicationStore.googleConnectionEmailDigest(email);
     const subscription = z.string().min(1).max(1_000).parse(input.subscription);
     const rows = await this.database<ConnectionRow[]>`
-      select id, household_id, adult_id, provider, label, external_account_id, email,
+      select id, household_id, adult_id, provider, external_account_id, email_digest,
+        details_key_id, details_ciphertext,
         encrypted_credentials, granted_scopes, status, cursor, metadata, last_synced_at
       from external_connections
-      where provider = 'google' and status = 'active' and lower(email) = ${email}
+      where provider = 'google' and status = 'active' and email_digest = ${emailDigest}
         and cursor->'gmail'->'watch'->>'subscription' = ${subscription}
       order by created_at
       limit 2
     `;
-    return rows.map(mapGoogleSyncConnection);
+    return rows.map((row) => mapGoogleSyncConnection(row, this.sensitiveJson));
   }
 
   public async getOwnedGoogleConnection(input: {
@@ -1428,14 +1575,15 @@ export class FlorenceRuntimeStore {
       .strictObject({ householdId: z.uuid(), adultId: z.uuid(), connectionId: z.uuid() })
       .parse(input);
     const rows = await this.database<ConnectionRow[]>`
-      select id, household_id, adult_id, provider, label, external_account_id, email,
+      select id, household_id, adult_id, provider, external_account_id, email_digest,
+        details_key_id, details_ciphertext,
         encrypted_credentials, granted_scopes, status, cursor, metadata, last_synced_at
       from external_connections
       where id = ${parsed.connectionId} and household_id = ${parsed.householdId}
         and adult_id = ${parsed.adultId} and provider = 'google'
       limit 1
     `;
-    return rows[0] ? mapGoogleSyncConnection(rows[0]) : null;
+    return rows[0] ? mapGoogleSyncConnection(rows[0], this.sensitiveJson) : null;
   }
 
   public async listOwnedGoogleConnections(input: {
@@ -1451,7 +1599,8 @@ export class FlorenceRuntimeStore {
       })
       .parse(input);
     const rows = await this.database<ConnectionRow[]>`
-      select id, household_id, adult_id, provider, label, external_account_id, email,
+      select id, household_id, adult_id, provider, external_account_id, email_digest,
+        details_key_id, details_ciphertext,
         encrypted_credentials, granted_scopes, status, cursor, metadata, last_synced_at
       from external_connections
       where household_id = ${parsed.householdId} and adult_id = ${parsed.adultId}
@@ -1459,7 +1608,7 @@ export class FlorenceRuntimeStore {
         and (${parsed.includeRevoked} or status <> 'revoked')
       order by created_at
     `;
-    return rows.map(mapGoogleSyncConnection);
+    return rows.map((row) => mapGoogleSyncConnection(row, this.sensitiveJson));
   }
 
   public async replaceEncryptedCredentials(input: {
@@ -1637,7 +1786,8 @@ export class FlorenceRuntimeStore {
   public async listOwnedGoogleCalendars(input: { householdId: string; adultId: string }): Promise<
     readonly {
       connectionId: string;
-      connectionLabel: string;
+      connectionAlias: string;
+      connectionEmail: string | null;
       calendarId: string;
       displayName: string;
       status: "active" | "excluded" | "deleted";
@@ -1648,7 +1798,8 @@ export class FlorenceRuntimeStore {
     const rows = await this.database<
       {
         connection_id: string;
-        connection_label: string;
+        details_key_id: string;
+        details_ciphertext: string;
         calendar_id: string;
         provider_calendar_id: string;
         display_name_ciphertext: string;
@@ -1656,7 +1807,7 @@ export class FlorenceRuntimeStore {
         is_primary: boolean;
       }[]
     >`
-      select state.connection_id, connection.label as connection_label, state.calendar_id,
+      select state.connection_id, connection.details_key_id, connection.details_ciphertext, state.calendar_id,
         state.provider_calendar_id, state.display_name_ciphertext, state.status, state.is_primary
       from google_calendar_sync_states state
       join external_connections connection on connection.id = state.connection_id
@@ -1679,9 +1830,20 @@ export class FlorenceRuntimeStore {
       } catch {
         throw new ApplicationStoreError("invalid_state", "Calendar display name could not be decrypted");
       }
+      const connectionDetails = googleConnectionDetailsSchema.parse(
+        this.sensitiveJson.open(
+          { keyId: row.details_key_id, ciphertext: row.details_ciphertext },
+          googleConnectionDetailsContext({
+            householdId: parsed.householdId,
+            adultId: parsed.adultId,
+            connectionId: row.connection_id,
+          }),
+        ),
+      );
       return {
         connectionId: row.connection_id,
-        connectionLabel: row.connection_label,
+        connectionAlias: connectionDetails.accountLabel,
+        connectionEmail: connectionDetails.email,
         calendarId: row.calendar_id,
         displayName,
         status: row.status,
@@ -2262,15 +2424,28 @@ export class FlorenceRuntimeStore {
         createdByApprovedActionId: persisted.createdByApprovedActionId ?? null,
       };
     }
+    const candidateBuckets = this.applicationStore.calendarBusyWindowCandidateBuckets({
+      householdId: parsed.householdId,
+      startsAt: parsed.busyWindow.startsAt,
+      endsAt: parsed.busyWindow.endsAt,
+    });
+    const sealedWindow = this.sensitiveJson.seal(
+      parsed.busyWindow,
+      calendarBusyWindowEncryptionContext({
+        householdId: parsed.householdId,
+        connectionId: parsed.connectionId,
+        calendarId: parsed.calendarId,
+        externalEventId: parsed.externalId,
+      }),
+    );
     const rows = await this.database<{ connection_id: string }[]>`
       insert into calendar_busy_windows (
         connection_id, household_id, owner_adult_id, calendar_id, external_event_id,
-        source_item_id, source_revision, starts_at, ends_at, all_day
+        source_item_id, source_revision, window_key_id, window_ciphertext, candidate_buckets
       )
       select connection.id, connection.household_id, connection.adult_id,
         ${parsed.calendarId}, ${parsed.externalId}, ${persisted.sourceItemId},
-        ${persisted.revision}, ${parsed.busyWindow.startsAt}, ${parsed.busyWindow.endsAt},
-        ${parsed.busyWindow.allDay}
+        ${persisted.revision}, ${sealedWindow.keyId}, ${sealedWindow.ciphertext}, ${candidateBuckets}::text[]
       from external_connections connection
       join source_items source on source.id = ${persisted.sourceItemId}
         and source.household_id = connection.household_id
@@ -2283,8 +2458,9 @@ export class FlorenceRuntimeStore {
         and state.household_id = connection.household_id and state.adult_id = connection.adult_id
       on conflict (connection_id, calendar_id, external_event_id)
       do update set source_item_id = excluded.source_item_id,
-        source_revision = excluded.source_revision, starts_at = excluded.starts_at,
-        ends_at = excluded.ends_at, all_day = excluded.all_day, updated_at = now()
+        source_revision = excluded.source_revision, window_key_id = excluded.window_key_id,
+        window_ciphertext = excluded.window_ciphertext, candidate_buckets = excluded.candidate_buckets,
+        updated_at = now()
       where calendar_busy_windows.source_revision <= excluded.source_revision
       returning connection_id
     `;
@@ -2402,8 +2578,14 @@ export class FlorenceRuntimeStore {
     if (synchronizedAt === null || Date.parse(synchronizedAt) < freshnessBoundary) {
       return { windows: [], complete: false, synchronizedAt };
     }
-    const rows = await this.database<{ starts_at: Date; ends_at: Date; all_day: boolean }[]>`
-      select distinct busy.starts_at, busy.ends_at, busy.all_day
+    const candidateBuckets = this.applicationStore.calendarBusyWindowCandidateBuckets({
+      householdId: parsed.householdId,
+      startsAt: parsed.from,
+      endsAt: parsed.to,
+    });
+    const rows = await this.database<CalendarBusyWindowRow[]>`
+      select busy.connection_id, busy.household_id, busy.calendar_id, busy.external_event_id,
+        busy.window_key_id, busy.window_ciphertext
       from calendar_busy_windows busy
       join external_connections connection on connection.id = busy.connection_id
       join google_calendar_sync_states state
@@ -2414,17 +2596,16 @@ export class FlorenceRuntimeStore {
         and connection.status = 'active' and connection.provider = 'google'
         and state.household_id = busy.household_id and state.adult_id = busy.owner_adult_id
         and state.status = 'active'
-        and busy.starts_at < ${parsed.to} and busy.ends_at > ${parsed.from}
-      order by busy.starts_at, busy.ends_at, busy.all_day
-      limit ${parsed.limit + 1}
+        and busy.candidate_buckets && ${candidateBuckets}::text[]
     `;
+    const windows = deduplicateCalendarBusyWindows(
+      rows
+        .map((row) => openCalendarBusyWindow(row, this.sensitiveJson))
+        .filter((window) => window.startsAt < parsed.to && window.endsAt > parsed.from),
+    );
     return {
-      windows: rows.slice(0, parsed.limit).map((row) => ({
-        startsAt: row.starts_at.toISOString(),
-        endsAt: row.ends_at.toISOString(),
-        allDay: row.all_day,
-      })),
-      complete: rows.length <= parsed.limit,
+      windows: windows.slice(0, parsed.limit),
+      complete: windows.length <= parsed.limit,
       synchronizedAt,
     };
   }
@@ -2489,9 +2670,9 @@ export class FlorenceRuntimeStore {
     }
 
     const writeTargets = await this.database<
-      { id: string; label: string; metadata: Record<string, unknown> }[]
+      { id: string; details_key_id: string; details_ciphertext: string }[]
     >`
-      select id, label, metadata
+      select id, details_key_id, details_ciphertext
       from external_connections
       where household_id = ${parsed.householdId} and adult_id = ${parsed.requestedByAdultId}
         and provider = 'google' and status = 'active'
@@ -2499,12 +2680,26 @@ export class FlorenceRuntimeStore {
       order by created_at, id
     `;
     const normalizedLabel =
-      parsed.accountLabel === undefined ? undefined : normalizeCalendarSelection(parsed.accountLabel);
-    const accountCandidates = writeTargets.filter((target) => {
-      if (parsed.targetConnectionId !== undefined) return target.id === parsed.targetConnectionId;
-      if (normalizedLabel === undefined) return true;
-      return normalizeCalendarSelection(calendarConnectionLabel(target)) === normalizedLabel;
-    });
+      parsed.accountLabel === undefined ? undefined : googleAccountAliasKey(parsed.accountLabel);
+    const accountCandidates = writeTargets
+      .map((target) => ({
+        ...target,
+        accountLabel: googleConnectionDetailsSchema.parse(
+          this.sensitiveJson.open(
+            { keyId: target.details_key_id, ciphertext: target.details_ciphertext },
+            googleConnectionDetailsContext({
+              householdId: parsed.householdId,
+              adultId: parsed.requestedByAdultId,
+              connectionId: target.id,
+            }),
+          ),
+        ).accountLabel,
+      }))
+      .filter((target) => {
+        if (parsed.targetConnectionId !== undefined) return target.id === parsed.targetConnectionId;
+        if (normalizedLabel === undefined) return true;
+        return googleAccountAliasKey(target.accountLabel) === normalizedLabel;
+      });
     if (accountCandidates.length === 0) return { status: "unavailable", reason: "no_write_connection" };
 
     const connections = await this.database<
@@ -2634,7 +2829,7 @@ export class FlorenceRuntimeStore {
       writableCalendars.push({
         connectionId: row.connection_id,
         calendarId: row.calendar_id,
-        accountLabel: calendarConnectionLabel(account),
+        accountLabel: account.accountLabel,
         displayName,
         primary: row.is_primary,
       });
@@ -2676,19 +2871,15 @@ export class FlorenceRuntimeStore {
     if (target === undefined) return { status: "unavailable", reason: "no_write_calendar" };
     const coveredConnectionIds = [...new Set(coverage.map((item) => item.connectionId))];
 
-    const overlaps = await this.database<
-      {
-        connection_id: string;
-        owner_adult_id: string;
-        calendar_id: string;
-        external_event_id: string;
-        source_revision: number;
-        starts_at: Date;
-        ends_at: Date;
-      }[]
-    >`
+    const candidateBuckets = this.applicationStore.calendarBusyWindowCandidateBuckets({
+      householdId: parsed.householdId,
+      startsAt: parsed.startsAt,
+      endsAt: parsed.endsAt,
+    });
+    const candidateRows = await this.database<CalendarBusyWindowOverlapRow[]>`
       select busy.connection_id, busy.owner_adult_id, busy.calendar_id,
-        busy.external_event_id, busy.source_revision, busy.starts_at, busy.ends_at
+        busy.external_event_id, busy.source_revision, busy.household_id,
+        busy.window_key_id, busy.window_ciphertext
       from calendar_busy_windows busy
       join external_connections connection on connection.id = busy.connection_id
       join google_calendar_sync_states state
@@ -2705,10 +2896,22 @@ export class FlorenceRuntimeStore {
           GOOGLE_CALENDAR_READONLY_SCOPE,
           GOOGLE_CALENDAR_EVENTS_SCOPE,
         ]}::text[]
-        and busy.starts_at < ${parsed.endsAt} and busy.ends_at > ${parsed.startsAt}
-      order by busy.owner_adult_id, busy.connection_id, busy.calendar_id,
-        busy.external_event_id, busy.source_revision
+        and busy.candidate_buckets && ${candidateBuckets}::text[]
     `;
+    const overlaps = candidateRows.flatMap((row) => {
+      const window = openCalendarBusyWindow(row, this.sensitiveJson);
+      return calendarBusyWindowsOverlap(window, parsed.startsAt, parsed.endsAt)
+        ? [{ ...row, ...window }]
+        : [];
+    });
+    overlaps.sort(
+      (left, right) =>
+        left.owner_adult_id.localeCompare(right.owner_adult_id) ||
+        left.connection_id.localeCompare(right.connection_id) ||
+        left.calendar_id.localeCompare(right.calendar_id) ||
+        left.external_event_id.localeCompare(right.external_event_id) ||
+        left.source_revision - right.source_revision,
+    );
     const digestMaterial = canonicalJson({
       schemaVersion: 2,
       householdId: parsed.householdId,
@@ -2724,8 +2927,8 @@ export class FlorenceRuntimeStore {
         calendarId: row.calendar_id,
         externalEventId: row.external_event_id,
         sourceRevision: row.source_revision,
-        startsAt: row.starts_at.toISOString(),
-        endsAt: row.ends_at.toISOString(),
+        startsAt: row.startsAt,
+        endsAt: row.endsAt,
       })),
     });
     return {
@@ -3061,8 +3264,8 @@ export class FlorenceRuntimeStore {
       const rows = await transaction<{ id: string }[]>`
         update external_connections
         set status = 'revoked', encrypted_credentials = null, granted_scopes = '{}',
-          cursor = '{}'::jsonb,
-          metadata = metadata || ${this.database.json({ revokedAt: parsed.revokedAt })},
+          email_digest = null, details_key_id = null, details_ciphertext = null,
+          cursor = '{}'::jsonb, metadata = '{}'::jsonb,
           updated_at = now()
         where id = ${parsed.connectionId} and household_id = ${parsed.householdId}
           and adult_id = ${parsed.adultId} and provider = 'google'
@@ -3113,11 +3316,13 @@ export class FlorenceRuntimeStore {
         status: z.enum(["active", "reauth_required", "error"]).default("active"),
       })
       .parse(input);
+    const metadata = { ...parsed.metadata };
+    delete metadata.accountLabel;
     const rows = await this.database<{ id: string }[]>`
       update external_connections
       set encrypted_credentials = coalesce(${parsed.encryptedCredentials ?? null}, encrypted_credentials),
         cursor = ${this.database.json(JSON.parse(JSON.stringify(parsed.cursor)))},
-        metadata = ${this.database.json(JSON.parse(JSON.stringify(parsed.metadata)))},
+        metadata = ${this.database.json(JSON.parse(JSON.stringify(metadata)))},
         last_synced_at = ${parsed.lastSyncedAt}, status = ${parsed.status}, updated_at = now()
       where id = ${parsed.connectionId} and household_id = ${parsed.householdId}
         and adult_id = ${parsed.adultId} and provider = 'google' and status <> 'revoked'
@@ -3142,33 +3347,50 @@ export class FlorenceRuntimeStore {
       throw new ApplicationStoreError("invalid_state", "Calendar work household does not match");
     }
     const id = randomUUID();
+    const digest = payloadDigest(parsed.work);
+    const sealed = this.sensitiveJson.seal(parsed.work, jobPayloadContext(parsed.householdId, id));
     const rows = await this.database<{ id: string }[]>`
       insert into jobs (
-        id, household_id, kind, status, payload, max_attempts, idempotency_key, control_epoch
+        id, household_id, connection_id, kind, work_kind, status, payload_digest,
+        payload_key_id, payload_ciphertext, max_attempts, idempotency_key, control_epoch
       )
-      select ${id}, household.id, 'google.calendar.sync', 'pending',
-        ${this.database.json(JSON.parse(JSON.stringify(parsed.work)))}, 8,
-        ${parsed.idempotencyKey}, household.control_epoch
+      select ${id}, household.id, ${parsed.work.connectionId}, 'google.calendar.sync',
+        ${parsed.work.kind}, 'pending', ${digest}, ${sealed.keyId}, ${sealed.ciphertext},
+        8, ${parsed.idempotencyKey}, household.control_epoch
       from households household
       where household.id = ${parsed.householdId} and household.status <> 'deleting'
       on conflict (idempotency_key) where idempotency_key is not null do nothing
       returning id
     `;
     if (rows[0]) return { jobId: rows[0].id, created: true };
-    const existing = await this.database<{ id: string; household_id: string; payload: unknown }[]>`
-      select id, household_id, payload from jobs where idempotency_key = ${parsed.idempotencyKey}
+    const existing = await this.database<
+      {
+        id: string;
+        household_id: string;
+        connection_id: string | null;
+        kind: string;
+        work_kind: string | null;
+        payload_digest: string;
+      }[]
+    >`
+      select id, household_id, connection_id, kind, work_kind, payload_digest
+      from jobs where idempotency_key = ${parsed.idempotencyKey}
     `;
     const row = existing[0];
     if (
       !row ||
       row.household_id !== parsed.householdId ||
-      canonicalJson(row.payload) !== canonicalJson(parsed.work)
+      row.connection_id !== parsed.work.connectionId ||
+      row.kind !== "google.calendar.sync" ||
+      row.work_kind !== parsed.work.kind ||
+      row.payload_digest !== digest
     ) {
       throw new ApplicationStoreError("invalid_state", "Calendar sync idempotency key conflict");
     }
+    const rearmPayload = this.sensitiveJson.seal(parsed.work, jobPayloadContext(parsed.householdId, row.id));
     return {
       jobId: row.id,
-      created: await rearmDeadGoogleMaintenanceJob(this.database, row.id),
+      created: await rearmDeadGoogleMaintenanceJob(this.database, row.id, rearmPayload),
     };
   }
 
@@ -3290,14 +3512,17 @@ export class FlorenceRuntimeStore {
     return this.database.begin(async (transaction) => {
       await transaction`
         update jobs set status = 'dead', lease_owner = null, lease_token = null,
-          lease_expires_at = null, last_error_code = 'lease_expired_after_max_attempts', updated_at = now()
+          lease_expires_at = null, payload_key_id = null, payload_ciphertext = null,
+          last_error_code = 'lease_expired_after_max_attempts', updated_at = now()
         where kind = 'google.calendar.sync' and status = 'leased' and lease_expires_at < now()
           and attempt >= max_attempts
       `;
       const rows = await transaction<
         {
           id: string;
-          payload: unknown;
+          household_id: string;
+          payload_key_id: string;
+          payload_ciphertext: string;
           attempt: number;
           max_attempts: number;
           lease_token: string;
@@ -3321,16 +3546,46 @@ export class FlorenceRuntimeStore {
           lease_expires_at = now() + (${parsed.leaseSeconds} * interval '1 second'),
           attempt = attempt + 1, updated_at = now()
         from candidates where jobs.id = candidates.id
-        returning jobs.id, jobs.payload, jobs.attempt, jobs.max_attempts, jobs.lease_token
+        returning jobs.id, jobs.household_id, jobs.payload_key_id, jobs.payload_ciphertext,
+          jobs.attempt, jobs.max_attempts, jobs.lease_token
       `;
       return rows.map((row) => ({
         rowId: row.id,
         leaseToken: row.lease_token,
-        work: calendarSyncWorkSchema.parse(row.payload),
+        work: calendarSyncWorkSchema.parse(
+          this.sensitiveJson.open(
+            { keyId: row.payload_key_id, ciphertext: row.payload_ciphertext },
+            jobPayloadContext(row.household_id, row.id),
+          ),
+        ),
         attempt: row.attempt,
         maxAttempts: row.max_attempts,
       }));
     });
+  }
+
+  public async renewGoogleSyncWork(input: {
+    rowId: string;
+    leaseToken: string;
+    leaseSeconds: number;
+  }): Promise<boolean> {
+    const parsed = z
+      .strictObject({
+        rowId: z.uuid(),
+        leaseToken: z.uuid(),
+        leaseSeconds: z.number().int().positive().max(3_600),
+      })
+      .parse(input);
+    const rows = await this.database<{ id: string }[]>`
+      update jobs
+      set lease_expires_at = now() + (${parsed.leaseSeconds} * interval '1 second'),
+        updated_at = now()
+      where id = ${parsed.rowId} and kind in ('google.sync', 'google.calendar.sync')
+        and status = 'leased' and lease_token = ${parsed.leaseToken}
+        and lease_expires_at > now()
+      returning id
+    `;
+    return rows.length === 1;
   }
 
   public async completeCalendarSyncWork(input: { rowId: string; leaseToken: string }): Promise<boolean> {
@@ -3354,9 +3609,13 @@ export class FlorenceRuntimeStore {
     const rows = await this.database<{ id: string }[]>`
       update jobs set status = case when attempt >= max_attempts then 'dead' else 'retry' end,
         available_at = ${parsed.retryAt}, last_error_code = ${parsed.errorCode},
-        lease_owner = null, lease_token = null, lease_expires_at = null, updated_at = now()
+        lease_owner = null, lease_token = null, lease_expires_at = null,
+        payload_key_id = case when attempt >= max_attempts then null else payload_key_id end,
+        payload_ciphertext = case when attempt >= max_attempts then null else payload_ciphertext end,
+        updated_at = now()
       where id = ${parsed.rowId} and kind = 'google.calendar.sync' and status = 'leased'
         and lease_token = ${parsed.leaseToken}
+        and lease_expires_at > now()
       returning id
     `;
     return rows.length === 1;
@@ -3376,9 +3635,11 @@ export class FlorenceRuntimeStore {
       .parse(input);
     const rows = await this.database<{ id: string }[]>`
       update jobs set status = 'dead', last_error_code = ${parsed.errorCode},
-        lease_owner = null, lease_token = null, lease_expires_at = null, updated_at = now()
+        lease_owner = null, lease_token = null, lease_expires_at = null,
+        payload_key_id = null, payload_ciphertext = null, updated_at = now()
       where id = ${parsed.rowId} and kind = 'google.calendar.sync' and status = 'leased'
         and lease_token = ${parsed.leaseToken}
+        and lease_expires_at > now()
       returning id
     `;
     return rows.length === 1;
@@ -3397,12 +3658,16 @@ export class FlorenceRuntimeStore {
       })
       .parse(input);
     const id = randomUUID();
+    const connectionId = "connectionId" in parsed.work ? parsed.work.connectionId : null;
+    const digest = payloadDigest(parsed.work);
+    const sealed = this.sensitiveJson.seal(parsed.work, jobPayloadContext(parsed.householdId, id));
     const rows = await this.database<{ id: string }[]>`
       insert into jobs (
-        id, household_id, kind, status, payload, max_attempts, idempotency_key, control_epoch
+        id, household_id, connection_id, kind, work_kind, status, payload_digest,
+        payload_key_id, payload_ciphertext, max_attempts, idempotency_key, control_epoch
       )
-      select ${id}, household.id, 'google.sync', 'pending',
-        ${this.database.json(JSON.parse(JSON.stringify(parsed.work)))}, 8,
+      select ${id}, household.id, ${connectionId}, 'google.sync', ${parsed.work.kind},
+        'pending', ${digest}, ${sealed.keyId}, ${sealed.ciphertext}, 8,
         ${parsed.idempotencyKey}, household.control_epoch
       from households household
       where household.id = ${parsed.householdId} and household.status <> 'deleting'
@@ -3410,20 +3675,34 @@ export class FlorenceRuntimeStore {
       returning id
     `;
     if (rows[0]) return { jobId: rows[0].id, created: true };
-    const existing = await this.database<{ id: string; household_id: string; payload: unknown }[]>`
-      select id, household_id, payload from jobs where idempotency_key = ${parsed.idempotencyKey}
+    const existing = await this.database<
+      {
+        id: string;
+        household_id: string;
+        connection_id: string | null;
+        kind: string;
+        work_kind: string | null;
+        payload_digest: string;
+      }[]
+    >`
+      select id, household_id, connection_id, kind, work_kind, payload_digest
+      from jobs where idempotency_key = ${parsed.idempotencyKey}
     `;
     const row = existing[0];
     if (
       !row ||
       row.household_id !== parsed.householdId ||
-      canonicalJson(row.payload) !== canonicalJson(parsed.work)
+      row.connection_id !== connectionId ||
+      row.kind !== "google.sync" ||
+      row.work_kind !== parsed.work.kind ||
+      row.payload_digest !== digest
     ) {
       throw new ApplicationStoreError("invalid_state", "Google sync idempotency key conflict");
     }
+    const rearmPayload = this.sensitiveJson.seal(parsed.work, jobPayloadContext(parsed.householdId, row.id));
     return {
       jobId: row.id,
-      created: await rearmDeadGoogleMaintenanceJob(this.database, row.id),
+      created: await rearmDeadGoogleMaintenanceJob(this.database, row.id, rearmPayload),
     };
   }
 
@@ -3432,7 +3711,7 @@ export class FlorenceRuntimeStore {
       select count(*)::text as count
       from jobs job
       join external_connections connection
-        on connection.id::text = job.payload->>'connectionId'
+        on connection.id = job.connection_id
         and connection.household_id = job.household_id
       join households household on household.id = connection.household_id
       where job.kind in ('google.sync', 'google.calendar.sync') and job.status = 'dead'
@@ -3440,6 +3719,84 @@ export class FlorenceRuntimeStore {
         and household.status <> 'deleting'
     `;
     return Number(rows[0]?.count ?? 0);
+  }
+
+  public async renewWorkerHeartbeat(name: string): Promise<void> {
+    const heartbeatName = z.string().min(1).max(100).parse(name);
+    await this.database`
+      insert into worker_heartbeats (name, renewed_at)
+      values (${heartbeatName}, now())
+      on conflict (name) do update
+      set renewed_at = excluded.renewed_at, updated_at = now()
+    `;
+  }
+
+  public async isWorkerHeartbeatFresh(name: string, maxAgeSeconds: number): Promise<boolean> {
+    const parsedName = z.string().min(1).max(100).parse(name);
+    const parsedAge = z.number().int().positive().max(3_600).parse(maxAgeSeconds);
+    const rows = await this.database<{ fresh: boolean }[]>`
+      select renewed_at >= now() - (${parsedAge} * interval '1 second') as fresh
+      from worker_heartbeats
+      where name = ${parsedName}
+    `;
+    return rows[0]?.fresh === true;
+  }
+
+  /** A newly configured Google runtime is ready before any account is connected. */
+  public async isGoogleRuntimeReady(input: {
+    gmailEnabled: boolean;
+    calendarEnabled: boolean;
+  }): Promise<boolean> {
+    const enabled = z.strictObject({ gmailEnabled: z.boolean(), calendarEnabled: z.boolean() }).parse(input);
+    const rows = await this.database<{ active_count: string; stale_count: string; dead_count: string }[]>`
+      with active_connections as (
+        select id, granted_scopes, cursor
+        from external_connections
+        where provider = 'google' and status = 'active'
+      ), health as (
+        select connection.id,
+          (
+            not (${enabled.gmailEnabled} and connection.granted_scopes && ${[GOOGLE_GMAIL_READONLY_SCOPE]}::text[])
+            or coalesce((connection.cursor->'gmail'->'watch'->>'expiresAt')::timestamptz > now(), false)
+          )
+          and (
+            not (${enabled.calendarEnabled} and connection.granted_scopes && ${[GOOGLE_CALENDAR_READONLY_SCOPE]}::text[])
+            or exists (
+              select 1
+              from google_calendar_sync_states state
+              join google_calendar_channels channel
+                on channel.connection_id = state.connection_id
+                and channel.calendar_id = state.calendar_id
+                and channel.status = 'active'
+                and channel.expires_at > now()
+              where state.connection_id = connection.id
+                and state.status = 'active' and state.selected
+                and state.sync_state->>'phase' = 'live'
+                and coalesce((state.sync_state->>'projectionReady')::boolean, false)
+            )
+          ) as fresh
+        from active_connections connection
+      )
+      select
+        (select count(*)::text from active_connections) as active_count,
+        (select count(*)::text from health where not fresh) as stale_count,
+        (
+          select count(*)::text
+          from jobs job
+          join external_connections connection
+            on connection.id = job.connection_id and connection.household_id = job.household_id
+          join households household on household.id = connection.household_id
+          where job.kind in ('google.sync', 'google.calendar.sync') and job.status = 'dead'
+            and connection.provider = 'google' and connection.status = 'active'
+            and household.status <> 'deleting'
+        ) as dead_count
+    `;
+    const result = rows[0];
+    return (
+      result !== undefined &&
+      (Number(result.active_count) === 0 ||
+        (Number(result.stale_count) === 0 && Number(result.dead_count) === 0))
+    );
   }
 
   public async reconcileGoogleSyncWork(asOf: string): Promise<number> {
@@ -3519,14 +3876,17 @@ export class FlorenceRuntimeStore {
     return this.database.begin(async (transaction) => {
       await transaction`
         update jobs set status = 'dead', lease_owner = null, lease_token = null,
-          lease_expires_at = null, last_error_code = 'lease_expired_after_max_attempts', updated_at = now()
+          lease_expires_at = null, payload_key_id = null, payload_ciphertext = null,
+          last_error_code = 'lease_expired_after_max_attempts', updated_at = now()
         where kind = 'google.sync' and status = 'leased' and lease_expires_at < now()
           and attempt >= max_attempts
       `;
       const rows = await transaction<
         {
           id: string;
-          payload: unknown;
+          household_id: string;
+          payload_key_id: string;
+          payload_ciphertext: string;
           attempt: number;
           max_attempts: number;
           lease_token: string;
@@ -3550,12 +3910,18 @@ export class FlorenceRuntimeStore {
           lease_expires_at = now() + (${parsed.leaseSeconds} * interval '1 second'),
           attempt = attempt + 1, updated_at = now()
         from candidates where jobs.id = candidates.id
-        returning jobs.id, jobs.payload, jobs.attempt, jobs.max_attempts, jobs.lease_token
+        returning jobs.id, jobs.household_id, jobs.payload_key_id, jobs.payload_ciphertext,
+          jobs.attempt, jobs.max_attempts, jobs.lease_token
       `;
       return rows.map((row) => ({
         rowId: row.id,
         leaseToken: row.lease_token,
-        work: gmailSyncWorkSchema.parse(row.payload),
+        work: gmailSyncWorkSchema.parse(
+          this.sensitiveJson.open(
+            { keyId: row.payload_key_id, ciphertext: row.payload_ciphertext },
+            jobPayloadContext(row.household_id, row.id),
+          ),
+        ),
         attempt: row.attempt,
         maxAttempts: row.max_attempts,
       }));
@@ -3565,24 +3931,28 @@ export class FlorenceRuntimeStore {
   public async completeGoogleSyncWork(input: { rowId: string; leaseToken: string }): Promise<boolean> {
     const parsed = z.strictObject({ rowId: z.uuid(), leaseToken: z.uuid() }).parse(input);
     return this.database.begin(async (transaction) => {
-      const rows = await transaction<{ id: string; household_id: string; payload: unknown }[]>`
+      const rows = await transaction<
+        { id: string; household_id: string; connection_id: string | null; work_kind: string | null }[]
+      >`
         update jobs set status = 'succeeded', lease_owner = null, lease_token = null,
-          lease_expires_at = null, updated_at = now()
+          lease_expires_at = null, payload_key_id = null, payload_ciphertext = null,
+          updated_at = now()
         where id = ${parsed.rowId} and kind = 'google.sync' and status = 'leased'
           and lease_token = ${parsed.leaseToken}
-        returning id, household_id, payload
+          and lease_expires_at > now()
+        returning id, household_id, connection_id, work_kind
       `;
       const row = rows[0];
       if (!row) return false;
-      const work = gmailSyncWorkSchema.parse(row.payload);
-      if (work.kind === "start" || work.kind === "continue") {
+      if (row.connection_id !== null && (row.work_kind === "start" || row.work_kind === "continue")) {
         await transaction`
           update jobs set status = 'cancelled', lease_owner = null, lease_token = null,
-            lease_expires_at = null, updated_at = now()
+            lease_expires_at = null, payload_key_id = null, payload_ciphertext = null,
+            updated_at = now()
           where household_id = ${row.household_id} and kind = 'google.sync' and status = 'dead'
-            and payload->>'connectionId' = ${work.connectionId}
-            and payload->>'kind' in ('start', 'continue')
-            and idempotency_key like ${`google:${work.connectionId}:activation:%`}
+            and connection_id = ${row.connection_id}
+            and work_kind in ('start', 'continue')
+            and idempotency_key like ${`google:${row.connection_id}:activation:%`}
         `;
       }
       return true;
@@ -3606,9 +3976,13 @@ export class FlorenceRuntimeStore {
     const rows = await this.database<{ id: string }[]>`
       update jobs set status = case when attempt >= max_attempts then 'dead' else 'retry' end,
         available_at = ${parsed.retryAt}, last_error_code = ${parsed.errorCode},
-        lease_owner = null, lease_token = null, lease_expires_at = null, updated_at = now()
+        lease_owner = null, lease_token = null, lease_expires_at = null,
+        payload_key_id = case when attempt >= max_attempts then null else payload_key_id end,
+        payload_ciphertext = case when attempt >= max_attempts then null else payload_ciphertext end,
+        updated_at = now()
       where id = ${parsed.rowId} and kind = 'google.sync' and status = 'leased'
         and lease_token = ${parsed.leaseToken}
+        and lease_expires_at > now()
       returning id
     `;
     return rows.length === 1;
@@ -3628,21 +4002,14 @@ export class FlorenceRuntimeStore {
       .parse(input);
     const rows = await this.database<{ id: string }[]>`
       update jobs set status = 'dead', last_error_code = ${parsed.errorCode},
-        lease_owner = null, lease_token = null, lease_expires_at = null, updated_at = now()
+        lease_owner = null, lease_token = null, lease_expires_at = null,
+        payload_key_id = null, payload_ciphertext = null, updated_at = now()
       where id = ${parsed.rowId} and kind = 'google.sync' and status = 'leased'
         and lease_token = ${parsed.leaseToken}
+        and lease_expires_at > now()
       returning id
     `;
     return rows.length === 1;
-  }
-
-  public async firstActiveOwner(householdId: string): Promise<string | null> {
-    const rows = await this.database<{ adult_id: string }[]>`
-      select adult_id from household_memberships
-      where household_id = ${z.uuid().parse(householdId)} and role = 'owner' and status = 'active'
-      order by created_at limit 1
-    `;
-    return rows[0]?.adult_id ?? null;
   }
 
   public digestHandle(handle: string): string {
@@ -3671,9 +4038,11 @@ export class FlorenceRuntimeStore {
     const parsed = z.strictObject({ rowId: z.uuid(), leaseToken: z.uuid() }).parse(input);
     const rows = await this.database<{ id: string }[]>`
       update jobs set status = ${status}, lease_owner = null, lease_token = null,
-        lease_expires_at = null, updated_at = now()
+        lease_expires_at = null, payload_key_id = null, payload_ciphertext = null,
+        updated_at = now()
       where id = ${parsed.rowId} and kind = 'google.calendar.sync' and status = 'leased'
         and lease_token = ${parsed.leaseToken}
+        and lease_expires_at > now()
       returning id
     `;
     return rows.length === 1;
@@ -3686,10 +4055,11 @@ export class FlorenceRuntimeStore {
     const parsed = z.strictObject({ householdId: z.uuid(), connectionId: z.uuid() }).parse(input);
     const rows = await this.database<{ id: string }[]>`
       update jobs set status = 'cancelled', lease_owner = null, lease_token = null,
-        lease_expires_at = null, updated_at = now()
+        lease_expires_at = null, payload_key_id = null, payload_ciphertext = null,
+        updated_at = now()
       where household_id = ${parsed.householdId} and kind = 'google.sync' and status = 'dead'
-        and payload->>'connectionId' = ${parsed.connectionId}
-        and payload->>'kind' in ('start', 'continue')
+        and connection_id = ${parsed.connectionId}
+        and work_kind in ('start', 'continue')
         and idempotency_key like ${`google:${parsed.connectionId}:activation:%`}
       returning id
     `;
@@ -3824,13 +4194,6 @@ function normalizeCalendarSelection(value: string): string {
   return value.normalize("NFKC").trim().toLocaleLowerCase("en-US");
 }
 
-function calendarConnectionLabel(target: { label: string; metadata: Record<string, unknown> }): string {
-  const metadataLabel = target.metadata.accountLabel;
-  return typeof metadataLabel === "string" && metadataLabel.trim().length > 0
-    ? metadataLabel.trim()
-    : target.label.trim();
-}
-
 function isWritableCalendarAccessRole(role: string | null): boolean {
   return role === "writerWithoutPrivateAccess" || role === "writer" || role === "owner";
 }
@@ -3963,11 +4326,16 @@ function calendarWorkIdempotencyKey(
  * exhausted row blocking that key forever, but recovery is deliberately bounded so a persistent
  * provider or data fault still becomes operator-visible.
  */
-async function rearmDeadGoogleMaintenanceJob(database: Database, jobId: string): Promise<boolean> {
+async function rearmDeadGoogleMaintenanceJob(
+  database: Database,
+  jobId: string,
+  payload: { keyId: string; ciphertext: string },
+): Promise<boolean> {
   const rows = await database<{ id: string }[]>`
     update jobs
     set status = 'pending', attempt = 0, available_at = now(),
       lease_owner = null, lease_token = null, lease_expires_at = null,
+      payload_key_id = ${payload.keyId}, payload_ciphertext = ${payload.ciphertext},
       last_error_code = null, last_error_detail = null,
       recovery_generation = recovery_generation + 1,
       last_rearmed_at = now(), updated_at = now()
@@ -3978,6 +4346,15 @@ async function rearmDeadGoogleMaintenanceJob(database: Database, jobId: string):
     returning id
   `;
   return rows.length === 1;
+}
+
+function jobPayloadContext(householdId: string, rowId: string) {
+  return {
+    tenant: { kind: "household" as const, id: householdId },
+    table: "jobs" as const,
+    rowId,
+    field: "payload",
+  };
 }
 
 async function requireOwnedGmailRecoveryRun(
@@ -4015,37 +4392,86 @@ export function canonicalizeLinqHandle(raw: string): string {
   return digits;
 }
 
-function mapConnection(row: ConnectionRow): ExternalConnectionRecord {
+function openCalendarBusyWindow(row: CalendarBusyWindowRow, cipher: TenantJsonCipher): CalendarBusyWindow {
+  return encryptedCalendarBusyWindowSchema.parse(
+    cipher.open(
+      { keyId: row.window_key_id, ciphertext: row.window_ciphertext },
+      calendarBusyWindowEncryptionContext({
+        householdId: row.household_id,
+        connectionId: row.connection_id,
+        calendarId: row.calendar_id,
+        externalEventId: row.external_event_id,
+      }),
+    ),
+  );
+}
+
+function calendarBusyWindowsOverlap(window: CalendarBusyWindow, from: string, to: string): boolean {
+  return Date.parse(window.startsAt) < Date.parse(to) && Date.parse(window.endsAt) > Date.parse(from);
+}
+
+function deduplicateCalendarBusyWindows(windows: CalendarBusyWindow[]): CalendarBusyWindow[] {
+  const deduplicated = new Map<string, CalendarBusyWindow>();
+  for (const window of windows) {
+    deduplicated.set(`${window.startsAt}\u0000${window.endsAt}\u0000${window.allDay}`, window);
+  }
+  return [...deduplicated.values()].sort(
+    (left, right) =>
+      Date.parse(left.startsAt) - Date.parse(right.startsAt) ||
+      Date.parse(left.endsAt) - Date.parse(right.endsAt) ||
+      Number(left.allDay) - Number(right.allDay),
+  );
+}
+
+function connectionDetails(row: ConnectionRow, cipher: TenantJsonCipher) {
+  if (row.details_key_id === null || row.details_ciphertext === null) {
+    return { label: REVOKED_GOOGLE_ACCOUNT_LABEL, accountLabel: REVOKED_GOOGLE_ACCOUNT_LABEL, email: null };
+  }
+  return googleConnectionDetailsSchema.parse(
+    cipher.open(
+      { keyId: row.details_key_id, ciphertext: row.details_ciphertext },
+      googleConnectionDetailsContext({
+        householdId: row.household_id,
+        adultId: row.adult_id,
+        connectionId: row.id,
+      }),
+    ),
+  );
+}
+
+function mapConnection(row: ConnectionRow, cipher: TenantJsonCipher): ExternalConnectionRecord {
+  const details = connectionDetails(row, cipher);
   return {
     id: row.id,
     householdId: row.household_id,
     adultId: row.adult_id,
     provider: row.provider,
-    label: row.label,
+    label: details.label,
     externalAccountId: row.external_account_id,
-    email: row.email,
+    email: details.email,
     encryptedCredentials: row.encrypted_credentials,
     grantedScopes: row.granted_scopes,
     status: row.status,
     cursor: row.cursor,
-    metadata: row.metadata,
+    metadata: { ...row.metadata, accountLabel: details.accountLabel },
     lastSyncedAt: row.last_synced_at?.toISOString() ?? null,
   };
 }
 
-function mapGoogleSyncConnection(row: ConnectionRow): GoogleSyncConnection {
+function mapGoogleSyncConnection(row: ConnectionRow, cipher: TenantJsonCipher): GoogleSyncConnection {
+  const details = connectionDetails(row, cipher);
   return {
     id: row.id,
     householdId: row.household_id,
     adultId: row.adult_id,
     provider: "google",
     externalAccountId: row.external_account_id,
-    email: row.email,
+    email: details.email,
     encryptedCredentials: row.encrypted_credentials,
     grantedScopes: row.granted_scopes,
     status: row.status,
     cursor: row.cursor,
-    metadata: row.metadata,
+    metadata: { ...row.metadata, accountLabel: details.accountLabel },
   };
 }
 

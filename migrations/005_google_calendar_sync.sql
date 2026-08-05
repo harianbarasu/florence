@@ -36,16 +36,18 @@ CREATE TABLE calendar_busy_windows (
   external_event_id text NOT NULL,
   source_item_id uuid NOT NULL REFERENCES source_items(id) ON DELETE CASCADE,
   source_revision bigint NOT NULL CHECK (source_revision > 0),
-  starts_at timestamptz NOT NULL,
-  ends_at timestamptz NOT NULL,
-  all_day boolean NOT NULL,
+  window_key_id text NOT NULL,
+  window_ciphertext text NOT NULL,
+  candidate_buckets text[] NOT NULL CHECK (cardinality(candidate_buckets) > 0),
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (connection_id, calendar_id, external_event_id),
-  CHECK (ends_at > starts_at),
   FOREIGN KEY (connection_id, household_id, owner_adult_id)
     REFERENCES external_connections (id, household_id, adult_id) ON DELETE CASCADE
 );
 
-CREATE INDEX calendar_busy_windows_household_time_idx
-  ON calendar_busy_windows (household_id, starts_at, ends_at);
+CREATE INDEX calendar_busy_windows_candidate_buckets_idx
+  ON calendar_busy_windows USING gin (candidate_buckets);
+
+CREATE INDEX calendar_busy_windows_window_key_idx
+  ON calendar_busy_windows (window_key_id);

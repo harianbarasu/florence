@@ -1,4 +1,4 @@
-import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 import { z } from "zod";
 import type { CalendarPushHeaders, GmailPubSubEvent, GoogleOAuthGrant } from "../adapters/google/index.js";
 import type { LinqRecoveredMessageEvent, LinqWebhookEvent } from "../adapters/linq/index.js";
@@ -10,14 +10,20 @@ import type {
   GoogleOAuthStartResult,
   ReadinessProbe,
 } from "../http/index.js";
+import { googleAccountAliasSchema } from "../security/durable-identity-privacy.js";
 import type { SecretBox } from "../security/secret-box.js";
+
+const GOOGLE_HANDOFF_VERSION = "v1";
+const GOOGLE_HANDOFF_AAD = "florence:google-oauth-handoff:v1";
+const GOOGLE_HANDOFF_IV_BYTES = 12;
+const GOOGLE_HANDOFF_TAG_BYTES = 16;
 
 const handoffPayloadSchema = z.strictObject({
   version: z.literal(1),
   householdId: z.uuid(),
   adultId: z.uuid(),
   returnConversationId: z.string().min(1).max(500),
-  accountLabel: z.string().trim().min(1).max(200),
+  accountLabel: googleAccountAliasSchema,
   loginHint: z.email().optional(),
   issuedAt: z.number().int().nonnegative(),
   expiresAt: z.number().int().positive(),
@@ -30,7 +36,7 @@ const oauthCiphertextSchema = z.strictObject({
   householdId: z.uuid(),
   adultId: z.uuid(),
   returnConversationId: z.string().min(1).max(500),
-  accountLabel: z.string().trim().min(1).max(200),
+  accountLabel: googleAccountAliasSchema,
   stateHash: z.string().regex(/^[a-f0-9]{64}$/u),
   codeVerifier: z.string().min(1),
 });
@@ -201,7 +207,7 @@ export interface GoogleOAuthConnectedEvent {
   activationId: string;
   hadPriorGmailState: boolean;
   accountLabel: string;
-  email: string | null;
+  email: string;
   grantedScopes: readonly string[];
 }
 
@@ -211,7 +217,7 @@ export interface GoogleOAuthFailedEvent {
   returnConversationId: string;
   accountLabel: string | null;
   failureRef: string;
-  reason: "declined" | "invalid" | "unavailable";
+  reason: "declined" | "invalid" | "alias_in_use" | "unavailable";
 }
 
 export interface GoogleOAuthHandoffServiceOptions {
@@ -362,7 +368,7 @@ export class GoogleOAuthHandoffService implements GoogleOAuthHandoff {
       });
       throw error;
     }
-    if (!grant.identity.emailVerified) {
+    if (!grant.identity.emailVerified || grant.identity.email === null) {
       await this.#notifyFailed({
         householdId: context.householdId,
         adultId: context.adultId,
@@ -393,19 +399,28 @@ export class GoogleOAuthHandoffService implements GoogleOAuthHandoff {
         provider: "google",
         label: context.accountLabel,
         externalAccountId: grant.identity.subject,
-        ...(grant.identity.email ? { email: grant.identity.email } : {}),
+        email: grant.identity.email,
         encryptedCredentials: this.#secretBox.seal(JSON.stringify(grant.tokens), credentialsAad),
         grantedScopes: grant.tokens.scope,
         cursor: {},
-        metadata: { credentialAadVersion: 1, accountLabel: context.accountLabel },
+        metadata: { credentialAadVersion: 1 },
       });
     } catch (error) {
-      if (
-        !(error instanceof ApplicationStoreError) ||
-        (error.code !== "external_account_in_use" && error.code !== "invalid_state")
-      ) {
+      if (!(error instanceof ApplicationStoreError)) {
         throw error;
       }
+      if (error.code === "external_account_alias_in_use") {
+        await this.#notifyFailed({
+          householdId: context.householdId,
+          adultId: context.adultId,
+          returnConversationId: context.returnConversationId,
+          accountLabel: context.accountLabel,
+          failureRef: stateHash,
+          reason: "alias_in_use",
+        });
+        return { kind: "invalid" };
+      }
+      if (error.code !== "external_account_in_use" && error.code !== "invalid_state") throw error;
       await this.#notifyFailed({
         householdId: context.householdId,
         adultId: context.adultId,
@@ -461,8 +476,12 @@ export function issueGoogleHandoffToken(
     expiresAt: input.expiresAt.getTime(),
     nonce: randomBytes(18).toString("base64url"),
   });
-  const encoded = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
-  return `${encoded}.${signature(encoded, secret)}`;
+  const iv = randomBytes(GOOGLE_HANDOFF_IV_BYTES);
+  const cipher = createCipheriv("aes-256-gcm", handoffEncryptionKey(secret), iv);
+  cipher.setAAD(Buffer.from(GOOGLE_HANDOFF_AAD, "utf8"));
+  const ciphertext = Buffer.concat([cipher.update(JSON.stringify(payload), "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return `${GOOGLE_HANDOFF_VERSION}.${Buffer.concat([iv, tag, ciphertext]).toString("base64url")}`;
 }
 
 export class ProductionReadiness implements ReadinessProbe {
@@ -487,17 +506,19 @@ function verifyGoogleHandoffToken(
   secret: string,
   now: Date,
 ): { kind: "valid"; payload: GoogleHandoffPayload } | { kind: "expired" } | { kind: "invalid" } {
-  const [encoded, supplied, extra] = token.split(".");
-  if (!encoded || !supplied || extra !== undefined) return { kind: "invalid" };
-  const expected = signature(encoded, secret);
-  const suppliedBytes = Buffer.from(supplied, "utf8");
-  const expectedBytes = Buffer.from(expected, "utf8");
-  if (suppliedBytes.length !== expectedBytes.length || !timingSafeEqual(suppliedBytes, expectedBytes)) {
-    return { kind: "invalid" };
-  }
+  const [version, encoded, extra] = token.split(".");
+  if (version !== GOOGLE_HANDOFF_VERSION || !encoded || extra !== undefined) return { kind: "invalid" };
   try {
+    const sealed = Buffer.from(encoded, "base64url");
+    if (sealed.length <= GOOGLE_HANDOFF_IV_BYTES + GOOGLE_HANDOFF_TAG_BYTES) return { kind: "invalid" };
+    const iv = sealed.subarray(0, GOOGLE_HANDOFF_IV_BYTES);
+    const tag = sealed.subarray(GOOGLE_HANDOFF_IV_BYTES, GOOGLE_HANDOFF_IV_BYTES + GOOGLE_HANDOFF_TAG_BYTES);
+    const ciphertext = sealed.subarray(GOOGLE_HANDOFF_IV_BYTES + GOOGLE_HANDOFF_TAG_BYTES);
+    const decipher = createDecipheriv("aes-256-gcm", handoffEncryptionKey(secret), iv);
+    decipher.setAAD(Buffer.from(GOOGLE_HANDOFF_AAD, "utf8"));
+    decipher.setAuthTag(tag);
     const payload = handoffPayloadSchema.parse(
-      JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")),
+      JSON.parse(Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString("utf8")),
     );
     if (payload.expiresAt <= now.getTime()) return { kind: "expired" };
     if (payload.issuedAt > now.getTime() + 60_000 || payload.expiresAt <= payload.issuedAt) {
@@ -509,8 +530,8 @@ function verifyGoogleHandoffToken(
   }
 }
 
-function signature(encoded: string, secret: string): string {
-  return createHmac("sha256", secret).update(encoded).digest("base64url");
+function handoffEncryptionKey(secret: string): Buffer {
+  return createHash("sha256").update(secret, "utf8").digest();
 }
 
 function sha256(value: string): string {

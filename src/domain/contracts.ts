@@ -339,13 +339,21 @@ export const PromotionAuthoritySchema = z.discriminatedUnion("kind", [
 
 export type PromotionAuthority = z.infer<typeof PromotionAuthoritySchema>;
 
-export const EpisodeTypeSchema = z.enum(["commitment", "research", "meal_plan"]);
+export const EpisodeTypeSchema = z.enum(["commitment", "research", "meal_plan", "project"]);
 export const EpisodeDelegationSchema = z.strictObject({
   jobId: WorkerJobIdSchema,
-  purpose: z.enum(["family_research", "meal_plan"]),
+  purpose: z.enum(["family_research", "meal_plan", "family_project"]),
 });
 
 export type EpisodeDelegation = z.infer<typeof EpisodeDelegationSchema>;
+
+export const EpisodeArtifactReferenceSchema = z.strictObject({
+  artifactRef: appIdSchema("ArtifactReference"),
+  contentDigest: ContentDigestSchema,
+  recordedAt: InstantStringSchema,
+});
+
+export type EpisodeArtifactReference = z.infer<typeof EpisodeArtifactReferenceSchema>;
 
 export const CommitmentStateSchema = z.enum([
   "proposed",
@@ -397,6 +405,7 @@ export const FamilyEpisodeSchema = z
     promotionAuthority: PromotionAuthoritySchema.optional(),
     sourceMatcher: PrivateSourceMatcherSchema.optional(),
     delegation: EpisodeDelegationSchema.optional(),
+    artifact: EpisodeArtifactReferenceSchema.optional(),
     temporalPlan: ResolvedTimePlanSchema.optional(),
     blockedReason: NeutralFactualTextSchema.optional(),
     createdAt: InstantStringSchema,
@@ -409,7 +418,9 @@ export const FamilyEpisodeSchema = z
         ? "family_research"
         : episode.type === "meal_plan"
           ? "meal_plan"
-          : undefined;
+          : episode.type === "project"
+            ? "family_project"
+            : undefined;
     if (
       (expectedDelegationPurpose === undefined) !== (episode.delegation === undefined) ||
       (expectedDelegationPurpose !== undefined && episode.delegation?.purpose !== expectedDelegationPurpose)
@@ -422,8 +433,16 @@ export const FamilyEpisodeSchema = z
     if (episode.state === "awaiting_acknowledgement" && episode.owner.status !== "proposed") {
       context.addIssue({ code: "custom", message: "awaiting acknowledgement requires a proposed owner" });
     }
-    if (["active", "blocked"].includes(episode.state) && episode.owner.status !== "acknowledged") {
+    const appOwnedDelegation = episode.delegation !== undefined && episode.owner.status === "unassigned";
+    if (
+      ["active", "blocked"].includes(episode.state) &&
+      episode.owner.status !== "acknowledged" &&
+      !appOwnedDelegation
+    ) {
       context.addIssue({ code: "custom", message: `${episode.state} requires an acknowledged owner` });
+    }
+    if (episode.artifact !== undefined && episode.type !== "project") {
+      context.addIssue({ code: "custom", message: "Only a general project may retain a project artifact" });
     }
     const terminal = ["completed", "dismissed", "superseded", "failed"].includes(episode.state);
     if (terminal !== (episode.outcome !== undefined)) {
@@ -489,7 +508,9 @@ export const EpisodeProposalSchema = z
         ? "family_research"
         : proposal.type === "meal_plan"
           ? "meal_plan"
-          : undefined;
+          : proposal.type === "project"
+            ? "family_project"
+            : undefined;
     if (
       (expectedDelegationPurpose === undefined) !== (proposal.delegation === undefined) ||
       (expectedDelegationPurpose !== undefined && proposal.delegation?.purpose !== expectedDelegationPurpose)
@@ -925,22 +946,42 @@ export const WorkerProposalSchema = z.strictObject({
 
 export type WorkerProposal = z.infer<typeof WorkerProposalSchema>;
 
-export const PendingExternalActionSchema = z.strictObject({
-  action: ExternalActionSchema,
-  state: z.enum(["awaiting_approval", "authorized", "executing", "succeeded", "failed", "unknown"]),
-  approvalId: ApprovalIdSchema.optional(),
-  promotionAuthority: PromotionAuthoritySchema.optional(),
-  proposedAt: InstantStringSchema,
-  updatedAt: InstantStringSchema,
-  effectReceipt: z
-    .strictObject({
-      receiptId: EffectReceiptIdSchema,
-      outcome: z.enum(["succeeded", "failed", "unknown"]),
-      recordedAt: InstantStringSchema,
-      providerReference: z.string().min(1).max(500).optional(),
-    })
-    .optional(),
-});
+export const PendingExternalActionSchema = z
+  .strictObject({
+    action: ExternalActionSchema,
+    state: z.enum([
+      "awaiting_approval",
+      "authorized",
+      "executing",
+      "succeeded",
+      "failed",
+      "unknown",
+      "declined",
+      "expired",
+    ]),
+    approvalId: ApprovalIdSchema.optional(),
+    promotionAuthority: PromotionAuthoritySchema.optional(),
+    proposedAt: InstantStringSchema,
+    expiresAt: InstantStringSchema,
+    updatedAt: InstantStringSchema,
+    effectReceipt: z
+      .strictObject({
+        receiptId: EffectReceiptIdSchema,
+        outcome: z.enum(["succeeded", "failed", "unknown"]),
+        recordedAt: InstantStringSchema,
+        providerReference: z.string().min(1).max(500).optional(),
+      })
+      .optional(),
+  })
+  .superRefine((pending, context) => {
+    if (Temporal.Instant.compare(pending.expiresAt, pending.proposedAt) <= 0) {
+      context.addIssue({
+        code: "custom",
+        path: ["expiresAt"],
+        message: "external action proposal expiry must follow proposal time",
+      });
+    }
+  });
 
 export type PendingExternalAction = z.infer<typeof PendingExternalActionSchema>;
 
@@ -979,9 +1020,16 @@ export const ConversationResponseContextSchema = z.discriminatedUnion("kind", [
     sharingRef: ConversationResponseReferenceSchema,
   }),
   z.strictObject({
+    kind: z.literal("consent_disclosure"),
+    adultId: AdultIdSchema,
+    audience: z.enum(["initiator", "invitee"]),
+    consentDisclosureVersion: z.literal(1),
+  }),
+  z.strictObject({
     kind: z.literal("invitation_transfer"),
     invitationId: ConversationResponseReferenceSchema,
     sourceBindingId: ConversationResponseReferenceSchema,
+    consentDisclosureVersion: z.literal(1),
   }),
 ]);
 
@@ -1022,6 +1070,7 @@ export const ExecuteExternalActionIntentSchema = z.strictObject({
   kind: z.literal("execute_external_action"),
   action: ExternalActionSchema,
   approvalId: ApprovalIdSchema,
+  executeBy: InstantStringSchema,
 });
 
 export const EnqueueWorkerIntentSchema = z.strictObject({
@@ -1251,6 +1300,14 @@ export const EpisodeProjectDelegatedSignalSchema = z.strictObject({
   instructionEvidence: EvidenceRefSchema,
 });
 
+export const EpisodeArtifactRecordedSignalSchema = z.strictObject({
+  ...SignalBaseShape,
+  kind: z.literal("episode.artifact_recorded"),
+  episodeId: EpisodeIdSchema,
+  baseEpisodeVersion: z.number().int().positive(),
+  artifact: EpisodeArtifactReferenceSchema,
+});
+
 export const EpisodeClosedSignalSchema = z.strictObject({
   ...SignalBaseShape,
   kind: z.literal("episode.closed"),
@@ -1300,6 +1357,18 @@ export const ExternalActionProposedSignalSchema = z.strictObject({
   ...SignalBaseShape,
   kind: z.literal("external_action.proposed"),
   action: ExternalActionSchema,
+});
+
+export const ExternalActionDeclinedSignalSchema = z.strictObject({
+  ...SignalBaseShape,
+  kind: z.literal("external_action.declined"),
+  actionId: ExternalActionIdSchema,
+});
+
+export const ExternalActionExpiredSignalSchema = z.strictObject({
+  ...SignalBaseShape,
+  kind: z.literal("external_action.expired"),
+  actionId: ExternalActionIdSchema,
 });
 
 export const ApprovalGrantedSignalSchema = z.strictObject({
@@ -1382,6 +1451,7 @@ export const HouseholdSignalSchema = z.discriminatedUnion("kind", [
   CommitmentOwnerReassignedSignalSchema,
   ConversationDeliveryObservedSignalSchema,
   EpisodeProjectDelegatedSignalSchema,
+  EpisodeArtifactRecordedSignalSchema,
   EpisodeClosedSignalSchema,
   EpisodeTemporalPlanReplacedSignalSchema,
   EpisodeSourceSupersededSignalSchema,
@@ -1389,6 +1459,8 @@ export const HouseholdSignalSchema = z.discriminatedUnion("kind", [
   EpisodeBlockedSignalSchema,
   EpisodeResumedSignalSchema,
   ExternalActionProposedSignalSchema,
+  ExternalActionDeclinedSignalSchema,
+  ExternalActionExpiredSignalSchema,
   ApprovalGrantedSignalSchema,
   ApprovalRevokedSignalSchema,
   PolicyApprovedSignalSchema,
@@ -1449,6 +1521,12 @@ export const DomainChangeSchema = z.discriminatedUnion("kind", [
     episodeId: EpisodeIdSchema,
     from: CommitmentStateSchema,
     to: CommitmentStateSchema,
+    episodeVersion: z.number().int().positive(),
+  }),
+  z.strictObject({
+    kind: z.literal("episode_artifact_recorded"),
+    episodeId: EpisodeIdSchema,
+    artifactRef: appIdSchema("ArtifactReference"),
     episodeVersion: z.number().int().positive(),
   }),
   z.strictObject({

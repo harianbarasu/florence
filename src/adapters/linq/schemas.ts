@@ -74,7 +74,7 @@ const linqMessageTransportSchema = z.union([
 
 const linqConversationBaseSchema = z.object({
   id: z.string().min(1),
-  ownerHandle: z.string().min(1).nullable(),
+  ownerHandle: z.string().min(1),
   knownParticipantHandles: z.array(z.string().min(1)),
 });
 

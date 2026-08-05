@@ -63,6 +63,16 @@ export const TEST_WORKER_ROUTES: WorkerRoutes = {
     maxToolCalls: 0,
     modelCapabilityProfile: "tool_planning",
   },
+  family_project: {
+    modelRouteId: "route.test.projects",
+    outputContractRef: "contract.test.projects",
+    capabilityIds: [],
+    allowedToolNames: [],
+    maxDurationMs: 60_000,
+    maxModelCalls: 5,
+    maxToolCalls: 0,
+    modelCapabilityProfile: "tool_planning",
+  },
 };
 
 export function setup(input?: {
@@ -88,7 +98,12 @@ export function setup(input?: {
   });
   const interpreter = new FakeApplicationInterpreter();
   const defaultWorkerResponse = (job: WorkerJob): WorkerResultPayload => ({
-    purpose: job.scopeGrant.purpose === "meal_plan" ? "meal_plan" : "family_research",
+    purpose:
+      job.scopeGrant.purpose === "meal_plan"
+        ? "meal_plan"
+        : job.scopeGrant.purpose === "family_project"
+          ? "family_project"
+          : "family_research",
     summary: "More information is required before this project can be completed.",
     completion: {
       status: "needs_input",

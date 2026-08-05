@@ -112,9 +112,14 @@ describe("Florence application coordinator", () => {
       intent: "approve_calendar_event",
       actionId: pending.action.actionId,
     });
-    await app.process(
-      groupMessage(approvalKey, `Approve ${pending.action.actionId}`, "2027-09-01T17:02:00Z"),
-    );
+    await app.process({
+      ...groupMessage(approvalKey, `Approve ${pending.action.actionId}`, "2027-09-01T17:02:00Z"),
+      replyTo: {
+        messageRef: "message_calendar_approval_request",
+        messageClass: "approval_request" as const,
+        responseContext: approvalRequest.responseContext,
+      },
+    });
     expect(harness.calendarActions.prepareCalls.at(-1)).toMatchObject({
       targetConnectionId: "connection_parent_personal",
       calendarId: "family_schedule_calendar",
@@ -221,7 +226,7 @@ describe("Florence application coordinator", () => {
     const bodies = harness.repository
       .intents("conversation.send")
       .flatMap((intent) => (intent.kind === "conversation.send" ? [intent.body] : []));
-    expect(bodies.at(-1)).toContain("selected calendar");
+    expect(bodies.at(-1)).toContain("exact current calendar proposal");
     expect(bodies.join(" ")).not.toMatch(/private-event|calendar owner|attendee|location/iu);
   });
 
@@ -238,8 +243,6 @@ describe("Florence application coordinator", () => {
       sourceClass: "school.form",
       sensitivity: "ordinary",
       temporalPlan: {
-        planId: "plan_field_trip",
-        version: 1,
         timeZone: "America/Los_Angeles",
         deadline: { kind: "instant", at: "2027-01-03T17:00:00Z" },
         usefulLeadMinutes: 1_440,
@@ -247,14 +250,10 @@ describe("Florence application coordinator", () => {
         finalBufferMinutes: 30,
         triggers: [
           {
-            triggerId: "trigger_field_trip_first",
-            timerId: "timer_field_trip_first",
             kind: "reminder",
             at: { kind: "instant", at: "2027-01-02T17:00:00Z" },
           },
           {
-            triggerId: "trigger_field_trip_final",
-            timerId: "timer_field_trip_final",
             kind: "reminder",
             at: { kind: "instant", at: "2027-01-03T16:00:00Z" },
           },
@@ -293,15 +292,19 @@ describe("Florence application coordinator", () => {
     });
     snapshot = await harness.repository.load(HOUSEHOLD_ID);
     expect(snapshot?.aggregate.episodes[0]?.state).toBe("active");
+    const firstTrigger = snapshot?.aggregate.episodes[0]?.temporalPlan?.triggers[0];
+    const finalTrigger = snapshot?.aggregate.episodes[0]?.temporalPlan?.triggers[1];
+    if (firstTrigger === undefined) throw new Error("Expected the first materialized temporal trigger");
+    if (finalTrigger === undefined) throw new Error("Expected the final materialized temporal trigger");
 
     const timerResult = await app.process({
       kind: "timer_fired",
       householdId: HOUSEHOLD_ID,
       idempotencyKey: "timer-fire-first",
-      timerId: "timer_field_trip_first",
+      timerId: firstTrigger.timerId,
       episodeId,
       temporalPlanVersion: 1,
-      triggerId: "trigger_field_trip_first",
+      triggerId: firstTrigger.triggerId,
       firedAt: "2027-01-02T17:00:00Z",
     });
     expect(timerResult.outcome.classification).toBe("timer:accepted");
@@ -309,10 +312,10 @@ describe("Florence application coordinator", () => {
       kind: "timer_fired",
       householdId: HOUSEHOLD_ID,
       idempotencyKey: "timer-fire-first",
-      timerId: "timer_field_trip_first",
+      timerId: firstTrigger.timerId,
       episodeId,
       temporalPlanVersion: 1,
-      triggerId: "trigger_field_trip_first",
+      triggerId: firstTrigger.triggerId,
       firedAt: "2027-01-02T17:00:00Z",
     });
     expect(duplicate.disposition).toBe("duplicate");
@@ -349,7 +352,7 @@ describe("Florence application coordinator", () => {
       domainEffects(harness.repository.outbox).filter((effect) => effect.kind === "cancel_timer"),
     ).toEqual([
       expect.objectContaining({
-        timerId: "timer_field_trip_final",
+        timerId: finalTrigger.timerId,
         temporalPlanVersion: 1,
       }),
     ]);

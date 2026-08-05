@@ -3,6 +3,7 @@ import { lookup } from "node:dns/promises";
 import { request as httpsRequest, type RequestOptions } from "node:https";
 import { isIP } from "node:net";
 import { isDeepStrictEqual } from "node:util";
+import { Temporal } from "@js-temporal/polyfill";
 import { z } from "zod";
 import {
   LinqApiError,
@@ -203,13 +204,33 @@ export class ProductionApplicationEffectExecutor implements ApplicationEffectExe
           effect.action.householdId === effect.householdId &&
           this.#calendarActions !== undefined
         ) {
+          const executionStartedAt = this.#now().toISOString();
+          if (
+            Temporal.Instant.compare(
+              Temporal.Instant.from(executionStartedAt),
+              Temporal.Instant.from(effect.executeBy),
+            ) >= 0
+          ) {
+            return EffectExecutionReceiptSchema.parse({
+              status: "permanent_failure",
+              receiptRef: stableReceipt("calendar_create_expired", effect.intentId),
+              recordedAt: executionStartedAt,
+              externalAction: {
+                receiptId: stableReceipt("action_receipt", effect.intentId, effect.approvalId),
+                actionId: effect.action.actionId,
+                actionDigest: effect.action.actionDigest,
+                outcome: "unknown",
+              },
+            });
+          }
           try {
-            const recordedAt = this.#now().toISOString();
             const created = await this.#calendarActions.createApprovedEvent({
               action: effect.action,
               idempotencyKey: effect.idempotencyKey,
-              asOf: recordedAt,
+              asOf: executionStartedAt,
+              executeBy: effect.executeBy,
             });
+            const recordedAt = this.#now().toISOString();
             return EffectExecutionReceiptSchema.parse({
               status: "succeeded",
               receiptRef: stableReceipt("calendar_create", effect.intentId, created.providerReference),
@@ -547,6 +568,40 @@ function personalCalendarProjectionDigest(
     .digest("hex")}`;
 }
 
+function mergeBusyWindows(
+  windows: readonly z.infer<typeof CalendarBusyWindowProjectionSchema>[],
+): z.infer<typeof CalendarBusyWindowProjectionSchema>[] {
+  const ordered = [...windows].sort(
+    (left, right) =>
+      Date.parse(left.startsAt) - Date.parse(right.startsAt) ||
+      Date.parse(left.endsAt) - Date.parse(right.endsAt),
+  );
+  const merged: z.infer<typeof CalendarBusyWindowProjectionSchema>[] = [];
+  for (const window of ordered) {
+    const previous = merged.at(-1);
+    if (previous === undefined || Date.parse(window.startsAt) > Date.parse(previous.endsAt)) {
+      merged.push({ ...window });
+      continue;
+    }
+    merged[merged.length - 1] = {
+      startsAt: previous.startsAt,
+      endsAt: Date.parse(window.endsAt) > Date.parse(previous.endsAt) ? window.endsAt : previous.endsAt,
+      allDay: previous.allDay || window.allDay,
+    };
+  }
+  return merged;
+}
+
+function windowsOverlappingHorizon(
+  windows: readonly z.infer<typeof CalendarBusyWindowProjectionSchema>[],
+  from: string,
+  to: string,
+): z.infer<typeof CalendarBusyWindowProjectionSchema>[] {
+  return windows.filter(
+    (window) => Date.parse(window.startsAt) < Date.parse(to) && Date.parse(window.endsAt) > Date.parse(from),
+  );
+}
+
 export interface CalendarScheduleProjectionPort {
   listPersonalCalendarBusyWindows(input: {
     householdId: string;
@@ -697,7 +752,9 @@ export class ScopedWorkerContext implements WorkerContextPort {
             title: episode.title,
             requiredOutcome: episode.requiredOutcome,
             scope: episode.scope,
+            artifact: episode.artifact,
           },
+          currentProjectArtifact: workerRecord.artifact,
           evidence: job.evidenceRefs.map((reference) => {
             const evidence = evidenceById.get(reference);
             if (evidence === undefined) throw new WorkerServiceError("invalid_context");
@@ -930,13 +987,27 @@ function createHouseholdScheduleTool(
   recordPersonalObservation: (observation: PersonalScheduleObservation) => void,
   markPersonalScheduleUnverifiable: () => void,
 ): WorkerTool {
-  const inputSchema = z.strictObject({
-    limit: z.number().int().min(1).max(50).default(25),
-    includeCompleted: z.boolean().default(false),
-  });
+  const inputSchema = z
+    .strictObject({
+      from: z.iso.datetime({ offset: true }),
+      to: z.iso.datetime({ offset: true }),
+      limit: z.number().int().min(1).max(50).default(25),
+      includeCompleted: z.boolean().default(false),
+    })
+    .superRefine((input, refinement) => {
+      const duration = Date.parse(input.to) - Date.parse(input.from);
+      if (duration <= 0 || duration > 366 * 24 * 60 * 60_000) {
+        refinement.addIssue({
+          code: "custom",
+          path: ["to"],
+          message: "The requested schedule horizon must be positive and at most 366 days.",
+        });
+      }
+    });
   return {
     name: "household_schedule",
-    description: "Read the authorized household schedule projection. This tool never writes.",
+    description:
+      "Read merged busy-time coverage for the exact requested planning horizon. Household results combine every consented adult without exposing adult identity or event details. This tool never writes.",
     inputSchema,
     requiredCapabilityIds: [HOUSEHOLD_SCHEDULE_CAPABILITY],
     async execute(rawInput, context) {
@@ -951,14 +1022,15 @@ function createHouseholdScheduleTool(
       const selected = visible.slice(0, input.limit);
       let calendarBusyWindows: z.infer<typeof CalendarBusyWindowProjectionSchema>[] = [];
       const asOf = now();
-      const calendarFrom = new Date(asOf.getTime() - 24 * 60 * 60_000).toISOString();
-      const calendarTo = new Date(asOf.getTime() + 180 * 24 * 60 * 60_000).toISOString();
+      const calendarFrom = input.from;
+      const calendarTo = input.to;
       let calendarCoverage: {
-        mode: "personal_owner" | "household_promotions_only";
+        mode: "personal_owner" | "household_all_adults";
         from: string;
         to: string;
         complete: boolean;
         synchronizedAt: string | null;
+        limitation?: string;
       };
       if (job.scopeGrant.visibility === "personal") {
         calendarCoverage = {
@@ -990,24 +1062,77 @@ function createHouseholdScheduleTool(
             ...observationInput,
             projectionDigest: personalCalendarProjectionDigest(projected),
           });
-          calendarBusyWindows = projected.windows;
+          calendarBusyWindows = windowsOverlappingHorizon(projected.windows, calendarFrom, calendarTo);
           calendarCoverage = {
             ...calendarCoverage,
             complete: projected.complete,
             synchronizedAt: projected.synchronizedAt,
+            ...(projected.complete
+              ? {}
+              : {
+                  limitation:
+                    "The selected personal Calendar coverage is unavailable, stale, or truncated for this horizon. Treat the schedule as partial and return needs_input rather than a complete plan.",
+                }),
           };
         } catch {
           markPersonalScheduleUnverifiable();
           throw new WorkerServiceError("context_unavailable");
         }
       } else {
-        // Household jobs see only separately promoted episode schedules above.
+        if (calendarSchedule === undefined) {
+          markPersonalScheduleUnverifiable();
+          throw new WorkerServiceError("context_unavailable");
+        }
+        const consentedAdultIds = new Set(snapshot.projection.onboarding.consentedAdultIds);
+        const relevantAdultIds = snapshot.aggregate.verifiedAdultIds.filter((adultId) =>
+          consentedAdultIds.has(adultId),
+        );
+        if (relevantAdultIds.length === 0) {
+          markPersonalScheduleUnverifiable();
+          throw new WorkerServiceError("invalid_context");
+        }
+        let complete = true;
+        const synchronizedAt: string[] = [];
+        try {
+          for (const adultId of relevantAdultIds) {
+            const observationInput = {
+              householdId: job.householdId,
+              adultId,
+              asOf: asOf.toISOString(),
+              from: calendarFrom,
+              to: calendarTo,
+              limit: 500,
+            } as const;
+            const projected = PersonalCalendarProjectionSchema.parse(
+              await calendarSchedule.listPersonalCalendarBusyWindows(observationInput),
+            );
+            recordPersonalObservation({
+              ...observationInput,
+              projectionDigest: personalCalendarProjectionDigest(projected),
+            });
+            calendarBusyWindows.push(
+              ...windowsOverlappingHorizon(projected.windows, calendarFrom, calendarTo),
+            );
+            complete &&= projected.complete;
+            if (projected.synchronizedAt !== null) synchronizedAt.push(projected.synchronizedAt);
+          }
+        } catch {
+          markPersonalScheduleUnverifiable();
+          throw new WorkerServiceError("context_unavailable");
+        }
+        calendarBusyWindows = mergeBusyWindows(calendarBusyWindows);
         calendarCoverage = {
-          mode: "household_promotions_only",
+          mode: "household_all_adults",
           from: calendarFrom,
           to: calendarTo,
-          complete: true,
-          synchronizedAt: null,
+          complete,
+          synchronizedAt: synchronizedAt.sort()[0] ?? null,
+          ...(complete
+            ? {}
+            : {
+                limitation:
+                  "One or more consented adults’ selected Calendar coverage is unavailable, stale, or truncated for this horizon. The merged availability is partial; return needs_input rather than a complete household meal plan.",
+              }),
         };
       }
       return JsonValueSchema.parse({

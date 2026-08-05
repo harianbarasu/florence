@@ -151,97 +151,14 @@ describe("operator HTTP interface", () => {
     await server.close();
   });
 
-  it("requires an exact bearer token before operator handlers or body parsing", async () => {
+  it("requires an exact bearer token before the operator status handler", async () => {
     services.operations.status = vi.fn(async () => ({ status: "ok" as const, checks: {} }));
-    services.operations.exportHousehold = vi.fn(async () => ({ private: "family export" }));
-    services.operations.deleteHousehold = vi.fn(async () => "accepted" as const);
+    const response = await server.inject({ method: "GET", url: "/operator/status" });
 
-    const requests = [
-      server.inject({ method: "GET", url: "/operator/status" }),
-      server.inject({
-        method: "POST",
-        url: "/operator/export",
-        headers: { "content-type": "application/json" },
-        payload: "{malformed-json",
-      }),
-      server.inject({
-        method: "POST",
-        url: "/operator/delete",
-        headers: {
-          authorization: "Bearer wrong-token",
-          "content-type": "application/json",
-        },
-        payload: { householdId: "household_family", confirmation: "household_family" },
-      }),
-    ];
-    const responses = await Promise.all(requests);
-
-    for (const response of responses) {
-      expect(response.statusCode).toBe(401);
-      expect(response.json()).toEqual({ error: "unauthorized" });
-      expect(response.headers["www-authenticate"]).toContain("Bearer");
-    }
+    expect(response.statusCode).toBe(401);
+    expect(response.json()).toEqual({ error: "unauthorized" });
+    expect(response.headers["www-authenticate"]).toContain("Bearer");
     expect(services.operations.status).not.toHaveBeenCalled();
-    expect(services.operations.exportHousehold).not.toHaveBeenCalled();
-    expect(services.operations.deleteHousehold).not.toHaveBeenCalled();
-  });
-
-  it("serves an authenticated no-store household export", async () => {
-    services.operations.exportHousehold = vi.fn(async () => ({
-      schemaVersion: 1,
-      household: { id: "household_family" },
-    }));
-
-    const response = await server.inject({
-      method: "POST",
-      url: "/operator/export",
-      headers: {
-        authorization: `Bearer ${OPERATOR_TOKEN}`,
-        "content-type": "application/json",
-      },
-      payload: { householdId: "household_family" },
-    });
-
-    expect(response.statusCode).toBe(200);
-    expect(response.headers["cache-control"]).toBe("no-store");
-    expect(response.headers["content-disposition"]).toBe(
-      'attachment; filename="florence-export-household_family.json"',
-    );
-    expect(response.json()).toEqual({
-      schemaVersion: 1,
-      household: { id: "household_family" },
-    });
-  });
-
-  it("requires matching confirmation and idempotency for deletion", async () => {
-    services.operations.deleteHousehold = vi.fn(async () => "accepted" as const);
-    const authorization = `Bearer ${OPERATOR_TOKEN}`;
-
-    const invalid = await server.inject({
-      method: "POST",
-      url: "/operator/delete",
-      headers: { authorization, "content-type": "application/json" },
-      payload: { householdId: "household_family", confirmation: "DELETE" },
-    });
-    expect(invalid.statusCode).toBe(400);
-    expect(services.operations.deleteHousehold).not.toHaveBeenCalled();
-
-    const accepted = await server.inject({
-      method: "POST",
-      url: "/operator/delete",
-      headers: {
-        authorization,
-        "content-type": "application/json",
-        "idempotency-key": "operator-delete-household-family-0001",
-      },
-      payload: { householdId: "household_family", confirmation: "household_family" },
-    });
-    expect(accepted.statusCode).toBe(202);
-    expect(accepted.body).toBe("");
-    expect(services.operations.deleteHousehold).toHaveBeenCalledWith({
-      householdId: "household_family",
-      idempotencyKey: "operator-delete-household-family-0001",
-    });
   });
 
   it("logs only fixed metadata, never query secrets or implementation errors", async () => {

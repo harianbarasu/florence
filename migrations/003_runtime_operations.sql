@@ -30,9 +30,9 @@ CREATE TABLE channel_suppressions (
   )
 );
 
-CREATE INDEX external_connections_active_email_idx
-  ON external_connections (provider, lower(email))
-  WHERE status = 'active' AND email IS NOT NULL;
+CREATE INDEX external_connections_active_email_digest_idx
+  ON external_connections (provider, email_digest)
+  WHERE status = 'active' AND email_digest IS NOT NULL;
 
 CREATE UNIQUE INDEX channel_bindings_one_household_group_idx
   ON channel_bindings (household_id)

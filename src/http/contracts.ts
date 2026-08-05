@@ -56,8 +56,6 @@ export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
 export type JsonObject = { [key: string]: JsonValue };
 
-export type OperatorDeleteResult = "accepted" | "already_deleted" | "not_found";
-
 export type CustomerExportConsumption =
   | { readonly status: "download"; readonly filename: string; readonly artifact: JsonObject }
   | { readonly status: "expired" | "invalid" | "consumed" | "unavailable" };
@@ -67,14 +65,9 @@ export interface CustomerExportHandoff {
   consumeExportToken(token: string): Promise<CustomerExportConsumption>;
 }
 
-/**
- * Export payloads must contain app-owned user data only; connector credentials,
- * OAuth tokens, encryption keys, and model traces are forbidden by contract.
- */
+/** Operational control-plane access is deliberately read-only. */
 export interface HouseholdOperations {
   status(): Promise<OperatorStatus>;
-  exportHousehold(input: { householdId: string }): Promise<JsonObject | null>;
-  deleteHousehold(input: { householdId: string; idempotencyKey: string }): Promise<OperatorDeleteResult>;
 }
 
 export interface FlorenceHttpServices {

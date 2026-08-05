@@ -509,6 +509,10 @@ function sanitizeCustomerExport(
     : { revisions: [], applications: [] };
   assertScopedRows(raw.connections, (row) => row.adult_id === requestedByAdultId);
   assertScopedRows(
+    raw.channels,
+    (row) => row.channel_type === "group" || row.adult_id === requestedByAdultId,
+  );
+  assertScopedRows(
     raw.sources,
     (row) => row.visibility === "household" || row.owner_adult_id === requestedByAdultId,
   );
@@ -683,21 +687,34 @@ function sanitizeJson(value: unknown, seen: WeakSet<object>, depth: number): Jso
 
 function forbiddenExportKey(key: string): boolean {
   const normalized = key.toLowerCase().replace(/[^a-z0-9]/gu, "");
-  return [
-    "accesstoken",
-    "refreshtoken",
-    "idtoken",
-    "apikey",
-    "authorization",
-    "credential",
-    "encrypted",
-    "modeltrace",
-    "password",
-    "privatekey",
-    "rawpayload",
-    "secret",
-    "token",
-  ].some((part) => normalized.includes(part));
+  return (
+    normalized.includes("accesstoken") ||
+    normalized.includes("refreshtoken") ||
+    normalized.includes("idtoken") ||
+    normalized.includes("apikey") ||
+    normalized.includes("authorization") ||
+    normalized.includes("clientsecret") ||
+    normalized.includes("cookie") ||
+    normalized.includes("credential") ||
+    normalized.includes("databaseurl") ||
+    normalized.includes("encryptedcontent") ||
+    normalized.startsWith("encrypted") ||
+    normalized.includes("encryptionkey") ||
+    normalized.includes("modeltrace") ||
+    normalized.includes("operatortoken") ||
+    normalized.includes("password") ||
+    normalized.includes("privatekey") ||
+    normalized.includes("providerreference") ||
+    normalized.includes("rawpayload") ||
+    normalized.includes("redisurl") ||
+    normalized.includes("signingkey") ||
+    normalized.includes("webhooksecret") ||
+    normalized.includes("secret") ||
+    normalized === "tokens" ||
+    normalized.endsWith("dsn") ||
+    normalized.endsWith("secret") ||
+    normalized.endsWith("token")
+  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

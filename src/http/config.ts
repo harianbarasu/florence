@@ -5,10 +5,10 @@ export const DEFAULT_HTTP_BODY_LIMIT_BYTES = 256 * 1_024;
 export const DEFAULT_LINQ_BODY_LIMIT_BYTES = 512 * 1_024;
 export const DEFAULT_GMAIL_PUSH_BODY_LIMIT_BYTES = 64 * 1_024;
 export const DEFAULT_CALENDAR_PUSH_BODY_LIMIT_BYTES = 4 * 1_024;
-export const DEFAULT_OPERATOR_BODY_LIMIT_BYTES = 16 * 1_024;
 
 const linqWebhookConfigSchema = z
   .object({
+    fromPhone: z.string().regex(/^\+[1-9]\d{1,14}$/u),
     webhookSecret: z.string().min(1),
     webhookToleranceMs: z
       .number()
@@ -62,6 +62,7 @@ export type FlorenceHttpConfigInput = z.input<typeof florenceHttpConfigSchema>;
 export interface FlorenceHttpEnvironmentConfig {
   FLORENCE_WEB_BASE_URL: string;
   FLORENCE_ADMIN_API_KEY: string;
+  LINQ_FROM_PHONE?: string;
   LINQ_WEBHOOK_SECRET?: string;
   GOOGLE_PUBSUB_VERIFICATION_TOKEN?: string;
   GOOGLE_PUBSUB_OIDC_AUDIENCE?: string;
@@ -74,9 +75,14 @@ export function parseFlorenceHttpConfig(input: FlorenceHttpConfigInput): Florenc
 }
 
 export function httpConfigFromFlorenceConfig(config: FlorenceHttpEnvironmentConfig): FlorenceHttpConfig {
-  const linqWebhook: Pick<LinqConfig, "webhookSecret" | "webhookToleranceMs" | "webhookVersion"> | null =
-    config.LINQ_WEBHOOK_SECRET
+  const linqWebhook:
+    | (Pick<LinqConfig, "webhookSecret" | "webhookToleranceMs" | "webhookVersion"> & {
+        fromPhone: string;
+      })
+    | null =
+    config.LINQ_WEBHOOK_SECRET && config.LINQ_FROM_PHONE
       ? {
+          fromPhone: config.LINQ_FROM_PHONE,
           webhookSecret: config.LINQ_WEBHOOK_SECRET,
           webhookToleranceMs: 5 * 60 * 1_000,
           webhookVersion: LINQ_WEBHOOK_VERSION,

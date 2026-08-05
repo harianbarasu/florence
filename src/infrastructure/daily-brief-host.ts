@@ -14,6 +14,7 @@ import {
 } from "../domain/index.js";
 import { privateReviewSummaryAad } from "../security/private-review.js";
 import type { SecretBox } from "../security/secret-box.js";
+import { startLeaseHeartbeat } from "./lease-heartbeat.js";
 
 const QueueErrorCodeSchema = z.string().regex(/^[a-z][a-z0-9_.-]{0,99}$/);
 const LocalDateSchema = z.iso.date();
@@ -127,6 +128,11 @@ export interface DailyBriefQueuePort {
     readonly limit: number;
     readonly leaseSeconds: number;
   }): Promise<readonly DailyBriefLease[]>;
+  renewLease(input: {
+    readonly rowId: string;
+    readonly leaseToken: string;
+    readonly leaseSeconds: number;
+  }): Promise<boolean>;
   complete(input: {
     readonly rowId: string;
     readonly leaseToken: string;
@@ -501,6 +507,29 @@ export class PostgresDailyBriefQueue implements DailyBriefQueuePort {
     );
   }
 
+  async renewLease(input: { rowId: string; leaseToken: string; leaseSeconds: number }): Promise<boolean> {
+    const parsed = z
+      .strictObject({
+        rowId: z.uuid(),
+        leaseToken: z.uuid(),
+        leaseSeconds: z.number().int().positive().max(86_400),
+      })
+      .parse(input);
+    const rows = await this.database<{ id: string }[]>`
+      update daily_brief_runs
+      set lease_expires_at = least(
+            now() + (${parsed.leaseSeconds} * interval '1 second'),
+            expires_at
+          ),
+          updated_at = now()
+      where id = ${parsed.rowId} and status = 'leased'
+        and lease_token = ${parsed.leaseToken} and lease_expires_at > now()
+        and expires_at > now()
+      returning id
+    `;
+    return rows.length === 1;
+  }
+
   async complete(input: { rowId: string; leaseToken: string; completedAt: string }): Promise<boolean> {
     const parsed = z
       .strictObject({
@@ -516,11 +545,12 @@ export class PostgresDailyBriefQueue implements DailyBriefQueuePort {
             lease_owner = null, lease_token = null, lease_expires_at = null,
             updated_at = now()
         where id = ${parsed.rowId} and status = 'leased' and lease_token = ${parsed.leaseToken}
+          and lease_expires_at > now() and expires_at > ${parsed.completedAt}
         returning id, kind
       `;
       if (rows[0]?.kind === "private_review") {
         await transaction`
-          update private_review_items set reviewed_at = ${parsed.completedAt}, updated_at = now()
+          delete from private_review_items
           where digest_run_id = ${parsed.rowId}
         `;
       }
@@ -573,6 +603,7 @@ export class PostgresDailyBriefQueue implements DailyBriefQueuePort {
             lease_owner = null,
             lease_token = null, lease_expires_at = null, updated_at = now()
         where id = ${parsed.rowId} and status = 'leased' and lease_token = ${parsed.leaseToken}
+          and lease_expires_at > now()
         returning status
       `;
       if (rows[0]?.status === "dead") {
@@ -858,30 +889,66 @@ export class DailyBriefHost implements ApplicationWorkerHost {
       await this.#recordFailure(lease, "daily_brief_window_expired", true, report);
       return;
     }
+    const heartbeat = await startLeaseHeartbeat({
+      leaseSeconds: this.#leaseSeconds,
+      upstreamSignal: signal,
+      renew: () =>
+        this.#queue.renewLease({
+          rowId: lease.rowId,
+          leaseToken: lease.leaseToken,
+          leaseSeconds: this.#leaseSeconds,
+        }),
+    });
+    if (!heartbeat.owned) {
+      await heartbeat.stop();
+      report.lostLease += 1;
+      return;
+    }
+    let processing:
+      | {
+          readonly ok: true;
+          readonly result: { readonly outcome: { readonly status: "processed" | "rejected" } };
+        }
+      | { readonly ok: false };
     try {
-      const result = await application.process(
-        lease.kind === "household"
-          ? {
-              kind: "daily_brief",
-              householdId: lease.householdId,
-              idempotencyKey: lease.idempotencyKey,
-              occurredAt: lease.scheduledFor,
-              reason: "scheduled",
-            }
-          : {
-              kind: "private_review_digest",
-              householdId: lease.householdId,
-              idempotencyKey: lease.idempotencyKey,
-              occurredAt: lease.scheduledFor,
-              localDate: lease.localDate,
-              adultId: lease.adultId,
-              items: lease.items,
-            },
-      );
-      if (result.outcome.status === "rejected") {
-        await this.#recordFailure(lease, "daily_brief_rejected", true, report);
-        return;
-      }
+      processing = {
+        ok: true,
+        result: await application.process(
+          lease.kind === "household"
+            ? {
+                kind: "daily_brief",
+                householdId: lease.householdId,
+                idempotencyKey: lease.idempotencyKey,
+                occurredAt: lease.scheduledFor,
+                reason: "scheduled",
+              }
+            : {
+                kind: "private_review_digest",
+                householdId: lease.householdId,
+                idempotencyKey: lease.idempotencyKey,
+                occurredAt: lease.scheduledFor,
+                localDate: lease.localDate,
+                adultId: lease.adultId,
+                items: lease.items,
+              },
+        ),
+      };
+    } catch {
+      processing = { ok: false };
+    }
+    if (!(await heartbeat.stop())) {
+      report.lostLease += 1;
+      return;
+    }
+    if (!processing.ok) {
+      await this.#recordFailure(lease, "daily_brief_processing_failure", false, report);
+      return;
+    }
+    if (processing.result.outcome.status === "rejected") {
+      await this.#recordFailure(lease, "daily_brief_rejected", true, report);
+      return;
+    }
+    try {
       const settled = await this.#queue.complete({
         rowId: lease.rowId,
         leaseToken: lease.leaseToken,
@@ -890,7 +957,7 @@ export class DailyBriefHost implements ApplicationWorkerHost {
       if (settled) report.succeeded += 1;
       else report.lostLease += 1;
     } catch {
-      await this.#recordFailure(lease, "daily_brief_processing_failure", false, report);
+      await this.#recordFailure(lease, "daily_brief_settlement_failure", false, report);
     }
   }
 

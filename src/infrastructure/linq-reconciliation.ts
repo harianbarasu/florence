@@ -16,6 +16,7 @@ const integrationDigestSchema = z.string().regex(/^sha256:[a-f0-9]{64}$/u);
 const ownerSchema = z.string().trim().min(1).max(200);
 const instantSchema = z.iso.datetime({ offset: true });
 const MAX_STALE_SWEEP_MS = 20 * 60_000;
+const REQUIRED_WEBHOOK_EVENTS = ["message.received", "reaction.added", "reaction.removed"] as const;
 
 export interface LinqReconciliationReader {
   listChatsPage(input?: {
@@ -128,6 +129,23 @@ export class PostgresLinqReconciliationStore {
     return rows.length === 1;
   }
 
+  /** Makes exact line/subscription validation visible without releasing the active sweep lease. */
+  public async recordConfigurationPreflight(lease: LinqReconciliationLease): Promise<boolean> {
+    if (lease.sweepStartedAt === null || lease.liveNotBeforeAt === null) {
+      throw new Error("Linq configuration preflight requires an initialized sweep");
+    }
+    const rows = await this.database<{ integration_digest: string }[]>`
+      update linq_reconciliation_state set
+        sweep_started_at = ${lease.sweepStartedAt}, live_not_before_at = ${lease.liveNotBeforeAt},
+        line_present = ${lease.linePresent}, line_reputation = ${lease.lineReputation},
+        subscription_status = ${lease.subscriptionStatus}, updated_at = now()
+      where integration_digest = ${this.#integrationDigest}
+        and status = 'leased' and lease_token = ${lease.leaseToken}
+      returning integration_digest
+    `;
+    return rows.length === 1;
+  }
+
   public async completeSweep(
     lease: LinqReconciliationLease,
     input: { coveredThroughAt: string; nextAvailableAt: string },
@@ -139,6 +157,8 @@ export class PostgresLinqReconciliationStore {
         status = 'pending', available_at = ${input.nextAvailableAt}, sweep_started_at = null,
         live_not_before_at = null, chat_page_loaded = false, chat_cursor = null,
         next_chat_cursor = null, remaining_chat_ids = '{}'::text[], message_cursor = null,
+        line_present = ${lease.linePresent}, line_reputation = ${lease.lineReputation},
+        subscription_status = ${lease.subscriptionStatus},
         attempt = 0, lease_owner = null, lease_token = null, lease_expires_at = null,
         last_full_sweep_at = ${input.coveredThroughAt}, last_error_code = null, updated_at = now()
       where integration_digest = ${this.#integrationDigest}
@@ -178,24 +198,32 @@ export class PostgresLinqReconciliationStore {
     `;
   }
 
-  public async isHealthy(asOf = new Date()): Promise<boolean> {
-    const rows = await this.database<
-      {
-        line_present: boolean | null;
-        subscription_status: SubscriptionStatus;
-        last_full_sweep_at: Date | null;
-      }[]
-    >`
-      select line_present, subscription_status, last_full_sweep_at
+  public async isHealthy(): Promise<boolean> {
+    const rows = await this.database<{ healthy: boolean }[]>`
+      select coalesce(
+        line_present = true
+          and line_reputation = 'HEALTHY'
+          and subscription_status = 'active'
+          and last_full_sweep_at >= now() - (${MAX_STALE_SWEEP_MS} * interval '1 millisecond'),
+        false
+      ) as healthy
       from linq_reconciliation_state where integration_digest = ${this.#integrationDigest}
     `;
-    const row = rows[0];
-    return Boolean(
-      row?.line_present === true &&
-        row.subscription_status === "active" &&
-        row.last_full_sweep_at !== null &&
-        asOf.getTime() - row.last_full_sweep_at.getTime() <= MAX_STALE_SWEEP_MS,
-    );
+    return rows[0]?.healthy === true;
+  }
+
+  /** Launch readiness depends on exact provider configuration, not exhaustive history recovery. */
+  public async isConfigurationReady(): Promise<boolean> {
+    const rows = await this.database<{ ready: boolean }[]>`
+      select coalesce(
+        line_present = true
+          and line_reputation = 'HEALTHY'
+          and subscription_status = 'active',
+        false
+      ) as ready
+      from linq_reconciliation_state where integration_digest = ${this.#integrationDigest}
+    `;
+    return rows[0]?.ready === true;
   }
 }
 
@@ -253,8 +281,10 @@ export class LinqReconciliationHost {
 
   public async run(signal: AbortSignal): Promise<void> {
     while (!signal.aborted) {
-      await this.runOnce(signal);
-      if (!signal.aborted) await sleep(this.#pollIntervalMs, undefined, { signal });
+      const outcome = await this.runOnce(signal);
+      if (!signal.aborted && outcome !== "progress") {
+        await sleep(this.#pollIntervalMs, undefined, { signal });
+      }
     }
   }
 
@@ -321,6 +351,9 @@ export class LinqReconciliationHost {
       this.options.expectedWebhookUrl,
       this.options.fromPhone,
     );
+    if (!(await this.options.store.recordConfigurationPreflight(lease))) {
+      throw new Error("Linq reconciliation lease was lost");
+    }
   }
 
   async #loadChatPage(lease: LinqReconciliationLease): Promise<void> {
@@ -417,12 +450,14 @@ export class LinqReconciliationHost {
   }
 }
 
-export function linqIntegrationDigest(fromPhone: string): string {
+export function linqIntegrationDigest(fromPhone: string, expectedWebhookUrl: string): string {
   const normalized = z
     .string()
     .regex(/^\+[1-9]\d{1,14}$/u)
     .parse(fromPhone);
-  return `sha256:${createHash("sha256").update(`linq-line\0${normalized}`).digest("hex")}`;
+  const webhookUrl = new URL(expectedWebhookUrl).toString();
+  const material = ["linq-line", normalized, webhookUrl, ...REQUIRED_WEBHOOK_EVENTS].join("\0");
+  return `sha256:${createHash("sha256").update(material).digest("hex")}`;
 }
 
 function leaseFromRow(row: ReconciliationRow): LinqReconciliationLease {
@@ -449,13 +484,20 @@ function subscriptionStatus(
   expectedUrl: string,
   fromPhone: string,
 ): SubscriptionStatus {
-  const exact = subscriptions.find((subscription) => subscription.targetUrl === expectedUrl);
-  if (exact === undefined) return subscriptions.length === 0 ? "missing" : "misconfigured";
-  if (!exact.isActive) return "inactive";
-  const receivesMessages = exact.subscribedEvents.includes("message.received");
-  const receivesLine =
-    exact.phoneNumbers === null || exact.phoneNumbers.length === 0 || exact.phoneNumbers.includes(fromPhone);
-  return receivesMessages && receivesLine ? "active" : "misconfigured";
+  const exactTargets = subscriptions.filter((subscription) => subscription.targetUrl === expectedUrl);
+  if (exactTargets.length === 0) return subscriptions.length === 0 ? "missing" : "misconfigured";
+  const isProperlyConfigured = (subscription: LinqWebhookSubscription): boolean => {
+    const scopedNumbers = subscription.phoneNumbers;
+    return (
+      subscription.isActive &&
+      scopedNumbers !== null &&
+      scopedNumbers.length === 1 &&
+      scopedNumbers[0] === fromPhone &&
+      REQUIRED_WEBHOOK_EVENTS.every((event) => subscription.subscribedEvents.includes(event))
+    );
+  };
+  if (exactTargets.some(isProperlyConfigured)) return "active";
+  return exactTargets.some((subscription) => subscription.isActive) ? "misconfigured" : "inactive";
 }
 
 class LinqCursorError extends Error {

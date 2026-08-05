@@ -41,7 +41,9 @@ export interface VerifiedLinqWebhook {
 export interface ParseLinqWebhookInput {
   rawBody: Uint8Array | string;
   headers: LinqWebhookHeaders;
-  config: Pick<LinqConfig, "webhookSecret" | "webhookToleranceMs" | "webhookVersion">;
+  config: Pick<LinqConfig, "webhookSecret" | "webhookToleranceMs" | "webhookVersion"> & {
+    fromPhone: string;
+  };
   now?: Date;
 }
 
@@ -107,7 +109,7 @@ export function parseVerifiedLinqWebhook(input: ParseLinqWebhookInput): LinqWebh
   let event: LinqInboundEvent | null;
   switch (envelope.event_type) {
     case "message.received":
-      event = parseMessageReceived(envelope);
+      event = parseMessageReceived(envelope, input.config.fromPhone);
       break;
     case "reaction.added":
     case "reaction.removed":
@@ -135,14 +137,27 @@ export function normalizeLinqConsentCommand(text: string): LinqConsentCommand {
   return null;
 }
 
-function parseMessageReceived(envelope: z.infer<typeof linqEnvelopeSchema>): LinqInboundEvent {
+function parseMessageReceived(
+  envelope: z.infer<typeof linqEnvelopeSchema>,
+  configuredFromPhone: string,
+): LinqInboundEvent {
   const data = envelope.data;
   const chat = asRecord(data.chat);
+  const owner = asRecord(chat.owner_handle);
   const sender = asRecord(data.sender_handle);
   const chatId = requiredString(chat.id, "data.chat.id");
   const isGroup = requiredBoolean(chat.is_group, "data.chat.is_group");
   const messageId = requiredString(data.id, "data.id");
   const senderHandle = requiredString(sender.handle, "data.sender_handle.handle");
+  const ownerHandle = requiredString(owner.handle, "data.chat.owner_handle.handle");
+  if (
+    ownerHandle !== configuredFromPhone ||
+    owner.is_me !== true ||
+    senderHandle === configuredFromPhone ||
+    sender.is_me !== false
+  ) {
+    throw new LinqWebhookPayloadError("message.received payload is not owned by the configured line");
+  }
   const direction = optionalString(data.direction);
   if (direction !== null && direction !== "inbound") {
     throw new LinqWebhookPayloadError("message.received payload is not inbound");
@@ -168,7 +183,6 @@ function parseMessageReceived(envelope: z.infer<typeof linqEnvelopeSchema>): Lin
   if (!text && attachments.length === 0) {
     throw new LinqWebhookPayloadError("message.received payload has no supported content");
   }
-  const ownerHandle = optionalString(asRecord(chat.owner_handle).handle);
   const knownParticipantHandles = uniqueStrings([ownerHandle, senderHandle]);
   const scope = isGroup ? "group" : "direct";
   const reply = asRecord(data.reply_to);

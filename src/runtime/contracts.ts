@@ -288,9 +288,27 @@ const HouseholdScheduleReceiptClaimsShape = {
   ...WorkerToolReceiptBaseClaimsShape,
   kind: z.literal("household_schedule"),
   timeZone: z.string().trim().min(1).max(100),
-  coverageMode: z.string().trim().min(1).max(100),
+  coverageMode: z.enum(["personal_owner", "household_all_adults"]),
+  coverageFrom: z.iso.datetime({ offset: true }),
+  coverageTo: z.iso.datetime({ offset: true }),
   coverageComplete: z.boolean(),
 };
+
+function validateHouseholdScheduleCoverage(
+  receipt: {
+    readonly coverageFrom: string;
+    readonly coverageTo: string;
+  },
+  context: z.RefinementCtx,
+): void {
+  if (Date.parse(receipt.coverageFrom) >= Date.parse(receipt.coverageTo)) {
+    context.addIssue({
+      code: "custom",
+      message: "Schedule coverage must have a positive horizon.",
+      path: ["coverageTo"],
+    });
+  }
+}
 
 export const ResearchSourceReceiptClaimsSchema = z
   .object(ResearchSourceReceiptClaimsShape)
@@ -302,7 +320,10 @@ export const ResearchSourceReceiptClaimsSchema = z
     }
   });
 
-export const HouseholdScheduleReceiptClaimsSchema = z.object(HouseholdScheduleReceiptClaimsShape).strict();
+export const HouseholdScheduleReceiptClaimsSchema = z
+  .object(HouseholdScheduleReceiptClaimsShape)
+  .strict()
+  .superRefine(validateHouseholdScheduleCoverage);
 
 export const WorkerToolReceiptClaimsSchema = z.union([
   ResearchSourceReceiptClaimsSchema,
@@ -328,7 +349,8 @@ const HouseholdScheduleReceiptSchema = z
     ...HouseholdScheduleReceiptClaimsShape,
     receiptId: ReceiptIdSchema,
   })
-  .strict();
+  .strict()
+  .superRefine(validateHouseholdScheduleCoverage);
 
 export const WorkerToolReceiptSchema = z
   .union([ResearchSourceReceiptSchema, HouseholdScheduleReceiptSchema])
@@ -377,6 +399,45 @@ export const ResearchArtifactSchema = z
 
 export type ResearchArtifact = z.infer<typeof ResearchArtifactSchema>;
 
+const ProjectPhaseSchema = z
+  .object({
+    name: z.string().trim().min(1).max(240),
+    outcome: BoundedResultTextSchema,
+    actions: z.array(BoundedResultTextSchema).min(1).max(50),
+  })
+  .strict();
+
+const ProjectDecisionSchema = z
+  .object({
+    decision: BoundedResultTextSchema,
+    recommendation: BoundedResultTextSchema,
+    rationale: BoundedResultTextSchema,
+  })
+  .strict();
+
+const ProjectRiskSchema = z
+  .object({
+    risk: BoundedResultTextSchema,
+    mitigation: BoundedResultTextSchema,
+  })
+  .strict();
+
+/** Durable, provider-neutral work product for one general family-project attempt. */
+export const ProjectArtifactSchema = z
+  .object({
+    asOf: z.iso.datetime({ offset: true }),
+    plan: BoundedResultTextSchema,
+    phases: z.array(ProjectPhaseSchema).min(1).max(20),
+    nextActions: z.array(BoundedResultTextSchema).min(1).max(50),
+    decisions: z.array(ProjectDecisionSchema).max(20),
+    risks: z.array(ProjectRiskSchema).max(20),
+    assumptions: z.array(BoundedResultTextSchema).max(20),
+    citationReceiptIds: ReceiptReferenceListSchema.optional(),
+  })
+  .strict();
+
+export type ProjectArtifact = z.infer<typeof ProjectArtifactSchema>;
+
 const MealPlanItemSchema = z
   .object({
     when: z.string().trim().min(1).max(240),
@@ -390,6 +451,8 @@ export const MealPlanArtifactSchema = z
   .object({
     asOf: z.iso.datetime({ offset: true }),
     horizon: z.string().trim().min(1).max(500),
+    horizonFrom: z.iso.datetime({ offset: true }),
+    horizonTo: z.iso.datetime({ offset: true }),
     scheduleReceiptId: ReceiptIdSchema,
     meals: z.array(MealPlanItemSchema).min(1).max(31),
     substitutions: z
@@ -419,6 +482,13 @@ export const MealPlanArtifactSchema = z
   })
   .strict()
   .superRefine((artifact, context) => {
+    if (Date.parse(artifact.horizonFrom) >= Date.parse(artifact.horizonTo)) {
+      context.addIssue({
+        code: "custom",
+        path: ["horizonTo"],
+        message: "The meal-plan horizon must be positive.",
+      });
+    }
     const mealSlots = artifact.meals.map((meal) => meal.when.toLocaleLowerCase());
     if (new Set(mealSlots).size !== mealSlots.length) {
       context.addIssue({ code: "custom", message: "Meal-plan slots must be unique." });
@@ -454,6 +524,16 @@ const MealPlanCompletionSchema = z.discriminatedUnion("status", [
     .strict(),
 ]);
 
+const ProjectCompletionSchema = z.discriminatedUnion("status", [
+  NeedsInputCompletionSchema,
+  z
+    .object({
+      status: z.literal("complete"),
+      artifact: ProjectArtifactSchema,
+    })
+    .strict(),
+]);
+
 const WorkerResultPayloadBaseShape = {
   summary: z.string().trim().min(1).max(20_000),
   warnings: z.array(z.string().trim().min(1).max(2_000)).max(50),
@@ -477,10 +557,19 @@ export const MealPlanWorkerResultPayloadSchema = z
   })
   .strict();
 
+export const ProjectWorkerResultPayloadSchema = z
+  .object({
+    ...WorkerResultPayloadBaseShape,
+    purpose: z.literal("family_project"),
+    completion: ProjectCompletionSchema,
+  })
+  .strict();
+
 /** The only model-authored result shapes. Runtime-issued receipts are deliberately absent. */
 export const WorkerResultPayloadSchema = z.discriminatedUnion("purpose", [
   ResearchWorkerResultPayloadSchema,
   MealPlanWorkerResultPayloadSchema,
+  ProjectWorkerResultPayloadSchema,
 ]);
 
 export type WorkerResultPayload = z.infer<typeof WorkerResultPayloadSchema>;
@@ -517,9 +606,12 @@ const ResearchWorkerResultSchema =
 const MealPlanWorkerResultSchema =
   MealPlanWorkerResultPayloadSchema.extend(WorkerResultIdentityShape).strict();
 
+const ProjectWorkerResultSchema = ProjectWorkerResultPayloadSchema.extend(WorkerResultIdentityShape).strict();
+
 export const WorkerResultSchema = z.discriminatedUnion("purpose", [
   ResearchWorkerResultSchema,
   MealPlanWorkerResultSchema,
+  ProjectWorkerResultSchema,
 ]);
 
 export type WorkerResult = z.infer<typeof WorkerResultSchema>;
@@ -599,12 +691,39 @@ export function verifyWorkerResultCompletion(
     return { status: "verified_complete", proofReceiptIds: citedIds };
   }
 
+  if (result.purpose === "family_project") {
+    const artifact = result.completion.artifact;
+    const citedIds = artifact.citationReceiptIds ?? [];
+    if (citedIds.length === 0 && result.toolReceipts.some((receipt) => receipt.kind === "research_sources")) {
+      return invalidVerification("project_research_receipts_uncited");
+    }
+    const citedReceipts = citedIds.map((receiptId) => receipts.get(receiptId));
+    if (
+      citedReceipts.some(
+        (receipt): receipt is undefined => receipt === undefined || receipt.kind !== "research_sources",
+      )
+    ) {
+      return invalidVerification("project_research_receipt_missing");
+    }
+    const researchReceipts = citedReceipts as Array<Extract<WorkerToolReceipt, { kind: "research_sources" }>>;
+    if (researchReceipts.some((receipt) => Date.parse(receipt.issuedAt) > Date.parse(artifact.asOf))) {
+      return invalidVerification("project_as_of_precedes_sources");
+    }
+    return { status: "verified_complete", proofReceiptIds: citedIds };
+  }
+
   const scheduleReceipt = receipts.get(result.completion.artifact.scheduleReceiptId);
   if (scheduleReceipt?.kind !== "household_schedule" || !scheduleReceipt.coverageComplete) {
     return invalidVerification("meal_schedule_receipt_missing_or_incomplete");
   }
   if (Date.parse(scheduleReceipt.issuedAt) > Date.parse(result.completion.artifact.asOf)) {
     return invalidVerification("meal_as_of_precedes_schedule");
+  }
+  if (
+    Date.parse(result.completion.artifact.horizonFrom) < Date.parse(scheduleReceipt.coverageFrom) ||
+    Date.parse(result.completion.artifact.horizonTo) > Date.parse(scheduleReceipt.coverageTo)
+  ) {
+    return invalidVerification("meal_horizon_outside_schedule_coverage");
   }
   const groceryItems = new Set(
     result.completion.artifact.groceryGroups.flatMap((group) =>

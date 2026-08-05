@@ -18,8 +18,14 @@ CREATE TABLE personal_attention_rule_revisions (
   revision integer NOT NULL CHECK (revision > 0),
   supersedes_revision_id uuid REFERENCES personal_attention_rule_revisions(id),
   status text NOT NULL CHECK (status IN ('active', 'revoked')),
-  rule jsonb NOT NULL CHECK (jsonb_typeof(rule) = 'object'),
-  statement text NOT NULL,
+  rule_digest text NOT NULL CONSTRAINT personal_attention_rule_revisions_rule_digest_check
+    CHECK (rule_digest ~ '^sha256:[a-f0-9]{64}$'),
+  statement_digest text NOT NULL CONSTRAINT personal_attention_rule_revisions_statement_digest_check
+    CHECK (statement_digest ~ '^sha256:[a-f0-9]{64}$'),
+  rule_key_id text NOT NULL,
+  rule_ciphertext text NOT NULL,
+  statement_key_id text NOT NULL,
+  statement_ciphertext text NOT NULL,
   sensitivity text NOT NULL DEFAULT 'ordinary' CHECK (sensitivity = 'ordinary'),
   source_message_ref text NOT NULL,
   source_event_id text NOT NULL,
@@ -29,7 +35,11 @@ CREATE TABLE personal_attention_rule_revisions (
   created_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE (household_id, adult_id, rule_key, revision),
   UNIQUE (household_id, adult_id, source_event_id),
-  CHECK ((revision = 1) = (supersedes_revision_id IS NULL))
+  CHECK ((revision = 1) = (supersedes_revision_id IS NULL)),
+  CONSTRAINT personal_attention_rule_revisions_ciphertext_check CHECK (
+    rule_key_id <> '' AND rule_ciphertext <> ''
+    AND statement_key_id <> '' AND statement_ciphertext <> ''
+  )
 );
 
 CREATE INDEX personal_attention_rule_revisions_active_idx
@@ -37,6 +47,12 @@ CREATE INDEX personal_attention_rule_revisions_active_idx
 
 CREATE INDEX personal_attention_rule_revisions_time_idx
   ON personal_attention_rule_revisions (household_id, adult_id, occurred_at, revision);
+
+CREATE INDEX personal_attention_rule_revisions_rule_key_idx
+  ON personal_attention_rule_revisions (rule_key_id);
+
+CREATE INDEX personal_attention_rule_revisions_statement_key_idx
+  ON personal_attention_rule_revisions (statement_key_id);
 
 CREATE TABLE personal_attention_applications (
   id uuid PRIMARY KEY,

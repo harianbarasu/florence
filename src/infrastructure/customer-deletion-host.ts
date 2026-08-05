@@ -9,6 +9,7 @@ import type {
   PostgresCustomerDataControlStore,
 } from "./customer-data-control-store.js";
 import { googleConnectionCredentialsAad } from "./google-sync.js";
+import { startLeaseHeartbeat } from "./lease-heartbeat.js";
 
 export interface CustomerDeletionGmailPort {
   stopWatch(accessToken: string): Promise<void>;
@@ -201,8 +202,8 @@ export class CustomerDeletionHost {
     });
     report.claimed = leases.length;
     for (const lease of leases) {
-      const completedAt = this.#instantNow();
       if (lease.kind === "local.finalize") {
+        const completedAt = this.#instantNow();
         try {
           const finalized = await this.options.store.finalizeDeletion({
             rowId: lease.rowId,
@@ -223,12 +224,32 @@ export class CustomerDeletionHost {
         }
         continue;
       }
+      const heartbeat = await startLeaseHeartbeat({
+        leaseSeconds: this.#leaseSeconds,
+        ...(signal === undefined ? {} : { upstreamSignal: signal }),
+        renew: () =>
+          this.options.store.renewCleanupStepLease({
+            rowId: lease.rowId,
+            leaseToken: lease.leaseToken,
+            leaseSeconds: this.#leaseSeconds,
+          }),
+      });
+      if (!heartbeat.owned) {
+        await heartbeat.stop();
+        report.lostLease += 1;
+        continue;
+      }
       let outcome: Awaited<ReturnType<CustomerDeletionRemoteCleanup["execute"]>>;
       try {
-        outcome = await this.options.remote.execute(lease, signal);
+        outcome = await this.options.remote.execute(lease, heartbeat.signal);
       } catch {
         outcome = { status: "retry", safeErrorCode: "remote_cleanup_unavailable" };
       }
+      if (!(await heartbeat.stop())) {
+        report.lostLease += 1;
+        continue;
+      }
+      const completedAt = this.#instantNow();
       if (outcome.status === "succeeded") {
         const settled = await this.options.store.completeCleanupStep({
           rowId: lease.rowId,

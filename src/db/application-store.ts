@@ -17,10 +17,28 @@ import type {
   ApplicationCommitResult,
   ApplicationRepositoryPort,
 } from "../application/ports.js";
-import { DomainChangeSchema, HouseholdAggregateSchema, HouseholdSignalSchema } from "../domain/index.js";
+import {
+  DomainChangeSchema,
+  type HouseholdAggregate,
+  HouseholdAggregateSchema,
+  HouseholdSignalSchema,
+} from "../domain/index.js";
 import type { BlindIndex } from "../security/blind-index.js";
+import { calendarBusyWindowCandidateBuckets } from "../security/calendar-busy-window-privacy.js";
 import { canonicalJson, payloadDigest } from "../security/canonical-json.js";
+import {
+  adultIdentityDetailsContext,
+  adultIdentityDetailsSchema,
+  canonicalGoogleAccountAlias,
+  googleAccountAliasKey,
+  googleAccountAliasSchema,
+  googleConnectionDetailsContext,
+  googleConnectionDetailsSchema,
+  normalizedEmail,
+  REVOKED_GOOGLE_ACCOUNT_LABEL,
+} from "../security/durable-identity-privacy.js";
 import { privateReviewSummaryAad } from "../security/private-review.js";
+import { isRawGoogleSource, rawGoogleSourceRetentionUntil } from "../security/raw-google-source-retention.js";
 import type { SecretBox } from "../security/secret-box.js";
 import type {
   EncryptionContext,
@@ -71,6 +89,7 @@ export class ApplicationStoreError extends Error {
       | "not_found"
       | "not_authorized"
       | "external_account_in_use"
+      | "external_account_alias_in_use"
       | "stale_projection_version"
       | "outbox_idempotency_conflict"
       | "invalid_state",
@@ -334,7 +353,6 @@ export type SourceItemRecord = {
   externalId: string;
   kind: string;
   occurredAt: string;
-  subject: string | null;
   contentHash: string;
   encryptedContent: string | null;
   metadata: Record<string, unknown>;
@@ -466,8 +484,6 @@ const providerInboxBodySchema = z.strictObject({
 
 const applicationCommitBodySchema = z.strictObject({
   idempotencyKey: z.string().min(1).max(512),
-  signals: z.array(HouseholdSignalSchema).max(1000),
-  changes: z.array(DomainChangeSchema).max(5000),
   outcome: ApplicationOutcomeSchema,
 });
 
@@ -522,7 +538,7 @@ const connectionSchema = z.strictObject({
   householdId: z.uuid(),
   adultId: z.uuid(),
   provider: z.literal("google"),
-  label: z.string().trim().min(1).max(200),
+  label: googleAccountAliasSchema,
   externalAccountId: z.string().min(1).max(500),
   email: z.email().optional(),
   encryptedCredentials: z.string().min(1),
@@ -543,7 +559,6 @@ const sourceItemSchema = z
     externalId: z.string().min(1).max(1000),
     kind: z.string().min(1).max(200),
     occurredAt: instantSchema,
-    subject: z.string().max(2000).optional(),
     contentHash: z.string().min(1).max(200),
     encryptedContent: z.string().min(1).optional(),
     metadata: jsonObjectSchema.default({}),
@@ -656,6 +671,27 @@ export class ApplicationStore implements ApplicationRepositoryPort {
     private readonly sensitiveJson: TenantJsonCipher,
     private readonly blindIndex: BlindIndex,
   ) {}
+
+  /** Returns keyed coarse candidates; exact calendar time never enters a query predicate. */
+  public calendarBusyWindowCandidateBuckets(input: {
+    householdId: string;
+    startsAt: string;
+    endsAt: string;
+  }): string[] {
+    const parsed = z
+      .strictObject({ householdId: z.uuid(), startsAt: instantSchema, endsAt: instantSchema })
+      .parse(input);
+    return calendarBusyWindowCandidateBuckets(
+      this.blindIndex,
+      parsed.householdId,
+      parsed.startsAt,
+      parsed.endsAt,
+    );
+  }
+
+  public googleConnectionEmailDigest(email: string): string {
+    return this.blindIndex.digest("google-connection-email", normalizedEmail(email));
+  }
 
   public async initializeApplicationSnapshot(input: {
     schemaVersion?: number;
@@ -859,21 +895,24 @@ export class ApplicationStore implements ApplicationRepositoryPort {
       // Keep the identity directory in the same transaction so invitations, exports, and operator
       // views never continue showing onboarding placeholders after a successful naming turn.
       for (const adult of parsed.projection.onboarding.adultNames) {
+        const details = this.sensitiveJson.seal(
+          adultIdentityDetailsSchema.parse({ displayName: adult.displayName }),
+          adultIdentityDetailsContext({ householdId: parsed.householdId, adultId: adult.adultId }),
+        );
         await transaction`
-          update adults
-          set display_name = ${adult.displayName}, updated_at = now()
-          where id = ${adult.adultId}
+          update adult_identity_details details
+          set details_key_id = ${details.keyId}, details_ciphertext = ${details.ciphertext}, updated_at = now()
+          where details.household_id = ${parsed.householdId} and details.adult_id = ${adult.adultId}
             and exists (
               select 1 from household_memberships membership
-              where membership.household_id = ${parsed.householdId}
-                and membership.adult_id = adults.id
+              where membership.household_id = details.household_id and membership.adult_id = details.adult_id
                 and membership.status in ('invited', 'active')
             )
         `;
       }
 
       for (const intent of parsed.outbox) {
-        await insertOutboxIntent(transaction, this.database, parsed.householdId, {
+        await insertOutboxIntent(transaction, this.sensitiveJson, parsed.householdId, {
           intentKey: intent.intentId,
           effectKind: intent.kind,
           idempotencyKey: intent.idempotencyKey,
@@ -951,8 +990,6 @@ export class ApplicationStore implements ApplicationRepositoryPort {
       const sealedCommit = this.sensitiveJson.seal(
         {
           idempotencyKey: parsed.idempotencyKey,
-          signals: parsed.signals,
-          changes: parsed.changes,
           outcome: parsed.outcome,
         },
         encryptedJsonContext("household", parsed.householdId, "application_commits", commitId, "body"),
@@ -968,7 +1005,13 @@ export class ApplicationStore implements ApplicationRepositoryPort {
       `;
       await transaction`
         update households
-        set next_audit_sequence = ${auditSequence}, updated_at = now()
+        set next_audit_sequence = ${auditSequence},
+          status = case
+            when ${parsed.projection.onboarding.phase} = 'active' and status = 'onboarding'
+              then 'active'
+            else status
+          end,
+          updated_at = now()
         where id = ${parsed.householdId}
       `;
       return { disposition: "committed" as const, revision, outcome: parsed.outcome };
@@ -1043,21 +1086,18 @@ export class ApplicationStore implements ApplicationRepositoryPort {
       await transaction`
         update provider_inbox
         set status = 'quarantined', quarantine_reason = 'idempotency_hash_conflict',
-            lease_owner = null, lease_token = null, lease_expires_at = null, updated_at = now()
+            lease_owner = null, lease_token = null, lease_expires_at = null,
+            body_key_id = null, body_ciphertext = null, updated_at = now()
         where id = ${existing.id}
       `;
       const conflictId = randomUUID();
-      const sealedConflict = this.sensitiveJson.seal(
-        { payload: input.payload },
-        encryptedJsonContext("provider_ingress", tenantId, "provider_inbox_conflicts", conflictId, "body"),
-      );
       await transaction`
         insert into provider_inbox_conflicts (
           id, inbox_id, content_digest, encryption_tenant_kind, encryption_tenant_id,
           body_key_id, body_ciphertext
         ) values (
           ${conflictId}, ${existing.id}, ${contentDigest}, 'provider_ingress', ${tenantId},
-          ${sealedConflict.keyId}, ${sealedConflict.ciphertext}
+          null, null
         )
         on conflict (inbox_id, content_digest) do nothing
       `;
@@ -1081,7 +1121,8 @@ export class ApplicationStore implements ApplicationRepositoryPort {
         )
         update provider_inbox
         set status = 'dead', lease_owner = null, lease_token = null,
-          lease_expires_at = null, last_error_code = 'lease_expired_after_max_attempts',
+          lease_expires_at = null, body_key_id = null, body_ciphertext = null,
+          last_error_code = 'lease_expired_after_max_attempts',
           updated_at = now()
         from exhausted where provider_inbox.id = exhausted.id
       `;
@@ -1131,6 +1172,29 @@ export class ApplicationStore implements ApplicationRepositoryPort {
     });
   }
 
+  public async renewProviderInboxLease(input: {
+    inboxId: string;
+    leaseToken: string;
+    leaseSeconds: number;
+  }): Promise<boolean> {
+    const parsed = z
+      .strictObject({
+        inboxId: z.uuid(),
+        leaseToken: z.uuid(),
+        leaseSeconds: z.number().int().positive().max(86_400),
+      })
+      .parse(input);
+    const rows = await this.database<{ id: string }[]>`
+      update provider_inbox
+      set lease_expires_at = now() + (${parsed.leaseSeconds} * interval '1 second'),
+          updated_at = now()
+      where id = ${parsed.inboxId} and status = 'leased'
+        and lease_token = ${parsed.leaseToken} and lease_expires_at > now()
+      returning id
+    `;
+    return rows.length === 1;
+  }
+
   public async resolveProviderInbox(input: {
     inboxId: string;
     leaseToken: string;
@@ -1152,25 +1216,19 @@ export class ApplicationStore implements ApplicationRepositoryPort {
           lease_expires_at
         from provider_inbox
         where id = ${parsed.inboxId} and status = 'leased' and lease_token = ${parsed.leaseToken}
+          and lease_expires_at > now()
         for update
       `;
       const row = rows[0];
       if (!row) return false;
-      const body = openProviderInboxBody(row, this.sensitiveJson);
-      const tenantKind = parsed.householdId ? "household" : row.encryption_tenant_kind;
-      const tenantId = parsed.householdId ?? row.encryption_tenant_id;
-      const sealed = this.sensitiveJson.seal(
-        { ...body, resolution: parsed.resolution },
-        encryptedJsonContext(tenantKind, tenantId, "provider_inbox", parsed.inboxId, "body"),
-      );
       const updated = await transaction<{ id: string }[]>`
         update provider_inbox
         set status = 'resolved', household_id = ${parsed.householdId ?? null},
-          encryption_tenant_kind = ${tenantKind}, encryption_tenant_id = ${tenantId},
-          body_key_id = ${sealed.keyId}, body_ciphertext = ${sealed.ciphertext},
+          body_key_id = null, body_ciphertext = null,
           resolved_at = now(), lease_owner = null, lease_token = null,
           lease_expires_at = null, updated_at = now()
         where id = ${parsed.inboxId} and status = 'leased' and lease_token = ${parsed.leaseToken}
+          and lease_expires_at > now()
         returning id
       `;
       return updated.length === 1;
@@ -1199,8 +1257,11 @@ export class ApplicationStore implements ApplicationRepositoryPort {
           available_at = now() + (${parsed.retryAfterSeconds} * interval '1 second'),
           lease_owner = null, lease_token = null, lease_expires_at = null,
           last_error_code = ${parsed.errorCode}, last_error_detail = ${parsed.safeDetail ?? null},
+          body_key_id = case when attempt >= max_attempts then null else body_key_id end,
+          body_ciphertext = case when attempt >= max_attempts then null else body_ciphertext end,
           updated_at = now()
       where id = ${parsed.inboxId} and status = 'leased' and lease_token = ${parsed.leaseToken}
+        and lease_expires_at > now()
       returning status
     `;
     return rows[0]?.status ?? "lost_lease";
@@ -1226,15 +1287,20 @@ export class ApplicationStore implements ApplicationRepositoryPort {
         insert into households (id, name, timezone, status, version)
         values (${householdId}, ${input.householdName}, ${input.timeZone}, 'onboarding', 0)
       `;
-      await transaction`
-        insert into adults (id, display_name, timezone)
-        values (${adultId}, ${input.adultDisplayName}, ${input.timeZone})
-      `;
+      await transaction`insert into adults (id, timezone) values (${adultId}, ${input.timeZone})`;
       await transaction`
         insert into household_memberships (household_id, adult_id, role, status, consented_at)
         values (
           ${householdId}, ${adultId}, 'owner', ${membershipStatus}, ${consentedAt}
         )
+      `;
+      const adultDetails = this.sensitiveJson.seal(
+        adultIdentityDetailsSchema.parse({ displayName: input.adultDisplayName }),
+        adultIdentityDetailsContext({ householdId, adultId }),
+      );
+      await transaction`
+        insert into adult_identity_details (household_id, adult_id, details_key_id, details_ciphertext)
+        values (${householdId}, ${adultId}, ${adultDetails.keyId}, ${adultDetails.ciphertext})
       `;
       await transaction`
         insert into household_projections (
@@ -1298,10 +1364,7 @@ export class ApplicationStore implements ApplicationRepositoryPort {
       if (!households[0]) {
         throw new ApplicationStoreError("not_found", "Unknown household");
       }
-      await transaction`
-        insert into adults (id, display_name, timezone)
-        values (${adultId}, ${parsed.displayName}, ${parsed.timeZone ?? null})
-      `;
+      await transaction`insert into adults (id, timezone) values (${adultId}, ${parsed.timeZone ?? null})`;
       await transaction`
         insert into household_memberships (
           household_id, adult_id, role, status, consented_at
@@ -1309,6 +1372,14 @@ export class ApplicationStore implements ApplicationRepositoryPort {
           ${parsed.householdId}, ${adultId}, ${parsed.role}, ${parsed.status},
           ${parsed.consentedAt ?? null}
         )
+      `;
+      const adultDetails = this.sensitiveJson.seal(
+        adultIdentityDetailsSchema.parse({ displayName: parsed.displayName }),
+        adultIdentityDetailsContext({ householdId: parsed.householdId, adultId }),
+      );
+      await transaction`
+        insert into adult_identity_details (household_id, adult_id, details_key_id, details_ciphertext)
+        values (${parsed.householdId}, ${adultId}, ${adultDetails.keyId}, ${adultDetails.ciphertext})
       `;
     });
     return { adultId };
@@ -1606,18 +1677,19 @@ export class ApplicationStore implements ApplicationRepositoryPort {
         await transaction`
           update scheduled_triggers
           set status = 'superseded', lease_owner = null, lease_token = null,
-              lease_expires_at = null, updated_at = now()
+              lease_expires_at = null, due_at = null, payload_key_id = null, payload_ciphertext = null,
+              updated_at = now()
           where household_id = ${parsed.householdId}
             and timer_key = any(${parsed.cancelTimerKeys})
             and status in ('scheduled', 'claimed')
         `;
       }
       for (const timer of parsed.timers) {
-        await upsertTimerIntent(transaction, this.database, parsed.householdId, timer);
+        await upsertTimerIntent(transaction, this.sensitiveJson, parsed.householdId, timer);
       }
 
       for (const effect of parsed.outbox) {
-        await insertOutboxIntent(transaction, this.database, parsed.householdId, effect);
+        await insertOutboxIntent(transaction, this.sensitiveJson, parsed.householdId, effect);
       }
 
       let auditSequence = Number(current.next_audit_sequence);
@@ -1652,7 +1724,7 @@ export class ApplicationStore implements ApplicationRepositoryPort {
     return this.database.begin(async (transaction) => {
       await requireWritableHousehold(transaction, parsed.householdId);
       return {
-        rowId: await upsertTimerIntent(transaction, this.database, parsed.householdId, parsed),
+        rowId: await upsertTimerIntent(transaction, this.sensitiveJson, parsed.householdId, parsed),
       };
     });
   }
@@ -1673,7 +1745,8 @@ export class ApplicationStore implements ApplicationRepositoryPort {
         await transaction`
           update scheduled_triggers
           set status = 'cancelled', lease_owner = null, lease_token = null,
-            lease_expires_at = null, updated_at = now()
+            lease_expires_at = null, due_at = null, payload_key_id = null, payload_ciphertext = null,
+            updated_at = now()
           where id = ${timer.id}
         `;
       }
@@ -1767,16 +1840,36 @@ export class ApplicationStore implements ApplicationRepositoryPort {
       : null;
   }
 
+  public async purgeExpiredOAuthStates(asOf: string): Promise<number> {
+    const parsed = instantSchema.parse(asOf);
+    const rows = await this.database<{ id: string }[]>`
+      delete from oauth_states where expires_at <= ${parsed} returning id
+    `;
+    return rows.length;
+  }
+
   public async upsertExternalConnection(
     rawInput: z.input<typeof connectionSchema>,
   ): Promise<{ connectionId: string; hadPriorGmailState: boolean }> {
     const input = connectionSchema.parse(rawInput);
     const requestedId = input.id ?? randomUUID();
+    const accountLabel = canonicalGoogleAccountAlias(input.label);
+    const accountAliasKey = googleAccountAliasKey(accountLabel);
+    const metadata = { ...input.metadata };
+    delete metadata.accountLabel;
     try {
       return await this.database.begin(async (transaction) => {
         await transaction`
           select pg_advisory_xact_lock(
             hashtextextended(${`external-connection:${input.provider}:${input.externalAccountId}`}, 0)
+          )
+        `;
+        await transaction`
+          select pg_advisory_xact_lock(
+            hashtextextended(
+              ${`external-connection-alias:${input.householdId}:${input.adultId}:${accountAliasKey}`},
+              0
+            )
           )
         `;
         const memberships = await transaction<{ adult_id: string }[]>`
@@ -1802,6 +1895,35 @@ export class ApplicationStore implements ApplicationRepositoryPort {
           for update
         `;
         const existing = existingRows[0];
+        const aliasRows = await transaction<
+          { id: string; details_key_id: string; details_ciphertext: string }[]
+        >`
+          select id, details_key_id, details_ciphertext
+          from external_connections
+          where household_id = ${input.householdId} and adult_id = ${input.adultId}
+            and provider = ${input.provider} and status <> 'revoked'
+          order by id
+        `;
+        const aliasInUse = aliasRows.some((row) => {
+          if (row.id === existing?.id) return false;
+          const details = googleConnectionDetailsSchema.parse(
+            this.sensitiveJson.open(
+              { keyId: row.details_key_id, ciphertext: row.details_ciphertext },
+              googleConnectionDetailsContext({
+                householdId: input.householdId,
+                adultId: input.adultId,
+                connectionId: row.id,
+              }),
+            ),
+          );
+          return googleAccountAliasKey(details.accountLabel) === accountAliasKey;
+        });
+        if (aliasInUse) {
+          throw new ApplicationStoreError(
+            "external_account_alias_in_use",
+            "Google account alias is already in use by this adult",
+          );
+        }
         const liveOwners = await transaction<{ household_id: string; adult_id: string }[]>`
           select household_id, adult_id from external_connections
           where provider = ${input.provider} and external_account_id = ${input.externalAccountId}
@@ -1818,19 +1940,37 @@ export class ApplicationStore implements ApplicationRepositoryPort {
             "Google account is already connected to another adult",
           );
         }
+        const details = this.sensitiveJson.seal(
+          googleConnectionDetailsSchema.parse({
+            label: input.label,
+            accountLabel,
+            email: input.email === undefined ? null : normalizedEmail(input.email),
+          }),
+          googleConnectionDetailsContext({
+            householdId: input.householdId,
+            adultId: input.adultId,
+            connectionId: existing?.id ?? requestedId,
+          }),
+        );
+        const emailDigest =
+          input.email === undefined
+            ? null
+            : this.blindIndex.digest("google-connection-email", normalizedEmail(input.email));
         const rows = await transaction<{ id: string }[]>`
           insert into external_connections (
-            id, household_id, adult_id, provider, label, external_account_id, email,
+            id, household_id, adult_id, provider, external_account_id, email_digest,
+            details_key_id, details_ciphertext,
             encrypted_credentials, granted_scopes, status, cursor, metadata, last_synced_at
           ) values (
             ${requestedId}, ${input.householdId}, ${input.adultId}, ${input.provider},
-            ${input.label}, ${input.externalAccountId}, ${input.email ?? null},
+            ${input.externalAccountId}, ${emailDigest}, ${details.keyId}, ${details.ciphertext},
             ${input.encryptedCredentials}, ${input.grantedScopes}, 'active',
-            ${json(this.database, input.cursor)}, ${json(this.database, input.metadata)},
+            ${json(this.database, input.cursor)}, ${json(this.database, metadata)},
             ${input.lastSyncedAt ?? null}
           )
           on conflict (household_id, adult_id, provider, external_account_id)
-          do update set label = excluded.label, email = excluded.email,
+          do update set email_digest = excluded.email_digest,
+            details_key_id = excluded.details_key_id, details_ciphertext = excluded.details_ciphertext,
             encrypted_credentials = excluded.encrypted_credentials,
             granted_scopes = excluded.granted_scopes, status = 'active',
             cursor = case when external_connections.status = 'revoked'
@@ -1875,13 +2015,14 @@ export class ApplicationStore implements ApplicationRepositoryPort {
       .parse(input);
     await this.assertActiveMember(parsed.householdId, parsed.adultId);
     const rows = await this.database<ExternalConnectionRow[]>`
-      select id, household_id, adult_id, provider, label, external_account_id, email,
-        encrypted_credentials, granted_scopes, status, cursor, metadata, last_synced_at
+        select id, household_id, adult_id, provider, external_account_id, email_digest,
+          details_key_id, details_ciphertext,
+          encrypted_credentials, granted_scopes, status, cursor, metadata, last_synced_at
       from external_connections
       where id = ${parsed.connectionId} and household_id = ${parsed.householdId}
         and adult_id = ${parsed.adultId}
     `;
-    return rows[0] ? mapExternalConnection(rows[0]) : null;
+    return rows[0] ? mapExternalConnection(rows[0], this.sensitiveJson) : null;
   }
 
   public async revokeExternalConnection(input: {
@@ -1897,7 +2038,9 @@ export class ApplicationStore implements ApplicationRepositoryPort {
       const rows = await transaction<{ id: string }[]>`
         update external_connections
         set status = 'revoked', encrypted_credentials = null, granted_scopes = '{}',
-            cursor = '{}'::jsonb, updated_at = now()
+            email_digest = null, details_key_id = null, details_ciphertext = null,
+            cursor = '{}'::jsonb, metadata = '{}'::jsonb,
+            updated_at = now()
         where id = ${parsed.connectionId} and household_id = ${parsed.householdId}
           and adult_id = ${parsed.adultId} and status <> 'revoked'
         returning id
@@ -1933,6 +2076,9 @@ export class ApplicationStore implements ApplicationRepositoryPort {
     createdByApprovedActionId?: string | null;
   }> {
     const input = sourceItemSchema.parse(rawInput);
+    const retentionUntil = isRawGoogleSource(input.provider, input.encryptedContent)
+      ? rawGoogleSourceRetentionUntil(input.retentionUntil)
+      : (input.retentionUntil ?? null);
     if (input.ownerAdultId) {
       await this.assertActiveMember(input.householdId, input.ownerAdultId);
     }
@@ -1985,14 +2131,14 @@ export class ApplicationStore implements ApplicationRepositoryPort {
         await transaction`
           insert into source_items (
             id, household_id, connection_id, owner_adult_id, visibility, provider,
-            external_id, kind, occurred_at, subject, content_hash, encrypted_content,
+            external_id, kind, occurred_at, content_hash, encrypted_content,
             metadata, retention_until, revision
           ) values (
             ${sourceItemId}, ${input.householdId}, ${input.connectionId ?? null},
             ${input.ownerAdultId ?? null}, ${input.visibility}, ${input.provider},
-            ${input.externalId}, ${input.kind}, ${input.occurredAt}, ${input.subject ?? null},
-            ${input.contentHash}, ${input.encryptedContent ?? null},
-            ${json(this.database, persistedMetadata)}, ${input.retentionUntil ?? null}, 1
+            ${input.externalId}, ${input.kind}, ${input.occurredAt}, ${input.contentHash},
+            ${input.encryptedContent ?? null},
+            ${json(this.database, persistedMetadata)}, ${retentionUntil}, 1
           )
         `;
         return {
@@ -2079,7 +2225,7 @@ export class ApplicationStore implements ApplicationRepositoryPort {
         if (retainedExistingGmailSource === "full") {
           await transaction`
             update source_items
-            set retention_until = ${input.retentionUntil ?? null},
+            set retention_until = ${retentionUntil},
                 metadata = ${json(this.database, {
                   ...mergedGmailDiscoveryMetadata(existing.metadata, input.metadata),
                 })},
@@ -2114,7 +2260,7 @@ export class ApplicationStore implements ApplicationRepositoryPort {
       ) {
         await transaction`
           update source_items
-          set retention_until = ${input.retentionUntil ?? null}, metadata = ${json(this.database, persistedMetadata)},
+          set retention_until = ${retentionUntil}, metadata = ${json(this.database, persistedMetadata)},
               updated_at = now()
           where id = ${existing.id}
         `;
@@ -2130,9 +2276,9 @@ export class ApplicationStore implements ApplicationRepositoryPort {
       await transaction`
         update source_items
         set kind = ${input.kind}, occurred_at = ${input.occurredAt},
-            subject = ${input.subject ?? null}, content_hash = ${input.contentHash},
-            encrypted_content = ${input.encryptedContent ?? null}, metadata = ${json(this.database, persistedMetadata)},
-            retention_until = ${input.retentionUntil ?? null}, revision = ${revision}, updated_at = now()
+            content_hash = ${input.contentHash}, encrypted_content = ${input.encryptedContent ?? null},
+            metadata = ${json(this.database, persistedMetadata)},
+            retention_until = ${retentionUntil}, revision = ${revision}, updated_at = now()
         where id = ${existing.id}
       `;
       return {
@@ -2155,7 +2301,7 @@ export class ApplicationStore implements ApplicationRepositoryPort {
     await this.assertActiveMember(parsed.householdId, parsed.viewerAdultId);
     const rows = await this.database<SourceItemRow[]>`
       select id, household_id, connection_id, owner_adult_id, visibility, provider,
-        external_id, kind, occurred_at, subject, content_hash, encrypted_content,
+        external_id, kind, occurred_at, content_hash, encrypted_content,
         metadata, retention_until, revision
       from source_items
       where id = ${parsed.sourceItemId} and household_id = ${parsed.householdId}
@@ -2169,9 +2315,9 @@ export class ApplicationStore implements ApplicationRepositoryPort {
     return this.database.begin(async (transaction) => {
       const sources = await transaction<{ id: string }[]>`
         update source_items
-        set subject = null, encrypted_content = null, updated_at = now()
+        set encrypted_content = null, updated_at = now()
         where retention_until is not null and retention_until <= ${parsed}
-          and (subject is not null or encrypted_content is not null)
+          and encrypted_content is not null
         returning id
       `;
       const privateReviews = await transaction<{ id: string }[]>`
@@ -2201,7 +2347,7 @@ export class ApplicationStore implements ApplicationRepositoryPort {
         )
         update scheduled_triggers
         set status = 'dead', dead_at = now(), lease_owner = null, lease_token = null,
-          lease_expires_at = null,
+          lease_expires_at = null, due_at = null, payload_key_id = null, payload_ciphertext = null,
           last_error_code = coalesce(last_error_code, 'max_attempts_exhausted'),
           updated_at = now()
         from exhausted where scheduled_triggers.id = exhausted.id
@@ -2232,12 +2378,36 @@ export class ApplicationStore implements ApplicationRepositoryPort {
           coalesce(scheduled_triggers.timer_key, 'legacy:' || scheduled_triggers.id::text) as timer_key,
           scheduled_triggers.household_id, scheduled_triggers.episode_key,
           scheduled_triggers.trigger_kind, scheduled_triggers.plan_version,
-          scheduled_triggers.due_at, scheduled_triggers.payload, scheduled_triggers.attempt,
+          scheduled_triggers.due_at, scheduled_triggers.payload_key_id,
+          scheduled_triggers.payload_ciphertext, scheduled_triggers.attempt,
           scheduled_triggers.max_attempts, scheduled_triggers.lease_token,
           scheduled_triggers.lease_expires_at
       `;
-      return rows.map(mapTimer);
+      return rows.map((row) => mapTimer(row, this.sensitiveJson));
     });
+  }
+
+  public async renewTimerLease(input: {
+    rowId: string;
+    leaseToken: string;
+    leaseSeconds: number;
+  }): Promise<boolean> {
+    const parsed = z
+      .strictObject({
+        rowId: z.uuid(),
+        leaseToken: z.uuid(),
+        leaseSeconds: z.number().int().positive().max(86_400),
+      })
+      .parse(input);
+    const rows = await this.database<{ id: string }[]>`
+      update scheduled_triggers
+      set lease_expires_at = now() + (${parsed.leaseSeconds} * interval '1 second'),
+          updated_at = now()
+      where id = ${parsed.rowId} and status = 'claimed'
+        and lease_token = ${parsed.leaseToken} and lease_expires_at > now()
+      returning id
+    `;
+    return rows.length === 1;
   }
 
   public async finishTimer(input: {
@@ -2255,8 +2425,10 @@ export class ApplicationStore implements ApplicationRepositoryPort {
     const rows = await this.database<{ id: string }[]>`
       update scheduled_triggers
       set status = ${parsed.outcome}, lease_owner = null, lease_token = null,
-          lease_expires_at = null, updated_at = now()
+          lease_expires_at = null, due_at = null, payload_key_id = null, payload_ciphertext = null,
+          updated_at = now()
       where id = ${parsed.rowId} and status = 'claimed' and lease_token = ${parsed.leaseToken}
+        and lease_expires_at > now()
       returning id
     `;
     return rows.length === 1;
@@ -2282,8 +2454,13 @@ export class ApplicationStore implements ApplicationRepositoryPort {
           available_at = case when attempt >= max_attempts then available_at else ${parsed.retryAt} end,
           dead_at = case when attempt >= max_attempts then now() else null end,
           last_error_code = ${parsed.errorCode}, lease_owner = null, lease_token = null,
-          lease_expires_at = null, updated_at = now()
+          lease_expires_at = null,
+          due_at = case when attempt >= max_attempts then null else due_at end,
+          payload_key_id = case when attempt >= max_attempts then null else payload_key_id end,
+          payload_ciphertext = case when attempt >= max_attempts then null else payload_ciphertext end,
+          updated_at = now()
       where id = ${parsed.rowId} and status = 'claimed' and lease_token = ${parsed.leaseToken}
+        and lease_expires_at > now()
       returning status
     `;
     return rows[0]?.status ?? "lost_lease";
@@ -2312,7 +2489,8 @@ export class ApplicationStore implements ApplicationRepositoryPort {
         )
         update outbox
         set status = 'dead', dead_at = now(), lease_owner = null, lease_token = null,
-          lease_expires_at = null, last_error_code = 'lease_expired_after_max_attempts',
+          lease_expires_at = null, payload_key_id = null, payload_ciphertext = null,
+          last_error_code = 'lease_expired_after_max_attempts',
           updated_at = now()
         from exhausted where outbox.id = exhausted.id
       `;
@@ -2343,11 +2521,35 @@ export class ApplicationStore implements ApplicationRepositoryPort {
         returning outbox.id,
           coalesce(outbox.intent_key, 'legacy:' || outbox.idempotency_key) as intent_key,
           outbox.household_id, outbox.effect_kind, outbox.idempotency_key,
-          outbox.payload, outbox.attempt, outbox.max_attempts,
+          outbox.payload_key_id, outbox.payload_ciphertext,
+          outbox.attempt, outbox.max_attempts,
           outbox.lease_token, outbox.lease_expires_at
       `;
-      return rows.map(mapOutbox);
+      return rows.map((row) => mapOutbox(row, this.sensitiveJson));
     });
+  }
+
+  public async renewOutboxLease(input: {
+    rowId: string;
+    leaseToken: string;
+    leaseSeconds: number;
+  }): Promise<boolean> {
+    const parsed = z
+      .strictObject({
+        rowId: z.uuid(),
+        leaseToken: z.uuid(),
+        leaseSeconds: z.number().int().positive().max(86_400),
+      })
+      .parse(input);
+    const rows = await this.database<{ id: string }[]>`
+      update outbox
+      set lease_expires_at = now() + (${parsed.leaseSeconds} * interval '1 second'),
+          updated_at = now()
+      where id = ${parsed.rowId} and status = 'leased'
+        and lease_token = ${parsed.leaseToken} and lease_expires_at > now()
+      returning id
+    `;
+    return rows.length === 1;
   }
 
   public async enqueueApplicationIntent(rawIntent: unknown): Promise<{ rowId: string }> {
@@ -2373,7 +2575,7 @@ export class ApplicationStore implements ApplicationRepositoryPort {
   ): Promise<{ rowId: string }> {
     const intent = ApplicationOutboxIntentSchema.parse(rawIntent);
     await requireWritableHousehold(transaction, intent.householdId);
-    const rowId = await insertOutboxIntent(transaction, this.database, intent.householdId, {
+    const rowId = await insertOutboxIntent(transaction, this.sensitiveJson, intent.householdId, {
       intentKey: intent.intentId,
       effectKind: intent.kind,
       idempotencyKey: intent.idempotencyKey,
@@ -2395,8 +2597,9 @@ export class ApplicationStore implements ApplicationRepositoryPort {
       update outbox
       set status = 'sent', provider_receipt = ${json(this.database, parsed.providerReceipt)},
           sent_at = now(), lease_owner = null, lease_token = null, lease_expires_at = null,
-          updated_at = now()
+          payload_key_id = null, payload_ciphertext = null, updated_at = now()
       where id = ${parsed.rowId} and status = 'leased' and lease_token = ${parsed.leaseToken}
+        and lease_expires_at > now()
       returning id
     `;
     return rows.length === 1;
@@ -2430,8 +2633,18 @@ export class ApplicationStore implements ApplicationRepositoryPort {
           available_at = now() + (${parsed.retryAfterSeconds} * interval '1 second'),
           dead_at = case when ${parsed.outcomeCertain} and attempt >= max_attempts then now() else null end,
           last_error_code = ${parsed.errorCode}, last_error_detail = ${parsed.safeDetail ?? null},
-          lease_owner = null, lease_token = null, lease_expires_at = null, updated_at = now()
+          lease_owner = null, lease_token = null, lease_expires_at = null,
+          payload_key_id = case
+            when ${parsed.outcomeCertain} and attempt >= max_attempts then null
+            else payload_key_id
+          end,
+          payload_ciphertext = case
+            when ${parsed.outcomeCertain} and attempt >= max_attempts then null
+            else payload_ciphertext
+          end,
+          updated_at = now()
       where id = ${parsed.rowId} and status = 'leased' and lease_token = ${parsed.leaseToken}
+        and lease_expires_at > now()
       returning status
     `;
     return rows[0]?.status ?? "lost_lease";
@@ -2455,8 +2668,10 @@ export class ApplicationStore implements ApplicationRepositoryPort {
       update outbox
       set status = 'dead', dead_at = now(), last_error_code = ${parsed.errorCode},
           last_error_detail = ${parsed.safeDetail ?? null}, lease_owner = null,
-          lease_token = null, lease_expires_at = null, updated_at = now()
+          lease_token = null, lease_expires_at = null,
+          payload_key_id = null, payload_ciphertext = null, updated_at = now()
       where id = ${parsed.rowId} and status = 'leased' and lease_token = ${parsed.leaseToken}
+        and lease_expires_at > now()
       returning id
     `;
     return rows.length === 1;
@@ -2491,6 +2706,12 @@ export class ApplicationStore implements ApplicationRepositoryPort {
           available_at = coalesce(${parsed.retryAt ?? null}, available_at),
           sent_at = case when ${parsed.resolution} = 'sent' then now() else null end,
           dead_at = case when ${parsed.resolution} = 'dead' then now() else null end,
+          payload_key_id = case
+            when ${parsed.resolution} in ('sent', 'dead') then null else payload_key_id
+          end,
+          payload_ciphertext = case
+            when ${parsed.resolution} in ('sent', 'dead') then null else payload_ciphertext
+          end,
           updated_at = now()
       where id = ${parsed.rowId} and status = 'ambiguous'
       returning id
@@ -2545,13 +2766,28 @@ export class ApplicationStore implements ApplicationRepositoryPort {
         from households where id = ${parsed.householdId}
       `;
       if (!household[0]) throw new ApplicationStoreError("not_found", "Unknown household");
-      const adults = await transaction<Record<string, unknown>[]>`
-        select a.id, a.display_name, a.timezone, hm.role, hm.status, hm.consented_at,
+      const adultRows = await transaction<
+        Array<Record<string, unknown> & { id: string; details_key_id: string; details_ciphertext: string }>
+      >`
+        select a.id, a.timezone, hm.role, hm.status, hm.consented_at,
+          details.details_key_id, details.details_ciphertext,
           hm.created_at, hm.updated_at
         from household_memberships hm join adults a on a.id = hm.adult_id
+        join adult_identity_details details
+          on details.household_id = hm.household_id and details.adult_id = hm.adult_id
         where hm.household_id = ${parsed.householdId}
         order by hm.created_at, a.id
       `;
+      const adults = adultRows.map(({ details_key_id, details_ciphertext, id, ...adult }) => ({
+        id,
+        display_name: adultIdentityDetailsSchema.parse(
+          this.sensitiveJson.open(
+            { keyId: details_key_id, ciphertext: details_ciphertext },
+            adultIdentityDetailsContext({ householdId: parsed.householdId, adultId: id }),
+          ),
+        ).displayName,
+        ...adult,
+      }));
       const channels = await transaction<Record<string, unknown>[]>`
         select id, adult_id, provider, channel_type, external_chat_id, external_handle,
           status, metadata, created_at, updated_at
@@ -2560,16 +2796,55 @@ export class ApplicationStore implements ApplicationRepositoryPort {
           and (channel_type = 'group' or adult_id = ${parsed.requestedByAdultId})
         order by created_at, id
       `;
-      const connections = await transaction<Record<string, unknown>[]>`
-        select id, adult_id, provider, label, external_account_id, email, granted_scopes,
-          status, cursor, metadata, last_synced_at, created_at, updated_at
+      const connectionRows = await transaction<
+        Array<
+          Record<string, unknown> & {
+            id: string;
+            adult_id: string;
+            details_key_id: string | null;
+            details_ciphertext: string | null;
+          }
+        >
+      >`
+        select id, adult_id, provider, external_account_id, granted_scopes,
+          status, cursor, metadata, last_synced_at, created_at, updated_at,
+          details_key_id, details_ciphertext
         from external_connections
         where household_id = ${parsed.householdId} and adult_id = ${parsed.requestedByAdultId}
         order by created_at, id
       `;
+      const connections = connectionRows.map(
+        ({ details_key_id, details_ciphertext, id, adult_id, ...connection }) => {
+          const details =
+            details_key_id && details_ciphertext
+              ? googleConnectionDetailsSchema.parse(
+                  this.sensitiveJson.open(
+                    { keyId: details_key_id, ciphertext: details_ciphertext },
+                    googleConnectionDetailsContext({
+                      householdId: parsed.householdId,
+                      adultId: adult_id,
+                      connectionId: id,
+                    }),
+                  ),
+                )
+              : {
+                  label: REVOKED_GOOGLE_ACCOUNT_LABEL,
+                  accountLabel: REVOKED_GOOGLE_ACCOUNT_LABEL,
+                  email: null,
+                };
+          return {
+            id,
+            adult_id,
+            ...connection,
+            label: details.label,
+            email: details.email,
+            account_label: details.accountLabel,
+          };
+        },
+      );
       const sources = await transaction<Record<string, unknown>[]>`
         select id, connection_id, owner_adult_id, visibility, provider, external_id, kind,
-          occurred_at, subject, content_hash, encrypted_content, metadata, retention_until,
+          occurred_at, content_hash, encrypted_content, metadata, retention_until,
           revision, created_at, updated_at
         from source_items
         where household_id = ${parsed.householdId}
@@ -2676,143 +2951,6 @@ export class ApplicationStore implements ApplicationRepositoryPort {
     });
   }
 
-  public async requestHouseholdDeletion(input: {
-    requestId?: string;
-    householdId: string;
-    requestedByAdultId: string;
-    confirmationDigest: string;
-  }): Promise<{ requestId: string }> {
-    const parsed = z
-      .strictObject({
-        requestId: z.uuid().optional(),
-        householdId: z.uuid(),
-        requestedByAdultId: z.uuid(),
-        confirmationDigest: z.string().min(32).max(256),
-      })
-      .parse(input);
-    await this.assertActiveOwner(parsed.householdId, parsed.requestedByAdultId);
-    const requestId = parsed.requestId ?? randomUUID();
-    await this.database`
-      insert into deletion_requests (
-        id, household_id, requested_by_adult_id, status, confirmation_digest
-      ) values (
-        ${requestId}, ${parsed.householdId}, ${parsed.requestedByAdultId},
-        'pending', ${parsed.confirmationDigest}
-      )
-    `;
-    return { requestId };
-  }
-
-  public async confirmHouseholdDeletion(input: {
-    requestId: string;
-    confirmationDigest: string;
-    confirmedAt: string;
-  }): Promise<boolean> {
-    const parsed = z
-      .strictObject({
-        requestId: z.uuid(),
-        confirmationDigest: z.string().min(32).max(256),
-        confirmedAt: instantSchema,
-      })
-      .parse(input);
-    const rows = await this.database<{ id: string }[]>`
-      update deletion_requests
-      set status = 'confirmed', confirmed_at = ${parsed.confirmedAt}
-      where id = ${parsed.requestId} and status = 'pending'
-        and confirmation_digest = ${parsed.confirmationDigest}
-      returning id
-    `;
-    return rows.length === 1;
-  }
-
-  public async executeHouseholdDeletion(input: {
-    requestId: string;
-    completedAt: string;
-  }): Promise<{ householdId: string; adultsDeleted: number }> {
-    const parsed = z.strictObject({ requestId: z.uuid(), completedAt: instantSchema }).parse(input);
-    return this.database.begin(async (transaction) => {
-      const requests = await transaction<{ household_id: string; requested_by_adult_id: string }[]>`
-        select household_id, requested_by_adult_id
-        from deletion_requests
-        where id = ${parsed.requestId} and status = 'confirmed'
-        for update
-      `;
-      const request = requests[0];
-      if (!request) {
-        throw new ApplicationStoreError("invalid_state", "Deletion request is not confirmed");
-      }
-      const memberRows = await transaction<{ adult_id: string }[]>`
-        select adult_id from household_memberships where household_id = ${request.household_id}
-      `;
-      const inboxDeleted = await transaction<{ id: string }[]>`
-        delete from provider_inbox where household_id = ${request.household_id} returning id
-      `;
-      const report = {
-        householdDeleted: true,
-        providerInboxDeleted: inboxDeleted.length,
-      };
-      await transaction`
-        insert into deletion_tombstones (
-          request_id, household_id, requested_by_adult_id, completed_at, report
-        ) values (
-          ${parsed.requestId}, ${request.household_id}, ${request.requested_by_adult_id},
-          ${parsed.completedAt}, ${json(this.database, report)}
-        )
-      `;
-      const deleted = await transaction<{ id: string }[]>`
-        delete from households where id = ${request.household_id} returning id
-      `;
-      if (deleted.length !== 1) {
-        throw new ApplicationStoreError("not_found", "Household disappeared during deletion");
-      }
-      let adultsDeleted = 0;
-      for (const member of memberRows) {
-        const removed = await transaction<{ id: string }[]>`
-          delete from adults
-          where id = ${member.adult_id}
-            and not exists (
-              select 1 from household_memberships where adult_id = ${member.adult_id}
-            )
-          returning id
-        `;
-        adultsDeleted += removed.length;
-      }
-      return { householdId: request.household_id, adultsDeleted };
-    });
-  }
-
-  public async getDeletionTombstone(requestId: string): Promise<{
-    requestId: string;
-    householdId: string;
-    requestedByAdultId: string;
-    completedAt: string;
-    report: Record<string, unknown>;
-  } | null> {
-    const parsedId = z.uuid().parse(requestId);
-    const rows = await this.database<
-      {
-        request_id: string;
-        household_id: string;
-        requested_by_adult_id: string;
-        completed_at: Date;
-        report: Record<string, unknown>;
-      }[]
-    >`
-      select request_id, household_id, requested_by_adult_id, completed_at, report
-      from deletion_tombstones where request_id = ${parsedId}
-    `;
-    const row = rows[0];
-    return row
-      ? {
-          requestId: row.request_id,
-          householdId: row.household_id,
-          requestedByAdultId: row.requested_by_adult_id,
-          completedAt: dateToString(row.completed_at),
-          report: row.report,
-        }
-      : null;
-  }
-
   private async assertActiveMember(householdId: string, adultId: string): Promise<void> {
     const rows = await this.database<{ adult_id: string }[]>`
       select adult_id from household_memberships
@@ -2822,17 +2960,6 @@ export class ApplicationStore implements ApplicationRepositoryPort {
       throw new ApplicationStoreError("not_authorized", "Adult is not an active household member");
     }
   }
-
-  private async assertActiveOwner(householdId: string, adultId: string): Promise<void> {
-    const rows = await this.database<{ adult_id: string }[]>`
-      select adult_id from household_memberships
-      where household_id = ${householdId} and adult_id = ${adultId}
-        and role = 'owner' and status = 'active'
-    `;
-    if (!rows[0]) {
-      throw new ApplicationStoreError("not_authorized", "Adult is not an active household owner");
-    }
-  }
 }
 
 type ExternalConnectionRow = {
@@ -2840,9 +2967,10 @@ type ExternalConnectionRow = {
   household_id: string;
   adult_id: string;
   provider: "google";
-  label: string;
   external_account_id: string;
-  email: string | null;
+  email_digest: string | null;
+  details_key_id: string | null;
+  details_ciphertext: string | null;
   encrypted_credentials: string | null;
   granted_scopes: string[];
   status: ExternalConnectionRecord["status"];
@@ -2861,7 +2989,6 @@ type SourceItemRow = {
   external_id: string;
   kind: string;
   occurred_at: Date;
-  subject: string | null;
   content_hash: string;
   encrypted_content: string | null;
   metadata: Record<string, unknown>;
@@ -2877,7 +3004,8 @@ type TimerRow = {
   trigger_kind: string;
   plan_version: string;
   due_at: Date;
-  payload: Record<string, unknown>;
+  payload_key_id: string | null;
+  payload_ciphertext: string | null;
   attempt: number;
   max_attempts: number;
   lease_token: string | null;
@@ -2890,7 +3018,8 @@ type OutboxRow = {
   household_id: string;
   effect_kind: string;
   idempotency_key: string;
-  payload: Record<string, unknown>;
+  payload_key_id: string | null;
+  payload_ciphertext: string | null;
   attempt: number;
   max_attempts: number;
   lease_token: string | null;
@@ -2903,7 +3032,7 @@ type OutboxIdentityRow = {
   intent_key: string | null;
   effect_kind: string;
   idempotency_key: string;
-  payload_hash: string | null;
+  payload_digest: string;
 };
 
 function mapProjection(row: ProjectionRow, cipher: TenantJsonCipher): HouseholdProjection {
@@ -3040,6 +3169,30 @@ function canViewPolicyRule(rule: AggregatePolicyRule, viewerAdultId: string): bo
   }
 }
 
+function pendingActionForExport(
+  pending: HouseholdAggregate["pendingActions"][number],
+  viewerAdultId: string,
+): Record<string, unknown> {
+  if (pending.action.kind !== "calendar_update" || pending.action.requestedByAdultId === viewerAdultId) {
+    return pending;
+  }
+  const {
+    targetConnectionId: _targetConnectionId,
+    calendarId: _calendarId,
+    relevantDataDigest: _relevantDataDigest,
+    ...sharedAction
+  } = pending.action;
+  const sharedReceipt =
+    pending.effectReceipt === undefined
+      ? undefined
+      : (({ providerReference: _providerReference, ...receipt }) => receipt)(pending.effectReceipt);
+  return {
+    ...pending,
+    action: sharedAction,
+    ...(sharedReceipt === undefined ? {} : { effectReceipt: sharedReceipt }),
+  };
+}
+
 function projectionForExport(
   row: Record<string, unknown>,
   viewerAdultId: string,
@@ -3076,9 +3229,9 @@ function projectionForExport(
           canViewScope(candidate.scope, viewerAdultId),
         ),
         memories: aggregate.memories.filter((memory) => canViewScope(memory.scope, viewerAdultId)),
-        pendingActions: aggregate.pendingActions.filter((action) =>
-          canViewScope(action.action.requestedFor, viewerAdultId),
-        ),
+        pendingActions: aggregate.pendingActions
+          .filter((action) => canViewScope(action.action.requestedFor, viewerAdultId))
+          .map((action) => pendingActionForExport(action, viewerAdultId)),
       },
       projection: {
         ...projection,
@@ -3119,20 +3272,36 @@ function applicationSnapshotForExport(
   return { ...rest, revision: version };
 }
 
-function mapExternalConnection(row: ExternalConnectionRow): ExternalConnectionRecord {
+function mapExternalConnection(
+  row: ExternalConnectionRow,
+  cipher: TenantJsonCipher,
+): ExternalConnectionRecord {
+  const details =
+    row.details_key_id && row.details_ciphertext
+      ? googleConnectionDetailsSchema.parse(
+          cipher.open(
+            { keyId: row.details_key_id, ciphertext: row.details_ciphertext },
+            googleConnectionDetailsContext({
+              householdId: row.household_id,
+              adultId: row.adult_id,
+              connectionId: row.id,
+            }),
+          ),
+        )
+      : { label: REVOKED_GOOGLE_ACCOUNT_LABEL, accountLabel: REVOKED_GOOGLE_ACCOUNT_LABEL, email: null };
   return {
     id: row.id,
     householdId: row.household_id,
     adultId: row.adult_id,
     provider: row.provider,
-    label: row.label,
+    label: details.label,
     externalAccountId: row.external_account_id,
-    email: row.email,
+    email: details.email,
     encryptedCredentials: row.encrypted_credentials,
     grantedScopes: row.granted_scopes,
     status: row.status,
     cursor: row.cursor,
-    metadata: row.metadata,
+    metadata: { ...row.metadata, accountLabel: details.accountLabel },
     lastSyncedAt: row.last_synced_at ? dateToString(row.last_synced_at) : null,
   };
 }
@@ -3148,7 +3317,6 @@ function mapSourceItem(row: SourceItemRow): SourceItemRecord {
     externalId: row.external_id,
     kind: row.kind,
     occurredAt: dateToString(row.occurred_at),
-    subject: row.subject,
     contentHash: row.content_hash,
     encryptedContent: row.encrypted_content,
     metadata: row.metadata,
@@ -3157,8 +3325,14 @@ function mapSourceItem(row: SourceItemRow): SourceItemRecord {
   };
 }
 
-function mapTimer(row: TimerRow): ClaimedTimer {
-  if (!row.timer_key || !row.lease_token || !row.lease_expires_at) {
+function mapTimer(row: TimerRow, cipher: TenantJsonCipher): ClaimedTimer {
+  if (
+    !row.timer_key ||
+    !row.lease_token ||
+    !row.lease_expires_at ||
+    !row.payload_key_id ||
+    !row.payload_ciphertext
+  ) {
     throw new ApplicationStoreError(
       "invalid_state",
       "Claimed timer is missing its durable identity or lease",
@@ -3172,7 +3346,12 @@ function mapTimer(row: TimerRow): ClaimedTimer {
     triggerKind: row.trigger_kind,
     planVersion: Number(row.plan_version),
     dueAt: dateToString(row.due_at),
-    payload: row.payload,
+    payload: jsonObjectSchema.parse(
+      cipher.open(
+        { keyId: row.payload_key_id, ciphertext: row.payload_ciphertext },
+        encryptedJsonContext("household", row.household_id, "scheduled_triggers", row.id, "payload"),
+      ),
+    ),
     attempt: row.attempt,
     maxAttempts: row.max_attempts,
     leaseToken: row.lease_token,
@@ -3180,8 +3359,14 @@ function mapTimer(row: TimerRow): ClaimedTimer {
   };
 }
 
-function mapOutbox(row: OutboxRow): ClaimedOutboxItem {
-  if (!row.intent_key || !row.lease_token || !row.lease_expires_at) {
+function mapOutbox(row: OutboxRow, cipher: TenantJsonCipher): ClaimedOutboxItem {
+  if (
+    !row.intent_key ||
+    !row.lease_token ||
+    !row.lease_expires_at ||
+    !row.payload_key_id ||
+    !row.payload_ciphertext
+  ) {
     throw new ApplicationStoreError("invalid_state", "Claimed outbox item is missing its identity or lease");
   }
   return {
@@ -3190,7 +3375,12 @@ function mapOutbox(row: OutboxRow): ClaimedOutboxItem {
     householdId: row.household_id,
     effectKind: row.effect_kind,
     idempotencyKey: row.idempotency_key,
-    payload: row.payload,
+    payload: jsonObjectSchema.parse(
+      cipher.open(
+        { keyId: row.payload_key_id, ciphertext: row.payload_ciphertext },
+        encryptedJsonContext("household", row.household_id, "outbox", row.id, "payload"),
+      ),
+    ),
     attempt: row.attempt,
     maxAttempts: row.max_attempts,
     leaseToken: row.lease_token,
@@ -3224,19 +3414,25 @@ async function requireWritableHousehold(
 
 async function upsertTimerIntent(
   transaction: TransactionSql<Record<string, never>>,
-  database: Database,
+  cipher: TenantJsonCipher,
   householdId: string,
   timer: z.output<typeof projectionTimerSchema>,
 ): Promise<string> {
   const rowId = randomUUID();
+  const digest = payloadDigest(timer.payload);
+  const sealed = cipher.seal(
+    timer.payload,
+    encryptedJsonContext("household", householdId, "scheduled_triggers", rowId, "payload"),
+  );
   const inserted = await transaction<{ id: string }[]>`
     insert into scheduled_triggers (
-      id, household_id, episode_id, timer_key, episode_key, trigger_kind,
-      plan_version, due_at, available_at, status, payload, max_attempts, control_epoch
+      id, household_id, timer_key, episode_key, trigger_kind,
+      plan_version, due_at, available_at, status, payload_digest, payload_key_id,
+      payload_ciphertext, max_attempts, control_epoch
     ) values (
-      ${rowId}, ${householdId}, null, ${timer.timerKey}, ${timer.episodeKey ?? null},
+      ${rowId}, ${householdId}, ${timer.timerKey}, ${timer.episodeKey ?? null},
       ${timer.triggerKind}, ${timer.planVersion}, ${timer.dueAt}, ${timer.dueAt},
-      'scheduled', ${json(database, timer.payload)}, ${timer.maxAttempts},
+      'scheduled', ${digest}, ${sealed.keyId}, ${sealed.ciphertext}, ${timer.maxAttempts},
       (select control_epoch from households where id = ${householdId})
     )
     on conflict (household_id, timer_key) where timer_key is not null
@@ -3252,7 +3448,7 @@ async function upsertTimerIntent(
         and plan_version = ${timer.planVersion}
         and due_at = ${timer.dueAt}
         and max_attempts = ${timer.maxAttempts}
-        and payload = ${json(database, timer.payload)} as definition_matches
+        and payload_digest = ${digest} as definition_matches
     from scheduled_triggers
     where household_id = ${householdId} and timer_key = ${timer.timerKey}
     for update
@@ -3272,19 +3468,23 @@ async function upsertTimerIntent(
 
 async function insertOutboxIntent(
   transaction: TransactionSql<Record<string, never>>,
-  database: Database,
+  cipher: TenantJsonCipher,
   householdId: string,
   effect: z.output<typeof projectionOutboxSchema>,
 ): Promise<string> {
   const rowId = randomUUID();
   const hash = payloadDigest({ effectKind: effect.effectKind, payload: effect.payload });
+  const sealed = cipher.seal(
+    effect.payload,
+    encryptedJsonContext("household", householdId, "outbox", rowId, "payload"),
+  );
   const inserted = await transaction<{ id: string }[]>`
     insert into outbox (
-      id, household_id, intent_key, effect_kind, idempotency_key, payload,
-      payload_hash, status, max_attempts, control_epoch
+      id, household_id, intent_key, effect_kind, idempotency_key, payload_digest,
+      payload_key_id, payload_ciphertext, status, max_attempts, control_epoch
     ) values (
       ${rowId}, ${householdId}, ${effect.intentKey}, ${effect.effectKind},
-      ${effect.idempotencyKey}, ${json(database, effect.payload)}, ${hash},
+      ${effect.idempotencyKey}, ${hash}, ${sealed.keyId}, ${sealed.ciphertext},
       'pending', ${effect.maxAttempts},
       (select control_epoch from households where id = ${householdId})
     )
@@ -3294,7 +3494,7 @@ async function insertOutboxIntent(
   if (inserted[0]) return inserted[0].id;
 
   const existingRows = await transaction<OutboxIdentityRow[]>`
-    select id, household_id, intent_key, effect_kind, idempotency_key, payload_hash
+    select id, household_id, intent_key, effect_kind, idempotency_key, payload_digest
     from outbox
     where idempotency_key = ${effect.idempotencyKey}
       or (household_id = ${householdId} and intent_key = ${effect.intentKey})
@@ -3306,7 +3506,7 @@ async function insertOutboxIntent(
       row.intent_key === effect.intentKey &&
       row.effect_kind === effect.effectKind &&
       row.idempotency_key === effect.idempotencyKey &&
-      row.payload_hash === hash,
+      row.payload_digest === hash,
   );
   if (existingRows.length !== 1 || matches.length !== 1) {
     throw new OutboxIdempotencyConflictError(effect.idempotencyKey);

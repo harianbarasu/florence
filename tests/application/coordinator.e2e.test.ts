@@ -286,6 +286,17 @@ describe("Florence application coordinator", () => {
       snippet: "A form is due Friday.",
       bodyText: privateText,
       attachmentRefs: ["attachment_permission_slip"],
+      attachmentContents: [
+        {
+          reference: "attachment_permission_slip",
+          kind: "unavailable",
+          mediaType: null,
+          filename: null,
+          sizeBytes: null,
+          contentDigest: `sha256:${"a".repeat(64)}`,
+          reason: "not_found",
+        },
+      ],
     });
 
     const beforeApproval = await harness.repository.load(HOUSEHOLD_ID);
@@ -365,6 +376,7 @@ describe("Florence application coordinator", () => {
         subject: "School notice",
         bodyText: "A school notice has a household consequence.",
         attachmentRefs: [],
+        attachmentContents: [],
       });
     };
 

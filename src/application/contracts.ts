@@ -50,43 +50,49 @@ const ConversationAttachmentBaseShape = {
   contentDigest: Sha256DigestSchema,
 } as const;
 
+const ImageAttachmentContentSchema = z.strictObject({
+  ...ConversationAttachmentBaseShape,
+  kind: z.literal("image"),
+  mediaType: z
+    .string()
+    .trim()
+    .regex(/^image\//u)
+    .max(255),
+  sizeBytes: z
+    .number()
+    .int()
+    .nonnegative()
+    .max(10 * 1024 * 1024),
+  dataBase64: z.string().min(1).max(14_000_000),
+});
+
+const FileAttachmentContentSchema = z.strictObject({
+  ...ConversationAttachmentBaseShape,
+  kind: z.literal("file"),
+  mediaType: z.string().trim().min(1).max(255),
+  sizeBytes: z
+    .number()
+    .int()
+    .nonnegative()
+    .max(10 * 1024 * 1024),
+  dataBase64: z.string().min(1).max(14_000_000),
+});
+
+const UnavailableAttachmentContentSchema = z.strictObject({
+  ...ConversationAttachmentBaseShape,
+  kind: z.literal("unavailable"),
+  reason: z.enum(["missing_reference", "too_large", "unsupported_type", "not_found", "invalid_content"]),
+});
+
 export const ConversationAttachmentContentSchema = z.discriminatedUnion("kind", [
-  z.strictObject({
-    ...ConversationAttachmentBaseShape,
-    kind: z.literal("image"),
-    mediaType: z
-      .string()
-      .trim()
-      .regex(/^image\//u)
-      .max(255),
-    sizeBytes: z
-      .number()
-      .int()
-      .nonnegative()
-      .max(10 * 1024 * 1024),
-    dataBase64: z.string().min(1).max(14_000_000),
-  }),
-  z.strictObject({
-    ...ConversationAttachmentBaseShape,
-    kind: z.literal("file"),
-    mediaType: z.string().trim().min(1).max(255),
-    sizeBytes: z
-      .number()
-      .int()
-      .nonnegative()
-      .max(10 * 1024 * 1024),
-    dataBase64: z.string().min(1).max(14_000_000),
-  }),
+  ImageAttachmentContentSchema,
+  FileAttachmentContentSchema,
   z.strictObject({
     ...ConversationAttachmentBaseShape,
     kind: z.literal("link"),
     url: z.url().refine((value) => new URL(value).protocol === "https:", "Conversation links must use HTTPS"),
   }),
-  z.strictObject({
-    ...ConversationAttachmentBaseShape,
-    kind: z.literal("unavailable"),
-    reason: z.enum(["missing_reference", "too_large", "unsupported_type", "not_found"]),
-  }),
+  UnavailableAttachmentContentSchema,
 ]);
 
 export type ConversationAttachmentContent = z.infer<typeof ConversationAttachmentContentSchema>;
@@ -154,28 +160,95 @@ export const ConversationInboxItemSchema = z
 
 export type ConversationInboxItem = z.infer<typeof ConversationInboxItemSchema>;
 
-export const GmailInboxItemSchema = z.strictObject({
-  kind: z.literal("gmail_message"),
+export const GmailAttachmentContentSchema = z.discriminatedUnion("kind", [
+  ImageAttachmentContentSchema,
+  FileAttachmentContentSchema,
+  UnavailableAttachmentContentSchema,
+]);
+
+export type GmailAttachmentContent = z.infer<typeof GmailAttachmentContentSchema>;
+
+export const GmailInboxItemSchema = z
+  .strictObject({
+    kind: z.literal("gmail_message"),
+    householdId: HouseholdIdSchema,
+    idempotencyKey: IdempotencyKeySchema,
+    occurredAt: InstantStringSchema,
+    ownerAdultId: AdultIdSchema,
+    accountRef: StableReferenceSchema,
+    messageRef: StableReferenceSchema,
+    revision: z.number().int().positive(),
+    labels: z.array(z.string().trim().min(1).max(100)).max(100),
+    sender: z.string().trim().max(1_000).optional(),
+    subject: z.string().max(2_000).optional(),
+    snippet: z.string().max(10_000).optional(),
+    bodyText: z.string().max(1_000_000).optional(),
+    attachmentRefs: z.array(StableReferenceSchema).max(20),
+    attachmentContents: z.array(GmailAttachmentContentSchema).max(20),
+  })
+  .superRefine((item, context) => {
+    const contentRefs = item.attachmentContents.map((attachment) => attachment.reference);
+    if (
+      contentRefs.length !== item.attachmentRefs.length ||
+      contentRefs.some((reference, index) => reference !== item.attachmentRefs[index]) ||
+      new Set(contentRefs).size !== contentRefs.length
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["attachmentContents"],
+        message: "Attachment content must account for each attachment reference exactly once and in order",
+      });
+    }
+  });
+
+export type GmailInboxItem = z.infer<typeof GmailInboxItemSchema>;
+
+const CalendarSourceIdentityShape = {
   householdId: HouseholdIdSchema,
   idempotencyKey: IdempotencyKeySchema,
   occurredAt: InstantStringSchema,
   ownerAdultId: AdultIdSchema,
   accountRef: StableReferenceSchema,
-  messageRef: StableReferenceSchema,
+  eventRef: StableReferenceSchema,
+  providerRef: StableReferenceSchema,
   revision: z.number().int().positive(),
-  labels: z.array(z.string().trim().min(1).max(100)).max(100),
-  sender: z.string().trim().max(1_000).optional(),
-  subject: z.string().max(2_000).optional(),
-  snippet: z.string().max(10_000).optional(),
-  bodyText: z.string().max(1_000_000).optional(),
-  attachmentRefs: z.array(StableReferenceSchema).max(100),
+} as const;
+
+export const CalendarEventInboxItemSchema = z
+  .strictObject({
+    kind: z.literal("calendar_event"),
+    ...CalendarSourceIdentityShape,
+    contentDigest: Sha256DigestSchema,
+    title: z.string().trim().min(1).max(2_000),
+    description: z.string().max(20_000).nullable(),
+    location: z.string().max(2_000).nullable(),
+    startsAt: InstantStringSchema,
+    endsAt: InstantStringSchema,
+    timeZone: TimeZoneSchema,
+    allDay: z.boolean(),
+    status: z.enum(["confirmed", "tentative"]),
+    recurrence: z.array(z.string().trim().min(1).max(2_000)).max(100),
+  })
+  .superRefine((item, context) => {
+    if (Date.parse(item.startsAt) >= Date.parse(item.endsAt)) {
+      context.addIssue({ code: "custom", path: ["endsAt"], message: "calendar end must follow start" });
+    }
+  });
+
+export type CalendarEventInboxItem = z.infer<typeof CalendarEventInboxItemSchema>;
+
+export const CalendarEventDeletedInboxItemSchema = z.strictObject({
+  kind: z.literal("calendar_event_deleted"),
+  ...CalendarSourceIdentityShape,
 });
 
-export type GmailInboxItem = z.infer<typeof GmailInboxItemSchema>;
+export type CalendarEventDeletedInboxItem = z.infer<typeof CalendarEventDeletedInboxItemSchema>;
 
 export const ProviderInboxItemSchema = z.discriminatedUnion("kind", [
   ConversationInboxItemSchema,
   GmailInboxItemSchema,
+  CalendarEventInboxItemSchema,
+  CalendarEventDeletedInboxItemSchema,
 ]);
 
 export type ProviderInboxItem = z.infer<typeof ProviderInboxItemSchema>;
@@ -449,6 +522,46 @@ export const GmailTriageResultSchema = z.discriminatedUnion("decision", [
 
 export type GmailTriageResult = z.infer<typeof GmailTriageResultSchema>;
 
+const CalendarTriageBaseShape = {
+  confidence: ConfidenceSchema,
+  sourceClass: SourceClassSchema,
+  sensitivity: SensitivitySchema,
+  familyImpact: z.boolean(),
+  rationale: NeutralFactualTextSchema,
+} as const;
+
+export const CalendarTriageResultSchema = z.discriminatedUnion("decision", [
+  z.strictObject({
+    ...CalendarTriageBaseShape,
+    decision: z.literal("ignore"),
+  }),
+  z.strictObject({
+    ...CalendarTriageBaseShape,
+    decision: z.literal("retain_private"),
+    privateSummary: NeutralFactualTextSchema,
+  }),
+  z.strictObject({
+    ...CalendarTriageBaseShape,
+    decision: z.literal("private_review"),
+    privateSummary: NeutralFactualTextSchema,
+  }),
+  z.strictObject({
+    ...CalendarTriageBaseShape,
+    decision: z.literal("private_interrupt"),
+    privateSummary: NeutralFactualTextSchema,
+    urgencyReason: NeutralFactualTextSchema,
+  }),
+  z.strictObject({
+    ...CalendarTriageBaseShape,
+    decision: z.literal("propose_family_episode"),
+    privateSummary: NeutralFactualTextSchema,
+    minimumHouseholdMeaning: NeutralDisplayTextSchema,
+    minimumRequiredOutcome: NeutralFactualTextSchema,
+  }),
+]);
+
+export type CalendarTriageResult = z.infer<typeof CalendarTriageResultSchema>;
+
 export const OnboardingProjectionSchema = z
   .strictObject({
     phase: z.enum([
@@ -542,6 +655,62 @@ export const GmailTriageRecordSchema = z.strictObject({
   recordedAt: InstantStringSchema,
 });
 
+export const CalendarTriageRecordSchema = z.strictObject({
+  sourceKey: StableReferenceSchema,
+  ownerAdultId: AdultIdSchema,
+  revision: z.number().int().positive(),
+  decision: z.enum([
+    "ignore",
+    "retain_private",
+    "private_review",
+    "private_interrupt",
+    "propose_family_episode",
+  ]),
+  sourceClass: SourceClassSchema,
+  sensitivity: SensitivitySchema,
+  familyImpact: z.boolean(),
+  confidence: ConfidenceSchema,
+  recordedAt: InstantStringSchema,
+});
+
+export const CalendarSourceRecordSchema = z
+  .strictObject({
+    sourceKey: StableReferenceSchema,
+    ownerAdultId: AdultIdSchema,
+    latestRevision: z.number().int().positive(),
+    status: z.enum(["active", "deleted"]),
+    contentDigest: Sha256DigestSchema.optional(),
+    pendingPromotionId: StableReferenceSchema.optional(),
+    episodeId: EpisodeIdSchema.optional(),
+    recordedAt: InstantStringSchema,
+  })
+  .superRefine((record, context) => {
+    if ((record.status === "active") !== (record.contentDigest !== undefined)) {
+      context.addIssue({
+        code: "custom",
+        path: ["contentDigest"],
+        message: "Only an active Calendar source retains its content digest",
+      });
+    }
+    if (
+      record.status === "deleted" &&
+      (record.pendingPromotionId !== undefined || record.episodeId !== undefined)
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "A deleted Calendar source cannot retain pending or active application work",
+      });
+    }
+    if (record.pendingPromotionId !== undefined && record.episodeId !== undefined) {
+      context.addIssue({
+        code: "custom",
+        message: "A Calendar source cannot be both pending promotion and promoted",
+      });
+    }
+  });
+
+export type CalendarSourceRecord = z.infer<typeof CalendarSourceRecordSchema>;
+
 export const PendingPromotionSchema = z.strictObject({
   promotionId: StableReferenceSchema,
   ownerAdultId: AdultIdSchema,
@@ -567,13 +736,26 @@ export const WorkerRecordSchema = z.strictObject({
 
 export type WorkerRecord = z.infer<typeof WorkerRecordSchema>;
 
-export const ApplicationProjectionSchema = z.strictObject({
-  onboarding: OnboardingProjectionSchema,
-  sharedProfile: SharedHouseholdProfileSchema,
-  gmailTriage: z.array(GmailTriageRecordSchema).max(100_000),
-  pendingPromotions: z.array(PendingPromotionSchema).max(10_000),
-  workers: z.array(WorkerRecordSchema).max(10_000),
-});
+export const ApplicationProjectionSchema = z
+  .strictObject({
+    onboarding: OnboardingProjectionSchema,
+    sharedProfile: SharedHouseholdProfileSchema,
+    gmailTriage: z.array(GmailTriageRecordSchema).max(100_000),
+    calendarTriage: z.array(CalendarTriageRecordSchema).max(100_000),
+    calendarSources: z.array(CalendarSourceRecordSchema).max(100_000),
+    pendingPromotions: z.array(PendingPromotionSchema).max(10_000),
+    workers: z.array(WorkerRecordSchema).max(10_000),
+  })
+  .superRefine((projection, context) => {
+    const sourceKeys = projection.calendarSources.map((record) => record.sourceKey);
+    if (new Set(sourceKeys).size !== sourceKeys.length) {
+      context.addIssue({
+        code: "custom",
+        path: ["calendarSources"],
+        message: "Calendar source records must have unique source keys",
+      });
+    }
+  });
 
 export type ApplicationProjection = z.infer<typeof ApplicationProjectionSchema>;
 
@@ -647,6 +829,8 @@ export const ApplicationAuditEntrySchema = z.strictObject({
   kind: z.enum([
     "conversation_classified",
     "gmail_triaged",
+    "calendar_triaged",
+    "calendar_reconciled",
     "onboarding_transition",
     "domain_accepted",
     "worker_reconciled",
@@ -723,6 +907,8 @@ export const EffectReceiptInputSchema = z.strictObject({
 export const ApplicationInputSchema = z.discriminatedUnion("kind", [
   ConversationInboxItemSchema,
   GmailInboxItemSchema,
+  CalendarEventInboxItemSchema,
+  CalendarEventDeletedInboxItemSchema,
   TimerFiredInputSchema,
   WorkerResultInputSchema,
   WorkerRunInputSchema,

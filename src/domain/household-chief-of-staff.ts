@@ -570,6 +570,92 @@ function handleEpisodeClosed(context: HandlerContext): MutationResult {
   );
 }
 
+function handleEpisodeSourceSuperseded(context: HandlerContext): MutationResult {
+  const { signal, draft } = context;
+  if (signal.kind !== "episode.source_superseded") {
+    throw new Error("wrong handler");
+  }
+  if (
+    signal.actor.kind !== "source_adapter" ||
+    (signal.actor.source !== "gmail" && signal.actor.source !== "calendar")
+  ) {
+    return rejected("unauthorized_actor");
+  }
+  const source = signal.actor.source;
+
+  const found = findEpisode(draft, signal.episodeId);
+  if (found === undefined) {
+    return rejected("episode_not_found");
+  }
+  const [index, episode] = found;
+  if (episode.version !== signal.baseEpisodeVersion) {
+    return rejected("stale_episode_version");
+  }
+  if (TERMINAL_STATES.has(episode.state)) {
+    return rejected("invalid_transition");
+  }
+
+  const matchingEvidence = episode.evidence.filter(
+    (evidence) => evidence.source === source && evidence.sourceRef === signal.supersedingEvidence.sourceRef,
+  );
+  const scopeMatches = matchingEvidence.every((evidence) =>
+    evidence.scope.kind === "personal"
+      ? signal.supersedingEvidence.scope.kind === "personal" &&
+        signal.supersedingEvidence.scope.adultId === evidence.scope.adultId
+      : signal.supersedingEvidence.scope.kind === evidence.scope.kind,
+  );
+  if (
+    signal.supersedingEvidence.source !== source ||
+    matchingEvidence.length === 0 ||
+    !scopeMatches ||
+    matchingEvidence.some((evidence) => evidence.revision >= signal.supersedingEvidence.revision) ||
+    signal.supersedingEvidence.observedAt !== signal.occurredAt
+  ) {
+    return rejected("invalid_transition");
+  }
+
+  const effects = cancelTimerEffects(signal, episode);
+  const temporalPlan =
+    episode.temporalPlan === undefined
+      ? undefined
+      : {
+          ...episode.temporalPlan,
+          triggers: episode.temporalPlan.triggers.map((trigger) =>
+            trigger.status === "pending" ? { ...trigger, status: "skipped" as const } : trigger,
+          ),
+        };
+  const withoutBlockedReason = { ...episode };
+  delete withoutBlockedReason.blockedReason;
+  const updated = FamilyEpisodeSchema.parse({
+    ...withoutBlockedReason,
+    version: episode.version + 1,
+    state: "superseded",
+    outcome: {
+      kind: "superseded",
+      summary: "A newer source revision replaced this episode.",
+      evidence: [signal.supersedingEvidence],
+      recordedAt: signal.occurredAt,
+    },
+    ...(temporalPlan === undefined ? {} : { temporalPlan }),
+    updatedAt: signal.occurredAt,
+  });
+  draft.episodes[index] = updated;
+
+  return accepted(
+    draft,
+    [
+      DomainChangeSchema.parse({
+        kind: "episode_state_changed",
+        episodeId: episode.episodeId,
+        from: episode.state,
+        to: "superseded",
+        episodeVersion: updated.version,
+      }),
+    ],
+    effects,
+  );
+}
+
 function handleTemporalPlanReplaced(context: HandlerContext): MutationResult {
   const { signal, draft } = context;
   if (signal.kind !== "episode.temporal_plan_replaced") {
@@ -1614,6 +1700,8 @@ function dispatch(context: HandlerContext): MutationResult {
       return handleDeliveryObserved(context);
     case "episode.closed":
       return handleEpisodeClosed(context);
+    case "episode.source_superseded":
+      return handleEpisodeSourceSuperseded(context);
     case "episode.temporal_plan_replaced":
       return handleTemporalPlanReplaced(context);
     case "routine_anchors.replaced":

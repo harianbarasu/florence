@@ -1132,6 +1132,14 @@ export const EpisodeTemporalPlanReplacedSignalSchema = z.strictObject({
   plan: SemanticTimePlanSchema,
 });
 
+export const EpisodeSourceSupersededSignalSchema = z.strictObject({
+  ...SignalBaseShape,
+  kind: z.literal("episode.source_superseded"),
+  episodeId: EpisodeIdSchema,
+  baseEpisodeVersion: z.number().int().positive(),
+  supersedingEvidence: EvidenceRefSchema,
+});
+
 export const RoutineAnchorsReplacedSignalSchema = z.strictObject({
   ...SignalBaseShape,
   kind: z.literal("routine_anchors.replaced"),
@@ -1228,6 +1236,7 @@ export const HouseholdSignalSchema = z.discriminatedUnion("kind", [
   ConversationDeliveryObservedSignalSchema,
   EpisodeClosedSignalSchema,
   EpisodeTemporalPlanReplacedSignalSchema,
+  EpisodeSourceSupersededSignalSchema,
   RoutineAnchorsReplacedSignalSchema,
   EpisodeBlockedSignalSchema,
   EpisodeResumedSignalSchema,

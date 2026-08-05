@@ -1,9 +1,10 @@
 import type { WorkerAttemptOptions, WorkerJob } from "../runtime/index.js";
-import type { ConversationInboxItem, GmailInboxItem } from "./contracts.js";
+import type { CalendarEventInboxItem, ConversationInboxItem, GmailInboxItem } from "./contracts.js";
 import {
   type ApplicationOutboxIntent,
   type ApplicationResult,
   ApplicationResultSchema,
+  type CalendarTriageResult,
   type ConversationClassification,
   EffectExecutionReceiptSchema,
   type GmailTriageResult,
@@ -17,6 +18,7 @@ import type {
   ApplicationInterpreterPort,
   ApplicationRepositoryPort,
   CalendarCreatePreparation,
+  CalendarTriageContext,
   ConversationInterpretationContext,
   GmailTriageContext,
   HouseholdCalendarActionsPort,
@@ -100,8 +102,10 @@ export class FakeApplicationInterpreter implements ApplicationInterpreterPort {
     context: ConversationInterpretationContext;
   }> = [];
   readonly gmailCalls: Array<{ input: GmailInboxItem; context: GmailTriageContext }> = [];
+  readonly calendarCalls: Array<{ input: CalendarEventInboxItem; context: CalendarTriageContext }> = [];
   readonly #conversation = new Map<string, ConversationClassification | unknown>();
   readonly #gmail = new Map<string, GmailTriageResult | unknown>();
+  readonly #calendar = new Map<string, CalendarTriageResult | unknown>();
 
   respondToConversation(idempotencyKey: string, response: ConversationClassification | unknown): void {
     this.#conversation.set(idempotencyKey, clone(response));
@@ -109,6 +113,10 @@ export class FakeApplicationInterpreter implements ApplicationInterpreterPort {
 
   respondToGmail(idempotencyKey: string, response: GmailTriageResult | unknown): void {
     this.#gmail.set(idempotencyKey, clone(response));
+  }
+
+  respondToCalendar(idempotencyKey: string, response: CalendarTriageResult | unknown): void {
+    this.#calendar.set(idempotencyKey, clone(response));
   }
 
   async interpretConversation(
@@ -131,6 +139,17 @@ export class FakeApplicationInterpreter implements ApplicationInterpreterPort {
       throw new Error(`No Gmail triage response for ${input.idempotencyKey}`);
     }
     return clone(this.#gmail.get(input.idempotencyKey));
+  }
+
+  async triageCalendar(
+    input: CalendarEventInboxItem,
+    context: CalendarTriageContext,
+  ): Promise<CalendarTriageResult | unknown> {
+    this.calendarCalls.push({ input: clone(input), context: clone(context) });
+    if (!this.#calendar.has(input.idempotencyKey)) {
+      throw new Error(`No Calendar triage response for ${input.idempotencyKey}`);
+    }
+    return clone(this.#calendar.get(input.idempotencyKey));
   }
 }
 

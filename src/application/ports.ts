@@ -11,6 +11,8 @@ import type {
   ApplicationOutcome,
   ApplicationProjection,
   ApplicationResult,
+  CalendarEventInboxItem,
+  CalendarTriageResult,
   ConversationClassification,
   ConversationInboxItem,
   EffectExecutionReceipt,
@@ -61,6 +63,17 @@ export interface GmailTriageContext {
   }[];
 }
 
+export interface CalendarTriageContext {
+  readonly currentTime: string;
+  readonly householdTimeZone: string;
+  readonly activeSharingRules: readonly {
+    readonly policyId: string;
+    readonly policyVersion: number;
+    readonly sourceClass: string;
+    readonly maximumSensitivity: "ordinary" | "sensitive";
+  }[];
+}
+
 /** Model-backed implementations may sit behind this app-owned, strictly parsed seam. */
 export interface ApplicationInterpreterPort {
   interpretConversation(
@@ -69,6 +82,11 @@ export interface ApplicationInterpreterPort {
   ): Promise<ConversationClassification | unknown>;
 
   triageGmail(input: GmailInboxItem, context: GmailTriageContext): Promise<GmailTriageResult | unknown>;
+
+  triageCalendar(
+    input: CalendarEventInboxItem,
+    context: CalendarTriageContext,
+  ): Promise<CalendarTriageResult | unknown>;
 }
 
 export interface ApplicationCommit {

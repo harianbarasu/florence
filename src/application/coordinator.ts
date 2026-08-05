@@ -38,6 +38,9 @@ import {
   ApplicationProjectionSchema,
   type ApplicationResult,
   ApplicationResultSchema,
+  type CalendarEventDeletedInboxItem,
+  type CalendarEventInboxItem,
+  CalendarTriageResultSchema,
   type ConversationClassification,
   ConversationClassificationSchema,
   type ConversationInboxItem,
@@ -165,7 +168,32 @@ function gmailEvidence(item: GmailInboxItem) {
       item.snippet ?? "",
       item.bodyText ?? "",
       ...item.attachmentRefs,
+      ...item.attachmentContents.map((attachment) => attachment.contentDigest),
     ),
+  });
+}
+
+function calendarSourceKey(item: CalendarEventInboxItem | CalendarEventDeletedInboxItem): string {
+  return stableId(
+    "calendar_source",
+    item.householdId,
+    item.ownerAdultId,
+    item.accountRef,
+    item.eventRef,
+    item.providerRef,
+  );
+}
+
+function calendarEvidence(item: CalendarEventInboxItem | CalendarEventDeletedInboxItem) {
+  const sourceRef = calendarSourceKey(item);
+  return EvidenceRefSchema.parse({
+    evidenceId: stableId("evidence", sourceRef, String(item.revision)),
+    source: "calendar",
+    sourceRef,
+    scope: { kind: "personal", adultId: item.ownerAdultId },
+    observedAt: item.occurredAt,
+    revision: item.revision,
+    ...(item.kind === "calendar_event" ? { contentDigest: item.contentDigest } : {}),
   });
 }
 
@@ -368,7 +396,7 @@ function enqueueWorker(
 
 function auditClassification(
   work: Work,
-  kind: "conversation_classified" | "gmail_triaged",
+  kind: "conversation_classified" | "gmail_triaged" | "calendar_triaged" | "calendar_reconciled",
   decision: string,
   sourceRef: string,
   adultId: string,
@@ -1282,6 +1310,14 @@ function approvePromotion(
   if (promoted.receipt.disposition !== "accepted") {
     return "rejected";
   }
+  const calendarSource = work.projection.calendarSources.find(
+    (candidate) => candidate.pendingPromotionId === pending.promotionId,
+  );
+  if (calendarSource !== undefined) {
+    delete calendarSource.pendingPromotionId;
+    calendarSource.episodeId = pending.proposal.episodeId;
+    calendarSource.recordedAt = item.occurredAt;
+  }
   let remembered = false;
   if (rememberForMatchingSource && pending.proposal.sensitivity !== "highly_sensitive") {
     const policy = acceptDomain(
@@ -1341,6 +1377,13 @@ function declinePromotion(
     return "rejected";
   }
   work.projection.pendingPromotions.splice(index, 1);
+  const calendarSource = work.projection.calendarSources.find(
+    (candidate) => candidate.pendingPromotionId === promotionId,
+  );
+  if (calendarSource !== undefined) {
+    delete calendarSource.pendingPromotionId;
+    calendarSource.recordedAt = item.occurredAt;
+  }
   queueMessage(
     work,
     "promotion-declined",
@@ -1582,6 +1625,409 @@ async function processGmail(
         `${triage.privateSummary} Share only this household meaning: “${triage.minimumHouseholdMeaning}”? Reply “share once ${pending.promotionId}” or, only if you want a standing rule for matching ${triage.sourceClass} items, “always share ${pending.promotionId}”.`,
       );
       return { status: "processed", classification: "gmail:promotion_pending" };
+    }
+  }
+}
+
+function calendarMinimumPromotion(
+  item: CalendarEventInboxItem,
+  triage: Extract<
+    ReturnType<typeof CalendarTriageResultSchema.parse>,
+    { decision: "propose_family_episode" }
+  >,
+): PendingPromotion {
+  const sourceKey = calendarSourceKey(item);
+  const evidence = calendarEvidence(item);
+  const promotionId = stableId("promotion", sourceKey, String(item.revision));
+  const temporalPlan = calendarTimingPlan(item, promotionId);
+  return {
+    promotionId,
+    ownerAdultId: item.ownerAdultId,
+    evidence,
+    proposal: EpisodeProposalSchema.parse({
+      episodeId: stableId("episode", promotionId),
+      type: "commitment",
+      targetScope: { kind: "household" },
+      title: triage.minimumHouseholdMeaning,
+      requiredOutcome: triage.minimumRequiredOutcome,
+      evidence: [evidence],
+      sourceClass: triage.sourceClass,
+      sensitivity: triage.sensitivity,
+      temporalPlan,
+    }),
+    minimumHouseholdMeaning: triage.minimumHouseholdMeaning,
+    createdAt: item.occurredAt,
+  };
+}
+
+const CALENDAR_USEFUL_LEAD_MINUTES = 7 * 24 * 60;
+const CALENDAR_FINAL_BUFFER_MINUTES = 30;
+const CALENDAR_MINIMUM_TIMER_DELAY_MINUTES = 5;
+
+function calendarTimingPlan(item: CalendarEventInboxItem, promotionId: string) {
+  const eventAt = Temporal.Instant.from(item.startsAt);
+  const observedAt = Temporal.Instant.from(item.occurredAt);
+  const earliestUsefulAt = eventAt.subtract({ minutes: CALENDAR_USEFUL_LEAD_MINUTES });
+  const lastResponsibleAt = eventAt.subtract({ minutes: CALENDAR_FINAL_BUFFER_MINUTES });
+  const candidates = [
+    { key: "day_before", at: eventAt.subtract({ hours: 24 }) },
+    { key: "two_hours_before", at: eventAt.subtract({ hours: 2 }) },
+  ].filter(
+    (candidate) =>
+      Temporal.Instant.compare(candidate.at, observedAt) > 0 &&
+      Temporal.Instant.compare(candidate.at, earliestUsefulAt) >= 0 &&
+      Temporal.Instant.compare(candidate.at, lastResponsibleAt) <= 0,
+  );
+
+  if (candidates.length === 0) {
+    const catchUpAt = observedAt.add({ minutes: CALENDAR_MINIMUM_TIMER_DELAY_MINUTES });
+    if (
+      Temporal.Instant.compare(catchUpAt, earliestUsefulAt) >= 0 &&
+      Temporal.Instant.compare(catchUpAt, lastResponsibleAt) <= 0
+    ) {
+      candidates.push({ key: "next_safe_time", at: catchUpAt });
+    }
+  }
+
+  return {
+    planId: stableId("plan", promotionId),
+    version: 1 as const,
+    timeZone: item.timeZone,
+    event: { kind: "instant" as const, at: eventAt.toString() },
+    earliestUseful: { kind: "instant" as const, at: earliestUsefulAt.toString() },
+    lastResponsible: { kind: "instant" as const, at: lastResponsibleAt.toString() },
+    usefulLeadMinutes: CALENDAR_USEFUL_LEAD_MINUTES,
+    preparationMinutes: 0,
+    finalBufferMinutes: CALENDAR_FINAL_BUFFER_MINUTES,
+    triggers: candidates.map((candidate) => ({
+      triggerId: stableId("trigger", promotionId, candidate.key),
+      timerId: stableId("timer", promotionId, candidate.key),
+      kind: "reminder" as const,
+      at: { kind: "instant" as const, at: candidate.at.toString() },
+    })),
+  };
+}
+
+function promoteCalendarByPolicy(
+  work: Work,
+  item: CalendarEventInboxItem,
+  pending: PendingPromotion,
+  policy: NonNullable<ReturnType<typeof matchingSharingPolicy>>,
+  confidence: number,
+): "processed" | "rejected" {
+  const jobId = DomainWorkerJobIdSchema.parse(stableId("job", item.idempotencyKey, "calendar-triage"));
+  const proposal = WorkerProposalSchema.parse({
+    resultId: stableId("worker_result", item.idempotencyKey, "calendar-triage"),
+    jobId,
+    householdId: item.householdId,
+    baseHouseholdVersion: work.aggregate.version,
+    basePolicyVersion: work.aggregate.policyVersion,
+    completedAt: item.occurredAt,
+    confidence,
+    evidence: [pending.evidence],
+    episodeProposals: [
+      {
+        ...pending.proposal,
+        promotionAuthority: {
+          kind: "policy",
+          policyId: policy.policyId,
+          policyVersion: policy.version,
+        },
+      },
+    ],
+    messageProposals: [],
+    actionProposals: [],
+    memoryCandidates: [],
+    policyCandidates: [],
+    unresolvedQuestions: [],
+    diagnostics: { warnings: [] },
+  });
+  const result = acceptDomain(work, "calendar-policy-promotion", item.occurredAt, { kind: "worker", jobId }, {
+    kind: "worker.proposal_received",
+    proposal,
+  } as Omit<HouseholdSignal, "householdId" | "signalId" | "sequence" | "occurredAt" | "actor">);
+  if (result.receipt.disposition === "accepted") {
+    queueMessage(
+      work,
+      "calendar-policy-household",
+      { kind: "household" },
+      "status",
+      pending.minimumHouseholdMeaning,
+    );
+  }
+  return statusForDomain(result);
+}
+
+type CalendarRevisionDisposition =
+  | { kind: "fresh"; sourceKey: string; index: number }
+  | { kind: "duplicate" | "stale" | "conflict"; sourceKey: string };
+
+function auditCalendarReconciliation(
+  work: Work,
+  item: CalendarEventInboxItem | CalendarEventDeletedInboxItem,
+  sourceKey: string,
+  decision: string,
+): void {
+  auditClassification(
+    work,
+    "calendar_reconciled",
+    decision,
+    sourceKey,
+    item.ownerAdultId,
+    true,
+    item.occurredAt,
+  );
+}
+
+function reconcileCalendarRevision(
+  work: Work,
+  item: CalendarEventInboxItem | CalendarEventDeletedInboxItem,
+): CalendarRevisionDisposition {
+  const sourceKey = calendarSourceKey(item);
+  const index = work.projection.calendarSources.findIndex(
+    (candidate) => candidate.sourceKey === sourceKey && candidate.ownerAdultId === item.ownerAdultId,
+  );
+  const prior = work.projection.calendarSources[index];
+  if (prior === undefined) {
+    return { kind: "fresh", sourceKey, index: work.projection.calendarSources.length };
+  }
+  if (item.revision < prior.latestRevision) {
+    auditCalendarReconciliation(work, item, sourceKey, "stale_revision");
+    return { kind: "stale", sourceKey };
+  }
+  if (item.revision === prior.latestRevision) {
+    const sameState =
+      (item.kind === "calendar_event_deleted" && prior.status === "deleted") ||
+      (item.kind === "calendar_event" &&
+        prior.status === "active" &&
+        prior.contentDigest === item.contentDigest);
+    auditCalendarReconciliation(
+      work,
+      item,
+      sourceKey,
+      sameState ? "duplicate_revision" : "revision_conflict",
+    );
+    return { kind: sameState ? "duplicate" : "conflict", sourceKey };
+  }
+
+  if (prior.pendingPromotionId !== undefined) {
+    const pendingIndex = work.projection.pendingPromotions.findIndex(
+      (candidate) =>
+        candidate.promotionId === prior.pendingPromotionId && candidate.ownerAdultId === item.ownerAdultId,
+    );
+    if (pendingIndex >= 0) {
+      work.projection.pendingPromotions.splice(pendingIndex, 1);
+      queueMessage(
+        work,
+        "calendar-promotion-invalidated",
+        personal(item.ownerAdultId),
+        "status",
+        "A private Calendar item changed, so its earlier sharing proposal is no longer pending.",
+      );
+    }
+  }
+
+  if (prior.episodeId !== undefined) {
+    const episode = work.aggregate.episodes.find((candidate) => candidate.episodeId === prior.episodeId);
+    if (episode === undefined) {
+      throw new Error(`Calendar source references an unknown episode: ${prior.episodeId}`);
+    }
+    if (!["completed", "dismissed", "superseded", "failed"].includes(episode.state)) {
+      const result = acceptDomain(
+        work,
+        `calendar-source-superseded:${sourceKey}:${item.revision}`,
+        item.occurredAt,
+        { kind: "source_adapter", source: "calendar" },
+        {
+          kind: "episode.source_superseded",
+          episodeId: episode.episodeId,
+          baseEpisodeVersion: episode.version,
+          supersedingEvidence: calendarEvidence(item),
+        } as Omit<HouseholdSignal, "householdId" | "signalId" | "sequence" | "occurredAt" | "actor">,
+      );
+      if (result.receipt.disposition !== "accepted") {
+        throw new Error(`Calendar source could not supersede episode: ${result.receipt.reason}`);
+      }
+    }
+  }
+
+  return { kind: "fresh", sourceKey, index };
+}
+
+function saveCalendarSource(
+  work: Work,
+  index: number,
+  record: ApplicationProjection["calendarSources"][number],
+): void {
+  if (index === work.projection.calendarSources.length) {
+    work.projection.calendarSources.push(record);
+    return;
+  }
+  work.projection.calendarSources[index] = record;
+}
+
+function calendarRevisionOutcome(disposition: CalendarRevisionDisposition): {
+  status: "processed" | "rejected";
+  classification: string;
+} | null {
+  switch (disposition.kind) {
+    case "fresh":
+      return null;
+    case "duplicate":
+      return { status: "processed", classification: "calendar:duplicate_revision" };
+    case "stale":
+      return { status: "processed", classification: "calendar:stale_revision" };
+    case "conflict":
+      return { status: "rejected", classification: "calendar:revision_conflict" };
+  }
+}
+
+function processCalendarDeleted(
+  work: Work,
+  item: CalendarEventDeletedInboxItem,
+): { status: "processed" | "rejected"; classification: string } {
+  if (!work.aggregate.verifiedAdultIds.includes(item.ownerAdultId)) {
+    return { status: "rejected", classification: "calendar_unknown_owner" };
+  }
+  const revision = reconcileCalendarRevision(work, item);
+  if (revision.kind !== "fresh") {
+    return calendarRevisionOutcome(revision) as Exclude<ReturnType<typeof calendarRevisionOutcome>, null>;
+  }
+  saveCalendarSource(work, revision.index, {
+    sourceKey: revision.sourceKey,
+    ownerAdultId: item.ownerAdultId,
+    latestRevision: item.revision,
+    status: "deleted",
+    recordedAt: item.occurredAt,
+  });
+  auditCalendarReconciliation(work, item, revision.sourceKey, "deleted");
+  return { status: "processed", classification: "calendar:deleted" };
+}
+
+async function processCalendar(
+  work: Work,
+  item: CalendarEventInboxItem,
+  dependencies: FlorenceApplicationDependencies,
+): Promise<{ status: "processed" | "rejected"; classification: string }> {
+  if (!work.aggregate.verifiedAdultIds.includes(item.ownerAdultId)) {
+    return { status: "rejected", classification: "calendar_unknown_owner" };
+  }
+  const revision = reconcileCalendarRevision(work, item);
+  if (revision.kind !== "fresh") {
+    return calendarRevisionOutcome(revision) as Exclude<ReturnType<typeof calendarRevisionOutcome>, null>;
+  }
+
+  const rules = work.aggregate.policies.flatMap((policy) =>
+    policy.status === "active" &&
+    policy.rule.kind === "sharing" &&
+    policy.rule.from.adultId === item.ownerAdultId
+      ? [
+          {
+            policyId: policy.policyId,
+            policyVersion: policy.version,
+            sourceClass: policy.rule.sourceClass,
+            maximumSensitivity: policy.rule.maximumSensitivity,
+          },
+        ]
+      : [],
+  );
+  const triage = CalendarTriageResultSchema.parse(
+    await dependencies.interpreter.triageCalendar(item, {
+      currentTime: item.occurredAt,
+      householdTimeZone: work.aggregate.timeZone,
+      activeSharingRules: rules,
+    }),
+  );
+  work.projection.calendarTriage.push({
+    sourceKey: revision.sourceKey,
+    ownerAdultId: item.ownerAdultId,
+    revision: item.revision,
+    decision: triage.decision,
+    sourceClass: triage.sourceClass,
+    sensitivity: triage.sensitivity,
+    familyImpact: triage.familyImpact,
+    confidence: triage.confidence,
+    recordedAt: item.occurredAt,
+  });
+  auditClassification(
+    work,
+    "calendar_triaged",
+    triage.decision,
+    revision.sourceKey,
+    item.ownerAdultId,
+    true,
+    item.occurredAt,
+  );
+
+  const sourceRecord = {
+    sourceKey: revision.sourceKey,
+    ownerAdultId: item.ownerAdultId,
+    latestRevision: item.revision,
+    status: "active" as const,
+    contentDigest: item.contentDigest,
+    recordedAt: item.occurredAt,
+  };
+  switch (triage.decision) {
+    case "ignore":
+    case "retain_private":
+      saveCalendarSource(work, revision.index, sourceRecord);
+      return { status: "processed", classification: `calendar:${triage.decision}` };
+    case "private_review":
+      saveCalendarSource(work, revision.index, sourceRecord);
+      queueMessage(
+        work,
+        "calendar-private-review",
+        personal(item.ownerAdultId),
+        "private_review",
+        triage.privateSummary,
+      );
+      return { status: "processed", classification: "calendar:private_review" };
+    case "private_interrupt":
+      saveCalendarSource(work, revision.index, sourceRecord);
+      queueMessage(
+        work,
+        "calendar-private-interrupt",
+        personal(item.ownerAdultId),
+        "private_interrupt",
+        triage.privateSummary,
+      );
+      return { status: "processed", classification: "calendar:private_interrupt" };
+    case "propose_family_episode": {
+      if (!triage.familyImpact) {
+        saveCalendarSource(work, revision.index, sourceRecord);
+        return { status: "rejected", classification: "calendar:family_impact_missing" };
+      }
+      const pending = calendarMinimumPromotion(item, triage);
+      const policy = matchingSharingPolicy(
+        work.aggregate,
+        item.ownerAdultId,
+        triage.sourceClass,
+        triage.sensitivity,
+      );
+      if (policy !== undefined) {
+        const status = promoteCalendarByPolicy(work, item, pending, policy, triage.confidence);
+        if (status !== "processed") {
+          throw new Error("Calendar policy promotion was rejected by the household domain");
+        }
+        saveCalendarSource(work, revision.index, {
+          ...sourceRecord,
+          episodeId: pending.proposal.episodeId,
+        });
+        return { status: "processed", classification: "calendar:policy_promotion" };
+      }
+      work.projection.pendingPromotions.push(pending);
+      saveCalendarSource(work, revision.index, {
+        ...sourceRecord,
+        pendingPromotionId: pending.promotionId,
+      });
+      queueMessage(
+        work,
+        "calendar-promotion-request",
+        personal(item.ownerAdultId),
+        "promotion_request",
+        `${triage.privateSummary} Share only this household meaning: “${triage.minimumHouseholdMeaning}” with this required outcome: “${triage.minimumRequiredOutcome}”? The event's start time will anchor follow-through; its raw title, description, and location stay private. Reply “share once ${pending.promotionId}” or, only if you want a standing rule for matching ${triage.sourceClass} items, “always share ${pending.promotionId}”.`,
+      );
+      return { status: "processed", classification: "calendar:promotion_pending" };
     }
   }
 }
@@ -2071,6 +2517,12 @@ async function processApplicationInput(
     case "gmail_message":
       processed = await processGmail(work, input, dependencies);
       break;
+    case "calendar_event":
+      processed = await processCalendar(work, input, dependencies);
+      break;
+    case "calendar_event_deleted":
+      processed = processCalendarDeleted(work, input);
+      break;
     case "worker_result":
       processed = processWorkerResult(work, input);
       break;
@@ -2123,6 +2575,8 @@ export function createApplicationProjection(
     onboarding,
     sharedProfile: { facts: [] },
     gmailTriage: [],
+    calendarTriage: [],
+    calendarSources: [],
     pendingPromotions: [],
     workers: [],
   });

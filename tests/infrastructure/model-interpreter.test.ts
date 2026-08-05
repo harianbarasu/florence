@@ -108,6 +108,7 @@ describe("ModelApplicationInterpreter", () => {
         subject: "School update",
         bodyText: "Private access code 9917",
         attachmentRefs: [],
+        attachmentContents: [],
       },
       { confirmedRoutineAnchors: [], activeSharingRules: [] },
     );
@@ -115,6 +116,104 @@ describe("ModelApplicationInterpreter", () => {
     expect(gateway.calls[0]?.profile).toBe("private_processing");
     expect(gateway.calls[0]?.request.responseSchemaName).toBe("florence_private_gmail_triage");
     expect(JSON.stringify(gateway.calls[0]?.request.messages)).toContain("Private access code 9917");
+  });
+
+  it("keeps Gmail binary evidence on the private multimodal route without duplicating bytes in JSON", async () => {
+    const gateway = new RecordingGateway({
+      decision: "private_review",
+      confidence: 0.9,
+      sourceClass: "school.notice",
+      sensitivity: "sensitive",
+      familyImpact: true,
+      rationale: "The attachment may require a family response.",
+      privateSummary: "A school attachment needs review.",
+    });
+    const interpreter = new ModelApplicationInterpreter(gateway);
+    const dataBase64 = Buffer.from("private image bytes").toString("base64");
+    await interpreter.triageGmail(
+      {
+        kind: "gmail_message",
+        householdId,
+        idempotencyKey: "gmail:event:binary",
+        occurredAt: "2027-01-01T08:00:00Z",
+        ownerAdultId: adultId,
+        accountRef: "account-1",
+        messageRef: "message-binary",
+        revision: 1,
+        labels: ["INBOX"],
+        attachmentRefs: ["attachment-1"],
+        attachmentContents: [
+          {
+            reference: "attachment-1",
+            kind: "image",
+            mediaType: "image/png",
+            filename: "notice.png",
+            sizeBytes: 19,
+            dataBase64,
+            contentDigest: `sha256:${"c".repeat(64)}`,
+          },
+        ],
+      },
+      { confirmedRoutineAnchors: [], activeSharingRules: [] },
+    );
+
+    expect(gateway.calls[0]?.profile).toBe("private_processing");
+    const userParts = gateway.calls[0]?.request.messages[1]?.parts ?? [];
+    expect(userParts[1]).toMatchObject({
+      type: "image",
+      mediaType: "image/png",
+      alt: "notice.png",
+      data: dataBase64,
+    });
+    expect(userParts[0]?.type === "text" ? userParts[0].text : "").not.toContain(dataBase64);
+  });
+
+  it("uses a private, provider-neutral route and context for inbound Calendar triage", async () => {
+    const gateway = new RecordingGateway({
+      decision: "retain_private",
+      confidence: 0.91,
+      sourceClass: "calendar.personal",
+      sensitivity: "sensitive",
+      familyImpact: false,
+      rationale: "The event is private and has no family consequence.",
+      privateSummary: "A private appointment remains private.",
+    });
+    const interpreter = new ModelApplicationInterpreter(gateway);
+    await interpreter.triageCalendar(
+      {
+        kind: "calendar_event",
+        householdId,
+        idempotencyKey: "calendar:event:1",
+        occurredAt: "2027-01-01T08:00:00Z",
+        ownerAdultId: adultId,
+        accountRef: "account-1",
+        eventRef: "event-1",
+        providerRef: "provider-event-1",
+        revision: 1,
+        contentDigest: `sha256:${"d".repeat(64)}`,
+        title: "Private appointment",
+        description: "Do not share this raw text",
+        location: null,
+        startsAt: "2027-01-02T17:00:00Z",
+        endsAt: "2027-01-02T18:00:00Z",
+        timeZone: "America/Los_Angeles",
+        allDay: false,
+        status: "confirmed",
+        recurrence: [],
+      },
+      {
+        currentTime: "2027-01-01T08:00:00Z",
+        householdTimeZone: "America/Los_Angeles",
+        activeSharingRules: [],
+      },
+    );
+
+    expect(gateway.calls[0]?.profile).toBe("private_processing");
+    expect(gateway.calls[0]?.request.responseSchemaName).toBe("florence_private_calendar_triage");
+    const serialized = JSON.stringify(gateway.calls[0]?.request.messages);
+    expect(serialized).toContain("triage_private_calendar_event");
+    expect(serialized).toContain("untrusted evidence");
+    expect(serialized).toContain("America/Los_Angeles");
   });
 
   it("routes attachment bytes through the vision/document contract without duplicating them in JSON", async () => {

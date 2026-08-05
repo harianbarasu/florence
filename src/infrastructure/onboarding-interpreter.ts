@@ -1,5 +1,7 @@
 import type {
   ApplicationInterpreterPort,
+  CalendarEventInboxItem,
+  CalendarTriageContext,
   ConversationInboxItem,
   ConversationInterpretationContext,
   GmailInboxItem,
@@ -107,6 +109,10 @@ export class OnboardingAwareInterpreter implements ApplicationInterpreterPort {
 
   public triageGmail(input: GmailInboxItem, context: GmailTriageContext): Promise<unknown> {
     return this.model.triageGmail(input, context);
+  }
+
+  public triageCalendar(input: CalendarEventInboxItem, context: CalendarTriageContext): Promise<unknown> {
+    return this.model.triageCalendar(input, context);
   }
 }
 

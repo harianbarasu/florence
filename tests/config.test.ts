@@ -63,6 +63,8 @@ describe("configuration", () => {
       GOOGLE_OAUTH_STATE_SECRET: "state-secret-that-is-at-least-thirty-two-bytes",
       GOOGLE_REDIRECT_URI: "https://florence.example.com/oauth/google/callback",
       GOOGLE_PUBSUB_VERIFICATION_TOKEN: "verification-token",
+      GOOGLE_PUBSUB_OIDC_AUDIENCE: "https://florence.example.com/webhooks/google/gmail",
+      GOOGLE_PUBSUB_SERVICE_ACCOUNT_EMAIL: "florence-push@example-project.iam.gserviceaccount.com",
       GOOGLE_GMAIL_TOPIC_NAME: "projects/florence/topics/gmail",
       GOOGLE_GMAIL_PUBSUB_SUBSCRIPTION: "projects/florence/subscriptions/gmail",
     });
@@ -71,6 +73,36 @@ describe("configuration", () => {
       gmail: true,
       googleCalendar: true,
     });
+  });
+
+  it("keeps Gmail unavailable until both Pub/Sub OIDC identity settings are present", () => {
+    const google = {
+      GOOGLE_CLIENT_ID: "client-id",
+      GOOGLE_CLIENT_SECRET: "client-secret",
+      GOOGLE_OAUTH_STATE_SECRET: "state-secret-that-is-at-least-thirty-two-bytes",
+      GOOGLE_REDIRECT_URI: "https://florence.example.com/oauth/google/callback",
+      GOOGLE_PUBSUB_VERIFICATION_TOKEN: "verification-token",
+      GOOGLE_GMAIL_TOPIC_NAME: "projects/florence/topics/gmail",
+      GOOGLE_GMAIL_PUBSUB_SUBSCRIPTION: "projects/florence/subscriptions/gmail",
+    };
+    expect(
+      availableIntegrations(
+        loadConfig({
+          ...validEnvironment(),
+          ...google,
+          GOOGLE_PUBSUB_OIDC_AUDIENCE: "https://florence.example.com/webhooks/google/gmail",
+        }),
+      ).gmail,
+    ).toBe(false);
+    expect(
+      availableIntegrations(
+        loadConfig({
+          ...validEnvironment(),
+          ...google,
+          GOOGLE_PUBSUB_SERVICE_ACCOUNT_EMAIL: "florence-push@example-project.iam.gserviceaccount.com",
+        }),
+      ).gmail,
+    ).toBe(false);
   });
 
   it("rejects a malformed Gmail Pub/Sub subscription name", () => {
@@ -105,11 +137,15 @@ describe("configuration", () => {
       LINQ_API_KEY: "",
       GOOGLE_REDIRECT_URI: "",
       GOOGLE_GMAIL_TOPIC_NAME: "",
+      GOOGLE_PUBSUB_OIDC_AUDIENCE: "",
+      GOOGLE_PUBSUB_SERVICE_ACCOUNT_EMAIL: "",
       OPEN_WEIGHT_BASE_URL: "",
     });
     expect(config.LINQ_API_KEY).toBeUndefined();
     expect(config.GOOGLE_REDIRECT_URI).toBeUndefined();
     expect(config.GOOGLE_GMAIL_TOPIC_NAME).toBeUndefined();
+    expect(config.GOOGLE_PUBSUB_OIDC_AUDIENCE).toBeUndefined();
+    expect(config.GOOGLE_PUBSUB_SERVICE_ACCOUNT_EMAIL).toBeUndefined();
     expect(config.OPEN_WEIGHT_BASE_URL).toBeUndefined();
   });
 

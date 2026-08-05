@@ -28,6 +28,14 @@ const environmentSchema = z.object({
   GOOGLE_OAUTH_STATE_SECRET: optionalSecret,
   GOOGLE_REDIRECT_URI: optionalUrl,
   GOOGLE_PUBSUB_VERIFICATION_TOKEN: optionalSecret,
+  GOOGLE_PUBSUB_OIDC_AUDIENCE: optionalUrl,
+  GOOGLE_PUBSUB_SERVICE_ACCOUNT_EMAIL: z.preprocess(
+    emptyStringAsUndefined,
+    z
+      .email()
+      .transform((value) => value.toLowerCase())
+      .optional(),
+  ),
   GOOGLE_GMAIL_TOPIC_NAME: z.preprocess(
     emptyStringAsUndefined,
     z
@@ -106,6 +114,8 @@ export function availableIntegrations(config: FlorenceConfig): {
     gmail: Boolean(
       googleOAuth &&
         config.GOOGLE_PUBSUB_VERIFICATION_TOKEN &&
+        config.GOOGLE_PUBSUB_OIDC_AUDIENCE &&
+        config.GOOGLE_PUBSUB_SERVICE_ACCOUNT_EMAIL &&
         config.GOOGLE_GMAIL_TOPIC_NAME &&
         config.GOOGLE_GMAIL_PUBSUB_SUBSCRIPTION,
     ),

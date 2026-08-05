@@ -45,7 +45,7 @@ describe.skipIf(!databaseUrl)("production composition PostgreSQL integration", (
     const running = composition.background.run(controller.signal);
     try {
       expect(composition.http.config.googleCalendarPushEnabled).toBe(true);
-      expect(composition.http.config.gmailPubSubVerificationToken).toBeNull();
+      expect(composition.http.config.gmailPubSubAuthentication).toBeNull();
       const firstOutcome = await Promise.race([
         running.then(
           () => "stopped" as const,

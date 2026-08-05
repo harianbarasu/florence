@@ -20,6 +20,10 @@ import {
   parseVerifiedLinqWebhook,
 } from "../adapters/linq/index.js";
 import {
+  type GooglePubSubAuthorization,
+  GooglePubSubOidcAuthenticator,
+} from "../security/google-pubsub-auth.js";
+import {
   DEFAULT_CALENDAR_PUSH_BODY_LIMIT_BYTES,
   DEFAULT_GMAIL_PUSH_BODY_LIMIT_BYTES,
   DEFAULT_LINQ_BODY_LIMIT_BYTES,
@@ -104,6 +108,9 @@ const idempotencyKeySchema = z.string().min(16).max(256);
 export interface CreateFlorenceHttpServerOptions {
   config: FlorenceHttpConfigInput;
   services: FlorenceHttpServices;
+  googlePubSubAuthenticator?: {
+    authenticate(input: GooglePubSubAuthorization): Promise<boolean>;
+  };
   logger?: false | HttpLoggerOptions;
 }
 
@@ -135,6 +142,7 @@ export async function createFlorenceHttpServer(
   options: CreateFlorenceHttpServerOptions,
 ): Promise<FastifyInstance> {
   const config = parseFlorenceHttpConfig(options.config);
+  const googlePubSubAuthenticator = options.googlePubSubAuthenticator ?? new GooglePubSubOidcAuthenticator();
   const app = Fastify({
     bodyLimit: config.bodyLimitBytes,
     trustProxy: config.trustProxy,
@@ -287,13 +295,32 @@ export async function createFlorenceHttpServer(
     },
     async (request, reply) => {
       reply.header("cache-control", "no-store");
-      const expectedToken = config.gmailPubSubVerificationToken;
+      const authentication = config.gmailPubSubAuthentication;
       const query = gmailPushQuerySchema.safeParse(request.query);
-      if (expectedToken === null || !query.success || !secretsMatch(expectedToken, query.data.token)) {
+      if (
+        authentication === null ||
+        !query.success ||
+        !secretsMatch(authentication.verificationToken, query.data.token)
+      ) {
         metrics.ingress.inc({ source: "gmail", outcome: "rejected" });
-        return reply.code(expectedToken === null ? 503 : 401).send({
-          error: expectedToken === null ? "unavailable" : "unauthorized",
+        return reply.code(authentication === null ? 503 : 401).send({
+          error: authentication === null ? "unavailable" : "unauthorized",
         });
+      }
+
+      let oidcAuthorized = false;
+      try {
+        oidcAuthorized = await googlePubSubAuthenticator.authenticate({
+          authorizationHeader: request.headers.authorization,
+          expectedAudience: authentication.oidcAudience,
+          expectedServiceAccountEmail: authentication.serviceAccountEmail,
+        });
+      } catch {
+        oidcAuthorized = false;
+      }
+      if (!oidcAuthorized) {
+        metrics.ingress.inc({ source: "gmail", outcome: "rejected" });
+        return reply.code(401).send({ error: "unauthorized" });
       }
 
       let event: GmailPubSubEvent;

@@ -148,6 +148,8 @@ first production system, not permission for models to access raw credentials.
 | `LINQ_WEBHOOK_SECRET` | Exact `whsec_...` secret returned for the production subscription |
 | `GOOGLE_OAUTH_STATE_SECRET` | Independent random value used only for short-lived handoffs |
 | `GOOGLE_PUBSUB_VERIFICATION_TOKEN` | Independent random query token used by the Gmail push route |
+| `GOOGLE_PUBSUB_OIDC_AUDIENCE` | Exact push-auth audience: `https://harianbarasu.com/webhooks/google/gmail` |
+| `GOOGLE_PUBSUB_SERVICE_ACCOUNT_EMAIL` | Dedicated push-auth service account selected on the subscription |
 | `LINQ_API_KEY` | Linq v3 bearer credential |
 | `LINQ_BASE_URL` | `https://api.linqapp.com/api/partner/v3` |
 | `LINQ_FROM_PHONE` | Florence's assigned E.164 phone number |
@@ -311,17 +313,36 @@ policy](https://developers.google.com/identity/protocols/oauth2/production-readi
    gmail-api-push@system.gserviceaccount.com
    ```
 
-3. Create a push subscription on that topic.
-4. Set its HTTPS endpoint to the following, substituting the secret value only in Google Cloud and
+3. Create a dedicated push-auth service account, for example
+   `florence-pubsub-push@<project-id>.iam.gserviceaccount.com`.
+4. Grant `roles/iam.serviceAccountTokenCreator` on that identity to the Pub/Sub service agent
+   `service-<project-number>@gcp-sa-pubsub.iam.gserviceaccount.com`. The principal configuring the
+   subscription also needs `iam.serviceAccounts.actAs` on the push-auth identity.
+5. Create a push subscription on the topic, enable authentication, and select the dedicated
+   push-auth service account. Set this explicit audience:
+
+   ```text
+   https://harianbarasu.com/webhooks/google/gmail
+   ```
+
+6. Set its HTTPS endpoint to the following, substituting the secret value only in Google Cloud and
    Railway:
 
    ```text
    https://harianbarasu.com/webhooks/google/gmail?token=<GOOGLE_PUBSUB_VERIFICATION_TOKEN>
    ```
 
-5. Set `GOOGLE_GMAIL_TOPIC_NAME`, the full `GOOGLE_GMAIL_PUBSUB_SUBSCRIPTION`, and the same random
-   verification token on every application service.
-6. Leave payload wrapping enabled; Florence expects the standard Pub/Sub push envelope.
+7. Set `GOOGLE_GMAIL_TOPIC_NAME`, the full `GOOGLE_GMAIL_PUBSUB_SUBSCRIPTION`, the same random
+   verification token, the exact OIDC audience, and the selected service-account email on every
+   application service.
+8. Leave payload wrapping enabled; Florence expects the standard Pub/Sub push envelope.
+
+Florence requires both authentication factors before parsing a push body: the query token must
+match, and Google Auth must verify the bearer JWT signature, lifetime, Google issuer, exact audience,
+verified email flag, and exact configured service-account email. Missing or partial OIDC
+configuration keeps Gmail ingress unavailable. Google documents that authenticated push JWTs can be
+up to one hour old and that audience and email must match the subscription settings. [Authenticated
+Pub/Sub push](https://docs.cloud.google.com/pubsub/docs/authenticate-push-subscriptions)
 
 Google's Gmail push guide requires granting its service account publish access, describes the
 base64url notification envelope, and says mailbox watches must be renewed at least every seven days
@@ -394,7 +415,7 @@ curl --output /dev/null --write-out '%{http_code}\n' \
 ```
 
 The Linq request should be rejected for invalid signature; the Gmail request should be rejected for
-missing verification token. Neither should create provider-inbox work.
+missing query-token and Google OIDC authentication. Neither should create provider-inbox work.
 
 ### Real family loop
 
@@ -451,6 +472,7 @@ Per-credential notes:
 | `GOOGLE_CLIENT_SECRET` | Replace on all application services, test OAuth and refresh, then retire the old secret |
 | `GOOGLE_OAUTH_STATE_SECRET` | Update all application services; outstanding short-lived handoff links become invalid and must be reissued |
 | `GOOGLE_PUBSUB_VERIFICATION_TOKEN` | Update Railway and the push endpoint as one maintenance action; Pub/Sub retries failures during a brief mismatch |
+| `GOOGLE_PUBSUB_OIDC_AUDIENCE` / `GOOGLE_PUBSUB_SERVICE_ACCOUNT_EMAIL` | Update the subscription and every application service in one maintenance action; verify a signed delivery before retiring the old identity |
 | `FLORENCE_ADMIN_API_KEY` | Update all application services, verify old token is rejected and new token succeeds |
 | PostgreSQL password | Rotate through Railway, update all references/connections, redeploy, and check migration/readiness |
 
@@ -494,4 +516,5 @@ release gate passes against it. [Railway PostgreSQL backups](https://docs.railwa
 - [Google web-server OAuth](https://developers.google.com/identity/protocols/oauth2/web-server)
 - [Google OAuth production readiness](https://developers.google.com/identity/protocols/oauth2/production-readiness/policy-compliance)
 - [Gmail push notifications](https://developers.google.com/workspace/gmail/api/guides/push)
+- [Authenticated Pub/Sub push](https://docs.cloud.google.com/pubsub/docs/authenticate-push-subscriptions)
 - [Cloud Pub/Sub push delivery](https://docs.cloud.google.com/pubsub/docs/push)

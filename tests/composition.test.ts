@@ -177,13 +177,19 @@ describe("production composition", () => {
   it("does not expose webhook ingress for partial provider configuration", async () => {
     const composition = await createProductionComposition({
       config: config({
+        GOOGLE_CLIENT_ID: "partial-client-id",
+        GOOGLE_CLIENT_SECRET: "partial-client-secret",
+        GOOGLE_OAUTH_STATE_SECRET: "partial-state-secret-with-at-least-thirty-two-bytes",
+        GOOGLE_REDIRECT_URI: "https://florence.example.test/oauth/google/callback",
         GOOGLE_PUBSUB_VERIFICATION_TOKEN: "partial-google-token",
+        GOOGLE_GMAIL_TOPIC_NAME: "projects/florence/topics/gmail",
+        GOOGLE_GMAIL_PUBSUB_SUBSCRIPTION: "projects/florence/subscriptions/gmail",
         LINQ_WEBHOOK_SECRET: "partial-linq-secret",
       }),
       migrate: false,
     });
     try {
-      expect(composition.http.config.gmailPubSubVerificationToken).toBeNull();
+      expect(composition.http.config.gmailPubSubAuthentication).toBeNull();
       expect(composition.http.config.linqWebhook).toBeNull();
     } finally {
       await composition.close();

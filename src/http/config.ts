@@ -19,11 +19,19 @@ const linqWebhookConfigSchema = z
   })
   .strict();
 
+const gmailPubSubAuthenticationSchema = z
+  .object({
+    verificationToken: z.string().min(1),
+    oidcAudience: z.string().url(),
+    serviceAccountEmail: z.email().transform((value) => value.toLowerCase()),
+  })
+  .strict();
+
 export const florenceHttpConfigSchema = z
   .object({
     publicUrl: z.string().url(),
     operatorToken: z.string().min(24),
-    gmailPubSubVerificationToken: z.string().min(1).nullable(),
+    gmailPubSubAuthentication: gmailPubSubAuthenticationSchema.nullable(),
     googleCalendarPushEnabled: z.boolean().default(false),
     linqWebhook: linqWebhookConfigSchema.nullable(),
     trustProxy: z.boolean().default(true),
@@ -56,6 +64,8 @@ export interface FlorenceHttpEnvironmentConfig {
   FLORENCE_ADMIN_API_KEY: string;
   LINQ_WEBHOOK_SECRET?: string;
   GOOGLE_PUBSUB_VERIFICATION_TOKEN?: string;
+  GOOGLE_PUBSUB_OIDC_AUDIENCE?: string;
+  GOOGLE_PUBSUB_SERVICE_ACCOUNT_EMAIL?: string;
   GOOGLE_CALENDAR_PUSH_ENABLED?: boolean;
 }
 
@@ -72,11 +82,21 @@ export function httpConfigFromFlorenceConfig(config: FlorenceHttpEnvironmentConf
           webhookVersion: LINQ_WEBHOOK_VERSION,
         }
       : null;
+  const gmailPubSubAuthentication =
+    config.GOOGLE_PUBSUB_VERIFICATION_TOKEN &&
+    config.GOOGLE_PUBSUB_OIDC_AUDIENCE &&
+    config.GOOGLE_PUBSUB_SERVICE_ACCOUNT_EMAIL
+      ? {
+          verificationToken: config.GOOGLE_PUBSUB_VERIFICATION_TOKEN,
+          oidcAudience: config.GOOGLE_PUBSUB_OIDC_AUDIENCE,
+          serviceAccountEmail: config.GOOGLE_PUBSUB_SERVICE_ACCOUNT_EMAIL,
+        }
+      : null;
 
   return parseFlorenceHttpConfig({
     publicUrl: config.FLORENCE_WEB_BASE_URL,
     operatorToken: config.FLORENCE_ADMIN_API_KEY,
-    gmailPubSubVerificationToken: config.GOOGLE_PUBSUB_VERIFICATION_TOKEN ?? null,
+    gmailPubSubAuthentication,
     googleCalendarPushEnabled: config.GOOGLE_CALENDAR_PUSH_ENABLED ?? false,
     linqWebhook,
   });

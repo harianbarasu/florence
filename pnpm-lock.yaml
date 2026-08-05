@@ -44,6 +44,9 @@ importers:
       fastify-raw-body:
         specifier: 5.0.0
         version: 5.0.0
+      google-auth-library:
+        specifier: 10.5.0
+        version: 10.5.0
       googleapis:
         specifier: 174.0.0
         version: 174.0.0

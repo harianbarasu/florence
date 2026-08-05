@@ -342,9 +342,16 @@ export async function createProductionComposition(
         ...(!integrations.linq || config.LINQ_WEBHOOK_SECRET === undefined
           ? {}
           : { LINQ_WEBHOOK_SECRET: config.LINQ_WEBHOOK_SECRET }),
-        ...(!integrations.gmail || config.GOOGLE_PUBSUB_VERIFICATION_TOKEN === undefined
+        ...(!integrations.gmail ||
+        config.GOOGLE_PUBSUB_VERIFICATION_TOKEN === undefined ||
+        config.GOOGLE_PUBSUB_OIDC_AUDIENCE === undefined ||
+        config.GOOGLE_PUBSUB_SERVICE_ACCOUNT_EMAIL === undefined
           ? {}
-          : { GOOGLE_PUBSUB_VERIFICATION_TOKEN: config.GOOGLE_PUBSUB_VERIFICATION_TOKEN }),
+          : {
+              GOOGLE_PUBSUB_VERIFICATION_TOKEN: config.GOOGLE_PUBSUB_VERIFICATION_TOKEN,
+              GOOGLE_PUBSUB_OIDC_AUDIENCE: config.GOOGLE_PUBSUB_OIDC_AUDIENCE,
+              GOOGLE_PUBSUB_SERVICE_ACCOUNT_EMAIL: config.GOOGLE_PUBSUB_SERVICE_ACCOUNT_EMAIL,
+            }),
         GOOGLE_CALENDAR_PUSH_ENABLED: google.calendarPush !== null,
       }),
       services: {

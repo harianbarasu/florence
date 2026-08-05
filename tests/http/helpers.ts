@@ -4,12 +4,19 @@ import type { FlorenceHttpConfigInput, FlorenceHttpServices } from "../../src/ht
 
 export const OPERATOR_TOKEN = "synthetic-operator-token-000000000001";
 export const PUBSUB_TOKEN = "synthetic-pubsub-token-000000000001";
+export const PUBSUB_AUTHORIZATION = "Bearer synthetic-google-id-token";
+export const PUBSUB_OIDC_AUDIENCE = "https://florence.example.test/webhooks/google/gmail";
+export const PUBSUB_SERVICE_ACCOUNT_EMAIL = "florence-push@example-project.iam.gserviceaccount.com";
 export const LINQ_SIGNING_KEY = Buffer.alloc(32, 0x42);
 
 export const HTTP_CONFIG: FlorenceHttpConfigInput = {
   publicUrl: "https://florence.example.test",
   operatorToken: OPERATOR_TOKEN,
-  gmailPubSubVerificationToken: PUBSUB_TOKEN,
+  gmailPubSubAuthentication: {
+    verificationToken: PUBSUB_TOKEN,
+    oidcAudience: PUBSUB_OIDC_AUDIENCE,
+    serviceAccountEmail: PUBSUB_SERVICE_ACCOUNT_EMAIL,
+  },
   googleCalendarPushEnabled: true,
   linqWebhook: {
     webhookSecret: `whsec_${LINQ_SIGNING_KEY.toString("base64")}`,

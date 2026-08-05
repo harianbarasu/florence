@@ -7,6 +7,7 @@ import {
   gmailPushPayload,
   HTTP_CONFIG,
   LINQ_SIGNING_KEY,
+  PUBSUB_AUTHORIZATION,
   PUBSUB_TOKEN,
   readHttpFixture,
   signedLinqHeaders,
@@ -15,10 +16,20 @@ import {
 describe("provider ingress HTTP interface", () => {
   let server: FastifyInstance;
   let services: ReturnType<typeof fakeHttpServices>;
+  const googlePubSubAuthenticator = {
+    authenticate: vi.fn(async (input: { authorizationHeader: string | undefined }) =>
+      Promise.resolve(input.authorizationHeader === PUBSUB_AUTHORIZATION),
+    ),
+  };
 
   beforeEach(async () => {
     services = fakeHttpServices();
-    server = await createFlorenceHttpServer({ config: HTTP_CONFIG, services });
+    googlePubSubAuthenticator.authenticate.mockClear();
+    server = await createFlorenceHttpServer({
+      config: HTTP_CONFIG,
+      services,
+      googlePubSubAuthenticator,
+    });
   });
 
   afterEach(async () => {
@@ -126,6 +137,7 @@ describe("provider ingress HTTP interface", () => {
     server = await createFlorenceHttpServer({
       config: { ...HTTP_CONFIG, bodyLimitBytes: 1_024 },
       services,
+      googlePubSubAuthenticator,
     });
     const oversized = JSON.stringify({ content: "x".repeat(2_000) });
     const oversizedResponse = await server.inject({
@@ -144,7 +156,10 @@ describe("provider ingress HTTP interface", () => {
     const response = await server.inject({
       method: "POST",
       url: `/webhooks/google/gmail?token=${encodeURIComponent(PUBSUB_TOKEN)}`,
-      headers: { "content-type": "application/json" },
+      headers: {
+        authorization: PUBSUB_AUTHORIZATION,
+        "content-type": "application/json",
+      },
       payload: gmailPushPayload(),
     });
 
@@ -161,6 +176,37 @@ describe("provider ingress HTTP interface", () => {
       publishedAt: "2026-08-05T15:30:00.000Z",
       deliveryAttempt: null,
     });
+    expect(googlePubSubAuthenticator.authenticate).toHaveBeenCalledWith({
+      authorizationHeader: PUBSUB_AUTHORIZATION,
+      expectedAudience: HTTP_CONFIG.gmailPubSubAuthentication?.oidcAudience,
+      expectedServiceAccountEmail: HTTP_CONFIG.gmailPubSubAuthentication?.serviceAccountEmail,
+    });
+  });
+  it("rejects missing or invalid Pub/Sub OIDC authorization before parsing Gmail content", async () => {
+    services.ingress.acceptGmailPush = vi.fn(async () => undefined);
+    const privatePayload = gmailPushPayload({ email: "private-parent@example.test" });
+
+    const missing = await server.inject({
+      method: "POST",
+      url: `/webhooks/google/gmail?token=${encodeURIComponent(PUBSUB_TOKEN)}`,
+      headers: { "content-type": "application/json" },
+      payload: privatePayload,
+    });
+    expect(missing.statusCode).toBe(401);
+
+    googlePubSubAuthenticator.authenticate.mockResolvedValueOnce(false);
+    const wrongClaims = await server.inject({
+      method: "POST",
+      url: `/webhooks/google/gmail?token=${encodeURIComponent(PUBSUB_TOKEN)}`,
+      headers: {
+        authorization: PUBSUB_AUTHORIZATION,
+        "content-type": "application/json",
+      },
+      payload: privatePayload,
+    });
+    expect(wrongClaims.statusCode).toBe(401);
+    expect(wrongClaims.body).not.toContain("private-parent");
+    expect(services.ingress.acceptGmailPush).not.toHaveBeenCalled();
   });
 
   it("rejects unauthenticated or malformed Gmail pushes without leaking mailbox data", async () => {
@@ -181,7 +227,10 @@ describe("provider ingress HTTP interface", () => {
     const malformed = await server.inject({
       method: "POST",
       url: `/webhooks/google/gmail?token=${encodeURIComponent(PUBSUB_TOKEN)}`,
-      headers: { "content-type": "application/json" },
+      headers: {
+        authorization: PUBSUB_AUTHORIZATION,
+        "content-type": "application/json",
+      },
       payload: { message: { data: "not-json" }, subscription: "synthetic" },
     });
     expect(malformed.statusCode).toBe(400);
@@ -196,7 +245,10 @@ describe("provider ingress HTTP interface", () => {
     const response = await server.inject({
       method: "POST",
       url: `/webhooks/google/gmail?token=${encodeURIComponent(PUBSUB_TOKEN)}`,
-      headers: { "content-type": "application/json" },
+      headers: {
+        authorization: PUBSUB_AUTHORIZATION,
+        "content-type": "application/json",
+      },
       payload: gmailPushPayload(),
     });
 

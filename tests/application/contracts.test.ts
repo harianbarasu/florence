@@ -91,5 +91,36 @@ describe("application-owned structured contracts", () => {
         ],
       }).success,
     ).toBe(true);
+    expect(
+      ConversationClassificationSchema.safeParse({
+        ...classificationBase,
+        intent: "onboarding",
+        action: "update_profile",
+        profileFacts: [
+          {
+            category: "routine_anchor",
+            subject: "School pickup",
+            detail: "Pickup is at 3:15 PM on weekdays.",
+          },
+        ],
+      }).success,
+    ).toBe(false);
+    expect(
+      ConversationClassificationSchema.safeParse({
+        ...classificationBase,
+        intent: "onboarding",
+        action: "update_profile",
+        profileFacts: [
+          {
+            category: "routine_anchor",
+            subject: "School pickup",
+            detail: "Pickup is at 3:15 PM on weekdays.",
+            timeZone: "America/Los_Angeles",
+            localTime: "15:15",
+            daysOfWeek: [1, 2, 3, 4, 5],
+          },
+        ],
+      }).success,
+    ).toBe(true);
   });
 });

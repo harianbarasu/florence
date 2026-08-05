@@ -21,6 +21,8 @@ import {
   InstantStringSchema,
   type OutboxIntent,
   PolicyIdSchema,
+  RoutineAnchorIdSchema,
+  RoutineAnchorSchema,
   WorkerProposalSchema,
 } from "../domain/index.js";
 import { type WorkerJob, WorkerJobSchema, type WorkerResult, WorkerResultSchema } from "../runtime/index.js";
@@ -46,6 +48,7 @@ import {
   HouseholdApplicationSnapshotSchema,
   OutboxExecutionResultSchema,
   type PendingPromotion,
+  SharedProfileFactSchema,
   type WorkerCommand,
   WorkerCommandSchema,
   type WorkerPurpose,
@@ -519,7 +522,18 @@ function applyOnboarding(
           "Shared profile details can be added by a verified adult in the household group.",
         );
       }
-      const changed = mergeSharedProfileFacts(work, item, classification.profileFacts);
+      const merge = mergeSharedProfileFacts(work, item, classification.profileFacts);
+      if (merge === "invalid_anchor") {
+        queueMessage(
+          work,
+          `onboarding-profile-invalid-anchor-${item.messageRef}`,
+          { kind: "household" },
+          "onboarding",
+          "I couldn't match that routine correction to a confirmed routine. Please review the routine IDs in the profile summary and try again.",
+        );
+        break;
+      }
+      const changed = merge === "changed";
       next = changed ? { ...onboarding, profileConfirmedAdultIds: [] } : onboarding;
       queueMessage(
         work,
@@ -547,6 +561,48 @@ function applyOnboarding(
         );
       }
       const confirmed = unique([...onboarding.profileConfirmedAdultIds, item.senderAdultId]);
+      if (confirmed.length === 2) {
+        const anchors = work.projection.sharedProfile.facts
+          .flatMap((fact) =>
+            fact.category === "routine_anchor"
+              ? [
+                  RoutineAnchorSchema.parse({
+                    anchorId: fact.anchorId,
+                    label: fact.subject,
+                    timeZone: fact.timeZone,
+                    localTime: fact.localTime,
+                    daysOfWeek: fact.daysOfWeek,
+                  }),
+                ]
+              : [],
+          )
+          .sort((left, right) => left.anchorId.localeCompare(right.anchorId));
+        const current = [...work.aggregate.routineAnchors].sort((left, right) =>
+          left.anchorId.localeCompare(right.anchorId),
+        );
+        if (JSON.stringify(anchors) !== JSON.stringify(current)) {
+          const result = acceptDomain(
+            work,
+            "routine-anchors-confirmed",
+            item.occurredAt,
+            { kind: "adult", adultId: item.senderAdultId },
+            {
+              kind: "routine_anchors.replaced",
+              anchors,
+            } as Omit<HouseholdSignal, "householdId" | "signalId" | "sequence" | "occurredAt" | "actor">,
+          );
+          if (result.receipt.disposition !== "accepted") {
+            queueMessage(
+              work,
+              `onboarding-routine-rejected-${item.messageRef}`,
+              { kind: "household" },
+              "onboarding",
+              "I couldn't safely apply the confirmed routine changes because an existing reminder would become invalid. The previous routines and reminders are unchanged; please correct the routine timing and confirm again.",
+            );
+            break;
+          }
+        }
+      }
       next = {
         ...onboarding,
         phase: onboarding.phase === "active" || confirmed.length === 2 ? "active" : "building_profile",
@@ -582,35 +638,80 @@ function mergeSharedProfileFacts(
   work: Work,
   item: ConversationInboxItem,
   candidates: NonNullable<Extract<ConversationClassification, { intent: "onboarding" }>["profileFacts"]>,
-): boolean {
+): "changed" | "unchanged" | "invalid_anchor" {
   const facts = new Map(work.projection.sharedProfile.facts.map((fact) => [fact.factKey, fact] as const));
+  const routineFactsByAnchorId = new Map(
+    work.projection.sharedProfile.facts.flatMap((fact) =>
+      fact.category === "routine_anchor" ? [[fact.anchorId, fact] as const] : [],
+    ),
+  );
   let changed = false;
   for (const candidate of candidates) {
     const normalizedSubject = candidate.subject.normalize("NFKC").trim().replace(/\s+/gu, " ").toLowerCase();
-    const factKey = `profile:${createHash("sha256")
-      .update(`${candidate.category}\u0000${normalizedSubject}`)
-      .digest("hex")
-      .slice(0, 32)}`;
+    const suppliedRoutine =
+      candidate.category === "routine_anchor" && candidate.anchorId !== undefined
+        ? routineFactsByAnchorId.get(candidate.anchorId)
+        : undefined;
+    if (
+      candidate.category === "routine_anchor" &&
+      candidate.anchorId !== undefined &&
+      suppliedRoutine === undefined
+    ) {
+      return "invalid_anchor";
+    }
+    const anchorId =
+      candidate.category === "routine_anchor"
+        ? (candidate.anchorId ??
+          RoutineAnchorIdSchema.parse(stableId("anchor", work.aggregate.householdId, normalizedSubject)))
+        : undefined;
+    const factKey =
+      suppliedRoutine?.factKey ??
+      `profile:${createHash("sha256")
+        .update(
+          candidate.category === "routine_anchor"
+            ? `routine_anchor\u0000${anchorId}`
+            : `${candidate.category}\u0000${normalizedSubject}`,
+        )
+        .digest("hex")
+        .slice(0, 32)}`;
     const existing = facts.get(factKey);
     if (
       existing?.category === candidate.category &&
       existing.subject === candidate.subject &&
-      existing.detail === candidate.detail
+      existing.detail === candidate.detail &&
+      (candidate.category !== "routine_anchor" ||
+        (existing.category === "routine_anchor" &&
+          existing.anchorId === anchorId &&
+          existing.timeZone === candidate.timeZone &&
+          existing.localTime === candidate.localTime &&
+          JSON.stringify(existing.daysOfWeek) === JSON.stringify(candidate.daysOfWeek)))
     ) {
       continue;
     }
-    facts.set(factKey, {
+    const fact = SharedProfileFactSchema.parse({
       factKey,
       category: candidate.category,
       subject: candidate.subject,
       detail: candidate.detail,
+      ...(candidate.category === "routine_anchor"
+        ? {
+            anchorId,
+            timeZone: candidate.timeZone,
+            localTime: candidate.localTime,
+            daysOfWeek: candidate.daysOfWeek,
+          }
+        : {}),
       sourceRef: item.messageRef,
       recordedByAdultId: item.senderAdultId,
       recordedAt: item.occurredAt,
     });
+    facts.set(factKey, fact);
+    if (fact.category === "routine_anchor") {
+      routineFactsByAnchorId.set(fact.anchorId, fact);
+    }
     changed = true;
   }
-  if (!changed) return false;
+  if (!changed) return "unchanged";
   work.projection.sharedProfile = ApplicationProjectionSchema.shape.sharedProfile.parse({
     facts: [...facts.values()].sort(
       (left, right) =>
@@ -627,7 +728,7 @@ function mergeSharedProfileFacts(
       containsPrivateData: false,
     }),
   );
-  return true;
+  return "changed";
 }
 
 function sharedProfileSummary(work: Work): string {
@@ -642,7 +743,11 @@ function sharedProfileSummary(work: Work): string {
   };
   const lines = work.projection.sharedProfile.facts
     .slice(0, 30)
-    .map((fact) => `${labels[fact.category]} — ${fact.subject}: ${fact.detail}`);
+    .map((fact) =>
+      fact.category === "routine_anchor"
+        ? `${labels[fact.category]} — ${fact.subject} [${fact.anchorId}]: ${fact.detail} (${fact.localTime} ${fact.timeZone}; ISO weekdays ${fact.daysOfWeek.join(",")})`
+        : `${labels[fact.category]} — ${fact.subject}: ${fact.detail}`,
+    );
   const summary = `Shared profile (${work.aggregate.timeZone}):\n${lines
     .map((line) => `• ${line}`)
     .join("\n")}`;
@@ -1404,7 +1509,10 @@ async function processGmail(
       : [],
   );
   const triage = GmailTriageResultSchema.parse(
-    await dependencies.interpreter.triageGmail(item, { activeSharingRules: rules }),
+    await dependencies.interpreter.triageGmail(item, {
+      confirmedRoutineAnchors: work.aggregate.routineAnchors,
+      activeSharingRules: rules,
+    }),
   );
   work.projection.gmailTriage.push({
     messageRef: item.messageRef,
@@ -1572,6 +1680,7 @@ async function processConversation(
       householdTimeZone: work.aggregate.timeZone,
       onboarding: work.projection.onboarding,
       sharedProfile: work.projection.sharedProfile,
+      confirmedRoutineAnchors: work.aggregate.routineAnchors,
       openEpisodes: visibleEpisodes,
       pendingPromotionIds,
       activePolicies,

@@ -34,6 +34,7 @@ const secondAdultId = AdultIdSchema.parse("33333333-3333-4333-8333-333333333333"
 const calendarContext = {
   currentTime: "2027-01-01T08:00:00Z",
   householdTimeZone: "America/Los_Angeles",
+  confirmedRoutineAnchors: [],
   pendingCalendarActions: [],
 } as const;
 
@@ -108,7 +109,7 @@ describe("ModelApplicationInterpreter", () => {
         bodyText: "Private access code 9917",
         attachmentRefs: [],
       },
-      { activeSharingRules: [] },
+      { confirmedRoutineAnchors: [], activeSharingRules: [] },
     );
 
     expect(gateway.calls[0]?.profile).toBe("private_processing");

@@ -667,4 +667,137 @@ describe("HouseholdChiefOfStaff interface", () => {
     expect(stale.receipt.reason).toBe("stale_temporal_plan");
     expect(stale.effects).toEqual([]);
   });
+
+  it("atomically replans every affected episode when a confirmed routine time changes", () => {
+    const anchor = {
+      anchorId: "anchor_school_pickup",
+      label: "School pickup",
+      timeZone: "America/Los_Angeles",
+      localTime: "15:15",
+      daysOfWeek: [1, 2, 3, 4, 5],
+    } as const;
+    const proposed = accept(
+      aggregate({ routineAnchors: [anchor] }),
+      signal({
+        householdId: HOUSEHOLD_ID,
+        signalId: "signal_routine_episode",
+        sequence: 1,
+        occurredAt: T0,
+        actor: { kind: "adult", adultId: ADULT_A },
+        kind: "episode.proposed",
+        proposal: episodeProposal({
+          temporalPlan: timePlan({
+            deadline: {
+              kind: "routine_anchor",
+              anchorId: anchor.anchorId,
+              date: "2026-01-02",
+              offsetMinutes: 0,
+              disambiguation: "compatible",
+            },
+            usefulLeadMinutes: 120,
+            preparationMinutes: 30,
+            finalBufferMinutes: 30,
+            triggers: [
+              {
+                triggerId: "trigger_pickup",
+                timerId: "timer_pickup_v1",
+                kind: "reminder",
+                at: {
+                  kind: "routine_anchor",
+                  anchorId: anchor.anchorId,
+                  date: "2026-01-02",
+                  offsetMinutes: -60,
+                  disambiguation: "compatible",
+                },
+              },
+            ],
+          }),
+        }),
+      }),
+    );
+    const replaced = accept(
+      proposed.aggregate,
+      signal({
+        householdId: HOUSEHOLD_ID,
+        signalId: "signal_routine_changed",
+        sequence: 2,
+        occurredAt: "2026-01-01T09:00:00Z",
+        actor: { kind: "adult", adultId: ADULT_B },
+        kind: "routine_anchors.replaced",
+        anchors: [{ ...anchor, localTime: "15:30" }],
+      }),
+    );
+
+    expect(replaced.receipt.disposition).toBe("accepted");
+    expect(replaced.aggregate.routineAnchors[0]?.localTime).toBe("15:30");
+    expect(replaced.aggregate.episodes[0]?.temporalPlan).toMatchObject({
+      definition: { version: 2 },
+      deadlineAt: "2026-01-02T23:30:00Z",
+    });
+    expect(replaced.effects).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: "cancel_timer", timerId: "timer_pickup_v1" }),
+        expect.objectContaining({
+          kind: "schedule_timer",
+          temporalPlanVersion: 2,
+          at: "2026-01-02T22:30:00Z",
+        }),
+      ]),
+    );
+    expect(replaced.changes).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: "routine_anchors_replaced" }),
+        expect.objectContaining({ kind: "temporal_plan_replaced", fromVersion: 1, toVersion: 2 }),
+      ]),
+    );
+  });
+
+  it("keeps routines and timers unchanged when a confirmed replacement cannot resolve", () => {
+    const anchor = {
+      anchorId: "anchor_school_pickup",
+      label: "School pickup",
+      timeZone: "America/Los_Angeles",
+      localTime: "15:15",
+      daysOfWeek: [1, 2, 3, 4, 5],
+    } as const;
+    const proposed = accept(
+      aggregate({ routineAnchors: [anchor] }),
+      signal({
+        householdId: HOUSEHOLD_ID,
+        signalId: "signal_routine_episode_for_reject",
+        sequence: 1,
+        occurredAt: T0,
+        actor: { kind: "adult", adultId: ADULT_A },
+        kind: "episode.proposed",
+        proposal: episodeProposal({
+          temporalPlan: timePlan({
+            deadline: {
+              kind: "routine_anchor",
+              anchorId: anchor.anchorId,
+              date: "2026-01-02",
+              offsetMinutes: 0,
+              disambiguation: "compatible",
+            },
+          }),
+        }),
+      }),
+    );
+    const rejected = accept(
+      proposed.aggregate,
+      signal({
+        householdId: HOUSEHOLD_ID,
+        signalId: "signal_remove_used_routine",
+        sequence: 2,
+        occurredAt: "2026-01-01T09:00:00Z",
+        actor: { kind: "adult", adultId: ADULT_B },
+        kind: "routine_anchors.replaced",
+        anchors: [],
+      }),
+    );
+
+    expect(rejected.receipt).toMatchObject({ disposition: "rejected", reason: "invalid_transition" });
+    expect(rejected.aggregate.routineAnchors).toEqual([anchor]);
+    expect(rejected.aggregate.episodes[0]?.temporalPlan?.definition.version).toBe(1);
+    expect(rejected.effects).toEqual([]);
+  });
 });

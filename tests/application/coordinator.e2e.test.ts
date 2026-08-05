@@ -567,6 +567,9 @@ describe("Florence application coordinator", () => {
           category: "routine_anchor",
           subject: "School pickup",
           detail: "School pickup is normally at 3:15 PM on weekdays.",
+          timeZone: "America/Los_Angeles",
+          localTime: "15:15",
+          daysOfWeek: [1, 2, 3, 4, 5],
         },
       ],
     });
@@ -597,6 +600,9 @@ describe("Florence application coordinator", () => {
           category: "routine_anchor",
           subject: "School pickup",
           detail: "School pickup is normally at 3:30 PM on weekdays.",
+          timeZone: "America/Los_Angeles",
+          localTime: "15:30",
+          daysOfWeek: [1, 2, 3, 4, 5],
         },
       ],
     });
@@ -610,6 +616,31 @@ describe("Florence application coordinator", () => {
         sourceRef: "message_shared-profile-correction",
       }),
     ]);
+
+    for (const [key, adultId] of [
+      ["confirm-routine-a", ADULT_A],
+      ["confirm-routine-b", ADULT_B],
+    ] as const) {
+      harness.interpreter.respondToConversation(key, {
+        ...classificationBase,
+        intent: "onboarding",
+        action: "confirm_profile",
+      });
+      await app.process({
+        ...groupMessage(key, "I confirm the profile", "2027-01-02T08:03:00Z"),
+        senderAdultId: adultId,
+      });
+    }
+    const confirmed = await harness.repository.load(HOUSEHOLD_ID);
+    expect(confirmed?.aggregate.routineAnchors).toEqual([
+      expect.objectContaining({
+        label: "School pickup",
+        timeZone: "America/Los_Angeles",
+        localTime: "15:30",
+        daysOfWeek: [1, 2, 3, 4, 5],
+      }),
+    ]);
+    expect(confirmed?.projection.onboarding.profileConfirmedAdultIds).toEqual([ADULT_A, ADULT_B]);
   });
 
   it("drives a group obligation through owner acknowledgement, reminder, and closure", async () => {

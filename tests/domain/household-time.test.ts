@@ -10,6 +10,18 @@ import {
 import { timePlan } from "./fixtures.js";
 
 describe("HouseholdTime interface", () => {
+  it("requires canonical unique ISO weekdays for routine anchors", () => {
+    expect(
+      RoutineAnchorSchema.safeParse({
+        anchorId: "anchor_pickup",
+        label: "School pickup",
+        timeZone: "America/Los_Angeles",
+        localTime: "15:15",
+        daysOfWeek: [5, 1, 1],
+      }).success,
+    ).toBe(false);
+  });
+
   it("derives a useful action window from lead, preparation, and final buffer", () => {
     const resolved = HouseholdTime.resolve({ plan: timePlan(), routineAnchors: [] });
 

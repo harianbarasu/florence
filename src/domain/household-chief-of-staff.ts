@@ -31,6 +31,9 @@ import {
   type PromotionAuthority,
   type RejectionReason,
   type ResolvedTimePlan,
+  ResolvedTimePlanSchema,
+  type RoutineAnchor,
+  TimerIdSchema,
 } from "./contracts.js";
 import { HouseholdTime, HouseholdTimeError } from "./household-time.js";
 
@@ -629,6 +632,158 @@ function handleTemporalPlanReplaced(context: HandlerContext): MutationResult {
     ],
     effects,
   );
+}
+
+function episodeUsesAnyRoutineAnchor(episode: FamilyEpisode, anchorIds: ReadonlySet<string>): boolean {
+  const definition = episode.temporalPlan?.definition;
+  if (definition === undefined) return false;
+  const moments = [
+    definition.event,
+    definition.deadline,
+    definition.earliestUseful,
+    definition.lastResponsible,
+    ...definition.triggers.map((trigger) => trigger.at),
+  ];
+  return moments.some((moment) => moment?.kind === "routine_anchor" && anchorIds.has(moment.anchorId));
+}
+
+function timerIdForAnchorReplan(episodeId: string, triggerId: string, planVersion: number) {
+  const digest = createHash("sha256")
+    .update(`${episodeId}\u0000${triggerId}\u0000${planVersion}`)
+    .digest("hex");
+  return TimerIdSchema.parse(`timer_${digest}`);
+}
+
+function sameRoutineAnchor(left: RoutineAnchor, right: RoutineAnchor): boolean {
+  return (
+    left.anchorId === right.anchorId &&
+    left.label === right.label &&
+    left.timeZone === right.timeZone &&
+    left.localTime === right.localTime &&
+    sameStrings(left.daysOfWeek.map(String), right.daysOfWeek.map(String))
+  );
+}
+
+function routineAnchorTimingChanged(left: RoutineAnchor, right: RoutineAnchor): boolean {
+  return (
+    left.timeZone !== right.timeZone ||
+    left.localTime !== right.localTime ||
+    !sameStrings(left.daysOfWeek.map(String), right.daysOfWeek.map(String))
+  );
+}
+
+function handleRoutineAnchorsReplaced(context: HandlerContext): MutationResult {
+  const { signal, draft } = context;
+  if (signal.kind !== "routine_anchors.replaced") {
+    throw new Error("wrong handler");
+  }
+  if (!isAdultActor(draft, signal.actor)) {
+    return rejected("unauthorized_actor");
+  }
+
+  const incomingIds = signal.anchors.map((anchor) => anchor.anchorId);
+  if (new Set(incomingIds).size !== incomingIds.length) {
+    return rejected("duplicate_entity");
+  }
+  const anchors = [...signal.anchors].sort((left, right) => left.anchorId.localeCompare(right.anchorId));
+  const beforeAnchors = [...draft.routineAnchors].sort((left, right) =>
+    left.anchorId.localeCompare(right.anchorId),
+  );
+  if (
+    anchors.length === beforeAnchors.length &&
+    anchors.every((anchor, index) => {
+      const before = beforeAnchors[index];
+      return before !== undefined && sameRoutineAnchor(before, anchor);
+    })
+  ) {
+    return rejected("duplicate_entity");
+  }
+
+  const nextById = new Map(anchors.map((anchor) => [anchor.anchorId, anchor] as const));
+  const timingChangedIds = new Set<string>();
+  for (const before of beforeAnchors) {
+    const next = nextById.get(before.anchorId);
+    if (next === undefined || routineAnchorTimingChanged(before, next)) {
+      timingChangedIds.add(before.anchorId);
+    }
+  }
+
+  const replacements: Array<{
+    index: number;
+    before: FamilyEpisode;
+    after: FamilyEpisode;
+  }> = [];
+  for (const [index, episode] of draft.episodes.entries()) {
+    if (
+      TERMINAL_STATES.has(episode.state) ||
+      !episodeUsesAnyRoutineAnchor(episode, timingChangedIds) ||
+      episode.temporalPlan === undefined
+    ) {
+      continue;
+    }
+    const priorPlan = episode.temporalPlan;
+    const planVersion = priorPlan.definition.version + 1;
+    const definition = {
+      ...priorPlan.definition,
+      version: planVersion,
+      triggers: priorPlan.definition.triggers.map((trigger) => ({
+        ...trigger,
+        timerId: timerIdForAnchorReplan(episode.episodeId, trigger.triggerId, planVersion),
+      })),
+    };
+    let resolved: ResolvedTimePlan;
+    try {
+      const fresh = HouseholdTime.resolve({ plan: definition, routineAnchors: anchors });
+      const priorStatus = new Map(
+        priorPlan.triggers.map((trigger) => [trigger.triggerId, trigger.status] as const),
+      );
+      resolved = ResolvedTimePlanSchema.parse({
+        ...fresh,
+        triggers: fresh.triggers.map((trigger) => ({
+          ...trigger,
+          status: priorStatus.get(trigger.triggerId) ?? "pending",
+        })),
+      });
+    } catch (error) {
+      if (error instanceof HouseholdTimeError) {
+        return rejected("invalid_transition");
+      }
+      throw error;
+    }
+    replacements.push({
+      index,
+      before: episode,
+      after: FamilyEpisodeSchema.parse({
+        ...episode,
+        version: episode.version + 1,
+        temporalPlan: resolved,
+        updatedAt: signal.occurredAt,
+      }),
+    });
+  }
+
+  draft.routineAnchors = anchors;
+  const changes: DomainChange[] = [
+    DomainChangeSchema.parse({
+      kind: "routine_anchors_replaced",
+      anchorIds: anchors.map((anchor) => anchor.anchorId),
+    }),
+  ];
+  const effects: OutboxIntent[] = [];
+  for (const replacement of replacements) {
+    effects.push(...cancelTimerEffects(signal, replacement.before));
+    draft.episodes[replacement.index] = replacement.after;
+    effects.push(...scheduleTimerEffects(signal, replacement.after));
+    changes.push(
+      DomainChangeSchema.parse({
+        kind: "temporal_plan_replaced",
+        episodeId: replacement.after.episodeId,
+        fromVersion: replacement.before.temporalPlan?.definition.version,
+        toVersion: replacement.after.temporalPlan?.definition.version,
+      }),
+    );
+  }
+  return accepted(draft, changes, effects);
 }
 
 function handleEpisodeBlocked(context: HandlerContext): MutationResult {
@@ -1461,6 +1616,8 @@ function dispatch(context: HandlerContext): MutationResult {
       return handleEpisodeClosed(context);
     case "episode.temporal_plan_replaced":
       return handleTemporalPlanReplaced(context);
+    case "routine_anchors.replaced":
+      return handleRoutineAnchorsReplaced(context);
     case "episode.blocked":
       return handleEpisodeBlocked(context);
     case "episode.resumed":

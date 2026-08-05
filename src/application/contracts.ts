@@ -13,6 +13,7 @@ import {
   HouseholdAggregateSchema,
   HouseholdIdSchema,
   InstantStringSchema,
+  LocalTimeSchema,
   MemoryCandidateSchema,
   NeutralDisplayTextSchema,
   NeutralFactualTextSchema,
@@ -20,6 +21,7 @@ import {
   PolicyIdSchema,
   ProposedExternalActionSchema,
   ProposedMessageSchema,
+  RoutineAnchorIdSchema,
   SemanticTimePlanSchema,
   SensitivitySchema,
   SourceClassSchema,
@@ -209,11 +211,43 @@ export const SharedProfileCategorySchema = z.enum([
   "dietary_constraint",
 ]);
 
-export const SharedProfileFactCandidateSchema = z.strictObject({
-  category: SharedProfileCategorySchema,
-  subject: NeutralDisplayTextSchema,
-  detail: FactualTextSchema,
-});
+const NonRoutineSharedProfileCategorySchema = z.enum([
+  "dependent",
+  "school_childcare",
+  "recurring_activity",
+  "dietary_constraint",
+]);
+
+const CanonicalDaysOfWeekSchema = z
+  .array(z.number().int().min(1).max(7))
+  .min(1)
+  .max(7)
+  .superRefine((days, context) => {
+    const canonical = [...new Set(days)].sort((left, right) => left - right);
+    if (canonical.length !== days.length || canonical.some((day, index) => day !== days[index])) {
+      context.addIssue({
+        code: "custom",
+        message: "daysOfWeek must contain unique ISO weekdays in ascending order",
+      });
+    }
+  });
+
+export const SharedProfileFactCandidateSchema = z.discriminatedUnion("category", [
+  z.strictObject({
+    category: NonRoutineSharedProfileCategorySchema,
+    subject: NeutralDisplayTextSchema,
+    detail: FactualTextSchema,
+  }),
+  z.strictObject({
+    category: z.literal("routine_anchor"),
+    anchorId: RoutineAnchorIdSchema.optional(),
+    subject: NeutralDisplayTextSchema,
+    detail: FactualTextSchema,
+    timeZone: TimeZoneSchema,
+    localTime: LocalTimeSchema,
+    daysOfWeek: CanonicalDaysOfWeekSchema,
+  }),
+]);
 
 export type SharedProfileFactCandidate = z.infer<typeof SharedProfileFactCandidateSchema>;
 
@@ -459,15 +493,29 @@ export const OnboardingProjectionSchema = z
 
 export type OnboardingProjection = z.infer<typeof OnboardingProjectionSchema>;
 
-export const SharedProfileFactSchema = z.strictObject({
+const SharedProfileFactBaseShape = {
   factKey: z.string().regex(/^profile:[a-f0-9]{32}$/u),
-  category: SharedProfileCategorySchema,
   subject: NeutralDisplayTextSchema,
   detail: FactualTextSchema,
   sourceRef: StableReferenceSchema,
   recordedByAdultId: AdultIdSchema,
   recordedAt: InstantStringSchema,
-});
+} as const;
+
+export const SharedProfileFactSchema = z.discriminatedUnion("category", [
+  z.strictObject({
+    ...SharedProfileFactBaseShape,
+    category: NonRoutineSharedProfileCategorySchema,
+  }),
+  z.strictObject({
+    ...SharedProfileFactBaseShape,
+    category: z.literal("routine_anchor"),
+    anchorId: RoutineAnchorIdSchema,
+    timeZone: TimeZoneSchema,
+    localTime: LocalTimeSchema,
+    daysOfWeek: CanonicalDaysOfWeekSchema,
+  }),
+]);
 
 export type SharedProfileFact = z.infer<typeof SharedProfileFactSchema>;
 

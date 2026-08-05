@@ -10,6 +10,7 @@ const MODEL_RESULT = { intent: "ignore", confidence: 1, rationale: "No explicit 
 const CALENDAR_CONTEXT = {
   currentTime: "2026-08-05T16:00:00Z",
   householdTimeZone: "America/Los_Angeles",
+  confirmedRoutineAnchors: [],
   pendingCalendarActions: [],
 } as const;
 

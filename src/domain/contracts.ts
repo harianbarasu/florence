@@ -196,13 +196,27 @@ export const SemanticMomentSchema = z.discriminatedUnion("kind", [
 
 export type SemanticMoment = z.infer<typeof SemanticMomentSchema>;
 
-export const RoutineAnchorSchema = z.strictObject({
-  anchorId: RoutineAnchorIdSchema,
-  label: FactualTextSchema,
-  timeZone: TimeZoneSchema,
-  localTime: LocalTimeSchema,
-  daysOfWeek: z.array(z.number().int().min(1).max(7)).min(1).max(7),
-});
+export const RoutineAnchorSchema = z
+  .strictObject({
+    anchorId: RoutineAnchorIdSchema,
+    label: FactualTextSchema,
+    timeZone: TimeZoneSchema,
+    localTime: LocalTimeSchema,
+    daysOfWeek: z.array(z.number().int().min(1).max(7)).min(1).max(7),
+  })
+  .superRefine((anchor, context) => {
+    const canonical = [...new Set(anchor.daysOfWeek)].sort((left, right) => left - right);
+    if (
+      canonical.length !== anchor.daysOfWeek.length ||
+      canonical.some((day, index) => day !== anchor.daysOfWeek[index])
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["daysOfWeek"],
+        message: "daysOfWeek must contain unique ISO weekdays in ascending order",
+      });
+    }
+  });
 
 export type RoutineAnchor = z.infer<typeof RoutineAnchorSchema>;
 
@@ -1118,6 +1132,12 @@ export const EpisodeTemporalPlanReplacedSignalSchema = z.strictObject({
   plan: SemanticTimePlanSchema,
 });
 
+export const RoutineAnchorsReplacedSignalSchema = z.strictObject({
+  ...SignalBaseShape,
+  kind: z.literal("routine_anchors.replaced"),
+  anchors: z.array(RoutineAnchorSchema).max(100),
+});
+
 export const EpisodeBlockedSignalSchema = z.strictObject({
   ...SignalBaseShape,
   kind: z.literal("episode.blocked"),
@@ -1208,6 +1228,7 @@ export const HouseholdSignalSchema = z.discriminatedUnion("kind", [
   ConversationDeliveryObservedSignalSchema,
   EpisodeClosedSignalSchema,
   EpisodeTemporalPlanReplacedSignalSchema,
+  RoutineAnchorsReplacedSignalSchema,
   EpisodeBlockedSignalSchema,
   EpisodeResumedSignalSchema,
   ExternalActionProposedSignalSchema,
@@ -1275,6 +1296,10 @@ export const DomainChangeSchema = z.discriminatedUnion("kind", [
     episodeId: EpisodeIdSchema,
     fromVersion: z.number().int().positive().optional(),
     toVersion: z.number().int().positive(),
+  }),
+  z.strictObject({
+    kind: z.literal("routine_anchors_replaced"),
+    anchorIds: z.array(RoutineAnchorIdSchema).max(100),
   }),
   z.strictObject({
     kind: z.literal("approval_recorded"),

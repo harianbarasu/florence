@@ -8,7 +8,7 @@ WORKDIR /app
 
 FROM toolchain AS dependencies
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
-RUN --mount=type=cache,id=pnpm,target=/pnpm/store pnpm install --frozen-lockfile
+RUN pnpm install --frozen-lockfile
 
 FROM dependencies AS build
 COPY tsconfig.json tsconfig.build.json ./
@@ -17,7 +17,7 @@ RUN pnpm build
 
 FROM toolchain AS production-dependencies
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
-RUN --mount=type=cache,id=pnpm-production,target=/pnpm/store pnpm install --prod --frozen-lockfile
+RUN pnpm install --prod --frozen-lockfile
 
 FROM node:24.19.0-bookworm-slim AS runtime
 ENV NODE_ENV=production
@@ -29,4 +29,3 @@ COPY --chown=node:node migrations ./migrations
 USER node
 EXPOSE 3000
 CMD ["sh", "-c", "node dist/cli/migrate.js && exec node dist/server.js"]
-

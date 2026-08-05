@@ -726,7 +726,7 @@ describe("ScopedWorkerContext", () => {
 
     const staleSnapshot = {
       ...snapshot,
-      aggregate: { ...snapshot.aggregate, version: snapshot.aggregate.version + 1 },
+      aggregate: { ...snapshot.aggregate, timeZone: "America/New_York" },
     };
     await expect(
       new ScopedWorkerContext({ now: () => WORKER_NOW }).contextFor(job, staleSnapshot),
@@ -738,7 +738,7 @@ describe("ScopedWorkerContext", () => {
         ...snapshot.projection,
         workers: snapshot.projection.workers.map((record) => ({
           ...record,
-          status: "reconciled" as const,
+          status: "completed" as const,
           resultRef: "worker_result_1",
         })),
       },

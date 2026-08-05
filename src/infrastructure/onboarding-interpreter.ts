@@ -93,7 +93,31 @@ export class OnboardingAwareInterpreter implements ApplicationInterpreterPort {
     }
 
     if (
-      onboarding.phase === "building_profile" &&
+      ["naming_adults", "building_profile", "connecting_sources", "active"].includes(onboarding.phase) &&
+      input.channel.scope === "household"
+    ) {
+      const displayName = extractSelfName(text);
+      if (displayName !== null) {
+        return {
+          ...onboardingClassification("set_name", "A verified adult stated the name Florence should use."),
+          displayName,
+        };
+      }
+    }
+
+    if (
+      ["building_profile", "connecting_sources"].includes(onboarding.phase) &&
+      input.channel.scope === "household" &&
+      emptyProfileConfirmation(normalized)
+    ) {
+      return onboardingClassification(
+        "confirm_profile",
+        "A verified adult explicitly confirmed that they have no shared profile details to add.",
+      );
+    }
+
+    if (
+      ["building_profile", "connecting_sources"].includes(onboarding.phase) &&
       input.channel.scope === "household" &&
       /\b(?:confirm|approve|looks good)\b/u.test(normalized) &&
       /\b(?:profile|routines?|details?|anchors?|looks good)\b/u.test(normalized)
@@ -136,11 +160,27 @@ function explicitInviteAcceptance(text: string): boolean {
   return /^(?:i\s+(?:accept|consent|agree)|accept|yes,?\s+i\s+(?:accept|consent|agree))\b/u.test(text);
 }
 
+function emptyProfileConfirmation(text: string): boolean {
+  return /^(?:none|none\s+for\s+now|unknown|nothing|nothing\s+to\s+add|no\s+(?:details|routines?|anchors?|constraints?))(?:[.!])?$/u.test(
+    text,
+  );
+}
+
 function onboardingClassification(
-  action: "consent" | "invite_adult" | "accept_invite" | "register_group" | "confirm_profile",
+  action: "consent" | "invite_adult" | "accept_invite" | "register_group" | "set_name" | "confirm_profile",
   rationale: string,
 ) {
   return { intent: "onboarding" as const, action, confidence: 1, rationale };
+}
+
+function extractSelfName(text: string): string | null {
+  const match = text
+    .trim()
+    .match(
+      /^(?:(?:i['’]?m|i am|my name is|call me)\s+)([\p{L}\p{M}][\p{L}\p{M}'’.-]*(?:\s+[\p{L}\p{M}][\p{L}\p{M}'’.-]*){0,4})[.!]?$/iu,
+    );
+  const value = match?.[1]?.trim();
+  return value === undefined || value.length === 0 || value.length > 100 ? null : value;
 }
 
 function preConsentIgnore(rationale: string) {

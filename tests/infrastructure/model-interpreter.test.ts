@@ -35,6 +35,8 @@ const calendarContext = {
   currentTime: "2027-01-01T08:00:00Z",
   householdTimeZone: "America/Los_Angeles",
   confirmedRoutineAnchors: [],
+  activeMemories: [],
+  pendingMemoryCandidates: [],
   pendingCalendarActions: [],
 } as const;
 
@@ -69,7 +71,12 @@ describe("ModelApplicationInterpreter", () => {
           consentedAdultIds: [adultId, secondAdultId],
           privateDmAdultIds: [adultId, secondAdultId],
           groupChannelId: "chat-1",
+          adultNames: [
+            { adultId, displayName: "Hari" },
+            { adultId: secondAdultId, displayName: "Partner" },
+          ],
           profileConfirmedAdultIds: [adultId, secondAdultId],
+          googleConnectedAdultIds: [adultId, secondAdultId],
         },
         sharedProfile: { facts: [] },
         openEpisodes: [],
@@ -110,7 +117,7 @@ describe("ModelApplicationInterpreter", () => {
         attachmentRefs: [],
         attachmentContents: [],
       },
-      { confirmedRoutineAnchors: [], activeSharingRules: [] },
+      { confirmedRoutineAnchors: [], activeMemories: [], activeSharingRules: [] },
     );
 
     expect(gateway.calls[0]?.profile).toBe("private_processing");
@@ -157,7 +164,7 @@ describe("ModelApplicationInterpreter", () => {
           },
         ],
       },
-      { confirmedRoutineAnchors: [], activeSharingRules: [] },
+      { confirmedRoutineAnchors: [], activeMemories: [], activeSharingRules: [] },
     );
 
     expect(gateway.calls[0]?.profile).toBe("private_processing");
@@ -207,6 +214,7 @@ describe("ModelApplicationInterpreter", () => {
       {
         currentTime: "2027-01-01T08:00:00Z",
         householdTimeZone: "America/Los_Angeles",
+        activeMemories: [],
         activeSharingRules: [],
       },
     );
@@ -261,7 +269,12 @@ describe("ModelApplicationInterpreter", () => {
           consentedAdultIds: [adultId, secondAdultId],
           privateDmAdultIds: [adultId, secondAdultId],
           groupChannelId: "chat-1",
+          adultNames: [
+            { adultId, displayName: "Hari" },
+            { adultId: secondAdultId, displayName: "Partner" },
+          ],
           profileConfirmedAdultIds: [adultId, secondAdultId],
+          googleConnectedAdultIds: [adultId, secondAdultId],
         },
         sharedProfile: { facts: [] },
         openEpisodes: [],

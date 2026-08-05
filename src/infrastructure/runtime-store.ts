@@ -1,14 +1,24 @@
 import { createHmac, randomUUID } from "node:crypto";
 import type { TransactionSql } from "postgres";
 import { z } from "zod";
-import { GOOGLE_CALENDAR_EVENTS_SCOPE, GOOGLE_CALENDAR_READONLY_SCOPE } from "../adapters/google/index.js";
+import {
+  GOOGLE_CALENDAR_EVENTS_SCOPE,
+  GOOGLE_CALENDAR_READONLY_SCOPE,
+  GOOGLE_GMAIL_READONLY_SCOPE,
+  googleCalendarAccessRoleSchema,
+} from "../adapters/google/index.js";
 import { LinqApiError, type LinqChat, type LinqSendReceipt } from "../adapters/linq/index.js";
 import {
   type ApplicationOutboxIntent,
   ApplicationOutboxIntentSchema,
+  type ConversationResponseContext,
+  ConversationResponseContextSchema,
   createApplicationProjection,
   createOnboardingProjection,
   type HouseholdApplicationSnapshot,
+  HouseholdApplicationSnapshotSchema,
+  type ProjectDeliveryGuard,
+  ProjectDeliveryGuardSchema,
 } from "../application/index.js";
 import {
   type ApplicationStore,
@@ -25,11 +35,16 @@ import {
   HouseholdIdSchema,
 } from "../domain/index.js";
 import { canonicalJson } from "../security/canonical-json.js";
+import { SecretBox } from "../security/secret-box.js";
 import {
   type CalendarBusyWindow,
+  type CalendarCatalogState,
   type CalendarPushTarget,
+  type CalendarSyncRecord,
   type CalendarSyncState,
   type CalendarSyncWork,
+  calendarCatalogNameAad,
+  calendarCatalogStateSchema,
   calendarSyncStateSchema,
   calendarSyncWorkSchema,
   type PersistPersonalCalendarSourceInput,
@@ -60,6 +75,14 @@ const groupBindingMetadataSchema = z
     healthStatus: z.literal("HEALTHY"),
   })
   .passthrough();
+const invitationTransferIdentitySchema = z.strictObject({
+  invitationId: z.uuid().optional(),
+  sourceHouseholdId: z.uuid(),
+  sourceAdultId: z.uuid(),
+  sourceBindingId: z.uuid(),
+  externalChatId: z.string().min(1).max(500),
+  externalHandle: handleSchema,
+});
 
 export type PreparedInvitation = {
   invitationId: string;
@@ -71,6 +94,28 @@ export type PreparedInvitation = {
 export type PendingInvitation = PreparedInvitation & {
   invitedByAdultId: string;
 };
+
+export type InvitationTransferResolution =
+  | {
+      status: "ready";
+      invitationId: string;
+      householdId: string;
+      adultId: string;
+      requiresApplicationAcceptance: boolean;
+    }
+  | {
+      status: "unavailable";
+      reason:
+        | "no_single_invitation"
+        | "source_identity_changed"
+        | "source_connections_active"
+        | "same_household"
+        | "target_state_changed";
+    };
+
+export type InvitationTransferFinalization =
+  | { status: "activated"; resolution: ChannelResolution }
+  | { status: "unavailable"; reason: Exclude<InvitationTransferResolution, { status: "ready" }>["reason"] };
 
 export type GroupIdentity = {
   householdId: string;
@@ -449,6 +494,313 @@ export class FlorenceRuntimeStore {
     };
   }
 
+  /**
+   * Resolves one pending invitation without changing which household owns the Linq identity.
+   * Callers must carry the returned invitation and current binding IDs in an app-owned reply context.
+   */
+  public async resolveInvitationTransfer(input: {
+    invitationId?: string;
+    sourceHouseholdId: string;
+    sourceAdultId: string;
+    sourceBindingId: string;
+    externalChatId: string;
+    externalHandle: string;
+  }): Promise<InvitationTransferResolution> {
+    const parsed = invitationTransferIdentitySchema.parse(input);
+    const identity = {
+      ...parsed,
+      externalHandle: canonicalizeLinqHandle(parsed.externalHandle),
+    };
+    return this.database.begin((transaction) => this.inspectInvitationTransfer(transaction, identity));
+  }
+
+  /**
+   * Retires the source identity and activates the invited identity in one transaction. Household
+   * history is retained under the original adult and binding rows; no data is copied or merged.
+   */
+  public async finalizeInvitationTransfer(input: {
+    invitationId: string;
+    sourceHouseholdId: string;
+    sourceAdultId: string;
+    sourceBindingId: string;
+    externalChatId: string;
+    externalHandle: string;
+    consentedAt: string;
+  }): Promise<InvitationTransferFinalization> {
+    const parsed = invitationTransferIdentitySchema
+      .extend({ invitationId: z.uuid(), consentedAt: instantSchema })
+      .parse(input);
+    const identity = {
+      ...parsed,
+      externalHandle: canonicalizeLinqHandle(parsed.externalHandle),
+    };
+    return this.database.begin(async (transaction) => {
+      const transfer = await this.inspectInvitationTransfer(transaction, identity);
+      if (transfer.status === "unavailable") return transfer;
+      if (transfer.requiresApplicationAcceptance) {
+        return { status: "unavailable", reason: "target_state_changed" } as const;
+      }
+
+      const revokedBindings = await transaction<{ id: string }[]>`
+        update channel_bindings
+        set status = 'revoked',
+          metadata = metadata || ${this.database.json({ revocationReason: "invitation_transfer" })},
+          updated_at = now()
+        where id = ${identity.sourceBindingId}
+          and household_id = ${identity.sourceHouseholdId}
+          and adult_id = ${identity.sourceAdultId}
+          and provider = 'linq' and channel_type = 'private'
+          and external_chat_id = ${identity.externalChatId}
+          and external_handle = ${identity.externalHandle}
+          and status = 'active'
+        returning id
+      `;
+      if (revokedBindings.length !== 1) {
+        throw new ApplicationStoreError("invalid_state", "Invitation transfer source binding changed");
+      }
+
+      const revokedMemberships = await transaction<{ adult_id: string }[]>`
+        update household_memberships
+        set status = 'revoked', updated_at = now()
+        where household_id = ${identity.sourceHouseholdId}
+          and adult_id = ${identity.sourceAdultId} and status = 'active'
+        returning adult_id
+      `;
+      if (revokedMemberships.length !== 1) {
+        throw new ApplicationStoreError("invalid_state", "Invitation transfer source membership changed");
+      }
+
+      await transaction`
+        update channel_bindings
+        set status = 'paused',
+          metadata = metadata || ${this.database.json({ pauseReason: "membership_transferred" })},
+          updated_at = now()
+        where household_id = ${identity.sourceHouseholdId}
+          and provider = 'linq' and channel_type = 'group'
+          and status in ('pending', 'active')
+      `;
+      await transaction`
+        update households
+        set status = 'paused', updated_at = now()
+        where id = ${identity.sourceHouseholdId}
+          and not exists (
+            select 1 from household_memberships
+            where household_id = ${identity.sourceHouseholdId}
+              and role = 'owner' and status = 'active'
+          )
+      `;
+
+      const acceptedInvitations = await transaction<{ id: string }[]>`
+        update invitations
+        set status = 'accepted', accepted_by_adult_id = ${transfer.adultId}, updated_at = now()
+        where id = ${transfer.invitationId}
+          and household_id = ${transfer.householdId}
+          and invitee_adult_id = ${transfer.adultId}
+          and invitee_handle_hash = ${this.digestHandle(identity.externalHandle)}
+          and status = 'pending'
+        returning id
+      `;
+      if (acceptedInvitations.length !== 1) {
+        throw new ApplicationStoreError("invalid_state", "Invitation transfer invitation changed");
+      }
+
+      const activatedMemberships = await transaction<{ adult_id: string }[]>`
+        update household_memberships
+        set status = 'active', consented_at = ${parsed.consentedAt}, updated_at = now()
+        where household_id = ${transfer.householdId} and adult_id = ${transfer.adultId}
+          and status = 'invited'
+        returning adult_id
+      `;
+      if (activatedMemberships.length !== 1) {
+        throw new ApplicationStoreError("invalid_state", "Invitation transfer target membership changed");
+      }
+
+      const bindingId = randomUUID();
+      const metadata = {
+        inboundFirstAt: parsed.consentedAt,
+        transferInvitationId: transfer.invitationId,
+        transferredAt: parsed.consentedAt,
+      };
+      await transaction`
+        insert into channel_bindings (
+          id, household_id, adult_id, provider, channel_type, external_chat_id,
+          external_handle, status, metadata
+        ) values (
+          ${bindingId}, ${transfer.householdId}, ${transfer.adultId}, 'linq', 'private',
+          ${identity.externalChatId}, ${identity.externalHandle}, 'active',
+          ${this.database.json(metadata)}
+        )
+      `;
+      return {
+        status: "activated",
+        resolution: {
+          bindingId,
+          provider: "linq",
+          channelType: "private",
+          householdId: transfer.householdId,
+          adultId: transfer.adultId,
+          bindingStatus: "active",
+          membershipStatus: "active",
+          metadata,
+        },
+      };
+    });
+  }
+
+  private async inspectInvitationTransfer(
+    transaction: TransactionSql<Record<string, never>>,
+    input: z.output<typeof invitationTransferIdentitySchema>,
+  ): Promise<InvitationTransferResolution> {
+    const handleHash = this.digestHandle(input.externalHandle);
+    await transaction`select pg_advisory_xact_lock(hashtextextended(${`invite:${handleHash}`}, 0))`;
+
+    const invitations = await transaction<
+      Array<
+        InvitationRow & {
+          invitee_status: string;
+          inviter_status: string;
+          inviter_role: string;
+          target_household_status: string;
+          unexpired: boolean;
+        }
+      >
+    >`
+      select invitation.id, invitation.household_id, invitation.invited_by_adult_id,
+        invitation.accepted_by_adult_id, invitation.invitee_adult_id, invitation.expires_at,
+        invitee.status as invitee_status, inviter.status as inviter_status,
+        inviter.role as inviter_role, household.status as target_household_status,
+        invitation.expires_at > now() as unexpired
+      from invitations invitation
+      join household_memberships invitee
+        on invitee.household_id = invitation.household_id
+        and invitee.adult_id = invitation.invitee_adult_id
+      join household_memberships inviter
+        on inviter.household_id = invitation.household_id
+        and inviter.adult_id = invitation.invited_by_adult_id
+      join households household on household.id = invitation.household_id
+      where invitation.invitee_handle_hash = ${handleHash}
+        and invitation.status = 'pending'
+      for update of invitation, invitee, inviter, household
+    `;
+    const invitation = invitations[0];
+    if (
+      invitations.length !== 1 ||
+      invitation === undefined ||
+      (input.invitationId !== undefined && invitation.id !== input.invitationId)
+    ) {
+      return { status: "unavailable", reason: "no_single_invitation" };
+    }
+    if (
+      invitation.invitee_adult_id === null ||
+      invitation.accepted_by_adult_id !== null ||
+      invitation.invitee_status !== "invited" ||
+      invitation.inviter_status !== "active" ||
+      invitation.inviter_role !== "owner" ||
+      invitation.target_household_status === "deleting"
+    ) {
+      return { status: "unavailable", reason: "target_state_changed" };
+    }
+    const inviteeAdultId = AdultIdSchema.parse(invitation.invitee_adult_id);
+    if (invitation.household_id === input.sourceHouseholdId) {
+      return { status: "unavailable", reason: "same_household" };
+    }
+
+    const sources = await transaction<
+      Array<{
+        id: string;
+        household_id: string;
+        adult_id: string | null;
+        external_chat_id: string;
+        status: ChannelResolution["bindingStatus"];
+        membership_status: ChannelResolution["membershipStatus"];
+        household_status: string;
+      }>
+    >`
+      select binding.id, binding.household_id, binding.adult_id, binding.external_chat_id,
+        binding.status, membership.status as membership_status,
+        household.status as household_status
+      from channel_bindings binding
+      join household_memberships membership
+        on membership.household_id = binding.household_id
+        and membership.adult_id = binding.adult_id
+      join households household on household.id = binding.household_id
+      where binding.provider = 'linq' and binding.channel_type = 'private'
+        and binding.external_handle = ${input.externalHandle}
+        and binding.status in ('pending', 'active', 'paused')
+      for update of binding, membership, household
+    `;
+    const source = sources[0];
+    if (
+      sources.length !== 1 ||
+      source === undefined ||
+      source.id !== input.sourceBindingId ||
+      source.household_id !== input.sourceHouseholdId ||
+      source.adult_id !== input.sourceAdultId ||
+      source.external_chat_id !== input.externalChatId ||
+      source.status !== "active" ||
+      source.membership_status !== "active" ||
+      source.household_status === "deleting"
+    ) {
+      return { status: "unavailable", reason: "source_identity_changed" };
+    }
+    const snapshots = await transaction<{ revision: string; aggregate: unknown; projection: unknown }[]>`
+      select revision, aggregate, projection
+      from application_snapshots
+      where household_id = ${invitation.household_id}
+      for update
+    `;
+    const snapshotRow = snapshots[0];
+    const snapshot = HouseholdApplicationSnapshotSchema.safeParse(
+      snapshotRow === undefined
+        ? null
+        : {
+            revision: Number(snapshotRow.revision),
+            aggregate: snapshotRow.aggregate,
+            projection: snapshotRow.projection,
+          },
+    );
+    if (
+      !snapshot.success ||
+      !snapshot.data.aggregate.verifiedAdultIds.includes(inviteeAdultId) ||
+      snapshot.data.projection.onboarding.invitedAdultId !== inviteeAdultId
+    ) {
+      return { status: "unavailable", reason: "target_state_changed" };
+    }
+    const onboarding = snapshot.data.projection.onboarding;
+    const alreadyConsented = onboarding.consentedAdultIds.includes(inviteeAdultId);
+    let requiresApplicationAcceptance: boolean;
+    if (onboarding.phase === "awaiting_invitee_consent" && !alreadyConsented) {
+      if (!invitation.unexpired) {
+        return { status: "unavailable", reason: "no_single_invitation" };
+      }
+      requiresApplicationAcceptance = true;
+    } else if (onboarding.phase === "awaiting_group" && alreadyConsented) {
+      if (input.invitationId === undefined && !invitation.unexpired) {
+        return { status: "unavailable", reason: "no_single_invitation" };
+      }
+      requiresApplicationAcceptance = false;
+    } else {
+      return { status: "unavailable", reason: "target_state_changed" };
+    }
+    const activeConnections = await transaction<{ id: string }[]>`
+      select id from external_connections
+      where household_id = ${input.sourceHouseholdId}
+        and adult_id = ${input.sourceAdultId}
+        and status = 'active'
+      for update
+    `;
+    if (activeConnections.length > 0) {
+      return { status: "unavailable", reason: "source_connections_active" };
+    }
+    return {
+      status: "ready",
+      invitationId: invitation.id,
+      householdId: invitation.household_id,
+      adultId: invitation.invitee_adult_id,
+      requiresApplicationAcceptance,
+    };
+  }
+
   public async bindPendingInvitee(input: {
     invitation: PendingInvitation;
     externalChatId: string;
@@ -504,13 +856,17 @@ export class FlorenceRuntimeStore {
         returning id
       `;
       if (!invitations[0]) return false;
-      await transaction`
+      const memberships = await transaction<{ adult_id: string }[]>`
         update household_memberships
         set status = 'active', consented_at = ${parsed.consentedAt}, updated_at = now()
         where household_id = ${parsed.householdId} and adult_id = ${parsed.adultId}
           and status = 'invited'
+        returning adult_id
       `;
-      await transaction`
+      if (memberships.length !== 1) {
+        throw new ApplicationStoreError("invalid_state", "Invitation membership could not be activated");
+      }
+      const bindings = await transaction<{ id: string }[]>`
         update channel_bindings
         set status = 'active', updated_at = now()
         where provider = 'linq' and channel_type = 'private'
@@ -518,7 +874,11 @@ export class FlorenceRuntimeStore {
           and external_chat_id = ${parsed.externalChatId}
           and external_handle = ${canonicalizeLinqHandle(parsed.externalHandle)}
           and status = 'pending'
+        returning id
       `;
+      if (bindings.length !== 1) {
+        throw new ApplicationStoreError("invalid_state", "Invitation channel could not be activated");
+      }
       return true;
     });
   }
@@ -709,12 +1069,20 @@ export class FlorenceRuntimeStore {
   public async executeSerializedSend(input: {
     householdId: string;
     targetScope: DurableScope;
+    responseContext?: ConversationResponseContext;
+    deliveryGuard?: ProjectDeliveryGuard;
     loadGroupChat: (chatId: string) => Promise<LinqChat>;
     send: (chatId: string) => Promise<LinqSendReceipt>;
     allowWhileDeleting?: boolean;
   }): Promise<SerializedLinqSendResult> {
     const householdId = HouseholdIdSchema.parse(input.householdId);
     const targetScope = DurableScopeSchema.parse(input.targetScope);
+    const responseContext =
+      input.responseContext === undefined
+        ? undefined
+        : ConversationResponseContextSchema.parse(input.responseContext);
+    const deliveryGuard =
+      input.deliveryGuard === undefined ? undefined : ProjectDeliveryGuardSchema.parse(input.deliveryGuard);
     const candidateRows =
       targetScope.kind === "household"
         ? await this.database<{ external_chat_id: string }[]>`
@@ -743,6 +1111,54 @@ export class FlorenceRuntimeStore {
         !(input.allowWhileDeleting === true && targetScope.kind === "personal")
       ) {
         return { status: "inactive" };
+      }
+      const hasEpisodeResponseContext =
+        responseContext?.kind === "episode_ownership" || responseContext?.kind === "episode_follow_up";
+      if (hasEpisodeResponseContext || deliveryGuard !== undefined) {
+        const snapshots = await transaction<{ revision: string; aggregate: unknown; projection: unknown }[]>`
+          select revision, aggregate, projection
+          from application_snapshots where household_id = ${householdId}
+          limit 1
+        `;
+        const snapshotRow = snapshots[0];
+        if (!snapshotRow) return { status: "obsolete" };
+        const snapshot = HouseholdApplicationSnapshotSchema.safeParse({
+          revision: Number(snapshotRow.revision),
+          aggregate: snapshotRow.aggregate,
+          projection: snapshotRow.projection,
+        });
+        if (!snapshot.success) {
+          return { status: "obsolete" };
+        }
+
+        if (hasEpisodeResponseContext) {
+          const episode = snapshot.data.aggregate.episodes.find(
+            (candidate) => candidate.episodeId === responseContext.episodeId,
+          );
+          if (
+            episode === undefined ||
+            episode.version !== responseContext.episodeVersion ||
+            canonicalJson(episode.scope) !== canonicalJson(targetScope)
+          ) {
+            return { status: "obsolete" };
+          }
+        }
+
+        if (deliveryGuard !== undefined) {
+          if (
+            responseContext?.kind !== "episode_follow_up" ||
+            responseContext.episodeId !== deliveryGuard.episodeId
+          ) {
+            return { status: "obsolete" };
+          }
+          const worker = snapshot.data.projection.workers.find(
+            (candidate) =>
+              candidate.episodeId === deliveryGuard.episodeId && candidate.job.jobId === deliveryGuard.jobId,
+          );
+          if (worker === undefined || worker.deliveryGeneration !== deliveryGuard.generation) {
+            return { status: "obsolete" };
+          }
+        }
       }
       type SerializedBindingRow = {
         id: string;
@@ -1183,6 +1599,367 @@ export class FlorenceRuntimeStore {
     return this.googleMutationFailure(parsed);
   }
 
+  public async getCalendarSyncRecord(input: {
+    householdId: string;
+    adultId: string;
+    connectionId: string;
+    calendarId: string;
+  }): Promise<CalendarSyncRecord | null> {
+    const parsed = z
+      .strictObject({
+        householdId: z.uuid(),
+        adultId: z.uuid(),
+        connectionId: z.uuid(),
+        calendarId: z.string().min(1).max(1_000),
+      })
+      .parse(input);
+    const rows = await this.database<
+      {
+        calendar_id: string;
+        provider_calendar_id: string;
+        status: "active" | "excluded" | "deleted";
+        selection_source: "provider" | "adult";
+        availability_only: boolean;
+        access_role: string | null;
+        sync_state: unknown;
+      }[]
+    >`
+      select state.calendar_id, state.provider_calendar_id, state.status,
+        state.selection_source, state.availability_only, state.access_role, state.sync_state
+      from google_calendar_sync_states state
+      join external_connections connection on connection.id = state.connection_id
+      where state.connection_id = ${parsed.connectionId}
+        and state.household_id = ${parsed.householdId} and state.adult_id = ${parsed.adultId}
+        and state.calendar_id = ${parsed.calendarId}
+        and connection.household_id = state.household_id and connection.adult_id = state.adult_id
+        and connection.provider = 'google' and connection.status = 'active'
+      limit 1
+    `;
+    const row = rows[0];
+    if (!row) return null;
+    const syncState = row.sync_state === null ? null : calendarSyncStateSchema.safeParse(row.sync_state);
+    if (syncState !== null && !syncState.success) {
+      throw new ApplicationStoreError("invalid_state", "Calendar sync state is invalid");
+    }
+    const accessRole =
+      row.access_role === null ? null : googleCalendarAccessRoleSchema.parse(row.access_role);
+    return {
+      calendarId: row.calendar_id,
+      providerCalendarId: row.provider_calendar_id,
+      status: row.status,
+      selectionSource: row.selection_source,
+      availabilityOnly: row.availability_only,
+      accessRole,
+      state: syncState === null ? null : syncState.data,
+    };
+  }
+
+  public async listOwnedGoogleCalendars(input: { householdId: string; adultId: string }): Promise<
+    readonly {
+      connectionId: string;
+      connectionLabel: string;
+      calendarId: string;
+      displayName: string;
+      status: "active" | "excluded" | "deleted";
+      primary: boolean;
+    }[]
+  > {
+    const parsed = z.strictObject({ householdId: z.uuid(), adultId: z.uuid() }).parse(input);
+    const rows = await this.database<
+      {
+        connection_id: string;
+        connection_label: string;
+        calendar_id: string;
+        provider_calendar_id: string;
+        display_name_ciphertext: string;
+        status: "active" | "excluded" | "deleted";
+        is_primary: boolean;
+      }[]
+    >`
+      select state.connection_id, connection.label as connection_label, state.calendar_id,
+        state.provider_calendar_id, state.display_name_ciphertext, state.status, state.is_primary
+      from google_calendar_sync_states state
+      join external_connections connection on connection.id = state.connection_id
+      where state.household_id = ${parsed.householdId} and state.adult_id = ${parsed.adultId}
+        and connection.household_id = state.household_id and connection.adult_id = state.adult_id
+        and connection.provider = 'google' and connection.status = 'active'
+      order by connection.created_at, state.is_primary desc, state.calendar_id
+    `;
+    const secretBox = new SecretBox(this.identityKey);
+    return rows.map((row) => {
+      let displayName: string;
+      try {
+        displayName = secretBox.open(
+          row.display_name_ciphertext,
+          calendarCatalogNameAad(
+            { householdId: parsed.householdId, adultId: parsed.adultId, id: row.connection_id },
+            row.provider_calendar_id,
+          ),
+        );
+      } catch {
+        throw new ApplicationStoreError("invalid_state", "Calendar display name could not be decrypted");
+      }
+      return {
+        connectionId: row.connection_id,
+        connectionLabel: row.connection_label,
+        calendarId: row.calendar_id,
+        displayName,
+        status: row.status,
+        primary: row.is_primary,
+      };
+    });
+  }
+
+  public async setOwnedGoogleCalendarEnabled(input: {
+    householdId: string;
+    adultId: string;
+    connectionId: string;
+    calendarId: string;
+    enabled: boolean;
+  }): Promise<"updated" | "not_found" | "primary_required" | "unavailable"> {
+    const parsed = z
+      .strictObject({
+        householdId: z.uuid(),
+        adultId: z.uuid(),
+        connectionId: z.uuid(),
+        calendarId: z.string().min(1).max(1_000),
+        enabled: z.boolean(),
+      })
+      .parse(input);
+    return this.database.begin(async (transaction) => {
+      const currentRows = await transaction<
+        { status: "active" | "excluded" | "deleted"; is_primary: boolean; access_role: string | null }[]
+      >`
+        select state.status, state.is_primary, state.access_role
+        from google_calendar_sync_states state
+        join external_connections connection on connection.id = state.connection_id
+        where state.connection_id = ${parsed.connectionId}
+          and state.household_id = ${parsed.householdId} and state.adult_id = ${parsed.adultId}
+          and state.calendar_id = ${parsed.calendarId}
+          and connection.household_id = state.household_id and connection.adult_id = state.adult_id
+          and connection.provider = 'google' and connection.status = 'active'
+        for update of state
+      `;
+      const current = currentRows[0];
+      if (!current) return "not_found" as const;
+      if (!parsed.enabled && current.is_primary) return "primary_required" as const;
+      if (parsed.enabled && (current.status === "deleted" || current.access_role === null)) {
+        return "unavailable" as const;
+      }
+      await transaction`
+        update google_calendar_sync_states
+        set status = ${parsed.enabled ? "active" : "excluded"}, selection_source = 'adult',
+          adult_enabled = ${parsed.enabled},
+          sync_state = case
+            when ${parsed.enabled} and status = 'active' then sync_state
+            else null
+          end,
+          updated_at = now()
+        where connection_id = ${parsed.connectionId} and household_id = ${parsed.householdId}
+          and adult_id = ${parsed.adultId} and calendar_id = ${parsed.calendarId}
+      `;
+      if (!parsed.enabled) {
+        await this.removeCalendarProjection(transaction, parsed, parsed.calendarId);
+      }
+      return "updated" as const;
+    });
+  }
+
+  public async saveCalendarCatalogState(input: {
+    householdId: string;
+    adultId: string;
+    connectionId: string;
+    expectedRevision: number;
+    state: CalendarCatalogState;
+  }): Promise<ScopedMutationResult> {
+    const parsed = z
+      .strictObject({
+        householdId: z.uuid(),
+        adultId: z.uuid(),
+        connectionId: z.uuid(),
+        expectedRevision: z.number().int().nonnegative(),
+        state: calendarCatalogStateSchema,
+      })
+      .parse(input);
+    const rows = await this.database<{ id: string }[]>`
+      update external_connections
+      set cursor = jsonb_set(
+            cursor, '{calendarCatalog}',
+            ${this.database.json(JSON.parse(JSON.stringify(parsed.state)))}, true
+          ), updated_at = now()
+      where id = ${parsed.connectionId} and household_id = ${parsed.householdId}
+        and adult_id = ${parsed.adultId} and provider = 'google' and status = 'active'
+        and coalesce((cursor->'calendarCatalog'->>'revision')::integer, 0) = ${parsed.expectedRevision}
+      returning id
+    `;
+    if (rows[0]) return "updated";
+    return this.googleMutationFailure(parsed);
+  }
+
+  public async applyCalendarCatalogPage(input: {
+    householdId: string;
+    adultId: string;
+    connectionId: string;
+    expectedRevision: number;
+    state: CalendarCatalogState;
+    fullScan: boolean;
+    entries: readonly {
+      calendarId: string;
+      providerCalendarId: string;
+      encryptedDisplayName: string;
+      accessRole: z.infer<typeof googleCalendarAccessRoleSchema> | null;
+      primary: boolean;
+      selected: boolean;
+      hidden: boolean;
+      deleted: boolean;
+      defaultEnabled: boolean;
+      availabilityOnly: boolean;
+      initialState: CalendarSyncState;
+    }[];
+  }): Promise<ScopedMutationResult> {
+    const entrySchema = z.strictObject({
+      calendarId: z.string().min(1).max(1_000),
+      providerCalendarId: z.string().min(1).max(1_000),
+      encryptedDisplayName: z.string().min(1),
+      accessRole: googleCalendarAccessRoleSchema.nullable(),
+      primary: z.boolean(),
+      selected: z.boolean(),
+      hidden: z.boolean(),
+      deleted: z.boolean(),
+      defaultEnabled: z.boolean(),
+      availabilityOnly: z.boolean(),
+      initialState: calendarSyncStateSchema,
+    });
+    const parsed = z
+      .strictObject({
+        householdId: z.uuid(),
+        adultId: z.uuid(),
+        connectionId: z.uuid(),
+        expectedRevision: z.number().int().nonnegative(),
+        state: calendarCatalogStateSchema,
+        fullScan: z.boolean(),
+        entries: z.array(entrySchema).max(250),
+      })
+      .parse(input);
+    const updated = await this.database.begin(async (transaction) => {
+      const connectionRows = await transaction<{ id: string }[]>`
+        update external_connections
+        set cursor = jsonb_set(
+              cursor, '{calendarCatalog}',
+              ${this.database.json(JSON.parse(JSON.stringify(parsed.state)))}, true
+            ), updated_at = now()
+        where id = ${parsed.connectionId} and household_id = ${parsed.householdId}
+          and adult_id = ${parsed.adultId} and provider = 'google' and status = 'active'
+          and coalesce((cursor->'calendarCatalog'->>'revision')::integer, 0) = ${parsed.expectedRevision}
+        returning id
+      `;
+      if (!connectionRows[0]) return false;
+
+      for (const entry of parsed.entries) {
+        const existingRows = await transaction<
+          {
+            status: "active" | "excluded" | "deleted";
+            selection_source: "provider" | "adult";
+            adult_enabled: boolean | null;
+            availability_only: boolean;
+            sync_state: unknown;
+          }[]
+        >`
+          select status, selection_source, adult_enabled, availability_only, sync_state
+          from google_calendar_sync_states
+          where connection_id = ${parsed.connectionId} and calendar_id = ${entry.calendarId}
+          for update
+        `;
+        const existing = existingRows[0];
+        const adultEnabled = existing?.selection_source === "adult" ? existing.adult_enabled : null;
+        const enabled = entry.accessRole !== null && (adultEnabled ?? entry.defaultEnabled);
+        const status: "active" | "excluded" | "deleted" = entry.deleted
+          ? "deleted"
+          : enabled
+            ? "active"
+            : "excluded";
+        const retainedState = calendarSyncStateSchema.safeParse(existing?.sync_state);
+        const modeChanged = existing !== undefined && existing.availability_only !== entry.availabilityOnly;
+        const syncState =
+          status === "active"
+            ? existing?.status === "active" && !modeChanged && retainedState.success
+              ? retainedState.data
+              : entry.initialState
+            : null;
+        const selectionSource = existing?.selection_source === "adult" ? "adult" : "provider";
+        await transaction`
+          insert into google_calendar_sync_states (
+            connection_id, household_id, adult_id, calendar_id, provider_calendar_id,
+            display_name_ciphertext, access_role, is_primary, selected, hidden, status,
+            selection_source, adult_enabled, availability_only, last_seen_scan_id,
+            catalog_revision, sync_state
+          ) values (
+            ${parsed.connectionId}, ${parsed.householdId}, ${parsed.adultId}, ${entry.calendarId},
+            ${entry.providerCalendarId}, ${entry.encryptedDisplayName}, ${entry.accessRole},
+            ${entry.primary}, ${entry.selected}, ${entry.hidden}, ${status}, ${selectionSource},
+            ${selectionSource === "adult" ? adultEnabled : null}, ${entry.availabilityOnly},
+            ${parsed.state.scanId}, ${parsed.state.revision},
+            ${syncState === null ? null : this.database.json(JSON.parse(JSON.stringify(syncState)))}
+          )
+          on conflict (connection_id, calendar_id) do update set
+            provider_calendar_id = excluded.provider_calendar_id,
+            display_name_ciphertext = excluded.display_name_ciphertext,
+            access_role = excluded.access_role, is_primary = excluded.is_primary,
+            selected = excluded.selected, hidden = excluded.hidden, status = excluded.status,
+            selection_source = excluded.selection_source, adult_enabled = excluded.adult_enabled,
+            availability_only = excluded.availability_only,
+            last_seen_scan_id = excluded.last_seen_scan_id,
+            catalog_revision = excluded.catalog_revision, sync_state = excluded.sync_state,
+            updated_at = now()
+        `;
+        if (status !== "active" || modeChanged) {
+          await this.removeCalendarProjection(transaction, parsed, entry.calendarId);
+        }
+      }
+
+      if (parsed.fullScan && parsed.state.phase === "live" && parsed.state.projectionReady) {
+        const absent = await transaction<{ calendar_id: string }[]>`
+          select calendar_id from google_calendar_sync_states
+          where connection_id = ${parsed.connectionId} and household_id = ${parsed.householdId}
+            and adult_id = ${parsed.adultId} and last_seen_scan_id <> ${parsed.state.scanId}
+          for update
+        `;
+        if (absent.length > 0) {
+          await transaction`
+            update google_calendar_sync_states
+            set status = 'deleted', sync_state = null, updated_at = now()
+            where connection_id = ${parsed.connectionId} and household_id = ${parsed.householdId}
+              and adult_id = ${parsed.adultId} and last_seen_scan_id <> ${parsed.state.scanId}
+          `;
+          for (const row of absent) {
+            await this.removeCalendarProjection(transaction, parsed, row.calendar_id);
+          }
+        }
+      }
+      return true;
+    });
+    if (updated) return "updated";
+    return this.googleMutationFailure(parsed);
+  }
+
+  private async removeCalendarProjection(
+    transaction: TransactionSql<Record<string, never>>,
+    scope: { householdId: string; adultId: string; connectionId: string },
+    calendarId: string,
+  ): Promise<void> {
+    await transaction`
+      update google_calendar_channels set status = 'stopped', updated_at = now()
+      where connection_id = ${scope.connectionId} and household_id = ${scope.householdId}
+        and adult_id = ${scope.adultId} and calendar_id = ${calendarId}
+        and status in ('active', 'retiring')
+    `;
+    await transaction`
+      delete from calendar_busy_windows
+      where connection_id = ${scope.connectionId} and household_id = ${scope.householdId}
+        and owner_adult_id = ${scope.adultId} and calendar_id = ${calendarId}
+    `;
+  }
+
   public async saveCalendarSyncState(input: {
     householdId: string;
     adultId: string;
@@ -1199,16 +1976,19 @@ export class FlorenceRuntimeStore {
         state: calendarSyncStateSchema,
       })
       .parse(input);
-    const rows = await this.database<{ id: string }[]>`
-      update external_connections
-      set cursor = jsonb_set(
-            cursor, '{calendar}', ${this.database.json(JSON.parse(JSON.stringify(parsed.state)))}, true
-          ),
-          last_synced_at = now(), updated_at = now()
-      where id = ${parsed.connectionId} and household_id = ${parsed.householdId}
-        and adult_id = ${parsed.adultId} and provider = 'google' and status = 'active'
-        and coalesce((cursor->'calendar'->>'revision')::integer, 0) = ${parsed.expectedRevision}
-      returning id
+    const rows = await this.database<{ connection_id: string }[]>`
+      update google_calendar_sync_states state
+      set sync_state = ${this.database.json(JSON.parse(JSON.stringify(parsed.state)))},
+        updated_at = now()
+      from external_connections connection
+      where state.connection_id = ${parsed.connectionId}
+        and state.household_id = ${parsed.householdId} and state.adult_id = ${parsed.adultId}
+        and state.calendar_id = ${parsed.state.calendarId} and state.status = 'active'
+        and coalesce((state.sync_state->>'revision')::integer, 0) = ${parsed.expectedRevision}
+        and connection.id = state.connection_id and connection.household_id = state.household_id
+        and connection.adult_id = state.adult_id and connection.provider = 'google'
+        and connection.status = 'active'
+      returning state.connection_id
     `;
     if (rows[0]) return "updated";
     return this.googleMutationFailure(parsed);
@@ -1231,22 +2011,25 @@ export class FlorenceRuntimeStore {
       })
       .parse(input);
     const updated = await this.database.begin(async (transaction) => {
-      const rows = await transaction<{ id: string }[]>`
-        update external_connections
-        set cursor = jsonb_set(
-              cursor, '{calendar}', ${this.database.json(JSON.parse(JSON.stringify(parsed.state)))}, true
-            ),
-            last_synced_at = now(), updated_at = now()
-        where id = ${parsed.connectionId} and household_id = ${parsed.householdId}
-          and adult_id = ${parsed.adultId} and provider = 'google' and status = 'active'
-          and coalesce((cursor->'calendar'->>'revision')::integer, 0) = ${parsed.expectedRevision}
-        returning id
+      const rows = await transaction<{ connection_id: string }[]>`
+        update google_calendar_sync_states state
+        set sync_state = ${this.database.json(JSON.parse(JSON.stringify(parsed.state)))},
+          updated_at = now()
+        from external_connections connection
+        where state.connection_id = ${parsed.connectionId}
+          and state.household_id = ${parsed.householdId} and state.adult_id = ${parsed.adultId}
+          and state.calendar_id = ${parsed.state.calendarId} and state.status = 'active'
+          and coalesce((state.sync_state->>'revision')::integer, 0) = ${parsed.expectedRevision}
+          and connection.id = state.connection_id and connection.household_id = state.household_id
+          and connection.adult_id = state.adult_id and connection.provider = 'google'
+          and connection.status = 'active'
+        returning state.connection_id
       `;
       if (!rows[0]) return false;
       await transaction`
         delete from calendar_busy_windows
         where connection_id = ${parsed.connectionId} and household_id = ${parsed.householdId}
-          and owner_adult_id = ${parsed.adultId}
+          and owner_adult_id = ${parsed.adultId} and calendar_id = ${parsed.state.calendarId}
       `;
       return true;
     });
@@ -1291,16 +2074,19 @@ export class FlorenceRuntimeStore {
     }
     const tokenDigest = this.calendarChannelTokenDigest(parsed.channel.channelToken);
     const updated = await this.database.begin(async (transaction) => {
-      const rows = await transaction<{ id: string }[]>`
-        update external_connections
-        set cursor = jsonb_set(
-              cursor, '{calendar}', ${this.database.json(JSON.parse(JSON.stringify(parsed.state)))}, true
-            ),
-            updated_at = now()
-        where id = ${parsed.connectionId} and household_id = ${parsed.householdId}
-          and adult_id = ${parsed.adultId} and provider = 'google' and status = 'active'
-          and coalesce((cursor->'calendar'->>'revision')::integer, 0) = ${parsed.expectedRevision}
-        returning id
+      const rows = await transaction<{ connection_id: string }[]>`
+        update google_calendar_sync_states state
+        set sync_state = ${this.database.json(JSON.parse(JSON.stringify(parsed.state)))},
+          updated_at = now()
+        from external_connections connection
+        where state.connection_id = ${parsed.connectionId}
+          and state.household_id = ${parsed.householdId} and state.adult_id = ${parsed.adultId}
+          and state.calendar_id = ${parsed.calendarId} and state.status = 'active'
+          and coalesce((state.sync_state->>'revision')::integer, 0) = ${parsed.expectedRevision}
+          and connection.id = state.connection_id and connection.household_id = state.household_id
+          and connection.adult_id = state.adult_id and connection.provider = 'google'
+          and connection.status = 'active'
+        returning state.connection_id
       `;
       if (!rows[0]) return false;
       await transaction`
@@ -1349,6 +2135,28 @@ export class FlorenceRuntimeStore {
     return rows[0] ? "updated" : "not_found";
   }
 
+  public async listCalendarWatches(input: {
+    householdId: string;
+    adultId: string;
+    connectionId: string;
+  }): Promise<readonly { channelId: string; resourceId: string }[]> {
+    const parsed = z
+      .strictObject({ householdId: z.uuid(), adultId: z.uuid(), connectionId: z.uuid() })
+      .parse(input);
+    const rows = await this.database<{ channel_id: string; resource_id: string }[]>`
+      select channel.channel_id, channel.resource_id
+      from google_calendar_channels channel
+      join external_connections connection on connection.id = channel.connection_id
+      where channel.connection_id = ${parsed.connectionId}
+        and channel.household_id = ${parsed.householdId} and channel.adult_id = ${parsed.adultId}
+        and channel.status in ('active', 'retiring')
+        and connection.household_id = channel.household_id
+        and connection.adult_id = channel.adult_id and connection.provider = 'google'
+      order by channel.created_at, channel.channel_id
+    `;
+    return rows.map((row) => ({ channelId: row.channel_id, resourceId: row.resource_id }));
+  }
+
   public async authenticateCalendarPush(input: {
     channelId: string;
     resourceId: string;
@@ -1382,6 +2190,8 @@ export class FlorenceRuntimeStore {
           channel.calendar_id, channel.last_message_number::text
         from google_calendar_channels channel
         join external_connections connection on connection.id = channel.connection_id
+        join google_calendar_sync_states state
+          on state.connection_id = channel.connection_id and state.calendar_id = channel.calendar_id
         where channel.channel_id = ${parsed.channelId}
           and channel.resource_id = ${parsed.resourceId}
           and channel.resource_uri = ${parsed.resourceUri}
@@ -1390,6 +2200,8 @@ export class FlorenceRuntimeStore {
           and connection.status = 'active' and connection.provider = 'google'
           and connection.household_id = channel.household_id
           and connection.adult_id = channel.adult_id
+          and state.household_id = channel.household_id and state.adult_id = channel.adult_id
+          and state.status = 'active'
         for update of channel
       `;
       const row = rows[0];
@@ -1483,9 +2295,12 @@ export class FlorenceRuntimeStore {
       join source_items source on source.id = ${persisted.sourceItemId}
         and source.household_id = connection.household_id
         and source.connection_id = connection.id and source.revision = ${persisted.revision}
+      join google_calendar_sync_states state on state.connection_id = connection.id
+        and state.calendar_id = ${parsed.calendarId} and state.status = 'active'
       where connection.id = ${parsed.connectionId} and connection.household_id = ${parsed.householdId}
         and connection.adult_id = ${parsed.adultId} and connection.provider = 'google'
         and connection.status = 'active'
+        and state.household_id = connection.household_id and state.adult_id = connection.adult_id
       on conflict (connection_id, calendar_id, external_event_id)
       do update set source_item_id = excluded.source_item_id,
         source_revision = excluded.source_revision, starts_at = excluded.starts_at,
@@ -1539,43 +2354,88 @@ export class FlorenceRuntimeStore {
     if (Date.parse(parsed.from) >= Date.parse(parsed.to)) {
       throw new ApplicationStoreError("invalid_state", "Calendar projection range is invalid");
     }
-    const connections = await this.database<{ cursor: Record<string, unknown> }[]>`
-      select cursor from external_connections
+    const connections = await this.database<{ id: string; cursor: Record<string, unknown> }[]>`
+      select id, cursor from external_connections
       where household_id = ${parsed.householdId} and adult_id = ${parsed.adultId}
         and provider = 'google' and status = 'active'
-        and granted_scopes && ${[GOOGLE_CALENDAR_READONLY_SCOPE, GOOGLE_CALENDAR_EVENTS_SCOPE]}::text[]
+        and granted_scopes @> ${[GOOGLE_CALENDAR_READONLY_SCOPE]}::text[]
       order by id
     `;
     if (connections.length === 0) {
       return { windows: [], complete: true, synchronizedAt: null };
     }
-    const states = connections.map((connection) =>
-      calendarSyncStateSchema.safeParse(connection.cursor.calendar),
+    const catalogs = connections.map((connection) =>
+      calendarCatalogStateSchema.safeParse(connection.cursor.calendarCatalog),
     );
-    if (states.some((state) => !state.success || !state.data.projectionReady)) {
+    const freshnessBoundary = Date.parse(parsed.asOf) - 30 * 60_000;
+    if (
+      catalogs.some(
+        (catalog) =>
+          !catalog.success ||
+          catalog.data.phase !== "live" ||
+          !catalog.data.projectionReady ||
+          catalog.data.lastSuccessfulSyncAt === null ||
+          Date.parse(catalog.data.lastSuccessfulSyncAt) < freshnessBoundary,
+      )
+    ) {
       return { windows: [], complete: false, synchronizedAt: null };
     }
-    const readyStates = states.flatMap((state) => (state.success ? [state.data] : []));
-    const earliestSynchronization = readyStates
-      .map((state) => state.lastSuccessfulSyncAt)
-      .filter((value): value is string => value !== null)
-      .sort()[0];
+    const connectionIds = connections.map((connection) => connection.id);
+    const stateRows = await this.database<{ connection_id: string; sync_state: unknown }[]>`
+      select connection_id, sync_state
+      from google_calendar_sync_states
+      where household_id = ${parsed.householdId} and adult_id = ${parsed.adultId}
+        and connection_id = any(${connectionIds}::uuid[]) and status = 'active'
+      order by connection_id, calendar_id
+    `;
+    const states = stateRows.map((row) => ({
+      connectionId: row.connection_id,
+      state: calendarSyncStateSchema.safeParse(row.sync_state),
+    }));
+    if (
+      connections.some((connection) => !states.some((state) => state.connectionId === connection.id)) ||
+      states.some(
+        ({ state }) =>
+          !state.success ||
+          state.data.phase !== "live" ||
+          !state.data.projectionReady ||
+          state.data.lastSuccessfulSyncAt === null ||
+          Date.parse(state.data.lastSuccessfulSyncAt) < freshnessBoundary ||
+          Date.parse(state.data.initialTimeMin) > Date.parse(parsed.from) ||
+          Date.parse(state.data.initialTimeMax) < Date.parse(parsed.to),
+      )
+    ) {
+      return { windows: [], complete: false, synchronizedAt: null };
+    }
+    const readyStates = states.flatMap(({ state }) => (state.success ? [state.data] : []));
+    const earliestSynchronization = [
+      ...catalogs.flatMap((catalog) =>
+        catalog.success && catalog.data.lastSuccessfulSyncAt !== null
+          ? [catalog.data.lastSuccessfulSyncAt]
+          : [],
+      ),
+      ...readyStates
+        .map((state) => state.lastSuccessfulSyncAt)
+        .filter((value): value is string => value !== null),
+    ].sort()[0];
     const synchronizedAt = earliestSynchronization ? new Date(earliestSynchronization).toISOString() : null;
-    if (synchronizedAt === null || Date.parse(synchronizedAt) < Date.parse(parsed.asOf) - 30 * 60_000) {
+    if (synchronizedAt === null || Date.parse(synchronizedAt) < freshnessBoundary) {
       return { windows: [], complete: false, synchronizedAt };
     }
     const rows = await this.database<{ starts_at: Date; ends_at: Date; all_day: boolean }[]>`
-      select busy.starts_at, busy.ends_at, busy.all_day
+      select distinct busy.starts_at, busy.ends_at, busy.all_day
       from calendar_busy_windows busy
       join external_connections connection on connection.id = busy.connection_id
+      join google_calendar_sync_states state
+        on state.connection_id = busy.connection_id and state.calendar_id = busy.calendar_id
       where busy.household_id = ${parsed.householdId} and busy.owner_adult_id = ${parsed.adultId}
         and connection.household_id = busy.household_id
         and connection.adult_id = busy.owner_adult_id
         and connection.status = 'active' and connection.provider = 'google'
-        and connection.cursor->'calendar'->>'phase' = 'live'
-        and coalesce((connection.cursor->'calendar'->>'projectionReady')::boolean, false)
+        and state.household_id = busy.household_id and state.adult_id = busy.owner_adult_id
+        and state.status = 'active'
         and busy.starts_at < ${parsed.to} and busy.ends_at > ${parsed.from}
-      order by busy.starts_at, busy.ends_at, busy.connection_id, busy.external_event_id
+      order by busy.starts_at, busy.ends_at, busy.all_day
       limit ${parsed.limit + 1}
     `;
     return {
@@ -1669,33 +2529,82 @@ export class FlorenceRuntimeStore {
       where household_id = ${parsed.householdId}
         and adult_id = any(${expectedAdults}::uuid[])
         and provider = 'google' and status = 'active'
-        and granted_scopes && ${[GOOGLE_CALENDAR_READONLY_SCOPE, GOOGLE_CALENDAR_EVENTS_SCOPE]}::text[]
+        and granted_scopes @> ${[GOOGLE_CALENDAR_READONLY_SCOPE]}::text[]
       order by adult_id, id
     `;
-    const coverage: Array<{ connectionId: string; adultId: string; calendarId: string }> = [];
+    if (
+      connections.length === 0 ||
+      expectedAdults.some((adultId) => !connections.some((connection) => connection.adult_id === adultId))
+    ) {
+      return { status: "unavailable", reason: "projection_incomplete" };
+    }
+    const freshnessBoundary = Date.parse(parsed.asOf) - 30 * 60_000;
+    const catalogByConnection = new Map<string, CalendarCatalogState>();
     for (const connection of connections) {
-      const state = calendarSyncStateSchema.safeParse(connection.cursor.calendar);
+      const catalog = calendarCatalogStateSchema.safeParse(connection.cursor.calendarCatalog);
+      if (
+        !catalog.success ||
+        catalog.data.phase !== "live" ||
+        !catalog.data.projectionReady ||
+        catalog.data.lastSuccessfulSyncAt === null ||
+        Date.parse(catalog.data.lastSuccessfulSyncAt) < freshnessBoundary
+      ) {
+        return { status: "unavailable", reason: "projection_incomplete" };
+      }
+      catalogByConnection.set(connection.id, catalog.data);
+    }
+    const connectionIds = connections.map((connection) => connection.id);
+    const calendarRows = await this.database<
+      { connection_id: string; adult_id: string; calendar_id: string; sync_state: unknown }[]
+    >`
+      select connection_id, adult_id, calendar_id, sync_state
+      from google_calendar_sync_states
+      where household_id = ${parsed.householdId} and adult_id = any(${expectedAdults}::uuid[])
+        and connection_id = any(${connectionIds}::uuid[]) and status = 'active'
+      order by adult_id, connection_id, calendar_id
+    `;
+    const coverage: Array<{
+      connectionId: string;
+      adultId: string;
+      calendarId: string;
+      catalogRevision: number;
+      stateRevision: number;
+      synchronizedAt: string;
+    }> = [];
+    for (const row of calendarRows) {
+      const state = calendarSyncStateSchema.safeParse(row.sync_state);
+      const catalog = catalogByConnection.get(row.connection_id);
       if (
         !state.success ||
+        catalog === undefined ||
         state.data.phase !== "live" ||
         !state.data.projectionReady ||
-        state.data.calendarId !== "primary" ||
         state.data.lastSuccessfulSyncAt === null ||
-        Date.parse(state.data.lastSuccessfulSyncAt) < Date.parse(parsed.asOf) - 30 * 60_000 ||
+        Date.parse(state.data.lastSuccessfulSyncAt) < freshnessBoundary ||
         Date.parse(state.data.initialTimeMin) > Date.parse(parsed.startsAt) ||
         Date.parse(state.data.initialTimeMax) < Date.parse(parsed.endsAt)
       ) {
         return { status: "unavailable", reason: "projection_incomplete" };
       }
       coverage.push({
-        connectionId: connection.id,
-        adultId: connection.adult_id,
+        connectionId: row.connection_id,
+        adultId: row.adult_id,
         calendarId: state.data.calendarId,
+        catalogRevision: catalog.revision,
+        stateRevision: state.data.revision,
+        synchronizedAt: state.data.lastSuccessfulSyncAt,
       });
     }
-    if (!coverage.some((item) => item.connectionId === target.id)) {
+    if (
+      !connections.every((connection) =>
+        coverage.some((item) => item.connectionId === connection.id && item.adultId === connection.adult_id),
+      ) ||
+      !expectedAdults.every((adultId) => coverage.some((item) => item.adultId === adultId)) ||
+      !coverage.some((item) => item.connectionId === target.id)
+    ) {
       return { status: "unavailable", reason: "projection_incomplete" };
     }
+    const coveredConnectionIds = [...new Set(coverage.map((item) => item.connectionId))];
 
     const overlaps = await this.database<
       {
@@ -1712,11 +2621,16 @@ export class FlorenceRuntimeStore {
         busy.external_event_id, busy.source_revision, busy.starts_at, busy.ends_at
       from calendar_busy_windows busy
       join external_connections connection on connection.id = busy.connection_id
+      join google_calendar_sync_states state
+        on state.connection_id = busy.connection_id and state.calendar_id = busy.calendar_id
       where busy.household_id = ${parsed.householdId}
         and busy.owner_adult_id = any(${expectedAdults}::uuid[])
+        and busy.connection_id = any(${coveredConnectionIds}::uuid[])
         and connection.household_id = busy.household_id
         and connection.adult_id = busy.owner_adult_id
         and connection.provider = 'google' and connection.status = 'active'
+        and state.household_id = busy.household_id and state.adult_id = busy.owner_adult_id
+        and state.status = 'active'
         and connection.granted_scopes && ${[
           GOOGLE_CALENDAR_READONLY_SCOPE,
           GOOGLE_CALENDAR_EVENTS_SCOPE,
@@ -1840,6 +2754,11 @@ export class FlorenceRuntimeStore {
         where connection_id = ${parsed.connectionId} and household_id = ${parsed.householdId}
           and owner_adult_id = ${parsed.adultId}
       `;
+      await transaction`
+        delete from google_calendar_sync_states
+        where connection_id = ${parsed.connectionId} and household_id = ${parsed.householdId}
+          and adult_id = ${parsed.adultId}
+      `;
       return "revoked" as const;
     });
   }
@@ -1939,13 +2858,25 @@ export class FlorenceRuntimeStore {
       join households household on household.id = connection.household_id
       where connection.provider = 'google' and connection.status = 'active'
         and household.status <> 'deleting'
-        and connection.granted_scopes && ${[GOOGLE_CALENDAR_READONLY_SCOPE, GOOGLE_CALENDAR_EVENTS_SCOPE]}::text[]
+        and connection.granted_scopes @> ${[GOOGLE_CALENDAR_READONLY_SCOPE]}::text[]
       order by connection.updated_at
     `;
+    const connectionIds = rows.map((row) => row.id);
+    const calendarRows =
+      connectionIds.length === 0
+        ? []
+        : await this.database<
+            { connection_id: string; calendar_id: string; availability_only: boolean; sync_state: unknown }[]
+          >`
+            select connection_id, calendar_id, availability_only, sync_state
+            from google_calendar_sync_states
+            where connection_id = any(${connectionIds}::uuid[]) and status = 'active'
+            order by connection_id, calendar_id
+          `;
     let created = 0;
     for (const row of rows) {
-      const stateResult = calendarSyncStateSchema.safeParse(row.cursor.calendar);
-      if (row.cursor.calendar !== undefined && !stateResult.success) {
+      const catalogResult = calendarCatalogStateSchema.safeParse(row.cursor.calendarCatalog);
+      if (row.cursor.calendarCatalog !== undefined && !catalogResult.success) {
         await this.markConnectionStatus({
           householdId: row.household_id,
           adultId: row.adult_id,
@@ -1954,20 +2885,60 @@ export class FlorenceRuntimeStore {
         });
         continue;
       }
-      const planned = calendarWorkForState(row, stateResult.success ? stateResult.data : null, now);
-      if (planned === null) continue;
-      const receipt = await this.enqueueCalendarSyncWork({
-        householdId: row.household_id,
-        idempotencyKey: calendarWorkIdempotencyKey(
-          row.id,
-          planned.work,
-          planned.revision,
+      const catalogPlan = calendarCatalogWorkForState(
+        row,
+        catalogResult.success ? catalogResult.data : null,
+        now,
+      );
+      if (catalogPlan !== null) {
+        const receipt = await this.enqueueCalendarSyncWork({
+          householdId: row.household_id,
+          idempotencyKey: calendarWorkIdempotencyKey(
+            row.id,
+            catalogPlan.work,
+            catalogPlan.revision,
+            now,
+            row.updated_at.toISOString(),
+          ),
+          work: catalogPlan.work,
+        });
+        if (receipt.created) created += 1;
+        continue;
+      }
+
+      const ownedCalendars = calendarRows.filter((calendar) => calendar.connection_id === row.id);
+      for (const calendar of ownedCalendars) {
+        const stateResult = calendarSyncStateSchema.safeParse(calendar.sync_state);
+        if (calendar.sync_state !== null && !stateResult.success) {
+          await this.markConnectionStatus({
+            householdId: row.household_id,
+            adultId: row.adult_id,
+            connectionId: row.id,
+            status: "error",
+          });
+          break;
+        }
+        const planned = calendarWorkForState(
+          row,
+          calendar.calendar_id,
+          calendar.availability_only,
+          stateResult.success ? stateResult.data : null,
           now,
-          row.updated_at.toISOString(),
-        ),
-        work: planned.work,
-      });
-      if (receipt.created) created += 1;
+        );
+        if (planned === null) continue;
+        const receipt = await this.enqueueCalendarSyncWork({
+          householdId: row.household_id,
+          idempotencyKey: calendarWorkIdempotencyKey(
+            row.id,
+            planned.work,
+            planned.revision,
+            now,
+            row.updated_at.toISOString(),
+          ),
+          work: planned.work,
+        });
+        if (receipt.created) created += 1;
+      }
     }
     return created;
   }
@@ -2125,24 +3096,51 @@ export class FlorenceRuntimeStore {
   public async reconcileGoogleSyncWork(asOf: string): Promise<number> {
     const now = instantSchema.parse(asOf);
     const rows = await this.database<
-      { id: string; household_id: string; adult_id: string; cursor: Record<string, unknown> }[]
+      {
+        id: string;
+        household_id: string;
+        adult_id: string;
+        cursor: Record<string, unknown>;
+      }[]
     >`
       select connection.id, connection.household_id, connection.adult_id, connection.cursor
       from external_connections connection
       join households household on household.id = connection.household_id
       where connection.provider = 'google' and connection.status = 'active'
-        and connection.cursor ? 'gmail' and household.status <> 'deleting'
+        and connection.granted_scopes && ${[GOOGLE_GMAIL_READONLY_SCOPE]}::text[]
+        and household.status <> 'deleting'
       order by connection.updated_at
     `;
     let created = 0;
     for (const row of rows) {
-      const state = gmailSyncStateSchema.safeParse(row.cursor.gmail);
-      if (!state.success) continue;
-      const work = googleWorkForState(row, state.data, now);
+      const storedState = row.cursor.gmail;
+      const state = gmailSyncStateSchema.safeParse(storedState);
+      if (storedState !== undefined && !state.success) {
+        await this.markConnectionStatus({
+          householdId: row.household_id,
+          adultId: row.adult_id,
+          connectionId: row.id,
+          status: "error",
+        });
+        continue;
+      }
+      const work = state.success
+        ? googleWorkForState(row, state.data, now)
+        : gmailSyncWorkSchema.parse({
+            kind: "start",
+            householdId: row.household_id,
+            adultId: row.adult_id,
+            connectionId: row.id,
+            depth: "full_history",
+          });
       if (!work) continue;
+      const revision = state.success ? state.data.revision : 0;
       const receipt = await this.enqueueGoogleSyncWork({
         householdId: row.household_id,
-        idempotencyKey: `google:${row.id}:${work.kind}:revision:${state.data.revision}`,
+        idempotencyKey:
+          work.kind === "start"
+            ? `google:${row.id}:start`
+            : `google:${row.id}:${work.kind}:revision:${revision}`,
         work,
       });
       if (receipt.created) created += 1;
@@ -2437,6 +3435,8 @@ function sameStrings(left: readonly string[], right: readonly string[]): boolean
 
 function calendarWorkForState(
   row: { id: string; household_id: string; adult_id: string },
+  calendarId: string,
+  availabilityOnly: boolean,
   state: CalendarSyncState | null,
   asOf: string,
 ): { work: CalendarSyncWork; revision: number } | null {
@@ -2444,7 +3444,7 @@ function calendarWorkForState(
     householdId: row.household_id,
     adultId: row.adult_id,
     connectionId: row.id,
-    calendarId: state?.calendarId ?? "primary",
+    calendarId,
   };
   if (state === null) {
     return { work: calendarSyncWorkSchema.parse({ kind: "start", ...identity }), revision: 0 };
@@ -2461,6 +3461,16 @@ function calendarWorkForState(
       work: calendarSyncWorkSchema.parse({ kind: "refresh_horizon", ...identity }),
       revision: state.revision,
     };
+  }
+  if (availabilityOnly) {
+    const staleThreshold = Date.parse(asOf) - 15 * 60_000;
+    if (state.lastSuccessfulSyncAt === null || Date.parse(state.lastSuccessfulSyncAt) <= staleThreshold) {
+      return {
+        work: calendarSyncWorkSchema.parse({ kind: "scheduled", ...identity }),
+        revision: state.revision,
+      };
+    }
+    return null;
   }
   const renewalThreshold = Date.parse(asOf) + 24 * 60 * 60_000;
   if (state.watch === null || Date.parse(state.watch.expiresAt) <= renewalThreshold) {
@@ -2479,6 +3489,40 @@ function calendarWorkForState(
   return null;
 }
 
+function calendarCatalogWorkForState(
+  row: { id: string; household_id: string; adult_id: string },
+  state: CalendarCatalogState | null,
+  asOf: string,
+): { work: CalendarSyncWork; revision: number } | null {
+  const work = calendarSyncWorkSchema.parse({
+    kind: "catalog",
+    householdId: row.household_id,
+    adultId: row.adult_id,
+    connectionId: row.id,
+  });
+  if (state === null) return { work, revision: 0 };
+  if (state.phase === "initial" || state.pageToken !== null || !state.projectionReady) {
+    return { work, revision: state.revision };
+  }
+  const fullRefreshThreshold = Date.parse(asOf) - 24 * 60 * 60_000;
+  if (state.lastFullScanAt === null || Date.parse(state.lastFullScanAt) <= fullRefreshThreshold) {
+    return {
+      work: calendarSyncWorkSchema.parse({
+        kind: "catalog_refresh",
+        householdId: row.household_id,
+        adultId: row.adult_id,
+        connectionId: row.id,
+      }),
+      revision: state.revision,
+    };
+  }
+  const staleThreshold = Date.parse(asOf) - 15 * 60_000;
+  if (state.lastSuccessfulSyncAt === null || Date.parse(state.lastSuccessfulSyncAt) <= staleThreshold) {
+    return { work, revision: state.revision };
+  }
+  return null;
+}
+
 function calendarWorkIdempotencyKey(
   connectionId: string,
   work: CalendarSyncWork,
@@ -2486,14 +3530,30 @@ function calendarWorkIdempotencyKey(
   asOf: string,
   connectionEpoch: string,
 ): string {
+  if (work.kind === "catalog") {
+    if (revision === 0) return `google-calendar:${connectionId}:catalog:start:${connectionEpoch}`;
+    const bucket = Math.floor(Date.parse(asOf) / (15 * 60_000));
+    return `google-calendar:${connectionId}:catalog:revision:${revision}:bucket:${bucket}`;
+  }
+  if (work.kind === "catalog_refresh") {
+    const bucket = Math.floor(Date.parse(asOf) / (24 * 60 * 60_000));
+    return `google-calendar:${connectionId}:catalog-refresh:revision:${revision}:bucket:${bucket}`;
+  }
+  if (work.kind === "revoke") {
+    return `google-calendar:${connectionId}:revoke:${connectionEpoch}`;
+  }
+  const calendarDigest = createHmac("sha256", connectionId)
+    .update(work.calendarId)
+    .digest("hex")
+    .slice(0, 24);
   if (work.kind === "start") {
-    return `google-calendar:${connectionId}:start:${connectionEpoch}`;
+    return `google-calendar:${connectionId}:${calendarDigest}:start:${connectionEpoch}`;
   }
   if (work.kind === "scheduled") {
     const bucket = Math.floor(Date.parse(asOf) / (15 * 60_000));
-    return `google-calendar:${connectionId}:scheduled:${bucket}`;
+    return `google-calendar:${connectionId}:${calendarDigest}:scheduled:${bucket}`;
   }
-  return `google-calendar:${connectionId}:${work.kind}:revision:${revision}`;
+  return `google-calendar:${connectionId}:${calendarDigest}:${work.kind}:revision:${revision}`;
 }
 
 export function canonicalizeLinqHandle(raw: string): string {

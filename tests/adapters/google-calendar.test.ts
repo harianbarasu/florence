@@ -22,6 +22,8 @@ const CALENDAR_EVENT = jsonFixture<calendar_v3.Schema$Event>("google/calendar-ev
 function calendarFactory(overrides: Record<string, unknown> = {}): CalendarApiFactory {
   return () =>
     ({
+      listCalendars: vi.fn(async () => ({ data: { items: [], nextSyncToken: "calendar-list-sync-001" } })),
+      queryFreeBusy: vi.fn(async () => ({ data: { calendars: { primary: { busy: [] } } } })),
       listEvents: vi.fn(async () => ({ data: { items: [], nextSyncToken: "sync-001" } })),
       getEvent: vi.fn(async () => ({ data: CALENDAR_EVENT })),
       insertEvent: vi.fn(async () => ({ data: CALENDAR_EVENT })),

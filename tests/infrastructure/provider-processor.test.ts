@@ -58,22 +58,30 @@ function claimed(payload: Record<string, unknown>, provider = "linq"): ClaimedPr
 }
 
 function snapshot(overrides: Partial<HouseholdApplicationSnapshot["projection"]["onboarding"]> = {}) {
+  const onboarding: HouseholdApplicationSnapshot["projection"]["onboarding"] = {
+    phase: "active",
+    initiatorAdultId: ADULT_A,
+    invitedAdultId: ADULT_B,
+    consentedAdultIds: [ADULT_A, ADULT_B],
+    privateDmAdultIds: [ADULT_A, ADULT_B],
+    groupChannelId: "group-1",
+    adultNames: [
+      { adultId: ADULT_A, displayName: "Hari" },
+      { adultId: ADULT_B, displayName: "Partner" },
+    ],
+    profileConfirmedAdultIds: [ADULT_A, ADULT_B],
+    googleConnectedAdultIds: [ADULT_A, ADULT_B],
+    ...overrides,
+  };
+
   return {
     revision: 0,
     aggregate: aggregate(),
     projection: {
-      onboarding: {
-        phase: "active" as const,
-        initiatorAdultId: ADULT_A,
-        invitedAdultId: ADULT_B,
-        consentedAdultIds: [ADULT_A, ADULT_B],
-        privateDmAdultIds: [ADULT_A, ADULT_B],
-        groupChannelId: "group-1",
-        profileConfirmedAdultIds: [ADULT_A, ADULT_B],
-        ...overrides,
-      },
+      onboarding,
       sharedProfile: { facts: [] },
       gmailTriage: [],
+      gmailSources: [],
       calendarTriage: [],
       calendarSources: [],
       pendingPromotions: [],
@@ -185,6 +193,7 @@ describe("ProductionProviderProcessor", () => {
       privateDmAdultIds: [],
       groupChannelId: undefined,
       profileConfirmedAdultIds: [],
+      googleConnectedAdultIds: [],
     });
     const harness = setup({ snapshots: [awaitingConsent, awaitingConsent] });
     await expect(harness.processor.process(claimed(event()))).resolves.toMatchObject({
@@ -229,6 +238,7 @@ describe("ProductionProviderProcessor", () => {
       privateDmAdultIds: [],
       groupChannelId: undefined,
       profileConfirmedAdultIds: [],
+      googleConnectedAdultIds: [],
     });
     const after = snapshot({
       phase: "awaiting_invitation",
@@ -237,6 +247,7 @@ describe("ProductionProviderProcessor", () => {
       privateDmAdultIds: [ADULT_A],
       groupChannelId: undefined,
       profileConfirmedAdultIds: [],
+      googleConnectedAdultIds: [],
     });
     const harness = setup({ snapshots: [before, after] });
     const consent = event({

@@ -171,6 +171,16 @@ export interface GoogleOAuthConnectedEvent {
   connectionId: string;
   accountLabel: string;
   email: string | null;
+  grantedScopes: readonly string[];
+}
+
+export interface GoogleOAuthFailedEvent {
+  householdId: string;
+  adultId: string;
+  returnConversationId: string;
+  accountLabel: string | null;
+  failureRef: string;
+  reason: "declined" | "invalid" | "unavailable";
 }
 
 export interface GoogleOAuthHandoffServiceOptions {
@@ -181,6 +191,7 @@ export interface GoogleOAuthHandoffServiceOptions {
   oauthStateTtlMs?: number;
   now?: () => Date;
   onConnected?: (event: GoogleOAuthConnectedEvent) => Promise<void>;
+  onFailed?: (event: GoogleOAuthFailedEvent) => Promise<void>;
 }
 
 export class GoogleOAuthHandoffService implements GoogleOAuthHandoff {
@@ -191,6 +202,7 @@ export class GoogleOAuthHandoffService implements GoogleOAuthHandoff {
   readonly #oauthStateTtlMs: number;
   readonly #now: () => Date;
   readonly #onConnected: ((event: GoogleOAuthConnectedEvent) => Promise<void>) | undefined;
+  readonly #onFailed: ((event: GoogleOAuthFailedEvent) => Promise<void>) | undefined;
 
   public constructor(options: GoogleOAuthHandoffServiceOptions) {
     if (Buffer.byteLength(options.handoffSecret, "utf8") < 32) {
@@ -203,6 +215,7 @@ export class GoogleOAuthHandoffService implements GoogleOAuthHandoff {
     this.#oauthStateTtlMs = options.oauthStateTtlMs ?? 15 * 60_000;
     this.#now = options.now ?? (() => new Date());
     this.#onConnected = options.onConnected;
+    this.#onFailed = options.onFailed;
   }
 
   public async start(input: { handoffToken: string }): Promise<GoogleOAuthStartResult> {
@@ -250,8 +263,6 @@ export class GoogleOAuthHandoffService implements GoogleOAuthHandoff {
       consumedAt: this.#now().toISOString(),
     });
     if (consumed === null) return { kind: "expired" };
-    if (input.providerError !== null) return { kind: "declined" };
-    if (input.code === null) return { kind: "invalid" };
 
     let context: z.infer<typeof oauthCiphertextSchema>;
     try {
@@ -267,16 +278,70 @@ export class GoogleOAuthHandoffService implements GoogleOAuthHandoff {
       context.adultId !== consumed.adultId ||
       context.returnConversationId !== consumed.returnConversationId
     ) {
+      await this.#notifyFailed({
+        householdId: consumed.householdId,
+        adultId: consumed.adultId,
+        returnConversationId: consumed.returnConversationId,
+        accountLabel: null,
+        failureRef: stateHash,
+        reason: "invalid",
+      });
       return { kind: "invalid" };
     }
 
-    const grant = await this.#oauth.completeCallback({
-      expectedState: input.state,
-      returnedState: input.state,
-      code: input.code,
-      codeVerifier: context.codeVerifier,
-    });
-    if (!grant.identity.emailVerified) return { kind: "invalid" };
+    if (input.providerError !== null) {
+      await this.#notifyFailed({
+        householdId: context.householdId,
+        adultId: context.adultId,
+        returnConversationId: context.returnConversationId,
+        accountLabel: context.accountLabel,
+        failureRef: stateHash,
+        reason: "declined",
+      });
+      return { kind: "declined" };
+    }
+    if (input.code === null) {
+      await this.#notifyFailed({
+        householdId: context.householdId,
+        adultId: context.adultId,
+        returnConversationId: context.returnConversationId,
+        accountLabel: context.accountLabel,
+        failureRef: stateHash,
+        reason: "invalid",
+      });
+      return { kind: "invalid" };
+    }
+
+    let grant: GoogleOAuthGrant;
+    try {
+      grant = await this.#oauth.completeCallback({
+        expectedState: input.state,
+        returnedState: input.state,
+        code: input.code,
+        codeVerifier: context.codeVerifier,
+      });
+    } catch (error) {
+      await this.#notifyFailed({
+        householdId: context.householdId,
+        adultId: context.adultId,
+        returnConversationId: context.returnConversationId,
+        accountLabel: context.accountLabel,
+        failureRef: stateHash,
+        reason: "unavailable",
+      });
+      throw error;
+    }
+    if (!grant.identity.emailVerified) {
+      await this.#notifyFailed({
+        householdId: context.householdId,
+        adultId: context.adultId,
+        returnConversationId: context.returnConversationId,
+        accountLabel: context.accountLabel,
+        failureRef: stateHash,
+        reason: "invalid",
+      });
+      return { kind: "invalid" };
+    }
     const credentialsAad = `google-connection:${context.householdId}:${context.adultId}:${grant.identity.subject}`;
     const connection = await this.#store.upsertExternalConnection({
       householdId: context.householdId,
@@ -297,8 +362,13 @@ export class GoogleOAuthHandoffService implements GoogleOAuthHandoff {
       connectionId: connection.connectionId,
       accountLabel: context.accountLabel,
       email: grant.identity.email,
+      grantedScopes: [...grant.tokens.scope],
     });
     return { kind: "connected" };
+  }
+
+  async #notifyFailed(event: GoogleOAuthFailedEvent): Promise<void> {
+    await this.#onFailed?.(event);
   }
 }
 

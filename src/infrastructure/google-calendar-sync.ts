@@ -6,8 +6,10 @@ import {
   GOOGLE_CALENDAR_EVENTS_SCOPE,
   GOOGLE_CALENDAR_READONLY_SCOPE,
   GoogleAdapterError,
+  type GoogleCalendarAccessRole,
   type GoogleCalendarAdapter,
   type GoogleCalendarEvent,
+  type GoogleCalendarListEntry,
   type GoogleCalendarPushEvent,
   GoogleSyncTokenExpiredError,
   type GoogleTokenSet,
@@ -74,21 +76,67 @@ export const calendarSyncStateSchema = z
 
 export type CalendarSyncState = z.infer<typeof calendarSyncStateSchema>;
 
-const calendarWorkIdentityShape = {
+export const calendarCatalogStateSchema = z
+  .strictObject({
+    schemaVersion: z.literal(1),
+    revision: z.number().int().nonnegative(),
+    phase: calendarSyncPhaseSchema,
+    scanId: z.uuid(),
+    pageToken: z.string().min(1).max(4_096).nullable(),
+    syncToken: z.string().min(1).max(4_096).nullable(),
+    projectionReady: z.boolean(),
+    lastSuccessfulSyncAt: instantSchema.nullable(),
+    lastFullScanAt: instantSchema.nullable(),
+  })
+  .superRefine((state, context) => {
+    if (state.phase === "initial" && state.syncToken !== null) {
+      context.addIssue({ code: "custom", path: ["syncToken"], message: "initial catalog has no token" });
+    }
+    if (state.phase === "initial" && state.projectionReady) {
+      context.addIssue({
+        code: "custom",
+        path: ["projectionReady"],
+        message: "initial catalog is incomplete",
+      });
+    }
+    if (state.phase === "live" && state.syncToken === null) {
+      context.addIssue({ code: "custom", path: ["syncToken"], message: "live catalog needs a token" });
+    }
+  });
+
+export type CalendarCatalogState = z.infer<typeof calendarCatalogStateSchema>;
+
+export type CalendarSyncRecord = {
+  calendarId: string;
+  providerCalendarId: string;
+  status: "active" | "excluded" | "deleted";
+  selectionSource: "provider" | "adult";
+  availabilityOnly: boolean;
+  accessRole: GoogleCalendarAccessRole | null;
+  state: CalendarSyncState | null;
+};
+
+const calendarConnectionWorkIdentityShape = {
   householdId: z.uuid(),
   adultId: z.uuid(),
   connectionId: z.uuid(),
+} as const;
+
+const calendarWorkIdentityShape = {
+  ...calendarConnectionWorkIdentityShape,
   calendarId: z.string().min(1).max(1_000),
 } as const;
 
 export const calendarSyncWorkSchema = z.discriminatedUnion("kind", [
+  z.strictObject({ kind: z.literal("catalog"), ...calendarConnectionWorkIdentityShape }),
+  z.strictObject({ kind: z.literal("catalog_refresh"), ...calendarConnectionWorkIdentityShape }),
   z.strictObject({ kind: z.literal("start"), ...calendarWorkIdentityShape }),
   z.strictObject({ kind: z.literal("continue"), ...calendarWorkIdentityShape }),
   z.strictObject({ kind: z.literal("push"), ...calendarWorkIdentityShape }),
   z.strictObject({ kind: z.literal("scheduled"), ...calendarWorkIdentityShape }),
   z.strictObject({ kind: z.literal("renew_watch"), ...calendarWorkIdentityShape }),
   z.strictObject({ kind: z.literal("refresh_horizon"), ...calendarWorkIdentityShape }),
-  z.strictObject({ kind: z.literal("revoke"), ...calendarWorkIdentityShape }),
+  z.strictObject({ kind: z.literal("revoke"), ...calendarConnectionWorkIdentityShape }),
 ]);
 
 export type CalendarSyncWork = z.infer<typeof calendarSyncWorkSchema>;
@@ -98,8 +146,8 @@ export type CalendarSyncResult = {
   connectionId: string;
   householdId: string;
   adultId: string;
-  calendarId: string;
-  phase: CalendarSyncPhase;
+  calendarId: string | null;
+  phase: CalendarSyncPhase | "catalog";
   processedEvents: number;
 };
 
@@ -112,6 +160,18 @@ export const calendarBusyWindowSchema = z.strictObject({
 export type CalendarBusyWindow = z.infer<typeof calendarBusyWindowSchema>;
 
 export interface CalendarProviderPort {
+  listCalendarsPage(input: {
+    accessToken: string;
+    pageToken?: string;
+    syncToken?: string;
+    maxResults?: number;
+  }): ReturnType<GoogleCalendarAdapter["listCalendarsPage"]>;
+  queryFreeBusy(input: {
+    accessToken: string;
+    calendarId: string;
+    timeMin: string;
+    timeMax: string;
+  }): ReturnType<GoogleCalendarAdapter["queryFreeBusy"]>;
   listEventsPage(input: {
     accessToken: string;
     googleSubject: string;
@@ -180,6 +240,40 @@ export interface CalendarPushTarget {
 }
 
 export interface CalendarSyncRepositoryPort {
+  getCalendarSyncRecord(input: {
+    householdId: string;
+    adultId: string;
+    connectionId: string;
+    calendarId: string;
+  }): Promise<CalendarSyncRecord | null>;
+  saveCalendarCatalogState(input: {
+    householdId: string;
+    adultId: string;
+    connectionId: string;
+    expectedRevision: number;
+    state: CalendarCatalogState;
+  }): Promise<ScopedMutationResult>;
+  applyCalendarCatalogPage(input: {
+    householdId: string;
+    adultId: string;
+    connectionId: string;
+    expectedRevision: number;
+    state: CalendarCatalogState;
+    fullScan: boolean;
+    entries: readonly {
+      calendarId: string;
+      providerCalendarId: string;
+      encryptedDisplayName: string;
+      accessRole: GoogleCalendarAccessRole | null;
+      primary: boolean;
+      selected: boolean;
+      hidden: boolean;
+      deleted: boolean;
+      defaultEnabled: boolean;
+      availabilityOnly: boolean;
+      initialState: CalendarSyncState;
+    }[];
+  }): Promise<ScopedMutationResult>;
   saveCalendarSyncState(input: {
     householdId: string;
     adultId: string;
@@ -232,6 +326,11 @@ export interface CalendarSyncRepositoryPort {
     connectionId: string;
     channelId: string;
   }): Promise<"updated" | "not_found">;
+  listCalendarWatches(input: {
+    householdId: string;
+    adultId: string;
+    connectionId: string;
+  }): Promise<readonly { channelId: string; resourceId: string }[]>;
   revokeConnection(input: {
     householdId: string;
     adultId: string;
@@ -367,32 +466,38 @@ export class GoogleCalendarSyncService {
     assertNotAborted(signal);
     try {
       const connection = await this.#ownedConnection(work);
-      if (connection.status === "revoked")
-        return calendarResult(connection, initialState(this.#now(), work.calendarId), "revoked", 0);
+      if (connection.status === "revoked") return connectionCalendarResult(connection, "revoked");
       if (connection.status === "reauth_required") {
-        return calendarResult(
-          connection,
-          stateFromConnection(connection, work.calendarId, this.#now()),
-          "reauth_required",
-          0,
-        );
+        return connectionCalendarResult(connection, "reauth_required");
       }
       if (connection.status !== "active") {
         throw new GoogleSyncError("Google Calendar connection is inactive", "not_authorized", false);
       }
       switch (work.kind) {
-        case "start":
-          return await this.#start(connection, work.calendarId);
-        case "renew_watch":
-          return await this.#renewWatch(connection, work.calendarId, signal);
-        case "refresh_horizon":
-          return await this.#refreshHorizon(connection, work.calendarId);
+        case "catalog":
+          return await this.#processCatalog(connection, signal);
+        case "catalog_refresh":
+          return await this.#refreshCatalog(connection);
         case "revoke":
-          return await this.#revoke(connection, work.calendarId, signal);
+          return await this.#revoke(connection, signal);
+        case "start":
+          return await this.#withActiveCalendar(connection, work.calendarId, (record) =>
+            this.#start(connection, record),
+          );
+        case "renew_watch":
+          return await this.#withActiveCalendar(connection, work.calendarId, (record) =>
+            this.#renewWatch(connection, record, signal),
+          );
+        case "refresh_horizon":
+          return await this.#withActiveCalendar(connection, work.calendarId, (record) =>
+            this.#refreshHorizon(connection, record),
+          );
         case "continue":
         case "push":
         case "scheduled":
-          return await this.#processPage(connection, work.calendarId, signal);
+          return await this.#withActiveCalendar(connection, work.calendarId, (record) =>
+            this.#processPage(connection, record, signal),
+          );
       }
     } catch (error) {
       if (error instanceof GoogleSyncError) throw error;
@@ -410,10 +515,125 @@ export class GoogleCalendarSyncService {
     }
   }
 
-  async #start(connection: GoogleSyncConnection, calendarId: string): Promise<CalendarSyncResult> {
-    const existing = connection.cursor.calendar;
-    if (existing !== undefined) {
-      const state = stateFromConnection(connection, calendarId, this.#now());
+  async #refreshCatalog(connection: GoogleSyncConnection): Promise<CalendarSyncResult> {
+    const current = catalogStateFromConnection(connection, this.#now());
+    const restarted = initialCatalogState(this.#now(), current.revision + 1);
+    const saved = await this.#repository.saveCalendarCatalogState({
+      householdId: connection.householdId,
+      adultId: connection.adultId,
+      connectionId: connection.id,
+      expectedRevision: current.revision,
+      state: restarted,
+    });
+    assertScopedUpdate(saved, "Calendar catalog full refresh");
+    return connectionCalendarResult(connection, "continuation_required");
+  }
+
+  async #processCatalog(connection: GoogleSyncConnection, signal?: AbortSignal): Promise<CalendarSyncResult> {
+    const state = catalogStateFromConnection(connection, this.#now());
+    const working = calendarCatalogStateSchema.parse({
+      ...state,
+      revision: state.revision + 1,
+      projectionReady: false,
+    });
+    const acquired = await this.#repository.saveCalendarCatalogState({
+      householdId: connection.householdId,
+      adultId: connection.adultId,
+      connectionId: connection.id,
+      expectedRevision: state.revision,
+      state: working,
+    });
+    assertScopedUpdate(acquired, "Calendar catalog lease");
+    try {
+      const page = await this.#withCredentials(connection, signal, (accessToken) =>
+        this.#calendar.listCalendarsPage({
+          accessToken,
+          maxResults: 250,
+          ...(working.pageToken ? { pageToken: working.pageToken } : {}),
+          ...(working.phase === "live" ? { syncToken: working.syncToken as string } : {}),
+        }),
+      );
+      const next = nextCatalogState(working, page.nextPageToken, page.nextSyncToken, this.#now());
+      const entries = page.calendars.map((entry) => this.#catalogEntry(connection, entry));
+      const applied = await this.#repository.applyCalendarCatalogPage({
+        householdId: connection.householdId,
+        adultId: connection.adultId,
+        connectionId: connection.id,
+        expectedRevision: working.revision,
+        state: next,
+        fullScan: working.phase === "initial",
+        entries,
+      });
+      assertScopedUpdate(applied, "Calendar catalog page");
+      return {
+        status: next.pageToken === null ? "processed" : "continuation_required",
+        connectionId: connection.id,
+        householdId: connection.householdId,
+        adultId: connection.adultId,
+        calendarId: null,
+        phase: "catalog",
+        processedEvents: page.calendars.length,
+      };
+    } catch (error) {
+      if (!(error instanceof GoogleSyncTokenExpiredError)) throw error;
+      const restarted = initialCatalogState(this.#now(), working.revision + 1);
+      const saved = await this.#repository.saveCalendarCatalogState({
+        householdId: connection.householdId,
+        adultId: connection.adultId,
+        connectionId: connection.id,
+        expectedRevision: working.revision,
+        state: restarted,
+      });
+      assertScopedUpdate(saved, "Calendar catalog reset");
+      return connectionCalendarResult(connection, "continuation_required");
+    }
+  }
+
+  #catalogEntry(
+    connection: GoogleSyncConnection,
+    entry: GoogleCalendarListEntry,
+  ): Parameters<CalendarSyncRepositoryPort["applyCalendarCatalogPage"]>[0]["entries"][number] {
+    const calendarId = entry.primary ? "primary" : entry.calendarId;
+    const availabilityOnly = entry.accessRole === "freeBusyReader";
+    const readable = entry.accessRole !== null;
+    return {
+      calendarId,
+      providerCalendarId: entry.calendarId,
+      encryptedDisplayName: this.#secretBox.seal(
+        entry.displayName,
+        calendarCatalogNameAad(connection, entry.calendarId),
+      ),
+      accessRole: entry.accessRole,
+      primary: entry.primary,
+      selected: entry.selected,
+      hidden: entry.hidden,
+      deleted: entry.deleted,
+      defaultEnabled: !entry.deleted && readable && (entry.primary || (entry.selected && !entry.hidden)),
+      availabilityOnly,
+      initialState: initialState(this.#now(), calendarId),
+    };
+  }
+
+  async #withActiveCalendar(
+    connection: GoogleSyncConnection,
+    calendarId: string,
+    operation: (record: CalendarSyncRecord) => Promise<CalendarSyncResult>,
+  ): Promise<CalendarSyncResult> {
+    const record = await this.#repository.getCalendarSyncRecord({
+      householdId: connection.householdId,
+      adultId: connection.adultId,
+      connectionId: connection.id,
+      calendarId,
+    });
+    if (record === null || record.status !== "active") {
+      return calendarResult(connection, record?.state ?? initialState(this.#now(), calendarId), "noop", 0);
+    }
+    return operation(record);
+  }
+
+  async #start(connection: GoogleSyncConnection, record: CalendarSyncRecord): Promise<CalendarSyncResult> {
+    if (record.state !== null) {
+      const state = record.state;
       return calendarResult(
         connection,
         state,
@@ -423,17 +643,19 @@ export class GoogleCalendarSyncService {
         0,
       );
     }
-    const state = initialState(this.#now(), calendarId);
+    const state = initialState(this.#now(), record.calendarId);
     const saved = await this.#saveState(connection, state);
     return calendarResult(connection, saved, "continuation_required", 0);
   }
 
   async #processPage(
     connection: GoogleSyncConnection,
-    calendarId: string,
+    record: CalendarSyncRecord,
     signal?: AbortSignal,
   ): Promise<CalendarSyncResult> {
-    const state = stateFromConnection(connection, calendarId, this.#now());
+    if (record.availabilityOnly) return this.#processFreeBusy(connection, record, signal);
+    const calendarId = record.calendarId;
+    const state = record.state ?? initialState(this.#now(), calendarId);
     // This CAS is both a per-connection page lease and a fail-closed coverage marker.
     // Schedule readers expose no windows until the complete page chain commits.
     const workingState = await this.#saveState(connection, { ...state, projectionReady: false });
@@ -462,7 +684,7 @@ export class GoogleCalendarSyncService {
             false,
           );
         }
-        await this.#persistEvent(connection, event, timeZone, workingState);
+        await this.#persistEvent(connection, event, timeZone, workingState, record.availabilityOnly);
         processedEvents += 1;
       }
 
@@ -496,12 +718,89 @@ export class GoogleCalendarSyncService {
     }
   }
 
-  async #renewWatch(
+  async #processFreeBusy(
     connection: GoogleSyncConnection,
-    calendarId: string,
+    record: CalendarSyncRecord,
     signal?: AbortSignal,
   ): Promise<CalendarSyncResult> {
-    const state = stateFromConnection(connection, calendarId, this.#now());
+    const current = record.state ?? initialState(this.#now(), record.calendarId);
+    const working = calendarSyncStateSchema.parse({
+      ...current,
+      revision: current.revision + 1,
+      projectionReady: false,
+      watch: null,
+    });
+    const restarted = await this.#repository.restartCalendarSync({
+      householdId: connection.householdId,
+      adultId: connection.adultId,
+      connectionId: connection.id,
+      expectedRevision: current.revision,
+      state: working,
+    });
+    assertScopedUpdate(restarted, "Calendar availability snapshot lease");
+    const windows = await this.#withCredentials(connection, signal, (accessToken) =>
+      this.#calendar.queryFreeBusy({
+        accessToken,
+        calendarId: record.calendarId,
+        timeMin: working.initialTimeMin,
+        timeMax: working.initialTimeMax,
+      }),
+    );
+    for (const window of windows) {
+      assertNotAborted(signal);
+      const externalId = `freebusy-${sha256(canonicalJson([window.startsAt, window.endsAt]))}`;
+      const content = canonicalJson({
+        schemaVersion: 1,
+        availabilityOnly: true,
+        calendarId: record.calendarId,
+        startsAt: window.startsAt,
+        endsAt: window.endsAt,
+      });
+      await this.#repository.persistPersonalCalendarSource({
+        householdId: connection.householdId,
+        adultId: connection.adultId,
+        connectionId: connection.id,
+        calendarId: record.calendarId,
+        externalId,
+        kind: "calendar_event",
+        occurredAt: this.#now().toISOString(),
+        contentHash: `sha256:${sha256(content)}`,
+        encryptedContent: this.#secretBox.seal(
+          content,
+          calendarSourceContentAad(connection, record.calendarId, externalId),
+        ),
+        metadata: {
+          schemaVersion: 1,
+          provider: "google-calendar",
+          sourceScope: "personal",
+          availabilityOnly: true,
+          calendarId: record.calendarId,
+          googleSubject: connection.externalAccountId,
+          contentAadVersion: 1,
+        },
+        busyWindow: { startsAt: window.startsAt, endsAt: window.endsAt, allDay: false },
+      });
+    }
+    const completed = calendarSyncStateSchema.parse({
+      ...working,
+      phase: "live",
+      pageToken: null,
+      syncToken: "freebusy-snapshot",
+      projectionReady: true,
+      lastSuccessfulSyncAt: this.#now().toISOString(),
+    });
+    const saved = await this.#saveState(connection, completed);
+    return calendarResult(connection, saved, "processed", windows.length);
+  }
+
+  async #renewWatch(
+    connection: GoogleSyncConnection,
+    record: CalendarSyncRecord,
+    signal?: AbortSignal,
+  ): Promise<CalendarSyncResult> {
+    const calendarId = record.calendarId;
+    const state = record.state ?? initialState(this.#now(), calendarId);
+    if (record.availabilityOnly) return calendarResult(connection, state, "noop", 0);
     if (state.phase !== "live" || !state.projectionReady) {
       return calendarResult(connection, state, "continuation_required", 0);
     }
@@ -581,8 +880,12 @@ export class GoogleCalendarSyncService {
     return calendarResult(connection, next, "processed", 0);
   }
 
-  async #refreshHorizon(connection: GoogleSyncConnection, calendarId: string): Promise<CalendarSyncResult> {
-    const state = stateFromConnection(connection, calendarId, this.#now());
+  async #refreshHorizon(
+    connection: GoogleSyncConnection,
+    record: CalendarSyncRecord,
+  ): Promise<CalendarSyncResult> {
+    const calendarId = record.calendarId;
+    const state = record.state ?? initialState(this.#now(), calendarId);
     const restarted = initialState(this.#now(), calendarId, state.revision + 1);
     const saved = await this.#repository.restartCalendarSync({
       householdId: connection.householdId,
@@ -595,21 +898,24 @@ export class GoogleCalendarSyncService {
     return calendarResult(connection, restarted, "continuation_required", 0);
   }
 
-  async #revoke(
-    connection: GoogleSyncConnection,
-    calendarId: string,
-    signal?: AbortSignal,
-  ): Promise<CalendarSyncResult> {
-    const state = stateFromConnection(connection, calendarId, this.#now());
+  async #revoke(connection: GoogleSyncConnection, signal?: AbortSignal): Promise<CalendarSyncResult> {
     if (connection.encryptedCredentials !== null) {
       try {
         const tokens = decryptCredentials(connection, this.#secretBox);
-        if (state.watch !== null) {
-          await this.#calendar.stopChannel({
-            accessToken: tokens.accessToken,
-            channelId: state.watch.channelId,
-            resourceId: state.watch.resourceId,
-          });
+        const watches = await this.#repository.listCalendarWatches({
+          householdId: connection.householdId,
+          adultId: connection.adultId,
+          connectionId: connection.id,
+        });
+        for (const watch of watches) {
+          assertNotAborted(signal);
+          await this.#calendar
+            .stopChannel({
+              accessToken: tokens.accessToken,
+              channelId: watch.channelId,
+              resourceId: watch.resourceId,
+            })
+            .catch(() => undefined);
         }
         assertNotAborted(signal);
         await this.#oauth.revoke(tokens);
@@ -626,7 +932,7 @@ export class GoogleCalendarSyncService {
     if (revoked === "not_found") {
       throw new GoogleSyncError("Calendar connection revocation was not scoped", "not_authorized", false);
     }
-    return calendarResult(connection, state, "revoked", 0);
+    return connectionCalendarResult(connection, "revoked");
   }
 
   async #persistEvent(
@@ -634,6 +940,7 @@ export class GoogleCalendarSyncService {
     event: GoogleCalendarEvent,
     timeZone: string | null,
     state: CalendarSyncState,
+    availabilityOnly: boolean,
   ): Promise<void> {
     const serialized = canonicalJson(event);
     const busyWindow = normalizeCalendarBusyWindow(event, timeZone);
@@ -668,6 +975,7 @@ export class GoogleCalendarSyncService {
       busyWindow,
     });
     if (persisted.retainedExisting === "stale") return;
+    if (availabilityOnly) return;
     if (!event.deleted && persisted.createdByApprovedActionId !== null) return;
 
     const observedAt = this.#now().toISOString();
@@ -915,18 +1223,57 @@ function initialState(now: Date, calendarId: string, revision = 0): CalendarSync
   });
 }
 
-function stateFromConnection(
-  connection: GoogleSyncConnection,
-  calendarId: string,
-  now: Date,
-): CalendarSyncState {
-  const raw = connection.cursor.calendar;
-  if (raw === undefined) return initialState(now, calendarId);
-  const parsed = calendarSyncStateSchema.safeParse(raw);
-  if (!parsed.success || parsed.data.calendarId !== calendarId) {
-    throw new GoogleSyncError("Stored Calendar cursor is invalid", "invalid_state", false);
+function initialCatalogState(_now: Date, revision = 0): CalendarCatalogState {
+  return calendarCatalogStateSchema.parse({
+    schemaVersion: 1,
+    revision,
+    phase: "initial",
+    scanId: randomUUID(),
+    pageToken: null,
+    syncToken: null,
+    projectionReady: false,
+    lastSuccessfulSyncAt: null,
+    lastFullScanAt: null,
+  });
+}
+
+function catalogStateFromConnection(connection: GoogleSyncConnection, now: Date): CalendarCatalogState {
+  const raw = connection.cursor.calendarCatalog;
+  if (raw === undefined) return initialCatalogState(now);
+  const parsed = calendarCatalogStateSchema.safeParse(raw);
+  if (!parsed.success) {
+    throw new GoogleSyncError("Stored Calendar catalog cursor is invalid", "invalid_state", false);
   }
   return parsed.data;
+}
+
+function nextCatalogState(
+  state: CalendarCatalogState,
+  nextPageToken: string | null,
+  nextSyncToken: string | null,
+  now: Date,
+): CalendarCatalogState {
+  if (nextPageToken !== null) {
+    return calendarCatalogStateSchema.parse({
+      ...state,
+      revision: state.revision + 1,
+      pageToken: nextPageToken,
+      projectionReady: false,
+    });
+  }
+  if (nextSyncToken === null) {
+    throw new GoogleSyncError("Calendar catalog page ended without a sync token", "invalid_state", false);
+  }
+  return calendarCatalogStateSchema.parse({
+    ...state,
+    revision: state.revision + 1,
+    phase: "live",
+    pageToken: null,
+    syncToken: nextSyncToken,
+    projectionReady: true,
+    lastSuccessfulSyncAt: now.toISOString(),
+    lastFullScanAt: state.phase === "initial" ? now.toISOString() : state.lastFullScanAt,
+  });
 }
 
 function nextCalendarState(
@@ -1107,6 +1454,28 @@ function calendarResult(
     phase: state.phase,
     processedEvents,
   };
+}
+
+function connectionCalendarResult(
+  connection: GoogleSyncConnection,
+  status: CalendarSyncResult["status"],
+): CalendarSyncResult {
+  return {
+    status,
+    connectionId: connection.id,
+    householdId: connection.householdId,
+    adultId: connection.adultId,
+    calendarId: null,
+    phase: "catalog",
+    processedEvents: 0,
+  };
+}
+
+export function calendarCatalogNameAad(
+  connection: Pick<GoogleSyncConnection, "householdId" | "adultId" | "id">,
+  providerCalendarId: string,
+): string {
+  return `google-calendar-name:${connection.householdId}:${connection.adultId}:${connection.id}:${providerCalendarId}`;
 }
 
 function headerValue(headers: CalendarPushHeaders, name: string): string | null {

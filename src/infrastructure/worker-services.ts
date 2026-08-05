@@ -18,12 +18,14 @@ import {
   EffectExecutionReceiptSchema,
   type HouseholdApplicationSnapshot,
   HouseholdApplicationSnapshotSchema,
+  type ProjectDeliveryGuard,
 } from "../application/contracts.js";
 import type {
   ApplicationEffectExecutorPort,
   HouseholdCalendarActionsPort,
   WorkerContextPort,
 } from "../application/ports.js";
+import { workerContextFingerprint } from "../application/worker-context-fingerprint.js";
 import type { ProjectionTimerIntent } from "../db/application-store.js";
 import { type DurableScope, DurableScopeSchema, type FamilyEpisode } from "../domain/index.js";
 import { JsonValueSchema } from "../models/contracts.js";
@@ -53,13 +55,15 @@ export type LinqChannelTarget = z.infer<typeof LinqChannelTargetSchema>;
 
 export type SerializedLinqSendResult =
   | { status: "sent"; target: LinqChannelTarget; receipt: LinqSendReceipt }
-  | { status: "inactive" | "binding_paused" };
+  | { status: "inactive" | "binding_paused" | "obsolete" };
 
 /** Serializes final authorization and provider send under one app-owned chat boundary. */
 export interface LinqChannelDirectory {
   executeSerializedSend(input: {
     readonly householdId: string;
     readonly targetScope: DurableScope;
+    readonly responseContext?: ConversationResponseContext;
+    readonly deliveryGuard?: ProjectDeliveryGuard;
     readonly loadGroupChat: (chatId: string) => Promise<LinqChat>;
     readonly send: (chatId: string) => Promise<LinqSendReceipt>;
     readonly allowWhileDeleting?: boolean;
@@ -136,6 +140,7 @@ export class ProductionApplicationEffectExecutor implements ApplicationEffectExe
         intent.targetScope,
         intent.messageClass,
         intent.responseContext,
+        intent.deliveryGuard,
         intent.body,
         intent.idempotencyKey,
         allowWhileDeleting,
@@ -154,6 +159,7 @@ export class ProductionApplicationEffectExecutor implements ApplicationEffectExe
           effect.targetScope,
           effect.messageClass,
           effect.responseContext,
+          undefined,
           effect.body,
           effect.idempotencyKey,
         );
@@ -260,6 +266,7 @@ export class ProductionApplicationEffectExecutor implements ApplicationEffectExe
       | "missed_window"
       | "approval_request",
     responseContext: ConversationResponseContext | undefined,
+    deliveryGuard: ProjectDeliveryGuard | undefined,
     body: string,
     idempotencyKey: string,
     allowWhileDeleting = false,
@@ -269,6 +276,8 @@ export class ProductionApplicationEffectExecutor implements ApplicationEffectExe
       result = await this.#channelDirectory.executeSerializedSend({
         householdId,
         targetScope,
+        ...(responseContext === undefined ? {} : { responseContext }),
+        ...(deliveryGuard === undefined ? {} : { deliveryGuard }),
         loadGroupChat: (chatId) => this.#linqChats.getChat(chatId),
         send: (chatId) =>
           this.#sender.sendText({
@@ -284,6 +293,12 @@ export class ProductionApplicationEffectExecutor implements ApplicationEffectExe
       );
     }
 
+    if (result.status === "obsolete") {
+      return this.#receipt(
+        "succeeded",
+        stableReceipt("conversation_send_obsolete", householdId, idempotencyKey),
+      );
+    }
     if (result.status !== "sent") return this.#receipt("permanent_failure");
     const targetResult = LinqChannelTargetSchema.safeParse(result.target);
     const sent = result.receipt;
@@ -506,6 +521,27 @@ const PersonalCalendarProjectionSchema = z.strictObject({
   synchronizedAt: z.iso.datetime({ offset: true }).nullable(),
 });
 
+function personalCalendarProjectionDigest(
+  projection: z.infer<typeof PersonalCalendarProjectionSchema>,
+): string {
+  const windows = [...projection.windows].sort((left, right) => {
+    const starts = left.startsAt.localeCompare(right.startsAt);
+    if (starts !== 0) return starts;
+    const ends = left.endsAt.localeCompare(right.endsAt);
+    if (ends !== 0) return ends;
+    return Number(left.allDay) - Number(right.allDay);
+  });
+  return `sha256:${createHash("sha256")
+    .update(
+      JSON.stringify({
+        windows,
+        complete: projection.complete,
+        synchronizedAt: projection.synchronizedAt,
+      }),
+    )
+    .digest("hex")}`;
+}
+
 export interface CalendarScheduleProjectionPort {
   listPersonalCalendarBusyWindows(input: {
     householdId: string;
@@ -515,6 +551,16 @@ export interface CalendarScheduleProjectionPort {
     to: string;
     limit: number;
   }): Promise<z.input<typeof PersonalCalendarProjectionSchema>>;
+}
+
+interface PersonalScheduleObservation {
+  readonly householdId: string;
+  readonly adultId: string;
+  readonly asOf: string;
+  readonly from: string;
+  readonly to: string;
+  readonly limit: number;
+  readonly projectionDigest: string;
 }
 
 interface ResearchBudget {
@@ -561,7 +607,6 @@ export class ScopedWorkerContext implements WorkerContextPort {
     const now = this.#now().getTime();
     if (
       job.householdId !== snapshot.aggregate.householdId ||
-      job.baseHouseholdVersion !== snapshot.aggregate.version ||
       job.policyVersion !== snapshot.aggregate.policyVersion ||
       Date.parse(job.deadline) <= now ||
       Date.parse(job.scopeGrant.expiresAt) <= now
@@ -590,6 +635,20 @@ export class ScopedWorkerContext implements WorkerContextPort {
     if (episode === undefined || !scopeCanRead(job, episode.scope)) {
       throw new WorkerServiceError("invalid_context");
     }
+    if (
+      workerRecord.contextFingerprint !==
+      workerContextFingerprint({
+        aggregate: snapshot.aggregate,
+        projection: snapshot.projection,
+        episodeId: episode.episodeId,
+        purpose: workerRecord.purpose,
+        scope: episode.scope,
+        evidenceRefs: job.evidenceRefs,
+        asOf: new Date(now).toISOString(),
+      })
+    ) {
+      throw new WorkerServiceError("invalid_context");
+    }
     const evidenceById = new Map<string, (typeof episode.evidence)[number]>(
       episode.evidence.map((item) => [item.evidenceId, item]),
     );
@@ -607,6 +666,23 @@ export class ScopedWorkerContext implements WorkerContextPort {
           schemaVersion: 1,
           purpose: job.scopeGrant.purpose,
           householdTimeZone: snapshot.aggregate.timeZone,
+          householdAdults: snapshot.projection.onboarding.adultNames,
+          sharedProfile: snapshot.projection.sharedProfile,
+          routineAnchors: snapshot.aggregate.routineAnchors,
+          confirmedMemories: snapshot.aggregate.memories
+            .filter(
+              (memory) =>
+                memory.status === "active" &&
+                scopeCanRead(job, memory.scope) &&
+                (memory.expiresAt === undefined || Date.parse(memory.expiresAt) > now),
+            )
+            .map((memory) => ({
+              memoryId: memory.memoryId,
+              kind: memory.kind,
+              statement: memory.statement,
+              scope: memory.scope,
+              confirmedAt: memory.confirmedAt,
+            })),
           episode: {
             episodeId: episode.episodeId,
             type: episode.type,
@@ -629,12 +705,25 @@ export class ScopedWorkerContext implements WorkerContextPort {
       },
     ];
 
+    const personalScheduleObservations: PersonalScheduleObservation[] = [];
+    let personalScheduleUnverifiable = false;
     const tools: WorkerTool[] = [];
     for (const toolName of job.allowedToolNames) {
       switch (toolName) {
         case "household_schedule":
           requireCapability(job, HOUSEHOLD_SCHEDULE_CAPABILITY);
-          tools.push(createHouseholdScheduleTool(job, snapshot, this.#calendarSchedule, this.#now));
+          tools.push(
+            createHouseholdScheduleTool(
+              job,
+              snapshot,
+              this.#calendarSchedule,
+              this.#now,
+              (observation) => personalScheduleObservations.push(observation),
+              () => {
+                personalScheduleUnverifiable = true;
+              },
+            ),
+          );
           break;
         case "research_sources":
           requireCapability(job, RESEARCH_CAPABILITY);
@@ -645,7 +734,39 @@ export class ScopedWorkerContext implements WorkerContextPort {
       }
     }
 
-    return { context, tools };
+    const validateBeforeAccept = job.allowedToolNames.includes("household_schedule")
+      ? async () => {
+          if (personalScheduleUnverifiable) return false;
+          if (personalScheduleObservations.length === 0) return true;
+          if (this.#calendarSchedule === undefined) return false;
+          try {
+            for (const observation of personalScheduleObservations) {
+              const current = PersonalCalendarProjectionSchema.parse(
+                await this.#calendarSchedule.listPersonalCalendarBusyWindows({
+                  householdId: observation.householdId,
+                  adultId: observation.adultId,
+                  asOf: observation.asOf,
+                  from: observation.from,
+                  to: observation.to,
+                  limit: observation.limit,
+                }),
+              );
+              if (personalCalendarProjectionDigest(current) !== observation.projectionDigest) {
+                return false;
+              }
+            }
+            return true;
+          } catch {
+            return false;
+          }
+        }
+      : undefined;
+
+    return {
+      context,
+      tools,
+      ...(validateBeforeAccept === undefined ? {} : { validateBeforeAccept }),
+    };
   }
 }
 
@@ -706,6 +827,8 @@ function createHouseholdScheduleTool(
   snapshot: HouseholdApplicationSnapshot,
   calendarSchedule: CalendarScheduleProjectionPort | undefined,
   now: () => Date,
+  recordPersonalObservation: (observation: PersonalScheduleObservation) => void,
+  markPersonalScheduleUnverifiable: () => void,
 ): WorkerTool {
   const inputSchema = z.strictObject({
     limit: z.number().int().min(1).max(50).default(25),
@@ -745,29 +868,37 @@ function createHouseholdScheduleTool(
           complete: false,
           synchronizedAt: null,
         };
-        if (calendarSchedule !== undefined) {
-          const adultId = job.scopeGrant.adultId;
-          if (adultId === undefined) throw new WorkerServiceError("invalid_context");
-          try {
-            const projected = PersonalCalendarProjectionSchema.parse(
-              await calendarSchedule.listPersonalCalendarBusyWindows({
-                householdId: job.householdId,
-                adultId,
-                asOf: asOf.toISOString(),
-                from: calendarFrom,
-                to: calendarTo,
-                limit: 500,
-              }),
-            );
-            calendarBusyWindows = projected.windows;
-            calendarCoverage = {
-              ...calendarCoverage,
-              complete: projected.complete,
-              synchronizedAt: projected.synchronizedAt,
-            };
-          } catch {
-            throw new WorkerServiceError("context_unavailable");
-          }
+        const adultId = job.scopeGrant.adultId;
+        if (adultId === undefined) throw new WorkerServiceError("invalid_context");
+        if (calendarSchedule === undefined) {
+          markPersonalScheduleUnverifiable();
+          throw new WorkerServiceError("context_unavailable");
+        }
+        const observationInput = {
+          householdId: job.householdId,
+          adultId,
+          asOf: asOf.toISOString(),
+          from: calendarFrom,
+          to: calendarTo,
+          limit: 500,
+        } as const;
+        try {
+          const projected = PersonalCalendarProjectionSchema.parse(
+            await calendarSchedule.listPersonalCalendarBusyWindows(observationInput),
+          );
+          recordPersonalObservation({
+            ...observationInput,
+            projectionDigest: personalCalendarProjectionDigest(projected),
+          });
+          calendarBusyWindows = projected.windows;
+          calendarCoverage = {
+            ...calendarCoverage,
+            complete: projected.complete,
+            synchronizedAt: projected.synchronizedAt,
+          };
+        } catch {
+          markPersonalScheduleUnverifiable();
+          throw new WorkerServiceError("context_unavailable");
         }
       } else {
         // Household jobs see only separately promoted episode schedules above.

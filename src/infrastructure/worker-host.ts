@@ -582,7 +582,7 @@ export class DurableWorkerHost implements ApplicationWorkerHost {
         await this.#retryOutbox(
           item,
           error instanceof QueueExecutionError ? error.code : "outbox_execution_failure",
-          error instanceof QueueExecutionError ? error.outcomeCertain : false,
+          error instanceof QueueExecutionError ? error.outcomeCertain : intent.data.kind === "worker.run",
           report,
         );
       }

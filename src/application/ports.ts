@@ -28,6 +28,19 @@ export interface ConversationInterpretationContext {
   readonly onboarding: ApplicationProjection["onboarding"];
   readonly sharedProfile: ApplicationProjection["sharedProfile"];
   readonly confirmedRoutineAnchors: ReadonlyArray<HouseholdAggregate["routineAnchors"][number]>;
+  readonly activeMemories: readonly {
+    readonly memoryId: string;
+    readonly kind: "preference" | "routine" | "fact" | "routing_observation";
+    readonly statement: string;
+    readonly scope: "personal" | "household";
+    readonly confirmedAt: string;
+  }[];
+  readonly pendingMemoryCandidates: readonly {
+    readonly candidateId: string;
+    readonly kind: "preference" | "routine" | "fact" | "routing_observation";
+    readonly statement: string;
+    readonly scope: "personal" | "household";
+  }[];
   readonly openEpisodes: readonly {
     readonly episodeId: string;
     readonly type: "commitment" | "research" | "meal_plan";
@@ -55,6 +68,7 @@ export interface ConversationInterpretationContext {
 
 export interface GmailTriageContext {
   readonly confirmedRoutineAnchors: ReadonlyArray<HouseholdAggregate["routineAnchors"][number]>;
+  readonly activeMemories: ConversationInterpretationContext["activeMemories"];
   readonly activeSharingRules: readonly {
     readonly policyId: string;
     readonly policyVersion: number;
@@ -66,6 +80,7 @@ export interface GmailTriageContext {
 export interface CalendarTriageContext {
   readonly currentTime: string;
   readonly householdTimeZone: string;
+  readonly activeMemories: ConversationInterpretationContext["activeMemories"];
   readonly activeSharingRules: readonly {
     readonly policyId: string;
     readonly policyVersion: number;

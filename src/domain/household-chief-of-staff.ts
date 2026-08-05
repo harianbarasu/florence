@@ -113,6 +113,31 @@ function sameStrings(left: readonly string[], right: readonly string[]): boolean
   );
 }
 
+function sameScope(left: DurableScope, right: DurableScope): boolean {
+  return (
+    left.kind === right.kind &&
+    (left.kind !== "personal" || (right.kind === "personal" && left.adultId === right.adultId))
+  );
+}
+
+function sameMemoryMeaning(
+  left: Pick<
+    FamilyEpisode | HouseholdAggregate["memoryCandidates"][number] | HouseholdAggregate["memories"][number],
+    "scope"
+  > & {
+    kind: string;
+    statement: string;
+  },
+  right: Pick<HouseholdAggregate["memoryCandidates"][number], "kind" | "statement" | "scope">,
+): boolean {
+  return (
+    left.kind === right.kind &&
+    left.statement.normalize("NFKC").trim().toLocaleLowerCase("en-US") ===
+      right.statement.normalize("NFKC").trim().toLocaleLowerCase("en-US") &&
+    sameScope(left.scope, right.scope)
+  );
+}
+
 function outboxBase(signal: HouseholdSignal, suffix: string) {
   const digest = createHash("sha256")
     .update(`${signal.householdId}\u0000${signal.signalId}\u0000${suffix}`)
@@ -348,6 +373,7 @@ function resolveEpisodeProposal(
     sensitivity: proposal.sensitivity,
     ...(proposal.promotionAuthority === undefined ? {} : { promotionAuthority: proposal.promotionAuthority }),
     ...(proposal.sourceMatcher === undefined ? {} : { sourceMatcher: proposal.sourceMatcher }),
+    ...(proposal.delegation === undefined ? {} : { delegation: proposal.delegation }),
     ...(temporalPlan === undefined ? {} : { temporalPlan }),
     createdAt: now,
     updatedAt: now,
@@ -517,23 +543,94 @@ function handleDeliveryObserved(context: HandlerContext): MutationResult {
   return ignored("delivery_is_not_approval");
 }
 
-function handleEpisodeClosed(context: HandlerContext): MutationResult {
+function handleProjectDelegated(context: HandlerContext): MutationResult {
   const { signal, draft } = context;
-  if (signal.kind !== "episode.closed") {
+  if (signal.kind !== "episode.project_delegated") {
     throw new Error("wrong handler");
   }
-  const authorizedActor =
-    isAdultActor(draft, signal.actor) ||
-    (signal.actor.kind === "source_adapter" && signal.actor.source === "effect_executor");
-  if (!authorizedActor) {
+  if (!isAdultActor(draft, signal.actor)) {
     return rejected("unauthorized_actor");
   }
-
   const found = findEpisode(draft, signal.episodeId);
   if (found === undefined) {
     return rejected("episode_not_found");
   }
   const [index, episode] = found;
+  if (episode.version !== signal.baseEpisodeVersion) {
+    return rejected("stale_episode_version");
+  }
+  const expectedPurpose =
+    episode.type === "research" ? "family_research" : episode.type === "meal_plan" ? "meal_plan" : undefined;
+  if (
+    expectedPurpose === undefined ||
+    signal.delegation.purpose !== expectedPurpose ||
+    episode.delegation === undefined ||
+    signal.delegation.jobId !== episode.delegation.jobId ||
+    (episode.scope.kind === "personal" && episode.scope.adultId !== signal.actor.adultId) ||
+    signal.instructionEvidence.scope.kind !== episode.scope.kind ||
+    (episode.scope.kind === "personal" &&
+      (signal.instructionEvidence.scope.kind !== "personal" ||
+        signal.instructionEvidence.scope.adultId !== episode.scope.adultId)) ||
+    episode.evidence.some((evidence) => evidence.evidenceId === signal.instructionEvidence.evidenceId) ||
+    episode.evidence.length >= 50
+  ) {
+    return rejected("invalid_transition");
+  }
+
+  const { blockedReason: _blockedReason, outcome: _outcome, ...current } = episode;
+  const nextState =
+    episode.owner.status === "unassigned"
+      ? "proposed"
+      : episode.owner.status === "proposed"
+        ? "awaiting_acknowledgement"
+        : "active";
+  const updated = FamilyEpisodeSchema.parse({
+    ...current,
+    version: episode.version + 1,
+    state: nextState,
+    delegation: signal.delegation,
+    evidence: [...episode.evidence, signal.instructionEvidence],
+    updatedAt: signal.occurredAt,
+  });
+  draft.episodes[index] = updated;
+  return accepted(
+    draft,
+    [
+      DomainChangeSchema.parse({
+        kind: "episode_state_changed",
+        episodeId: episode.episodeId,
+        from: episode.state,
+        to: updated.state,
+        episodeVersion: updated.version,
+      }),
+    ],
+    [],
+  );
+}
+
+function handleEpisodeClosed(context: HandlerContext): MutationResult {
+  const { signal, draft } = context;
+  if (signal.kind !== "episode.closed") {
+    throw new Error("wrong handler");
+  }
+  const found = findEpisode(draft, signal.episodeId);
+  if (found === undefined) {
+    return rejected("episode_not_found");
+  }
+  const [index, episode] = found;
+  const workerJobId = signal.actor.kind === "worker" ? signal.actor.jobId : undefined;
+  const authorizedWorker =
+    workerJobId !== undefined &&
+    episode.delegation?.jobId === workerJobId &&
+    signal.outcome.kind === "completed" &&
+    signal.outcome.evidence.some((item) => item.source === "worker" && item.sourceRef === workerJobId);
+  const authorizedActor =
+    isAdultActor(draft, signal.actor) ||
+    (signal.actor.kind === "source_adapter" && signal.actor.source === "effect_executor") ||
+    authorizedWorker;
+  if (!authorizedActor) {
+    return rejected("unauthorized_actor");
+  }
   if (episode.version !== signal.baseEpisodeVersion) {
     return rejected("stale_episode_version");
   }
@@ -1321,6 +1418,35 @@ function handleMemoryConfirmed(context: HandlerContext): MutationResult {
   );
 }
 
+function handleMemoryCandidateRejected(context: HandlerContext): MutationResult {
+  const { signal, draft } = context;
+  if (signal.kind !== "memory.candidate_rejected") {
+    throw new Error("wrong handler");
+  }
+  if (!isAdultActor(draft, signal.actor)) {
+    return rejected("unauthorized_actor");
+  }
+  const index = draft.memoryCandidates.findIndex((candidate) => candidate.candidateId === signal.candidateId);
+  const candidate = draft.memoryCandidates[index];
+  if (candidate === undefined) {
+    return rejected("candidate_not_found");
+  }
+  if (candidate.scope.kind === "personal" && candidate.scope.adultId !== signal.actor.adultId) {
+    return rejected("unauthorized_actor");
+  }
+  draft.memoryCandidates.splice(index, 1);
+  return accepted(
+    draft,
+    [
+      DomainChangeSchema.parse({
+        kind: "memory_candidate_rejected",
+        candidateId: candidate.candidateId,
+      }),
+    ],
+    [],
+  );
+}
+
 function handleMemoryRevoked(context: HandlerContext): MutationResult {
   const { signal, draft } = context;
   if (signal.kind !== "memory.revoked") {
@@ -1561,6 +1687,16 @@ function handleWorkerProposal(context: HandlerContext): MutationResult {
     ) {
       return rejected("worker_cannot_promote");
     }
+    const alreadyPending = draft.memoryCandidates.some((current) => sameMemoryMeaning(current, candidate));
+    const alreadyActive = draft.memories.some(
+      (memory) =>
+        memory.status === "active" &&
+        (memory.expiresAt === undefined || instantCompare(memory.expiresAt, signal.occurredAt) > 0) &&
+        sameMemoryMeaning(memory, candidate),
+    );
+    if (alreadyPending || alreadyActive) {
+      continue;
+    }
     draft.memoryCandidates.push(candidate);
     changes.push(
       DomainChangeSchema.parse({
@@ -1593,12 +1729,12 @@ function handleWorkerProposal(context: HandlerContext): MutationResult {
 
 function reminderBody(episode: FamilyEpisode, missedWindow: boolean): string {
   if (missedWindow) {
-    return `The “${episode.title}” commitment has passed its last responsible moment and is still open. Is it handled, or should we reassign it?`;
+    return `The “${episode.title}” commitment has passed its last responsible moment and is still open. Use iMessage’s Reply on this Florence message with “handled” or “reassign to [name].”`;
   }
   if (episode.state === "awaiting_acknowledgement") {
-    return `The “${episode.title}” commitment is awaiting an owner acknowledgment. Is it handled, or should we reassign it?`;
+    return `The “${episode.title}” commitment is awaiting an owner acknowledgment. Use iMessage’s Reply on this Florence message with “handled” or “reassign to [name].”`;
   }
-  return `The “${episode.title}” commitment is still open. Is it handled, or should we reassign it?`;
+  return `The “${episode.title}” commitment is still open. Use iMessage’s Reply on this Florence message with “handled” or “reassign to [name].”`;
 }
 
 function handleTimerFired(context: HandlerContext): MutationResult {
@@ -1674,6 +1810,11 @@ function handleTimerFired(context: HandlerContext): MutationResult {
         messageClass: missedWindow ? "missed_window" : "reminder",
         body: reminderBody(episode, missedWindow),
         episodeId: EpisodeIdSchema.parse(episode.episodeId),
+        responseContext: {
+          kind: "episode_follow_up",
+          episodeId: episode.episodeId,
+          episodeVersion: updated.version,
+        },
       }),
     ],
   );
@@ -1751,6 +1892,8 @@ function dispatch(context: HandlerContext): MutationResult {
       return handleOwnerReassigned(context);
     case "conversation.delivery_observed":
       return handleDeliveryObserved(context);
+    case "episode.project_delegated":
+      return handleProjectDelegated(context);
     case "episode.closed":
       return handleEpisodeClosed(context);
     case "episode.source_superseded":
@@ -1775,6 +1918,8 @@ function dispatch(context: HandlerContext): MutationResult {
       return handlePolicyRevoked(context);
     case "memory.confirmed":
       return handleMemoryConfirmed(context);
+    case "memory.candidate_rejected":
+      return handleMemoryCandidateRejected(context);
     case "memory.revoked":
       return handleMemoryRevoked(context);
     case "worker.proposal_received":

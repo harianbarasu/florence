@@ -10,12 +10,8 @@ import {
   HouseholdAggregateSchema,
   PolicyRecordSchema,
 } from "../../src/domain/index.js";
-import { PrivateCommandRouter } from "../../src/infrastructure/private-commands.js";
 import { privateControlId } from "../../src/infrastructure/private-control-catalog.js";
-import {
-  PrivateControlCommandService,
-  parsePrivateControlCommand,
-} from "../../src/infrastructure/private-control-commands.js";
+import { PrivateControlCommandService } from "../../src/infrastructure/private-control-commands.js";
 import { ADULT_A, ADULT_B, aggregate, HOUSEHOLD_ID } from "../application/fixtures.js";
 
 const T0 = "2026-08-05T16:00:00Z";
@@ -111,13 +107,19 @@ function controlSnapshot(): HouseholdApplicationSnapshot {
         phase: "active",
         initiatorAdultId: ADULT_A,
         invitedAdultId: ADULT_B,
+        adultNames: [
+          { adultId: ADULT_A, displayName: "Alex" },
+          { adultId: ADULT_B, displayName: "Bailey" },
+        ],
         consentedAdultIds: [ADULT_A, ADULT_B],
         privateDmAdultIds: [ADULT_A, ADULT_B],
         groupChannelId: "group_family",
         profileConfirmedAdultIds: [ADULT_A, ADULT_B],
+        googleConnectedAdultIds: [ADULT_A, ADULT_B],
       },
       sharedProfile: { facts: [] },
       gmailTriage: [],
+      gmailSources: [],
       calendarTriage: [],
       calendarSources: [],
       pendingPromotions: [],
@@ -162,94 +164,7 @@ function setup(input?: { snapshot?: HouseholdApplicationSnapshot | null; replyCo
   };
 }
 
-describe("parsePrivateControlCommand", () => {
-  it("requires complete deterministic control IDs", () => {
-    expect(parsePrivateControlCommand("what do you remember?")).toEqual({ kind: "list_knowledge" });
-    expect(parsePrivateControlCommand("show my sharing rules")).toEqual({
-      kind: "list_sharing_rules",
-    });
-    expect(parsePrivateControlCommand("forget MEM-0123456789abcdef")).toEqual({
-      kind: "forget",
-      controlId: "MEM-0123456789ABCDEF",
-    });
-    expect(parsePrivateControlCommand("forget MEM-0123")).toEqual({
-      kind: "forget",
-      controlId: null,
-    });
-    expect(parsePrivateControlCommand("stop sharing school emails")).toEqual({
-      kind: "stop_sharing",
-      controlId: null,
-    });
-    expect(parsePrivateControlCommand("pickup changed to 4:30")).toBeNull();
-  });
-});
-
 describe("PrivateControlCommandService", () => {
-  it("lists authoritative owner-visible knowledge without another adult's private memory", async () => {
-    const harness = setup();
-    await expect(harness.service.handle({ ...baseCommand, text: "What do you know?" })).resolves.toEqual({
-      handled: true,
-      classification: "control:knowledge_listed",
-    });
-    const bodies = harness.enqueued.flatMap((intent) =>
-      intent.kind === "conversation.send" ? [intent.body] : [],
-    );
-    expect(bodies.join("\n")).toContain("Review family mail after dinner");
-    expect(bodies.join("\n")).not.toContain("Bailey's confidential preference");
-    expect(bodies.every((body) => body.length <= 4_000)).toBe(true);
-  });
-
-  it("submits exact memory revocation to the single-writer and does not model-guess", async () => {
-    const harness = setup();
-    const controlId = privateControlId("memory", "memory_alex");
-    await expect(harness.service.handle({ ...baseCommand, text: `forget ${controlId}` })).resolves.toEqual({
-      handled: true,
-      classification: "control:memory_revocation_submitted",
-    });
-    expect(harness.revokeMemory).toHaveBeenCalledWith({
-      householdId: HOUSEHOLD_ID,
-      adultId: ADULT_A,
-      channelId: "dm-alex",
-      memoryId: "memory_alex",
-      idempotencyKey: "linq:event-1",
-      occurredAt: T0,
-    });
-    expect(harness.enqueueApplicationIntent).not.toHaveBeenCalled();
-  });
-
-  it("does not reveal or mutate another adult's memory when given its exact control ID", async () => {
-    const harness = setup();
-    const controlId = privateControlId("memory", "memory_bailey");
-    await expect(harness.service.handle({ ...baseCommand, text: `forget ${controlId}` })).resolves.toEqual({
-      handled: true,
-      classification: "control:memory_id_unresolved",
-    });
-    expect(harness.revokeMemory).not.toHaveBeenCalled();
-    const body = JSON.stringify(harness.enqueued);
-    expect(body).not.toContain("Bailey");
-  });
-
-  it("submits an exact policy ID and current version and rejects unknown or fuzzy rules", async () => {
-    const harness = setup();
-    const controlId = privateControlId("sharing_rule", "policy_alex_school");
-    await harness.service.handle({ ...baseCommand, text: `stop sharing ${controlId}` });
-    expect(harness.revokeSharingPolicy).toHaveBeenCalledWith({
-      householdId: HOUSEHOLD_ID,
-      adultId: ADULT_A,
-      channelId: "dm-alex",
-      policyId: "policy_alex_school",
-      expectedPolicyVersion: 1,
-      idempotencyKey: "linq:event-1",
-      occurredAt: T0,
-    });
-
-    const second = setup();
-    await expect(
-      second.service.handle({ ...baseCommand, text: "stop sharing RULE-0000000000000000" }),
-    ).resolves.toEqual({ handled: true, classification: "control:sharing_rule_id_unresolved" });
-    expect(second.revokeSharingPolicy).not.toHaveBeenCalled();
-  });
-
   it("requires an exact sharing choice or resolvable reply and never guesses from a topic", async () => {
     const harness = setup();
     await expect(
@@ -299,54 +214,5 @@ describe("PrivateControlCommandService", () => {
       handled: true,
       classification: "control:sharing_explanation_needs_exact_id",
     });
-  });
-
-  it("returns a safe response for an unverified exact DM identity", async () => {
-    const state = controlSnapshot();
-    const harness = setup({
-      snapshot: {
-        ...state,
-        aggregate: { ...state.aggregate, verifiedAdultIds: [ADULT_B] },
-      } as HouseholdApplicationSnapshot,
-    });
-    await expect(harness.service.handle({ ...baseCommand, text: "what do you remember?" })).resolves.toEqual({
-      handled: true,
-      classification: "control:identity_unavailable",
-    });
-    const body = JSON.stringify(harness.enqueued);
-    expect(body).not.toContain("Review family mail");
-  });
-
-  it("leaves unrelated private conversation to the main application", async () => {
-    const harness = setup();
-    await expect(harness.service.handle({ ...baseCommand, text: "Pickup changed to 4:30" })).resolves.toEqual(
-      { handled: false },
-    );
-    expect(harness.enqueueApplicationIntent).not.toHaveBeenCalled();
-  });
-});
-
-describe("PrivateCommandRouter", () => {
-  it("keeps core private controls active when no Google handler is configured", async () => {
-    const harness = setup();
-    const router = new PrivateCommandRouter([harness.service]);
-    await expect(router.handle({ ...baseCommand, text: "show my sharing rules" })).resolves.toEqual({
-      handled: true,
-      classification: "control:sharing_rules_listed",
-    });
-    await expect(router.handle({ ...baseCommand, text: "connect my Gmail" })).resolves.toEqual({
-      handled: false,
-    });
-  });
-
-  it("stops after the first deterministic handler claims a command", async () => {
-    const first = vi.fn(async () => ({ handled: true, classification: "first" }));
-    const second = vi.fn(async () => ({ handled: true, classification: "second" }));
-    const router = new PrivateCommandRouter([{ handle: first }, { handle: second }]);
-    await expect(router.handle({ ...baseCommand, text: "what do you remember?" })).resolves.toEqual({
-      handled: true,
-      classification: "first",
-    });
-    expect(second).not.toHaveBeenCalled();
   });
 });

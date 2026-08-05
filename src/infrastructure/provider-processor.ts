@@ -15,11 +15,19 @@ import type {
   ConversationAttachmentContent,
   FlorenceApplication,
   HouseholdApplicationSnapshot,
+  ReferencedConversationMessage,
 } from "../application/index.js";
 import type { ChannelResolution, ClaimedProviderInboxItem } from "../db/application-store.js";
 import { AdultIdSchema } from "../domain/index.js";
 import type { ConversationMessageRegistry } from "./conversation-feedback-store.js";
-import { canonicalizeLinqHandle, type GroupIdentity, type PendingInvitation } from "./runtime-store.js";
+import { isTransferConfirmation } from "./invitation-transfer-commands.js";
+import {
+  canonicalizeLinqHandle,
+  type GroupIdentity,
+  type InvitationTransferFinalization,
+  type InvitationTransferResolution,
+  type PendingInvitation,
+} from "./runtime-store.js";
 
 export type ProviderProcessingResult = {
   householdId?: string;
@@ -39,10 +47,13 @@ export interface PrivateCommandHandler {
   handle(input: {
     householdId: string;
     adultId: string;
+    bindingId?: string;
     channelId: string;
+    externalHandle?: string;
     messageId: string;
     text: string;
     replyToMessageId?: string;
+    replyTo?: ReferencedConversationMessage;
     occurredAt: string;
     idempotencyKey: string;
   }): Promise<{ handled: boolean; classification?: string }>;
@@ -126,6 +137,23 @@ export interface ProviderRuntimeStore {
     externalHandle: string;
     consentedAt: string;
   }): Promise<boolean>;
+  resolveInvitationTransfer?(input: {
+    invitationId?: string;
+    sourceHouseholdId: string;
+    sourceAdultId: string;
+    sourceBindingId: string;
+    externalChatId: string;
+    externalHandle: string;
+  }): Promise<InvitationTransferResolution>;
+  finalizeInvitationTransfer?(input: {
+    invitationId: string;
+    sourceHouseholdId: string;
+    sourceAdultId: string;
+    sourceBindingId: string;
+    externalChatId: string;
+    externalHandle: string;
+    consentedAt: string;
+  }): Promise<InvitationTransferFinalization>;
   resolveExactGroup(participantHandles: readonly string[]): Promise<GroupIdentity | null>;
   bindHouseholdGroup(input: {
     householdId: string;
@@ -262,16 +290,46 @@ export class ProductionProviderProcessor {
           });
     if (
       event.scope === "direct" &&
+      this.options.runtimeStore.resolveInvitationTransfer !== undefined &&
+      replyTo?.responseContext?.kind === "invitation_transfer" &&
+      event.message.attachments.length === 0 &&
+      isTransferConfirmation(event.message.text.normalize("NFKC").trim().toLowerCase())
+    ) {
+      const transfer = await this.options.runtimeStore.resolveInvitationTransfer({
+        invitationId: replyTo.responseContext.invitationId,
+        sourceHouseholdId: route.resolution.householdId,
+        sourceAdultId: route.senderAdultId,
+        sourceBindingId: replyTo.responseContext.sourceBindingId,
+        externalChatId: event.conversation.id,
+        externalHandle: handle,
+      });
+      if (transfer.status === "ready") {
+        return this.processConfirmedInvitationTransfer(
+          item,
+          event,
+          handle,
+          route,
+          replyTo,
+          replyTo.responseContext.sourceBindingId,
+          transfer,
+        );
+      }
+    }
+    if (
+      event.scope === "direct" &&
       this.options.privateCommands &&
       route.resolution.membershipStatus === "active"
     ) {
       const command = await this.options.privateCommands.handle({
         householdId: route.resolution.householdId,
         adultId: route.senderAdultId,
+        bindingId: route.resolution.bindingId,
         channelId: event.conversation.id,
+        externalHandle: handle,
         messageId: event.message.id,
         text: event.message.text,
         ...(event.message.replyTo === null ? {} : { replyToMessageId: event.message.replyTo.messageId }),
+        ...(replyTo === null ? {} : { replyTo }),
         occurredAt: event.occurredAt,
         idempotencyKey: item.idempotencyKey,
       });
@@ -340,6 +398,94 @@ export class ProductionProviderProcessor {
 
     return {
       householdId: route.resolution.householdId,
+      resolution: {
+        classification: applicationResult.outcome.classification,
+        disposition: applicationResult.disposition,
+        revision: applicationResult.revision,
+      },
+    };
+  }
+
+  private async processConfirmedInvitationTransfer(
+    item: ClaimedProviderInboxItem,
+    event: Extract<LinqInboundEvent, { eventType: "message.received"; scope: "direct" }>,
+    handle: string,
+    sourceRoute: { resolution: ChannelResolution; senderAdultId: string },
+    replyTo: ReferencedConversationMessage,
+    sourceBindingId: string,
+    transfer: Extract<InvitationTransferResolution, { status: "ready" }>,
+  ): Promise<ProviderProcessingResult> {
+    const finalizeTransfer = this.options.runtimeStore.finalizeInvitationTransfer;
+    if (finalizeTransfer === undefined) {
+      throw new ProviderProcessingError(
+        "invitation_transfer_unavailable",
+        false,
+        "Invitation transfer support is not configured",
+      );
+    }
+    const applicationResult = transfer.requiresApplicationAcceptance
+      ? await this.options.application.process({
+          kind: "conversation_message",
+          householdId: transfer.householdId,
+          idempotencyKey: item.idempotencyKey,
+          occurredAt: event.occurredAt,
+          channel: { channelId: event.conversation.id, scope: "personal", adultId: transfer.adultId },
+          senderAdultId: transfer.adultId,
+          messageRef: `linq:message:${event.message.id}`,
+          text: event.message.text,
+          attachmentRefs: [],
+          attachmentContents: [],
+        })
+      : null;
+    const finalized = await finalizeTransfer.call(this.options.runtimeStore, {
+      invitationId: transfer.invitationId,
+      sourceHouseholdId: sourceRoute.resolution.householdId,
+      sourceAdultId: sourceRoute.senderAdultId,
+      sourceBindingId,
+      externalChatId: event.conversation.id,
+      externalHandle: handle,
+      consentedAt: event.occurredAt,
+    });
+    if (finalized.status === "unavailable") {
+      if (applicationResult?.disposition === "committed") {
+        throw new ProviderProcessingError(
+          "invitation_transfer_finalize_pending",
+          true,
+          "Target consent is durable but invitation identity finalization must be retried",
+        );
+      }
+      if (this.options.privateCommands) {
+        await this.options.privateCommands.handle({
+          householdId: sourceRoute.resolution.householdId,
+          adultId: sourceRoute.senderAdultId,
+          bindingId: sourceRoute.resolution.bindingId,
+          channelId: event.conversation.id,
+          externalHandle: handle,
+          messageId: event.message.id,
+          text: event.message.text,
+          ...(event.message.replyTo === null ? {} : { replyToMessageId: event.message.replyTo.messageId }),
+          replyTo,
+          occurredAt: event.occurredAt,
+          idempotencyKey: item.idempotencyKey,
+        });
+      }
+      return {
+        householdId: sourceRoute.resolution.householdId,
+        resolution: { classification: `invitation_transfer:${finalized.reason}` },
+      };
+    }
+    if (applicationResult === null) {
+      const snapshot = await this.options.applicationStore.load(transfer.householdId);
+      return {
+        householdId: transfer.householdId,
+        resolution: {
+          classification: "invitation_transfer:activated",
+          ...(snapshot === null ? {} : { revision: snapshot.revision }),
+        },
+      };
+    }
+    return {
+      householdId: transfer.householdId,
       resolution: {
         classification: applicationResult.outcome.classification,
         disposition: applicationResult.disposition,

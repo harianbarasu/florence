@@ -139,18 +139,24 @@ class LangChainProviderAdapter implements ModelProviderAdapter {
       callbacks: [],
       maxRetries: this.#config.maxRetries ?? 2,
       ...(this.#config.timeoutMs === undefined ? {} : { timeout: this.#config.timeoutMs }),
-      ...(request.temperature === undefined ? {} : { temperature: request.temperature }),
       ...(request.maxOutputTokens === undefined ? {} : { maxTokens: request.maxOutputTokens }),
     };
 
     if (this.#config.provider === "anthropic") {
-      return new ChatAnthropic({ ...common, apiKey: this.#config.apiKey });
+      return new ChatAnthropic({
+        ...common,
+        apiKey: this.#config.apiKey,
+        ...(request.temperature === undefined ? {} : { temperature: request.temperature }),
+      });
     }
 
     if (this.#config.provider === "openai") {
       return new ChatOpenAI({
         ...common,
         apiKey: this.#config.apiKey,
+        // Current OpenAI reasoning routes reject the temperature parameter.
+        // Structured contracts provide the determinism Florence needs, so the
+        // optional sampling hint is deliberately omitted on this surface.
         // Florence's workers combine reasoning, strict output contracts, and
         // tools. The Responses API is the supported OpenAI surface for that
         // combination and keeps the choice inside this provider adapter.
@@ -163,6 +169,7 @@ class LangChainProviderAdapter implements ModelProviderAdapter {
     return new ChatOpenAI({
       ...common,
       apiKey: this.#config.apiKey ?? "not-provided",
+      ...(request.temperature === undefined ? {} : { temperature: request.temperature }),
       useResponsesApi: false,
       configuration: { baseURL: this.#config.baseUrl },
     });

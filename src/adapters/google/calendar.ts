@@ -211,6 +211,41 @@ export interface GoogleCalendarPage {
   timeZone: string | null;
 }
 
+export const googleCalendarAccessRoleSchema = z.enum([
+  "freeBusyReader",
+  "reader",
+  "writerWithoutPrivateAccess",
+  "writer",
+  "owner",
+]);
+
+export type GoogleCalendarAccessRole = z.infer<typeof googleCalendarAccessRoleSchema>;
+
+export const googleCalendarListEntrySchema = z.strictObject({
+  calendarId: z.string().min(1).max(1_000),
+  displayName: z.string().min(1).max(1_024),
+  primary: z.boolean(),
+  selected: z.boolean(),
+  hidden: z.boolean(),
+  deleted: z.boolean(),
+  accessRole: googleCalendarAccessRoleSchema.nullable(),
+  timeZone: z.string().min(1).max(200).nullable(),
+  etag: z.string().min(1).max(1_000).nullable(),
+});
+
+export type GoogleCalendarListEntry = z.infer<typeof googleCalendarListEntrySchema>;
+
+export interface GoogleCalendarListPage {
+  calendars: GoogleCalendarListEntry[];
+  nextPageToken: string | null;
+  nextSyncToken: string | null;
+}
+
+export type GoogleCalendarFreeBusyWindow = {
+  startsAt: string;
+  endsAt: string;
+};
+
 export interface GoogleCalendarWatchReceipt {
   channelId: string;
   resourceId: string;
@@ -226,6 +261,20 @@ export interface CalendarDeleteReceipt {
 }
 
 interface CalendarApiPort {
+  listCalendars(params: {
+    maxResults: number;
+    showDeleted: true;
+    showHidden: true;
+    pageToken?: string;
+    syncToken?: string;
+  }): Promise<{ data: calendar_v3.Schema$CalendarList }>;
+  queryFreeBusy(params: {
+    requestBody: {
+      timeMin: string;
+      timeMax: string;
+      items: { id: string }[];
+    };
+  }): Promise<{ data: calendar_v3.Schema$FreeBusyResponse }>;
   listEvents(params: {
     calendarId: string;
     maxResults: number;
@@ -273,6 +322,70 @@ export class GoogleCalendarAdapter {
 
   constructor(config: GoogleAdapterConfig, apiFactory?: CalendarApiFactory) {
     this.#apiFactory = apiFactory ?? defaultCalendarApiFactory(config);
+  }
+
+  async listCalendarsPage(input: {
+    accessToken: string;
+    pageToken?: string;
+    syncToken?: string;
+    maxResults?: number;
+  }): Promise<GoogleCalendarListPage> {
+    requireAccessToken(input.accessToken);
+    const maxResults = boundedInteger(input.maxResults ?? 250, 1, 250, "Calendar list page size");
+    try {
+      const response = await this.#apiFactory(input.accessToken).listCalendars({
+        maxResults,
+        showDeleted: true,
+        showHidden: true,
+        ...(input.pageToken ? { pageToken: input.pageToken } : {}),
+        ...(input.syncToken ? { syncToken: input.syncToken } : {}),
+      });
+      return {
+        calendars: (response.data.items ?? []).map(parseGoogleCalendarListEntry),
+        nextPageToken: response.data.nextPageToken ?? null,
+        nextSyncToken: response.data.nextSyncToken ?? null,
+      };
+    } catch (error) {
+      if (providerStatus(error) === 410) {
+        throw new GoogleSyncTokenExpiredError("calendar");
+      }
+      throw mapGoogleProviderError("Google Calendar list retrieval", error);
+    }
+  }
+
+  async queryFreeBusy(input: {
+    accessToken: string;
+    calendarId: string;
+    timeMin: string;
+    timeMax: string;
+  }): Promise<GoogleCalendarFreeBusyWindow[]> {
+    requireAccessToken(input.accessToken);
+    const timeMin = normalizeIsoTimestamp(input.timeMin, "Calendar free/busy timeMin");
+    const timeMax = normalizeIsoTimestamp(input.timeMax, "Calendar free/busy timeMax");
+    if (Date.parse(timeMin) >= Date.parse(timeMax)) {
+      throw new GoogleAdapterError("Calendar free/busy range is invalid", "invalid_request", null, false);
+    }
+    try {
+      const response = await this.#apiFactory(input.accessToken).queryFreeBusy({
+        requestBody: { timeMin, timeMax, items: [{ id: input.calendarId }] },
+      });
+      const calendar =
+        response.data.calendars?.[input.calendarId] ?? Object.values(response.data.calendars ?? {})[0];
+      if (!calendar || (calendar.errors?.length ?? 0) > 0) {
+        throw new GoogleAdapterError("Calendar free/busy lookup was incomplete", "permanent", null, false);
+      }
+      return (calendar.busy ?? []).map((window) => {
+        if (!window.start || !window.end) {
+          throw new GoogleAdapterError("Calendar free/busy window is incomplete", "permanent", null, false);
+        }
+        return {
+          startsAt: normalizeIsoTimestamp(window.start, "Calendar free/busy start"),
+          endsAt: normalizeIsoTimestamp(window.end, "Calendar free/busy end"),
+        };
+      });
+    } catch (error) {
+      throw mapGoogleProviderError("Google Calendar free/busy lookup", error);
+    }
   }
 
   async listEventsPage(input: {
@@ -571,6 +684,8 @@ function defaultCalendarApiFactory(config: GoogleAdapterConfig): CalendarApiFact
       auth: googleAuthWithAccessToken(config, accessToken),
     });
     return {
+      listCalendars: (params) => api.calendarList.list(params),
+      queryFreeBusy: (params) => api.freebusy.query(params),
       listEvents: (params) => api.events.list(params),
       getEvent: (params) => api.events.get(params),
       insertEvent: (params) => api.events.insert(params),
@@ -580,6 +695,31 @@ function defaultCalendarApiFactory(config: GoogleAdapterConfig): CalendarApiFact
       stopChannel: (params) => api.channels.stop(params),
     };
   };
+}
+
+export function parseGoogleCalendarListEntry(
+  entry: calendar_v3.Schema$CalendarListEntry,
+): GoogleCalendarListEntry {
+  if (!entry.id) {
+    throw new GoogleAdapterError(
+      "Calendar list entry is missing a stable identity",
+      "permanent",
+      null,
+      false,
+    );
+  }
+  const displayName = (entry.summaryOverride ?? entry.summary ?? "Unnamed calendar").trim();
+  return googleCalendarListEntrySchema.parse({
+    calendarId: entry.id,
+    displayName: displayName || "Unnamed calendar",
+    primary: entry.primary ?? false,
+    selected: entry.selected ?? false,
+    hidden: entry.hidden ?? false,
+    deleted: entry.deleted ?? false,
+    accessRole: entry.accessRole === "none" ? null : (entry.accessRole ?? null),
+    timeZone: entry.timeZone ?? null,
+    etag: entry.etag ?? null,
+  });
 }
 
 function parseEventTime(

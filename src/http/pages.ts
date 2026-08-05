@@ -66,11 +66,15 @@ export function sendHandoffPage(reply: FastifyReply, page: HandoffPage, statusCo
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${content.title}</title>
+${pageStyles()}
 </head>
 <body>
 <main>
+<div class="mark" aria-hidden="true">F</div>
+<p class="eyebrow">Florence · Family Chief of Staff</p>
 <h1>${content.heading}</h1>
 <p>${content.body}</p>
+<p class="foot">Private by default. Shared only with your direction.</p>
 </main>
 </body>
 </html>`);
@@ -90,13 +94,35 @@ export function sendCustomerExportHandoff(reply: FastifyReply, token: string): F
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Download your Florence data</title>
+${pageStyles()}
 </head>
 <body>
 <main>
+<div class="mark" aria-hidden="true">F</div>
+<p class="eyebrow">Florence · Private data control</p>
 <h1>Your private Florence export</h1>
 <p>This link works once. Download it only on a device you trust.</p>
-<p><a href="${downloadPath}" rel="noreferrer">Download my data</a></p>
+<p><a class="button" href="${downloadPath}" rel="noreferrer">Download my data</a></p>
+<p class="foot">Florence never asks for this link in a group conversation.</p>
 </main>
 </body>
 </html>`);
+}
+
+function pageStyles(): string {
+  return `<style>
+:root { color-scheme: light; font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f4f1eb; color: #1d2a26; }
+* { box-sizing: border-box; }
+body { min-height: 100vh; margin: 0; display: grid; place-items: center; padding: 28px; background: radial-gradient(circle at top, #fffaf0 0, #f4f1eb 58%, #e7ece7 100%); }
+main { width: min(100%, 620px); padding: clamp(30px, 7vw, 64px); border: 1px solid rgba(29, 42, 38, .12); border-radius: 28px; background: rgba(255, 255, 255, .84); box-shadow: 0 24px 70px rgba(29, 42, 38, .10); backdrop-filter: blur(16px); }
+.mark { width: 44px; height: 44px; display: grid; place-items: center; border-radius: 14px; background: #254f42; color: #fffaf0; font-family: Georgia, serif; font-size: 25px; }
+.eyebrow { margin: 24px 0 10px; color: #527066; font-size: 12px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
+h1 { margin: 0 0 18px; font-family: Georgia, "Times New Roman", serif; font-size: clamp(36px, 8vw, 60px); font-weight: 500; line-height: 1.02; letter-spacing: -.035em; }
+p { margin: 0; font-size: 18px; line-height: 1.62; }
+.foot { margin-top: 30px; padding-top: 22px; border-top: 1px solid rgba(29, 42, 38, .12); color: #60716b; font-size: 14px; }
+.button { display: inline-flex; margin-top: 24px; padding: 13px 18px; border-radius: 999px; background: #254f42; color: white; font-size: 16px; font-weight: 700; text-decoration: none; }
+.button:hover { background: #193a30; }
+.button:focus-visible { outline: 3px solid #b57a35; outline-offset: 3px; }
+@media (prefers-reduced-transparency: reduce) { main { background: white; backdrop-filter: none; } }
+</style>`;
 }

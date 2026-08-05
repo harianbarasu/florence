@@ -17,6 +17,7 @@ import {
   calendarApplicationContent,
   calendarApplicationContentDigest,
   calendarSourceContentAad,
+  calendarSyncStateSchema,
   GoogleCalendarPushIngress,
   GoogleCalendarSyncService,
   normalizeCalendarBusyWindow,
@@ -127,6 +128,26 @@ function harness() {
     },
   );
   const repository: CalendarSyncRepositoryPort = {
+    async getCalendarSyncRecord(input) {
+      const state = calendarSyncStateSchema.safeParse(owned.cursor.calendar);
+      return {
+        calendarId: input.calendarId,
+        providerCalendarId: input.calendarId,
+        status: "active",
+        selectionSource: "provider",
+        availabilityOnly: false,
+        accessRole: "owner",
+        state: state.success ? state.data : null,
+      };
+    },
+    async saveCalendarCatalogState(input) {
+      owned.cursor.calendarCatalog = structuredClone(input.state);
+      return "updated";
+    },
+    async applyCalendarCatalogPage(input) {
+      owned.cursor.calendarCatalog = structuredClone(input.state);
+      return "updated";
+    },
     async saveCalendarSyncState(input) {
       const revision = Number((owned.cursor.calendar as { revision?: number } | undefined)?.revision ?? 0);
       if (revision !== input.expectedRevision) return "conflict";
@@ -153,6 +174,12 @@ function harness() {
     async markCalendarWatchStopped() {
       return "updated";
     },
+    async listCalendarWatches() {
+      const state = calendarSyncStateSchema.safeParse(owned.cursor.calendar);
+      return state.success && state.data.watch
+        ? [{ channelId: state.data.watch.channelId, resourceId: state.data.watch.resourceId }]
+        : [];
+    },
     async revokeConnection() {
       owned.status = "revoked";
       owned.encryptedCredentials = null;
@@ -165,6 +192,12 @@ function harness() {
     nextSyncToken: "sync-token-1",
     timeZone: "America/Los_Angeles",
   }));
+  const listCalendarsPage = vi.fn<CalendarProviderPort["listCalendarsPage"]>(async () => ({
+    calendars: [],
+    nextPageToken: null,
+    nextSyncToken: "calendar-list-sync-1",
+  }));
+  const queryFreeBusy = vi.fn<CalendarProviderPort["queryFreeBusy"]>(async () => []);
   const watchEvents = vi.fn<CalendarProviderPort["watchEvents"]>(async () => ({
     channelId: "calendar-channel-1",
     resourceId: "calendar-resource-1",
@@ -190,7 +223,7 @@ function harness() {
   const service = new GoogleCalendarSyncService({
     directory: { getOwnedGoogleConnection: async () => owned },
     repository,
-    calendar: { listEventsPage, watchEvents, stopChannel },
+    calendar: { listCalendarsPage, queryFreeBusy, listEventsPage, watchEvents, stopChannel },
     oauth: { refresh: vi.fn(async () => tokenSet()), revoke: vi.fn(async () => undefined) },
     application: { process: applicationProcess as FlorenceApplication["process"] },
     secretBox,
@@ -532,7 +565,8 @@ describe("GoogleCalendarSyncService", () => {
     await fixture.service.execute({ kind: "continue", ...fixture.identity });
     await fixture.service.execute({ kind: "renew_watch", ...fixture.identity });
 
-    await expect(fixture.service.execute({ kind: "revoke", ...fixture.identity })).resolves.toMatchObject({
+    const { calendarId: _calendarId, ...connectionIdentity } = fixture.identity;
+    await expect(fixture.service.execute({ kind: "revoke", ...connectionIdentity })).resolves.toMatchObject({
       status: "revoked",
     });
     expect(fixture.stopChannel).toHaveBeenLastCalledWith({

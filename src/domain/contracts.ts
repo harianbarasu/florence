@@ -184,7 +184,7 @@ export const RoutineAnchorMomentSchema = z.strictObject({
   kind: z.literal("routine_anchor"),
   anchorId: RoutineAnchorIdSchema,
   date: LocalDateSchema,
-  offsetMinutes: z.number().int().min(-10_080).max(10_080),
+  offsetMinutes: z.number().int().min(-525_600).max(525_600),
   disambiguation: z.enum(["compatible", "earlier", "later", "reject"]),
 });
 
@@ -340,6 +340,13 @@ export const PromotionAuthoritySchema = z.discriminatedUnion("kind", [
 export type PromotionAuthority = z.infer<typeof PromotionAuthoritySchema>;
 
 export const EpisodeTypeSchema = z.enum(["commitment", "research", "meal_plan"]);
+export const EpisodeDelegationSchema = z.strictObject({
+  jobId: WorkerJobIdSchema,
+  purpose: z.enum(["family_research", "meal_plan"]),
+});
+
+export type EpisodeDelegation = z.infer<typeof EpisodeDelegationSchema>;
+
 export const CommitmentStateSchema = z.enum([
   "proposed",
   "awaiting_acknowledgement",
@@ -389,6 +396,7 @@ export const FamilyEpisodeSchema = z
     sensitivity: SensitivitySchema,
     promotionAuthority: PromotionAuthoritySchema.optional(),
     sourceMatcher: PrivateSourceMatcherSchema.optional(),
+    delegation: EpisodeDelegationSchema.optional(),
     temporalPlan: ResolvedTimePlanSchema.optional(),
     blockedReason: NeutralFactualTextSchema.optional(),
     createdAt: InstantStringSchema,
@@ -396,6 +404,21 @@ export const FamilyEpisodeSchema = z
     outcome: EpisodeOutcomeSchema.optional(),
   })
   .superRefine((episode, context) => {
+    const expectedDelegationPurpose =
+      episode.type === "research"
+        ? "family_research"
+        : episode.type === "meal_plan"
+          ? "meal_plan"
+          : undefined;
+    if (
+      (expectedDelegationPurpose === undefined) !== (episode.delegation === undefined) ||
+      (expectedDelegationPurpose !== undefined && episode.delegation?.purpose !== expectedDelegationPurpose)
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "delegated episode type and worker purpose must agree",
+      });
+    }
     if (episode.state === "awaiting_acknowledgement" && episode.owner.status !== "proposed") {
       context.addIssue({ code: "custom", message: "awaiting acknowledgement requires a proposed owner" });
     }
@@ -444,20 +467,39 @@ export const FamilyEpisodeSchema = z
 
 export type FamilyEpisode = z.infer<typeof FamilyEpisodeSchema>;
 
-export const EpisodeProposalSchema = z.strictObject({
-  episodeId: EpisodeIdSchema,
-  type: EpisodeTypeSchema,
-  targetScope: DurableScopeSchema,
-  title: NeutralDisplayTextSchema,
-  requiredOutcome: NeutralFactualTextSchema,
-  proposedOwnerAdultId: AdultIdSchema.optional(),
-  evidence: z.array(EvidenceRefSchema).min(1).max(50),
-  sourceClass: SourceClassSchema,
-  sensitivity: SensitivitySchema,
-  temporalPlan: SemanticTimePlanSchema.optional(),
-  promotionAuthority: PromotionAuthoritySchema.optional(),
-  sourceMatcher: PrivateSourceMatcherSchema.optional(),
-});
+export const EpisodeProposalSchema = z
+  .strictObject({
+    episodeId: EpisodeIdSchema,
+    type: EpisodeTypeSchema,
+    targetScope: DurableScopeSchema,
+    title: NeutralDisplayTextSchema,
+    requiredOutcome: NeutralFactualTextSchema,
+    proposedOwnerAdultId: AdultIdSchema.optional(),
+    evidence: z.array(EvidenceRefSchema).min(1).max(50),
+    sourceClass: SourceClassSchema,
+    sensitivity: SensitivitySchema,
+    temporalPlan: SemanticTimePlanSchema.optional(),
+    promotionAuthority: PromotionAuthoritySchema.optional(),
+    sourceMatcher: PrivateSourceMatcherSchema.optional(),
+    delegation: EpisodeDelegationSchema.optional(),
+  })
+  .superRefine((proposal, context) => {
+    const expectedDelegationPurpose =
+      proposal.type === "research"
+        ? "family_research"
+        : proposal.type === "meal_plan"
+          ? "meal_plan"
+          : undefined;
+    if (
+      (expectedDelegationPurpose === undefined) !== (proposal.delegation === undefined) ||
+      (expectedDelegationPurpose !== undefined && proposal.delegation?.purpose !== expectedDelegationPurpose)
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "delegated episode type and worker purpose must agree",
+      });
+    }
+  });
 
 export type EpisodeProposal = z.infer<typeof EpisodeProposalSchema>;
 
@@ -919,6 +961,10 @@ export const ConversationResponseContextSchema = z.discriminatedUnion("kind", [
   }),
   z.strictObject({ kind: z.literal("calendar_approval"), actionId: ConversationResponseReferenceSchema }),
   z.strictObject({
+    kind: z.literal("memory_confirmation"),
+    candidateId: ConversationResponseReferenceSchema,
+  }),
+  z.strictObject({
     kind: z.literal("episode_ownership"),
     episodeId: ConversationResponseReferenceSchema,
     episodeVersion: z.number().int().positive(),
@@ -931,6 +977,11 @@ export const ConversationResponseContextSchema = z.discriminatedUnion("kind", [
   z.strictObject({
     kind: z.literal("sharing_explanation"),
     sharingRef: ConversationResponseReferenceSchema,
+  }),
+  z.strictObject({
+    kind: z.literal("invitation_transfer"),
+    invitationId: ConversationResponseReferenceSchema,
+    sourceBindingId: ConversationResponseReferenceSchema,
   }),
 ]);
 
@@ -1191,6 +1242,15 @@ export const ConversationDeliveryObservedSignalSchema = z.strictObject({
   deliveredAt: InstantStringSchema,
 });
 
+export const EpisodeProjectDelegatedSignalSchema = z.strictObject({
+  ...SignalBaseShape,
+  kind: z.literal("episode.project_delegated"),
+  episodeId: EpisodeIdSchema,
+  baseEpisodeVersion: z.number().int().positive(),
+  delegation: EpisodeDelegationSchema,
+  instructionEvidence: EvidenceRefSchema,
+});
+
 export const EpisodeClosedSignalSchema = z.strictObject({
   ...SignalBaseShape,
   kind: z.literal("episode.closed"),
@@ -1277,6 +1337,12 @@ export const MemoryConfirmedSignalSchema = z.strictObject({
   promotionAuthority: PromotionAuthoritySchema.optional(),
 });
 
+export const MemoryCandidateRejectedSignalSchema = z.strictObject({
+  ...SignalBaseShape,
+  kind: z.literal("memory.candidate_rejected"),
+  candidateId: MemoryCandidateIdSchema,
+});
+
 export const MemoryRevokedSignalSchema = z.strictObject({
   ...SignalBaseShape,
   kind: z.literal("memory.revoked"),
@@ -1315,6 +1381,7 @@ export const HouseholdSignalSchema = z.discriminatedUnion("kind", [
   CommitmentOwnerAcknowledgedSignalSchema,
   CommitmentOwnerReassignedSignalSchema,
   ConversationDeliveryObservedSignalSchema,
+  EpisodeProjectDelegatedSignalSchema,
   EpisodeClosedSignalSchema,
   EpisodeTemporalPlanReplacedSignalSchema,
   EpisodeSourceSupersededSignalSchema,
@@ -1327,6 +1394,7 @@ export const HouseholdSignalSchema = z.discriminatedUnion("kind", [
   PolicyApprovedSignalSchema,
   PolicyRevokedSignalSchema,
   MemoryConfirmedSignalSchema,
+  MemoryCandidateRejectedSignalSchema,
   MemoryRevokedSignalSchema,
   WorkerProposalReceivedSignalSchema,
   TimerFiredSignalSchema,
@@ -1411,6 +1479,10 @@ export const DomainChangeSchema = z.discriminatedUnion("kind", [
   z.strictObject({
     kind: z.literal("memory_confirmed"),
     memoryId: MemoryIdSchema,
+  }),
+  z.strictObject({
+    kind: z.literal("memory_candidate_rejected"),
+    candidateId: MemoryCandidateIdSchema,
   }),
   z.strictObject({
     kind: z.literal("memory_revoked"),

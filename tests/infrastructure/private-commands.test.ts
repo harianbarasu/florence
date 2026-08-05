@@ -105,7 +105,6 @@ describe("PrivateGoogleCommandService", () => {
           householdId: HOUSEHOLD,
           adultId: ADULT,
           connectionId: CONNECTION,
-          calendarId: "primary",
         },
       }),
     );
@@ -127,7 +126,7 @@ describe("PrivateGoogleCommandService", () => {
   });
 
   it("starts recent-first progressive synchronization after OAuth", async () => {
-    const harness = setup();
+    const harness = setup([connection()], { calendarQueue: true });
     await harness.service.onGoogleConnected({
       householdId: HOUSEHOLD,
       adultId: ADULT,
@@ -135,6 +134,10 @@ describe("PrivateGoogleCommandService", () => {
       connectionId: CONNECTION,
       accountLabel: "Personal",
       email: "parent@example.test",
+      grantedScopes: [
+        "https://www.googleapis.com/auth/gmail.readonly",
+        "https://www.googleapis.com/auth/calendar.readonly",
+      ],
     });
     expect(harness.enqueueGoogleSyncWork).toHaveBeenCalledWith({
       householdId: HOUSEHOLD,
@@ -152,7 +155,7 @@ describe("PrivateGoogleCommandService", () => {
     );
   });
 
-  it("does not strand Gmail work when only Calendar sync is configured", async () => {
+  it("keeps onboarding incomplete when required Gmail sync is unavailable", async () => {
     const harness = setup([connection()], { calendarQueue: true, gmailSyncEnabled: false });
     await harness.service.onGoogleConnected({
       householdId: HOUSEHOLD,
@@ -161,11 +164,15 @@ describe("PrivateGoogleCommandService", () => {
       connectionId: CONNECTION,
       accountLabel: "Personal",
       email: "parent@example.test",
+      grantedScopes: [
+        "https://www.googleapis.com/auth/gmail.readonly",
+        "https://www.googleapis.com/auth/calendar.readonly",
+      ],
     });
     expect(harness.enqueueGoogleSyncWork).not.toHaveBeenCalled();
     expect(harness.enqueueApplicationIntent).toHaveBeenCalledWith(
       expect.objectContaining({
-        body: expect.stringContaining("privately synchronizing your primary calendar"),
+        body: expect.stringContaining("Gmail synchronization service is unavailable"),
       }),
     );
   });

@@ -256,7 +256,10 @@ guide](https://developers.google.com/identity/protocols/oauth2/web-server)
 
 Florence implements Linq partner API v3 and pins webhook payload version `2026-02-03`.
 
-1. Confirm the production API key and assigned Florence phone number in Linq.
+1. Confirm the production API key and assigned Florence phone number in Linq. Before enabling
+   outbound work, call `GET /api/partner/v3/phone_numbers` and require that exact line's reputation
+   is `HEALTHY`. Do not silently substitute another line on the partner account: pause the launch
+   and deliberately choose or recover the Florence number if it is `AT_RISK` or `CRITICAL`.
 2. Create a webhook subscription for:
    - `message.received`
    - `reaction.added`

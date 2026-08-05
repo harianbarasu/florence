@@ -464,6 +464,31 @@ describe("Florence application coordinator", () => {
         key: "onboard-group",
         input: groupMessage("onboard-group", "This is our household group", "2027-01-01T08:03:00Z"),
         response: { ...classificationBase, intent: "onboarding", action: "register_group" },
+        phase: "naming_adults",
+      },
+      {
+        key: "onboard-name-a",
+        input: groupMessage("onboard-name-a", "Call me Alex", "2027-01-01T08:03:10Z"),
+        response: {
+          ...classificationBase,
+          intent: "onboarding",
+          action: "set_name",
+          displayName: "Alex",
+        },
+        phase: "naming_adults",
+      },
+      {
+        key: "onboard-name-b",
+        input: {
+          ...groupMessage("onboard-name-b", "Call me Bailey", "2027-01-01T08:03:20Z"),
+          senderAdultId: ADULT_B,
+        },
+        response: {
+          ...classificationBase,
+          intent: "onboarding",
+          action: "set_name",
+          displayName: "Bailey",
+        },
         phase: "building_profile",
       },
       {
@@ -511,7 +536,7 @@ describe("Florence application coordinator", () => {
           senderAdultId: ADULT_B,
         },
         response: { ...classificationBase, intent: "onboarding", action: "confirm_profile" },
-        phase: "active",
+        phase: "connecting_sources",
       },
     ] as const;
 
@@ -532,6 +557,22 @@ describe("Florence application coordinator", () => {
       }
     }
 
+    for (const [adultId, connectionId, occurredAt] of [
+      [ADULT_A, "google_alex", "2027-01-01T08:06:00Z"],
+      [ADULT_B, "google_bailey", "2027-01-01T08:07:00Z"],
+    ] as const) {
+      await app.process({
+        kind: "google_connected",
+        householdId: HOUSEHOLD_ID,
+        idempotencyKey: `onboard-${connectionId}`,
+        occurredAt,
+        adultId,
+        connectionId,
+        gmailReady: true,
+        calendarReady: true,
+      });
+    }
+
     const snapshot = await harness.repository.load(HOUSEHOLD_ID);
     expect(snapshot?.projection.onboarding).toMatchObject({
       phase: "active",
@@ -539,7 +580,12 @@ describe("Florence application coordinator", () => {
       consentedAdultIds: [ADULT_A, ADULT_B],
       privateDmAdultIds: [ADULT_A, ADULT_B],
       groupChannelId: GROUP_CHANNEL,
+      adultNames: [
+        { adultId: ADULT_A, displayName: "Alex" },
+        { adultId: ADULT_B, displayName: "Bailey" },
+      ],
       profileConfirmedAdultIds: [ADULT_A, ADULT_B],
+      googleConnectedAdultIds: [ADULT_A, ADULT_B],
     });
     expect(snapshot?.aggregate.version).toBe(0);
     expect(snapshot?.aggregate.lastProcessedSequence).toBe(0);
@@ -706,6 +752,7 @@ describe("Florence application coordinator", () => {
     expect(
       domainEffects(harness.repository.outbox).filter((effect) => effect.kind === "schedule_timer"),
     ).toHaveLength(2);
+    if (episodeId === undefined) throw new Error("Expected the proposed commitment episode");
 
     const ackKey = "group-obligation-ack";
     harness.interpreter.respondToConversation(ackKey, {
@@ -714,7 +761,14 @@ describe("Florence application coordinator", () => {
       episodeId,
       baseEpisodeVersion: 1,
     });
-    await app.process(groupMessage(ackKey, "I will handle it", "2027-01-01T08:01:00Z"));
+    await app.process({
+      ...groupMessage(ackKey, "I will handle it", "2027-01-01T08:01:00Z"),
+      replyTo: {
+        messageRef: "message_group-obligation-status",
+        messageClass: "status",
+        responseContext: { kind: "episode_ownership", episodeId, episodeVersion: 1 },
+      },
+    });
     snapshot = await harness.repository.load(HOUSEHOLD_ID);
     expect(snapshot?.aggregate.episodes[0]?.state).toBe("active");
 
@@ -759,7 +813,14 @@ describe("Florence application coordinator", () => {
       outcome: "completed",
       summary: "The signed field-trip form was returned.",
     });
-    await app.process(groupMessage(closeKey, "The form is returned", "2027-01-02T18:00:00Z"));
+    await app.process({
+      ...groupMessage(closeKey, "The form is returned", "2027-01-02T18:00:00Z"),
+      replyTo: {
+        messageRef: "message_group-obligation-reminder",
+        messageClass: "reminder",
+        responseContext: { kind: "episode_follow_up", episodeId, episodeVersion: 3 },
+      },
+    });
     snapshot = await harness.repository.load(HOUSEHOLD_ID);
     expect(snapshot?.aggregate.episodes[0]?.state).toBe("completed");
     expect(
@@ -772,7 +833,7 @@ describe("Florence application coordinator", () => {
     ]);
   });
 
-  it("rejects a validly shaped worker result when its household base version is stale", async () => {
+  it("requeues a valid worker result when worker-visible household context changed", async () => {
     const harness = setup();
     const app = createFlorenceApplication(harness.dependencies);
     const researchKey = "research-stale";
@@ -795,15 +856,19 @@ describe("Florence application coordinator", () => {
     const changeKey = "research-stale-change";
     harness.interpreter.respondToConversation(changeKey, {
       ...classificationBase,
-      intent: "propose_commitment",
-      title: "Confirm Friday pickup",
-      requiredOutcome: "Friday pickup coverage is confirmed",
-      sourceClass: "household.pickup",
-      sensitivity: "ordinary",
+      intent: "onboarding",
+      action: "update_profile",
+      profileFacts: [
+        {
+          category: "dependent",
+          subject: "Maya",
+          detail: "Maya is a child in the household.",
+        },
+      ],
     });
-    await app.process(groupMessage(changeKey, "We also need Friday pickup coverage", "2027-02-01T08:01:00Z"));
+    await app.process(groupMessage(changeKey, "Maya is our child", "2027-02-01T08:01:00Z"));
     snapshot = await harness.repository.load(HOUSEHOLD_ID);
-    expect(snapshot?.aggregate.version).toBe((job?.baseHouseholdVersion ?? 0) + 1);
+    expect(snapshot?.projection.sharedProfile.facts).toHaveLength(1);
     if (job === undefined) {
       throw new Error("Expected a queued worker job");
     }
@@ -862,14 +927,17 @@ describe("Florence application coordinator", () => {
       result: workerResult,
     });
 
-    expect(reconciled.outcome.status).toBe("rejected");
-    expect(reconciled.outcome.domainReceipts[0]).toMatchObject({
-      disposition: "rejected",
-      reason: "stale_household_version",
+    expect(reconciled.outcome).toMatchObject({
+      status: "processed",
+      classification: "worker_requeued:worker_context_changed",
     });
     snapshot = await harness.repository.load(HOUSEHOLD_ID);
-    expect(snapshot?.projection.workers[0]?.status).toBe("rejected");
-    expect(harness.repository.outbox).toHaveLength(beforeResultEffects);
+    expect(snapshot?.projection.workers[0]).toMatchObject({
+      status: "queued",
+      attemptNumber: 2,
+      automaticRetryCount: 1,
+    });
+    expect(harness.repository.outbox).toHaveLength(beforeResultEffects + 1);
   });
 
   it("runs research and meal workers only after in-scope adult requests", async () => {
@@ -1006,13 +1074,15 @@ describe("Florence application coordinator", () => {
     expect(harness.repository.intents("worker.run")).toHaveLength(workerCount);
     expect(harness.workerRuntime.calls).toHaveLength(2);
     const snapshot = await harness.repository.load(HOUSEHOLD_ID);
-    expect(snapshot?.projection.workers.map((worker) => worker.status)).toEqual(["reconciled", "reconciled"]);
+    expect(snapshot?.projection.workers.map((worker) => worker.status)).toEqual(["completed", "completed"]);
 
-    const resultBodies = domainEffects(harness.repository.outbox).flatMap((effect) =>
-      effect.kind === "send_message" && effect.messageClass === "status" ? [effect.body] : [],
-    );
-    expect(resultBodies.some((body) => body.includes("Research comparison"))).toBe(true);
-    expect(resultBodies.some((body) => body.includes("Grocery list"))).toBe(true);
+    const resultBodies = harness.repository
+      .intents("conversation.send")
+      .flatMap((intent) =>
+        intent.kind === "conversation.send" && intent.messageClass === "status" ? [intent.body] : [],
+      );
+    expect(resultBodies).toContain("A sourced comparison is ready.");
+    expect(resultBodies).toContain("A meal plan and grocery list are ready.");
     expect(
       domainEffects(harness.repository.outbox).some((effect) => effect.kind === "execute_external_action"),
     ).toBe(false);

@@ -743,6 +743,23 @@ export class ApplicationStore implements ApplicationRepositoryPort {
         where household_id = ${parsed.householdId}
       `;
 
+      // The application projection is authoritative for the names each adult asked Florence to use.
+      // Keep the identity directory in the same transaction so invitations, exports, and operator
+      // views never continue showing onboarding placeholders after a successful naming turn.
+      for (const adult of parsed.projection.onboarding.adultNames) {
+        await transaction`
+          update adults
+          set display_name = ${adult.displayName}, updated_at = now()
+          where id = ${adult.adultId}
+            and exists (
+              select 1 from household_memberships membership
+              where membership.household_id = ${parsed.householdId}
+                and membership.adult_id = adults.id
+                and membership.status in ('invited', 'active')
+            )
+        `;
+      }
+
       for (const intent of parsed.outbox) {
         await insertOutboxIntent(transaction, this.database, parsed.householdId, {
           intentKey: intent.intentId,
@@ -1133,6 +1150,7 @@ export class ApplicationStore implements ApplicationRepositoryPort {
           and channel_type = ${input.channelType}
           and external_chat_id = ${input.externalChatId}
           and external_handle is not distinct from ${input.externalHandle ?? null}
+          and status <> 'revoked'
         for update
       `;
       if (existing[0]) {
@@ -1200,6 +1218,7 @@ export class ApplicationStore implements ApplicationRepositoryPort {
       where cb.provider = ${parsed.provider}
         and cb.external_chat_id = ${parsed.externalChatId}
         and cb.external_handle is not distinct from ${parsed.externalHandle ?? null}
+        and cb.status <> 'revoked'
       limit 1
     `;
     const row = rows[0];
@@ -1501,29 +1520,39 @@ export class ApplicationStore implements ApplicationRepositoryPort {
     rawInput: z.input<typeof connectionSchema>,
   ): Promise<{ connectionId: string }> {
     const input = connectionSchema.parse(rawInput);
-    await this.assertActiveMember(input.householdId, input.adultId);
     const requestedId = input.id ?? randomUUID();
-    const rows = await this.database<{ id: string }[]>`
-      insert into external_connections (
-        id, household_id, adult_id, provider, label, external_account_id, email,
-        encrypted_credentials, granted_scopes, status, cursor, metadata, last_synced_at
-      ) values (
-        ${requestedId}, ${input.householdId}, ${input.adultId}, ${input.provider},
-        ${input.label}, ${input.externalAccountId}, ${input.email ?? null},
-        ${input.encryptedCredentials}, ${input.grantedScopes}, 'active',
-        ${json(this.database, input.cursor)}, ${json(this.database, input.metadata)},
-        ${input.lastSyncedAt ?? null}
-      )
-      on conflict (household_id, adult_id, provider, external_account_id)
-      do update set label = excluded.label, email = excluded.email,
-        encrypted_credentials = excluded.encrypted_credentials,
-        granted_scopes = excluded.granted_scopes, status = 'active', cursor = excluded.cursor,
-        metadata = excluded.metadata, last_synced_at = excluded.last_synced_at, updated_at = now()
-      returning id
-    `;
-    const row = rows[0];
-    if (!row) throw new ApplicationStoreError("invalid_state", "Connection upsert returned no row");
-    return { connectionId: row.id };
+    return this.database.begin(async (transaction) => {
+      const memberships = await transaction<{ adult_id: string }[]>`
+        select adult_id from household_memberships
+        where household_id = ${input.householdId} and adult_id = ${input.adultId}
+          and status = 'active'
+        for update
+      `;
+      if (memberships.length !== 1) {
+        throw new ApplicationStoreError("not_authorized", "Adult is not active in this household");
+      }
+      const rows = await transaction<{ id: string }[]>`
+        insert into external_connections (
+          id, household_id, adult_id, provider, label, external_account_id, email,
+          encrypted_credentials, granted_scopes, status, cursor, metadata, last_synced_at
+        ) values (
+          ${requestedId}, ${input.householdId}, ${input.adultId}, ${input.provider},
+          ${input.label}, ${input.externalAccountId}, ${input.email ?? null},
+          ${input.encryptedCredentials}, ${input.grantedScopes}, 'active',
+          ${json(this.database, input.cursor)}, ${json(this.database, input.metadata)},
+          ${input.lastSyncedAt ?? null}
+        )
+        on conflict (household_id, adult_id, provider, external_account_id)
+        do update set label = excluded.label, email = excluded.email,
+          encrypted_credentials = excluded.encrypted_credentials,
+          granted_scopes = excluded.granted_scopes, status = 'active', cursor = excluded.cursor,
+          metadata = excluded.metadata, last_synced_at = excluded.last_synced_at, updated_at = now()
+        returning id
+      `;
+      const row = rows[0];
+      if (!row) throw new ApplicationStoreError("invalid_state", "Connection upsert returned no row");
+      return { connectionId: row.id };
+    });
   }
 
   public async getExternalConnection(input: {
@@ -1554,15 +1583,33 @@ export class ApplicationStore implements ApplicationRepositoryPort {
       .strictObject({ connectionId: z.uuid(), householdId: z.uuid(), adultId: z.uuid() })
       .parse(input);
     await this.assertActiveMember(parsed.householdId, parsed.adultId);
-    const rows = await this.database<{ id: string }[]>`
-      update external_connections
-      set status = 'revoked', encrypted_credentials = null, granted_scopes = '{}',
-          cursor = '{}'::jsonb, updated_at = now()
-      where id = ${parsed.connectionId} and household_id = ${parsed.householdId}
-        and adult_id = ${parsed.adultId} and status <> 'revoked'
-      returning id
-    `;
-    return rows.length === 1;
+    return this.database.begin(async (transaction) => {
+      const rows = await transaction<{ id: string }[]>`
+        update external_connections
+        set status = 'revoked', encrypted_credentials = null, granted_scopes = '{}',
+            cursor = '{}'::jsonb, updated_at = now()
+        where id = ${parsed.connectionId} and household_id = ${parsed.householdId}
+          and adult_id = ${parsed.adultId} and status <> 'revoked'
+        returning id
+      `;
+      if (rows.length !== 1) return false;
+      await transaction`
+        update google_calendar_channels set status = 'stopped', updated_at = now()
+        where connection_id = ${parsed.connectionId} and household_id = ${parsed.householdId}
+          and adult_id = ${parsed.adultId} and status in ('active', 'retiring')
+      `;
+      await transaction`
+        delete from calendar_busy_windows
+        where connection_id = ${parsed.connectionId} and household_id = ${parsed.householdId}
+          and owner_adult_id = ${parsed.adultId}
+      `;
+      await transaction`
+        delete from google_calendar_sync_states
+        where connection_id = ${parsed.connectionId} and household_id = ${parsed.householdId}
+          and adult_id = ${parsed.adultId}
+      `;
+      return true;
+    });
   }
 
   public async persistSourceItem(rawInput: z.input<typeof sourceItemSchema>): Promise<{
@@ -2532,6 +2579,7 @@ function projectionForExport(
       projection: {
         ...projection,
         gmailTriage: projection.gmailTriage.filter((record) => record.ownerAdultId === viewerAdultId),
+        gmailSources: projection.gmailSources.filter((record) => record.ownerAdultId === viewerAdultId),
         calendarTriage: projection.calendarTriage.filter((record) => record.ownerAdultId === viewerAdultId),
         calendarSources: projection.calendarSources.filter((record) => record.ownerAdultId === viewerAdultId),
         pendingPromotions: projection.pendingPromotions.filter(

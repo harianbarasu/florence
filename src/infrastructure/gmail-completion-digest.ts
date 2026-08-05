@@ -66,7 +66,7 @@ function completionBody(depth: "recent_90_days" | "one_year" | "full_history", m
     messageCount === GMAIL_DISCOVERY_MESSAGE_COUNT_MAX
       ? `at least ${formatInteger(messageCount)}`
       : formatInteger(messageCount);
-  return `Private Gmail discovery is complete for ${range}: ${count} messages were stored. This status contains no email content and is private to you.`;
+  return `Private Gmail discovery is complete for ${range}: ${count} messages were imported and privately reviewed. This status contains no email content and is private to you.`;
 }
 
 function formatInteger(value: number): string {

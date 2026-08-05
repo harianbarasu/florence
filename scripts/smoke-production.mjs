@@ -1,6 +1,7 @@
 import process from "node:process";
 
-const rawBaseUrl = process.argv[2] ?? process.env.FLORENCE_SMOKE_BASE_URL;
+const positionalArguments = process.argv.slice(2).filter((argument) => argument !== "--");
+const rawBaseUrl = positionalArguments[0] ?? process.env.FLORENCE_SMOKE_BASE_URL;
 if (!rawBaseUrl) {
   process.stderr.write("Usage: pnpm smoke:production -- https://your-florence-host\n");
   process.exitCode = 2;

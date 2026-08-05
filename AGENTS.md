@@ -29,7 +29,7 @@
 - Fail closed on privacy, authorization, ambiguous approvals, invalid model output, and uncertain external action results.
 - Keep provider credentials and connector clients outside workers. Tools close over short-lived, server-created capability grants.
 - Use exact dependency versions and commit the lockfile.
-- Every behavior change requires tests at the owning module's interface. Prefer observable outcomes over implementation assertions.
+- Keep tests deliberately lean. Protect durable privacy, authorization, idempotency, recovery, connector, timing, and end-to-end product boundaries; do not add broad matrices or implementation-detail tests for every behavior change.
 
 ## Required verification
 

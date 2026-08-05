@@ -518,7 +518,7 @@ describe("GoogleSyncService", () => {
     expect(harness.getInputs).toHaveLength(0);
   });
 
-  it("triages only a recent message.added while persisting later label-only revisions", async () => {
+  it("reconciles both a recent addition and its later label-only revision", async () => {
     let page = 0;
     let fetchedVersion = 0;
     const harness = createHarness({
@@ -585,16 +585,17 @@ describe("GoogleSyncService", () => {
 
     expect(harness.applicationItems).toMatchObject([
       { ownerAdultId: ADULT_ID, revision: 2, idempotencyKey: expect.stringContaining("revision:2") },
+      { ownerAdultId: ADULT_ID, revision: 3, idempotencyKey: expect.stringContaining("revision:3") },
     ]);
     const stored = harness.store.sources.get("message-1");
-    expect(stored).toMatchObject({ adultId: ADULT_ID, kind: "gmail_message", revision: 2 });
+    expect(stored).toMatchObject({ adultId: ADULT_ID, kind: "gmail_message", revision: 3 });
     expect(stored?.encryptedContent).not.toContain("Pickup");
     expect(
       harness.secretBox.open(
         stored?.encryptedContent ?? "",
         gmailSourceContentAad(harness.store.connection, "message-1"),
       ),
-    ).toContain("Pickup is at 4:00");
+    ).toContain("Pickup is at 6:00");
     expect((harness.store.connection.cursor.gmail as GmailSyncState).history).toEqual({
       cursorId: "102",
       startId: null,
@@ -602,12 +603,12 @@ describe("GoogleSyncService", () => {
       targetId: null,
     });
     await expect(harness.service.execute(historyNotice("102"))).resolves.toMatchObject({ status: "noop" });
-    expect(harness.applicationItems).toHaveLength(1);
+    expect(harness.applicationItems).toHaveLength(2);
     expect(stored?.metadata).toMatchObject({ schemaVersion: 2, contentCompleteness: "full" });
-    expect(harness.getInputs.map((input) => input.format)).toEqual(["metadata", "full", "metadata"]);
+    expect(harness.getInputs.map((input) => input.format)).toEqual(["metadata", "full", "metadata", "full"]);
   });
 
-  it("stores historical scans as stripped metadata envelopes without attachment or application work", async () => {
+  it("full-fetches historical scans into private application ingestion", async () => {
     const embeddedData = Buffer.from("historical-private-bytes").toString("base64url");
     const harness = createHarness({
       async list() {
@@ -621,6 +622,16 @@ describe("GoogleSyncService", () => {
         return message(1, messageId, {
           attachments: [attachment(1, { embeddedDataBase64Url: embeddedData, providerAttachmentId: null })],
         });
+      },
+      async retrieve({ attachment: descriptor }) {
+        const bytes = Uint8Array.from(Buffer.from(descriptor.embeddedDataBase64Url ?? "", "base64url"));
+        return {
+          kind: "file",
+          mediaType: descriptor.mimeType,
+          filename: descriptor.filename,
+          sizeBytes: bytes.byteLength,
+          bytes,
+        };
       },
     });
     harness.store.connection.cursor = {
@@ -640,22 +651,32 @@ describe("GoogleSyncService", () => {
       }),
     ).resolves.toMatchObject({ processedMessages: 1, phase: "live" });
 
-    expect(harness.getInputs.map((input) => input.format)).toEqual(["metadata"]);
-    expect(harness.retrieveInputs).toHaveLength(0);
-    expect(harness.applicationItems).toHaveLength(0);
+    expect(harness.getInputs.map((input) => input.format)).toEqual(["metadata", "full"]);
+    expect(harness.retrieveInputs).toHaveLength(1);
+    expect(harness.applicationItems).toMatchObject([
+      { ownerAdultId: ADULT_ID, messageRef: `gmail:${CONNECTION_ID}:historical-with-attachment` },
+    ]);
     const stored = harness.store.sources.get("historical-with-attachment");
-    expect(stored?.metadata).toMatchObject({ schemaVersion: 2, contentCompleteness: "metadata" });
+    expect(stored?.metadata).toMatchObject({ schemaVersion: 2, contentCompleteness: "full" });
     expect(JSON.stringify(stored?.metadata)).not.toContain(embeddedData);
     const cleartext = harness.secretBox.open(
       stored?.encryptedContent ?? "",
       gmailSourceContentAad(harness.store.connection, "historical-with-attachment"),
     );
-    expect(cleartext).not.toContain(embeddedData);
-    expect(gmailStoredSourceEnvelopeSchema.parse(JSON.parse(cleartext))).toMatchObject({
+    const envelope = gmailStoredSourceEnvelopeSchema.parse(JSON.parse(cleartext));
+    expect(envelope).toMatchObject({
       schemaVersion: 2,
-      contentCompleteness: "metadata",
+      contentCompleteness: "full",
       message: { attachments: [{ embeddedDataBase64Url: null }] },
     });
+    if (envelope.contentCompleteness !== "full") throw new Error("Expected a full Gmail envelope");
+    const historicalAttachment = envelope.attachmentContents[0];
+    if (!historicalAttachment || historicalAttachment.kind === "unavailable") {
+      throw new Error("Expected retrieved historical attachment content");
+    }
+    expect(Buffer.from(historicalAttachment.dataBase64, "base64").toString()).toBe(
+      "historical-private-bytes",
+    );
   });
 
   it("hydrates recent additions in descriptor order and persists attachment bytes only in the full envelope", async () => {
@@ -938,7 +959,7 @@ describe("GoogleSyncService", () => {
     });
   });
 
-  it("persists old, label-only, unknown-date, far-future, and deleted history without live triage", async () => {
+  it("triages only recent revisions while retaining old metadata and reconciling deletion", async () => {
     const internalDates = new Map<string, string | null>([
       ["recent", "2027-01-01T07:00:00.000Z"],
       ["future-tolerated", "2027-01-01T08:04:00.000Z"],
@@ -969,6 +990,16 @@ describe("GoogleSyncService", () => {
           attachments: messageId === "recent" || messageId === "future-tolerated" ? [] : [attachment(1)],
         });
       },
+      async retrieve({ attachment: descriptor }) {
+        const bytes = new TextEncoder().encode("test");
+        return {
+          kind: "file",
+          mediaType: descriptor.mimeType,
+          filename: descriptor.filename,
+          sizeBytes: bytes.byteLength,
+          bytes,
+        };
+      },
     });
 
     await expect(harness.service.execute(historyNotice("107"))).resolves.toMatchObject({
@@ -979,9 +1010,11 @@ describe("GoogleSyncService", () => {
     expect(harness.applicationItems.map((item) => (item as { messageRef: string }).messageRef)).toEqual([
       `gmail:${CONNECTION_ID}:recent`,
       `gmail:${CONNECTION_ID}:future-tolerated`,
+      `gmail:${CONNECTION_ID}:label-only`,
+      `gmail:${CONNECTION_ID}:deleted`,
     ]);
     expect(harness.store.sources.size).toBe(7);
-    expect(harness.retrieveInputs).toHaveLength(0);
+    expect(harness.retrieveInputs).toHaveLength(1);
     expect(harness.getInputs.map((input) => `${input.messageId}:${input.format}`)).toEqual([
       "recent:metadata",
       "recent:full",
@@ -991,6 +1024,7 @@ describe("GoogleSyncService", () => {
       "future-rejected:metadata",
       "unknown:metadata",
       "label-only:metadata",
+      "label-only:full",
     ]);
   });
 
@@ -1026,25 +1060,92 @@ describe("GoogleSyncService", () => {
     });
   });
 
-  it("rebases an expired history cursor with exactly one capped 24-hour recovery page", async () => {
+  it("paginates an expired-history gap without advancing the cursor past failed private ingestion", async () => {
     const harness = createHarness({
       async history() {
         throw new GoogleSyncTokenExpiredError("gmail");
       },
+      async list({ pageToken }) {
+        return pageToken
+          ? {
+              messages: [{ messageId: "recovery-page-2", threadId: "thread-page-2" }],
+              nextPageToken: null,
+              resultSizeEstimate: 1,
+            }
+          : {
+              messages: [{ messageId: "recovery-page-1", threadId: "thread-page-1" }],
+              nextPageToken: "recovery-page-token-2",
+              resultSizeEstimate: 2,
+            };
+      },
+      async get({ messageId }) {
+        return message(1, messageId, { internalDate: "2026-12-30T07:00:00.000Z" });
+      },
     });
+    harness.store.connection.cursor = {
+      gmail: syncState({ lastSuccessfulSyncAt: "2026-12-29T08:00:00.000Z" }),
+    };
 
     await expect(harness.service.execute(historyNotice("150"))).resolves.toMatchObject({
-      status: "processed",
+      status: "continuation_required",
       phase: "live",
+      processedMessages: 1,
     });
-    const oneDayAgo = Math.floor((NOW.getTime() - 24 * 60 * 60 * 1_000) / 1_000);
-    expect(harness.queries).toEqual([`after:${oneDayAgo}`]);
+    expect((harness.store.connection.cursor.gmail as GmailSyncState).history).toEqual({
+      cursorId: null,
+      startId: "150",
+      pageToken: "recovery-page-token-2",
+      targetId: "150",
+    });
+
+    harness.applicationControl.fail = true;
+    await expect(
+      harness.service.execute({
+        kind: "continue",
+        householdId: HOUSEHOLD_ID,
+        adultId: ADULT_ID,
+        connectionId: CONNECTION_ID,
+      }),
+    ).rejects.toMatchObject({ code: "invalid_state" } satisfies Partial<GoogleSyncError>);
+    expect((harness.store.connection.cursor.gmail as GmailSyncState).history).toEqual({
+      cursorId: null,
+      startId: "150",
+      pageToken: "recovery-page-token-2",
+      targetId: "150",
+    });
+
+    harness.applicationControl.fail = false;
+    await expect(
+      harness.service.execute({
+        kind: "continue",
+        householdId: HOUSEHOLD_ID,
+        adultId: ADULT_ID,
+        connectionId: CONNECTION_ID,
+      }),
+    ).resolves.toMatchObject({ status: "processed", processedMessages: 1 });
+
+    const recoveryAfter = Date.parse("2026-12-29T08:00:00.000Z") / 1_000;
+    expect(harness.queries).toEqual(Array(3).fill(`after:${recoveryAfter}`));
     expect(harness.listInputs).toMatchObject([
-      { maxResults: 20, includeSpamTrash: false, query: `after:${oneDayAgo}` },
+      { maxResults: 20, includeSpamTrash: false, query: `after:${recoveryAfter}` },
+      { maxResults: 20, pageToken: "recovery-page-token-2" },
+      { maxResults: 20, pageToken: "recovery-page-token-2" },
     ]);
-    expect((harness.store.connection.cursor.gmail as GmailSyncState).history.cursorId).toBe("150");
-    expect(harness.applicationItems).toHaveLength(0);
-    expect(harness.getInputs).toHaveLength(0);
+    expect((harness.store.connection.cursor.gmail as GmailSyncState).history).toEqual({
+      cursorId: "150",
+      startId: null,
+      pageToken: null,
+      targetId: null,
+    });
+    expect(harness.applicationItems).toHaveLength(3);
+    expect(harness.getInputs.map((input) => input.format)).toEqual([
+      "metadata",
+      "full",
+      "metadata",
+      "full",
+      "metadata",
+      "full",
+    ]);
     expect(harness.completionPublishes).toHaveLength(0);
   });
 
@@ -1056,7 +1157,7 @@ describe("GoogleSyncService", () => {
       async list() {
         return {
           messages: [{ messageId: "recovered", threadId: "thread-recovered" }],
-          nextPageToken: "ignored-page",
+          nextPageToken: null,
           resultSizeEstimate: 40,
         };
       },
@@ -1130,9 +1231,16 @@ describe("GoogleSyncService", () => {
       `after:${oneYearAgo} before:${ninetyDaysAgo}`,
       `before:${oneYearAgo}`,
     ]);
-    expect(harness.applicationItems).toHaveLength(0);
+    expect(harness.applicationItems).toHaveLength(3);
     expect(harness.store.sources.size).toBe(3);
-    expect(harness.getInputs.map((input) => input.format)).toEqual(["metadata", "metadata", "metadata"]);
+    expect(harness.getInputs.map((input) => input.format)).toEqual([
+      "metadata",
+      "full",
+      "metadata",
+      "full",
+      "metadata",
+      "full",
+    ]);
     expect(harness.retrieveInputs).toHaveLength(0);
     expect(harness.completionPublishes).toHaveLength(1);
     expect(harness.completionPublishes[0]?.state.discovery).toEqual({
@@ -1198,7 +1306,7 @@ describe("GoogleSyncService", () => {
         status: "published",
       },
     });
-    expect(harness.applicationItems).toHaveLength(0);
+    expect(harness.applicationItems).toHaveLength(1);
     expect(harness.completionPublishes).toHaveLength(2);
   });
 

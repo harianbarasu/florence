@@ -194,16 +194,20 @@ export const GmailAttachmentContentSchema = z.discriminatedUnion("kind", [
 
 export type GmailAttachmentContent = z.infer<typeof GmailAttachmentContentSchema>;
 
+const GmailSourceIdentityShape = {
+  householdId: HouseholdIdSchema,
+  idempotencyKey: IdempotencyKeySchema,
+  occurredAt: InstantStringSchema,
+  ownerAdultId: AdultIdSchema,
+  accountRef: StableReferenceSchema,
+  messageRef: StableReferenceSchema,
+  revision: z.number().int().positive(),
+} as const;
+
 export const GmailInboxItemSchema = z
   .strictObject({
     kind: z.literal("gmail_message"),
-    householdId: HouseholdIdSchema,
-    idempotencyKey: IdempotencyKeySchema,
-    occurredAt: InstantStringSchema,
-    ownerAdultId: AdultIdSchema,
-    accountRef: StableReferenceSchema,
-    messageRef: StableReferenceSchema,
-    revision: z.number().int().positive(),
+    ...GmailSourceIdentityShape,
     labels: z.array(z.string().trim().min(1).max(100)).max(100),
     sender: z.string().trim().max(1_000).optional(),
     subject: z.string().max(2_000).optional(),
@@ -228,6 +232,13 @@ export const GmailInboxItemSchema = z
   });
 
 export type GmailInboxItem = z.infer<typeof GmailInboxItemSchema>;
+
+export const GmailMessageDeletedInboxItemSchema = z.strictObject({
+  kind: z.literal("gmail_message_deleted"),
+  ...GmailSourceIdentityShape,
+});
+
+export type GmailMessageDeletedInboxItem = z.infer<typeof GmailMessageDeletedInboxItemSchema>;
 
 const CalendarSourceIdentityShape = {
   householdId: HouseholdIdSchema,
@@ -273,6 +284,7 @@ export type CalendarEventDeletedInboxItem = z.infer<typeof CalendarEventDeletedI
 export const ProviderInboxItemSchema = z.discriminatedUnion("kind", [
   ConversationInboxItemSchema,
   GmailInboxItemSchema,
+  GmailMessageDeletedInboxItemSchema,
   CalendarEventInboxItemSchema,
   CalendarEventDeletedInboxItemSchema,
 ]);
@@ -359,11 +371,19 @@ const OnboardingClassificationSchema = z
       "invite_adult",
       "accept_invite",
       "register_group",
+      "set_name",
       "update_profile",
+      "remove_profile",
       "confirm_profile",
     ]),
     invitedAdultId: AdultIdSchema.optional(),
+    displayName: z.string().trim().min(1).max(100).optional(),
     profileFacts: z.array(SharedProfileFactCandidateSchema).min(1).max(30).optional(),
+    profileFactKeys: z
+      .array(z.string().regex(/^profile:[a-f0-9]{32}$/u))
+      .min(1)
+      .max(30)
+      .optional(),
   })
   .superRefine((classification, context) => {
     if ((classification.action === "invite_adult") !== (classification.invitedAdultId !== undefined)) {
@@ -373,11 +393,25 @@ const OnboardingClassificationSchema = z
         message: "Only an invite action identifies the invited adult",
       });
     }
+    if ((classification.action === "set_name") !== (classification.displayName !== undefined)) {
+      context.addIssue({
+        code: "custom",
+        path: ["displayName"],
+        message: "Only a naming action supplies an adult display name",
+      });
+    }
     if ((classification.action === "update_profile") !== (classification.profileFacts !== undefined)) {
       context.addIssue({
         code: "custom",
         path: ["profileFacts"],
         message: "Only a profile update supplies shared profile facts",
+      });
+    }
+    if ((classification.action === "remove_profile") !== (classification.profileFactKeys !== undefined)) {
+      context.addIssue({
+        code: "custom",
+        path: ["profileFactKeys"],
+        message: "Only a profile removal supplies exact shared profile fact keys",
       });
     }
   });
@@ -411,6 +445,25 @@ const MealPlanRequestClassificationSchema = z.strictObject({
   constraints: z.array(FactualTextSchema).max(20),
   scopeAssessment: HouseholdScopeAssessmentSchema,
 });
+
+const ProjectFollowUpClassificationSchema = z
+  .strictObject({
+    ...ClassificationBaseShape,
+    intent: z.literal("project_follow_up"),
+    episodeId: EpisodeIdSchema,
+    baseEpisodeVersion: z.number().int().positive(),
+    action: z.enum(["status", "continue", "cancel"]),
+    instruction: NeutralFactualTextSchema.optional(),
+  })
+  .superRefine((classification, context) => {
+    if ((classification.action === "continue") !== (classification.instruction !== undefined)) {
+      context.addIssue({
+        code: "custom",
+        path: ["instruction"],
+        message: "Only a project continuation supplies a follow-up instruction",
+      });
+    }
+  });
 
 const CalendarEventCreateRequestClassificationSchema = z
   .strictObject({
@@ -473,6 +526,7 @@ export const ConversationClassificationSchema = z.discriminatedUnion("intent", [
   }),
   ResearchRequestClassificationSchema,
   MealPlanRequestClassificationSchema,
+  ProjectFollowUpClassificationSchema,
   CalendarEventCreateRequestClassificationSchema,
   CalendarEventClarificationClassificationSchema,
   z.strictObject({
@@ -494,6 +548,12 @@ export const ConversationClassificationSchema = z.discriminatedUnion("intent", [
     ...ClassificationBaseShape,
     intent: z.literal("decline_promotion"),
     promotionId: StableReferenceSchema,
+  }),
+  z.strictObject({
+    ...ClassificationBaseShape,
+    intent: z.literal("memory_candidate_decision"),
+    candidateId: StableReferenceSchema,
+    decision: z.enum(["remember", "reject"]),
   }),
   z.strictObject({
     ...ClassificationBaseShape,
@@ -597,7 +657,9 @@ export const OnboardingProjectionSchema = z
       "awaiting_invitation",
       "awaiting_invitee_consent",
       "awaiting_group",
+      "naming_adults",
       "building_profile",
+      "connecting_sources",
       "active",
     ]),
     initiatorAdultId: AdultIdSchema,
@@ -605,30 +667,68 @@ export const OnboardingProjectionSchema = z
     consentedAdultIds: z.array(AdultIdSchema).max(2),
     privateDmAdultIds: z.array(AdultIdSchema).max(2),
     groupChannelId: StableReferenceSchema.optional(),
+    adultNames: z
+      .array(
+        z.strictObject({
+          adultId: AdultIdSchema,
+          displayName: z.string().trim().min(1).max(100),
+        }),
+      )
+      .max(2),
     profileConfirmedAdultIds: z.array(AdultIdSchema).max(2),
+    googleConnectedAdultIds: z.array(AdultIdSchema).max(2),
   })
   .superRefine((projection, context) => {
     const unique = (values: readonly string[]) => new Set(values).size === values.length;
     if (
       !unique(projection.consentedAdultIds) ||
       !unique(projection.privateDmAdultIds) ||
-      !unique(projection.profileConfirmedAdultIds)
+      !unique(projection.profileConfirmedAdultIds) ||
+      !unique(projection.googleConnectedAdultIds) ||
+      !unique(projection.adultNames.map((adult) => adult.adultId))
     ) {
       context.addIssue({ code: "custom", message: "Onboarding adult lists must be unique" });
     }
     if (
-      ["awaiting_invitee_consent", "awaiting_group", "building_profile", "active"].includes(
-        projection.phase,
-      ) &&
+      [
+        "awaiting_invitee_consent",
+        "awaiting_group",
+        "naming_adults",
+        "building_profile",
+        "connecting_sources",
+        "active",
+      ].includes(projection.phase) &&
       projection.invitedAdultId === undefined
     ) {
       context.addIssue({ code: "custom", message: "This onboarding phase requires an invitee" });
     }
     if (
-      ["building_profile", "active"].includes(projection.phase) &&
+      ["naming_adults", "building_profile", "connecting_sources", "active"].includes(projection.phase) &&
       projection.groupChannelId === undefined
     ) {
       context.addIssue({ code: "custom", message: "This onboarding phase requires a group" });
+    }
+    const participants = new Set([
+      projection.initiatorAdultId,
+      ...(projection.invitedAdultId === undefined ? [] : [projection.invitedAdultId]),
+    ]);
+    if (projection.googleConnectedAdultIds.some((adultId) => !participants.has(adultId))) {
+      context.addIssue({ code: "custom", message: "Google connections must belong to onboarding adults" });
+    }
+    if (projection.adultNames.some((adult) => !participants.has(adult.adultId))) {
+      context.addIssue({ code: "custom", message: "Named adults must belong to the onboarding household" });
+    }
+    if (
+      ["building_profile", "connecting_sources", "active"].includes(projection.phase) &&
+      projection.adultNames.length !== 2
+    ) {
+      context.addIssue({ code: "custom", message: "This onboarding phase requires both adult names" });
+    }
+    if (projection.phase === "active" && projection.googleConnectedAdultIds.length !== 2) {
+      context.addIssue({
+        code: "custom",
+        message: "Active onboarding requires one Google account per adult",
+      });
     }
   });
 
@@ -682,6 +782,44 @@ export const GmailTriageRecordSchema = z.strictObject({
   confidence: ConfidenceSchema,
   recordedAt: InstantStringSchema,
 });
+
+export const GmailSourceRecordSchema = z
+  .strictObject({
+    sourceKey: StableReferenceSchema,
+    ownerAdultId: AdultIdSchema,
+    latestRevision: z.number().int().positive(),
+    status: z.enum(["active", "deleted"]),
+    contentDigest: Sha256DigestSchema.optional(),
+    pendingPromotionId: StableReferenceSchema.optional(),
+    episodeId: EpisodeIdSchema.optional(),
+    recordedAt: InstantStringSchema,
+  })
+  .superRefine((record, context) => {
+    if ((record.status === "active") !== (record.contentDigest !== undefined)) {
+      context.addIssue({
+        code: "custom",
+        path: ["contentDigest"],
+        message: "Only an active Gmail source retains its content digest",
+      });
+    }
+    if (
+      record.status === "deleted" &&
+      (record.pendingPromotionId !== undefined || record.episodeId !== undefined)
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "A deleted Gmail source cannot retain pending or active application work",
+      });
+    }
+    if (record.pendingPromotionId !== undefined && record.episodeId !== undefined) {
+      context.addIssue({
+        code: "custom",
+        message: "A Gmail source cannot be both pending promotion and promoted",
+      });
+    }
+  });
+
+export type GmailSourceRecord = z.infer<typeof GmailSourceRecordSchema>;
 
 export const CalendarTriageRecordSchema = z.strictObject({
   sourceKey: StableReferenceSchema,
@@ -754,13 +892,35 @@ export type PendingPromotion = z.infer<typeof PendingPromotionSchema>;
 export const WorkerPurposeSchema = z.enum(["family_research", "meal_plan"]);
 export type WorkerPurpose = z.infer<typeof WorkerPurposeSchema>;
 
+export const ProjectDeliveryGuardSchema = z.strictObject({
+  kind: z.literal("project_worker"),
+  episodeId: EpisodeIdSchema,
+  jobId: StableReferenceSchema,
+  generation: z.number().int().positive(),
+});
+
+export type ProjectDeliveryGuard = z.infer<typeof ProjectDeliveryGuardSchema>;
+
 export const WorkerRecordSchema = z.strictObject({
   purpose: WorkerPurposeSchema,
   episodeId: EpisodeIdSchema,
+  baseEpisodeVersion: z.number().int().positive(),
+  contextFingerprint: Sha256DigestSchema,
   job: RuntimeWorkerJobSchema,
-  status: z.enum(["queued", "reconciled", "rejected", "failed"]),
+  status: z.enum(["queued", "awaiting_input", "completed", "cancelled", "failed"]),
+  attemptNumber: z.number().int().positive(),
+  automaticRetryCount: z.number().int().nonnegative().max(3),
+  deliveryGeneration: z.number().int().positive(),
+  projectBrief: z.string().trim().min(1).max(20_000),
+  latestSummary: z.string().trim().min(1).max(4_000).optional(),
+  outstandingQuestions: z.array(z.string().trim().min(1).max(2_000)).max(50),
   createdAt: InstantStringSchema,
+  updatedAt: InstantStringSchema,
   resultRef: StableReferenceSchema.optional(),
+  lastErrorCode: z
+    .string()
+    .regex(/^[a-z][a-z0-9_.-]{0,99}$/u)
+    .optional(),
 });
 
 export type WorkerRecord = z.infer<typeof WorkerRecordSchema>;
@@ -770,12 +930,21 @@ export const ApplicationProjectionSchema = z
     onboarding: OnboardingProjectionSchema,
     sharedProfile: SharedHouseholdProfileSchema,
     gmailTriage: z.array(GmailTriageRecordSchema).max(100_000),
+    gmailSources: z.array(GmailSourceRecordSchema).max(100_000),
     calendarTriage: z.array(CalendarTriageRecordSchema).max(100_000),
     calendarSources: z.array(CalendarSourceRecordSchema).max(100_000),
     pendingPromotions: z.array(PendingPromotionSchema).max(10_000),
     workers: z.array(WorkerRecordSchema).max(10_000),
   })
   .superRefine((projection, context) => {
+    const gmailSourceKeys = projection.gmailSources.map((record) => record.sourceKey);
+    if (new Set(gmailSourceKeys).size !== gmailSourceKeys.length) {
+      context.addIssue({
+        code: "custom",
+        path: ["gmailSources"],
+        message: "Gmail source records must have unique source keys",
+      });
+    }
     const sourceKeys = projection.calendarSources.map((record) => record.sourceKey);
     if (new Set(sourceKeys).size !== sourceKeys.length) {
       context.addIssue({
@@ -802,22 +971,37 @@ const ApplicationOutboxBaseShape = {
   idempotencyKey: IdempotencyKeySchema,
 } as const;
 
-export const ConversationSendIntentSchema = z.strictObject({
-  ...ApplicationOutboxBaseShape,
-  kind: z.literal("conversation.send"),
-  targetScope: DurableScopeSchema,
-  messageClass: z.enum([
-    "onboarding",
-    "private_review",
-    "private_interrupt",
-    "promotion_request",
-    "clarifying_question",
-    "status",
-    "daily_brief",
-  ]),
-  responseContext: ConversationResponseContextSchema.optional(),
-  body: z.string().trim().min(1).max(4_000),
-});
+export const ConversationSendIntentSchema = z
+  .strictObject({
+    ...ApplicationOutboxBaseShape,
+    kind: z.literal("conversation.send"),
+    targetScope: DurableScopeSchema,
+    messageClass: z.enum([
+      "onboarding",
+      "private_review",
+      "private_interrupt",
+      "promotion_request",
+      "clarifying_question",
+      "status",
+      "daily_brief",
+    ]),
+    responseContext: ConversationResponseContextSchema.optional(),
+    deliveryGuard: ProjectDeliveryGuardSchema.optional(),
+    body: z.string().trim().min(1).max(4_000),
+  })
+  .superRefine((intent, context) => {
+    if (
+      intent.deliveryGuard !== undefined &&
+      (intent.responseContext?.kind !== "episode_follow_up" ||
+        intent.responseContext.episodeId !== intent.deliveryGuard.episodeId)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["deliveryGuard"],
+        message: "A project delivery guard must match an episode follow-up response context",
+      });
+    }
+  });
 
 export const WorkerRunIntentSchema = z.strictObject({
   ...ApplicationOutboxBaseShape,
@@ -859,6 +1043,7 @@ export const ApplicationAuditEntrySchema = z.strictObject({
   kind: z.enum([
     "conversation_classified",
     "gmail_triaged",
+    "gmail_reconciled",
     "calendar_triaged",
     "calendar_reconciled",
     "onboarding_transition",
@@ -895,11 +1080,34 @@ export const WorkerResultInputSchema = z.strictObject({
   result: RuntimeWorkerResultSchema,
 });
 
+export const WorkerFailureInputSchema = z.strictObject({
+  kind: z.literal("worker_failure"),
+  householdId: HouseholdIdSchema,
+  idempotencyKey: IdempotencyKeySchema,
+  receivedAt: InstantStringSchema,
+  jobId: StableReferenceSchema,
+  attemptId: StableReferenceSchema,
+  errorCode: z.string().regex(/^[a-z][a-z0-9_.-]{0,99}$/u),
+  retryable: z.boolean(),
+});
+
+export const GoogleConnectedInputSchema = z.strictObject({
+  kind: z.literal("google_connected"),
+  householdId: HouseholdIdSchema,
+  idempotencyKey: IdempotencyKeySchema,
+  occurredAt: InstantStringSchema,
+  adultId: AdultIdSchema,
+  connectionId: StableReferenceSchema,
+  gmailReady: z.boolean(),
+  calendarReady: z.boolean(),
+});
+
 export const WorkerRunInputSchema = z.strictObject({
   kind: z.literal("run_worker"),
   householdId: HouseholdIdSchema,
   idempotencyKey: IdempotencyKeySchema,
   jobId: StableReferenceSchema,
+  attemptId: StableReferenceSchema,
   requestedAt: InstantStringSchema,
 });
 
@@ -969,10 +1177,13 @@ export type PrivateControlInput = z.infer<typeof PrivateControlInputSchema>;
 export const ApplicationInputSchema = z.discriminatedUnion("kind", [
   ConversationInboxItemSchema,
   GmailInboxItemSchema,
+  GmailMessageDeletedInboxItemSchema,
   CalendarEventInboxItemSchema,
   CalendarEventDeletedInboxItemSchema,
   TimerFiredInputSchema,
   WorkerResultInputSchema,
+  WorkerFailureInputSchema,
+  GoogleConnectedInputSchema,
   WorkerRunInputSchema,
   DailyBriefInputSchema,
   EffectReceiptInputSchema,

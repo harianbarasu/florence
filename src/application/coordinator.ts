@@ -10,6 +10,7 @@ import {
   type DomainChange,
   WorkerJobIdSchema as DomainWorkerJobIdSchema,
   type DurableScope,
+  EpisodeIdSchema,
   EpisodeProposalSchema,
   EvidenceRefSchema,
   ExternalActionIdSchema,
@@ -27,7 +28,13 @@ import {
   RoutineAnchorSchema,
   WorkerProposalSchema,
 } from "../domain/index.js";
-import { type WorkerJob, WorkerJobSchema, type WorkerResult, WorkerResultSchema } from "../runtime/index.js";
+import {
+  asWorkerRuntimeError,
+  type WorkerJob,
+  WorkerJobSchema,
+  type WorkerResult,
+  WorkerResultSchema,
+} from "../runtime/index.js";
 import {
   type ApplicationAuditEntry,
   ApplicationAuditEntrySchema,
@@ -49,11 +56,13 @@ import {
   type ConversationResponseContext,
   EffectExecutionReceiptSchema,
   type GmailInboxItem,
+  type GmailMessageDeletedInboxItem,
   GmailTriageResultSchema,
   type HouseholdApplicationSnapshot,
   HouseholdApplicationSnapshotSchema,
   OutboxExecutionResultSchema,
   type PendingPromotion,
+  type ProjectDeliveryGuard,
   SharedProfileFactSchema,
   type WorkerCommand,
   WorkerCommandSchema,
@@ -62,6 +71,7 @@ import {
   WorkerRoutesSchema,
 } from "./contracts.js";
 import type { ApplicationCommit, FlorenceApplication, FlorenceApplicationDependencies } from "./ports.js";
+import { workerContextFingerprint } from "./worker-context-fingerprint.js";
 
 export const DEFAULT_WORKER_ROUTES: WorkerRoutes = WorkerRoutesSchema.parse({
   family_research: {
@@ -249,6 +259,47 @@ function targetScope(item: ConversationInboxItem): DurableScope {
   };
 }
 
+function scopeCanSeeMemory(scope: DurableScope, memoryScope: DurableScope): boolean {
+  if (scope.kind === "household") return memoryScope.kind === "household";
+  return memoryScope.kind === "household" || memoryScope.adultId === scope.adultId;
+}
+
+function activeMemoryContext(aggregate: HouseholdAggregate, scope: DurableScope, asOf: string) {
+  return aggregate.memories.flatMap((memory) => {
+    if (
+      memory.status !== "active" ||
+      !scopeCanSeeMemory(scope, memory.scope) ||
+      (memory.expiresAt !== undefined && Date.parse(memory.expiresAt) <= Date.parse(asOf))
+    ) {
+      return [];
+    }
+    return [
+      {
+        memoryId: memory.memoryId,
+        kind: memory.kind,
+        statement: memory.statement,
+        scope: memory.scope.kind,
+        confirmedAt: memory.confirmedAt,
+      },
+    ];
+  });
+}
+
+function pendingMemoryContext(aggregate: HouseholdAggregate, scope: DurableScope) {
+  return aggregate.memoryCandidates.flatMap((candidate) =>
+    scopeCanSeeMemory(scope, candidate.scope)
+      ? [
+          {
+            candidateId: candidate.candidateId,
+            kind: candidate.kind,
+            statement: candidate.statement,
+            scope: candidate.scope.kind,
+          },
+        ]
+      : [],
+  );
+}
+
 function conversationEvidence(item: ConversationInboxItem) {
   return EvidenceRefSchema.parse({
     evidenceId: stableId("evidence", item.householdId, item.messageRef),
@@ -265,22 +316,34 @@ function conversationEvidence(item: ConversationInboxItem) {
   });
 }
 
-function gmailEvidence(item: GmailInboxItem) {
+function gmailSourceKey(item: GmailInboxItem | GmailMessageDeletedInboxItem): string {
+  return stableId("gmail_source", item.householdId, item.ownerAdultId, item.accountRef, item.messageRef);
+}
+
+function gmailEvidence(item: GmailInboxItem | GmailMessageDeletedInboxItem) {
+  const sourceRef = gmailSourceKey(item);
   return EvidenceRefSchema.parse({
-    evidenceId: stableId("evidence", item.householdId, item.ownerAdultId, item.messageRef),
+    evidenceId: stableId("evidence", sourceRef, String(item.revision)),
     source: "gmail",
-    sourceRef: item.messageRef,
+    sourceRef,
     scope: { kind: "personal", adultId: item.ownerAdultId },
     observedAt: item.occurredAt,
     revision: item.revision,
-    contentDigest: contentDigest(
-      item.sender ?? "",
-      item.subject ?? "",
-      item.snippet ?? "",
-      item.bodyText ?? "",
-      ...item.attachmentRefs,
-      ...item.attachmentContents.map((attachment) => attachment.contentDigest),
-    ),
+    ...(item.kind === "gmail_message_deleted"
+      ? {}
+      : {
+          contentDigest: contentDigest(
+            item.labels.some((label) => label === "SPAM" || label === "TRASH")
+              ? "excluded:spam_or_trash"
+              : "eligible",
+            item.sender ?? "",
+            item.subject ?? "",
+            item.snippet ?? "",
+            item.bodyText ?? "",
+            ...item.attachmentRefs,
+            ...item.attachmentContents.map((attachment) => attachment.contentDigest),
+          ),
+        }),
   });
 }
 
@@ -337,6 +400,7 @@ function queueMessage(
     | "daily_brief",
   body: string,
   responseContext?: ConversationResponseContext,
+  deliveryGuard?: ProjectDeliveryGuard,
 ): void {
   work.outbox.push(
     ApplicationOutboxIntentSchema.parse({
@@ -345,6 +409,7 @@ function queueMessage(
       targetScope: scope,
       messageClass,
       ...(responseContext === undefined ? {} : { responseContext }),
+      ...(deliveryGuard === undefined ? {} : { deliveryGuard }),
       body,
     }),
   );
@@ -416,15 +481,31 @@ function workerObjective(
   details: readonly string[],
 ): string {
   const label = purpose === "meal_plan" ? "Prepare the requested household meal plan" : "Research";
-  return [
+  const fixed = [
     `${label}: ${title}.`,
     `Completion contract: ${requiredOutcome}.`,
-    ...(details.length === 0 ? [] : [`Constraints: ${details.join("; ")}.`]),
     "Return only app-owned proposed commands. Do not send messages or perform external actions.",
   ].join(" ");
+  if (details.length === 0) return fixed;
+  const maximumLength = 20_000;
+  let objective = `${fixed} Context and constraints:`;
+  for (const detail of details) {
+    const addition = ` ${detail.trim()};`;
+    const remaining = maximumLength - objective.length;
+    if (remaining <= 1) break;
+    if (addition.length <= remaining) {
+      objective += addition;
+      continue;
+    }
+    objective += `${addition.slice(0, Math.max(0, remaining - 1))}…`;
+    break;
+  }
+  return objective;
 }
 
 function buildWorkerJob(input: {
+  jobId?: string;
+  attemptNumber?: number;
   purpose: WorkerPurpose;
   work: Work;
   episodeId: string;
@@ -437,16 +518,18 @@ function buildWorkerJob(input: {
   occurredAt: string;
 }): WorkerJob {
   const route = input.routes[input.purpose];
-  const jobId = stableId("job", input.work.input.idempotencyKey, input.purpose);
+  const jobId = input.jobId ?? stableId("job", input.work.input.idempotencyKey, input.purpose);
+  const attemptNumber = input.attemptNumber ?? 1;
+  const attemptId = `${jobId}.attempt.${attemptNumber}`;
   return WorkerJobSchema.parse({
     jobId,
-    attemptId: `${jobId}.attempt.1`,
+    attemptId,
     householdId: input.work.aggregate.householdId,
     baseHouseholdVersion: input.work.aggregate.version,
     policyVersion: input.work.aggregate.policyVersion,
     objective: workerObjective(input.purpose, input.title, input.requiredOutcome, input.details),
     scopeGrant: {
-      grantId: stableId("context_grant", jobId),
+      grantId: stableId("context_grant", jobId, attemptId),
       visibility: input.scope.kind,
       ...(input.scope.kind === "personal" ? { adultId: input.scope.adultId } : {}),
       purpose: input.purpose,
@@ -471,36 +554,39 @@ function enqueueWorker(
   work: Work,
   purpose: WorkerPurpose,
   episodeId: string,
-  evidenceId: string,
-  title: string,
-  requiredOutcome: string,
-  details: readonly string[],
-  scope: DurableScope,
-  routes: WorkerRoutes,
-  occurredAt: string,
+  job: WorkerJob,
+  createdAt: string,
 ): void {
-  const job = buildWorkerJob({
-    purpose,
-    work,
-    episodeId,
-    evidenceId,
-    title,
-    requiredOutcome,
-    details,
-    scope,
-    routes,
-    occurredAt,
-  });
+  const episode = work.aggregate.episodes.find((candidate) => candidate.episodeId === episodeId);
+  if (episode === undefined) {
+    throw new Error(`Cannot delegate missing family episode: ${episodeId}`);
+  }
   work.projection.workers.push({
     purpose,
-    episodeId: EpisodeProposalSchema.shape.episodeId.parse(episodeId),
+    episodeId: EpisodeIdSchema.parse(episodeId),
+    baseEpisodeVersion: episode.version,
+    contextFingerprint: workerContextFingerprint({
+      aggregate: work.aggregate,
+      projection: work.projection,
+      episodeId,
+      purpose,
+      scope: episode.scope,
+      evidenceRefs: job.evidenceRefs,
+      asOf: createdAt,
+    }),
     job,
     status: "queued",
-    createdAt: occurredAt,
+    attemptNumber: 1,
+    automaticRetryCount: 0,
+    deliveryGeneration: 1,
+    projectBrief: job.objective,
+    outstandingQuestions: [],
+    createdAt,
+    updatedAt: createdAt,
   });
   work.outbox.push(
     ApplicationOutboxIntentSchema.parse({
-      ...appOutboxBase(work.input, `run:${job.jobId}`),
+      ...appOutboxBase(work.input, `run:${job.attemptId}`),
       kind: "worker.run",
       job,
     }),
@@ -509,7 +595,12 @@ function enqueueWorker(
 
 function auditClassification(
   work: Work,
-  kind: "conversation_classified" | "gmail_triaged" | "calendar_triaged" | "calendar_reconciled",
+  kind:
+    | "conversation_classified"
+    | "gmail_triaged"
+    | "gmail_reconciled"
+    | "calendar_triaged"
+    | "calendar_reconciled",
   decision: string,
   sourceRef: string,
   adultId: string,
@@ -528,10 +619,12 @@ function auditClassification(
   );
 }
 
-function onboardingParticipants(projection: ApplicationProjection["onboarding"]): string[] {
+function onboardingParticipants(
+  projection: ApplicationProjection["onboarding"],
+): Array<ApplicationProjection["onboarding"]["initiatorAdultId"]> {
   return unique(
     [projection.initiatorAdultId, projection.invitedAdultId].filter(
-      (value): value is NonNullable<typeof value> => value !== undefined,
+      (value): value is ApplicationProjection["onboarding"]["initiatorAdultId"] => value !== undefined,
     ),
   );
 }
@@ -543,6 +636,27 @@ function personal(adultId: string): DurableScope {
 function invalidOnboarding(work: Work, item: ConversationInboxItem, body: string): boolean {
   queueMessage(work, "onboarding-invalid", targetScope(item), "onboarding", body);
   return false;
+}
+
+function onboardingRecoveryBody(onboarding: ApplicationProjection["onboarding"]): string {
+  switch (onboarding.phase) {
+    case "awaiting_initiator_consent":
+      return "I still need the initiating adult to reply “I consent” in their private DM. You can text STOP at any time.";
+    case "awaiting_invitation":
+      return "In the initiating adult’s private DM, reply “invite +1…” with the second adult’s full phone number, or “invite name@example.com” with their iMessage email.";
+    case "awaiting_invitee_consent":
+      return "The invited adult still needs to text Florence from the invited iMessage identity and reply exactly “I accept.” If that identity already uses Florence, they should instead send exactly “join my pending Florence household” in their existing private Florence DM.";
+    case "awaiting_group":
+      return "Create one iMessage group with both adults and Florence, then send “connect this family” in that group.";
+    case "naming_adults":
+      return "In the household group, each adult should send “I’m [name]” or “Call me [name].”";
+    case "building_profile":
+      return "In the household group, add any useful family coordination details. If there are none, reply “None”; otherwise review the summary and reply “I confirm the profile.” Both adults must confirm.";
+    case "connecting_sources":
+      return "To finish setup, each adult who has not connected yet should DM Florence “connect my Google account.” Google links and account details stay private to that adult.";
+    case "active":
+      return "Florence is ready.";
+  }
 }
 
 function applyOnboarding(
@@ -572,7 +686,7 @@ function applyOnboarding(
         "onboarding-consented",
         personal(item.senderAdultId),
         "onboarding",
-        "Consent recorded. Invite the second adult from this private conversation.",
+        "Consent recorded. From this private conversation, reply “invite +1…” with the second adult’s full phone number, or “invite name@example.com” with their iMessage email.",
       );
       break;
     }
@@ -597,7 +711,7 @@ function applyOnboarding(
         "onboarding-inviter",
         personal(item.senderAdultId),
         "onboarding",
-        "The invitation is ready. For inbound-first consent, ask the second adult to text Florence from their own iMessage number and explicitly accept. Florence will not contact them first.",
+        "The invitation is ready. Ask the second adult to text Florence from that invited iMessage identity and reply exactly “I accept.” If they already use Florence, ask them to send exactly “join my pending Florence household” in their existing private Florence DM. Florence will not contact them first.",
       );
       break;
     }
@@ -621,7 +735,7 @@ function applyOnboarding(
           `onboarding-group-${adultId}`,
           personal(adultId),
           "onboarding",
-          "Both adults have consented. Create one group with both adults and Florence.",
+          "Both adults have consented. Create one iMessage group with both adults and Florence, then send “connect this family” in that group.",
         );
       }
       break;
@@ -637,21 +751,58 @@ function applyOnboarding(
       }
       next = {
         ...onboarding,
-        phase: "building_profile",
+        phase: "naming_adults",
         groupChannelId: item.channel.channelId,
       };
       queueMessage(
         work,
-        "onboarding-profile",
+        "onboarding-names",
         { kind: "household" },
         "onboarding",
-        `The household group is connected. Let's make a light shared profile—not a meticulous tracker. In one or several messages, share only what helps coordination: children or other dependents and their schools or childcare, recurring activities, normal morning/pickup/bedtime anchors, and dietary constraints. “None” or “unknown” is fine. Florence currently uses ${work.aggregate.timeZone}. I’ll summarize what I record before both adults confirm it.`,
+        "The household group is connected. Before we build the family profile, each adult should send one message here saying “I’m [name]” or “Call me [name].” I’ll use those names to understand ownership without guessing.",
+      );
+      break;
+    }
+    case "set_name": {
+      if (
+        !["naming_adults", "building_profile", "connecting_sources", "active"].includes(onboarding.phase) ||
+        item.channel.scope !== "household" ||
+        item.channel.channelId !== onboarding.groupChannelId ||
+        !onboardingParticipants(onboarding).includes(item.senderAdultId) ||
+        classification.displayName === undefined
+      ) {
+        return invalidOnboarding(
+          work,
+          item,
+          "Each verified adult can set or correct only their own name in the household group.",
+        );
+      }
+      const adultNames = [
+        ...onboarding.adultNames.filter((adult) => adult.adultId !== item.senderAdultId),
+        { adultId: item.senderAdultId, displayName: classification.displayName },
+      ].sort((left, right) => left.adultId.localeCompare(right.adultId));
+      const allNamed = onboardingParticipants(onboarding).every((adultId) =>
+        adultNames.some((adult) => adult.adultId === adultId),
+      );
+      next = {
+        ...onboarding,
+        phase: onboarding.phase === "naming_adults" && allNamed ? "building_profile" : onboarding.phase,
+        adultNames,
+      };
+      queueMessage(
+        work,
+        allNamed ? "onboarding-profile" : "onboarding-name-recorded",
+        { kind: "household" },
+        "onboarding",
+        allNamed
+          ? `Thanks—I'll use ${adultNames.map((adult) => adult.displayName).join(" and ")} for ownership. Let's make a light shared profile—not a meticulous tracker. In one or several messages, share only what helps coordination: children or other dependents and their schools or childcare, recurring activities, normal morning/pickup/bedtime anchors, and dietary constraints. If you have nothing to add, reply “None”; I’ll count that as this adult’s empty-profile confirmation, and the other adult must confirm too. Florence currently uses ${work.aggregate.timeZone}. I’ll summarize any details I record before both adults confirm them.`
+          : `Thanks, ${classification.displayName}. I still need the other adult to share the name they want me to use.`,
       );
       break;
     }
     case "update_profile": {
       if (
-        !["building_profile", "active"].includes(onboarding.phase) ||
+        !["building_profile", "connecting_sources", "active"].includes(onboarding.phase) ||
         item.channel.scope !== "household" ||
         item.channel.channelId !== onboarding.groupChannelId ||
         !onboardingParticipants(onboarding).includes(item.senderAdultId) ||
@@ -687,18 +838,62 @@ function applyOnboarding(
       );
       break;
     }
-    case "confirm_profile": {
+    case "remove_profile": {
       if (
-        !["building_profile", "active"].includes(onboarding.phase) ||
+        !["building_profile", "connecting_sources", "active"].includes(onboarding.phase) ||
         item.channel.scope !== "household" ||
         item.channel.channelId !== onboarding.groupChannelId ||
         !onboardingParticipants(onboarding).includes(item.senderAdultId) ||
-        work.projection.sharedProfile.facts.length === 0
+        classification.profileFactKeys === undefined
       ) {
         return invalidOnboarding(
           work,
           item,
-          "Add at least one useful shared profile detail before confirming it.",
+          "Shared profile details can only be removed by a verified adult in the household group.",
+        );
+      }
+      const removal = removeSharedProfileFacts(work, item, classification.profileFactKeys);
+      if (removal === "unknown") {
+        queueMessage(
+          work,
+          `onboarding-profile-remove-unknown-${item.messageRef}`,
+          { kind: "household" },
+          "onboarding",
+          "I couldn’t match that request to the current shared profile, so I removed nothing.",
+        );
+        break;
+      }
+      if (removal === "blocked") {
+        queueMessage(
+          work,
+          `onboarding-profile-remove-blocked-${item.messageRef}`,
+          { kind: "household" },
+          "onboarding",
+          "That routine is still used by an open family reminder, so I left it in place. Update or close the affected commitment first.",
+        );
+        break;
+      }
+      next = { ...onboarding, profileConfirmedAdultIds: [] };
+      queueMessage(
+        work,
+        `onboarding-profile-removed-${item.messageRef}`,
+        { kind: "household" },
+        "onboarding",
+        "I removed that shared profile detail. Both adults can review the updated profile and confirm it again.",
+      );
+      break;
+    }
+    case "confirm_profile": {
+      if (
+        !["building_profile", "connecting_sources", "active"].includes(onboarding.phase) ||
+        item.channel.scope !== "household" ||
+        item.channel.channelId !== onboarding.groupChannelId ||
+        !onboardingParticipants(onboarding).includes(item.senderAdultId)
+      ) {
+        return invalidOnboarding(
+          work,
+          item,
+          "The shared profile can only be confirmed by a verified adult in the household group.",
         );
       }
       const confirmed = unique([...onboarding.profileConfirmedAdultIds, item.senderAdultId]);
@@ -744,9 +939,20 @@ function applyOnboarding(
           }
         }
       }
+      const sourcesReady = onboardingParticipants(onboarding).every((adultId) =>
+        onboarding.googleConnectedAdultIds.includes(adultId),
+      );
+      const ready = confirmed.length === 2 && sourcesReady;
       next = {
         ...onboarding,
-        phase: onboarding.phase === "active" || confirmed.length === 2 ? "active" : "building_profile",
+        phase:
+          onboarding.phase === "active" || ready
+            ? "active"
+            : confirmed.length === 2
+              ? "connecting_sources"
+              : onboarding.phase === "connecting_sources"
+                ? "connecting_sources"
+                : "building_profile",
         profileConfirmedAdultIds: confirmed,
       };
       queueMessage(
@@ -754,10 +960,24 @@ function applyOnboarding(
         `onboarding-confirm-${item.senderAdultId}`,
         { kind: "household" },
         "onboarding",
-        confirmed.length === 2
-          ? "Both adults confirmed the shared profile. Florence is ready."
-          : "One adult confirmed the shared profile. The other adult can review and confirm it.",
+        ready
+          ? "Both adults confirmed the shared profile and connected Google. Florence is ready."
+          : confirmed.length === 2
+            ? "Both adults confirmed the shared profile. To finish setup, each adult should DM Florence “connect my Google account.” The private link and each account’s mail and calendar review stay in that adult’s DM."
+            : "One adult confirmed the shared profile. The other adult can review it and reply “I confirm the profile,” or reply “None” if there are no details to add.",
       );
+      if (confirmed.length === 2 && !sourcesReady) {
+        for (const adultId of onboardingParticipants(onboarding)) {
+          if (onboarding.googleConnectedAdultIds.includes(adultId)) continue;
+          queueMessage(
+            work,
+            `onboarding-google-${adultId}`,
+            personal(adultId),
+            "onboarding",
+            "To finish Florence setup, reply in this private DM: “connect my Google account.” You can connect more accounts later. Mail and calendar content remain private unless you explicitly share minimum family meaning or approve a narrow rule.",
+          );
+        }
+      }
       break;
     }
   }
@@ -872,6 +1092,47 @@ function mergeSharedProfileFacts(
   return "changed";
 }
 
+function removeSharedProfileFacts(
+  work: Work,
+  item: ConversationInboxItem,
+  factKeys: readonly string[],
+): "changed" | "unknown" | "blocked" {
+  const requested = new Set(factKeys);
+  const removed = work.projection.sharedProfile.facts.filter((fact) => requested.has(fact.factKey));
+  if (removed.length !== requested.size) return "unknown";
+  const removedAnchorIds = new Set(
+    removed.flatMap((fact) => (fact.category === "routine_anchor" ? [fact.anchorId] : [])),
+  );
+  if (removedAnchorIds.size > 0) {
+    const anchors = work.aggregate.routineAnchors.filter((anchor) => !removedAnchorIds.has(anchor.anchorId));
+    const result = acceptDomain(
+      work,
+      "routine-anchors-removed",
+      item.occurredAt,
+      { kind: "adult", adultId: item.senderAdultId },
+      {
+        kind: "routine_anchors.replaced",
+        anchors,
+      } as Omit<HouseholdSignal, "householdId" | "signalId" | "sequence" | "occurredAt" | "actor">,
+    );
+    if (result.receipt.disposition !== "accepted") return "blocked";
+  }
+  work.projection.sharedProfile = ApplicationProjectionSchema.shape.sharedProfile.parse({
+    facts: work.projection.sharedProfile.facts.filter((fact) => !requested.has(fact.factKey)),
+  });
+  work.audit.push(
+    ApplicationAuditEntrySchema.parse({
+      kind: "onboarding_transition",
+      occurredAt: item.occurredAt,
+      decision: "shared_profile:removed",
+      sourceRef: item.messageRef,
+      adultId: item.senderAdultId,
+      containsPrivateData: false,
+    }),
+  );
+  return "changed";
+}
+
 function sharedProfileSummary(work: Work): string {
   const labels: Readonly<
     Record<ApplicationProjection["sharedProfile"]["facts"][number]["category"], string>
@@ -895,7 +1156,8 @@ function sharedProfileSummary(work: Work): string {
   return summary.length <= 3_000 ? summary : `${summary.slice(0, 2_997)}…`;
 }
 
-function briefBody(aggregate: HouseholdAggregate): string {
+function briefBody(work: Work, asOf: string): string {
+  const aggregate = work.aggregate;
   const terminal = new Set(["completed", "dismissed", "superseded", "failed"]);
   const episodes = aggregate.episodes
     .filter((episode) => episode.scope.kind === "household" && !terminal.has(episode.state))
@@ -904,19 +1166,91 @@ function briefBody(aggregate: HouseholdAggregate): string {
       const rightTime = right.temporalPlan?.referenceAt ?? "9999-12-31T23:59:59Z";
       return leftTime.localeCompare(rightTime) || left.title.localeCompare(right.title);
     })
-    .slice(0, 10);
-  if (episodes.length === 0) {
-    return "Daily brief: there are no open household commitments or requested projects.";
-  }
-  const lines = episodes.map((episode) => {
+    .slice(0, 30);
+  const now = Temporal.Instant.from(asOf);
+  const localNow = now.toZonedDateTimeISO(aggregate.timeZone);
+  const todayStart = localNow.startOfDay().toInstant();
+  const tomorrowStart = localNow.startOfDay().add({ days: 1 }).toInstant();
+  const weekEnd = localNow.startOfDay().add({ days: 8 }).toInstant();
+  const reference = (episode: (typeof episodes)[number]) =>
+    episode.temporalPlan?.deadlineAt ?? episode.temporalPlan?.eventAt;
+  const adultNames = new Map(
+    work.projection.onboarding.adultNames.map((adult) => [adult.adultId, adult.displayName] as const),
+  );
+  const line = (episode: (typeof episodes)[number]) => {
     const state =
       episode.state === "awaiting_acknowledgement"
-        ? "awaiting owner acknowledgement"
-        : episode.state.replaceAll("_", " ");
-    const timing = episode.temporalPlan?.deadlineAt ?? episode.temporalPlan?.eventAt;
-    return `• ${episode.title} — ${state}${timing === undefined ? "" : `; reference ${timing}`}`;
+        ? "needs an owner acknowledgment"
+        : episode.state === "blocked"
+          ? "blocked and needs a decision"
+          : episode.state.replaceAll("_", " ");
+    const timing = reference(episode);
+    const owner =
+      episode.owner.status === "unassigned"
+        ? ""
+        : `; owner: ${adultNames.get(episode.owner.adultId) ?? "assigned adult"}`;
+    if (timing === undefined) return `• ${episode.title} — ${state}${owner}`;
+    const local = Temporal.Instant.from(timing).toZonedDateTimeISO(aggregate.timeZone);
+    const minute = String(local.minute).padStart(2, "0");
+    return `• ${episode.title} — ${state}${owner}; ${local.month}/${local.day} at ${local.hour}:${minute}`;
+  };
+  const used = new Set<string>();
+  const select = (predicate: (episode: (typeof episodes)[number]) => boolean) =>
+    episodes
+      .filter((episode) => !used.has(episode.episodeId) && predicate(episode))
+      .map((episode) => {
+        used.add(episode.episodeId);
+        return line(episode);
+      });
+  const attention = select((episode) => {
+    const timing = reference(episode);
+    return (
+      ["awaiting_acknowledgement", "blocked"].includes(episode.state) ||
+      (timing !== undefined && Temporal.Instant.compare(Temporal.Instant.from(timing), now) < 0)
+    );
   });
-  return `Daily brief:\n${lines.join("\n")}`;
+  const today = select((episode) => {
+    const timing = reference(episode);
+    return (
+      timing !== undefined &&
+      Temporal.Instant.compare(Temporal.Instant.from(timing), todayStart) >= 0 &&
+      Temporal.Instant.compare(Temporal.Instant.from(timing), tomorrowStart) < 0
+    );
+  });
+  const upcoming = select((episode) => {
+    const timing = reference(episode);
+    return (
+      timing !== undefined &&
+      Temporal.Instant.compare(Temporal.Instant.from(timing), tomorrowStart) >= 0 &&
+      Temporal.Instant.compare(Temporal.Instant.from(timing), weekEnd) < 0
+    );
+  });
+  const projects = select((episode) => ["research", "meal_plan"].includes(episode.type));
+  const open = select(() => true).slice(0, 5);
+  const pendingApprovals = aggregate.pendingActions
+    .filter((action) => action.state === "awaiting_approval")
+    .slice(0, 5)
+    .map((pending) =>
+      pending.action.kind === "calendar_update"
+        ? `• Approve or decline “${pending.action.title}” before Florence writes it to the calendar.`
+        : `• Approve or decline: ${pending.action.summary}.`,
+    );
+  const sectionEntries: Array<[string, string[]]> = [
+    ["Needs attention", attention],
+    ["Today", today],
+    ["Next 7 days", upcoming],
+    ["Projects", projects],
+    ["Decisions", pendingApprovals],
+    ["Other open items", open],
+  ];
+  const sections = sectionEntries
+    .filter((section) => section[1].length > 0)
+    .map(([title, lines]) => `${title}:\n${lines.join("\n")}`);
+  const body =
+    sections.length === 0
+      ? "Daily brief: the shared family plan is clear today—no open commitments, projects, or decisions need attention."
+      : `Daily brief for ${localNow.month}/${localNow.day}:\n\n${sections.join("\n\n")}`;
+  return body.length <= 4_000 ? body : `${body.slice(0, 3_999)}…`;
 }
 
 function statusForDomain(result: AcceptanceResult): "processed" | "rejected" {
@@ -970,6 +1304,11 @@ function processProjectRequest(
     classification.scopeAssessment.decision === "narrow"
       ? classification.scopeAssessment.householdConsequence
       : classification.requiredOutcome;
+  const details =
+    classification.intent === "meal_plan_request"
+      ? [`Horizon: ${classification.horizon}`, ...classification.constraints]
+      : classification.constraints;
+  const jobId = stableId("job", work.input.idempotencyKey, purpose);
   const result = acceptDomain(
     work,
     `project:${purpose}`,
@@ -986,28 +1325,31 @@ function processProjectRequest(
         evidence: [evidence],
         sourceClass: purpose === "meal_plan" ? "household.meal_request" : "household.research_request",
         sensitivity: "ordinary",
+        delegation: {
+          jobId: DomainWorkerJobIdSchema.parse(jobId),
+          purpose,
+        },
       }),
     } as Omit<HouseholdSignal, "householdId" | "signalId" | "sequence" | "occurredAt" | "actor">,
   );
   if (result.receipt.disposition !== "accepted") {
     return "rejected";
   }
-  const details =
-    classification.intent === "meal_plan_request"
-      ? [`Horizon: ${classification.horizon}`, ...classification.constraints]
-      : classification.constraints;
-  enqueueWorker(
-    work,
+  const job = buildWorkerJob({
+    jobId,
     purpose,
+    work,
     episodeId,
-    evidence.evidenceId,
-    classification.title,
+    evidenceId: evidence.evidenceId,
+    title: classification.title,
     requiredOutcome,
     details,
     scope,
     routes,
-    item.occurredAt,
-  );
+    occurredAt: item.occurredAt,
+  });
+  enqueueWorker(work, purpose, episodeId, job, item.occurredAt);
+  const startedWorker = latestProjectWorker(work, episodeId);
   queueMessage(
     work,
     `project-started-${purpose}`,
@@ -1016,6 +1358,327 @@ function processProjectRequest(
     purpose === "meal_plan"
       ? "The requested meal-planning project is open. Florence will return a practical plan and grocery list."
       : "The requested household research project is open. Florence will return a sourced comparison.",
+    {
+      kind: "episode_follow_up",
+      episodeId,
+      episodeVersion:
+        work.aggregate.episodes.find((episode) => episode.episodeId === episodeId)?.version ?? 1,
+    },
+    startedWorker === undefined ? undefined : projectDeliveryGuard(startedWorker),
+  );
+  return "processed";
+}
+
+function latestProjectWorker(work: Work, episodeId: string) {
+  return work.projection.workers.find((worker) => worker.episodeId === episodeId);
+}
+
+function projectDeliveryGuard(worker: ApplicationProjection["workers"][number]): ProjectDeliveryGuard {
+  return {
+    kind: "project_worker",
+    episodeId: worker.episodeId,
+    jobId: worker.job.jobId,
+    generation: worker.deliveryGeneration,
+  };
+}
+
+function advanceProjectDeliveryGeneration(work: Work, episodeId: string): ProjectDeliveryGuard | undefined {
+  const workerIndex = work.projection.workers.findIndex((worker) => worker.episodeId === episodeId);
+  const worker = work.projection.workers[workerIndex];
+  if (worker === undefined) return undefined;
+  const updated = {
+    ...worker,
+    deliveryGeneration: worker.deliveryGeneration + 1,
+  };
+  work.projection.workers[workerIndex] = updated;
+  return projectDeliveryGuard(updated);
+}
+
+function replyBindsEpisode(
+  item: ConversationInboxItem,
+  kinds: readonly ("episode_follow_up" | "episode_ownership")[],
+  episodeId: string,
+  episodeVersion: number,
+): boolean {
+  const context = item.replyTo?.responseContext;
+  return (
+    context !== undefined &&
+    (context.kind === "episode_follow_up" || context.kind === "episode_ownership") &&
+    kinds.includes(context.kind) &&
+    context.episodeId === episodeId &&
+    context.episodeVersion === episodeVersion
+  );
+}
+
+function scopeMatchesConversation(
+  episode: HouseholdAggregate["episodes"][number],
+  item: ConversationInboxItem,
+) {
+  const scope = targetScope(item);
+  return (
+    episode.scope.kind === scope.kind &&
+    (episode.scope.kind === "household" ||
+      (scope.kind === "personal" && episode.scope.adultId === scope.adultId))
+  );
+}
+
+function processProjectFollowUp(
+  work: Work,
+  item: ConversationInboxItem,
+  classification: Extract<ConversationClassification, { intent: "project_follow_up" }>,
+  routes: WorkerRoutes,
+): "processed" | "rejected" {
+  const episode = work.aggregate.episodes.find(
+    (candidate) => candidate.episodeId === classification.episodeId,
+  );
+  const scope = targetScope(item);
+  const boundReply = replyBindsEpisode(
+    item,
+    ["episode_follow_up"],
+    classification.episodeId,
+    classification.baseEpisodeVersion,
+  );
+  const visibleOpenProjects = work.aggregate.episodes.filter(
+    (candidate) =>
+      ["research", "meal_plan"].includes(candidate.type) &&
+      !["completed", "dismissed", "superseded", "failed"].includes(candidate.state) &&
+      scopeMatchesConversation(candidate, item),
+  );
+  const soleOpenProject = visibleOpenProjects.length === 1 ? visibleOpenProjects[0] : undefined;
+  const unboundStatusProject =
+    classification.action === "status" &&
+    item.replyTo?.responseContext === undefined &&
+    soleOpenProject?.episodeId === classification.episodeId &&
+    soleOpenProject.version === classification.baseEpisodeVersion;
+  if (
+    episode === undefined ||
+    !["research", "meal_plan"].includes(episode.type) ||
+    episode.version !== classification.baseEpisodeVersion ||
+    episode.scope.kind !== scope.kind ||
+    (episode.scope.kind === "personal" &&
+      (scope.kind !== "personal" || episode.scope.adultId !== scope.adultId)) ||
+    (!boundReply && !unboundStatusProject)
+  ) {
+    const repliedContext = item.replyTo?.responseContext;
+    const repliedEpisode =
+      repliedContext?.kind === "episode_follow_up"
+        ? work.aggregate.episodes.find((candidate) => candidate.episodeId === repliedContext.episodeId)
+        : undefined;
+    const currentContext =
+      repliedEpisode === undefined ||
+      !["research", "meal_plan"].includes(repliedEpisode.type) ||
+      !scopeMatchesConversation(repliedEpisode, item)
+        ? undefined
+        : ({
+            kind: "episode_follow_up" as const,
+            episodeId: repliedEpisode.episodeId,
+            episodeVersion: repliedEpisode.version,
+          } as const);
+    const deliveryGuard =
+      currentContext === undefined
+        ? undefined
+        : advanceProjectDeliveryGeneration(work, currentContext.episodeId);
+    queueMessage(
+      work,
+      "project-follow-up-stale",
+      scope,
+      "status",
+      "That project reply no longer points to the current project version. Ask me for its status or send the updated instruction again.",
+      currentContext,
+      deliveryGuard,
+    );
+    return "rejected";
+  }
+
+  const latestWorker = latestProjectWorker(work, episode.episodeId);
+  if (classification.action === "status") {
+    const body =
+      latestWorker === undefined
+        ? "I can’t find a delegated run for that project yet. Reply here with what you want me to investigate next."
+        : latestWorker.status === "queued"
+          ? "The Project Lead is still working on this. I’ll return the result here when it is ready."
+          : latestWorker.status === "awaiting_input"
+            ? (latestWorker.latestSummary ??
+              `The Project Lead is waiting for: ${latestWorker.outstandingQuestions.join("; ")}`)
+            : latestWorker.status === "completed"
+              ? (latestWorker.latestSummary ?? "The latest Project Lead run completed.")
+              : latestWorker.status === "cancelled"
+                ? "That project is cancelled. Reply here with a new instruction if you want to reopen it."
+                : "The last Project Lead run did not complete safely. Reply here with a follow-up instruction and I’ll restart from the current family context.";
+    const deliveryGuard = advanceProjectDeliveryGeneration(work, episode.episodeId);
+    queueMessage(
+      work,
+      "project-follow-up-status",
+      episode.scope,
+      "status",
+      body,
+      {
+        kind: "episode_follow_up",
+        episodeId: episode.episodeId,
+        episodeVersion: episode.version,
+      },
+      deliveryGuard,
+    );
+    return "processed";
+  }
+
+  const evidence = conversationEvidence(item);
+  if (classification.action === "cancel") {
+    if (["completed", "dismissed", "superseded", "failed"].includes(episode.state)) {
+      const deliveryGuard = advanceProjectDeliveryGeneration(work, episode.episodeId);
+      queueMessage(
+        work,
+        "project-follow-up-already-closed",
+        episode.scope,
+        "status",
+        "That project is already closed. No further work will run unless you reply with a new instruction.",
+        {
+          kind: "episode_follow_up",
+          episodeId: episode.episodeId,
+          episodeVersion: episode.version,
+        },
+        deliveryGuard,
+      );
+      return "processed";
+    }
+    const result = acceptDomain(
+      work,
+      "project-cancelled",
+      item.occurredAt,
+      { kind: "adult", adultId: item.senderAdultId },
+      {
+        kind: "episode.closed",
+        episodeId: episode.episodeId,
+        baseEpisodeVersion: episode.version,
+        outcome: {
+          kind: "dismissed",
+          summary: "An adult cancelled the delegated family project.",
+          evidence: [evidence],
+          recordedAt: item.occurredAt,
+        },
+      } as Omit<HouseholdSignal, "householdId" | "signalId" | "sequence" | "occurredAt" | "actor">,
+    );
+    if (result.receipt.disposition === "accepted") {
+      if (latestWorker !== undefined) {
+        work.projection.workers[work.projection.workers.indexOf(latestWorker)] = {
+          ...latestWorker,
+          status: "cancelled",
+          updatedAt: item.occurredAt,
+        };
+      }
+      const cancelledEpisode = work.aggregate.episodes.find(
+        (candidate) => candidate.episodeId === episode.episodeId,
+      );
+      const deliveryGuard = advanceProjectDeliveryGeneration(work, episode.episodeId);
+      queueMessage(
+        work,
+        "project-follow-up-cancelled",
+        episode.scope,
+        "status",
+        "I stopped that project.",
+        {
+          kind: "episode_follow_up",
+          episodeId: episode.episodeId,
+          episodeVersion: cancelledEpisode?.version ?? episode.version,
+        },
+        deliveryGuard,
+      );
+    }
+    return statusForDomain(result);
+  }
+
+  if (classification.instruction === undefined) {
+    return "rejected";
+  }
+  const purpose: WorkerPurpose = episode.type === "meal_plan" ? "meal_plan" : "family_research";
+  if (latestWorker === undefined || episode.delegation === undefined) {
+    return "rejected";
+  }
+  const jobId = episode.delegation.jobId;
+  const delegated = acceptDomain(
+    work,
+    "project-follow-up",
+    item.occurredAt,
+    { kind: "adult", adultId: item.senderAdultId },
+    {
+      kind: "episode.project_delegated",
+      episodeId: episode.episodeId,
+      baseEpisodeVersion: episode.version,
+      delegation: { jobId: DomainWorkerJobIdSchema.parse(jobId), purpose },
+      instructionEvidence: evidence,
+    } as Omit<HouseholdSignal, "householdId" | "signalId" | "sequence" | "occurredAt" | "actor">,
+  );
+  if (delegated.receipt.disposition !== "accepted") {
+    return "rejected";
+  }
+  const updatedEpisode = work.aggregate.episodes.find(
+    (candidate) => candidate.episodeId === episode.episodeId,
+  );
+  if (updatedEpisode === undefined) {
+    throw new Error("Delegated project disappeared from the household aggregate");
+  }
+  const job = buildWorkerJob({
+    jobId,
+    attemptNumber: latestWorker.attemptNumber + 1,
+    purpose,
+    work,
+    episodeId: updatedEpisode.episodeId,
+    evidenceId: evidence.evidenceId,
+    title: updatedEpisode.title,
+    requiredOutcome: updatedEpisode.requiredOutcome,
+    details: [
+      `Project Lead follow-up: ${classification.instruction}`,
+      `Original project brief: ${latestWorker.projectBrief}`,
+      ...(latestWorker.latestSummary === undefined
+        ? []
+        : [`Previous Project Lead result: ${latestWorker.latestSummary}`]),
+      ...latestWorker.outstandingQuestions.map((question) => `Earlier open question: ${question}`),
+    ],
+    scope: updatedEpisode.scope,
+    routes,
+    occurredAt: item.occurredAt,
+  });
+  const workerIndex = work.projection.workers.indexOf(latestWorker);
+  const { lastErrorCode: _lastErrorCode, resultRef: _resultRef, ...worker } = latestWorker;
+  work.projection.workers[workerIndex] = {
+    ...worker,
+    baseEpisodeVersion: updatedEpisode.version,
+    contextFingerprint: workerContextFingerprint({
+      aggregate: work.aggregate,
+      projection: work.projection,
+      episodeId: updatedEpisode.episodeId,
+      purpose,
+      scope: updatedEpisode.scope,
+      evidenceRefs: job.evidenceRefs,
+      asOf: item.occurredAt,
+    }),
+    job,
+    status: "queued",
+    attemptNumber: latestWorker.attemptNumber + 1,
+    automaticRetryCount: 0,
+    deliveryGeneration: latestWorker.deliveryGeneration + 1,
+    outstandingQuestions: [],
+    updatedAt: item.occurredAt,
+  };
+  work.outbox.push(
+    ApplicationOutboxIntentSchema.parse({
+      ...appOutboxBase(work.input, `run:${job.attemptId}`),
+      kind: "worker.run",
+      job,
+    }),
+  );
+  queueMessage(
+    work,
+    "project-follow-up-started",
+    updatedEpisode.scope,
+    "status",
+    "I updated the Project Lead with that instruction. I’ll return the next result here.",
+    {
+      kind: "episode_follow_up",
+      episodeId: updatedEpisode.episodeId,
+      episodeVersion: updatedEpisode.version,
+    },
+    projectDeliveryGuard(work.projection.workers[workerIndex] as ApplicationProjection["workers"][number]),
   );
   return "processed";
 }
@@ -1222,6 +1885,34 @@ async function approveCalendarEvent(
   return statusForDomain(result);
 }
 
+function commitmentForBoundReply(
+  work: Work,
+  item: ConversationInboxItem,
+  episodeId: string,
+  episodeVersion: number,
+  kinds: readonly ("episode_follow_up" | "episode_ownership")[],
+): HouseholdAggregate["episodes"][number] | undefined {
+  const episode = work.aggregate.episodes.find((candidate) => candidate.episodeId === episodeId);
+  return episode !== undefined &&
+    episode.type === "commitment" &&
+    episode.version === episodeVersion &&
+    scopeMatchesConversation(episode, item) &&
+    replyBindsEpisode(item, kinds, episodeId, episodeVersion)
+    ? episode
+    : undefined;
+}
+
+function rejectUnboundCommitment(work: Work, item: ConversationInboxItem): "rejected" {
+  queueMessage(
+    work,
+    "commitment-reply-unbound",
+    targetScope(item),
+    "status",
+    "I couldn’t bind that reply to one current commitment, so I changed nothing. Reply directly to the relevant Florence commitment message.",
+  );
+  return "rejected";
+}
+
 async function processActiveConversation(
   work: Work,
   item: ConversationInboxItem,
@@ -1247,19 +1938,38 @@ async function processActiveConversation(
         >,
       );
       if (result.receipt.disposition === "accepted") {
+        const episode = work.aggregate.episodes.find(
+          (candidate) => candidate.episodeId === proposal.episodeId,
+        );
+        if (episode === undefined) {
+          throw new Error("Accepted commitment is missing from the household aggregate");
+        }
         queueMessage(
           work,
           "commitment-captured",
           targetScope(item),
           "status",
           classification.proposedOwnerAdultId === undefined
-            ? `Captured “${proposal.title}” as an open proposed commitment.`
-            : `Captured “${proposal.title}”. The proposed owner needs to acknowledge it explicitly.`,
+            ? `Captured “${proposal.title}” as an open proposed commitment. Use iMessage’s Reply on this Florence message for an update or completion.`
+            : `Captured “${proposal.title}”. The proposed owner should use iMessage’s Reply on this Florence message and say “I accept.”`,
+          {
+            kind:
+              classification.proposedOwnerAdultId === undefined ? "episode_follow_up" : "episode_ownership",
+            episodeId: episode.episodeId,
+            episodeVersion: episode.version,
+          },
         );
       }
       return statusForDomain(result);
     }
     case "acknowledge_owner": {
+      if (
+        commitmentForBoundReply(work, item, classification.episodeId, classification.baseEpisodeVersion, [
+          "episode_ownership",
+        ]) === undefined
+      ) {
+        return rejectUnboundCommitment(work, item);
+      }
       const result = acceptDomain(
         work,
         "owner-acknowledged",
@@ -1272,17 +1982,36 @@ async function processActiveConversation(
         } as Omit<HouseholdSignal, "householdId" | "signalId" | "sequence" | "occurredAt" | "actor">,
       );
       if (result.receipt.disposition === "accepted") {
+        const episode = work.aggregate.episodes.find(
+          (candidate) => candidate.episodeId === classification.episodeId,
+        );
+        if (episode === undefined) {
+          throw new Error("Acknowledged commitment is missing from the household aggregate");
+        }
         queueMessage(
           work,
           "owner-acknowledged-status",
           targetScope(item),
           "status",
           "The commitment owner is acknowledged.",
+          {
+            kind: "episode_follow_up",
+            episodeId: episode.episodeId,
+            episodeVersion: episode.version,
+          },
         );
       }
       return statusForDomain(result);
     }
     case "reassign_owner": {
+      if (
+        commitmentForBoundReply(work, item, classification.episodeId, classification.baseEpisodeVersion, [
+          "episode_follow_up",
+          "episode_ownership",
+        ]) === undefined
+      ) {
+        return rejectUnboundCommitment(work, item);
+      }
       const result = acceptDomain(
         work,
         "owner-reassigned",
@@ -1295,9 +2024,36 @@ async function processActiveConversation(
           proposedOwnerAdultId: classification.proposedOwnerAdultId,
         } as Omit<HouseholdSignal, "householdId" | "signalId" | "sequence" | "occurredAt" | "actor">,
       );
+      if (result.receipt.disposition === "accepted") {
+        const episode = work.aggregate.episodes.find(
+          (candidate) => candidate.episodeId === classification.episodeId,
+        );
+        if (episode === undefined) {
+          throw new Error("Reassigned commitment is missing from the household aggregate");
+        }
+        queueMessage(
+          work,
+          "owner-reassigned-status",
+          targetScope(item),
+          "status",
+          "The proposed owner was updated. They should use iMessage’s Reply on this Florence message and say “I accept.”",
+          {
+            kind: "episode_ownership",
+            episodeId: episode.episodeId,
+            episodeVersion: episode.version,
+          },
+        );
+      }
       return statusForDomain(result);
     }
     case "close_episode": {
+      if (
+        commitmentForBoundReply(work, item, classification.episodeId, classification.baseEpisodeVersion, [
+          "episode_follow_up",
+        ]) === undefined
+      ) {
+        return rejectUnboundCommitment(work, item);
+      }
       const evidence = conversationEvidence(item);
       const result = acceptDomain(
         work,
@@ -1332,6 +2088,8 @@ async function processActiveConversation(
     case "research_request":
     case "meal_plan_request":
       return processProjectRequest(work, item, classification, routes);
+    case "project_follow_up":
+      return processProjectFollowUp(work, item, classification, routes);
     case "calendar_event_create_request":
       return proposeCalendarEvent(work, item, classification, dependencies);
     case "calendar_event_clarification":
@@ -1339,7 +2097,7 @@ async function processActiveConversation(
     case "approve_calendar_event":
       return approveCalendarEvent(work, item, classification.actionId, dependencies);
     case "daily_brief_request":
-      queueMessage(work, "brief-request", targetScope(item), "daily_brief", briefBody(work.aggregate));
+      queueMessage(work, "brief-request", targetScope(item), "daily_brief", briefBody(work, item.occurredAt));
       return "processed";
     case "approve_promotion":
       return approvePromotion(
@@ -1350,9 +2108,74 @@ async function processActiveConversation(
       );
     case "decline_promotion":
       return declinePromotion(work, item, classification.promotionId);
+    case "memory_candidate_decision":
+      return decideMemoryCandidate(work, item, classification.candidateId, classification.decision);
     case "revoke_policy":
       return revokePolicy(work, item, classification.policyId, classification.expectedPolicyVersion);
   }
+}
+
+function decideMemoryCandidate(
+  work: Work,
+  item: ConversationInboxItem,
+  candidateId: string,
+  decision: "remember" | "reject",
+): "processed" | "rejected" {
+  const candidate = work.aggregate.memoryCandidates.find((current) => current.candidateId === candidateId);
+  const visible =
+    candidate !== undefined &&
+    ((candidate.scope.kind === "household" && item.channel.scope === "household") ||
+      (candidate.scope.kind === "personal" &&
+        item.channel.scope === "personal" &&
+        candidate.scope.adultId === item.senderAdultId));
+  if (!visible || candidate === undefined) {
+    queueMessage(
+      work,
+      "memory-candidate-stale",
+      targetScope(item),
+      "status",
+      "That learning suggestion is no longer pending, so I didn’t change what Florence remembers.",
+    );
+    return "rejected";
+  }
+
+  const signal =
+    decision === "remember"
+      ? ({
+          kind: "memory.confirmed",
+          memoryId: stableId("memory", candidate.candidateId),
+          candidateId: candidate.candidateId,
+          targetScope: candidate.scope,
+        } as Omit<
+          Extract<HouseholdSignal, { kind: "memory.confirmed" }>,
+          "householdId" | "signalId" | "sequence" | "occurredAt" | "actor"
+        >)
+      : ({
+          kind: "memory.candidate_rejected",
+          candidateId: candidate.candidateId,
+        } as Omit<
+          Extract<HouseholdSignal, { kind: "memory.candidate_rejected" }>,
+          "householdId" | "signalId" | "sequence" | "occurredAt" | "actor"
+        >);
+  const result = acceptDomain(
+    work,
+    `memory-candidate:${decision}`,
+    item.occurredAt,
+    { kind: "adult", adultId: item.senderAdultId },
+    signal,
+  );
+  queueMessage(
+    work,
+    `memory-candidate-${decision}-status`,
+    candidate.scope,
+    "status",
+    result.receipt.disposition !== "accepted"
+      ? "That learning suggestion changed before I could apply your answer, so I didn’t change what Florence remembers."
+      : decision === "remember"
+        ? "Got it. I’ll use that in future family work, and you can tell me to forget it at any time."
+        : "Understood. I won’t remember that suggestion.",
+  );
+  return statusForDomain(result);
 }
 
 function approvePromotion(
@@ -1431,6 +2254,14 @@ function approvePromotion(
     calendarSource.episodeId = pending.proposal.episodeId;
     calendarSource.recordedAt = item.occurredAt;
   }
+  const gmailSource = work.projection.gmailSources.find(
+    (candidate) => candidate.pendingPromotionId === pending.promotionId,
+  );
+  if (gmailSource !== undefined) {
+    delete gmailSource.pendingPromotionId;
+    gmailSource.episodeId = pending.proposal.episodeId;
+    gmailSource.recordedAt = item.occurredAt;
+  }
   let remembered = false;
   if (
     rememberForMatchingSource &&
@@ -1504,6 +2335,13 @@ function declinePromotion(
   if (calendarSource !== undefined) {
     delete calendarSource.pendingPromotionId;
     calendarSource.recordedAt = item.occurredAt;
+  }
+  const gmailSource = work.projection.gmailSources.find(
+    (candidate) => candidate.pendingPromotionId === promotionId,
+  );
+  if (gmailSource !== undefined) {
+    delete gmailSource.pendingPromotionId;
+    gmailSource.recordedAt = item.occurredAt;
   }
   queueMessage(
     work,
@@ -1602,7 +2440,13 @@ function minimumPromotion(
   triage: Extract<ReturnType<typeof GmailTriageResultSchema.parse>, { decision: "propose_family_episode" }>,
 ): PendingPromotion {
   const evidence = gmailEvidence(item);
-  const promotionId = stableId("promotion", item.householdId, item.ownerAdultId, item.messageRef);
+  const promotionId = stableId(
+    "promotion",
+    item.householdId,
+    item.ownerAdultId,
+    item.messageRef,
+    String(item.revision),
+  );
   const sourceMatcher = gmailSourceMatcher(item);
   const proposal = EpisodeProposalSchema.parse({
     episodeId: stableId("episode", promotionId),
@@ -1693,6 +2537,164 @@ function promoteByPolicy(
   return statusForDomain(result);
 }
 
+type GmailRevisionDisposition =
+  | { kind: "fresh"; sourceKey: string; index: number }
+  | { kind: "duplicate" | "metadata" | "episode_preserved" | "stale" | "conflict"; sourceKey: string };
+
+function auditGmailReconciliation(
+  work: Work,
+  item: GmailInboxItem | GmailMessageDeletedInboxItem,
+  sourceKey: string,
+  decision: string,
+): void {
+  auditClassification(
+    work,
+    "gmail_reconciled",
+    decision,
+    sourceKey,
+    item.ownerAdultId,
+    true,
+    item.occurredAt,
+  );
+}
+
+function reconcileGmailRevision(
+  work: Work,
+  item: GmailInboxItem | GmailMessageDeletedInboxItem,
+): GmailRevisionDisposition {
+  const sourceKey = gmailSourceKey(item);
+  const index = work.projection.gmailSources.findIndex(
+    (candidate) => candidate.sourceKey === sourceKey && candidate.ownerAdultId === item.ownerAdultId,
+  );
+  const prior = work.projection.gmailSources[index];
+  if (prior === undefined) {
+    return { kind: "fresh", sourceKey, index: work.projection.gmailSources.length };
+  }
+  if (item.revision < prior.latestRevision) {
+    auditGmailReconciliation(work, item, sourceKey, "stale_revision");
+    return { kind: "stale", sourceKey };
+  }
+  if (item.revision === prior.latestRevision) {
+    const digest = gmailEvidence(item).contentDigest;
+    const sameState =
+      (item.kind === "gmail_message_deleted" && prior.status === "deleted") ||
+      (item.kind === "gmail_message" && prior.status === "active" && prior.contentDigest === digest);
+    auditGmailReconciliation(work, item, sourceKey, sameState ? "duplicate_revision" : "revision_conflict");
+    return { kind: sameState ? "duplicate" : "conflict", sourceKey };
+  }
+
+  const currentDigest = gmailEvidence(item).contentDigest;
+  if (
+    item.kind === "gmail_message" &&
+    prior.status === "active" &&
+    currentDigest !== undefined &&
+    prior.contentDigest === currentDigest
+  ) {
+    prior.latestRevision = item.revision;
+    prior.recordedAt = item.occurredAt;
+    auditGmailReconciliation(work, item, sourceKey, "metadata_only_revision");
+    return { kind: "metadata", sourceKey };
+  }
+
+  if (prior.pendingPromotionId !== undefined) {
+    const pendingIndex = work.projection.pendingPromotions.findIndex(
+      (candidate) =>
+        candidate.promotionId === prior.pendingPromotionId && candidate.ownerAdultId === item.ownerAdultId,
+    );
+    if (pendingIndex >= 0) {
+      work.projection.pendingPromotions.splice(pendingIndex, 1);
+      queueMessage(
+        work,
+        "gmail-promotion-invalidated",
+        personal(item.ownerAdultId),
+        "status",
+        "That private email changed or was removed, so its earlier sharing proposal is no longer pending.",
+      );
+    }
+  }
+
+  if (prior.episodeId !== undefined) {
+    const episode = work.aggregate.episodes.find((candidate) => candidate.episodeId === prior.episodeId);
+    if (episode === undefined) {
+      throw new Error(`Gmail source references an unknown episode: ${prior.episodeId}`);
+    }
+    if (!["completed", "dismissed", "superseded", "failed"].includes(episode.state)) {
+      queueMessage(
+        work,
+        "gmail-shared-source-changed",
+        personal(item.ownerAdultId),
+        "private_review",
+        item.kind === "gmail_message_deleted"
+          ? `The private source email for “${episode.title}” was deleted. I kept the family item and its reminders active; update or close it in the household group if the obligation changed.`
+          : `The private source email for “${episode.title}” changed. I kept the existing family item and its reminders active; update or close it in the household group if the obligation changed.`,
+      );
+      if (item.kind === "gmail_message" && currentDigest !== undefined) {
+        prior.latestRevision = item.revision;
+        prior.contentDigest = currentDigest;
+        prior.recordedAt = item.occurredAt;
+        auditGmailReconciliation(work, item, sourceKey, "shared_episode_preserved");
+        return { kind: "episode_preserved", sourceKey };
+      }
+    }
+  }
+
+  return { kind: "fresh", sourceKey, index };
+}
+
+function saveGmailSource(
+  work: Work,
+  index: number,
+  record: ApplicationProjection["gmailSources"][number],
+): void {
+  if (index === work.projection.gmailSources.length) {
+    work.projection.gmailSources.push(record);
+    return;
+  }
+  work.projection.gmailSources[index] = record;
+}
+
+function gmailRevisionOutcome(disposition: GmailRevisionDisposition): {
+  status: "processed" | "rejected";
+  classification: string;
+} | null {
+  switch (disposition.kind) {
+    case "fresh":
+      return null;
+    case "duplicate":
+      return { status: "processed", classification: "gmail:duplicate_revision" };
+    case "metadata":
+      return { status: "processed", classification: "gmail:metadata_revision" };
+    case "episode_preserved":
+      return { status: "processed", classification: "gmail:shared_episode_preserved" };
+    case "stale":
+      return { status: "processed", classification: "gmail:stale_revision" };
+    case "conflict":
+      return { status: "rejected", classification: "gmail:revision_conflict" };
+  }
+}
+
+function processGmailDeleted(
+  work: Work,
+  item: GmailMessageDeletedInboxItem,
+): { status: "processed" | "rejected"; classification: string } {
+  if (!work.aggregate.verifiedAdultIds.includes(item.ownerAdultId)) {
+    return { status: "rejected", classification: "gmail_unknown_owner" };
+  }
+  const revision = reconcileGmailRevision(work, item);
+  if (revision.kind !== "fresh") {
+    return gmailRevisionOutcome(revision) as Exclude<ReturnType<typeof gmailRevisionOutcome>, null>;
+  }
+  saveGmailSource(work, revision.index, {
+    sourceKey: revision.sourceKey,
+    ownerAdultId: item.ownerAdultId,
+    latestRevision: item.revision,
+    status: "deleted",
+    recordedAt: item.occurredAt,
+  });
+  auditGmailReconciliation(work, item, revision.sourceKey, "deleted");
+  return { status: "processed", classification: "gmail:deleted" };
+}
+
 async function processGmail(
   work: Work,
   item: GmailInboxItem,
@@ -1701,6 +2703,22 @@ async function processGmail(
   if (!work.aggregate.verifiedAdultIds.includes(item.ownerAdultId)) {
     return { status: "rejected", classification: "gmail_unknown_owner" };
   }
+  const revision = reconcileGmailRevision(work, item);
+  if (revision.kind !== "fresh") {
+    return gmailRevisionOutcome(revision) as Exclude<ReturnType<typeof gmailRevisionOutcome>, null>;
+  }
+  const evidence = gmailEvidence(item);
+  if (evidence.contentDigest === undefined) {
+    throw new Error("An active Gmail source must carry a content digest");
+  }
+  saveGmailSource(work, revision.index, {
+    sourceKey: revision.sourceKey,
+    ownerAdultId: item.ownerAdultId,
+    latestRevision: item.revision,
+    status: "active",
+    contentDigest: evidence.contentDigest,
+    recordedAt: item.occurredAt,
+  });
   const sourceMatcher = gmailSourceMatcher(item);
   const rules = work.aggregate.policies.flatMap((policy) =>
     policy.status === "active" &&
@@ -1721,6 +2739,7 @@ async function processGmail(
   const triage = GmailTriageResultSchema.parse(
     await dependencies.interpreter.triageGmail(item, {
       confirmedRoutineAnchors: work.aggregate.routineAnchors,
+      activeMemories: activeMemoryContext(work.aggregate, personal(item.ownerAdultId), item.occurredAt),
       activeSharingRules: rules,
     }),
   );
@@ -1779,12 +2798,23 @@ async function processGmail(
         sourceMatcher,
       );
       if (policy !== undefined && pending.standingRuleEligible) {
+        const status = promoteByPolicy(work, item, pending, policy);
+        if (status === "processed") {
+          const source = work.projection.gmailSources[revision.index];
+          if (source === undefined) throw new Error("Gmail source disappeared during promotion");
+          source.episodeId = pending.proposal.episodeId;
+          source.recordedAt = item.occurredAt;
+        }
         return {
-          status: promoteByPolicy(work, item, pending, policy),
+          status,
           classification: "gmail:policy_promotion",
         };
       }
       work.projection.pendingPromotions.push(pending);
+      const source = work.projection.gmailSources[revision.index];
+      if (source === undefined) throw new Error("Gmail source disappeared during private review");
+      source.pendingPromotionId = pending.promotionId;
+      source.recordedAt = item.occurredAt;
       queueMessage(
         work,
         "gmail-promotion-request",
@@ -1804,11 +2834,12 @@ function calendarMinimumPromotion(
     ReturnType<typeof CalendarTriageResultSchema.parse>,
     { decision: "propose_family_episode" }
   >,
+  routineAnchors: HouseholdAggregate["routineAnchors"],
 ): PendingPromotion {
   const sourceKey = calendarSourceKey(item);
   const evidence = calendarEvidence(item);
   const promotionId = stableId("promotion", sourceKey, String(item.revision));
-  const temporalPlan = calendarTimingPlan(item, promotionId);
+  const temporalPlan = calendarTimingPlan(item, promotionId, routineAnchors);
   const sourceMatcher = calendarSourceMatcher(item);
   const proposal = EpisodeProposalSchema.parse({
     episodeId: stableId("episode", promotionId),
@@ -1840,18 +2871,154 @@ function calendarMinimumPromotion(
   };
 }
 
-const CALENDAR_USEFUL_LEAD_MINUTES = 7 * 24 * 60;
+const CALENDAR_USEFUL_LEAD_MINUTES = 8 * 24 * 60;
 const CALENDAR_FINAL_BUFFER_MINUTES = 30;
 const CALENDAR_MINIMUM_TIMER_DELAY_MINUTES = 5;
 
-function calendarTimingPlan(item: CalendarEventInboxItem, promotionId: string) {
+function calendarTimingPlan(
+  item: CalendarEventInboxItem,
+  promotionId: string,
+  routineAnchors: HouseholdAggregate["routineAnchors"],
+) {
   const eventAt = Temporal.Instant.from(item.startsAt);
   const observedAt = Temporal.Instant.from(item.occurredAt);
-  const earliestUsefulAt = eventAt.subtract({ minutes: CALENDAR_USEFUL_LEAD_MINUTES });
-  const lastResponsibleAt = eventAt.subtract({ minutes: CALENDAR_FINAL_BUFFER_MINUTES });
+  const eventZoned = eventAt.toZonedDateTimeISO(item.timeZone);
+  const eventDate = eventZoned.toPlainDate();
+
+  const morningAnchor = item.allDay
+    ? routineAnchors
+        .filter(
+          (anchor) =>
+            anchor.timeZone === item.timeZone &&
+            anchor.daysOfWeek.includes(eventDate.dayOfWeek) &&
+            anchor.localTime >= "05:00" &&
+            anchor.localTime <= "12:00",
+        )
+        .sort((left, right) => left.localTime.localeCompare(right.localTime))[0]
+    : undefined;
+  const deadlineMoment = item.allDay
+    ? morningAnchor === undefined
+      ? ({
+          kind: "local" as const,
+          date: eventDate.toString(),
+          time: "08:00",
+          timeZone: item.timeZone,
+          disambiguation: "compatible" as const,
+        } as const)
+      : ({
+          kind: "routine_anchor" as const,
+          anchorId: morningAnchor.anchorId,
+          date: eventDate.toString(),
+          offsetMinutes: 0,
+          disambiguation: "compatible" as const,
+        } as const)
+    : undefined;
+  const deadlineAt = item.allDay
+    ? Temporal.PlainDateTime.from(`${eventDate.toString()}T${morningAnchor?.localTime ?? "08:00"}`)
+        .toZonedDateTime(morningAnchor?.timeZone ?? item.timeZone, {
+          disambiguation: "compatible",
+        })
+        .toInstant()
+    : eventAt;
+  const earliestUsefulAt = deadlineAt.subtract({ minutes: CALENDAR_USEFUL_LEAD_MINUTES });
+  const lastResponsibleAt = deadlineAt.subtract({ minutes: CALENDAR_FINAL_BUFFER_MINUTES });
+  const earliestUsefulLocal = earliestUsefulAt.toZonedDateTimeISO(item.timeZone);
+  const lastResponsibleLocal = lastResponsibleAt.toZonedDateTimeISO(item.timeZone);
+  const earliestUsefulMoment =
+    item.allDay && morningAnchor !== undefined
+      ? {
+          kind: "routine_anchor" as const,
+          anchorId: morningAnchor.anchorId,
+          date: eventDate.toString(),
+          offsetMinutes: -CALENDAR_USEFUL_LEAD_MINUTES,
+          disambiguation: "compatible" as const,
+        }
+      : item.allDay
+        ? {
+            kind: "local" as const,
+            date: earliestUsefulLocal.toPlainDate().toString(),
+            time: `${String(earliestUsefulLocal.hour).padStart(2, "0")}:${String(
+              earliestUsefulLocal.minute,
+            ).padStart(2, "0")}`,
+            timeZone: item.timeZone,
+            disambiguation: "compatible" as const,
+          }
+        : { kind: "instant" as const, at: earliestUsefulAt.toString() };
+  const lastResponsibleMoment =
+    item.allDay && morningAnchor !== undefined
+      ? {
+          kind: "routine_anchor" as const,
+          anchorId: morningAnchor.anchorId,
+          date: eventDate.toString(),
+          offsetMinutes: -CALENDAR_FINAL_BUFFER_MINUTES,
+          disambiguation: "compatible" as const,
+        }
+      : item.allDay
+        ? {
+            kind: "local" as const,
+            date: lastResponsibleLocal.toPlainDate().toString(),
+            time: `${String(lastResponsibleLocal.hour).padStart(2, "0")}:${String(
+              lastResponsibleLocal.minute,
+            ).padStart(2, "0")}`,
+            timeZone: item.timeZone,
+            disambiguation: "compatible" as const,
+          }
+        : { kind: "instant" as const, at: lastResponsibleAt.toString() };
+
+  const previousDate = eventDate.subtract({ days: 1 });
+  const previousEvening = Temporal.PlainDateTime.from(`${previousDate.toString()}T18:00`)
+    .toZonedDateTime(item.timeZone, { disambiguation: "compatible" })
+    .toInstant();
+  const finalLeadMinutes = item.allDay ? 60 : eventZoned.hour < 9 ? 60 : 120;
+  const finalReminderAt = deadlineAt.subtract({ minutes: finalLeadMinutes });
+  const finalReminderLocal = finalReminderAt.toZonedDateTimeISO(item.timeZone);
+  const includeFinalReminder = item.allDay || finalReminderLocal.hour >= 6;
   const candidates = [
-    { key: "day_before", at: eventAt.subtract({ hours: 24 }) },
-    { key: "two_hours_before", at: eventAt.subtract({ hours: 2 }) },
+    ...(item.allDay || eventZoned.hour < 9
+      ? [
+          {
+            key: "previous_evening",
+            at: previousEvening,
+            moment: {
+              kind: "local" as const,
+              date: previousDate.toString(),
+              time: "18:00",
+              timeZone: item.timeZone,
+              disambiguation: "compatible" as const,
+            },
+          },
+        ]
+      : [
+          {
+            key: "day_before",
+            at: eventZoned.subtract({ days: 1 }).toInstant(),
+            moment: {
+              kind: "instant" as const,
+              at: eventZoned.subtract({ days: 1 }).toInstant().toString(),
+            },
+          },
+        ]),
+    ...(includeFinalReminder
+      ? [
+          {
+            key: item.allDay ? "before_family_day" : "final_preparation",
+            at: finalReminderAt,
+            moment:
+              item.allDay && morningAnchor !== undefined
+                ? {
+                    kind: "routine_anchor" as const,
+                    anchorId: morningAnchor.anchorId,
+                    date: eventDate.toString(),
+                    offsetMinutes: -finalLeadMinutes,
+                    disambiguation: "compatible" as const,
+                  }
+                : {
+                    kind: "instant" as const,
+                    at: finalReminderAt.toString(),
+                  },
+          },
+        ]
+      : []),
   ].filter(
     (candidate) =>
       Temporal.Instant.compare(candidate.at, observedAt) > 0 &&
@@ -1865,7 +3032,11 @@ function calendarTimingPlan(item: CalendarEventInboxItem, promotionId: string) {
       Temporal.Instant.compare(catchUpAt, earliestUsefulAt) >= 0 &&
       Temporal.Instant.compare(catchUpAt, lastResponsibleAt) <= 0
     ) {
-      candidates.push({ key: "next_safe_time", at: catchUpAt });
+      candidates.push({
+        key: "next_safe_time",
+        at: catchUpAt,
+        moment: { kind: "instant", at: catchUpAt.toString() },
+      });
     }
   }
 
@@ -1873,9 +3044,11 @@ function calendarTimingPlan(item: CalendarEventInboxItem, promotionId: string) {
     planId: stableId("plan", promotionId),
     version: 1 as const,
     timeZone: item.timeZone,
-    event: { kind: "instant" as const, at: eventAt.toString() },
-    earliestUseful: { kind: "instant" as const, at: earliestUsefulAt.toString() },
-    lastResponsible: { kind: "instant" as const, at: lastResponsibleAt.toString() },
+    ...(item.allDay
+      ? { deadline: deadlineMoment }
+      : { event: { kind: "instant" as const, at: eventAt.toString() } }),
+    earliestUseful: earliestUsefulMoment,
+    lastResponsible: lastResponsibleMoment,
     usefulLeadMinutes: CALENDAR_USEFUL_LEAD_MINUTES,
     preparationMinutes: 0,
     finalBufferMinutes: CALENDAR_FINAL_BUFFER_MINUTES,
@@ -1883,7 +3056,7 @@ function calendarTimingPlan(item: CalendarEventInboxItem, promotionId: string) {
       triggerId: stableId("trigger", promotionId, candidate.key),
       timerId: stableId("timer", promotionId, candidate.key),
       kind: "reminder" as const,
-      at: { kind: "instant" as const, at: candidate.at.toString() },
+      at: candidate.moment,
     })),
   };
 }
@@ -2124,6 +3297,7 @@ async function processCalendar(
     await dependencies.interpreter.triageCalendar(item, {
       currentTime: item.occurredAt,
       householdTimeZone: work.aggregate.timeZone,
+      activeMemories: activeMemoryContext(work.aggregate, personal(item.ownerAdultId), item.occurredAt),
       activeSharingRules: rules,
     }),
   );
@@ -2186,7 +3360,7 @@ async function processCalendar(
         saveCalendarSource(work, revision.index, sourceRecord);
         return { status: "rejected", classification: "calendar:family_impact_missing" };
       }
-      const pending = calendarMinimumPromotion(item, triage);
+      const pending = calendarMinimumPromotion(item, triage, work.aggregate.routineAnchors);
       const policy = matchingSharingPolicy(
         work.aggregate,
         item.ownerAdultId,
@@ -2321,6 +3495,8 @@ async function processConversation(
       onboarding: work.projection.onboarding,
       sharedProfile: work.projection.sharedProfile,
       confirmedRoutineAnchors: work.aggregate.routineAnchors,
+      activeMemories: activeMemoryContext(work.aggregate, targetScope(item), item.occurredAt),
+      pendingMemoryCandidates: pendingMemoryContext(work.aggregate, targetScope(item)),
       openEpisodes: visibleEpisodes,
       pendingPromotionIds,
       activePolicies,
@@ -2342,7 +3518,7 @@ async function processConversation(
       "onboarding-required",
       targetScope(item),
       "onboarding",
-      "I'm Florence, an adult-only family Chief of Staff. I can notice family obligations, keep private accounts private by default, and follow shared work through without assigning blame. I will not contact third parties, purchase, book, submit, or expose private information without the required approval. Reply “I consent” in this DM to continue; you can text STOP at any time.",
+      onboardingRecoveryBody(work.projection.onboarding),
     );
     return { status: "rejected", classification: "onboarding_required" };
   }
@@ -2425,6 +3601,8 @@ function workerProposalFromCommands(
   result: WorkerResult,
   commands: readonly WorkerCommand[],
   completedAt: string,
+  baseHouseholdVersion: number,
+  basePolicyVersion: number,
 ) {
   const evidence = unique(commands.flatMap(commandEvidence).map((item) => JSON.stringify(item))).map((item) =>
     EvidenceRefSchema.parse(JSON.parse(item)),
@@ -2433,8 +3611,8 @@ function workerProposalFromCommands(
     resultId: stableId("worker_result", result.jobId, result.attemptId),
     jobId: DomainWorkerJobIdSchema.parse(result.jobId),
     householdId: result.householdId,
-    baseHouseholdVersion: result.baseHouseholdVersion,
-    basePolicyVersion: result.policyVersion,
+    baseHouseholdVersion,
+    basePolicyVersion,
     completedAt,
     confidence: result.confidence,
     evidence,
@@ -2458,29 +3636,235 @@ function workerProposalFromCommands(
   });
 }
 
-function rejectWorkerRecord(
+function failWorkerRecord(
   work: Work,
   workerIndex: number,
   receivedAt: string,
   decision: string,
-): { status: "rejected"; classification: string } {
+  body: string,
+): { status: "processed"; classification: string } {
   const worker = work.projection.workers[workerIndex];
   if (worker !== undefined) {
     work.projection.workers[workerIndex] = {
       ...worker,
-      status: "rejected",
-      resultRef: stableId("worker_result_ref", worker.job.jobId, decision),
+      status: "failed",
+      deliveryGeneration: worker.deliveryGeneration + 1,
+      updatedAt: receivedAt,
+      lastErrorCode: decision,
+      resultRef: stableId("worker_result_ref", worker.job.attemptId, decision),
     };
+    const episode = work.aggregate.episodes.find((candidate) => candidate.episodeId === worker.episodeId);
+    if (episode !== undefined) {
+      queueMessage(
+        work,
+        `worker-project-${decision}`,
+        episode.scope,
+        "status",
+        body,
+        {
+          kind: "episode_follow_up",
+          episodeId: episode.episodeId,
+          episodeVersion: episode.version,
+        },
+        projectDeliveryGuard(
+          work.projection.workers[workerIndex] as ApplicationProjection["workers"][number],
+        ),
+      );
+    }
   }
   work.audit.push(
     ApplicationAuditEntrySchema.parse({
       kind: "worker_reconciled",
       occurredAt: receivedAt,
       decision,
-      containsPrivateData: false,
+      containsPrivateData: worker?.job.scopeGrant.visibility === "personal",
     }),
   );
-  return { status: "rejected", classification: decision };
+  return { status: "processed", classification: decision };
+}
+
+function requeueWorkerForCurrentContext(
+  work: Work,
+  workerIndex: number,
+  receivedAt: string,
+  reason: string,
+): { status: "processed"; classification: string } {
+  const worker = work.projection.workers[workerIndex];
+  if (worker === undefined) {
+    throw new Error("Cannot requeue a missing worker record");
+  }
+  const episode = work.aggregate.episodes.find((candidate) => candidate.episodeId === worker.episodeId);
+  if (
+    episode === undefined ||
+    episode.delegation?.jobId !== worker.job.jobId ||
+    ["completed", "dismissed", "superseded", "failed"].includes(episode.state)
+  ) {
+    work.projection.workers[workerIndex] = {
+      ...worker,
+      status: "cancelled",
+      updatedAt: receivedAt,
+      lastErrorCode: "worker_project_no_longer_active",
+    };
+    return ignoreWorkerAttempt(
+      work,
+      receivedAt,
+      "worker_project_no_longer_active",
+      worker.job.scopeGrant.visibility === "personal",
+    );
+  }
+  if (worker.automaticRetryCount >= 3) {
+    return failWorkerRecord(
+      work,
+      workerIndex,
+      receivedAt,
+      "worker_retry_exhausted",
+      "I couldn’t complete this project safely after several fresh attempts. Reply here with an updated instruction and I’ll restart from the current family context.",
+    );
+  }
+
+  const attemptNumber = worker.attemptNumber + 1;
+  const attemptId = `${worker.job.jobId}.attempt.${attemptNumber}`;
+  const job = WorkerJobSchema.parse({
+    ...worker.job,
+    attemptId,
+    baseHouseholdVersion: work.aggregate.version,
+    policyVersion: work.aggregate.policyVersion,
+    scopeGrant: {
+      ...worker.job.scopeGrant,
+      grantId: stableId("context_grant", worker.job.jobId, attemptId),
+      expiresAt: plusMilliseconds(receivedAt, 20 * 60_000),
+    },
+    deadline: plusMilliseconds(receivedAt, 15 * 60_000),
+  });
+  const { resultRef: _resultRef, ...record } = worker;
+  work.projection.workers[workerIndex] = {
+    ...record,
+    baseEpisodeVersion: episode.version,
+    contextFingerprint: workerContextFingerprint({
+      aggregate: work.aggregate,
+      projection: work.projection,
+      episodeId: episode.episodeId,
+      purpose: worker.purpose,
+      scope: episode.scope,
+      evidenceRefs: job.evidenceRefs,
+      asOf: receivedAt,
+    }),
+    job,
+    status: "queued",
+    attemptNumber,
+    automaticRetryCount: worker.automaticRetryCount + 1,
+    updatedAt: receivedAt,
+    lastErrorCode: reason,
+  };
+  work.outbox.push(
+    ApplicationOutboxIntentSchema.parse({
+      ...appOutboxBase(work.input, `rerun:${job.attemptId}`),
+      kind: "worker.run",
+      job,
+    }),
+  );
+  work.audit.push(
+    ApplicationAuditEntrySchema.parse({
+      kind: "worker_reconciled",
+      occurredAt: receivedAt,
+      decision: `worker_requeued:${reason}`,
+      containsPrivateData: job.scopeGrant.visibility === "personal",
+    }),
+  );
+  return { status: "processed", classification: `worker_requeued:${reason}` };
+}
+
+function truncateMessagePart(value: string, maximumLength: number): string {
+  if (maximumLength <= 0) return "";
+  if (value.length <= maximumLength) return value;
+  if (maximumLength === 1) return "…";
+  return `${value.slice(0, maximumLength - 1)}…`;
+}
+
+function workerResultMessage(result: WorkerResult): string {
+  return truncateMessagePart(result.summary.trim(), 4_000);
+}
+
+function workerQuestionMessage(result: WorkerResult): string {
+  const blockingQuestion = result.questions[0]?.trim();
+  if (blockingQuestion === undefined || blockingQuestion.length === 0) {
+    throw new Error("An awaiting-input worker result must contain a blocking question");
+  }
+  const remaining = result.questions.length - 1;
+  const questionBlock = [
+    "Florence still needs:",
+    `• ${blockingQuestion}`,
+    ...(remaining === 0
+      ? []
+      : [
+          `I’ll work through the other ${remaining} open ${remaining === 1 ? "question" : "questions"} after this answer.`,
+        ]),
+    "Use iMessage’s Reply on this Florence message with your answer.",
+  ].join("\n");
+  const separator = "\n\n";
+  const summaryBudget = Math.max(0, 4_000 - questionBlock.length - separator.length);
+  const summary = truncateMessagePart(result.summary.trim(), summaryBudget);
+  return summary.length === 0 ? questionBlock : `${summary}${separator}${questionBlock}`;
+}
+
+function workerCompletionEvidence(
+  result: WorkerResult,
+  worker: ApplicationProjection["workers"][number],
+  scope: DurableScope,
+  receivedAt: string,
+) {
+  return EvidenceRefSchema.parse({
+    evidenceId: stableId("evidence", result.jobId, result.attemptId, "completion"),
+    source: "worker",
+    sourceRef: worker.job.jobId,
+    scope,
+    observedAt: receivedAt,
+    revision: 1,
+    contentDigest: `sha256:${createHash("sha256").update(result.summary).digest("hex")}`,
+  });
+}
+
+function ignoreWorkerAttempt(
+  work: Work,
+  receivedAt: string,
+  decision: string,
+  personal: boolean,
+): { status: "processed"; classification: string } {
+  work.audit.push(
+    ApplicationAuditEntrySchema.parse({
+      kind: "worker_reconciled",
+      occurredAt: receivedAt,
+      decision,
+      containsPrivateData: personal,
+    }),
+  );
+  return { status: "processed", classification: decision };
+}
+
+function processWorkerFailure(
+  work: Work,
+  input: Extract<ApplicationInput, { kind: "worker_failure" }>,
+): { status: "processed" | "rejected"; classification: string } {
+  const workerIndex = work.projection.workers.findIndex((candidate) => candidate.job.jobId === input.jobId);
+  const worker = work.projection.workers[workerIndex];
+  if (worker === undefined || worker.job.attemptId !== input.attemptId || worker.status !== "queued") {
+    return ignoreWorkerAttempt(
+      work,
+      input.receivedAt,
+      "worker_failure_obsolete",
+      worker?.job.scopeGrant.visibility === "personal",
+    );
+  }
+  if (input.retryable) {
+    return requeueWorkerForCurrentContext(work, workerIndex, input.receivedAt, input.errorCode);
+  }
+  return failWorkerRecord(
+    work,
+    workerIndex,
+    input.receivedAt,
+    input.errorCode,
+    "I couldn’t complete this project safely. Reply here with an updated instruction and I’ll restart from the current family context.",
+  );
 }
 
 function processWorkerResult(
@@ -2490,17 +3874,120 @@ function processWorkerResult(
   const result = WorkerResultSchema.parse(input.result);
   const workerIndex = work.projection.workers.findIndex((candidate) => candidate.job.jobId === result.jobId);
   const worker = work.projection.workers[workerIndex];
-  if (worker === undefined || worker.status !== "queued") {
-    return rejectWorkerRecord(work, workerIndex, input.receivedAt, "worker_result_unknown");
+  if (worker === undefined || worker.job.attemptId !== result.attemptId || worker.status !== "queued") {
+    return ignoreWorkerAttempt(
+      work,
+      input.receivedAt,
+      "worker_result_obsolete",
+      worker?.job.scopeGrant.visibility === "personal",
+    );
   }
   if (!workerIdentityMatches(result, worker.job)) {
-    return rejectWorkerRecord(work, workerIndex, input.receivedAt, "worker_result_identity_mismatch");
+    return failWorkerRecord(
+      work,
+      workerIndex,
+      input.receivedAt,
+      "worker_result_identity_mismatch",
+      "The Project Lead returned a result that could not be authenticated to this exact attempt, so I discarded it. Reply here if you want me to restart the project.",
+    );
   }
+  const originatingEpisode = work.aggregate.episodes.find(
+    (candidate) => candidate.episodeId === worker.episodeId,
+  );
+  if (originatingEpisode === undefined || originatingEpisode.delegation?.jobId !== worker.job.jobId) {
+    return failWorkerRecord(
+      work,
+      workerIndex,
+      input.receivedAt,
+      "worker_episode_identity_mismatch",
+      "The Project Lead result no longer matches this family project, so I discarded it. Reply here if you want to restart from the current project.",
+    );
+  }
+  if (["completed", "dismissed", "superseded", "failed"].includes(originatingEpisode.state)) {
+    return ignoreWorkerAttempt(
+      work,
+      input.receivedAt,
+      "worker_result_obsolete",
+      worker.job.scopeGrant.visibility === "personal",
+    );
+  }
+  const currentContextFingerprint = workerContextFingerprint({
+    aggregate: work.aggregate,
+    projection: work.projection,
+    episodeId: originatingEpisode.episodeId,
+    purpose: worker.purpose,
+    scope: originatingEpisode.scope,
+    evidenceRefs: worker.job.evidenceRefs,
+    asOf: input.receivedAt,
+  });
+  if (
+    worker.contextFingerprint !== currentContextFingerprint ||
+    worker.job.policyVersion !== work.aggregate.policyVersion
+  ) {
+    return requeueWorkerForCurrentContext(work, workerIndex, input.receivedAt, "worker_context_changed");
+  }
+
+  if (result.questions.length > 0) {
+    const message = workerQuestionMessage(result);
+    const { lastErrorCode: _lastErrorCode, ...current } = worker;
+    work.projection.workers[workerIndex] = {
+      ...current,
+      status: "awaiting_input",
+      deliveryGeneration: worker.deliveryGeneration + 1,
+      latestSummary: message,
+      outstandingQuestions: result.questions,
+      updatedAt: input.receivedAt,
+      resultRef: stableId("worker_result", result.jobId, result.attemptId),
+    };
+    queueMessage(
+      work,
+      "worker-project-questions",
+      originatingEpisode.scope,
+      "clarifying_question",
+      message,
+      {
+        kind: "episode_follow_up",
+        episodeId: originatingEpisode.episodeId,
+        episodeVersion: originatingEpisode.version,
+      },
+      projectDeliveryGuard(work.projection.workers[workerIndex] as ApplicationProjection["workers"][number]),
+    );
+    work.audit.push(
+      ApplicationAuditEntrySchema.parse({
+        kind: "worker_reconciled",
+        occurredAt: input.receivedAt,
+        decision: "awaiting_input",
+        containsPrivateData: worker.job.scopeGrant.visibility === "personal",
+      }),
+    );
+    return { status: "processed", classification: "worker_result:awaiting_input" };
+  }
+
   const commands = parseWorkerCommands(result, worker.job);
   if (commands === null) {
-    return rejectWorkerRecord(work, workerIndex, input.receivedAt, "worker_result_invalid_commands");
+    return requeueWorkerForCurrentContext(
+      work,
+      workerIndex,
+      input.receivedAt,
+      "worker_result_invalid_commands",
+    );
   }
-  const proposal = workerProposalFromCommands(result, commands, input.receivedAt);
+  let retainedMemoryCandidates = 0;
+  const reconciledCommands = commands.filter((command) => {
+    if (command.kind === "message.propose" || command.kind === "policy.candidate") return false;
+    if (command.kind === "action.propose") return false;
+    if (command.kind !== "memory.candidate") return true;
+    if (command.payload.confidence < 0.8 || retainedMemoryCandidates >= 3) return false;
+    retainedMemoryCandidates += 1;
+    return true;
+  });
+  const proposal = workerProposalFromCommands(
+    result,
+    reconciledCommands,
+    input.receivedAt,
+    work.aggregate.version,
+    work.aggregate.policyVersion,
+  );
   const accepted = acceptDomain(
     work,
     "worker-result",
@@ -2511,22 +3998,97 @@ function processWorkerResult(
       "householdId" | "signalId" | "sequence" | "occurredAt" | "actor"
     >,
   );
+  if (accepted.receipt.disposition !== "accepted") {
+    return requeueWorkerForCurrentContext(work, workerIndex, input.receivedAt, "worker_domain_rejected");
+  }
+
+  const episode = work.aggregate.episodes.find((candidate) => candidate.episodeId === worker.episodeId);
+  if (episode === undefined) {
+    throw new Error("Reconciled worker episode is missing from the household aggregate");
+  }
+  const message = workerResultMessage(result);
+  const evidence = workerCompletionEvidence(result, worker, episode.scope, input.receivedAt);
+  const closure = acceptDomain(
+    work,
+    "worker-project-completed",
+    input.receivedAt,
+    { kind: "worker", jobId: DomainWorkerJobIdSchema.parse(worker.job.jobId) },
+    {
+      kind: "episode.closed",
+      episodeId: episode.episodeId,
+      baseEpisodeVersion: episode.version,
+      outcome: {
+        kind: "completed",
+        summary:
+          worker.purpose === "meal_plan"
+            ? "Florence completed the requested meal plan and grocery list."
+            : "Florence completed the requested household research.",
+        evidence: [evidence],
+        recordedAt: input.receivedAt,
+      },
+    } as Omit<HouseholdSignal, "householdId" | "signalId" | "sequence" | "occurredAt" | "actor">,
+  );
+  if (closure.receipt.disposition !== "accepted") {
+    throw new Error(`Worker episode closure was rejected: ${closure.receipt.reason ?? "unknown"}`);
+  }
+  const completedEpisode = work.aggregate.episodes.find(
+    (candidate) => candidate.episodeId === worker.episodeId,
+  );
+  if (completedEpisode === undefined) {
+    throw new Error("Completed worker episode is missing from the household aggregate");
+  }
+  const { lastErrorCode: _lastErrorCode, ...current } = worker;
   work.projection.workers[workerIndex] = {
-    ...worker,
-    status: accepted.receipt.disposition === "accepted" ? "reconciled" : "rejected",
+    ...current,
+    baseEpisodeVersion: completedEpisode.version,
+    status: "completed",
+    deliveryGeneration: worker.deliveryGeneration + 1,
+    latestSummary: message,
+    outstandingQuestions: [],
+    updatedAt: input.receivedAt,
     resultRef: proposal.resultId,
   };
+  queueMessage(
+    work,
+    "worker-project-result",
+    episode.scope,
+    "status",
+    message,
+    {
+      kind: "episode_follow_up",
+      episodeId: episode.episodeId,
+      episodeVersion: completedEpisode.version,
+    },
+    projectDeliveryGuard(work.projection.workers[workerIndex] as ApplicationProjection["workers"][number]),
+  );
+
+  const recordedCandidateIds = new Set(
+    accepted.changes.flatMap((change) =>
+      change.kind === "memory_candidate_recorded" ? [change.candidateId] : [],
+    ),
+  );
+  for (const candidate of work.aggregate.memoryCandidates) {
+    if (!recordedCandidateIds.has(candidate.candidateId)) continue;
+    queueMessage(
+      work,
+      `memory-candidate:${candidate.candidateId}`,
+      candidate.scope,
+      "clarifying_question",
+      `I noticed a possible ${candidate.kind.replace("_", " ")}: “${candidate.statement}” Should I remember this for future family work? Reply “remember” or “don’t remember.”`,
+      { kind: "memory_confirmation", candidateId: candidate.candidateId },
+    );
+  }
   work.audit.push(
     ApplicationAuditEntrySchema.parse({
       kind: "worker_reconciled",
       occurredAt: input.receivedAt,
-      decision: accepted.receipt.disposition,
+      decision: "completed",
       containsPrivateData: worker.job.scopeGrant.visibility === "personal",
     }),
   );
   return {
-    status: statusForDomain(accepted),
-    classification: `worker_result:${accepted.receipt.disposition}`,
+    status: "processed",
+    classification: "worker_result:completed",
   };
 }
 
@@ -2596,7 +4158,7 @@ function processDailyBrief(
     input.reason === "scheduled"
       ? { kind: "household" }
       : { kind: "personal", adultId: AdultIdSchema.parse(input.requestedByAdultId) };
-  queueMessage(work, "daily-brief", scope, "daily_brief", briefBody(work.aggregate));
+  queueMessage(work, "daily-brief", scope, "daily_brief", briefBody(work, input.occurredAt));
   work.audit.push(
     ApplicationAuditEntrySchema.parse({
       kind: "daily_brief_built",
@@ -2607,6 +4169,66 @@ function processDailyBrief(
     }),
   );
   return { status: "processed", classification: `daily_brief:${input.reason}` };
+}
+
+function processGoogleConnected(
+  work: Work,
+  input: Extract<ApplicationInput, { kind: "google_connected" }>,
+): { status: "processed" | "rejected"; classification: string } {
+  const onboarding = work.projection.onboarding;
+  if (
+    !work.aggregate.verifiedAdultIds.includes(input.adultId) ||
+    !onboardingParticipants(onboarding).includes(input.adultId)
+  ) {
+    return { status: "rejected", classification: "google_connected:unknown_adult" };
+  }
+  if (!input.gmailReady || !input.calendarReady) {
+    work.audit.push(
+      ApplicationAuditEntrySchema.parse({
+        kind: "onboarding_transition",
+        occurredAt: input.occurredAt,
+        decision: "google_connection_incomplete",
+        sourceRef: input.connectionId,
+        adultId: input.adultId,
+        containsPrivateData: true,
+      }),
+    );
+    return { status: "processed", classification: "google_connected:incomplete" };
+  }
+  const connected = unique([...onboarding.googleConnectedAdultIds, input.adultId]);
+  const allConnected = onboardingParticipants(onboarding).every((adultId) => connected.includes(adultId));
+  const ready =
+    onboarding.phase === "connecting_sources" &&
+    onboarding.profileConfirmedAdultIds.length === 2 &&
+    allConnected;
+  work.projection.onboarding = ApplicationProjectionSchema.shape.onboarding.parse({
+    ...onboarding,
+    phase: ready ? "active" : onboarding.phase,
+    googleConnectedAdultIds: connected,
+  });
+  if (ready) {
+    queueMessage(
+      work,
+      "onboarding-ready-after-google",
+      { kind: "household" },
+      "onboarding",
+      "Both adults are connected. Florence is ready: I’ll privately filter mail and calendars, surface only family-relevant meaning with the agreed privacy boundaries, and follow shared work through in this group.",
+    );
+  }
+  work.audit.push(
+    ApplicationAuditEntrySchema.parse({
+      kind: "onboarding_transition",
+      occurredAt: input.occurredAt,
+      decision: `${onboarding.phase}:${ready ? "active" : onboarding.phase}:google_connected`,
+      sourceRef: input.connectionId,
+      adultId: input.adultId,
+      containsPrivateData: true,
+    }),
+  );
+  return {
+    status: "processed",
+    classification: ready ? "google_connected:onboarding_complete" : "google_connected:recorded",
+  };
 }
 
 function processPrivateControl(
@@ -2739,19 +4361,82 @@ async function runWorker(
   }
   const snapshot = await loadSnapshot(dependencies, input.householdId);
   const record = snapshot.projection.workers.find((candidate) => candidate.job.jobId === input.jobId);
-  if (record === undefined || record.status !== "queued") {
-    throw new Error(`Worker job is not queued: ${input.jobId}`);
+  if (record === undefined || record.job.attemptId !== input.attemptId || record.status !== "queued") {
+    return ApplicationResultSchema.parse({
+      householdId: input.householdId,
+      idempotencyKey: input.idempotencyKey,
+      disposition: "duplicate",
+      revision: snapshot.revision,
+      outcome: {
+        status: "processed",
+        classification: "worker_run_obsolete",
+        domainReceipts: [],
+        outboxIntentIds: [],
+      },
+    });
   }
-  const options = await dependencies.workerContext.contextFor(record.job, snapshot);
-  const result = await dependencies.workerRuntime.run(record.job, options);
+  const routes = WorkerRoutesSchema.parse(dependencies.workerRoutes ?? DEFAULT_WORKER_ROUTES);
+  const completedAt = () => new Date(Math.max(Date.now(), Date.parse(input.requestedAt))).toISOString();
+  const failAttempt = (errorCode: string, retryable: boolean) =>
+    processApplicationInput(
+      dependencies,
+      routes,
+      ApplicationInputSchema.parse({
+        kind: "worker_failure",
+        householdId: input.householdId,
+        idempotencyKey: input.idempotencyKey,
+        receivedAt: completedAt(),
+        jobId: input.jobId,
+        attemptId: input.attemptId,
+        errorCode,
+        retryable,
+      }),
+    );
+  const episode = snapshot.aggregate.episodes.find((candidate) => candidate.episodeId === record.episodeId);
+  const contextChanged =
+    episode === undefined ||
+    record.contextFingerprint !==
+      workerContextFingerprint({
+        aggregate: snapshot.aggregate,
+        projection: snapshot.projection,
+        episodeId: record.episodeId,
+        purpose: record.purpose,
+        scope: episode?.scope ?? { kind: "household" },
+        evidenceRefs: record.job.evidenceRefs,
+        asOf: new Date().toISOString(),
+      });
+  if (
+    contextChanged ||
+    record.job.policyVersion !== snapshot.aggregate.policyVersion ||
+    Date.parse(record.job.deadline) <= Date.now() ||
+    Date.parse(record.job.scopeGrant.expiresAt) <= Date.now()
+  ) {
+    return failAttempt("worker_context_stale", true);
+  }
+  let result: WorkerResult;
+  try {
+    const options = await dependencies.workerContext.contextFor(record.job, snapshot);
+    result = await dependencies.workerRuntime.run(record.job, options);
+    if (options.validateBeforeAccept !== undefined && !(await options.validateBeforeAccept())) {
+      return failAttempt("worker_context_stale", true);
+    }
+  } catch (error) {
+    const runtimeError = asWorkerRuntimeError(error);
+    const retryable =
+      runtimeError.retryable ||
+      ["invalid_output", "deadline_exceeded", "budget_exceeded", "tool_failed", "cleanup_failed"].includes(
+        runtimeError.code,
+      );
+    return failAttempt(`worker_${runtimeError.code}`, retryable);
+  }
   return processApplicationInput(
     dependencies,
-    WorkerRoutesSchema.parse(dependencies.workerRoutes ?? DEFAULT_WORKER_ROUTES),
+    routes,
     ApplicationInputSchema.parse({
       kind: "worker_result",
       householdId: input.householdId,
       idempotencyKey: input.idempotencyKey,
-      receivedAt: input.requestedAt,
+      receivedAt: completedAt(),
       result,
     }),
   );
@@ -2779,6 +4464,9 @@ async function processApplicationInput(
     case "gmail_message":
       processed = await processGmail(work, input, dependencies);
       break;
+    case "gmail_message_deleted":
+      processed = processGmailDeleted(work, input);
+      break;
     case "calendar_event":
       processed = await processCalendar(work, input, dependencies);
       break;
@@ -2788,6 +4476,9 @@ async function processApplicationInput(
     case "worker_result":
       processed = processWorkerResult(work, input);
       break;
+    case "worker_failure":
+      processed = processWorkerFailure(work, input);
+      break;
     case "timer_fired":
       processed = processTimer(work, input);
       break;
@@ -2796,6 +4487,9 @@ async function processApplicationInput(
       break;
     case "daily_brief":
       processed = processDailyBrief(work, input);
+      break;
+    case "google_connected":
+      processed = processGoogleConnected(work, input);
       break;
     case "private_control":
       processed = processPrivateControl(work, input);
@@ -2821,7 +4515,12 @@ export function createOnboardingProjection(input: {
       consentedAdultIds: [input.initiatorAdultId, input.invitedAdultId],
       privateDmAdultIds: [input.initiatorAdultId, input.invitedAdultId],
       groupChannelId: input.groupChannelId,
+      adultNames: [
+        { adultId: input.initiatorAdultId, displayName: "Adult 1" },
+        { adultId: input.invitedAdultId, displayName: "Adult 2" },
+      ],
       profileConfirmedAdultIds: [input.initiatorAdultId, input.invitedAdultId],
+      googleConnectedAdultIds: [input.initiatorAdultId, input.invitedAdultId],
     });
   }
   return ApplicationProjectionSchema.shape.onboarding.parse({
@@ -2829,7 +4528,9 @@ export function createOnboardingProjection(input: {
     initiatorAdultId: input.initiatorAdultId,
     consentedAdultIds: [],
     privateDmAdultIds: [],
+    adultNames: [],
     profileConfirmedAdultIds: [],
+    googleConnectedAdultIds: [],
   });
 }
 
@@ -2840,6 +4541,7 @@ export function createApplicationProjection(
     onboarding,
     sharedProfile: { facts: [] },
     gmailTriage: [],
+    gmailSources: [],
     calendarTriage: [],
     calendarSources: [],
     pendingPromotions: [],
@@ -2869,6 +4571,7 @@ export function createFlorenceApplication(
             householdId: intent.householdId,
             idempotencyKey: `${intent.idempotencyKey}:result`,
             jobId: intent.job.jobId,
+            attemptId: intent.job.attemptId,
             requestedAt: recordedAt,
           }),
         );

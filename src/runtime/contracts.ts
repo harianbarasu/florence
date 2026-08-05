@@ -139,6 +139,7 @@ export interface WorkerAttemptOptions {
   readonly context?: readonly WorkerContextItem[];
   readonly tools?: readonly WorkerTool[];
   readonly signal?: AbortSignal;
+  readonly validateBeforeAccept?: () => Promise<boolean>;
   readonly cleanup?: (context: WorkerToolCleanupContext) => Promise<void>;
 }
 
@@ -154,9 +155,9 @@ export type ProposedWorkerCommand = z.infer<typeof ProposedWorkerCommandSchema>;
 /** The only model-authored result shape. It is always parsed again by the app. */
 export const WorkerResultPayloadSchema = z
   .object({
-    summary: z.string().min(1).max(20_000),
+    summary: z.string().trim().min(1).max(20_000),
     evidenceRefs: z.array(z.string().min(1)).max(100),
-    questions: z.array(z.string().min(1).max(2_000)).max(50),
+    questions: z.array(z.string().trim().min(1).max(2_000)).max(50),
     warnings: z.array(z.string().min(1).max(2_000)).max(50),
     proposedCommands: z.array(ProposedWorkerCommandSchema).max(50),
     confidence: z.number().min(0).max(1),

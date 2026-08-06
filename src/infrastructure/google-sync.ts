@@ -6,6 +6,7 @@ import {
   type GmailHistoryChange,
   type GmailMessage,
   type GmailMessageFormat,
+  type GmailProfile,
   type GmailRetrievedAttachment,
   GOOGLE_GMAIL_READONLY_SCOPE,
   GoogleAdapterError,
@@ -14,7 +15,6 @@ import {
   type GoogleTokenSet,
   gmailAttachmentSchema,
   gmailMessageSchema,
-  gmailPubSubEventSchema,
   googleTokenSetSchema,
   type RetrieveGmailAttachmentInput,
 } from "../adapters/google/index.js";
@@ -107,12 +107,6 @@ const gmailHistoryCursorSchema = z.strictObject({
   targetId: z.string().regex(/^\d+$/).nullable(),
 });
 
-const gmailWatchStateSchema = z.strictObject({
-  historyId: z.string().regex(/^\d+$/),
-  expiresAt: instantSchema,
-  subscription: z.string().min(1).max(1_000),
-});
-
 const gmailRecoveryStateSchema = z.strictObject({
   generationId: z.uuid(),
   snapshotComplete: z.boolean(),
@@ -138,7 +132,6 @@ export const gmailSyncStateSchema = z.strictObject({
     .max(500)
     .refine((ids) => new Set(ids).size === ids.length, "Processed Gmail message IDs must be unique"),
   history: gmailHistoryCursorSchema,
-  watch: gmailWatchStateSchema.nullable(),
   recovery: gmailRecoveryStateSchema.nullable(),
   lastSuccessfulSyncAt: instantSchema.nullable(),
   discovery: gmailDiscoveryRunSchema.nullable(),
@@ -170,10 +163,6 @@ export type GoogleSyncConnection = z.infer<typeof googleSyncConnectionSchema>;
 
 export const gmailSyncWorkSchema = z.discriminatedUnion("kind", [
   z.strictObject({
-    kind: z.literal("history_notice"),
-    event: gmailPubSubEventSchema,
-  }),
-  z.strictObject({
     kind: z.literal("start"),
     householdId: z.string().min(1).max(500),
     adultId: z.string().min(1).max(500),
@@ -182,12 +171,6 @@ export const gmailSyncWorkSchema = z.discriminatedUnion("kind", [
   }),
   z.strictObject({
     kind: z.literal("continue"),
-    householdId: z.string().min(1).max(500),
-    adultId: z.string().min(1).max(500),
-    connectionId: z.uuid(),
-  }),
-  z.strictObject({
-    kind: z.literal("renew_watch"),
     householdId: z.string().min(1).max(500),
     adultId: z.string().min(1).max(500),
     connectionId: z.uuid(),
@@ -223,11 +206,6 @@ export type GmailSyncResult = {
  * unscoped connection and filtering it in the caller is not sufficient.
  */
 export interface GoogleConnectionDirectoryPort {
-  findActiveGmailConnections(input: {
-    normalizedMailboxEmail: string;
-    subscription: string;
-  }): Promise<readonly GoogleSyncConnection[]>;
-
   getOwnedGoogleConnection(input: {
     householdId: string;
     adultId: string;
@@ -348,6 +326,7 @@ export interface GmailDiscoveryCompletionPort {
 }
 
 export interface GmailProviderPort {
+  getProfile(accessToken: string): Promise<GmailProfile>;
   getMessage(input: {
     accessToken: string;
     googleSubject: string;
@@ -369,8 +348,6 @@ export interface GmailProviderPort {
     query?: string;
     includeSpamTrash?: boolean;
   }): ReturnType<GmailAdapter["listMessageIdsPage"]>;
-  startWatch(input: { accessToken: string; topicName: string }): ReturnType<GmailAdapter["startWatch"]>;
-  stopWatch(accessToken: string): ReturnType<GmailAdapter["stopWatch"]>;
 }
 
 export interface GoogleCredentialLifecyclePort {
@@ -386,8 +363,6 @@ export interface GoogleSyncServiceOptions {
   application: Pick<FlorenceApplication, "process">;
   completionDigest: GmailDiscoveryCompletionPort;
   secretBox: Pick<SecretBox, "open" | "seal">;
-  gmailTopicName: string;
-  gmailPubSubSubscription: string;
   now?: () => Date;
   refreshSkewMs?: number;
   pageSize?: number;
@@ -424,8 +399,6 @@ export class GoogleSyncService {
   readonly #application: Pick<FlorenceApplication, "process">;
   readonly #completionDigest: GmailDiscoveryCompletionPort;
   readonly #secretBox: Pick<SecretBox, "open" | "seal">;
-  readonly #gmailTopicName: string;
-  readonly #gmailPubSubSubscription: string;
   readonly #now: () => Date;
   readonly #refreshSkewMs: number;
   readonly #pageSize: number;
@@ -438,11 +411,6 @@ export class GoogleSyncService {
     this.#application = options.application;
     this.#completionDigest = options.completionDigest;
     this.#secretBox = options.secretBox;
-    this.#gmailTopicName = z
-      .string()
-      .regex(/^projects\/[^/]+\/topics\/[^/]+$/)
-      .parse(options.gmailTopicName);
-    this.#gmailPubSubSubscription = z.string().min(1).max(1_000).parse(options.gmailPubSubSubscription);
     this.#now = options.now ?? (() => new Date());
     this.#refreshSkewMs = z
       .number()
@@ -463,14 +431,10 @@ export class GoogleSyncService {
 
     try {
       switch (work.kind) {
-        case "history_notice":
-          return await this.#handleHistoryNotice(work.event, signal);
         case "start":
           return await this.#start(work, signal);
         case "continue":
           return await this.#continue(work, signal);
-        case "renew_watch":
-          return await this.#renewWatch(work, signal);
         case "cancel":
           return await this.#cancel(work);
         case "revoke":
@@ -492,77 +456,6 @@ export class GoogleSyncService {
     }
   }
 
-  public processPush(
-    event: z.input<typeof gmailPubSubEventSchema>,
-    signal?: AbortSignal,
-  ): Promise<GmailSyncResult> {
-    return this.execute({ kind: "history_notice", event }, signal);
-  }
-
-  async #handleHistoryNotice(
-    event: z.infer<typeof gmailPubSubEventSchema>,
-    signal?: AbortSignal,
-  ): Promise<GmailSyncResult> {
-    if (event.subscription !== this.#gmailPubSubSubscription) {
-      throw new GoogleSyncError("Gmail notification subscription is not authorized", "not_authorized", false);
-    }
-    const normalizedMailboxEmail = normalizeEmail(event.mailboxEmail);
-    const candidates = await this.#directory.findActiveGmailConnections({
-      normalizedMailboxEmail,
-      subscription: event.subscription,
-    });
-    if (candidates.length !== 1) {
-      throw new GoogleSyncError(
-        "Gmail notification could not be attributed to exactly one adult account",
-        candidates.length === 0 ? "not_authorized" : "ambiguous_connection",
-        false,
-      );
-    }
-    const connection = requireValidConnection(candidates[0]);
-    if (connection.status !== "active" || normalizeEmail(connection.email) !== normalizedMailboxEmail) {
-      throw new GoogleSyncError("Gmail notification ownership did not match", "not_authorized", false);
-    }
-    const state = stateFromConnection(connection, this.#now());
-    if (state.watch?.subscription !== event.subscription) {
-      throw new GoogleSyncError(
-        "Gmail notification is not bound to this connection",
-        "not_authorized",
-        false,
-      );
-    }
-    if (state.phase === "cancelled") return result(connection, state, "cancelled", EMPTY_COUNTS);
-    if (state.phase === "revoked") return result(connection, state, "revoked", EMPTY_COUNTS);
-    if (state.phase === "reauth_required") {
-      return result(connection, state, "reauth_required", EMPTY_COUNTS);
-    }
-
-    const targetId = maxHistoryId(state.history.targetId, event.historyId);
-    if (
-      state.history.pageToken === null &&
-      state.history.cursorId !== null &&
-      targetId !== null &&
-      compareHistoryIds(targetId, state.history.cursorId) <= 0
-    ) {
-      if (isScanPhase(state.phase)) {
-        return result(connection, state, "continuation_required", EMPTY_COUNTS);
-      }
-      if (state.discovery?.status === "pending") {
-        const published = await this.#publishPendingDiscovery(connection, state);
-        return result(connection, published, "processed", EMPTY_COUNTS);
-      }
-      return result(connection, state, "noop", EMPTY_COUNTS);
-    }
-
-    const targetedState: GmailSyncState = {
-      ...state,
-      history: { ...state.history, targetId },
-    };
-    if (targetedState.history.cursorId === null) {
-      return this.#recoverExpiredHistoryCursor(connection, targetedState, signal);
-    }
-    return this.#processHistoryPage(connection, targetedState, event.publishedAt, signal);
-  }
-
   async #start(
     work: Extract<GmailSyncWork, { kind: "start" }>,
     signal?: AbortSignal,
@@ -580,9 +473,7 @@ export class GoogleSyncService {
       return result(connection, current, "noop", EMPTY_COUNTS);
     }
     const boundaryAt = this.#now().toISOString();
-    const watch = await this.#withCredentials(connection, signal, (accessToken) =>
-      this.#gmail.startWatch({ accessToken, topicName: this.#gmailTopicName }),
-    );
+    const profile = await this.#mailboxProfile(connection, signal);
     const state = gmailSyncStateSchema.parse({
       ...current,
       phase: "recent_90_days",
@@ -591,15 +482,10 @@ export class GoogleSyncService {
       scanPageToken: null,
       scanProcessedMessageIds: [],
       history: {
-        cursorId: current.history.cursorId ?? watch.historyId,
+        cursorId: current.history.cursorId ?? profile.historyId,
         startId: null,
         pageToken: null,
         targetId: current.history.targetId,
-      },
-      watch: {
-        historyId: watch.historyId,
-        expiresAt: watch.expiresAt,
-        subscription: this.#gmailPubSubSubscription,
       },
       recovery: null,
       discovery: {
@@ -639,54 +525,73 @@ export class GoogleSyncService {
       const published = await this.#publishPendingDiscovery(connection, state);
       return result(connection, published, "processed", EMPTY_COUNTS);
     }
-    if (isScanPhase(state.phase)) return this.#processScanPage(connection, state, signal);
+    if (isScanPhase(state.phase)) {
+      const profile = await this.#mailboxProfile(connection, signal);
+      const targetId = maxHistoryId(state.history.targetId, profile.historyId);
+      const targetedState: GmailSyncState = {
+        ...state,
+        history: { ...state.history, targetId },
+      };
+      if (targetedState.history.cursorId === null) {
+        return this.#recoverExpiredHistoryCursor(connection, targetedState, signal);
+      }
+      if (targetId !== null && compareHistoryIds(targetId, targetedState.history.cursorId) > 0) {
+        return this.#processHistoryPage(connection, targetedState, this.#now().toISOString(), signal);
+      }
+      return this.#processScanPage(connection, state, signal);
+    }
     if (state.phase !== "live") {
       throw new GoogleSyncError("Gmail sync phase cannot continue", "invalid_state", false);
     }
-    return result(connection, state, "noop", EMPTY_COUNTS);
+    return this.#pollMailbox(connection, state, signal);
   }
 
-  async #renewWatch(
-    work: Extract<GmailSyncWork, { kind: "renew_watch" }>,
+  async #pollMailbox(
+    connection: GoogleSyncConnection,
+    state: GmailSyncState,
     signal?: AbortSignal,
   ): Promise<GmailSyncResult> {
-    const connection = await this.#ownedActiveConnection(work);
-    const state = stateFromConnection(connection, this.#now());
-    const watch = await this.#withCredentials(connection, signal, (accessToken) =>
-      this.#gmail.startWatch({ accessToken, topicName: this.#gmailTopicName }),
-    );
-    const recoveringHistory = isRecoveringExpiredHistory(state);
-    const nextCursorId = recoveringHistory ? null : (state.history.cursorId ?? watch.historyId);
-    const observedTargetId = maxHistoryId(state.history.targetId, watch.historyId);
-    const nextTargetId = recoveringHistory
-      ? observedTargetId
-      : nextCursorId !== null &&
-          observedTargetId !== null &&
-          compareHistoryIds(observedTargetId, nextCursorId) > 0
-        ? observedTargetId
-        : null;
-    let saved = await this.#saveState(connection, {
+    const profile = await this.#mailboxProfile(connection, signal);
+    const targetId = maxHistoryId(state.history.targetId, profile.historyId);
+    const targetedState: GmailSyncState = {
       ...state,
-      history: {
-        ...state.history,
-        cursorId: nextCursorId,
-        targetId: nextTargetId,
-      },
-      watch: {
-        historyId: watch.historyId,
-        expiresAt: watch.expiresAt,
-        subscription: this.#gmailPubSubSubscription,
-      },
-    });
-    if (saved.discovery?.status === "pending" && !hasPendingHistory(saved)) {
-      saved = await this.#publishPendingDiscovery(connection, saved);
+      history: { ...state.history, targetId },
+    };
+    if (targetedState.history.cursorId === null) {
+      return this.#recoverExpiredHistoryCursor(connection, targetedState, signal);
     }
-    return result(
-      connection,
-      saved,
-      requiresContinuation(saved) ? "continuation_required" : "processed",
-      EMPTY_COUNTS,
+    if (
+      targetId === null ||
+      compareHistoryIds(targetId, targetedState.history.cursorId) <= 0
+    ) {
+      const saved = await this.#saveState(connection, {
+        ...targetedState,
+        history: { ...targetedState.history, targetId: null },
+        lastSuccessfulSyncAt: this.#now().toISOString(),
+      });
+      return result(connection, saved, "noop", EMPTY_COUNTS);
+    }
+    return this.#processHistoryPage(connection, targetedState, this.#now().toISOString(), signal);
+  }
+
+  async #mailboxProfile(
+    connection: GoogleSyncConnection,
+    signal?: AbortSignal,
+  ): Promise<GmailProfile> {
+    const profile = await this.#withCredentials(connection, signal, (accessToken) =>
+      this.#gmail.getProfile(accessToken),
     );
+    if (
+      normalizeEmail(connection.email) === "" ||
+      normalizeEmail(profile.emailAddress) !== normalizeEmail(connection.email)
+    ) {
+      throw new GoogleSyncError(
+        "Gmail profile does not match the connected adult account",
+        "not_authorized",
+        false,
+      );
+    }
+    return profile;
   }
 
   async #cancel(work: Extract<GmailSyncWork, { kind: "cancel" }>): Promise<GmailSyncResult> {
@@ -739,8 +644,6 @@ export class GoogleSyncService {
     if (connection.encryptedCredentials !== null) {
       try {
         const tokens = decryptCredentials(connection, this.#secretBox);
-        assertNotAborted(signal);
-        await this.#gmail.stopWatch(tokens.accessToken).catch(() => undefined);
         assertNotAborted(signal);
         await this.#oauth.revoke(tokens).catch(() => undefined);
       } catch {
@@ -922,10 +825,7 @@ export class GoogleSyncService {
     const continuingRecovery = isRecoveringExpiredHistory(state) && state.recovery !== null;
     const recoveryBaseId = isRecoveringExpiredHistory(state)
       ? state.history.startId
-      : maxHistoryId(
-          maxHistoryId(state.history.targetId, state.watch?.historyId ?? null),
-          state.history.cursorId,
-        );
+      : maxHistoryId(state.history.targetId, state.history.cursorId);
     if (recoveryBaseId === null) {
       throw new GoogleSyncError("Gmail recovery target is missing", "invalid_state", false);
     }
@@ -1566,7 +1466,6 @@ function initialState(now: Date): GmailSyncState {
     scanPageToken: null,
     scanProcessedMessageIds: [],
     history: { cursorId: null, startId: null, pageToken: null, targetId: null },
-    watch: null,
     recovery: null,
     lastSuccessfulSyncAt: null,
     discovery: null,
@@ -1686,7 +1585,7 @@ function advanceScanPhase(state: GmailSyncState, completedAt: string): GmailSync
     scanPageToken: null,
     scanProcessedMessageIds: [],
     history: {
-      cursorId: state.history.cursorId ?? state.watch?.historyId ?? null,
+      cursorId: state.history.cursorId,
       startId: null,
       pageToken: null,
       targetId:

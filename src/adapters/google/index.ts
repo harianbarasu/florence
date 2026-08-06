@@ -56,6 +56,7 @@ export {
   type GmailMessage,
   type GmailMessageFormat,
   type GmailMessageIdPage,
+  type GmailProfile,
   type GmailPubSubEvent,
   type GmailRetrievedAttachment,
   type GmailWatchReceipt,

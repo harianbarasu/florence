@@ -512,16 +512,6 @@ export async function createProductionComposition(
               LINQ_FROM_PHONE: linqConfiguration.fromPhone,
               LINQ_WEBHOOK_SECRET: linqConfiguration.webhookSecret,
             }),
-        ...(!integrations.gmail ||
-        config.GOOGLE_PUBSUB_VERIFICATION_TOKEN === undefined ||
-        config.GOOGLE_PUBSUB_OIDC_AUDIENCE === undefined ||
-        config.GOOGLE_PUBSUB_SERVICE_ACCOUNT_EMAIL === undefined
-          ? {}
-          : {
-              GOOGLE_PUBSUB_VERIFICATION_TOKEN: config.GOOGLE_PUBSUB_VERIFICATION_TOKEN,
-              GOOGLE_PUBSUB_OIDC_AUDIENCE: config.GOOGLE_PUBSUB_OIDC_AUDIENCE,
-              GOOGLE_PUBSUB_SERVICE_ACCOUNT_EMAIL: config.GOOGLE_PUBSUB_SERVICE_ACCOUNT_EMAIL,
-            }),
         GOOGLE_CALENDAR_PUSH_ENABLED: google.calendarPush !== null,
       }),
       services: {
@@ -694,12 +684,8 @@ function createGoogleComposition(input: {
     secretBox: input.secretBox,
   });
   const backgrounds: BackgroundLoop[] = [];
-  let pushProcessor: GoogleComposition["pushProcessor"] = new UnavailableGooglePushProcessor();
-  if (
-    input.gmailEnabled &&
-    config.GOOGLE_GMAIL_TOPIC_NAME !== undefined &&
-    config.GOOGLE_GMAIL_PUBSUB_SUBSCRIPTION !== undefined
-  ) {
+  const pushProcessor: GoogleComposition["pushProcessor"] = new UnavailableGooglePushProcessor();
+  if (input.gmailEnabled) {
     const gmailSync = new GoogleSyncService({
       directory: input.runtimeStore,
       repository: input.runtimeStore,
@@ -708,10 +694,7 @@ function createGoogleComposition(input: {
       application: input.application,
       completionDigest: new GmailPrivateCompletionDigestAdapter(input.runtimeStore),
       secretBox: input.secretBox,
-      gmailTopicName: config.GOOGLE_GMAIL_TOPIC_NAME,
-      gmailPubSubSubscription: config.GOOGLE_GMAIL_PUBSUB_SUBSCRIPTION,
     });
-    pushProcessor = gmailSync;
     backgrounds.push(
       new GoogleSyncBackgroundHost<GmailSyncWork>({
         queue: input.runtimeStore,

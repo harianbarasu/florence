@@ -37,9 +37,6 @@ const HOUSEHOLD_ID = HouseholdIdSchema.parse("11111111-1111-4111-8111-1111111111
 const ADULT_ID = "22222222-2222-4222-8222-222222222222";
 const OTHER_ADULT_ID = "33333333-3333-4333-8333-333333333333";
 const CONNECTION_ID = "44444444-4444-4444-8444-444444444444";
-const SUBSCRIPTION = "projects/florence/subscriptions/gmail";
-const TOPIC = "projects/florence/topics/gmail";
-
 function syncState(overrides: Partial<GmailSyncState> = {}): GmailSyncState {
   return gmailSyncStateSchema.parse({
     schemaVersion: 2,
@@ -50,11 +47,6 @@ function syncState(overrides: Partial<GmailSyncState> = {}): GmailSyncState {
     scanPageToken: null,
     scanProcessedMessageIds: [],
     history: { cursorId: "100", startId: null, pageToken: null, targetId: null },
-    watch: {
-      historyId: "100",
-      expiresAt: "2027-01-08T08:00:00.000Z",
-      subscription: SUBSCRIPTION,
-    },
     recovery: null,
     lastSuccessfulSyncAt: null,
     discovery: null,
@@ -152,15 +144,6 @@ class MemoryGoogleStore implements GoogleConnectionDirectoryPort, GoogleSyncRepo
 
   public constructor(connectionRecord: GoogleSyncConnection) {
     this.connection = connectionRecord;
-  }
-
-  public async findActiveGmailConnections(input: { normalizedMailboxEmail: string; subscription: string }) {
-    const state = this.connection.cursor.gmail as GmailSyncState | undefined;
-    return this.connection.status === "active" &&
-      this.connection.email?.toLowerCase() === input.normalizedMailboxEmail &&
-      state?.watch?.subscription === input.subscription
-      ? [structuredClone(this.connection)]
-      : [];
   }
 
   public async getOwnedGoogleConnection(input: {
@@ -366,6 +349,7 @@ class MemoryGoogleStore implements GoogleConnectionDirectoryPort, GoogleSyncRepo
 }
 
 type FakeGmailOptions = {
+  profile?: () => Promise<{ emailAddress: string; historyId: string }>;
   history?: (input: Parameters<GmailProviderPort["listHistoryPage"]>[0]) => Promise<GmailHistoryPage>;
   list?: (input: Parameters<GmailProviderPort["listMessageIdsPage"]>[0]) => Promise<GmailMessageIdPage>;
   get?: (input: Parameters<GmailProviderPort["getMessage"]>[0]) => Promise<GmailMessage>;
@@ -385,9 +369,15 @@ function createHarness(options: FakeGmailOptions = {}) {
   const completionPublishes: Parameters<GmailDiscoveryCompletionPort["publish"]>[0][] = [];
   const completionControl = { fail: false };
   const applicationControl = { fail: false };
-  const stopWatch = vi.fn(async () => undefined);
+  const profileHistoryId = { value: "100" };
   const revoke = vi.fn(async () => undefined);
   const gmail: GmailProviderPort = {
+    async getProfile() {
+      return options.profile?.() ?? {
+        emailAddress: "parent@example.com",
+        historyId: profileHistoryId.value,
+      };
+    },
     async getMessage(input) {
       getInputs.push(structuredClone(input));
       return options.get?.(input) ?? message(1, input.messageId);
@@ -409,10 +399,6 @@ function createHarness(options: FakeGmailOptions = {}) {
       if (input.query) queries.push(input.query);
       return options.list?.(input) ?? { messages: [], nextPageToken: null, resultSizeEstimate: 0 };
     },
-    async startWatch() {
-      return { historyId: "100", expiresAt: "2027-01-08T08:00:00.000Z" };
-    },
-    stopWatch,
   };
   const oauth: GoogleCredentialLifecyclePort = {
     async refresh(tokens) {
@@ -453,8 +439,6 @@ function createHarness(options: FakeGmailOptions = {}) {
     },
     completionDigest,
     secretBox,
-    gmailTopicName: TOPIC,
-    gmailPubSubSubscription: SUBSCRIPTION,
     now: () => NOW,
     pageSize: 25,
   });
@@ -470,25 +454,18 @@ function createHarness(options: FakeGmailOptions = {}) {
     completionPublishes,
     completionControl,
     applicationControl,
-    stopWatch,
+    profileHistoryId,
     revoke,
   };
 }
 
-function historyNotice(historyId: string) {
+function pollWork(harness: { profileHistoryId: { value: string } }, historyId: string) {
+  harness.profileHistoryId.value = historyId;
   return {
-    kind: "history_notice" as const,
-    event: {
-      schemaVersion: 1 as const,
-      source: "gmail" as const,
-      sourceScope: "personal" as const,
-      providerEventId: `push-${historyId}`,
-      subscription: SUBSCRIPTION,
-      mailboxEmail: "PARENT@example.com",
-      historyId,
-      publishedAt: NOW.toISOString(),
-      deliveryAttempt: 1,
-    },
+    kind: "continue" as const,
+    householdId: HOUSEHOLD_ID,
+    adultId: ADULT_ID,
+    connectionId: CONNECTION_ID,
   };
 }
 
@@ -515,7 +492,6 @@ describe("GoogleSyncService", () => {
   it("fails closed when an explicit request tries to cross the connection's adult boundary", async () => {
     const harness = createHarness();
     const unsafeDirectory: GoogleConnectionDirectoryPort = {
-      findActiveGmailConnections: (input) => harness.store.findActiveGmailConnections(input),
       async getOwnedGoogleConnection() {
         return structuredClone(harness.store.connection);
       },
@@ -524,6 +500,9 @@ describe("GoogleSyncService", () => {
       directory: unsafeDirectory,
       repository: harness.store,
       gmail: {
+        getProfile: async () => {
+          throw new Error("must not fetch profile");
+        },
         getMessage: async () => {
           throw new Error("must not fetch");
         },
@@ -536,10 +515,6 @@ describe("GoogleSyncService", () => {
         listMessageIdsPage: async () => {
           throw new Error("must not list");
         },
-        startWatch: async () => {
-          throw new Error("must not watch");
-        },
-        stopWatch: async () => undefined,
       },
       oauth: {
         refresh: async (tokens) => tokens,
@@ -548,8 +523,6 @@ describe("GoogleSyncService", () => {
       application: { process: async () => Promise.reject(new Error("must not process")) },
       completionDigest: { publish: async () => Promise.reject(new Error("must not publish")) },
       secretBox: harness.secretBox,
-      gmailTopicName: TOPIC,
-      gmailPubSubSubscription: SUBSCRIPTION,
       now: () => NOW,
     });
 
@@ -580,7 +553,7 @@ describe("GoogleSyncService", () => {
       },
     });
 
-    await expect(harness.service.execute(historyNotice("101"))).rejects.toMatchObject({
+    await expect(harness.service.execute(pollWork(harness, "101"))).rejects.toMatchObject({
       code: "not_authorized",
     } satisfies Partial<GoogleSyncError>);
     expect(harness.store.sources.size).toBe(0);
@@ -637,7 +610,7 @@ describe("GoogleSyncService", () => {
       },
     });
 
-    await expect(harness.service.processPush(historyNotice("102").event)).resolves.toMatchObject({
+    await expect(harness.service.execute(pollWork(harness, "102"))).resolves.toMatchObject({
       status: "continuation_required",
       householdId: HOUSEHOLD_ID,
       adultId: ADULT_ID,
@@ -671,7 +644,7 @@ describe("GoogleSyncService", () => {
       pageToken: null,
       targetId: null,
     });
-    await expect(harness.service.execute(historyNotice("102"))).resolves.toMatchObject({ status: "noop" });
+    await expect(harness.service.execute(pollWork(harness, "102"))).resolves.toMatchObject({ status: "noop" });
     expect(harness.applicationItems).toHaveLength(2);
     expect(stored?.metadata).toMatchObject({ schemaVersion: 2, contentCompleteness: "full" });
     expect(harness.getInputs.map((input) => input.format)).toEqual(["metadata", "full", "metadata", "full"]);
@@ -708,7 +681,7 @@ describe("GoogleSyncService", () => {
       },
     });
 
-    await expect(harness.service.execute(historyNotice("101"))).resolves.toMatchObject({
+    await expect(harness.service.execute(pollWork(harness, "101"))).resolves.toMatchObject({
       processedMessages: 1,
     });
 
@@ -748,7 +721,7 @@ describe("GoogleSyncService", () => {
     });
     harness.applicationControl.fail = true;
 
-    await expect(harness.service.execute(historyNotice("101"))).rejects.toMatchObject({
+    await expect(harness.service.execute(pollWork(harness, "101"))).rejects.toMatchObject({
       code: "invalid_state",
     } satisfies Partial<GoogleSyncError>);
     expect(harness.store.sources.get("crash-safe")).toMatchObject({
@@ -757,7 +730,7 @@ describe("GoogleSyncService", () => {
     });
 
     harness.applicationControl.fail = false;
-    await expect(harness.service.execute(historyNotice("101"))).resolves.toMatchObject({
+    await expect(harness.service.execute(pollWork(harness, "101"))).resolves.toMatchObject({
       status: "processed",
     });
     expect(harness.store.sources.get("crash-safe")).toMatchObject({
@@ -802,7 +775,7 @@ describe("GoogleSyncService", () => {
       revision: 3,
     });
 
-    await expect(harness.service.execute(historyNotice("101"))).resolves.toMatchObject({
+    await expect(harness.service.execute(pollWork(harness, "101"))).resolves.toMatchObject({
       status: "processed",
       processedMessages: 1,
     });
@@ -845,7 +818,7 @@ describe("GoogleSyncService", () => {
       revision: 2,
     });
 
-    await expect(harness.service.execute(historyNotice("103"))).resolves.toMatchObject({
+    await expect(harness.service.execute(pollWork(harness, "103"))).resolves.toMatchObject({
       status: "processed",
       processedMessages: 1,
     });
@@ -876,7 +849,7 @@ describe("GoogleSyncService", () => {
       }),
     };
 
-    await expect(harness.service.execute(historyNotice("101"))).resolves.toMatchObject({
+    await expect(harness.service.execute(pollWork(harness, "101"))).resolves.toMatchObject({
       status: "continuation_required",
       phase: "recent_90_days",
     });
@@ -936,7 +909,7 @@ describe("GoogleSyncService", () => {
       revision: 1,
     });
 
-    await expect(harness.service.execute(historyNotice("150"))).resolves.toMatchObject({
+    await expect(harness.service.execute(pollWork(harness, "150"))).resolves.toMatchObject({
       status: "continuation_required",
       phase: "live",
       processedMessages: 0,
@@ -1052,7 +1025,7 @@ describe("GoogleSyncService", () => {
       }),
     };
 
-    await expect(harness.service.execute(historyNotice("150"))).resolves.toMatchObject({
+    await expect(harness.service.execute(pollWork(harness, "150"))).resolves.toMatchObject({
       status: "continuation_required",
       phase: "one_year_backfill",
       processedMessages: 0,

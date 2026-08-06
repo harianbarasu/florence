@@ -1,976 +1,1039 @@
-# Florence: Family Chief of Staff Product and Implementation Plan
+# Florence — Canonical Product Contract and Build Plan
 
-Plan date: 2026-08-04
-Status: accepted for full implementation on 2026-08-05
-Product and assistant name: Florence
-Canonical code identity: `harianbarasu/florence` at `/Users/harianbarasu/Projects/florence`
-Initial users: one founding family consisting of two verified adults
-Primary channel: one household iMessage group through Linq, with private DMs to the same assistant
-Initial hosting: Railway web service, background worker, and PostgreSQL; Google Cloud Pub/Sub for Gmail change notifications
-Model runtime: provider-neutral model gateway; initial credentials may use OpenAI, with Anthropic and open-weight/local adapters supported without domain changes; Codex remains a development tool, not the consumer runtime
+Status: approved working contract for the clean rebuild
 
-## Executive decision
+Date: 2026-08-05
 
-Build Florence, an iMessage-first Chief of Staff for parents.
+Canonical repository: `/Users/harianbarasu/Projects/florence` and `harianbarasu/florence`
 
-The product's first promise is:
+Production target: Railway, served from `https://harianbarasu.com`
 
-> Send the family group chat any school message, invitation, screenshot, email, or obligation. The assistant determines what must happen, gets an adult to own it, and follows through until it is handled.
+This document supersedes every earlier Florence plan, prototype assumption, and stale product
+invariant. The existing implementation is evidence and a source of proven mechanics; it is not an
+architecture to preserve. There will be no compatibility layer around the old adult-owned,
+two-person-household, snapshot-centered model.
 
-This is not a shared calendar with an AI chat box, a family dashboard, or a general personal assistant. It is a shared responsibility system that closes family loops.
+The full research transfer and evidence classification are in
+[`docs/research/florence-architecture-transfer-from-session-019fcdde-2026-08-05.md`](docs/research/florence-architecture-transfer-from-session-019fcdde-2026-08-05.md).
+That audit accounts for every branch in Codex task `019fcdde-cef2-7833-8f30-b6b9420dbec9` and
+separates primary-source facts, prior-task synthesis, Florence-specific inference, weak evidence,
+and non-transferable enterprise assumptions.
 
-The everyday product is one group conversation containing the two verified adults and Florence as one consistent Chief-of-Staff identity. Each adult also has a private DM with Florence. Children, schools, activities, and caregivers may be represented in household records, but children are not participants or account holders in v1.
+## 1. Product thesis
 
-The sharp initial wedge is sourced family obligations. The same engine also supports request-led family research, planning, meal planning, and grocery-list creation. These broader capabilities demonstrate the long-term Chief-of-Staff and multi-agent vision without diluting the initial promise.
+Florence is the group-chat-native family Chief of Staff that catches family obligations wherever
+they arrive and makes sure coverage is explicitly owned before the useful window closes.
 
-The product's deepest invariant is:
+The consumer behavior is:
 
-> **Persistent household intelligence, ephemeral cognition.** Models and workers may disappear; household commitments, policies, memories, evidence, approvals, actions, and outcomes may not.
+> **Add or forward it to Florence; she makes sure the family has it covered.**
 
-## Product thesis
+Parents should not need to maintain another perfect task system. Information already arrives through
+iMessage groups, private messages, Gmail, calendars, PDFs, screenshots, schools, sports, caregivers,
+and other parents. Florence converts that firehose into a small number of reliable coordination
+loops in the conversations where the family already operates.
 
-Parents do not primarily need another place to organize information. They need a reliable way to answer:
+The product is one visible Florence. Internally, a persistent application-owned orchestrator may
+delegate bounded cognition to ephemeral workers. Users never manage a swarm of agents.
 
-> Something entered family life. What does it mean, who owns the next step, when must it happen, and is it actually handled?
+### The first complete promise
 
-The durable product object is therefore not a message, calendar event, task, agent thread, or model trace. It is a proof-carrying **Family Episode**:
+The first complete release does one job end to end:
 
 ```text
-source evidence
-→ accepted family meaning
-→ required outcome
-→ owner and authority
-→ temporal plan
-→ actions and reminders
-→ result or resolution
-→ correction and approved learning
+permitted source
+→ relevant family need
+→ exact uncertainty or proposed coverage
+→ explicit acknowledgment by the person taking it
+→ useful, neutral follow-through
+→ covered, reopened, dismissed, cancelled, superseded, or expired-uncovered
 ```
 
-The first episode type is a family commitment. Research projects and meal plans use the same structure later: source, goal, plan, decision, action, outcome, and learning.
+It is a real, deployable product—not a scaffold—but deliberately proves the coverage-loop behavior
+before expanding into shopping, budgeting, travel booking, health, or a general life dashboard.
 
-The architectural implication is equally important: product connectors such as Linq, Gmail, and Calendar; model providers such as OpenAI, Anthropic, and open-weight/local endpoints; and worker harnesses such as LangGraph and Deep Agents all sit at separate replaceable seams. The household's accepted state and learning remain ours.
+### Product metric
 
-## Product contract
+The primary metric is **coverage loops safely closed**, not messages sent, tasks created, agents run,
+or whether Florence merely pinged somebody.
 
-### What Florence does
+A loop is safely covered when:
 
-Florence, acting as the household Chief of Staff:
+- the actual required outcome was identified from authorized evidence;
+- a named person explicitly acknowledged coverage before the last responsible moment;
+- that acknowledgment remained current or the loop was correctly reopened;
+- Florence disclosed no information outside the effective audience; and
+- Florence did not infer responsibility from silence, delivery, or model confidence.
 
-- monitors explicitly connected Gmail and calendars;
-- listens in the household group without treating every message as a request;
-- distinguishes ordinary conversation from a family obligation, decision, correction, or project;
-- turns relevant sources into proposed Family Episodes;
-- establishes the required outcome, owner, useful timing, and follow-up plan;
-- detects conflicts, preparation needs, deadline risk, and source changes;
-- keeps the household informed through neutral group reminders and a concise daily brief;
-- delegates bounded research and planning to ephemeral specialists;
-- learns household-specific relevance, privacy, timing, and preference rules;
-- asks less as approved rules and demonstrated patterns accumulate;
-- records what happened so later work can improve.
+Track separately:
 
-Florence does not:
+- obligations caught versus later discovered;
+- time from actionable evidence to acknowledged coverage;
+- loops expired without coverage;
+- consciously dismissed or cancelled loops;
+- unnecessary interruptions and repeated reminders;
+- corrections and reopened commitments; and
+- privacy, authorization, duplicate-effect, and timing incidents.
 
-- silently copy one adult's private email into the household;
-- interpret silence as acceptance or completion;
-- assign blame between adults;
-- send external communications, submit forms, RSVP, purchase, pay, book, cancel, or change an external account without the required approval;
-- become a general work or personal-productivity assistant;
-- let a worker write household truth or broaden its own permissions;
-- use conversation history, vector memory, a filesystem, or a framework checkpoint as canonical household state.
+## 2. People and product surfaces
 
-### Household-scope gate
+### People
 
-A request is in scope when its outcome materially affects the household, dependents, shared resources, or family commitments.
+A `Person` is global. A person may participate in several households and conversations without
+creating several Florence accounts. Phone numbers, emails, and provider handles are verified
+identities attached to that one person.
 
-In scope:
+Observed but unclaimed handles create provisional principals. Claiming an identity joins the
+provisional history to the verified person only after an exact, private confirmation. Florence never
+silently merges two people.
 
-- children, school, activities, caregiving, and adult availability;
-- household calendar, transportation, travel, and logistics;
-- meals, groceries, home supplies, and recurring household work;
-- shared purchases, subscriptions, finances, events, gifts, and social plans;
-- research supporting a household decision;
-- an adult's obligation when it changes household availability or responsibility.
+Household roles are relationship-local labels over explicit capabilities:
 
-Out of scope:
+- **steward:** co-equal household governance;
+- **caregiver:** may see and coordinate the exact family scope granted to them;
+- **participant:** limited relationship or conversation participation;
+- **dependent:** represented in family state but not an account holder in the first release.
 
-- work deliverables;
-- solo professional research;
-- general-purpose trivia;
-- individual projects with no household effect;
-- requests that merely happen to come from a parent.
+Caregivers include babysitters, grandparents, relatives, and other trusted adults. One caregiver may
+belong to several households without their contexts being joined.
 
-For mixed requests, the assistant handles only the household consequence. A work trip may create pickup and meal-planning consequences; it does not authorize the assistant to prepare the adult's work presentation.
+Stewards are co-equal contributors. Adding a new co-equal steward requires every current steward and
+the invitee. Any steward may immediately suspend a caregiver's household access. Removing a co-equal
+steward is not unilateral. Any person may narrow their own source grants, stop their own DM, or leave
+a relationship without another steward's permission.
 
-### Proactivity contract
+### Everyday surfaces
 
-The assistant is:
+1. **Private iMessage DM** — registration, personal integrations, private findings, source controls,
+   sensitive corrections, approvals, general questions, and step-up authentication.
+2. **iMessage groups** — the primary coordination and distribution surface once the exact current
+   participant set is eligible.
+3. **Mobile web companion** — onboarding, authority, inspectability, integrations, privacy, and
+   exceptional items requiring review. It is not a second chat client or family planner.
 
-- **proactive** about detected responsibilities, deadlines, changes, conflicts, preparation needs, risks, and explicitly authorized recurring routines;
-- **request-led** for optional planning such as meals, groceries, travel, gifts, purchases, and general family research.
+Florence may answer non-parenting and general questions when explicitly asked. Such answers use
+public knowledge and content supplied in the request by default. They do not silently retrieve
+private sources, create durable family state, or begin proactive work. If a request becomes
+family-operational, Florence explicitly promotes it into a family loop or project under the normal
+authority rules.
 
-Once an optional project is requested, the assistant may drive that episode to completion. It does not initiate a new discretionary project later unless the household creates a recurring rule.
+## 3. Canonical product nouns
 
-### Action contract
+| Noun | Meaning | Authoritative owner |
+|---|---|---|
+| `Person` | One human across Florence | Identity module |
+| `PersonIdentity` | Verified phone, email, or provider handle | Identity module |
+| `Household` | A relationship space with local members and authority | Relationship module |
+| `Membership` | Person, role label, and explicit capability grants in one household | Relationship module |
+| `Conversation` | App-owned chat space independent of a provider ID | Conversation authority module |
+| `ParticipantEpoch` | Immutable exact audience for one period of a conversation | Conversation authority module |
+| `Integration` | One person-owned external account connection | Source intelligence module |
+| `SourceRevision` | Immutable captured version of a message, thread, event, or attachment | Source vault |
+| `EvidenceRef` | Stable provenance pointer without copying raw content | Source vault |
+| `BridgeRule` | Narrow authority to derive a named minimum meaning into an exact destination | Authority module |
+| `MemoryCandidate` | Proposed fact, preference, or routine with evidence and uncertainty | Knowledge module |
+| `AcceptedMemory` | Versioned, scoped, inspectable accepted meaning | Knowledge module |
+| `Routine` | Recurring family expectation and notification policy | Coordination module |
+| `RoutineOccurrence` | One materialized occurrence that can open a loop | Coordination module |
+| `CoverageLoop` | One family outcome requiring acknowledged coverage | Coordination module |
+| `SkillVersion` | Governed procedure for producing typed proposals | Skills module |
+| `WorkerAttempt` | Bounded execution of a pinned task, skill, harness, and runtime | Orchestration module |
+| `ActionIntent` | Exact authorized external effect proposal | Effects module |
+| `EffectReceipt` | Authenticated outcome of an attempted effect | Effects module |
+| `AuditEvent` | Append-only explanation of a consequential decision or transition | Audit module |
 
-After trust is established, the assistant may automatically:
+Retrieval evidence and accepted operational truth are deliberately separate. A retrieved sentence is
+not automatically current, authorized, agreed, or safe to share.
 
-- create or update internal family commitments, plans, reminders, and daily-brief items;
-- update a household calendar when an approved source rule clearly authorizes that projection;
-- reschedule its own reminders when source facts or family routines change;
-- suppress repeatedly irrelevant inputs;
-- execute other reversible, household-internal actions covered by an approved rule.
+## 4. Conversation authority and the group-chat wedge
 
-The assistant must obtain explicit approval before:
+Every provider chat maps to an app-owned `Conversation`. Every authoritative participant change
+ends the current `ParticipantEpoch` and starts a new immutable epoch.
 
-- sending or replying to email;
-- messaging a school, caregiver, vendor, or other third party;
-- submitting a form or RSVP;
-- purchasing, paying, booking, canceling, or changing an account;
-- exposing information outside its current personal or household scope;
-- establishing a new category of external authority.
+### Conversation modes
 
-An approval binds the exact action, relevant data, approver, policy version, and expiry. Editing an action invalidates the old approval.
+| Mode | Condition | Ordinary content processing | Florence may write |
+|---|---|---|---|
+| `content_disabled` | At least one current participant is unregistered or has not consented to the epoch | No persistence, model call, attachment fetch, derivation, or retrieval; retain only routing, dedupe, membership, security, and opt-out metadata | No |
+| `read_enabled_write_disabled` | Every participant is registered and consented, but the effective policy or group rule forbids writing | Chat-epoch-local ingestion is allowed | No |
+| `trusted_write_enabled` | Every participant is registered, the live epoch matches, the participant-policy intersection permits the operation, and an applicable group rule exists for proactivity | Allowed within the epoch and exact grants | Direct answers and rule-authorized proactivity only |
+| `paused` | STOP, participant change, deletion fence, policy conflict, or safety hold | No new ordinary processing | No |
 
-## Core user flows
+“Read-only” therefore never means reading non-consenting people in secret. Adding Florence designates
+the chat as a potential source; it does not itself authorize ordinary processing. Registration may
+be lightweight—a verified private-DM claim and consent—without creating a household or connecting
+Google. This preserves the viral invite loop while keeping the permission boundary honest.
 
-### 1. Conversational household onboarding
+The inviter may authorize one private enrollment invitation to each unregistered participant. The
+invitation names the inviter, explains Florence plainly, sends at most once unless requested again,
+and supports immediate STOP. Florence sends nothing in the group before eligibility.
 
-Onboarding is conducted by the assistant in iMessage. There is no onboarding dashboard or product wizard.
+### Effective shared policy
 
-1. The initiating adult texts the Linq number first, establishing inbound-first consent and control of the phone number.
-2. The assistant explains the adult-only household model, privacy boundary, proactivity, and initial action limits.
-3. The initiating adult invites the second adult. The invitee accepts from their own phone and first establishes a private DM with the assistant.
-4. Each adult privately connects one or more of their own Gmail and calendar accounts. Every connection retains its owner, account label, grant, cursor, and privacy policy. The assistant sends secure browser links only for Google OAuth and required legal consent, then immediately continues the conversation in iMessage.
-5. Each adult establishes private account labels, work/personal distinctions, obvious exclusions, and initial sharing rules.
-6. After both adults are verified, they create or join one group containing both adults and the Linq number. The exact Linq group-creation path is confirmed in the vendor spike before implementation is generalized.
-7. The assistant builds the shared family profile collaboratively in the group: children's names and grades, schools, activities, important caregivers, routines, pickup/drop-off patterns, recurring responsibilities, and preferred planning times.
-8. Household time anchors are required: time zone, school start and departure, pickup, commute, recurring activities, work constraints, bedtime or preparation windows where relevant, and quiet hours.
-9. The assistant summarizes what it believes, identifies private versus shared facts, and allows either adult to correct the shared profile.
-10. The household begins in private learning mode before trusted automations activate.
-
-Private DM owns personal integrations, private source rules, sensitive corrections, consent, disconnection, export, and deletion. The group owns shared family facts, routines, commitments, and household rules.
-
-Acceptance criteria:
-
-- Both adults are independently verified and consented.
-- One adult cannot connect, expose, or revoke the other adult's mailbox.
-- Gmail and calendar OAuth tokens never enter model context.
-- The assistant cannot create the household group or begin proactive group messaging until both adults complete consent.
-- The family profile is useful without asking for unnecessary child data.
-- Browser handoffs are limited to secure operations that cannot safely occur in iMessage.
-
-### 2. Gmail monitoring and private-to-household promotion
-
-Each connected Gmail mailbox remains personal to its owner.
-
-1. Gmail notifies the connector of mailbox changes.
-2. The connector retrieves changed messages under that adult's grant and excludes spam, trash, obvious promotions, and unrelated work content.
-3. Private triage classifies each relevant message as:
-   - ignore;
-   - retain as private context;
-   - include in the ordinary private review;
-   - interrupt the mailbox owner privately because it is urgent;
-   - propose a current family episode.
-4. Raw email is never pasted into the group automatically.
-5. For a proposed family episode, the owner sees the minimum useful private prompt, source, interpretation, and proposed household wording.
-6. The owner may share once, keep private, dismiss, correct, or create a durable rule such as “always share messages from this school.”
-7. Once a rule is approved, matching messages follow it without repeated confirmation unless the new content materially exceeds the rule or enters a sensitive category.
-8. The shared group receives only the minimum necessary family meaning and resulting commitment, not the private mailbox contents.
-
-Sensitive medical, financial, employment, legal, and relationship information remains private unless explicitly promoted. A trusted sender is not a blanket waiver: a school domain may still send content that materially exceeds an existing sharing rule.
-
-Ordinary findings are batched into one private daily review. High-confidence, time-sensitive findings interrupt privately when delay would make the result less useful.
-
-Acceptance criteria:
-
-- Zero personal-to-household leakage.
-- Every shared item has a source owner and an applicable approval or rule version.
-- The group summary reveals no unnecessary private content.
-- A revoked rule affects future processing immediately.
-- A source change updates or supersedes the existing episode rather than creating duplicates.
-
-### 3. Group conversation to closed family commitment
-
-1. A verified adult sends a message, screenshot, photo, PDF, link, or forwarded context to the group.
-2. A lightweight turn-taking gate chooses `respond`, `react`, `ignore`, or `plan`. The assistant stays quiet during ordinary adult conversation.
-3. If a family obligation exists, the assistant identifies the source, required outcome, timing, missing information, and proposed owner.
-4. In v1, the proposed owner explicitly acknowledges responsibility. Group delivery or silence is never treated as acceptance because group iMessage does not provide read receipts.
-5. The assistant creates the commitment, temporal plan, reminder plan, and evidence links.
-6. Reminders may appear in the group. Their language describes the state, not the adult's character or failure.
-7. If completion is uncertain, the assistant asks whether the obligation is handled or should be reassigned.
-8. Completion, dismissal, supersession, or failure closes the episode with an outcome.
-
-Good reminder:
-
-> The field-trip form is still open and due tomorrow. Is it handled, or should we reassign it?
-
-Bad reminder:
-
-> Hari still has not completed the form.
-
-Acceptance criteria:
-
-- Duplicate Linq events create no duplicate commitments or replies.
-- The assistant identifies the speaker and conversation scope correctly.
-- A commitment cannot become assigned through silence.
-- Neutral reminder language is evaluated and regression-tested.
-- Closure records the outcome and cancels stale timers.
-
-### 4. Deep temporal reasoning and the daily household brief
-
-The assistant reasons about useful action windows, not only stated deadlines.
-
-Every commitment may contain:
-
-- event time;
-- formal deadline;
-- preparation duration;
-- earliest useful action window;
-- last responsible moment;
-- departure or transition anchor;
-- relevant availability and travel constraints;
-- reminder cadence and escalation policy.
-
-Example:
+For every retrieval and send:
 
 ```text
-“Pajama day is Tuesday”
-→ surface Sunday while shopping remains possible
-→ remind Monday during household preparation time
-→ final reminder Tuesday before school departure
-→ never send the first useful reminder after school starts
+system safety policy
+∩ exact live participant epoch
+∩ every participant's applicable policy
+∩ source visibility
+∩ source-owner bridge grants
+∩ conversation purpose and rule
+∩ current retention and revocation state
 ```
 
-The model may extract semantic timing from sources. A deterministic time module resolves time zones, daylight-saving transitions, household anchors, conflicts, stale plans, and exact trigger instants. Every timer carries the episode and temporal-plan version and reevaluates current state before sending.
+Missing authority is a denial. A source or skill can only narrow this set; it cannot widen it.
 
-The group receives one concise daily brief at a household-chosen time containing:
+Registration alone permits neither private-source disclosure nor proactive messaging. A directly
+addressed question in a fully registered group may receive a group-local/public answer under the
+policy intersection. Proactivity additionally requires an established rule for that conversation.
 
-- today's and near-term schedule;
-- current preparation needs;
-- open and at-risk commitments;
-- meaningful changes or conflicts;
-- decisions that genuinely need an adult.
+Any participant can immediately make a conversation read-only, pause Florence, shorten retention,
+or STOP. That does not let them disable another person's private DM, personal integrations, or other
+conversations. Widening a shared conversation's retention or proactive behavior requires every
+affected current participant.
 
-Private source detail is excluded unless a sharing rule permits it.
+Earlier-epoch content is never automatically disclosed to a newly added participant. Outbound sends
+reauthorize against the provider's live participant list immediately before execution.
 
-Acceptance criteria:
+## 5. Identity, registration, and onboarding
 
-- At least 90% of pilot reminders arrive inside a useful action window.
-- Changed schedules invalidate old reminder plans.
-- The brief does not repeat already resolved work.
-- A missed window is surfaced honestly rather than disguised as a timely reminder.
+### Passwordless identity
 
-### 5. Request-led family research and planning
+The private Linq DM is the root recovery channel for the first release.
 
-An adult may ask the group or a private DM to handle a bounded household project:
+1. A verified inbound private DM resolves or creates a provisional phone-bound person.
+2. Florence issues a random 256-bit, single-purpose handoff and stores only its digest, person,
+   exact private binding, authority epoch, expiry, state, and encrypted context.
+3. The browser landing page is generic and non-consuming.
+4. An explicit POST atomically consumes the handoff and revalidates the live private identity.
+5. Florence creates a server-side person session in a Secure, HttpOnly, SameSite, `__Host-` cookie
+   and redirects to a token-free URL.
+6. Browser writes require CSRF protection plus Origin and Host validation.
+7. Sessions revalidate person and relationship authority for every operation and are revoked by
+   STOP, identity changes, deletion fencing, or explicit logout.
+8. High-risk actions require a fresh challenge delivered to and confirmed from the same private DM.
 
-> Find three summer camps that fit our calendar and compare cost, location, and cancellation policy.
+Default browser sessions expire after 30 days of inactivity and 90 days absolutely. Users can view
+and revoke active sessions.
 
-1. The CoS applies the household-scope gate.
-2. It defines the decision, evidence required, constraints, budget, and completion contract.
-3. It creates an episode and delegates bounded work to ephemeral research, calendar, comparison, or verification workers.
-4. Workers receive only purpose-scoped context and tools.
-5. The CoS reconciles their results against current household state, resolves conflicts, and returns one decision-ready recommendation.
-6. Any external communication, booking, or payment remains approval-gated.
-7. The episode remains accessible through the CoS until resolved; internal workers disappear.
+Google identity is an integration identity, not Florence login. Connecting several work and personal
+Google accounts never creates several Florence people.
 
-Acceptance criteria:
+### Progressive hybrid onboarding
 
-- Out-of-scope personal or work research is declined or narrowed.
-- Sources and as-of dates remain attached to material claims.
-- A worker cannot see unrelated private household data.
-- A worker result cannot directly message the family or commit state.
-- The answer is useful without exposing internal agent choreography.
+Onboarding begins in iMessage and moves to mobile web when structured or sensitive choices are
+clearer there. It is resumable and useful before every optional field is complete.
 
-### 6. Request-led meal plan to grocery list
+1. Register the global person and confirm name, timezone, quiet hours, consent, and recovery phone.
+2. Create or join a household.
+3. Invite co-stewards and caregivers through exact private invitations.
+4. Represent dependents, schools, activities, and important places without creating child accounts.
+5. Capture the few recurring routines that are not on a calendar: pickup, drop-off, practices,
+   meals, recurring forms, and coverage preferences.
+6. Connect one or more person-owned Google accounts.
+7. Select Gmail import behavior and each Google calendar's private processing level.
+8. Add Florence to one or more chats and privately inspect their participant/eligibility status.
+9. Establish a narrow household-group proactivity rule once every current participant is registered.
+10. Begin in exceptions-first learning mode; Florence proposes narrow recurring rules when repetition
+    is demonstrated.
 
-Meal planning is supported but never initiated without a request or an explicitly approved recurring rule.
+## 6. Mobile web companion
 
-1. An adult asks for a meal plan and supplies or confirms the time horizon.
-2. The CoS uses the week's household schedule, known preferences, dietary constraints, preparation time, leftovers, and explicitly provided pantry information.
-3. It proposes a practical plan, asks only for consequential missing information, and incorporates feedback.
-4. It creates one shared grocery list grouped for action.
-5. Ordering or checkout is outside the first pilot and would require explicit approval later.
-6. Low-risk preferences may become household memory; sensitive dietary or medical facts require confirmation.
+The web app is an authority and exception plane. Ordinary conversation and coordination stay in
+iMessage.
 
-Acceptance criteria:
+### Home
 
-- The assistant does not start a weekly meal-planning conversation unless asked.
-- The plan reflects actual schedule constraints rather than generic recipes.
-- Rejected meals and accepted substitutions improve later requested plans.
-- No retailer order or payment occurs in v1.
+Show onboarding progress when incomplete. Otherwise show only:
 
-### 7. Conversational inspection, correction, and control
+- uncovered or at-risk loops requiring this person's input;
+- pending approvals or private-source reviews;
+- integration/backfill failures;
+- participant or privacy changes; and
+- a plain status that Florence is connected and monitoring.
 
-There is no customer dashboard in v1. Adults manage the product through private DMs:
+### Me & relationships
 
-- “Which Gmail accounts are connected?”
-- “Why did you share that?”
-- “Show my automatic-sharing rules.”
-- “Stop sharing messages from this sender.”
-- “What do you know about our school schedule?”
-- “Forget that.”
-- “Disconnect my work email.”
-- “Export my data.”
-- “Delete my data.”
+- verified identities and active sessions;
+- households, memberships, roles, capability grants, and invitations;
+- represented dependents and household basics;
+- safe leave, role-change, and identity-claim flows.
 
-The assistant answers from authoritative records and performs validated commands. OAuth, legal consent, and later payment may use secure browser pages; ordinary control returns to iMessage.
+### Chats
 
-Acceptance criteria:
+- provider chat, current exact participants, and current epoch start;
+- each participant's registration/consent state;
+- `content_disabled`, silent, trusted, or paused mode;
+- effective retention, quiet-hours, and proactivity intersection;
+- last participant change and why a write gate is closed;
+- applicable bridge and conversation rules.
 
-- Every material decision is explainable from source, rule, and authority records.
-- Corrections supersede rather than silently mutate history.
-- Revocation and deletion commands are authenticated and auditable.
-- A DM never reveals the other adult's private-source content.
+### Sources & privacy
 
-### 8. Failure and recovery
+- person-owned Google connections and sync health;
+- Gmail import progress and pause/resume controls;
+- calendars in `full_private`, `availability_only`, or `off` mode;
+- accepted memories, profile facts, routines, source/as-of/scope, and review dates;
+- pending candidates and private review items;
+- standing bridge rules and recent “why Florence shared/interrupted” explanations;
+- correct, forget, stop-sharing, disconnect, and revoke controls.
 
-The assistant behaves like a responsible Chief of Staff when work fails.
+### Data & safety
 
-It reports:
+- STOP/pause status and notification controls;
+- exports;
+- leave household, delete person, and delete household as distinct operations;
+- deletion/revocation progress and receipts;
+- active browser sessions.
 
-- what remains unfinished;
-- whether a deadline or useful window is at risk;
-- the smallest decision, permission, or input needed;
-- what safe work can continue;
-- whether the system is retrying, reconciling, or has stopped.
+Do not build a general task dashboard, calendar clone, raw Gmail browser, full iMessage archive,
+agent builder, skill administration page, or free-form relationship graph editor.
 
-It never marks an episode complete because a model said it was complete. Unknown external-action outcomes are reconciled before retrying to prevent duplicates.
+### High-risk step-up
 
-## Privacy, memory, and learning
+Require a new exact private-DM challenge for:
 
-### Scope model
+- adding, removing, or merging a verified identity;
+- accepting/leaving a household or widening a role/capability;
+- adding a co-equal steward;
+- activating trusted ambient behavior or widening epoch retention/proactivity;
+- creating a standing private-source bridge to a new audience;
+- connecting, replacing, or disconnecting an integration;
+- export, account deletion, household deletion, or destructive chat-history removal; and
+- any external write added in a later release.
 
-All durable information has one of three scopes:
+Narrowing, pausing, STOP, correcting, and forgetting take effect immediately.
 
-- **job:** temporary context for one bounded worker; discarded after completion and retention expiry;
-- **personal:** private to one verified adult;
-- **household:** available to the household CoS and workers whose purpose requires it.
+## 7. Coverage loops
 
-Derived data cannot have broader visibility or lower sensitivity than its sources unless an applicable adult approval or durable policy explicitly permits promotion.
-
-### Memory model
-
-Every durable memory records:
-
-- scope;
-- source and provenance;
-- confidence;
-- sensitivity;
-- valid-from and optional expiration time;
-- confirmation status;
-- the rule or authority that permitted promotion;
-- correction, revocation, and supersession history.
-
-Promotion policy:
-
-- explicit statements and confirmations become durable immediately;
-- trusted sources covered by an approved rule may update matching household facts;
-- low-risk preferences and routines may be learned automatically and corrected conversationally;
-- sensitive facts and all new personal-to-household sharing require confirmation;
-- workers return memory candidates but cannot promote them.
-
-### Routing self-learning
-
-Every inbox or message classification preserves the decision, confidence, applicable rules, and eventual household response.
-
-Feedback includes:
-
-- not relevant;
-- this was urgent;
-- share once;
-- always share this source or class;
-- keep these private;
-- wrong owner;
-- wrong time;
-- handled, dismissed, superseded, or missed.
-
-The learning boundary is asymmetric:
-
-- the assistant may automatically become quieter and improve prioritization;
-- expanding disclosure or action authority always requires one explicit approval;
-- once approved, the assistant follows the rule without repeatedly asking;
-- exceptions are triggered only when new content materially exceeds the rule.
-
-### Harness self-improvement
-
-Household feedback may generate candidate changes to prompts, classifiers, policies, context selection, time interpretation, or worker configurations. The improver may not modify its evaluator, permissions, approval thresholds, protected regression cases, or production release directly.
-
-Product-wide improvement follows:
+### State machine
 
 ```text
-episode and outcome evidence
-→ failure pattern
-→ bounded candidate change
-→ replay against held-in and protected held-out scenarios
-→ privacy, timing, quality, cost, and reliability report
-→ explicit release promotion
+provisional
+  → open
+  → awaiting_response
+  → covered
+
+covered → at_risk → awaiting_response | covered
+
+any live state → cancelled | superseded | dismissed | expired_uncovered
 ```
 
-Household-specific rules stay household-specific. Raw private household data is not pooled for cross-customer learning without separate, explicit consent.
+- `provisional`: credible need, but one consequential fact is unresolved.
+- `open`: the required family outcome is clear and lacks acknowledged coverage.
+- `awaiting_response`: Florence has asked an exact person or eligible group for coverage.
+- `covered`: a named person explicitly acknowledged the commitment.
+- `at_risk`: credible new evidence contradicts or withdraws the current coverage.
+- `dismissed`: an authorized person consciously says the loop is unnecessary.
+- `expired_uncovered`: the last responsible moment passed without current acknowledged coverage.
 
-## Gmail and calendar history
+The first release closes the **coverage** loop. It does not pretend to prove that the child was
+physically picked up. Later evidence may record fulfillment as `observed_done`, `observed_failed`, or
+`unknown`, but absence of that evidence does not rewrite an honestly acknowledged coverage result.
 
-Onboarding uses tiered processing:
+### Authority and language
 
-1. Process the most recent 90 days first for rapid usefulness.
-2. Backfill at least one year of Gmail during onboarding, newest first.
-3. Progressively analyze the remaining mailbox in the background.
-4. Use full history privately to learn recurring relationships, annual patterns, senders, and relevant context.
-5. Activate an old finding only when it is still currently actionable or the adult asks about it.
-6. Use Gmail push notifications and incremental history synchronization after the initial sync.
+- Any authorized steward, caregiver, or participant may originate a loop within their scope.
+- Connected sources and workers may propose a loop; they cannot establish intent or ownership.
+- Only the proposed person may commit themselves.
+- A private decline produces only “coverage is still open” in a shared destination. Florence may not
+  disclose the person's unavailability or reason without their explicit approval.
+- Silence, message delivery, read status, reactions, historical habits, and model confidence never
+  establish ownership.
+- Credible contradiction reopens a covered loop as `at_risk`.
+- Group messages describe state and choices, never character, fault, neglect, or comparative effort.
 
-Gmail remains the source of truth for raw email. The product retains encrypted source references, classifications, structured facts, episode evidence, and only the raw content necessary for current processing, retrieval, audit, or an explicit retention promise. Raw-body caches and attachment copies have defined expiration and deletion behavior.
+Preferred reminder shape:
 
-All Gmail content and derived embeddings or summaries are treated as restricted user data. Public launch requires Google OAuth verification and any applicable security assessment before scaling beyond approved test users.
+> Pickup coverage is still open for Wednesday at 3:00. Is it handled, or should we find someone?
 
-## System architecture
+Once a person has publicly accepted, Florence may neutrally state that recorded coverage. It should
+not publicly name a nonresponsive nominee.
+
+### Provisional uncertainty
+
+- Group-local ambiguity is clarified in that group when the conversation may write.
+- Private or cross-scope uncertainty is asked privately of the source owner.
+- Urgent consequential uncertainty is asked now.
+- Low-risk uncertainty batches into private review.
+- Florence opens a cautious provisional loop rather than silently inventing an owner, time, or fact.
+
+## 8. Routines, time, and notifications
+
+Recurring hidden routines are first-class. A routine materializes dated occurrences so exceptions,
+school breaks, vacations, one-off swaps, and source changes can affect one occurrence without
+rewriting the standing routine.
+
+The default notification mode is `exceptions_only`. A standing holder may make an occurrence
+covered automatically only when that person explicitly created or approved the standing routine.
+
+Every occurrence carries:
+
+- event/deadline and timezone;
+- preparation/travel duration when relevant;
+- earliest useful time and last responsible moment;
+- quiet-hours and escalation policy;
+- destination and participant epoch;
+- source/routine version; and
+- current plan version.
+
+Models interpret semantic time; deterministic code resolves exact instants, recurrence, timezone,
+DST, quiet hours, and versioned timers. A timer is a request to reevaluate current state, sources,
+audience, and rules—not permission to send a stale reminder.
+
+### Notification policy
+
+A proactive message must reveal a material change, uncovered obligation, conflict, blocking decision,
+prepared approval, useful last-window reminder, or meaningful closure. Successful unchanged routine
+execution is silent.
+
+For one loop, Florence normally sends no more than:
+
+1. the opening coverage request;
+2. one reminder at a materially later useful/escalation boundary; and
+3. a message for a real state change, closure, cancellation, or renewed risk.
+
+Additional messages require new evidence or an explicit request. Low-urgency private findings batch
+into one private review. A household brief is optional and is suppressed when it would only say “all
+clear.”
+
+Onboarding asks for quiet hours. Until configured, use 9:00 PM–7:00 AM local for private messages and
+the conservative union of every participant's quiet hours for a group. A quiet-hours override is
+allowed only when waiting crosses the last responsible moment and every affected participant's
+policy permits that category. Urgency never widens a private audience.
+
+## 9. Source and integration contract
+
+### Four separate permissions
+
+Never collapse these into one “has access” flag:
+
+1. **Ingestion** — may Florence receive and inspect this source?
+2. **Retrieval/disclosure** — may the source or a derivative enter this exact task and audience?
+3. **Acceptance** — who may promote the proposal into accepted personal/shared state?
+4. **Destination/action** — may Florence send, schedule, write, or otherwise affect this target?
+
+### Common pipeline
+
+```text
+verified provider event
+→ deterministic person/epoch/grant admission
+→ encrypted private or chat-local source revision
+→ bounded ephemeral interpretation
+→ private candidate, review, or interrupt
+→ exact approval or applicable standing bridge
+→ minimum destination-safe artifact
+→ authoritative memory/routine/coverage transition
+→ live audience reauthorization before send
+```
+
+An approval applies once unless it explicitly creates a narrow standing rule. When Florence sees a
+likely repetition, it may ask once whether similar future items should follow the same rule. After
+approval it should stop asking for matching items. A generic “yes” never becomes broad future
+disclosure authority.
+
+### Linq
+
+- Verify webhook signatures over raw bytes before business parsing.
+- Persist/deduplicate the provider event before acknowledgment and process asynchronously.
+- Support messages, edits, replies, reactions, participant added/removed events, attachments, and
+  outbound sent/failed receipts.
+- Fetch the authoritative live chat for participant changes and immediately before every send.
+- Never ingest pre-Florence, pre-registration, pre-consent, or earlier-epoch group history.
+- Fetch attachments only after the content-admission gate.
+- Periodically reconcile provider state after missed or out-of-order events.
+
+### Gmail
+
+Every Google connection belongs to one global person and is keyed by Google subject, not household.
+One person may connect several personal and work accounts and grant narrow derivatives into several
+relationships without re-OAuth.
+
+The first release uses `gmail.readonly`. Gmail sending, drafting, deletion, labels, and account
+mutation are not enabled.
+
+Use the Gmail History API cursor as the authoritative incremental mechanism. The worker polls live
+history frequently; optional Pub/Sub may later wake the same durable sync path but is not required
+for correctness. Safety polling and full recovery handle delayed notifications and expired history.
+
+Live capture starts before backfill. Keep separate live and historical cursors with this priority:
+
+1. live changes;
+2. newest 30 days;
+3. days 31–90;
+4. days 91–365;
+5. older history, newest-first, low-priority, resumable, and explicitly enabled.
+
+Hari has already opted into the older-history pass for the founding account. The general product
+asks during onboarding and provides pause/cancel/progress controls.
+
+“Process history” means metadata-first relevance filtering and body/attachment retrieval for likely
+family material—not permanently mirroring or sending every email to a model. Spam and trash are
+rejected deterministically. Promotions, newsletters, and social categories still receive cheap
+metadata triage because schools and activities are often mislabeled.
+
+Historical processing is silent. It may propose current routines and narrow source rules, or surface
+a still-actionable item privately. It never floods a household with retroactive reminders.
+
+### Attachments and PDFs
+
+The first complete set supports PDF, common images, plain text/HTML, CSV, and ICS.
+
+- Preserve provider message/thread/part identity, content hash, MIME, size, and source revision.
+- Validate bytes rather than trusting filenames.
+- Enforce bounded size/count limits and identify decorative inline assets.
+- Store raw bytes encrypted and separate from metadata.
+- Derive text/OCR/chunks/citations as rebuildable, source-scoped output.
+- Analyze hostile content in a worker with no credentials, write tools, or policy access.
+- Unsupported, encrypted, corrupt, or oversized relevant files produce a private recoverable notice.
+
+### Google Calendar
+
+The first release is read-only. Each person selects each calendar as:
+
+- `full_private`: private event content may be interpreted;
+- `availability_only`: Florence stores only busy windows and minimal event identity; or
+- `off`.
+
+A shared Google calendar is not automatically household-visible. Calendar scope and relationship
+bridges remain separate.
+
+Synchronize one year backward and eighteen months forward. Historical events may propose routines
+silently; upcoming changes may open private provisional loops. Use per-calendar sync tokens,
+frequent polling, and scoped full recovery on invalid tokens. Provider push may become an optional
+wake-up optimization later.
+
+Calendar creation/update/delete is deferred until the coverage product proves the approval and
+effect boundary. Linq messages are the only customer-visible outbound effect in the first release.
+
+## 10. Privacy, memory, retention, and deletion
+
+### Memory promotion
+
+```text
+source or explicit statement
+→ scoped candidate
+→ authority, provenance, sensitivity, and time check
+→ accepted personal/shared memory or typed operational state
+→ purpose-aware use
+→ correction, expiry, supersession, forgetting, or deletion
+```
+
+Explicit first-person low-risk preferences may be accepted directly. Third-party statements,
+inferences, sensitive facts, conflicts, consequential commitments, and scope widening remain
+candidates until the appropriate authority boundary is satisfied.
+
+Every accepted record has owner/subject, scope, purpose, evidence receipt, valid time, review date,
+sensitivity, revision, and deletion lineage. Corrections create atomic new revisions and invalidate
+dependent context. Forgetting creates a revocation tombstone so stale source replay cannot recreate
+the forgotten state silently.
+
+The disappearance of a source does not automatically erase deliberately accepted state. Its
+provenance becomes unavailable and the record can require reconfirmation.
+
+### Retention
+
+| Record class | Maximum/default retention |
+|---|---|
+| Unregistered-group ordinary content and attachments | None; no model processing or attachment fetch |
+| Registered private/group raw source | 30 days maximum; groups use the shortest participant cap |
+| Raw attachment bytes | Same or shorter than parent source |
+| OCR, chunks, embeddings, and rebuildable summaries | Never outlive source authorization or retention |
+| Private review item | Seven days unless acted upon |
+| Worker scratch | Seven days maximum |
+| Accepted fact, rule, routine, loop, and outcome | Durable until corrected, expired, forgotten, revoked, or deleted |
+| Minimal non-content source/authority receipt | Durable with the accepted record |
+| Credentials, cursors, and provider IDs | Connection lifetime; credentials erased on revocation |
+
+After Gmail raw expiry, Florence may refetch under the still-valid connection and purpose. Revocation
+or deletion invalidates derivatives transitively.
+
+### Data controls
+
+- **Export me:** person-owned identities, sources, grants, memories, memberships, decisions, and
+  audit explanations that person is authorized to receive.
+- **Leave household:** revoke future relationship access without pretending already delivered group
+  messages can be erased.
+- **Delete my account:** immediately fence the person, erase credentials and personal content,
+  revoke sessions, re-evaluate/redact dependent shared derivatives, and create a replay tombstone.
+- **Delete household:** sole steward or unanimous current stewards fence and erase shared household
+  state; personal integrations remain person-owned unless separately deleted.
+
+Primary records are crypto-erased promptly. Backup aging is at most 30 days, with deletion
+tombstones reapplied after any restore. The UI shows durable deletion receipts and explains data
+Florence cannot remove from iMessage or Google.
+
+## 11. Chief of Staff, workers, and governed skills
+
+The persistent “agent” is the Florence application and its durable state—not a never-ending model
+conversation. One authoritative application entry point reconciles every signal and commits every
+consequential transition.
+
+Workers are bounded and non-authoritative. They receive a purpose, exact evidence references,
+small context packet, requested capabilities, budget, deadline, pinned skill, and typed output
+contract. They return proposals and artifacts, then expire.
+
+Workers may not:
+
+- message a person or group;
+- accept or change household truth;
+- promote memory or a bridge rule;
+- add/remove people or alter participant policy;
+- hold refresh tokens or broad credentials;
+- schedule future work or execute an external action; or
+- widen or delegate their grants.
+
+### Initial product skills
+
+| Skill | Typed proposal |
+|---|---|
+| `coverage.need_interpret` | Ignore/private-review/propose disposition, changed fact, required outcome, evidence, sensitivity, time facts, uncertainties, and prior-loop link |
+| `coverage.commitment_propose` | Proposed outcome, proposed person, semantic timing, consequential question, and follow-up shape |
+| `coverage.minimum_disclosure` | Minimum group-safe meaning for one exact destination epoch and omitted-sensitive-category flags |
+| `coverage.outcome_assess` | Acknowledged, corrected, contradicted, dismissed, superseded, missed, expired, or unknown proposal with evidence |
+
+Authorization, dedupe, exact scheduling, state transitions, and effect execution remain deterministic
+code, never skills.
+
+Each immutable `SkillVersion` carries a stable ID/version, owner, purpose, input/output schemas,
+requested capability profiles, tool ceiling, risk class, examples, evaluation release, status, and
+rollback target. Only relevant skills enter context.
+
+Every authoritative attempt pins:
+
+```text
+TaskVersion + SkillVersion + HarnessRelease + RuntimeRoute + EvaluationRelease + AttemptId + TraceId
+```
+
+Deep Agents, LangGraph, Hermes, Mastra, or a thin custom harness may implement `WorkerRuntime` if it
+wins the same protected evaluations. None may own people, chats, permissions, coverage, memory,
+approvals, or outcomes.
+
+The first runtime should be a thin bounded structured-output adapter over the existing open-source
+LangChain provider interfaces. The four coverage skills do not require a framework-owned workflow.
+Deep Agents remains an optional adapter for later tool-heavy research, not required infrastructure.
+
+## 12. Learning and evaluation
+
+Florence has two different learning loops:
+
+1. **Family learning:** accepted facts, routines, source bridges, notification preferences, and
+   corrections scoped to the exact person/household/conversation.
+2. **Product learning:** versioned skill, prompt, context-selection, classifier, or harness candidates
+   evaluated before an operator promotes them.
+
+Repeated matching items may propose one narrow standing rule. Once the source owner approves it,
+future matching items use it without asking again. Florence may automatically narrow interruption
+cadence or batch low-value items when that cannot discard a real obligation; it may never
+automatically widen disclosure, retention, tools, or action authority.
+
+### Trace-to-candidate loop
+
+```text
+pinned task/skill/harness/runtime
+→ typed trace and receipts
+→ reconciled family outcome
+→ objective observation
+→ failure cluster or severe incident
+→ narrow inactive candidate
+→ held-in replay
+→ protected holdout
+→ shadow comparison
+→ explicit operator promotion
+→ monitored release
+→ automatic safety pause and manual resume/rollback
+```
+
+Product learning uses synthetic or minimized reproductions by default. Raw household traces never
+become cross-customer training/evaluation data without separate explicit consent.
+
+Automatic production promotion is forbidden. A hard privacy, authority, or duplicate-effect failure
+automatically pauses the implicated release; resumption is explicit and audited. Hari is the initial
+product-release operator. Household users may approve household routines, not product skills.
+
+### Lean protected evaluation set
+
+Keep verification deliberately small and risk-shaped. Do not pursue a test-count or coverage-percent
+target.
+
+Hard zero-failure cases:
+
+- private data reaches the wrong person, household, chat, or epoch;
+- unregistered content is processed;
+- source scope widens without the exact owner rule;
+- silence or delivery becomes ownership;
+- a worker writes state, sends, or escalates capability;
+- an outbound effect duplicates under retry/replay;
+- stale participant/timer/source state authorizes a send;
+- evidence is fabricated or a rolled-back skill produces an accepted result.
+
+Coverage-quality cases:
+
+- relevant obligation versus ordinary/noisy content;
+- correct outcome, uncertainty, person, recurrence, timezone, and useful window;
+- neutral no-blame coordination;
+- explicit acknowledgment, private decline, contradiction/reopen, dismissal, cancellation, and
+  expired-uncovered;
+- source edit/deletion and provider recovery;
+- minimal disclosure and user correction.
+
+Use deterministic scorers for policy, state, timing, duplicates, and receipts. A pinned model grader
+may score clarity or tone, but cannot override a hard gate.
+
+## 13. Clean engineering architecture
+
+Choose a normalized TypeScript/PostgreSQL modular monolith. Do not use framework checkpoints or an
+event-sourced household snapshot as canonical state.
 
 ```mermaid
 flowchart LR
-    Linq["Linq group and private DMs"] --> Ingress["Authenticated signal adapters"]
-    Gmail["Gmail watch and history"] --> Ingress
-    Calendar["Google Calendar"] --> Ingress
-    Clock["Timers and daily sweep"] --> Ingress
-
-    Ingress --> Journal[("PostgreSQL signal journal")]
-    Journal --> Queue["Household-serialized durable queue"]
-    Queue --> CoS["HouseholdChiefOfStaff"]
-
-    CoS --> Policy["Scope, privacy, authority, and temporal policy"]
-    CoS --> Context["Purpose-scoped context grants"]
-    CoS --> Runtime["WorkerRuntime interface"]
-    Runtime --> Harness["LangGraph.js and Deep Agents.js adapter"]
-    Harness --> Workers["Ephemeral specialist workers"]
-    Harness --> Gateway["ModelGateway interface"]
-    Gateway --> Models["OpenAI, Anthropic, and open-weight/local adapters"]
-    Workers --> Runtime
-    Runtime --> CoS
-
-    CoS --> State[("Episodes, commitments, memory, rules, approvals, audit")]
-    CoS --> Outbox["Transactional outbox"]
-    Outbox --> Effects["Linq, Calendar, email, and future action adapters"]
-    Effects --> Ingress
+    L["Linq webhooks"] --> A["Provider adapters"]
+    G["Google Gmail/Calendar"] --> A
+    W["Mobile web commands"] --> APP["FlorenceApplication.process"]
+    A --> APP
+    T["Timers / worker results / effect receipts"] --> APP
+    APP --> I["Identity & relationships"]
+    APP --> C["Conversation authority"]
+    APP --> S["Source intelligence"]
+    APP --> K["Knowledge & coordination"]
+    APP --> P["Authority policy"]
+    APP --> D[("PostgreSQL")]
+    APP --> J["Durable jobs / outbox"]
+    J --> R["Ephemeral WorkerRuntime"]
+    J --> E["Deterministic effect executors"]
+    R --> APP
+    E --> APP
 ```
 
-### Primary module interface
+### Deep modules
+
+| Module | Owns | Does not own |
+|---|---|---|
+| `IdentityRelationships` | People, verified identities, sessions, households, memberships, invitations, capabilities | Chat policy or source data |
+| `ConversationAuthority` | Conversations, provider bindings, participant epochs/policies, mode, live send authorization | Household membership or message generation |
+| `SourceIntelligence` | Integrations, sync cursors, encrypted sources/blobs, derivatives, provenance, invalidation | Acceptance or destination authority |
+| `KnowledgeLedger` | Candidates, accepted memories, revisions, expiry, revocation | Raw provider credentials |
+| `Coordination` | Routines, occurrences, coverage loops, transitions, semantic plans | Model execution or provider sends |
+| `AuthorityPolicy` | Bridge rules, disclosure decisions, approvals, capability intersection | Content classification |
+| `HouseholdTime` | Timezone, recurrence, quiet hours, useful windows, deterministic timers | Whether a message is authorized |
+| `SkillsAndEvaluation` | Skill versions/releases, eval suites/results, candidates, rollback | Household permissions |
+| `DurableWork` | Jobs, leases, retries, deadlines, outbox, dead letters | Business decisions |
+| `WorkerRuntime` | Bounded proposal generation behind provider/harness adapters | Durable truth, credentials, or effects |
+| `Effects` | Exact authorized sends/revocations and authenticated receipts | Approval or state transitions |
+| `FlorenceQueries` | Scoped read models, exports, explanations, control-plane views | Mutation bypass |
+
+### Public seams
 
 ```ts
-interface HouseholdChiefOfStaff {
-  accept(input: HouseholdSignal): Promise<AcceptanceReceipt>;
+interface FlorenceApplication {
+  process(input: AppEnvelope): Promise<ProcessReceipt>;
+}
+
+interface FlorenceQueries {
+  query(input: AppQuery): Promise<AppView>;
+}
+
+interface WorkerRuntime {
+  run(job: WorkerJob, options?: RunOptions): Promise<WorkerResult>;
+}
+
+interface ModelGateway {
+  complete(profile: ModelProfile, request: ModelRequest): Promise<ModelResult>;
+}
+
+interface EffectExecutor {
+  execute(intent: EffectIntent): Promise<EffectReceipt>;
 }
 ```
 
-Every Linq message, Gmail or Calendar cursor change, timer, worker result, connector change, correction, and approval becomes one authenticated, idempotent `HouseholdSignal`.
+`FlorenceApplication.process` opens one transaction, resolves current person/epoch/authority, obtains
+a pure domain decision, and atomically persists normalized changes, audit entries, jobs, timers, and
+outbox intents. Worker results and effect receipts re-enter through the same seam and are revalidated
+against current authority before acceptance.
 
-`accept` performs no long model call and no external action. It validates, deduplicates, appends the signal, assigns its per-household sequence, and queues durable processing atomically.
+### Processes and stack
 
-Administrative inspection and recovery use a separate read-only `HouseholdOperations` module. This exists for tests, operations, support, and DM answers; it is not a customer dashboard.
+- Node.js 24, TypeScript, pnpm, exact dependency versions.
+- Fastify for webhooks, OAuth, API, health/readiness, and static delivery.
+- A mobile-first React/Vite client served by the Fastify release.
+- PostgreSQL as the only required durable service.
+- One web process and one worker process from the same release/image.
+- SQL migrations and explicit transactions; no ORM-generated hidden authorization.
+- Encrypted sensitive text and blobs using an environment-held key with per-record nonces/version.
+- Postgres `bytea` for bounded encrypted pilot attachments; introduce object storage only after
+  measured size/throughput requires it.
+- App-owned structured audit manifests; no hidden chain-of-thought or raw private telemetry.
 
-### Processing order
+Provider SDK and framework types stop at adapters. The domain stores app-owned IDs, contracts,
+digests, receipts, and model/harness metadata only.
 
-1. The source adapter verifies the webhook or authenticated adult and resolves its household binding.
-2. The signal journal deduplicates and persists the normalized event.
-3. The household queue serializes authoritative processing by household.
-4. The scope and privacy gate runs before broad retrieval or delegation.
-5. The CoS loads the current household projection and creates the minimum necessary context grant.
-6. Deterministic policy chooses ignore, react, respond, update, plan, or delegate.
-7. Ephemeral workers return typed proposals, evidence, artifacts, questions, and candidate memories.
-8. The CoS revalidates state version, scope, provenance, timing, permissions, and approvals.
-9. One transaction commits domain state, timers, audit entries, and outbox intents.
-10. Effect adapters execute idempotently and return receipts as new signals.
+## 14. Minimum normalized schema
 
-### Concurrency and durability
+The first schema is relational and authoritative. Append-only journals explain decisions but are not
+the only way to reconstruct state.
 
-- Each household has one authoritative commit stream.
-- Read-only workers may run concurrently against a recorded household version.
-- Worker results are stale until reconciled against current state and policy.
-- PostgreSQL is the initial durable queue using leases and `FOR UPDATE SKIP LOCKED` semantics.
-- Queue notification is an optimization; polling and lease recovery prevent lost work.
-- Every external effect has a stable idempotency key and receipt.
-- A timer is a request to reevaluate, not permission to send a stale reminder.
-- Framework checkpoints are runtime progress only and may be rebuilt from the domain journal.
+### Identity and relationships
 
-## Ownership and reuse map
+- `people`
+- `person_identities`
+- `person_sessions`
+- `auth_handoffs`
+- `households`
+- `household_memberships`
+- `membership_capabilities`
+- `invitations`
 
-| Module | Owns | Reuses or adapts | Explicitly does not own |
+### Conversations
+
+- `conversations`
+- `conversation_channels`
+- `participant_epochs`
+- `epoch_participants`
+- `participant_policies`
+- `conversation_rules`
+- `channel_suppressions`
+
+### Integrations and evidence
+
+- `integrations`
+- `integration_grants`
+- `oauth_attempts`
+- `sync_cursors`
+- `provider_events`
+- `source_objects`
+- `source_revisions`
+- `source_blobs`
+- `source_derivatives`
+- `provenance_edges`
+
+### Knowledge and coordination
+
+- `knowledge_candidates`
+- `memory_records`
+- `memory_revisions`
+- `routines`
+- `routine_revisions`
+- `routine_occurrences`
+- `coverage_loops`
+- `coverage_transitions`
+- `coverage_participants`
+
+### Authority, work, and effects
+
+- `bridge_rules`
+- `bridge_rule_revisions`
+- `disclosure_decisions`
+- `skills`
+- `skill_versions`
+- `skill_release_events`
+- `tasks`
+- `worker_attempts`
+- `worker_results`
+- `trace_manifests`
+- `evaluation_releases`
+- `evaluation_runs`
+- `jobs`
+- `timers`
+- `action_intents`
+- `action_approvals`
+- `outbox`
+- `effect_receipts`
+- `audit_events`
+- `deletion_requests`
+- `revocation_tombstones`
+
+Hard constraints include:
+
+- one active claimed owner for a verified identity;
+- one active Google integration per Google subject/person pair;
+- immutable participant epoch membership and unique participant-set digest;
+- every source revision bound to an owner or exact chat epoch, never neither;
+- every derivative no broader and no longer-lived than all parents;
+- optimistic version checks on coverage, routines, rules, and accepted memory;
+- one active skill release per skill/channel;
+- unique inbound provider event and outbound idempotency keys;
+- approvals bound to exact action/data/policy/target digests and expiry;
+- no outbox row without a committed authorization decision;
+- deletion/control epochs checked by every session, job, timer, and effect.
+
+## 15. Action surface for the first release
+
+Allowed automatically under current deterministic authority:
+
+- create/update internal candidates, memories, routines, occurrences, coverage loops, plans, timers,
+  and audit records;
+- batch/suppress notifications according to approved attention rules;
+- synchronize read-only Linq/Google sources;
+- run proposal-only workers; and
+- send Florence messages to an eligible exact private DM or trusted exact group epoch.
+
+Blocked in the first release:
+
+- email send/reply/draft;
+- Calendar create/update/delete;
+- school/caregiver/vendor messages outside an existing eligible Florence conversation;
+- form submissions or RSVPs;
+- booking, purchasing, payment, cancellation, account mutation, and grocery checkout.
+
+The generic action-intent/approval/receipt boundary still exists so later capabilities do not require
+redesign. No blocked action is exposed as if it works.
+
+## 16. Implementation sequence
+
+Each layer ends in a working deployed product slice; later layers extend it without replacing its
+authority model.
+
+### Layer 0 — Preserve evidence, then replace
+
+- Commit the current research artifacts and frozen Gmail polling work as a recoverable pre-rebuild
+  snapshot without secrets.
+- Record the current Railway/GitHub/database topology and create a recoverable database backup.
+- Rewrite `AGENTS.md` to this product contract.
+- Remove obsolete source, migrations, tests, scripts, and documentation rather than wrapping them.
+- Scaffold the clean TypeScript/Fastify/PostgreSQL/React release.
+
+### Layer 1 — Identity, web sessions, and absolute chat gate
+
+- Create the new schema and transaction/application seams.
+- Implement verified private-DM registration and one-time web handoff.
+- Implement people, households, memberships, invitations, sessions, and control-plane shell.
+- Implement Linq raw verification, durable inbox, dedupe, STOP, conversations, participant epochs,
+  registration status, and zero-write/content-disabled modes.
+- Deploy and exercise real private DM plus group membership changes.
+
+### Layer 2 — Real coverage coordination
+
+- Implement coverage-loop/routine/time state machines and normalized audit views.
+- Implement exact acknowledgments, private decline, at-risk reopening, neutral reminders, quiet hours,
+  timers, outbox sends, and provider receipts.
+- Add the chat/source/privacy/data control pages.
+- Exercise a real group loop from open through acknowledged coverage and participant-change pause.
+
+### Layer 3 — Google source intelligence
+
+- Implement multi-account Google OAuth/PKCE and encrypted person-owned credentials.
+- Implement Gmail live polling, independent newest-first backfill, filtering, recovery, revocation,
+  and import controls.
+- Implement attachments/PDF/image/CSV/ICS extraction with source-scoped encrypted blobs.
+- Implement Calendar catalog, per-calendar modes, sync/recovery, and upcoming-event interpretation.
+- Implement private review, one-time promotion, standing bridge approval, and minimum disclosure.
+- Exercise real personal/work accounts and prove no raw private content enters a group.
+
+### Layer 4 — Orchestrator, skills, and learning
+
+- Implement the four immutable product skills and context compiler.
+- Implement a bounded provider-neutral worker runtime and pinned task/skill/harness/runtime traces.
+- Reconcile all worker proposals through `FlorenceApplication.process`.
+- Implement outcome observations, inactive improvement candidates, protected eval releases,
+  operator promotion, safety pause, and rollback.
+- Add only the lean hard-gate and coverage-quality checks defined above.
+
+### Layer 5 — Production operations and domain
+
+- Run fresh and repeated migrations, build the production image, and deploy web plus worker to Railway.
+- Configure Linq webhook/event subscriptions and reconcile live chat state.
+- Configure Google OAuth redirect/scopes/test users and verify token refresh/revocation.
+- Bind `harianbarasu.com`, TLS, security headers, privacy/terms, and token-free browser redirects.
+- Verify health/readiness, worker ownership, queues, backfills, retries, dead letters, exports,
+  deletion, backup restore, and log redaction.
+- Rotate the initially supplied secrets after the first validated deployment, as already agreed.
+
+## 17. Lean release and live validation scorecard
+
+Automated verification is necessary evidence, not the product itself. Keep it focused.
+
+| Area | Automated evidence | Real production exercise | Pass condition |
 |---|---|---|---|
-| `HouseholdChiefOfStaff` | Household ordering, episode transitions, single-writer commits, proposal reconciliation, authoritative communication | Policy, time, context, runtime, and effect modules | Provider webhooks, raw OAuth credentials, framework state |
-| `SignalJournal` | Authentication result, deduplication, per-household sequence, durable inbox | PostgreSQL | Business interpretation or messaging |
-| `FamilyEpisodes` | Commitments, projects, accepted meaning, owners, plans, actions, outcomes, state transitions | Source and evidence references | Raw email or model traces |
-| `ScopeAndAuthority` | Household-impact gate, personal/household lattice, privacy promotion, approval rules, action digests | Verified identity and household policies | Content classification implementation |
-| `HouseholdTime` | Time zones, routine anchors, useful windows, last responsible moment, conflicts, timer versions | Calendar projections and episode meaning | Cron as household truth; model-generated exact triggers |
-| `ContextVault` | Encrypted content references, retention, purpose grants, minimum-necessary reads | Gmail/Linq attachments and object storage | Canonical family meaning |
-| `HouseholdMemory` | Personal and shared durable memories, provenance, validity, correction, promotion status | Memory candidates and approved rules | Agent chat history as truth |
-| `WorkerRuntime` | Bounded worker execution, isolated subagent lifecycle, structured results, budgets, and trace references | LangGraph.js and Deep Agents.js initially; possible future harness adapters | Household writes, approvals, connector credentials, durable family memory |
-| `ModelGateway` | Capability-based model selection, provider configuration, normalized requests/results, and usage metadata | OpenAI, Anthropic, and open-weight/local model adapters | Household policy, worker orchestration, prompts, or provider-specific types outside the seam |
-| `WorkerCatalog` | Versioned worker definitions, tool and context requirements, evaluation release | Triage, schedule, research, comparison, meal, and verification roles | Permanent user-facing agent identities |
-| `ActionExecutor` | Idempotent provider calls, outcome reconciliation, receipts | Linq, Google Calendar, Gmail, future commerce adapters | Deciding whether an action is authorized |
-| `PolicyLearner` | Feedback aggregation and candidate household-rule changes | Episode outcomes and routing decisions | Expanding disclosure automatically; approving itself |
-| `Evaluation` | Scenario datasets, held-out tests, scorer versions, release reports | Deterministic tests and bounded model graders | Production truth or automatic release promotion |
-| `HouseholdOperations` | Read-only inspection, repair commands, export/deletion orchestration | Authoritative domain records | Customer operational dashboard |
-
-The deep module seam is deliberate. Provider or framework types do not appear in the `HouseholdChiefOfStaff` interface. Internal seams exist for testing and replacement without forcing every implementation detail into a public package.
-
-## Agent and framework strategy
-
-### Persistent CoS, ephemeral workers
-
-The persistent CoS is durable identity, charter, policies, episodes, memory, and history. It is not an immortal prompt, process, or model conversation.
-
-Initial bounded worker roles include:
-
-- group turn-taking and intent triage;
-- Gmail relevance, sensitivity, and urgency classification;
-- obligation and commitment interpretation;
-- calendar conflict and preparation analysis;
-- family research and comparison;
-- meal planning and grocery-list synthesis;
-- result verification and source checking.
-
-Workers receive an app-owned `WorkerJob` containing an objective, base household version, policy version, source references, short-lived context grant, `CapabilityGrant` identifiers, budget, deadline, and `OutputContractRef`. They return an app-owned `WorkerResult` containing evidence, proposed episode changes, messages, timers, actions, memory candidates, unresolved questions, confidence, and diagnostics.
-
-Neither contract contains LangChain messages, Deep Agents state, provider content blocks, provider tool calls, framework thread/run IDs, or provider model identifiers. Provider tool-call IDs never become action IDs; capabilities, approvals, and effect digests use app-owned stable identities.
-
-Workers cannot message the family, promote memories, create policies, execute actions, or write household state. The CoS is the only writer.
-
-### Initial runtime choice
-
-Use a custom TypeScript household control plane and PostgreSQL durable execution. Run the MIT-licensed LangGraph.js and Deep Agents.js packages inside our worker process, behind the internal `WorkerRuntime` seam, for bounded planning, tool use, and isolated subagents. Their managed deployment and observability products are not required infrastructure.
-
-Each `WorkerJob` starts with fresh runtime context and a job-scoped scratch backend. Synchronous subagents may be created during that attempt, but they return typed results rather than identities or durable authority. Async or stateful subagents are disabled initially. Scratch files, framework messages, and checkpoints have a short retention window and are purged after result reconciliation or expiry. A failed attempt restarts from the durable app job; it is never resumed mid-checkpoint on a different provider.
-
-LangGraph may orchestrate one bounded worker attempt; it does not orchestrate the household product. Do not make Deep Agents, LangGraph, LangChain model objects, a provider conversation, a managed agent platform, or Codex app-server the household's source of truth. Do not use framework memory as family memory or allow framework tools to bypass server-side grants. Deep Agents receives a curated tool set with no unrestricted shell, connector credential, or general household-search capability.
-
-Mastra or a thin custom harness may later become another `WorkerRuntime` adapter if evaluation shows an advantage. Replacing the harness must not require a household-state migration or changes to the `HouseholdChiefOfStaff` interface.
-
-Codex is used to develop this product. Initial pilot inference may use the company-owned OpenAI API account, but model choice is runtime configuration rather than a product or domain dependency.
-
-### Model-provider portability
-
-`ModelGateway` is a small product-owned interface beneath `WorkerRuntime`. All model calls pass through it. It accepts a capability profile and a provider-neutral request, then returns a normalized result with usage, latency, and provider/model metadata. Domain modules never import provider SDKs, LangChain model classes, provider tool-call types, or model identifiers.
-
-Initial capability profiles include:
-
-- inexpensive classification and extraction;
-- strong tool-using planning;
-- vision and document interpretation;
-- long-context research and synthesis;
-- optional private or self-hosted processing.
-
-Workers declare required capabilities rather than preferred vendors. Configuration maps those profiles to OpenAI, Anthropic, or an open-weight/local adapter. An adapter may target a direct provider API, a hosted open-weight model, or a self-hosted endpoint such as vLLM or Ollama. A model is eligible only when it passes the worker's structured-output, tool-calling, latency, privacy, and quality gates; portability does not mean pretending all models behave identically.
-
-The gateway owns provider-neutral text, image, document-reference, citation, tool-request, and structured-result types. App-owned schemas validate every structured result even when a provider offers a native strict mode. Provider failures map to stable error categories such as `rate_limited`, `context_exceeded`, `unsupported_capability`, `invalid_output`, `transient`, and `permanent`. Raw usage may be retained as adapter metadata, but normalized accounting does not pretend providers tokenize identically.
-
-Provider portability is proven, not merely asserted:
-
-- maintain contract tests for every `ModelGateway` adapter;
-- run the same held-out worker scenarios against at least two materially different providers before the external pilot cohort;
-- keep prompts, tool schemas, worker definitions, and evaluation cases in product-owned files;
-- record provider/model/version on every worker result without making it canonical household truth;
-- make provider routing a configuration change with a rollback path;
-- require no LangSmith, LangGraph Platform, or provider-hosted conversation state for correctness.
-
-### Context and tool selection
-
-The runtime never receives the entire household or tool catalog by default. Context is progressively assembled from:
-
-- the current signal and episode;
-- the adult and conversation scope;
-- relevant family members, routines, and commitments;
-- applicable source evidence and policy versions;
-- only the capabilities required for the current job.
-
-Email, webpages, attachments, and retrieved text are untrusted data, not instructions. Credentials stay outside model context and tool execution validates every short-lived grant server-side.
-
-## Initial data model
-
-The first schema needs durable identities for:
-
-- households;
-- adults, memberships, invitations, and consent;
-- channel handles, group chats, and private conversations;
-- external connections and encrypted OAuth grants;
-- source items, revisions, evidence references, and retention state;
-- household signals and per-household sequence;
-- Family Episodes, commitments, owners, states, and outcomes;
-- semantic time facts, temporal-plan versions, and scheduled triggers;
-- personal and household memories;
-- sharing, routing, timing, and action policies;
-- approvals, action digests, external effects, and receipts;
-- worker jobs, grants, results, budgets, and trace references;
-- transactional outbox events;
-- audit entries, feedback, evaluation cases, and release versions.
-
-PostgreSQL is canonical. Gmail, Google Calendar, and Linq remain external sources or projections. Chat history, embeddings, worker scratch files, framework memory, and traces remain supporting artifacts.
-
-## Repository and deployment shape
-
-Start as a modular TypeScript monolith, not a distributed agent platform.
-
-```text
-src/
-  server/                 Fastify webhooks, OAuth callbacks, health
-  worker/                 durable queue processing and scheduled sweep
-  household/              deep Chief-of-Staff domain module
-  episodes/               commitments, projects, plans, outcomes
-  identity/               adults, invitations, memberships, channels
-  policy/                 scope, privacy, authority, learned rules
-  time/                   household temporal model
-  memory/                 personal and household durable memory
-  context/                encrypted source vault and context grants
-  workers/                WorkerRuntime, app-owned contracts, and worker catalog
-    deep/                 LangGraph.js and Deep Agents.js adapter only
-  models/                 ModelGateway, capability profiles, and provider adapters
-  effects/                outbox and provider executors
-  adapters/
-    linq/
-    gmail/
-    google-calendar/
-    object-storage/
-  evaluation/             scenario fixtures, scorers, release gates
-```
-
-One repository produces two Railway processes:
-
-- **web service:** Linq webhooks, Google OAuth callbacks, Gmail Pub/Sub push endpoint, minimal secure browser handoffs, and health checks;
-- **background worker:** Gmail synchronization, household queue, agent jobs, timers, daily briefs, outbox execution, backfills, and evaluation sampling.
-
-Infrastructure:
-
-- Railway PostgreSQL;
-- S3-compatible encrypted object storage behind an adapter;
-- managed key-encryption or envelope-encryption strategy before real family data;
-- Google Cloud project for Gmail OAuth, API access, and Pub/Sub;
-- Linq number and signed webhooks;
-- provider-scoped credentials, endpoint URLs, enablement, and model-profile mappings stored only in worker infrastructure configuration and never placed in a `WorkerJob` or model context;
-- backups, restore tests, and structured redacted logs.
-
-There is no React customer application in v1. Secure browser pages are narrowly scoped to OAuth, consent, and later payment. Internal operations may use scripts or an authenticated operator-only surface without becoming a customer workflow.
-
-## Founding-family pilot
-
-The first family is the parent co-founder and their partner. The product never calls them “Household Zero.”
-
-### Pilot stages
-
-1. **Synthetic and founder testing**
-   - Linq group semantics, duplicate delivery, STOP, private/group routing, attachments, replies, and reactions;
-   - synthetic Gmail and calendar fixtures;
-   - privacy, timing, no-blame, stale-source, and crash-recovery scenarios.
-2. **Private learning mode**
-   - both adults complete onboarding;
-   - Gmail and calendars monitor real data;
-   - candidate family findings remain private until approved;
-   - source, sensitivity, urgency, timing, and owner corrections are captured.
-3. **Trusted automation**
-   - approved source rules promote matching commitments automatically;
-   - group reminders and the daily brief run;
-   - the family completes at least one bounded research/planning episode and one requested meal-to-grocery-list episode.
-4. **Fourteen-day review**
-   - compare week one and week two;
-   - inspect every privacy error, false interruption, missed obligation, badly timed reminder, duplicate, and unclosed episode;
-   - decide whether to fix and repeat, expand to a small invited cohort, or narrow the product.
-
-### Pilot success scorecard
-
-| Dimension | Initial bar |
-|---|---:|
-| Personal-email leakage into household | **0; hard gate** |
-| Unauthorized external action | **0; hard gate** |
-| Real family obligations caught during review | at least 80% |
-| Surfaced items judged useful | at least 85% |
-| Reminders inside a genuinely useful action window | at least 90% |
-| Accepted commitments completed or consciously dismissed | at least 75% |
-| Week-two relevance and timing | measurably better than week one |
-| General delegated work | one successful family research/planning episode |
-| Meal capability | one successful requested meal-plan-to-grocery-list episode |
-| Household pull | both adults actively choose to keep using it |
-
-With one family, the percentages are diagnostic rather than statistically meaningful. Privacy and unauthorized action remain absolute gates.
-
-## Implementation plan
-
-### Tranche 0: freeze the plan and reset the repository
-
-- Keep the snapshot commit and pre-pivot branch recoverable.
-- Retain research artifacts and this plan.
-- Treat `harianbarasu/florence` as the intended canonical GitHub repository and Florence as the package, deployment, and assistant identity.
-- Move the recoverable current worktree from `/Users/harianbarasu/Projects/life-os` to `/Users/harianbarasu/Projects/florence` before new implementation begins; do not maintain duplicate active checkouts.
-- Audit the existing Florence GitHub repository and Railway project read-only for reusable configuration names, external bindings, and non-secret assumptions before replacement.
-- Use the currently supplied Florence credentials only through local or Railway secret configuration for initial deployment and validation. Never place them in Git, generated artifacts, logs, test fixtures, or the plan; support configuration-only rotation and rotate them after initial validation.
-- Preserve any useful old implementation only in a clean, secret-scanned reference snapshot before replacing the repository contents.
-- Remove the React Life OS interface, project/life domain code, Codex app-server runtime, and assumptions tied to a single-user web product.
-- Recreate a minimal TypeScript/Fastify/PostgreSQL modular monolith with separate server and worker entrypoints.
-- Preserve generic toolchain pieces only when they do not pull old product abstractions back into the design.
-
-Exit criteria:
-
-- clean build, lint, typecheck, and test commands;
-- no production path depends on a web dashboard or Codex subscription;
-- active credentials exist only in ignored local environment or Railway secret configuration, no secret appears in repository history or logs, and a post-validation rotation checklist exists;
-- the new Florence repository and deployment identifiers are consistent and the prior implementation remains recoverable until replacement is verified;
-- the active local checkout is `/Users/harianbarasu/Projects/florence`, with `harianbarasu/florence` as its sole canonical GitHub remote;
-- module interfaces and architecture decisions are recorded before feature code.
-
-### Tranche 1: domain kernel and deterministic test harness
-
-Build:
-
-- household, adult, membership, invitation, consent, and channel identity;
-- personal/household scope lattice;
-- signal journal, idempotency, household sequence, Postgres queue, leases, and outbox;
-- Family Episode and commitment reducer;
-- policy and approval records;
-- fake clock, Linq, Gmail, Calendar, `WorkerRuntime`, `ModelGateway`, and effect adapters;
-- provider-adapter contract fixtures that domain tests can run without selecting a real provider;
-- scenario test runner and redacted structured logging.
-
-Exit criteria:
-
-- duplicate and out-of-order signals cannot duplicate state or effects;
-- personal content cannot enter household scope without a rule or approval;
-- workers cannot mutate canonical state;
-- crash-after-every-transition replay tests recover correctly.
-
-### Tranche 2: Linq vendor spike and adult onboarding
-
-Resolve before general implementation:
-
-- user-created versus API-created group behavior;
-- participant add/remove and stable chat identity;
-- group STOP and opt-out semantics;
-- inbound-first consent and unknown-sender behavior;
-- attachment retrieval and retention;
-- flagged-line recovery, backup numbers, pricing, and production provisioning;
-- vendor treatment of adult-provided child data;
-- Linq's conflicting public retention descriptions.
-
-Build:
-
-- signed webhook verification and durable inbox;
-- group and private DM routing;
-- sender identity, replies, reactions, and attachment references;
-- invite and consent conversation;
-- browser-only OAuth/consent handoff shell;
-- `respond | react | ignore | plan` turn-taking gate;
-- DM inspection and correction commands.
-
-Exit criteria:
-
-- two verified adults can onboard and form one shared group;
-- the assistant remains silent during scripted adult conversation;
-- any opt-out immediately suppresses outbound group messages under the chosen safety policy;
-- duplicate and retry behavior is proven against recorded Linq fixtures.
-
-### Tranche 3: group commitment-to-closure vertical slice
-
-Build:
-
-- group text and attachment interpretation;
-- proposed outcome, owner, evidence, and explicit acknowledgment;
-- commitment states, neutral reminders, reassignment, and closure;
-- deterministic `HouseholdTime` values and timer versions;
-- daily household brief;
-- LangGraph.js/Deep Agents.js `WorkerRuntime` adapter for bounded interpretation and verification workers;
-- provider-neutral `ModelGateway` with OpenAI plus one Anthropic or open-weight/local adapter exercised by the same contract suite;
-- app-owned worker contract validation and job-scoped scratch cleanup.
-
-Exit criteria:
-
-- a real group message becomes an acknowledged commitment, is reminded at a useful time, and closes without a dashboard;
-- changed facts invalidate stale timers;
-- group reminders pass no-blame evaluations;
-- switching the configured eligible model provider requires no domain-code change and preserves the worker result contract;
-- provider/model failure cannot create false completion.
-
-### Tranche 4: private Gmail and Calendar intelligence
-
-Build:
-
-- separate Google OAuth grants for each adult;
-- Gmail watch, Pub/Sub, history synchronization, retry, and resync;
-- private relevance, sensitivity, urgency, and family-impact triage;
-- private review, urgent interruption, and household-promotion conversation;
-- trusted source/class rules and material-exception detection;
-- Google Calendar read and approved household projection;
-- one-year backfill with recent-first priority;
-- resumable full-history background processing.
-
-Exit criteria:
-
-- a new school email privately becomes one approved shared commitment;
-- unrelated work and spam stay suppressed;
-- raw email never enters the group automatically;
-- revoking Gmail immediately stops access and background work;
-- one-year backfill can pause, resume, and report progress without blocking live monitoring.
-
-### Tranche 5: learning and evaluation loop
-
-Build:
-
-- feedback capture for relevance, urgency, sharing, owner, timing, and outcome;
-- durable household routing and privacy rules;
-- low-risk preference and routine memory;
-- rule explanations, revocation, and DM inspection;
-- candidate harness and policy revisions;
-- protected scenario corpus and release comparison;
-- pilot scorecard reporting.
-
-Exit criteria:
-
-- approved rules stop repeated questions;
-- automatic learning can reduce noise but cannot broaden disclosure;
-- week-two decisions can be replayed against week-one failures;
-- a candidate prompt or policy cannot modify its own evaluator or promote itself.
-
-### Tranche 6: request-led delegation and meals
-
-Build:
-
-- bounded family research and comparison episode;
-- synchronous ephemeral specialist delegation through the runtime adapter;
-- evidence, as-of dates, decision-ready synthesis, and cancellation;
-- requested meal planning using household schedule and preferences;
-- shared grocery-list artifact;
-- household-scope rejection and narrowing behavior.
-
-Exit criteria:
-
-- one summer-camp-style comparison completes with sources and calendar fit;
-- one requested meal plan produces a usable grocery list;
-- neither flow initiates itself later without a recurring rule;
-- external booking, ordering, and payment remain blocked.
-
-### Tranche 7: fourteen-day founding-family pilot
-
-- complete synthetic privacy and failure testing;
-- run private learning mode;
-- activate trusted automations gradually;
-- review failures daily without exposing raw private content in telemetry;
-- complete the pilot scorecard;
-- produce a go, repeat, narrow, or stop decision.
-
-### Tranche 8: public-readiness gates after product proof
-
-Only after the founding-family loop proves pull:
-
-- Google OAuth verification and restricted-scope security assessment;
-- production privacy policy, terms, data maps, deletion proof, and incident plan;
-- encryption-key rotation, backup restore, disaster recovery, and account recovery;
-- Linq commercial/SLA and minor-data answers;
-- multi-household isolation and adversarial authorization tests;
-- support and operator access policy;
-- cost controls, rate limits, abuse controls, and later pricing work;
-- invitation of a small external cohort.
-
-## Decision log
-
-| Decision | Resolution |
-|---|---|
-| Product and assistant name | Florence |
-| Canonical repository | Existing `harianbarasu/florence` repository after read-only inventory, secret rotation, and recoverable clean snapshot |
-| Canonical local folder | `/Users/harianbarasu/Projects/florence`; retire the `life-os` path after the recoverable move |
-| Customer | Parents and families first |
-| Competitive frame | Direct Ollie competitor, differentiated by reliable closure and learning |
-| Primary surface | One household iMessage group |
-| Private surface | One DM per verified adult with the same CoS |
-| Messaging provider | Linq for the initial pilot, behind a channel adapter |
-| Participants | Verified adults only; children are represented, not direct users |
-| First promise | Turn family obligations into owned, timed, closed loops |
-| Initial ownership | CoS proposes; adult explicitly acknowledges in v1 |
-| Gmail | Continuous monitoring is core, not a later add-on |
-| Mailbox privacy | Personal by default; minimum derived meaning promoted only by approval or rule |
-| Inbox attention | Urgent high-confidence findings interrupt privately; routine candidates batch |
-| Rule learning | May reduce noise automatically; disclosure expansion requires one approval and then persists |
-| Reminders | May be in the group; always neutral and non-blaming |
-| Daily rhythm | One concise household group brief |
-| Time | Explicit onboarding anchors plus useful-window reasoning; deterministic final scheduling |
-| Internal actions | Reversible household actions may become automatic under trusted rules |
-| External actions | Communication, submission, booking, purchasing, payment, and cancellation require approval |
-| Optional planning | Request-led; no unsolicited meal or research projects |
-| Meal capability | Requested meal plan through shared grocery list in the pilot |
-| Product scope | Household-impacting work only, including mixed requests' family consequence |
-| Onboarding | Conducted in iMessage; browser only for secure OAuth/consent/payment handoffs |
-| Customer web app | None in v1; control through private DMs |
-| Initial history | Recent 90 days first, at least one year backfilled, entire history processed privately over time |
-| Historical activation | Old data informs private context; only current actionability enters the household |
-| CoS state | Persistent domain state, not persistent model context |
-| Specialists | Ephemeral, scoped, invisible workers |
-| Writer authority | Persistent CoS is the sole household writer and communicator |
-| Runtime | Custom TypeScript domain core and Postgres execution; MIT-licensed LangGraph.js and Deep Agents.js behind `WorkerRuntime` |
-| Model providers | Product-owned `ModelGateway`; OpenAI, Anthropic, and open-weight/local models selected by capability and evaluation |
-| Managed agent services | Optional for development only; no LangSmith, LangGraph Platform, or provider conversation state required for correctness |
-| Codex | Development tool only; product inference uses separately configured provider credentials or self-hosted endpoints |
-| Pricing | Deliberately deferred until pilot value and cost are known |
-| First family | Parent co-founder and partner; never called “Household Zero” in product |
-
-## Explicit non-goals for v1
-
-- A native iOS app or Messages extension.
-- A customer dashboard, household workspace, or calendar clone.
-- Child accounts or direct child interaction.
-- Cross-protocol Android/SMS behavior during the first iMessage-only pilot.
-- General personal or work assistance.
-- Autonomous third-party communication, commerce, booking, or payment.
-- Retailer grocery checkout.
-- Shared cross-household learning from private data.
-- A permanent visible roster of agents.
-- A generic agent builder, skill marketplace, or user-configurable workflow studio.
-- A custom vector database, knowledge graph platform, Temporal cluster, or microservice fleet before measured need.
-- Pricing, billing, and growth work before the founding-family loop works.
-- Exposing raw model reasoning or agent traces to the family.
-
-## Risks and gates
-
-| Risk | Gate or mitigation |
-|---|---|
-| Private email leaks into group | Scope lattice, personal-first ingestion, minimum-derived promotion, hard-zero pilot gate |
-| Linq or Apple line flagging | Inbound-first onboarding, low volume, opt-out suppression, vendor spike, backup plan |
-| No group read receipts | Explicit ownership and completion acknowledgment; never infer receipt |
-| Duplicate or out-of-order webhooks | Durable journal, provider event dedupe, household sequence, idempotent outbox |
-| Bad reminder timing | Explicit anchors, semantic time values, deterministic scheduler, plan versions, timing evals |
-| Assistant creates family conflict | Neutral state language, no blame, scenario evaluation, correction loop |
-| Model or worker becomes authority | Typed proposals, short-lived grants, single-writer reconciliation, deterministic action policy |
-| Self-learning reward hacking | Evaluators and permissions outside the loop, held-out scenarios, explicit release promotion |
-| Historical processing becomes invasive | Personal scope, recency priority, actionability gate, minimal raw retention, DM controls |
-| Gmail public-launch delay | Begin OAuth verification/security work early; keep initial users inside approved test cohort |
-| Temporarily exposed initial credentials | Owner authorized initial use; isolate them in secret configuration, never print or commit them, monitor initial use, and rotate after deployment validation |
-| Model-provider lock-in | Product-owned capability interface, at least two exercised adapters, cross-provider evals, configuration-based routing, and no provider types in domain code |
-| Framework lock-in | MIT-licensed in-process packages, domain-owned interfaces and Postgres state, framework types behind `WorkerRuntime`, no required managed platform, and a harness replacement test |
-| Trace and telemetry leakage | Redacted references, no raw email/child/health content in external traces, strict retention |
-| Product becomes feature soup | Household-impact gate, obligations as wedge, request-led optional capabilities |
-| Assistant is broad but unreliable | Pilot scorecard, complete vertical slices, no expansion before closure and privacy gates pass |
-
-## Research basis
-
-Primary internal syntheses:
-
-- [Parent/family Chief-of-Staff research](./docs/research/parent-family-chief-of-staff.md)
-- [Consumer AI product research](./docs/research/consumer-ai-products.md)
-- [Agent architecture research](./docs/research/agent-architecture.md)
-- [Agent framework research](./docs/research/agent-frameworks.md)
-- [Deep Agents and Stripe research](./docs/research/deep-agents-stripe.md)
-- [Security and data-model research](./docs/research/security-data-model.md)
-- [Runtime architecture research](./docs/research/runtime-architecture-historical.md)
-
-Key external sources:
-
-- [Ollie](https://www.ollie.ai/) and [Ollie privacy policy](https://www.ollie.ai/privacy-policy/)
-- [Ohai's 2026 product reset](https://www.ohai.ai/blog/meet-the-new-ohai-household-manager-built-for-your-whole-family/)
-- [Sense](https://getsense.ai/) and [its child-account design](https://getsense.ai/blog/posts/why-sense-doesnt-have-kid-accounts)
-- [Linq group chats](https://docs.linqapp.com/guides/chats/group-chats/), [webhooks](https://docs.linqapp.com/guides/webhooks/), and [protocol behavior](https://docs.linqapp.com/guides/messaging/protocol-selection/)
-- [Google Gmail synchronization](https://developers.google.com/workspace/gmail/api/guides/sync), [scopes](https://developers.google.com/workspace/gmail/api/auth/scopes), and [user-data policy](https://developers.google.com/workspace/workspace-api-user-data-developer-policy)
-- [Stripe Kai on Deep Agents](https://www.langchain.com/blog/how-stripe-built-their-knowledge-ai-platform-on-deep-agents)
-- [Deep Agents repository and MIT license](https://github.com/langchain-ai/deepagents)
-- [Deep Agents.js model-provider configuration](https://docs.langchain.com/oss/javascript/deepagents/models)
-- [Deep Agents.js synchronous subagents](https://docs.langchain.com/oss/javascript/deepagents/subagents)
-- [LangGraph repository and MIT license](https://github.com/langchain-ai/langgraph)
-- [Lilian Weng, Harness Engineering for Self-Improvement](https://lilianweng.github.io/posts/2026-07-04-harness/)
-- [Codex SDK](https://learn.chatgpt.com/docs/codex-sdk) and [Codex authentication](https://learn.chatgpt.com/docs/auth)
-
-## Acceptance and next action
-
-This plan is accepted. Implementation is authorized through a complete, deployed Florence v1 rather than a disposable prototype or partial checkpoint.
-
-The next action is Tranche 0: inventory the old Florence assets read-only, freeze recoverable snapshots, move active work into the canonical Florence repository, and replace obsolete code with the modular parent-first Florence service. Current credentials may be used through secret configuration for deployment validation and rotated afterward.
+| Build/schema | lint, typecheck, small test suite, build, fresh migration twice | health/readiness after deploy and restart | all green; no secret or stale process |
+| Identity/auth | single-use handoff, CSRF, expiry, session revocation, step-up | register two adults and one caregiver from real DMs | one global person each; exact sessions/roles |
+| Linq gate | signature-before-parse, dedupe, STOP, epoch mismatch, send idempotency | group with unregistered member, then registration, then add/remove participant | no pre-registration content use/write; correct pause/resume; one logical send |
+| Coverage | state/time/no-blame contracts | real pickup/activity loop, acknowledgment, change, and closure | no silence-as-owner; useful timing; correct reopen |
+| Gmail | private admission, cursors, independent backfill, replay/recovery, revocation | connect personal/work accounts; send synthetic school mail and PDF | one private finding; resumable import; zero group leakage |
+| Calendar | catalog/modes/sync-token recovery | sync two accounts; edit/delete an event | correct private/full/free-busy projections |
+| Web controls | authz, scoped queries, correction/revoke/export/delete | inspect both people's different views and perform a step-up | no cross-person data; immediate narrowing; durable receipt |
+| Workers/skills | proposal-only capability, budget, stale-result rejection, pinned release | one real source interpretation and minimum-disclosure proposal | worker cannot commit/send; Chief reconciles once |
+| Recovery | crash points around inbox/commit/outbox/receipt and lease expiry | restart worker during sync and queued send; isolated backup restore | no lost/duplicate logical work; visible recovery |
+
+Before declaring the product usable, perform the full real flow:
+
+1. Hari registers by private iMessage and opens the mobile web companion.
+2. A second adult registers independently and joins the household.
+3. A caregiver registers and joins only the granted household/conversations.
+4. A group containing an unregistered handle proves zero content processing and zero writes.
+5. After all register and establish the rule, Florence ingests the new epoch and answers a direct
+   group-local question.
+6. A Gmail/PDF or Calendar source produces a private candidate; irrelevant mail remains silent.
+7. One exact approval promotes minimum family meaning; a narrow standing rule handles the next
+   matching item without asking again.
+8. Florence proactively opens a coverage loop in the authorized group.
+9. The named person explicitly accepts; a private decline reveals only that coverage remains open.
+10. A changed fact reopens the loop and stale timers do not fire.
+11. Retry/restart produces no duplicate message or state transition.
+12. Memory correction, stop-sharing, export, disconnect, session revocation, and deletion are
+    exercised from the real control plane.
+
+## 18. Railway production topology
+
+- `florence-web`: Fastify API/webhooks/OAuth/static React app.
+- `florence-worker`: durable inbox, Google sync/backfill, timers, workers, outbox, retention, deletion.
+- Railway PostgreSQL: authoritative normalized state.
+- Same immutable image and release version for web and worker.
+- Migration command runs once per release before readiness becomes healthy.
+- `/healthz` proves process liveness; `/readyz` proves database/schema/config readiness.
+- Worker lease proves exactly one active owner per singleton maintenance job.
+
+Canonical URLs:
+
+- app and public pages: `https://harianbarasu.com`
+- Google callback: `https://harianbarasu.com/oauth/google/callback`
+- Linq webhook: `https://harianbarasu.com/webhooks/linq`
+- Railway-generated domain remains a diagnostic fallback, not the customer URL.
+
+Secrets remain only in ignored local configuration or Railway variables. Never print, commit,
+fixture, snapshot, or include them in model/trace content.
+
+## 19. Explicitly deferred
+
+- Pricing and billing.
+- Native iOS app or Messages extension.
+- WhatsApp until an official group-capable transport is proven.
+- Child accounts, custody/guardianship adjudication, or inferred sensitive relationships.
+- Gmail sending and Calendar writes.
+- Forms, bookings, purchases, payments, cancellations, and third-party communications.
+- Full household planner/calendar/task dashboard.
+- Budgets, health tracking, media/books/restaurants, meal/grocery automation, and the earlier broad
+  Life OS modules.
+- Durable general research/learning projects until the coverage wedge is reliable; bounded requested
+  general answers remain allowed.
+- Universal search/knowledge graph, custom vector database, or graph database without measured need.
+- Public skill marketplace, user-authored workflows, or visible permanent subagents.
+- Automatic production self-promotion, capability widening, or cross-household raw-trace learning.
+- Custom model training, inference, sandbox fleet, or managed agent control plane.
+
+These are product sequencing decisions, not compatibility promises. A deferred capability is added
+only when it can reuse the same identity, authority, source, coordination, effect, and evaluation
+contracts without weakening them.
+
+## 20. Definition of done
+
+Florence is complete for the first release only when all of the following are current, deployed, and
+supported by direct evidence:
+
+- the research transfer audit remains source-accounted and linked;
+- the old architecture has been removed, with its useful mechanics preserved only through the clean
+  interfaces above;
+- real Linq private and arbitrary-adult group flows work with registration and participant epochs;
+- multiple person-owned Gmail and Calendar accounts continuously ingest and recover;
+- PDF/image/text/CSV/ICS sources can open private candidates and authorized coverage loops;
+- the mobile web companion makes identity, chats, sources, memory, rules, and data controls legible;
+- coverage loops open proactively, require explicit self-acknowledgment, remind before useful
+  windows, remain neutral, and safely close/reopen;
+- private facts never cross scope without an exact approval or standing bridge;
+- workers are bounded, ephemeral, and proposal-only;
+- skills and product learning are versioned, evaluated, promoted, and rolled back outside the model;
+- retry, restart, provider duplication, cursor expiry, participant changes, revocation, export, and
+  deletion have been exercised;
+- Railway web/worker readiness is healthy on `harianbarasu.com`; and
+- Hari can perform the full production validation flow above through real iMessage, Google, and web
+  interfaces without operator-only database intervention.

@@ -10,16 +10,20 @@
 
 ## Product invariants
 
-- Florence is one persistent household Chief of Staff. Model calls and specialist workers are ephemeral.
-- PostgreSQL and app-owned domain records are canonical. Chat history, model context, framework state, traces, and scratch files are not.
-- `HouseholdChiefOfStaff.accept()` is the only mutating ingress into household truth. One household writer reconciles proposals and commits changes.
-- Workers may propose. They may not message people, mutate household state, approve actions, widen disclosure, or canonize learning.
-- Private adult data is personal by default. Household promotion requires explicit approval or a previously approved, applicable rule.
-- External communication, submission, booking, purchasing, payment, cancellation, or account mutation requires app-owned approval.
+- Florence is one persistent family Chief of Staff. Model calls and specialist workers are ephemeral.
+- One global person identity may participate in multiple relationships and conversations. Roles, context, and authority are relationship-local.
+- PostgreSQL and app-owned normalized domain records are canonical. Chat history, model context, framework state, traces, and scratch files are not.
+- `FlorenceApplication.process()` is the only mutating ingress into authoritative product state. It reconciles proposals and atomically commits state, audit, jobs, timers, and effects.
+- Workers may propose. They may not message people, mutate accepted state, approve actions, widen disclosure, change people or chat policy, schedule future work, or canonize learning.
+- A group is content-disabled while any current participant is unregistered or unconsented. Every participant change starts a new immutable epoch and closes the write gate.
+- Private person-owned data is private by default. Promotion to a household or chat requires an exact approval or a previously approved applicable bridge rule.
+- Shared output uses the intersection of the live participant epoch, every participant's applicable policy, source visibility, purpose, and bridge rules.
+- Consequential external communication, submission, booking, purchasing, payment, cancellation, or account mutation requires an app-owned action intent, exact approval, and reconciled receipt.
 - Group reminders are neutral and factual. Florence never assigns blame.
 - Timers trigger reevaluation. They are never authority to send stale reminders.
 - A provider or framework type must never cross the `ModelGateway` or `WorkerRuntime` seam into domain code.
-- No customer dashboard in v1. Browser pages are limited to secure OAuth and consent handoffs.
+- The mobile web app is an authority and exception plane for onboarding, integrations, identity, chats, memory, privacy, and data controls. It is not a parallel chat, task dashboard, calendar, or planner.
+- The first complete release closes coverage loops. Do not widen the implementation into deferred Life OS modules before the production acceptance flow in `PLAN.md` passes.
 
 ## Security and operations
 

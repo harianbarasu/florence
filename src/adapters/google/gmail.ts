@@ -120,6 +120,11 @@ export interface GmailMessageIdPage {
   resultSizeEstimate: number | null;
 }
 
+export interface GmailProfile {
+  emailAddress: string;
+  historyId: string;
+}
+
 export interface GmailWatchReceipt {
   historyId: string;
   expiresAt: string;
@@ -178,6 +183,7 @@ const GMAIL_MEDIA_TYPE_ALIASES = new Map([
 ]);
 
 interface GmailApiPort {
+  getProfile(params: { userId: "me" }): Promise<{ data: gmail_v1.Schema$Profile }>;
   getMessage(params: {
     userId: "me";
     id: string;
@@ -224,6 +230,29 @@ export class GmailAdapter {
 
   constructor(config: GoogleAdapterConfig, apiFactory?: GmailApiFactory) {
     this.#apiFactory = apiFactory ?? defaultGmailApiFactory(config);
+  }
+
+  async getProfile(accessToken: string): Promise<GmailProfile> {
+    requireAccessToken(accessToken);
+    try {
+      const response = await this.#apiFactory(accessToken).getProfile({ userId: "me" });
+      const profile = z
+        .object({
+          emailAddress: z.email(),
+          historyId: z.string().regex(/^\d+$/),
+        })
+        .passthrough()
+        .safeParse(response.data);
+      if (!profile.success) {
+        throw new GoogleAdapterError("Gmail profile is incomplete", "permanent", null, false);
+      }
+      return {
+        emailAddress: profile.data.emailAddress,
+        historyId: profile.data.historyId,
+      };
+    } catch (error) {
+      throw mapGoogleProviderError("Gmail profile fetch", error);
+    }
   }
 
   async getMessage(input: {
@@ -558,6 +587,7 @@ function defaultGmailApiFactory(config: GoogleAdapterConfig): GmailApiFactory {
       auth: googleAuthWithAccessToken(config, accessToken),
     });
     return {
+      getProfile: (params) => api.users.getProfile(params),
       getMessage: (params) => api.users.messages.get(params),
       getAttachment: (params, options) => api.users.messages.attachments.get(params, options),
       listHistory: (params) => api.users.history.list(params),

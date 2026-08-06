@@ -50,30 +50,6 @@ const environmentSchema = z
     GOOGLE_CLIENT_SECRET: optionalSecret,
     GOOGLE_OAUTH_STATE_SECRET: optionalSecret,
     GOOGLE_REDIRECT_URI: optionalUrl,
-    GOOGLE_PUBSUB_VERIFICATION_TOKEN: optionalSecret,
-    GOOGLE_PUBSUB_OIDC_AUDIENCE: optionalUrl,
-    GOOGLE_PUBSUB_SERVICE_ACCOUNT_EMAIL: z.preprocess(
-      emptyStringAsUndefined,
-      z
-        .email()
-        .transform((value) => value.toLowerCase())
-        .optional(),
-    ),
-    GOOGLE_GMAIL_TOPIC_NAME: z.preprocess(
-      emptyStringAsUndefined,
-      z
-        .string()
-        .regex(/^projects\/[^/]+\/topics\/[^/]+$/u)
-        .optional(),
-    ),
-    GOOGLE_GMAIL_PUBSUB_SUBSCRIPTION: z.preprocess(
-      emptyStringAsUndefined,
-      z
-        .string()
-        .max(1_000)
-        .regex(/^projects\/[^/]+\/subscriptions\/[^/]+$/u)
-        .optional(),
-    ),
     MODEL_PROVIDER: z.enum(["openai", "anthropic", "open-weight"]).default("openai"),
     OPENAI_API_KEY: optionalSecret,
     OPENAI_BASE_URL: z.string().url().default("https://api.openai.com/v1"),
@@ -119,15 +95,7 @@ const environmentSchema = z
       "GOOGLE_OAUTH_STATE_SECRET",
       "GOOGLE_REDIRECT_URI",
     ] as const;
-    const gmailPubSubFields = [
-      "GOOGLE_PUBSUB_VERIFICATION_TOKEN",
-      "GOOGLE_PUBSUB_OIDC_AUDIENCE",
-      "GOOGLE_PUBSUB_SERVICE_ACCOUNT_EMAIL",
-      "GOOGLE_GMAIL_TOPIC_NAME",
-      "GOOGLE_GMAIL_PUBSUB_SUBSCRIPTION",
-    ] as const;
     requireFields(googleOAuthFields);
-    requireFields(gmailPubSubFields);
 
     switch (value.MODEL_PROVIDER) {
       case "openai":
@@ -185,14 +153,7 @@ export function availableIntegrations(config: FlorenceConfig): {
   return {
     linq: Boolean(config.LINQ_API_KEY && config.LINQ_FROM_PHONE && config.LINQ_WEBHOOK_SECRET),
     googleOAuth,
-    gmail: Boolean(
-      googleOAuth &&
-        config.GOOGLE_PUBSUB_VERIFICATION_TOKEN &&
-        config.GOOGLE_PUBSUB_OIDC_AUDIENCE &&
-        config.GOOGLE_PUBSUB_SERVICE_ACCOUNT_EMAIL &&
-        config.GOOGLE_GMAIL_TOPIC_NAME &&
-        config.GOOGLE_GMAIL_PUBSUB_SUBSCRIPTION,
-    ),
+    gmail: googleOAuth,
     googleCalendar: googleOAuth,
     openai: Boolean(config.OPENAI_API_KEY),
     anthropic: Boolean(config.ANTHROPIC_API_KEY),

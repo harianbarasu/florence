@@ -81,6 +81,8 @@ import type { LinqChannelTarget, SerializedLinqSendResult } from "./worker-servi
 const instantSchema = z.iso.datetime({ offset: true });
 const handleSchema = z.string().trim().min(3).max(320);
 const GMAIL_RECOVERY_PROVIDER_PAGE_LIMIT = 100;
+const GMAIL_POLL_INTERVAL_MS = 60_000;
+const GMAIL_RUNTIME_STALE_AFTER_MINUTES = 5;
 const groupBindingMetadataSchema = z
   .object({
     participantHandleDigests: z.array(z.string().min(1)).length(2),
@@ -3765,14 +3767,22 @@ export class FlorenceRuntimeStore {
     const enabled = z.strictObject({ gmailEnabled: z.boolean(), calendarEnabled: z.boolean() }).parse(input);
     const rows = await this.database<{ active_count: string; stale_count: string; dead_count: string }[]>`
       with active_connections as (
-        select id, granted_scopes, cursor
+        select id, granted_scopes, cursor, last_synced_at
         from external_connections
         where provider = 'google' and status = 'active'
       ), health as (
         select connection.id,
           (
             not (${enabled.gmailEnabled} and connection.granted_scopes && ${[GOOGLE_GMAIL_READONLY_SCOPE]}::text[])
-            or coalesce((connection.cursor->'gmail'->'watch'->>'expiresAt')::timestamptz > now(), false)
+            or (
+              connection.cursor->'gmail'->>'phase' in (
+                'recent_90_days', 'one_year_backfill', 'full_history_backfill', 'live'
+              )
+              and coalesce(
+                connection.last_synced_at > now() - (${GMAIL_RUNTIME_STALE_AFTER_MINUTES} * interval '1 minute'),
+                false
+              )
+            )
           )
           and (
             not (${enabled.calendarEnabled} and connection.granted_scopes && ${[GOOGLE_CALENDAR_READONLY_SCOPE]}::text[])
@@ -4546,9 +4556,15 @@ function googleWorkForState(
     return gmailSyncWorkSchema.parse({ kind: "continue", ...identity });
   }
   if (state.phase !== "live") return null;
-  const renewBefore = new Date(asOf).getTime() + 24 * 60 * 60_000;
-  if (state.watch === null || new Date(state.watch.expiresAt).getTime() <= renewBefore) {
-    return gmailSyncWorkSchema.parse({ kind: "renew_watch", ...identity });
+  const lastSuccessfulSyncAt = state.lastSuccessfulSyncAt === null
+    ? null
+    : new Date(state.lastSuccessfulSyncAt).getTime();
+  if (
+    lastSuccessfulSyncAt === null ||
+    !Number.isFinite(lastSuccessfulSyncAt) ||
+    lastSuccessfulSyncAt + GMAIL_POLL_INTERVAL_MS <= new Date(asOf).getTime()
+  ) {
+    return gmailSyncWorkSchema.parse({ kind: "continue", ...identity });
   }
   return null;
 }

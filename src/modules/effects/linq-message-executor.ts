@@ -11,10 +11,21 @@ const LinqEffectPayloadSchema = z.strictObject({
   expectedProviderParticipantDigest: z.string().regex(/^linq-v1:[a-f0-9]{64}$/u),
   text: z.string().trim().min(1).max(10_000),
 });
+const LinqCreateDirectEffectPayloadSchema = z.strictObject({
+  recipient: z.union([z.string().regex(/^\+[1-9]\d{6,14}$/u), z.string().trim().email().max(320)]),
+  text: z.string().trim().min(1).max(10_000),
+});
+const LinqMessageEffectPayloadSchema = z.union([
+  LinqEffectPayloadSchema,
+  LinqCreateDirectEffectPayloadSchema,
+]);
 
 export class LinqMessageEffectExecutor {
   public constructor(
-    private readonly linq: Pick<LinqClient, "getMessageDelivery" | "sendMessage">,
+    private readonly linq: Pick<
+      LinqClient,
+      "createDirectChat" | "getChat" | "getMessageDelivery" | "sendMessage"
+    >,
     private readonly outbox: Pick<
       EffectOutbox,
       "reauthorizeForSubmission" | "recordReceipt" | "recordReconciliation" | "retry"
@@ -22,27 +33,39 @@ export class LinqMessageEffectExecutor {
   ) {}
 
   public async execute(effect: ClaimedEffect): Promise<void> {
-    const payload = LinqEffectPayloadSchema.parse(effect.payload);
+    const payload = LinqMessageEffectPayloadSchema.parse(effect.payload);
     try {
-      const receipt = await this.linq.sendMessage(
-        {
-          providerChatId: payload.providerChatId,
-          expectedParticipantDigest: payload.expectedProviderParticipantDigest,
-          idempotencyKey: effect.idempotencyKey,
-          text: payload.text,
-        },
-        undefined,
-        async () => {
-          try {
-            if (!(await this.outbox.reauthorizeForSubmission(effect))) {
-              throw new EffectAuthorizationStaleError();
-            }
-          } catch (error) {
-            if (error instanceof EffectAuthorizationStaleError) throw error;
-            throw new EffectAuthorizationCheckError();
+      const beforeSubmit = async () => {
+        try {
+          if (!(await this.outbox.reauthorizeForSubmission(effect))) {
+            throw new EffectAuthorizationStaleError();
           }
-        },
-      );
+        } catch (error) {
+          if (error instanceof EffectAuthorizationStaleError) throw error;
+          throw new EffectAuthorizationCheckError();
+        }
+      };
+      const receipt =
+        "providerChatId" in payload
+          ? await this.linq.sendMessage(
+              {
+                providerChatId: payload.providerChatId,
+                expectedParticipantDigest: payload.expectedProviderParticipantDigest,
+                idempotencyKey: effect.idempotencyKey,
+                text: payload.text,
+              },
+              undefined,
+              beforeSubmit,
+            )
+          : await this.linq.createDirectChat(
+              {
+                recipient: payload.recipient,
+                idempotencyKey: effect.idempotencyKey,
+                text: payload.text,
+              },
+              undefined,
+              beforeSubmit,
+            );
       await this.record(effect, receipt);
     } catch (error) {
       if (error instanceof EffectAuthorizationStaleError) return;
@@ -69,7 +92,7 @@ export class LinqMessageEffectExecutor {
    * calls sendMessage; the original external mutation remains a one-way boundary.
    */
   public async reconcile(effect: ClaimedSubmittedEffect, now = new Date()): Promise<void> {
-    const payload = LinqEffectPayloadSchema.safeParse(effect.payload);
+    const payload = LinqMessageEffectPayloadSchema.safeParse(effect.payload);
     if (!payload.success || effect.providerReceiptId === null) {
       await this.outbox.recordReconciliation({
         effect,
@@ -92,7 +115,7 @@ export class LinqMessageEffectExecutor {
       await this.recordLookupFailure(effect, effect.providerReceiptId, error, now);
       return;
     }
-    if (receipt.providerChatId !== payload.data.providerChatId) {
+    if ("providerChatId" in payload.data && receipt.providerChatId !== payload.data.providerChatId) {
       await this.outbox.recordReconciliation({
         effect,
         status: "ambiguous",
@@ -102,6 +125,33 @@ export class LinqMessageEffectExecutor {
         now,
       });
       return;
+    }
+    if (!("providerChatId" in payload.data)) {
+      try {
+        const chat = await this.linq.getChat(receipt.providerChatId);
+        const recipient = payload.data.recipient.toLocaleLowerCase("en-US");
+        const humans = chat.participants.filter(
+          (participant) => participant.status === "active" && !participant.isSelf,
+        );
+        if (
+          chat.kind !== "direct" ||
+          humans.length !== 1 ||
+          humans[0]?.address.toLocaleLowerCase("en-US") !== recipient
+        ) {
+          await this.outbox.recordReconciliation({
+            effect,
+            status: "ambiguous",
+            providerReceiptId: effect.providerReceiptId,
+            receipt: auditReceipt(receipt, "chat_mismatch"),
+            errorCode: "linq_created_chat_audience_mismatch",
+            now,
+          });
+          return;
+        }
+      } catch (error) {
+        await this.recordLookupFailure(effect, effect.providerReceiptId, error, now);
+        return;
+      }
     }
     const status = reconciliationStatus(receipt);
     const exhausted = reconciliationExhausted(effect, now);

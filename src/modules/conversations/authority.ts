@@ -112,6 +112,16 @@ export function authorizeSendFromSnapshot(
   ) {
     return SendAuthorizationSchema.parse({ ...base, allowed: false, reason: "participant_policy_denied" });
   }
+  if (
+    input.sendKind === "transactional" &&
+    snapshot.participants.some((participant) => participant.proactivePaused)
+  ) {
+    return SendAuthorizationSchema.parse({
+      ...base,
+      allowed: false,
+      reason: "participant_proactive_paused",
+    });
+  }
   if (input.sendKind === "proactive") {
     if (snapshot.participants.some((participant) => participant.proactivePaused)) {
       return SendAuthorizationSchema.parse({

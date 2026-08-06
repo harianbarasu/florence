@@ -172,6 +172,12 @@ export interface LinqSendMessageRequest {
   replyTo?: LinqReplyRef;
 }
 
+export interface LinqCreateDirectMessageRequest {
+  recipient: string;
+  idempotencyKey: string;
+  text: string;
+}
+
 export type LinqProviderDeliveryStatus =
   | "pending"
   | "queued"

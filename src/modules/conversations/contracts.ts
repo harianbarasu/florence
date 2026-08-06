@@ -176,7 +176,7 @@ export const AuthorizeSendInputSchema = z
     expectedParticipantEpochId: EntityIdSchema,
     expectedParticipantSetDigest: DigestSchema,
     liveParticipantIdentityIds: z.array(EntityIdSchema).min(1).max(100),
-    sendKind: z.enum(["direct_response", "proactive"]),
+    sendKind: z.enum(["direct_response", "transactional", "proactive"]),
     operation: z.string().trim().min(1).max(100),
     ruleId: EntityIdSchema.nullable().default(null),
   })

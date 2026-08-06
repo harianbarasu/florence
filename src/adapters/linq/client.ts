@@ -4,6 +4,7 @@ import type { LinqConfig } from "./config.js";
 import type {
   LinqChatHealth,
   LinqChatSnapshot,
+  LinqCreateDirectMessageRequest,
   LinqDownloadedAttachment,
   LinqMessageDeliveryReceipt,
   LinqMessagingService,
@@ -15,12 +16,17 @@ import { LinqApiError, LinqAttachmentError, LinqAudienceChangedError } from "./e
 import {
   providerAttachmentMetadataSchema,
   providerChatSchema,
+  providerCreateChatResponseSchema,
   providerErrorResponseSchema,
   providerMessageDeliverySchema,
   providerSendResponseSchema,
 } from "./schemas.js";
 
 const providerIdSchema = z.string().uuid();
+const outboundRecipientSchema = z.union([
+  z.string().regex(/^\+[1-9]\d{6,14}$/u),
+  z.string().trim().email().max(320),
+]);
 
 const sendRequestSchema = z
   .object({
@@ -44,6 +50,19 @@ const sendRequestSchema = z
     (value) => Boolean(value.text) || Boolean(value.providerAttachmentIds?.length),
     "A Linq message needs text or an attachment",
   );
+
+const createDirectRequestSchema = z.strictObject({
+  recipient: outboundRecipientSchema,
+  idempotencyKey: z.string().min(1).max(255),
+  text: z
+    .string()
+    .trim()
+    .min(1)
+    .max(10_000)
+    .refine((value) => !/https?:\/\//iu.test(value), {
+      message: "The first outbound message cannot contain a link",
+    }),
+});
 
 interface LinqClientOptions {
   fetch?: typeof fetch;
@@ -286,6 +305,69 @@ export class LinqClient {
       submittedAt: normalizeTimestamp(response.data.message.created_at, "message created_at"),
       audienceCheckedAt: currentChat.checkedAt,
       participantDigest: currentChat.activeParticipantDigest,
+    };
+  }
+
+  async createDirectChat(
+    request: LinqCreateDirectMessageRequest,
+    signal?: AbortSignal,
+    beforeSubmit?: () => Promise<void>,
+  ): Promise<LinqSendReceipt> {
+    const parsed = createDirectRequestSchema.safeParse(request);
+    if (!parsed.success) {
+      throw new LinqApiError("The Linq direct-chat request is invalid", {
+        status: 400,
+        providerCode: "invalid_create_chat_request",
+        retryable: false,
+      });
+    }
+    await beforeSubmit?.();
+    const raw = await this.#requestJson("/chats", {
+      method: "POST",
+      body: JSON.stringify({
+        from: this.#config.phoneNumber,
+        to: [parsed.data.recipient],
+        message: {
+          idempotency_key: parsed.data.idempotencyKey,
+          parts: [{ type: "text", value: parsed.data.text }],
+        },
+      }),
+      signal,
+    });
+    const response = providerCreateChatResponseSchema.safeParse(raw);
+    if (!response.success) {
+      throw new LinqApiError("Linq returned an invalid created chat", {
+        status: 502,
+        providerCode: "invalid_provider_response",
+        retryable: true,
+      });
+    }
+    const participants = response.data.chat.handles.map(normalizeParticipant);
+    const activePeople = participants.filter((participant) => participant.status === "active");
+    const expectedRecipient = parsed.data.recipient.trim().toLocaleLowerCase("en-US");
+    const exactRecipient = activePeople.filter(
+      (participant) =>
+        !participant.isSelf && participant.address.trim().toLocaleLowerCase("en-US") === expectedRecipient,
+    );
+    const exactSender = activePeople.filter(
+      (participant) => participant.isSelf && participant.address === this.#config.phoneNumber,
+    );
+    if (response.data.chat.is_group || exactRecipient.length !== 1 || exactSender.length !== 1) {
+      throw new LinqApiError("Linq created a chat with an unexpected audience", {
+        status: 502,
+        providerCode: "created_chat_audience_mismatch",
+        retryable: false,
+      });
+    }
+    return {
+      providerChatId: response.data.chat.id,
+      providerMessageId: response.data.chat.message.id,
+      idempotencyKey: parsed.data.idempotencyKey,
+      status: "accepted",
+      providerDeliveryStatus: response.data.chat.message.delivery_status,
+      submittedAt: normalizeTimestamp(response.data.chat.message.created_at, "message created_at"),
+      audienceCheckedAt: this.#now().toISOString(),
+      participantDigest: computeLinqParticipantDigest(participants),
     };
   }
 

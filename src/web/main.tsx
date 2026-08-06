@@ -102,36 +102,139 @@ function PublicLanding() {
 
 function AppShell({ viewer }: { viewer: Viewer }) {
   const location = useLocation();
-  const title = useMemo(() => {
-    const titles: Record<string, string> = {
-      "/home": "Today",
-      "/people": "Me & relationships",
-      "/chats": "Chats",
-      "/sources": "Sources & privacy",
-      "/safety": "Data & safety",
-    };
-    return titles[location.pathname] ?? "Florence";
-  }, [location.pathname]);
+  const currentPage = useMemo(
+    () => APP_LINKS.find((link) => link.to === location.pathname) ?? APP_LINKS[0],
+    [location.pathname],
+  );
+  const primaryHousehold = viewer.households[0];
+  const householdName = primaryHousehold?.name ?? "Your family";
+  const householdDetail = primaryHousehold
+    ? `${primaryHousehold.memberCount} ${primaryHousehold.memberCount === 1 ? "person" : "people"}`
+    : "Ready to set up";
+  const florencePhone = document.documentElement.dataset.florencePhone;
 
   return (
     <div className="app-shell">
-      <aside className="sidebar">
-        <Brand />
-        <AppNavigation />
-        <div className="sidebar-person">
+      <aside className="household-rail" aria-label="Household and Florence">
+        <div className="household-identity">
+          <Brand compact />
+          <div>
+            <strong>{householdName}</strong>
+            <span>{householdDetail}</span>
+          </div>
+        </div>
+        {florencePhone ? (
+          <a className="ask-florence" href={`sms:${florencePhone}`}>
+            <ShellIcon name="message" />
+            <span>Ask Florence</span>
+          </a>
+        ) : (
+          <div className="ask-florence unavailable">
+            <ShellIcon name="message" />
+            <span>Florence is connecting</span>
+          </div>
+        )}
+        <NavLink className="setup-card" to="/sources">
+          <span className="setup-card-icon">
+            <ShellIcon name="sources" />
+          </span>
+          <span>
+            <strong>Sources & setup</strong>
+            <small>Review mail, calendars, routines, and what stays private.</small>
+          </span>
+          <span className="setup-card-arrow" aria-hidden="true">
+            ›
+          </span>
+        </NavLink>
+
+        <div className="rail-group">
+          <span className="rail-label">Your assistant</span>
+          <NavLink className="assistant-link" to="/home">
+            <span className="assistant-mark">F</span>
+            <span>
+              <strong>Florence</strong>
+              <small>Coordinates in iMessage</small>
+            </span>
+          </NavLink>
+        </div>
+
+        <div className="rail-group household-spaces">
+          <span className="rail-label">Family spaces</span>
+          {viewer.households.length > 0 ? (
+            viewer.households.map((household) => (
+              <NavLink className="household-space" to="/people" key={household.id}>
+                <span className="space-mark">{household.name.slice(0, 1).toUpperCase()}</span>
+                <span>
+                  <strong>{household.name}</strong>
+                  <small>
+                    {household.memberCount} {household.memberCount === 1 ? "person" : "people"}
+                  </small>
+                </span>
+              </NavLink>
+            ))
+          ) : (
+            <NavLink className="household-space" to="/people">
+              <span className="space-mark">
+                <ShellIcon name="people" />
+              </span>
+              <span>
+                <strong>Set up your family</strong>
+                <small>Add people and permissions</small>
+              </span>
+            </NavLink>
+          )}
+        </div>
+
+        <NavLink className="sidebar-person" to="/people">
           <Avatar name={viewer.person.name} />
           <div>
             <strong>{viewer.person.name}</strong>
-            <span>{viewer.households[0]?.name ?? "Personal"}</span>
+            <span>Your private profile</span>
           </div>
+          <span className="profile-arrow" aria-hidden="true">
+            ›
+          </span>
+        </NavLink>
+      </aside>
+
+      <aside className="section-rail" aria-label="Florence companion sections">
+        <div className="section-rail-heading">
+          <span className="section-kicker">Florence companion</span>
+          <h2>Family controls</h2>
+          <p>Review what Florence can use and where she can help.</p>
+        </div>
+        <AppNavigation />
+        <div className="coordination-note">
+          <ShellIcon name="message" />
+          <p>
+            Family planning stays in <strong>iMessage</strong>. This companion is for setup, privacy, and
+            decisions.
+          </p>
         </div>
       </aside>
+
       <div className="app-column">
         <header className="mobile-header">
-          <Brand compact />
-          <h1>{title}</h1>
+          <div className="mobile-identity">
+            <Brand compact />
+            <div>
+              <span>{householdName}</span>
+              <h1>{currentPage.title}</h1>
+            </div>
+          </div>
+          {florencePhone ? (
+            <a className="mobile-ask" href={`sms:${florencePhone}`} aria-label="Ask Florence in iMessage">
+              <ShellIcon name="message" />
+              <span>Ask</span>
+            </a>
+          ) : null}
         </header>
         <main className="app-main">
+          <header className="canvas-header">
+            <span className="section-kicker">{currentPage.group}</span>
+            <h1>{currentPage.title}</h1>
+            <p>{currentPage.description}</p>
+          </header>
           <Outlet />
         </main>
         <nav className="bottom-nav">
@@ -142,23 +245,129 @@ function AppShell({ viewer }: { viewer: Viewer }) {
   );
 }
 
+const APP_LINKS = [
+  {
+    to: "/home",
+    label: "Today",
+    title: "Today",
+    group: "Overview",
+    icon: "today",
+    description: "Anything that needs your attention, and nothing that doesn’t.",
+  },
+  {
+    to: "/people",
+    label: "Family",
+    title: "Family & people",
+    group: "Family",
+    icon: "people",
+    description: "Manage who Florence knows and what each person can do.",
+  },
+  {
+    to: "/chats",
+    label: "Groups",
+    title: "iMessage groups",
+    group: "Family",
+    icon: "chats",
+    description: "Review the iMessage groups where Florence is present.",
+  },
+  {
+    to: "/sources",
+    label: "Sources",
+    title: "Sources & routines",
+    group: "Florence setup",
+    icon: "sources",
+    description: "Connect private sources and manage the routines Florence watches.",
+  },
+  {
+    to: "/safety",
+    label: "Privacy",
+    title: "Privacy & account",
+    group: "Florence setup",
+    icon: "safety",
+    description: "Control your data, browser sessions, and Florence’s access.",
+  },
+] as const;
+
+const APP_GROUPS = ["Overview", "Family", "Florence setup"] as const;
+
 function AppNavigation({ compact = false }: { compact?: boolean }) {
-  const links = [
-    ["/home", "Today", "⌂"],
-    ["/people", "People", "◉"],
-    ["/chats", "Chats", "◌"],
-    ["/sources", "Sources", "⌁"],
-    ["/safety", "Safety", "◇"],
-  ] as const;
+  if (compact) {
+    return (
+      <div className="nav-links compact">
+        {APP_LINKS.map((link) => (
+          <NavLink key={link.to} to={link.to} className={({ isActive }) => (isActive ? "active" : "")}>
+            <span className="nav-icon">
+              <ShellIcon name={link.icon} />
+            </span>
+            <span>{link.label}</span>
+          </NavLink>
+        ))}
+      </div>
+    );
+  }
+
   return (
-    <div className={compact ? "nav-links compact" : "nav-links"}>
-      {links.map(([to, label, icon]) => (
-        <NavLink key={to} to={to} className={({ isActive }) => (isActive ? "active" : "")}>
-          <span className="nav-icon">{icon}</span>
-          <span>{label}</span>
-        </NavLink>
+    <div className="nav-groups">
+      {APP_GROUPS.map((group) => (
+        <div className="nav-group" key={group}>
+          <span className="nav-group-label">{group}</span>
+          <div className="nav-links">
+            {APP_LINKS.filter((link) => link.group === group).map((link) => (
+              <NavLink key={link.to} to={link.to} className={({ isActive }) => (isActive ? "active" : "")}>
+                <span className="nav-icon">
+                  <ShellIcon name={link.icon} />
+                </span>
+                <span>{link.title}</span>
+              </NavLink>
+            ))}
+          </div>
+        </div>
       ))}
     </div>
+  );
+}
+
+function ShellIcon({ name }: { name: (typeof APP_LINKS)[number]["icon"] | "message" }) {
+  if (name === "today") {
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M4 10.5 12 4l8 6.5V20H4z" />
+        <path d="M9 20v-6h6v6" />
+      </svg>
+    );
+  }
+  if (name === "people") {
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <circle cx="9" cy="8" r="3" />
+        <path d="M3.5 19c.3-3.4 2.1-5.2 5.5-5.2s5.2 1.8 5.5 5.2" />
+        <path d="M15 6.2a3 3 0 0 1 0 5.6M16 14c2.6.3 4 2 4.2 5" />
+      </svg>
+    );
+  }
+  if (name === "chats" || name === "message") {
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M5 5.5h14v10H9l-4 3z" />
+        <path d="M8 9h8M8 12h5" />
+      </svg>
+    );
+  }
+  if (name === "sources") {
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <rect x="4" y="4" width="7" height="7" rx="1.5" />
+        <rect x="13" y="4" width="7" height="7" rx="1.5" />
+        <rect x="4" y="13" width="7" height="7" rx="1.5" />
+        <path d="M16.5 14v5M14 16.5h5" />
+      </svg>
+    );
+  }
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M12 3 19 6v5c0 4.4-2.8 7.9-7 10-4.2-2.1-7-5.6-7-10V6z" />
+      <path d="m9 12 2 2 4-4" />
+    </svg>
   );
 }
 
@@ -215,7 +424,7 @@ function PeoplePage({ viewer }: { viewer: Viewer }) {
   const [actionMessage, setActionMessage] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [inviteRoles, setInviteRoles] = useState<Record<string, "steward" | "caregiver" | "participant">>({});
-  const [dependentNames, setDependentNames] = useState<Record<string, string>>({});
+  const [dependentDrafts, setDependentDrafts] = useState<Record<string, DependentDraft>>({});
 
   async function runAction(key: string, path: string, body: unknown, success: string) {
     setBusy(key);
@@ -281,6 +490,34 @@ function PeoplePage({ viewer }: { viewer: Viewer }) {
                         : `Join ${invitation.householdName} as ${roleLabel(invitation.role)}`}
                     </h3>
                     <p>{invitation.detail}</p>
+                    {!approving && invitation.sharedContext ? (
+                      <div>
+                        <strong>Family context already shared with Florence</strong>
+                        <p>
+                          Florence already knows these details, so you won’t be asked to enter them again. By
+                          joining, you agree Florence can use them as shared context for this family.
+                        </p>
+                        <div className="family-members">
+                          {invitation.sharedContext.children.map((child) => (
+                            <div
+                              className="family-person"
+                              key={`${child.preferredName}:${child.birthYear ?? ""}:${child.school}`}
+                            >
+                              <Avatar name={child.preferredName} />
+                              <div>
+                                <strong>{child.preferredName}</strong>
+                                <span>{invitationChildSummary(child)}</span>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                        <p>
+                          {invitation.role === "steward"
+                            ? "After you join, you can correct these details from this page."
+                            : "After you join, these details stay visible here and a family steward can correct them."}
+                        </p>
+                      </div>
+                    ) : null}
                   </div>
                   <button
                     type="button"
@@ -348,19 +585,53 @@ function PeoplePage({ viewer }: { viewer: Viewer }) {
           <div className="family-subsection">
             <h4>People</h4>
             <div className="family-members">
-              {household.members.map((member) => (
-                <div className="family-person" key={member.id}>
-                  <Avatar name={member.name} />
-                  <div>
-                    <strong>{member.name}</strong>
-                    <span>
-                      {member.represented ? "Represented child or dependent" : roleLabel(member.role)}
-                    </span>
+              {household.members.map((member) => {
+                const context = member.context;
+                const editKey = `dependent-edit:${member.id}`;
+                const draft = dependentDrafts[member.id] ?? dependentDraft(member);
+                return (
+                  <div className="family-person" key={member.id}>
+                    <Avatar name={member.name} />
+                    <div>
+                      <strong>{member.name}</strong>
+                      <span>
+                        {member.represented ? "Child represented by the family" : roleLabel(member.role)}
+                      </span>
+                      {context ? <small>{dependentContextSummary(context)}</small> : null}
+                      {member.represented && household.canAddDependent ? (
+                        <details>
+                          <summary>Edit the details Florence uses to recognize them</summary>
+                          <form
+                            onSubmit={(event) => {
+                              event.preventDefault();
+                              if (!draft.displayName.trim()) return;
+                              void runAction(
+                                editKey,
+                                `/api/households/${household.id}/dependents/${member.id}`,
+                                dependentPayload(draft),
+                                `${draft.displayName.trim()}’s details are updated for the whole family.`,
+                              );
+                            }}
+                          >
+                            <DependentFields
+                              idPrefix={`edit-${member.id}`}
+                              value={draft}
+                              onChange={(next) =>
+                                setDependentDrafts((current) => ({ ...current, [member.id]: next }))
+                              }
+                            />
+                            <button type="submit" className="quiet-button" disabled={busy === editKey}>
+                              Save for everyone
+                            </button>
+                          </form>
+                        </details>
+                      ) : null}
+                    </div>
+                    {member.self ? <span className="tiny-label">You</span> : null}
+                    {member.represented ? <span className="tiny-label represented">Represented</span> : null}
                   </div>
-                  {member.self ? <span className="tiny-label">You</span> : null}
-                  {member.represented ? <span className="tiny-label represented">Represented</span> : null}
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
 
@@ -369,38 +640,40 @@ function PeoplePage({ viewer }: { viewer: Viewer }) {
               className="family-inline-form"
               onSubmit={(event) => {
                 event.preventDefault();
-                const displayName = dependentNames[household.id]?.trim();
+                const draft = dependentDrafts[household.id] ?? emptyDependentDraft();
+                const displayName = draft.displayName.trim();
                 if (!displayName) return;
                 void runAction(
                   `dependent:${household.id}`,
                   `/api/households/${household.id}/dependents`,
-                  { displayName },
-                  `${displayName} was added as a represented child or dependent.`,
+                  dependentPayload(draft),
+                  `${displayName} was added. These details are shared with family members, so Florence won’t ask them again.`,
                 ).then((saved) => {
-                  if (saved) setDependentNames((current) => ({ ...current, [household.id]: "" }));
+                  if (saved)
+                    setDependentDrafts((current) => ({ ...current, [household.id]: emptyDependentDraft() }));
                 });
               }}
             >
-              <label htmlFor={`dependent-${household.id}`}>Add a child or dependent</label>
-              <div>
-                <input
-                  id={`dependent-${household.id}`}
-                  maxLength={80}
-                  placeholder="Name"
-                  value={dependentNames[household.id] ?? ""}
-                  onChange={(event) =>
-                    setDependentNames((current) => ({ ...current, [household.id]: event.target.value }))
-                  }
-                />
-                <button
-                  type="submit"
-                  className="quiet-button"
-                  disabled={busy === `dependent:${household.id}` || !dependentNames[household.id]?.trim()}
-                >
-                  Add
-                </button>
-              </div>
-              <small>They’re represented by the family and do not need their own Florence account.</small>
+              <label htmlFor={`dependent-${household.id}-name`}>Add a child</label>
+              <DependentFields
+                idPrefix={`dependent-${household.id}`}
+                value={dependentDrafts[household.id] ?? emptyDependentDraft()}
+                onChange={(next) => setDependentDrafts((current) => ({ ...current, [household.id]: next }))}
+              />
+              <button
+                type="submit"
+                className="quiet-button"
+                disabled={
+                  busy === `dependent:${household.id}` ||
+                  !(dependentDrafts[household.id] ?? emptyDependentDraft()).displayName.trim()
+                }
+              >
+                Add child
+              </button>
+              <small>
+                Name is enough to start. Aliases, birth year, school, and activities help Florence match
+                messages without asking the other parent again.
+              </small>
             </form>
           ) : null}
 
@@ -409,20 +682,27 @@ function PeoplePage({ viewer }: { viewer: Viewer }) {
               <div className="family-section-heading">
                 <div>
                   <h4>Invite from a current group</h4>
-                  <p>Only registered people already sharing an iMessage group with you appear here.</p>
+                  <p>
+                    Choose someone already sharing an iMessage group with you. Florence will enroll them in a
+                    private chat before sharing any family context.
+                  </p>
                 </div>
               </div>
               {household.eligibleParticipants.length > 0 ? (
                 <div className="family-candidates">
                   {household.eligibleParticipants.map((participant) => {
                     const selectionKey = `${household.id}:${participant.personId}`;
-                    const role = inviteRoles[selectionKey] ?? "caregiver";
+                    const role = inviteRoles[selectionKey] ?? "steward";
                     const inviteKey = `invite:${selectionKey}`;
                     return (
                       <div className="family-candidate" key={selectionKey}>
                         <div>
                           <strong>{participant.name}</strong>
-                          <span>Registered in a shared group</span>
+                          <span>
+                            {participant.registered
+                              ? "Registered in a shared group"
+                              : "Not registered · Florence will ask privately"}
+                          </span>
                         </div>
                         <select
                           aria-label={`Role for ${participant.name}`}
@@ -451,7 +731,9 @@ function PeoplePage({ viewer }: { viewer: Viewer }) {
                                 inviteePersonId: participant.personId,
                                 role,
                               },
-                              `The invitation is ready for ${participant.name} in their private Florence account.`,
+                              participant.registered
+                                ? `Florence texted ${participant.name} a fresh private family invitation.`
+                                : `Florence privately asked ${participant.name} whether they want to join.`,
                             )
                           }
                         >
@@ -463,8 +745,7 @@ function PeoplePage({ viewer }: { viewer: Viewer }) {
                 </div>
               ) : (
                 <p className="family-empty-line">
-                  No one is ready to invite. Add Florence to an iMessage group and have each person register
-                  privately.
+                  Add Florence to an iMessage group with the person you want to invite, then return here.
                 </p>
               )}
             </div>
@@ -525,6 +806,126 @@ function PeoplePage({ viewer }: { viewer: Viewer }) {
           </div>
         </section>
       ))}
+    </div>
+  );
+}
+
+interface DependentDraft {
+  displayName: string;
+  aliases: string;
+  birthYear: string;
+  school: string;
+  activities: string;
+}
+
+function emptyDependentDraft(): DependentDraft {
+  return { displayName: "", aliases: "", birthYear: "", school: "", activities: "" };
+}
+
+function dependentDraft(member: PeopleView["households"][number]["members"][number]): DependentDraft {
+  return {
+    displayName: member.name,
+    aliases: member.context?.aliases.join(", ") ?? "",
+    birthYear: member.context?.birthYear ? String(member.context.birthYear) : "",
+    school: member.context?.school ?? "",
+    activities: member.context?.activities.join(", ") ?? "",
+  };
+}
+
+function dependentPayload(value: DependentDraft) {
+  return {
+    displayName: value.displayName.trim(),
+    aliases: commaSeparatedValues(value.aliases),
+    birthYear: value.birthYear.trim() ? Number(value.birthYear) : null,
+    school: value.school.trim(),
+    activities: commaSeparatedValues(value.activities),
+  };
+}
+
+function commaSeparatedValues(value: string): string[] {
+  return [
+    ...new Set(
+      value
+        .split(",")
+        .map((entry) => entry.trim())
+        .filter(Boolean),
+    ),
+  ];
+}
+
+function dependentContextSummary(
+  context: NonNullable<PeopleView["households"][number]["members"][number]["context"]>,
+): string {
+  const facts = [
+    context.aliases.length ? `also ${context.aliases.join(", ")}` : null,
+    context.birthYear ? `born ${context.birthYear}` : null,
+    context.school || null,
+    context.activities.length ? context.activities.join(", ") : null,
+  ].filter((entry): entry is string => Boolean(entry));
+  return facts.length ? facts.join(" · ") : "Add school, aliases, or activities when useful.";
+}
+
+function invitationChildSummary(
+  child: NonNullable<PeopleView["invitations"][number]["sharedContext"]>["children"][number],
+): string {
+  const facts = [
+    child.aliases.length ? `Also called ${child.aliases.join(", ")}` : null,
+    child.birthYear ? `Born ${child.birthYear}` : null,
+    child.school ? `School: ${child.school}` : null,
+    child.activities.length ? `Activities: ${child.activities.join(", ")}` : null,
+  ].filter((entry): entry is string => Boolean(entry));
+  return facts.length ? facts.join(" · ") : "Preferred name";
+}
+
+function DependentFields({
+  idPrefix,
+  value,
+  onChange,
+}: {
+  idPrefix: string;
+  value: DependentDraft;
+  onChange: (next: DependentDraft) => void;
+}) {
+  return (
+    <div>
+      <input
+        id={`${idPrefix}-name`}
+        maxLength={80}
+        placeholder="Name"
+        aria-label="Child’s name"
+        value={value.displayName}
+        onChange={(event) => onChange({ ...value, displayName: event.target.value })}
+      />
+      <input
+        maxLength={300}
+        placeholder="Also called (comma separated)"
+        aria-label="Child’s aliases"
+        value={value.aliases}
+        onChange={(event) => onChange({ ...value, aliases: event.target.value })}
+      />
+      <input
+        type="number"
+        min={1900}
+        max={2100}
+        placeholder="Birth year"
+        aria-label="Child’s birth year"
+        value={value.birthYear}
+        onChange={(event) => onChange({ ...value, birthYear: event.target.value })}
+      />
+      <input
+        maxLength={160}
+        placeholder="School"
+        aria-label="Child’s school"
+        value={value.school}
+        onChange={(event) => onChange({ ...value, school: event.target.value })}
+      />
+      <input
+        maxLength={1000}
+        placeholder="Activities (comma separated)"
+        aria-label="Child’s activities"
+        value={value.activities}
+        onChange={(event) => onChange({ ...value, activities: event.target.value })}
+      />
     </div>
   );
 }

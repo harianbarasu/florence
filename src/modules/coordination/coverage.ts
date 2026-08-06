@@ -39,7 +39,9 @@ export const CoverageCommandSchema = z.discriminatedUnion("kind", [
     actorPersonId: EntityIdSchema,
     occurredAt: InstantSchema,
     minimumSharedMeaning: z.string().trim().min(1).max(500),
+    unresolvedFacts: z.array(z.string().trim().min(1).max(300)).max(20),
     proposedHolderPersonId: EntityIdSchema.nullable(),
+    timing: ResolvedTimePlanSchema,
     evidenceRefs: z.array(EvidenceRefSchema).min(1).max(20),
   }),
   z.strictObject({
@@ -215,10 +217,11 @@ export function transitionCoverage(
         command,
         "facts_resolved",
         {
-          state: "open",
-          unresolvedFacts: [],
+          state: command.unresolvedFacts.length === 0 ? "open" : "provisional",
+          unresolvedFacts: command.unresolvedFacts,
           minimumSharedMeaning: command.minimumSharedMeaning,
           proposedHolderPersonId: command.proposedHolderPersonId,
+          timing: command.timing,
         },
         "coverage_still_open",
       );

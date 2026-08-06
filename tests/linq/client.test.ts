@@ -85,6 +85,54 @@ function jsonResponse(value: unknown, status = 200): Response {
 }
 
 describe("LinqClient", () => {
+  it("opens one exact direct chat with a link-free idempotent enrollment message", async () => {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(input), ...(init ? { init } : {}) });
+      return jsonResponse({
+        chat: {
+          ...providerChat,
+          display_name: null,
+          is_group: false,
+          message: {
+            id: messageId,
+            created_at: "2026-08-05T12:00:00Z",
+            delivery_status: "pending",
+          },
+        },
+      });
+    }) as typeof fetch;
+    const client = new LinqClient(config, { fetch: fetchMock, now: () => fixedNow });
+
+    const receipt = await client.createDirectChat({
+      recipient: "+14155550100",
+      idempotencyKey: "household-enrollment-one",
+      text: "Jackson invited you to Florence. Reply yes to agree, or STOP.",
+    });
+
+    expect(calls.map((call) => [call.init?.method, call.url])).toEqual([
+      ["POST", "https://linq.test/api/partner/v3/chats"],
+    ]);
+    expect(JSON.parse(String(calls[0]?.init?.body))).toEqual({
+      from: config.phoneNumber,
+      to: ["+14155550100"],
+      message: {
+        idempotency_key: "household-enrollment-one",
+        parts: [
+          {
+            type: "text",
+            value: "Jackson invited you to Florence. Reply yes to agree, or STOP.",
+          },
+        ],
+      },
+    });
+    expect(receipt).toMatchObject({
+      providerChatId: chatId,
+      providerMessageId: messageId,
+      idempotencyKey: "household-enrollment-one",
+    });
+  });
+
   it("reauthorizes the live audience and sends one idempotent message", async () => {
     const calls: Array<{ url: string; init?: RequestInit }> = [];
     const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {

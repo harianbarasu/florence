@@ -135,13 +135,19 @@ export const providerAttachmentMetadataSchema = z.object({
   download_url: z.string().url().nullish(),
 });
 
+const providerSendMessageSchema = z.object({
+  id: z.string().min(1),
+  created_at: z.string().min(1),
+  delivery_status: z.enum(["pending", "queued", "sent", "delivered", "received", "read", "failed"]),
+});
+
 export const providerSendResponseSchema = z.object({
   chat_id: z.string().min(1),
-  message: z.object({
-    id: z.string().min(1),
-    created_at: z.string().min(1),
-    delivery_status: z.enum(["pending", "queued", "sent", "delivered", "received", "read", "failed"]),
-  }),
+  message: providerSendMessageSchema,
+});
+
+export const providerCreateChatResponseSchema = z.object({
+  chat: providerChatSchema.extend({ message: providerSendMessageSchema }),
 });
 
 export const providerMessageDeliverySchema = z.object({

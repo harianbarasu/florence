@@ -62,6 +62,13 @@ const reviseRoutineBodySchema = z
     message: "Florence must start watching before the last responsible moment",
     path: ["earliestUsefulMinutesBefore"],
   });
+const dependentBodySchema = z.strictObject({
+  displayName: z.string().trim().min(1).max(80),
+  aliases: z.array(z.string().trim().min(1).max(80)).max(12).default([]),
+  birthYear: z.number().int().min(1900).max(2100).nullable().default(null),
+  school: z.string().trim().max(160).default(""),
+  activities: z.array(z.string().trim().min(1).max(120)).max(24).default([]),
+});
 
 export async function createServer(input?: { config?: FlorenceConfig; database?: Database }) {
   const config = input?.config ?? loadConfig();
@@ -201,6 +208,7 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
       const body = z
         .strictObject({ token: z.string().regex(/^[A-Za-z0-9_-]{32,128}$/u) })
         .parse(request.body);
+      const preview = await auth.previewHandoff(body.token);
       const session = await auth.consumeHandoff(body.token);
       reply.setCookie(sessionCookieName(config), session.sessionToken, {
         path: "/",
@@ -212,11 +220,13 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
       reply.header("Cache-Control", "no-store");
       return {
         redirect:
-          session.assuranceKind === "google_connect"
-            ? "/sources?step_up=google_connect"
-            : session.assuranceKind === "account_controls"
-              ? "/safety?step_up=account_controls"
-              : "/home",
+          preview.purpose === "invitation"
+            ? "/people"
+            : session.assuranceKind === "google_connect"
+              ? "/sources?step_up=google_connect"
+              : session.assuranceKind === "account_controls"
+                ? "/safety?step_up=account_controls"
+                : "/people",
       };
     },
   );
@@ -385,11 +395,23 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
       .string()
       .uuid()
       .parse((request.params as { householdId?: unknown }).householdId);
-    const body = z.strictObject({ displayName: z.string().trim().min(1).max(80) }).parse(request.body);
+    const body = dependentBodySchema.parse(request.body);
     return application.process({
       kind: "web.command",
       actorPersonId: principal.personId,
-      command: { kind: "add_dependent", householdId, displayName: body.displayName },
+      command: { kind: "add_dependent", householdId, ...body },
+    });
+  });
+  app.post("/api/households/:householdId/dependents/:dependentPersonId", async (request) => {
+    const principal = await requireWriteSession(request, config, auth);
+    const params = z
+      .strictObject({ householdId: z.string().uuid(), dependentPersonId: z.string().uuid() })
+      .parse(request.params);
+    const body = dependentBodySchema.parse(request.body);
+    return application.process({
+      kind: "web.command",
+      actorPersonId: principal.personId,
+      command: { kind: "update_dependent", ...params, ...body },
     });
   });
   app.post("/api/chats/:conversationId/coverage-rule-approval", async (request) => {

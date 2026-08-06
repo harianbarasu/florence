@@ -317,13 +317,20 @@ export class PostgresFlorenceQueries {
           role: string;
           person_status: string;
           display_name_ciphertext: Buffer | null;
+          aliases_ciphertext: Buffer | null;
+          birth_year: number | null;
+          school_ciphertext: Buffer | null;
+          activities_ciphertext: Buffer | null;
           joined_at: Date;
         }[]
       >`
         select member.person_id, member.role, person.status as person_status,
-          person.display_name_ciphertext, member.joined_at
+          person.display_name_ciphertext, profile.aliases_ciphertext,
+          profile.birth_year, profile.school_ciphertext,
+          profile.activities_ciphertext, member.joined_at
         from household_memberships member
         join people person on person.id = member.person_id
+        left join dependent_profiles profile on profile.person_id = person.id
         where member.household_id = ${household.id} and member.status = 'active'
         order by case member.role when 'steward' then 0 when 'caregiver' then 1
           when 'participant' then 2 else 3 end, member.joined_at
@@ -333,12 +340,17 @@ export class PostgresFlorenceQueries {
             {
               person_id: string;
               conversation_id: string;
+              identity_id: string;
+              person_status: string;
               display_name_ciphertext: Buffer | null;
+              subject_ciphertext: Buffer | null;
             }[]
           >`
             select distinct on (candidate.person_id)
               candidate.person_id, conversation.id as conversation_id,
-              person.display_name_ciphertext
+              identity.id as identity_id,
+              person.status as person_status, person.display_name_ciphertext,
+              identity.subject_ciphertext
             from conversations conversation
             join participant_epochs epoch on epoch.id = conversation.current_epoch_id
               and epoch.ended_at is null
@@ -347,11 +359,10 @@ export class PostgresFlorenceQueries {
               and viewer_participant.person_id = ${personId}
             join epoch_participants candidate on candidate.participant_epoch_id = epoch.id
               and candidate.person_id <> ${personId}
-              and candidate.registration_status = 'registered'
-              and candidate.consented_at is not null
-            join people person on person.id = candidate.person_id and person.status = 'registered'
+            join people person on person.id = candidate.person_id
+              and person.status in ('provisional', 'registered')
             join person_identities identity on identity.id = candidate.person_identity_id
-              and identity.status = 'verified'
+              and identity.status in ('observed', 'verified')
             where conversation.kind = 'group' and conversation.status = 'active'
               and not exists(
                 select 1 from household_memberships existing_member
@@ -444,13 +455,45 @@ export class PostgresFlorenceQueries {
           role: relationshipRole(member.role),
           self: member.person_id === personId,
           represented: member.role === "dependent" && member.person_status !== "registered",
+          context:
+            member.role === "dependent" && member.person_status !== "registered"
+              ? {
+                  aliases: decryptDependentList(
+                    this.#secretBox,
+                    member.person_id,
+                    "aliases",
+                    member.aliases_ciphertext,
+                  ),
+                  birthYear: member.birth_year === null ? null : Number(member.birth_year),
+                  school:
+                    decryptDependentText(
+                      this.#secretBox,
+                      member.person_id,
+                      "school",
+                      member.school_ciphertext,
+                    ) ?? "",
+                  activities: decryptDependentList(
+                    this.#secretBox,
+                    member.person_id,
+                    "activities",
+                    member.activities_ciphertext,
+                  ),
+                }
+              : null,
         })),
         eligibleParticipants: eligibleRows.map((participant) => ({
           personId: participant.person_id,
           conversationId: participant.conversation_id,
           name:
             decryptPersonName(this.#secretBox, participant.person_id, participant.display_name_ciphertext) ??
-            "Registered group participant",
+            maskedIdentityLabel(
+              decryptIdentitySubject(
+                this.#secretBox,
+                participant.identity_id,
+                participant.subject_ciphertext,
+              ),
+            ),
+          registered: participant.person_status === "registered",
         })),
         coverageGroups: groupRows.map((group, groupIndex) => {
           const active = group.active;
@@ -525,6 +568,59 @@ export class PostgresFlorenceQueries {
       group by invitation.id
       order by invitation.created_at
     `;
+    const invitationContextRows = await this.database<
+      {
+        invitation_id: string;
+        person_id: string;
+        display_name_ciphertext: Buffer | null;
+        aliases_ciphertext: Buffer | null;
+        birth_year: number | null;
+        school_ciphertext: Buffer | null;
+        activities_ciphertext: Buffer | null;
+      }[]
+    >`
+      select invitation.id as invitation_id, dependent_person.id as person_id,
+        dependent_person.display_name_ciphertext, profile.aliases_ciphertext,
+        profile.birth_year, profile.school_ciphertext, profile.activities_ciphertext
+      from invitations invitation
+      join households household on household.id = invitation.household_id
+        and household.membership_version = invitation.household_membership_version
+      join person_identities invitee_identity on invitee_identity.id = invitation.invitee_identity_id
+        and invitee_identity.person_id = ${personId} and invitee_identity.status = 'verified'
+      join people invitee on invitee.id = invitee_identity.person_id
+        and invitee.status = 'registered'
+      join household_memberships dependent_membership
+        on dependent_membership.household_id = invitation.household_id
+        and dependent_membership.role = 'dependent'
+        and dependent_membership.status = 'active'
+      join people dependent_person on dependent_person.id = dependent_membership.person_id
+        and dependent_person.status = 'provisional'
+      left join dependent_profiles profile on profile.person_id = dependent_person.id
+      where invitation.status = 'pending' and invitation.expires_at > now()
+      order by invitation.created_at, dependent_membership.joined_at
+    `;
+    const sharedChildrenByInvitation = new Map<
+      string,
+      NonNullable<PeopleView["invitations"][number]["sharedContext"]>["children"]
+    >();
+    for (const child of invitationContextRows) {
+      const children = sharedChildrenByInvitation.get(child.invitation_id) ?? [];
+      children.push({
+        preferredName:
+          decryptPersonName(this.#secretBox, child.person_id, child.display_name_ciphertext) ?? "Child",
+        aliases: decryptDependentList(this.#secretBox, child.person_id, "aliases", child.aliases_ciphertext),
+        birthYear: child.birth_year === null ? null : Number(child.birth_year),
+        school:
+          decryptDependentText(this.#secretBox, child.person_id, "school", child.school_ciphertext) ?? "",
+        activities: decryptDependentList(
+          this.#secretBox,
+          child.person_id,
+          "activities",
+          child.activities_ciphertext,
+        ),
+      });
+      sharedChildrenByInvitation.set(child.invitation_id, children);
+    }
     const householdNames = new Map(households.map((household) => [household.id, household.name]));
     return {
       households,
@@ -544,9 +640,11 @@ export class PostgresFlorenceQueries {
           canAct: true,
           detail: "A co-steward must be approved by every current steward.",
           expiresAt: invitation.expires_at.toISOString(),
+          sharedContext: null,
         })),
         ...acceptanceRows.map((invitation) => {
           const ready = Number(invitation.remaining_approvals) === 0;
+          const children = sharedChildrenByInvitation.get(invitation.invitation_id) ?? [];
           return {
             id: invitation.invitation_id,
             householdId: invitation.household_id,
@@ -559,6 +657,7 @@ export class PostgresFlorenceQueries {
               ? "This family is ready for you to join."
               : "The family’s current stewards are still approving this invitation.",
             expiresAt: invitation.expires_at.toISOString(),
+            sharedContext: children.length > 0 ? { children } : null,
           };
         }),
       ],
@@ -1183,6 +1282,73 @@ function decryptPersonName(secretBox: SecretBox, personId: string, ciphertext: B
     return name.length > 0 && name.length <= 80 ? name : null;
   } catch {
     return null;
+  }
+}
+
+function decryptIdentitySubject(
+  secretBox: SecretBox,
+  identityId: string,
+  ciphertext: Buffer | null,
+): string | null {
+  if (!ciphertext) return null;
+  try {
+    const subject = secretBox
+      .decrypt(JSON.parse(ciphertext.toString("utf8")) as unknown, `identity-subject:${identityId}`)
+      .toString("utf8")
+      .trim();
+    return subject.length > 0 && subject.length <= 320 ? subject : null;
+  } catch {
+    return null;
+  }
+}
+
+function maskedIdentityLabel(subject: string | null): string {
+  if (!subject) return "Unregistered group participant";
+  if (/^\+[1-9]\d{6,14}$/u.test(subject)) return `Group participant ending ${subject.slice(-4)}`;
+  const at = subject.lastIndexOf("@");
+  if (at > 0) return `Group participant at ${subject.slice(at + 1)}`;
+  return "Unregistered group participant";
+}
+
+function decryptDependentText(
+  secretBox: SecretBox,
+  personId: string,
+  field: "school",
+  ciphertext: Buffer | null,
+): string | null {
+  if (!ciphertext) return null;
+  try {
+    const value = secretBox
+      .decrypt(JSON.parse(ciphertext.toString("utf8")) as unknown, `dependent-${field}:${personId}`)
+      .toString("utf8")
+      .replace(/\s+/gu, " ")
+      .trim();
+    return value.length > 0 && value.length <= 160 ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function decryptDependentList(
+  secretBox: SecretBox,
+  personId: string,
+  field: "aliases" | "activities",
+  ciphertext: Buffer | null,
+): string[] {
+  if (!ciphertext) return [];
+  try {
+    const value = JSON.parse(
+      secretBox
+        .decrypt(JSON.parse(ciphertext.toString("utf8")) as unknown, `dependent-${field}:${personId}`)
+        .toString("utf8"),
+    ) as unknown;
+    if (!Array.isArray(value)) return [];
+    return value.filter(
+      (entry): entry is string =>
+        typeof entry === "string" && entry.trim().length > 0 && entry.trim().length <= 120,
+    );
+  } catch {
+    return [];
   }
 }
 

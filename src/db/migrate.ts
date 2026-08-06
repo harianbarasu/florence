@@ -2,11 +2,14 @@ import { createHash } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import postgres from "postgres";
-import type { FlorenceConfig } from "../config.js";
+import type { FlorenceDatabaseConfig } from "../config.js";
 
 const MIGRATION_LOCK = 4_607_346_622;
 
-export async function migrate(config: FlorenceConfig, directory = path.resolve("migrations")): Promise<void> {
+export async function migrate(
+  config: FlorenceDatabaseConfig,
+  directory = path.resolve("migrations"),
+): Promise<void> {
   const admin = postgres(config.database.url, {
     max: 1,
     ssl: config.database.ssl ? "require" : false,

@@ -164,7 +164,8 @@ the chat as a potential source; it does not itself authorize ordinary processing
 be lightweight—a verified private-DM claim and consent—without creating a household or connecting
 Google. This preserves the viral invite loop while keeping the permission boundary honest.
 
-A private `START` is explicit global Florence consent. New exact participant epochs project each
+A natural affirmative reply to Florence's explicit private consent question is global Florence
+consent; magic commands such as `START` are not required. New exact participant epochs project each
 registered person's existing conservative policy; they never synthesize consent from observation.
 Participant changes invalidate proactive rules and require a new exact-audience rule, but Florence
 does not ask an already registered person to re-register for every chat.
@@ -243,10 +244,38 @@ clearer there. It is resumable and useful before every optional field is complet
 10. Begin in exceptions-first learning mode; Florence proposes narrow recurring rules when repetition
     is demonstrated.
 
-## 6. Mobile web companion
+## 6. Web cockpit
 
-The web app is an authority and exception plane. Ordinary conversation and coordination stay in
-iMessage.
+The observed product pattern and Florence-specific transfer are documented in
+[`docs/research/energy-parent-agent-product-reference-2026-08-06.md`](docs/research/energy-parent-agent-product-reference-2026-08-06.md).
+
+The web app is the persistent visual home for the same Florence a family knows in iMessage. It is
+not a separate admin product, a display of internal agents, or a raw archive of everything Florence
+can access. It should minimize the time required to understand what matters, trust why Florence is
+acting, and make the occasional structured choice that is awkward in a text thread.
+
+For the first pilot, ordinary conversation and coordination stay in iMessage. The web “Ask
+Florence” action returns to the person's exact private Florence thread rather than presenting a fake
+or disconnected web chat. A later web conversation surface may become a second entry point only
+when it shares the same person, household, memory, authority, work, and audit state as iMessage.
+
+### Desktop information architecture
+
+Use a stable three-zone workspace:
+
+1. **Relationship rail** — the current household, one visible Florence, a real “Ask Florence”
+   action, setup/source readiness, family spaces, and the signed-in person. This is the human and
+   relationship context, not a list of ephemeral workers.
+2. **Capability rail** — Today, family, conversations, routines/sources, memory, and safety in plain
+   parent language. The current pilot may combine capabilities when they share one real route; it
+   must not expose empty or pretend destinations to imitate a reference product.
+3. **Focused canvas** — one decision, review surface, or understandable body of state at a time.
+   Exceptions and next actions lead; implementation telemetry stays behind an explanation when it
+   is useful.
+
+On small screens, collapse both rails into a compact household header and bottom navigation. The
+mobile view remains an excellent companion reached from iMessage, not a shrunken desktop control
+panel.
 
 ### Home
 

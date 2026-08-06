@@ -21,6 +21,60 @@ function openLoop() {
 }
 
 describe("coverage state machine", () => {
+  it("keeps partial answers provisional and applies the resolved timing when the last fact arrives", () => {
+    const provisional = createCoverageLoop({
+      loopId: IDS.loop,
+      householdId: IDS.household,
+      minimumSharedMeaning: "School pickup",
+      unresolvedFacts: ["which day", "pickup time"],
+      proposedHolderPersonId: IDS.holder,
+      timing: timing(),
+      destination,
+      sourceEvidenceRefs: ["evidence:group-message"],
+      occurredAt: "2026-08-05T18:00:00Z",
+    });
+
+    const partiallyResolved = transitionCoverage(provisional, {
+      kind: "resolve_facts",
+      transitionId: IDS.transition1,
+      expectedVersion: 1,
+      actorPersonId: IDS.actor,
+      occurredAt: "2026-08-05T18:01:00Z",
+      minimumSharedMeaning: "Wednesday school pickup",
+      unresolvedFacts: ["pickup time"],
+      proposedHolderPersonId: IDS.holder,
+      timing: timing(),
+      evidenceRefs: ["evidence:wednesday"],
+    }).loop;
+
+    const resolvedTiming = {
+      ...timing(),
+      localDate: "2026-08-12",
+      eventAt: "2026-08-12T22:00:00Z",
+      deadlineAt: "2026-08-12T21:30:00Z",
+      lastResponsibleAt: "2026-08-12T21:30:00Z",
+    };
+    const resolved = transitionCoverage(partiallyResolved, {
+      kind: "resolve_facts",
+      transitionId: IDS.transition2,
+      expectedVersion: 2,
+      actorPersonId: IDS.actor,
+      occurredAt: "2026-08-05T18:02:00Z",
+      minimumSharedMeaning: "Wednesday school pickup at 3 PM",
+      unresolvedFacts: [],
+      proposedHolderPersonId: IDS.holder,
+      timing: resolvedTiming,
+      evidenceRefs: ["evidence:three-pm"],
+    });
+
+    expect(partiallyResolved).toMatchObject({ state: "provisional", unresolvedFacts: ["pickup time"] });
+    expect(resolved.loop).toMatchObject({
+      state: "open",
+      unresolvedFacts: [],
+      timing: { eventAt: "2026-08-12T22:00:00Z" },
+    });
+  });
+
   it("requires the proposed person to explicitly acknowledge their own coverage", () => {
     const requested = transitionCoverage(openLoop(), {
       kind: "request_coverage",

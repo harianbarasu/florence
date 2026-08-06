@@ -58,6 +58,11 @@ export type AppEnvelope =
       readonly maxOccurrences: number;
     }
   | {
+      readonly kind: "maintenance.redrive_effects";
+      readonly asOf: string;
+      readonly limit: number;
+    }
+  | {
       readonly kind: "web.command";
       readonly actorPersonId: string;
       readonly command:
@@ -75,6 +80,20 @@ export type AppEnvelope =
             readonly kind: "add_dependent";
             readonly householdId: string;
             readonly displayName: string;
+            readonly aliases: readonly string[];
+            readonly birthYear: number | null;
+            readonly school: string;
+            readonly activities: readonly string[];
+          }
+        | {
+            readonly kind: "update_dependent";
+            readonly householdId: string;
+            readonly dependentPersonId: string;
+            readonly displayName: string;
+            readonly aliases: readonly string[];
+            readonly birthYear: number | null;
+            readonly school: string;
+            readonly activities: readonly string[];
           }
         | { readonly kind: "approve_group_coverage_rule"; readonly conversationId: string }
         | ({ readonly kind: "create_routine" } & WebRoutineFields)

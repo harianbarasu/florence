@@ -322,6 +322,11 @@ async function main(): Promise<void> {
       const now = new Date();
       await work.cancelStale(now);
       await outbox.cancelStale(now);
+      await application.process({
+        kind: "maintenance.redrive_effects",
+        asOf: now.toISOString(),
+        limit: 20,
+      });
       const timers = new DurableTimers(database);
       await timers.cancelStale(now);
       await timers.recoverOrphanedClaims(now);

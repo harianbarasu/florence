@@ -100,7 +100,8 @@ export class FlorenceOrchestrator {
     const context = await this.compileLinqContext(internalProviderEventId);
     if (!context) return "stale_or_ineligible";
 
-    const acknowledgment = await this.tryExplicitCoverageResponse(context);
+    const replyTargetLoopId = await this.loadReplyTargetCoverageLoopId(context);
+    const acknowledgment = await this.tryExplicitCoverageResponse(context, replyTargetLoopId);
     if (acknowledgment) return acknowledgment;
 
     const currentCoverage = await this.loadCurrentCoverageContext(context);
@@ -120,10 +121,12 @@ export class FlorenceOrchestrator {
             minimumSharedMeaning: loop.minimumSharedMeaning,
             proposedHolderPersonId: loop.proposedHolderPersonId,
             acknowledgedByPersonId: loop.acknowledgment?.personId ?? null,
+            unresolvedFacts: loop.unresolvedFacts,
             eventAt: loop.timing.eventAt,
             deadlineAt: loop.timing.deadlineAt,
           })),
         )}`,
+        `Exact replied-to coverage loop ID: ${replyTargetLoopId ?? "none"}`,
         `Message: ${context.text}`,
         ...(context.images.length > 0
           ? [`Attached images available to inspect: ${context.images.length}`]
@@ -140,12 +143,19 @@ export class FlorenceOrchestrator {
     }
 
     if (need.proposal.disposition === "propose_coverage") {
-      const changedFactDisposition = await this.applyChangedFactToCurrentLoop(
+      const provisionalDisposition = await this.resolveProvisionalCoverage(
         context,
         need.proposal,
         currentCoverage,
+        replyTargetLoopId,
       );
-      const disposition = changedFactDisposition ?? (await this.proposeCoverage(context, need.proposal));
+      const changedFactDisposition = provisionalDisposition
+        ? null
+        : await this.applyChangedFactToCurrentLoop(context, need.proposal, currentCoverage);
+      const disposition =
+        provisionalDisposition ??
+        changedFactDisposition ??
+        (await this.proposeCoverage(context, need.proposal));
       await this.workers.reconcile(
         need.attemptId,
         disposition.includes("failed") ? "rejected" : disposition.includes("stale") ? "stale" : "accepted",
@@ -618,17 +628,29 @@ export class FlorenceOrchestrator {
     return output;
   }
 
-  private async tryExplicitCoverageResponse(context: MessageContext): Promise<string | null> {
+  private async loadReplyTargetCoverageLoopId(context: MessageContext): Promise<string | null> {
+    const providerMessageId = context.event.message.replyTo?.providerMessageId;
+    if (!providerMessageId) return null;
+    const rows = await this.database<{ readonly coverage_loop_id: string }[]>`
+      select effect.coverage_loop_id
+      from effect_receipts receipt
+      join outbox effect on effect.id = receipt.outbox_id
+      where receipt.provider_receipt_id = ${providerMessageId}
+        and effect.conversation_id = ${context.record.routing.conversationId}
+        and effect.participant_epoch_id = ${context.record.routing.participantEpochId}
+        and effect.coverage_loop_id is not null
+      order by receipt.occurred_at desc
+      limit 1
+    `;
+    return rows[0]?.coverage_loop_id ?? null;
+  }
+
+  private async tryExplicitCoverageResponse(
+    context: MessageContext,
+    replyTargetLoopId: string | null,
+  ): Promise<string | null> {
     const personId = context.record.routing.senderPersonId;
     if (!personId) return null;
-    const normalized = context.text.toLowerCase().replace(/[.!]/gu, "").trim();
-    const acknowledges =
-      /^(?:yes[, ]+)?(?:i have it|i've got it|i got it|i can cover(?: it)?|i will cover(?: it)?|i'll cover(?: it)?|got it)$/u.test(
-        normalized,
-      );
-    const declines =
-      /^(?:sorry[, ]+)?(?:i can't|i cannot|can't do it|not available|i'm not available)$/u.test(normalized);
-    if (!acknowledges && !declines) return null;
     const loops = await this.database<CoverageResponseTargetRow[]>`
       select loop.id, loop.state, loop.proposed_holder_person_id,
         loop.acknowledged_by_person_id, loop.destination_conversation_id,
@@ -663,39 +685,96 @@ export class FlorenceOrchestrator {
           )
         )
         and (
-          (${acknowledges} and (
-            (loop.proposed_holder_person_id = ${personId} and loop.state in ('awaiting_response', 'at_risk'))
-            or (loop.proposed_holder_person_id is null and loop.state in ('open', 'at_risk'))
-          ))
-          or (${declines} and (
-            (loop.proposed_holder_person_id = ${personId} and loop.state = 'awaiting_response')
-            or (loop.acknowledged_by_person_id = ${personId} and loop.state = 'covered')
-          ))
+          (loop.proposed_holder_person_id = ${personId} and loop.state in ('awaiting_response', 'at_risk'))
+          or (loop.proposed_holder_person_id is null and loop.state in ('open', 'at_risk'))
+          or (loop.acknowledged_by_person_id = ${personId} and loop.state = 'covered')
         )
-      order by loop.last_transition_at desc limit 2
+      order by loop.last_transition_at desc limit 8
     `;
-    const onlyLoop = loops.length === 1 ? loops[0] : undefined;
-    if (!onlyLoop) {
-      if (loops.length > 1 && context.record.routing.chatKind === "direct") {
-        await this.database.begin(async (transaction) => {
-          const snapshot = await new PostgresConversationAuthority(transaction).snapshot(
-            context.record.routing.conversationId,
-          );
-          await queueConversationEffect({
-            transaction,
-            secretBox: this.secretBox,
-            context,
-            snapshot,
-            text: "I found more than one current family commitment that could match. Tell me which one you mean.",
-            sendKind: "direct_response",
-            operation: "coverage_coordination",
-            idempotencyKey: `coverage-response-ambiguous:${context.row.id}`,
-          });
-        });
+    if (loops.length === 0) return null;
+
+    const coordination = new PostgresCoordination(this.database, this.secretBox);
+    const candidateLoops = (
+      await Promise.all(loops.map(async (row) => ({ row, loop: await coordination.load(row.id) })))
+    ).flatMap((candidate) => (candidate.loop ? [{ row: candidate.row, loop: candidate.loop }] : []));
+    if (candidateLoops.length === 0) return null;
+
+    const deterministic = deterministicCoverageResponse(context.text, replyTargetLoopId !== null);
+    let action: "acknowledge" | "decline" | null = deterministic;
+    let target =
+      action && replyTargetLoopId
+        ? chooseDeterministicCoverageTarget(candidateLoops, personId, action, replyTargetLoopId)
+        : null;
+    let responseAttemptId: string | null = null;
+    if (!target) {
+      const interpreted = await this.workers.run({
+        attemptId: randomUUID(),
+        taskVersionId: randomUUID(),
+        skill: PRODUCT_SKILLS.responseInterpret,
+        authorizedContext: [
+          `Authenticated sender person ID: ${personId}`,
+          `Conversation audience: ${context.record.routing.chatKind}`,
+          `Exact replied-to coverage loop ID: ${replyTargetLoopId ?? "none"}`,
+          `Current response-eligible loops: ${JSON.stringify(
+            candidateLoops.map(({ loop }) => ({
+              loopId: loop.loopId,
+              state: loop.state,
+              minimumSharedMeaning: loop.minimumSharedMeaning,
+              proposedHolderPersonId: loop.proposedHolderPersonId,
+              acknowledgedByPersonId: loop.acknowledgment?.personId ?? null,
+              eventAt: loop.timing.eventAt,
+              deadlineAt: loop.timing.deadlineAt,
+            })),
+          )}`,
+          `Message: ${context.text}`,
+        ].join("\n"),
+        goal: "Interpret whether this message explicitly accepts or declines one current coverage loop.",
+        deadline: new Date(Date.now() + 30_000),
+        budget: { maxModelCalls: 1, maxOutputTokens: 600 },
+      });
+      responseAttemptId = interpreted.attemptId;
+      if (interpreted.status !== "proposed" || !interpreted.proposal) {
+        await this.workers.reconcile(interpreted.attemptId, "rejected");
+        return null;
+      }
+      const proposal = interpreted.proposal;
+      if (proposal.disposition === "not_response") {
+        await this.workers.reconcile(interpreted.attemptId, "accepted");
+        return null;
+      }
+      action =
+        proposal.disposition === "acknowledge" || proposal.disposition === "decline"
+          ? proposal.disposition
+          : null;
+      const interpretedAction = action;
+      target =
+        interpretedAction && proposal.targetLoopId
+          ? (candidateLoops.find(
+              ({ loop }) =>
+                loop.loopId === proposal.targetLoopId &&
+                isCoverageResponseEligible(loop, personId, interpretedAction),
+            ) ?? null)
+          : null;
+      const safelyInterpreted =
+        target !== null &&
+        proposal.explicitSelfStatement &&
+        proposal.confidence >= 0.8 &&
+        (replyTargetLoopId === null || target.loop.loopId === replyTargetLoopId);
+      if (!safelyInterpreted) {
+        await this.workers.reconcile(interpreted.attemptId, "rejected");
+        await this.queueCoverageResponseClarification(context, candidateLoops, replyTargetLoopId);
         return "coverage_response_ambiguous";
       }
-      return null;
     }
+
+    if (!action || !target) return null;
+    if (responseAttemptId) await this.workers.reconcile(responseAttemptId, "accepted");
+    const acknowledges = action === "acknowledge";
+    const declines = action === "decline";
+    const onlyLoop = target.row;
+    const responderLabel =
+      (await this.loadCurrentParticipantLabels([personId])).find((entry) => entry.personId === personId)
+        ?.label ?? "Someone";
 
     const crossConversation = onlyLoop.destination_conversation_id !== context.record.routing.conversationId;
     let liveDestination: LinqChatSnapshot | null = null;
@@ -827,7 +906,9 @@ export class FlorenceOrchestrator {
         context: destinationContext,
         snapshot,
         text: acknowledges
-          ? `Covered: ${decision.loop.minimumSharedMeaning}`
+          ? crossConversation
+            ? `Covered — ${sentenceFragment(decision.loop.minimumSharedMeaning)}.`
+            : `Covered — ${responderLabel} has ${sentenceFragment(decision.loop.minimumSharedMeaning)}.`
           : `Coverage is still open: ${decision.loop.minimumSharedMeaning}`,
         sendKind: crossConversation ? "proactive" : "direct_response",
         operation: crossConversation
@@ -837,6 +918,7 @@ export class FlorenceOrchestrator {
             : "coverage_state_change",
         ruleId: proactiveRule?.ruleId ?? null,
         idempotencyKey: `coverage:${decision.loop.loopId}:v${decision.loop.version}`,
+        coverageLoop: { id: decision.loop.loopId, version: decision.loop.version },
       });
       await reconcileCoverageTimers({
         transaction,
@@ -850,6 +932,38 @@ export class FlorenceOrchestrator {
         : recordsRisk
           ? "coverage_holder_withdrew_privately"
           : "coverage_declined";
+    });
+  }
+
+  private async queueCoverageResponseClarification(
+    context: MessageContext,
+    candidates: readonly { readonly loop: CoverageLoop }[],
+    replyTargetLoopId: string | null,
+  ): Promise<void> {
+    const exact = replyTargetLoopId
+      ? candidates.find(({ loop }) => loop.loopId === replyTargetLoopId)?.loop
+      : null;
+    const meanings = (exact ? [exact] : candidates.map(({ loop }) => loop))
+      .slice(0, 3)
+      .map((loop) => loop.minimumSharedMeaning);
+    const text =
+      meanings.length === 1
+        ? `Just to be sure, what should I record for “${meanings[0]}”?`
+        : `Which coverage item do you mean: ${meanings.map((meaning) => `“${meaning}”`).join("; ")}?`;
+    await this.database.begin(async (transaction) => {
+      const snapshot = await new PostgresConversationAuthority(transaction).snapshot(
+        context.record.routing.conversationId,
+      );
+      await queueConversationEffect({
+        transaction,
+        secretBox: this.secretBox,
+        context,
+        snapshot,
+        text,
+        sendKind: "direct_response",
+        operation: "coverage_coordination",
+        idempotencyKey: `coverage-response-ambiguous:${context.row.id}`,
+      });
     });
   }
 
@@ -875,6 +989,151 @@ export class FlorenceOrchestrator {
       if (loop) current.push({ loop });
     }
     return current;
+  }
+
+  private async resolveProvisionalCoverage(
+    context: MessageContext,
+    interpretation: (typeof PRODUCT_SKILLS.needInterpret.outputSchema)["_output"],
+    currentCoverage: readonly CurrentCoverageContext[],
+    replyTargetLoopId: string | null,
+  ): Promise<string | null> {
+    if (!context.household || !context.record.routing.senderPersonId) return null;
+    const senderPersonId = context.record.routing.senderPersonId;
+    const provisional = currentCoverage.filter(({ loop }) => loop.state === "provisional");
+    if (provisional.length === 0) return null;
+    const requestedLoopId = replyTargetLoopId ?? interpretation.priorLoopId;
+    let matched = requestedLoopId
+      ? provisional.find(({ loop }) => loop.loopId === requestedLoopId)?.loop
+      : undefined;
+    if (!matched && !requestedLoopId && interpretation.changedFact) {
+      if (provisional.length === 1) matched = provisional[0]?.loop;
+      else {
+        await this.queueCoverageResponseClarification(context, provisional, null);
+        return "coverage_fact_ambiguous";
+      }
+    }
+    if (!matched) return null;
+
+    const currentPeople = context.snapshot.participants.map((participant) => participant.personId);
+    const participantLabels = await this.loadCurrentParticipantLabels(currentPeople);
+    const commitment = await this.workers.run({
+      attemptId: randomUUID(),
+      taskVersionId: randomUUID(),
+      skill: PRODUCT_SKILLS.commitmentPropose,
+      authorizedContext: [
+        `Current instant: ${new Date().toISOString()}`,
+        `Household time zone: ${context.household.timezone}`,
+        `Current participant person IDs: ${currentPeople.join(", ")}`,
+        `Current participant label-to-person-ID map: ${JSON.stringify(participantLabels)}`,
+        `Exact provisional loop: ${JSON.stringify({
+          loopId: matched.loopId,
+          minimumSharedMeaning: matched.minimumSharedMeaning,
+          unresolvedFacts: matched.unresolvedFacts,
+          proposedHolderPersonId: matched.proposedHolderPersonId,
+          timing: matched.timing,
+        })}`,
+        `Newly interpreted changed fact: ${interpretation.changedFact ?? "none"}`,
+        `New message answering the loop: ${context.text}`,
+        `Exact new evidence source revision IDs: ${context.evidenceSourceRevisionIds.join(", ")}`,
+        "Revise this exact loop rather than proposing another one. Preserve facts already established. Return every fact that is still unresolved in unresolvedFacts.",
+      ].join("\n"),
+      ...(context.images.length > 0 ? { images: context.images } : {}),
+      goal: "Apply this answer to the exact provisional coverage loop and ask only the next blocking question.",
+      deadline: new Date(Date.now() + 45_000),
+      budget: { maxModelCalls: 1, maxOutputTokens: 1_200 },
+    });
+    if (commitment.status !== "proposed" || !commitment.proposal) {
+      await this.workers.reconcile(commitment.attemptId, "rejected");
+      return "coverage_fact_resolution_failed";
+    }
+    const proposal = commitment.proposal;
+    const proposedPersonId =
+      proposal.proposedPersonId && currentPeople.includes(proposal.proposedPersonId)
+        ? proposal.proposedPersonId
+        : matched.proposedHolderPersonId && currentPeople.includes(matched.proposedHolderPersonId)
+          ? matched.proposedHolderPersonId
+          : null;
+    const unresolvedFacts = [...new Set(proposal.unresolvedFacts)];
+    const timing = resolveProposalTiming(proposal, context.household.timezone);
+    const proposedLabel =
+      participantLabels.find((entry) => entry.personId === proposedPersonId)?.label ?? null;
+    const disposition = await this.database.begin(async (transaction) => {
+      const latest = await new PostgresConversationAuthority(transaction).snapshot(
+        context.record.routing.conversationId,
+      );
+      if (
+        latest.participantEpochId !== context.record.routing.participantEpochId ||
+        latest.participantSetDigest !== context.record.routing.appParticipantDigest
+      ) {
+        return "coverage_fact_resolution_stale";
+      }
+      const coordination = new PostgresCoordination(transaction, this.secretBox);
+      const current = await coordination.loadForUpdate(matched.loopId);
+      if (
+        current?.state !== "provisional" ||
+        current.version !== matched.version ||
+        current.destination.conversationId !== context.record.routing.conversationId ||
+        current.destination.participantEpochId !== context.record.routing.participantEpochId ||
+        current.destination.participantSetDigest !== context.record.routing.appParticipantDigest
+      ) {
+        return "coverage_fact_resolution_stale";
+      }
+      let persisted = (
+        await coordination.transition({
+          loopId: current.loopId,
+          command: {
+            kind: "resolve_facts",
+            transitionId: randomUUID(),
+            expectedVersion: current.version,
+            actorPersonId: senderPersonId,
+            occurredAt: new Date().toISOString(),
+            minimumSharedMeaning: proposal.outcome,
+            unresolvedFacts,
+            proposedHolderPersonId: proposedPersonId,
+            timing,
+            evidenceRefs: [...context.evidenceSourceRevisionIds],
+          },
+        })
+      ).loop;
+      if (persisted.state === "open" && proposedPersonId) {
+        persisted = (
+          await coordination.transition({
+            loopId: persisted.loopId,
+            command: {
+              kind: "request_coverage",
+              transitionId: randomUUID(),
+              expectedVersion: persisted.version,
+              actorPersonId: senderPersonId,
+              requestedPersonId: proposedPersonId,
+              occurredAt: new Date().toISOString(),
+              evidenceRefs: [...context.evidenceSourceRevisionIds],
+            },
+          })
+        ).loop;
+      }
+      const text = coveragePrompt(persisted, proposedLabel, proposal.consequentialQuestion);
+      const queued = await queueConversationEffect({
+        transaction,
+        secretBox: this.secretBox,
+        context,
+        snapshot: latest,
+        text,
+        sendKind: "direct_response",
+        operation: "coverage_coordination",
+        idempotencyKey: `coverage:${persisted.loopId}:v${persisted.version}:facts`,
+        coverageLoop: { id: persisted.loopId, version: persisted.version },
+      });
+      await reconcileCoverageTimers({
+        transaction,
+        loop: persisted,
+        snapshot: latest,
+        now: new Date(),
+        allowReminder: queued,
+      });
+      return `coverage_${persisted.state}`;
+    });
+    await this.workers.reconcile(commitment.attemptId, disposition.includes("stale") ? "stale" : "accepted");
+    return disposition;
   }
 
   private async applyChangedFactToCurrentLoop(
@@ -980,6 +1239,7 @@ export class FlorenceOrchestrator {
             operation: sendKind === "proactive" ? "proactive_coverage" : "coverage_coordination",
             ruleId: sendKind === "proactive" ? (proactiveRule?.ruleId ?? null) : null,
             idempotencyKey: `coverage:${decision.loop.loopId}:v${decision.loop.version}:reopened`,
+            coverageLoop: { id: decision.loop.loopId, version: decision.loop.version },
           })
         : false;
       await reconcileCoverageTimers({
@@ -1055,7 +1315,9 @@ export class FlorenceOrchestrator {
     const proposedPersonId =
       proposal.proposedPersonId && currentPeople.includes(proposal.proposedPersonId)
         ? proposal.proposedPersonId
-        : null;
+        : soleAlternateCoverageCandidate(context.text, currentPeople, context.record.routing.senderPersonId);
+    const proposedLabel =
+      participantLabels.find((entry) => entry.personId === proposedPersonId)?.label ?? null;
     const explicitAddress = isExplicitQuestion(context) || /\bflorence\b/iu.test(context.text);
     const proactiveRule = context.snapshot.rules.find(
       (rule) =>
@@ -1071,7 +1333,7 @@ export class FlorenceOrchestrator {
     }
 
     const timing = resolveProposalTiming(proposal, context.household.timezone);
-    const unresolved = [...new Set([...interpretation.uncertainties, ...proposal.unresolvedTimeFacts])];
+    const unresolved = [...new Set([...interpretation.uncertainties, ...proposal.unresolvedFacts])];
     const loop = createCoverageLoop({
       loopId: randomUUID(),
       householdId: context.household.id,
@@ -1116,12 +1378,7 @@ export class FlorenceOrchestrator {
           })
         ).loop;
       }
-      const message =
-        persisted.state === "provisional"
-          ? `I caught a possible coverage loop: ${persisted.minimumSharedMeaning}. ${proposal.consequentialQuestion ?? "What timing should I use?"}`
-          : persisted.state === "awaiting_response"
-            ? `${persisted.minimumSharedMeaning} needs coverage. Can the proposed person confirm they have it?`
-            : `${persisted.minimumSharedMeaning} is open. Who can cover it?`;
+      const message = coveragePrompt(persisted, proposedLabel, proposal.consequentialQuestion);
       const queued = await queueConversationEffect({
         transaction,
         secretBox: this.secretBox,
@@ -1132,6 +1389,7 @@ export class FlorenceOrchestrator {
         operation: sendKind === "proactive" ? "proactive_coverage" : "coverage_coordination",
         ruleId: sendKind === "proactive" ? (proactiveRule?.ruleId ?? null) : null,
         idempotencyKey: `coverage:${persisted.loopId}:v${persisted.version}:open`,
+        coverageLoop: { id: persisted.loopId, version: persisted.version },
       });
       await reconcileCoverageTimers({
         transaction,
@@ -1192,6 +1450,7 @@ async function queueConversationEffect(input: {
   operation: string;
   ruleId?: string | null;
   idempotencyKey: string;
+  coverageLoop?: { readonly id: string; readonly version: number };
 }): Promise<boolean> {
   const { transaction, context, snapshot } = input;
   if (!snapshot.participantEpochId || !snapshot.participantSetDigest) return false;
@@ -1216,6 +1475,7 @@ async function queueConversationEffect(input: {
       : {}),
     effectKind: "linq.message",
     idempotencyKey: input.idempotencyKey,
+    ...(input.coverageLoop ? { coverageLoop: input.coverageLoop } : {}),
     data: { text: input.text },
     policy: {
       authorityVersion: snapshot.authorityVersion,
@@ -1232,7 +1492,7 @@ async function queueConversationEffect(input: {
       text: input.text,
     },
     reasonCodes: ["current_conversation_authority", input.operation],
-    authorizationExpiresAt: new Date(Date.now() + 5 * 60_000),
+    authorizationExpiresAt: new Date(Date.now() + (input.coverageLoop ? 24 * 60 * 60_000 : 5 * 60_000)),
     participantEpochId: snapshot.participantEpochId,
     expectedParticipantDigest: snapshot.participantSetDigest,
     conversation: { id: context.record.routing.conversationId, authorityVersion: snapshot.authorityVersion },
@@ -1249,6 +1509,116 @@ async function queueConversationEffect(input: {
       : {}),
   });
   return true;
+}
+
+function coveragePrompt(
+  loop: CoverageLoop,
+  proposedHolderLabel: string | null,
+  consequentialQuestion: string | null,
+): string {
+  if (loop.state === "provisional") {
+    const nextQuestion =
+      consequentialQuestion ??
+      (loop.unresolvedFacts[0]
+        ? `What should I use for ${loop.unresolvedFacts[0]}?`
+        : "What detail am I missing?");
+    return `I have “${loop.minimumSharedMeaning}” open, but I need one detail. ${nextQuestion}`;
+  }
+  if (loop.state === "awaiting_response") {
+    return proposedHolderLabel
+      ? `${proposedHolderLabel}, can you take ${sentenceFragment(loop.minimumSharedMeaning)}?`
+      : `Can whoever is taking “${loop.minimumSharedMeaning}” confirm it?`;
+  }
+  return `“${loop.minimumSharedMeaning}” is still uncovered. Who can take it?`;
+}
+
+function soleAlternateCoverageCandidate(
+  message: string,
+  currentPeople: readonly string[],
+  senderPersonId: string | null,
+): string | null {
+  if (!senderPersonId || currentPeople.length !== 2 || !currentPeople.includes(senderPersonId)) return null;
+  const normalized = message.toLocaleLowerCase("en-US").replace(/[’]/gu, "'").replace(/\s+/gu, " ");
+  if (!/\bi (?:can't|cannot|won't be able to|am not able to|am unavailable)\b/u.test(normalized)) {
+    return null;
+  }
+  return currentPeople.find((personId) => personId !== senderPersonId) ?? null;
+}
+
+function sentenceFragment(value: string): string {
+  const fragment = value.trim().replace(/[.!?]+$/gu, "");
+  if (!fragment) return "this coverage item";
+  return fragment;
+}
+
+function deterministicCoverageResponse(
+  message: string,
+  hasExactReplyTarget: boolean,
+): "acknowledge" | "decline" | null {
+  const normalized = message.toLowerCase().replace(/[’]/gu, "'").replace(/\s+/gu, " ").trim();
+  // Conditional and third-party promises are not the sender's own commitment.
+  // Leave them to the semantic interpreter instead of mutating loop state.
+  if (/\b(?:but|if|maybe|might|probably|unless|except)\b/u.test(normalized)) return null;
+  if (/\bi(?:'ll| will| can) (?:ask|have|get)\b[^,.!?]{0,80}\bto\b/u.test(normalized)) {
+    return null;
+  }
+  if (
+    /\b(?:i (?:can't|cannot|won't|am not able to|am unavailable)|i'm not available|can't do (?:it|that)|cannot do (?:it|that))\b/u.test(
+      normalized,
+    )
+  ) {
+    return "decline";
+  }
+  if (
+    /^(?:yes[, ]+)?(?:i have it|i've got it|i got it|got it|leave it with me)$/u.test(
+      normalized.replace(/[.!]$/u, ""),
+    ) ||
+    /\bi(?:'ll| will| can) (?:cover|handle|take|do|make|pick|get|collect|drop|drive|bring|watch|babysit)\b/u.test(
+      normalized,
+    )
+  ) {
+    return "acknowledge";
+  }
+  if (
+    hasExactReplyTarget &&
+    /^(?:yes|yep|yeah|sure|ok|okay|absolutely|works for me|i can)[.!]?$/u.test(normalized)
+  ) {
+    return "acknowledge";
+  }
+  return null;
+}
+
+function chooseDeterministicCoverageTarget<
+  Candidate extends { readonly row: CoverageResponseTargetRow; readonly loop: CoverageLoop },
+>(
+  candidates: readonly Candidate[],
+  personId: string,
+  action: "acknowledge" | "decline",
+  replyTargetLoopId: string | null,
+): Candidate | null {
+  const eligible = candidates.filter(({ loop }) => isCoverageResponseEligible(loop, personId, action));
+  if (replyTargetLoopId) {
+    return eligible.find(({ loop }) => loop.loopId === replyTargetLoopId) ?? null;
+  }
+  return eligible.length === 1 ? (eligible[0] ?? null) : null;
+}
+
+function isCoverageResponseEligible(
+  loop: CoverageLoop,
+  personId: string,
+  action: "acknowledge" | "decline",
+): boolean {
+  if (action === "acknowledge") {
+    return (
+      (loop.proposedHolderPersonId === personId &&
+        (loop.state === "awaiting_response" || loop.state === "at_risk")) ||
+      (loop.proposedHolderPersonId === null && (loop.state === "open" || loop.state === "at_risk"))
+    );
+  }
+  return (
+    (loop.proposedHolderPersonId === personId && loop.state === "awaiting_response") ||
+    (loop.acknowledgment?.personId === personId && loop.state === "covered")
+  );
 }
 
 async function resolveHousehold(

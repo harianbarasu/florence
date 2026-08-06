@@ -10,6 +10,15 @@ const optionalUrl = z.preprocess(
   z.string().trim().url().optional(),
 );
 
+const databaseEnvironmentSchema = z.object({
+  NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
+  FLORENCE_DATABASE_URL: z.string().trim().min(1),
+  FLORENCE_POSTGRES_SCHEMA: z
+    .string()
+    .regex(/^[a-z][a-z0-9_]{0,62}$/u)
+    .default("florence_v4"),
+});
+
 const environmentSchema = z
   .object({
     NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
@@ -77,11 +86,24 @@ const environmentSchema = z
   });
 
 export type FlorenceConfig = ReturnType<typeof loadConfig>;
+export type FlorenceDatabaseConfig = ReturnType<typeof loadDatabaseConfig>;
+
+/** Migration tooling needs database authority, not connector or model credentials. */
+export function loadDatabaseConfig(environment: NodeJS.ProcessEnv = process.env) {
+  const parsed = databaseEnvironmentSchema.parse(environment);
+  return {
+    database: {
+      url: parseDatabaseUrl(parsed.FLORENCE_DATABASE_URL).toString(),
+      schema: parsed.FLORENCE_POSTGRES_SCHEMA,
+      ssl: parsed.NODE_ENV === "production",
+    },
+  } as const;
+}
 
 export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
   const parsed = environmentSchema.parse(environment);
   const publicBaseUrl = parsePublicBaseUrl(parsed.FLORENCE_WEB_BASE_URL, parsed.NODE_ENV);
-  const databaseUrl = parseDatabaseUrl(parsed.FLORENCE_DATABASE_URL);
+  const database = loadDatabaseConfig(environment);
   const linqBaseUrl = parseServiceBaseUrl(parsed.LINQ_BASE_URL, "LINQ_BASE_URL", true);
   const openAiBaseUrl = parseServiceBaseUrl(parsed.OPENAI_BASE_URL, "OPENAI_BASE_URL", false);
   const openWeightBaseUrl = parsed.OPEN_WEIGHT_BASE_URL
@@ -95,11 +117,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
     port: parsed.PORT,
     logLevel: parsed.LOG_LEVEL,
     publicBaseUrl: publicBaseUrl.origin,
-    database: {
-      url: databaseUrl.toString(),
-      schema: parsed.FLORENCE_POSTGRES_SCHEMA,
-      ssl: parsed.NODE_ENV === "production",
-    },
+    database: database.database,
     security: {
       tokenKey: parsed.FLORENCE_TOKEN_ENCRYPTION_KEY,
       activeDataKeyId: parsed.FLORENCE_DATA_ACTIVE_KEY_ID,

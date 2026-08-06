@@ -34,11 +34,18 @@ export interface PeopleView {
       role: FamilyRole;
       self: boolean;
       represented: boolean;
+      context: {
+        aliases: string[];
+        birthYear: number | null;
+        school: string;
+        activities: string[];
+      } | null;
     }[];
     eligibleParticipants: {
       personId: string;
       conversationId: string;
       name: string;
+      registered: boolean;
     }[];
     coverageGroups: {
       conversationId: string;
@@ -61,6 +68,15 @@ export interface PeopleView {
     canAct: boolean;
     detail: string;
     expiresAt: string;
+    sharedContext: {
+      children: {
+        preferredName: string;
+        aliases: string[];
+        birthYear: number | null;
+        school: string;
+        activities: string[];
+      }[];
+    } | null;
   }[];
 }
 

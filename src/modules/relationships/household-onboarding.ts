@@ -16,6 +16,19 @@ type Transaction = TransactionSql<Record<string, never>>;
 type Executor = Database | Transaction;
 
 const RoleSchema = z.enum(["steward", "caregiver", "participant"]);
+const DependentContextSchema = z.strictObject({
+  aliases: z.array(z.string().trim().min(1).max(80)).max(12).default([]),
+  birthYear: z.number().int().min(1900).max(2100).nullable().default(null),
+  school: z.string().trim().max(160).default(""),
+  activities: z.array(z.string().trim().min(1).max(120)).max(24).default([]),
+});
+
+export interface DependentContext {
+  readonly aliases: readonly string[];
+  readonly birthYear: number | null;
+  readonly school: string;
+  readonly activities: readonly string[];
+}
 
 export interface HouseholdInvitationInput {
   readonly actorPersonId: string;
@@ -28,8 +41,9 @@ export interface HouseholdInvitationInput {
 
 /**
  * Keeps relationship onboarding behind one authority seam. Invitations target
- * a verified person already present in an exact live Florence group, so the UI
- * never needs to reveal or accept somebody else's phone number.
+ * a person already present in the exact live Florence group, so the UI never
+ * accepts an arbitrary phone number. Unregistered people receive only a private
+ * enrollment request; family context stays unavailable until they opt in.
  */
 export class HouseholdOnboarding {
   public constructor(
@@ -60,17 +74,20 @@ export class HouseholdOnboarding {
           subject_digest: string;
           registration_status: string;
           consented_at: Date | null;
+          participant_epoch_id: string;
+          participant_set_digest: string;
         }[]
       >`
         select identity.id as identity_id, identity.subject_digest,
-          participant.registration_status, participant.consented_at
+          participant.registration_status, participant.consented_at,
+          epoch.id as participant_epoch_id, epoch.participant_set_digest
         from conversations conversation
         join participant_epochs epoch on epoch.id = conversation.current_epoch_id
           and epoch.ended_at is null
         join epoch_participants participant on participant.participant_epoch_id = epoch.id
           and participant.person_id = ${input.inviteePersonId}
         join person_identities identity on identity.id = participant.person_identity_id
-          and identity.status = 'verified'
+          and identity.status in ('observed', 'verified')
         where conversation.id = ${input.conversationId}
           and conversation.kind = 'group' and conversation.status = 'active'
           and exists(
@@ -79,9 +96,7 @@ export class HouseholdOnboarding {
           )
       `;
       const target = targets[0];
-      if (target?.registration_status !== "registered" || !target.consented_at) {
-        throw new UnauthorizedError("That group participant must register privately before joining a family");
-      }
+      if (!target) throw new UnauthorizedError("That person is no longer in the current group");
       const existing = await transaction<{ status: string }[]>`
         select status from household_memberships
         where household_id = ${input.householdId} and person_id = ${input.inviteePersonId}
@@ -101,12 +116,26 @@ export class HouseholdOnboarding {
         expiresAt: new Date(input.createdAt.getTime() + 7 * 86_400_000).toISOString(),
         createdAt: input.createdAt.toISOString(),
       });
+      await transaction`
+        update invitations
+        set source_conversation_id = ${input.conversationId},
+          source_participant_epoch_id = ${target.participant_epoch_id},
+          source_participant_digest = ${target.participant_set_digest},
+          updated_at = ${input.createdAt}
+        where id = ${invitation.invitationId}
+      `;
       await appendHouseholdAudit(transaction, {
         householdId: input.householdId,
         actorPersonId: input.actorPersonId,
         eventType: "household_invitation_created",
         targetId: invitation.invitationId,
-        reasons: [input.role, "exact_current_group_participant"],
+        reasons: [
+          input.role,
+          "exact_current_group_participant",
+          target.registration_status === "registered" && target.consented_at
+            ? "registered_invitee"
+            : "private_enrollment_required",
+        ],
         occurredAt: input.createdAt,
       });
       return invitation;
@@ -163,6 +192,10 @@ export class HouseholdOnboarding {
     readonly actorPersonId: string;
     readonly householdId: string;
     readonly displayName: string;
+    readonly aliases?: readonly string[];
+    readonly birthYear?: number | null;
+    readonly school?: string;
+    readonly activities?: readonly string[];
     readonly createdAt: Date;
   }): Promise<{ dependentPersonId: string; membershipId: string }> {
     const input = z
@@ -170,6 +203,7 @@ export class HouseholdOnboarding {
         actorPersonId: z.string().uuid(),
         householdId: z.string().uuid(),
         displayName: z.string().trim().min(1).max(80),
+        ...DependentContextSchema.shape,
         createdAt: z.date(),
       })
       .parse(inputCandidate);
@@ -200,6 +234,12 @@ export class HouseholdOnboarding {
           ${input.createdAt}, 1, ${input.createdAt}, ${input.createdAt}
         )
       `;
+      await saveDependentContext(transaction, this.secretBox, {
+        actorPersonId: input.actorPersonId,
+        dependentPersonId: personId,
+        context: input,
+        changedAt: input.createdAt,
+      });
       await transaction`
         update households set membership_version = membership_version + 1, updated_at = ${input.createdAt}
         where id = ${input.householdId}
@@ -215,6 +255,134 @@ export class HouseholdOnboarding {
       return { dependentPersonId: personId, membershipId };
     });
   }
+
+  public async updateDependent(inputCandidate: {
+    readonly actorPersonId: string;
+    readonly householdId: string;
+    readonly dependentPersonId: string;
+    readonly displayName: string;
+    readonly aliases?: readonly string[];
+    readonly birthYear?: number | null;
+    readonly school?: string;
+    readonly activities?: readonly string[];
+    readonly updatedAt: Date;
+  }): Promise<void> {
+    const input = z
+      .strictObject({
+        actorPersonId: z.string().uuid(),
+        householdId: z.string().uuid(),
+        dependentPersonId: z.string().uuid(),
+        displayName: z.string().trim().min(1).max(80),
+        ...DependentContextSchema.shape,
+        updatedAt: z.date(),
+      })
+      .parse(inputCandidate);
+    await inTransaction(this.database, async (transaction) => {
+      await requireHouseholdCapability(
+        transaction,
+        input.householdId,
+        input.actorPersonId,
+        "household.govern",
+      );
+      const dependents = await transaction<{ person_id: string }[]>`
+        select membership.person_id
+        from household_memberships membership
+        join people person on person.id = membership.person_id
+        where membership.household_id = ${input.householdId}
+          and membership.person_id = ${input.dependentPersonId}
+          and membership.role = 'dependent' and membership.status = 'active'
+          and person.status = 'provisional'
+        for update of membership, person
+      `;
+      if (!dependents[0]) throw new NotFoundError("That represented child is no longer in this family");
+      const encryptedName = this.secretBox.encrypt(
+        input.displayName,
+        `person-display-name:${input.dependentPersonId}`,
+      );
+      await transaction`
+        update people
+        set display_name_ciphertext = ${Buffer.from(JSON.stringify(encryptedName), "utf8")},
+          display_name_key_version = ${encryptedName.kid}, updated_at = ${input.updatedAt}
+        where id = ${input.dependentPersonId}
+      `;
+      await saveDependentContext(transaction, this.secretBox, {
+        actorPersonId: input.actorPersonId,
+        dependentPersonId: input.dependentPersonId,
+        context: input,
+        changedAt: input.updatedAt,
+      });
+      await appendHouseholdAudit(transaction, {
+        householdId: input.householdId,
+        actorPersonId: input.actorPersonId,
+        eventType: "dependent_context_updated",
+        targetId: input.dependentPersonId,
+        reasons: ["represented_dependent", "family_context"],
+        occurredAt: input.updatedAt,
+      });
+    });
+  }
+}
+
+async function saveDependentContext(
+  transaction: Transaction,
+  secretBox: SecretBox,
+  input: {
+    readonly actorPersonId: string;
+    readonly dependentPersonId: string;
+    readonly context: DependentContext;
+    readonly changedAt: Date;
+  },
+): Promise<void> {
+  const aliases = uniqueValues(input.context.aliases);
+  const activities = uniqueValues(input.context.activities);
+  const encryptedAliases = aliases.length
+    ? secretBox.encrypt(JSON.stringify(aliases), `dependent-aliases:${input.dependentPersonId}`)
+    : null;
+  const encryptedSchool = input.context.school
+    ? secretBox.encrypt(input.context.school, `dependent-school:${input.dependentPersonId}`)
+    : null;
+  const encryptedActivities = activities.length
+    ? secretBox.encrypt(JSON.stringify(activities), `dependent-activities:${input.dependentPersonId}`)
+    : null;
+  await transaction`
+    insert into dependent_profiles (
+      person_id, aliases_ciphertext, aliases_key_version, birth_year,
+      school_ciphertext, school_key_version, activities_ciphertext,
+      activities_key_version, updated_by_person_id, created_at, updated_at
+    ) values (
+      ${input.dependentPersonId},
+      ${encryptedAliases ? Buffer.from(JSON.stringify(encryptedAliases), "utf8") : null},
+      ${encryptedAliases?.kid ?? null}, ${input.context.birthYear},
+      ${encryptedSchool ? Buffer.from(JSON.stringify(encryptedSchool), "utf8") : null},
+      ${encryptedSchool?.kid ?? null},
+      ${encryptedActivities ? Buffer.from(JSON.stringify(encryptedActivities), "utf8") : null},
+      ${encryptedActivities?.kid ?? null}, ${input.actorPersonId},
+      ${input.changedAt}, ${input.changedAt}
+    )
+    on conflict (person_id) do update set
+      aliases_ciphertext = excluded.aliases_ciphertext,
+      aliases_key_version = excluded.aliases_key_version,
+      birth_year = excluded.birth_year,
+      school_ciphertext = excluded.school_ciphertext,
+      school_key_version = excluded.school_key_version,
+      activities_ciphertext = excluded.activities_ciphertext,
+      activities_key_version = excluded.activities_key_version,
+      updated_by_person_id = excluded.updated_by_person_id,
+      updated_at = excluded.updated_at
+  `;
+}
+
+function uniqueValues(values: readonly string[]): string[] {
+  const output: string[] = [];
+  const seen = new Set<string>();
+  for (const value of values) {
+    const trimmed = value.trim();
+    const key = trimmed.toLocaleLowerCase("en-US");
+    if (!trimmed || seen.has(key)) continue;
+    seen.add(key);
+    output.push(trimmed);
+  }
+  return output;
 }
 
 function capabilitiesForRole(role: z.infer<typeof RoleSchema>) {

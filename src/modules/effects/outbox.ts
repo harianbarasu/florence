@@ -11,6 +11,13 @@ export interface AuthorizedEffectInput extends AuthorityFence {
   readonly participantEpochId?: string;
   readonly expectedParticipantDigest?: string;
   readonly coverageLoop?: { readonly id: string; readonly version: number };
+  readonly invitation?: { readonly id: string; readonly inviteeIdentityAuthorityVersion: number };
+  readonly sourceConversation?: {
+    readonly id: string;
+    readonly authorityVersion: number;
+    readonly participantEpochId: string;
+    readonly participantSetDigest: string;
+  };
   readonly effectKind: "linq.message";
   readonly idempotencyKey: string;
   readonly data: unknown;
@@ -98,6 +105,9 @@ export class EffectOutbox {
         insert into outbox (
           id, authorization_decision_id, action_intent_id, household_id, person_id, conversation_id,
           participant_epoch_id, expected_participant_digest, coverage_loop_id, coverage_loop_version,
+          invitation_id, invitee_identity_authority_version,
+          source_conversation_id, source_participant_epoch_id,
+          source_expected_participant_digest, source_conversation_authority_version,
           effect_kind, idempotency_key,
           payload_digest, payload_ciphertext, payload_key_version, status, available_at,
           person_control_epoch, household_control_epoch, conversation_authority_version
@@ -106,7 +116,12 @@ export class EffectOutbox {
           ${input.household?.id ?? null}, ${input.person?.id ?? null},
           ${input.conversation?.id ?? null}, ${input.participantEpochId ?? null},
           ${input.expectedParticipantDigest ?? null}, ${input.coverageLoop?.id ?? null},
-          ${input.coverageLoop?.version ?? null}, ${input.effectKind}, ${input.idempotencyKey},
+          ${input.coverageLoop?.version ?? null}, ${input.invitation?.id ?? null},
+          ${input.invitation?.inviteeIdentityAuthorityVersion ?? null},
+          ${input.sourceConversation?.id ?? null}, ${input.sourceConversation?.participantEpochId ?? null},
+          ${input.sourceConversation?.participantSetDigest ?? null},
+          ${input.sourceConversation?.authorityVersion ?? null},
+          ${input.effectKind}, ${input.idempotencyKey},
           ${payloadDigest}, ${Buffer.from(JSON.stringify(encrypted), "utf8")}, ${encrypted.kid},
           'pending', ${now}, ${input.person?.controlEpoch ?? null},
           ${input.household?.controlEpoch ?? null}, ${input.conversation?.authorityVersion ?? null}
@@ -128,6 +143,13 @@ export class EffectOutbox {
         left join conversations conversation on conversation.id = effect.conversation_id
         left join participant_epochs epoch on epoch.id = effect.participant_epoch_id
         left join coverage_loops coverage on coverage.id = effect.coverage_loop_id
+        left join invitations invitation on invitation.id = effect.invitation_id
+        left join person_identities invitee_identity on invitee_identity.id = invitation.invitee_identity_id
+        left join households invitation_household on invitation_household.id = invitation.household_id
+        left join conversations invitation_source on invitation_source.id = invitation.source_conversation_id
+        left join participant_epochs invitation_epoch on invitation_epoch.id = invitation.source_participant_epoch_id
+        left join conversations source_conversation on source_conversation.id = effect.source_conversation_id
+        left join participant_epochs source_epoch on source_epoch.id = effect.source_participant_epoch_id
         where effect.status in ('pending', 'retry', 'leased')
           and effect.available_at <= ${now}
           and (effect.status <> 'leased' or effect.lease_expires_at <= ${now})
@@ -145,7 +167,23 @@ export class EffectOutbox {
           ))
           and (effect.coverage_loop_id is null or (
             coverage.version = effect.coverage_loop_version
-            and coverage.state in ('provisional', 'open', 'awaiting_response', 'at_risk')
+          ))
+          and (effect.invitation_id is null or (
+            invitation.status = 'pending' and invitation.expires_at > ${now}
+            and invitation_household.membership_version = invitation.household_membership_version
+            and invitee_identity.status in ('observed', 'verified')
+            and invitee_identity.authority_version = effect.invitee_identity_authority_version
+            and invitation_source.status = 'active'
+            and invitation_source.current_epoch_id = invitation.source_participant_epoch_id
+            and invitation_epoch.ended_at is null
+            and invitation_epoch.participant_set_digest = invitation.source_participant_digest
+          ))
+          and (effect.source_conversation_id is null or (
+            source_conversation.status = 'active'
+            and source_conversation.authority_version = effect.source_conversation_authority_version
+            and source_conversation.current_epoch_id = effect.source_participant_epoch_id
+            and source_epoch.ended_at is null
+            and source_epoch.participant_set_digest = effect.source_expected_participant_digest
           ))
         order by effect.available_at, effect.created_at
         for update of effect skip locked
@@ -262,6 +300,13 @@ export class EffectOutbox {
         left join conversations conversation on conversation.id = candidate.conversation_id
         left join participant_epochs epoch on epoch.id = candidate.participant_epoch_id
         left join coverage_loops coverage on coverage.id = candidate.coverage_loop_id
+        left join invitations invitation on invitation.id = candidate.invitation_id
+        left join person_identities invitee_identity on invitee_identity.id = invitation.invitee_identity_id
+        left join households invitation_household on invitation_household.id = invitation.household_id
+        left join conversations invitation_source on invitation_source.id = invitation.source_conversation_id
+        left join participant_epochs invitation_epoch on invitation_epoch.id = invitation.source_participant_epoch_id
+        left join conversations source_conversation on source_conversation.id = candidate.source_conversation_id
+        left join participant_epochs source_epoch on source_epoch.id = candidate.source_participant_epoch_id
         where candidate.id = ${effect.outboxId}
           and candidate.status = 'leased' and candidate.lease_token = ${effect.leaseToken}
           and decision.outcome = 'allow' and decision.revoked_at is null and decision.expires_at > ${now}
@@ -281,7 +326,23 @@ export class EffectOutbox {
           ))
           and (candidate.coverage_loop_id is null or (
             coverage.version = candidate.coverage_loop_version
-            and coverage.state in ('provisional', 'open', 'awaiting_response', 'at_risk')
+          ))
+          and (candidate.invitation_id is null or (
+            invitation.status = 'pending' and invitation.expires_at > ${now}
+            and invitation_household.membership_version = invitation.household_membership_version
+            and invitee_identity.status in ('observed', 'verified')
+            and invitee_identity.authority_version = candidate.invitee_identity_authority_version
+            and invitation_source.status = 'active'
+            and invitation_source.current_epoch_id = invitation.source_participant_epoch_id
+            and invitation_epoch.ended_at is null
+            and invitation_epoch.participant_set_digest = invitation.source_participant_digest
+          ))
+          and (candidate.source_conversation_id is null or (
+            source_conversation.status = 'active'
+            and source_conversation.authority_version = candidate.source_conversation_authority_version
+            and source_conversation.current_epoch_id = candidate.source_participant_epoch_id
+            and source_epoch.ended_at is null
+            and source_epoch.participant_set_digest = candidate.source_expected_participant_digest
           ))
         for update of candidate
       `;
@@ -417,8 +478,11 @@ export class EffectOutbox {
     retryable: boolean,
     now = new Date(),
   ): Promise<"retry" | "dead" | "stale"> {
-    const retry = retryable && effect.attemptCount < 8;
-    const delay = Math.min(15 * 60_000, 1_000 * 2 ** Math.max(0, effect.attemptCount - 1));
+    // A provider outage must not turn an already-authorized family message into
+    // an operator repair. Retryable failures keep backing off until their
+    // authority fence expires or changes; non-retryable failures still stop.
+    const retry = retryable;
+    const delay = Math.min(15 * 60_000, 1_000 * 2 ** Math.min(10, Math.max(0, effect.attemptCount - 1)));
     const rows = await this.database<{ status: "retry" | "dead" }[]>`
       update outbox set status = ${retry ? "retry" : "dead"},
         available_at = ${retry ? new Date(now.getTime() + delay) : now}, lease_owner = null,
@@ -428,6 +492,143 @@ export class EffectOutbox {
       returning status
     `;
     return rows[0]?.status ?? "stale";
+  }
+
+  /**
+   * Starts a fresh provider attempt only after Linq has definitively reported
+   * failure. The original attempt and receipts remain immutable, and every
+   * person/household/conversation/loop/invitation fence must still match.
+   */
+  public async redriveFailed(now = new Date(), limit = 20): Promise<number> {
+    return inTransaction(this.database, async (transaction) => {
+      const candidates = await transaction<
+        {
+          id: string;
+          authorization_decision_id: string;
+          root_id: string;
+          redrive_sequence: number | string;
+          updated_at: Date;
+        }[]
+      >`
+        select effect.id, effect.authorization_decision_id,
+          coalesce(effect.redrive_root_id, effect.id) as root_id,
+          coalesce(effect.redrive_sequence, 0) as redrive_sequence,
+          effect.updated_at
+        from outbox effect
+        join disclosure_decisions decision on decision.id = effect.authorization_decision_id
+        left join people person on person.id = effect.person_id
+        left join households household on household.id = effect.household_id
+        left join conversations conversation on conversation.id = effect.conversation_id
+        left join participant_epochs epoch on epoch.id = effect.participant_epoch_id
+        left join coverage_loops coverage on coverage.id = effect.coverage_loop_id
+        left join invitations invitation on invitation.id = effect.invitation_id
+        left join person_identities invitee_identity on invitee_identity.id = invitation.invitee_identity_id
+        left join households invitation_household on invitation_household.id = invitation.household_id
+        left join conversations invitation_source on invitation_source.id = invitation.source_conversation_id
+        left join participant_epochs invitation_epoch on invitation_epoch.id = invitation.source_participant_epoch_id
+        left join conversations source_conversation on source_conversation.id = effect.source_conversation_id
+        left join participant_epochs source_epoch on source_epoch.id = effect.source_participant_epoch_id
+        where effect.status = 'dead' and effect.last_error_code = 'linq_delivery_failed'
+          and effect.action_intent_id is null
+          and decision.outcome = 'allow' and decision.revoked_at is null and decision.expires_at > ${now}
+          and (effect.person_id is null or (
+            person.status = 'registered' and person.control_epoch = effect.person_control_epoch
+          ))
+          and (effect.household_id is null or (
+            household.status in ('onboarding', 'active', 'paused')
+            and household.control_epoch = effect.household_control_epoch
+          ))
+          and (effect.conversation_id is null or (
+            conversation.status = 'active'
+            and conversation.authority_version = effect.conversation_authority_version
+            and conversation.current_epoch_id = effect.participant_epoch_id
+            and epoch.ended_at is null
+            and epoch.participant_set_digest = effect.expected_participant_digest
+          ))
+          and (effect.coverage_loop_id is null or coverage.version = effect.coverage_loop_version)
+          and (effect.invitation_id is null or (
+            invitation.status = 'pending' and invitation.expires_at > ${now}
+            and invitation_household.membership_version = invitation.household_membership_version
+            and invitee_identity.status in ('observed', 'verified')
+            and invitee_identity.authority_version = effect.invitee_identity_authority_version
+            and invitation_source.status = 'active'
+            and invitation_source.current_epoch_id = invitation.source_participant_epoch_id
+            and invitation_epoch.ended_at is null
+            and invitation_epoch.participant_set_digest = invitation.source_participant_digest
+          ))
+          and (effect.source_conversation_id is null or (
+            source_conversation.status = 'active'
+            and source_conversation.authority_version = effect.source_conversation_authority_version
+            and source_conversation.current_epoch_id = effect.source_participant_epoch_id
+            and source_epoch.ended_at is null
+            and source_epoch.participant_set_digest = effect.source_expected_participant_digest
+          ))
+          and not exists (
+            select 1 from outbox later
+            where later.redrive_root_id = coalesce(effect.redrive_root_id, effect.id)
+              and later.redrive_sequence > coalesce(effect.redrive_sequence, 0)
+          )
+        order by effect.updated_at
+        for update of effect skip locked
+        limit ${Math.max(1, Math.min(limit * 4, 100))}
+      `;
+      let redriven = 0;
+      for (const candidate of candidates) {
+        if (redriven >= limit) break;
+        const nextSequence = Number(candidate.redrive_sequence) + 1;
+        const delayMs = Math.min(6 * 60 * 60_000, 60_000 * 2 ** Math.min(nextSequence - 1, 9));
+        if (candidate.updated_at.getTime() + delayMs > now.getTime()) continue;
+        const idempotencyKey = `linq-redrive:${candidate.root_id}:attempt-${nextSequence}`;
+        const decisionId = randomUUID();
+        const decisions = await transaction<{ id: string }[]>`
+          insert into disclosure_decisions (
+            id, outcome, actor_person_id, household_id, conversation_id, participant_epoch_id,
+            action_digest, data_digest, policy_digest, target_digest, reason_codes,
+            decided_at, expires_at
+          )
+          select ${decisionId}, decision.outcome, decision.actor_person_id, decision.household_id,
+            decision.conversation_id, decision.participant_epoch_id,
+            ${digest({ effectKind: "linq.message", idempotencyKey })}, decision.data_digest,
+            decision.policy_digest, decision.target_digest,
+            array_append(decision.reason_codes, 'automatic_delivery_redrive'), ${now}, decision.expires_at
+          from disclosure_decisions decision
+          where decision.id = ${candidate.authorization_decision_id}
+            and decision.outcome = 'allow' and decision.revoked_at is null
+            and decision.expires_at > ${now}
+          returning id
+        `;
+        if (!decisions[0]) continue;
+        const rows = await transaction<{ id: string }[]>`
+          insert into outbox (
+            id, authorization_decision_id, action_intent_id, household_id, person_id, conversation_id,
+            participant_epoch_id, expected_participant_digest, coverage_loop_id, coverage_loop_version,
+            invitation_id, invitee_identity_authority_version, redrive_root_id, redrive_sequence,
+            source_conversation_id, source_participant_epoch_id,
+            source_expected_participant_digest, source_conversation_authority_version,
+            effect_kind, idempotency_key, payload_digest, payload_ciphertext, payload_key_version,
+            status, attempt_count, reconciliation_attempt_count, available_at,
+            person_control_epoch, household_control_epoch, conversation_authority_version,
+            created_at, updated_at
+          )
+          select ${randomUUID()}, ${decisionId}, effect.action_intent_id, effect.household_id,
+            effect.person_id, effect.conversation_id, effect.participant_epoch_id,
+            effect.expected_participant_digest, effect.coverage_loop_id, effect.coverage_loop_version,
+            effect.invitation_id, effect.invitee_identity_authority_version,
+            ${candidate.root_id}, ${nextSequence}, effect.source_conversation_id,
+            effect.source_participant_epoch_id, effect.source_expected_participant_digest,
+            effect.source_conversation_authority_version, effect.effect_kind, ${idempotencyKey},
+            effect.payload_digest, effect.payload_ciphertext, effect.payload_key_version,
+            'pending', 0, 0, ${now}, effect.person_control_epoch, effect.household_control_epoch,
+            effect.conversation_authority_version, ${now}, ${now}
+          from outbox effect
+          where effect.id = ${candidate.id} and effect.status = 'dead'
+          on conflict do nothing
+          returning id
+        `;
+        redriven += rows.length;
+      }
+      return redriven;
+    });
   }
 
   /** Removes effects that can no longer be claimed so queue health reflects reality. */
@@ -465,7 +666,32 @@ export class EffectOutbox {
           select 1 from coverage_loops coverage
           where coverage.id = effect.coverage_loop_id
             and coverage.version = effect.coverage_loop_version
-            and coverage.state in ('provisional', 'open', 'awaiting_response', 'at_risk')
+        ))
+        or (effect.invitation_id is not null and not exists (
+          select 1
+          from invitations invitation
+          join person_identities invitee_identity on invitee_identity.id = invitation.invitee_identity_id
+          join households household on household.id = invitation.household_id
+          join conversations source on source.id = invitation.source_conversation_id
+          join participant_epochs epoch on epoch.id = invitation.source_participant_epoch_id
+          where invitation.id = effect.invitation_id
+            and invitation.status = 'pending' and invitation.expires_at > ${now}
+            and household.membership_version = invitation.household_membership_version
+            and invitee_identity.status in ('observed', 'verified')
+            and invitee_identity.authority_version = effect.invitee_identity_authority_version
+            and source.status = 'active' and source.current_epoch_id = epoch.id
+            and epoch.ended_at is null
+            and epoch.participant_set_digest = invitation.source_participant_digest
+        ))
+        or (effect.source_conversation_id is not null and not exists (
+          select 1
+          from conversations source
+          join participant_epochs epoch on epoch.id = source.current_epoch_id
+          where source.id = effect.source_conversation_id and source.status = 'active'
+            and source.authority_version = effect.source_conversation_authority_version
+            and source.current_epoch_id = effect.source_participant_epoch_id
+            and epoch.ended_at is null
+            and epoch.participant_set_digest = effect.source_expected_participant_digest
         ))
       )
       returning id
@@ -489,6 +715,22 @@ function validateEffectScope(input: AuthorizedEffectInput): void {
     (!Number.isSafeInteger(input.coverageLoop.version) || input.coverageLoop.version < 1)
   ) {
     throw new Error("Coverage effect versions must be positive integers");
+  }
+  if (
+    input.invitation &&
+    (!Number.isSafeInteger(input.invitation.inviteeIdentityAuthorityVersion) ||
+      input.invitation.inviteeIdentityAuthorityVersion < 1)
+  ) {
+    throw new Error("Invitation effects require an exact identity authority version");
+  }
+  if (
+    input.sourceConversation &&
+    (!Number.isSafeInteger(input.sourceConversation.authorityVersion) ||
+      input.sourceConversation.authorityVersion < 1 ||
+      !input.sourceConversation.participantEpochId ||
+      !/^[a-f0-9]{64}$/u.test(input.sourceConversation.participantSetDigest))
+  ) {
+    throw new Error("Source conversation effects require an exact authority fence");
   }
   if (input.conversation) {
     if (!input.participantEpochId || !input.expectedParticipantDigest) {

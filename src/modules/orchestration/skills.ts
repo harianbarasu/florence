@@ -30,7 +30,7 @@ export const commitmentProposalSchema = z
     timeZone: z.string().min(1).max(100),
     eventAt: z.iso.datetime({ offset: true }).nullable(),
     deadlineAt: z.iso.datetime({ offset: true }).nullable(),
-    unresolvedTimeFacts: z.array(z.string().min(1).max(300)).max(8),
+    unresolvedFacts: z.array(z.string().min(1).max(300)).max(8),
     consequentialQuestion: z.string().min(1).max(500).nullable(),
     followUpShape: z.enum(["ask_person_privately", "ask_group_neutrally", "batch_private_review"]),
     evidence: z.array(evidenceReferenceSchema).min(1).max(12),
@@ -67,6 +67,16 @@ export const outcomeAssessmentSchema = z
   })
   .strict();
 
+export const coverageResponseInterpretationSchema = z
+  .object({
+    disposition: z.enum(["acknowledge", "decline", "not_response", "ambiguous"]),
+    targetLoopId: z.string().uuid().nullable(),
+    explicitSelfStatement: z.boolean(),
+    confidence: z.number().min(0).max(1),
+    rationale: z.string().min(1).max(700),
+  })
+  .strict();
+
 export const generalAnswerSchema = z
   .object({
     answer: z.string().min(1).max(4_000),
@@ -83,25 +93,25 @@ claim that your proposal is accepted state. Return only the requested schema.`.t
 export const PRODUCT_SKILLS = {
   needInterpret: {
     id: "coverage.need_interpret",
-    version: 1,
+    version: 2,
     purpose: "Decide whether authorized evidence contains a current family coverage need.",
-    instructions: `${commonGuardrails}\nIdentify the actual required outcome, changed facts, time facts, sensitivity, and consequential uncertainty. Ordinary conversation and unrelated work should be ignored.`,
+    instructions: `${commonGuardrails}\nIdentify the actual required outcome, changed facts, time facts, sensitivity, and consequential uncertainty. When a message answers an unresolved fact for a supplied current loop, select that exact priorLoopId and put the supplied answer in changedFact instead of proposing a duplicate loop. Prefer an exact replied-to loop when supplied. Ordinary conversation and unrelated work should be ignored.`,
     outputSchema: needInterpretationSchema,
-    outputSchemaName: "coverage_need_interpret_v1",
+    outputSchemaName: "coverage_need_interpret_v2",
     riskClass: "medium",
     requestedCapabilities: [] as const,
-    evaluationRelease: "coverage-core-1",
+    evaluationRelease: "coverage-core-2",
   } satisfies PinnedSkill<typeof needInterpretationSchema>,
   commitmentPropose: {
     id: "coverage.commitment_propose",
-    version: 1,
+    version: 2,
     purpose: "Propose an exact coverage outcome, person, timing, and smallest next question.",
-    instructions: `${commonGuardrails}\nPropose a person only when evidence maps that person to an exact supplied person ID; the person still must self-acknowledge. Resolve time against the supplied current instant and household IANA time zone when evidence supports it. Never invent a time. Put missing consequential time facts in unresolvedTimeFacts and ask only a question that blocks safe coordination.`,
+    instructions: `${commonGuardrails}\nPropose a person only when evidence maps that person to an exact supplied person ID; the person still must self-acknowledge. Resolve time against the supplied current instant and household IANA time zone when evidence supports it. Never invent facts. Phrase outcome as a concise ownership item that reads naturally after “take” or “has,” such as “Avery's Wednesday 3 PM pickup,” not as an imperative. Put every missing consequential fact in unresolvedFacts and ask only a question that blocks safe coordination.`,
     outputSchema: commitmentProposalSchema,
-    outputSchemaName: "coverage_commitment_propose_v1",
+    outputSchemaName: "coverage_commitment_propose_v2",
     riskClass: "medium",
     requestedCapabilities: [] as const,
-    evaluationRelease: "coverage-core-1",
+    evaluationRelease: "coverage-core-2",
   } satisfies PinnedSkill<typeof commitmentProposalSchema>,
   minimumDisclosure: {
     id: "coverage.minimum_disclosure",
@@ -125,6 +135,17 @@ export const PRODUCT_SKILLS = {
     requestedCapabilities: [] as const,
     evaluationRelease: "coverage-core-1",
   } satisfies PinnedSkill<typeof outcomeAssessmentSchema>,
+  responseInterpret: {
+    id: "coverage.response_interpret",
+    version: 1,
+    purpose: "Interpret a person's natural-language response to an exact current coverage loop.",
+    instructions: `${commonGuardrails}\nClassify only the authenticated sender's own explicit response. Natural confirmations such as “sure,” “I'll pick them up,” and “yes, I can do Wednesday” can acknowledge coverage when the supplied loop context makes their target unambiguous. Natural refusals can decline only the sender's own proposed or acknowledged coverage. Questions, tentative language, third-person statements, reactions, and silence are not commitments. Prefer the exact replied-to loop when supplied. If more than one loop could match and the message does not identify one, return ambiguous. Select only a supplied loop ID.`,
+    outputSchema: coverageResponseInterpretationSchema,
+    outputSchemaName: "coverage_response_interpret_v1",
+    riskClass: "high",
+    requestedCapabilities: [] as const,
+    evaluationRelease: "coverage-core-2",
+  } satisfies PinnedSkill<typeof coverageResponseInterpretationSchema>,
 } as const;
 
 /** Explicitly requested general answers are bounded and never create durable projects or memories. */

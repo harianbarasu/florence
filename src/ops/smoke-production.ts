@@ -1,7 +1,7 @@
 const REQUEST_TIMEOUT_MS = 10_000;
 
 try {
-  const baseUrl = productionBaseUrl(process.argv[2]);
+  const baseUrl = productionBaseUrl(commandArgument(process.argv.slice(2)));
   const completed: string[] = [];
 
   const health = await getJson(baseUrl, "/healthz");
@@ -60,6 +60,11 @@ function productionBaseUrl(argument: string | undefined): URL {
     throw new Error("the smoke-check target must use HTTPS unless it is local");
   }
   return url;
+}
+
+function commandArgument(arguments_: string[]): string | undefined {
+  const normalized = arguments_[0] === "--" ? arguments_.slice(1) : arguments_;
+  return normalized.length === 1 ? normalized[0] : undefined;
 }
 
 async function getJson(baseUrl: URL, path: string): Promise<Record<string, unknown>> {

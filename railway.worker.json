@@ -5,9 +5,13 @@
     "dockerfilePath": "Dockerfile"
   },
   "deploy": {
-    "preDeployCommand": "node dist/cli/migrate.js",
+    "preDeployCommand": "node dist/ops/predeploy-production.js",
+    "startCommand": "node dist/worker.js",
+    "numReplicas": 1,
+    "sleepApplication": false,
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 10,
-    "startCommand": "node dist/worker.js"
+    "overlapSeconds": 0,
+    "drainingSeconds": 30
   }
 }

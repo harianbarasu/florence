@@ -1,45 +1,20 @@
 services:
   postgres:
-    image: postgres:18-alpine
+    image: postgres:17.10-alpine3.24@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
     environment:
       POSTGRES_DB: florence
-      POSTGRES_PASSWORD: florence
       POSTGRES_USER: florence
+      POSTGRES_PASSWORD: florence
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - florence_postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U florence -d florence"]
       interval: 2s
-      timeout: 3s
+      timeout: 2s
       retries: 20
-    ports:
-      - "5432:5432"
-    volumes:
-      - florence-postgres:/var/lib/postgresql
-
-  web:
-    build: .
-    env_file: .env
-    environment:
-      FLORENCE_DATABASE_URL: postgres://florence:florence@postgres:5432/florence
-      FLORENCE_PROCESS_ROLE: web
-      PORT: 3000
-    depends_on:
-      postgres:
-        condition: service_healthy
-    ports:
-      - "3000:3000"
-    restart: unless-stopped
-
-  worker:
-    build: .
-    command: ["sh", "-c", "node dist/cli/migrate.js && exec node dist/worker.js"]
-    env_file: .env
-    environment:
-      FLORENCE_DATABASE_URL: postgres://florence:florence@postgres:5432/florence
-      FLORENCE_PROCESS_ROLE: worker
-    depends_on:
-      postgres:
-        condition: service_healthy
-    restart: unless-stopped
+    stop_grace_period: 30s
 
 volumes:
-  florence-postgres:
+  florence_postgres_data:

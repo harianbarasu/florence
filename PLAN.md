@@ -154,8 +154,8 @@ ends the current `ParticipantEpoch` and starts a new immutable epoch.
 
 | Mode | Condition | Ordinary content processing | Florence may write |
 |---|---|---|---|
-| `content_disabled` | At least one current participant is unregistered or has not consented to the epoch | No persistence, model call, attachment fetch, derivation, or retrieval; retain only routing, dedupe, membership, security, and opt-out metadata | No |
-| `read_enabled_write_disabled` | Every participant is registered and consented, but the effective policy or group rule forbids writing | Chat-epoch-local ingestion is allowed | No |
+| `content_disabled` | At least one current participant lacks verified global registration and explicit Florence consent | No persistence, model call, attachment fetch, derivation, or retrieval; retain only routing, dedupe, membership, security, and opt-out metadata | No |
+| `read_enabled_write_disabled` | Every participant's verified registration and explicit Florence consent is projected into the exact epoch, but the effective policy or group rule forbids writing | Chat-epoch-local ingestion is allowed | No |
 | `trusted_write_enabled` | Every participant is registered, the live epoch matches, the participant-policy intersection permits the operation, and an applicable group rule exists for proactivity | Allowed within the epoch and exact grants | Direct answers and rule-authorized proactivity only |
 | `paused` | STOP, participant change, deletion fence, policy conflict, or safety hold | No new ordinary processing | No |
 
@@ -163,6 +163,11 @@ ends the current `ParticipantEpoch` and starts a new immutable epoch.
 the chat as a potential source; it does not itself authorize ordinary processing. Registration may
 be lightweight—a verified private-DM claim and consent—without creating a household or connecting
 Google. This preserves the viral invite loop while keeping the permission boundary honest.
+
+A private `START` is explicit global Florence consent. New exact participant epochs project each
+registered person's existing conservative policy; they never synthesize consent from observation.
+Participant changes invalidate proactive rules and require a new exact-audience rule, but Florence
+does not ask an already registered person to re-register for every chat.
 
 The inviter may authorize one private enrollment invitation to each unregistered participant. The
 invitation names the inviter, explains Florence plainly, sends at most once unless requested again,

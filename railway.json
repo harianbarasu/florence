@@ -5,11 +5,15 @@
     "dockerfilePath": "Dockerfile"
   },
   "deploy": {
+    "preDeployCommand": "node dist/ops/predeploy-production.js",
+    "startCommand": "node dist/server.js",
+    "numReplicas": 1,
     "healthcheckPath": "/readyz",
-    "healthcheckTimeout": 180,
-    "preDeployCommand": "node dist/cli/migrate.js",
+    "healthcheckTimeout": 120,
+    "sleepApplication": false,
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 10,
-    "startCommand": "node dist/server.js"
+    "overlapSeconds": 5,
+    "drainingSeconds": 30
   }
 }

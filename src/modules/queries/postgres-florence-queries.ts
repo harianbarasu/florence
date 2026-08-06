@@ -1,0 +1,1372 @@
+import { createHash } from "node:crypto";
+import type { Database } from "../../db/client.js";
+import type { SecretBox } from "../../shared/crypto.js";
+import type {
+  ChatView,
+  DataSafetyView,
+  HomeView,
+  PeopleView,
+  RoutineView,
+  SourceView,
+  Viewer,
+} from "../../web/api.js";
+import { openPrivateBridgePayload, PrivateSourceBridge } from "../bridges/index.js";
+import { PostgresSourceIntelligence } from "../sources/index.js";
+
+interface PersonRow {
+  id: string;
+  timezone: string | null;
+  display_name_ciphertext: Buffer | null;
+}
+
+interface HouseholdRow {
+  id: string;
+  role: string;
+  member_count: number | string;
+}
+
+/**
+ * Scoped control-plane read models. Every query starts from the authenticated
+ * person and joins through an active relationship; callers cannot supply a
+ * household scope they have not earned.
+ */
+export class PostgresFlorenceQueries {
+  readonly #sources: PostgresSourceIntelligence;
+  readonly #secretBox: SecretBox;
+
+  public constructor(
+    private readonly database: Database,
+    secretBox: SecretBox,
+    rawRetentionDays = 30,
+  ) {
+    this.#secretBox = secretBox;
+    this.#sources = new PostgresSourceIntelligence(database, secretBox, {
+      rawRetentionDays,
+      privateCandidateRetentionDays: 7,
+    });
+  }
+
+  public async viewer(
+    personId: string,
+    csrfToken: string,
+    session: Viewer["session"] = { assuranceKind: "base", assuranceExpiresAt: null },
+  ): Promise<Viewer> {
+    const people = await this.database<PersonRow[]>`
+      select id, timezone, display_name_ciphertext from people
+      where id = ${personId} and status = 'registered'
+    `;
+    const person = people[0];
+    if (!person) throw new Error("Registered person does not exist");
+    const households = await this.database<HouseholdRow[]>`
+      select household.id, membership.role,
+        count(other_members.id) filter (where other_members.status = 'active') as member_count
+      from household_memberships membership
+      join households household on household.id = membership.household_id
+      left join household_memberships other_members on other_members.household_id = household.id
+      where membership.person_id = ${personId}
+        and membership.status = 'active'
+        and household.status not in ('deletion_fenced', 'deleted')
+      group by household.id, membership.role, membership.joined_at
+      order by membership.joined_at
+    `;
+    return {
+      person: {
+        id: person.id,
+        name: decryptPersonName(this.#secretBox, person.id, person.display_name_ciphertext) ?? "You",
+        phone: "Verified iMessage",
+        timezone: person.timezone ?? "America/Los_Angeles",
+      },
+      households: households.map((household, index) => ({
+        id: household.id,
+        name: index === 0 ? "Your family" : `Family ${index + 1}`,
+        role: household.role,
+        memberCount: Number(household.member_count),
+      })),
+      session,
+      csrfToken,
+    };
+  }
+
+  public async home(personId: string): Promise<HomeView> {
+    const loops = await this.database<
+      { id: string; state: string; updated_at: Date; household_id: string }[]
+    >`
+      select loop.id, loop.state, loop.updated_at, loop.household_id
+      from coverage_loops loop
+      join household_memberships membership on membership.household_id = loop.household_id
+      where membership.person_id = ${personId}
+        and membership.status = 'active'
+        and loop.state in ('provisional', 'open', 'awaiting_response', 'at_risk')
+      order by
+        case loop.state when 'at_risk' then 0 when 'awaiting_response' then 1 else 2 end,
+        loop.updated_at
+      limit 50
+    `;
+    const candidates = await this.database<{ id: string; candidate_kind: string; proposed_at: Date }[]>`
+      select id, candidate_kind, proposed_at
+      from knowledge_candidates
+      where owner_person_id = ${personId} and status = 'pending'
+      order by proposed_at desc
+      limit 25
+    `;
+    const integrations = await this.database<{ count: number | string }[]>`
+      select count(*) as count from integrations
+      where person_id = ${personId} and status in ('reauth_required', 'error')
+    `;
+    const items: HomeView["items"] = [
+      ...loops.map((loop) => ({
+        id: loop.id,
+        kind: "coverage" as const,
+        title:
+          loop.state === "at_risk"
+            ? "Coverage changed"
+            : loop.state === "awaiting_response"
+              ? "Waiting for an answer"
+              : "Coverage is still open",
+        detail: "Florence is keeping this family commitment visible until someone explicitly takes it.",
+        urgency: loop.state === "at_risk" ? ("now" as const) : ("soon" as const),
+      })),
+      ...candidates.map((candidate) => ({
+        id: candidate.id,
+        kind: "private_review" as const,
+        title: "Florence found something that may matter",
+        detail: `Private ${candidate.candidate_kind.replaceAll("_", " ")} awaiting your review.`,
+        urgency: "routine" as const,
+        href: "/sources",
+      })),
+    ];
+    if (Number(integrations[0]?.count ?? 0) > 0) {
+      items.push({
+        id: "connection-attention",
+        kind: "connection",
+        title: "A source needs to be reconnected",
+        detail: "Florence paused that private source until you reconnect it.",
+        urgency: "soon",
+        href: "/sources",
+      });
+    }
+    const householdCount = await this.database<{ count: number | string }[]>`
+      select count(*) as count from household_memberships
+      where person_id = ${personId} and status = 'active'
+    `;
+    const integrationCount = await this.database<{ count: number | string }[]>`
+      select count(*) as count from integrations
+      where person_id = ${personId} and status = 'active'
+    `;
+    const completed =
+      1 +
+      (Number(householdCount[0]?.count ?? 0) > 0 ? 1 : 0) +
+      (Number(integrationCount[0]?.count ?? 0) > 0 ? 1 : 0);
+    return {
+      monitoring: {
+        status: items.length > 0 ? "attention" : completed < 3 ? "learning" : "healthy",
+        label:
+          items.length > 0
+            ? `${items.length} thing${items.length === 1 ? "" : "s"} need attention`
+            : "Your family is covered",
+        detail:
+          items.length > 0
+            ? "Florence is following the open loops and will stay quiet about everything else."
+            : "Nothing currently needs a handoff or decision.",
+      },
+      items,
+      onboarding:
+        completed < 3
+          ? {
+              completed,
+              total: 3,
+              next: completed === 1 ? "Create or join your family" : "Connect a private Google account",
+            }
+          : null,
+    };
+  }
+
+  public async chats(personId: string): Promise<ChatView[]> {
+    const chats = await this.database<
+      {
+        id: string;
+        kind: string;
+        status: string;
+        epoch_id: string;
+        sequence: number | string;
+        epoch_started_at: Date;
+        participant_set_digest: string;
+        active_suppression: boolean;
+        all_registered: boolean;
+        all_content_allowed: boolean;
+        all_direct_allowed: boolean;
+        retention_seconds: number | string | null;
+        proactive_rule: boolean;
+      }[]
+    >`
+      select conversation.id, conversation.kind, conversation.status,
+        epoch.id as epoch_id, epoch.sequence, epoch.started_at as epoch_started_at,
+        epoch.participant_set_digest,
+        exists(
+          select 1 from channel_suppressions suppression
+          where suppression.conversation_id = conversation.id and suppression.active
+            and suppression.kind in ('stop', 'pause', 'read_only', 'deletion_fence', 'safety_hold')
+        ) as active_suppression,
+        bool_and(participant.registration_status = 'registered' and participant.consented_at is not null)
+          as all_registered,
+        bool_and(coalesce(policy.allow_content_processing, false)) as all_content_allowed,
+        bool_and(coalesce(policy.allow_direct_responses, false)) as all_direct_allowed,
+        min(policy.retention_seconds) as retention_seconds,
+        exists(
+          select 1 from conversation_rules rule
+          where rule.conversation_id = conversation.id and rule.status = 'active'
+            and 'proactive_coverage' = any(rule.allowed_operations)
+            and rule.participant_set_digest = epoch.participant_set_digest
+        ) as proactive_rule
+      from conversations conversation
+      join participant_epochs epoch on epoch.id = conversation.current_epoch_id and epoch.ended_at is null
+      join epoch_participants participant on participant.participant_epoch_id = epoch.id
+      left join participant_policies policy on policy.conversation_id = conversation.id
+        and policy.person_id = participant.person_id and policy.status = 'active'
+      where exists(
+        select 1 from epoch_participants viewer_participant
+        where viewer_participant.participant_epoch_id = epoch.id
+          and viewer_participant.person_id = ${personId}
+      )
+      group by conversation.id, epoch.id
+      order by conversation.updated_at desc
+    `;
+    const output: ChatView[] = [];
+    for (const chat of chats) {
+      const participants = await this.database<
+        { person_id: string; registration_status: string; consented_at: Date | null }[]
+      >`
+        select person_id, registration_status, consented_at
+        from epoch_participants where participant_epoch_id = ${chat.epoch_id}
+        order by person_id
+      `;
+      const mode: ChatView["mode"] =
+        chat.status === "paused" || chat.active_suppression
+          ? "paused"
+          : !chat.all_registered || !chat.all_content_allowed
+            ? "content_disabled"
+            : chat.all_direct_allowed
+              ? "trusted_write_enabled"
+              : "read_enabled_write_disabled";
+      output.push({
+        id: chat.id,
+        title: chat.kind === "direct" ? "Private conversation" : "Family group",
+        mode,
+        epochId: chat.epoch_id,
+        epochStartedAt: chat.epoch_started_at.toISOString(),
+        participants: participants.map((participant, index) => ({
+          id: participant.person_id,
+          name: participant.person_id === personId ? "You" : `Person ${index + 1}`,
+          registered: participant.registration_status === "registered",
+          consented: participant.consented_at !== null,
+        })),
+        retentionDays:
+          chat.retention_seconds === null ? null : Math.floor(Number(chat.retention_seconds) / 86_400),
+        proactive: chat.proactive_rule,
+        blockedReason:
+          mode === "content_disabled"
+            ? "Florence does not retain or use ordinary messages until every current participant registers and consents."
+            : mode === "read_enabled_write_disabled"
+              ? "Florence can learn from this chat but will not write here under the current shared settings."
+              : mode === "paused"
+                ? "A participant narrowed or paused this chat."
+                : null,
+      });
+    }
+    return output;
+  }
+
+  public async people(personId: string): Promise<PeopleView> {
+    const householdRows = await this.database<
+      {
+        id: string;
+        status: string;
+        viewer_role: string;
+        joined_at: Date;
+        capabilities: string[];
+      }[]
+    >`
+      select household.id, household.status, viewer_membership.role as viewer_role,
+        viewer_membership.joined_at,
+        coalesce(array_agg(capability.capability order by capability.capability)
+          filter (where capability.status = 'active'), '{}') as capabilities
+      from household_memberships viewer_membership
+      join households household on household.id = viewer_membership.household_id
+      left join membership_capabilities capability
+        on capability.membership_id = viewer_membership.id
+      where viewer_membership.person_id = ${personId}
+        and viewer_membership.status = 'active'
+        and household.status in ('onboarding', 'active', 'paused')
+        and exists(
+          select 1 from membership_capabilities read_grant
+          where read_grant.membership_id = viewer_membership.id
+            and read_grant.capability = 'household.read'
+            and read_grant.status = 'active'
+        )
+      group by household.id, viewer_membership.id
+      order by viewer_membership.joined_at
+    `;
+
+    const households: PeopleView["households"] = [];
+    for (const [householdIndex, household] of householdRows.entries()) {
+      const canInvite = household.capabilities.includes("membership.invite");
+      const canAddDependent = household.capabilities.includes("household.govern");
+      const memberRows = await this.database<
+        {
+          person_id: string;
+          role: string;
+          person_status: string;
+          display_name_ciphertext: Buffer | null;
+          joined_at: Date;
+        }[]
+      >`
+        select member.person_id, member.role, person.status as person_status,
+          person.display_name_ciphertext, member.joined_at
+        from household_memberships member
+        join people person on person.id = member.person_id
+        where member.household_id = ${household.id} and member.status = 'active'
+        order by case member.role when 'steward' then 0 when 'caregiver' then 1
+          when 'participant' then 2 else 3 end, member.joined_at
+      `;
+      const eligibleRows = canInvite
+        ? await this.database<
+            {
+              person_id: string;
+              conversation_id: string;
+              display_name_ciphertext: Buffer | null;
+            }[]
+          >`
+            select distinct on (candidate.person_id)
+              candidate.person_id, conversation.id as conversation_id,
+              person.display_name_ciphertext
+            from conversations conversation
+            join participant_epochs epoch on epoch.id = conversation.current_epoch_id
+              and epoch.ended_at is null
+            join epoch_participants viewer_participant
+              on viewer_participant.participant_epoch_id = epoch.id
+              and viewer_participant.person_id = ${personId}
+            join epoch_participants candidate on candidate.participant_epoch_id = epoch.id
+              and candidate.person_id <> ${personId}
+              and candidate.registration_status = 'registered'
+              and candidate.consented_at is not null
+            join people person on person.id = candidate.person_id and person.status = 'registered'
+            join person_identities identity on identity.id = candidate.person_identity_id
+              and identity.status = 'verified'
+            where conversation.kind = 'group' and conversation.status = 'active'
+              and not exists(
+                select 1 from household_memberships existing_member
+                where existing_member.household_id = ${household.id}
+                  and existing_member.person_id = candidate.person_id
+                  and existing_member.status = 'active'
+              )
+              and not exists(
+                select 1 from invitations pending_invitation
+                join person_identities invited_identity
+                  on invited_identity.id = pending_invitation.invitee_identity_id
+                where pending_invitation.household_id = ${household.id}
+                  and pending_invitation.status = 'pending'
+                  and pending_invitation.expires_at > now()
+                  and invited_identity.person_id = candidate.person_id
+              )
+            order by candidate.person_id, conversation.updated_at desc
+          `
+        : [];
+      const groupRows = await this.database<
+        {
+          conversation_id: string;
+          required_count: number | string;
+          all_ready: boolean;
+          active: boolean;
+          approved_count: number | string;
+          viewer_approved: boolean;
+          updated_at: Date;
+        }[]
+      >`
+        select conversation.id as conversation_id, conversation.updated_at,
+          count(distinct participant.person_id) as required_count,
+          coalesce(bool_and(
+            participant.registration_status = 'registered'
+            and participant.consented_at is not null
+            and policy.id is not null
+          ), false) as all_ready,
+          exists(
+            select 1 from conversation_rules active_rule
+            where active_rule.conversation_id = conversation.id
+              and active_rule.status = 'active'
+              and active_rule.participant_set_digest = epoch.participant_set_digest
+              and 'proactive_coverage' = any(active_rule.allowed_operations)
+          ) as active,
+          count(distinct approval.person_id) as approved_count,
+          coalesce(bool_or(approval.person_id = ${personId}), false) as viewer_approved
+        from conversations conversation
+        join participant_epochs epoch on epoch.id = conversation.current_epoch_id
+          and epoch.ended_at is null
+        join epoch_participants participant on participant.participant_epoch_id = epoch.id
+        left join participant_policies policy on policy.conversation_id = conversation.id
+          and policy.person_id = participant.person_id and policy.status = 'active'
+        left join lateral (
+          select candidate_rule.id
+          from conversation_rules candidate_rule
+          where candidate_rule.conversation_id = conversation.id
+            and candidate_rule.rule_key = 'family_coverage_proposal'
+            and candidate_rule.status = 'candidate'
+            and candidate_rule.participant_set_digest = epoch.participant_set_digest
+          order by candidate_rule.version desc limit 1
+        ) proposal on true
+        left join conversation_rule_approvals approval
+          on approval.conversation_rule_id = proposal.id
+          and approval.participant_epoch_id = epoch.id
+          and approval.participant_set_digest = epoch.participant_set_digest
+        where conversation.household_id = ${household.id}
+          and conversation.kind = 'group' and conversation.status = 'active'
+          and exists(
+            select 1 from epoch_participants viewer_participant
+            where viewer_participant.participant_epoch_id = epoch.id
+              and viewer_participant.person_id = ${personId}
+          )
+        group by conversation.id, epoch.id
+        order by conversation.updated_at desc
+      `;
+      households.push({
+        id: household.id,
+        name: householdIndex === 0 ? "Your family" : `Your family ${householdIndex + 1}`,
+        status: household.status,
+        viewerRole: relationshipRole(household.viewer_role),
+        canInvite,
+        canAddDependent,
+        members: memberRows.map((member) => ({
+          id: member.person_id,
+          name:
+            member.person_id === personId
+              ? "You"
+              : (decryptPersonName(this.#secretBox, member.person_id, member.display_name_ciphertext) ??
+                (member.role === "dependent" ? "Dependent" : "Family member")),
+          role: relationshipRole(member.role),
+          self: member.person_id === personId,
+          represented: member.role === "dependent" && member.person_status !== "registered",
+        })),
+        eligibleParticipants: eligibleRows.map((participant) => ({
+          personId: participant.person_id,
+          conversationId: participant.conversation_id,
+          name:
+            decryptPersonName(this.#secretBox, participant.person_id, participant.display_name_ciphertext) ??
+            "Registered group participant",
+        })),
+        coverageGroups: groupRows.map((group, groupIndex) => {
+          const active = group.active;
+          const allReady = group.all_ready;
+          const viewerApproved = active || group.viewer_approved;
+          const requiredCount = Number(group.required_count);
+          return {
+            conversationId: group.conversation_id,
+            label: groupIndex === 0 ? "Family group" : `Family group ${groupIndex + 1}`,
+            active,
+            approvedCount: active ? requiredCount : Number(group.approved_count),
+            requiredCount,
+            viewerApproved,
+            canApprove: allReady && !active && !viewerApproved,
+            blockedReason: !allReady
+              ? "Everyone in this group must finish private registration first."
+              : !active && viewerApproved
+                ? "You approved this. Florence is waiting for everyone else."
+                : null,
+          };
+        }),
+      });
+    }
+
+    const approvalRows = await this.database<
+      {
+        invitation_id: string;
+        household_id: string;
+        requested_role: string;
+        expires_at: Date;
+        invitee_person_id: string;
+        display_name_ciphertext: Buffer | null;
+      }[]
+    >`
+      select invitation.id as invitation_id, invitation.household_id,
+        invitation.requested_role, invitation.expires_at,
+        invitee.id as invitee_person_id, invitee.display_name_ciphertext
+      from invitation_approvals approval
+      join household_memberships approver_membership
+        on approver_membership.id = approval.approver_membership_id
+        and approver_membership.person_id = ${personId}
+        and approver_membership.status = 'active'
+      join invitations invitation on invitation.id = approval.invitation_id
+      join households household on household.id = invitation.household_id
+        and household.membership_version = invitation.household_membership_version
+      join person_identities invitee_identity on invitee_identity.id = invitation.invitee_identity_id
+      join people invitee on invitee.id = invitee_identity.person_id
+      where approval.approved_at is null and invitation.status = 'pending'
+        and invitation.expires_at > now()
+      order by invitation.created_at
+    `;
+    const acceptanceRows = await this.database<
+      {
+        invitation_id: string;
+        household_id: string;
+        requested_role: string;
+        expires_at: Date;
+        remaining_approvals: number | string;
+      }[]
+    >`
+      select invitation.id as invitation_id, invitation.household_id,
+        invitation.requested_role, invitation.expires_at,
+        count(approval.approver_membership_id)
+          filter (where approval.approved_at is null) as remaining_approvals
+      from invitations invitation
+      join households household on household.id = invitation.household_id
+        and household.membership_version = invitation.household_membership_version
+      join person_identities invitee_identity on invitee_identity.id = invitation.invitee_identity_id
+        and invitee_identity.person_id = ${personId} and invitee_identity.status = 'verified'
+      left join invitation_approvals approval on approval.invitation_id = invitation.id
+      where invitation.status = 'pending' and invitation.expires_at > now()
+      group by invitation.id
+      order by invitation.created_at
+    `;
+    const householdNames = new Map(households.map((household) => [household.id, household.name]));
+    return {
+      households,
+      invitations: [
+        ...approvalRows.map((invitation) => ({
+          id: invitation.invitation_id,
+          householdId: invitation.household_id,
+          householdName: householdNames.get(invitation.household_id) ?? "Your family",
+          personName:
+            decryptPersonName(
+              this.#secretBox,
+              invitation.invitee_person_id,
+              invitation.display_name_ciphertext,
+            ) ?? "A registered group participant",
+          role: invitationRole(invitation.requested_role),
+          action: "approve" as const,
+          canAct: true,
+          detail: "A co-steward must be approved by every current steward.",
+          expiresAt: invitation.expires_at.toISOString(),
+        })),
+        ...acceptanceRows.map((invitation) => {
+          const ready = Number(invitation.remaining_approvals) === 0;
+          return {
+            id: invitation.invitation_id,
+            householdId: invitation.household_id,
+            householdName: householdNames.get(invitation.household_id) ?? "A family",
+            personName: "You",
+            role: invitationRole(invitation.requested_role),
+            action: "accept" as const,
+            canAct: ready,
+            detail: ready
+              ? "This family is ready for you to join."
+              : "The family’s current stewards are still approving this invitation.",
+            expiresAt: invitation.expires_at.toISOString(),
+          };
+        }),
+      ],
+    };
+  }
+
+  public async routines(personId: string): Promise<RoutineView> {
+    const destinations = await this.database<
+      {
+        conversation_id: string;
+        household_id: string;
+        participant_count: number | string;
+        can_create: boolean;
+      }[]
+    >`
+      select conversation.id as conversation_id, conversation.household_id,
+        count(participant.person_id) as participant_count,
+        exists(
+          select 1 from membership_capabilities capability
+          where capability.membership_id = viewer_membership.id
+            and capability.capability = 'coordination.originate'
+            and capability.status = 'active'
+        ) as can_create
+      from household_memberships viewer_membership
+      join membership_capabilities read_capability
+        on read_capability.membership_id = viewer_membership.id
+        and read_capability.capability = 'household.read' and read_capability.status = 'active'
+      join households household on household.id = viewer_membership.household_id
+        and household.status = 'active'
+      join conversations conversation on conversation.household_id = household.id
+        and conversation.kind = 'group' and conversation.status = 'active'
+      join participant_epochs epoch on epoch.id = conversation.current_epoch_id
+        and epoch.ended_at is null
+      join epoch_participants participant on participant.participant_epoch_id = epoch.id
+      join people current_person on current_person.id = participant.person_id
+      join person_identities identity on identity.id = participant.person_identity_id
+      left join participant_policies policy on policy.conversation_id = conversation.id
+        and policy.person_id = participant.person_id and policy.status = 'active'
+      where viewer_membership.person_id = ${personId} and viewer_membership.status = 'active'
+        and exists(
+          select 1 from epoch_participants viewer_participant
+          where viewer_participant.participant_epoch_id = epoch.id
+            and viewer_participant.person_id = ${personId}
+        )
+      group by conversation.id, viewer_membership.id
+      having bool_and(
+        participant.registration_status = 'registered'
+        and participant.consented_at is not null
+        and current_person.status = 'registered'
+        and identity.status = 'verified'
+        and coalesce(policy.allow_content_processing, false)
+      )
+      order by conversation.updated_at desc, conversation.id
+    `;
+    const destinationViews: RoutineView["destinations"] = destinations.map((destination, index) => ({
+      conversationId: destination.conversation_id,
+      householdId: destination.household_id,
+      label: index === 0 ? "Family group" : `Family group ${index + 1}`,
+      participantCount: Number(destination.participant_count),
+      canCreate: destination.can_create,
+    }));
+    const destinationById = new Map(
+      destinationViews.map((destination) => [destination.conversationId, destination]),
+    );
+
+    const people = await this.database<
+      {
+        household_id: string;
+        person_id: string;
+        display_name_ciphertext: Buffer | null;
+      }[]
+    >`
+      select member.household_id, member.person_id, person.display_name_ciphertext
+      from household_memberships viewer_membership
+      join membership_capabilities read_capability
+        on read_capability.membership_id = viewer_membership.id
+        and read_capability.capability = 'household.read' and read_capability.status = 'active'
+      join households household on household.id = viewer_membership.household_id
+        and household.status = 'active'
+      join household_memberships member on member.household_id = household.id
+        and member.status = 'active' and member.role <> 'dependent'
+      join people person on person.id = member.person_id and person.status = 'registered'
+      where viewer_membership.person_id = ${personId} and viewer_membership.status = 'active'
+      order by member.household_id, member.joined_at, member.person_id
+    `;
+    const peopleViews: RoutineView["people"] = people.map((person) => ({
+      personId: person.person_id,
+      householdId: person.household_id,
+      name:
+        person.person_id === personId
+          ? "You"
+          : (decryptPersonName(this.#secretBox, person.person_id, person.display_name_ciphertext) ??
+            "Family member"),
+      self: person.person_id === personId,
+    }));
+    const personNames = new Map(peopleViews.map((person) => [person.personId, person.name]));
+
+    const rows = await this.database<
+      {
+        routine_id: string;
+        household_id: string;
+        status: string;
+        current_revision: number | string;
+        version: number | string;
+        content_ciphertext: Buffer;
+        content_key_version: string;
+        recurrence: unknown;
+        semantic_time_plan: unknown;
+        notification_mode: string;
+        destination_conversation_id: string;
+        proposed_holder_person_id: string | null;
+        standing_holder_person_id: string | null;
+        can_revise: boolean;
+        can_manage: boolean;
+        participant_count: number | string;
+      }[]
+    >`
+      select routine.id as routine_id, routine.household_id, routine.status,
+        routine.current_revision, routine.version, revision.content_ciphertext,
+        revision.content_key_version, revision.recurrence, revision.semantic_time_plan,
+        revision.notification_mode, revision.destination_conversation_id,
+        revision.proposed_holder_person_id, revision.standing_holder_person_id,
+        exists(
+          select 1 from membership_capabilities capability
+          where capability.membership_id = viewer_membership.id
+            and capability.capability = 'coordination.originate' and capability.status = 'active'
+        ) as can_revise,
+        exists(
+          select 1 from membership_capabilities capability
+          where capability.membership_id = viewer_membership.id
+            and capability.capability = 'coordination.coordinate' and capability.status = 'active'
+        ) as can_manage,
+        (
+          select count(*) from epoch_participants participant
+          join conversations conversation on conversation.current_epoch_id = participant.participant_epoch_id
+          where conversation.id = revision.destination_conversation_id
+        ) as participant_count
+      from household_memberships viewer_membership
+      join membership_capabilities read_capability
+        on read_capability.membership_id = viewer_membership.id
+        and read_capability.capability = 'household.read' and read_capability.status = 'active'
+      join households household on household.id = viewer_membership.household_id
+        and household.status = 'active'
+      join routines routine on routine.household_id = household.id
+      join routine_revisions revision on revision.routine_id = routine.id
+        and revision.revision = routine.current_revision
+      where viewer_membership.person_id = ${personId} and viewer_membership.status = 'active'
+      order by case routine.status when 'active' then 0 when 'paused' then 1 else 2 end,
+        routine.updated_at desc, routine.id
+    `;
+
+    const routines: RoutineView["routines"] = rows.map((row) => {
+      const content = decryptRoutineContent(
+        this.#secretBox,
+        row.routine_id,
+        Number(row.current_revision),
+        row.content_ciphertext,
+        row.content_key_version,
+      );
+      const shape = editableWeeklyRoutineShape(row.recurrence, row.semantic_time_plan);
+      const destination = destinationById.get(row.destination_conversation_id);
+      const destinationLabel = destination?.label ?? `Family group · ${Number(row.participant_count)} people`;
+      const holderId = row.proposed_holder_person_id;
+      const status = routineStatus(row.status);
+      return {
+        id: row.routine_id,
+        householdId: row.household_id,
+        title: content?.title ?? "Routine details unavailable",
+        sharedMeaning: content?.sharedMeaning ?? "Florence cannot currently open these details.",
+        cadence: shape ? cadenceLabel(shape.weekdays) : "Recurring routine",
+        time: shape ? `${friendlyLocalTime(shape.localEventTime)} · ${shape.timeZone}` : "Timing unavailable",
+        destination: {
+          conversationId: row.destination_conversation_id,
+          label: destinationLabel,
+        },
+        status,
+        holder: holderId
+          ? {
+              personId: holderId,
+              name: personNames.get(holderId) ?? "Family member",
+              standing: row.standing_holder_person_id === holderId,
+            }
+          : null,
+        version: Number(row.version),
+        canRevise:
+          row.can_revise &&
+          status !== "retired" &&
+          content !== null &&
+          shape !== null &&
+          destination !== undefined,
+        canManage: row.can_manage && status !== "retired",
+        weekdays: shape?.weekdays ?? [],
+        startsOn: shape?.startsOn ?? "",
+        endsOn: shape?.endsOn ?? null,
+        timeZone: shape?.timeZone ?? "UTC",
+        localEventTime: shape?.localEventTime ?? "09:00",
+        earliestUsefulMinutesBefore: shape?.earliestUsefulMinutesBefore ?? 180,
+        lastResponsibleMinutesBefore: shape?.lastResponsibleMinutesBefore ?? 30,
+        notificationMode: notificationMode(row.notification_mode),
+        standingSelfCoverage:
+          row.standing_holder_person_id === personId && row.proposed_holder_person_id === personId,
+      };
+    });
+    return { destinations: destinationViews, people: peopleViews, routines };
+  }
+
+  public async sources(personId: string): Promise<SourceView> {
+    const integrations = await this.database<
+      {
+        id: string;
+        status: string;
+        control_epoch: number | string;
+        connected_at: Date;
+        updated_at: Date;
+      }[]
+    >`
+      select id, status, control_epoch, connected_at, updated_at
+      from integrations
+      where person_id = ${personId} and provider = 'google'
+        and status <> 'revoked'
+      order by connected_at
+    `;
+    const integrationIds = integrations.map((integration) => integration.id);
+    const cursors =
+      integrationIds.length === 0
+        ? []
+        : await this.database<
+            {
+              integration_id: string;
+              resource_kind: string;
+              state: string;
+              checkpoint_at: Date | null;
+              updated_at: Date;
+            }[]
+          >`
+          select integration_id, resource_kind, state, checkpoint_at, updated_at
+          from sync_cursors
+          where integration_id = any(${this.database.array(integrationIds)}::uuid[])
+        `;
+    const calendarPolicies =
+      integrationIds.length === 0
+        ? []
+        : await this.database<{ integration_id: string; calendar_id_digest: string; mode: string }[]>`
+          select integration_id, scope->>'calendarIdDigest' as calendar_id_digest,
+            scope->>'mode' as mode
+          from integration_grants
+          where integration_id = any(${this.database.array(integrationIds)}::uuid[])
+            and grant_kind = 'calendar_privacy' and status = 'active'
+        `;
+    const googleJobs =
+      integrationIds.length === 0
+        ? []
+        : await this.database<
+            {
+              idempotency_key: string;
+              job_kind: string;
+              status: string;
+              updated_at: Date;
+            }[]
+          >`
+          select idempotency_key, job_kind, status, updated_at
+          from jobs
+          where person_id = ${personId} and job_kind like 'google.%'
+          order by updated_at desc
+        `;
+
+    const connections: SourceView["connections"] = [];
+    for (const integration of integrations) {
+      const controlEpoch = Number(integration.control_epoch);
+      const profile = await this.#sources
+        .read({
+          kind: "integration_profile",
+          integrationId: integration.id,
+          personId,
+          expectedControlEpoch: controlEpoch,
+        })
+        .catch(() => null);
+      const accountEmail =
+        profile?.kind === "integration_profile" ? profile.accountEmail : "Account email unavailable";
+      const connectionCursors = cursors.filter((cursor) => cursor.integration_id === integration.id);
+      const connectionJobs = googleJobs.filter((job) => job.idempotency_key.includes(integration.id));
+      const gmailHistory = connectionCursors.find((cursor) => cursor.resource_kind === "gmail_history");
+      const backfillKinds = ["newest_30_days", "days_31_to_90", "days_91_to_365"];
+      const olderHistoryEnabled =
+        connectionCursors.some((cursor) => cursor.resource_kind === "gmail_backfill:older_history") ||
+        connectionJobs.some((job) => job.idempotency_key.includes(":older_history:"));
+      if (olderHistoryEnabled) backfillKinds.push("older_history");
+      const completedBackfills = backfillKinds.filter((stage) =>
+        connectionCursors.some(
+          (cursor) => cursor.resource_kind === `gmail_backfill:${stage}` && cursor.state === "exhausted",
+        ),
+      ).length;
+      const gmailJobFailed = connectionJobs.some(
+        (job) => job.job_kind.startsWith("google.gmail.") && job.status === "dead",
+      );
+      const liveState: SourceView["connections"][number]["gmail"]["liveState"] =
+        integration.status === "paused"
+          ? "paused"
+          : integration.status === "reauth_required" ||
+              integration.status === "error" ||
+              gmailHistory?.state === "expired" ||
+              gmailHistory?.state === "error" ||
+              gmailJobFailed
+            ? "needs_attention"
+            : gmailHistory?.state === "active"
+              ? "watching"
+              : "waiting";
+      const liveLabel =
+        liveState === "watching"
+          ? "Keeping up with new mail"
+          : liveState === "paused"
+            ? "Mail monitoring is paused"
+            : liveState === "needs_attention"
+              ? "Mail needs to be reconnected"
+              : "Mail monitoring is starting";
+      const backfillLabel =
+        completedBackfills >= backfillKinds.length
+          ? "Past mail is ready"
+          : gmailJobFailed
+            ? "Past mail needs attention"
+            : `${completedBackfills} of ${backfillKinds.length} history passes complete`;
+
+      let calendarCatalog: readonly CalendarCatalogEntry[] = [];
+      let calendarCatalogLabel = "Looking for your calendars…";
+      try {
+        const catalog = await this.#sources.read({
+          kind: "sync_cursor",
+          integrationId: integration.id,
+          personId,
+          expectedIntegrationControlEpoch: controlEpoch,
+          resourceKind: "calendar_catalog",
+        });
+        if (catalog.kind === "sync_cursor") {
+          calendarCatalog = parseCalendarCatalog(catalog.cursor);
+          calendarCatalogLabel =
+            calendarCatalog.length === 0
+              ? "No calendars found"
+              : `${calendarCatalog.length} calendar${calendarCatalog.length === 1 ? "" : "s"} found`;
+        }
+      } catch {
+        if (integration.status === "reauth_required" || integration.status === "error") {
+          calendarCatalogLabel = "Calendar access needs attention";
+        }
+      }
+      const policyByCalendar = new Map(
+        calendarPolicies
+          .filter((policy) => policy.integration_id === integration.id)
+          .map((policy) => [policy.calendar_id_digest, calendarMode(policy.mode)] as const),
+      );
+      connections.push({
+        id: integration.id,
+        label: "Google",
+        email: accountEmail,
+        status: integration.status,
+        statusLabel: integrationStatusLabel(integration.status),
+        gmail: {
+          liveState,
+          liveLabel,
+          lastCheckedAt: gmailHistory?.checkpoint_at?.toISOString() ?? null,
+          backfillCompleted: completedBackfills,
+          backfillTotal: backfillKinds.length,
+          backfillLabel,
+        },
+        calendarCatalogLabel,
+        calendars: calendarCatalog
+          .filter((calendar) => !calendar.deleted)
+          .map((calendar) => ({
+            id: calendar.id,
+            name: calendar.summary,
+            primary: calendar.primary,
+            timezone: calendar.timezone,
+            mode: policyByCalendar.get(sha256Hex(calendar.id)) ?? "off",
+          })),
+      });
+    }
+
+    const reviewResult = await this.#sources.read({
+      kind: "pending_private_candidates",
+      personId,
+      asOf: new Date().toISOString(),
+      limit: 50,
+    });
+    const reviews = reviewResult.kind === "pending_private_candidates" ? reviewResult.candidates : [];
+    const evidenceIds = [...new Set(reviews.flatMap((review) => [...review.evidenceSourceRevisionIds]))];
+    const evidence =
+      evidenceIds.length === 0
+        ? []
+        : await this.database<{ revision_id: string; provider: string; object_kind: string }[]>`
+          select revision.id as revision_id, object.provider, object.object_kind
+          from source_revisions revision
+          join source_objects object on object.id = revision.source_object_id
+          where revision.id = any(${this.database.array(evidenceIds)}::uuid[])
+            and revision.owner_person_id = ${personId}
+        `;
+    const destinations = await new PrivateSourceBridge(this.database, this.#secretBox).listDestinations(
+      personId,
+    );
+    const intentRows = await this.database<
+      {
+        id: string;
+        action_digest: string;
+        data_digest: string;
+        policy_digest: string;
+        target_digest: string;
+        payload_ciphertext: Buffer;
+        status: string;
+      }[]
+    >`
+      select id, action_digest, data_digest, policy_digest, target_digest,
+        payload_ciphertext, status
+      from action_intents
+      where person_id = ${personId} and action_kind = 'private_source_to_coverage_loop'
+        and status in ('proposed', 'awaiting_approval', 'approved', 'executing') and expires_at > now()
+      order by updated_at desc limit 100
+    `;
+    const intentsByCandidate = new Map<
+      string,
+      {
+        id: string;
+        status: string;
+        payload: ReturnType<typeof openPrivateBridgePayload>;
+        digests: {
+          actionDigest: string;
+          dataDigest: string;
+          policyDigest: string;
+          targetDigest: string;
+        };
+      }
+    >();
+    for (const intent of intentRows) {
+      try {
+        const payload = openPrivateBridgePayload(this.#secretBox, intent.id, intent.payload_ciphertext);
+        if (!intentsByCandidate.has(payload.candidateId)) {
+          intentsByCandidate.set(payload.candidateId, {
+            id: intent.id,
+            status: intent.status,
+            payload,
+            digests: {
+              actionDigest: intent.action_digest,
+              dataDigest: intent.data_digest,
+              policyDigest: intent.policy_digest,
+              targetDigest: intent.target_digest,
+            },
+          });
+        }
+      } catch {
+        // A stale or old encrypted intent is not a control the owner can safely act on.
+      }
+    }
+    const privateReviews: SourceView["privateReviews"] = reviews.map((review) => {
+      const requiredOutcome = optionalString(review.content.requiredOutcome);
+      const changedFact = optionalString(review.content.changedFact);
+      const timeFacts = stringValues(review.content.timeFacts);
+      const uncertainties = stringValues(review.content.uncertainties);
+      const sourceLabels = [
+        ...new Set(
+          evidence
+            .filter((item) => review.evidenceSourceRevisionIds.includes(item.revision_id))
+            .map((item) => sourceLabel(item.provider, item.object_kind)),
+        ),
+      ];
+      const intent = intentsByCandidate.get(review.candidateId);
+      const proposed =
+        intent?.status === "awaiting_approval" && intent.payload.phase === "awaiting_approval"
+          ? intent.payload
+          : null;
+      const standingRuleLabel =
+        proposed?.sourcePattern?.kind === "gmail_thread"
+          ? "Future coverage items from this exact email thread"
+          : proposed?.sourcePattern?.kind === "calendar_series"
+            ? "Future coverage items from this exact recurring calendar series"
+            : null;
+      return {
+        id: review.candidateId,
+        kind: review.candidateKind,
+        title: candidateTitle(review.candidateKind),
+        summary: requiredOutcome ?? changedFact ?? "Florence found something that may matter to your family.",
+        details: [
+          ...(changedFact && changedFact !== requiredOutcome ? [changedFact] : []),
+          ...timeFacts,
+          ...uncertainties.map((uncertainty) => `Still unclear: ${uncertainty}`),
+          ...(review.candidateKind === "coverage_proposal"
+            ? ["Keeping this stays private until you choose where it should go."]
+            : []),
+        ],
+        sourceLabel: sourceLabels.join(" + ") || "Your private source",
+        proposedAt: review.proposedAt,
+        expiresAt: review.expiresAt,
+        destinations: review.candidateKind === "coverage_proposal" ? destinations : [],
+        preparingShare:
+          intent?.status === "proposed" || intent?.status === "approved" || intent?.status === "executing",
+        shareProposal:
+          proposed && intent
+            ? {
+                actionIntentId: intent.id,
+                minimumMeaning: proposed.minimumDisclosure.minimumMeaning,
+                canCreateStandingRule: proposed.sourcePattern !== null,
+                standingRuleLabel,
+                ...intent.digests,
+              }
+            : null,
+      };
+    });
+    const memories = await this.database<
+      { id: string; memory_key: string; scope_kind: string; effective_at: Date }[]
+    >`
+      select memory.id, memory.memory_key, memory.scope_kind, revision.effective_at
+      from memory_records memory
+      join memory_revisions revision on revision.id = memory.current_revision_id
+      where memory.owner_person_id = ${personId} and memory.status = 'accepted'
+      order by revision.effective_at desc limit 100
+    `;
+    const rules = await this.database<{ id: string; rule_key: string; destination_kind: string }[]>`
+      select id, rule_key,
+        case when destination_conversation_id is not null then 'one chat' else 'your family' end as destination_kind
+      from bridge_rules
+      where owner_person_id = ${personId} and status = 'active'
+      order by updated_at desc
+    `;
+    return {
+      connections,
+      privateReviews,
+      memories: memories.map((memory) => ({
+        id: memory.id,
+        label: memory.memory_key.split(":", 1)[0]?.replaceAll("_", " ") ?? "private memory",
+        scope: memory.scope_kind,
+        source: "Approved source evidence",
+        asOf: memory.effective_at.toLocaleDateString(),
+      })),
+      rules: rules.map((rule) => ({
+        id: rule.id,
+        label: rule.rule_key.replaceAll("_", " "),
+        source: "Your private sources",
+        destination: rule.destination_kind,
+      })),
+    };
+  }
+
+  public async safety(personId: string, currentSessionId: string): Promise<DataSafetyView> {
+    const people = await this.database<{ proactive_paused: boolean }[]>`
+      select coalesce((quiet_hours ->> 'proactivePaused')::boolean, false) as proactive_paused
+      from people where id = ${personId}
+    `;
+    const sessions = await this.database<{ id: string; created_at: Date; last_seen_at: Date }[]>`
+      select id, created_at, last_seen_at from person_sessions
+      where person_id = ${personId} and revoked_at is null
+        and idle_expires_at > now() and absolute_expires_at > now()
+      order by last_seen_at desc
+    `;
+    const deletion = await this.database<{ status: string; requested_at: Date }[]>`
+      select status, requested_at from deletion_requests
+      where target_person_id = ${personId}
+      order by requested_at desc limit 1
+    `;
+    const integrations = await this.database<
+      { id: string; provider: string; status: string; control_epoch: number | string }[]
+    >`
+      select id, provider, status, control_epoch
+      from integrations
+      where person_id = ${personId} and status <> 'revoked'
+      order by connected_at
+    `;
+    const connections: DataSafetyView["connections"] = [];
+    for (const integration of integrations) {
+      if (integration.provider !== "google") continue;
+      const profile = await this.#sources
+        .read({
+          kind: "integration_profile",
+          integrationId: integration.id,
+          personId,
+          expectedControlEpoch: Number(integration.control_epoch),
+        })
+        .catch(() => null);
+      connections.push({
+        id: integration.id,
+        provider: "google",
+        email: profile?.kind === "integration_profile" ? profile.accountEmail : "Google account",
+        status: integration.status,
+      });
+    }
+    return {
+      paused: people[0]?.proactive_paused ?? false,
+      sessions: sessions.map((session) => ({
+        id: session.id,
+        createdAt: session.created_at.toISOString(),
+        lastSeenAt: session.last_seen_at.toISOString(),
+        current: session.id === currentSessionId,
+      })),
+      connections,
+      deletion: deletion[0]
+        ? { status: deletion[0].status, requestedAt: deletion[0].requested_at.toISOString() }
+        : null,
+    };
+  }
+}
+
+function relationshipRole(value: string): PeopleView["households"][number]["members"][number]["role"] {
+  switch (value) {
+    case "steward":
+    case "caregiver":
+    case "participant":
+    case "dependent":
+      return value;
+    default:
+      return "participant";
+  }
+}
+
+function invitationRole(value: string): PeopleView["invitations"][number]["role"] {
+  return value === "steward" || value === "caregiver" ? value : "participant";
+}
+
+function decryptPersonName(secretBox: SecretBox, personId: string, ciphertext: Buffer | null): string | null {
+  if (!ciphertext) return null;
+  try {
+    const encrypted = JSON.parse(ciphertext.toString("utf8")) as unknown;
+    const name = secretBox
+      .decrypt(encrypted, `person-display-name:${personId}`)
+      .toString("utf8")
+      .replace(/\s+/gu, " ")
+      .trim();
+    return name.length > 0 && name.length <= 80 ? name : null;
+  } catch {
+    return null;
+  }
+}
+
+function decryptRoutineContent(
+  secretBox: SecretBox,
+  routineId: string,
+  revision: number,
+  ciphertext: Buffer,
+  keyVersion: string,
+): { readonly title: string; readonly sharedMeaning: string } | null {
+  try {
+    const encrypted = JSON.parse(ciphertext.toString("utf8")) as unknown;
+    if (!isRecord(encrypted) || encrypted.kid !== keyVersion) return null;
+    const content = JSON.parse(
+      secretBox.decrypt(encrypted, `routine-revision-content:${routineId}:${revision}`).toString("utf8"),
+    ) as unknown;
+    if (
+      !isRecord(content) ||
+      typeof content.title !== "string" ||
+      typeof content.minimumSharedMeaning !== "string"
+    ) {
+      return null;
+    }
+    return { title: content.title, sharedMeaning: content.minimumSharedMeaning };
+  } catch {
+    return null;
+  }
+}
+
+interface EditableWeeklyRoutineShape {
+  readonly weekdays: number[];
+  readonly startsOn: string;
+  readonly endsOn: string | null;
+  readonly timeZone: string;
+  readonly localEventTime: string;
+  readonly earliestUsefulMinutesBefore: number;
+  readonly lastResponsibleMinutesBefore: number;
+}
+
+function editableWeeklyRoutineShape(
+  recurrenceCandidate: unknown,
+  timePlanCandidate: unknown,
+): EditableWeeklyRoutineShape | null {
+  if (!isRecord(recurrenceCandidate) || recurrenceCandidate.kind !== "weekly") return null;
+  if (!Array.isArray(recurrenceCandidate.weekdays)) return null;
+  const weekdays = recurrenceCandidate.weekdays.filter(
+    (weekday): weekday is number => Number.isInteger(weekday) && Number(weekday) >= 1 && Number(weekday) <= 7,
+  );
+  if (weekdays.length !== recurrenceCandidate.weekdays.length || weekdays.length === 0) return null;
+  if (
+    typeof recurrenceCandidate.startsOn !== "string" ||
+    (recurrenceCandidate.endsOn !== null && typeof recurrenceCandidate.endsOn !== "string") ||
+    !isRecord(timePlanCandidate) ||
+    typeof timePlanCandidate.timeZone !== "string" ||
+    !isRecord(timePlanCandidate.event) ||
+    timePlanCandidate.event.kind !== "local_clock" ||
+    timePlanCandidate.event.dayOffset !== 0 ||
+    typeof timePlanCandidate.event.time !== "string" ||
+    !isRecord(timePlanCandidate.earliestUseful) ||
+    timePlanCandidate.earliestUseful.kind !== "relative" ||
+    timePlanCandidate.earliestUseful.anchor !== "event" ||
+    typeof timePlanCandidate.earliestUseful.offsetMinutes !== "number" ||
+    timePlanCandidate.earliestUseful.offsetMinutes > 0 ||
+    !isRecord(timePlanCandidate.lastResponsible) ||
+    timePlanCandidate.lastResponsible.kind !== "relative" ||
+    timePlanCandidate.lastResponsible.anchor !== "event" ||
+    typeof timePlanCandidate.lastResponsible.offsetMinutes !== "number" ||
+    timePlanCandidate.lastResponsible.offsetMinutes > 0
+  ) {
+    return null;
+  }
+  return {
+    weekdays,
+    startsOn: recurrenceCandidate.startsOn,
+    endsOn: recurrenceCandidate.endsOn,
+    timeZone: timePlanCandidate.timeZone,
+    localEventTime: timePlanCandidate.event.time,
+    earliestUsefulMinutesBefore: -timePlanCandidate.earliestUseful.offsetMinutes,
+    lastResponsibleMinutesBefore: -timePlanCandidate.lastResponsible.offsetMinutes,
+  };
+}
+
+function routineStatus(value: string): RoutineView["routines"][number]["status"] {
+  return value === "paused" || value === "retired" ? value : "active";
+}
+
+function notificationMode(value: string): RoutineView["routines"][number]["notificationMode"] {
+  return value === "always" || value === "silent" ? value : "exceptions_only";
+}
+
+function cadenceLabel(weekdays: readonly number[]): string {
+  const labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+  return `Every ${weekdays
+    .map((weekday) => labels[weekday - 1])
+    .filter(Boolean)
+    .join(", ")}`;
+}
+
+function friendlyLocalTime(value: string): string {
+  const [hourCandidate, minute = "00"] = value.split(":");
+  const hour = Number(hourCandidate);
+  if (!Number.isInteger(hour) || hour < 0 || hour > 23) return value;
+  const suffix = hour >= 12 ? "PM" : "AM";
+  const displayHour = hour % 12 || 12;
+  return `${displayHour}:${minute} ${suffix}`;
+}
+
+interface CalendarCatalogEntry {
+  readonly id: string;
+  readonly summary: string;
+  readonly primary: boolean;
+  readonly timezone: string | null;
+  readonly deleted: boolean;
+}
+
+function parseCalendarCatalog(candidate: unknown): readonly CalendarCatalogEntry[] {
+  if (!Array.isArray(candidate)) return [];
+  return candidate.flatMap((entry) => {
+    if (!isRecord(entry) || typeof entry.id !== "string" || typeof entry.summary !== "string") return [];
+    return [
+      {
+        id: entry.id,
+        summary: entry.summary,
+        primary: entry.primary === true,
+        timezone: typeof entry.timezone === "string" ? entry.timezone : null,
+        deleted: entry.deleted === true,
+      },
+    ];
+  });
+}
+
+function integrationStatusLabel(status: string): string {
+  switch (status) {
+    case "active":
+      return "Connected privately";
+    case "paused":
+      return "Paused";
+    case "reauth_required":
+      return "Reconnect needed";
+    case "error":
+      return "Needs attention";
+    default:
+      return "Unavailable";
+  }
+}
+
+function calendarMode(value: string): "full_private" | "availability_only" | "off" {
+  return value === "full_private" || value === "availability_only" ? value : "off";
+}
+
+function candidateTitle(kind: string): string {
+  switch (kind) {
+    case "coverage_proposal":
+      return "Possible family plan";
+    case "coverage_needs_household":
+      return "A family setup is needed";
+    case "family_message_review":
+      return "A message worth reviewing";
+    default:
+      return "Something worth a look";
+  }
+}
+
+function optionalString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function stringValues(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.flatMap((entry) => (typeof entry === "string" && entry.trim().length > 0 ? [entry.trim()] : []))
+    : [];
+}
+
+function sourceLabel(provider: string, objectKind: string): string {
+  if (provider === "gmail" || objectKind === "mail_message") return "Gmail";
+  if (provider === "google.calendar" || objectKind === "calendar_event") return "Google Calendar";
+  if (objectKind === "conversation_message") return "Private Florence chat";
+  return "Private source";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function sha256Hex(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}

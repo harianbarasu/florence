@@ -1,379 +1,365 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { z } from "zod";
-import { LINQ_WEBHOOK_VERSION, type LinqConfig } from "./config.js";
-import { linqMessageBusinessDedupeKey } from "./conversation.js";
+import type { LinqChannelRef, LinqMessagePart, LinqParticipant, LinqWebhookEnvelope } from "./contracts.js";
+import { LINQ_WEBHOOK_VERSION } from "./contracts.js";
+import { LinqWebhookError } from "./errors.js";
 import {
-  type LinqAttachment,
-  type LinqConsentCommand,
-  type LinqInboundEvent,
-  type LinqWebhookEvent,
-  linqInboundEventSchema,
+  providerLinkPartSchema,
+  providerMediaPartSchema,
+  providerMessageEditedSchema,
+  providerMessageFailedSchema,
+  providerMessageReceivedSchema,
+  providerMessageSentSchema,
+  providerParticipantChangedSchema,
+  providerReactionSchema,
+  providerTextPartSchema,
+  providerWebhookBaseSchema,
 } from "./schemas.js";
 
-export type LinqWebhookHeaders = Readonly<Record<string, string | readonly string[] | undefined>>;
+export type LinqWebhookHeaders = Headers | Readonly<Record<string, string | readonly string[] | undefined>>;
 
-export class LinqWebhookVerificationError extends Error {
-  override readonly name = "LinqWebhookVerificationError";
-}
-
-export class LinqWebhookPayloadError extends Error {
-  override readonly name = "LinqWebhookPayloadError";
-}
-
-const linqEnvelopeSchema = z
-  .object({
-    api_version: z.literal("v3"),
-    webhook_version: z.literal(LINQ_WEBHOOK_VERSION),
-    event_type: z.string().min(1),
-    event_id: z.string().min(1),
-    created_at: z.string().min(1),
-    trace_id: z.string().optional(),
-    partner_id: z.string().min(1),
-    data: z.record(z.string(), z.unknown()),
-  })
-  .passthrough();
-
-export interface VerifiedLinqWebhook {
-  webhookId: string;
-  timestamp: Date;
-}
-
-export interface ParseLinqWebhookInput {
-  rawBody: Uint8Array | string;
+export interface UnwrapLinqWebhookInput {
+  rawBody: string | Uint8Array;
   headers: LinqWebhookHeaders;
-  config: Pick<LinqConfig, "webhookSecret" | "webhookToleranceMs" | "webhookVersion"> & {
-    fromPhone: string;
-  };
-  now?: Date;
+  webhookSecret: string;
+  receivedAt?: Date;
+  toleranceSeconds?: number;
+  maxBodyBytes?: number;
 }
 
-export function verifyLinqWebhookSignature(input: ParseLinqWebhookInput): VerifiedLinqWebhook {
-  const webhookId = requiredHeader(input.headers, "webhook-id");
-  const timestampValue = requiredHeader(input.headers, "webhook-timestamp");
-  const signatureValue = requiredHeader(input.headers, "webhook-signature");
-  const timestampSeconds = Number(timestampValue);
-
-  if (!Number.isSafeInteger(timestampSeconds) || timestampSeconds < 0) {
-    throw new LinqWebhookVerificationError("invalid webhook timestamp");
-  }
-
-  const timestamp = new Date(timestampSeconds * 1_000);
-  const now = input.now ?? new Date();
-  if (
-    !Number.isFinite(timestamp.getTime()) ||
-    Math.abs(now.getTime() - timestamp.getTime()) > input.config.webhookToleranceMs
-  ) {
-    throw new LinqWebhookVerificationError("webhook timestamp is outside the replay window");
-  }
-
-  const secret = decodeSigningSecret(input.config.webhookSecret);
-  const body = toBuffer(input.rawBody);
-  const signedContent = Buffer.concat([Buffer.from(`${webhookId}.${timestampValue}.`, "utf8"), body]);
-  const expected = createHmac("sha256", secret).update(signedContent).digest();
-  const valid = signatureValue.split(/\s+/).some((candidate) => {
-    if (!candidate.startsWith("v1,")) {
-      return false;
-    }
-    const supplied = decodeBase64(candidate.slice(3));
-    return supplied !== null && supplied.length === expected.length && timingSafeEqual(supplied, expected);
-  });
-
-  if (!valid) {
-    throw new LinqWebhookVerificationError("invalid webhook signature");
-  }
-
-  return { webhookId, timestamp };
+interface VerifiedWebhook {
+  eventId: string;
+  body: Uint8Array;
 }
 
-export function parseVerifiedLinqWebhook(input: ParseLinqWebhookInput): LinqWebhookEvent | null {
-  const verified = verifyLinqWebhookSignature(input);
-  let rawPayload: unknown;
-  try {
-    rawPayload = JSON.parse(toBuffer(input.rawBody).toString("utf8"));
-  } catch {
-    throw new LinqWebhookPayloadError("webhook body is not valid JSON");
+function getHeader(headers: LinqWebhookHeaders, name: string): string | undefined {
+  if ("get" in headers && typeof headers.get === "function") {
+    return headers.get(name) ?? undefined;
   }
 
-  const parsed = linqEnvelopeSchema.safeParse(rawPayload);
-  if (!parsed.success) {
-    throw new LinqWebhookPayloadError("webhook body does not match the pinned Linq v3 schema");
-  }
-  const envelope = parsed.data;
-  if (envelope.webhook_version !== input.config.webhookVersion) {
-    throw new LinqWebhookPayloadError("unexpected Linq webhook version");
-  }
-  if (verified.webhookId !== envelope.event_id) {
-    throw new LinqWebhookVerificationError("webhook header and payload event IDs differ");
-  }
-
-  let event: LinqInboundEvent | null;
-  switch (envelope.event_type) {
-    case "message.received":
-      event = parseMessageReceived(envelope, input.config.fromPhone);
-      break;
-    case "reaction.added":
-    case "reaction.removed":
-      event = parseReaction(envelope);
-      break;
-    default:
-      return null;
-  }
-
-  const normalized = linqInboundEventSchema.safeParse(event);
-  if (!normalized.success) {
-    throw new LinqWebhookPayloadError("could not normalize Linq webhook payload");
-  }
-  return normalized.data as LinqWebhookEvent;
+  const found = Object.entries(headers).find(([key]) => key.toLowerCase() === name.toLowerCase());
+  const value = found?.[1];
+  return Array.isArray(value) ? value.join(" ") : value;
 }
 
-export function normalizeLinqConsentCommand(text: string): LinqConsentCommand {
-  const normalized = text.normalize("NFKC").trim().toLowerCase();
-  if (["stop", "stopall", "unsubscribe", "cancel", "end", "quit"].includes(normalized)) {
-    return "stop";
-  }
-  if (["start", "resume", "unstop"].includes(normalized)) {
-    return "start";
-  }
-  return null;
-}
-
-function parseMessageReceived(
-  envelope: z.infer<typeof linqEnvelopeSchema>,
-  configuredFromPhone: string,
-): LinqInboundEvent {
-  const data = envelope.data;
-  const chat = asRecord(data.chat);
-  const owner = asRecord(chat.owner_handle);
-  const sender = asRecord(data.sender_handle);
-  const chatId = requiredString(chat.id, "data.chat.id");
-  const isGroup = requiredBoolean(chat.is_group, "data.chat.is_group");
-  const messageId = requiredString(data.id, "data.id");
-  const senderHandle = requiredString(sender.handle, "data.sender_handle.handle");
-  const ownerHandle = requiredString(owner.handle, "data.chat.owner_handle.handle");
-  if (
-    ownerHandle !== configuredFromPhone ||
-    owner.is_me !== true ||
-    senderHandle === configuredFromPhone ||
-    sender.is_me !== false
-  ) {
-    throw new LinqWebhookPayloadError("message.received payload is not owned by the configured line");
-  }
-  const direction = optionalString(data.direction);
-  if (direction !== null && direction !== "inbound") {
-    throw new LinqWebhookPayloadError("message.received payload is not inbound");
-  }
-
-  const parts = Array.isArray(data.parts) ? data.parts : [];
-  const textParts: string[] = [];
-  const attachments: LinqAttachment[] = [];
-  for (const [partIndex, rawPart] of parts.entries()) {
-    const part = asRecord(rawPart);
-    const type = optionalString(part.type)?.toLowerCase() ?? "unknown";
-    if (type === "text") {
-      const value = optionalString(part.value);
-      if (value !== null) {
-        textParts.push(value);
-      }
-      continue;
-    }
-    attachments.push(normalizeAttachment(part, partIndex, type));
-  }
-
-  const text = textParts.join("\n");
-  if (!text && attachments.length === 0) {
-    throw new LinqWebhookPayloadError("message.received payload has no supported content");
-  }
-  const knownParticipantHandles = uniqueStrings([ownerHandle, senderHandle]);
-  const scope = isGroup ? "group" : "direct";
-  const reply = asRecord(data.reply_to);
-  const replyMessageId = optionalString(reply.message_id);
-  const occurredAt = normalizeTimestamp(data.sent_at ?? envelope.created_at);
-
-  return linqInboundEventSchema.parse({
-    schemaVersion: 1,
-    source: "linq",
-    transport: "webhook",
-    providerEventId: envelope.event_id,
-    dedupeKey: `linq:${envelope.partner_id}:${envelope.event_id}`,
-    businessDedupeKey: linqMessageBusinessDedupeKey(messageId),
-    occurredAt,
-    webhookVersion: LINQ_WEBHOOK_VERSION,
-    partnerId: envelope.partner_id,
-    eventType: "message.received",
-    scope,
-    conversation: {
-      id: chatId,
-      kind: scope,
-      ownerHandle,
-      knownParticipantHandles,
-    },
-    sender: {
-      id: optionalString(sender.id),
-      handle: senderHandle,
-      service: optionalString(sender.service) ?? optionalString(data.service),
-    },
-    message: {
-      id: messageId,
-      text,
-      attachments,
-      replyTo:
-        replyMessageId === null
-          ? null
-          : {
-              messageId: replyMessageId,
-              partIndex: optionalNonnegativeInteger(reply.part_index),
-            },
-      consentCommand: normalizeLinqConsentCommand(text),
-    },
-  });
-}
-
-function parseReaction(envelope: z.infer<typeof linqEnvelopeSchema>): LinqInboundEvent {
-  const data = envelope.data;
-  const sender = asRecord(data.from_handle);
-  const sticker = asRecord(data.sticker);
-  const isGroup = typeof data.is_group === "boolean" ? data.is_group : null;
-  const scope = isGroup === null ? "unknown" : isGroup ? "group" : "direct";
-  const senderHandle = optionalString(sender.handle) ?? requiredString(data.from, "data.from");
-
-  return {
-    schemaVersion: 1,
-    source: "linq",
-    transport: "webhook",
-    providerEventId: envelope.event_id,
-    dedupeKey: `linq:${envelope.partner_id}:${envelope.event_id}`,
-    occurredAt: normalizeTimestamp(data.reacted_at ?? envelope.created_at),
-    webhookVersion: LINQ_WEBHOOK_VERSION,
-    partnerId: envelope.partner_id,
-    eventType: envelope.event_type as "reaction.added" | "reaction.removed",
-    scope,
-    conversation: {
-      id: requiredString(data.chat_id, "data.chat_id"),
-      kind: scope,
-    },
-    sender: {
-      id: optionalString(sender.id),
-      handle: senderHandle,
-      service: optionalString(sender.service) ?? optionalString(data.service),
-    },
-    reaction: {
-      operation: envelope.event_type === "reaction.added" ? "add" : "remove",
-      targetMessageId: requiredString(data.message_id, "data.message_id"),
-      targetPartIndex: optionalNonnegativeInteger(data.part_index),
-      type: requiredString(data.reaction_type, "data.reaction_type"),
-      customEmoji: optionalString(data.custom_emoji),
-      stickerAttachmentId: optionalString(sticker.attachment_id) ?? optionalString(sticker.id),
-    },
-  };
-}
-
-function normalizeAttachment(
-  part: Record<string, unknown>,
-  partIndex: number,
-  rawType: string,
-): LinqAttachment {
-  const kind = rawType === "media" || rawType === "link" || rawType === "sticker" ? rawType : "unknown";
-  const rawUrl = optionalString(part.url) ?? (kind === "link" ? optionalString(part.value) : null);
-  return {
-    kind,
-    partIndex,
-    providerAttachmentId: optionalString(part.id) ?? optionalString(part.attachment_id),
-    url: rawUrl,
-    mimeType: optionalString(part.mime_type),
-    filename: optionalString(part.filename),
-    sizeBytes: optionalNonnegativeInteger(part.size_bytes),
-  };
-}
-
-function requiredHeader(headers: LinqWebhookHeaders, name: string): string {
-  const value = headerValue(headers, name);
-  if (value === null) {
-    throw new LinqWebhookVerificationError(`missing ${name} header`);
+function requireHeader(headers: LinqWebhookHeaders, name: string): string {
+  const value = getHeader(headers, name)?.trim();
+  if (!value) {
+    throw new LinqWebhookError("missing_header", `Missing ${name} webhook header`);
   }
   return value;
 }
 
-function headerValue(headers: LinqWebhookHeaders, name: string): string | null {
-  const target = name.toLowerCase();
-  for (const [key, rawValue] of Object.entries(headers)) {
-    if (key.toLowerCase() !== target || rawValue === undefined) {
-      continue;
-    }
-    const value = Array.isArray(rawValue) ? rawValue[0] : rawValue;
-    return value?.trim() || null;
-  }
-  return null;
-}
-
-function decodeSigningSecret(secret: string): Buffer {
+function decodeSigningSecret(secret: string): Uint8Array {
   if (!secret.startsWith("whsec_")) {
-    throw new LinqWebhookVerificationError("invalid webhook signing secret format");
+    throw new LinqWebhookError("invalid_secret", "The Linq webhook secret has an invalid format");
   }
-  const decoded = decodeBase64(secret.slice("whsec_".length));
-  if (decoded === null || decoded.length < 16) {
-    throw new LinqWebhookVerificationError("invalid webhook signing secret format");
+
+  const encoded = secret.slice("whsec_".length);
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) {
+    throw new LinqWebhookError("invalid_secret", "The Linq webhook secret has an invalid format");
+  }
+
+  const decoded = Buffer.from(encoded, "base64");
+  if (decoded.byteLength < 16) {
+    throw new LinqWebhookError("invalid_secret", "The Linq webhook secret is too short");
   }
   return decoded;
 }
 
-function decodeBase64(value: string): Buffer | null {
-  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(value)) {
-    return null;
+function verifyWebhook(input: UnwrapLinqWebhookInput): VerifiedWebhook {
+  const rawBody = typeof input.rawBody === "string" ? Buffer.from(input.rawBody, "utf8") : input.rawBody;
+  const maxBodyBytes = input.maxBodyBytes ?? 1024 * 1024;
+  if (rawBody.byteLength > maxBodyBytes) {
+    throw new LinqWebhookError("body_too_large", "The Linq webhook body exceeds the configured limit");
   }
+
+  const eventId = requireHeader(input.headers, "webhook-id");
+  const timestamp = requireHeader(input.headers, "webhook-timestamp");
+  const signatures = requireHeader(input.headers, "webhook-signature");
+  if (!/^\d+$/.test(timestamp)) {
+    throw new LinqWebhookError("invalid_timestamp", "The Linq webhook timestamp is invalid");
+  }
+
+  const timestampSeconds = Number(timestamp);
+  const receivedAt = input.receivedAt ?? new Date();
+  const toleranceSeconds = input.toleranceSeconds ?? 300;
+  if (
+    !Number.isSafeInteger(timestampSeconds) ||
+    Math.abs(receivedAt.getTime() / 1000 - timestampSeconds) > toleranceSeconds
+  ) {
+    throw new LinqWebhookError("stale_timestamp", "The Linq webhook timestamp is outside the replay window");
+  }
+
+  const prefix = Buffer.from(`${eventId}.${timestamp}.`, "utf8");
+  const expected = createHmac("sha256", decodeSigningSecret(input.webhookSecret))
+    .update(prefix)
+    .update(rawBody)
+    .digest();
+
+  const valid = signatures.split(/\s+/).some((candidate) => {
+    if (!candidate.startsWith("v1,")) {
+      return false;
+    }
+    try {
+      const actual = Buffer.from(candidate.slice(3), "base64");
+      return actual.byteLength === expected.byteLength && timingSafeEqual(actual, expected);
+    } catch {
+      return false;
+    }
+  });
+
+  if (!valid) {
+    throw new LinqWebhookError("invalid_signature", "The Linq webhook signature is invalid");
+  }
+
+  return { eventId, body: rawBody };
+}
+
+function toIsoTimestamp(value: string, field: string): string {
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) {
+    throw new LinqWebhookError("invalid_payload", `The Linq ${field} timestamp is invalid`);
+  }
+  return new Date(parsed).toISOString();
+}
+
+function normalizeService(service: "iMessage" | "SMS" | "RCS") {
+  if (service === "iMessage") {
+    return "imessage" as const;
+  }
+  return service.toLowerCase() as "sms" | "rcs";
+}
+
+function normalizeParticipant(input: {
+  id: string;
+  handle: string;
+  service: "iMessage" | "SMS" | "RCS";
+  is_me?: boolean | null | undefined;
+  status?: "active" | "left" | "removed" | null | undefined;
+  joined_at: string;
+  left_at?: string | null | undefined;
+}): LinqParticipant {
+  const leftAt = input.left_at ? toIsoTimestamp(input.left_at, "participant left_at") : undefined;
+  return {
+    providerParticipantId: input.id,
+    address: input.handle,
+    service: normalizeService(input.service),
+    isSelf: input.is_me ?? false,
+    status: input.status ?? (leftAt ? "left" : "active"),
+    joinedAt: toIsoTimestamp(input.joined_at, "participant joined_at"),
+    ...(leftAt ? { leftAt } : {}),
+  };
+}
+
+function normalizeChannel(chatId: string, kind: LinqChannelRef["kind"]): LinqChannelRef {
+  return { providerChatId: chatId, kind };
+}
+
+function normalizePart(input: unknown): LinqMessagePart {
+  const text = providerTextPartSchema.safeParse(input);
+  if (text.success) {
+    return { kind: "text", text: text.data.value };
+  }
+
+  const media = providerMediaPartSchema.safeParse(input);
+  if (media.success) {
+    return {
+      kind: "attachment",
+      providerAttachmentId: media.data.id,
+      ...(media.data.filename ? { filename: media.data.filename } : {}),
+      ...(media.data.mime_type ? { mediaType: media.data.mime_type } : {}),
+      ...(media.data.size_bytes !== null && media.data.size_bytes !== undefined
+        ? { sizeBytes: media.data.size_bytes }
+        : {}),
+    };
+  }
+
+  const link = providerLinkPartSchema.safeParse(input);
+  if (link.success) {
+    return { kind: "link", url: link.data.value };
+  }
+
+  const providerPartType =
+    typeof input === "object" && input !== null && "type" in input && typeof input.type === "string"
+      ? input.type
+      : "unknown";
+  return { kind: "unsupported", providerPartType };
+}
+
+function parseData<T>(
+  schema: { safeParse(input: unknown): { success: true; data: T } | { success: false; error: Error } },
+  input: unknown,
+): T {
+  const result = schema.safeParse(input);
+  if (!result.success) {
+    throw new LinqWebhookError("invalid_payload", "The Linq webhook payload is invalid", {
+      cause: result.error,
+    });
+  }
+  return result.data;
+}
+
+export function unwrapLinqWebhook(input: UnwrapLinqWebhookInput): LinqWebhookEnvelope {
+  const verified = verifyWebhook(input);
+  let decoded: unknown;
   try {
-    const decoded = Buffer.from(value, "base64");
-    return decoded.length > 0 ? decoded : null;
-  } catch {
-    return null;
+    decoded = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(verified.body));
+  } catch (cause) {
+    throw new LinqWebhookError("invalid_json", "The verified Linq webhook is not valid JSON", { cause });
   }
-}
 
-function toBuffer(value: Uint8Array | string): Buffer {
-  return typeof value === "string" ? Buffer.from(value, "utf8") : Buffer.from(value);
-}
-
-function asRecord(value: unknown): Record<string, unknown> {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    return {};
+  const parsedBase = providerWebhookBaseSchema.safeParse(decoded);
+  if (!parsedBase.success) {
+    throw new LinqWebhookError("invalid_payload", "The Linq webhook envelope is invalid", {
+      cause: parsedBase.error,
+    });
   }
-  return value as Record<string, unknown>;
-}
-
-function requiredString(value: unknown, field: string): string {
-  const normalized = optionalString(value);
-  if (normalized === null) {
-    throw new LinqWebhookPayloadError(`missing ${field}`);
+  const base = parsedBase.data;
+  if (base.event_id !== verified.eventId) {
+    throw new LinqWebhookError("event_id_mismatch", "The Linq webhook header and body event IDs differ");
   }
-  return normalized;
-}
-
-function optionalString(value: unknown): string | null {
-  return typeof value === "string" && value.trim() ? value.trim() : null;
-}
-
-function requiredBoolean(value: unknown, field: string): boolean {
-  if (typeof value !== "boolean") {
-    throw new LinqWebhookPayloadError(`missing ${field}`);
+  if (base.webhook_version !== LINQ_WEBHOOK_VERSION) {
+    throw new LinqWebhookError(
+      "unsupported_version",
+      `Unsupported Linq webhook version: ${base.webhook_version}`,
+    );
   }
-  return value;
-}
 
-function optionalNonnegativeInteger(value: unknown): number | null {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
-}
+  const receivedAt = (input.receivedAt ?? new Date()).toISOString();
+  const providerCreatedAt = toIsoTimestamp(base.created_at, "created_at");
+  const common = {
+    provider: "linq" as const,
+    providerEventId: base.event_id,
+    providerTraceId: base.trace_id,
+    providerCreatedAt,
+    receivedAt,
+  };
 
-function uniqueStrings(values: readonly (string | null)[]): string[] {
-  return [...new Set(values.filter((value): value is string => value !== null))];
-}
-
-function normalizeTimestamp(value: unknown): string {
-  if (typeof value !== "string") {
-    throw new LinqWebhookPayloadError("missing event timestamp");
+  switch (base.event_type) {
+    case "message.received": {
+      const data = parseData(providerMessageReceivedSchema, base.data);
+      const sentAt = toIsoTimestamp(data.sent_at, "message sent_at");
+      const replyTo = data.reply_to
+        ? {
+            providerMessageId: data.reply_to.message_id,
+            partIndex: data.reply_to.part_index ?? 0,
+          }
+        : undefined;
+      return {
+        ...common,
+        eventType: "linq.message.received",
+        occurredAt: sentAt,
+        channel: normalizeChannel(data.chat.id, data.chat.is_group ? "group" : "direct"),
+        message: {
+          providerMessageId: data.id,
+          sender: normalizeParticipant(data.sender_handle),
+          service: normalizeService(data.service),
+          parts: data.parts.map(normalizePart),
+          sentAt,
+          ...(replyTo ? { replyTo } : {}),
+        },
+      };
+    }
+    case "message.edited": {
+      const data = parseData(providerMessageEditedSchema, base.data);
+      const editedAt = toIsoTimestamp(data.edited_at, "message edited_at");
+      return {
+        ...common,
+        eventType: "linq.message.edited",
+        occurredAt: editedAt,
+        channel: normalizeChannel(data.chat.id, data.chat.is_group ? "group" : "direct"),
+        edit: {
+          providerMessageId: data.id,
+          editor: normalizeParticipant(data.sender_handle),
+          direction: data.direction,
+          partIndex: data.part.index,
+          text: data.part.text,
+          editedAt,
+        },
+      };
+    }
+    case "reaction.added":
+    case "reaction.removed": {
+      const data = parseData(providerReactionSchema, base.data);
+      const changedAt = toIsoTimestamp(data.reacted_at, "reaction reacted_at");
+      const kind =
+        data.reaction_type === "custom"
+          ? ("emoji" as const)
+          : data.reaction_type === "sticker"
+            ? ("sticker" as const)
+            : ("tapback" as const);
+      return {
+        ...common,
+        eventType: base.event_type === "reaction.added" ? "linq.reaction.added" : "linq.reaction.removed",
+        occurredAt: changedAt,
+        channel: normalizeChannel(data.chat_id, "unknown"),
+        reaction: {
+          providerMessageId: data.message_id,
+          partIndex: data.part_index,
+          reactor: normalizeParticipant(data.from_handle),
+          kind,
+          value: data.reaction_type === "custom" ? (data.custom_emoji ?? "custom") : data.reaction_type,
+          changedAt,
+        },
+      };
+    }
+    case "participant.added":
+    case "participant.removed": {
+      const data = parseData(providerParticipantChangedSchema, base.data);
+      const timestamp = base.event_type === "participant.added" ? data.added_at : data.removed_at;
+      if (!timestamp) {
+        throw new LinqWebhookError("invalid_payload", "The Linq participant event has no change time");
+      }
+      const changedAt = toIsoTimestamp(timestamp, "participant changed_at");
+      return {
+        ...common,
+        eventType:
+          base.event_type === "participant.added" ? "linq.participant.added" : "linq.participant.removed",
+        occurredAt: changedAt,
+        channel: normalizeChannel(data.chat_id, "group"),
+        participant: normalizeParticipant(data.participant),
+        changedAt,
+      };
+    }
+    case "message.sent": {
+      const data = parseData(providerMessageSentSchema, base.data);
+      const sentAt = toIsoTimestamp(data.sent_at, "message sent_at");
+      return {
+        ...common,
+        eventType: "linq.outbound.sent",
+        occurredAt: sentAt,
+        channel: normalizeChannel(data.chat.id, data.chat.is_group ? "group" : "direct"),
+        receipt: {
+          providerMessageId: data.id,
+          sender: normalizeParticipant(data.sender_handle),
+          sentAt,
+          ...(data.idempotency_key ? { idempotencyKey: data.idempotency_key } : {}),
+        },
+      };
+    }
+    case "message.failed": {
+      const data = parseData(providerMessageFailedSchema, base.data);
+      const failedAt = toIsoTimestamp(data.failed_at, "message failed_at");
+      return {
+        ...common,
+        eventType: "linq.outbound.failed",
+        occurredAt: failedAt,
+        channel: normalizeChannel(data.chat_id, "unknown"),
+        receipt: {
+          providerMessageId: data.message_id,
+          failedAt,
+          errorCode: String(data.code),
+          reason: data.reason,
+        },
+      };
+    }
+    default:
+      return {
+        ...common,
+        eventType: "linq.ignored",
+        providerEventType: base.event_type,
+        reason: "unsupported_event",
+        occurredAt: providerCreatedAt,
+      };
   }
-  const millisecondPrecision = value.replace(/(\.\d{3})\d+(?=Z$)/, "$1");
-  const timestamp = new Date(millisecondPrecision);
-  if (!Number.isFinite(timestamp.getTime())) {
-    throw new LinqWebhookPayloadError("invalid event timestamp");
-  }
-  return timestamp.toISOString();
 }

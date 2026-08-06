@@ -1,0 +1,1958 @@
+import { createHash, randomUUID } from "node:crypto";
+import type { TransactionSql } from "postgres";
+import type { Database } from "../../db/client.js";
+import { canonicalDigest, canonicalJson } from "../../shared/canonical-json.js";
+import type { EncryptedValue, SecretBox } from "../../shared/crypto.js";
+import { ConflictError, NotFoundError, StaleAuthorityError, UnauthorizedError } from "../../shared/errors.js";
+import {
+  type CalendarPrivacyMode,
+  type IntegrationStatus,
+  type IntegrationView,
+  JsonObjectSchema,
+  JsonValueSchema,
+  type SourceCommand,
+  SourceCommandSchema,
+  type SourceIntelligence,
+  type SourceMutationResult,
+  type SourceQuery,
+  SourceQuerySchema,
+  type SourceReadResult,
+  type SourceScope,
+  type SyncCursorState,
+} from "./contracts.js";
+
+type Transaction = TransactionSql<Record<string, never>>;
+type Executor = Database | Transaction;
+
+export interface SourceIntelligenceOptions {
+  readonly rawRetentionDays: number;
+  readonly maxSourceContentBytes?: number;
+  readonly maxBlobBytes?: number;
+  readonly maxDerivativeBytes?: number;
+  readonly privateCandidateRetentionDays?: number;
+}
+
+interface IntegrationRow {
+  readonly id: string;
+  readonly person_id: string;
+  readonly provider: string;
+  readonly status: string;
+  readonly credential_ciphertext: Buffer | null;
+  readonly credential_key_version: string | null;
+  readonly control_epoch: number | string;
+  readonly connected_at: Date;
+  readonly updated_at: Date;
+}
+
+interface SourceRevisionRow {
+  readonly id: string;
+  readonly source_object_id: string;
+  readonly revision_number: number | string;
+  readonly owner_person_id: string | null;
+  readonly participant_epoch_id: string | null;
+  readonly scope_digest: string;
+  readonly content_digest: string;
+  readonly content_ciphertext: Buffer | null;
+  readonly content_key_version: string | null;
+  readonly occurred_at: Date;
+  readonly captured_at: Date;
+  readonly retention_until: Date;
+  readonly revoked_at: Date | null;
+}
+
+interface ScopeResolution {
+  readonly ownerPersonId: string | null;
+  readonly participantEpochId: string | null;
+  readonly scopeDigest: string;
+  readonly retentionSeconds: number;
+}
+
+interface EncryptedColumn {
+  readonly ciphertext: Buffer;
+  readonly keyVersion: string;
+}
+
+const DAY_MS = 24 * 60 * 60 * 1_000;
+
+/**
+ * PostgreSQL adapter for Florence's source-intelligence module. This is the
+ * only place provider-normalized source data becomes durable plaintext-free
+ * evidence. All mutations own a transaction and all reads re-check scope.
+ */
+export class PostgresSourceIntelligence implements SourceIntelligence {
+  readonly #rawRetentionMs: number;
+  readonly #maxSourceContentBytes: number;
+  readonly #maxBlobBytes: number;
+  readonly #maxDerivativeBytes: number;
+  readonly #privateCandidateRetentionMs: number;
+
+  public constructor(
+    private readonly database: Executor,
+    private readonly secretBox: SecretBox,
+    options: SourceIntelligenceOptions,
+  ) {
+    this.#rawRetentionMs = requirePositiveInteger(options.rawRetentionDays, "rawRetentionDays") * DAY_MS;
+    this.#maxSourceContentBytes = options.maxSourceContentBytes ?? 2 * 1024 * 1024;
+    this.#maxBlobBytes = options.maxBlobBytes ?? 15 * 1024 * 1024;
+    this.#maxDerivativeBytes = options.maxDerivativeBytes ?? 2 * 1024 * 1024;
+    this.#privateCandidateRetentionMs = (options.privateCandidateRetentionDays ?? 7) * DAY_MS;
+    requirePositiveInteger(this.#maxSourceContentBytes, "maxSourceContentBytes");
+    requirePositiveInteger(this.#maxBlobBytes, "maxBlobBytes");
+    requirePositiveInteger(this.#maxDerivativeBytes, "maxDerivativeBytes");
+    requirePositiveInteger(this.#privateCandidateRetentionMs, "privateCandidateRetentionMs");
+  }
+
+  public async apply(commandCandidate: SourceCommand): Promise<SourceMutationResult> {
+    const command = SourceCommandSchema.parse(commandCandidate);
+    switch (command.kind) {
+      case "connect_integration":
+        return this.connectIntegration(command);
+      case "set_integration_status":
+        return this.setIntegrationStatus(command);
+      case "revoke_integration":
+        return this.revokeIntegration(command);
+      case "begin_oauth_attempt":
+        return this.beginOAuthAttempt(command);
+      case "consume_oauth_attempt":
+        return this.consumeOAuthAttempt(command);
+      case "checkpoint_cursor":
+        return this.checkpointCursor(command);
+      case "configure_calendar_privacy":
+        return this.configureCalendarPrivacy(command);
+      case "ingest_source":
+        return this.ingestSource(command);
+      case "store_blob":
+        return this.storeBlob(command);
+      case "store_derivative":
+        return this.storeDerivative(command);
+      case "propose_private_candidate":
+        return this.proposePrivateCandidate(command);
+      case "review_private_candidate":
+        return this.reviewPrivateCandidate(command);
+      case "mark_source_deleted":
+        return this.markSourceDeleted(command);
+      case "invalidate_conversation_epoch":
+        return this.invalidateConversationEpoch(command);
+      case "sweep_retention":
+        return this.sweepRetention(command);
+    }
+  }
+
+  public async read(queryCandidate: SourceQuery): Promise<SourceReadResult> {
+    const query = SourceQuerySchema.parse(queryCandidate);
+    switch (query.kind) {
+      case "integration_access":
+        return this.readIntegrationAccess(query);
+      case "integration_profile":
+        return this.readIntegrationProfile(query);
+      case "sync_cursor":
+        return this.readCursor(query);
+      case "calendar_privacy":
+        return this.readCalendarPrivacy(query);
+      case "source_revision":
+        return this.readSourceRevision(query);
+      case "source_blob":
+        return this.readSourceBlob(query);
+      case "source_derivative":
+        return this.readSourceDerivative(query);
+      case "pending_private_candidates":
+        return this.readPendingPrivateCandidates(query);
+    }
+  }
+
+  private async connectIntegration(
+    command: Extract<SourceCommand, { kind: "connect_integration" }>,
+  ): Promise<SourceMutationResult> {
+    return inTransaction(this.database, async (transaction) => {
+      await requireRegisteredPerson(transaction, command.personId, true);
+      const lockKey = `integration:${command.provider}:${command.personId}:${command.externalSubjectDigest}`;
+      await transaction`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`;
+
+      const existingRows = await transaction<IntegrationRow[]>`
+        select id, person_id, provider, status, credential_ciphertext, credential_key_version,
+          control_epoch, connected_at, updated_at
+        from integrations
+        where person_id = ${command.personId}
+          and provider = ${command.provider}
+          and external_subject_digest = ${command.externalSubjectDigest}
+          and status in ('active', 'paused', 'reauth_required', 'error')
+        order by connected_at desc
+        limit 1
+        for update
+      `;
+      const integrationId = existingRows[0]?.id ?? randomUUID();
+      const credentials = sealJson(
+        this.secretBox,
+        command.credentials,
+        integrationPurpose(integrationId),
+        this.#maxSourceContentBytes,
+      );
+      const connectedAt = new Date(command.connectedAt);
+
+      if (existingRows[0]) {
+        const rows = await transaction<IntegrationRow[]>`
+          update integrations
+          set status = 'active',
+              credential_ciphertext = ${credentials.ciphertext},
+              credential_key_version = ${credentials.keyVersion},
+              control_epoch = control_epoch + 1,
+              connected_at = ${connectedAt},
+              revoked_at = null,
+              updated_at = ${connectedAt}
+          where id = ${integrationId}
+          returning id, person_id, provider, status, credential_ciphertext, credential_key_version,
+            control_epoch, connected_at, updated_at
+        `;
+        return {
+          kind: "integration_connected",
+          ...integrationView(requireRow(rows[0], "Integration update failed")),
+        };
+      }
+
+      const rows = await transaction<IntegrationRow[]>`
+        insert into integrations (
+          id, person_id, provider, external_subject_digest, status,
+          credential_ciphertext, credential_key_version, control_epoch,
+          connected_at, updated_at
+        ) values (
+          ${integrationId}, ${command.personId}, ${command.provider},
+          ${command.externalSubjectDigest}, 'active', ${credentials.ciphertext},
+          ${credentials.keyVersion}, 1, ${connectedAt}, ${connectedAt}
+        )
+        returning id, person_id, provider, status, credential_ciphertext, credential_key_version,
+          control_epoch, connected_at, updated_at
+      `;
+      return {
+        kind: "integration_connected",
+        ...integrationView(requireRow(rows[0], "Integration insert failed")),
+      };
+    });
+  }
+
+  private async setIntegrationStatus(
+    command: Extract<SourceCommand, { kind: "set_integration_status" }>,
+  ): Promise<SourceMutationResult> {
+    return inTransaction(this.database, async (transaction) => {
+      const integration = await loadIntegrationForUpdate(
+        transaction,
+        command.integrationId,
+        command.personId,
+      );
+      assertControlEpoch(integration, command.expectedControlEpoch);
+      if (integration.status === "revoked")
+        throw new UnauthorizedError("A revoked integration cannot change status");
+      if (command.status === "active" && integration.credential_ciphertext === null) {
+        throw new ConflictError("An integration without credentials cannot become active");
+      }
+      const rows = await transaction<IntegrationRow[]>`
+        update integrations
+        set status = ${command.status}, control_epoch = control_epoch + 1,
+            updated_at = ${new Date(command.changedAt)}
+        where id = ${command.integrationId}
+        returning id, person_id, provider, status, credential_ciphertext, credential_key_version,
+          control_epoch, connected_at, updated_at
+      `;
+      return {
+        kind: "integration_status_changed",
+        ...integrationView(requireRow(rows[0], "Integration status update failed")),
+      };
+    });
+  }
+
+  private async revokeIntegration(
+    command: Extract<SourceCommand, { kind: "revoke_integration" }>,
+  ): Promise<SourceMutationResult> {
+    return inTransaction(this.database, async (transaction) => {
+      const integration = await loadIntegrationForUpdate(
+        transaction,
+        command.integrationId,
+        command.personId,
+      );
+      assertControlEpoch(integration, command.expectedControlEpoch);
+      if (integration.status === "revoked") {
+        return {
+          kind: "integration_revoked",
+          integrationId: integration.id,
+          controlEpoch: Number(integration.control_epoch),
+          invalidatedRevisionCount: 0,
+          revokedCandidateCount: 0,
+        };
+      }
+      const revokedAt = new Date(command.revokedAt);
+      const revisionRows = await transaction<{ readonly id: string }[]>`
+        select revision.id
+        from source_revisions revision
+        join source_objects object on object.id = revision.source_object_id
+        where object.integration_id = ${command.integrationId}
+          and revision.revoked_at is null
+        for update of revision
+      `;
+      const invalidation = await invalidateRevisions(
+        transaction,
+        revisionRows.map((row) => row.id),
+        revokedAt,
+      );
+      await transaction`
+        update source_objects set status = 'revoked', updated_at = ${revokedAt}
+        where integration_id = ${command.integrationId}
+      `;
+      await transaction`
+        update sync_cursors
+        set cursor_ciphertext = null, cursor_key_version = null, state = 'exhausted',
+            checkpoint_at = ${revokedAt}, updated_at = ${revokedAt}
+        where integration_id = ${command.integrationId}
+      `;
+      await transaction`
+        update integration_grants
+        set status = 'revoked', revoked_at = ${revokedAt}
+        where integration_id = ${command.integrationId} and status = 'active'
+      `;
+      const updated = await transaction<{ readonly control_epoch: number | string }[]>`
+        update integrations
+        set status = 'revoked', credential_ciphertext = null, credential_key_version = null,
+            control_epoch = control_epoch + 1, revoked_at = ${revokedAt}, updated_at = ${revokedAt}
+        where id = ${command.integrationId}
+        returning control_epoch
+      `;
+      return {
+        kind: "integration_revoked",
+        integrationId: command.integrationId,
+        controlEpoch: Number(requireRow(updated[0], "Integration revocation failed").control_epoch),
+        invalidatedRevisionCount: invalidation.invalidatedRevisionCount,
+        revokedCandidateCount: invalidation.revokedCandidateCount,
+      };
+    });
+  }
+
+  private async beginOAuthAttempt(
+    command: Extract<SourceCommand, { kind: "begin_oauth_attempt" }>,
+  ): Promise<SourceMutationResult> {
+    const createdAt = new Date(command.createdAt);
+    const expiresAt = new Date(command.expiresAt);
+    if (expiresAt <= createdAt) throw new ConflictError("OAuth attempt must expire after creation");
+    return inTransaction(this.database, async (transaction) => {
+      const person = await requireRegisteredPerson(transaction, command.personId, true);
+      if (Number(person.control_epoch) !== command.expectedPersonControlEpoch) {
+        throw new StaleAuthorityError("Person authority changed before OAuth began");
+      }
+      await transaction`select pg_advisory_xact_lock(hashtextextended(${`oauth:${command.stateDigest}`}, 0))`;
+      const existing = await transaction<{ readonly id: string }[]>`
+        select id from oauth_attempts where state_digest = ${command.stateDigest}
+      `;
+      if (existing[0]) throw new ConflictError("OAuth state has already been issued");
+      const oauthAttemptId = randomUUID();
+      const verifier = sealBytes(
+        this.secretBox,
+        Buffer.from(command.pkceVerifier, "utf8"),
+        oauthPurpose(oauthAttemptId),
+      );
+      await transaction`
+        insert into oauth_attempts (
+          id, person_id, provider, state_digest, pkce_verifier_ciphertext,
+          key_version, return_path, person_control_epoch, expires_at, created_at
+        ) values (
+          ${oauthAttemptId}, ${command.personId}, ${command.provider}, ${command.stateDigest},
+          ${verifier.ciphertext}, ${verifier.keyVersion}, ${command.returnPath},
+          ${command.expectedPersonControlEpoch}, ${expiresAt}, ${createdAt}
+        )
+      `;
+      return {
+        kind: "oauth_attempt_started",
+        oauthAttemptId,
+        expiresAt: expiresAt.toISOString(),
+      };
+    });
+  }
+
+  private async consumeOAuthAttempt(
+    command: Extract<SourceCommand, { kind: "consume_oauth_attempt" }>,
+  ): Promise<SourceMutationResult> {
+    return inTransaction(this.database, async (transaction) => {
+      const rows = await transaction<
+        {
+          readonly id: string;
+          readonly person_id: string;
+          readonly provider: string;
+          readonly pkce_verifier_ciphertext: Buffer;
+          readonly return_path: string;
+          readonly person_control_epoch: number | string;
+          readonly current_control_epoch: number | string;
+          readonly person_status: string;
+          readonly expires_at: Date;
+          readonly consumed_at: Date | null;
+        }[]
+      >`
+        select attempt.id, attempt.person_id, attempt.provider,
+          attempt.pkce_verifier_ciphertext, attempt.return_path,
+          attempt.person_control_epoch, attempt.expires_at, attempt.consumed_at,
+          person.control_epoch as current_control_epoch, person.status as person_status
+        from oauth_attempts attempt
+        join people person on person.id = attempt.person_id
+        where attempt.state_digest = ${command.stateDigest}
+        for update of attempt, person
+      `;
+      const attempt = rows[0];
+      if (!attempt || attempt.provider !== command.provider) {
+        throw new NotFoundError("OAuth attempt does not exist");
+      }
+      const consumedAt = new Date(command.consumedAt);
+      if (attempt.consumed_at !== null) throw new ConflictError("OAuth attempt was already consumed");
+      if (attempt.expires_at <= consumedAt) throw new UnauthorizedError("OAuth attempt has expired");
+      if (attempt.person_status !== "registered") throw new UnauthorizedError("OAuth owner is not active");
+      if (Number(attempt.person_control_epoch) !== Number(attempt.current_control_epoch)) {
+        throw new StaleAuthorityError("Person authority changed during OAuth");
+      }
+      const verifier = openBytes(
+        this.secretBox,
+        attempt.pkce_verifier_ciphertext,
+        oauthPurpose(attempt.id),
+      ).toString("utf8");
+      await transaction`
+        update oauth_attempts set consumed_at = ${consumedAt} where id = ${attempt.id}
+      `;
+      return {
+        kind: "oauth_attempt_consumed",
+        oauthAttemptId: attempt.id,
+        personId: attempt.person_id,
+        provider: attempt.provider,
+        pkceVerifier: verifier,
+        returnPath: attempt.return_path,
+        personControlEpoch: Number(attempt.person_control_epoch),
+      };
+    });
+  }
+
+  private async checkpointCursor(
+    command: Extract<SourceCommand, { kind: "checkpoint_cursor" }>,
+  ): Promise<SourceMutationResult> {
+    if (command.state === "active" && command.cursor === null) {
+      throw new ConflictError("An active sync cursor requires cursor state");
+    }
+    return inTransaction(this.database, async (transaction) => {
+      const integration = await loadIntegrationForUpdate(
+        transaction,
+        command.integrationId,
+        command.personId,
+      );
+      assertControlEpoch(integration, command.expectedIntegrationControlEpoch);
+      if (integration.status !== "active")
+        throw new UnauthorizedError("Only an active integration may checkpoint");
+      const lockKey = `cursor:${command.integrationId}:${command.resourceKind}`;
+      await transaction`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`;
+      const currentRows = await transaction<{ readonly updated_at: Date }[]>`
+        select updated_at from sync_cursors
+        where integration_id = ${command.integrationId} and resource_kind = ${command.resourceKind}
+        for update
+      `;
+      const currentUpdatedAt = currentRows[0]?.updated_at.toISOString() ?? null;
+      if (currentUpdatedAt !== command.expectedUpdatedAt) {
+        throw new StaleAuthorityError("Sync cursor changed before checkpoint");
+      }
+      const sealed =
+        command.cursor === null
+          ? null
+          : sealJson(
+              this.secretBox,
+              command.cursor,
+              cursorPurpose(command.integrationId, command.resourceKind),
+              this.#maxSourceContentBytes,
+            );
+      const updatedAt = new Date(command.updatedAt);
+      await transaction`
+        insert into sync_cursors (
+          id, integration_id, resource_kind, cursor_ciphertext, cursor_key_version,
+          state, checkpoint_at, updated_at
+        ) values (
+          ${randomUUID()}, ${command.integrationId}, ${command.resourceKind},
+          ${sealed?.ciphertext ?? null}, ${sealed?.keyVersion ?? null}, ${command.state},
+          ${command.checkpointAt === null ? null : new Date(command.checkpointAt)}, ${updatedAt}
+        )
+        on conflict (integration_id, resource_kind) do update
+        set cursor_ciphertext = excluded.cursor_ciphertext,
+            cursor_key_version = excluded.cursor_key_version,
+            state = excluded.state,
+            checkpoint_at = excluded.checkpoint_at,
+            updated_at = excluded.updated_at
+      `;
+      return {
+        kind: "cursor_checkpointed",
+        integrationId: command.integrationId,
+        resourceKind: command.resourceKind,
+        state: command.state,
+        checkpointAt: command.checkpointAt,
+        updatedAt: command.updatedAt,
+      };
+    });
+  }
+
+  private async configureCalendarPrivacy(
+    command: Extract<SourceCommand, { kind: "configure_calendar_privacy" }>,
+  ): Promise<SourceMutationResult> {
+    return inTransaction(this.database, async (transaction) => {
+      const integration = await loadIntegrationForUpdate(
+        transaction,
+        command.integrationId,
+        command.personId,
+      );
+      assertControlEpoch(integration, command.expectedIntegrationControlEpoch);
+      if (integration.status === "revoked") {
+        throw new UnauthorizedError("A revoked integration cannot change calendar privacy");
+      }
+      const lockKey = `calendar-privacy:${command.integrationId}:${command.calendarIdDigest}`;
+      await transaction`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`;
+      const versions = await transaction<{ readonly version: number | string }[]>`
+        select version
+        from integration_grants
+        where integration_id = ${command.integrationId}
+          and grant_kind = 'calendar_privacy'
+          and scope->>'calendarIdDigest' = ${command.calendarIdDigest}
+        order by version desc
+        limit 1
+        for update
+      `;
+      const changedAt = new Date(command.changedAt);
+      await transaction`
+        update integration_grants
+        set status = 'revoked', revoked_at = ${changedAt}
+        where integration_id = ${command.integrationId}
+          and grant_kind = 'calendar_privacy'
+          and scope->>'calendarIdDigest' = ${command.calendarIdDigest}
+          and status = 'active'
+      `;
+      const grantVersion = Number(versions[0]?.version ?? 0) + 1;
+      await transaction`
+        insert into integration_grants (
+          id, integration_id, grant_kind, scope, status, version, created_at
+        ) values (
+          ${randomUUID()}, ${command.integrationId}, 'calendar_privacy',
+          ${transaction.json({ calendarIdDigest: command.calendarIdDigest, mode: command.mode })},
+          'active', ${grantVersion}, ${changedAt}
+        )
+      `;
+      const updated = await transaction<{ readonly control_epoch: number | string }[]>`
+        update integrations
+        set updated_at = ${changedAt}
+        where id = ${command.integrationId}
+        returning control_epoch
+      `;
+      return {
+        kind: "calendar_privacy_configured",
+        integrationId: command.integrationId,
+        calendarIdDigest: command.calendarIdDigest,
+        mode: command.mode,
+        grantVersion,
+        integrationControlEpoch: Number(
+          requireRow(updated[0], "Integration calendar policy update failed").control_epoch,
+        ),
+      };
+    });
+  }
+
+  private async ingestSource(
+    command: Extract<SourceCommand, { kind: "ingest_source" }>,
+  ): Promise<SourceMutationResult> {
+    return inTransaction(this.database, async (transaction) => {
+      const capturedAt = new Date(command.capturedAt);
+      const scope = await resolveScopeForIngestion(transaction, command.scope, command.integrationId);
+      if (command.artifactKind === "calendar_event") {
+        if (command.integrationId === null || command.resourceDigest === undefined) {
+          throw new UnauthorizedError("Calendar source is missing its configured resource identity");
+        }
+        const mode = await loadCalendarPrivacy(transaction, command.integrationId, command.resourceDigest);
+        if (mode === "off") throw new UnauthorizedError("Calendar source processing is disabled");
+        if (mode === "availability_only") assertAvailabilityOnlyCalendarContent(command.content);
+      }
+      const requestedRetentionUntil = new Date(command.requestedRetentionUntil);
+      const globalCap = new Date(capturedAt.getTime() + this.#rawRetentionMs);
+      const scopeCap = new Date(capturedAt.getTime() + scope.retentionSeconds * 1_000);
+      const retentionUntil = earliestDate(requestedRetentionUntil, globalCap, scopeCap);
+      const envelope = {
+        artifactKind: command.artifactKind,
+        origin: command.origin,
+        data: command.content,
+      };
+      const serialized = canonicalJson(envelope);
+      assertByteLimit(serialized, this.#maxSourceContentBytes, "Source content");
+      const contentDigest = sha256(serialized);
+      const objectIdentity = sourceObjectIdentity(
+        command.integrationId,
+        command.scope,
+        command.artifactKind,
+        command.origin,
+      );
+      const externalObjectId = `${command.artifactKind}:${objectIdentity}`;
+      await transaction`select pg_advisory_xact_lock(hashtextextended(${`source:${command.origin.system}:${externalObjectId}`}, 0))`;
+
+      const objects = await transaction<
+        { readonly id: string; readonly latest_revision_number: number | string; readonly status: string }[]
+      >`
+        select id, latest_revision_number, status
+        from source_objects
+        where provider = ${command.origin.system} and external_object_id = ${externalObjectId}
+        for update
+      `;
+      const sourceObjectId = objects[0]?.id ?? randomUUID();
+      const latestRevisionNumber = Number(objects[0]?.latest_revision_number ?? 0);
+      if (objects[0]) {
+        const latestRows = await transaction<SourceRevisionRow[]>`
+          select id, source_object_id, revision_number, owner_person_id, participant_epoch_id,
+            scope_digest, content_digest, content_ciphertext, content_key_version,
+            occurred_at, captured_at, retention_until, revoked_at
+          from source_revisions
+          where source_object_id = ${sourceObjectId} and revision_number = ${latestRevisionNumber}
+        `;
+        const latest = latestRows[0];
+        if (
+          latest &&
+          latest.scope_digest === scope.scopeDigest &&
+          latest.content_digest === contentDigest &&
+          latest.revoked_at === null &&
+          ((latest.content_ciphertext !== null && latest.retention_until > capturedAt) ||
+            latest.retention_until <= latest.captured_at) &&
+          objects[0].status === "active"
+        ) {
+          return {
+            kind: "source_ingested",
+            sourceObjectId,
+            sourceRevisionId: latest.id,
+            revisionNumber: Number(latest.revision_number),
+            contentDigest,
+            scopeDigest: scope.scopeDigest,
+            retentionUntil: latest.retention_until.toISOString(),
+            rawContentStored: latest.content_ciphertext !== null,
+            duplicate: true,
+          };
+        }
+        if (
+          latest &&
+          (latest.scope_digest !== scope.scopeDigest || latest.content_digest !== contentDigest)
+        ) {
+          await invalidateRevisionDependents(transaction, [latest.id]);
+        }
+      } else {
+        await transaction`
+          insert into source_objects (
+            id, integration_id, provider, external_object_id, object_kind,
+            status, latest_revision_number, created_at, updated_at
+          ) values (
+            ${sourceObjectId}, ${command.integrationId}, ${command.origin.system},
+            ${externalObjectId}, ${command.artifactKind}, 'active', 0,
+            ${capturedAt}, ${capturedAt}
+          )
+        `;
+      }
+
+      const sourceRevisionId = randomUUID();
+      const rawContentStored = retentionUntil > capturedAt;
+      const content = rawContentStored
+        ? sealBytes(this.secretBox, Buffer.from(serialized, "utf8"), sourceRevisionPurpose(sourceRevisionId))
+        : null;
+      const revisionNumber = latestRevisionNumber + 1;
+      await transaction`
+        insert into source_revisions (
+          id, source_object_id, revision_number, owner_person_id, participant_epoch_id,
+          scope_digest, content_digest, content_ciphertext, content_key_version,
+          occurred_at, captured_at, retention_until
+        ) values (
+          ${sourceRevisionId}, ${sourceObjectId}, ${revisionNumber},
+          ${scope.ownerPersonId}, ${scope.participantEpochId}, ${scope.scopeDigest},
+          ${contentDigest}, ${content?.ciphertext ?? null}, ${content?.keyVersion ?? null},
+          ${new Date(command.occurredAt)}, ${capturedAt}, ${retentionUntil}
+        )
+      `;
+      await transaction`
+        update source_objects
+        set status = 'active', latest_revision_number = ${revisionNumber}, updated_at = ${capturedAt}
+        where id = ${sourceObjectId}
+      `;
+      return {
+        kind: "source_ingested",
+        sourceObjectId,
+        sourceRevisionId,
+        revisionNumber,
+        contentDigest,
+        scopeDigest: scope.scopeDigest,
+        retentionUntil: retentionUntil.toISOString(),
+        rawContentStored,
+        duplicate: false,
+      };
+    });
+  }
+
+  private async storeBlob(
+    command: Extract<SourceCommand, { kind: "store_blob" }>,
+  ): Promise<SourceMutationResult> {
+    const bytes = Buffer.from(command.bytes);
+    if (bytes.length === 0) throw new ConflictError("A source blob cannot be empty");
+    if (bytes.length > this.#maxBlobBytes)
+      throw new ConflictError("Source blob exceeds the configured limit");
+    return inTransaction(this.database, async (transaction) => {
+      const storedAt = new Date(command.storedAt);
+      const parent = await loadReadableRevision(
+        transaction,
+        command.sourceRevisionId,
+        command.scope,
+        storedAt,
+        true,
+      );
+      const contentDigest = sha256(bytes);
+      const lockKey = `blob:${command.sourceRevisionId}:${command.blobKind}:${contentDigest}`;
+      await transaction`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`;
+      const existing = await transaction<{ readonly id: string; readonly retention_until: Date }[]>`
+        select id, retention_until from source_blobs
+        where source_revision_id = ${command.sourceRevisionId}
+          and blob_kind = ${command.blobKind}
+          and content_digest = ${contentDigest}
+      `;
+      if (existing[0]) {
+        return {
+          kind: "blob_stored",
+          sourceBlobId: existing[0].id,
+          contentDigest,
+          retentionUntil: existing[0].retention_until.toISOString(),
+          duplicate: true,
+        };
+      }
+      const sourceBlobId = randomUUID();
+      const sealed = sealBytes(this.secretBox, bytes, sourceBlobPurpose(sourceBlobId));
+      await transaction`
+        insert into source_blobs (
+          id, source_revision_id, blob_kind, content_digest, mime_type,
+          byte_length, ciphertext, key_version, retention_until, created_at
+        ) values (
+          ${sourceBlobId}, ${command.sourceRevisionId}, ${command.blobKind}, ${contentDigest},
+          ${command.mimeType}, ${bytes.length}, ${sealed.ciphertext}, ${sealed.keyVersion},
+          ${parent.retention_until}, ${storedAt}
+        )
+      `;
+      return {
+        kind: "blob_stored",
+        sourceBlobId,
+        contentDigest,
+        retentionUntil: parent.retention_until.toISOString(),
+        duplicate: false,
+      };
+    });
+  }
+
+  private async storeDerivative(
+    command: Extract<SourceCommand, { kind: "store_derivative" }>,
+  ): Promise<SourceMutationResult> {
+    const serialized = canonicalJson(command.content);
+    assertByteLimit(serialized, this.#maxDerivativeBytes, "Source derivative");
+    return inTransaction(this.database, async (transaction) => {
+      const createdAt = new Date(command.createdAt);
+      const parent = await loadReadableRevision(
+        transaction,
+        command.sourceRevisionId,
+        command.scope,
+        createdAt,
+        true,
+      );
+      const retentionUntil = earliestDate(new Date(command.requestedRetentionUntil), parent.retention_until);
+      if (retentionUntil <= createdAt) throw new ConflictError("Source derivative would already be expired");
+      const contentDigest = sha256(serialized);
+      const lockKey = `derivative:${command.sourceRevisionId}:${command.derivativeKind}:${contentDigest}`;
+      await transaction`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`;
+      const existing = await transaction<{ readonly id: string; readonly retention_until: Date }[]>`
+        select id, retention_until from source_derivatives
+        where parent_source_revision_id = ${command.sourceRevisionId}
+          and kind = ${command.derivativeKind}
+          and content_digest = ${contentDigest}
+      `;
+      if (existing[0]) {
+        return {
+          kind: "derivative_stored",
+          sourceDerivativeId: existing[0].id,
+          contentDigest,
+          retentionUntil: existing[0].retention_until.toISOString(),
+          duplicate: true,
+        };
+      }
+      const sourceDerivativeId = randomUUID();
+      const sealed = sealBytes(
+        this.secretBox,
+        Buffer.from(serialized, "utf8"),
+        sourceDerivativePurpose(sourceDerivativeId),
+      );
+      await transaction`
+        insert into source_derivatives (
+          id, parent_source_revision_id, owner_person_id, participant_epoch_id,
+          kind, scope_digest, content_digest, content_ciphertext, content_key_version,
+          retention_until, created_at
+        ) values (
+          ${sourceDerivativeId}, ${command.sourceRevisionId}, ${parent.owner_person_id},
+          ${parent.participant_epoch_id}, ${command.derivativeKind}, ${parent.scope_digest},
+          ${contentDigest}, ${sealed.ciphertext}, ${sealed.keyVersion}, ${retentionUntil}, ${createdAt}
+        )
+      `;
+      await transaction`
+        insert into provenance_edges (
+          id, parent_source_revision_id, child_derivative_id, relation, created_at
+        ) values (
+          ${randomUUID()}, ${command.sourceRevisionId}, ${sourceDerivativeId},
+          'derived_from', ${createdAt}
+        )
+      `;
+      return {
+        kind: "derivative_stored",
+        sourceDerivativeId,
+        contentDigest,
+        retentionUntil: retentionUntil.toISOString(),
+        duplicate: false,
+      };
+    });
+  }
+
+  private async proposePrivateCandidate(
+    command: Extract<SourceCommand, { kind: "propose_private_candidate" }>,
+  ): Promise<SourceMutationResult> {
+    const proposedAt = new Date(command.proposedAt);
+    const requestedExpiresAt = new Date(command.requestedExpiresAt);
+    if (requestedExpiresAt <= proposedAt)
+      throw new ConflictError("Private candidate must expire after proposal");
+    const expiresAt = earliestDate(
+      requestedExpiresAt,
+      new Date(proposedAt.getTime() + this.#privateCandidateRetentionMs),
+    );
+    const evidenceIds = [...new Set(command.evidenceSourceRevisionIds)].sort();
+    const serialized = canonicalJson(command.content);
+    assertByteLimit(serialized, this.#maxDerivativeBytes, "Private candidate");
+    const contentDigest = sha256(serialized);
+    return inTransaction(this.database, async (transaction) => {
+      await requireRegisteredPerson(transaction, command.personId, false);
+      const evidenceRows = await transaction<
+        { readonly id: string; readonly owner_person_id: string | null; readonly revoked_at: Date | null }[]
+      >`
+        select id, owner_person_id, revoked_at
+        from source_revisions
+        where id = any(${transaction.array(evidenceIds)}::uuid[])
+        for share
+      `;
+      if (evidenceRows.length !== evidenceIds.length)
+        throw new NotFoundError("Candidate evidence is incomplete");
+      if (evidenceRows.some((row) => row.owner_person_id !== command.personId || row.revoked_at !== null)) {
+        throw new UnauthorizedError("Private candidate evidence is not active and person-owned");
+      }
+      const lockKey = `candidate:${command.personId}:${command.candidateKind}:${contentDigest}`;
+      await transaction`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`;
+      const existing = await transaction<{ readonly id: string; readonly expires_at: Date }[]>`
+        select id, expires_at
+        from knowledge_candidates
+        where scope_kind = 'person'
+          and owner_person_id = ${command.personId}
+          and candidate_kind = ${command.candidateKind}
+          and content_digest = ${contentDigest}
+          and evidence_refs = ${transaction.json(evidenceIds)}::jsonb
+          and status = 'pending'
+          and (expires_at is null or expires_at > ${proposedAt})
+        order by proposed_at desc
+        limit 1
+      `;
+      if (existing[0]) {
+        return {
+          kind: "private_candidate_proposed",
+          candidateId: existing[0].id,
+          contentDigest,
+          expiresAt: existing[0].expires_at.toISOString(),
+          duplicate: true,
+        };
+      }
+      const candidateId = randomUUID();
+      const sealed = sealBytes(
+        this.secretBox,
+        Buffer.from(serialized, "utf8"),
+        privateCandidatePurpose(candidateId),
+      );
+      await transaction`
+        insert into knowledge_candidates (
+          id, scope_kind, owner_person_id, candidate_kind, content_digest,
+          content_ciphertext, content_key_version, evidence_refs, confidence,
+          status, proposed_at, expires_at
+        ) values (
+          ${candidateId}, 'person', ${command.personId}, ${command.candidateKind}, ${contentDigest},
+          ${sealed.ciphertext}, ${sealed.keyVersion}, ${transaction.json(evidenceIds)},
+          ${command.confidence}, 'pending', ${proposedAt}, ${expiresAt}
+        )
+      `;
+      return {
+        kind: "private_candidate_proposed",
+        candidateId,
+        contentDigest,
+        expiresAt: expiresAt.toISOString(),
+        duplicate: false,
+      };
+    });
+  }
+
+  private async reviewPrivateCandidate(
+    command: Extract<SourceCommand, { kind: "review_private_candidate" }>,
+  ): Promise<SourceMutationResult> {
+    return inTransaction(this.database, async (transaction) => {
+      await requireRegisteredPerson(transaction, command.personId, false);
+      const rows = await transaction<
+        {
+          readonly status: string;
+          readonly candidate_kind: string;
+          readonly content_digest: string;
+          readonly content_ciphertext: Buffer;
+          readonly evidence_refs: unknown;
+          readonly reviewed_by_person_id: string | null;
+          readonly reviewed_at: Date | null;
+          readonly expires_at: Date | null;
+        }[]
+      >`
+        select status, candidate_kind, content_digest, content_ciphertext, evidence_refs,
+          reviewed_by_person_id, reviewed_at, expires_at
+        from knowledge_candidates
+        where id = ${command.candidateId}
+          and scope_kind = 'person'
+          and owner_person_id = ${command.personId}
+        for update
+      `;
+      const candidate = rows[0];
+      if (!candidate) throw new NotFoundError("Private review does not exist");
+      const reviewedAt = new Date(command.reviewedAt);
+      if (candidate.status === command.decision && candidate.reviewed_by_person_id === command.personId) {
+        if (command.decision === "accepted") {
+          await promotePrivateCandidateMemory(
+            transaction,
+            this.secretBox,
+            command.candidateId,
+            command.personId,
+            candidate,
+            candidate.reviewed_at ?? reviewedAt,
+          );
+        }
+        return {
+          kind: "private_candidate_reviewed",
+          candidateId: command.candidateId,
+          decision: command.decision,
+          reviewedAt: (candidate.reviewed_at ?? reviewedAt).toISOString(),
+          duplicate: true,
+        };
+      }
+      if (candidate.status !== "pending") {
+        throw new ConflictError("Private review is no longer awaiting a decision");
+      }
+      if (candidate.expires_at !== null && candidate.expires_at <= reviewedAt) {
+        await transaction`
+          update knowledge_candidates set status = 'expired'
+          where id = ${command.candidateId}
+        `;
+        throw new ConflictError("Private review has expired");
+      }
+      await transaction`
+        update knowledge_candidates
+        set status = ${command.decision}, reviewed_by_person_id = ${command.personId},
+            reviewed_at = ${reviewedAt}
+        where id = ${command.candidateId}
+      `;
+      if (command.decision === "accepted") {
+        await promotePrivateCandidateMemory(
+          transaction,
+          this.secretBox,
+          command.candidateId,
+          command.personId,
+          candidate,
+          reviewedAt,
+        );
+      }
+      return {
+        kind: "private_candidate_reviewed",
+        candidateId: command.candidateId,
+        decision: command.decision,
+        reviewedAt: reviewedAt.toISOString(),
+        duplicate: false,
+      };
+    });
+  }
+
+  private async markSourceDeleted(
+    command: Extract<SourceCommand, { kind: "mark_source_deleted" }>,
+  ): Promise<SourceMutationResult> {
+    return inTransaction(this.database, async (transaction) => {
+      await resolveScopeForInvalidation(transaction, command.scope, command.integrationId);
+      const objectIdentity = sourceObjectIdentity(
+        command.integrationId,
+        command.scope,
+        command.artifactKind,
+        command.origin,
+      );
+      const externalObjectId = `${command.artifactKind}:${objectIdentity}`;
+      await transaction`select pg_advisory_xact_lock(hashtextextended(${`source:${command.origin.system}:${externalObjectId}`}, 0))`;
+      const objects = await transaction<{ readonly id: string }[]>`
+        select id from source_objects
+        where provider = ${command.origin.system} and external_object_id = ${externalObjectId}
+        for update
+      `;
+      const object = objects[0];
+      if (!object) {
+        return {
+          kind: "source_deleted",
+          sourceObjectId: null,
+          invalidatedRevisionCount: 0,
+          revokedCandidateCount: 0,
+        };
+      }
+      const revisions = await transaction<{ readonly id: string }[]>`
+        select id from source_revisions
+        where source_object_id = ${object.id} and revoked_at is null
+        for update
+      `;
+      const invalidation = await invalidateRevisions(
+        transaction,
+        revisions.map((revision) => revision.id),
+        new Date(command.deletedAt),
+      );
+      await transaction`
+        update source_objects set status = 'deleted', updated_at = ${new Date(command.deletedAt)}
+        where id = ${object.id}
+      `;
+      return {
+        kind: "source_deleted",
+        sourceObjectId: object.id,
+        ...invalidation,
+      };
+    });
+  }
+
+  private async invalidateConversationEpoch(
+    command: Extract<SourceCommand, { kind: "invalidate_conversation_epoch" }>,
+  ): Promise<SourceMutationResult> {
+    return inTransaction(this.database, async (transaction) => {
+      const epochs = await transaction<{ readonly id: string }[]>`
+        select id from participant_epochs where id = ${command.participantEpochId} for update
+      `;
+      if (!epochs[0]) throw new NotFoundError("Conversation epoch does not exist");
+      const revisions = await transaction<{ readonly id: string }[]>`
+        select id from source_revisions
+        where participant_epoch_id = ${command.participantEpochId} and revoked_at is null
+        for update
+      `;
+      const revisionIds = revisions.map((revision) => revision.id);
+      const invalidation = await invalidateRevisions(
+        transaction,
+        revisionIds,
+        new Date(command.invalidatedAt),
+      );
+      if (revisionIds.length > 0) {
+        await transaction`
+          update source_objects object
+          set status = 'revoked', updated_at = ${new Date(command.invalidatedAt)}
+          where exists (
+            select 1 from source_revisions revision
+            where revision.source_object_id = object.id
+              and revision.id = any(${transaction.array(revisionIds)}::uuid[])
+          )
+        `;
+      }
+      return {
+        kind: "conversation_epoch_invalidated",
+        participantEpochId: command.participantEpochId,
+        ...invalidation,
+      };
+    });
+  }
+
+  private async sweepRetention(
+    command: Extract<SourceCommand, { kind: "sweep_retention" }>,
+  ): Promise<SourceMutationResult> {
+    return inTransaction(this.database, async (transaction) => {
+      const asOf = new Date(command.asOf);
+      const derivativeRows = await transaction<{ readonly id: string }[]>`
+        select id from source_derivatives
+        where retention_until <= ${asOf}
+        order by retention_until
+        limit ${command.limit}
+        for update skip locked
+      `;
+      if (derivativeRows.length > 0) {
+        await transaction`
+          delete from source_derivatives
+          where id = any(${transaction.array(derivativeRows.map((row) => row.id))}::uuid[])
+        `;
+      }
+      const blobRows = await transaction<{ readonly id: string }[]>`
+        select id from source_blobs
+        where retention_until <= ${asOf}
+        order by retention_until
+        limit ${command.limit}
+        for update skip locked
+      `;
+      if (blobRows.length > 0) {
+        await transaction`
+          delete from source_blobs
+          where id = any(${transaction.array(blobRows.map((row) => row.id))}::uuid[])
+        `;
+      }
+      const revisionRows = await transaction<{ readonly id: string }[]>`
+        select id from source_revisions
+        where retention_until <= ${asOf} and content_ciphertext is not null
+        order by retention_until
+        limit ${command.limit}
+        for update skip locked
+      `;
+      if (revisionRows.length > 0) {
+        const revisionIds = revisionRows.map((row) => row.id);
+        await transaction`
+          delete from source_derivatives
+          where parent_source_revision_id = any(${transaction.array(revisionIds)}::uuid[])
+        `;
+        await transaction`
+          delete from source_blobs
+          where source_revision_id = any(${transaction.array(revisionIds)}::uuid[])
+        `;
+        await transaction`
+          update source_revisions
+          set content_ciphertext = null, content_key_version = null
+          where id = any(${transaction.array(revisionIds)}::uuid[])
+        `;
+      }
+      const expiredCandidates = await transaction<{ readonly id: string }[]>`
+        update knowledge_candidates
+        set status = 'expired'
+        where id in (
+          select id from knowledge_candidates
+          where status = 'pending' and expires_at is not null and expires_at <= ${asOf}
+          order by expires_at
+          limit ${command.limit}
+          for update skip locked
+        )
+        returning id
+      `;
+      const expiredOAuth = await transaction<{ readonly id: string }[]>`
+        delete from oauth_attempts
+        where id in (
+          select id from oauth_attempts
+          where expires_at <= ${asOf} or consumed_at is not null
+          order by created_at
+          limit ${command.limit}
+          for update skip locked
+        )
+        returning id
+      `;
+      return {
+        kind: "retention_swept",
+        expiredRevisionCount: revisionRows.length,
+        expiredBlobCount: blobRows.length,
+        expiredDerivativeCount: derivativeRows.length,
+        expiredCandidateCount: expiredCandidates.length,
+        expiredOAuthAttemptCount: expiredOAuth.length,
+      };
+    });
+  }
+
+  private async readIntegrationAccess(
+    query: Extract<SourceQuery, { kind: "integration_access" }>,
+  ): Promise<SourceReadResult> {
+    const rows = await this.database<IntegrationRow[]>`
+      select id, person_id, provider, status, credential_ciphertext, credential_key_version,
+        control_epoch, connected_at, updated_at
+      from integrations
+      where id = ${query.integrationId} and person_id = ${query.personId}
+    `;
+    const integration = rows[0];
+    if (!integration) throw new NotFoundError("Integration does not exist");
+    assertControlEpoch(integration, query.expectedControlEpoch);
+    if (integration.status !== "active" || integration.credential_ciphertext === null) {
+      throw new UnauthorizedError("Integration credentials are not available");
+    }
+    const credentials = JsonObjectSchema.parse(
+      openJson(this.secretBox, integration.credential_ciphertext, integrationPurpose(integration.id)),
+    );
+    return {
+      kind: "integration_access",
+      integration: integrationView(integration),
+      credentials,
+    };
+  }
+
+  private async readIntegrationProfile(
+    query: Extract<SourceQuery, { kind: "integration_profile" }>,
+  ): Promise<SourceReadResult> {
+    const rows = await this.database<IntegrationRow[]>`
+      select id, person_id, provider, status, credential_ciphertext, credential_key_version,
+        control_epoch, connected_at, updated_at
+      from integrations
+      where id = ${query.integrationId} and person_id = ${query.personId}
+    `;
+    const integration = rows[0];
+    if (!integration) throw new NotFoundError("Integration does not exist");
+    assertControlEpoch(integration, query.expectedControlEpoch);
+    if (integration.status === "revoked" || integration.credential_ciphertext === null) {
+      throw new UnauthorizedError("Integration profile is no longer available");
+    }
+    const credentials = JsonObjectSchema.parse(
+      openJson(this.secretBox, integration.credential_ciphertext, integrationPurpose(integration.id)),
+    );
+    const accountEmail = credentials.accountEmail;
+    if (typeof accountEmail !== "string" || accountEmail.length > 320 || !accountEmail.includes("@")) {
+      throw new ConflictError("Connected Google account email is unavailable");
+    }
+    return {
+      kind: "integration_profile",
+      integration: integrationView(integration),
+      accountEmail,
+    };
+  }
+
+  private async readCursor(query: Extract<SourceQuery, { kind: "sync_cursor" }>): Promise<SourceReadResult> {
+    const integrationRows = await this.database<IntegrationRow[]>`
+      select id, person_id, provider, status, credential_ciphertext, credential_key_version,
+        control_epoch, connected_at, updated_at
+      from integrations
+      where id = ${query.integrationId} and person_id = ${query.personId}
+    `;
+    const integration = integrationRows[0];
+    if (!integration) throw new NotFoundError("Integration does not exist");
+    assertControlEpoch(integration, query.expectedIntegrationControlEpoch);
+    if (integration.status === "revoked") throw new UnauthorizedError("Integration was revoked");
+    const rows = await this.database<
+      {
+        readonly cursor_ciphertext: Buffer | null;
+        readonly state: string;
+        readonly checkpoint_at: Date | null;
+        readonly updated_at: Date;
+      }[]
+    >`
+      select cursor_ciphertext, state, checkpoint_at, updated_at
+      from sync_cursors
+      where integration_id = ${query.integrationId} and resource_kind = ${query.resourceKind}
+    `;
+    const cursor = rows[0];
+    if (!cursor) throw new NotFoundError("Sync cursor does not exist");
+    return {
+      kind: "sync_cursor",
+      integrationId: query.integrationId,
+      resourceKind: query.resourceKind,
+      state: cursor.state as SyncCursorState,
+      cursor:
+        cursor.cursor_ciphertext === null
+          ? null
+          : JsonValueSchema.parse(
+              openJson(
+                this.secretBox,
+                cursor.cursor_ciphertext,
+                cursorPurpose(query.integrationId, query.resourceKind),
+              ),
+            ),
+      checkpointAt: cursor.checkpoint_at?.toISOString() ?? null,
+      updatedAt: cursor.updated_at.toISOString(),
+    };
+  }
+
+  private async readCalendarPrivacy(
+    query: Extract<SourceQuery, { kind: "calendar_privacy" }>,
+  ): Promise<SourceReadResult> {
+    const integrationRows = await this.database<IntegrationRow[]>`
+      select id, person_id, provider, status, credential_ciphertext, credential_key_version,
+        control_epoch, connected_at, updated_at
+      from integrations
+      where id = ${query.integrationId} and person_id = ${query.personId}
+    `;
+    const integration = integrationRows[0];
+    if (!integration) throw new NotFoundError("Integration does not exist");
+    assertControlEpoch(integration, query.expectedIntegrationControlEpoch);
+    if (integration.status === "revoked") throw new UnauthorizedError("Integration was revoked");
+    const rows = await this.database<{ readonly mode: string; readonly version: number | string }[]>`
+      select scope->>'mode' as mode, version
+      from integration_grants
+      where integration_id = ${query.integrationId}
+        and grant_kind = 'calendar_privacy'
+        and scope->>'calendarIdDigest' = ${query.calendarIdDigest}
+        and status = 'active'
+      order by version desc
+      limit 1
+    `;
+    const policy = rows[0];
+    if (!policy) throw new NotFoundError("Calendar privacy has not been configured");
+    return {
+      kind: "calendar_privacy",
+      integrationId: query.integrationId,
+      calendarIdDigest: query.calendarIdDigest,
+      mode: policy.mode as CalendarPrivacyMode,
+      grantVersion: Number(policy.version),
+    };
+  }
+
+  private async readSourceRevision(
+    query: Extract<SourceQuery, { kind: "source_revision" }>,
+  ): Promise<SourceReadResult> {
+    return inTransaction(this.database, async (transaction) => {
+      const asOf = new Date(query.asOf);
+      await revalidateReadScope(transaction, query.scope);
+      const revision = await loadReadableRevision(
+        transaction,
+        query.sourceRevisionId,
+        query.scope,
+        asOf,
+        false,
+      );
+      if (revision.content_ciphertext === null)
+        throw new NotFoundError("Source content is no longer retained");
+      return {
+        kind: "source_revision",
+        sourceRevisionId: revision.id,
+        sourceObjectId: revision.source_object_id,
+        revisionNumber: Number(revision.revision_number),
+        scopeDigest: revision.scope_digest,
+        contentDigest: revision.content_digest,
+        content: JsonObjectSchema.parse(
+          openJson(this.secretBox, revision.content_ciphertext, sourceRevisionPurpose(revision.id)),
+        ),
+        occurredAt: revision.occurred_at.toISOString(),
+        capturedAt: revision.captured_at.toISOString(),
+        retentionUntil: revision.retention_until.toISOString(),
+      };
+    });
+  }
+
+  private async readSourceBlob(
+    query: Extract<SourceQuery, { kind: "source_blob" }>,
+  ): Promise<SourceReadResult> {
+    return inTransaction(this.database, async (transaction) => {
+      const asOf = new Date(query.asOf);
+      await revalidateReadScope(transaction, query.scope);
+      const rows = await transaction<
+        {
+          readonly id: string;
+          readonly source_revision_id: string;
+          readonly blob_kind: string;
+          readonly mime_type: string;
+          readonly content_digest: string;
+          readonly ciphertext: Buffer;
+          readonly retention_until: Date;
+          readonly owner_person_id: string | null;
+          readonly participant_epoch_id: string | null;
+          readonly revision_revoked_at: Date | null;
+        }[]
+      >`
+        select blob.id, blob.source_revision_id, blob.blob_kind, blob.mime_type,
+          blob.content_digest, blob.ciphertext, blob.retention_until,
+          revision.owner_person_id, revision.participant_epoch_id,
+          revision.revoked_at as revision_revoked_at
+        from source_blobs blob
+        join source_revisions revision on revision.id = blob.source_revision_id
+        where blob.id = ${query.sourceBlobId}
+      `;
+      const blob = rows[0];
+      if (!blob) throw new NotFoundError("Source blob does not exist");
+      assertScopeMatchesRow(query.scope, blob);
+      if (blob.revision_revoked_at !== null || blob.retention_until <= asOf) {
+        throw new NotFoundError("Source blob is no longer retained");
+      }
+      return {
+        kind: "source_blob",
+        sourceBlobId: blob.id,
+        sourceRevisionId: blob.source_revision_id,
+        blobKind: blob.blob_kind,
+        mimeType: blob.mime_type,
+        contentDigest: blob.content_digest,
+        bytes: openBytes(this.secretBox, blob.ciphertext, sourceBlobPurpose(blob.id)),
+        retentionUntil: blob.retention_until.toISOString(),
+      };
+    });
+  }
+
+  private async readSourceDerivative(
+    query: Extract<SourceQuery, { kind: "source_derivative" }>,
+  ): Promise<SourceReadResult> {
+    return inTransaction(this.database, async (transaction) => {
+      const asOf = new Date(query.asOf);
+      await revalidateReadScope(transaction, query.scope);
+      const rows = await transaction<
+        {
+          readonly id: string;
+          readonly parent_source_revision_id: string;
+          readonly owner_person_id: string | null;
+          readonly participant_epoch_id: string | null;
+          readonly kind: string;
+          readonly scope_digest: string;
+          readonly content_digest: string;
+          readonly content_ciphertext: Buffer;
+          readonly retention_until: Date;
+          readonly parent_revoked_at: Date | null;
+        }[]
+      >`
+        select derivative.id, derivative.parent_source_revision_id,
+          derivative.owner_person_id, derivative.participant_epoch_id,
+          derivative.kind, derivative.scope_digest, derivative.content_digest,
+          derivative.content_ciphertext, derivative.retention_until,
+          parent.revoked_at as parent_revoked_at
+        from source_derivatives derivative
+        join source_revisions parent on parent.id = derivative.parent_source_revision_id
+        where derivative.id = ${query.sourceDerivativeId}
+      `;
+      const derivative = rows[0];
+      if (!derivative) throw new NotFoundError("Source derivative does not exist");
+      assertScopeMatchesRow(query.scope, derivative);
+      if (derivative.parent_revoked_at !== null || derivative.retention_until <= asOf) {
+        throw new NotFoundError("Source derivative is no longer retained");
+      }
+      return {
+        kind: "source_derivative",
+        sourceDerivativeId: derivative.id,
+        sourceRevisionId: derivative.parent_source_revision_id,
+        derivativeKind: derivative.kind,
+        scopeDigest: derivative.scope_digest,
+        contentDigest: derivative.content_digest,
+        content: JsonValueSchema.parse(
+          openJson(this.secretBox, derivative.content_ciphertext, sourceDerivativePurpose(derivative.id)),
+        ),
+        retentionUntil: derivative.retention_until.toISOString(),
+      };
+    });
+  }
+
+  private async readPendingPrivateCandidates(
+    query: Extract<SourceQuery, { kind: "pending_private_candidates" }>,
+  ): Promise<SourceReadResult> {
+    return inTransaction(this.database, async (transaction) => {
+      await requireRegisteredPerson(transaction, query.personId, false);
+      const rows = await transaction<
+        {
+          readonly id: string;
+          readonly candidate_kind: string;
+          readonly content_digest: string;
+          readonly content_ciphertext: Buffer;
+          readonly evidence_refs: unknown;
+          readonly confidence: string | number;
+          readonly proposed_at: Date;
+          readonly expires_at: Date | null;
+        }[]
+      >`
+        select id, candidate_kind, content_digest, content_ciphertext,
+          evidence_refs, confidence, proposed_at, expires_at
+        from knowledge_candidates
+        where scope_kind = 'person' and owner_person_id = ${query.personId}
+          and status = 'pending'
+          and (expires_at is null or expires_at > ${new Date(query.asOf)})
+        order by proposed_at desc
+        limit ${query.limit}
+      `;
+      return {
+        kind: "pending_private_candidates",
+        personId: query.personId,
+        candidates: rows.map((row) => ({
+          candidateId: row.id,
+          candidateKind: row.candidate_kind,
+          contentDigest: row.content_digest,
+          content: JsonObjectSchema.parse(
+            openJson(this.secretBox, row.content_ciphertext, privateCandidatePurpose(row.id)),
+          ),
+          evidenceSourceRevisionIds: stringArray(row.evidence_refs),
+          confidence: Number(row.confidence),
+          proposedAt: row.proposed_at.toISOString(),
+          expiresAt: row.expires_at?.toISOString() ?? null,
+        })),
+      };
+    });
+  }
+}
+
+function inTransaction<Result>(
+  executor: Executor,
+  operation: (transaction: Transaction) => Promise<Result>,
+): Promise<Result> {
+  return "begin" in executor
+    ? (executor.begin(operation) as unknown as Promise<Result>)
+    : operation(executor);
+}
+
+async function requireRegisteredPerson(
+  transaction: Transaction,
+  personId: string,
+  forUpdate: boolean,
+): Promise<{ readonly status: string; readonly control_epoch: number | string }> {
+  const rows = forUpdate
+    ? await transaction<{ readonly status: string; readonly control_epoch: number | string }[]>`
+        select status, control_epoch from people where id = ${personId} for update
+      `
+    : await transaction<{ readonly status: string; readonly control_epoch: number | string }[]>`
+        select status, control_epoch from people where id = ${personId}
+      `;
+  const person = rows[0];
+  if (!person) throw new NotFoundError("Person does not exist");
+  if (person.status !== "registered") throw new UnauthorizedError("Person is not registered");
+  return person;
+}
+
+async function loadIntegrationForUpdate(
+  transaction: Transaction,
+  integrationId: string,
+  personId: string,
+): Promise<IntegrationRow> {
+  const rows = await transaction<IntegrationRow[]>`
+    select id, person_id, provider, status, credential_ciphertext, credential_key_version,
+      control_epoch, connected_at, updated_at
+    from integrations
+    where id = ${integrationId} and person_id = ${personId}
+    for update
+  `;
+  if (!rows[0]) throw new NotFoundError("Integration does not exist");
+  return rows[0];
+}
+
+function assertControlEpoch(integration: IntegrationRow, expectedControlEpoch: number): void {
+  if (Number(integration.control_epoch) !== expectedControlEpoch) {
+    throw new StaleAuthorityError("Integration authority changed");
+  }
+}
+
+async function resolveScopeForIngestion(
+  transaction: Transaction,
+  scope: SourceScope,
+  integrationId: string | null,
+): Promise<ScopeResolution> {
+  if (scope.kind === "person") {
+    if (integrationId === null)
+      throw new UnauthorizedError("Person-owned provider data requires an integration");
+    await requireRegisteredPerson(transaction, scope.personId, false);
+    const rows = await transaction<
+      { readonly person_id: string; readonly status: string; readonly control_epoch: number | string }[]
+    >`
+      select person_id, status, control_epoch from integrations where id = ${integrationId}
+    `;
+    const integration = rows[0];
+    if (!integration || integration.person_id !== scope.personId || integration.status !== "active") {
+      throw new UnauthorizedError("Integration is not active for the source owner");
+    }
+    return {
+      ownerPersonId: scope.personId,
+      participantEpochId: null,
+      scopeDigest: canonicalDigest({
+        kind: "person",
+        personId: scope.personId,
+        integrationId,
+        integrationControlEpoch: Number(integration.control_epoch),
+      }),
+      retentionSeconds: 30 * 24 * 60 * 60,
+    };
+  }
+  if (integrationId !== null)
+    throw new UnauthorizedError("Conversation evidence cannot use a person integration");
+  return resolveActiveConversationScope(transaction, scope.participantEpochId);
+}
+
+async function loadCalendarPrivacy(
+  transaction: Transaction,
+  integrationId: string,
+  calendarIdDigest: string,
+): Promise<CalendarPrivacyMode> {
+  const rows = await transaction<{ readonly mode: string }[]>`
+    select scope->>'mode' as mode
+    from integration_grants
+    where integration_id = ${integrationId}
+      and grant_kind = 'calendar_privacy'
+      and scope->>'calendarIdDigest' = ${calendarIdDigest}
+      and status = 'active'
+    order by version desc
+    limit 1
+  `;
+  const mode = rows[0]?.mode;
+  if (mode !== "full_private" && mode !== "availability_only" && mode !== "off") {
+    throw new UnauthorizedError("Calendar privacy has not been configured");
+  }
+  return mode;
+}
+
+function assertAvailabilityOnlyCalendarContent(content: Readonly<Record<string, unknown>>): void {
+  const allowedKeys = new Set(["identityDigest", "start", "end", "status", "busy"]);
+  if (Object.keys(content).some((key) => !allowedKeys.has(key))) {
+    throw new UnauthorizedError("Availability-only calendar content contains private event detail");
+  }
+  if (
+    typeof content.identityDigest !== "string" ||
+    !/^[a-f0-9]{64}$/u.test(content.identityDigest) ||
+    typeof content.start !== "string" ||
+    typeof content.end !== "string" ||
+    typeof content.status !== "string" ||
+    typeof content.busy !== "boolean"
+  ) {
+    throw new ConflictError("Availability-only calendar content is incomplete");
+  }
+}
+
+async function resolveScopeForInvalidation(
+  transaction: Transaction,
+  scope: SourceScope,
+  integrationId: string | null,
+): Promise<void> {
+  if (scope.kind === "person") {
+    if (integrationId === null)
+      throw new UnauthorizedError("Person-owned provider data requires an integration");
+    const rows = await transaction<{ readonly person_id: string }[]>`
+      select person_id from integrations where id = ${integrationId}
+    `;
+    if (!rows[0] || rows[0].person_id !== scope.personId) {
+      throw new UnauthorizedError("Integration does not belong to the source owner");
+    }
+    return;
+  }
+  if (integrationId !== null)
+    throw new UnauthorizedError("Conversation evidence cannot use a person integration");
+  const rows = await transaction<{ readonly id: string }[]>`
+    select id from participant_epochs where id = ${scope.participantEpochId}
+  `;
+  if (!rows[0]) throw new NotFoundError("Conversation epoch does not exist");
+}
+
+async function resolveActiveConversationScope(
+  transaction: Transaction,
+  participantEpochId: string,
+): Promise<ScopeResolution> {
+  const rows = await transaction<
+    {
+      readonly authority_digest: string;
+      readonly ended_at: Date | null;
+      readonly conversation_status: string;
+      readonly current_epoch_id: string | null;
+      readonly participant_count: number | string;
+      readonly registered_count: number | string;
+      readonly permitted_count: number | string;
+      readonly retention_seconds: number | string | null;
+    }[]
+  >`
+    select epoch.authority_digest, epoch.ended_at,
+      conversation.status as conversation_status,
+      conversation.current_epoch_id,
+      (select count(*) from epoch_participants participant
+        where participant.participant_epoch_id = epoch.id) as participant_count,
+      (select count(*) from epoch_participants participant
+        where participant.participant_epoch_id = epoch.id
+          and participant.registration_status = 'registered'
+          and participant.consented_at is not null) as registered_count,
+      (select count(*)
+        from epoch_participants participant
+        join participant_policies policy
+          on policy.conversation_id = conversation.id
+          and policy.person_id = participant.person_id
+          and policy.status = 'active'
+        where participant.participant_epoch_id = epoch.id
+          and policy.allow_content_processing = true) as permitted_count,
+      (select min(policy.retention_seconds)
+        from epoch_participants participant
+        join participant_policies policy
+          on policy.conversation_id = conversation.id
+          and policy.person_id = participant.person_id
+          and policy.status = 'active'
+        where participant.participant_epoch_id = epoch.id
+          and policy.allow_content_processing = true) as retention_seconds
+    from participant_epochs epoch
+    join conversations conversation on conversation.id = epoch.conversation_id
+    where epoch.id = ${participantEpochId}
+  `;
+  const row = rows[0];
+  if (!row) throw new NotFoundError("Conversation epoch does not exist");
+  const participantCount = Number(row.participant_count);
+  if (
+    row.conversation_status !== "active" ||
+    row.current_epoch_id !== participantEpochId ||
+    row.ended_at !== null
+  ) {
+    throw new StaleAuthorityError("Conversation epoch is no longer current");
+  }
+  if (
+    participantCount === 0 ||
+    Number(row.registered_count) !== participantCount ||
+    Number(row.permitted_count) !== participantCount ||
+    row.retention_seconds === null
+  ) {
+    throw new UnauthorizedError("Conversation content processing is not unanimously authorized");
+  }
+  return {
+    ownerPersonId: null,
+    participantEpochId,
+    scopeDigest: canonicalDigest({
+      kind: "conversation_epoch",
+      participantEpochId,
+      authorityDigest: row.authority_digest,
+    }),
+    retentionSeconds: Number(row.retention_seconds),
+  };
+}
+
+async function revalidateReadScope(transaction: Transaction, scope: SourceScope): Promise<void> {
+  if (scope.kind === "person") {
+    await requireRegisteredPerson(transaction, scope.personId, false);
+    return;
+  }
+  await resolveActiveConversationScope(transaction, scope.participantEpochId);
+}
+
+async function loadReadableRevision(
+  transaction: Transaction,
+  revisionId: string,
+  scope: SourceScope,
+  asOf: Date,
+  lock: boolean,
+): Promise<SourceRevisionRow> {
+  const rows = lock
+    ? await transaction<SourceRevisionRow[]>`
+        select id, source_object_id, revision_number, owner_person_id, participant_epoch_id,
+          scope_digest, content_digest, content_ciphertext, content_key_version,
+          occurred_at, captured_at, retention_until, revoked_at
+        from source_revisions where id = ${revisionId} for update
+      `
+    : await transaction<SourceRevisionRow[]>`
+        select id, source_object_id, revision_number, owner_person_id, participant_epoch_id,
+          scope_digest, content_digest, content_ciphertext, content_key_version,
+          occurred_at, captured_at, retention_until, revoked_at
+        from source_revisions where id = ${revisionId}
+      `;
+  const revision = rows[0];
+  if (!revision) throw new NotFoundError("Source revision does not exist");
+  assertScopeMatchesRow(scope, revision);
+  if (revision.revoked_at !== null || revision.retention_until <= asOf) {
+    throw new NotFoundError("Source revision is no longer retained");
+  }
+  return revision;
+}
+
+function assertScopeMatchesRow(
+  scope: SourceScope,
+  row: { readonly owner_person_id: string | null; readonly participant_epoch_id: string | null },
+): void {
+  const matches =
+    scope.kind === "person"
+      ? row.owner_person_id === scope.personId && row.participant_epoch_id === null
+      : row.participant_epoch_id === scope.participantEpochId && row.owner_person_id === null;
+  if (!matches) throw new UnauthorizedError("Source is outside the requested exact scope");
+}
+
+async function invalidateRevisions(
+  transaction: Transaction,
+  revisionIds: readonly string[],
+  invalidatedAt: Date,
+): Promise<{ readonly invalidatedRevisionCount: number; readonly revokedCandidateCount: number }> {
+  if (revisionIds.length === 0) {
+    return { invalidatedRevisionCount: 0, revokedCandidateCount: 0 };
+  }
+  const mutableRevisionIds = [...revisionIds];
+  const revokedCandidateCount = await invalidateRevisionDependents(transaction, mutableRevisionIds);
+  await transaction`
+    delete from source_blobs
+    where source_revision_id = any(${transaction.array(mutableRevisionIds)}::uuid[])
+  `;
+  const invalidated = await transaction<{ readonly id: string }[]>`
+    update source_revisions
+    set content_ciphertext = null, content_key_version = null,
+        revoked_at = coalesce(revoked_at, ${invalidatedAt})
+    where id = any(${transaction.array(mutableRevisionIds)}::uuid[])
+    returning id
+  `;
+  return {
+    invalidatedRevisionCount: invalidated.length,
+    revokedCandidateCount,
+  };
+}
+
+async function invalidateRevisionDependents(
+  transaction: Transaction,
+  revisionIds: readonly string[],
+): Promise<number> {
+  if (revisionIds.length === 0) return 0;
+  const mutableRevisionIds = [...revisionIds];
+  await transaction`
+    delete from source_derivatives
+    where parent_source_revision_id = any(${transaction.array(mutableRevisionIds)}::uuid[])
+  `;
+  const revokedCandidates = await transaction<{ readonly id: string }[]>`
+    update knowledge_candidates candidate
+    set status = 'revoked'
+    where candidate.status = 'pending'
+      and exists (
+        select 1
+        from jsonb_array_elements_text(candidate.evidence_refs) evidence(reference)
+        where evidence.reference = any(${transaction.array(mutableRevisionIds)}::text[])
+      )
+    returning candidate.id
+  `;
+  return revokedCandidates.length;
+}
+
+async function promotePrivateCandidateMemory(
+  transaction: Transaction,
+  secretBox: SecretBox,
+  candidateId: string,
+  personId: string,
+  candidate: {
+    readonly candidate_kind: string;
+    readonly content_digest: string;
+    readonly content_ciphertext: Buffer;
+    readonly evidence_refs: unknown;
+  },
+  acceptedAt: Date,
+): Promise<void> {
+  const memoryKey = `${candidate.candidate_kind}:${candidate.content_digest.slice(0, 16)}`;
+  await transaction`
+    select pg_advisory_xact_lock(hashtextextended(${`memory:${personId}:${memoryKey}`}, 0))
+  `;
+  const existing = await transaction<
+    {
+      readonly id: string;
+      readonly status: "accepted" | "forgotten";
+      readonly current_revision_id: string | null;
+    }[]
+  >`
+    select id, status, current_revision_id
+    from memory_records
+    where scope_kind = 'person' and owner_person_id = ${personId}
+      and memory_key = ${memoryKey} and status in ('accepted', 'forgotten')
+    order by case status when 'forgotten' then 0 else 1 end
+    for update
+  `;
+  if (existing[0]?.status === "forgotten") return;
+  if (existing[0]?.current_revision_id) return;
+
+  const memoryRecordId = existing[0]?.id ?? randomUUID();
+  if (!existing[0]) {
+    await transaction`
+      insert into memory_records (
+        id, scope_kind, owner_person_id, memory_key, status, current_revision_id,
+        version, expires_at, revoked_at, created_at, updated_at
+      ) values (
+        ${memoryRecordId}, 'person', ${personId}, ${memoryKey}, 'accepted', null,
+        1, null, null, ${acceptedAt}, ${acceptedAt}
+      )
+    `;
+  }
+
+  const revisionId = randomUUID();
+  const plaintext = openBytes(secretBox, candidate.content_ciphertext, privateCandidatePurpose(candidateId));
+  const sealed = sealBytes(secretBox, plaintext, memoryRevisionPurpose(revisionId));
+  await transaction`
+    insert into memory_revisions (
+      id, memory_record_id, revision, content_digest, content_ciphertext,
+      content_key_version, scope_digest, evidence_refs, accepted_by_person_id,
+      effective_at, ended_at
+    ) values (
+      ${revisionId}, ${memoryRecordId}, 1, ${candidate.content_digest}, ${sealed.ciphertext},
+      ${sealed.keyVersion}, ${canonicalDigest({ scopeKind: "person", ownerPersonId: personId })},
+      ${transaction.json(stringArray(candidate.evidence_refs))}, ${personId}, ${acceptedAt}, null
+    )
+  `;
+  await transaction`
+    update memory_records
+    set current_revision_id = ${revisionId}, updated_at = ${acceptedAt}
+    where id = ${memoryRecordId} and current_revision_id is null
+  `;
+}
+
+function sourceObjectIdentity(
+  integrationId: string | null,
+  scope: SourceScope,
+  artifactKind: string,
+  origin: { readonly system: string; readonly remoteObjectId: string },
+): string {
+  return canonicalDigest({
+    integrationId,
+    scope,
+    artifactKind,
+    system: origin.system,
+    remoteObjectId: origin.remoteObjectId,
+  });
+}
+
+function integrationView(row: IntegrationRow): IntegrationView {
+  return {
+    integrationId: row.id,
+    personId: row.person_id,
+    provider: row.provider,
+    status: row.status as IntegrationStatus,
+    controlEpoch: Number(row.control_epoch),
+    connectedAt: row.connected_at.toISOString(),
+    updatedAt: row.updated_at.toISOString(),
+  };
+}
+
+function sealJson(
+  secretBox: SecretBox,
+  value: unknown,
+  purpose: string,
+  maximumBytes: number,
+): EncryptedColumn {
+  const serialized = canonicalJson(value);
+  assertByteLimit(serialized, maximumBytes, "Encrypted JSON");
+  return sealBytes(secretBox, Buffer.from(serialized, "utf8"), purpose);
+}
+
+function sealBytes(secretBox: SecretBox, value: Uint8Array, purpose: string): EncryptedColumn {
+  const encrypted = secretBox.encrypt(value, purpose);
+  return {
+    ciphertext: Buffer.from(JSON.stringify(encrypted), "utf8"),
+    keyVersion: encrypted.kid,
+  };
+}
+
+function openJson(secretBox: SecretBox, value: Buffer, purpose: string): unknown {
+  return JSON.parse(openBytes(secretBox, value, purpose).toString("utf8")) as unknown;
+}
+
+function openBytes(secretBox: SecretBox, value: Buffer, purpose: string): Buffer {
+  const encrypted = JSON.parse(value.toString("utf8")) as EncryptedValue;
+  return secretBox.decrypt(encrypted, purpose);
+}
+
+function integrationPurpose(integrationId: string): string {
+  return `florence:integration:${integrationId}:credentials`;
+}
+
+function oauthPurpose(oauthAttemptId: string): string {
+  return `florence:oauth:${oauthAttemptId}:pkce`;
+}
+
+function cursorPurpose(integrationId: string, resourceKind: string): string {
+  return `florence:integration:${integrationId}:cursor:${resourceKind}`;
+}
+
+function sourceRevisionPurpose(sourceRevisionId: string): string {
+  return `florence:source-revision:${sourceRevisionId}:content`;
+}
+
+function sourceBlobPurpose(sourceBlobId: string): string {
+  return `florence:source-blob:${sourceBlobId}:bytes`;
+}
+
+function sourceDerivativePurpose(sourceDerivativeId: string): string {
+  return `florence:source-derivative:${sourceDerivativeId}:content`;
+}
+
+function privateCandidatePurpose(candidateId: string): string {
+  return `florence:knowledge-candidate:${candidateId}:content`;
+}
+
+function memoryRevisionPurpose(memoryRevisionId: string): string {
+  return `florence:memory-revision:${memoryRevisionId}:content`;
+}
+
+function earliestDate(...dates: readonly Date[]): Date {
+  return new Date(Math.min(...dates.map((date) => date.getTime())));
+}
+
+function sha256(value: string | Uint8Array): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function assertByteLimit(value: string, limit: number, label: string): void {
+  if (Buffer.byteLength(value, "utf8") > limit)
+    throw new ConflictError(`${label} exceeds the configured limit`);
+}
+
+function requirePositiveInteger(value: number, name: string): number {
+  if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`${name} must be a positive integer`);
+  return value;
+}
+
+function requireRow<T>(value: T | undefined, message: string): T {
+  if (value === undefined) throw new Error(message);
+  return value;
+}
+
+function stringArray(value: unknown): string[] {
+  if (!Array.isArray(value) || !value.every((entry) => typeof entry === "string")) {
+    throw new Error("Stored evidence references are invalid");
+  }
+  return value;
+}

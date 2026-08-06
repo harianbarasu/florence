@@ -15,7 +15,7 @@
 - PostgreSQL and app-owned normalized domain records are canonical. Chat history, model context, framework state, traces, and scratch files are not.
 - `FlorenceApplication.process()` is the only mutating ingress into authoritative product state. It reconciles proposals and atomically commits state, audit, jobs, timers, and effects.
 - Workers may propose. They may not message people, mutate accepted state, approve actions, widen disclosure, change people or chat policy, schedule future work, or canonize learning.
-- A group is content-disabled while any current participant is unregistered or unconsented. Every participant change starts a new immutable epoch and closes the write gate.
+- A group is content-disabled while any current participant lacks verified global registration and consent. Every participant change starts a new immutable epoch, invalidates proactive rules, and requires an exact new-audience rule before proactive writing.
 - Private person-owned data is private by default. Promotion to a household or chat requires an exact approval or a previously approved applicable bridge rule.
 - Shared output uses the intersection of the live participant epoch, every participant's applicable policy, source visibility, purpose, and bridge rules.
 - Consequential external communication, submission, booking, purchasing, payment, cancellation, or account mutation requires an app-owned action intent, exact approval, and reconciled receipt.

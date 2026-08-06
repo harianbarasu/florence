@@ -1,52 +1,63 @@
 import { z } from "zod";
+import { LinqConfigurationError } from "./errors.js";
 
-export const LINQ_V3_BASE_URL = "https://api.linqapp.com/api/partner/v3";
-export const LINQ_WEBHOOK_VERSION = "2026-02-03";
+const DEFAULT_BASE_URL = "https://api.linqapp.com/api/partner/v3";
 
-export const linqConfigSchema = z
-  .object({
-    apiKey: z.string().min(1),
-    webhookSecret: z.string().regex(/^whsec_[A-Za-z0-9+/]+={0,2}$/),
-    apiBaseUrl: z
-      .string()
-      .url()
-      .refine((value) => new URL(value).protocol === "https:", "Linq API URL must use HTTPS")
-      .default(LINQ_V3_BASE_URL),
-    webhookVersion: z.literal(LINQ_WEBHOOK_VERSION).default(LINQ_WEBHOOK_VERSION),
-    webhookToleranceMs: z
-      .number()
-      .int()
-      .positive()
-      .max(15 * 60_000)
-      .default(5 * 60_000),
-    requestTimeoutMs: z.number().int().positive().max(60_000).default(20_000),
-  })
-  .strict()
-  .transform((config) => ({
-    ...config,
-    apiBaseUrl: config.apiBaseUrl.replace(/\/+$/, ""),
-  }));
+const envSchema = z.object({
+  LINQ_API_KEY: z.string().trim().min(1),
+  LINQ_BASE_URL: z.string().trim().url().default(DEFAULT_BASE_URL),
+  LINQ_PHONE_NUMBER: z
+    .string()
+    .trim()
+    .regex(/^\+[1-9]\d{6,14}$/),
+  LINQ_WEBHOOK_SECRET: z
+    .string()
+    .trim()
+    .regex(/^whsec_[A-Za-z0-9+/]+={0,2}$/),
+  LINQ_REQUEST_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(120_000).default(15_000),
+  LINQ_MAX_ATTACHMENT_BYTES: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .max(100 * 1024 * 1024)
+    .default(20 * 1024 * 1024),
+  LINQ_MAX_WEBHOOK_BYTES: z.coerce
+    .number()
+    .int()
+    .min(1_024)
+    .max(10 * 1024 * 1024)
+    .default(1024 * 1024),
+});
 
-export type LinqConfig = z.output<typeof linqConfigSchema>;
-
-export function parseLinqConfig(input: z.input<typeof linqConfigSchema>): LinqConfig {
-  return linqConfigSchema.parse(input);
+export interface LinqConfig {
+  apiKey: string;
+  baseUrl: string;
+  phoneNumber: string;
+  webhookSecret: string;
+  requestTimeoutMs: number;
+  maxAttachmentBytes: number;
+  maxWebhookBytes: number;
 }
 
-export function linqConfigFromEnv(env: Readonly<Record<string, string | undefined>>): LinqConfig {
-  return parseLinqConfig({
-    apiKey: requiredEnv(env, "LINQ_API_KEY"),
-    webhookSecret: requiredEnv(env, "LINQ_WEBHOOK_SECRET"),
-    ...(env.LINQ_BASE_URL ? { apiBaseUrl: env.LINQ_BASE_URL } : {}),
-    ...(env.LINQ_WEBHOOK_TOLERANCE_MS ? { webhookToleranceMs: Number(env.LINQ_WEBHOOK_TOLERANCE_MS) } : {}),
-    ...(env.LINQ_REQUEST_TIMEOUT_MS ? { requestTimeoutMs: Number(env.LINQ_REQUEST_TIMEOUT_MS) } : {}),
-  });
-}
-
-function requiredEnv(env: Readonly<Record<string, string | undefined>>, name: string): string {
-  const value = env[name];
-  if (!value) {
-    throw new Error(`${name} is required`);
+export function loadLinqConfig(environment: NodeJS.ProcessEnv = process.env): LinqConfig {
+  const result = envSchema.safeParse(environment);
+  if (!result.success) {
+    const names = [...new Set(result.error.issues.map((issue) => issue.path.join(".")))].join(", ");
+    throw new LinqConfigurationError(`Invalid Linq configuration: ${names}`);
   }
-  return value;
+
+  const baseUrl = new URL(result.data.LINQ_BASE_URL);
+  if (baseUrl.protocol !== "https:" || baseUrl.search || baseUrl.hash) {
+    throw new LinqConfigurationError("LINQ_BASE_URL must be an HTTPS URL without a query or fragment");
+  }
+
+  return {
+    apiKey: result.data.LINQ_API_KEY,
+    baseUrl: baseUrl.toString().replace(/\/$/, ""),
+    phoneNumber: result.data.LINQ_PHONE_NUMBER,
+    webhookSecret: result.data.LINQ_WEBHOOK_SECRET,
+    requestTimeoutMs: result.data.LINQ_REQUEST_TIMEOUT_MS,
+    maxAttachmentBytes: result.data.LINQ_MAX_ATTACHMENT_BYTES,
+    maxWebhookBytes: result.data.LINQ_MAX_WEBHOOK_BYTES,
+  };
 }

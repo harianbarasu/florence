@@ -2,10 +2,8 @@ import { defineConfig } from "vitest/config";
 
 export default defineConfig({
   test: {
-    coverage: {
-      reporter: ["text", "json-summary"],
-    },
-    exclude: ["**/node_modules/**", "**/dist/**"],
+    environment: "node",
+    include: ["tests/**/*.test.ts"],
     testTimeout: 15_000,
   },
 });

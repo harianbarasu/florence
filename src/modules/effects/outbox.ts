@@ -1,0 +1,508 @@
+import { createHash, randomUUID } from "node:crypto";
+import type { TransactionSql } from "postgres";
+import type { Database } from "../../db/client.js";
+import { canonicalJson } from "../../shared/canonical-json.js";
+import type { SecretBox } from "../../shared/crypto.js";
+import type { AuthorityFence } from "../work/index.js";
+
+export interface AuthorizedEffectInput extends AuthorityFence {
+  readonly actionIntentId?: string;
+  readonly actorPersonId?: string;
+  readonly participantEpochId?: string;
+  readonly expectedParticipantDigest?: string;
+  readonly coverageLoop?: { readonly id: string; readonly version: number };
+  readonly effectKind: "linq.message";
+  readonly idempotencyKey: string;
+  readonly data: unknown;
+  readonly policy: unknown;
+  readonly target: unknown;
+  readonly payload: unknown;
+  readonly reasonCodes: readonly string[];
+  readonly authorizationExpiresAt: Date;
+}
+
+export interface ClaimedEffect<Payload = unknown> {
+  readonly outboxId: string;
+  readonly effectKind: "linq.message";
+  readonly idempotencyKey: string;
+  readonly payload: Payload;
+  readonly attemptCount: number;
+  readonly leaseToken: string;
+}
+
+export interface ClaimedSubmittedEffect<Payload = unknown> extends ClaimedEffect<Payload> {
+  readonly providerReceiptId: string | null;
+  readonly submittedAt: Date;
+  readonly reconciliationAttemptCount: number;
+}
+
+interface OutboxRow {
+  id: string;
+  effect_kind: "linq.message";
+  idempotency_key: string;
+  payload_ciphertext: Buffer;
+  attempt_count: number;
+  lease_token: string;
+}
+
+interface SubmittedReceiptRow {
+  provider_receipt_id: string | null;
+  submitted_at: Date;
+}
+
+type Transaction = TransactionSql<Record<string, never>>;
+type Executor = Database | Transaction;
+
+/** Exact-authority effect queue. It is impossible to insert without a committed allow decision. */
+export class EffectOutbox {
+  public constructor(
+    private readonly database: Executor,
+    private readonly secretBox: SecretBox,
+  ) {}
+
+  public async authorizeAndEnqueue(
+    input: AuthorizedEffectInput,
+    now = new Date(),
+  ): Promise<{ outboxId: string; created: boolean }> {
+    validateEffectScope(input);
+    if (input.authorizationExpiresAt <= now)
+      throw new Error("Effect authorization must expire in the future");
+    const actionDigest = digest({ effectKind: input.effectKind, idempotencyKey: input.idempotencyKey });
+    const dataDigest = digest(input.data);
+    const policyDigest = digest(input.policy);
+    const targetDigest = digest(input.target);
+    const payloadJson = canonicalJson(input.payload);
+    const payloadDigest = sha256Hex(payloadJson);
+    const encrypted = this.secretBox.encrypt(payloadJson, "effect-payload");
+    return inTransaction(this.database, async (transaction) => {
+      const existing = await transaction<{ id: string }[]>`
+        select id from outbox where idempotency_key = ${input.idempotencyKey}
+      `;
+      if (existing[0]) return { outboxId: existing[0].id, created: false };
+
+      const decisionId = randomUUID();
+      await transaction`
+        insert into disclosure_decisions (
+          id, outcome, actor_person_id, household_id, conversation_id, participant_epoch_id,
+          action_digest, data_digest, policy_digest, target_digest, reason_codes,
+          decided_at, expires_at
+        ) values (
+          ${decisionId}, 'allow', ${input.actorPersonId ?? null}, ${input.household?.id ?? null},
+          ${input.conversation?.id ?? null}, ${input.participantEpochId ?? null},
+          ${actionDigest}, ${dataDigest}, ${policyDigest}, ${targetDigest},
+          ${transaction.array([...input.reasonCodes])}, ${now}, ${input.authorizationExpiresAt}
+        )
+      `;
+      const outboxId = randomUUID();
+      await transaction`
+        insert into outbox (
+          id, authorization_decision_id, action_intent_id, household_id, person_id, conversation_id,
+          participant_epoch_id, expected_participant_digest, coverage_loop_id, coverage_loop_version,
+          effect_kind, idempotency_key,
+          payload_digest, payload_ciphertext, payload_key_version, status, available_at,
+          person_control_epoch, household_control_epoch, conversation_authority_version
+        ) values (
+          ${outboxId}, ${decisionId}, ${input.actionIntentId ?? null},
+          ${input.household?.id ?? null}, ${input.person?.id ?? null},
+          ${input.conversation?.id ?? null}, ${input.participantEpochId ?? null},
+          ${input.expectedParticipantDigest ?? null}, ${input.coverageLoop?.id ?? null},
+          ${input.coverageLoop?.version ?? null}, ${input.effectKind}, ${input.idempotencyKey},
+          ${payloadDigest}, ${Buffer.from(JSON.stringify(encrypted), "utf8")}, ${encrypted.kid},
+          'pending', ${now}, ${input.person?.controlEpoch ?? null},
+          ${input.household?.controlEpoch ?? null}, ${input.conversation?.authorityVersion ?? null}
+        )
+      `;
+      return { outboxId, created: true };
+    });
+  }
+
+  public async claim(workerId: string, limit = 10, now = new Date()): Promise<ClaimedEffect[]> {
+    const leaseUntil = new Date(now.getTime() + 60_000);
+    return inTransaction(this.database, async (transaction) => {
+      const candidates = await transaction<{ id: string }[]>`
+        select effect.id
+        from outbox effect
+        join disclosure_decisions decision on decision.id = effect.authorization_decision_id
+        left join people person on person.id = effect.person_id
+        left join households household on household.id = effect.household_id
+        left join conversations conversation on conversation.id = effect.conversation_id
+        left join participant_epochs epoch on epoch.id = effect.participant_epoch_id
+        left join coverage_loops coverage on coverage.id = effect.coverage_loop_id
+        where effect.status in ('pending', 'retry', 'leased')
+          and effect.available_at <= ${now}
+          and (effect.status <> 'leased' or effect.lease_expires_at <= ${now})
+          and decision.outcome = 'allow' and decision.revoked_at is null and decision.expires_at > ${now}
+          and (effect.person_id is null or (
+            person.status = 'registered' and person.control_epoch = effect.person_control_epoch
+          ))
+          and (effect.household_id is null or household.control_epoch = effect.household_control_epoch)
+          and (effect.conversation_id is null or (
+            conversation.status = 'active'
+            and conversation.authority_version = effect.conversation_authority_version
+            and conversation.current_epoch_id = effect.participant_epoch_id
+            and epoch.ended_at is null
+            and epoch.participant_set_digest = effect.expected_participant_digest
+          ))
+          and (effect.coverage_loop_id is null or (
+            coverage.version = effect.coverage_loop_version
+            and coverage.state in ('provisional', 'open', 'awaiting_response', 'at_risk')
+          ))
+        order by effect.available_at, effect.created_at
+        for update of effect skip locked
+        limit ${Math.max(1, Math.min(limit, 100))}
+      `;
+      const claimed: ClaimedEffect[] = [];
+      for (const candidate of candidates) {
+        const leaseToken = randomUUID();
+        const rows = await transaction<OutboxRow[]>`
+          update outbox set status = 'leased', lease_owner = ${workerId}, lease_token = ${leaseToken},
+            lease_expires_at = ${leaseUntil}, attempt_count = attempt_count + 1, updated_at = ${now}
+          where id = ${candidate.id}
+          returning id, effect_kind, idempotency_key, payload_ciphertext, attempt_count, lease_token
+        `;
+        const row = rows[0];
+        if (!row) continue;
+        const payload = JSON.parse(
+          this.secretBox
+            .decrypt(JSON.parse(row.payload_ciphertext.toString("utf8")), "effect-payload")
+            .toString("utf8"),
+        ) as unknown;
+        claimed.push({
+          outboxId: row.id,
+          effectKind: row.effect_kind,
+          idempotencyKey: row.idempotency_key,
+          payload,
+          attemptCount: row.attempt_count,
+          leaseToken: row.lease_token,
+        });
+      }
+      return claimed;
+    });
+  }
+
+  /**
+   * Leases provider-accepted effects for status lookup only. A submitted effect is
+   * deliberately excluded from the send claim above, so reconciliation cannot
+   * accidentally invoke the external mutation a second time.
+   */
+  public async claimSubmittedForReconciliation(
+    workerId: string,
+    limit = 10,
+    now = new Date(),
+  ): Promise<ClaimedSubmittedEffect[]> {
+    const leaseUntil = new Date(now.getTime() + 60_000);
+    return inTransaction(this.database, async (transaction) => {
+      const candidates = await transaction<{ id: string }[]>`
+        select effect.id
+        from outbox effect
+        where effect.status = 'submitted'
+          and effect.available_at <= ${now}
+          and (effect.lease_token is null or effect.lease_expires_at <= ${now})
+        order by effect.available_at, effect.created_at
+        for update of effect skip locked
+        limit ${Math.max(1, Math.min(limit, 100))}
+      `;
+      const claimed: ClaimedSubmittedEffect[] = [];
+      for (const candidate of candidates) {
+        const leaseToken = randomUUID();
+        const rows = await transaction<(OutboxRow & { reconciliation_attempt_count: number })[]>`
+          update outbox set lease_owner = ${workerId}, lease_token = ${leaseToken},
+            lease_expires_at = ${leaseUntil},
+            reconciliation_attempt_count = reconciliation_attempt_count + 1, updated_at = ${now}
+          where id = ${candidate.id} and status = 'submitted'
+            and (lease_token is null or lease_expires_at <= ${now})
+          returning id, effect_kind, idempotency_key, payload_ciphertext, attempt_count,
+            lease_token, reconciliation_attempt_count
+        `;
+        const row = rows[0];
+        if (!row) continue;
+        const receiptRows = await transaction<SubmittedReceiptRow[]>`
+          select provider_receipt_id, min(occurred_at) over () as submitted_at
+          from effect_receipts where outbox_id = ${row.id}
+          order by (provider_receipt_id is null), occurred_at
+          limit 1
+        `;
+        const firstReceipt = receiptRows[0];
+        const payload = JSON.parse(
+          this.secretBox
+            .decrypt(JSON.parse(row.payload_ciphertext.toString("utf8")), "effect-payload")
+            .toString("utf8"),
+        ) as unknown;
+        claimed.push({
+          outboxId: row.id,
+          effectKind: row.effect_kind,
+          idempotencyKey: row.idempotency_key,
+          payload,
+          attemptCount: row.attempt_count,
+          leaseToken: row.lease_token,
+          providerReceiptId: firstReceipt?.provider_receipt_id ?? null,
+          submittedAt: firstReceipt?.submitted_at ?? now,
+          reconciliationAttemptCount: row.reconciliation_attempt_count,
+        });
+      }
+      return claimed;
+    });
+  }
+
+  /**
+   * Rechecks every app-owned authority fence after Linq's live-audience read and
+   * immediately before the irreversible provider POST.
+   */
+  public async reauthorizeForSubmission(
+    effect: Pick<ClaimedEffect, "outboxId" | "leaseToken">,
+    now = new Date(),
+  ): Promise<boolean> {
+    return inTransaction(this.database, async (transaction) => {
+      const rows = await transaction<{ readonly id: string }[]>`
+        select candidate.id
+        from outbox candidate
+        join disclosure_decisions decision on decision.id = candidate.authorization_decision_id
+        left join people person on person.id = candidate.person_id
+        left join households household on household.id = candidate.household_id
+        left join conversations conversation on conversation.id = candidate.conversation_id
+        left join participant_epochs epoch on epoch.id = candidate.participant_epoch_id
+        left join coverage_loops coverage on coverage.id = candidate.coverage_loop_id
+        where candidate.id = ${effect.outboxId}
+          and candidate.status = 'leased' and candidate.lease_token = ${effect.leaseToken}
+          and decision.outcome = 'allow' and decision.revoked_at is null and decision.expires_at > ${now}
+          and (candidate.person_id is null or (
+            person.status = 'registered' and person.control_epoch = candidate.person_control_epoch
+          ))
+          and (candidate.household_id is null or (
+            household.status in ('onboarding', 'active', 'paused')
+            and household.control_epoch = candidate.household_control_epoch
+          ))
+          and (candidate.conversation_id is null or (
+            conversation.status = 'active'
+            and conversation.authority_version = candidate.conversation_authority_version
+            and conversation.current_epoch_id = candidate.participant_epoch_id
+            and epoch.ended_at is null
+            and epoch.participant_set_digest = candidate.expected_participant_digest
+          ))
+          and (candidate.coverage_loop_id is null or (
+            coverage.version = candidate.coverage_loop_version
+            and coverage.state in ('provisional', 'open', 'awaiting_response', 'at_risk')
+          ))
+        for update of candidate
+      `;
+      if (rows[0]) return true;
+      await transaction`
+        update outbox set status = 'cancelled', lease_owner = null, lease_token = null,
+          lease_expires_at = null, last_error_code = 'authority_fence_changed', updated_at = ${now}
+        where id = ${effect.outboxId} and status = 'leased' and lease_token = ${effect.leaseToken}
+      `;
+      return false;
+    });
+  }
+
+  public async recordReceipt(input: {
+    effect: Pick<ClaimedEffect, "outboxId" | "leaseToken" | "idempotencyKey">;
+    status: "submitted" | "confirmed" | "failed" | "ambiguous";
+    providerReceiptId?: string;
+    receipt: unknown;
+    errorCode?: string;
+    now?: Date;
+  }): Promise<boolean> {
+    const now = input.now ?? new Date();
+    const receiptJson = canonicalJson(input.receipt);
+    const receiptDigest = sha256Hex(receiptJson);
+    const encrypted = this.secretBox.encrypt(receiptJson, "effect-receipt");
+    return inTransaction(this.database, async (transaction) => {
+      const effects = await transaction<{ id: string }[]>`
+        select id from outbox where id = ${input.effect.outboxId}
+          and status = 'leased' and lease_token = ${input.effect.leaseToken}
+        for update
+      `;
+      if (!effects[0]) return false;
+      await transaction`
+        insert into effect_receipts (
+          id, outbox_id, idempotency_key, provider_receipt_id, status,
+          receipt_digest, receipt_ciphertext, receipt_key_version, occurred_at,
+          reconciled_at, error_code
+        ) values (
+          ${randomUUID()}, ${input.effect.outboxId}, ${input.effect.idempotencyKey},
+          ${input.providerReceiptId ?? null}, ${input.status}, ${receiptDigest},
+          ${Buffer.from(JSON.stringify(encrypted), "utf8")}, ${encrypted.kid}, ${now},
+          ${input.status === "submitted" ? null : now}, ${input.errorCode ?? null}
+        ) on conflict do nothing
+      `;
+      const terminal =
+        input.status === "confirmed"
+          ? "confirmed"
+          : input.status === "failed"
+            ? "dead"
+            : input.status === "ambiguous"
+              ? "ambiguous"
+              : "submitted";
+      await transaction`
+        update outbox set status = ${terminal}, lease_owner = null, lease_token = null,
+          lease_expires_at = null,
+          available_at = ${input.status === "submitted" ? new Date(now.getTime() + 60_000) : now},
+          last_error_code = ${input.errorCode ?? null}, updated_at = ${now}
+        where id = ${input.effect.outboxId}
+      `;
+      return true;
+    });
+  }
+
+  public async recordReconciliation(input: {
+    effect: Pick<
+      ClaimedSubmittedEffect,
+      "outboxId" | "leaseToken" | "idempotencyKey" | "reconciliationAttemptCount"
+    >;
+    status: "submitted" | "confirmed" | "failed" | "ambiguous";
+    providerReceiptId?: string;
+    receipt: unknown;
+    errorCode?: string;
+    nextAttemptAt?: Date;
+    now?: Date;
+  }): Promise<boolean> {
+    const now = input.now ?? new Date();
+    if (input.nextAttemptAt && input.nextAttemptAt <= now) {
+      throw new Error("A reconciliation retry time must be in the future");
+    }
+    if (input.status === "submitted" && !input.nextAttemptAt) {
+      throw new Error("An unresolved reconciliation needs a future retry time");
+    }
+    if (input.nextAttemptAt && input.status !== "submitted" && input.status !== "failed") {
+      throw new Error("Only unresolved or provisionally failed delivery can be rechecked");
+    }
+    const receiptJson = canonicalJson({
+      reconciliationAttempt: input.effect.reconciliationAttemptCount,
+      result: input.receipt,
+    });
+    const receiptDigest = sha256Hex(receiptJson);
+    const encrypted = this.secretBox.encrypt(receiptJson, "effect-receipt");
+    return inTransaction(this.database, async (transaction) => {
+      const effects = await transaction<{ id: string }[]>`
+        select id from outbox where id = ${input.effect.outboxId}
+          and status = 'submitted' and lease_token = ${input.effect.leaseToken}
+        for update
+      `;
+      if (!effects[0]) return false;
+      await transaction`
+        insert into effect_receipts (
+          id, outbox_id, idempotency_key, provider_receipt_id, status,
+          receipt_digest, receipt_ciphertext, receipt_key_version, occurred_at,
+          reconciled_at, error_code
+        ) values (
+          ${randomUUID()}, ${input.effect.outboxId}, ${input.effect.idempotencyKey},
+          ${input.providerReceiptId ?? null}, ${input.status}, ${receiptDigest},
+          ${Buffer.from(JSON.stringify(encrypted), "utf8")}, ${encrypted.kid}, ${now},
+          ${input.status === "submitted" ? null : now}, ${input.errorCode ?? null}
+        ) on conflict do nothing
+      `;
+      const terminal = input.nextAttemptAt
+        ? "submitted"
+        : input.status === "confirmed"
+          ? "confirmed"
+          : input.status === "failed"
+            ? "dead"
+            : input.status === "ambiguous"
+              ? "ambiguous"
+              : "submitted";
+      await transaction`
+        update outbox set status = ${terminal}, available_at = ${input.nextAttemptAt ?? now},
+          lease_owner = null, lease_token = null, lease_expires_at = null,
+          last_error_code = ${input.errorCode ?? null}, updated_at = ${now}
+        where id = ${input.effect.outboxId}
+      `;
+      return true;
+    });
+  }
+
+  public async retry(
+    effect: Pick<ClaimedEffect, "outboxId" | "leaseToken" | "attemptCount">,
+    errorCode: string,
+    retryable: boolean,
+    now = new Date(),
+  ): Promise<"retry" | "dead" | "stale"> {
+    const retry = retryable && effect.attemptCount < 8;
+    const delay = Math.min(15 * 60_000, 1_000 * 2 ** Math.max(0, effect.attemptCount - 1));
+    const rows = await this.database<{ status: "retry" | "dead" }[]>`
+      update outbox set status = ${retry ? "retry" : "dead"},
+        available_at = ${retry ? new Date(now.getTime() + delay) : now}, lease_owner = null,
+        lease_token = null, lease_expires_at = null, last_error_code = ${errorCode.slice(0, 200)},
+        updated_at = ${now}
+      where id = ${effect.outboxId} and status = 'leased' and lease_token = ${effect.leaseToken}
+      returning status
+    `;
+    return rows[0]?.status ?? "stale";
+  }
+
+  /** Removes effects that can no longer be claimed so queue health reflects reality. */
+  public async cancelStale(now = new Date()): Promise<number> {
+    const rows = await this.database<{ readonly id: string }[]>`
+      update outbox effect set status = 'cancelled', lease_owner = null, lease_token = null,
+        lease_expires_at = null, last_error_code = 'authority_fence_changed', updated_at = ${now}
+      where effect.status in ('pending', 'retry', 'leased') and (
+        not exists (
+          select 1 from disclosure_decisions decision
+          where decision.id = effect.authorization_decision_id
+            and decision.outcome = 'allow' and decision.revoked_at is null
+            and decision.expires_at > ${now}
+        )
+        or (effect.person_id is not null and not exists (
+          select 1 from people person where person.id = effect.person_id
+            and person.status = 'registered' and person.control_epoch = effect.person_control_epoch
+        ))
+        or (effect.household_id is not null and not exists (
+          select 1 from households household where household.id = effect.household_id
+            and household.status in ('onboarding', 'active', 'paused')
+            and household.control_epoch = effect.household_control_epoch
+        ))
+        or (effect.conversation_id is not null and not exists (
+          select 1
+          from conversations conversation
+          join participant_epochs epoch on epoch.id = conversation.current_epoch_id
+          where conversation.id = effect.conversation_id and conversation.status = 'active'
+            and conversation.authority_version = effect.conversation_authority_version
+            and conversation.current_epoch_id = effect.participant_epoch_id
+            and epoch.ended_at is null
+            and epoch.participant_set_digest = effect.expected_participant_digest
+        ))
+        or (effect.coverage_loop_id is not null and not exists (
+          select 1 from coverage_loops coverage
+          where coverage.id = effect.coverage_loop_id
+            and coverage.version = effect.coverage_loop_version
+            and coverage.state in ('provisional', 'open', 'awaiting_response', 'at_risk')
+        ))
+      )
+      returning id
+    `;
+    return rows.length;
+  }
+}
+
+function inTransaction<Result>(
+  executor: Executor,
+  operation: (transaction: Transaction) => Promise<Result>,
+): Promise<Result> {
+  return "begin" in executor
+    ? (executor.begin(operation) as unknown as Promise<Result>)
+    : operation(executor);
+}
+
+function validateEffectScope(input: AuthorizedEffectInput): void {
+  if (
+    input.coverageLoop &&
+    (!Number.isSafeInteger(input.coverageLoop.version) || input.coverageLoop.version < 1)
+  ) {
+    throw new Error("Coverage effect versions must be positive integers");
+  }
+  if (input.conversation) {
+    if (!input.participantEpochId || !input.expectedParticipantDigest) {
+      throw new Error("Conversation effects require an exact participant epoch and digest");
+    }
+  } else if (input.participantEpochId || input.expectedParticipantDigest) {
+    throw new Error("Participant authority cannot exist without a conversation effect scope");
+  }
+}
+
+function digest(value: unknown): string {
+  return sha256Hex(canonicalJson(value));
+}
+
+function sha256Hex(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}

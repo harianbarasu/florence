@@ -1,43 +1,27 @@
 import postgres, { type Sql } from "postgres";
+import type { FlorenceConfig } from "../config.js";
 
 export type Database = Sql<Record<string, never>>;
 
-const schemaPattern = /^[a-z][a-z0-9_]{0,62}$/u;
-
-export function createDatabase(
-  databaseUrl: string,
-  options: { max?: number; schema?: string } = {},
-): Database {
-  const schema = options.schema ?? "florence";
-  if (!schemaPattern.test(schema)) {
-    throw new Error("Invalid PostgreSQL schema name");
-  }
-  return postgres(databaseUrl, {
-    max: options.max ?? 10,
+export function createDatabase(config: FlorenceConfig, applicationName: string): Database {
+  return postgres(config.database.url, {
+    max: applicationName === "florence-web" ? 10 : 5,
     idle_timeout: 20,
     connect_timeout: 15,
-    max_lifetime: 60 * 30,
-    onnotice: () => undefined,
+    ssl: config.database.ssl ? "require" : false,
     connection: {
-      application_name: "florence",
-      search_path: `${schema},public`,
+      application_name: applicationName,
+      search_path: config.database.schema,
+      statement_timeout: 30_000,
+      lock_timeout: 5_000,
+      idle_in_transaction_session_timeout: 30_000,
+      TimeZone: "UTC",
     },
-    transform: {
-      undefined: null,
-    },
+    onnotice: () => undefined,
   });
 }
 
-export function assertDatabaseSchemaName(schema: string): void {
-  if (!schemaPattern.test(schema)) {
-    throw new Error("Invalid PostgreSQL schema name");
-  }
-}
-
-export async function checkDatabase(database: Database): Promise<void> {
-  await database`select 1 as ok`;
-}
-
-export async function closeDatabase(database: Database): Promise<void> {
-  await database.end({ timeout: 5 });
+export async function verifyDatabase(database: Database): Promise<void> {
+  const result = await database<{ ok: number }[]>`select 1 as ok`;
+  if (result[0]?.ok !== 1) throw new Error("Database readiness query failed");
 }

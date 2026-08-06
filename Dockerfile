@@ -1,31 +1,24 @@
-# syntax=docker/dockerfile:1.7
+ARG NODE_IMAGE=node:24.19.0-bookworm-slim@sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03
 
-FROM node:24.19.0-bookworm-slim AS toolchain
-ENV PNPM_HOME=/pnpm
-ENV PATH=$PNPM_HOME:$PATH
-RUN corepack enable && corepack prepare pnpm@10.10.0 --activate
+FROM ${NODE_IMAGE} AS build
 WORKDIR /app
-
-FROM toolchain AS dependencies
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+RUN corepack enable
+COPY package.json pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile
-
-FROM dependencies AS build
-COPY tsconfig.json tsconfig.build.json ./
-COPY src ./src
+COPY . .
 RUN pnpm build
+RUN test -f dist/server.js && test -f dist/worker.js && test -f dist/cli/migrate.js \
+  && test -f dist/ops/predeploy-production.js && test -f dist/ops/smoke-production.js \
+  && test -f dist/public/index.html
 
-FROM toolchain AS production-dependencies
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
-RUN pnpm install --prod --frozen-lockfile
-
-FROM node:24.19.0-bookworm-slim AS runtime
-ENV NODE_ENV=production
+FROM ${NODE_IMAGE} AS runtime
 WORKDIR /app
-COPY --from=production-dependencies --chown=node:node /app/node_modules ./node_modules
-COPY --from=build --chown=node:node /app/dist ./dist
-COPY --chown=node:node package.json ./package.json
-COPY --chown=node:node migrations ./migrations
+ENV NODE_ENV=production \
+    NODE_OPTIONS=--enable-source-maps
+RUN corepack enable
+COPY package.json pnpm-lock.yaml ./
+RUN pnpm install --prod --frozen-lockfile
+COPY --chown=node:node --from=build /app/dist ./dist
+COPY --chown=node:node --from=build /app/migrations ./migrations
 USER node
-EXPOSE 3000
-CMD ["sh", "-c", "node dist/cli/migrate.js && exec node dist/server.js"]
+CMD ["node", "dist/server.js"]

@@ -1,8 +1,8 @@
 # Florence — Canonical Product Contract and Build Plan
 
-Status: approved working contract for the clean rebuild
+Status: active build-and-learn contract
 
-Date: 2026-08-05
+Date: 2026-08-06
 
 Canonical repository: `/Users/harianbarasu/Projects/florence` and `harianbarasu/florence`
 
@@ -18,6 +18,218 @@ The full research transfer and evidence classification are in
 That audit accounts for every branch in Codex task `019fcdde-cef2-7833-8f30-b6b9420dbec9` and
 separates primary-source facts, prior-task synthesis, Florence-specific inference, weak evidence,
 and non-transferable enterprise assumptions.
+
+## Core User Flows
+
+These three flows are the product spine. Reversible details are implementation defaults and are
+changed from real usage; privacy, audience, authority, and the meaning of a safely closed loop remain
+hard product decisions.
+
+### Flow 1 — A parent privately activates Florence and connects Google
+
+- **Trigger:** a parent sends any natural first private iMessage to Florence, or an existing parent
+  without a connected source sends their next private message.
+- **User steps:** Florence establishes private consent and identity, creates or resolves the
+  household, then sends a single-use mobile-web handoff for the parent's primary personal Google
+  account. Gmail and Calendar begin syncing immediately. While that work runs, Florence learns or
+  confirms children, aliases, schools, activities, and routines and allows the parent to invite an
+  equal co-parent.
+- **Visible states:** private connection confirmation; “reviewing recent email and calendar”; recent
+  sources reconciled; older history continuing in the background; exact reconnect action if a
+  capability fails. Detailed account, calendar, stage, and error state lives on `/sources`.
+- **Partial and error behavior:** declining Google does not block Florence and does not create generic
+  nagging. Florence offers it again only when it directly enables requested help. Mail and Calendar
+  capabilities fail independently. A work account defaults to Calendar-only unless the person
+  explicitly grants mail.
+- **Success:** recent mail and Calendar reach a known high-water mark without exposing either source
+  to a household, and the parent understands that Florence is actively monitoring.
+- **Recovery:** OAuth cancellation changes nothing; an expired handoff is replaced from the private
+  DM; reauthorization resumes the same person-owned integration under a new control epoch.
+- **Existing code reused:** private Linq registration, `PostgresWebAuth`, Google OAuth,
+  `PostgresSourceIntelligence`, `GoogleSyncService`, staged jobs/cursors, and the `/sources` account
+  cards. The true gaps are prompt timing, private milestone delivery, and an explicit recent-source
+  reconciliation gate.
+
+### Flow 2 — Florence is cold-added to any group
+
+- **Trigger:** somebody adds Florence to an existing iMessage group, including a household,
+  caregiver, school, sports, or parent-community chat.
+- **User steps:** none are required in the group. Florence silently captures new messages from the
+  exact participant epoch beginning when she is added. Every currently registered Florence user in
+  that exact chat receives an independent private source view; unregistered participants receive no
+  product access merely by being observed. If a sender deterministically invokes Florence with a
+  leading “Florence” address, or replies to a Florence-owned message proven by a local receipt,
+  Florence continues privately with that exact sender. The source group remains silent.
+- **Visible states:** the group itself sees no Florence message, reaction, typing indicator,
+  enrollment copy, error, or administrative announcement while observe-only. Registered users can
+  inspect the source privately. A household may separately authorize an exact current group as
+  interactive only after every current participant has registered and explicitly approved writing.
+- **Partial and error behavior:** ambiguous mentions do nothing. Failure to open the exact sender's
+  private DM creates no group output. Participant changes create a new epoch and immediately revoke
+  prior write approval; ingestion continues for the new observe-only epoch while Florence
+  re-evaluates private access.
+- **Success:** Florence learns useful context from the ambient family firehose without ever writing
+  to the cold-added group or widening raw chat content beyond exact, individually authorized access.
+- **Recovery:** STOP or disabled mode halts new content retention for the requester or exact chat as
+  applicable. Deletion and revocation fence all later retrieval and effects.
+- **Existing code reused:** provider-chat reconciliation, immutable participant epochs, encrypted
+  source revisions, participant policies, exact group rules, outbox audience checks, and Linq direct
+  chat creation. The true gaps are observe-only admission independent of registration, per-person
+  exact-chat source grants, and private deterministic invocation routing.
+
+### Flow 3 — Florence turns evidence into an acknowledged coverage loop
+
+- **Trigger:** a private source, authorized group source, explicit request, or routine implies a
+  current family obligation whose coverage is genuinely uncertain.
+- **User steps:** Florence first creates a silent candidate. She reconciles the newest Gmail thread,
+  attachments, Calendar revisions, cancellations, and related evidence. With no standing rule, she
+  privately offers the source owner the minimum current risk: “Want me to make sure it is covered?”
+  One-time approval promotes only the minimum operational meaning into the smallest authorized
+  household audience. A person explicitly accepts responsibility in natural language.
+- **Visible states:** syncing/reconciling; private candidate; awaiting approval; open; awaiting
+  response; covered; at risk; cancelled/superseded/dismissed; or expired uncovered. The web home
+  shows only authorized active exceptions; normal coordination stays in iMessage.
+- **Partial and error behavior:** incomplete or conflicting evidence remains a silent candidate or
+  produces one narrow private question. Silence never means acceptance. A model or connector failure
+  produces a recoverable private status rather than disappearing. New evidence that changes action
+  updates the same loop and notifies only its reliance set.
+- **Success:** a named person explicitly acknowledges coverage before the last responsible moment;
+  Florence stops reminders. The first release does not claim to prove physical fulfillment.
+- **Recovery:** a decline keeps coverage open without disclosing the person's reason. A contradiction
+  reopens the same loop. If nobody responds, Florence escalates minimum necessary meaning to every
+  parent steward before the deadline, neutrally and without blame.
+- **Existing code reused:** `knowledge_candidates`, `PrivateSourceBridge`, typed bridge and
+  conversation rules, `PostgresCoordination`, coverage timers, effects/outbox, and explicit reply
+  reconciliation. The true gaps are source reconciliation before interruption, private proposal
+  delivery/reply binding, approval-bound reliance escalation, and authorized household context in
+  interpretation.
+
+## Ownership And Reuse Map
+
+| Product noun | Current owner and reused implementation | True gap | Owner alignment / migration gate |
+|---|---|---|---|
+| Person and identity | Identity module; `people`, `person_identities`, sessions, observed/claim flows | None | Do not add a separate parent account model |
+| Household, role, authority | Relationship module; households, memberships, capabilities, invitations | None for the pilot | `steward` is the equal parent/customer role |
+| Exact chat and write authority | Conversation authority module; conversations, immutable epochs, participant policies, exact rules and approvals | Observe-only ingestion and per-person access grants | Extend this owner; do not create parallel chat state |
+| External source and revision | Source intelligence module; integrations, grants, cursors, encrypted objects/revisions/blobs/derivatives | A deep sync-health projection, not another source layer | No progress table until exact counts or resumable run identity require one |
+| Child and family context | Relationship module; dependent `people`, membership, encrypted dependent profiles and aliases | Interpretation does not yet consume the authorized projection; rules lack stable child binding | Wire context first; add normalized subject links only when a rule must enforce “this child only” |
+| Candidate | Person-scoped `knowledge_candidates` with `coverage_proposal` | Reconciliation/readiness metadata and private delivery binding | No candidate-loop table |
+| Household coverage loop | Coordination module; coverage loops, transitions, participants, routines and occurrences | Cross-chat reliance and all-steward escalation | Core loop table remains canonical; a versioned approval-bound reliance record is justified |
+| Standing behavior | Typed conversation rules, private bridge rules, and routine revisions | Plain-language projection and future-facing step-up | Do not add one generic rule-builder table |
+| Delivery | Effects module; action intents, disclosure decisions, outbox and receipts | Reliance is not equivalent to receipt delivery | Persist reliance authority; never infer it from sent/read state |
+| Web companion | `PostgresFlorenceQueries` read model and existing `/home`, `/people`, `/chats`, `/sources`, `/safety` routes | Purposeful handoff focus, named sync milestones, authorized loop meaning, clearer rule copy | Keep the current information architecture |
+
+## Decision Log
+
+1. **Build while learning.** Reversible operating details are defaults, not interview blockers. Ask
+   Hari only when a choice changes privacy, safety, external authority, or the product thesis.
+2. **Parents are the customers.** Parent stewards are co-equal. Caregivers and grandparents may use
+   Florence and originate or accept loops, but receive only bounded relationship-local authority.
+3. **One person, many relationships.** Claiming an observed identity joins it to the global person;
+   it never creates separate accounts for every chat or family.
+4. **Cold addition means ingestion intent, not write authority.** From the moment Florence is added,
+   the exact chat becomes an observe-only source. Florence never writes there by default.
+5. **Interactive writing is exact and unanimous.** Every current participant must be a registered
+   Florence user and explicitly approve that exact membership. Membership changes revoke approval.
+6. **Observe-only means visually absent.** No messages, reactions, typing indicators, enrollment
+   announcements, or errors appear in the source group.
+7. **Group invocation is deterministic.** Only a leading Florence address or a verified reply to
+   Florence counts. It routes to the exact sender's private DM and never creates a group effect.
+8. **Raw context remains exact.** Each registered participant in the source chat gets an independent
+   private source view. Household use requires explicit promotion or a narrow standing bridge.
+9. **Minimum meaning may bridge.** A loop can widen “Wednesday pickup needs coverage” without
+   revealing that Jenny privately said she is unavailable.
+10. **Google starts with the first parent.** Florence does not wait for the co-parent. The second
+    parent reviews existing family context and adds only corrections or missing facts.
+11. **Personal Google comes first.** It is the first mobile-web step after household resolution;
+    work Calendar and additional accounts are optional later connections.
+12. **Initial import does not speak from partial evidence.** Candidates remain silent until current
+    sources are reconciled. Florence gives private milestone updates and detailed web progress.
+13. **First value is one current coordination risk.** Do not manufacture an inbox digest or prompt
+    merely to demonstrate activity.
+14. **Corrections are action-change driven.** Update the same loop only when new evidence changes
+    required behavior; notify the reliance set, not the whole household, and reveal no private source.
+15. **Coverage requires acknowledgment.** Sending or pinging is not closure; silence never assigns
+    responsibility. Physical fulfillment is deliberately a later capability.
+16. **Parents are the final safety net.** Every unresolved household loop reaches all parent stewards
+    before its decision deadline, using minimum necessary and blame-free language.
+17. **Automation is learned explicitly.** One-time approval does not silently become broad standing
+    authority. Florence asks once for future behavior, stores a narrow human-readable rule, and
+    broadens it only with confirmation.
+18. **Typed rule owners remain separate.** A chat rule authorizes writing, a bridge rule authorizes
+    private-source disclosure, and a routine authorizes recurring coordination.
+19. **One visible Florence, ephemeral specialists.** The app-owned Chief of Staff orchestrates
+    bounded ephemeral workers and governed skills behind provider-neutral seams.
+20. **The product metric is loops safely closed.** Messages, tasks, model calls, and pings are input
+    metrics, not the outcome.
+
+## Implementation Plan
+
+### Iteration 0 — Exercise the currently working two-phone spine
+
+- Run natural DM registration, household creation, exact group enrollment, second-parent invitation,
+  unanimous group approval, an explicit timed pickup gap, a natural acceptance, and named closure on
+  production phones.
+- Use “I can't pick Avery up Wednesday at 3:00” for this first exercise; family-context recovery of
+  an omitted routine time is implemented in the next iteration.
+- **Done when:** one real production loop reaches `covered`, Florence sends no later reminder, and
+  every confusing or broken step is recorded as product evidence.
+
+### Iteration 1 — Make parent activation and Google syncing feel alive
+
+- Offer personal Google once immediately after a parent household is resolved, including a one-time
+  nudge for existing parent stewards without an active connection.
+- Consume the existing allowlisted handoff context and use purpose-specific copy/focus.
+- Project the existing newest-30-day, 31–90-day, one-year, and older-history stages as named web
+  milestones; send connection/current-caught-up/background-history/error milestones privately.
+- Inject authorized dependent aliases, schools, activities, and current routines into interpretation
+  through one read-only context interface. Add other accepted household memories only when a
+  canonical household-scoped producer exists.
+- **Done when:** a parent connects Google from the private Florence flow, sees honest progress, and a
+  routine time omitted from an approved household-group message can be recovered from authorized
+  family context.
+
+### Iteration 2 — Reconcile evidence before the first interruption
+
+- Give each integration a deterministic recent-source readiness projection across live Gmail,
+  newest-first mail, relevant full threads/attachments, Calendar catalog, and initial Calendar sync.
+- Keep candidates internal until that projection is ready. Deduplicate candidates by current family
+  outcome and evidence lineage, then surface at most the highest-value current unresolved item.
+- Bind the private proposal message to its candidate/action intent so a natural reply can approve,
+  dismiss, or clarify the exact item without a magic command.
+- **Done when:** a later cancellation/update suppresses an obsolete first prompt, and the parent can
+  move the surviving item into coordination directly from iMessage.
+
+### Iteration 3 — Complete group-source and escalation authority
+
+- Admit and encrypt post-addition messages for every observe-only exact participant epoch without
+  granting group write authority.
+- Add per-person exact-chat source access grants for registered participants and deterministic
+  private invocation routing for the exact sender.
+- Persist versioned, approval-bound reliance membership/provenance and escalate unresolved household
+  loops to all parent stewards before the last responsible moment.
+- **Done when:** a community chat remains entirely silent while informing a registered parent
+  privately, and a subset-audience household loop safely reaches every parent only at its approved
+  escalation boundary.
+
+### Iteration 4 — Tighten the existing web companion and standing behavior
+
+- Refresh viewer state after household mutations; honor exception links; show authorized active-loop
+  meaning and deadline on Home without creating a task dashboard.
+- Render each routine/bridge/chat rule as an exact plain-language sentence and require a fresh
+  private-DM confirmation before future-facing activation.
+- **Done when:** a nontechnical parent can understand, correct, pause, or revoke what Florence will do
+  next without seeing internal agents or schema language.
+
+### Iteration 5 — Production verification and learning loop
+
+- Run the repository's lean verification gates, migrate once per release, deploy the same image to
+  Railway web and worker, and perform targeted connector plus real-phone checks.
+- Instrument loops proposed/opened/acknowledged/reopened/expired, interruption quality, corrections,
+  privacy denials, and time-to-coverage. Review failed traces as candidate skill/harness changes;
+  workers never self-promote behavior.
+- **Done when:** the production test script passes repeatedly for two parents, restart/retry creates
+  no duplicate logical effects, and the next iteration is chosen from actual loop evidence.
 
 ## 1. Product thesis
 
@@ -154,15 +366,21 @@ ends the current `ParticipantEpoch` and starts a new immutable epoch.
 
 | Mode | Condition | Ordinary content processing | Florence may write |
 |---|---|---|---|
-| `content_disabled` | At least one current participant lacks verified global registration and explicit Florence consent | No persistence, model call, attachment fetch, derivation, or retrieval; retain only routing, dedupe, membership, security, and opt-out metadata | No |
-| `read_enabled_write_disabled` | Every participant's verified registration and explicit Florence consent is projected into the exact epoch, but the effective policy or group rule forbids writing | Chat-epoch-local ingestion is allowed | No |
+| `observe_only` | Florence is present but this exact current participant epoch has not unanimously authorized writing | Encrypt new post-addition content in the exact chat epoch; registered exact-chat participants may receive independent private source views under their own policies | No |
+| `disabled` | The exact chat or applicable person has stopped/disabled new retention | Retain only routing, dedupe, membership, security, invocation detection, revocation, and opt-out metadata | No |
 | `trusted_write_enabled` | Every participant is registered, the live epoch matches, the participant-policy intersection permits the operation, and an applicable group rule exists for proactivity | Allowed within the epoch and exact grants | Direct answers and rule-authorized proactivity only |
 | `paused` | STOP, participant change, deletion fence, policy conflict, or safety hold | No new ordinary processing | No |
 
-“Read-only” therefore never means reading non-consenting people in secret. Adding Florence designates
-the chat as a potential source; it does not itself authorize ordinary processing. Registration may
-be lightweight—a verified private-DM claim and consent—without creating a household or connecting
-Google. This preserves the viral invite loop while keeping the permission boundary honest.
+Adding Florence designates the exact post-addition chat epoch as an observe-only source. It does not
+authorize Florence to write, react, type, announce enrollment, expose raw content to another chat, or
+make an unregistered participant a full Florence user. Each currently registered Florence user in
+the exact chat receives an independent private source grant bounded by their own policy; nobody else
+receives product access merely because their messages were observed.
+
+A deterministic leading address such as “Florence, …” or a reply to a locally proven Florence-owned
+message may route the exact sender into a private Florence DM. The source group remains completely
+silent. Generic questions, fuzzy model inference, and name mentions in the middle of a sentence are
+not invocations.
 
 A natural affirmative reply to Florence's explicit private consent question is global Florence
 consent; magic commands such as `START` are not required. New exact participant epochs project each
@@ -170,9 +388,10 @@ registered person's existing conservative policy; they never synthesize consent 
 Participant changes invalidate proactive rules and require a new exact-audience rule, but Florence
 does not ask an already registered person to re-register for every chat.
 
-The inviter may authorize one private enrollment invitation to each unregistered participant. The
-invitation names the inviter, explains Florence plainly, sends at most once unless requested again,
-and supports immediate STOP. Florence sends nothing in the group before eligibility.
+An explicit household invitation may send one private enrollment message to the exact invitee. It
+names the inviter, explains Florence plainly, sends at most once unless requested again, and supports
+immediate STOP. Cold addition by itself does not enroll or message every observed participant.
+Florence sends nothing in the group before exact write eligibility.
 
 ### Effective shared policy
 
@@ -233,16 +452,19 @@ clearer there. It is resumable and useful before every optional field is complet
 
 1. Register the global person and confirm name, timezone, quiet hours, consent, and recovery phone.
 2. Create or join a household.
-3. Invite co-stewards and caregivers through exact private invitations.
-4. Represent dependents, schools, activities, and important places without creating child accounts.
-5. Capture the few recurring routines that are not on a calendar: pickup, drop-off, practices,
-   meals, recurring forms, and coverage preferences.
-6. Connect one or more person-owned Google accounts.
-7. Select Gmail import behavior and each Google calendar's private processing level.
-8. Add Florence to one or more chats and privately inspect their participant/eligibility status.
-9. Establish a narrow household-group proactivity rule once every current participant is registered.
-10. Begin in exceptions-first learning mode; Florence proposes narrow recurring rules when repetition
-    is demonstrated.
+3. For a parent steward, connect the primary personal Google account immediately so recent Gmail and
+   Calendar reconciliation can begin. Caregiver connections remain optional and contextual.
+4. While sync runs, represent dependents, aliases, schools, activities, and important places without
+   creating child accounts; capture the few routines that are not listed elsewhere.
+5. Invite co-stewards and caregivers through exact private invitations. An invited co-steward reviews
+   existing household facts and supplies only corrections or additions rather than repeating intake.
+6. Add optional personal accounts and work Calendars, and select each Calendar's private processing
+   level. Declining an account never blocks ordinary Florence use.
+7. Add Florence to one or more chats and privately inspect their source and write status.
+8. Establish a narrow household-group proactivity rule once every current participant is registered
+   and that exact membership has approved writing.
+9. Begin in exceptions-first learning mode; Florence proposes one future-facing rule after a
+   successful example, then stops asking for matching situations once it is approved.
 
 ## 6. Web cockpit
 
@@ -298,7 +520,7 @@ Show onboarding progress when incomplete. Otherwise show only:
 
 - provider chat, current exact participants, and current epoch start;
 - each participant's registration/consent state;
-- `content_disabled`, silent, trusted, or paused mode;
+- observe-only, disabled, interactive, or paused mode;
 - effective retention, quiet-hours, and proactivity intersection;
 - last participant change and why a write gate is closed;
 - applicable bridge and conversation rules.
@@ -432,6 +654,21 @@ Additional messages require new evidence or an explicit request. Low-urgency pri
 into one private review. A household brief is optional and is suppressed when it would only say “all
 clear.”
 
+Candidates created during initial import do not notify anyone until the newest available Gmail
+thread, relevant attachments, Calendar revisions, and current sync high-water marks have been
+reconciled. Florence reports import milestones privately, but never narrates speculative findings.
+
+After a loop has been communicated, only evidence that changes the required action, time, place,
+deadline, responsible person, or whether the loop still exists causes another message. The same loop
+is updated; a duplicate loop is not opened. Corrections go to the reliance set—the people who saw,
+accepted, or must act on the earlier state—and never automatically to the entire household. Private
+source and reason remain undisclosed.
+
+If a household loop remains unresolved, every current parent steward is the final safety net.
+Florence escalates the minimum operational meaning privately before the last responsible moment,
+even when initial coordination used a smaller approved audience. This widening must be backed by
+versioned household authority and reliance provenance; urgency alone never invents that authority.
+
 Onboarding asks for quiet hours. Until configured, use 9:00 PM–7:00 AM local for private messages and
 the conservative union of every participant's quiet hours for a group. A quiet-hours override is
 allowed only when waiting crosses the last responsible moment and every affected participant's
@@ -474,8 +711,13 @@ disclosure authority.
 - Support messages, edits, replies, reactions, participant added/removed events, attachments, and
   outbound sent/failed receipts.
 - Fetch the authoritative live chat for participant changes and immediately before every send.
-- Never ingest pre-Florence, pre-registration, pre-consent, or earlier-epoch group history.
-- Fetch attachments only after the content-admission gate.
+- Never ingest pre-Florence or earlier-epoch group history. Post-addition observe-only content is
+  exact-epoch encrypted context even when some participants are not registered; it grants no group
+  write authority and no automatic household disclosure.
+- Fetch attachments only after exact-epoch admission and keep their retrieval/use subject to the
+  same source and audience grants as the parent message.
+- Treat leading Florence address and locally proven reply-to-Florence as control signals before any
+  ordinary-content suppression; route privately to the exact sender and emit nothing in the group.
 - Periodically reconcile provider state after missed or out-of-order events.
 
 ### Gmail
@@ -913,10 +1155,10 @@ Blocked in the first release:
 The generic action-intent/approval/receipt boundary still exists so later capabilities do not require
 redesign. No blocked action is exposed as if it works.
 
-## 16. Implementation sequence
+## 16. Completed rebuild foundation (historical sequence)
 
-Each layer ends in a working deployed product slice; later layers extend it without replacing its
-authority model.
+These layers describe how the current deployed foundation was produced. The active forward sequence
+is the `Implementation Plan` near the beginning of this document.
 
 ### Layer 0 — Preserve evidence, then replace
 
@@ -933,7 +1175,7 @@ authority model.
 - Implement verified private-DM registration and one-time web handoff.
 - Implement people, households, memberships, invitations, sessions, and control-plane shell.
 - Implement Linq raw verification, durable inbox, dedupe, STOP, conversations, participant epochs,
-  registration status, and zero-write/content-disabled modes.
+  registration status, and exact write-disabled modes.
 - Deploy and exercise real private DM plus group membership changes.
 
 ### Layer 2 — Real coverage coordination
@@ -981,7 +1223,7 @@ Automated verification is necessary evidence, not the product itself. Keep it fo
 |---|---|---|---|
 | Build/schema | lint, typecheck, small test suite, build, fresh migration twice | health/readiness after deploy and restart | all green; no secret or stale process |
 | Identity/auth | single-use handoff, CSRF, expiry, session revocation, step-up | register two adults and one caregiver from real DMs | one global person each; exact sessions/roles |
-| Linq gate | signature-before-parse, dedupe, STOP, epoch mismatch, send idempotency | group with unregistered member, then registration, then add/remove participant | no pre-registration content use/write; correct pause/resume; one logical send |
+| Linq gate | signature-before-parse, dedupe, STOP, epoch mismatch, send idempotency | cold-added observe-only group, deterministic private invocation, later exact write approval, then add/remove participant | post-addition context stays exact/private; zero observe-only group output; write approval revokes on membership change; one logical send |
 | Coverage | state/time/no-blame contracts | real pickup/activity loop, acknowledgment, change, and closure | no silence-as-owner; useful timing; correct reopen |
 | Gmail | private admission, cursors, independent backfill, replay/recovery, revocation | connect personal/work accounts; send synthetic school mail and PDF | one private finding; resumable import; zero group leakage |
 | Calendar | catalog/modes/sync-token recovery | sync two accounts; edit/delete an event | correct private/full/free-busy projections |
@@ -994,9 +1236,10 @@ Before declaring the product usable, perform the full real flow:
 1. Hari registers by private iMessage and opens the mobile web companion.
 2. A second adult registers independently and joins the household.
 3. A caregiver registers and joins only the granted household/conversations.
-4. A group containing an unregistered handle proves zero content processing and zero writes.
-5. After all register and establish the rule, Florence ingests the new epoch and answers a direct
-   group-local question.
+4. A cold-added group containing an unregistered handle proves exact-epoch ingestion and zero group
+   output; a deterministic Florence invocation continues only in the sender's private DM.
+5. After all register and establish the exact rule, Florence may answer and coordinate in that
+   current group without exposing another source's raw content.
 6. A Gmail/PDF or Calendar source produces a private candidate; irrelevant mail remains silent.
 7. One exact approval promotes minimum family meaning; a narrow standing rule handles the next
    matching item without asking again.

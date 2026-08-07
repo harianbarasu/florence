@@ -973,13 +973,22 @@ function SourcesPage({ viewer }: { viewer: Viewer }) {
   }, [data, reload]);
   const googleSyncStarting = data?.connections.some(
     (connection) =>
-      connection.mail?.liveState === "waiting" ||
-      (connection.mail !== null && connection.mail.backfillCompleted < connection.mail.backfillTotal) ||
-      connection.calendar?.syncState === "waiting",
+      connection.status === "active" &&
+      (connection.mail?.liveState === "waiting" ||
+        connection.mail?.historyState === "waiting" ||
+        connection.mail?.historyState === "running" ||
+        connection.mail?.historyState === "needs_attention" ||
+        connection.calendar?.syncState === "waiting" ||
+        connection.calendar?.syncState === "needs_attention"),
   );
   useEffect(() => {
     if (!googleSyncStarting) return;
-    const poll = window.setInterval(() => void reload(false), 10_000);
+    let polls = 0;
+    const poll = window.setInterval(() => {
+      polls += 1;
+      void reload(false);
+      if (polls >= 30) window.clearInterval(poll);
+    }, 10_000);
     return () => window.clearInterval(poll);
   }, [googleSyncStarting, reload]);
   if (loading) return <PageSkeleton />;
@@ -1133,12 +1142,12 @@ function SourcesPage({ viewer }: { viewer: Viewer }) {
           {actionError}
         </div>
       ) : null}
-      <RoutinesSection viewer={viewer} />
       <SectionHeading title="Connections" count={data.connections.length} />
       <div className="card-list">
         {data.connections.map((connection) => {
           const needsAttention =
             connection.mail?.liveState === "needs_attention" ||
+            connection.mail?.historyState === "needs_attention" ||
             connection.calendar?.syncState === "needs_attention";
           return (
             <article className="source-card" key={connection.id}>
@@ -1158,39 +1167,15 @@ function SourcesPage({ viewer }: { viewer: Viewer }) {
               </div>
               <div className="source-status-grid">
                 {connection.mail ? (
-                  <>
-                    <div>
-                      <span>New mail</span>
-                      <strong>{connection.mail.liveLabel}</strong>
-                      <small>
-                        {connection.mail.lastCheckedAt
-                          ? `Last checked ${friendlyTime(connection.mail.lastCheckedAt)}`
-                          : "Starting shortly"}
-                      </small>
-                    </div>
-                    <div>
-                      <span>Earlier mail</span>
-                      <strong>{connection.mail.backfillLabel}</strong>
-                      <div
-                        className="mini-progress"
-                        role="progressbar"
-                        aria-label="Past mail setup"
-                        aria-valuemin={0}
-                        aria-valuemax={connection.mail.backfillTotal}
-                        aria-valuenow={connection.mail.backfillCompleted}
-                      >
-                        <span
-                          style={{
-                            width: `${
-                              connection.mail.backfillTotal === 0
-                                ? 0
-                                : (connection.mail.backfillCompleted / connection.mail.backfillTotal) * 100
-                            }%`,
-                          }}
-                        />
-                      </div>
-                    </div>
-                  </>
+                  <div>
+                    <span>New mail</span>
+                    <strong>{connection.mail.liveLabel}</strong>
+                    <small>
+                      {connection.mail.lastCheckedAt
+                        ? `Last checked ${friendlyTime(connection.mail.lastCheckedAt)}`
+                        : "Starting shortly"}
+                    </small>
+                  </div>
                 ) : null}
                 {connection.calendar ? (
                   <div>
@@ -1201,6 +1186,26 @@ function SourcesPage({ viewer }: { viewer: Viewer }) {
                         ? `Last checked ${friendlyTime(connection.calendar.lastCheckedAt)}`
                         : "Starting shortly"}
                     </small>
+                  </div>
+                ) : null}
+                {connection.mail ? (
+                  <div className="mail-history-card">
+                    <div className="mail-history-heading">
+                      <span>Earlier mail</span>
+                      <strong>{connection.mail.historyLabel}</strong>
+                    </div>
+                    <ul className="sync-milestone-list" aria-label="Earlier mail progress">
+                      {connection.mail.milestones.map((milestone) => (
+                        <li className={`sync-milestone ${milestone.state}`} key={milestone.id}>
+                          <span className="sync-milestone-marker" aria-hidden="true" />
+                          <span className="sync-milestone-copy">
+                            <strong>{milestone.label}</strong>
+                            <small>{milestone.detail}</small>
+                          </span>
+                          <span className="sync-milestone-state">{milestone.stateLabel}</span>
+                        </li>
+                      ))}
+                    </ul>
                   </div>
                 ) : null}
               </div>
@@ -1285,6 +1290,7 @@ function SourcesPage({ viewer }: { viewer: Viewer }) {
           {data.connections.length === 0 ? "Connect Google" : "Connect another Google account"}
         </button>
       )}
+      <RoutinesSection viewer={viewer} />
       <SectionHeading title="Private review" count={data.privateReviews.length} />
       <p className="section-explainer">
         Only you can see these suggestions. Keeping one does not share it with a chat or family member.

@@ -1169,18 +1169,70 @@ p {
   font-size: 12px;
   line-height: 1.35;
 }
-.mini-progress {
-  height: 5px;
-  margin-top: 6px;
-  border-radius: 99px;
-  background: #e7e1d5;
+.source-status-grid > .mail-history-card {
+  grid-column: 1 / -1;
+  min-height: 0;
+  gap: 12px;
+}
+.mail-history-heading {
+  display: grid;
+  gap: 4px;
+}
+.sync-milestone-list {
+  display: grid;
+  gap: 1px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border: 1px solid #e7e1d5;
+  border-radius: 11px;
   overflow: hidden;
 }
-.mini-progress span {
-  display: block;
-  height: 100%;
-  border-radius: inherit;
+.sync-milestone {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 11px;
+  background: var(--card);
+}
+.sync-milestone + .sync-milestone {
+  border-top: 1px solid #eeeae1;
+}
+.sync-milestone-marker {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #c8c1b4;
+}
+.sync-milestone.running .sync-milestone-marker {
+  background: #c89b52;
+}
+.sync-milestone.complete .sync-milestone-marker {
   background: var(--sage);
+}
+.sync-milestone.needs_attention .sync-milestone-marker {
+  background: #b85f48;
+}
+.sync-milestone-copy {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+.source-status-grid .sync-milestone-copy strong {
+  font-size: 11px;
+}
+.sync-milestone-state {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+  text-align: right;
+}
+.sync-milestone.complete .sync-milestone-state {
+  color: var(--sage);
+}
+.sync-milestone.needs_attention .sync-milestone-state {
+  color: #9a4d39;
 }
 .calendar-heading {
   display: flex;
@@ -1731,6 +1783,13 @@ button:disabled {
   }
   .source-status-grid {
     grid-template-columns: 1fr;
+  }
+  .sync-milestone {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+  .sync-milestone-state {
+    grid-column: 2;
+    text-align: left;
   }
   .source-connect-actions {
     grid-template-columns: 1fr;

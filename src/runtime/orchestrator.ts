@@ -26,6 +26,10 @@ import {
 import { EffectOutbox } from "../modules/effects/index.js";
 import type { WorkerRuntime } from "../modules/orchestration/contracts.js";
 import { GENERAL_ANSWER_SKILL, PRODUCT_SKILLS } from "../modules/orchestration/skills.js";
+import {
+  type AuthorizedHouseholdContextProjection,
+  PostgresHouseholdContextProjection,
+} from "../modules/relationships/index.js";
 import { JsonObjectSchema, PostgresSourceIntelligence, type SourceScope } from "../modules/sources/index.js";
 import type { SecretBox } from "../shared/crypto.js";
 import { NotFoundError, UnauthorizedError } from "../shared/errors.js";
@@ -106,6 +110,16 @@ export class FlorenceOrchestrator {
     if (acknowledgment) return acknowledgment;
 
     const currentCoverage = await this.loadCurrentCoverageContext(context);
+    const householdContext =
+      context.household && context.record.routing.senderPersonId
+        ? await new PostgresHouseholdContextProjection(this.database, this.secretBox).project({
+            householdId: context.household.id,
+            conversationId: context.record.routing.conversationId,
+            participantEpochId: context.record.routing.participantEpochId,
+            participantSetDigest: context.record.routing.appParticipantDigest,
+            senderPersonId: context.record.routing.senderPersonId,
+          })
+        : null;
 
     const need = await this.workers.run({
       attemptId: randomUUID(),
@@ -128,6 +142,11 @@ export class FlorenceOrchestrator {
           })),
         )}`,
         `Exact replied-to coverage loop ID: ${replyTargetLoopId ?? "none"}`,
+        ...(householdContext
+          ? [
+              `Authorized normalized household context for this exact destination (bounded): ${JSON.stringify(householdContext)}`,
+            ]
+          : []),
         `Message: ${context.text}`,
         ...(context.images.length > 0
           ? [`Attached images available to inspect: ${context.images.length}`]
@@ -149,6 +168,7 @@ export class FlorenceOrchestrator {
         need.proposal,
         currentCoverage,
         replyTargetLoopId,
+        householdContext,
       );
       const changedFactDisposition = provisionalDisposition
         ? null
@@ -156,7 +176,7 @@ export class FlorenceOrchestrator {
       const disposition =
         provisionalDisposition ??
         changedFactDisposition ??
-        (await this.proposeCoverage(context, need.proposal));
+        (await this.proposeCoverage(context, need.proposal, householdContext));
       await this.workers.reconcile(
         need.attemptId,
         disposition.includes("failed") ? "rejected" : disposition.includes("stale") ? "stale" : "accepted",
@@ -1031,6 +1051,7 @@ export class FlorenceOrchestrator {
     interpretation: (typeof PRODUCT_SKILLS.needInterpret.outputSchema)["_output"],
     currentCoverage: readonly CurrentCoverageContext[],
     replyTargetLoopId: string | null,
+    householdContext: AuthorizedHouseholdContextProjection | null,
   ): Promise<string | null> {
     if (!context.household || !context.record.routing.senderPersonId) return null;
     const senderPersonId = context.record.routing.senderPersonId;
@@ -1060,6 +1081,11 @@ export class FlorenceOrchestrator {
         `Household time zone: ${context.household.timezone}`,
         `Current participant person IDs: ${currentPeople.join(", ")}`,
         `Current participant label-to-person-ID map: ${JSON.stringify(participantLabels)}`,
+        ...(householdContext
+          ? [
+              `Authorized normalized household context for this exact destination (bounded): ${JSON.stringify(householdContext)}`,
+            ]
+          : []),
         `Exact provisional loop: ${JSON.stringify({
           loopId: matched.loopId,
           minimumSharedMeaning: matched.minimumSharedMeaning,
@@ -1293,6 +1319,7 @@ export class FlorenceOrchestrator {
   private async proposeCoverage(
     context: MessageContext,
     interpretation: (typeof PRODUCT_SKILLS.needInterpret.outputSchema)["_output"],
+    householdContext: AuthorizedHouseholdContextProjection | null,
   ): Promise<string> {
     const existing = await this.database<{ id: string; state: string }[]>`
       select id, state from coverage_loops
@@ -1333,6 +1360,11 @@ export class FlorenceOrchestrator {
         `Household time zone: ${context.household.timezone}`,
         `Current participant person IDs: ${currentPeople.join(", ")}`,
         `Current participant label-to-person-ID map: ${JSON.stringify(participantLabels)}`,
+        ...(householdContext
+          ? [
+              `Authorized normalized household context for this exact destination (bounded): ${JSON.stringify(householdContext)}`,
+            ]
+          : []),
         `Required outcome: ${interpretation.requiredOutcome ?? "unknown"}`,
         `Time facts: ${interpretation.timeFacts.join("; ")}`,
         `Uncertainties: ${interpretation.uncertainties.join("; ")}`,

@@ -77,6 +77,18 @@ interface ProviderEventRow {
   processing_status: string;
 }
 
+interface ExactPrivateRoute {
+  readonly conversationId: string;
+  readonly participantEpochId: string;
+  readonly participantSetDigest: string;
+  readonly liveIdentityIds: readonly string[];
+  readonly privateIdentityId: string;
+  readonly providerChatId: string;
+  readonly providerParticipantDigest: string;
+}
+
+type ParentGoogleActivationReason = "household_resolved" | "existing_steward_dm";
+
 /**
  * Florence's sole authoritative mutation seam. Provider, timer, browser, worker,
  * and receipt inputs all re-enter here so current scope and authority are checked
@@ -649,7 +661,7 @@ export class FlorenceApplication {
       await this.queueSystemEnrollmentMessage(
         transaction,
         record,
-        `Hi—I’m Florence, a family Chief of Staff. I can read what you send me and, after everyone opts in, help your family keep logistics covered. I stay silent and retain no ordinary content in groups until everyone registers. Permitted raw context is kept for up to ${this.config.defaults.rawSourceRetentionDays} days; you can change controls or delete data later. Privacy: ${this.config.publicBaseUrl}/privacy\n\nWould you like to create your private Florence account? Reply yes to agree. You can text STOP any time.`,
+        `Hi—I’m Florence, a family Chief of Staff. I can read what you send me and help your family keep logistics covered. When I’m added to a group, new messages may be retained as private context for that exact participant lineup, but I stay silent there unless every current participant registers and approves writing in that exact group. Permitted raw context is kept for up to ${this.config.defaults.rawSourceRetentionDays} days; you can change controls or delete data later. Privacy: ${this.config.publicBaseUrl}/privacy\n\nWould you like to create your private Florence account? Reply yes to agree. You can text STOP any time.`,
       );
       return "enrollment_prompted";
     }
@@ -706,19 +718,24 @@ export class FlorenceApplication {
       record.routing.conversationId,
     );
     const knownName = decryptPersonName(this.secretBox, personId, current.display_name_ciphertext);
-    const welcome = knownName
-      ? await this.returningEnrollmentWelcome(transaction, record, knownName)
-      : "You’re in. I’m Florence—what should I call you?";
-    await this.queueAuthorizedConversationMessage(
-      transaction,
-      record,
-      snapshot,
-      welcome,
-      "direct_response",
-      "onboarding_welcome",
-      null,
-      new Date(consentedAt.getTime() + 24 * 60 * 60_000),
-    );
+    const googleOffered = knownName
+      ? await this.queueParentGoogleActivationOffer(transaction, personId, "household_resolved", record)
+      : false;
+    if (!googleOffered) {
+      const welcome = knownName
+        ? await this.returningEnrollmentWelcome(transaction, record, knownName)
+        : "You’re in. I’m Florence—what should I call you?";
+      await this.queueAuthorizedConversationMessage(
+        transaction,
+        record,
+        snapshot,
+        welcome,
+        "direct_response",
+        "onboarding_welcome",
+        null,
+        new Date(consentedAt.getTime() + 24 * 60 * 60_000),
+      );
+    }
     return "registered";
   }
 
@@ -934,17 +951,25 @@ export class FlorenceApplication {
       const snapshot = await new PostgresConversationAuthority(transaction).snapshot(
         record.routing.conversationId,
       );
-      const nextStep = await this.returningEnrollmentWelcome(transaction, record, displayName);
-      await this.queueAuthorizedConversationMessage(
+      const googleOffered = await this.queueParentGoogleActivationOffer(
         transaction,
+        personId,
+        "household_resolved",
         record,
-        snapshot,
-        nextStep,
-        "direct_response",
-        "profile_name_updated",
-        null,
-        new Date(Date.now() + 24 * 60 * 60_000),
       );
+      if (!googleOffered) {
+        const nextStep = await this.returningEnrollmentWelcome(transaction, record, displayName);
+        await this.queueAuthorizedConversationMessage(
+          transaction,
+          record,
+          snapshot,
+          nextStep,
+          "direct_response",
+          "profile_name_updated",
+          null,
+          new Date(Date.now() + 24 * 60 * 60_000),
+        );
+      }
       return "profile_name_updated";
     }
     if (
@@ -1002,31 +1027,39 @@ export class FlorenceApplication {
         update people set onboarding_step = 'complete', updated_at = now()
         where id = ${personId} and status = 'registered'
       `;
-      const handoff = await new PostgresWebAuth(
-        transaction,
-        this.secretBox,
-        this.config.security.tokenKey,
-      ).createHandoff({
-        personId,
-        privateIdentityId: identityId,
-        privateConversationId: record.routing.conversationId,
-        purpose: "web_sign_in",
-        context: { onboarding: true, returnPath: "/people" },
-        expiresInSeconds: 10 * 60,
-      });
       const snapshot = await new PostgresConversationAuthority(transaction).snapshot(
         record.routing.conversationId,
       );
-      await this.queueAuthorizedConversationMessage(
+      const googleOffered = await this.queueParentGoogleActivationOffer(
         transaction,
+        personId,
+        "household_resolved",
         record,
-        snapshot,
-        `Done—your private family space is ready. Add me to a group with your co-parent or caregiver; I’ll stay silent there until everyone opts in. Add your children and the family context you want me to know here: ${this.config.publicBaseUrl}/handoff/${handoff.token}\n\nIf the link expires, text me “settings” for a fresh one.`,
-        "direct_response",
-        "family_created",
-        null,
-        new Date(Date.now() + 24 * 60 * 60_000),
       );
+      if (!googleOffered) {
+        const handoff = await new PostgresWebAuth(
+          transaction,
+          this.secretBox,
+          this.config.security.tokenKey,
+        ).createHandoff({
+          personId,
+          privateIdentityId: identityId,
+          privateConversationId: record.routing.conversationId,
+          purpose: "web_sign_in",
+          context: { onboarding: true, returnPath: "/people" },
+          expiresInSeconds: 10 * 60,
+        });
+        await this.queueAuthorizedConversationMessage(
+          transaction,
+          record,
+          snapshot,
+          `Done—your private family space is ready. Add me to a group with your co-parent or caregiver; I’ll stay silent there unless every current participant registers and approves writing in that exact group. Add your children and the family context you want me to know here: ${this.config.publicBaseUrl}/handoff/${handoff.token}\n\nIf the link expires, text me “settings” for a fresh one.`,
+          "direct_response",
+          "family_created",
+          null,
+          new Date(Date.now() + 24 * 60 * 60_000),
+        );
+      }
       return "family_created";
     }
     if (
@@ -1052,6 +1085,14 @@ export class FlorenceApplication {
         "family_setup_deferred",
       );
       return "family_setup_deferred";
+    }
+    if (record.routing.chatKind === "direct" && record.routing.senderPersonId && person) {
+      await this.queueParentGoogleActivationOffer(
+        transaction,
+        record.routing.senderPersonId,
+        "existing_steward_dm",
+        record,
+      );
     }
     await new DurableWork(transaction, this.secretBox).enqueue({
       kind: "orchestrate.linq_message",
@@ -1211,6 +1252,188 @@ export class FlorenceApplication {
     });
   }
 
+  /**
+   * Offers the first parent-owned source exactly once. The outbox key is also
+   * the durable "do not nag" receipt: ignoring or declining this generic offer
+   * never creates a later generic resend. Work and additional Google accounts
+   * remain independent connections; only an existing personal connection
+   * suppresses this activation step.
+   */
+  private async queueParentGoogleActivationOffer(
+    transaction: Transaction,
+    personId: string,
+    reason: ParentGoogleActivationReason,
+    currentRecord?: StoredLinqEvent,
+  ): Promise<boolean> {
+    const scopes = await transaction<
+      {
+        household_id: string;
+        household_control_epoch: number | string;
+        person_control_epoch: number | string;
+      }[]
+    >`
+      select membership.household_id, household.control_epoch as household_control_epoch,
+        person.control_epoch as person_control_epoch
+      from household_memberships membership
+      join households household on household.id = membership.household_id
+        and household.status in ('onboarding', 'active')
+      join people person on person.id = membership.person_id and person.status = 'registered'
+      where membership.person_id = ${personId} and membership.role = 'steward'
+        and membership.status = 'active'
+        and not exists(
+          select 1 from integrations integration
+          where integration.person_id = membership.person_id
+            and integration.provider = 'google'
+            and integration.account_kind = 'personal_family'
+            and integration.status <> 'revoked'
+        )
+      order by membership.joined_at, membership.id
+      limit 1
+      for update of person
+    `;
+    const scope = scopes[0];
+    if (!scope) return false;
+
+    const idempotencyKey = `google-parent-activation:${personId}`;
+    const existing = await transaction<{ present: boolean }[]>`
+      select exists(
+        select 1 from outbox where idempotency_key = ${idempotencyKey}
+      ) as present
+    `;
+    if (existing[0]?.present) return false;
+
+    let route: ExactPrivateRoute | null = null;
+    if (
+      currentRecord?.routing.chatKind === "direct" &&
+      currentRecord.routing.senderPersonId === personId &&
+      currentRecord.routing.senderIdentityId !== null &&
+      currentRecord.routing.liveIdentityIds.length === 1 &&
+      currentRecord.routing.liveIdentityIds[0] === currentRecord.routing.senderIdentityId
+    ) {
+      route = {
+        conversationId: currentRecord.routing.conversationId,
+        participantEpochId: currentRecord.routing.participantEpochId,
+        participantSetDigest: currentRecord.routing.appParticipantDigest,
+        liveIdentityIds: [...currentRecord.routing.liveIdentityIds],
+        privateIdentityId: currentRecord.routing.senderIdentityId,
+        providerChatId: currentRecord.routing.providerChatId,
+        providerParticipantDigest: currentRecord.routing.providerParticipantDigest,
+      };
+    } else if (!currentRecord) {
+      const routes = await transaction<
+        {
+          conversation_id: string;
+          participant_epoch_id: string;
+          participant_set_digest: string;
+          identity_id: string;
+          external_channel_id: string;
+          latest_participant_digest: string | null;
+        }[]
+      >`
+        select conversation.id as conversation_id, epoch.id as participant_epoch_id,
+          epoch.participant_set_digest, participant.person_identity_id as identity_id,
+          channel.external_channel_id, channel.latest_participant_digest
+        from conversations conversation
+        join conversation_channels channel on channel.conversation_id = conversation.id
+          and channel.provider = 'linq' and channel.status = 'active'
+        join participant_epochs epoch on epoch.id = conversation.current_epoch_id
+          and epoch.ended_at is null
+        join epoch_participants participant on participant.participant_epoch_id = epoch.id
+          and participant.person_id = ${personId}
+          and participant.registration_status = 'registered' and participant.consented_at is not null
+        join person_identities identity on identity.id = participant.person_identity_id
+          and identity.status = 'verified'
+        where conversation.kind = 'direct' and conversation.status = 'active'
+          and (select count(*) from epoch_participants exact_participant
+            where exact_participant.participant_epoch_id = epoch.id) = 1
+        order by conversation.updated_at desc, conversation.id
+        limit 1
+      `;
+      const saved = routes[0];
+      if (saved?.latest_participant_digest) {
+        route = {
+          conversationId: saved.conversation_id,
+          participantEpochId: saved.participant_epoch_id,
+          participantSetDigest: saved.participant_set_digest,
+          liveIdentityIds: [saved.identity_id],
+          privateIdentityId: saved.identity_id,
+          providerChatId: saved.external_channel_id,
+          providerParticipantDigest: saved.latest_participant_digest,
+        };
+      }
+    }
+    if (!route) return false;
+
+    const sendKind = currentRecord ? "direct_response" : "transactional";
+    const authority = await new PostgresConversationAuthority(transaction).authorizeSend({
+      conversationId: route.conversationId,
+      expectedParticipantEpochId: route.participantEpochId,
+      expectedParticipantSetDigest: route.participantSetDigest,
+      liveParticipantIdentityIds: [...route.liveIdentityIds],
+      sendKind,
+      operation: "parent_google_activation",
+      ruleId: null,
+    });
+    if (!authority.allowed || !authority.participantEpochId || !authority.participantSetDigest) {
+      return false;
+    }
+
+    const handoff = await new PostgresWebAuth(
+      transaction,
+      this.secretBox,
+      this.config.security.tokenKey,
+    ).createHandoff({
+      personId,
+      privateIdentityId: route.privateIdentityId,
+      privateConversationId: route.conversationId,
+      purpose: "google_connect",
+      context: {
+        activation: "parent_google",
+        profile: "personal_family",
+        returnPath: "/sources",
+      },
+      expiresInSeconds: 10 * 60,
+    });
+    const link = `${this.config.publicBaseUrl}/handoff/${handoff.token}`;
+    const text =
+      reason === "household_resolved"
+        ? `Your private family space is ready. The best next step is to connect your primary personal Google account so I can privately start reviewing recent Gmail and Calendar: ${link}\n\nWhile that sync runs, you can keep talking with me and add your co-parent, children, and family details. Connecting Google is optional; if you skip it, I won’t keep asking. If the link expires, text me “connect Google” for a fresh one.`
+        : `I’ll keep working on what you just sent. One private setup step can make future family help more useful: connect your primary personal Google account so I can start reviewing recent Gmail and Calendar: ${link}\n\nIt’s optional; if you skip it, I won’t keep asking. If the link expires, text me “connect Google” for a fresh one.`;
+    await new EffectOutbox(transaction, this.secretBox).authorizeAndEnqueue({
+      actorPersonId: personId,
+      person: { id: personId, controlEpoch: Number(scope.person_control_epoch) },
+      household: {
+        id: scope.household_id,
+        controlEpoch: Number(scope.household_control_epoch),
+      },
+      conversation: { id: route.conversationId, authorityVersion: authority.authorityVersion },
+      participantEpochId: authority.participantEpochId,
+      expectedParticipantDigest: authority.participantSetDigest,
+      effectKind: "linq.message",
+      idempotencyKey,
+      data: { accountKind: "personal_family", reason, textDigest: sha256Hex(text) },
+      policy: {
+        exactPrivateDm: true,
+        operation: "parent_google_activation",
+        optional: true,
+        sendKind,
+      },
+      target: {
+        providerChatId: route.providerChatId,
+        personId,
+        participantEpochId: authority.participantEpochId,
+      },
+      payload: {
+        providerChatId: route.providerChatId,
+        expectedProviderParticipantDigest: route.providerParticipantDigest,
+        text,
+      },
+      reasonCodes: ["active_parent_steward", "no_personal_google_connection", "exact_private_dm", reason],
+      authorizationExpiresAt: new Date(Date.now() + 24 * 60 * 60_000),
+    });
+    return true;
+  }
+
   private async queueHouseholdInvitationMessage(
     transaction: Transaction,
     invitationId: string,
@@ -1287,7 +1510,7 @@ export class FlorenceApplication {
       if (!recipient || !isOutboundIdentitySubject(recipient)) {
         throw new NotFoundError("Florence cannot safely open a private chat with that group participant");
       }
-      const text = `${inviterName} invited you to Florence as ${role}. Florence is a private family Chief of Staff. I won’t use or share your messages unless you opt in, and groups stay read-only until everyone registers. Would you like to create your private Florence account and review the invitation? Reply yes to agree, or STOP to decline.`;
+      const text = `${inviterName} invited you to Florence as ${role}. Florence is a private family Chief of Staff. I won’t use or share your private messages unless you opt in, and groups stay observe-only unless every current participant registers and approves writing in that exact group. Would you like to create your private Florence account and review the invitation? Reply yes to agree, or STOP to decline.`;
       await new EffectOutbox(transaction, this.secretBox).authorizeAndEnqueue({
         actorPersonId: invitation.inviter_person_id,
         person: {
@@ -1452,7 +1675,7 @@ export class FlorenceApplication {
         householdId: candidate.household_id,
         noticeKind: "enrollment-offer",
         message: (link) =>
-          `I’m now in one of your groups with ${count === 1 ? "one person who hasn’t" : `${count} people who haven’t`} registered. I’ll stay silent there and won’t retain ordinary messages. If you want me to send ${count === 1 ? "them" : "each of them"} one private enrollment invitation, review the exact group here: ${link}`,
+          `I’m now in one of your observe-only groups with ${count === 1 ? "one person who hasn’t" : `${count} people who haven’t`} registered. I’ll stay silent there, and any permitted new context stays scoped to that exact participant lineup. If you want me to send ${count === 1 ? "them" : "each of them"} one private enrollment invitation, review the exact group here: ${link}`,
       });
     }
   }
@@ -1641,6 +1864,7 @@ export class FlorenceApplication {
             where person_id = ${actorPersonId} and status = 'active' limit 1
           `;
           if (existing[0]) {
+            await this.queueParentGoogleActivationOffer(transaction, actorPersonId, "household_resolved");
             return {
               accepted: true,
               duplicate: true,
@@ -1653,6 +1877,7 @@ export class FlorenceApplication {
             timezone: this.config.defaults.timezone,
             createdAt: new Date().toISOString(),
           });
+          await this.queueParentGoogleActivationOffer(transaction, actorPersonId, "household_resolved");
           return {
             accepted: true,
             duplicate: false,
@@ -1731,6 +1956,7 @@ export class FlorenceApplication {
             update households set status = 'active', updated_at = now()
             where id = ${membership.householdId} and status = 'onboarding'
           `;
+          await this.queueParentGoogleActivationOffer(transaction, actorPersonId, "household_resolved");
           for (const group of linkedGroups) {
             await this.queuePrivateGroupReadyNotices(transaction, group.id, "group-ready");
           }

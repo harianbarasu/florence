@@ -921,8 +921,6 @@ export class PostgresFlorenceQueries {
               older_status: string | null;
               message_pending: boolean;
               message_dead: boolean;
-              processing_pending: boolean;
-              processing_dead: boolean;
               calendar_poll_failed: boolean;
             }[]
           >`
@@ -947,20 +945,6 @@ export class PostgresFlorenceQueries {
                 and message.job_kind = 'google.gmail.message'
                 and message.status = 'dead'
             ) as message_dead,
-            exists(
-              select 1 from jobs processing
-              where processing.integration_id = integration.id
-                and processing.integration_control_epoch = integration.control_epoch
-                and processing.job_kind = 'orchestrate.private_source'
-                and processing.status in ('pending', 'retry', 'leased')
-            ) as processing_pending,
-            exists(
-              select 1 from jobs processing
-              where processing.integration_id = integration.id
-                and processing.integration_control_epoch = integration.control_epoch
-                and processing.job_kind = 'orchestrate.private_source'
-                and processing.status = 'dead'
-            ) as processing_dead,
             exists(
               select 1
               from integration_grants grant_row
@@ -1061,27 +1045,36 @@ export class PostgresFlorenceQueries {
       );
       const jobHealth = jobHealthByIntegration.get(integration.id);
       const gmailHistory = connectionCursors.find((cursor) => cursor.resource_kind === "gmail_history");
-      const backfillKinds = ["newest_30_days", "days_31_to_90", "days_91_to_365"];
+      const backfillKinds: Array<
+        NonNullable<SourceView["connections"][number]["mail"]>["milestones"][number]["id"]
+      > = ["newest_30_days", "days_31_to_90", "days_91_to_365"];
       const olderHistoryEnabled =
         allConnectionCursors.some((cursor) => cursor.resource_kind === "gmail_backfill:older_history") ||
         (jobHealth !== undefined && jobHealth.older_status !== null);
       if (olderHistoryEnabled) backfillKinds.push("older_history");
-      const completedBackfills = backfillKinds.filter((stage) =>
-        allConnectionCursors.some(
-          (cursor) => cursor.resource_kind === `gmail_backfill:${stage}` && cursor.state === "exhausted",
-        ),
-      ).length;
       const gmailJobFailed = jobHealth?.live_status === "dead";
-      const backfillJobFailed = [
-        jobHealth?.newest_status,
-        jobHealth?.middle_status,
-        jobHealth?.year_status,
-        jobHealth?.older_status,
-      ].some((status) => status === "dead");
-      const processingPending = jobHealth?.processing_pending ?? false;
-      const processingFailed = jobHealth?.processing_dead ?? false;
-      const mailProcessingPending = activeCapabilities.has("mail") && processingPending;
-      const mailProcessingFailed = activeCapabilities.has("mail") && processingFailed;
+      const backfillJobStatuses = {
+        newest_30_days: jobHealth?.newest_status ?? null,
+        days_31_to_90: jobHealth?.middle_status ?? null,
+        days_91_to_365: jobHealth?.year_status ?? null,
+        older_history: jobHealth?.older_status ?? null,
+      } satisfies Record<(typeof backfillKinds)[number], string | null>;
+      const historyMilestones = backfillKinds.map((stage) => {
+        const cursor = connectionCursors.find(
+          (candidate) => candidate.resource_kind === `gmail_backfill:${stage}`,
+        );
+        const state = mailHistoryMilestoneState(
+          integration.status,
+          cursor?.state ?? null,
+          backfillJobStatuses[stage],
+        );
+        return {
+          id: stage,
+          ...mailHistoryMilestoneCopy(stage),
+          state,
+          stateLabel: syncMilestoneStateLabel(state),
+        };
+      });
       const liveState: NonNullable<SourceView["connections"][number]["mail"]>["liveState"] =
         integration.status === "paused"
           ? "paused"
@@ -1102,16 +1095,27 @@ export class PostgresFlorenceQueries {
             : liveState === "needs_attention"
               ? "Mail needs to be reconnected"
               : "Mail monitoring is starting";
-      const backfillLabel =
-        backfillJobFailed || jobHealth?.message_dead || mailProcessingFailed
-          ? "Some past mail needs attention"
-          : jobHealth?.message_pending
-            ? "Finishing queued messages"
-            : mailProcessingPending
-              ? "Florence is processing your mail"
-              : completedBackfills >= backfillKinds.length
-                ? "Past mail is ready"
-                : `${completedBackfills} of ${backfillKinds.length} history passes complete`;
+      const historyState: NonNullable<SourceView["connections"][number]["mail"]>["historyState"] =
+        historyMilestones.some((milestone) => milestone.state === "needs_attention") ||
+        jobHealth?.message_dead
+          ? "needs_attention"
+          : historyMilestones.some((milestone) => milestone.state === "running") || jobHealth?.message_pending
+            ? "running"
+            : historyMilestones.every((milestone) => milestone.state === "complete")
+              ? "complete"
+              : "waiting";
+      const historyLabel =
+        historyState === "needs_attention"
+          ? "Some mail needs attention"
+          : historyState === "running"
+            ? jobHealth?.message_pending
+              ? "Florence is importing queued mail"
+              : "Florence is scanning earlier mail"
+            : historyState === "complete"
+              ? "Earlier mail is imported"
+              : integration.status === "paused"
+                ? "Waiting while this connection is paused"
+                : "Waiting to check earlier mail";
 
       let calendarCatalog: readonly CalendarCatalogEntry[] = [];
       let calendarCatalogLabel = "Looking for your calendars…";
@@ -1153,8 +1157,6 @@ export class PostgresFlorenceQueries {
       const calendarResourcesReady = enabledCalendarCursors.every((cursor) => cursor?.state === "active");
       const calendarCatalogFailed = jobHealth?.calendar_catalog_status === "dead";
       const calendarPollFailed = jobHealth?.calendar_poll_failed ?? false;
-      const calendarProcessingPending = !activeCapabilities.has("mail") && processingPending;
-      const calendarProcessingFailed = !activeCapabilities.has("mail") && processingFailed;
       const calendarAccessFailed =
         integration.status === "reauth_required" ||
         integration.status === "error" ||
@@ -1165,11 +1167,9 @@ export class PostgresFlorenceQueries {
       const calendarSyncState: NonNullable<SourceView["connections"][number]["calendar"]>["syncState"] =
         integration.status === "paused"
           ? "paused"
-          : calendarAccessFailed || calendarSyncFailed || calendarProcessingFailed
+          : calendarAccessFailed || calendarSyncFailed
             ? "needs_attention"
-            : calendarCatalogCursor?.state === "active" &&
-                calendarResourcesReady &&
-                !calendarProcessingPending
+            : calendarCatalogCursor?.state === "active" && calendarResourcesReady
               ? "ready"
               : "waiting";
       const calendarSyncLabel =
@@ -1181,14 +1181,16 @@ export class PostgresFlorenceQueries {
               ? calendarAccessFailed
                 ? "Calendar needs to be reconnected"
                 : "Some calendar information needs attention"
-              : calendarProcessingPending
-                ? "Florence is processing your calendar"
-                : "Calendar sync is starting";
+              : "Calendar sync is starting";
       const policyByCalendar = new Map(
         connectionCalendarPolicies.map(
           (policy) => [policy.calendar_id_digest, calendarMode(policy.mode)] as const,
         ),
       );
+      const childNeedsAttention =
+        (activeCapabilities.has("mail") &&
+          (liveState === "needs_attention" || historyState === "needs_attention")) ||
+        (activeCapabilities.has("calendar") && calendarSyncState === "needs_attention");
       connections.push({
         id: integration.id,
         label: "Google",
@@ -1196,15 +1198,15 @@ export class PostgresFlorenceQueries {
         accountKind,
         accountKindLabel: accountKind === "work" ? "Work calendar" : "Personal & family",
         status: integration.status,
-        statusLabel: integrationStatusLabel(integration.status),
+        statusLabel: childNeedsAttention ? "Needs attention" : integrationStatusLabel(integration.status),
         mail: activeCapabilities.has("mail")
           ? {
               liveState,
               liveLabel,
               lastCheckedAt: gmailHistory?.checkpoint_at?.toISOString() ?? null,
-              backfillCompleted: completedBackfills,
-              backfillTotal: backfillKinds.length,
-              backfillLabel,
+              historyState,
+              historyLabel,
+              milestones: historyMilestones,
             }
           : null,
         calendar: activeCapabilities.has("calendar")
@@ -1687,6 +1689,63 @@ function integrationStatusLabel(status: string): string {
       return "Needs attention";
     default:
       return "Unavailable";
+  }
+}
+
+function mailHistoryMilestoneState(
+  integrationStatus: string,
+  cursorState: string | null,
+  jobStatus: string | null,
+): NonNullable<SourceView["connections"][number]["mail"]>["milestones"][number]["state"] {
+  if (cursorState === "exhausted") return "complete";
+  if (integrationStatus === "paused") return "waiting";
+  if (
+    integrationStatus === "reauth_required" ||
+    integrationStatus === "error" ||
+    cursorState === "expired" ||
+    cursorState === "error" ||
+    jobStatus === "dead"
+  ) {
+    return "needs_attention";
+  }
+  if (
+    jobStatus === "pending" ||
+    jobStatus === "retry" ||
+    jobStatus === "leased" ||
+    jobStatus === "succeeded"
+  ) {
+    return "running";
+  }
+  return "waiting";
+}
+
+function mailHistoryMilestoneCopy(
+  stage: NonNullable<SourceView["connections"][number]["mail"]>["milestones"][number]["id"],
+): { label: string; detail: string } {
+  switch (stage) {
+    case "newest_30_days":
+      return { label: "Recent mail", detail: "From the last 30 days" };
+    case "days_31_to_90":
+      return { label: "Earlier mail", detail: "From 31 to 90 days ago" };
+    case "days_91_to_365":
+      return { label: "Past year", detail: "From 91 days to one year ago" };
+    case "older_history":
+      return { label: "Older mail", detail: "From more than one year ago" };
+  }
+}
+
+function syncMilestoneStateLabel(
+  state: NonNullable<SourceView["connections"][number]["mail"]>["milestones"][number]["state"],
+): string {
+  switch (state) {
+    case "waiting":
+      return "Waiting";
+    case "running":
+      return "Scanning";
+    case "complete":
+      return "Scan complete";
+    case "needs_attention":
+      return "Needs attention";
   }
 }
 

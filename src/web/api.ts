@@ -133,9 +133,15 @@ export interface SourceView {
       liveState: "waiting" | "watching" | "paused" | "needs_attention";
       liveLabel: string;
       lastCheckedAt: string | null;
-      backfillCompleted: number;
-      backfillTotal: number;
-      backfillLabel: string;
+      historyState: "waiting" | "running" | "complete" | "needs_attention";
+      historyLabel: string;
+      milestones: {
+        id: "newest_30_days" | "days_31_to_90" | "days_91_to_365" | "older_history";
+        label: string;
+        detail: string;
+        state: "waiting" | "running" | "complete" | "needs_attention";
+        stateLabel: string;
+      }[];
     } | null;
     calendar: {
       syncState: "waiting" | "ready" | "paused" | "needs_attention";

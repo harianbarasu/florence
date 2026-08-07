@@ -1,9 +1,16 @@
 # Jackson and Kendall acceptance contract
 
-Florence is not ready for a two-parent pilot until this flow works from real phones without an
-operator, database intervention, magic keywords, or advance explanation.
+Florence is not ready for a two-parent pilot until these flows work from real phones without an
+operator, database intervention, magic keywords, or advance explanation. We exercise them in short
+iterations rather than waiting for every source integration before learning from the group
+coordination experience.
 
-## 1. Jackson meets Florence naturally
+## Iteration A — Direct group coverage
+
+This is the first production exercise because the deployed product already supports the complete
+coverage state machine without waiting on Gmail backfill.
+
+### 1. Jackson meets Florence naturally
 
 Jackson sends any ordinary first message to the Florence number, for example:
 
@@ -11,27 +18,34 @@ Jackson sends any ordinary first message to the Florence number, for example:
 
 Florence answers plainly, explains that she can retain permitted family context, links privacy
 details, and asks for consent in natural language. Jackson may consent with an ordinary affirmative
-reply; no `START`, `NAME`, or other command is required. Florence then learns what to call him,
-offers to create his family, and gives him a private web link only when structured controls are
-useful.
+reply; no `START`, `NAME`, or other command is required. Florence learns what to call him, offers to
+create his family, and moves to a secure mobile-web handoff when structured controls are useful.
 
-## 2. Kendall joins without rediscovering the product
+### 2. Jackson connects Google while setup continues
 
-Jackson adds Florence and Kendall to an iMessage group. Florence remains silent in that group while
-Kendall is unregistered. In Jackson's DM, Florence explains the closed write gate and asks whether
-she may send Kendall one private enrollment invitation.
+After the household is resolved, Florence offers Jackson a private, single-use handoff for personal
+Google. Sync begins immediately without waiting for Kendall. Florence confirms meaningful private
+milestones while Jackson can continue adding children, schools, activities, routines, and a
+co-parent. Declining Google does not block Florence or create repeated generic reminders.
 
-After Jackson agrees, Kendall receives one private message that names Jackson as the inviter,
-explains Florence without jargon, supports immediate `STOP`, and asks for natural consent. Florence
-does not ask Kendall to repeat family facts Jackson already supplied. Kendall sees those facts as
-proposed shared household context and can correct conflicts or add non-conflicting aliases.
+### 3. Kendall joins without rediscovering the product
 
-Jackson invites Kendall as a co-steward. Kendall receives the invitation in her DM as well as the
-private web companion and accepts it. Each parent can approve the exact current family group for
-proactive coverage. Florence tells each person privately when the group is ready; she does not post
-an administrative announcement in the group.
+Jackson adds Florence and Kendall to an iMessage group. Florence remains completely silent in that
+group while it is observe-only. New post-addition messages belong only to that exact chat epoch; they
+do not give Florence write authority or make Kendall a Florence user.
 
-## 3. Florence knows enough family context
+Jackson invites Kendall as a co-steward from his private controls. Kendall receives one private
+message that names Jackson as the inviter, explains Florence without jargon, supports immediate
+`STOP`, and asks for natural consent. Florence does not ask Kendall to repeat family facts Jackson
+already supplied. Kendall reviews those facts, corrects conflicts, and adds missing information or
+non-conflicting aliases.
+
+Kendall accepts as an equal parent. Each parent separately approves proactive coverage for the exact
+current family group. Florence tells each person privately when it is ready; she does not post an
+administrative announcement in the group. A later participant change revokes the write rule and
+returns the new exact epoch to observe-only.
+
+### 4. Florence knows enough family context
 
 At minimum the household can represent:
 
@@ -41,15 +55,14 @@ At minimum the household can represent:
 - activities; and
 - recurring pickup/drop-off facts needed for coverage.
 
-The second parent confirms or corrects existing context instead of completing a duplicate intake.
 Different names such as Jonathan, John, and Johnny are treated as possible aliases, not immediate
-conflicts.
+conflicts. Real contradictions are flagged once to the parent stewards.
 
-## 4. The first coverage loop closes naturally
+### 5. The first coverage loop closes naturally
 
-In the approved family group:
+For the first exercise, include the time explicitly:
 
-> **Jackson:** I can't pick Avery up Wednesday.
+> **Jackson:** I can't pick Avery up Wednesday at 3:00.
 >
 > **Florence:** Avery's Wednesday pickup at 3:00 is uncovered. Kendall, can you take it?
 >
@@ -61,18 +74,36 @@ Pass conditions:
 
 - Florence derives the obligation only from permitted context and current evidence.
 - The named proposed holder is the only person who can accept for themselves.
-- Natural acknowledgments work; silence, delivery, read state, and vague historical habits do not.
-- A reply to Florence's message targets that exact loop. If more than one loop still matches,
-  Florence asks which one in the writable conversation.
-- If a consequential fact is missing, Florence asks once and the answer advances the existing
-  provisional loop rather than creating or ignoring another one.
-- A private decline reveals only that coverage remains open unless the declining person explicitly
-  approves more disclosure.
-- Reminders occur before the useful decision boundary, use neutral language, and stop immediately
-  after coverage.
+- Natural acknowledgments work; silence, delivery, read state, and historical habits do not.
+- A reply to Florence targets the exact loop. If more than one loop matches, Florence asks which one.
+- If a consequential fact is missing, Florence asks once and advances the existing provisional loop.
+- A private decline reveals only that coverage remains open unless the person approves more detail.
+- Reminders occur before the useful boundary, remain neutral, and stop immediately after coverage.
 
-## 5. Production gate
+After authorized household context is wired into interpretation, repeat without the time:
 
-The release passes only after the complete flow above runs through the production Linq number,
-Railway web and worker services, PostgreSQL, the configured model, and two independent browser
-sessions. Synthetic checks may support that evidence but cannot replace it.
+> **Jackson:** I can't pick Avery up Wednesday.
+
+Florence must recover the time only from the current authorized routine/family projection. If more
+than one current routine matches, she asks one narrow question instead of guessing.
+
+## Iteration B — Google-derived coverage
+
+1. Florence privately confirms connection and reports only meaningful milestones: recent sources
+   being reviewed, current information reconciled, older history continuing, or an actionable error.
+2. A synthetic school email and a later update or cancellation arrive in the same thread, with a
+   matching Calendar revision when appropriate.
+3. Florence keeps candidate findings silent until the newest thread, relevant attachment, and current
+   Calendar state are reconciled.
+4. If the obligation remains current and uncovered, Florence privately offers Jackson the minimum
+   operational risk. Raw private email never enters the family group.
+5. Jackson approves the exact item from iMessage. Florence opens the minimum-meaning loop in the
+   exact interactive household group; Kendall accepts naturally; Florence closes it.
+6. Repeat with a later cancellation. Florence suppresses an obsolete prompt or updates the same
+   already-open loop; it never creates a duplicate.
+
+## Production gate
+
+Each iteration passes only after its complete flow runs through the production Linq number, Railway
+web and worker services, PostgreSQL, the configured model, and two independent browser sessions.
+Synthetic checks support that evidence but cannot replace it.

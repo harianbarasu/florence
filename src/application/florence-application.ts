@@ -586,7 +586,6 @@ export class FlorenceApplication {
                 : null;
       const belongsToPriorParticipantEpoch =
         ordinaryGroupContentAt !== null &&
-        reconciled.epochSequence > 1 &&
         Date.parse(ordinaryGroupContentAt) < Date.parse(reconciled.epochStartedAt);
       const precedesParticipantConsent =
         ordinaryGroupContentAt !== null &&

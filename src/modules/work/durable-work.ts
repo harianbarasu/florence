@@ -292,6 +292,9 @@ export class DurableWork {
         left join integrations integration on integration.id = job.integration_id
         where job.job_kind = ${input.kind}
           and job.status = 'dead'
+          and coalesce(job.last_error_code, '') not in (
+            'invalid_job_payload', 'runtime_contract_violation'
+          )
           and (${input.requireIntegrationFence !== true} or job.integration_id is not null)
           and job.updated_at >= ${lookbackStart}
           and (job.deadline_at is null or job.deadline_at > ${now})

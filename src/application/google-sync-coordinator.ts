@@ -852,6 +852,17 @@ export class GoogleSyncCoordinator {
     const existing = await existingOutbox(transaction, idempotencyKey);
     if (existing) return { outboxId: existing, created: false };
 
+    if (reason === "recent-review-failed") {
+      return this.enqueueEffect(transaction, {
+        scope,
+        route,
+        idempotencyKey,
+        phase,
+        text: attentionRequiredMessage(scope, null, reason),
+        reasonCodes: ["google_sync_attention_required", reason, "exact_private_dm"],
+      });
+    }
+
     const handoff = await new PostgresWebAuth(
       transaction,
       this.secretBox,
@@ -864,7 +875,7 @@ export class GoogleSyncCoordinator {
       context: {
         returnPath: "/sources",
         integrationId: scope.integrationId,
-        reconnect: reason !== "recent-review-failed",
+        reconnect: true,
       },
       expiresInSeconds: 10 * 60,
     });
@@ -973,7 +984,7 @@ function recentCurrentMessage(scope: IntegrationScope): string {
 
 function attentionRequiredMessage(
   scope: IntegrationScope,
-  link: string,
+  link: string | null,
   reason: "reauth" | "integration-error" | "recent-review-failed",
 ): string {
   const source =
@@ -981,8 +992,9 @@ function attentionRequiredMessage(
       ? "work Google Calendar"
       : `${scope.accountKind === "work" ? "work" : "personal"} Google account`;
   if (reason === "recent-review-failed") {
-    return `I couldn’t finish reviewing part of your recent ${sourceNames(scope)} information. Your ${source} is still connected, and I’ll keep recovery bounded to your private account. Review the connection or reconnect it privately here: ${link}\n\nThis secure link expires in 10 minutes. If it expires, text me “connect Google” for a fresh one.`;
+    return `I hit a problem reviewing part of your recent ${sourceNames(scope)} information. Your ${source} is still connected, and I’ll retry recovery privately. You don’t need to reconnect.`;
   }
+  if (!link) throw new Error("Google reconnect notice requires a private link");
   const opening =
     reason === "reauth" ? `I lost access to your ${source}.` : `I hit a problem syncing your ${source}.`;
   return `${opening} Reconnect it privately here so I can resume reviewing ${sourceNames(scope)}: ${link}\n\nThis secure link expires in 10 minutes. If it expires, text me “connect Google” for a fresh one.`;

@@ -942,7 +942,7 @@ export class GoogleSyncService {
     await this.#work.enqueue({
       kind: "google.gmail.message",
       idempotencyKey: `gmail:message:${payload.integrationId}:${controlEpochKey(payload)}:${messageId}:${sha256Hex(observationKey)}`,
-      payload: { ...payload, messageId, sourcePriority: priority },
+      payload: buildGmailMessageJobPayload(payload, messageId, priority),
       ...googleJobFence(payload),
       priority,
       maxAttempts: 8,
@@ -1269,7 +1269,19 @@ export class GoogleSyncService {
   }
 }
 
-function basePayload(payload: z.infer<typeof GoogleBootstrapPayloadSchema>): GoogleJobBase {
+export function buildGmailMessageJobPayload(
+  payload: GoogleJobBase,
+  messageId: string,
+  sourcePriority: number,
+): z.input<typeof GmailMessagePayloadSchema> {
+  return GmailMessagePayloadSchema.parse({
+    ...basePayload(payload),
+    messageId,
+    sourcePriority,
+  });
+}
+
+function basePayload(payload: GoogleJobBase): GoogleJobBase {
   return {
     integrationId: payload.integrationId,
     personId: payload.personId,

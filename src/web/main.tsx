@@ -1127,7 +1127,7 @@ function SourcesPage({ viewer }: { viewer: Viewer }) {
       setActionMessage(
         mode === "standing"
           ? "Approved. Florence may share only matching future coverage items from that exact source."
-          : "Approved once. Florence is opening the family coverage loop.",
+          : "Approved once. Florence is applying the exact family coverage change you reviewed.",
       );
       await reload();
     } catch (reason) {
@@ -1408,7 +1408,7 @@ function SourcesPage({ viewer }: { viewer: Viewer }) {
               {shareProposal ? (
                 <div className="source-empty">
                   <strong>Exactly what the family will see</strong>
-                  <p>{shareProposal.minimumMeaning}</p>
+                  <p>{shareProposal.outboundText}</p>
                   <div className="review-actions">
                     <button
                       type="button"
@@ -1416,7 +1416,9 @@ function SourcesPage({ viewer }: { viewer: Viewer }) {
                       disabled={busy?.startsWith(`approve:${shareProposal.actionIntentId}`) === true}
                       onClick={() => void approveShare(shareProposal, "once")}
                     >
-                      Share this once
+                      {review.kind === "coverage_loop_update_review"
+                        ? "Apply this update"
+                        : "Share this once"}
                     </button>
                     {shareProposal.canCreateStandingRule ? (
                       <button
@@ -1437,7 +1439,7 @@ function SourcesPage({ viewer }: { viewer: Viewer }) {
                 <div className="source-empty">
                   Florence is preparing or committing this exact family-safe share…
                 </div>
-              ) : review.kind === "coverage_proposal" && review.destinations.length > 0 ? (
+              ) : review.destinations.length > 0 ? (
                 <div className="review-actions">
                   <select
                     aria-label="Family group for this coverage item"
@@ -1458,24 +1460,33 @@ function SourcesPage({ viewer }: { viewer: Viewer }) {
                     disabled={!selectedDestination || busy === `share:${review.id}`}
                     onClick={() => void prepareShare(review, selectedDestination)}
                   >
-                    Prepare for this group
+                    {review.kind === "coverage_loop_update_review"
+                      ? "Prepare this update"
+                      : "Prepare for this group"}
                   </button>
                 </div>
-              ) : review.kind === "coverage_proposal" ? (
+              ) : review.kind === "coverage_proposal" || review.kind === "coverage_loop_update_review" ? (
                 <div className="source-empty">
                   No fully registered family group currently allows Florence to write. Nothing can be shared
                   yet.
                 </div>
               ) : null}
               <div className="review-actions">
-                <button
-                  type="button"
-                  className="primary-button"
-                  disabled={busy === `review:${review.id}`}
-                  onClick={() => void reviewCandidate(review.id, "accepted")}
-                >
-                  Keep privately
-                </button>
+                {review.kind === "coverage_proposal" ? (
+                  <button
+                    type="button"
+                    className="primary-button"
+                    disabled={busy === `review:${review.id}`}
+                    onClick={() => void reviewCandidate(review.id, "accepted")}
+                  >
+                    Keep privately
+                  </button>
+                ) : (
+                  <span className="source-empty">
+                    Florence will change the existing family loop only after showing you the exact group
+                    update for explicit approval.
+                  </span>
+                )}
                 <button
                   type="button"
                   className="quiet-button"

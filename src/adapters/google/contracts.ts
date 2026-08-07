@@ -19,7 +19,8 @@ export interface GoogleTokenExchange {
 }
 
 export interface GmailAttachmentReference {
-  attachmentId: string;
+  attachmentId: string | null;
+  bodyData: string | null;
   partId: string;
   filename: string;
   mimeType: string;
@@ -42,6 +43,7 @@ export interface NormalizedGmailMessage {
   text: string;
   html: string | null;
   attachments: readonly GmailAttachmentReference[];
+  hasAttachmentHint: boolean;
   snippet: string;
 }
 

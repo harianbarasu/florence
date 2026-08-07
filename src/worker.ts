@@ -30,7 +30,7 @@ import {
   GoogleSyncService,
 } from "./runtime/google-sync.js";
 import { bootstrapGovernedSkills, GovernedWorkerRuntime } from "./runtime/governed-worker-runtime.js";
-import { FlorenceOrchestrator } from "./runtime/orchestrator.js";
+import { FlorenceOrchestrator, PrivateSourceJobOutcomeError } from "./runtime/orchestrator.js";
 import { dispatchTimerProcessJob, TimerRuntime } from "./runtime/timer-runtime.js";
 import { SecretBox } from "./shared/crypto.js";
 import { ConflictError, NotFoundError, StaleAuthorityError, UnauthorizedError } from "./shared/errors.js";
@@ -56,6 +56,19 @@ const PrivateSourcePayloadSchema = z.strictObject({
   integrationControlEpoch: z.number().int().positive(),
 });
 const PrivateBridgePayloadSchema = z.strictObject({ actionIntentId: z.string().uuid() });
+const PrivateSourceCandidateNoticePayloadSchema = z.strictObject({
+  candidateId: z.string().uuid(),
+  personId: z.string().uuid(),
+  integrationId: z.string().uuid(),
+  expectedIntegrationControlEpoch: z.number().int().positive(),
+});
+
+class PrivateSourceCandidateRouteUnavailableError extends Error {
+  public constructor() {
+    super("Exact private route is not available yet");
+    this.name = "PrivateSourceCandidateRouteUnavailableError";
+  }
+}
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -165,6 +178,17 @@ async function main(): Promise<void> {
           await dispatch(job);
           if (await work.succeed(job)) await observeGoogleSyncMilestone(job);
         } catch (error) {
+          if (
+            error instanceof PrivateSourceJobOutcomeError &&
+            error.outcome.kind === "not_ready" &&
+            !error.outcome.retryable
+          ) {
+            if (await work.needsAttention(job, error.code)) await observeGoogleSyncMilestone(job);
+            process.stderr.write(
+              `${JSON.stringify({ level: "warn", jobKind: job.kind, errorCode: error.code })}\n`,
+            );
+            continue;
+          }
           let providerAuthFailure = false;
           try {
             providerAuthFailure = await google.handleProviderAuthFailure(job.kind, job.payload, error);
@@ -209,17 +233,29 @@ async function main(): Promise<void> {
         }
         case "orchestrate.private_source": {
           const payload = PrivateSourcePayloadSchema.parse(job.payload);
-          await orchestrator.processPrivateSourceRevision(
+          const outcome = await orchestrator.processPrivateSourceRevision(
             payload.sourceRevisionId,
             payload.personId,
             payload.integrationId,
             payload.integrationControlEpoch,
           );
+          if (outcome.kind === "not_ready") {
+            throw new PrivateSourceJobOutcomeError(outcome);
+          }
           return;
         }
         case "orchestrate.private_bridge_proposal": {
           const payload = PrivateBridgePayloadSchema.parse(job.payload);
           await orchestrator.proposePrivateBridge(payload.actionIntentId);
+          return;
+        }
+        case "private_source.deliver_candidate_notice": {
+          const payload = PrivateSourceCandidateNoticePayloadSchema.parse(job.payload);
+          const receipt = await application.process({
+            kind: "private_source.deliver_candidate_notice",
+            ...payload,
+          });
+          if (!receipt.accepted) throw new PrivateSourceCandidateRouteUnavailableError();
           return;
         }
         case "private_bridge.commit": {
@@ -708,6 +744,9 @@ function wait(milliseconds: number): Promise<void> {
 
 function errorCode(error: unknown): string {
   if (error instanceof z.ZodError) return "invalid_job_payload";
+  if (error instanceof PrivateSourceJobOutcomeError) return error.code;
+  if (error instanceof PrivateSourceCandidateRouteUnavailableError)
+    return "private_source_candidate_route_unavailable";
   if (error instanceof LinqAudienceChangedError) return "linq_audience_changed";
   if (error instanceof LinqAttachmentError) return `linq_attachment_${error.code}`;
   if (error instanceof LinqApiError) return "linq_api_error";
@@ -720,6 +759,7 @@ function errorCode(error: unknown): string {
 }
 
 function isRetryableJobError(error: unknown): boolean {
+  if (error instanceof PrivateSourceJobOutcomeError) return error.retryable;
   if (error instanceof LinqApiError) return error.retryable;
   if (error instanceof LinqAudienceChangedError) return false;
   if (error instanceof LinqAttachmentError) return error.code === "download_failed";

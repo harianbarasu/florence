@@ -10,7 +10,11 @@ import type {
   SourceView,
   Viewer,
 } from "../../web/api.js";
-import { openPrivateBridgePayload, PrivateSourceBridge } from "../bridges/index.js";
+import {
+  openPrivateBridgePayload,
+  PrivateSourceBridge,
+  privateBridgeOutboundText,
+} from "../bridges/index.js";
 import { PostgresSourceIntelligence } from "../sources/index.js";
 
 interface PersonRow {
@@ -409,7 +413,7 @@ export class PostgresFlorenceQueries {
                 and job.integration_control_epoch = integration.control_epoch
                 and job.job_kind in ('google.gmail.message', 'orchestrate.private_source')
                 and job.priority <= ${RECENT_SOURCE_PRIORITY_CEILING}
-                and job.status in ('pending', 'retry', 'leased', 'dead')
+                and job.status in ('pending', 'retry', 'leased', 'attention', 'dead')
             )
         ) as personal_ready
     `;
@@ -1269,7 +1273,7 @@ export class PostgresFlorenceQueries {
               where interpretation.integration_id = integration.id
                 and interpretation.integration_control_epoch = integration.control_epoch
                 and interpretation.job_kind = 'orchestrate.private_source'
-                and interpretation.status = 'dead'
+                and interpretation.status in ('attention', 'dead')
             ) as interpretation_dead,
             exists(
               select 1
@@ -1590,6 +1594,27 @@ export class PostgresFlorenceQueries {
     const destinations = await new PrivateSourceBridge(this.database, this.#secretBox).listDestinations(
       personId,
     );
+    const updateLoopIds = [
+      ...new Set(
+        reviews.flatMap((review) => {
+          const loopId = optionalString(review.content.existingLoopId);
+          return review.candidateKind === "coverage_loop_update_review" && loopId ? [loopId] : [];
+        }),
+      ),
+    ];
+    const updateLoopRows =
+      updateLoopIds.length === 0
+        ? []
+        : await this.database<{ readonly id: string; readonly conversation_id: string }[]>`
+          select loop.id, loop.destination_conversation_id as conversation_id
+          from coverage_loops loop
+          join household_memberships membership on membership.household_id = loop.household_id
+            and membership.person_id = ${personId} and membership.status = 'active'
+          where loop.id = any(${this.database.array(updateLoopIds)}::uuid[])
+        `;
+    const updateDestinationByLoop = new Map(
+      updateLoopRows.map((row) => [row.id, row.conversation_id] as const),
+    );
     const intentRows = await this.database<
       {
         id: string;
@@ -1647,6 +1672,7 @@ export class PostgresFlorenceQueries {
       const changedFact = optionalString(review.content.changedFact);
       const timeFacts = stringValues(review.content.timeFacts);
       const uncertainties = stringValues(review.content.uncertainties);
+      const existingLoopId = optionalString(review.content.existingLoopId);
       const sourceLabels = [
         ...new Set(
           evidence
@@ -1681,15 +1707,24 @@ export class PostgresFlorenceQueries {
         sourceLabel: sourceLabels.join(" + ") || "Your private source",
         proposedAt: review.proposedAt,
         expiresAt: review.expiresAt,
-        destinations: review.candidateKind === "coverage_proposal" ? destinations : [],
+        destinations:
+          review.candidateKind === "coverage_proposal"
+            ? destinations
+            : existingLoopId
+              ? destinations.filter(
+                  (destination) => destination.conversationId === updateDestinationByLoop.get(existingLoopId),
+                )
+              : [],
         preparingShare:
           intent?.status === "proposed" || intent?.status === "approved" || intent?.status === "executing",
         shareProposal:
           proposed && intent
             ? {
                 actionIntentId: intent.id,
-                minimumMeaning: proposed.minimumDisclosure.minimumMeaning,
-                canCreateStandingRule: proposed.sourcePattern !== null,
+                outboundText: privateBridgeOutboundText(proposed),
+                canCreateStandingRule:
+                  proposed.sourcePattern !== null &&
+                  !("loopUpdate" in proposed && proposed.loopUpdate !== null),
                 standingRuleLabel,
                 ...intent.digests,
               }

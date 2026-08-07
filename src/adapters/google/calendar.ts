@@ -79,6 +79,13 @@ export class CalendarAdapter {
 }
 
 function normalizeEvent(calendarId: string, event: calendar_v3.Schema$Event): NormalizedCalendarEvent {
+  const start =
+    event.start?.dateTime ??
+    event.start?.date ??
+    event.originalStartTime?.dateTime ??
+    event.originalStartTime?.date ??
+    "";
+  const end = event.end?.dateTime ?? event.end?.date ?? start;
   return {
     id: event.id as string,
     calendarId,
@@ -87,8 +94,8 @@ function normalizeEvent(calendarId: string, event: calendar_v3.Schema$Event): No
     summary: event.summary ?? null,
     description: event.description ?? null,
     location: event.location ?? null,
-    start: event.start?.dateTime ?? event.start?.date ?? "",
-    end: event.end?.dateTime ?? event.end?.date ?? "",
+    start,
+    end,
     timezone: event.start?.timeZone ?? null,
     recurringEventId: event.recurringEventId ?? null,
     updatedAt: event.updated ? new Date(event.updated) : null,

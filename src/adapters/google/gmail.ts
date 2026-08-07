@@ -92,11 +92,26 @@ export class GmailAdapter {
     return normalizeMessage(response.data);
   }
 
-  public async attachment(messageId: string, attachmentId: string): Promise<Buffer> {
+  public async threadMetadata(threadId: string): Promise<readonly NormalizedGmailMessage[]> {
+    const response = await this.#gmail.users.threads.get({
+      userId: "me",
+      id: threadId,
+      format: "metadata",
+      metadataHeaders: ["From", "To", "Cc", "Subject", "Message-ID", "Content-Type"],
+    });
+    return (response.data.messages ?? []).map(normalizeMessage);
+  }
+
+  public async attachment(
+    messageId: string,
+    reference: Pick<GmailAttachmentReference, "attachmentId" | "bodyData">,
+  ): Promise<Buffer> {
+    if (reference.bodyData) return decodeBase64Url(reference.bodyData);
+    if (!reference.attachmentId) throw new Error("Gmail attachment has no retrievable body");
     const response = await this.#gmail.users.messages.attachments.get({
       userId: "me",
       messageId,
-      id: attachmentId,
+      id: reference.attachmentId,
     });
     return decodeBase64Url(requireString(response.data.data, "Gmail attachment has no data"));
   }
@@ -136,6 +151,9 @@ export function normalizeMessage(message: gmail_v1.Schema$Message): NormalizedGm
     text,
     html: html || null,
     attachments: collected.attachments,
+    hasAttachmentHint:
+      collected.attachments.length > 0 ||
+      /\bmultipart\/mixed\b|\bname\s*=/iu.test(headers.get("content-type") ?? ""),
     snippet: message.snippet ?? "",
   };
 }
@@ -151,27 +169,32 @@ function collectParts(
   };
   if (!part) return result;
   const partId = (part.partId ?? path.join(".")) || "0";
-  if (part.body?.data && part.mimeType === "text/plain") result.textParts.push(part.body.data);
-  if (part.body?.data && part.mimeType === "text/html") result.htmlParts.push(part.body.data);
-  if (part.body?.attachmentId) {
-    const contentId = (part.headers ?? []).find(
-      (header) => header.name?.toLowerCase() === "content-id",
-    )?.value;
+  const headers = new Map(
+    (part.headers ?? []).flatMap((header) =>
+      header.name && header.value ? [[header.name.toLowerCase(), header.value] as const] : [],
+    ),
+  );
+  const contentId = headers.get("content-id");
+  const disposition = headers.get("content-disposition")?.toLowerCase() ?? "";
+  const hasAttachmentSemantics =
+    Boolean(part.filename) ||
+    Boolean(contentId) ||
+    disposition.includes("attachment") ||
+    disposition.includes("inline");
+  if (hasAttachmentSemantics && (part.body?.attachmentId || part.body?.data)) {
     result.attachments.push({
-      attachmentId: part.body.attachmentId,
+      attachmentId: part.body?.attachmentId ?? null,
+      bodyData: part.body?.data ?? null,
       partId,
       filename: part.filename || `attachment-${partId}`,
       mimeType: part.mimeType ?? "application/octet-stream",
       size: part.body.size ?? 0,
-      inline:
-        Boolean(contentId) ||
-        (part.headers ?? []).some(
-          (header) =>
-            header.name?.toLowerCase() === "content-disposition" &&
-            header.value?.toLowerCase().includes("inline"),
-        ),
+      inline: Boolean(contentId) || disposition.includes("inline"),
       ...(contentId ? { contentId } : {}),
     });
+  } else {
+    if (part.body?.data && part.mimeType === "text/plain") result.textParts.push(part.body.data);
+    if (part.body?.data && part.mimeType === "text/html") result.htmlParts.push(part.body.data);
   }
   for (const [index, child] of (part.parts ?? []).entries()) {
     const nested = collectParts(child, [...path, String(index)]);

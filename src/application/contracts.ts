@@ -31,6 +31,38 @@ export interface GoogleSyncObservationFields {
   readonly triggeringJobId: string | null;
 }
 
+export interface Citation {
+  readonly sourceRevisionId: string;
+  readonly support: string;
+}
+
+/** A model proposal over one app-compiled, person-private source frontier. */
+export interface PrivateSourceReconciliationProposal {
+  /** Exact persisted governed-worker attempt whose output is being committed. */
+  readonly workerAttemptId: string;
+  readonly anchorSourceRevisionId: string;
+  readonly expectedFrontierDigest: string;
+  readonly decision:
+    | {
+        readonly kind: "unchanged";
+        readonly evidence: readonly Citation[];
+      }
+    | {
+        readonly kind: "coverage_needed";
+        readonly requiredOutcome: string;
+        readonly changedFact: string | null;
+        readonly timeFacts: readonly string[];
+        readonly uncertainties: readonly string[];
+        readonly sensitivity: "ordinary" | "personal" | "sensitive";
+        readonly evidence: readonly Citation[];
+      }
+    | {
+        readonly kind: "coverage_cancelled";
+        readonly reason: "cancelled" | "superseded";
+        readonly evidence: readonly Citation[];
+      };
+}
+
 /** A worker may interpret evidence, but it cannot choose mutation authority or a loop target. */
 export type CoverageProposal =
   | {
@@ -126,6 +158,27 @@ export type AppEnvelope =
       readonly completedAt: string;
     }
   | ({ readonly kind: "google.sync.observe" } & GoogleSyncObservationFields)
+  | {
+      /** Privately hands a current source candidate to its exact registered owner. */
+      readonly kind: "private_source.notify_candidate";
+      readonly candidateId: string;
+      readonly personId: string;
+      readonly integrationId: string;
+      readonly expectedIntegrationControlEpoch: number;
+    }
+  | {
+      /** Delivers a previously scheduled exact-private candidate handoff. */
+      readonly kind: "private_source.deliver_candidate_notice";
+      readonly candidateId: string;
+      readonly personId: string;
+      readonly integrationId: string;
+      readonly expectedIntegrationControlEpoch: number;
+    }
+  | {
+      /** Reopens the exact private frontier before committing a worker proposal. */
+      readonly kind: "private_source.reconcile";
+      readonly proposal: PrivateSourceReconciliationProposal;
+    }
   | {
       readonly kind: "web.command";
       readonly actorPersonId: string;

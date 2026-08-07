@@ -181,7 +181,7 @@ export interface SourceView {
     preparingShare: boolean;
     shareProposal: {
       actionIntentId: string;
-      minimumMeaning: string;
+      outboundText: string;
       canCreateStandingRule: boolean;
       standingRuleLabel: string | null;
       actionDigest: string;

@@ -1,5 +1,10 @@
 import { z } from "zod";
-import type { LinqClient, LinqMessageDeliveryReceipt, LinqSendReceipt } from "../../adapters/linq/index.js";
+import type {
+  LinqClient,
+  LinqMessageDeliveryReceipt,
+  LinqSendReceipt,
+  LinqSubmitGuard,
+} from "../../adapters/linq/index.js";
 import { LinqApiError, LinqAudienceChangedError } from "../../adapters/linq/index.js";
 import type { ClaimedEffect, ClaimedSubmittedEffect, EffectOutbox } from "./outbox.js";
 
@@ -35,12 +40,23 @@ export class LinqMessageEffectExecutor {
   public async execute(effect: ClaimedEffect): Promise<void> {
     const payload = LinqMessageEffectPayloadSchema.parse(effect.payload);
     try {
-      const beforeSubmit = async () => {
+      const submitGuard: LinqSubmitGuard = async (submit) => {
+        let providerFailure: { readonly error: unknown } | undefined;
         try {
-          if (!(await this.outbox.reauthorizeForSubmission(effect))) {
+          const authorization = await this.outbox.reauthorizeForSubmission(effect, async () => {
+            try {
+              return await submit();
+            } catch (error) {
+              providerFailure = { error };
+              throw error;
+            }
+          });
+          if (!authorization.authorized) {
             throw new EffectAuthorizationStaleError();
           }
+          return authorization.result;
         } catch (error) {
+          if (providerFailure) throw providerFailure.error;
           if (error instanceof EffectAuthorizationStaleError) throw error;
           throw new EffectAuthorizationCheckError();
         }
@@ -55,7 +71,7 @@ export class LinqMessageEffectExecutor {
                 text: payload.text,
               },
               undefined,
-              beforeSubmit,
+              submitGuard,
             )
           : await this.linq.createDirectChat(
               {
@@ -64,7 +80,7 @@ export class LinqMessageEffectExecutor {
                 text: payload.text,
               },
               undefined,
-              beforeSubmit,
+              submitGuard,
             );
       await this.record(effect, receipt);
     } catch (error) {

@@ -33,6 +33,16 @@ export const CreateCoverageLoopInputSchema = z.strictObject({
 
 export const CoverageCommandSchema = z.discriminatedUnion("kind", [
   z.strictObject({
+    kind: z.literal("revise"),
+    transitionId: EntityIdSchema,
+    expectedVersion: z.number().int().positive(),
+    actorPersonId: EntityIdSchema,
+    occurredAt: InstantSchema,
+    minimumSharedMeaning: z.string().trim().min(1).max(500),
+    timing: ResolvedTimePlanSchema,
+    evidenceRefs: z.array(EvidenceRefSchema).min(1).max(100),
+  }),
+  z.strictObject({
     kind: z.literal("resolve_facts"),
     transitionId: EntityIdSchema,
     expectedVersion: z.number().int().positive(),
@@ -95,7 +105,7 @@ export const CoverageCommandSchema = z.discriminatedUnion("kind", [
     kind: z.enum(["cancel", "supersede", "dismiss"]),
     transitionId: EntityIdSchema,
     expectedVersion: z.number().int().positive(),
-    actorPersonId: EntityIdSchema,
+    actorPersonId: EntityIdSchema.nullable(),
     occurredAt: InstantSchema,
     evidenceRefs: z.array(EvidenceRefSchema).max(20).default([]),
   }),
@@ -210,6 +220,24 @@ export function transitionCoverage(
   if (!LIVE_STATES.has(loop.state)) throw new CoordinationError("invalid_transition");
 
   switch (command.kind) {
+    case "revise":
+      return decision(
+        loop,
+        command,
+        "coverage_revised",
+        {
+          state: "open",
+          minimumSharedMeaning: command.minimumSharedMeaning,
+          unresolvedFacts: [],
+          proposedHolderPersonId: null,
+          acknowledgment: null,
+          timing: command.timing,
+          planVersion: loop.planVersion + 1,
+          attentionCycle: loop.attentionCycle + 1,
+        },
+        "coverage_still_open",
+      );
+
     case "resolve_facts":
       requireState(loop, "provisional");
       return decision(

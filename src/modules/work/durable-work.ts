@@ -20,6 +20,8 @@ export interface EnqueueJobInput extends AuthorityFence {
   readonly deadlineAt?: Date;
   readonly maxAttempts?: number;
   readonly priority?: number;
+  /** Opaque application case identity used only to supersede recovered bounded work. */
+  readonly caseKeyDigest?: string;
 }
 
 export interface ClaimedJob<Payload = unknown> {
@@ -31,6 +33,7 @@ export interface ClaimedJob<Payload = unknown> {
   readonly leaseToken: string;
   readonly deadlineAt: Date | null;
   readonly fence: AuthorityFence;
+  readonly caseKeyDigest?: string | null;
 }
 
 export interface DeadJobRedriveInput {
@@ -61,6 +64,7 @@ interface JobRow {
   conversation_authority_version: number | string | null;
   integration_id: string | null;
   integration_control_epoch: number | string | null;
+  case_key_digest: string | null;
 }
 
 interface DeadJobRow {
@@ -82,6 +86,7 @@ interface DeadJobRow {
   household_control_epoch: number | string | null;
   conversation_authority_version: number | string | null;
   integration_control_epoch: number | string | null;
+  case_key_digest: string | null;
 }
 
 type Transaction = TransactionSql<Record<string, never>>;
@@ -100,6 +105,7 @@ export class DurableWork {
   public async enqueue(input: EnqueueJobInput): Promise<{ jobId: string; created: boolean }> {
     validateFence(input);
     validatePriority(input.priority);
+    validateCaseKeyDigest(input.caseKeyDigest);
     const payloadJson = canonicalJson(input.payload);
     const digest = sha256Hex(payloadJson);
     const encrypted = this.secretBox.encrypt(payloadJson, "durable-job-payload");
@@ -109,7 +115,7 @@ export class DurableWork {
         idempotency_key, payload_digest, payload_ciphertext, payload_key_version,
         status, max_attempts, priority, available_at, deadline_at,
         person_control_epoch, household_control_epoch, conversation_authority_version,
-        integration_control_epoch
+        integration_control_epoch, case_key_digest
       ) values (
         ${randomUUID()}, ${input.kind}, ${input.household?.id ?? null}, ${input.person?.id ?? null},
         ${input.conversation?.id ?? null}, ${input.integration?.id ?? null},
@@ -119,7 +125,7 @@ export class DurableWork {
         ${input.availableAt ?? new Date()},
         ${input.deadlineAt ?? null}, ${input.person?.controlEpoch ?? null},
         ${input.household?.controlEpoch ?? null}, ${input.conversation?.authorityVersion ?? null},
-        ${input.integration?.controlEpoch ?? null}
+        ${input.integration?.controlEpoch ?? null}, ${input.caseKeyDigest ?? null}
       )
       on conflict (idempotency_key) do update set idempotency_key = jobs.idempotency_key
       returning id, (xmax = 0) as inserted
@@ -173,7 +179,7 @@ export class DurableWork {
           returning id, job_kind, payload_ciphertext, payload_key_version, attempt_count,
             max_attempts, deadline_at, lease_token, person_id, person_control_epoch,
             household_id, household_control_epoch, conversation_id, conversation_authority_version,
-            integration_id, integration_control_epoch
+            integration_id, integration_control_epoch, case_key_digest
         `;
         const row = rows[0];
         if (!row) continue;
@@ -191,16 +197,52 @@ export class DurableWork {
           leaseToken: row.lease_token,
           deadlineAt: row.deadline_at,
           fence: fenceFromRow(row),
+          caseKeyDigest: row.case_key_digest,
         });
       }
       return claimed;
     });
   }
 
-  public async succeed(job: Pick<ClaimedJob, "id" | "leaseToken">, now = new Date()): Promise<boolean> {
+  public async succeed(
+    job: Pick<ClaimedJob, "id" | "leaseToken" | "fence" | "caseKeyDigest">,
+    now = new Date(),
+  ): Promise<boolean> {
+    return inTransaction(this.database, async (transaction) => {
+      const rows = await transaction<{ id: string; created_at: Date }[]>`
+        update jobs set status = 'succeeded', lease_owner = null, lease_token = null,
+          lease_expires_at = null, updated_at = ${now}
+        where id = ${job.id} and status = 'leased' and lease_token = ${job.leaseToken}
+        returning id, created_at
+      `;
+      const succeeded = rows[0];
+      if (!succeeded) return false;
+      if (job.caseKeyDigest && job.fence.integration) {
+        await transaction`
+          update jobs prior set status = 'cancelled', last_error_code = 'case_frontier_recovered',
+            updated_at = ${now}
+          where prior.id <> ${job.id} and prior.job_kind = 'orchestrate.private_source'
+            and prior.status in ('attention', 'dead')
+            and prior.integration_id = ${job.fence.integration.id}
+            and prior.integration_control_epoch = ${job.fence.integration.controlEpoch}
+            and prior.case_key_digest = ${job.caseKeyDigest}
+            and prior.created_at < ${succeeded.created_at}
+        `;
+      }
+      return true;
+    });
+  }
+
+  /** Settles bounded work that cannot be completed without a new source or user action. */
+  public async needsAttention(
+    job: Pick<ClaimedJob, "id" | "leaseToken">,
+    reasonCode: string,
+    now = new Date(),
+  ): Promise<boolean> {
     const rows = await this.database<{ id: string }[]>`
-      update jobs set status = 'succeeded', lease_owner = null, lease_token = null,
-        lease_expires_at = null, updated_at = ${now}
+      update jobs set status = 'attention', available_at = ${now},
+        lease_owner = null, lease_token = null, lease_expires_at = null,
+        last_error_code = ${reasonCode.slice(0, 200)}, updated_at = ${now}
       where id = ${job.id} and status = 'leased' and lease_token = ${job.leaseToken}
       returning id
     `;
@@ -242,7 +284,7 @@ export class DurableWork {
           job.integration_id, job.task_id, job.idempotency_key, job.payload_digest,
           job.payload_ciphertext, job.payload_key_version, job.max_attempts, job.priority,
           job.deadline_at, job.person_control_epoch, job.household_control_epoch,
-          job.conversation_authority_version, job.integration_control_epoch
+          job.conversation_authority_version, job.integration_control_epoch, job.case_key_digest
         from jobs job
         left join people person on person.id = job.person_id
         left join households household on household.id = job.household_id
@@ -284,7 +326,7 @@ export class DurableWork {
             idempotency_key, payload_digest, payload_ciphertext, payload_key_version,
             status, max_attempts, priority, available_at, deadline_at,
             person_control_epoch, household_control_epoch, conversation_authority_version,
-            integration_control_epoch
+            integration_control_epoch, case_key_digest
           ) values (
             ${randomUUID()}, ${candidate.job_kind}, ${candidate.household_id}, ${candidate.person_id},
             ${candidate.conversation_id}, ${candidate.integration_id}, ${candidate.task_id},
@@ -292,7 +334,8 @@ export class DurableWork {
             ${candidate.payload_key_version}, 'pending', ${candidate.max_attempts},
             ${candidate.priority}, ${now}, ${candidate.deadline_at},
             ${candidate.person_control_epoch}, ${candidate.household_control_epoch},
-            ${candidate.conversation_authority_version}, ${candidate.integration_control_epoch}
+            ${candidate.conversation_authority_version}, ${candidate.integration_control_epoch},
+            ${candidate.case_key_digest}
           )
           on conflict (idempotency_key) do nothing
           returning id
@@ -368,6 +411,12 @@ function validatePriority(priority: number | undefined): void {
     (!Number.isSafeInteger(priority) || priority < 0 || priority > MAX_PRIORITY)
   ) {
     throw new Error(`Job priority must be an integer between 0 and ${MAX_PRIORITY}`);
+  }
+}
+
+function validateCaseKeyDigest(value: string | undefined): void {
+  if (value !== undefined && !/^[a-f0-9]{64}$/u.test(value)) {
+    throw new Error("Job case key digest is invalid");
   }
 }
 

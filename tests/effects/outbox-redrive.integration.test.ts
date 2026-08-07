@@ -54,7 +54,10 @@ describeDatabase("effect delivery redrive", () => {
   });
 
   it("creates one fenced successor while preserving the failed attempt and blocks revoked authority", async () => {
-    const now = new Date("2026-08-06T12:00:00.000Z");
+    // The database trigger evaluates expiry against its real clock, so a fixed
+    // wall-clock fixture eventually becomes invalid even though the behavior
+    // under test is unrelated to expiration.
+    const now = new Date();
     const prefix = `redrive-test:${randomUUID()}`;
     prefixes.push(prefix);
     const outbox = new EffectOutbox(database, secretBox);

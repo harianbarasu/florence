@@ -26,6 +26,39 @@ export function isFullMailContentAdmitted(admission: MailAdmission): boolean {
   return admission.ingestMetadata && admission.bodyRetrieval === "now";
 }
 
+/**
+ * A non-reversible case identity for one Gmail thread within one exact
+ * integration. The provider thread ID remains only inside encrypted evidence.
+ */
+export function gmailThreadCaseDigest(input: {
+  readonly integrationId: string;
+  readonly threadId: string;
+}): string {
+  const integrationId = requireUuid(input.integrationId, "Google integration ID");
+  const threadId = input.threadId.trim();
+  if (threadId.length === 0 || threadId.length > 2_000) throw new Error("Expected a Gmail thread ID");
+  return canonicalDigest({ caseKind: "gmail_thread", integrationId, threadId });
+}
+
+/** Serializes a private frontier read against source writes for one integration. */
+export function privateSourceIntegrationLockKey(integrationIdCandidate: string): string {
+  const integrationId = requireUuid(integrationIdCandidate, "Google integration ID");
+  return `private-source-integration:${integrationId}`;
+}
+
+/** Serializes every Gmail object that contributes to one person's exact thread frontier. */
+export function gmailThreadFrontierLockKey(input: {
+  readonly ownerPersonId: string;
+  readonly integrationId: string;
+  readonly caseKeyDigest: string;
+}): string {
+  const ownerPersonId = requireUuid(input.ownerPersonId, "Gmail source owner ID");
+  const integrationId = requireUuid(input.integrationId, "Google integration ID");
+  const caseKeyDigest = input.caseKeyDigest.trim().toLowerCase();
+  if (!/^[a-f0-9]{64}$/u.test(caseKeyDigest)) throw new Error("Expected a Gmail thread digest");
+  return `private-source-frontier:${ownerPersonId}:${integrationId}:${caseKeyDigest}`;
+}
+
 const FAMILY_SIGNAL =
   /\b(?:school|teacher|class(?:room)?|camp|daycare|preschool|coach|practice|game|tournament|pickup|pick-up|dropoff|drop-off|dismissal|permission|field trip|activity|lesson|recital|pediatric|appointment|birthday|parent|guardian|caregiver|babysitt|tuition|lunch|meal|allerg|vacation|flight|hotel)\b/iu;
 
@@ -192,4 +225,12 @@ function requireInstant(candidate: string): Date {
   const result = new Date(candidate);
   if (Number.isNaN(result.getTime())) throw new Error("Expected a valid instant");
   return result;
+}
+
+function requireUuid(value: string, label: string): string {
+  const normalized = value.trim().toLowerCase();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(normalized)) {
+    throw new Error(`Expected a ${label}`);
+  }
+  return normalized;
 }

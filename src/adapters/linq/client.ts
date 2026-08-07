@@ -11,6 +11,7 @@ import type {
   LinqParticipant,
   LinqSendMessageRequest,
   LinqSendReceipt,
+  LinqSubmitGuard,
 } from "./contracts.js";
 import { LinqApiError, LinqAttachmentError, LinqAudienceChangedError } from "./errors.js";
 import {
@@ -237,7 +238,7 @@ export class LinqClient {
   async sendMessage(
     request: LinqSendMessageRequest,
     signal?: AbortSignal,
-    beforeSubmit?: () => Promise<void>,
+    submitGuard?: LinqSubmitGuard,
   ): Promise<LinqSendReceipt> {
     const parsed = sendRequestSchema.safeParse(request);
     if (!parsed.success) {
@@ -285,12 +286,13 @@ export class LinqClient {
           : {}),
       },
     };
-    await beforeSubmit?.();
-    const raw = await this.#requestJson(`/chats/${encodeURIComponent(parsed.data.providerChatId)}/messages`, {
-      method: "POST",
-      body: JSON.stringify(body),
-      signal,
-    });
+    const submit = () =>
+      this.#requestJson(`/chats/${encodeURIComponent(parsed.data.providerChatId)}/messages`, {
+        method: "POST",
+        body: JSON.stringify(body),
+        signal,
+      });
+    const raw = submitGuard ? await submitGuard(submit) : await submit();
     const response = providerSendResponseSchema.safeParse(raw);
     if (!response.success || response.data.chat_id !== parsed.data.providerChatId) {
       throw new LinqApiError("Linq returned an invalid send receipt", {
@@ -315,7 +317,7 @@ export class LinqClient {
   async createDirectChat(
     request: LinqCreateDirectMessageRequest,
     signal?: AbortSignal,
-    beforeSubmit?: () => Promise<void>,
+    submitGuard?: LinqSubmitGuard,
   ): Promise<LinqSendReceipt> {
     const parsed = createDirectRequestSchema.safeParse(request);
     if (!parsed.success) {
@@ -325,19 +327,20 @@ export class LinqClient {
         retryable: false,
       });
     }
-    await beforeSubmit?.();
-    const raw = await this.#requestJson("/chats", {
-      method: "POST",
-      body: JSON.stringify({
-        from: this.#config.phoneNumber,
-        to: [parsed.data.recipient],
-        message: {
-          idempotency_key: parsed.data.idempotencyKey,
-          parts: [{ type: "text", value: parsed.data.text }],
-        },
-      }),
-      signal,
-    });
+    const submit = () =>
+      this.#requestJson("/chats", {
+        method: "POST",
+        body: JSON.stringify({
+          from: this.#config.phoneNumber,
+          to: [parsed.data.recipient],
+          message: {
+            idempotency_key: parsed.data.idempotencyKey,
+            parts: [{ type: "text", value: parsed.data.text }],
+          },
+        }),
+        signal,
+      });
+    const raw = submitGuard ? await submitGuard(submit) : await submit();
     const response = providerCreateChatResponseSchema.safeParse(raw);
     if (!response.success) {
       throw new LinqApiError("Linq returned an invalid created chat", {

@@ -26,7 +26,7 @@ import { type IntegrationCapability, PostgresSourceIntelligence } from "../modul
 import { DurableWork } from "../modules/work/index.js";
 import { canonicalDigest, canonicalJson } from "../shared/canonical-json.js";
 import type { SecretBox } from "../shared/crypto.js";
-import { NotFoundError, StaleAuthorityError, UnauthorizedError } from "../shared/errors.js";
+import { ConflictError, NotFoundError, StaleAuthorityError, UnauthorizedError } from "../shared/errors.js";
 import type {
   AppEnvelope,
   ApplicationTimerProcessor,
@@ -36,6 +36,7 @@ import type {
 import { CoverageCoordinator } from "./coverage-coordinator.js";
 import { reconcileCoverageTimers } from "./coverage-timer-reconciliation.js";
 import { GoogleSyncCoordinator } from "./google-sync-coordinator.js";
+import { PrivateSourceReconciler } from "./private-source-reconciler.js";
 
 type Transaction = TransactionSql<Record<string, never>>;
 const MAX_LIVE_GROUP_INVOCATION_AGE_MS = 10 * 60_000;
@@ -151,6 +152,12 @@ export class FlorenceApplication {
         return this.completeGoogleOAuth(input);
       case "google.sync.observe":
         return this.observeGoogleSync(input);
+      case "private_source.notify_candidate":
+        return this.schedulePrivateSourceCandidateNotice(input);
+      case "private_source.deliver_candidate_notice":
+        return this.deliverPrivateSourceCandidateNotice(input);
+      case "private_source.reconcile":
+        return this.reconcilePrivateSource(input);
       case "private_bridge.proposal": {
         const result = await new PrivateSourceBridge(
           this.database,
@@ -310,6 +317,166 @@ export class FlorenceApplication {
         ...(result.outboxIds[1] ? { secondOutboxId: result.outboxIds[1] } : {}),
       },
     };
+  }
+
+  private async schedulePrivateSourceCandidateNotice(
+    input: Extract<AppEnvelope, { kind: "private_source.notify_candidate" }>,
+  ): Promise<ProcessReceipt> {
+    return this.database.begin(async (transaction) => {
+      const rows = await transaction<
+        {
+          readonly person_control_epoch: number | string;
+          readonly integration_control_epoch: number | string;
+          readonly expires_at: Date;
+        }[]
+      >`
+        select person.control_epoch as person_control_epoch,
+          integration.control_epoch as integration_control_epoch,
+          candidate.expires_at
+        from knowledge_candidates candidate
+        join private_source_frontiers frontier
+          on frontier.current_candidate_id = candidate.id
+          and frontier.owner_person_id = candidate.owner_person_id
+          and frontier.disposition = 'candidate'
+        join people person on person.id = candidate.owner_person_id and person.status = 'registered'
+        join integrations integration on integration.id = frontier.integration_id
+          and integration.person_id = person.id and integration.status = 'active'
+        where candidate.id = ${input.candidateId}
+          and candidate.owner_person_id = ${input.personId}
+          and candidate.scope_kind = 'person' and candidate.status = 'pending'
+          and candidate.expires_at > now()
+          and integration.id = ${input.integrationId}
+          and integration.control_epoch = ${input.expectedIntegrationControlEpoch}
+        for share of candidate, frontier, person, integration
+      `;
+      const current = rows[0];
+      if (!current) {
+        return {
+          accepted: true,
+          duplicate: true,
+          disposition: "private_source_candidate_notice_obsolete",
+          ids: { candidateId: input.candidateId },
+        };
+      }
+      const queued = await new DurableWork(transaction, this.secretBox).enqueue({
+        kind: "private_source.deliver_candidate_notice",
+        idempotencyKey: `private-source-notice:${input.candidateId}`,
+        payload: {
+          candidateId: input.candidateId,
+          personId: input.personId,
+          integrationId: input.integrationId,
+          expectedIntegrationControlEpoch: input.expectedIntegrationControlEpoch,
+        },
+        person: { id: input.personId, controlEpoch: Number(current.person_control_epoch) },
+        integration: {
+          id: input.integrationId,
+          controlEpoch: Number(current.integration_control_epoch),
+        },
+        deadlineAt: current.expires_at,
+        priority: 25,
+        maxAttempts: 672,
+      });
+      return {
+        accepted: true,
+        duplicate: !queued.created,
+        disposition: queued.created
+          ? "private_source_candidate_notice_scheduled"
+          : "private_source_candidate_notice_already_scheduled",
+        ids: { candidateId: input.candidateId, jobId: queued.jobId },
+      };
+    });
+  }
+
+  private async deliverPrivateSourceCandidateNotice(
+    input: Extract<AppEnvelope, { kind: "private_source.deliver_candidate_notice" }>,
+  ): Promise<ProcessReceipt> {
+    const result = await new GoogleSyncCoordinator(
+      this.database,
+      this.config,
+      this.secretBox,
+    ).notifyPrivateSourceCandidate(input);
+    return {
+      accepted: result.kind !== "route_unavailable",
+      duplicate: result.kind !== "queued" || !result.created,
+      disposition:
+        result.kind === "route_unavailable"
+          ? "private_source_candidate_private_route_unavailable"
+          : result.kind === "obsolete"
+            ? "private_source_candidate_notice_obsolete"
+            : result.created
+              ? "private_source_candidate_private_notice_queued"
+              : "private_source_candidate_private_notice_already_recorded",
+      ids: {
+        candidateId: input.candidateId,
+        ...(result.kind === "queued" ? { outboxId: result.outboxId } : {}),
+      },
+    };
+  }
+
+  private async reconcilePrivateSource(
+    input: Extract<AppEnvelope, { kind: "private_source.reconcile" }>,
+  ): Promise<ProcessReceipt> {
+    const reconciledAt = new Date().toISOString();
+    const result = await this.database.begin(async (transaction) =>
+      new PrivateSourceReconciler(transaction, this.secretBox, {
+        rawRetentionDays: this.config.defaults.rawSourceRetentionDays,
+      }).apply(input.proposal, reconciledAt),
+    );
+    switch (result.kind) {
+      case "duplicate":
+        return {
+          accepted: true,
+          duplicate: true,
+          disposition: "private_source_reconciliation_duplicate",
+          ids: {
+            anchorSourceRevisionId: input.proposal.anchorSourceRevisionId,
+            ...(result.candidateId ? { candidateId: result.candidateId } : {}),
+          },
+        };
+      case "unchanged":
+        return {
+          accepted: true,
+          duplicate: false,
+          disposition: "private_source_reconciliation_unchanged",
+          ids: {
+            anchorSourceRevisionId: input.proposal.anchorSourceRevisionId,
+            ...(result.candidateId ? { candidateId: result.candidateId } : {}),
+          },
+        };
+      case "candidate_created":
+        return {
+          accepted: true,
+          duplicate: false,
+          disposition: "private_source_coverage_candidate_created",
+          ids: {
+            anchorSourceRevisionId: input.proposal.anchorSourceRevisionId,
+            candidateId: result.candidateId,
+          },
+        };
+      case "cancelled":
+        return {
+          accepted: true,
+          duplicate: false,
+          disposition: "private_source_coverage_cancelled",
+          ids: {
+            anchorSourceRevisionId: input.proposal.anchorSourceRevisionId,
+            ...(result.loopId ? { loopId: result.loopId } : {}),
+            correction: result.correction,
+          },
+        };
+      case "loop_update_review_created":
+      case "loop_update_review_pending":
+        return {
+          accepted: true,
+          duplicate: result.kind === "loop_update_review_pending",
+          disposition: "private_source_loop_update_review_pending",
+          ids: {
+            anchorSourceRevisionId: input.proposal.anchorSourceRevisionId,
+            candidateId: result.candidateId,
+            loopId: result.loopId,
+          },
+        };
+    }
   }
 
   private async materializeRoutines(
@@ -2861,6 +3028,19 @@ export class FlorenceApplication {
           };
         }
         case "review_private_candidate": {
+          const candidateKinds = await transaction<{ readonly candidate_kind: string }[]>`
+            select candidate_kind from knowledge_candidates
+            where id = ${command.candidateId} and owner_person_id = ${actorPersonId}
+              and scope_kind = 'person'
+          `;
+          if (
+            command.decision === "accepted" &&
+            candidateKinds[0]?.candidate_kind === "coverage_loop_update_review"
+          ) {
+            throw new ConflictError(
+              "An existing family loop can change only through its explicit update approval flow",
+            );
+          }
           const result = await new PostgresSourceIntelligence(transaction, this.secretBox, {
             rawRetentionDays: this.config.defaults.rawSourceRetentionDays,
             privateCandidateRetentionDays: 7,

@@ -47,7 +47,14 @@ export interface GoogleSyncMilestoneResult {
   readonly outboxIds: readonly string[];
 }
 
-const RECENT_PRIORITY_CEILING = 110;
+export type PrivateSourceCandidateNoticeResult =
+  | { readonly kind: "obsolete" }
+  | { readonly kind: "route_unavailable" }
+  | { readonly kind: "queued"; readonly outboxId: string; readonly created: boolean };
+
+const RECENT_GMAIL_CAPTURE_PRIORITY_CEILING = 110;
+// Thread reconciliation is scheduled one bounded step after its capture work.
+const RECENT_GMAIL_RECONCILIATION_PRIORITY_CEILING = RECENT_GMAIL_CAPTURE_PRIORITY_CEILING + 5;
 const EFFECT_AUTHORIZATION_MS = 10 * 60_000;
 
 /**
@@ -143,6 +150,129 @@ export class GoogleSyncCoordinator {
     });
   }
 
+  public async notifyPrivateSourceCandidate(input: {
+    readonly candidateId: string;
+    readonly personId: string;
+    readonly integrationId: string;
+    readonly expectedIntegrationControlEpoch: number;
+  }): Promise<PrivateSourceCandidateNoticeResult> {
+    if (
+      !UUID_PATTERN.test(input.candidateId) ||
+      !UUID_PATTERN.test(input.personId) ||
+      !UUID_PATTERN.test(input.integrationId) ||
+      !Number.isSafeInteger(input.expectedIntegrationControlEpoch) ||
+      input.expectedIntegrationControlEpoch < 1
+    ) {
+      throw new Error("Private source notification fence is invalid");
+    }
+    return inTransaction(this.database, async (transaction) => {
+      await transaction`
+        select pg_advisory_xact_lock(hashtextextended(${`private-source-notice:${input.candidateId}`}, 0))
+      `;
+      const rows = await transaction<
+        {
+          readonly person_control_epoch: number | string;
+          readonly integration_control_epoch: number | string;
+        }[]
+      >`
+        select person.control_epoch as person_control_epoch,
+          integration.control_epoch as integration_control_epoch
+        from knowledge_candidates candidate
+        join private_source_frontiers frontier
+          on frontier.current_candidate_id = candidate.id
+          and frontier.owner_person_id = candidate.owner_person_id
+          and frontier.disposition = 'candidate'
+        join people person on person.id = candidate.owner_person_id
+          and person.status = 'registered'
+        join integrations integration on integration.id = frontier.integration_id
+          and integration.person_id = person.id and integration.status = 'active'
+        where candidate.id = ${input.candidateId}
+          and candidate.owner_person_id = ${input.personId}
+          and candidate.scope_kind = 'person' and candidate.status = 'pending'
+          and candidate.expires_at > now()
+          and integration.id = ${input.integrationId}
+          and integration.control_epoch = ${input.expectedIntegrationControlEpoch}
+        for share of candidate, frontier, person, integration
+      `;
+      const current = rows[0];
+      if (!current) return { kind: "obsolete" };
+      const route = await this.resolveExactPrivateRoute(transaction, input.personId);
+      if (!route) return { kind: "route_unavailable" };
+      const authority = await new PostgresConversationAuthority(transaction).authorizeSend({
+        conversationId: route.conversationId,
+        expectedParticipantEpochId: route.participantEpochId,
+        expectedParticipantSetDigest: route.participantSetDigest,
+        liveParticipantIdentityIds: [route.identityId],
+        sendKind: "transactional",
+        operation: "private_source_review",
+        ruleId: null,
+      });
+      if (
+        !authority.allowed ||
+        authority.authorityVersion !== route.conversationAuthorityVersion ||
+        authority.participantEpochId !== route.participantEpochId ||
+        authority.participantSetDigest !== route.participantSetDigest
+      ) {
+        return { kind: "route_unavailable" };
+      }
+      const idempotencyKey = `private-source-review:${input.candidateId}`;
+      const existing = await existingOutbox(transaction, idempotencyKey);
+      if (existing) return { kind: "queued", outboxId: existing, created: false };
+      const handoff = await new PostgresWebAuth(
+        transaction,
+        this.secretBox,
+        this.config.security.tokenKey,
+      ).createHandoff({
+        personId: input.personId,
+        privateIdentityId: route.identityId,
+        privateConversationId: route.conversationId,
+        purpose: "web_sign_in",
+        context: { returnPath: "/sources", candidateId: input.candidateId },
+        expiresInSeconds: 10 * 60,
+      });
+      const text = `I found something in your connected account that may need family coordination. Review it privately: ${this.config.publicBaseUrl}/handoff/${handoff.token}\n\nThis secure link expires in 10 minutes. If it expires, text me “settings” for a fresh one.`;
+      const queued = await new EffectOutbox(transaction, this.secretBox).authorizeAndEnqueue({
+        actorPersonId: input.personId,
+        person: { id: input.personId, controlEpoch: Number(current.person_control_epoch) },
+        integration: {
+          id: input.integrationId,
+          controlEpoch: Number(current.integration_control_epoch),
+        },
+        conversation: {
+          id: route.conversationId,
+          authorityVersion: route.conversationAuthorityVersion,
+        },
+        participantEpochId: route.participantEpochId,
+        expectedParticipantDigest: route.participantSetDigest,
+        effectKind: "linq.message",
+        idempotencyKey,
+        data: {
+          candidateId: input.candidateId,
+          integrationId: input.integrationId,
+          textDigest: sha256Hex(text),
+        },
+        policy: {
+          exactPrivateDm: true,
+          noSourceContent: true,
+          operation: "private_source_review",
+        },
+        target: {
+          providerChatId: route.providerChatId,
+          participantEpochId: route.participantEpochId,
+          personId: input.personId,
+        },
+        payload: {
+          providerChatId: route.providerChatId,
+          expectedProviderParticipantDigest: route.providerParticipantDigest,
+          text,
+        },
+        reasonCodes: ["current_private_source_candidate", "exact_private_dm", "no_source_content"],
+        authorizationExpiresAt: new Date(Date.now() + EFFECT_AUTHORIZATION_MS),
+      });
+      return { kind: "queued", ...queued };
+    });
+  }
+
   private async reopenIntegration(
     transaction: Transaction,
     input: GoogleSyncObservationFields,
@@ -216,7 +346,7 @@ export class GoogleSyncCoordinator {
           job_kind like 'google.%'
           or job_kind = 'orchestrate.private_source'
         )
-        and status in ('succeeded', 'dead', 'cancelled', 'retry')
+        and status in ('succeeded', 'attention', 'dead', 'cancelled', 'retry')
     `;
     const row = rows[0];
     return row
@@ -240,9 +370,17 @@ export class GoogleSyncCoordinator {
             and job.person_control_epoch = ${scope.personControlEpoch}
             and job.integration_id = ${scope.integrationId}
             and job.integration_control_epoch = ${scope.integrationControlEpoch}
-            and job.status = 'dead'
-            and job.job_kind in ('google.gmail.message', 'orchestrate.private_source')
-            and job.priority <= ${RECENT_PRIORITY_CEILING}
+            and job.status in ('attention', 'dead')
+            and (
+              (
+                job.job_kind = 'google.gmail.message'
+                and job.priority <= ${RECENT_GMAIL_CAPTURE_PRIORITY_CEILING}
+              )
+              or (
+                job.job_kind = 'orchestrate.private_source'
+                and job.priority <= ${RECENT_GMAIL_RECONCILIATION_PRIORITY_CEILING}
+              )
+            )
         )
         or coalesce((
           select job.status from jobs job
@@ -379,12 +517,15 @@ export class GoogleSyncCoordinator {
           and job.person_control_epoch = ${scope.personControlEpoch}
           and job.integration_id = ${scope.integrationId}
           and job.integration_control_epoch = ${scope.integrationControlEpoch}
-          and job.status in ('pending', 'retry', 'leased', 'dead')
+          and job.status in ('pending', 'retry', 'leased', 'attention', 'dead')
           and (
-            (job.job_kind = 'google.gmail.message' and job.priority <= ${RECENT_PRIORITY_CEILING})
+            (
+              job.job_kind = 'google.gmail.message'
+              and job.priority <= ${RECENT_GMAIL_CAPTURE_PRIORITY_CEILING}
+            )
             or (
               job.job_kind = 'orchestrate.private_source'
-              and job.priority <= ${RECENT_PRIORITY_CEILING}
+              and job.priority <= ${RECENT_GMAIL_RECONCILIATION_PRIORITY_CEILING}
             )
             or (
               job.job_kind = 'google.gmail.backfill'

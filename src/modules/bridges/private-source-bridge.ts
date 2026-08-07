@@ -8,13 +8,20 @@ import type { SecretBox } from "../../shared/crypto.js";
 import { ConflictError, NotFoundError, StaleAuthorityError, UnauthorizedError } from "../../shared/errors.js";
 import { evaluateConversationMode, PostgresConversationAuthority } from "../conversations/index.js";
 import {
+  type CoverageLoop,
+  type CoverageState,
   createCoverageLoop,
   PostgresCoordination,
   planCoverageFollowUpTimer,
 } from "../coordination/index.js";
 import { EffectOutbox } from "../effects/index.js";
 import { commitmentProposalSchema, minimumDisclosureSchema } from "../orchestration/skills.js";
-import { JsonObjectSchema, PostgresSourceIntelligence } from "../sources/index.js";
+import {
+  gmailThreadFrontierLockKey,
+  JsonObjectSchema,
+  PostgresSourceIntelligence,
+  privateSourceIntegrationLockKey,
+} from "../sources/index.js";
 import { DurableTimers, DurableWork } from "../work/index.js";
 
 type Transaction = TransactionSql<Record<string, never>>;
@@ -66,6 +73,40 @@ const StandingRuleFenceSchema = z.strictObject({
   ruleVersion: z.number().int().positive(),
 });
 
+const LoopUpdateReviewContentSchema = z.object({
+  existingLoopId: z.string().uuid(),
+  sourceActionIntentId: z.string().uuid(),
+  priorCandidateId: z.string().uuid(),
+});
+
+const IntentDigestFenceSchema = z.strictObject({
+  actionDigest: DigestSchema,
+  dataDigest: DigestSchema,
+  policyDigest: DigestSchema,
+  targetDigest: DigestSchema,
+});
+
+const SourceFrontierFenceSchema = z.strictObject({
+  frontierId: z.string().uuid(),
+  integrationId: z.string().uuid(),
+  caseKind: z.literal("gmail_thread"),
+  caseKeyDigest: DigestSchema,
+  version: z.number().int().positive(),
+  frontierDigest: DigestSchema,
+  sourceGeneration: z.number().int().nonnegative(),
+});
+
+const LoopUpdateFenceSchema = z.strictObject({
+  existingLoopId: z.string().uuid(),
+  expectedLoopVersion: z.number().int().positive(),
+  expectedLoopDestinationDigest: DigestSchema,
+  priorCandidateId: z.string().uuid(),
+  priorCandidateContentDigest: DigestSchema,
+  sourceActionIntentId: z.string().uuid(),
+  sourceActionIntentDigests: IntentDigestFenceSchema,
+  sourceFrontier: SourceFrontierFenceSchema,
+});
+
 const PreparedPayloadSchema = z.strictObject({
   schemaVersion: z.literal(1),
   phase: z.literal("prepared"),
@@ -77,6 +118,7 @@ const PreparedPayloadSchema = z.strictObject({
   destination: DestinationSchema,
   personControlEpoch: z.number().int().positive(),
   standingRule: StandingRuleFenceSchema.nullable(),
+  loopUpdate: LoopUpdateFenceSchema.nullable(),
 });
 
 const ProposedPayloadSchema = PreparedPayloadSchema.omit({ phase: true }).extend({
@@ -107,6 +149,7 @@ export interface PrivateBridgeProposalContext {
   readonly destination: z.infer<typeof DestinationSchema>;
   readonly currentParticipantPersonIds: readonly string[];
   readonly standingRule: z.infer<typeof StandingRuleFenceSchema> | null;
+  readonly loopUpdate: z.infer<typeof LoopUpdateFenceSchema> | null;
 }
 
 export interface PrivateBridgeProposalInput {
@@ -124,6 +167,41 @@ export interface PrivateBridgeApprovalInput {
   readonly targetDigest: string;
   readonly mode: "once" | "standing";
 }
+
+export interface AcceptedPrivateBridgeCandidateInput {
+  readonly ownerPersonId: string;
+  readonly candidateId: string;
+  readonly candidateContentDigest: string;
+}
+
+export interface AcceptedPrivateBridgeLoopReference {
+  readonly actionIntentId: string;
+  readonly loopId: string;
+}
+
+export interface AcceptedPrivateBridgeWithdrawalInput extends AcceptedPrivateBridgeCandidateInput {
+  readonly intent: "cancel" | "supersede";
+  readonly evidenceSourceRevisionIds: readonly string[];
+  readonly withdrawnAt: Date;
+}
+
+export type AcceptedPrivateBridgeCorrection =
+  | { readonly kind: "not_needed" }
+  | { readonly kind: "not_authorized" }
+  | { readonly kind: "queued"; readonly outboxId: string; readonly duplicate: boolean };
+
+export type AcceptedPrivateBridgeWithdrawalResult =
+  | { readonly kind: "not_found" }
+  | {
+      readonly kind: "withdrawn" | "already_terminal";
+      readonly actionIntentId: string;
+      readonly loopId: string;
+      readonly loopState: CoverageState;
+      readonly cancelledOpeningEffectCount: number;
+      readonly supersededTimerCount: number;
+      readonly openingMayHaveEscaped: boolean;
+      readonly correction: AcceptedPrivateBridgeCorrection;
+    };
 
 interface IntentRow {
   readonly id: string;
@@ -248,6 +326,14 @@ export class PrivateSourceBridge {
   }): Promise<{ actionIntentId: string; duplicate: boolean }> {
     return inTransaction(this.database, async (transaction) => {
       const now = new Date();
+      const discoveredUpdateFrontier = await discoverLoopUpdateSourceFrontier(
+        transaction,
+        input.actorPersonId,
+        input.candidateId,
+      );
+      if (discoveredUpdateFrontier) {
+        await acquireLoopUpdateSourceLocks(transaction, input.actorPersonId, discoveredUpdateFrontier);
+      }
       const candidate = await loadCandidateForOwner(
         transaction,
         input.candidateId,
@@ -255,8 +341,8 @@ export class PrivateSourceBridge {
         now,
         true,
       );
-      if (candidate.candidate_kind !== "coverage_proposal") {
-        throw new ConflictError("Only a family coverage proposal can be shared");
+      if (!["coverage_proposal", "coverage_loop_update_review"].includes(candidate.candidate_kind)) {
+        throw new ConflictError("Only a family coverage proposal or update can be shared");
       }
       const personRows = await transaction<{ readonly control_epoch: number | string }[]>`
         select control_epoch from people
@@ -273,6 +359,26 @@ export class PrivateSourceBridge {
       await requireCurrentEvidence(transaction, input.actorPersonId, evidenceIds, now);
       const sourcePattern = await this.deriveSourcePattern(input.actorPersonId, evidenceIds);
       const standingRule = input.standingRule ?? null;
+      const loopUpdate =
+        candidate.candidate_kind === "coverage_loop_update_review"
+          ? await prepareLoopUpdateFence(
+              transaction,
+              this.secretBox,
+              input.actorPersonId,
+              candidate,
+              destination,
+            )
+          : null;
+      if (
+        loopUpdate &&
+        (!discoveredUpdateFrontier ||
+          !sameSourceFrontierLockTarget(loopUpdate.sourceFrontier, discoveredUpdateFrontier))
+      ) {
+        throw new StaleAuthorityError("Coverage update source frontier changed during preparation");
+      }
+      if (loopUpdate && standingRule) {
+        throw new ConflictError("An existing coverage loop update always requires one exact approval");
+      }
       if (standingRule) {
         if (!sourcePattern) throw new StaleAuthorityError("Standing source pattern is no longer available");
         await requireStandingRule(transaction, input.actorPersonId, standingRule, sourcePattern, destination);
@@ -288,12 +394,14 @@ export class PrivateSourceBridge {
         destination,
         personControlEpoch: Number(person.control_epoch),
         standingRule,
+        loopUpdate,
       };
       const preparedActionDigest = canonicalDigest({
         actionKind: "private_source_to_coverage_loop",
         candidateId: candidate.id,
         conversationId: destination.conversationId,
         standingRuleId: standingRule?.ruleId ?? null,
+        loopUpdate,
       });
       await transaction`
         select pg_advisory_xact_lock(hashtextextended(${`private-bridge:${preparedActionDigest}`}, 0))
@@ -323,7 +431,7 @@ export class PrivateSourceBridge {
           ${destination.conversationId}, ${destination.participantEpochId},
           'private_source_to_coverage_loop', ${preparedActionDigest},
           ${canonicalDigest({ candidateContentDigest: candidate.content_digest, evidenceIds })},
-          ${canonicalDigest({ ownerApprovalRequired: true, standingRule })},
+          ${canonicalDigest({ ownerApprovalRequired: true, standingRule, loopUpdate })},
           ${destinationDigest(destination)}, ${sealed.ciphertext}, ${sealed.keyVersion}, 'proposed',
           ${Number(person.control_epoch)}, ${destination.householdControlEpoch},
           ${destination.conversationAuthorityVersion}, ${expiresAt}, ${now}, ${now}
@@ -441,6 +549,7 @@ export class PrivateSourceBridge {
       destination: payload.destination,
       currentParticipantPersonIds: snapshot.participants.map((participant) => participant.personId),
       standingRule: payload.standingRule,
+      loopUpdate: payload.loopUpdate,
     };
   }
 
@@ -450,6 +559,28 @@ export class PrivateSourceBridge {
     const minimumDisclosure = minimumDisclosureSchema.parse(input.minimumDisclosure);
     const commitment = commitmentProposalSchema.parse(input.commitment);
     return inTransaction(this.database, async (transaction) => {
+      const observedRows = await transaction<IntentRow[]>`
+        select id, household_id, person_id, conversation_id, participant_epoch_id,
+          action_digest, data_digest, policy_digest, target_digest, payload_ciphertext,
+          status, person_control_epoch, household_control_epoch,
+          conversation_authority_version, expires_at
+        from action_intents where id = ${input.actionIntentId}
+          and action_kind = 'private_source_to_coverage_loop'
+      `;
+      const observedIntent = observedRows[0];
+      if (!observedIntent) throw new NotFoundError("Private bridge intent does not exist");
+      const observedPayload = openPrivateBridgePayload(
+        this.secretBox,
+        observedIntent.id,
+        observedIntent.payload_ciphertext,
+      );
+      if (observedPayload.loopUpdate) {
+        await acquireLoopUpdateSourceLocks(
+          transaction,
+          observedIntent.person_id,
+          observedPayload.loopUpdate.sourceFrontier,
+        );
+      }
       const rows = await transaction<IntentRow[]>`
         select id, household_id, person_id, conversation_id, participant_epoch_id,
           action_digest, data_digest, policy_digest, target_digest, payload_ciphertext,
@@ -460,6 +591,8 @@ export class PrivateSourceBridge {
       `;
       const intent = rows[0];
       if (!intent) throw new NotFoundError("Private bridge intent does not exist");
+      const prepared = openPrivateBridgePayload(this.secretBox, intent.id, intent.payload_ciphertext);
+      requireSameObservedUpdateFrontier(observedPayload, prepared);
       if (intent.status !== "proposed") {
         if (["awaiting_approval", "approved", "executing", "succeeded"].includes(intent.status)) {
           return {
@@ -469,12 +602,12 @@ export class PrivateSourceBridge {
         }
         throw new StaleAuthorityError("Private bridge intent is no longer proposable");
       }
-      const prepared = openPrivateBridgePayload(this.secretBox, intent.id, intent.payload_ciphertext);
       if (prepared.phase !== "prepared") throw new ConflictError("Private bridge proposal phase changed");
       await new PrivateSourceBridge(transaction, this.secretBox, this.rawRetentionDays).revalidate(
         intent,
         prepared,
         false,
+        prepared.loopUpdate !== null,
       );
       requireExactProposalEvidence(prepared, minimumDisclosure.evidence, commitment.evidence);
       if (minimumDisclosure.destinationEpochId !== prepared.destination.participantEpochId) {
@@ -486,7 +619,7 @@ export class PrivateSourceBridge {
       const proposed: z.infer<typeof ProposedPayloadSchema> = {
         ...prepared,
         phase: "awaiting_approval",
-        loopId: randomUUID(),
+        loopId: prepared.loopUpdate?.existingLoopId ?? randomUUID(),
         minimumDisclosure,
         commitment,
         approvalMode: prepared.standingRule ? "standing" : null,
@@ -494,7 +627,7 @@ export class PrivateSourceBridge {
       const digests = proposalDigests(intent.id, proposed);
       const sealed = sealPayload(this.secretBox, intent.id, proposed);
       const standingRule = prepared.standingRule;
-      const autoApproved = standingRule !== null;
+      const autoApproved = standingRule !== null && prepared.loopUpdate === null;
       if (standingRule && prepared.sourcePattern) {
         await requireStandingRule(
           transaction,
@@ -533,6 +666,228 @@ export class PrivateSourceBridge {
     return rows.length === 1;
   }
 
+  /**
+   * Withdraws only bridge work whose encrypted payload is bound to this exact
+   * candidate and content digest. Construct this bridge with the caller's
+   * transaction to make withdrawal atomic with candidate replacement.
+   */
+  public async cancelPendingCandidateWork(input: {
+    readonly ownerPersonId: string;
+    readonly candidateId: string;
+    readonly candidateContentDigest: string;
+    readonly cancelledAt: Date;
+  }): Promise<{ readonly cancelledActionIntentIds: readonly string[] }> {
+    return inTransaction(this.database, async (transaction) => {
+      const intents = await transaction<
+        { readonly id: string; readonly payload_ciphertext: Buffer; readonly status: string }[]
+      >`
+        select id, payload_ciphertext, status
+        from action_intents
+        where person_id = ${input.ownerPersonId}
+          and action_kind = 'private_source_to_coverage_loop'
+          and status in ('proposed', 'awaiting_approval', 'approved')
+        for update
+      `;
+      const exactIntentIds: string[] = [];
+      for (const intent of intents) {
+        let payload: PrivateBridgePayload;
+        try {
+          payload = openPrivateBridgePayload(this.secretBox, intent.id, intent.payload_ciphertext);
+        } catch {
+          continue;
+        }
+        if (
+          payload.candidateId === input.candidateId &&
+          payload.candidateContentDigest === input.candidateContentDigest
+        ) {
+          exactIntentIds.push(intent.id);
+        }
+      }
+      if (exactIntentIds.length === 0) return { cancelledActionIntentIds: [] };
+
+      await transaction`
+        update action_approvals
+        set revoked_at = coalesce(revoked_at, ${input.cancelledAt})
+        where action_intent_id = any(${transaction.array(exactIntentIds)}::uuid[])
+      `;
+      await transaction`
+        update disclosure_decisions decision
+        set revoked_at = coalesce(decision.revoked_at, ${input.cancelledAt})
+        from outbox effect
+        where effect.action_intent_id = any(${transaction.array(exactIntentIds)}::uuid[])
+          and effect.authorization_decision_id = decision.id
+          and effect.status in ('pending', 'retry', 'leased')
+      `;
+      await transaction`
+        update outbox
+        set status = 'cancelled', lease_owner = null, lease_token = null,
+          lease_expires_at = null, updated_at = ${input.cancelledAt}
+        where action_intent_id = any(${transaction.array(exactIntentIds)}::uuid[])
+          and status in ('pending', 'retry', 'leased')
+      `;
+      await transaction`
+        update jobs
+        set status = 'cancelled', lease_owner = null, lease_token = null,
+          lease_expires_at = null, updated_at = ${input.cancelledAt}
+        where idempotency_key = any(${transaction.array(
+          exactIntentIds.flatMap((id) => [`private-bridge:proposal:${id}`, `private-bridge:commit:${id}`]),
+        )}::text[])
+          and status in ('pending', 'retry', 'leased')
+      `;
+      await transaction`
+        update action_intents
+        set status = 'cancelled', updated_at = ${input.cancelledAt}
+        where id = any(${transaction.array(exactIntentIds)}::uuid[])
+          and status in ('proposed', 'awaiting_approval', 'approved')
+      `;
+      return { cancelledActionIntentIds: exactIntentIds };
+    });
+  }
+
+  /** Resolves only the canonical loop already created from this exact accepted candidate. */
+  public async resolveAcceptedCandidateLoop(
+    inputCandidate: AcceptedPrivateBridgeCandidateInput,
+  ): Promise<AcceptedPrivateBridgeLoopReference | null> {
+    const input = parseAcceptedCandidateInput(inputCandidate);
+    return inTransaction(this.database, async (transaction) => {
+      const exact = await resolveExactAcceptedBridge(transaction, this.secretBox, input, false);
+      return exact ? { actionIntentId: exact.intent.id, loopId: exact.loop.loopId } : null;
+    });
+  }
+
+  /**
+   * Withdraws the one shared loop created from an exact accepted private candidate.
+   * The caller owns the surrounding application transaction; this module keeps the
+   * encrypted bridge lookup, opening-effect race, loop transition, timer cleanup,
+   * and optional minimum-meaning correction behind one interface.
+   */
+  public async withdrawAcceptedCandidate(
+    inputCandidate: AcceptedPrivateBridgeWithdrawalInput,
+  ): Promise<AcceptedPrivateBridgeWithdrawalResult> {
+    const input = parseAcceptedWithdrawalInput(inputCandidate);
+    return inTransaction(this.database, async (transaction) => {
+      const exact = await resolveExactAcceptedBridge(transaction, this.secretBox, input, true);
+      if (!exact) return { kind: "not_found" };
+
+      const openingKey = `private-bridge:${exact.intent.id}:open`;
+      const openingEffects = await transaction<
+        {
+          readonly id: string;
+          readonly authorization_decision_id: string;
+          readonly status: string;
+        }[]
+      >`
+        select effect.id, effect.authorization_decision_id, effect.status
+        from outbox effect
+        where effect.action_intent_id = ${exact.intent.id}
+          and effect.effect_kind = 'linq.message'
+          and (
+            effect.idempotency_key = ${openingKey}
+            or exists (
+              select 1 from outbox root
+              where root.id = effect.redrive_root_id and root.idempotency_key = ${openingKey}
+            )
+          )
+        for update of effect
+      `;
+      const openingMayHaveEscaped = openingEffects.some((effect) =>
+        ["leased", "retry", "submitted", "confirmed", "ambiguous"].includes(effect.status),
+      );
+      const openingIds = openingEffects.map((effect) => effect.id);
+      const decisionIds = openingEffects.map((effect) => effect.authorization_decision_id);
+      let cancelledOpeningEffectCount = 0;
+      if (openingIds.length > 0) {
+        const cancelled = await transaction<{ readonly id: string }[]>`
+          update outbox
+          set status = 'cancelled', lease_owner = null, lease_token = null,
+            lease_expires_at = null, last_error_code = 'private_bridge_withdrawn',
+            updated_at = ${input.withdrawnAt}
+          where id = any(${transaction.array(openingIds)}::uuid[])
+            and status in ('pending', 'retry', 'leased')
+          returning id
+        `;
+        cancelledOpeningEffectCount = cancelled.length;
+      }
+      if (decisionIds.length > 0) {
+        await transaction`
+          update disclosure_decisions
+          set revoked_at = coalesce(revoked_at, ${input.withdrawnAt})
+          where id = any(${transaction.array(decisionIds)}::uuid[])
+        `;
+      }
+      await transaction`
+        update action_approvals
+        set revoked_at = coalesce(revoked_at, ${input.withdrawnAt})
+        where action_intent_id = ${exact.intent.id}
+      `;
+
+      const coordination = new PostgresCoordination(transaction, this.secretBox);
+      const loop = exact.loop;
+      const wasLive = isLiveCoverageState(loop.state);
+      const resolvedLoop = wasLive
+        ? (
+            await coordination.transition({
+              loopId: loop.loopId,
+              command: {
+                kind: input.intent,
+                transitionId: randomUUID(),
+                expectedVersion: loop.version,
+                actorPersonId: null,
+                occurredAt: input.withdrawnAt.toISOString(),
+                evidenceRefs: [...input.evidenceSourceRevisionIds],
+              },
+            })
+          ).loop
+        : loop;
+      const supersededTimerCount = await new DurableTimers(transaction).supersedeCoverageTimers(
+        resolvedLoop.loopId,
+        wasLive ? resolvedLoop.version : resolvedLoop.version + 1,
+      );
+      const correction =
+        wasLive && openingMayHaveEscaped
+          ? await new PrivateSourceBridge(
+              transaction,
+              this.secretBox,
+              this.rawRetentionDays,
+            ).queueAcceptedWithdrawalCorrection({
+              ownerPersonId: input.ownerPersonId,
+              actionIntentId: exact.intent.id,
+              payload: exact.payload,
+              loop: resolvedLoop,
+              intent: input.intent,
+            })
+          : ({ kind: "not_needed" } as const);
+
+      await appendBridgeAudit(transaction, {
+        personId: input.ownerPersonId,
+        householdId: exact.intent.household_id,
+        conversationId: exact.intent.conversation_id,
+        targetId: exact.intent.id,
+        eventType: "accepted_private_source_bridge_withdrawn",
+        reasons: [input.intent, `correction_${correction.kind}`],
+        manifest: {
+          candidateId: input.candidateId,
+          loopId: resolvedLoop.loopId,
+          loopState: resolvedLoop.state,
+          openingMayHaveEscaped,
+          cancelledOpeningEffectCount,
+          supersededTimerCount,
+          rawContentDisclosed: false,
+        },
+      });
+      return {
+        kind: wasLive ? "withdrawn" : "already_terminal",
+        actionIntentId: exact.intent.id,
+        loopId: resolvedLoop.loopId,
+        loopState: resolvedLoop.state,
+        cancelledOpeningEffectCount,
+        supersededTimerCount,
+        openingMayHaveEscaped,
+        correction,
+      };
+    });
+  }
+
   public async approve(
     input: PrivateBridgeApprovalInput,
   ): Promise<{ actionIntentId: string; bridgeRuleId: string | null; duplicate: boolean }> {
@@ -543,6 +898,30 @@ export class PrivateSourceBridge {
       targetDigest: DigestSchema.parse(input.targetDigest),
     };
     return inTransaction(this.database, async (transaction) => {
+      const observedRows = await transaction<IntentRow[]>`
+        select id, household_id, person_id, conversation_id, participant_epoch_id,
+          action_digest, data_digest, policy_digest, target_digest, payload_ciphertext,
+          status, person_control_epoch, household_control_epoch,
+          conversation_authority_version, expires_at
+        from action_intents where id = ${input.actionIntentId}
+          and action_kind = 'private_source_to_coverage_loop'
+      `;
+      const observedIntent = observedRows[0];
+      if (!observedIntent || observedIntent.person_id !== input.actorPersonId) {
+        throw new UnauthorizedError("Only the private source owner can approve sharing");
+      }
+      const observedPayload = openPrivateBridgePayload(
+        this.secretBox,
+        observedIntent.id,
+        observedIntent.payload_ciphertext,
+      );
+      if (observedPayload.loopUpdate) {
+        await acquireLoopUpdateSourceLocks(
+          transaction,
+          observedIntent.person_id,
+          observedPayload.loopUpdate.sourceFrontier,
+        );
+      }
       const rows = await transaction<IntentRow[]>`
         select id, household_id, person_id, conversation_id, participant_epoch_id,
           action_digest, data_digest, policy_digest, target_digest, payload_ciphertext,
@@ -556,6 +935,7 @@ export class PrivateSourceBridge {
         throw new UnauthorizedError("Only the private source owner can approve sharing");
       }
       const payload = openPrivateBridgePayload(this.secretBox, intent.id, intent.payload_ciphertext);
+      requireSameObservedUpdateFrontier(observedPayload, payload);
       if (payload.phase !== "awaiting_approval") throw new ConflictError("Sharing proposal is not ready");
       if (["approved", "executing", "succeeded"].includes(intent.status)) {
         if (
@@ -576,7 +956,11 @@ export class PrivateSourceBridge {
         intent,
         payload,
         false,
+        payload.loopUpdate !== null,
       );
+      if (payload.loopUpdate && input.mode !== "once") {
+        throw new ConflictError("An existing coverage loop update requires one exact approval");
+      }
       if (input.mode === "standing" && payload.sourcePattern === null) {
         throw new ConflictError("This source cannot support a narrow standing rule");
       }
@@ -606,6 +990,28 @@ export class PrivateSourceBridge {
     actionIntentId: string,
   ): Promise<{ loopId: string; duplicate: boolean; cancelled: boolean }> {
     return inTransaction(this.database, async (transaction) => {
+      const observedRows = await transaction<IntentRow[]>`
+        select id, household_id, person_id, conversation_id, participant_epoch_id,
+          action_digest, data_digest, policy_digest, target_digest, payload_ciphertext,
+          status, person_control_epoch, household_control_epoch,
+          conversation_authority_version, expires_at
+        from action_intents where id = ${actionIntentId}
+          and action_kind = 'private_source_to_coverage_loop'
+      `;
+      const observedIntent = observedRows[0];
+      if (!observedIntent) throw new NotFoundError("Private bridge intent does not exist");
+      const observedPayload = openPrivateBridgePayload(
+        this.secretBox,
+        observedIntent.id,
+        observedIntent.payload_ciphertext,
+      );
+      if (observedPayload.loopUpdate) {
+        await acquireLoopUpdateSourceLocks(
+          transaction,
+          observedIntent.person_id,
+          observedPayload.loopUpdate.sourceFrontier,
+        );
+      }
       const rows = await transaction<IntentRow[]>`
         select id, household_id, person_id, conversation_id, participant_epoch_id,
           action_digest, data_digest, policy_digest, target_digest, payload_ciphertext,
@@ -617,6 +1023,7 @@ export class PrivateSourceBridge {
       const intent = rows[0];
       if (!intent) throw new NotFoundError("Private bridge intent does not exist");
       const payload = openPrivateBridgePayload(this.secretBox, intent.id, intent.payload_ciphertext);
+      requireSameObservedUpdateFrontier(observedPayload, payload);
       if (payload.phase !== "awaiting_approval")
         throw new ConflictError("Private bridge has no approved meaning");
       if (intent.status === "succeeded") {
@@ -660,13 +1067,16 @@ export class PrivateSourceBridge {
         policyDigest: approval.policy_digest,
         targetDigest: approval.target_digest,
       });
-      let current: { destination: z.infer<typeof DestinationSchema> };
+      let current: {
+        destination: z.infer<typeof DestinationSchema>;
+        updateLoop: CoverageLoop | null;
+      };
       try {
         current = await new PrivateSourceBridge(
           transaction,
           this.secretBox,
           this.rawRetentionDays,
-        ).revalidate(intent, payload, true);
+        ).revalidate(intent, payload, true, true);
         const authorization = await new PostgresConversationAuthority(transaction).authorizeSend({
           conversationId: payload.destination.conversationId,
           expectedParticipantEpochId: payload.destination.participantEpochId,
@@ -707,66 +1117,76 @@ export class PrivateSourceBridge {
         return { loopId: payload.loopId, duplicate: false, cancelled: true };
       }
 
-      let loop = await new PostgresCoordination(transaction, this.secretBox).load(payload.loopId);
-      if (!loop) {
-        loop = await new PostgresCoordination(transaction, this.secretBox).create(
-          createCoverageLoop({
-            loopId: payload.loopId,
-            householdId: payload.destination.householdId,
-            minimumSharedMeaning: payload.minimumDisclosure.minimumMeaning,
-            // The owner approved an actionable minimum meaning. Timing uncertainty remains
-            // in the private intent; it must not block opening or monitoring the coverage loop.
-            unresolvedFacts: [],
-            proposedHolderPersonId: null,
-            timing: resolveTiming(payload.commitment, payload.destination.timeZone),
-            planVersion: 1,
-            notificationMode: "always",
-            destination: {
-              conversationId: payload.destination.conversationId,
-              participantEpochId: payload.destination.participantEpochId,
-              participantSetDigest: payload.destination.participantSetDigest,
-              audience: "group",
+      const coordination = new PostgresCoordination(transaction, this.secretBox);
+      const committedAt = new Date();
+      let loop: CoverageLoop;
+      if (payload.loopUpdate) {
+        const updateLoop = current.updateLoop;
+        if (!updateLoop) throw new StaleAuthorityError("Coverage update lost its exact live loop");
+        loop = (
+          await coordination.transition({
+            loopId: updateLoop.loopId,
+            command: {
+              kind: "revise",
+              transitionId: randomUUID(),
+              expectedVersion: payload.loopUpdate.expectedLoopVersion,
+              actorPersonId: intent.person_id,
+              occurredAt: committedAt.toISOString(),
+              minimumSharedMeaning: payload.minimumDisclosure.minimumMeaning,
+              timing: resolveTiming(payload.commitment, payload.destination.timeZone),
+              evidenceRefs: payload.evidenceSourceRevisionIds,
             },
-            sourceEvidenceRefs: payload.evidenceSourceRevisionIds,
-            occurredAt: new Date().toISOString(),
-          }),
-        );
+          })
+        ).loop;
+        await new DurableTimers(transaction).supersedeCoverageTimers(loop.loopId, loop.version);
+      } else {
+        const existing = await coordination.load(payload.loopId);
+        loop =
+          existing ??
+          (await coordination.create(
+            createCoverageLoop({
+              loopId: payload.loopId,
+              householdId: payload.destination.householdId,
+              minimumSharedMeaning: payload.minimumDisclosure.minimumMeaning,
+              // The owner approved an actionable minimum meaning. Timing uncertainty remains
+              // in the private intent; it must not block opening or monitoring the coverage loop.
+              unresolvedFacts: [],
+              proposedHolderPersonId: null,
+              timing: resolveTiming(payload.commitment, payload.destination.timeZone),
+              planVersion: 1,
+              notificationMode: "always",
+              destination: {
+                conversationId: payload.destination.conversationId,
+                participantEpochId: payload.destination.participantEpochId,
+                participantSetDigest: payload.destination.participantSetDigest,
+                audience: "group",
+              },
+              sourceEvidenceRefs: payload.evidenceSourceRevisionIds,
+              occurredAt: committedAt.toISOString(),
+            }),
+          ));
       }
+      const opening = openingEffectPlan(intent.id, payload);
       await new EffectOutbox(transaction, this.secretBox).authorizeAndEnqueue({
         actionIntentId: intent.id,
         actorPersonId: intent.person_id,
         person: { id: intent.person_id, controlEpoch: Number(intent.person_control_epoch) },
+        ...(payload.loopUpdate ? { sourceFrontier: payload.loopUpdate.sourceFrontier } : {}),
         household: { id: intent.household_id, controlEpoch: Number(intent.household_control_epoch) },
         conversation: {
           id: intent.conversation_id,
           authorityVersion: Number(intent.conversation_authority_version),
         },
+        coverageLoop: { id: loop.loopId, version: loop.version },
         participantEpochId: intent.participant_epoch_id,
         expectedParticipantDigest: payload.destination.participantSetDigest,
-        effectKind: "linq.message",
-        idempotencyKey: `private-bridge:${intent.id}:open`,
-        data: { minimumMeaning: payload.minimumDisclosure.minimumMeaning },
-        policy: {
-          exactOwnerApproval: true,
-          actionDigest: intent.action_digest,
-          operation: "proactive_coverage",
-        },
-        target: {
-          conversationId: intent.conversation_id,
-          participantEpochId: intent.participant_epoch_id,
-          participantSetDigest: payload.destination.participantSetDigest,
-        },
-        payload: {
-          providerChatId: payload.destination.providerChatId,
-          expectedProviderParticipantDigest: payload.destination.providerParticipantDigest,
-          text: `${payload.minimumDisclosure.minimumMeaning} Coverage is open. Who can cover it?`,
-        },
+        ...opening,
         reasonCodes: ["exact_source_owner_approval", "minimum_disclosure", "current_group_epoch"],
-        authorizationExpiresAt: new Date(Date.now() + 5 * 60_000),
+        authorizationExpiresAt: openingAuthorizationExpiry(intent, loop),
       });
       const followUp = planCoverageFollowUpTimer({
         loop,
-        now: new Date().toISOString(),
+        now: committedAt.toISOString(),
         remindersAuthorized: true,
       });
       if (followUp) {
@@ -800,6 +1220,9 @@ export class PrivateSourceBridge {
         reasons: ["exact_owner_approval", "exact_current_epoch", "raw_content_not_disclosed"],
         manifest: {
           loopId: loop.loopId,
+          operation: payload.loopUpdate ? "coverage_loop_revised" : "coverage_loop_created",
+          priorLoopVersion: payload.loopUpdate?.expectedLoopVersion ?? null,
+          committedLoopVersion: loop.version,
           sourceRevisionCount: payload.evidenceSourceRevisionIds.length,
           destinationEpochId: payload.destination.participantEpochId,
           standingRuleId: payload.standingRule?.ruleId ?? null,
@@ -810,11 +1233,109 @@ export class PrivateSourceBridge {
     });
   }
 
+  private async queueAcceptedWithdrawalCorrection(input: {
+    readonly ownerPersonId: string;
+    readonly actionIntentId: string;
+    readonly payload: z.infer<typeof ProposedPayloadSchema>;
+    readonly loop: CoverageLoop;
+    readonly intent: "cancel" | "supersede";
+  }): Promise<AcceptedPrivateBridgeCorrection> {
+    try {
+      const destination = await this.resolveDestination(
+        input.ownerPersonId,
+        input.loop.destination.conversationId,
+      );
+      if (
+        destination.householdId !== input.loop.householdId ||
+        destination.conversationId !== input.loop.destination.conversationId ||
+        destination.participantEpochId !== input.loop.destination.participantEpochId ||
+        destination.participantSetDigest !== input.loop.destination.participantSetDigest ||
+        destination.providerChatId !== input.payload.destination.providerChatId
+      ) {
+        return { kind: "not_authorized" };
+      }
+      const authorization = await new PostgresConversationAuthority(this.database).authorizeSend({
+        conversationId: destination.conversationId,
+        expectedParticipantEpochId: destination.participantEpochId,
+        expectedParticipantSetDigest: destination.participantSetDigest,
+        liveParticipantIdentityIds: destination.liveIdentityIds,
+        sendKind: "proactive",
+        operation: "coverage_closure",
+        ruleId: destination.proactiveRuleId,
+      });
+      if (!authorization.allowed) return { kind: "not_authorized" };
+      const people = await this.database<{ readonly control_epoch: number | string }[]>`
+        select control_epoch from people
+        where id = ${input.ownerPersonId} and status = 'registered'
+      `;
+      const person = people[0];
+      if (!person) return { kind: "not_authorized" };
+      const now = new Date();
+      const queued = await new EffectOutbox(this.database, this.secretBox).authorizeAndEnqueue(
+        {
+          actorPersonId: input.ownerPersonId,
+          person: { id: input.ownerPersonId, controlEpoch: Number(person.control_epoch) },
+          household: {
+            id: destination.householdId,
+            controlEpoch: destination.householdControlEpoch,
+          },
+          conversation: {
+            id: destination.conversationId,
+            authorityVersion: destination.conversationAuthorityVersion,
+          },
+          participantEpochId: destination.participantEpochId,
+          expectedParticipantDigest: destination.participantSetDigest,
+          coverageLoop: { id: input.loop.loopId, version: input.loop.version },
+          effectKind: "linq.message",
+          idempotencyKey: `private-bridge:${input.actionIntentId}:loop-v${input.loop.version}:${input.intent}:correction`,
+          data: {
+            coverageLoopId: input.loop.loopId,
+            loopVersion: input.loop.version,
+            minimumSharedMeaning: input.loop.minimumSharedMeaning,
+          },
+          policy: {
+            operation: "coverage_closure",
+            sendKind: "proactive",
+            exactParticipantEpoch: true,
+            minimumMeaningOnly: true,
+          },
+          target: {
+            providerChatId: destination.providerChatId,
+            participantEpochId: destination.participantEpochId,
+          },
+          payload: {
+            providerChatId: destination.providerChatId,
+            expectedProviderParticipantDigest: destination.providerParticipantDigest,
+            text: neutralAcceptedWithdrawalText(input.loop.minimumSharedMeaning, input.intent),
+          },
+          reasonCodes: ["current_conversation_authority", "neutral_coverage_closure"],
+          authorizationExpiresAt: new Date(now.getTime() + 5 * 60_000),
+        },
+        now,
+      );
+      return { kind: "queued", outboxId: queued.outboxId, duplicate: !queued.created };
+    } catch (error) {
+      if (
+        error instanceof StaleAuthorityError ||
+        error instanceof UnauthorizedError ||
+        error instanceof NotFoundError ||
+        error instanceof ConflictError
+      ) {
+        return { kind: "not_authorized" };
+      }
+      throw error;
+    }
+  }
+
   private async revalidate(
     intent: IntentRow,
     payload: PrivateBridgePayload,
     requireApprovedCandidate: boolean,
-  ): Promise<{ destination: z.infer<typeof DestinationSchema> }> {
+    lockUpdateLoop = false,
+  ): Promise<{
+    destination: z.infer<typeof DestinationSchema>;
+    updateLoop: CoverageLoop | null;
+  }> {
     if (intent.expires_at <= new Date()) throw new StaleAuthorityError("Private bridge expired");
     const destination = await this.resolveDestination(intent.person_id, intent.conversation_id);
     if (
@@ -856,7 +1377,20 @@ export class PrivateSourceBridge {
         destination,
       );
     }
-    return { destination };
+    if (payload.loopUpdate && payload.standingRule) {
+      throw new StaleAuthorityError("A coverage-loop update cannot use standing approval");
+    }
+    const updateLoop = payload.loopUpdate
+      ? await requireCurrentLoopUpdate(
+          this.database,
+          this.secretBox,
+          intent,
+          payload,
+          candidate,
+          lockUpdateLoop,
+        )
+      : null;
+    return { destination, updateLoop };
   }
 
   private async resolveDestination(
@@ -1176,26 +1710,80 @@ function requireExactProposalEvidence(
 }
 
 function proposalDigests(actionIntentId: string, payload: z.infer<typeof ProposedPayloadSchema>) {
+  const opening = openingEffectPlan(actionIntentId, payload);
   return {
     actionDigest: canonicalDigest({
-      actionKind: "private_source_to_coverage_loop",
-      actionIntentId,
-      loopId: payload.loopId,
+      effectKind: opening.effectKind,
+      idempotencyKey: opening.idempotencyKey,
     }),
     dataDigest: canonicalDigest({
+      data: opening.data,
+      payloadDigest: canonicalDigest(opening.payload),
+    }),
+    policyDigest: canonicalDigest(opening.policy),
+    targetDigest: canonicalDigest(opening.target),
+  };
+}
+
+function openingEffectPlan(actionIntentId: string, payload: z.infer<typeof ProposedPayloadSchema>) {
+  const loopUpdate = payload.loopUpdate;
+  return {
+    effectKind: "linq.message" as const,
+    idempotencyKey: loopUpdate
+      ? `private-bridge:${actionIntentId}:loop-v${loopUpdate.expectedLoopVersion + 1}:update`
+      : `private-bridge:${actionIntentId}:open`,
+    data: {
       candidateContentDigest: payload.candidateContentDigest,
       evidenceDigest: payload.evidenceDigest,
       minimumMeaning: payload.minimumDisclosure.minimumMeaning,
       commitment: payload.commitment,
-    }),
-    policyDigest: canonicalDigest({
+      loopUpdate,
+    },
+    policy: {
       exactSourceOwnerApproval: true,
       noRawContent: true,
       standingRule: payload.standingRule,
       approvalMode: payload.approvalMode,
-    }),
-    targetDigest: destinationDigest(payload.destination),
-  };
+      operation: "proactive_coverage",
+      transition: loopUpdate ? "coverage_revised" : "coverage_created",
+    },
+    target: {
+      destination: payload.destination,
+      loopId: payload.loopId,
+      expectedLoopVersion: loopUpdate?.expectedLoopVersion ?? null,
+      resultingLoopVersion: loopUpdate ? loopUpdate.expectedLoopVersion + 1 : 1,
+    },
+    payload: {
+      providerChatId: payload.destination.providerChatId,
+      expectedProviderParticipantDigest: payload.destination.providerParticipantDigest,
+      text: privateBridgeOutboundText(payload),
+    },
+  } as const;
+}
+
+/** The exact complete text rendered for approval and later sealed into the outbound effect. */
+export function privateBridgeOutboundText(
+  payload: Extract<PrivateBridgePayload, { readonly phase: "awaiting_approval" }>,
+): string {
+  return payload.loopUpdate
+    ? neutralCoverageUpdateText(payload.minimumDisclosure.minimumMeaning)
+    : `${payload.minimumDisclosure.minimumMeaning} Coverage is open. Who can cover it?`;
+}
+
+function neutralCoverageUpdateText(minimumSharedMeaning: string): string {
+  const trimmed = minimumSharedMeaning.trim();
+  const meaning = /[.!?]$/u.test(trimmed) ? trimmed : `${trimmed}.`;
+  return `${meaning} This coverage request was updated. Coverage is open. Who can cover it?`;
+}
+
+function openingAuthorizationExpiry(intent: IntentRow, loop: CoverageLoop): Date {
+  const now = Date.now();
+  const lastResponsibleAt = new Date(loop.timing.lastResponsibleAt).getTime();
+  const expiresAt = new Date(Math.min(intent.expires_at.getTime(), lastResponsibleAt));
+  if (!Number.isFinite(lastResponsibleAt) || expiresAt.getTime() <= now) {
+    throw new StaleAuthorityError("Coverage opening is already too late to send");
+  }
+  return expiresAt;
 }
 
 function destinationDigest(destination: z.infer<typeof DestinationSchema>): string {
@@ -1432,6 +2020,465 @@ async function enqueueCommit(
     deadlineAt: intent.expires_at,
     maxAttempts: 5,
   });
+}
+
+async function prepareLoopUpdateFence(
+  transaction: Transaction,
+  secretBox: SecretBox,
+  ownerPersonId: string,
+  candidate: CandidateRow,
+  destination: z.infer<typeof DestinationSchema>,
+): Promise<z.infer<typeof LoopUpdateFenceSchema>> {
+  const review = LoopUpdateReviewContentSchema.parse(openCandidate(secretBox, candidate));
+  const priorCandidates = await transaction<CandidateRow[]>`
+    select id, owner_person_id, candidate_kind, content_digest, content_ciphertext,
+      evidence_refs, status, reviewed_by_person_id, expires_at
+    from knowledge_candidates
+    where id = ${review.priorCandidateId} and owner_person_id = ${ownerPersonId}
+      and scope_kind = 'person' and candidate_kind = 'coverage_proposal'
+      and status = 'accepted' and reviewed_by_person_id = ${ownerPersonId}
+    for share
+  `;
+  const priorCandidate = priorCandidates[0];
+  if (!priorCandidate) {
+    throw new StaleAuthorityError("Coverage update lost its exact accepted source candidate");
+  }
+  const priorIntent = await loadSucceededBridgeIntent(
+    transaction,
+    review.sourceActionIntentId,
+    ownerPersonId,
+  );
+  const priorPayload = openPrivateBridgePayload(secretBox, priorIntent.id, priorIntent.payload_ciphertext);
+  if (
+    priorPayload.phase !== "awaiting_approval" ||
+    priorPayload.candidateId !== priorCandidate.id ||
+    priorPayload.candidateContentDigest !== priorCandidate.content_digest ||
+    priorPayload.loopId !== review.existingLoopId
+  ) {
+    throw new StaleAuthorityError("Coverage update no longer matches its accepted source action");
+  }
+  const loop = await new PostgresCoordination(transaction, secretBox).load(review.existingLoopId);
+  if (!loop) throw new StaleAuthorityError("Coverage update lost its existing loop");
+  requireExactAcceptedLoop(priorIntent, priorPayload, loop);
+  requireLiveUpdateDestination(loop, destination);
+  if (!isLiveCoverageState(loop.state)) {
+    throw new StaleAuthorityError("Only a live coverage loop can be updated");
+  }
+  const sourceFrontier = await loadCurrentCandidateFrontierFence(
+    transaction,
+    ownerPersonId,
+    candidate,
+    false,
+  );
+  return LoopUpdateFenceSchema.parse({
+    existingLoopId: loop.loopId,
+    expectedLoopVersion: loop.version,
+    expectedLoopDestinationDigest: canonicalDigest(loop.destination),
+    priorCandidateId: priorCandidate.id,
+    priorCandidateContentDigest: priorCandidate.content_digest,
+    sourceActionIntentId: priorIntent.id,
+    sourceActionIntentDigests: intentDigests(priorIntent),
+    sourceFrontier,
+  });
+}
+
+async function requireCurrentLoopUpdate(
+  executor: Executor,
+  secretBox: SecretBox,
+  intent: IntentRow,
+  payload: PrivateBridgePayload,
+  candidate: CandidateRow,
+  lockLoop: boolean,
+): Promise<CoverageLoop> {
+  const fence = payload.loopUpdate;
+  if (!fence || (payload.phase === "prepared" && payload.standingRule)) {
+    throw new StaleAuthorityError("Coverage update fence is invalid");
+  }
+  if (candidate.candidate_kind !== "coverage_loop_update_review") {
+    throw new StaleAuthorityError("Coverage update candidate kind changed");
+  }
+  const review = LoopUpdateReviewContentSchema.parse(openCandidate(secretBox, candidate));
+  if (
+    review.existingLoopId !== fence.existingLoopId ||
+    review.existingLoopId !==
+      (payload.phase === "awaiting_approval" ? payload.loopId : review.existingLoopId) ||
+    review.sourceActionIntentId !== fence.sourceActionIntentId ||
+    review.priorCandidateId !== fence.priorCandidateId
+  ) {
+    throw new StaleAuthorityError("Coverage update review no longer matches its authenticated fence");
+  }
+  const priorCandidates = await executor<CandidateRow[]>`
+    select id, owner_person_id, candidate_kind, content_digest, content_ciphertext,
+      evidence_refs, status, reviewed_by_person_id, expires_at
+    from knowledge_candidates
+    where id = ${fence.priorCandidateId} and owner_person_id = ${intent.person_id}
+      and scope_kind = 'person' and candidate_kind = 'coverage_proposal'
+      and status = 'accepted' and reviewed_by_person_id = ${intent.person_id}
+    for share
+  `;
+  const priorCandidate = priorCandidates[0];
+  if (priorCandidate?.content_digest !== fence.priorCandidateContentDigest) {
+    throw new StaleAuthorityError("Coverage update's accepted source candidate changed");
+  }
+  const priorIntent = await loadSucceededBridgeIntent(executor, fence.sourceActionIntentId, intent.person_id);
+  if (canonicalDigest(intentDigests(priorIntent)) !== canonicalDigest(fence.sourceActionIntentDigests)) {
+    throw new StaleAuthorityError("Coverage update's accepted source action changed");
+  }
+  const priorPayload = openPrivateBridgePayload(secretBox, priorIntent.id, priorIntent.payload_ciphertext);
+  if (
+    priorPayload.phase !== "awaiting_approval" ||
+    priorPayload.candidateId !== priorCandidate.id ||
+    priorPayload.candidateContentDigest !== priorCandidate.content_digest ||
+    priorPayload.loopId !== fence.existingLoopId
+  ) {
+    throw new StaleAuthorityError("Coverage update source action no longer matches the loop");
+  }
+  const coordination = new PostgresCoordination(executor, secretBox);
+  const loop = lockLoop
+    ? await coordination.loadForUpdate(fence.existingLoopId)
+    : await coordination.load(fence.existingLoopId);
+  if (!loop) throw new StaleAuthorityError("Coverage update lost its existing loop");
+  requireExactAcceptedLoop(priorIntent, priorPayload, loop);
+  requireLiveUpdateDestination(loop, payload.destination);
+  if (
+    !isLiveCoverageState(loop.state) ||
+    loop.version !== fence.expectedLoopVersion ||
+    canonicalDigest(loop.destination) !== fence.expectedLoopDestinationDigest
+  ) {
+    throw new StaleAuthorityError("Coverage loop changed after this update was prepared");
+  }
+  const currentFrontier = await loadCurrentCandidateFrontierFence(
+    executor,
+    intent.person_id,
+    candidate,
+    lockLoop,
+  );
+  if (canonicalDigest(currentFrontier) !== canonicalDigest(fence.sourceFrontier)) {
+    throw new StaleAuthorityError("New private source evidence arrived after this update was prepared");
+  }
+  return loop;
+}
+
+async function loadCurrentCandidateFrontierFence(
+  executor: Executor,
+  ownerPersonId: string,
+  candidate: CandidateRow,
+  lock: boolean,
+): Promise<z.infer<typeof SourceFrontierFenceSchema>> {
+  const lockClause = lock ? executor`for update` : executor`for share`;
+  const rows = await executor<
+    {
+      readonly id: string;
+      readonly integration_id: string;
+      readonly case_kind: string;
+      readonly case_key_digest: string;
+      readonly version: number | string;
+      readonly frontier_digest: string;
+      readonly source_generation: number | string;
+      readonly reconciled_generation: number | string;
+      readonly current_candidate_id: string | null;
+      readonly disposition: string;
+    }[]
+  >`
+    select id, integration_id, case_kind, case_key_digest, version, frontier_digest,
+      source_generation, reconciled_generation, current_candidate_id, disposition
+    from private_source_frontiers
+    where owner_person_id = ${ownerPersonId} and current_candidate_id = ${candidate.id}
+      and disposition = 'candidate'
+    ${lockClause}
+  `;
+  if (rows.length !== 1) {
+    throw new StaleAuthorityError("Coverage update lost its exact private source frontier");
+  }
+  const row = rows[0];
+  if (!row) throw new StaleAuthorityError("Coverage update source frontier disappeared");
+  if (
+    row.case_kind !== "gmail_thread" ||
+    row.current_candidate_id !== candidate.id ||
+    row.disposition !== "candidate" ||
+    Number(row.source_generation) !== Number(row.reconciled_generation)
+  ) {
+    throw new StaleAuthorityError("Coverage update source frontier is no longer clean and current");
+  }
+  return SourceFrontierFenceSchema.parse({
+    frontierId: row.id,
+    integrationId: row.integration_id,
+    caseKind: row.case_kind,
+    caseKeyDigest: row.case_key_digest,
+    version: Number(row.version),
+    frontierDigest: row.frontier_digest,
+    sourceGeneration: Number(row.source_generation),
+  });
+}
+
+async function discoverLoopUpdateSourceFrontier(
+  executor: Executor,
+  ownerPersonId: string,
+  candidateId: string,
+): Promise<z.infer<typeof SourceFrontierFenceSchema> | null> {
+  const rows = await executor<
+    {
+      readonly id: string;
+      readonly integration_id: string;
+      readonly case_kind: string;
+      readonly case_key_digest: string;
+      readonly version: number | string;
+      readonly frontier_digest: string;
+      readonly source_generation: number | string;
+    }[]
+  >`
+    select frontier.id, frontier.integration_id, frontier.case_kind,
+      frontier.case_key_digest, frontier.version, frontier.frontier_digest,
+      frontier.source_generation
+    from private_source_frontiers frontier
+    join knowledge_candidates candidate on candidate.id = frontier.current_candidate_id
+    where candidate.id = ${candidateId} and candidate.owner_person_id = ${ownerPersonId}
+      and candidate.scope_kind = 'person'
+      and candidate.candidate_kind = 'coverage_loop_update_review'
+      and candidate.status = 'pending' and frontier.disposition = 'candidate'
+  `;
+  if (rows.length > 1) {
+    throw new ConflictError("Coverage update is attached to multiple private source frontiers");
+  }
+  const row = rows[0];
+  return row
+    ? SourceFrontierFenceSchema.parse({
+        frontierId: row.id,
+        integrationId: row.integration_id,
+        caseKind: row.case_kind,
+        caseKeyDigest: row.case_key_digest,
+        version: Number(row.version),
+        frontierDigest: row.frontier_digest,
+        sourceGeneration: Number(row.source_generation),
+      })
+    : null;
+}
+
+function sameSourceFrontierLockTarget(
+  left: z.infer<typeof SourceFrontierFenceSchema>,
+  right: z.infer<typeof SourceFrontierFenceSchema>,
+): boolean {
+  return (
+    left.frontierId === right.frontierId &&
+    left.integrationId === right.integrationId &&
+    left.caseKind === right.caseKind &&
+    left.caseKeyDigest === right.caseKeyDigest
+  );
+}
+
+function requireSameObservedUpdateFrontier(
+  observed: PrivateBridgePayload,
+  authoritative: PrivateBridgePayload,
+): void {
+  if (
+    canonicalDigest(observed.loopUpdate?.sourceFrontier ?? null) !==
+    canonicalDigest(authoritative.loopUpdate?.sourceFrontier ?? null)
+  ) {
+    throw new StaleAuthorityError("Private source action changed while acquiring its exact locks");
+  }
+}
+
+async function acquireLoopUpdateSourceLocks(
+  transaction: Transaction,
+  ownerPersonId: string,
+  frontier: z.infer<typeof SourceFrontierFenceSchema>,
+): Promise<void> {
+  await transaction`
+    select pg_advisory_xact_lock(
+      hashtextextended(${privateSourceIntegrationLockKey(frontier.integrationId)}, 0)
+    )
+  `;
+  await transaction`
+    select pg_advisory_xact_lock(
+      hashtextextended(${gmailThreadFrontierLockKey({
+        ownerPersonId,
+        integrationId: frontier.integrationId,
+        caseKeyDigest: frontier.caseKeyDigest,
+      })}, 0)
+    )
+  `;
+}
+
+async function loadSucceededBridgeIntent(
+  executor: Executor,
+  actionIntentId: string,
+  ownerPersonId: string,
+): Promise<IntentRow> {
+  const rows = await executor<IntentRow[]>`
+    select id, household_id, person_id, conversation_id, participant_epoch_id,
+      action_digest, data_digest, policy_digest, target_digest, payload_ciphertext,
+      status, person_control_epoch, household_control_epoch,
+      conversation_authority_version, expires_at
+    from action_intents
+    where id = ${actionIntentId} and person_id = ${ownerPersonId}
+      and action_kind = 'private_source_to_coverage_loop' and status = 'succeeded'
+    for share
+  `;
+  const intent = rows[0];
+  if (!intent) throw new StaleAuthorityError("Accepted private source action is no longer current");
+  return intent;
+}
+
+function intentDigests(intent: IntentRow): z.infer<typeof IntentDigestFenceSchema> {
+  return IntentDigestFenceSchema.parse({
+    actionDigest: intent.action_digest,
+    dataDigest: intent.data_digest,
+    policyDigest: intent.policy_digest,
+    targetDigest: intent.target_digest,
+  });
+}
+
+function requireLiveUpdateDestination(
+  loop: CoverageLoop,
+  destination: z.infer<typeof DestinationSchema>,
+): void {
+  if (
+    loop.householdId !== destination.householdId ||
+    loop.destination.audience !== "group" ||
+    loop.destination.conversationId !== destination.conversationId ||
+    loop.destination.participantEpochId !== destination.participantEpochId ||
+    loop.destination.participantSetDigest !== destination.participantSetDigest
+  ) {
+    throw new StaleAuthorityError("Coverage update targets a different live group");
+  }
+}
+
+async function resolveExactAcceptedBridge(
+  transaction: Transaction,
+  secretBox: SecretBox,
+  input: AcceptedPrivateBridgeCandidateInput,
+  lock: boolean,
+): Promise<{
+  readonly intent: IntentRow;
+  readonly payload: z.infer<typeof ProposedPayloadSchema>;
+  readonly loop: CoverageLoop;
+} | null> {
+  const candidates = await transaction<{ readonly id: string; readonly content_digest: string }[]>`
+    select id, content_digest
+    from knowledge_candidates
+    where id = ${input.candidateId} and owner_person_id = ${input.ownerPersonId}
+      and scope_kind = 'person' and candidate_kind = 'coverage_proposal'
+      and status = 'accepted' and reviewed_by_person_id = ${input.ownerPersonId}
+  `;
+  if (candidates[0]?.content_digest !== input.candidateContentDigest) return null;
+
+  const intentLockClause = lock ? transaction`for update` : transaction``;
+  const intentRows = await transaction<IntentRow[]>`
+    select id, household_id, person_id, conversation_id, participant_epoch_id,
+      action_digest, data_digest, policy_digest, target_digest, payload_ciphertext,
+      status, person_control_epoch, household_control_epoch,
+      conversation_authority_version, expires_at
+    from action_intents
+    where person_id = ${input.ownerPersonId}
+      and action_kind = 'private_source_to_coverage_loop' and status = 'succeeded'
+    ${intentLockClause}
+  `;
+  const exactIntents: {
+    readonly intent: IntentRow;
+    readonly payload: z.infer<typeof ProposedPayloadSchema>;
+  }[] = [];
+  for (const intent of intentRows) {
+    let payload: PrivateBridgePayload;
+    try {
+      payload = openPrivateBridgePayload(secretBox, intent.id, intent.payload_ciphertext);
+    } catch {
+      continue;
+    }
+    if (
+      payload.phase === "awaiting_approval" &&
+      payload.candidateId === input.candidateId &&
+      payload.candidateContentDigest === input.candidateContentDigest
+    ) {
+      exactIntents.push({ intent, payload });
+    }
+  }
+  if (exactIntents.length === 0) return null;
+  if (exactIntents.length !== 1) {
+    throw new ConflictError("Accepted private source candidate has multiple succeeded bridges");
+  }
+  const exact = exactIntents[0];
+  if (!exact) throw new ConflictError("Accepted private source bridge disappeared");
+  if (lock) {
+    const lockedCandidates = await transaction<{ readonly id: string; readonly content_digest: string }[]>`
+      select id, content_digest
+      from knowledge_candidates
+      where id = ${input.candidateId} and owner_person_id = ${input.ownerPersonId}
+        and scope_kind = 'person' and candidate_kind = 'coverage_proposal'
+        and status = 'accepted' and reviewed_by_person_id = ${input.ownerPersonId}
+      for share
+    `;
+    if (lockedCandidates[0]?.content_digest !== input.candidateContentDigest) return null;
+  }
+  const coordination = new PostgresCoordination(transaction, secretBox);
+  const loop = lock
+    ? await coordination.loadForUpdate(exact.payload.loopId)
+    : await coordination.load(exact.payload.loopId);
+  if (!loop) throw new ConflictError("Accepted private source bridge has no coverage loop");
+  requireExactAcceptedLoop(exact.intent, exact.payload, loop);
+  if (!isLiveCoverageState(loop.state)) return null;
+  return { ...exact, loop };
+}
+
+function parseAcceptedCandidateInput(
+  input: AcceptedPrivateBridgeCandidateInput,
+): AcceptedPrivateBridgeCandidateInput {
+  return {
+    ownerPersonId: z.string().uuid().parse(input.ownerPersonId),
+    candidateId: z.string().uuid().parse(input.candidateId),
+    candidateContentDigest: DigestSchema.parse(input.candidateContentDigest),
+  };
+}
+
+function parseAcceptedWithdrawalInput(
+  input: AcceptedPrivateBridgeWithdrawalInput,
+): AcceptedPrivateBridgeWithdrawalInput {
+  const evidenceSourceRevisionIds = z
+    .array(z.string().uuid())
+    .min(1)
+    .max(20)
+    .parse([...input.evidenceSourceRevisionIds]);
+  if (!(input.withdrawnAt instanceof Date) || Number.isNaN(input.withdrawnAt.getTime())) {
+    throw new ConflictError("Accepted bridge withdrawal requires a valid instant");
+  }
+  const candidate = parseAcceptedCandidateInput(input);
+  return {
+    ...candidate,
+    intent: z.enum(["cancel", "supersede"]).parse(input.intent),
+    evidenceSourceRevisionIds: [...new Set(evidenceSourceRevisionIds)].sort(),
+    withdrawnAt: new Date(input.withdrawnAt),
+  };
+}
+
+function requireExactAcceptedLoop(
+  intent: IntentRow,
+  payload: z.infer<typeof ProposedPayloadSchema>,
+  loop: CoverageLoop,
+): void {
+  if (
+    loop.loopId !== payload.loopId ||
+    loop.householdId !== intent.household_id ||
+    loop.householdId !== payload.destination.householdId ||
+    loop.destination.audience !== "group" ||
+    loop.destination.conversationId !== intent.conversation_id ||
+    loop.destination.conversationId !== payload.destination.conversationId ||
+    loop.destination.participantEpochId !== intent.participant_epoch_id ||
+    loop.destination.participantEpochId !== payload.destination.participantEpochId ||
+    loop.destination.participantSetDigest !== payload.destination.participantSetDigest
+  ) {
+    throw new ConflictError("Succeeded private source bridge does not match its coverage loop");
+  }
+}
+
+function isLiveCoverageState(state: CoverageState): boolean {
+  return ["provisional", "open", "awaiting_response", "covered", "at_risk"].includes(state);
+}
+
+function neutralAcceptedWithdrawalText(minimumSharedMeaning: string, intent: "cancel" | "supersede"): string {
+  const trimmed = minimumSharedMeaning.trim();
+  const meaning = /[.!?]$/u.test(trimmed) ? trimmed : `${trimmed}.`;
+  return intent === "cancel"
+    ? `${meaning} This coverage request was cancelled.`
+    : `${meaning} This coverage request is no longer current.`;
 }
 
 function resolveTiming(proposal: z.infer<typeof commitmentProposalSchema>, fallbackTimeZone: string) {

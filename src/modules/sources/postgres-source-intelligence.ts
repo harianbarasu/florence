@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { TransactionSql } from "postgres";
+import { z } from "zod";
 import type { Database } from "../../db/client.js";
 import { canonicalDigest, canonicalJson } from "../../shared/canonical-json.js";
 import type { EncryptedValue, SecretBox } from "../../shared/crypto.js";
@@ -26,6 +27,7 @@ import {
   type SourceScope,
   type SyncCursorState,
 } from "./contracts.js";
+import { gmailThreadFrontierLockKey, privateSourceIntegrationLockKey } from "./policy.js";
 
 type Transaction = TransactionSql<Record<string, never>>;
 type Executor = Database | Transaction;
@@ -888,6 +890,18 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
         command.conversationAccessMode,
         occurredAt,
       );
+      await acquireSourceWriteAuthorityLocks(transaction, {
+        integrationId: command.integrationId,
+        expectedIntegrationControlEpoch: command.expectedIntegrationControlEpoch,
+        ownerPersonId: scope.ownerPersonId,
+        sourceProvider: command.origin.system,
+      });
+      await acquireGmailSourceCaseLock(transaction, {
+        integrationId: command.integrationId,
+        ownerPersonId: scope.ownerPersonId,
+        sourceProvider: command.origin.system,
+        correlationDigest: command.correlationDigest ?? null,
+      });
       if (command.artifactKind === "calendar_event") {
         if (command.integrationId === null || command.resourceDigest === undefined) {
           throw new UnauthorizedError("Calendar source is missing its configured resource identity");
@@ -914,6 +928,7 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
       const serialized = canonicalJson(envelope);
       assertByteLimit(serialized, this.#maxSourceContentBytes, "Source content");
       const contentDigest = sha256(serialized);
+      const parentSourceObjectId = await resolveAttachmentParentSourceObject(transaction, command, scope);
       const objectIdentity = sourceObjectIdentity(
         command.integrationId,
         command.scope,
@@ -929,15 +944,44 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
           readonly latest_revision_number: number | string;
           readonly status: string;
           readonly updated_at: Date;
+          readonly correlation_digest: string | null;
+          readonly parent_source_object_id: string | null;
         }[]
       >`
-        select id, latest_revision_number, status, updated_at
+        select id, latest_revision_number, status, updated_at, correlation_digest,
+          parent_source_object_id
         from source_objects
         where provider = ${command.origin.system} and external_object_id = ${externalObjectId}
         for update
       `;
       const sourceObjectId = objects[0]?.id ?? randomUUID();
       const latestRevisionNumber = Number(objects[0]?.latest_revision_number ?? 0);
+      let correlationDigest = command.correlationDigest ?? null;
+      if (
+        objects[0] &&
+        objects[0].correlation_digest === null &&
+        correlationDigest !== null &&
+        (command.origin.system === "gmail" || command.origin.system === "gmail.attachment")
+      ) {
+        await transaction`
+          update source_objects set correlation_digest = ${correlationDigest}
+          where id = ${sourceObjectId} and correlation_digest is null
+        `;
+      } else if (objects[0] && objects[0].correlation_digest !== correlationDigest) {
+        throw new ConflictError("A source object's correlation identity cannot change");
+      } else if (objects[0]) {
+        correlationDigest = objects[0].correlation_digest;
+      }
+      if (objects[0]?.parent_source_object_id !== parentSourceObjectId) {
+        if (objects[0]?.parent_source_object_id === null && parentSourceObjectId !== null) {
+          await transaction`
+            update source_objects set parent_source_object_id = ${parentSourceObjectId}
+            where id = ${sourceObjectId} and parent_source_object_id is null
+          `;
+        } else {
+          throw new ConflictError("A source object's parent identity cannot change");
+        }
+      }
       if (objects[0] && objects[0].status !== "active" && objects[0].updated_at >= occurredAt) {
         throw new StaleAuthorityError("Source event predates its deletion or revocation fence");
       }
@@ -980,6 +1024,7 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
             retentionUntil: latest.retention_until.toISOString(),
             rawContentStored: latest.content_ciphertext !== null,
             privateViewCount,
+            correlationDigest,
             duplicate: true,
           };
         }
@@ -993,11 +1038,12 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
         await transaction`
           insert into source_objects (
             id, integration_id, provider, external_object_id, object_kind,
-            status, latest_revision_number, created_at, updated_at
+            status, latest_revision_number, correlation_digest, parent_source_object_id,
+            created_at, updated_at
           ) values (
             ${sourceObjectId}, ${command.integrationId}, ${command.origin.system},
             ${externalObjectId}, ${command.artifactKind}, 'active', 0,
-            ${capturedAt}, ${capturedAt}
+            ${correlationDigest}, ${parentSourceObjectId}, ${capturedAt}, ${capturedAt}
           )
         `;
       }
@@ -1033,6 +1079,13 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
               requireRow(scope.participantEpochId ?? undefined, "Private source epoch is missing"),
             )
           : 0;
+      await markPrivateSourceFrontiersDirty(transaction, {
+        integrationId: command.integrationId,
+        ownerPersonId: scope.ownerPersonId,
+        sourceProvider: command.origin.system,
+        correlationDigest,
+        changedAt: capturedAt,
+      });
       return {
         kind: "source_ingested",
         sourceObjectId,
@@ -1043,6 +1096,7 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
         retentionUntil: retentionUntil.toISOString(),
         rawContentStored,
         privateViewCount,
+        correlationDigest,
         duplicate: false,
       };
     });
@@ -1057,6 +1111,12 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
       throw new ConflictError("Source blob exceeds the configured limit");
     return inTransaction(this.database, async (transaction) => {
       const storedAt = new Date(command.storedAt);
+      await acquireSourceWriteAuthorityLocks(transaction, {
+        integrationId: command.integrationId,
+        expectedIntegrationControlEpoch: command.expectedIntegrationControlEpoch,
+        ownerPersonId: command.scope.kind === "person" ? command.scope.personId : null,
+        sourceProvider: null,
+      });
       const parent = await loadReadableRevision(
         transaction,
         command.sourceRevisionId,
@@ -1117,6 +1177,12 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
     assertByteLimit(serialized, this.#maxDerivativeBytes, "Source derivative");
     return inTransaction(this.database, async (transaction) => {
       const createdAt = new Date(command.createdAt);
+      await acquireSourceWriteAuthorityLocks(transaction, {
+        integrationId: command.integrationId,
+        expectedIntegrationControlEpoch: command.expectedIntegrationControlEpoch,
+        ownerPersonId: command.scope.kind === "person" ? command.scope.personId : null,
+        sourceProvider: null,
+      });
       const parent = await loadReadableRevision(
         transaction,
         command.sourceRevisionId,
@@ -1201,7 +1267,14 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
     assertByteLimit(serialized, this.#maxDerivativeBytes, "Private candidate");
     const contentDigest = sha256(serialized);
     return inTransaction(this.database, async (transaction) => {
-      await requireRegisteredPerson(transaction, command.personId, false);
+      if (command.integrationId !== null) {
+        await transaction`
+          select pg_advisory_xact_lock(
+            hashtextextended(${privateSourceIntegrationLockKey(command.integrationId)}, 0)
+          )
+        `;
+      }
+      await requireRegisteredPerson(transaction, command.personId, true);
       if (command.integrationId !== null) {
         const integration = await loadIntegrationForUpdate(
           transaction,
@@ -1319,7 +1392,7 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
     command: Extract<SourceCommand, { kind: "review_private_candidate" }>,
   ): Promise<SourceMutationResult> {
     return inTransaction(this.database, async (transaction) => {
-      await requireRegisteredPerson(transaction, command.personId, false);
+      await requireRegisteredPerson(transaction, command.personId, true);
       const rows = await transaction<
         {
           readonly status: string;
@@ -1415,9 +1488,35 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
         command.origin,
       );
       const externalObjectId = `${command.artifactKind}:${objectIdentity}`;
+      let correlationDigest = command.correlationDigest ?? null;
+      await acquireSourceWriteAuthorityLocks(transaction, {
+        integrationId: command.integrationId,
+        expectedIntegrationControlEpoch: command.expectedIntegrationControlEpoch,
+        ownerPersonId: command.scope.kind === "person" ? command.scope.personId : null,
+        sourceProvider: command.origin.system,
+      });
+      if (
+        correlationDigest === null &&
+        (command.origin.system === "gmail" || command.origin.system === "gmail.attachment")
+      ) {
+        const existing = await transaction<{ readonly correlation_digest: string | null }[]>`
+          select correlation_digest from source_objects
+          where provider = ${command.origin.system} and external_object_id = ${externalObjectId}
+        `;
+        correlationDigest = existing[0]?.correlation_digest ?? null;
+      }
+      await acquireGmailSourceCaseLock(transaction, {
+        integrationId: command.integrationId,
+        ownerPersonId: command.scope.kind === "person" ? command.scope.personId : null,
+        sourceProvider: command.origin.system,
+        correlationDigest,
+        correlationRequired: false,
+      });
       await transaction`select pg_advisory_xact_lock(hashtextextended(${`source:${command.origin.system}:${externalObjectId}`}, 0))`;
-      const objects = await transaction<{ readonly id: string }[]>`
-        select id from source_objects
+      const objects = await transaction<
+        { readonly id: string; readonly correlation_digest: string | null; readonly status: string }[]
+      >`
+        select id, correlation_digest, status from source_objects
         where provider = ${command.origin.system} and external_object_id = ${externalObjectId}
         for update
       `;
@@ -1428,13 +1527,20 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
         await transaction`
           insert into source_objects (
             id, integration_id, provider, external_object_id, object_kind,
-            status, latest_revision_number, created_at, updated_at
+            status, latest_revision_number, correlation_digest, created_at, updated_at
           ) values (
             ${sourceObjectId}, ${command.integrationId}, ${command.origin.system},
             ${externalObjectId}, ${command.artifactKind}, 'deleted', 0,
-            ${deletedAt}, ${deletedAt}
+            ${correlationDigest}, ${deletedAt}, ${deletedAt}
           )
         `;
+        await markPrivateSourceFrontiersDirty(transaction, {
+          integrationId: command.integrationId,
+          ownerPersonId: command.scope.kind === "person" ? command.scope.personId : null,
+          sourceProvider: command.origin.system,
+          correlationDigest,
+          changedAt: deletedAt,
+        });
         return {
           kind: "source_deleted",
           sourceObjectId,
@@ -1442,9 +1548,29 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
           revokedCandidateCount: 0,
         };
       }
-      const revisions = await transaction<{ readonly id: string }[]>`
-        select id from source_revisions
-        where source_object_id = ${object.id} and revoked_at is null
+      if (
+        object.correlation_digest === null &&
+        correlationDigest !== null &&
+        (command.origin.system === "gmail" || command.origin.system === "gmail.attachment")
+      ) {
+        await transaction`
+          update source_objects set correlation_digest = ${correlationDigest}
+          where id = ${object.id} and correlation_digest is null
+        `;
+      } else if (object.correlation_digest !== correlationDigest) {
+        throw new ConflictError("A source deletion cannot change its correlation identity");
+      }
+      const revisions = await transaction<{ readonly id: string; readonly source_object_id: string }[]>`
+        select revision.id, revision.source_object_id
+        from source_revisions revision
+        where revision.revoked_at is null
+          and (
+            revision.source_object_id = ${object.id}
+            or revision.source_object_id in (
+              select child.id from source_objects child
+              where child.parent_source_object_id = ${object.id}
+            )
+          )
         for update
       `;
       const invalidation = await invalidateRevisions(
@@ -1455,8 +1581,17 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
       await transaction`
         update source_objects
         set status = 'deleted', updated_at = greatest(updated_at, ${new Date(command.deletedAt)})
-        where id = ${object.id}
+        where id = ${object.id} or parent_source_object_id = ${object.id}
       `;
+      if (object.status !== "deleted" || invalidation.invalidatedRevisionCount > 0) {
+        await markPrivateSourceFrontiersDirty(transaction, {
+          integrationId: command.integrationId,
+          ownerPersonId: command.scope.kind === "person" ? command.scope.personId : null,
+          sourceProvider: command.origin.system,
+          correlationDigest,
+          changedAt: new Date(command.deletedAt),
+        });
+      }
       return {
         kind: "source_deleted",
         sourceObjectId: object.id,
@@ -2492,11 +2627,16 @@ async function assertSourceObjectIntegrationEpoch(
   const rows = await transaction<
     {
       readonly integration_id: string | null;
-      readonly status: string | null;
+      readonly object_status: string;
+      readonly source_provider: string;
+      readonly integration_status: string | null;
+      readonly integration_provider: string | null;
       readonly control_epoch: number | string | null;
     }[]
   >`
-    select object.integration_id, integration.status, integration.control_epoch
+    select object.integration_id, object.status as object_status,
+      object.provider as source_provider, integration.status as integration_status,
+      integration.provider as integration_provider, integration.control_epoch
     from source_objects object
     left join integrations integration on integration.id = object.integration_id
     where object.id = ${sourceObjectId}
@@ -2510,11 +2650,16 @@ async function assertSourceObjectIntegrationEpoch(
     if (source.integration_id !== null) {
       throw new UnauthorizedError("Provider source work requires an integration fence");
     }
+    if (source.object_status !== "active") {
+      throw new StaleAuthorityError("Source object is no longer active for enrichment");
+    }
     return;
   }
   if (
     source.integration_id !== expectedIntegrationId ||
-    source.status !== "active" ||
+    source.object_status !== "active" ||
+    source.integration_status !== "active" ||
+    source.integration_provider !== integrationProviderForSourceSystem(source.source_provider) ||
     Number(source.control_epoch) !== expectedIntegrationControlEpoch
   ) {
     throw new StaleAuthorityError("Integration authority changed before source enrichment");
@@ -3107,6 +3252,161 @@ function sourceObjectIdentity(
     system: origin.system,
     remoteObjectId: origin.remoteObjectId,
   });
+}
+
+async function resolveAttachmentParentSourceObject(
+  transaction: Transaction,
+  command: Extract<SourceCommand, { kind: "ingest_source" }>,
+  scope: ScopeResolution,
+): Promise<string | null> {
+  if (command.artifactKind !== "attachment_manifest" || command.origin.system !== "gmail.attachment") {
+    return null;
+  }
+  const parentSourceRevisionId = z.string().uuid().parse(command.content.parentSourceRevisionId);
+  const rows = await transaction<{ readonly id: string }[]>`
+    select object.id
+    from source_revisions revision
+    join source_objects object on object.id = revision.source_object_id
+    where revision.id = ${parentSourceRevisionId}
+      and revision.owner_person_id = ${scope.ownerPersonId}
+      and revision.participant_epoch_id is null
+      and revision.revoked_at is null
+      and object.integration_id = ${command.integrationId}
+      and object.provider = 'gmail' and object.object_kind = 'mail_message'
+      and object.status = 'active'
+    for share of revision, object
+  `;
+  const parent = rows[0];
+  if (!parent) {
+    throw new StaleAuthorityError("Gmail attachment lost its current parent message authority");
+  }
+  return parent.id;
+}
+
+async function acquireSourceWriteAuthorityLocks(
+  transaction: Transaction,
+  input: {
+    readonly integrationId: string | null;
+    readonly expectedIntegrationControlEpoch: number | null;
+    readonly ownerPersonId: string | null;
+    readonly sourceProvider: string | null;
+  },
+): Promise<void> {
+  if ((input.integrationId === null) !== (input.expectedIntegrationControlEpoch === null)) {
+    throw new UnauthorizedError("Source work requires a complete integration authority fence");
+  }
+  if (input.ownerPersonId === null) {
+    if (input.integrationId !== null) {
+      throw new UnauthorizedError("Integration source work requires an exact person owner");
+    }
+    return;
+  }
+  if (input.integrationId === null) {
+    await requireRegisteredPerson(transaction, input.ownerPersonId, true);
+    return;
+  }
+
+  await transaction`
+    select pg_advisory_xact_lock(
+      hashtextextended(${privateSourceIntegrationLockKey(input.integrationId)}, 0)
+    )
+  `;
+
+  // Keep this row-lock order aligned with person deletion and integration
+  // connection: person first, then the exact integration.
+  await requireRegisteredPerson(transaction, input.ownerPersonId, true);
+  const integration = await loadIntegrationForUpdate(transaction, input.integrationId, input.ownerPersonId);
+  if (integration.status !== "active") {
+    throw new UnauthorizedError("Source integration is not active for this person");
+  }
+  const expectedControlEpoch = input.expectedIntegrationControlEpoch;
+  if (expectedControlEpoch === null) {
+    throw new UnauthorizedError("Source authority fence is missing");
+  }
+  assertControlEpoch(integration, expectedControlEpoch);
+  if (
+    input.sourceProvider !== null &&
+    integration.provider !== integrationProviderForSourceSystem(input.sourceProvider)
+  ) {
+    throw new UnauthorizedError("Source provider does not match the active integration");
+  }
+}
+
+async function acquireGmailSourceCaseLock(
+  transaction: Transaction,
+  input: {
+    readonly integrationId: string | null;
+    readonly ownerPersonId: string | null;
+    readonly sourceProvider: string;
+    readonly correlationDigest: string | null;
+    readonly correlationRequired?: boolean;
+  },
+): Promise<void> {
+  if (input.sourceProvider !== "gmail" && input.sourceProvider !== "gmail.attachment") return;
+  if (input.ownerPersonId === null || input.correlationDigest === null) {
+    if (input.correlationRequired === false) return;
+    throw new UnauthorizedError("Gmail evidence is missing its private frontier authority");
+  }
+  if (input.integrationId === null) {
+    throw new UnauthorizedError("Gmail evidence is missing its integration authority");
+  }
+  await transaction`
+    select pg_advisory_xact_lock(
+      hashtextextended(${gmailThreadFrontierLockKey({
+        ownerPersonId: input.ownerPersonId,
+        integrationId: input.integrationId,
+        caseKeyDigest: input.correlationDigest,
+      })}, 0)
+    )
+  `;
+}
+
+async function markPrivateSourceFrontiersDirty(
+  transaction: Transaction,
+  input: {
+    readonly integrationId: string | null;
+    readonly ownerPersonId: string | null;
+    readonly sourceProvider: string;
+    readonly correlationDigest: string | null;
+    readonly changedAt: Date;
+  },
+): Promise<void> {
+  if (input.integrationId === null || input.ownerPersonId === null) {
+    return;
+  }
+  if (input.sourceProvider === "google.calendar") {
+    await transaction`
+      update private_source_frontiers
+      set source_generation = source_generation + 1,
+        updated_at = greatest(updated_at, ${input.changedAt})
+      where owner_person_id = ${input.ownerPersonId}
+        and integration_id = ${input.integrationId}
+    `;
+    return;
+  }
+  if (
+    (input.sourceProvider !== "gmail" && input.sourceProvider !== "gmail.attachment") ||
+    input.correlationDigest === null
+  ) {
+    return;
+  }
+  await transaction`
+    update private_source_frontiers
+    set source_generation = source_generation + 1,
+      updated_at = greatest(updated_at, ${input.changedAt})
+    where owner_person_id = ${input.ownerPersonId}
+      and integration_id = ${input.integrationId}
+      and case_kind = 'gmail_thread'
+      and case_key_digest = ${input.correlationDigest}
+  `;
+}
+
+function integrationProviderForSourceSystem(sourceProvider: string): string {
+  return sourceProvider === "gmail" ||
+    sourceProvider === "gmail.attachment" ||
+    sourceProvider === "google.calendar"
+    ? "google"
+    : sourceProvider;
 }
 
 function integrationView(

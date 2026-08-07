@@ -199,6 +199,7 @@ const IngestSourceCommandSchema = z
     artifactKind: SourceArtifactKindSchema,
     origin: SourceOriginSchema,
     resourceDigest: DigestSchema.optional(),
+    correlationDigest: DigestSchema.optional(),
     scope: SourceScopeSchema,
     conversationAccessMode: ConversationSourceAccessModeSchema.optional(),
     content: JsonObjectSchema,
@@ -219,6 +220,23 @@ const IngestSourceCommandSchema = z
         code: "custom",
         path: ["resourceDigest"],
         message: "Calendar ingestion requires its configured calendar digest",
+      });
+    }
+    const gmailCorrelated =
+      (command.origin.system === "gmail" && command.artifactKind === "mail_message") ||
+      (command.origin.system === "gmail.attachment" && command.artifactKind === "attachment_manifest");
+    if (gmailCorrelated && command.correlationDigest === undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["correlationDigest"],
+        message: "Gmail thread evidence requires its private frontier digest",
+      });
+    }
+    if (!gmailCorrelated && command.correlationDigest !== undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["correlationDigest"],
+        message: "Only Gmail thread evidence may set a correlation digest",
       });
     }
     if (command.scope.kind === "person" && command.conversationAccessMode !== undefined) {
@@ -319,6 +337,7 @@ const MarkSourceDeletedCommandSchema = z
     expectedIntegrationControlEpoch: z.number().int().positive().nullable(),
     artifactKind: SourceArtifactKindSchema,
     origin: SourceOriginSchema,
+    correlationDigest: DigestSchema.optional(),
     scope: SourceScopeSchema,
     deletedAt: InstantSchema,
   })
@@ -328,6 +347,17 @@ const MarkSourceDeletedCommandSchema = z
         code: "custom",
         path: ["expectedIntegrationControlEpoch"],
         message: "Provider deletion requires a complete integration authority fence",
+      });
+    }
+    if (
+      command.correlationDigest !== undefined &&
+      command.origin.system !== "gmail" &&
+      command.origin.system !== "gmail.attachment"
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["correlationDigest"],
+        message: "Only Gmail deletion may set a thread correlation digest",
       });
     }
   });
@@ -582,6 +612,7 @@ export type SourceMutationResult =
       readonly retentionUntil: string;
       readonly rawContentStored: boolean;
       readonly privateViewCount: number;
+      readonly correlationDigest: string | null;
       readonly duplicate: boolean;
     }
   | {

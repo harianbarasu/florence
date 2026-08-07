@@ -8,6 +8,15 @@ const evidenceReferenceSchema = z
   })
   .strict();
 
+const frontierCitationsSchema = z
+  .array(evidenceReferenceSchema)
+  .min(1)
+  .max(32)
+  .refine(
+    (citations) => new Set(citations.map((citation) => citation.sourceRevisionId)).size === citations.length,
+    "Frontier citations must be unique",
+  );
+
 export const needInterpretationSchema = z
   .object({
     disposition: z.enum(["ignore", "private_review", "propose_coverage"]),
@@ -75,6 +84,33 @@ export const coverageResponseInterpretationSchema = z
     rationale: z.string().min(1).max(700),
   })
   .strict();
+
+export const privateSourceReconciliationDecisionSchema = z.discriminatedUnion("kind", [
+  z
+    .object({
+      kind: z.literal("unchanged"),
+      evidence: frontierCitationsSchema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("coverage_needed"),
+      requiredOutcome: z.string().min(1).max(500),
+      changedFact: z.string().min(1).max(500).nullable(),
+      timeFacts: z.array(z.string().min(1).max(300)).max(12),
+      uncertainties: z.array(z.string().min(1).max(300)).max(8),
+      sensitivity: z.enum(["ordinary", "personal", "sensitive"]),
+      evidence: frontierCitationsSchema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("coverage_cancelled"),
+      reason: z.enum(["cancelled", "superseded"]),
+      evidence: frontierCitationsSchema,
+    })
+    .strict(),
+]);
 
 export const generalAnswerSchema = z
   .object({
@@ -145,6 +181,18 @@ export const PRODUCT_SKILLS = {
     requestedCapabilities: [] as const,
     evaluationRelease: "coverage-core-2",
   } satisfies PinnedSkill<typeof coverageResponseInterpretationSchema>,
+  privateSourceReconcile: {
+    id: "private_source.reconcile",
+    version: 1,
+    purpose:
+      "Reconcile one private Gmail thread, its attachments, and current Calendar evidence into current family coverage meaning.",
+    instructions: `${commonGuardrails}\nThe application sends this skill only after its bounded source case passes explicit completeness checks. The supplied evidence contains every admitted current Gmail message and supported attachment in that case, plus only Calendar events selected by deterministic date and token relevance. Reconcile the supplied case as a unit, ordered by occurredAt. Newer updates, corrections, and cancellations supersede older asks; never revive an older request that current evidence replaced or withdrew. A replacement that still needs family coordination is coverage_needed with only the current outcome. Use coverage_cancelled only when current evidence withdraws or supersedes the prior need without leaving a current replacement need. If there is no current family coverage need and no supplied evidence changes or withdraws an earlier need, return unchanged. Thanks, acknowledgments, signatures, delivery chatter, and unrelated replies are unchanged. Calendar evidence can clarify current schedule facts but never proves that a person accepted responsibility. Every evidence citation must use a sourceRevisionId supplied in this frontier and explain its support; never invent or cite outside evidence. Never choose or infer a person ID, destination, household, conversation, coverage loop, disclosure audience, permission, standing rule, or mutation authority. Return only current private meaning for application validation.`,
+    outputSchema: privateSourceReconciliationDecisionSchema,
+    outputSchemaName: "private_source_reconcile_v1",
+    riskClass: "high",
+    requestedCapabilities: [] as const,
+    evaluationRelease: "private-source-frontier-1",
+  } satisfies PinnedSkill<typeof privateSourceReconciliationDecisionSchema>,
 } as const;
 
 /** Explicitly requested general answers are bounded and never create durable projects or memories. */

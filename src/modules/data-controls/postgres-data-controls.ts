@@ -4,6 +4,7 @@ import type { Database } from "../../db/client.js";
 import type { SecretBox } from "../../shared/crypto.js";
 import { NotFoundError, UnauthorizedError } from "../../shared/errors.js";
 import { PostgresCoordination } from "../coordination/index.js";
+import { privateSourceIntegrationLockKey } from "../sources/policy.js";
 
 type Transaction = TransactionSql<Record<string, never>>;
 type Executor = Database | Transaction;
@@ -20,6 +21,18 @@ export class PostgresDataControls {
     readonly deletedAt: Date;
   }): Promise<{ deletionRequestId: string; receiptDigest: string; duplicate: boolean }> {
     return inTransaction(this.database, async (transaction) => {
+      const integrationRows = await transaction<{ readonly id: string }[]>`
+        select id from integrations
+        where person_id = ${input.actorPersonId}
+        order by id
+      `;
+      for (const integration of integrationRows) {
+        await transaction`
+          select pg_advisory_xact_lock(
+            hashtextextended(${privateSourceIntegrationLockKey(integration.id)}, 0)
+          )
+        `;
+      }
       const people = await transaction<{ status: string; control_epoch: number | string }[]>`
         select status, control_epoch from people where id = ${input.actorPersonId} for update
       `;
@@ -106,7 +119,10 @@ export class PostgresDataControls {
         where cursor.integration_id = integration.id and integration.person_id = ${input.actorPersonId}
       `;
       const revisions = await transaction<{ id: string }[]>`
-        select id from source_revisions where owner_person_id = ${input.actorPersonId}
+        select id from source_revisions
+        where owner_person_id = ${input.actorPersonId}
+        order by id
+        for update
       `;
       const revisionIds = revisions.map((entry) => entry.id);
       if (revisionIds.length > 0) {
@@ -123,6 +139,9 @@ export class PostgresDataControls {
           where id = any(${transaction.array(revisionIds)}::uuid[])
         `;
       }
+      await transaction`
+        delete from private_source_frontiers where owner_person_id = ${input.actorPersonId}
+      `;
       await transaction`
         delete from knowledge_candidates where owner_person_id = ${input.actorPersonId}
       `;

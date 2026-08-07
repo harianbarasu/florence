@@ -182,6 +182,9 @@ export interface LinqCreateDirectMessageRequest {
   text: string;
 }
 
+/** Wraps the literal provider mutation so callers can hold authority locks through it. */
+export type LinqSubmitGuard = <Result>(submit: () => Promise<Result>) => Promise<Result>;
+
 export type LinqProviderDeliveryStatus =
   | "pending"
   | "queued"

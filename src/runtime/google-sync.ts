@@ -12,13 +12,16 @@ import type { Database } from "../db/client.js";
 import {
   assessMailMetadata,
   type CalendarPrivacyMode,
+  gmailThreadCaseDigest,
   type IntegrationAccountKind,
   type IntegrationCapability,
   isFullMailContentAdmitted,
   JsonObjectSchema,
+  type JsonValue,
   PostgresSourceIntelligence,
   planCalendarSyncWindow,
   planNewestFirstMailBackfill,
+  privateSourceIntegrationLockKey,
   projectCalendarArtifact,
   type SourceReadResult,
 } from "../modules/sources/index.js";
@@ -30,7 +33,6 @@ const GOOGLE_JOB_PRIORITY = {
   activation: 50,
   live: 50,
   calendar: 60,
-  calendarBackfill: 110,
   recentBackfill: 110,
   middleBackfill: 120,
   yearBackfill: 130,
@@ -350,97 +352,133 @@ export class GoogleSyncService {
   public async ingestGmailMessage(payloadCandidate: unknown): Promise<string | null> {
     const payload = GmailMessagePayloadSchema.parse(payloadCandidate);
     const { gmail } = await this.clients(payload, "mail");
-    let metadata: NormalizedGmailMessage;
+    let triggeredMetadata: NormalizedGmailMessage;
     try {
-      metadata = await gmail.message(payload.messageId, true);
+      triggeredMetadata = await gmail.message(payload.messageId, true);
     } catch (error) {
       if (googleErrorStatus(error) === 404) {
-        await this.#sources.apply({
-          kind: "mark_source_deleted",
-          integrationId: payload.integrationId,
-          expectedIntegrationControlEpoch: payload.integrationControlEpoch,
-          artifactKind: "mail_message",
-          origin: { system: "gmail", remoteObjectId: payload.messageId },
-          scope: { kind: "person", personId: payload.personId },
-          deletedAt: new Date().toISOString(),
-        });
+        await this.markGmailMessageDeleted(payload, payload.messageId);
         return null;
       }
       throw error;
     }
-    const admission = assessMailMetadata({
-      labelIds: metadata.labelIds,
-      from: metadata.from,
-      subject: metadata.subject,
-      snippet: metadata.snippet,
-      hasAttachments: metadata.attachments.length > 0,
-    });
-    if (!admission.ingestMetadata) return null;
-    const fullContentAdmitted = isFullMailContentAdmitted(admission);
-    const message = fullContentAdmitted ? await gmail.message(payload.messageId, false) : metadata;
-    const content = JsonObjectSchema.parse(
-      JSON.parse(
-        JSON.stringify({
-          threadId: message.threadId,
-          historyId: message.historyId,
-          internalDate: message.internalDate.toISOString(),
-          labelIds: [...message.labelIds],
-          from: message.from,
-          to: [...message.to],
-          cc: [...message.cc],
-          subject: message.subject,
-          messageIdHeader: message.messageIdHeader,
-          snippet: message.snippet,
-          text: fullContentAdmitted ? message.text : null,
-          admissionReasons: [...admission.reasons],
-          bodyRetrieval: admission.bodyRetrieval,
-          attachments: message.attachments.map((attachment) => ({
-            partId: attachment.partId,
-            filename: attachment.filename,
-            mimeType: attachment.mimeType,
-            size: attachment.size,
-            inline: attachment.inline,
-          })),
-        }),
-      ),
-    );
-    const ingested = await this.#sources.apply({
-      kind: "ingest_source",
+
+    const correlationDigest = gmailThreadCaseDigest({
       integrationId: payload.integrationId,
-      expectedIntegrationControlEpoch: payload.integrationControlEpoch,
-      artifactKind: "mail_message",
-      origin: { system: "gmail", remoteObjectId: payload.messageId, remoteRevisionId: message.historyId },
-      scope: { kind: "person", personId: payload.personId },
-      content,
-      occurredAt: message.internalDate.toISOString(),
-      capturedAt: new Date().toISOString(),
-      requestedRetentionUntil: new Date(
-        Date.now() + this.config.defaults.rawSourceRetentionDays * 86_400_000,
-      ).toISOString(),
+      threadId: triggeredMetadata.threadId,
     });
-    if (ingested.kind !== "source_ingested") return null;
-    if (fullContentAdmitted) {
-      for (const attachment of message.attachments.filter(
-        (entry) => !entry.inline && entry.size <= 15 * 1024 * 1024,
-      )) {
-        await this.ingestGmailAttachment(gmail, message, ingested.sourceRevisionId, payload, attachment);
+    let threadMetadata: readonly NormalizedGmailMessage[];
+    try {
+      threadMetadata = await gmail.threadMetadata(triggeredMetadata.threadId);
+    } catch (error) {
+      if (googleErrorStatus(error) === 404) {
+        await this.markGmailMessageDeleted(payload, payload.messageId, correlationDigest);
+        return null;
+      }
+      throw error;
+    }
+    let triggeredSourceRevisionId: string | null = null;
+    let newestCurrent: {
+      readonly internalDate: Date;
+      readonly messageId: string;
+      readonly sourceRevisionId: string;
+    } | null = null;
+    let hasFullContent = false;
+
+    for (const metadata of threadMetadata) {
+      if (metadata.threadId !== triggeredMetadata.threadId) {
+        throw new Error("Gmail thread metadata contained a message from a different thread");
+      }
+      const admission = assessMailMetadata({
+        labelIds: metadata.labelIds,
+        from: metadata.from,
+        subject: metadata.subject,
+        snippet: metadata.snippet,
+        hasAttachments: metadata.hasAttachmentHint,
+      });
+      if (!admission.ingestMetadata) {
+        await this.markGmailMessageDeleted(payload, metadata.id, correlationDigest);
+        continue;
+      }
+
+      const fullContentAdmitted = isFullMailContentAdmitted(admission);
+      let message = metadata;
+      if (fullContentAdmitted) {
+        try {
+          message = await gmail.message(metadata.id, false);
+        } catch (error) {
+          if (googleErrorStatus(error) === 404) {
+            await this.markGmailMessageDeleted(payload, metadata.id, correlationDigest);
+            continue;
+          }
+          throw error;
+        }
+      }
+
+      const ingested = await this.ingestGmailThreadMessage(
+        payload,
+        message,
+        admission,
+        correlationDigest,
+        fullContentAdmitted,
+      );
+      if (metadata.id === payload.messageId) triggeredSourceRevisionId = ingested.sourceRevisionId;
+
+      if (
+        newestCurrent === null ||
+        compareGmailMessageRecency(
+          { internalDate: message.internalDate, messageId: message.id },
+          newestCurrent,
+        ) > 0
+      ) {
+        newestCurrent = {
+          internalDate: message.internalDate,
+          messageId: message.id,
+          sourceRevisionId: ingested.sourceRevisionId,
+        };
+      }
+
+      if (fullContentAdmitted) {
+        hasFullContent = true;
+        for (const attachment of message.attachments) {
+          if (attachment.size > 15 * 1024 * 1024) {
+            await this.ingestGmailAttachmentOmission(
+              message,
+              ingested.sourceRevisionId,
+              correlationDigest,
+              payload,
+              attachment,
+            );
+          } else {
+            await this.ingestGmailAttachment(
+              gmail,
+              message,
+              ingested.sourceRevisionId,
+              correlationDigest,
+              payload,
+              attachment,
+            );
+          }
+        }
       }
     }
-    if (!fullContentAdmitted) return ingested.sourceRevisionId;
+
+    if (!hasFullContent || !newestCurrent) return triggeredSourceRevisionId;
     await this.#work.enqueue({
       kind: "orchestrate.private_source",
-      idempotencyKey: `orchestrate:source:${ingested.sourceRevisionId}:${controlEpochKey(payload)}`,
+      idempotencyKey: `orchestrate:source:${newestCurrent.sourceRevisionId}:${controlEpochKey(payload)}`,
       payload: {
-        sourceRevisionId: ingested.sourceRevisionId,
+        sourceRevisionId: newestCurrent.sourceRevisionId,
         personId: payload.personId,
         integrationId: payload.integrationId,
         integrationControlEpoch: payload.integrationControlEpoch,
       },
       ...googleJobFence(payload),
-      priority: payload.sourcePriority,
+      caseKeyDigest: correlationDigest,
+      priority: Math.min(1_000, payload.sourcePriority + 5),
       maxAttempts: 8,
     });
-    return ingested.sourceRevisionId;
+    return triggeredSourceRevisionId ?? newestCurrent.sourceRevisionId;
   }
 
   public async catalogCalendars(payloadCandidate: unknown): Promise<void> {
@@ -548,6 +586,8 @@ export class GoogleSyncService {
     const cursorKind = `calendar:${payload.calendarIdDigest}`;
     let syncToken: string | undefined;
     let expectedCursorUpdate: string | null = null;
+    let cursorForCheckpoint: JsonValue | null = null;
+    let reconcileInterruptedFrontier = false;
     try {
       const cursor = await this.#sources.read({
         kind: "sync_cursor",
@@ -563,16 +603,34 @@ export class GoogleSyncService {
       ) {
         syncToken = cursor.cursor.syncToken;
       }
-      if (cursor.kind === "sync_cursor") expectedCursorUpdate = cursor.updatedAt;
+      if (cursor.kind === "sync_cursor") {
+        expectedCursorUpdate = cursor.updatedAt;
+        cursorForCheckpoint = cursor.cursor;
+        reconcileInterruptedFrontier = cursor.state === "initial" && cursor.checkpointAt === null;
+      }
     } catch (error) {
       if (!(error instanceof NotFoundError)) throw error;
     }
+    const processingAt = new Date().toISOString();
+    await this.withCalendarPollAuthority(payload, async ({ sources }) => {
+      await sources.apply({
+        kind: "checkpoint_cursor",
+        integrationId: payload.integrationId,
+        personId: payload.personId,
+        expectedIntegrationControlEpoch: payload.integrationControlEpoch,
+        resourceKind: cursorKind,
+        cursor: cursorForCheckpoint,
+        state: "initial",
+        expectedUpdatedAt: expectedCursorUpdate,
+        checkpointAt: null,
+        updatedAt: processingAt,
+      });
+    });
+    expectedCursorUpdate = processingAt;
     const window = planCalendarSyncWindow(new Date().toISOString());
-    const interpretationPriority = syncToken
-      ? GOOGLE_JOB_PRIORITY.calendar
-      : GOOGLE_JOB_PRIORITY.calendarBackfill;
     let pageToken: string | undefined;
     let nextSyncToken: string | undefined;
+    let frontierChanged = false;
     try {
       do {
         await this.assertCalendarPollAuthority(payload);
@@ -589,20 +647,6 @@ export class GoogleSyncService {
             remoteObjectId: `${payload.calendarId}:${event.id}`,
             ...(event.etag ? { remoteRevisionId: event.etag } : {}),
           };
-          if (event.status === "cancelled") {
-            await this.withCalendarPollAuthority(payload, async ({ sources }) => {
-              await sources.apply({
-                kind: "mark_source_deleted",
-                integrationId: payload.integrationId,
-                expectedIntegrationControlEpoch: payload.integrationControlEpoch,
-                artifactKind: "calendar_event",
-                origin,
-                scope: { kind: "person", personId: payload.personId },
-                deletedAt: new Date().toISOString(),
-              });
-            });
-            continue;
-          }
           const projected = projectCalendarArtifact(
             {
               remoteEventId: event.id,
@@ -618,7 +662,7 @@ export class GoogleSyncService {
             payload.mode,
           );
           if (!projected) continue;
-          await this.withCalendarPollAuthority(payload, async ({ sources, work }) => {
+          await this.withCalendarPollAuthority(payload, async ({ sources }) => {
             const ingested = await sources.apply({
               kind: "ingest_source",
               integrationId: payload.integrationId,
@@ -634,21 +678,7 @@ export class GoogleSyncService {
                 Date.now() + this.config.defaults.rawSourceRetentionDays * 86_400_000,
               ).toISOString(),
             });
-            if (ingested.kind === "source_ingested") {
-              await work.enqueue({
-                kind: "orchestrate.private_source",
-                idempotencyKey: `orchestrate:source:${ingested.sourceRevisionId}:${controlEpochKey(payload)}`,
-                payload: {
-                  sourceRevisionId: ingested.sourceRevisionId,
-                  personId: payload.personId,
-                  integrationId: payload.integrationId,
-                  integrationControlEpoch: payload.integrationControlEpoch,
-                },
-                ...googleJobFence(payload),
-                priority: interpretationPriority,
-                maxAttempts: 8,
-              });
-            }
+            if (ingested.kind === "source_ingested" && !ingested.duplicate) frontierChanged = true;
           });
         }
         pageToken = page.nextPageToken;
@@ -663,7 +693,8 @@ export class GoogleSyncService {
       }
       throw error;
     }
-    await this.withCalendarPollAuthority(payload, async ({ sources }) => {
+    const settledAt = new Date().toISOString();
+    await this.withCalendarPollAuthority(payload, async ({ transaction, sources, work }) => {
       await sources.apply({
         kind: "checkpoint_cursor",
         integrationId: payload.integrationId,
@@ -673,9 +704,12 @@ export class GoogleSyncService {
         cursor: nextSyncToken ? { syncToken: nextSyncToken } : null,
         state: nextSyncToken ? "active" : "initial",
         expectedUpdatedAt: expectedCursorUpdate,
-        checkpointAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
+        checkpointAt: settledAt,
+        updatedAt: settledAt,
       });
+      if ((frontierChanged || reconcileInterruptedFrontier) && nextSyncToken) {
+        await this.enqueueCurrentPrivateFrontiers(payload, `${cursorKind}:${settledAt}`, transaction, work);
+      }
     });
     const bucket = Math.floor(
       (Date.now() + this.config.intervals.calendarPollMs) / this.config.intervals.calendarPollMs,
@@ -691,6 +725,55 @@ export class GoogleSyncService {
         maxAttempts: 8,
       });
     });
+  }
+
+  private async enqueueCurrentPrivateFrontiers(
+    payload: GoogleJobBase,
+    reconcileKey: string,
+    transaction: Transaction,
+    work: DurableWork,
+  ): Promise<void> {
+    const frontiers = await transaction<
+      { readonly case_key_digest: string; readonly source_revision_id: string }[]
+    >`
+      select frontier.case_key_digest, anchor.source_revision_id
+      from private_source_frontiers frontier
+      join lateral (
+        select revision.id as source_revision_id
+        from source_objects object
+        join source_revisions revision on revision.source_object_id = object.id
+          and revision.revision_number = object.latest_revision_number
+        where object.integration_id = frontier.integration_id
+          and object.provider = 'gmail' and object.object_kind = 'mail_message'
+          and object.correlation_digest = frontier.case_key_digest
+          and object.status = 'active'
+          and revision.owner_person_id = frontier.owner_person_id
+          and revision.revoked_at is null and revision.retention_until > now()
+          and revision.content_ciphertext is not null
+        order by revision.occurred_at desc, revision.id desc
+        limit 1
+      ) anchor on true
+      where frontier.integration_id = ${payload.integrationId}
+        and frontier.owner_person_id = ${payload.personId}
+      order by frontier.updated_at, frontier.id
+    `;
+    const generation = sha256Hex(reconcileKey);
+    for (const frontier of frontiers) {
+      await work.enqueue({
+        kind: "orchestrate.private_source",
+        idempotencyKey: `orchestrate:frontier:${payload.integrationId}:${controlEpochKey(payload)}:${frontier.case_key_digest}:calendar:${generation}`,
+        payload: {
+          sourceRevisionId: frontier.source_revision_id,
+          personId: payload.personId,
+          integrationId: payload.integrationId,
+          integrationControlEpoch: payload.integrationControlEpoch,
+        },
+        ...googleJobFence(payload),
+        caseKeyDigest: frontier.case_key_digest,
+        priority: GOOGLE_JOB_PRIORITY.calendar + 5,
+        maxAttempts: 8,
+      });
+    }
   }
 
   public async handleProviderAuthFailure(
@@ -808,6 +891,11 @@ export class GoogleSyncService {
     operation: (context: CalendarAuthorityContext) => Promise<Result>,
   ): Promise<Result> {
     return this.#database.begin(async (transaction) => {
+      await transaction`
+        select pg_advisory_xact_lock(
+          hashtextextended(${privateSourceIntegrationLockKey(payload.integrationId)}, 0)
+        )
+      `;
       const integrations = await transaction<
         {
           readonly person_id: string;
@@ -981,14 +1069,87 @@ export class GoogleSyncService {
     });
   }
 
+  private async ingestGmailThreadMessage(
+    payload: z.infer<typeof GmailMessagePayloadSchema>,
+    message: NormalizedGmailMessage,
+    admission: ReturnType<typeof assessMailMetadata>,
+    correlationDigest: string,
+    fullContentAdmitted: boolean,
+  ) {
+    const content = JsonObjectSchema.parse(
+      JSON.parse(
+        JSON.stringify({
+          threadId: message.threadId,
+          historyId: message.historyId,
+          internalDate: message.internalDate.toISOString(),
+          labelIds: [...message.labelIds],
+          from: message.from,
+          to: [...message.to],
+          cc: [...message.cc],
+          subject: message.subject,
+          messageIdHeader: message.messageIdHeader,
+          snippet: message.snippet,
+          text: fullContentAdmitted ? message.text : null,
+          admissionReasons: [...admission.reasons],
+          bodyRetrieval: admission.bodyRetrieval,
+          attachments: message.attachments.map((attachment) => ({
+            partId: attachment.partId,
+            filename: attachment.filename,
+            mimeType: attachment.mimeType,
+            size: attachment.size,
+            inline: attachment.inline,
+          })),
+        }),
+      ),
+    );
+    const capturedAt = new Date();
+    const ingested = await this.#sources.apply({
+      kind: "ingest_source",
+      integrationId: payload.integrationId,
+      expectedIntegrationControlEpoch: payload.integrationControlEpoch,
+      artifactKind: "mail_message",
+      origin: { system: "gmail", remoteObjectId: message.id, remoteRevisionId: message.historyId },
+      correlationDigest,
+      scope: { kind: "person", personId: payload.personId },
+      content,
+      occurredAt: message.internalDate.toISOString(),
+      capturedAt: capturedAt.toISOString(),
+      requestedRetentionUntil: new Date(
+        capturedAt.getTime() + this.config.defaults.rawSourceRetentionDays * 86_400_000,
+      ).toISOString(),
+    });
+    if (ingested.kind !== "source_ingested") {
+      throw new Error("Gmail source ingestion did not produce a revision");
+    }
+    return ingested;
+  }
+
+  private async markGmailMessageDeleted(
+    payload: z.infer<typeof GmailMessagePayloadSchema>,
+    messageId: string,
+    correlationDigest?: string,
+  ): Promise<void> {
+    await this.#sources.apply({
+      kind: "mark_source_deleted",
+      integrationId: payload.integrationId,
+      expectedIntegrationControlEpoch: payload.integrationControlEpoch,
+      artifactKind: "mail_message",
+      origin: { system: "gmail", remoteObjectId: messageId },
+      ...(correlationDigest ? { correlationDigest } : {}),
+      scope: { kind: "person", personId: payload.personId },
+      deletedAt: new Date().toISOString(),
+    });
+  }
+
   private async ingestGmailAttachment(
     gmail: GmailAdapter,
     message: NormalizedGmailMessage,
     parentSourceRevisionId: string,
+    correlationDigest: string,
     payload: z.infer<typeof GmailMessagePayloadSchema>,
     attachment: NormalizedGmailMessage["attachments"][number],
   ): Promise<void> {
-    const bytes = await gmail.attachment(message.id, attachment.attachmentId);
+    const bytes = await gmail.attachment(message.id, attachment);
     let extracted: Awaited<ReturnType<typeof extractDocument>> | null = null;
     try {
       extracted = await extractDocument(bytes, attachment.mimeType);
@@ -1007,12 +1168,16 @@ export class GoogleSyncService {
         remoteObjectId: `${message.id}:${attachment.partId}`,
         remoteRevisionId: message.historyId,
       },
+      correlationDigest,
       scope: { kind: "person", personId: payload.personId },
       content: JsonObjectSchema.parse({
         parentSourceRevisionId,
+        partId: attachment.partId,
         filename: attachment.filename,
         declaredMime: attachment.mimeType,
         detectedMime,
+        size: attachment.size,
+        inline: attachment.inline,
         kind: extracted?.kind ?? "unsupported",
         text: extracted?.text ?? "",
         metadata: extracted?.metadata ?? { bytes: bytes.length, unsupportedExtraction: true },
@@ -1058,18 +1223,48 @@ export class GoogleSyncService {
         createdAt: new Date().toISOString(),
       });
     }
-    await this.#work.enqueue({
-      kind: "orchestrate.private_source",
-      idempotencyKey: `orchestrate:source:${ingested.sourceRevisionId}:${controlEpochKey(payload)}`,
-      payload: {
-        sourceRevisionId: ingested.sourceRevisionId,
-        personId: payload.personId,
-        integrationId: payload.integrationId,
-        integrationControlEpoch: payload.integrationControlEpoch,
+  }
+
+  private async ingestGmailAttachmentOmission(
+    message: NormalizedGmailMessage,
+    parentSourceRevisionId: string,
+    correlationDigest: string,
+    payload: z.infer<typeof GmailMessagePayloadSchema>,
+    attachment: NormalizedGmailMessage["attachments"][number],
+  ): Promise<void> {
+    const capturedAt = new Date();
+    await this.#sources.apply({
+      kind: "ingest_source",
+      integrationId: payload.integrationId,
+      expectedIntegrationControlEpoch: payload.integrationControlEpoch,
+      artifactKind: "attachment_manifest",
+      origin: {
+        system: "gmail.attachment",
+        remoteObjectId: `${message.id}:${attachment.partId}`,
+        remoteRevisionId: message.historyId,
       },
-      ...googleJobFence(payload),
-      priority: payload.sourcePriority,
-      maxAttempts: 8,
+      correlationDigest,
+      scope: { kind: "person", personId: payload.personId },
+      content: JsonObjectSchema.parse({
+        parentSourceRevisionId,
+        partId: attachment.partId,
+        filename: attachment.filename,
+        declaredMime: attachment.mimeType,
+        size: attachment.size,
+        inline: attachment.inline,
+        kind: "omitted",
+        text: "",
+        metadata: {
+          bytes: attachment.size,
+          omissionReason: "attachment_exceeds_15_mib_processing_limit",
+        },
+        untrustedEvidence: true,
+      }),
+      occurredAt: message.internalDate.toISOString(),
+      capturedAt: capturedAt.toISOString(),
+      requestedRetentionUntil: new Date(
+        capturedAt.getTime() + this.config.defaults.rawSourceRetentionDays * 86_400_000,
+      ).toISOString(),
     });
   }
 }
@@ -1145,6 +1340,14 @@ function gmailDateQuery(afterExclusive: string | null, beforeOrEqual: string | n
 
 function gmailDate(instant: string): string {
   return new Date(instant).toISOString().slice(0, 10).replaceAll("-", "/");
+}
+
+function compareGmailMessageRecency(
+  left: Pick<NormalizedGmailMessage, "internalDate"> & { readonly messageId: string },
+  right: Pick<NormalizedGmailMessage, "internalDate"> & { readonly messageId: string },
+): number {
+  const timeDifference = left.internalDate.getTime() - right.internalDate.getTime();
+  return timeDifference === 0 ? left.messageId.localeCompare(right.messageId) : timeDifference;
 }
 
 function googleErrorStatus(error: unknown): number | undefined {

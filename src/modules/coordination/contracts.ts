@@ -333,6 +333,7 @@ export const CoverageTransitionSchema = z.strictObject({
   toVersion: z.number().int().positive(),
   kind: z.enum([
     "facts_resolved",
+    "coverage_revised",
     "coverage_requested",
     "coverage_acknowledged",
     "coverage_declined_privately",
@@ -344,7 +345,7 @@ export const CoverageTransitionSchema = z.strictObject({
     "expired_uncovered",
   ]),
   actorPersonId: EntityIdSchema.nullable(),
-  evidenceRefs: z.array(EvidenceRefSchema).max(20),
+  evidenceRefs: z.array(EvidenceRefSchema).max(100),
   occurredAt: InstantSchema,
 });
 export type CoverageTransition = z.infer<typeof CoverageTransitionSchema>;

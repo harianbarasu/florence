@@ -222,11 +222,13 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
         redirect:
           preview.purpose === "invitation"
             ? "/people"
-            : session.assuranceKind === "google_connect"
-              ? "/sources?step_up=google_connect"
-              : session.assuranceKind === "account_controls"
-                ? "/safety?step_up=account_controls"
-                : "/people",
+            : preview.purpose === "private_review"
+              ? "/sources"
+              : session.assuranceKind === "google_connect"
+                ? "/sources?step_up=google_connect"
+                : session.assuranceKind === "account_controls"
+                  ? "/safety?step_up=account_controls"
+                  : "/people",
       };
     },
   );

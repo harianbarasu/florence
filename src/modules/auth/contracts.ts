@@ -5,6 +5,7 @@ export const HandoffPurposeSchema = z.enum([
   "google_connect",
   "account_controls",
   "invitation",
+  "private_review",
 ]);
 export type HandoffPurpose = z.infer<typeof HandoffPurposeSchema>;
 

@@ -69,6 +69,10 @@ const dependentBodySchema = z.strictObject({
   school: z.string().trim().max(160).default(""),
   activities: z.array(z.string().trim().min(1).max(120)).max(24).default([]),
 });
+const groupCoverageApprovalBodySchema = z.strictObject({
+  expectedParticipantEpochId: z.string().uuid(),
+  expectedParticipantSetDigest: z.string().regex(/^[a-f0-9]{64}$/u),
+});
 
 export async function createServer(input?: { config?: FlorenceConfig; database?: Database }) {
   const config = input?.config ?? loadConfig();
@@ -490,14 +494,17 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
       .string()
       .uuid()
       .parse((request.params as { conversationId?: unknown }).conversationId);
+    const body = groupCoverageApprovalBodySchema.parse(request.body);
     const principal = await requireExactStepUpWriteSession(request, config, auth, "group_coverage", {
       action: "approve",
       conversationId,
+      expectedParticipantEpochId: body.expectedParticipantEpochId,
+      expectedParticipantSetDigest: body.expectedParticipantSetDigest,
     });
     return application.process({
       kind: "web.command",
       actorPersonId: principal.personId,
-      command: { kind: "approve_group_coverage_rule", conversationId },
+      command: { kind: "approve_group_coverage_rule", conversationId, ...body },
     });
   });
   app.post("/api/routines", async (request) => {
@@ -690,7 +697,12 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
         }),
         z.strictObject({
           purpose: z.literal("group_coverage"),
-          context: z.strictObject({ action: z.literal("approve"), conversationId: z.string().uuid() }),
+          context: z.strictObject({
+            action: z.literal("approve"),
+            conversationId: z.string().uuid(),
+            expectedParticipantEpochId: z.string().uuid(),
+            expectedParticipantSetDigest: z.string().regex(/^[a-f0-9]{64}$/u),
+          }),
         }),
         z.strictObject({
           purpose: z.literal("private_bridge_standing"),

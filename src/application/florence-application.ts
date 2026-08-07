@@ -578,14 +578,16 @@ export class FlorenceApplication {
         return this.deactivateLinqConversation(transaction, event, liveChat);
       }
       const reconciled = await this.reconcileLinqConversation(transaction, event, liveChat);
-      if (
-        liveChat.kind === "group" &&
-        reconciled.snapshot.participants.some(
+      if (liveChat.kind === "group") {
+        const hasUnregisteredParticipant = reconciled.snapshot.participants.some(
           (participant) =>
             participant.registrationStatus !== "registered" || participant.consentedAt === null,
-        )
-      ) {
-        await this.queuePrivateGroupEnrollmentOffers(transaction, reconciled.conversationId);
+        );
+        if (hasUnregisteredParticipant) {
+          await this.queuePrivateGroupEnrollmentOffers(transaction, reconciled.conversationId);
+        } else {
+          await this.queuePrivateGroupReadyNotices(transaction, reconciled.conversationId, "group-ready");
+        }
       }
       const ordinaryGroupContentAt =
         liveChat.kind !== "group"
@@ -710,6 +712,17 @@ export class FlorenceApplication {
         return this.deactivateLinqConversation(transaction, null, liveChat);
       }
       const reconciled = await this.reconcileLinqConversation(transaction, null, liveChat);
+      if (liveChat.kind === "group") {
+        const hasUnregisteredParticipant = reconciled.snapshot.participants.some(
+          (participant) =>
+            participant.registrationStatus !== "registered" || participant.consentedAt === null,
+        );
+        if (hasUnregisteredParticipant) {
+          await this.queuePrivateGroupEnrollmentOffers(transaction, reconciled.conversationId);
+        } else {
+          await this.queuePrivateGroupReadyNotices(transaction, reconciled.conversationId, "group-ready");
+        }
+      }
       await appendAudit(transaction, {
         conversationId: reconciled.conversationId,
         householdId: reconciled.householdId,
@@ -1728,6 +1741,19 @@ export class FlorenceApplication {
       where id = ${personId} and status = 'registered'
     `;
     await this.consentPersonAcrossObservedEpochs(transaction, personId, consentedAt);
+    const affectedGroups = await transaction<{ id: string }[]>`
+      select distinct conversation.id
+      from conversations conversation
+      join participant_epochs epoch on epoch.id = conversation.current_epoch_id
+        and epoch.ended_at is null
+      join epoch_participants participant on participant.participant_epoch_id = epoch.id
+        and participant.person_id = ${personId}
+      where conversation.kind = 'group' and conversation.status = 'active'
+      order by conversation.id
+    `;
+    for (const group of affectedGroups) {
+      await this.queuePrivateGroupReadyNotices(transaction, group.id, "group-ready");
+    }
     const snapshot = await new PostgresConversationAuthority(transaction).snapshot(
       record.routing.conversationId,
     );
@@ -2947,6 +2973,7 @@ export class FlorenceApplication {
       ruleId: null,
     });
     if (!directAuthority.allowed) return;
+    const isGroupCoverageApproval = input.noticeKind === "group-ready";
     const handoff = await new PostgresWebAuth(
       transaction,
       this.secretBox,
@@ -2955,8 +2982,16 @@ export class FlorenceApplication {
       personId: input.personId,
       privateIdentityId: route.direct_identity_id,
       privateConversationId: route.direct_conversation_id,
-      purpose: "web_sign_in",
-      context: { returnPath: "/people" },
+      purpose: isGroupCoverageApproval ? "group_coverage" : "web_sign_in",
+      context: isGroupCoverageApproval
+        ? {
+            action: "approve",
+            conversationId: input.conversationId,
+            expectedParticipantEpochId: route.group_epoch_id,
+            expectedParticipantSetDigest: route.group_participant_digest,
+            returnPath: "/people",
+          }
+        : { returnPath: "/people" },
       expiresInSeconds: 10 * 60,
     });
     const text = `${input.message(`${this.config.publicBaseUrl}/handoff/${handoff.token}`)}\n\nIf the link expires, text me “settings” for a fresh one.`;
@@ -2999,23 +3034,51 @@ export class FlorenceApplication {
     conversationId: string,
     noticeKind: "coverage-active" | "group-ready",
   ): Promise<void> {
-    const participants = await transaction<{ person_id: string; household_id: string }[]>`
-      select participant.person_id, conversation.household_id
-      from conversations conversation
-      join participant_epochs epoch on epoch.id = conversation.current_epoch_id and epoch.ended_at is null
-      join epoch_participants participant on participant.participant_epoch_id = epoch.id
-        and participant.registration_status = 'registered' and participant.consented_at is not null
-      join household_memberships membership on membership.household_id = conversation.household_id
-        and membership.person_id = participant.person_id and membership.status = 'active'
-      where conversation.id = ${conversationId} and conversation.kind = 'group'
-        and conversation.status = 'active' and conversation.household_id is not null
-      order by participant.person_id
+    const groups = await transaction<{ household_id: string }[]>`
+      select household_id from conversations
+      where id = ${conversationId} and kind = 'group' and status = 'active'
+        and household_id is not null
     `;
-    for (const participant of participants) {
+    const group = groups[0];
+    if (!group) return;
+    const snapshot = await new PostgresConversationAuthority(transaction).snapshot(conversationId);
+    if (!snapshot.participantEpochId || !snapshot.participantSetDigest) return;
+    if (
+      snapshot.participants.length === 0 ||
+      snapshot.participants.some(
+        (participant) =>
+          participant.registrationStatus !== "registered" ||
+          participant.consentedAt === null ||
+          participant.policy === null,
+      )
+    )
+      return;
+    const participantIds = [
+      ...new Set(snapshot.participants.map((participant) => participant.personId)),
+    ].sort();
+    const memberships = await transaction<{ person_id: string }[]>`
+      select person_id from household_memberships
+      where household_id = ${group.household_id} and status = 'active'
+        and person_id = any(${transaction.array(participantIds)}::uuid[])
+      order by person_id
+    `;
+    if (memberships.length !== participantIds.length) return;
+    const coverageActive = snapshot.rules.some(
+      (rule) =>
+        rule.active &&
+        rule.participantSetDigest === snapshot.participantSetDigest &&
+        rule.allowedOperations.includes("proactive_coverage"),
+    );
+    if (
+      (noticeKind === "group-ready" && coverageActive) ||
+      (noticeKind === "coverage-active" && !coverageActive)
+    )
+      return;
+    for (const personId of participantIds) {
       await this.queuePrivateGroupNotice(transaction, {
         conversationId,
-        personId: participant.person_id,
-        householdId: participant.household_id,
+        personId,
+        householdId: group.household_id,
         noticeKind,
         message:
           noticeKind === "coverage-active"
@@ -3190,6 +3253,8 @@ export class FlorenceApplication {
           const result = await new GroupRuleOnboarding(transaction).approveFamilyCoverage({
             conversationId: command.conversationId,
             actorPersonId,
+            expectedParticipantEpochId: command.expectedParticipantEpochId,
+            expectedParticipantSetDigest: command.expectedParticipantSetDigest,
             approvedAt: new Date(),
           });
           if (result.status === "active") {

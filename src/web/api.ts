@@ -55,6 +55,8 @@ export interface PeopleView {
     }[];
     coverageGroups: {
       conversationId: string;
+      participantEpochId: string;
+      participantSetDigest: string;
       label: string;
       active: boolean;
       approvedCount: number;

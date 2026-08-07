@@ -234,7 +234,12 @@ export type AppEnvelope =
             readonly school: string;
             readonly activities: readonly string[];
           }
-        | { readonly kind: "approve_group_coverage_rule"; readonly conversationId: string }
+        | {
+            readonly kind: "approve_group_coverage_rule";
+            readonly conversationId: string;
+            readonly expectedParticipantEpochId: string;
+            readonly expectedParticipantSetDigest: string;
+          }
         | ({ readonly kind: "create_routine" } & WebRoutineFields)
         | ({
             readonly kind: "revise_routine";

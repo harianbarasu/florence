@@ -799,6 +799,8 @@ export class PostgresFlorenceQueries {
       const groupRows = await this.database<
         {
           conversation_id: string;
+          participant_epoch_id: string;
+          participant_set_digest: string;
           required_count: number | string;
           all_ready: boolean;
           active: boolean;
@@ -808,6 +810,8 @@ export class PostgresFlorenceQueries {
         }[]
       >`
         select conversation.id as conversation_id, conversation.updated_at,
+          epoch.id as participant_epoch_id,
+          epoch.participant_set_digest,
           count(distinct participant.person_id) as required_count,
           coalesce(bool_and(
             participant.registration_status = 'registered'
@@ -916,6 +920,8 @@ export class PostgresFlorenceQueries {
           const requiredCount = Number(group.required_count);
           return {
             conversationId: group.conversation_id,
+            participantEpochId: group.participant_epoch_id,
+            participantSetDigest: group.participant_set_digest,
             label: groupIndex === 0 ? "Family group" : `Family group ${groupIndex + 1}`,
             active,
             approvedCount: active ? requiredCount : Number(group.approved_count),

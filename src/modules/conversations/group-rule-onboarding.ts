@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { TransactionSql } from "postgres";
 import type { Database } from "../../db/client.js";
-import { UnauthorizedError } from "../../shared/errors.js";
+import { StaleAuthorityError, UnauthorizedError } from "../../shared/errors.js";
 import { participantApprovalDigest } from "./authority.js";
 import { PostgresConversationAuthority } from "./postgres-conversation-authority.js";
 
@@ -22,6 +22,8 @@ export class GroupRuleOnboarding {
   public async approveFamilyCoverage(input: {
     readonly conversationId: string;
     readonly actorPersonId: string;
+    readonly expectedParticipantEpochId: string;
+    readonly expectedParticipantSetDigest: string;
     readonly approvedAt: Date;
   }): Promise<GroupRuleApprovalResult> {
     return inTransaction(this.database, async (transaction) => {
@@ -38,6 +40,14 @@ export class GroupRuleOnboarding {
       let snapshot = await authority.snapshot(input.conversationId);
       if (!snapshot.participantEpochId || !snapshot.participantSetDigest) {
         throw new UnauthorizedError("This group has no current participant set");
+      }
+      if (
+        snapshot.participantEpochId !== input.expectedParticipantEpochId ||
+        snapshot.participantSetDigest !== input.expectedParticipantSetDigest
+      ) {
+        throw new StaleAuthorityError(
+          "This group changed after the approval link was issued; review the current group again",
+        );
       }
       if (
         snapshot.participants.some(

@@ -893,11 +893,19 @@ function PeoplePage({ viewer }: { viewer: Viewer }) {
                             void runProtectedAction(
                               approvalKey,
                               `/api/chats/${group.conversationId}/coverage-rule-approval`,
-                              {},
+                              {
+                                expectedParticipantEpochId: group.participantEpochId,
+                                expectedParticipantSetDigest: group.participantSetDigest,
+                              },
                               "Your approval is saved. The group status is updated below.",
                               {
                                 purpose: "group_coverage",
-                                context: { action: "approve", conversationId: group.conversationId },
+                                context: {
+                                  action: "approve",
+                                  conversationId: group.conversationId,
+                                  expectedParticipantEpochId: group.participantEpochId,
+                                  expectedParticipantSetDigest: group.participantSetDigest,
+                                },
                               },
                             )
                           }

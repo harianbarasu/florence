@@ -205,7 +205,6 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
         .regex(/^[A-Za-z0-9_-]{32,128}$/u)
         .parse((request.params as { token?: unknown }).token);
       reply.header("Cache-Control", "no-store, max-age=0");
-      reply.header("Clear-Site-Data", '"cache"');
       let preview: Awaited<ReturnType<PostgresWebAuth["previewHandoff"]>>;
       try {
         preview = await auth.previewHandoff(token);

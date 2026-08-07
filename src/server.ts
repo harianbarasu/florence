@@ -14,7 +14,12 @@ import { LinqClient, type LinqConfig, LinqWebhookError, unwrapLinqWebhook } from
 import { FlorenceApplication } from "./application/index.js";
 import { type FlorenceConfig, loadConfig } from "./config.js";
 import { createDatabase, type Database, verifyDatabase } from "./db/client.js";
-import { PostgresWebAuth, type SessionPrincipal } from "./modules/auth/index.js";
+import {
+  type AuthenticatedSession,
+  type HandoffPurpose,
+  PostgresWebAuth,
+  type SessionPrincipal,
+} from "./modules/auth/index.js";
 import { PostgresDataExporter } from "./modules/data-controls/index.js";
 import { PostgresFlorenceQueries } from "./modules/queries/index.js";
 import { PostgresSourceIntelligence } from "./modules/sources/index.js";
@@ -240,18 +245,7 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
       });
       reply.header("Cache-Control", "no-store");
       return {
-        redirect:
-          preview.purpose === "invitation"
-            ? "/people"
-            : preview.purpose === "private_review"
-              ? "/sources"
-              : session.assuranceKind === "google_connect"
-                ? "/sources?step_up=google_connect"
-                : session.assuranceKind === "account_controls"
-                  ? "/safety?step_up=account_controls"
-                  : session.assuranceKind === "private_bridge_standing"
-                    ? "/sources?step_up=private_bridge_standing"
-                    : "/people",
+        redirect: completedHandoffRedirect(preview.purpose, session),
       };
     },
   );
@@ -1008,8 +1002,33 @@ async function readTextOrFallback(target: string, fallback: string): Promise<str
 }
 
 function handoffPage(token: string, purpose: string): string {
-  const title = purpose === "account_controls" ? "Confirm private controls" : "Open Florence";
-  return `<!doctype html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>${title}</title><link rel="stylesheet" href="/handoff.css"></head><body><main data-handoff-token="${escapeHtml(token)}"><div class="mark">F</div><h1>${title}</h1><p>This single-use link came through your exact private Florence conversation. Continue to create a secure browser session.</p><form><button type="submit">Continue securely</button></form><div data-status aria-live="polite"></div><small>The link is not used until you tap Continue. It expires shortly and cannot be reused.</small></main><script src="/handoff.js" defer></script></body></html>`;
+  const googleConnect = purpose === "google_connect";
+  const title = googleConnect
+    ? "Connect Google"
+    : purpose === "account_controls"
+      ? "Confirm private controls"
+      : "Open Florence";
+  const explanation = googleConnect
+    ? "Continue to Google to choose the account Florence should privately connect to you."
+    : "This link came through your exact private Florence conversation. Continue to open your secure account.";
+  const button = googleConnect ? "Continue to Google" : "Continue securely";
+  return `<!doctype html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>${title}</title><link rel="stylesheet" href="/handoff.css"></head><body><main data-handoff-token="${escapeHtml(token)}" data-handoff-purpose="${escapeHtml(purpose)}"><div class="mark">F</div><h1>${title}</h1><p>${explanation}</p><form><button type="submit">${button}</button></form><div data-status aria-live="polite"></div><small>The link is not used until you tap Continue. It expires shortly and cannot be reused.</small></main><script src="/handoff.js" defer></script></body></html>`;
+}
+
+function completedHandoffRedirect(purpose: HandoffPurpose, session: AuthenticatedSession): string {
+  if (purpose === "invitation") return "/people";
+  if (purpose === "private_review") return "/sources";
+  if (session.assuranceKind === "google_connect") {
+    const profile = session.assuranceContext.profile;
+    return profile === "personal_family" || profile === "work"
+      ? `/oauth/google/start?profile=${profile}`
+      : "/sources?step_up=google_connect";
+  }
+  if (session.assuranceKind === "account_controls") return "/safety?step_up=account_controls";
+  if (session.assuranceKind === "private_bridge_standing") {
+    return "/sources?step_up=private_bridge_standing";
+  }
+  return "/people";
 }
 
 function unavailableHandoffPage(florencePhone: string): string {

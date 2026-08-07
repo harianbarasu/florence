@@ -28,6 +28,7 @@ import type { WorkerRuntime } from "../modules/orchestration/contracts.js";
 import { GENERAL_ANSWER_SKILL, PRODUCT_SKILLS } from "../modules/orchestration/skills.js";
 import { JsonObjectSchema, PostgresSourceIntelligence, type SourceScope } from "../modules/sources/index.js";
 import type { SecretBox } from "../shared/crypto.js";
+import { NotFoundError, UnauthorizedError } from "../shared/errors.js";
 
 type Transaction = TransactionSql<Record<string, never>>;
 
@@ -171,6 +172,8 @@ export class FlorenceOrchestrator {
       await this.#sources.apply({
         kind: "propose_private_candidate",
         personId: context.record.routing.senderPersonId,
+        integrationId: null,
+        expectedIntegrationControlEpoch: null,
         candidateKind: "family_message_review",
         content: jsonObject({
           requiredOutcome: need.proposal.requiredOutcome,
@@ -195,13 +198,26 @@ export class FlorenceOrchestrator {
   }
 
   /** Private integrations can propose family meaning, but never disclose it without a bridge approval. */
-  public async processPrivateSourceRevision(sourceRevisionId: string, personId: string): Promise<string> {
-    const source = await this.#sources.read({
-      kind: "source_revision",
-      sourceRevisionId,
-      scope: { kind: "person", personId },
-      asOf: new Date().toISOString(),
-    });
+  public async processPrivateSourceRevision(
+    sourceRevisionId: string,
+    personId: string,
+    integrationId: string,
+    integrationControlEpoch: number,
+  ): Promise<string> {
+    const source = await this.#sources
+      .read({
+        kind: "source_revision",
+        sourceRevisionId,
+        scope: { kind: "person", personId },
+        integrationId,
+        expectedIntegrationControlEpoch: integrationControlEpoch,
+        asOf: new Date().toISOString(),
+      })
+      .catch((error: unknown) => {
+        if (error instanceof NotFoundError) return null;
+        throw error;
+      });
+    if (source === null) return "source_unavailable";
     if (source.kind !== "source_revision") return "source_unavailable";
     const images = await this.loadAuthorizedPrivateImages(sourceRevisionId, personId);
     const proposal = await this.workers.run({
@@ -221,30 +237,43 @@ export class FlorenceOrchestrator {
     });
     if (proposal.status !== "proposed" || !proposal.proposal) {
       await this.workers.reconcile(proposal.attemptId, "rejected");
-      return "private_source_interpretation_failed";
+      throw new Error(
+        `Private source interpretation did not complete: ${proposal.errorCode ?? proposal.status}`,
+      );
     }
     if (proposal.proposal.disposition === "ignore") {
       await this.workers.reconcile(proposal.attemptId, "accepted");
       return "private_source_quiet_ignore";
     }
-    const candidate = await this.#sources.apply({
-      kind: "propose_private_candidate",
-      personId,
-      candidateKind:
-        proposal.proposal.disposition === "propose_coverage" ? "coverage_proposal" : "private_review",
-      content: jsonObject({
-        requiredOutcome: proposal.proposal.requiredOutcome,
-        changedFact: proposal.proposal.changedFact,
-        timeFacts: proposal.proposal.timeFacts,
-        uncertainties: proposal.proposal.uncertainties,
-        sensitivity: proposal.proposal.sensitivity,
-        disclosureStatus: "private_owner_only",
-      }),
-      evidenceSourceRevisionIds: [sourceRevisionId],
-      confidence: proposal.proposal.disposition === "propose_coverage" ? 0.85 : 0.65,
-      proposedAt: new Date().toISOString(),
-      requestedExpiresAt: new Date(Date.now() + 7 * 86_400_000).toISOString(),
-    });
+    const candidate = await this.#sources
+      .apply({
+        kind: "propose_private_candidate",
+        personId,
+        integrationId,
+        expectedIntegrationControlEpoch: integrationControlEpoch,
+        candidateKind:
+          proposal.proposal.disposition === "propose_coverage" ? "coverage_proposal" : "private_review",
+        content: jsonObject({
+          requiredOutcome: proposal.proposal.requiredOutcome,
+          changedFact: proposal.proposal.changedFact,
+          timeFacts: proposal.proposal.timeFacts,
+          uncertainties: proposal.proposal.uncertainties,
+          sensitivity: proposal.proposal.sensitivity,
+          disclosureStatus: "private_owner_only",
+        }),
+        evidenceSourceRevisionIds: [sourceRevisionId],
+        confidence: proposal.proposal.disposition === "propose_coverage" ? 0.85 : 0.65,
+        proposedAt: new Date().toISOString(),
+        requestedExpiresAt: new Date(Date.now() + 7 * 86_400_000).toISOString(),
+      })
+      .catch((error: unknown) => {
+        if (error instanceof NotFoundError || error instanceof UnauthorizedError) return null;
+        throw error;
+      });
+    if (candidate === null) {
+      await this.workers.reconcile(proposal.attemptId, "stale");
+      return "source_unavailable";
+    }
     const created = candidate.kind === "private_candidate_proposed";
     await this.workers.reconcile(proposal.attemptId, created ? "accepted" : "rejected");
     if (!created) return "private_candidate_failed";
@@ -453,6 +482,7 @@ export class FlorenceOrchestrator {
     const ingested = await this.#sources.apply({
       kind: "ingest_source",
       integrationId: null,
+      expectedIntegrationControlEpoch: null,
       artifactKind: "conversation_message",
       origin: {
         system: "linq",
@@ -562,6 +592,7 @@ export class FlorenceOrchestrator {
       const ingested = await this.#sources.apply({
         kind: "ingest_source",
         integrationId: null,
+        expectedIntegrationControlEpoch: null,
         artifactKind: "attachment_manifest",
         origin: { system: "linq.attachment", remoteObjectId: downloaded.providerAttachmentId },
         scope: input.scope,
@@ -584,6 +615,8 @@ export class FlorenceOrchestrator {
         kind: "store_blob",
         sourceRevisionId: ingested.sourceRevisionId,
         scope: input.scope,
+        integrationId: null,
+        expectedIntegrationControlEpoch: null,
         blobKind: `linq_attachment:${downloaded.providerAttachmentId}`,
         mimeType: detectedMime,
         bytes: new Uint8Array(bytes),
@@ -594,6 +627,8 @@ export class FlorenceOrchestrator {
           kind: "store_derivative",
           sourceRevisionId: ingested.sourceRevisionId,
           scope: input.scope,
+          integrationId: null,
+          expectedIntegrationControlEpoch: null,
           derivativeKind: `attachment_text:${downloaded.providerAttachmentId}`,
           content: JsonObjectSchema.parse({
             filename: downloaded.filename,
@@ -1272,6 +1307,8 @@ export class FlorenceOrchestrator {
         await this.#sources.apply({
           kind: "propose_private_candidate",
           personId,
+          integrationId: null,
+          expectedIntegrationControlEpoch: null,
           candidateKind: "coverage_needs_household",
           content: jsonObject({
             requiredOutcome: interpretation.requiredOutcome,

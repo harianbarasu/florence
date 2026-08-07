@@ -20,7 +20,7 @@ import { PostgresDataControls } from "../modules/data-controls/index.js";
 import { EffectOutbox } from "../modules/effects/index.js";
 import { PostgresIdentityRelationships } from "../modules/identity/index.js";
 import { HouseholdOnboarding } from "../modules/relationships/index.js";
-import { PostgresSourceIntelligence } from "../modules/sources/index.js";
+import { type IntegrationCapability, PostgresSourceIntelligence } from "../modules/sources/index.js";
 import { DurableWork } from "../modules/work/index.js";
 import { canonicalDigest, canonicalJson } from "../shared/canonical-json.js";
 import type { SecretBox } from "../shared/crypto.js";
@@ -121,6 +121,10 @@ export class FlorenceApplication {
           ids: { redriven: String(redriven) },
         };
       }
+      case "google.oauth.begin":
+        return this.beginGoogleOAuth(input);
+      case "google.oauth.complete":
+        return this.completeGoogleOAuth(input);
       case "private_bridge.proposal": {
         const result = await new PrivateSourceBridge(
           this.database,
@@ -155,6 +159,106 @@ export class FlorenceApplication {
       case "web.command":
         return this.processWebCommand(input.actorPersonId, input.command);
     }
+  }
+
+  private async beginGoogleOAuth(
+    input: Extract<AppEnvelope, { kind: "google.oauth.begin" }>,
+  ): Promise<ProcessReceipt> {
+    const result = await new PostgresSourceIntelligence(this.database, this.secretBox, {
+      rawRetentionDays: this.config.defaults.rawSourceRetentionDays,
+    }).apply({
+      kind: "begin_oauth_attempt",
+      personId: input.personId,
+      provider: "google",
+      initiatingSessionId: input.initiatingSessionId,
+      stateDigest: input.stateDigest,
+      pkceVerifier: input.pkceVerifier,
+      returnPath: input.returnPath,
+      requestedCapabilities: [...input.requestedCapabilities],
+      accountKind: input.accountKind,
+      expectedPersonControlEpoch: input.expectedPersonControlEpoch,
+      expiresAt: input.expiresAt,
+      createdAt: input.createdAt,
+    });
+    if (result.kind !== "oauth_attempt_started") {
+      throw new Error("Google OAuth attempt did not start");
+    }
+    return {
+      accepted: true,
+      duplicate: false,
+      disposition: "google_oauth_started",
+      ids: { oauthAttemptId: result.oauthAttemptId },
+    };
+  }
+
+  private async completeGoogleOAuth(
+    input: Extract<AppEnvelope, { kind: "google.oauth.complete" }>,
+  ): Promise<ProcessReceipt> {
+    return this.database.begin(async (transaction) => {
+      const sources = new PostgresSourceIntelligence(transaction, this.secretBox, {
+        rawRetentionDays: this.config.defaults.rawSourceRetentionDays,
+      });
+      const consumed = await sources.apply({
+        kind: "consume_oauth_attempt",
+        provider: "google",
+        stateDigest: input.stateDigest,
+        consumedAt: input.completedAt,
+      });
+      if (consumed.kind !== "oauth_attempt_consumed" || consumed.provider !== "google") {
+        throw new Error("Google OAuth attempt did not resolve");
+      }
+
+      const actuallyGranted = new Set<IntegrationCapability>(input.grantedCapabilities);
+      const activeCapabilities = consumed.requestedCapabilities.filter((capability) =>
+        actuallyGranted.has(capability),
+      );
+      if (activeCapabilities.length === 0) {
+        throw new UnauthorizedError("Google granted no requested account capability");
+      }
+
+      const connected = await sources.apply({
+        kind: "connect_integration",
+        personId: consumed.personId,
+        provider: "google",
+        externalSubjectDigest: input.externalSubjectDigest,
+        accountKind: consumed.accountKind,
+        activeCapabilities: [...activeCapabilities],
+        credentials: input.credentials,
+        expectedPersonControlEpoch: consumed.personControlEpoch,
+        connectedAt: input.completedAt,
+      });
+      if (connected.kind !== "integration_connected") {
+        throw new Error("Google integration did not connect");
+      }
+
+      const bootstrap = await new DurableWork(transaction, this.secretBox).enqueue({
+        kind: "google.bootstrap",
+        idempotencyKey: `google:bootstrap:${connected.integrationId}:e${connected.controlEpoch}`,
+        payload: {
+          integrationId: connected.integrationId,
+          personId: consumed.personId,
+          integrationControlEpoch: connected.controlEpoch,
+          personControlEpoch: consumed.personControlEpoch,
+          olderHistoryEnabled: true,
+        },
+        person: { id: consumed.personId, controlEpoch: consumed.personControlEpoch },
+        integration: { id: connected.integrationId, controlEpoch: connected.controlEpoch },
+        priority: 50,
+        maxAttempts: 8,
+      });
+
+      return {
+        accepted: true,
+        duplicate: !bootstrap.created,
+        disposition: "google_oauth_completed",
+        ids: {
+          oauthAttemptId: consumed.oauthAttemptId,
+          integrationId: connected.integrationId,
+          bootstrapJobId: bootstrap.jobId,
+          returnPath: consumed.returnPath,
+        },
+      };
+    });
   }
 
   private async materializeRoutines(
@@ -1817,23 +1921,62 @@ export class FlorenceApplication {
           `;
           const integration = integrations[0];
           if (!integration) throw new Error("Google connection does not belong to this person");
-          const result = await new PostgresSourceIntelligence(transaction, this.secretBox, {
+          const sources = new PostgresSourceIntelligence(transaction, this.secretBox, {
             rawRetentionDays: this.config.defaults.rawSourceRetentionDays,
-          }).apply({
+          });
+          const changedAt = new Date();
+          const result = await sources.apply({
             kind: "configure_calendar_privacy",
             integrationId: command.integrationId,
             personId: actorPersonId,
             expectedIntegrationControlEpoch: Number(integration.control_epoch),
             calendarIdDigest: sha256Hex(command.calendarId),
             mode: command.mode,
-            changedAt: new Date().toISOString(),
+            changedAt: changedAt.toISOString(),
           });
           if (result.kind !== "calendar_privacy_configured")
             throw new Error("Calendar privacy did not update");
+
+          await transaction`
+            update jobs
+            set status = 'cancelled', lease_owner = null, lease_token = null,
+              lease_expires_at = null, last_error_code = 'calendar_policy_changed',
+              updated_at = ${changedAt}
+            where integration_id = ${command.integrationId}
+              and integration_control_epoch = ${result.integrationControlEpoch}
+              and person_id = ${actorPersonId}
+              and job_kind = 'google.calendar.poll'
+              and status in ('pending', 'retry', 'leased')
+              and (
+                idempotency_key like ${`calendar:poll:${command.integrationId}:%:${result.calendarIdDigest}:%`}
+                or idempotency_key like ${`google:calendar:${command.integrationId}:%:${result.calendarIdDigest}:%`}
+              )
+          `;
+
+          const cursorKind = `calendar:${result.calendarIdDigest}`;
+          const cursorRows = await transaction<{ readonly updated_at: Date }[]>`
+            select updated_at from sync_cursors
+            where integration_id = ${command.integrationId}
+              and resource_kind = ${cursorKind}
+            for update
+          `;
+          const resetAt = new Date(Math.max(Date.now(), changedAt.getTime() + 1));
+          await sources.apply({
+            kind: "checkpoint_cursor",
+            integrationId: command.integrationId,
+            personId: actorPersonId,
+            expectedIntegrationControlEpoch: result.integrationControlEpoch,
+            resourceKind: cursorKind,
+            cursor: null,
+            state: "initial",
+            expectedUpdatedAt: cursorRows[0]?.updated_at.toISOString() ?? null,
+            checkpointAt: null,
+            updatedAt: resetAt.toISOString(),
+          });
           if (command.mode !== "off") {
             await new DurableWork(transaction, this.secretBox).enqueue({
               kind: "google.calendar.poll",
-              idempotencyKey: `google:calendar:${command.integrationId}:${result.calendarIdDigest}:policy-v${result.grantVersion}`,
+              idempotencyKey: `calendar:poll:${command.integrationId}:e${result.integrationControlEpoch}:${result.calendarIdDigest}:v${result.grantVersion}:${command.mode}:policy`,
               payload: {
                 integrationId: command.integrationId,
                 personId: actorPersonId,
@@ -1842,8 +1985,14 @@ export class FlorenceApplication {
                 calendarId: command.calendarId,
                 calendarIdDigest: result.calendarIdDigest,
                 mode: command.mode,
+                grantVersion: result.grantVersion,
               },
               person: { id: actorPersonId, controlEpoch: Number(people[0].control_epoch) },
+              integration: {
+                id: command.integrationId,
+                controlEpoch: result.integrationControlEpoch,
+              },
+              priority: 60,
               maxAttempts: 8,
             });
           }

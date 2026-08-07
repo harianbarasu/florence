@@ -907,22 +907,135 @@ export class PostgresFlorenceQueries {
           where integration_id = any(${this.database.array(integrationIds)}::uuid[])
             and grant_kind = 'calendar_privacy' and status = 'active'
         `;
-    const googleJobs =
+    const googleJobHealth =
       integrationIds.length === 0
         ? []
         : await this.database<
             {
-              idempotency_key: string;
-              job_kind: string;
-              status: string;
-              updated_at: Date;
+              integration_id: string;
+              live_status: string | null;
+              calendar_catalog_status: string | null;
+              newest_status: string | null;
+              middle_status: string | null;
+              year_status: string | null;
+              older_status: string | null;
+              message_pending: boolean;
+              message_dead: boolean;
+              processing_pending: boolean;
+              processing_dead: boolean;
+              calendar_poll_failed: boolean;
             }[]
           >`
-          select idempotency_key, job_kind, status, updated_at
-          from jobs
-          where person_id = ${personId} and job_kind like 'google.%'
-          order by updated_at desc
+          select integration.id as integration_id,
+            live.status as live_status,
+            calendar_catalog.status as calendar_catalog_status,
+            newest.status as newest_status,
+            middle.status as middle_status,
+            year_stage.status as year_status,
+            older.status as older_status,
+            exists(
+              select 1 from jobs message
+              where message.integration_id = integration.id
+                and message.integration_control_epoch = integration.control_epoch
+                and message.job_kind = 'google.gmail.message'
+                and message.status in ('pending', 'retry', 'leased')
+            ) as message_pending,
+            exists(
+              select 1 from jobs message
+              where message.integration_id = integration.id
+                and message.integration_control_epoch = integration.control_epoch
+                and message.job_kind = 'google.gmail.message'
+                and message.status = 'dead'
+            ) as message_dead,
+            exists(
+              select 1 from jobs processing
+              where processing.integration_id = integration.id
+                and processing.integration_control_epoch = integration.control_epoch
+                and processing.job_kind = 'orchestrate.private_source'
+                and processing.status in ('pending', 'retry', 'leased')
+            ) as processing_pending,
+            exists(
+              select 1 from jobs processing
+              where processing.integration_id = integration.id
+                and processing.integration_control_epoch = integration.control_epoch
+                and processing.job_kind = 'orchestrate.private_source'
+                and processing.status = 'dead'
+            ) as processing_dead,
+            exists(
+              select 1
+              from integration_grants grant_row
+              left join sync_cursors event_cursor
+                on event_cursor.integration_id = integration.id
+                and event_cursor.resource_kind = 'calendar:' || (grant_row.scope->>'calendarIdDigest')
+              where grant_row.integration_id = integration.id
+                and grant_row.grant_kind = 'calendar_privacy'
+                and grant_row.status = 'active'
+                and grant_row.scope->>'mode' <> 'off'
+                and exists(
+                  select 1 from jobs failed_poll
+                  where failed_poll.integration_id = integration.id
+                    and failed_poll.integration_control_epoch = integration.control_epoch
+                    and failed_poll.job_kind = 'google.calendar.poll'
+                    and failed_poll.status = 'dead'
+                    and failed_poll.idempotency_key like
+                      'calendar:poll:' || integration.id || ':e' || integration.control_epoch || ':' ||
+                      (grant_row.scope->>'calendarIdDigest') || ':v' || grant_row.version || ':' ||
+                      (grant_row.scope->>'mode') || ':%'
+                    and (event_cursor.updated_at is null or failed_poll.updated_at >= event_cursor.updated_at)
+                )
+            ) as calendar_poll_failed
+          from integrations integration
+          left join lateral (
+            select job.status from jobs job
+            where job.integration_id = integration.id
+              and job.integration_control_epoch = integration.control_epoch
+              and job.job_kind in ('google.bootstrap', 'google.gmail.bootstrap', 'google.gmail.poll')
+            order by job.updated_at desc limit 1
+          ) live on true
+          left join lateral (
+            select job.status from jobs job
+            where job.integration_id = integration.id
+              and job.integration_control_epoch = integration.control_epoch
+              and job.job_kind = 'google.calendar.catalog'
+            order by job.updated_at desc limit 1
+          ) calendar_catalog on true
+          left join lateral (
+            select job.status from jobs job
+            where job.integration_id = integration.id
+              and job.integration_control_epoch = integration.control_epoch
+              and job.job_kind = 'google.gmail.backfill'
+              and job.idempotency_key like '%:newest_30_days:%'
+            order by job.updated_at desc limit 1
+          ) newest on true
+          left join lateral (
+            select job.status from jobs job
+            where job.integration_id = integration.id
+              and job.integration_control_epoch = integration.control_epoch
+              and job.job_kind = 'google.gmail.backfill'
+              and job.idempotency_key like '%:days_31_to_90:%'
+            order by job.updated_at desc limit 1
+          ) middle on true
+          left join lateral (
+            select job.status from jobs job
+            where job.integration_id = integration.id
+              and job.integration_control_epoch = integration.control_epoch
+              and job.job_kind = 'google.gmail.backfill'
+              and job.idempotency_key like '%:days_91_to_365:%'
+            order by job.updated_at desc limit 1
+          ) year_stage on true
+          left join lateral (
+            select job.status from jobs job
+            where job.integration_id = integration.id
+              and job.integration_control_epoch = integration.control_epoch
+              and job.job_kind = 'google.gmail.backfill'
+              and job.idempotency_key like '%:older_history:%'
+            order by job.updated_at desc limit 1
+          ) older on true
+          where integration.id = any(${this.database.array(integrationIds)}::uuid[])
         `;
+    const jobHealthByIntegration = new Map(
+      googleJobHealth.map((health) => [health.integration_id, health] as const),
+    );
 
     const connections: SourceView["connections"] = [];
     for (const integration of integrations) {
@@ -937,23 +1050,39 @@ export class PostgresFlorenceQueries {
         .catch(() => null);
       const accountEmail =
         profile?.kind === "integration_profile" ? profile.accountEmail : "Account email unavailable";
-      const connectionCursors = cursors.filter((cursor) => cursor.integration_id === integration.id);
-      const connectionJobs = googleJobs.filter((job) => job.idempotency_key.includes(integration.id));
+      const accountKind =
+        profile?.kind === "integration_profile" ? profile.integration.accountKind : "personal_family";
+      const activeCapabilities = new Set(
+        profile?.kind === "integration_profile" ? profile.integration.activeCapabilities : [],
+      );
+      const allConnectionCursors = cursors.filter((cursor) => cursor.integration_id === integration.id);
+      const connectionCursors = allConnectionCursors.filter(
+        (cursor) => cursor.updated_at >= integration.connected_at,
+      );
+      const jobHealth = jobHealthByIntegration.get(integration.id);
       const gmailHistory = connectionCursors.find((cursor) => cursor.resource_kind === "gmail_history");
       const backfillKinds = ["newest_30_days", "days_31_to_90", "days_91_to_365"];
       const olderHistoryEnabled =
-        connectionCursors.some((cursor) => cursor.resource_kind === "gmail_backfill:older_history") ||
-        connectionJobs.some((job) => job.idempotency_key.includes(":older_history:"));
+        allConnectionCursors.some((cursor) => cursor.resource_kind === "gmail_backfill:older_history") ||
+        (jobHealth !== undefined && jobHealth.older_status !== null);
       if (olderHistoryEnabled) backfillKinds.push("older_history");
       const completedBackfills = backfillKinds.filter((stage) =>
-        connectionCursors.some(
+        allConnectionCursors.some(
           (cursor) => cursor.resource_kind === `gmail_backfill:${stage}` && cursor.state === "exhausted",
         ),
       ).length;
-      const gmailJobFailed = connectionJobs.some(
-        (job) => job.job_kind.startsWith("google.gmail.") && job.status === "dead",
-      );
-      const liveState: SourceView["connections"][number]["gmail"]["liveState"] =
+      const gmailJobFailed = jobHealth?.live_status === "dead";
+      const backfillJobFailed = [
+        jobHealth?.newest_status,
+        jobHealth?.middle_status,
+        jobHealth?.year_status,
+        jobHealth?.older_status,
+      ].some((status) => status === "dead");
+      const processingPending = jobHealth?.processing_pending ?? false;
+      const processingFailed = jobHealth?.processing_dead ?? false;
+      const mailProcessingPending = activeCapabilities.has("mail") && processingPending;
+      const mailProcessingFailed = activeCapabilities.has("mail") && processingFailed;
+      const liveState: NonNullable<SourceView["connections"][number]["mail"]>["liveState"] =
         integration.status === "paused"
           ? "paused"
           : integration.status === "reauth_required" ||
@@ -974,14 +1103,21 @@ export class PostgresFlorenceQueries {
               ? "Mail needs to be reconnected"
               : "Mail monitoring is starting";
       const backfillLabel =
-        completedBackfills >= backfillKinds.length
-          ? "Past mail is ready"
-          : gmailJobFailed
-            ? "Past mail needs attention"
-            : `${completedBackfills} of ${backfillKinds.length} history passes complete`;
+        backfillJobFailed || jobHealth?.message_dead || mailProcessingFailed
+          ? "Some past mail needs attention"
+          : jobHealth?.message_pending
+            ? "Finishing queued messages"
+            : mailProcessingPending
+              ? "Florence is processing your mail"
+              : completedBackfills >= backfillKinds.length
+                ? "Past mail is ready"
+                : `${completedBackfills} of ${backfillKinds.length} history passes complete`;
 
       let calendarCatalog: readonly CalendarCatalogEntry[] = [];
       let calendarCatalogLabel = "Looking for your calendars…";
+      const calendarCatalogCursor = connectionCursors.find(
+        (cursor) => cursor.resource_kind === "calendar_catalog",
+      );
       try {
         const catalog = await this.#sources.read({
           kind: "sync_cursor",
@@ -1002,35 +1138,94 @@ export class PostgresFlorenceQueries {
           calendarCatalogLabel = "Calendar access needs attention";
         }
       }
+      const connectionCalendarPolicies = calendarPolicies.filter(
+        (policy) => policy.integration_id === integration.id,
+      );
+      const enabledCalendarDigests = connectionCalendarPolicies
+        .filter((policy) => calendarMode(policy.mode) !== "off")
+        .map((policy) => policy.calendar_id_digest);
+      const enabledCalendarCursors = enabledCalendarDigests.map((digest) =>
+        connectionCursors.find((cursor) => cursor.resource_kind === `calendar:${digest}`),
+      );
+      const calendarResourcesFailed = enabledCalendarCursors.some(
+        (cursor) => cursor?.state === "expired" || cursor?.state === "error",
+      );
+      const calendarResourcesReady = enabledCalendarCursors.every((cursor) => cursor?.state === "active");
+      const calendarCatalogFailed = jobHealth?.calendar_catalog_status === "dead";
+      const calendarPollFailed = jobHealth?.calendar_poll_failed ?? false;
+      const calendarProcessingPending = !activeCapabilities.has("mail") && processingPending;
+      const calendarProcessingFailed = !activeCapabilities.has("mail") && processingFailed;
+      const calendarAccessFailed =
+        integration.status === "reauth_required" ||
+        integration.status === "error" ||
+        calendarCatalogCursor?.state === "expired" ||
+        calendarCatalogCursor?.state === "error" ||
+        calendarResourcesFailed;
+      const calendarSyncFailed = calendarCatalogFailed || calendarPollFailed;
+      const calendarSyncState: NonNullable<SourceView["connections"][number]["calendar"]>["syncState"] =
+        integration.status === "paused"
+          ? "paused"
+          : calendarAccessFailed || calendarSyncFailed || calendarProcessingFailed
+            ? "needs_attention"
+            : calendarCatalogCursor?.state === "active" &&
+                calendarResourcesReady &&
+                !calendarProcessingPending
+              ? "ready"
+              : "waiting";
+      const calendarSyncLabel =
+        calendarSyncState === "ready"
+          ? "Calendars are up to date"
+          : calendarSyncState === "paused"
+            ? "Calendar monitoring is paused"
+            : calendarSyncState === "needs_attention"
+              ? calendarAccessFailed
+                ? "Calendar needs to be reconnected"
+                : "Some calendar information needs attention"
+              : calendarProcessingPending
+                ? "Florence is processing your calendar"
+                : "Calendar sync is starting";
       const policyByCalendar = new Map(
-        calendarPolicies
-          .filter((policy) => policy.integration_id === integration.id)
-          .map((policy) => [policy.calendar_id_digest, calendarMode(policy.mode)] as const),
+        connectionCalendarPolicies.map(
+          (policy) => [policy.calendar_id_digest, calendarMode(policy.mode)] as const,
+        ),
       );
       connections.push({
         id: integration.id,
         label: "Google",
         email: accountEmail,
+        accountKind,
+        accountKindLabel: accountKind === "work" ? "Work calendar" : "Personal & family",
         status: integration.status,
         statusLabel: integrationStatusLabel(integration.status),
-        gmail: {
-          liveState,
-          liveLabel,
-          lastCheckedAt: gmailHistory?.checkpoint_at?.toISOString() ?? null,
-          backfillCompleted: completedBackfills,
-          backfillTotal: backfillKinds.length,
-          backfillLabel,
-        },
-        calendarCatalogLabel,
-        calendars: calendarCatalog
-          .filter((calendar) => !calendar.deleted)
-          .map((calendar) => ({
-            id: calendar.id,
-            name: calendar.summary,
-            primary: calendar.primary,
-            timezone: calendar.timezone,
-            mode: policyByCalendar.get(sha256Hex(calendar.id)) ?? "off",
-          })),
+        mail: activeCapabilities.has("mail")
+          ? {
+              liveState,
+              liveLabel,
+              lastCheckedAt: gmailHistory?.checkpoint_at?.toISOString() ?? null,
+              backfillCompleted: completedBackfills,
+              backfillTotal: backfillKinds.length,
+              backfillLabel,
+            }
+          : null,
+        calendar: activeCapabilities.has("calendar")
+          ? {
+              syncState: calendarSyncState,
+              syncLabel: calendarSyncLabel,
+              catalogLabel: calendarCatalogLabel,
+              lastCheckedAt: calendarCatalogCursor?.checkpoint_at?.toISOString() ?? null,
+            }
+          : null,
+        calendars: activeCapabilities.has("calendar")
+          ? calendarCatalog
+              .filter((calendar) => !calendar.deleted)
+              .map((calendar) => ({
+                id: calendar.id,
+                name: calendar.summary,
+                primary: calendar.primary,
+                timezone: calendar.timezone,
+                mode: policyByCalendar.get(sha256Hex(calendar.id)) ?? "off",
+              }))
+          : [],
       });
     }
 

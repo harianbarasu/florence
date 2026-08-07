@@ -118,9 +118,18 @@ After the web service has its canonical domain:
 1. In Linq, set the webhook endpoint to `<origin>/webhooks/linq`, select payload version `2026-02-03`, and copy
    that endpoint's signing secret into `LINQ_WEBHOOK_SECRET`. The API key is not the webhook signing secret.
 2. In Google Cloud, register `<origin>/oauth/google/callback` on the OAuth web client and add the intended test
-   users while the consent screen remains in testing.
+   users while the consent screen remains in testing. Enable both the Gmail API and Google Calendar API for
+   the project. Florence offers two least-privilege connection profiles: personal/family requests read-only
+   Mail and Calendar, while work requests read-only Calendar only. Each connection forces Google's account
+   chooser so one person can attach multiple Google accounts deliberately.
 3. Send only synthetic messages during the first connector smoke. Confirm webhook authentication failures do
    not create provider-event rows and that a duplicate delivery does not create duplicate work or output.
+
+For the first Google smoke, connect a personal test account from Sources. Confirm that the card reaches “Keeping
+up with new mail,” the primary calendar appears, and recent mail begins moving before older history completes.
+Then connect a different work account and confirm its card contains Calendar but no Mail status. Provider auth
+failures must change the connection to `reauth_required`; reconnecting the same account starts a new integration
+authority epoch so stale queued work cannot continue.
 
 Linq references: [webhook events](https://docs.linqapp.com/guides/webhooks/events/),
 [message sending](https://docs.linqapp.com/api/resources/chats/subresources/messages/methods/send/).

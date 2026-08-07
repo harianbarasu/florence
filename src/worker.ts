@@ -23,6 +23,7 @@ import {
   CalendarCatalogPayloadSchema,
   CalendarPollPayloadSchema,
   GmailBackfillPayloadSchema,
+  GmailBootstrapPayloadSchema,
   GmailMessagePayloadSchema,
   GmailPollPayloadSchema,
   GoogleBootstrapPayloadSchema,
@@ -38,6 +39,10 @@ const WORKER_ADVISORY_LOCK = 4_607_346_623;
 const WORKER_LEASE_NAME = "florence-worker-singleton";
 const WORKER_LEASE_WAIT_MS = 45_000;
 const WORKER_HEARTBEAT_MS = 10_000;
+const GOOGLE_JOB_REDRIVE_LIMIT = 20;
+const GOOGLE_JOB_REDRIVE_LOOKBACK_MS = 7 * 24 * 60 * 60_000;
+const GOOGLE_JOB_REDRIVE_BUCKET_MS = 60 * 60_000;
+const GOOGLE_JOB_REDRIVE_MAX_GENERATIONS = 3;
 
 const StepUpPayloadSchema = z.strictObject({
   actorPersonId: z.string().uuid(),
@@ -47,6 +52,8 @@ const OrchestrateMessagePayloadSchema = z.strictObject({ internalProviderEventId
 const PrivateSourcePayloadSchema = z.strictObject({
   sourceRevisionId: z.string().uuid(),
   personId: z.string().uuid(),
+  integrationId: z.string().uuid(),
+  integrationControlEpoch: z.number().int().positive(),
 });
 const PrivateBridgePayloadSchema = z.strictObject({ actionIntentId: z.string().uuid() });
 
@@ -158,10 +165,17 @@ async function main(): Promise<void> {
           await dispatch(job);
           await work.succeed(job);
         } catch (error) {
-          const retryable = isRetryableJobError(error);
-          await work.fail(job, errorCode(error), { retryable });
+          let providerAuthFailure = false;
+          try {
+            providerAuthFailure = await google.handleProviderAuthFailure(job.kind, job.payload, error);
+          } catch {
+            // Retry the provider job when the guarded health transition could not be persisted.
+          }
+          const retryable = !providerAuthFailure && isRetryableJobError(error);
+          const jobErrorCode = providerAuthFailure ? "google_reauth_required" : errorCode(error);
+          await work.fail(job, jobErrorCode, { retryable });
           process.stderr.write(
-            `${JSON.stringify({ level: "error", jobKind: job.kind, errorCode: errorCode(error) })}\n`,
+            `${JSON.stringify({ level: "error", jobKind: job.kind, errorCode: jobErrorCode })}\n`,
           );
         }
       }
@@ -189,7 +203,12 @@ async function main(): Promise<void> {
         }
         case "orchestrate.private_source": {
           const payload = PrivateSourcePayloadSchema.parse(job.payload);
-          await orchestrator.processPrivateSourceRevision(payload.sourceRevisionId, payload.personId);
+          await orchestrator.processPrivateSourceRevision(
+            payload.sourceRevisionId,
+            payload.personId,
+            payload.integrationId,
+            payload.integrationControlEpoch,
+          );
           return;
         }
         case "orchestrate.private_bridge_proposal": {
@@ -207,6 +226,9 @@ async function main(): Promise<void> {
         }
         case "google.bootstrap":
           await google.bootstrap(GoogleBootstrapPayloadSchema.parse(job.payload));
+          return;
+        case "google.gmail.bootstrap":
+          await google.bootstrapGmail(GmailBootstrapPayloadSchema.parse(job.payload));
           return;
         case "google.gmail.poll":
           await google.pollGmail(GmailPollPayloadSchema.parse(job.payload));
@@ -327,6 +349,26 @@ async function main(): Promise<void> {
         asOf: now.toISOString(),
         limit: 20,
       });
+      await work.redriveDeadCurrentAuthority({
+        kind: "google.gmail.message",
+        idempotencyNamespace: "job-redrive:google-gmail-message",
+        now,
+        limit: GOOGLE_JOB_REDRIVE_LIMIT,
+        lookbackMs: GOOGLE_JOB_REDRIVE_LOOKBACK_MS,
+        bucketMs: GOOGLE_JOB_REDRIVE_BUCKET_MS,
+        maxGenerations: GOOGLE_JOB_REDRIVE_MAX_GENERATIONS,
+        requireIntegrationFence: true,
+      });
+      await work.redriveDeadCurrentAuthority({
+        kind: "orchestrate.private_source",
+        idempotencyNamespace: "job-redrive:google-private-source",
+        now,
+        limit: GOOGLE_JOB_REDRIVE_LIMIT,
+        lookbackMs: GOOGLE_JOB_REDRIVE_LOOKBACK_MS,
+        bucketMs: GOOGLE_JOB_REDRIVE_BUCKET_MS,
+        maxGenerations: GOOGLE_JOB_REDRIVE_MAX_GENERATIONS,
+        requireIntegrationFence: true,
+      });
       const timers = new DurableTimers(database);
       await timers.cancelStale(now);
       await timers.recoverOrphanedClaims(now);
@@ -392,14 +434,27 @@ async function main(): Promise<void> {
           readonly integration_control_epoch: number | string;
           readonly person_id: string;
           readonly person_control_epoch: number | string;
+          readonly mail_active: boolean;
+          readonly calendar_active: boolean;
           readonly gmail_cursor_ready: boolean;
           readonly gmail_chain_live: boolean;
+          readonly gmail_backfill_healthy: boolean;
           readonly calendar_chain_healthy: boolean;
         }[]
       >`
         select integration.id as integration_id,
           integration.control_epoch as integration_control_epoch,
           person.id as person_id, person.control_epoch as person_control_epoch,
+          exists(
+            select 1 from integration_capabilities capability
+            where capability.integration_id = integration.id
+              and capability.capability = 'mail' and capability.status = 'active'
+          ) as mail_active,
+          exists(
+            select 1 from integration_capabilities capability
+            where capability.integration_id = integration.id
+              and capability.capability = 'calendar' and capability.status = 'active'
+          ) as calendar_active,
           exists(
             select 1 from sync_cursors cursor
             where cursor.integration_id = integration.id
@@ -409,16 +464,52 @@ async function main(): Promise<void> {
           exists(
             select 1 from jobs job
             where job.person_id = person.id
-              and job.job_kind in ('google.bootstrap', 'google.gmail.poll')
-              and job.idempotency_key like '%' || integration.id::text || '%'
+              and job.integration_id = integration.id
+              and job.integration_control_epoch = integration.control_epoch
+              and job.job_kind in ('google.bootstrap', 'google.gmail.bootstrap', 'google.gmail.poll')
               and job.status in ('pending', 'retry', 'leased')
           ) as gmail_chain_live,
           (
             exists(
               select 1 from jobs job
               where job.person_id = person.id
+                and job.integration_id = integration.id
+                and job.integration_control_epoch = integration.control_epoch
+                and job.job_kind in ('google.bootstrap', 'google.gmail.bootstrap')
+                and job.status in ('pending', 'retry', 'leased')
+            )
+            or not exists(
+              select 1
+              from (values
+                ('newest_30_days'),
+                ('days_31_to_90'),
+                ('days_91_to_365'),
+                ('older_history')
+              ) as stage(name)
+              where not exists(
+                select 1 from sync_cursors cursor
+                where cursor.integration_id = integration.id
+                  and cursor.resource_kind = 'gmail_backfill:' || stage.name
+                  and cursor.state = 'exhausted'
+              )
+              and not exists(
+                select 1 from jobs job
+                where job.person_id = person.id
+                  and job.integration_id = integration.id
+                  and job.integration_control_epoch = integration.control_epoch
+                  and job.job_kind = 'google.gmail.backfill'
+                  and job.idempotency_key like '%:' || stage.name || ':%'
+                  and job.status in ('pending', 'retry', 'leased')
+              )
+            )
+          ) as gmail_backfill_healthy,
+          (
+            exists(
+              select 1 from jobs job
+              where job.person_id = person.id
+                and job.integration_id = integration.id
+                and job.integration_control_epoch = integration.control_epoch
                 and job.job_kind in ('google.bootstrap', 'google.calendar.catalog')
-                and job.idempotency_key like '%' || integration.id::text || '%'
                 and job.status in ('pending', 'retry', 'leased')
             )
             and not exists(
@@ -431,9 +522,13 @@ async function main(): Promise<void> {
                 and not exists(
                   select 1 from jobs job
                   where job.person_id = person.id
+                    and job.integration_id = integration.id
+                    and job.integration_control_epoch = integration.control_epoch
                     and job.job_kind = 'google.calendar.poll'
-                    and job.idempotency_key like '%' || integration.id::text || '%'
-                    and job.idempotency_key like '%' || (grant_row.scope->>'calendarIdDigest') || '%'
+                    and job.idempotency_key like
+                      'calendar:poll:' || integration.id || ':e' || integration.control_epoch || ':' ||
+                      (grant_row.scope->>'calendarIdDigest') || ':v' || grant_row.version || ':' ||
+                      (grant_row.scope->>'mode') || ':%'
                     and job.status in ('pending', 'retry', 'leased')
                 )
             )
@@ -452,33 +547,61 @@ async function main(): Promise<void> {
           personControlEpoch: Number(integration.person_control_epoch),
         };
         const person = { id: integration.person_id, controlEpoch: payload.personControlEpoch };
-        let bootstrapQueued = false;
-        if (!integration.gmail_chain_live) {
+        const integrationFence = {
+          id: integration.integration_id,
+          controlEpoch: payload.integrationControlEpoch,
+        };
+        const epochKey = `e${payload.integrationControlEpoch}`;
+        if (integration.mail_active && !integration.gmail_chain_live) {
           await work.enqueue(
             integration.gmail_cursor_ready
               ? {
                   kind: "google.gmail.poll",
-                  idempotencyKey: `gmail:poll:${integration.integration_id}:watchdog:t${minuteBucket}`,
+                  idempotencyKey: `gmail:poll:${integration.integration_id}:${epochKey}:watchdog:t${minuteBucket}`,
                   payload,
                   person,
+                  integration: integrationFence,
+                  priority: 50,
                   maxAttempts: 8,
                 }
               : {
-                  kind: "google.bootstrap",
-                  idempotencyKey: `google:bootstrap:${integration.integration_id}:watchdog:t${minuteBucket}`,
-                  payload: { ...payload, olderHistoryEnabled: true },
+                  kind: "google.gmail.bootstrap",
+                  idempotencyKey: `gmail:bootstrap:${integration.integration_id}:${epochKey}:watchdog:t${minuteBucket}`,
+                  payload: {
+                    ...payload,
+                    olderHistoryEnabled: true,
+                    runKey: `watchdog-${minuteBucket}`,
+                  },
                   person,
+                  integration: integrationFence,
+                  priority: 50,
                   maxAttempts: 8,
                 },
           );
-          bootstrapQueued = !integration.gmail_cursor_ready;
         }
-        if (!integration.calendar_chain_healthy && !bootstrapQueued) {
+        if (integration.mail_active && !integration.gmail_backfill_healthy) {
+          await work.enqueue({
+            kind: "google.gmail.bootstrap",
+            idempotencyKey: `gmail:bootstrap:${integration.integration_id}:${epochKey}:backfill-watchdog:t${minuteBucket}`,
+            payload: {
+              ...payload,
+              olderHistoryEnabled: true,
+              runKey: `watchdog-${minuteBucket}`,
+            },
+            person,
+            integration: integrationFence,
+            priority: 50,
+            maxAttempts: 8,
+          });
+        }
+        if (integration.calendar_active && !integration.calendar_chain_healthy) {
           await work.enqueue({
             kind: "google.calendar.catalog",
-            idempotencyKey: `calendar:catalog:${integration.integration_id}:watchdog:t${minuteBucket}`,
+            idempotencyKey: `calendar:catalog:${integration.integration_id}:${epochKey}:watchdog:t${minuteBucket}`,
             payload,
             person,
+            integration: integrationFence,
+            priority: 60,
             maxAttempts: 8,
           });
         }

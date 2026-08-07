@@ -61,6 +61,20 @@ export type SourceOrigin = z.infer<typeof SourceOriginSchema>;
 export const IntegrationStatusSchema = z.enum(["active", "paused", "reauth_required", "revoked", "error"]);
 export type IntegrationStatus = z.infer<typeof IntegrationStatusSchema>;
 
+export const IntegrationCapabilitySchema = z.enum(["mail", "calendar"]);
+export type IntegrationCapability = z.infer<typeof IntegrationCapabilitySchema>;
+
+export const IntegrationAccountKindSchema = z.enum(["personal_family", "work"]);
+export type IntegrationAccountKind = z.infer<typeof IntegrationAccountKindSchema>;
+
+const IntegrationCapabilitiesSchema = z
+  .array(IntegrationCapabilitySchema)
+  .min(1)
+  .max(IntegrationCapabilitySchema.options.length)
+  .refine((capabilities) => new Set(capabilities).size === capabilities.length, {
+    message: "Integration capabilities must be unique",
+  });
+
 export const SyncCursorStateSchema = z.enum(["initial", "active", "exhausted", "expired", "error"]);
 export type SyncCursorState = z.infer<typeof SyncCursorStateSchema>;
 
@@ -72,7 +86,10 @@ const ConnectIntegrationCommandSchema = z.strictObject({
   personId: EntityIdSchema,
   provider: DurableKindSchema,
   externalSubjectDigest: DigestSchema,
+  accountKind: IntegrationAccountKindSchema,
+  activeCapabilities: IntegrationCapabilitiesSchema,
   credentials: JsonObjectSchema,
+  expectedPersonControlEpoch: z.number().int().positive(),
   connectedAt: InstantSchema,
 });
 
@@ -97,6 +114,7 @@ const BeginOAuthAttemptCommandSchema = z.strictObject({
   kind: z.literal("begin_oauth_attempt"),
   personId: EntityIdSchema,
   provider: DurableKindSchema,
+  initiatingSessionId: EntityIdSchema,
   stateDigest: DigestSchema,
   pkceVerifier: z.string().min(43).max(512),
   returnPath: z
@@ -110,6 +128,8 @@ const BeginOAuthAttemptCommandSchema = z.strictObject({
         ![...value].some((character) => character.charCodeAt(0) < 32),
       "Return path must be a local path without control characters",
     ),
+  requestedCapabilities: IntegrationCapabilitiesSchema,
+  accountKind: IntegrationAccountKindSchema,
   expectedPersonControlEpoch: z.number().int().positive(),
   expiresAt: InstantSchema,
   createdAt: InstantSchema,
@@ -145,10 +165,34 @@ const ConfigureCalendarPrivacyCommandSchema = z.strictObject({
   changedAt: InstantSchema,
 });
 
+const ResetIntegrationSyncCommandSchema = z.strictObject({
+  kind: z.literal("reset_integration_sync"),
+  integrationId: EntityIdSchema,
+  personId: EntityIdSchema,
+  expectedIntegrationControlEpoch: z.number().int().positive(),
+  affectedCapability: IntegrationCapabilitySchema,
+  resetAt: InstantSchema,
+});
+
+const ReconcileCalendarCatalogCommandSchema = z.strictObject({
+  kind: z.literal("reconcile_calendar_catalog"),
+  integrationId: EntityIdSchema,
+  personId: EntityIdSchema,
+  expectedIntegrationControlEpoch: z.number().int().positive(),
+  activeCalendarIdDigests: z
+    .array(DigestSchema)
+    .max(5_000)
+    .refine((digests) => new Set(digests).size === digests.length, {
+      message: "Active calendar digests must be unique",
+    }),
+  reconciledAt: InstantSchema,
+});
+
 const IngestSourceCommandSchema = z
   .strictObject({
     kind: z.literal("ingest_source"),
     integrationId: EntityIdSchema.nullable(),
+    expectedIntegrationControlEpoch: z.number().int().positive().nullable(),
     artifactKind: SourceArtifactKindSchema,
     origin: SourceOriginSchema,
     resourceDigest: DigestSchema.optional(),
@@ -159,6 +203,13 @@ const IngestSourceCommandSchema = z
     requestedRetentionUntil: InstantSchema,
   })
   .superRefine((command, context) => {
+    if ((command.integrationId === null) !== (command.expectedIntegrationControlEpoch === null)) {
+      context.addIssue({
+        code: "custom",
+        path: ["expectedIntegrationControlEpoch"],
+        message: "Provider source mutations require a complete integration authority fence",
+      });
+    }
     if (command.artifactKind === "calendar_event" && command.resourceDigest === undefined) {
       context.addIssue({
         code: "custom",
@@ -168,36 +219,72 @@ const IngestSourceCommandSchema = z
     }
   });
 
-const StoreBlobCommandSchema = z.strictObject({
-  kind: z.literal("store_blob"),
-  sourceRevisionId: EntityIdSchema,
-  scope: SourceScopeSchema,
-  blobKind: DurableKindSchema,
-  mimeType: z.string().trim().min(1).max(200),
-  bytes: z.instanceof(Uint8Array),
-  storedAt: InstantSchema,
-});
+const StoreBlobCommandSchema = z
+  .strictObject({
+    kind: z.literal("store_blob"),
+    sourceRevisionId: EntityIdSchema,
+    scope: SourceScopeSchema,
+    integrationId: EntityIdSchema.nullable(),
+    expectedIntegrationControlEpoch: z.number().int().positive().nullable(),
+    blobKind: DurableKindSchema,
+    mimeType: z.string().trim().min(1).max(200),
+    bytes: z.instanceof(Uint8Array),
+    storedAt: InstantSchema,
+  })
+  .superRefine((command, context) => {
+    if ((command.integrationId === null) !== (command.expectedIntegrationControlEpoch === null)) {
+      context.addIssue({
+        code: "custom",
+        path: ["expectedIntegrationControlEpoch"],
+        message: "Source blob writes require a complete integration authority fence",
+      });
+    }
+  });
 
-const StoreDerivativeCommandSchema = z.strictObject({
-  kind: z.literal("store_derivative"),
-  sourceRevisionId: EntityIdSchema,
-  scope: SourceScopeSchema,
-  derivativeKind: DurableKindSchema,
-  content: JsonValueSchema,
-  requestedRetentionUntil: InstantSchema,
-  createdAt: InstantSchema,
-});
+const StoreDerivativeCommandSchema = z
+  .strictObject({
+    kind: z.literal("store_derivative"),
+    sourceRevisionId: EntityIdSchema,
+    scope: SourceScopeSchema,
+    integrationId: EntityIdSchema.nullable(),
+    expectedIntegrationControlEpoch: z.number().int().positive().nullable(),
+    derivativeKind: DurableKindSchema,
+    content: JsonValueSchema,
+    requestedRetentionUntil: InstantSchema,
+    createdAt: InstantSchema,
+  })
+  .superRefine((command, context) => {
+    if ((command.integrationId === null) !== (command.expectedIntegrationControlEpoch === null)) {
+      context.addIssue({
+        code: "custom",
+        path: ["expectedIntegrationControlEpoch"],
+        message: "Source derivative writes require a complete integration authority fence",
+      });
+    }
+  });
 
-const ProposePrivateCandidateCommandSchema = z.strictObject({
-  kind: z.literal("propose_private_candidate"),
-  personId: EntityIdSchema,
-  candidateKind: DurableKindSchema,
-  content: JsonObjectSchema,
-  evidenceSourceRevisionIds: z.array(EntityIdSchema).min(1).max(100),
-  confidence: z.number().min(0).max(1),
-  proposedAt: InstantSchema,
-  requestedExpiresAt: InstantSchema,
-});
+const ProposePrivateCandidateCommandSchema = z
+  .strictObject({
+    kind: z.literal("propose_private_candidate"),
+    personId: EntityIdSchema,
+    integrationId: EntityIdSchema.nullable(),
+    expectedIntegrationControlEpoch: z.number().int().positive().nullable(),
+    candidateKind: DurableKindSchema,
+    content: JsonObjectSchema,
+    evidenceSourceRevisionIds: z.array(EntityIdSchema).min(1).max(100),
+    confidence: z.number().min(0).max(1),
+    proposedAt: InstantSchema,
+    requestedExpiresAt: InstantSchema,
+  })
+  .superRefine((command, context) => {
+    if ((command.integrationId === null) !== (command.expectedIntegrationControlEpoch === null)) {
+      context.addIssue({
+        code: "custom",
+        path: ["expectedIntegrationControlEpoch"],
+        message: "Private source proposals require a complete integration authority fence",
+      });
+    }
+  });
 
 const ReviewPrivateCandidateCommandSchema = z.strictObject({
   kind: z.literal("review_private_candidate"),
@@ -207,14 +294,25 @@ const ReviewPrivateCandidateCommandSchema = z.strictObject({
   reviewedAt: InstantSchema,
 });
 
-const MarkSourceDeletedCommandSchema = z.strictObject({
-  kind: z.literal("mark_source_deleted"),
-  integrationId: EntityIdSchema.nullable(),
-  artifactKind: SourceArtifactKindSchema,
-  origin: SourceOriginSchema,
-  scope: SourceScopeSchema,
-  deletedAt: InstantSchema,
-});
+const MarkSourceDeletedCommandSchema = z
+  .strictObject({
+    kind: z.literal("mark_source_deleted"),
+    integrationId: EntityIdSchema.nullable(),
+    expectedIntegrationControlEpoch: z.number().int().positive().nullable(),
+    artifactKind: SourceArtifactKindSchema,
+    origin: SourceOriginSchema,
+    scope: SourceScopeSchema,
+    deletedAt: InstantSchema,
+  })
+  .superRefine((command, context) => {
+    if ((command.integrationId === null) !== (command.expectedIntegrationControlEpoch === null)) {
+      context.addIssue({
+        code: "custom",
+        path: ["expectedIntegrationControlEpoch"],
+        message: "Provider deletion requires a complete integration authority fence",
+      });
+    }
+  });
 
 const InvalidateEpochCommandSchema = z.strictObject({
   kind: z.literal("invalidate_conversation_epoch"),
@@ -236,6 +334,8 @@ export const SourceCommandSchema = z.discriminatedUnion("kind", [
   ConsumeOAuthAttemptCommandSchema,
   CheckpointCursorCommandSchema,
   ConfigureCalendarPrivacyCommandSchema,
+  ResetIntegrationSyncCommandSchema,
+  ReconcileCalendarCatalogCommandSchema,
   IngestSourceCommandSchema,
   StoreBlobCommandSchema,
   StoreDerivativeCommandSchema,
@@ -252,6 +352,7 @@ const ReadIntegrationAccessQuerySchema = z.strictObject({
   integrationId: EntityIdSchema,
   personId: EntityIdSchema,
   expectedControlEpoch: z.number().int().positive(),
+  requiredCapability: IntegrationCapabilitySchema,
 });
 
 const ReadIntegrationProfileQuerySchema = z.strictObject({
@@ -259,6 +360,13 @@ const ReadIntegrationProfileQuerySchema = z.strictObject({
   integrationId: EntityIdSchema,
   personId: EntityIdSchema,
   expectedControlEpoch: z.number().int().positive(),
+});
+
+const ReadOAuthAttemptAccessQuerySchema = z.strictObject({
+  kind: z.literal("oauth_attempt_access"),
+  provider: DurableKindSchema,
+  stateDigest: DigestSchema,
+  asOf: InstantSchema,
 });
 
 const ReadCursorQuerySchema = z.strictObject({
@@ -277,12 +385,24 @@ const ReadCalendarPrivacyQuerySchema = z.strictObject({
   calendarIdDigest: DigestSchema,
 });
 
-const ReadSourceRevisionQuerySchema = z.strictObject({
-  kind: z.literal("source_revision"),
-  sourceRevisionId: EntityIdSchema,
-  scope: SourceScopeSchema,
-  asOf: InstantSchema,
-});
+const ReadSourceRevisionQuerySchema = z
+  .strictObject({
+    kind: z.literal("source_revision"),
+    sourceRevisionId: EntityIdSchema,
+    scope: SourceScopeSchema,
+    integrationId: EntityIdSchema.optional(),
+    expectedIntegrationControlEpoch: z.number().int().positive().optional(),
+    asOf: InstantSchema,
+  })
+  .superRefine((query, context) => {
+    if ((query.integrationId === undefined) !== (query.expectedIntegrationControlEpoch === undefined)) {
+      context.addIssue({
+        code: "custom",
+        path: ["expectedIntegrationControlEpoch"],
+        message: "Integration-fenced reads require both integration identity and authority epoch",
+      });
+    }
+  });
 
 const ReadBlobQuerySchema = z.strictObject({
   kind: z.literal("source_blob"),
@@ -308,6 +428,7 @@ const ReadPendingCandidatesQuerySchema = z.strictObject({
 export const SourceQuerySchema = z.discriminatedUnion("kind", [
   ReadIntegrationAccessQuerySchema,
   ReadIntegrationProfileQuerySchema,
+  ReadOAuthAttemptAccessQuerySchema,
   ReadCursorQuerySchema,
   ReadCalendarPrivacyQuerySchema,
   ReadSourceRevisionQuerySchema,
@@ -321,6 +442,8 @@ export interface IntegrationView {
   readonly integrationId: string;
   readonly personId: string;
   readonly provider: string;
+  readonly accountKind: IntegrationAccountKind;
+  readonly activeCapabilities: readonly IntegrationCapability[];
   readonly status: IntegrationStatus;
   readonly controlEpoch: number;
   readonly connectedAt: string;
@@ -347,9 +470,12 @@ export type SourceMutationResult =
       readonly oauthAttemptId: string;
       readonly personId: string;
       readonly provider: string;
+      readonly initiatingSessionId: string;
       readonly pkceVerifier: string;
       readonly returnPath: string;
       readonly personControlEpoch: number;
+      readonly requestedCapabilities: readonly IntegrationCapability[];
+      readonly accountKind: IntegrationAccountKind;
     }
   | {
       readonly kind: "cursor_checkpointed";
@@ -366,6 +492,19 @@ export type SourceMutationResult =
       readonly mode: CalendarPrivacyMode;
       readonly grantVersion: number;
       readonly integrationControlEpoch: number;
+    }
+  | {
+      readonly kind: "integration_sync_reset";
+      readonly integrationId: string;
+      readonly integrationControlEpoch: number;
+      readonly affectedCapability: IntegrationCapability;
+    }
+  | {
+      readonly kind: "calendar_catalog_reconciled";
+      readonly integrationId: string;
+      readonly integrationControlEpoch: number;
+      readonly retiredCalendarCount: number;
+      readonly resetRequired: boolean;
     }
   | {
       readonly kind: "source_ingested";
@@ -437,6 +576,19 @@ export type SourceReadResult =
       readonly kind: "integration_profile";
       readonly integration: IntegrationView;
       readonly accountEmail: string;
+    }
+  | {
+      readonly kind: "oauth_attempt_access";
+      readonly oauthAttemptId: string;
+      readonly personId: string;
+      readonly provider: string;
+      readonly initiatingSessionId: string;
+      readonly pkceVerifier: string;
+      readonly returnPath: string;
+      readonly personControlEpoch: number;
+      readonly requestedCapabilities: readonly IntegrationCapability[];
+      readonly accountKind: IntegrationAccountKind;
+      readonly expiresAt: string;
     }
   | {
       readonly kind: "sync_cursor";

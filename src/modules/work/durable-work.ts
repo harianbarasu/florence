@@ -8,6 +8,7 @@ export interface AuthorityFence {
   readonly person?: { id: string; controlEpoch: number };
   readonly household?: { id: string; controlEpoch: number };
   readonly conversation?: { id: string; authorityVersion: number };
+  readonly integration?: { id: string; controlEpoch: number };
 }
 
 export interface EnqueueJobInput extends AuthorityFence {
@@ -18,6 +19,7 @@ export interface EnqueueJobInput extends AuthorityFence {
   readonly availableAt?: Date;
   readonly deadlineAt?: Date;
   readonly maxAttempts?: number;
+  readonly priority?: number;
 }
 
 export interface ClaimedJob<Payload = unknown> {
@@ -29,6 +31,17 @@ export interface ClaimedJob<Payload = unknown> {
   readonly leaseToken: string;
   readonly deadlineAt: Date | null;
   readonly fence: AuthorityFence;
+}
+
+export interface DeadJobRedriveInput {
+  readonly kind: string;
+  readonly idempotencyNamespace: string;
+  readonly now?: Date;
+  readonly limit?: number;
+  readonly lookbackMs: number;
+  readonly bucketMs: number;
+  readonly maxGenerations: number;
+  readonly requireIntegrationFence?: boolean;
 }
 
 interface JobRow {
@@ -46,10 +59,36 @@ interface JobRow {
   household_control_epoch: number | string | null;
   conversation_id: string | null;
   conversation_authority_version: number | string | null;
+  integration_id: string | null;
+  integration_control_epoch: number | string | null;
+}
+
+interface DeadJobRow {
+  id: string;
+  job_kind: string;
+  household_id: string | null;
+  person_id: string | null;
+  conversation_id: string | null;
+  integration_id: string | null;
+  task_id: string | null;
+  idempotency_key: string;
+  payload_digest: string;
+  payload_ciphertext: Buffer;
+  payload_key_version: string;
+  max_attempts: number;
+  priority: number;
+  deadline_at: Date | null;
+  person_control_epoch: number | string | null;
+  household_control_epoch: number | string | null;
+  conversation_authority_version: number | string | null;
+  integration_control_epoch: number | string | null;
 }
 
 type Transaction = TransactionSql<Record<string, never>>;
 type Executor = Database | Transaction;
+
+const DEFAULT_PRIORITY = 100;
+const MAX_PRIORITY = 2_147_483_647;
 
 /** Postgres-backed at-least-once work queue with explicit authority fences. */
 export class DurableWork {
@@ -60,22 +99,27 @@ export class DurableWork {
 
   public async enqueue(input: EnqueueJobInput): Promise<{ jobId: string; created: boolean }> {
     validateFence(input);
+    validatePriority(input.priority);
     const payloadJson = canonicalJson(input.payload);
     const digest = sha256Hex(payloadJson);
     const encrypted = this.secretBox.encrypt(payloadJson, "durable-job-payload");
     const rows = await this.database<{ id: string; inserted: boolean }[]>`
       insert into jobs (
-        id, job_kind, household_id, person_id, conversation_id, task_id,
+        id, job_kind, household_id, person_id, conversation_id, integration_id, task_id,
         idempotency_key, payload_digest, payload_ciphertext, payload_key_version,
-        status, max_attempts, available_at, deadline_at,
-        person_control_epoch, household_control_epoch, conversation_authority_version
+        status, max_attempts, priority, available_at, deadline_at,
+        person_control_epoch, household_control_epoch, conversation_authority_version,
+        integration_control_epoch
       ) values (
         ${randomUUID()}, ${input.kind}, ${input.household?.id ?? null}, ${input.person?.id ?? null},
-        ${input.conversation?.id ?? null}, ${input.taskId ?? null}, ${input.idempotencyKey},
-        ${digest}, ${Buffer.from(JSON.stringify(encrypted), "utf8")}, ${encrypted.kid},
-        'pending', ${input.maxAttempts ?? 8}, ${input.availableAt ?? new Date()},
+        ${input.conversation?.id ?? null}, ${input.integration?.id ?? null},
+        ${input.taskId ?? null}, ${input.idempotencyKey}, ${digest},
+        ${Buffer.from(JSON.stringify(encrypted), "utf8")}, ${encrypted.kid},
+        'pending', ${input.maxAttempts ?? 8}, ${input.priority ?? DEFAULT_PRIORITY},
+        ${input.availableAt ?? new Date()},
         ${input.deadlineAt ?? null}, ${input.person?.controlEpoch ?? null},
-        ${input.household?.controlEpoch ?? null}, ${input.conversation?.authorityVersion ?? null}
+        ${input.household?.controlEpoch ?? null}, ${input.conversation?.authorityVersion ?? null},
+        ${input.integration?.controlEpoch ?? null}
       )
       on conflict (idempotency_key) do update set idempotency_key = jobs.idempotency_key
       returning id, (xmax = 0) as inserted
@@ -94,10 +138,12 @@ export class DurableWork {
         left join people person on person.id = job.person_id
         left join households household on household.id = job.household_id
         left join conversations conversation on conversation.id = job.conversation_id
+        left join integrations integration on integration.id = job.integration_id
         where job.status in ('pending', 'retry', 'leased')
           and job.available_at <= ${now}
           and (job.deadline_at is null or job.deadline_at > ${now})
           and (job.status <> 'leased' or job.lease_expires_at <= ${now})
+          and (job.job_kind not like 'google.%' or job.integration_id is not null)
           and (job.person_id is null or (
             person.status = 'registered' and person.control_epoch = job.person_control_epoch
           ))
@@ -109,7 +155,11 @@ export class DurableWork {
             conversation.status not in ('deletion_fenced', 'deleted')
             and conversation.authority_version = job.conversation_authority_version
           ))
-        order by job.available_at, job.created_at
+          and (job.integration_id is null or (
+            integration.status = 'active'
+            and integration.control_epoch = job.integration_control_epoch
+          ))
+        order by job.priority, job.available_at, job.created_at
         for update of job skip locked
         limit ${Math.max(1, Math.min(limit, 100))}
       `;
@@ -122,7 +172,8 @@ export class DurableWork {
           where id = ${candidate.id}
           returning id, job_kind, payload_ciphertext, payload_key_version, attempt_count,
             max_attempts, deadline_at, lease_token, person_id, person_control_epoch,
-            household_id, household_control_epoch, conversation_id, conversation_authority_version
+            household_id, household_control_epoch, conversation_id, conversation_authority_version,
+            integration_id, integration_control_epoch
         `;
         const row = rows[0];
         if (!row) continue;
@@ -175,6 +226,89 @@ export class DurableWork {
     return rows[0]?.status ?? "stale";
   }
 
+  /** Reissues a bounded, linear generation of dead work while its authority fences are current. */
+  public async redriveDeadCurrentAuthority(input: DeadJobRedriveInput): Promise<number> {
+    validateRedriveInput(input);
+    const now = input.now ?? new Date();
+    const limit = input.limit ?? 20;
+    const bucket = Math.floor(now.getTime() / input.bucketMs);
+    const namespace = input.idempotencyNamespace;
+    const currentBucketPattern = `${namespace}:%:b${bucket}`;
+    const exhaustedGenerationPattern = `${namespace}:g${input.maxGenerations}:%`;
+    const lookbackStart = new Date(now.getTime() - input.lookbackMs);
+    return inTransaction(this.database, async (transaction) => {
+      const candidates = await transaction<DeadJobRow[]>`
+        select job.id, job.job_kind, job.household_id, job.person_id, job.conversation_id,
+          job.integration_id, job.task_id, job.idempotency_key, job.payload_digest,
+          job.payload_ciphertext, job.payload_key_version, job.max_attempts, job.priority,
+          job.deadline_at, job.person_control_epoch, job.household_control_epoch,
+          job.conversation_authority_version, job.integration_control_epoch
+        from jobs job
+        left join people person on person.id = job.person_id
+        left join households household on household.id = job.household_id
+        left join conversations conversation on conversation.id = job.conversation_id
+        left join integrations integration on integration.id = job.integration_id
+        where job.job_kind = ${input.kind}
+          and job.status = 'dead'
+          and (${input.requireIntegrationFence !== true} or job.integration_id is not null)
+          and job.updated_at >= ${lookbackStart}
+          and (job.deadline_at is null or job.deadline_at > ${now})
+          and job.idempotency_key not like ${currentBucketPattern}
+          and job.idempotency_key not like ${exhaustedGenerationPattern}
+          and (job.person_id is null or (
+            person.status = 'registered' and person.control_epoch = job.person_control_epoch
+          ))
+          and (job.household_id is null or (
+            household.status in ('onboarding', 'active', 'paused')
+            and household.control_epoch = job.household_control_epoch
+          ))
+          and (job.conversation_id is null or (
+            conversation.status not in ('deletion_fenced', 'deleted')
+            and conversation.authority_version = job.conversation_authority_version
+          ))
+          and (job.integration_id is null or (
+            integration.status = 'active'
+            and integration.control_epoch = job.integration_control_epoch
+          ))
+        order by job.updated_at, job.id
+        for update of job skip locked
+        limit ${limit}
+      `;
+      let redriven = 0;
+      for (const candidate of candidates) {
+        const identity = nextRedriveIdentity(candidate, namespace, bucket, input.maxGenerations);
+        if (!identity) continue;
+        const inserted = await transaction<{ readonly id: string }[]>`
+          insert into jobs (
+            id, job_kind, household_id, person_id, conversation_id, integration_id, task_id,
+            idempotency_key, payload_digest, payload_ciphertext, payload_key_version,
+            status, max_attempts, priority, available_at, deadline_at,
+            person_control_epoch, household_control_epoch, conversation_authority_version,
+            integration_control_epoch
+          ) values (
+            ${randomUUID()}, ${candidate.job_kind}, ${candidate.household_id}, ${candidate.person_id},
+            ${candidate.conversation_id}, ${candidate.integration_id}, ${candidate.task_id},
+            ${identity.idempotencyKey}, ${candidate.payload_digest}, ${candidate.payload_ciphertext},
+            ${candidate.payload_key_version}, 'pending', ${candidate.max_attempts},
+            ${candidate.priority}, ${now}, ${candidate.deadline_at},
+            ${candidate.person_control_epoch}, ${candidate.household_control_epoch},
+            ${candidate.conversation_authority_version}, ${candidate.integration_control_epoch}
+          )
+          on conflict (idempotency_key) do nothing
+          returning id
+        `;
+        if (!inserted[0]) continue;
+        await transaction`
+          update jobs
+          set status = 'cancelled', last_error_code = 'recovery_scheduled', updated_at = ${now}
+          where id = ${candidate.id} and status = 'dead'
+        `;
+        redriven += 1;
+      }
+      return redriven;
+    });
+  }
+
   public async cancelStale(now = new Date()): Promise<number> {
     const rows = await this.database<{ id: string }[]>`
       update jobs job set status = 'cancelled', lease_owner = null, lease_token = null,
@@ -195,6 +329,12 @@ export class DurableWork {
             and conversation.status not in ('deletion_fenced', 'deleted')
             and conversation.authority_version = job.conversation_authority_version
         ))
+        or (job.integration_id is not null and not exists (
+          select 1 from integrations integration where integration.id = job.integration_id
+            and integration.status = 'active'
+            and integration.control_epoch = job.integration_control_epoch
+        ))
+        or (job.job_kind like 'google.%' and job.integration_id is null)
       ) returning id
     `;
     return rows.length;
@@ -211,7 +351,7 @@ function inTransaction<Result>(
 }
 
 function validateFence(input: AuthorityFence): void {
-  for (const entry of [input.person, input.household, input.conversation]) {
+  for (const entry of [input.person, input.household, input.conversation, input.integration]) {
     if (
       entry &&
       (!Number.isSafeInteger("controlEpoch" in entry ? entry.controlEpoch : entry.authorityVersion) ||
@@ -220,6 +360,51 @@ function validateFence(input: AuthorityFence): void {
       throw new Error("Authority fence versions must be positive integers");
     }
   }
+}
+
+function validatePriority(priority: number | undefined): void {
+  if (
+    priority !== undefined &&
+    (!Number.isSafeInteger(priority) || priority < 0 || priority > MAX_PRIORITY)
+  ) {
+    throw new Error(`Job priority must be an integer between 0 and ${MAX_PRIORITY}`);
+  }
+}
+
+function validateRedriveInput(input: DeadJobRedriveInput): void {
+  if (!/^[a-z0-9][a-z0-9._:-]{0,119}$/u.test(input.kind)) {
+    throw new Error("Redrive job kind is invalid");
+  }
+  if (!/^[a-z0-9][a-z0-9.:-]{0,119}$/u.test(input.idempotencyNamespace)) {
+    throw new Error("Redrive idempotency namespace is invalid");
+  }
+  for (const [name, value] of [
+    ["lookbackMs", input.lookbackMs],
+    ["bucketMs", input.bucketMs],
+    ["maxGenerations", input.maxGenerations],
+    ["limit", input.limit ?? 20],
+  ] as const) {
+    if (!Number.isSafeInteger(value) || value < 1) throw new Error(`Redrive ${name} must be positive`);
+  }
+  if ((input.limit ?? 20) > 100) throw new Error("Redrive limit cannot exceed 100");
+}
+
+function nextRedriveIdentity(
+  candidate: Pick<DeadJobRow, "id" | "idempotency_key">,
+  namespace: string,
+  bucket: number,
+  maxGenerations: number,
+): { readonly idempotencyKey: string } | null {
+  const escapedNamespace = namespace.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  const match = new RegExp(`^${escapedNamespace}:g([1-9][0-9]*):([0-9a-f-]{36}):b[0-9]+$`, "u").exec(
+    candidate.idempotency_key,
+  );
+  const generation = match ? Number(match[1]) : 0;
+  const rootId = match?.[2] ?? candidate.id;
+  if (!Number.isSafeInteger(generation) || generation >= maxGenerations) return null;
+  return {
+    idempotencyKey: `${namespace}:g${generation + 1}:${rootId}:b${bucket}`,
+  };
 }
 
 function fenceFromRow(row: JobRow): AuthorityFence {
@@ -235,6 +420,14 @@ function fenceFromRow(row: JobRow): AuthorityFence {
           conversation: {
             id: row.conversation_id,
             authorityVersion: Number(row.conversation_authority_version),
+          },
+        }
+      : {}),
+    ...(row.integration_id && row.integration_control_epoch
+      ? {
+          integration: {
+            id: row.integration_id,
+            controlEpoch: Number(row.integration_control_epoch),
           },
         }
       : {}),

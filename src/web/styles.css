@@ -223,6 +223,24 @@ p {
   color: var(--ink);
   border: 1px solid var(--line);
 }
+.source-connect-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.source-connect-actions .primary-button,
+.source-connect-actions .secondary-button {
+  min-height: 68px;
+  margin: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+.source-connect-actions small {
+  color: inherit;
+  font-size: 10px;
+  font-weight: 500;
+  opacity: 0.76;
+}
 .promise-grid {
   max-width: 1040px;
   margin: 0 auto 100px;
@@ -1712,6 +1730,9 @@ button:disabled {
     margin-left: 53px;
   }
   .source-status-grid {
+    grid-template-columns: 1fr;
+  }
+  .source-connect-actions {
     grid-template-columns: 1fr;
   }
   .routine-builder > form,

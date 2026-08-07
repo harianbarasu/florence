@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import type { OAuth2Client } from "google-auth-library";
+import type { TransactionSql } from "postgres";
 import { z } from "zod";
 import { extractDocument } from "../adapters/content/extract.js";
 import { CalendarAdapter } from "../adapters/google/calendar.js";
@@ -10,15 +12,31 @@ import type { Database } from "../db/client.js";
 import {
   assessMailMetadata,
   type CalendarPrivacyMode,
+  type IntegrationAccountKind,
+  type IntegrationCapability,
   isFullMailContentAdmitted,
   JsonObjectSchema,
   PostgresSourceIntelligence,
   planCalendarSyncWindow,
   planNewestFirstMailBackfill,
   projectCalendarArtifact,
+  type SourceReadResult,
 } from "../modules/sources/index.js";
 import { DurableWork } from "../modules/work/index.js";
 import type { SecretBox } from "../shared/crypto.js";
+import { NotFoundError, StaleAuthorityError, UnauthorizedError } from "../shared/errors.js";
+
+const GOOGLE_JOB_PRIORITY = {
+  activation: 50,
+  live: 50,
+  calendar: 60,
+  calendarBackfill: 110,
+  recentBackfill: 110,
+  middleBackfill: 120,
+  yearBackfill: 130,
+  olderHistory: 140,
+} as const;
+const GOOGLE_OAUTH_CLIENT_CACHE_LIMIT = 512;
 
 const GoogleJobBaseSchema = z.strictObject({
   integrationId: z.string().uuid(),
@@ -27,17 +45,18 @@ const GoogleJobBaseSchema = z.strictObject({
   personControlEpoch: z.number().int().positive(),
 });
 
-export const GoogleBootstrapPayloadSchema = z.strictObject({
-  integrationId: z.string().uuid(),
-  personId: z.string().uuid(),
-  integrationControlEpoch: z.number().int().positive(),
-  personControlEpoch: z.number().int().positive(),
+const GoogleActivationPayloadSchema = GoogleJobBaseSchema.extend({
   olderHistoryEnabled: z.boolean().default(false),
+});
+export const GoogleBootstrapPayloadSchema = GoogleActivationPayloadSchema;
+export const GmailBootstrapPayloadSchema = GoogleActivationPayloadSchema.extend({
+  runKey: z.string().min(1).max(100).optional(),
 });
 
 export const GmailPollPayloadSchema = GoogleJobBaseSchema;
 export const GmailMessagePayloadSchema = GoogleJobBaseSchema.extend({
   messageId: z.string().min(1).max(500),
+  sourcePriority: z.number().int().min(0),
 });
 export const GmailBackfillPayloadSchema = GoogleJobBaseSchema.extend({
   stage: z.enum(["newest_30_days", "days_31_to_90", "days_91_to_365", "older_history"]),
@@ -51,15 +70,25 @@ export const CalendarPollPayloadSchema = GoogleJobBaseSchema.extend({
   calendarId: z.string().min(1).max(2_000),
   calendarIdDigest: z.string().regex(/^[a-f0-9]{64}$/u),
   mode: z.enum(["full_private", "availability_only"]),
+  grantVersion: z.number().int().positive(),
 });
 
 type GoogleJobBase = z.infer<typeof GoogleJobBaseSchema>;
+type CalendarPollPayload = z.infer<typeof CalendarPollPayloadSchema>;
+type Transaction = TransactionSql<Record<string, never>>;
+interface CalendarAuthorityContext {
+  readonly transaction: Transaction;
+  readonly sources: PostgresSourceIntelligence;
+  readonly work: DurableWork;
+}
 
 export class GoogleSyncService {
   readonly #database: Database;
   readonly #sources: PostgresSourceIntelligence;
   readonly #work: DurableWork;
   readonly #oauth: GoogleOAuthAdapter;
+  readonly #secretBox: SecretBox;
+  readonly #oauthClients = new Map<string, OAuth2Client>();
 
   public constructor(
     database: Database,
@@ -67,6 +96,7 @@ export class GoogleSyncService {
     secretBox: SecretBox,
   ) {
     this.#database = database;
+    this.#secretBox = secretBox;
     this.#sources = new PostgresSourceIntelligence(database, secretBox, {
       rawRetentionDays: config.defaults.rawSourceRetentionDays,
       privateCandidateRetentionDays: 7,
@@ -77,59 +107,97 @@ export class GoogleSyncService {
 
   public async bootstrap(payloadCandidate: unknown): Promise<void> {
     const payload = GoogleBootstrapPayloadSchema.parse(payloadCandidate);
-    const { gmail } = await this.clients(payload);
-    const profile = await gmail.profile();
-    await this.#sources.apply({
-      kind: "checkpoint_cursor",
-      integrationId: payload.integrationId,
-      personId: payload.personId,
-      expectedIntegrationControlEpoch: payload.integrationControlEpoch,
-      resourceKind: "gmail_history",
-      cursor: { historyId: profile.historyId },
-      state: "active",
-      expectedUpdatedAt: null,
-      checkpointAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    });
+    const profile = await this.integrationProfile(payload);
+    const capabilities = new Set(profile.integration.activeCapabilities);
+    if (capabilities.has("mail")) {
+      await this.#work.enqueue({
+        kind: "google.gmail.bootstrap",
+        idempotencyKey: `gmail:bootstrap:${payload.integrationId}:${controlEpochKey(payload)}`,
+        payload,
+        ...googleJobFence(payload),
+        priority: GOOGLE_JOB_PRIORITY.activation,
+        maxAttempts: 8,
+      });
+    }
+    if (capabilities.has("calendar")) {
+      await this.#work.enqueue({
+        kind: "google.calendar.catalog",
+        idempotencyKey: `calendar:catalog:${payload.integrationId}:${controlEpochKey(payload)}:activation`,
+        payload: basePayload(payload),
+        ...googleJobFence(payload),
+        priority: GOOGLE_JOB_PRIORITY.calendar,
+        maxAttempts: 8,
+      });
+    }
+    if (!capabilities.has("mail") && !capabilities.has("calendar")) {
+      throw new UnauthorizedError("Google integration has no active capability");
+    }
+  }
+
+  public async bootstrapGmail(payloadCandidate: unknown): Promise<void> {
+    const payload = GmailBootstrapPayloadSchema.parse(payloadCandidate);
+    const { gmail } = await this.clients(payload, "mail");
+    const existingCursor = await this.readOptionalCursor(payload, "gmail_history");
+    let historyId =
+      existingCursor &&
+      existingCursor.state === "active" &&
+      isRecord(existingCursor.cursor) &&
+      typeof existingCursor.cursor.historyId === "string"
+        ? existingCursor.cursor.historyId
+        : null;
+    if (!historyId) {
+      const profile = await gmail.profile();
+      historyId = profile.historyId;
+      const checkpointedAt = new Date().toISOString();
+      await this.#sources.apply({
+        kind: "checkpoint_cursor",
+        integrationId: payload.integrationId,
+        personId: payload.personId,
+        expectedIntegrationControlEpoch: payload.integrationControlEpoch,
+        resourceKind: "gmail_history",
+        cursor: { historyId },
+        state: "active",
+        expectedUpdatedAt: existingCursor?.updatedAt ?? null,
+        checkpointAt: checkpointedAt,
+        updatedAt: checkpointedAt,
+      });
+    }
     await this.#work.enqueue({
       kind: "google.gmail.poll",
-      idempotencyKey: `gmail:poll:${payload.integrationId}:${profile.historyId}`,
+      idempotencyKey: `gmail:poll:${payload.integrationId}:${controlEpochKey(payload)}:${historyId}`,
       payload: basePayload(payload),
-      person: { id: payload.personId, controlEpoch: payload.personControlEpoch },
+      ...googleJobFence(payload),
+      priority: GOOGLE_JOB_PRIORITY.live,
       maxAttempts: 8,
     });
+    const runKey = payload.runKey ?? `activation-${payload.integrationControlEpoch}`;
     for (const stage of planNewestFirstMailBackfill({
       asOf: new Date().toISOString(),
       olderHistoryEnabled: payload.olderHistoryEnabled,
     }).filter((entry) => entry.kind !== "live")) {
+      const stageCursor = await this.readOptionalCursor(payload, `gmail_backfill:${stage.kind}`);
+      if (stageCursor?.state === "exhausted") continue;
       await this.#work.enqueue({
         kind: "google.gmail.backfill",
-        idempotencyKey: `gmail:backfill:${payload.integrationId}:${stage.kind}:start`,
+        idempotencyKey: `gmail:backfill:${payload.integrationId}:${controlEpochKey(payload)}:${stage.kind}:${runKey}:start`,
         payload: {
           ...basePayload(payload),
           stage: stage.kind,
           afterExclusive: stage.afterExclusive,
           beforeOrEqual: stage.beforeOrEqual,
           pageToken: null,
-          runKey: "initial",
+          runKey,
         },
-        person: { id: payload.personId, controlEpoch: payload.personControlEpoch },
-        availableAt: new Date(Date.now() + stage.priority * 1_000),
+        ...googleJobFence(payload),
+        priority: backfillPriority(stage.kind),
         maxAttempts: 8,
       });
     }
-    await this.#work.enqueue({
-      kind: "google.calendar.catalog",
-      idempotencyKey: `calendar:catalog:${payload.integrationId}:${payload.integrationControlEpoch}`,
-      payload: basePayload(payload),
-      person: { id: payload.personId, controlEpoch: payload.personControlEpoch },
-      maxAttempts: 8,
-    });
   }
 
   public async pollGmail(payloadCandidate: unknown): Promise<void> {
     const payload = GmailPollPayloadSchema.parse(payloadCandidate);
-    const { gmail } = await this.clients(payload);
+    const { gmail } = await this.clients(payload, "mail");
     const cursor = await this.#sources.read({
       kind: "sync_cursor",
       integrationId: payload.integrationId,
@@ -173,23 +241,18 @@ export class GoogleSyncService {
       } while (pageToken);
     } catch (error) {
       if (googleErrorStatus(error) === 404) {
-        await this.#sources.apply({
-          kind: "checkpoint_cursor",
-          integrationId: payload.integrationId,
-          personId: payload.personId,
-          expectedIntegrationControlEpoch: payload.integrationControlEpoch,
-          resourceKind: "gmail_history",
-          cursor: null,
-          state: "expired",
-          expectedUpdatedAt: expectedCursorUpdate,
-          checkpointAt: null,
-          updatedAt: new Date().toISOString(),
-        });
+        await this.recoverIntegrationSync(payload, "mail");
+        return;
       }
       throw error;
     }
     for (const messageId of messageIds) {
-      await this.enqueueGmailMessage(payload, messageId, `history:${newestHistoryId}`);
+      await this.enqueueGmailMessage(
+        payload,
+        messageId,
+        `history:${newestHistoryId}`,
+        GOOGLE_JOB_PRIORITY.live,
+      );
     }
     await this.#sources.apply({
       kind: "checkpoint_cursor",
@@ -208,9 +271,10 @@ export class GoogleSyncService {
     );
     await this.#work.enqueue({
       kind: "google.gmail.poll",
-      idempotencyKey: `gmail:poll:${payload.integrationId}:t${bucket}`,
+      idempotencyKey: `gmail:poll:${payload.integrationId}:${controlEpochKey(payload)}:t${bucket}`,
       payload,
-      person: { id: payload.personId, controlEpoch: payload.personControlEpoch },
+      ...googleJobFence(payload),
+      priority: GOOGLE_JOB_PRIORITY.live,
       availableAt: new Date(Date.now() + this.config.intervals.gmailPollMs),
       maxAttempts: 8,
     });
@@ -220,11 +284,11 @@ export class GoogleSyncService {
     const runKey = `recovery-${Math.floor(Date.now() / 86_400_000)}`;
     for (const stage of planNewestFirstMailBackfill({
       asOf: new Date().toISOString(),
-      olderHistoryEnabled: false,
+      olderHistoryEnabled: true,
     }).filter((entry) => entry.kind !== "live")) {
       await this.#work.enqueue({
         kind: "google.gmail.backfill",
-        idempotencyKey: `gmail:${runKey}:${payload.integrationId}:${stage.kind}:start`,
+        idempotencyKey: `gmail:backfill:${payload.integrationId}:${controlEpochKey(payload)}:${stage.kind}:${runKey}:start`,
         payload: {
           ...payload,
           stage: stage.kind,
@@ -233,7 +297,8 @@ export class GoogleSyncService {
           pageToken: null,
           runKey,
         },
-        person: { id: payload.personId, controlEpoch: payload.personControlEpoch },
+        ...googleJobFence(payload),
+        priority: backfillPriority(stage.kind),
         maxAttempts: 8,
       });
     }
@@ -241,20 +306,27 @@ export class GoogleSyncService {
 
   public async backfillGmail(payloadCandidate: unknown): Promise<void> {
     const payload = GmailBackfillPayloadSchema.parse(payloadCandidate);
-    const { gmail } = await this.clients(payload);
+    const { gmail } = await this.clients(payload, "mail");
     const page = await gmail.listMessages(
       gmailDateQuery(payload.afterExclusive, payload.beforeOrEqual),
       payload.pageToken ?? undefined,
+      50,
     );
     for (const messageId of page.messageIds) {
-      await this.enqueueGmailMessage(payload, messageId, `backfill:${payload.runKey}`);
+      await this.enqueueGmailMessage(
+        payload,
+        messageId,
+        `backfill:${payload.runKey}`,
+        backfillPriority(payload.stage),
+      );
     }
     if (page.nextPageToken) {
       await this.#work.enqueue({
         kind: "google.gmail.backfill",
-        idempotencyKey: `gmail:backfill:${payload.integrationId}:${payload.stage}:${payload.runKey}:${sha256Hex(page.nextPageToken)}`,
+        idempotencyKey: `gmail:backfill:${payload.integrationId}:${controlEpochKey(payload)}:${payload.stage}:${payload.runKey}:${sha256Hex(page.nextPageToken)}`,
         payload: { ...payload, pageToken: page.nextPageToken },
-        person: { id: payload.personId, controlEpoch: payload.personControlEpoch },
+        ...googleJobFence(payload),
+        priority: backfillPriority(payload.stage),
         maxAttempts: 8,
       });
     } else {
@@ -277,7 +349,7 @@ export class GoogleSyncService {
 
   public async ingestGmailMessage(payloadCandidate: unknown): Promise<string | null> {
     const payload = GmailMessagePayloadSchema.parse(payloadCandidate);
-    const { gmail } = await this.clients(payload);
+    const { gmail } = await this.clients(payload, "mail");
     let metadata: NormalizedGmailMessage;
     try {
       metadata = await gmail.message(payload.messageId, true);
@@ -286,6 +358,7 @@ export class GoogleSyncService {
         await this.#sources.apply({
           kind: "mark_source_deleted",
           integrationId: payload.integrationId,
+          expectedIntegrationControlEpoch: payload.integrationControlEpoch,
           artifactKind: "mail_message",
           origin: { system: "gmail", remoteObjectId: payload.messageId },
           scope: { kind: "person", personId: payload.personId },
@@ -334,6 +407,7 @@ export class GoogleSyncService {
     const ingested = await this.#sources.apply({
       kind: "ingest_source",
       integrationId: payload.integrationId,
+      expectedIntegrationControlEpoch: payload.integrationControlEpoch,
       artifactKind: "mail_message",
       origin: { system: "gmail", remoteObjectId: payload.messageId, remoteRevisionId: message.historyId },
       scope: { kind: "person", personId: payload.personId },
@@ -345,7 +419,7 @@ export class GoogleSyncService {
       ).toISOString(),
     });
     if (ingested.kind !== "source_ingested") return null;
-    if (fullContentAdmitted && !ingested.duplicate) {
+    if (fullContentAdmitted) {
       for (const attachment of message.attachments.filter(
         (entry) => !entry.inline && entry.size <= 15 * 1024 * 1024,
       )) {
@@ -355,18 +429,23 @@ export class GoogleSyncService {
     if (!fullContentAdmitted) return ingested.sourceRevisionId;
     await this.#work.enqueue({
       kind: "orchestrate.private_source",
-      idempotencyKey: `orchestrate:source:${ingested.sourceRevisionId}`,
-      payload: { sourceRevisionId: ingested.sourceRevisionId, personId: payload.personId },
-      person: { id: payload.personId, controlEpoch: payload.personControlEpoch },
-      maxAttempts: 5,
-      deadlineAt: new Date(Date.now() + 10 * 60_000),
+      idempotencyKey: `orchestrate:source:${ingested.sourceRevisionId}:${controlEpochKey(payload)}`,
+      payload: {
+        sourceRevisionId: ingested.sourceRevisionId,
+        personId: payload.personId,
+        integrationId: payload.integrationId,
+        integrationControlEpoch: payload.integrationControlEpoch,
+      },
+      ...googleJobFence(payload),
+      priority: payload.sourcePriority,
+      maxAttempts: 8,
     });
     return ingested.sourceRevisionId;
   }
 
   public async catalogCalendars(payloadCandidate: unknown): Promise<void> {
     const payload = CalendarCatalogPayloadSchema.parse(payloadCandidate);
-    const { calendar } = await this.clients(payload);
+    const { accountKind, calendar } = await this.clients(payload, "calendar");
     const calendars: Array<{
       id: string;
       summary: string;
@@ -401,6 +480,23 @@ export class GoogleSyncService {
       checkpointAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     });
+    const reconciled = await this.#sources.apply({
+      kind: "reconcile_calendar_catalog",
+      integrationId: payload.integrationId,
+      personId: payload.personId,
+      expectedIntegrationControlEpoch: payload.integrationControlEpoch,
+      activeCalendarIdDigests: [
+        ...new Set(calendars.filter((entry) => !entry.deleted).map((entry) => sha256Hex(entry.id))),
+      ],
+      reconciledAt: new Date().toISOString(),
+    });
+    if (reconciled.kind !== "calendar_catalog_reconciled") {
+      throw new Error("Calendar catalog reconciliation did not complete");
+    }
+    if (reconciled.resetRequired) {
+      await this.enqueueIntegrationBootstrap(payload, reconciled.integrationControlEpoch, "calendar-catalog");
+      return;
+    }
     for (const entry of calendars.filter((calendarEntry) => !calendarEntry.deleted)) {
       const digest = sha256Hex(entry.id);
       try {
@@ -412,18 +508,34 @@ export class GoogleSyncService {
           calendarIdDigest: digest,
         });
         if (policy.kind === "calendar_privacy" && policy.mode !== "off") {
-          await this.enqueueCalendarPoll(payload, entry.id, digest, policy.mode);
+          await this.enqueueCalendarPoll(payload, entry.id, digest, policy.mode, policy.grantVersion);
         }
-      } catch {
-        // Missing policy is a deliberate default-off state surfaced in the control plane.
+      } catch (error) {
+        if (!(error instanceof NotFoundError)) throw error;
+        if (!entry.primary) continue;
+        const mode = defaultPrimaryCalendarMode(accountKind);
+        const configured = await this.#sources.apply({
+          kind: "configure_calendar_privacy",
+          integrationId: payload.integrationId,
+          personId: payload.personId,
+          expectedIntegrationControlEpoch: payload.integrationControlEpoch,
+          calendarIdDigest: digest,
+          mode,
+          changedAt: new Date().toISOString(),
+        });
+        if (configured.kind !== "calendar_privacy_configured") {
+          throw new Error("Primary calendar privacy default was not configured");
+        }
+        await this.enqueueCalendarPoll(payload, entry.id, digest, mode, configured.grantVersion);
       }
     }
     const bucket = Math.floor((Date.now() + 24 * 60 * 60_000) / (24 * 60 * 60_000));
     await this.#work.enqueue({
       kind: "google.calendar.catalog",
-      idempotencyKey: `calendar:catalog:${payload.integrationId}:d${bucket}`,
+      idempotencyKey: `calendar:catalog:${payload.integrationId}:${controlEpochKey(payload)}:d${bucket}`,
       payload,
-      person: { id: payload.personId, controlEpoch: payload.personControlEpoch },
+      ...googleJobFence(payload),
+      priority: GOOGLE_JOB_PRIORITY.calendar,
       availableAt: new Date(Date.now() + 24 * 60 * 60_000),
       maxAttempts: 8,
     });
@@ -431,7 +543,8 @@ export class GoogleSyncService {
 
   public async pollCalendar(payloadCandidate: unknown): Promise<void> {
     const payload = CalendarPollPayloadSchema.parse(payloadCandidate);
-    const { calendar } = await this.clients(payload);
+    await this.assertCalendarPollAuthority(payload);
+    const { calendar } = await this.clients(payload, "calendar");
     const cursorKind = `calendar:${payload.calendarIdDigest}`;
     let syncToken: string | undefined;
     let expectedCursorUpdate: string | null = null;
@@ -451,14 +564,18 @@ export class GoogleSyncService {
         syncToken = cursor.cursor.syncToken;
       }
       if (cursor.kind === "sync_cursor") expectedCursorUpdate = cursor.updatedAt;
-    } catch {
-      syncToken = undefined;
+    } catch (error) {
+      if (!(error instanceof NotFoundError)) throw error;
     }
     const window = planCalendarSyncWindow(new Date().toISOString());
+    const interpretationPriority = syncToken
+      ? GOOGLE_JOB_PRIORITY.calendar
+      : GOOGLE_JOB_PRIORITY.calendarBackfill;
     let pageToken: string | undefined;
     let nextSyncToken: string | undefined;
     try {
       do {
+        await this.assertCalendarPollAuthority(payload);
         const page = await calendar.listEvents({
           calendarId: payload.calendarId,
           ...(syncToken
@@ -473,13 +590,16 @@ export class GoogleSyncService {
             ...(event.etag ? { remoteRevisionId: event.etag } : {}),
           };
           if (event.status === "cancelled") {
-            await this.#sources.apply({
-              kind: "mark_source_deleted",
-              integrationId: payload.integrationId,
-              artifactKind: "calendar_event",
-              origin,
-              scope: { kind: "person", personId: payload.personId },
-              deletedAt: new Date().toISOString(),
+            await this.withCalendarPollAuthority(payload, async ({ sources }) => {
+              await sources.apply({
+                kind: "mark_source_deleted",
+                integrationId: payload.integrationId,
+                expectedIntegrationControlEpoch: payload.integrationControlEpoch,
+                artifactKind: "calendar_event",
+                origin,
+                scope: { kind: "person", personId: payload.personId },
+                deletedAt: new Date().toISOString(),
+              });
             });
             continue;
           }
@@ -498,98 +618,245 @@ export class GoogleSyncService {
             payload.mode,
           );
           if (!projected) continue;
-          const ingested = await this.#sources.apply({
-            kind: "ingest_source",
-            integrationId: payload.integrationId,
-            artifactKind: "calendar_event",
-            origin,
-            resourceDigest: payload.calendarIdDigest,
-            scope: { kind: "person", personId: payload.personId },
-            content: projected,
-            occurredAt: event.updatedAt?.toISOString() ?? new Date().toISOString(),
-            capturedAt: new Date().toISOString(),
-            requestedRetentionUntil: new Date(
-              Date.now() + this.config.defaults.rawSourceRetentionDays * 86_400_000,
-            ).toISOString(),
-          });
-          if (ingested.kind === "source_ingested") {
-            await this.#work.enqueue({
-              kind: "orchestrate.private_source",
-              idempotencyKey: `orchestrate:source:${ingested.sourceRevisionId}`,
-              payload: { sourceRevisionId: ingested.sourceRevisionId, personId: payload.personId },
-              person: { id: payload.personId, controlEpoch: payload.personControlEpoch },
-              maxAttempts: 5,
+          await this.withCalendarPollAuthority(payload, async ({ sources, work }) => {
+            const ingested = await sources.apply({
+              kind: "ingest_source",
+              integrationId: payload.integrationId,
+              expectedIntegrationControlEpoch: payload.integrationControlEpoch,
+              artifactKind: "calendar_event",
+              origin,
+              resourceDigest: payload.calendarIdDigest,
+              scope: { kind: "person", personId: payload.personId },
+              content: projected,
+              occurredAt: event.updatedAt?.toISOString() ?? new Date().toISOString(),
+              capturedAt: new Date().toISOString(),
+              requestedRetentionUntil: new Date(
+                Date.now() + this.config.defaults.rawSourceRetentionDays * 86_400_000,
+              ).toISOString(),
             });
-          }
+            if (ingested.kind === "source_ingested") {
+              await work.enqueue({
+                kind: "orchestrate.private_source",
+                idempotencyKey: `orchestrate:source:${ingested.sourceRevisionId}:${controlEpochKey(payload)}`,
+                payload: {
+                  sourceRevisionId: ingested.sourceRevisionId,
+                  personId: payload.personId,
+                  integrationId: payload.integrationId,
+                  integrationControlEpoch: payload.integrationControlEpoch,
+                },
+                ...googleJobFence(payload),
+                priority: interpretationPriority,
+                maxAttempts: 8,
+              });
+            }
+          });
         }
         pageToken = page.nextPageToken;
         nextSyncToken = page.nextSyncToken ?? nextSyncToken;
       } while (pageToken);
     } catch (error) {
       if (googleErrorStatus(error) === 410) {
-        await this.#sources.apply({
-          kind: "checkpoint_cursor",
-          integrationId: payload.integrationId,
-          personId: payload.personId,
-          expectedIntegrationControlEpoch: payload.integrationControlEpoch,
-          resourceKind: cursorKind,
-          cursor: null,
-          state: "expired",
-          expectedUpdatedAt: expectedCursorUpdate,
-          checkpointAt: null,
-          updatedAt: new Date().toISOString(),
+        await this.withCalendarPollAuthority(payload, async ({ sources, work }) => {
+          await this.recoverIntegrationSync(payload, "calendar", sources, work);
         });
+        return;
       }
       throw error;
     }
-    await this.#sources.apply({
-      kind: "checkpoint_cursor",
-      integrationId: payload.integrationId,
-      personId: payload.personId,
-      expectedIntegrationControlEpoch: payload.integrationControlEpoch,
-      resourceKind: cursorKind,
-      cursor: nextSyncToken ? { syncToken: nextSyncToken } : null,
-      state: nextSyncToken ? "active" : "initial",
-      expectedUpdatedAt: expectedCursorUpdate,
-      checkpointAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
+    await this.withCalendarPollAuthority(payload, async ({ sources }) => {
+      await sources.apply({
+        kind: "checkpoint_cursor",
+        integrationId: payload.integrationId,
+        personId: payload.personId,
+        expectedIntegrationControlEpoch: payload.integrationControlEpoch,
+        resourceKind: cursorKind,
+        cursor: nextSyncToken ? { syncToken: nextSyncToken } : null,
+        state: nextSyncToken ? "active" : "initial",
+        expectedUpdatedAt: expectedCursorUpdate,
+        checkpointAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
     });
     const bucket = Math.floor(
       (Date.now() + this.config.intervals.calendarPollMs) / this.config.intervals.calendarPollMs,
     );
-    await this.#work.enqueue({
-      kind: "google.calendar.poll",
-      idempotencyKey: `calendar:poll:${payload.integrationId}:${payload.calendarIdDigest}:t${bucket}`,
-      payload,
-      person: { id: payload.personId, controlEpoch: payload.personControlEpoch },
-      availableAt: new Date(Date.now() + this.config.intervals.calendarPollMs),
-      maxAttempts: 8,
+    await this.withCalendarPollAuthority(payload, async ({ work }) => {
+      await work.enqueue({
+        kind: "google.calendar.poll",
+        idempotencyKey: calendarPollKey(payload, `t${bucket}`),
+        payload,
+        ...googleJobFence(payload),
+        priority: GOOGLE_JOB_PRIORITY.calendar,
+        availableAt: new Date(Date.now() + this.config.intervals.calendarPollMs),
+        maxAttempts: 8,
+      });
     });
   }
 
-  private async clients(payload: GoogleJobBase) {
+  public async handleProviderAuthFailure(
+    jobKind: string,
+    payloadCandidate: unknown,
+    error: unknown,
+  ): Promise<boolean> {
+    const affectedCapability = googleJobCapability(jobKind);
+    if (!affectedCapability || !isGoogleProviderAuthFailure(error)) return false;
+    const parsedPayload = GoogleJobBaseSchema.safeParse(payloadCandidate);
+    if (!parsedPayload.success) return false;
+    const payload = parsedPayload.data;
+    await this.#sources.apply({
+      kind: "set_integration_status",
+      integrationId: payload.integrationId,
+      personId: payload.personId,
+      expectedControlEpoch: payload.integrationControlEpoch,
+      status: "reauth_required",
+      changedAt: new Date().toISOString(),
+    });
+    return true;
+  }
+
+  private async integrationProfile(payload: GoogleJobBase) {
+    const profile = await this.#sources.read({
+      kind: "integration_profile",
+      integrationId: payload.integrationId,
+      personId: payload.personId,
+      expectedControlEpoch: payload.integrationControlEpoch,
+    });
+    if (profile.kind !== "integration_profile") {
+      throw new Error("Google integration profile is not accessible");
+    }
+    if (profile.integration.provider !== "google") {
+      throw new UnauthorizedError("Integration is not a Google account");
+    }
+    if (profile.integration.status !== "active") {
+      throw new UnauthorizedError("Google integration is not active");
+    }
+    return profile;
+  }
+
+  private async integrationAccess(payload: GoogleJobBase, requiredCapability: IntegrationCapability) {
     const access = await this.#sources.read({
       kind: "integration_access",
       integrationId: payload.integrationId,
       personId: payload.personId,
       expectedControlEpoch: payload.integrationControlEpoch,
+      requiredCapability,
     });
     if (access.kind !== "integration_access") throw new Error("Google integration is not accessible");
+    if (access.integration.provider !== "google") {
+      throw new UnauthorizedError("Integration is not a Google account");
+    }
+    return access;
+  }
+
+  private async clients(payload: GoogleJobBase, requiredCapability: IntegrationCapability) {
+    const access = await this.integrationAccess(payload, requiredCapability);
     const credentials = access.credentials as GoogleCredentials;
-    const oauthClient = this.#oauth.client(credentials);
-    return { gmail: new GmailAdapter(oauthClient), calendar: new CalendarAdapter(oauthClient) };
+    const oauthClient = this.oauthClient(payload, credentials);
+    return {
+      accountKind: access.integration.accountKind,
+      gmail: new GmailAdapter(oauthClient),
+      calendar: new CalendarAdapter(oauthClient),
+    };
+  }
+
+  private oauthClient(payload: GoogleJobBase, credentials: GoogleCredentials): OAuth2Client {
+    const cacheKey = `${payload.integrationId}:e${payload.integrationControlEpoch}`;
+    const cached = this.#oauthClients.get(cacheKey);
+    if (cached) {
+      this.#oauthClients.delete(cacheKey);
+      this.#oauthClients.set(cacheKey, cached);
+      return cached;
+    }
+    for (const key of this.#oauthClients.keys()) {
+      if (key.startsWith(`${payload.integrationId}:`) && key !== cacheKey) {
+        this.#oauthClients.delete(key);
+      }
+    }
+    const client = this.#oauth.client(credentials);
+    this.#oauthClients.set(cacheKey, client);
+    while (this.#oauthClients.size > GOOGLE_OAUTH_CLIENT_CACHE_LIMIT) {
+      const oldest = this.#oauthClients.keys().next().value;
+      if (oldest === undefined) break;
+      this.#oauthClients.delete(oldest);
+    }
+    return client;
+  }
+
+  private async assertCalendarPollAuthority(
+    payload: CalendarPollPayload,
+    sources = this.#sources,
+  ): Promise<void> {
+    const policy = await sources.read({
+      kind: "calendar_privacy",
+      integrationId: payload.integrationId,
+      personId: payload.personId,
+      expectedIntegrationControlEpoch: payload.integrationControlEpoch,
+      calendarIdDigest: payload.calendarIdDigest,
+    });
+    if (
+      policy.kind !== "calendar_privacy" ||
+      policy.mode === "off" ||
+      policy.mode !== payload.mode ||
+      policy.grantVersion !== payload.grantVersion
+    ) {
+      throw new StaleAuthorityError("Calendar privacy authority changed");
+    }
+  }
+
+  private async withCalendarPollAuthority<Result>(
+    payload: CalendarPollPayload,
+    operation: (context: CalendarAuthorityContext) => Promise<Result>,
+  ): Promise<Result> {
+    return this.#database.begin(async (transaction) => {
+      const integrations = await transaction<
+        {
+          readonly person_id: string;
+          readonly provider: string;
+          readonly status: string;
+          readonly control_epoch: number | string;
+        }[]
+      >`
+        select person_id, provider, status, control_epoch
+        from integrations
+        where id = ${payload.integrationId}
+        for update
+      `;
+      const integration = integrations[0];
+      if (!integration || integration.person_id !== payload.personId) {
+        throw new UnauthorizedError("Calendar integration is not accessible");
+      }
+      if (integration.provider !== "google" || integration.status !== "active") {
+        throw new UnauthorizedError("Calendar integration is not active");
+      }
+      if (Number(integration.control_epoch) !== payload.integrationControlEpoch) {
+        throw new StaleAuthorityError("Calendar integration authority changed");
+      }
+      await transaction`select pg_advisory_xact_lock(hashtextextended(${calendarPolicyLockKey(payload)}, 0))`;
+      const sources = new PostgresSourceIntelligence(transaction, this.#secretBox, {
+        rawRetentionDays: this.config.defaults.rawSourceRetentionDays,
+        privateCandidateRetentionDays: 7,
+      });
+      await this.assertCalendarPollAuthority(payload, sources);
+      return operation({
+        transaction,
+        sources,
+        work: new DurableWork(transaction, this.#secretBox),
+      });
+    }) as unknown as Promise<Result>;
   }
 
   private async enqueueGmailMessage(
     payload: GoogleJobBase,
     messageId: string,
     observationKey: string,
+    priority: number,
   ): Promise<void> {
     await this.#work.enqueue({
       kind: "google.gmail.message",
-      idempotencyKey: `gmail:message:${payload.integrationId}:${messageId}:${sha256Hex(observationKey)}`,
-      payload: { ...payload, messageId },
-      person: { id: payload.personId, controlEpoch: payload.personControlEpoch },
+      idempotencyKey: `gmail:message:${payload.integrationId}:${controlEpochKey(payload)}:${messageId}:${sha256Hex(observationKey)}`,
+      payload: { ...payload, messageId, sourcePriority: priority },
+      ...googleJobFence(payload),
+      priority,
       maxAttempts: 8,
     });
   }
@@ -599,25 +866,58 @@ export class GoogleSyncService {
     calendarId: string,
     calendarIdDigest: string,
     mode: Exclude<CalendarPrivacyMode, "off">,
+    grantVersion: number,
   ): Promise<void> {
-    const live = await this.#database<{ readonly present: boolean }[]>`
-      select exists(
-        select 1 from jobs
-        where person_id = ${payload.personId}
-          and job_kind = 'google.calendar.poll'
-          and idempotency_key like ${`calendar:poll:${payload.integrationId}:${calendarIdDigest}:%`}
-          and status in ('pending', 'retry', 'leased')
-      ) as present
-    `;
-    if (live[0]?.present) return;
-    const recoveryBucket = Math.floor(Date.now() / 60_000);
-    await this.#work.enqueue({
-      kind: "google.calendar.poll",
-      idempotencyKey: `calendar:poll:${payload.integrationId}:${calendarIdDigest}:seed${recoveryBucket}`,
-      payload: { ...payload, calendarId, calendarIdDigest, mode },
-      person: { id: payload.personId, controlEpoch: payload.personControlEpoch },
-      maxAttempts: 8,
+    const pollPayload = CalendarPollPayloadSchema.parse({
+      ...payload,
+      calendarId,
+      calendarIdDigest,
+      mode,
+      grantVersion,
     });
+    await this.withCalendarPollAuthority(pollPayload, async ({ transaction, work }) => {
+      const live = await transaction<{ readonly present: boolean }[]>`
+        select exists(
+          select 1 from jobs
+          where integration_id = ${payload.integrationId}
+            and integration_control_epoch = ${payload.integrationControlEpoch}
+            and person_id = ${payload.personId}
+            and job_kind = 'google.calendar.poll'
+            and idempotency_key like ${`${calendarPollKeyPrefix(pollPayload)}%`}
+            and status in ('pending', 'retry', 'leased')
+        ) as present
+      `;
+      if (live[0]?.present) return;
+      const recoveryBucket = Math.floor(Date.now() / 60_000);
+      await work.enqueue({
+        kind: "google.calendar.poll",
+        idempotencyKey: calendarPollKey(pollPayload, `seed${recoveryBucket}`),
+        payload: pollPayload,
+        ...googleJobFence(payload),
+        priority: GOOGLE_JOB_PRIORITY.calendar,
+        maxAttempts: 8,
+      });
+    });
+  }
+
+  private async readOptionalCursor(
+    payload: GoogleJobBase,
+    resourceKind: string,
+  ): Promise<Extract<SourceReadResult, { kind: "sync_cursor" }> | null> {
+    try {
+      const cursor = await this.#sources.read({
+        kind: "sync_cursor",
+        integrationId: payload.integrationId,
+        personId: payload.personId,
+        expectedIntegrationControlEpoch: payload.integrationControlEpoch,
+        resourceKind,
+      });
+      if (cursor.kind !== "sync_cursor") throw new Error("Google sync cursor read was inconsistent");
+      return cursor;
+    } catch (error) {
+      if (error instanceof NotFoundError) return null;
+      throw error;
+    }
   }
 
   private async cursorUpdatedAt(payload: GoogleJobBase, resourceKind: string): Promise<string | null> {
@@ -633,6 +933,52 @@ export class GoogleSyncService {
     } catch {
       return null;
     }
+  }
+
+  private async recoverIntegrationSync(
+    payload: GoogleJobBase,
+    affectedCapability: IntegrationCapability,
+    sources = this.#sources,
+    work = this.#work,
+  ): Promise<void> {
+    const reset = await sources.apply({
+      kind: "reset_integration_sync",
+      integrationId: payload.integrationId,
+      personId: payload.personId,
+      expectedIntegrationControlEpoch: payload.integrationControlEpoch,
+      affectedCapability,
+      resetAt: new Date().toISOString(),
+    });
+    if (reset.kind !== "integration_sync_reset") {
+      throw new Error("Google synchronization recovery did not reset authority");
+    }
+    await this.enqueueIntegrationBootstrap(
+      payload,
+      reset.integrationControlEpoch,
+      `${affectedCapability}-cursor`,
+      work,
+    );
+  }
+
+  private async enqueueIntegrationBootstrap(
+    payload: GoogleJobBase,
+    integrationControlEpoch: number,
+    reason: "mail-cursor" | "calendar-cursor" | "calendar-catalog",
+    work = this.#work,
+  ): Promise<void> {
+    const recoveredPayload = {
+      ...payload,
+      integrationControlEpoch,
+      olderHistoryEnabled: true,
+    };
+    await work.enqueue({
+      kind: "google.bootstrap",
+      idempotencyKey: `google:bootstrap:${payload.integrationId}:e${integrationControlEpoch}:recovery:${reason}`,
+      payload: recoveredPayload,
+      ...googleJobFence(recoveredPayload),
+      priority: GOOGLE_JOB_PRIORITY.activation,
+      maxAttempts: 8,
+    });
   }
 
   private async ingestGmailAttachment(
@@ -654,6 +1000,7 @@ export class GoogleSyncService {
     const ingested = await this.#sources.apply({
       kind: "ingest_source",
       integrationId: payload.integrationId,
+      expectedIntegrationControlEpoch: payload.integrationControlEpoch,
       artifactKind: "attachment_manifest",
       origin: {
         system: "gmail.attachment",
@@ -682,6 +1029,8 @@ export class GoogleSyncService {
       kind: "store_blob",
       sourceRevisionId: ingested.sourceRevisionId,
       scope: { kind: "person", personId: payload.personId },
+      integrationId: payload.integrationId,
+      expectedIntegrationControlEpoch: payload.integrationControlEpoch,
       blobKind: `gmail_attachment:${attachment.partId}`,
       mimeType: detectedMime,
       bytes: new Uint8Array(bytes),
@@ -692,6 +1041,8 @@ export class GoogleSyncService {
         kind: "store_derivative",
         sourceRevisionId: ingested.sourceRevisionId,
         scope: { kind: "person", personId: payload.personId },
+        integrationId: payload.integrationId,
+        expectedIntegrationControlEpoch: payload.integrationControlEpoch,
         derivativeKind: `attachment_text:${attachment.partId}`,
         content: JsonObjectSchema.parse({
           filename: attachment.filename,
@@ -707,16 +1058,19 @@ export class GoogleSyncService {
         createdAt: new Date().toISOString(),
       });
     }
-    if (!ingested.duplicate) {
-      await this.#work.enqueue({
-        kind: "orchestrate.private_source",
-        idempotencyKey: `orchestrate:source:${ingested.sourceRevisionId}`,
-        payload: { sourceRevisionId: ingested.sourceRevisionId, personId: payload.personId },
-        person: { id: payload.personId, controlEpoch: payload.personControlEpoch },
-        maxAttempts: 5,
-        deadlineAt: new Date(Date.now() + 10 * 60_000),
-      });
-    }
+    await this.#work.enqueue({
+      kind: "orchestrate.private_source",
+      idempotencyKey: `orchestrate:source:${ingested.sourceRevisionId}:${controlEpochKey(payload)}`,
+      payload: {
+        sourceRevisionId: ingested.sourceRevisionId,
+        personId: payload.personId,
+        integrationId: payload.integrationId,
+        integrationControlEpoch: payload.integrationControlEpoch,
+      },
+      ...googleJobFence(payload),
+      priority: payload.sourcePriority,
+      maxAttempts: 8,
+    });
   }
 }
 
@@ -727,6 +1081,58 @@ function basePayload(payload: z.infer<typeof GoogleBootstrapPayloadSchema>): Goo
     integrationControlEpoch: payload.integrationControlEpoch,
     personControlEpoch: payload.personControlEpoch,
   };
+}
+
+function googleJobFence(payload: GoogleJobBase) {
+  return {
+    person: { id: payload.personId, controlEpoch: payload.personControlEpoch },
+    integration: { id: payload.integrationId, controlEpoch: payload.integrationControlEpoch },
+  } as const;
+}
+
+function controlEpochKey(payload: GoogleJobBase): string {
+  return `e${payload.integrationControlEpoch}`;
+}
+
+function calendarPolicyLockKey(payload: Pick<CalendarPollPayload, "integrationId" | "calendarIdDigest">) {
+  return `calendar-privacy:${payload.integrationId}:${payload.calendarIdDigest}`;
+}
+
+function calendarPollKeyPrefix(payload: CalendarPollPayload): string {
+  return `calendar:poll:${payload.integrationId}:${controlEpochKey(payload)}:${payload.calendarIdDigest}:v${payload.grantVersion}:${payload.mode}:`;
+}
+
+function calendarPollKey(payload: CalendarPollPayload, occurrence: string): string {
+  return `${calendarPollKeyPrefix(payload)}${occurrence}`;
+}
+
+function backfillPriority(
+  stage: "live" | "newest_30_days" | "days_31_to_90" | "days_91_to_365" | "older_history",
+): number {
+  switch (stage) {
+    case "live":
+      return GOOGLE_JOB_PRIORITY.live;
+    case "newest_30_days":
+      return GOOGLE_JOB_PRIORITY.recentBackfill;
+    case "days_31_to_90":
+      return GOOGLE_JOB_PRIORITY.middleBackfill;
+    case "days_91_to_365":
+      return GOOGLE_JOB_PRIORITY.yearBackfill;
+    case "older_history":
+      return GOOGLE_JOB_PRIORITY.olderHistory;
+  }
+}
+
+function defaultPrimaryCalendarMode(
+  accountKind: IntegrationAccountKind,
+): Exclude<CalendarPrivacyMode, "off"> {
+  return accountKind === "personal_family" ? "full_private" : "availability_only";
+}
+
+function googleJobCapability(jobKind: string): IntegrationCapability | null {
+  if (jobKind.startsWith("google.gmail.")) return "mail";
+  if (jobKind.startsWith("google.calendar.")) return "calendar";
+  return null;
 }
 
 function gmailDateQuery(afterExclusive: string | null, beforeOrEqual: string | null): string {
@@ -744,6 +1150,9 @@ function gmailDate(instant: string): string {
 function googleErrorStatus(error: unknown): number | undefined {
   if (typeof error !== "object" || error === null) return undefined;
   if ("code" in error && typeof error.code === "number") return error.code;
+  if ("code" in error && typeof error.code === "string" && /^\d{3}$/u.test(error.code)) {
+    return Number(error.code);
+  }
   if (
     "response" in error &&
     typeof error.response === "object" &&
@@ -753,6 +1162,36 @@ function googleErrorStatus(error: unknown): number | undefined {
     return typeof error.response.status === "number" ? error.response.status : undefined;
   }
   return undefined;
+}
+
+function isGoogleProviderAuthFailure(error: unknown): boolean {
+  if (googleErrorStatus(error) === 401) return true;
+  const markers = googleErrorMarkers(error);
+  return markers.some((marker) =>
+    /(?:^|[^a-z])(?:invalid_grant|invalid_client|unauthorized_client|autherror)(?:[^a-z]|$)/iu.test(marker),
+  );
+}
+
+function googleErrorMarkers(error: unknown): string[] {
+  if (!isRecord(error)) return [];
+  const markers: string[] = [];
+  for (const value of [error.code, error.message, error.error, error.error_description]) {
+    if (typeof value === "string") markers.push(value);
+  }
+  if (!isRecord(error.response) || !isRecord(error.response.data)) return markers;
+  for (const value of [error.response.data.error, error.response.data.error_description]) {
+    if (typeof value === "string") markers.push(value);
+  }
+  const nestedErrors = error.response.data.errors;
+  if (Array.isArray(nestedErrors)) {
+    for (const nested of nestedErrors) {
+      if (!isRecord(nested)) continue;
+      for (const value of [nested.reason, nested.message]) {
+        if (typeof value === "string") markers.push(value);
+      }
+    }
+  }
+  return markers;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

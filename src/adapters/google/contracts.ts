@@ -1,3 +1,6 @@
+export type GoogleCapability = "mail" | "calendar";
+export type GoogleConnectionProfile = "personal_family" | "work";
+
 export interface GoogleCredentials {
   accessToken?: string;
   refreshToken?: string;
@@ -12,6 +15,7 @@ export interface GoogleTokenExchange {
   subject: string;
   email: string;
   grantedScopes: readonly string[];
+  grantedCapabilities: readonly GoogleCapability[];
 }
 
 export interface GmailAttachmentReference {

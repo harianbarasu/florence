@@ -1,5 +1,6 @@
 import type { LinqChatSnapshot, LinqWebhookEnvelope } from "../adapters/linq/index.js";
 import type { PrivateBridgeProposalInput } from "../modules/bridges/index.js";
+import type { IntegrationAccountKind, IntegrationCapability, JsonObject } from "../modules/sources/index.js";
 import type { TimerProcessPayload } from "../modules/work/index.js";
 
 export interface ApplicationTimerProcessor {
@@ -61,6 +62,27 @@ export type AppEnvelope =
       readonly kind: "maintenance.redrive_effects";
       readonly asOf: string;
       readonly limit: number;
+    }
+  | {
+      readonly kind: "google.oauth.begin";
+      readonly personId: string;
+      readonly initiatingSessionId: string;
+      readonly stateDigest: string;
+      readonly pkceVerifier: string;
+      readonly returnPath: string;
+      readonly requestedCapabilities: readonly IntegrationCapability[];
+      readonly accountKind: IntegrationAccountKind;
+      readonly expectedPersonControlEpoch: number;
+      readonly expiresAt: string;
+      readonly createdAt: string;
+    }
+  | {
+      readonly kind: "google.oauth.complete";
+      readonly stateDigest: string;
+      readonly externalSubjectDigest: string;
+      readonly credentials: JsonObject;
+      readonly grantedCapabilities: readonly IntegrationCapability[];
+      readonly completedAt: string;
     }
   | {
       readonly kind: "web.command";

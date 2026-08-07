@@ -968,9 +968,20 @@ function SourcesPage({ viewer }: { viewer: Viewer }) {
     new Date(viewer.session.assuranceExpiresAt) > new Date();
   useEffect(() => {
     if (!data?.privateReviews.some((review) => review.preparingShare)) return;
-    const poll = window.setInterval(() => void reload(), 3_000);
+    const poll = window.setInterval(() => void reload(false), 3_000);
     return () => window.clearInterval(poll);
   }, [data, reload]);
+  const googleSyncStarting = data?.connections.some(
+    (connection) =>
+      connection.mail?.liveState === "waiting" ||
+      (connection.mail !== null && connection.mail.backfillCompleted < connection.mail.backfillTotal) ||
+      connection.calendar?.syncState === "waiting",
+  );
+  useEffect(() => {
+    if (!googleSyncStarting) return;
+    const poll = window.setInterval(() => void reload(false), 10_000);
+    return () => window.clearInterval(poll);
+  }, [googleSyncStarting, reload]);
   if (loading) return <PageSkeleton />;
   if (error || !data) return <ErrorCard message={error ?? "Could not load sources."} />;
   async function changeCalendar(
@@ -1105,8 +1116,12 @@ function SourcesPage({ viewer }: { viewer: Viewer }) {
       />
       {location.search.includes("connected=1") ? (
         <div className="success-notice">
-          Google is connected. Florence is starting with new mail, then working backward quietly.
+          Google is connected. Florence is syncing the newest information first and will keep working quietly
+          in the background.
         </div>
+      ) : null}
+      {location.search.includes("google=cancelled") ? (
+        <div className="error-notice">Google was not connected. Nothing changed.</div>
       ) : null}
       {actionMessage ? (
         <div className="success-notice" role="status">
@@ -1121,104 +1136,145 @@ function SourcesPage({ viewer }: { viewer: Viewer }) {
       <RoutinesSection viewer={viewer} />
       <SectionHeading title="Connections" count={data.connections.length} />
       <div className="card-list">
-        {data.connections.map((connection) => (
-          <article className="source-card" key={connection.id}>
-            <div className="source-heading">
-              <div className="provider-mark">G</div>
-              <div>
-                <h3>{connection.email}</h3>
-                <p>{connection.label}</p>
-              </div>
-              <span className={`status-pill ${connection.gmail.liveState === "watching" ? "good" : ""}`}>
-                {connection.statusLabel}
-              </span>
-            </div>
-            <div className="source-status-grid">
-              <div>
-                <span>New mail</span>
-                <strong>{connection.gmail.liveLabel}</strong>
-                <small>
-                  {connection.gmail.lastCheckedAt
-                    ? `Last checked ${friendlyTime(connection.gmail.lastCheckedAt)}`
-                    : "Starting shortly"}
-                </small>
-              </div>
-              <div>
-                <span>Earlier mail</span>
-                <strong>{connection.gmail.backfillLabel}</strong>
-                <div
-                  className="mini-progress"
-                  role="progressbar"
-                  aria-label="Past mail setup"
-                  aria-valuemin={0}
-                  aria-valuemax={connection.gmail.backfillTotal}
-                  aria-valuenow={connection.gmail.backfillCompleted}
-                >
-                  <span
-                    style={{
-                      width: `${(connection.gmail.backfillCompleted / connection.gmail.backfillTotal) * 100}%`,
-                    }}
-                  />
+        {data.connections.map((connection) => {
+          const needsAttention =
+            connection.mail?.liveState === "needs_attention" ||
+            connection.calendar?.syncState === "needs_attention";
+          return (
+            <article className="source-card" key={connection.id}>
+              <div className="source-heading">
+                <div className="provider-mark">G</div>
+                <div>
+                  <h3>{connection.email}</h3>
+                  <p>
+                    {connection.label} · {connection.accountKindLabel}
+                  </p>
                 </div>
+                <span
+                  className={`status-pill ${connection.status === "active" && !needsAttention ? "good" : ""}`}
+                >
+                  {connection.statusLabel}
+                </span>
               </div>
-            </div>
-            <div className="calendar-heading">
-              <div>
-                <h4>Calendars</h4>
-                <p>{connection.calendarCatalogLabel}</p>
-              </div>
-              <span>Private to you</span>
-            </div>
-            <div className="calendar-list">
-              {connection.calendars.map((calendar) => {
-                const busyKey = `calendar:${connection.id}:${calendar.id}`;
-                return (
-                  <label key={calendar.id}>
-                    <span>
-                      <strong>{calendar.name}</strong>
+              <div className="source-status-grid">
+                {connection.mail ? (
+                  <>
+                    <div>
+                      <span>New mail</span>
+                      <strong>{connection.mail.liveLabel}</strong>
                       <small>
-                        {calendar.primary ? "Primary calendar" : (calendar.timezone ?? "Google Calendar")}
+                        {connection.mail.lastCheckedAt
+                          ? `Last checked ${friendlyTime(connection.mail.lastCheckedAt)}`
+                          : "Starting shortly"}
                       </small>
-                    </span>
-                    <select
-                      aria-label={`How Florence may use ${calendar.name}`}
-                      disabled={busy === busyKey}
-                      value={calendar.mode}
-                      onChange={(event) =>
-                        void changeCalendar(
-                          connection.id,
-                          calendar.id,
-                          event.target
-                            .value as SourceView["connections"][number]["calendars"][number]["mode"],
-                        )
-                      }
-                    >
-                      <option value="off">Don’t use</option>
-                      <option value="availability_only">Busy times only</option>
-                      <option value="full_private">Read details privately</option>
-                    </select>
-                  </label>
-                );
-              })}
-            </div>
-            {connection.calendars.length === 0 ? (
-              <div className="source-empty">
-                Florence will list each calendar here as soon as Google finishes connecting.
+                    </div>
+                    <div>
+                      <span>Earlier mail</span>
+                      <strong>{connection.mail.backfillLabel}</strong>
+                      <div
+                        className="mini-progress"
+                        role="progressbar"
+                        aria-label="Past mail setup"
+                        aria-valuemin={0}
+                        aria-valuemax={connection.mail.backfillTotal}
+                        aria-valuenow={connection.mail.backfillCompleted}
+                      >
+                        <span
+                          style={{
+                            width: `${
+                              connection.mail.backfillTotal === 0
+                                ? 0
+                                : (connection.mail.backfillCompleted / connection.mail.backfillTotal) * 100
+                            }%`,
+                          }}
+                        />
+                      </div>
+                    </div>
+                  </>
+                ) : null}
+                {connection.calendar ? (
+                  <div>
+                    <span>Calendar</span>
+                    <strong>{connection.calendar.syncLabel}</strong>
+                    <small>
+                      {connection.calendar.lastCheckedAt
+                        ? `Last checked ${friendlyTime(connection.calendar.lastCheckedAt)}`
+                        : "Starting shortly"}
+                    </small>
+                  </div>
+                ) : null}
               </div>
-            ) : null}
-          </article>
-        ))}
+              {connection.calendar ? (
+                <>
+                  <div className="calendar-heading">
+                    <div>
+                      <h4>Calendars</h4>
+                      <p>{connection.calendar.catalogLabel}</p>
+                    </div>
+                    <span>Private to you</span>
+                  </div>
+                  <div className="calendar-list">
+                    {connection.calendars.map((calendar) => {
+                      const busyKey = `calendar:${connection.id}:${calendar.id}`;
+                      return (
+                        <label key={calendar.id}>
+                          <span>
+                            <strong>{calendar.name}</strong>
+                            <small>
+                              {calendar.primary
+                                ? "Primary calendar"
+                                : (calendar.timezone ?? "Google Calendar")}
+                            </small>
+                          </span>
+                          <select
+                            aria-label={`How Florence may use ${calendar.name}`}
+                            disabled={busy === busyKey}
+                            value={calendar.mode}
+                            onChange={(event) =>
+                              void changeCalendar(
+                                connection.id,
+                                calendar.id,
+                                event.target
+                                  .value as SourceView["connections"][number]["calendars"][number]["mode"],
+                              )
+                            }
+                          >
+                            <option value="off">Don’t use</option>
+                            <option value="availability_only">Busy times only</option>
+                            <option value="full_private">Read details privately</option>
+                          </select>
+                        </label>
+                      );
+                    })}
+                  </div>
+                  {connection.calendars.length === 0 ? (
+                    <div className="source-empty">
+                      Florence will list each calendar here as soon as Google finishes connecting.
+                    </div>
+                  ) : null}
+                </>
+              ) : null}
+            </article>
+          );
+        })}
       </div>
       {data.connections.length === 0 ? (
         <EmptyState
           title="No private accounts connected"
-          copy="Connect Google to let Florence quietly watch new mail and show you each calendar before using it."
+          copy="Connect personal Google for Mail and Calendar, or add a work calendar without giving Florence work email access."
         />
       ) : null}
       {googleStepUpReady ? (
-        <a className="secondary-button" href="/oauth/google/start">
-          Continue securely to Google
-        </a>
+        <div className="source-connect-actions">
+          <a className="primary-button" href="/oauth/google/start?profile=personal_family">
+            Connect personal Google
+            <small>Mail and Calendar</small>
+          </a>
+          <a className="secondary-button" href="/oauth/google/start?profile=work">
+            Connect work Google
+            <small>Calendar only</small>
+          </a>
+        </div>
       ) : (
         <button
           type="button"
@@ -2228,17 +2284,20 @@ function useResource<T>(path: string) {
   const [data, setData] = useState<T | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const reload = useCallback(async () => {
-    setLoading(true);
-    try {
-      setData(await getJson<T>(path));
-      setError(null);
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Request failed");
-    } finally {
-      setLoading(false);
-    }
-  }, [path]);
+  const reload = useCallback(
+    async (showLoading = true) => {
+      if (showLoading) setLoading(true);
+      try {
+        setData(await getJson<T>(path));
+        setError(null);
+      } catch (reason) {
+        setError(reason instanceof Error ? reason.message : "Request failed");
+      } finally {
+        setLoading(false);
+      }
+    },
+    [path],
+  );
   useEffect(() => {
     void reload();
   }, [reload]);

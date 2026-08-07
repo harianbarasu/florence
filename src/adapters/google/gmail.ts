@@ -58,11 +58,18 @@ export class GmailAdapter {
     };
   }
 
-  public async listMessages(query: string, pageToken?: string): Promise<GmailMessagePage> {
+  public async listMessages(
+    query: string,
+    pageToken?: string,
+    requestedPageSize = 100,
+  ): Promise<GmailMessagePage> {
+    const maxResults = Number.isFinite(requestedPageSize)
+      ? Math.max(1, Math.min(Math.trunc(requestedPageSize), 500))
+      : 100;
     const response = await this.#gmail.users.messages.list({
       userId: "me",
       q: query,
-      maxResults: 500,
+      maxResults,
       includeSpamTrash: false,
       ...(pageToken ? { pageToken } : {}),
     });

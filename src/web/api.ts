@@ -125,17 +125,24 @@ export interface SourceView {
     id: string;
     label: string;
     email: string;
+    accountKind: "personal_family" | "work";
+    accountKindLabel: string;
     status: string;
     statusLabel: string;
-    gmail: {
+    mail: {
       liveState: "waiting" | "watching" | "paused" | "needs_attention";
       liveLabel: string;
       lastCheckedAt: string | null;
       backfillCompleted: number;
       backfillTotal: number;
       backfillLabel: string;
-    };
-    calendarCatalogLabel: string;
+    } | null;
+    calendar: {
+      syncState: "waiting" | "ready" | "paused" | "needs_attention";
+      syncLabel: string;
+      catalogLabel: string;
+      lastCheckedAt: string | null;
+    } | null;
     calendars: {
       id: string;
       name: string;

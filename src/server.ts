@@ -8,6 +8,7 @@ import fastifyStatic from "@fastify/static";
 import Fastify, { type FastifyRequest, LogController } from "fastify";
 import rawBody from "fastify-raw-body";
 import { z } from "zod";
+import type { GoogleCapability, GoogleConnectionProfile } from "./adapters/google/contracts.js";
 import { GoogleOAuthAdapter } from "./adapters/google/oauth.js";
 import { LinqClient, type LinqConfig, LinqWebhookError, unwrapLinqWebhook } from "./adapters/linq/index.js";
 import { FlorenceApplication } from "./application/index.js";
@@ -17,7 +18,6 @@ import { PostgresWebAuth, type SessionPrincipal } from "./modules/auth/index.js"
 import { PostgresDataExporter } from "./modules/data-controls/index.js";
 import { PostgresFlorenceQueries } from "./modules/queries/index.js";
 import { PostgresSourceIntelligence } from "./modules/sources/index.js";
-import { DurableWork } from "./modules/work/index.js";
 import { randomOpaqueToken, SecretBox } from "./shared/crypto.js";
 import { ConflictError, NotFoundError, StaleAuthorityError, UnauthorizedError } from "./shared/errors.js";
 
@@ -242,38 +242,73 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
 
   app.get("/oauth/google/start", async (request, reply) => {
     const principal = await requireStepUpSession(request, config, auth, "google_connect");
+    const query = z
+      .strictObject({ profile: z.enum(["personal_family", "work"]).default("personal_family") })
+      .parse(request.query);
+    const requestedCapabilities = googleCapabilitiesForProfile(query.profile);
     const pkce = googleOAuth.createPkce();
     const state = randomOpaqueToken(32);
-    await sources.apply({
-      kind: "begin_oauth_attempt",
+    await application.process({
+      kind: "google.oauth.begin",
       personId: principal.personId,
-      provider: "google",
+      initiatingSessionId: principal.sessionId,
       stateDigest: sha256Hex(state),
       pkceVerifier: pkce.verifier,
       returnPath: "/sources",
+      requestedCapabilities,
+      accountKind: query.profile,
       expectedPersonControlEpoch: principal.controlEpoch,
       expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
       createdAt: new Date().toISOString(),
     });
-    return reply.redirect(googleOAuth.authorizationUrl({ state, challenge: pkce.challenge }));
+    return reply.redirect(
+      googleOAuth.authorizationUrl({
+        state,
+        challenge: pkce.challenge,
+        requestedCapabilities,
+      }),
+    );
   });
 
   app.get("/oauth/google/callback", async (request, reply) => {
     const query = z
-      .strictObject({ code: z.string().min(1), state: z.string().min(32).max(256) })
+      .object({
+        code: z.string().min(1).optional(),
+        state: z.string().min(32).max(256),
+        error: z.string().trim().min(1).max(200).optional(),
+      })
+      .passthrough()
       .parse(request.query);
-    const consumed = await sources.apply({
-      kind: "consume_oauth_attempt",
+    const principal = await requireSession(request, config, auth);
+    const attempt = await sources.read({
+      kind: "oauth_attempt_access",
       provider: "google",
       stateDigest: sha256Hex(query.state),
-      consumedAt: new Date().toISOString(),
+      asOf: new Date().toISOString(),
     });
-    if (consumed.kind !== "oauth_attempt_consumed") throw new Error("Google OAuth state did not resolve");
-    const exchange = await googleOAuth.exchange(query.code, consumed.pkceVerifier);
-    const connected = await sources.apply({
-      kind: "connect_integration",
-      personId: consumed.personId,
-      provider: "google",
+    if (attempt.kind !== "oauth_attempt_access" || attempt.provider !== "google") {
+      throw new Error("Google OAuth state did not resolve");
+    }
+    if (
+      attempt.initiatingSessionId !== principal.sessionId ||
+      attempt.personId !== principal.personId ||
+      attempt.personControlEpoch !== principal.controlEpoch
+    ) {
+      throw new UnauthorizedError("Google authorization must finish in the browser that started it");
+    }
+    if (query.error) {
+      if (query.error === "access_denied") return reply.redirect(`${attempt.returnPath}?google=cancelled`);
+      throw new UnauthorizedError("Google authorization was not completed");
+    }
+    if (!query.code) throw new UnauthorizedError("Google did not return an authorization code");
+    const exchange = await googleOAuth.exchange(
+      query.code,
+      attempt.pkceVerifier,
+      attempt.requestedCapabilities,
+    );
+    const completed = await application.process({
+      kind: "google.oauth.complete",
+      stateDigest: sha256Hex(query.state),
       externalSubjectDigest: sha256Hex(exchange.subject),
       credentials: JSON.parse(
         JSON.stringify({
@@ -282,23 +317,11 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
           grantedScopes: [...exchange.grantedScopes],
         }),
       ),
-      connectedAt: new Date().toISOString(),
+      grantedCapabilities: exchange.grantedCapabilities,
+      completedAt: new Date().toISOString(),
     });
-    if (connected.kind !== "integration_connected") throw new Error("Google integration was not connected");
-    await new DurableWork(database, secretBox).enqueue({
-      kind: "google.bootstrap",
-      idempotencyKey: `google:bootstrap:${connected.integrationId}:${connected.controlEpoch}`,
-      payload: {
-        integrationId: connected.integrationId,
-        personId: consumed.personId,
-        integrationControlEpoch: connected.controlEpoch,
-        personControlEpoch: consumed.personControlEpoch,
-        olderHistoryEnabled: true,
-      },
-      person: { id: consumed.personId, controlEpoch: consumed.personControlEpoch },
-      maxAttempts: 8,
-    });
-    return reply.redirect(`${consumed.returnPath}?connected=1`);
+    if (!completed.accepted) throw new Error("Google integration was not connected");
+    return reply.redirect(`${attempt.returnPath}?connected=1`);
   });
 
   app.get("/api/me", async (request, reply) => {
@@ -846,4 +869,8 @@ function escapeHtml(value: string): string {
 
 function sha256Hex(value: string): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function googleCapabilitiesForProfile(profile: GoogleConnectionProfile): readonly GoogleCapability[] {
+  return profile === "work" ? ["calendar"] : ["mail", "calendar"];
 }

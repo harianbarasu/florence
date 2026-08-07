@@ -193,9 +193,24 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
         .string()
         .regex(/^[A-Za-z0-9_-]{32,128}$/u)
         .parse((request.params as { token?: unknown }).token);
-      const preview = await auth.previewHandoff(token);
       reply.header("Cache-Control", "no-store, max-age=0");
       reply.header("Clear-Site-Data", '"cache"');
+      let preview: Awaited<ReturnType<PostgresWebAuth["previewHandoff"]>>;
+      try {
+        preview = await auth.previewHandoff(token);
+      } catch (error) {
+        if (
+          error instanceof NotFoundError ||
+          error instanceof ConflictError ||
+          error instanceof UnauthorizedError
+        ) {
+          return reply
+            .code(410)
+            .type("text/html; charset=utf-8")
+            .send(unavailableHandoffPage(config.linq.fromPhone));
+        }
+        throw error;
+      }
       return reply.type("text/html; charset=utf-8").send(handoffPage(token, preview.purpose));
     },
   );
@@ -977,6 +992,10 @@ async function readTextOrFallback(target: string, fallback: string): Promise<str
 function handoffPage(token: string, purpose: string): string {
   const title = purpose === "account_controls" ? "Confirm private controls" : "Open Florence";
   return `<!doctype html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>${title}</title><link rel="stylesheet" href="/handoff.css"></head><body><main data-handoff-token="${escapeHtml(token)}"><div class="mark">F</div><h1>${title}</h1><p>This single-use link came through your exact private Florence conversation. Continue to create a secure browser session.</p><form><button type="submit">Continue securely</button></form><div data-status aria-live="polite"></div><small>The link is not used until you tap Continue. It expires shortly and cannot be reused.</small></main><script src="/handoff.js" defer></script></body></html>`;
+}
+
+function unavailableHandoffPage(florencePhone: string): string {
+  return `<!doctype html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>Get a fresh Florence link</title><link rel="stylesheet" href="/handoff.css"></head><body><main><div class="mark">F</div><h1>This private link is no longer available</h1><p>Florence links are single-use and expire quickly. Nothing is wrong with your account.</p><p>Text <strong>connect Google</strong> to connect Gmail and Calendar, or <strong>settings</strong> for your private controls.</p><a href="sms:${escapeHtml(florencePhone)}">Text Florence</a></main></body></html>`;
 }
 
 function policyPage(title: string, paragraphs: readonly string[]): string {

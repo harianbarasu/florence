@@ -1970,8 +1970,9 @@ export class FlorenceApplication {
         )[0]
       : null;
     const person = record.routing.chatKind === "direct" ? registeredSender : null;
+    const naturalGreeting = isNaturalPrivateGreeting(record.routing.chatKind, text);
     const displayName =
-      record.routing.chatKind === "direct"
+      record.routing.chatKind === "direct" && !naturalGreeting
         ? parseNameResponse(text, person?.onboarding_step === "name_pending")
         : null;
     if (displayName) {
@@ -2008,6 +2009,43 @@ export class FlorenceApplication {
         );
       }
       return "profile_name_updated";
+    }
+    if (
+      record.routing.chatKind === "direct" &&
+      person?.onboarding_step === "name_pending" &&
+      naturalGreeting
+    ) {
+      const snapshot = await new PostgresConversationAuthority(transaction).snapshot(
+        record.routing.conversationId,
+      );
+      await this.queueAuthorizedConversationMessage(
+        transaction,
+        record,
+        snapshot,
+        "Hi! What should I call you?",
+        "direct_response",
+        "profile_name_requested",
+      );
+      return "profile_name_requested";
+    }
+    if (record.routing.chatKind === "direct" && person && isSelfNameQuestion(text)) {
+      const personId = record.routing.senderPersonId;
+      if (!personId) return "ignored";
+      const knownName = decryptPersonName(this.secretBox, personId, person.display_name_ciphertext);
+      const snapshot = await new PostgresConversationAuthority(transaction).snapshot(
+        record.routing.conversationId,
+      );
+      await this.queueAuthorizedConversationMessage(
+        transaction,
+        record,
+        snapshot,
+        knownName
+          ? `I have your name as ${knownName}.`
+          : "I don’t have your name yet—what should I call you?",
+        "direct_response",
+        "profile_name_recalled",
+      );
+      return "profile_name_recalled";
     }
     if (
       record.routing.chatKind === "direct" &&
@@ -3819,10 +3857,25 @@ function isExplicitPrivateQuestion(value: string): boolean {
   return /\?|^(?:who|what|when|where|why|how|can|could|would|should|is|are|do|does)\b/iu.test(value.trim());
 }
 
+function isSelfNameQuestion(value: string): boolean {
+  const normalized = value
+    .trim()
+    .toLocaleLowerCase("en-US")
+    .replace(/[’]/gu, "'")
+    .replace(/[.!?]+$/gu, "")
+    .replace(/\s+/gu, " ");
+  return /^(?:what(?:'s| is) my name|what do you (?:call|know me as)|what should you call me)$/u.test(
+    normalized,
+  );
+}
+
 function parseNameResponse(value: string, allowBareName: boolean): string | null {
   const normalized = value.trim().replace(/\s+/gu, " ");
   if (!normalized || normalized.length > 100 || /[\r\n]/u.test(normalized)) return null;
-  const introduced = /^(?:my name is|i am|i['’]m|call me)\s+(.+)$/iu.exec(normalized);
+  const introduced =
+    /^(?:actually[, ]+)?(?:my name (?:is|['’]s)|i am|i['’]m|call me)(?:\s+actually)?[, ]+(.+)$/iu.exec(
+      normalized,
+    );
   const candidate = (introduced?.[1] ?? (allowBareName ? normalized : "")).replace(/[.!]+$/gu, "").trim();
   if (!candidate || candidate.length > 80) return null;
   const reserved = new Set([
@@ -3839,6 +3892,9 @@ function parseNameResponse(value: string, allowBareName: boolean): string | null
     "connect google",
     "review",
     "open review",
+    "hi",
+    "hello",
+    "hey",
   ]);
   if (reserved.has(candidate.toLocaleLowerCase("en-US"))) return null;
   if (!/^[\p{L}\p{M}][\p{L}\p{M}'’ .-]*$/u.test(candidate)) return null;

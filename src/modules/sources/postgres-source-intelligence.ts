@@ -972,7 +972,7 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
       } else if (objects[0]) {
         correlationDigest = objects[0].correlation_digest;
       }
-      if (objects[0]?.parent_source_object_id !== parentSourceObjectId) {
+      if (objects[0] && objects[0].parent_source_object_id !== parentSourceObjectId) {
         if (objects[0]?.parent_source_object_id === null && parentSourceObjectId !== null) {
           await transaction`
             update source_objects set parent_source_object_id = ${parentSourceObjectId}

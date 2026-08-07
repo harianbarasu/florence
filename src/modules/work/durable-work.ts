@@ -45,6 +45,7 @@ export interface DeadJobRedriveInput {
   readonly bucketMs: number;
   readonly maxGenerations: number;
   readonly requireIntegrationFence?: boolean;
+  readonly attentionErrorCodes?: readonly string[];
 }
 
 interface JobRow {
@@ -278,6 +279,7 @@ export class DurableWork {
     const currentBucketPattern = `${namespace}:%:b${bucket}`;
     const exhaustedGenerationPattern = `${namespace}:g${input.maxGenerations}:%`;
     const lookbackStart = new Date(now.getTime() - input.lookbackMs);
+    const attentionErrorCodes = [...(input.attentionErrorCodes ?? [])];
     return inTransaction(this.database, async (transaction) => {
       const candidates = await transaction<DeadJobRow[]>`
         select job.id, job.job_kind, job.household_id, job.person_id, job.conversation_id,
@@ -291,7 +293,14 @@ export class DurableWork {
         left join conversations conversation on conversation.id = job.conversation_id
         left join integrations integration on integration.id = job.integration_id
         where job.job_kind = ${input.kind}
-          and job.status = 'dead'
+          and (
+            job.status = 'dead'
+            or (
+              cardinality(${transaction.array(attentionErrorCodes)}::text[]) > 0
+              and job.status = 'attention'
+              and job.last_error_code = any(${transaction.array(attentionErrorCodes)}::text[])
+            )
+          )
           and coalesce(job.last_error_code, '') not in (
             'invalid_job_payload', 'runtime_contract_violation'
           )
@@ -347,7 +356,11 @@ export class DurableWork {
         await transaction`
           update jobs
           set status = 'cancelled', last_error_code = 'recovery_scheduled', updated_at = ${now}
-          where id = ${candidate.id} and status = 'dead'
+          where id = ${candidate.id}
+            and (
+              status = 'dead'
+              or (status = 'attention' and last_error_code = any(${transaction.array(attentionErrorCodes)}::text[]))
+            )
         `;
         redriven += 1;
       }
@@ -476,6 +489,14 @@ function validateRedriveInput(input: DeadJobRedriveInput): void {
     if (!Number.isSafeInteger(value) || value < 1) throw new Error(`Redrive ${name} must be positive`);
   }
   if ((input.limit ?? 20) > 100) throw new Error("Redrive limit cannot exceed 100");
+  if ((input.attentionErrorCodes?.length ?? 0) > 20) {
+    throw new Error("Redrive attention error-code list is too large");
+  }
+  for (const code of input.attentionErrorCodes ?? []) {
+    if (!/^[a-z0-9][a-z0-9_:-]{0,119}$/u.test(code)) {
+      throw new Error("Redrive attention error code is invalid");
+    }
+  }
 }
 
 function nextRedriveIdentity(

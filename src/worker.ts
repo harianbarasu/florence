@@ -165,6 +165,7 @@ async function main(): Promise<void> {
         `${config.model.provider}:langchain-structured-v1`,
       ),
     );
+    const google = new GoogleSyncService(database, config, secretBox);
     const orchestrator = new FlorenceOrchestrator(
       database,
       config,
@@ -172,8 +173,8 @@ async function main(): Promise<void> {
       modelRuntime,
       linq,
       application,
+      google,
     );
-    const google = new GoogleSyncService(database, config, secretBox);
     const sources = new PostgresSourceIntelligence(database, secretBox, {
       rawRetentionDays: config.defaults.rawSourceRetentionDays,
       privateCandidateRetentionDays: 7,
@@ -470,6 +471,10 @@ async function main(): Promise<void> {
           },
           expiresInSeconds: 10 * 60,
         });
+        const stepUpText =
+          payload.purpose === "group_coverage" && payload.context.groupLabel
+            ? `Privately approve Florence for ${payload.context.groupLabel}. No one needs to reply in the group: ${config.publicBaseUrl}/handoff/${handoff.token}`
+            : `Open your private Florence controls: ${config.publicBaseUrl}/handoff/${handoff.token}`;
         await new EffectOutbox(transaction, secretBox).authorizeAndEnqueue({
           actorPersonId: payload.actorPersonId,
           person: { id: payload.actorPersonId, controlEpoch: Number(row.person_control_epoch) },
@@ -484,7 +489,7 @@ async function main(): Promise<void> {
           payload: {
             providerChatId: row.external_channel_id,
             expectedProviderParticipantDigest: live.activeParticipantDigest,
-            text: `Open your private Florence controls: ${config.publicBaseUrl}/handoff/${handoff.token}`,
+            text: stepUpText,
           },
           reasonCodes: ["fresh_private_step_up"],
           authorizationExpiresAt: new Date(Date.now() + 5 * 60_000),
@@ -522,6 +527,7 @@ async function main(): Promise<void> {
         bucketMs: GOOGLE_JOB_REDRIVE_BUCKET_MS,
         maxGenerations: GOOGLE_JOB_REDRIVE_MAX_GENERATIONS,
         requireIntegrationFence: true,
+        attentionErrorCodes: ["worker_model_failed"],
       });
       const timers = new DurableTimers(database);
       await timers.cancelStale(now);

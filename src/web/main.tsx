@@ -115,12 +115,15 @@ function AppShell({ viewer }: { viewer: Viewer }) {
 
   return (
     <div className="app-shell">
-      <aside className="household-rail" aria-label="Household and Florence">
-        <div className="household-identity">
-          <Brand compact />
-          <div>
-            <strong>{householdName}</strong>
-            <span>{householdDetail}</span>
+      <aside className="app-sidebar" aria-label="Florence navigation">
+        <div className="sidebar-heading">
+          <Brand />
+          <div className="sidebar-household">
+            <span className="sidebar-household-mark">{householdName.slice(0, 1).toUpperCase()}</span>
+            <span>
+              <strong>{householdName}</strong>
+              <small>{householdDetail}</small>
+            </span>
           </div>
         </div>
         {florencePhone ? (
@@ -134,56 +137,9 @@ function AppShell({ viewer }: { viewer: Viewer }) {
             <span>Florence is connecting</span>
           </div>
         )}
-        <NavLink className="setup-card" to="/sources">
-          <span className="setup-card-icon">
-            <ShellIcon name="sources" />
-          </span>
-          <span>
-            <strong>Sources & setup</strong>
-            <small>Review mail, calendars, routines, and what stays private.</small>
-          </span>
-          <span className="setup-card-arrow" aria-hidden="true">
-            ›
-          </span>
-        </NavLink>
-
-        <div className="rail-group">
-          <span className="rail-label">Your assistant</span>
-          <NavLink className="assistant-link" to="/home">
-            <span className="assistant-mark">F</span>
-            <span>
-              <strong>Florence</strong>
-              <small>Coordinates in iMessage</small>
-            </span>
-          </NavLink>
-        </div>
-
-        <div className="rail-group household-spaces">
-          <span className="rail-label">Family spaces</span>
-          {viewer.households.length > 0 ? (
-            viewer.households.map((household) => (
-              <NavLink className="household-space" to="/people" key={household.id}>
-                <span className="space-mark">{household.name.slice(0, 1).toUpperCase()}</span>
-                <span>
-                  <strong>{household.name}</strong>
-                  <small>
-                    {household.memberCount} {household.memberCount === 1 ? "person" : "people"}
-                  </small>
-                </span>
-              </NavLink>
-            ))
-          ) : (
-            <NavLink className="household-space" to="/people">
-              <span className="space-mark">
-                <ShellIcon name="people" />
-              </span>
-              <span>
-                <strong>Set up your family</strong>
-                <small>Add people and permissions</small>
-              </span>
-            </NavLink>
-          )}
-        </div>
+        <nav className="sidebar-navigation" aria-label="Family controls">
+          <AppNavigation />
+        </nav>
 
         <NavLink className="sidebar-person" to="/people">
           <Avatar name={viewer.person.name} />
@@ -195,22 +151,6 @@ function AppShell({ viewer }: { viewer: Viewer }) {
             ›
           </span>
         </NavLink>
-      </aside>
-
-      <aside className="section-rail" aria-label="Florence companion sections">
-        <div className="section-rail-heading">
-          <span className="section-kicker">Florence companion</span>
-          <h2>Family controls</h2>
-          <p>Review what Florence can use and where she can help.</p>
-        </div>
-        <AppNavigation />
-        <div className="coordination-note">
-          <ShellIcon name="message" />
-          <p>
-            Family planning stays in <strong>iMessage</strong>. This companion is for setup, privacy, and
-            decisions.
-          </p>
-        </div>
       </aside>
 
       <div className="app-column">
@@ -288,8 +228,6 @@ const APP_LINKS = [
   },
 ] as const;
 
-const APP_GROUPS = ["Overview", "Family", "Florence setup"] as const;
-
 function AppNavigation({ compact = false }: { compact?: boolean }) {
   if (compact) {
     return (
@@ -307,21 +245,14 @@ function AppNavigation({ compact = false }: { compact?: boolean }) {
   }
 
   return (
-    <div className="nav-groups">
-      {APP_GROUPS.map((group) => (
-        <div className="nav-group" key={group}>
-          <span className="nav-group-label">{group}</span>
-          <div className="nav-links">
-            {APP_LINKS.filter((link) => link.group === group).map((link) => (
-              <NavLink key={link.to} to={link.to} className={({ isActive }) => (isActive ? "active" : "")}>
-                <span className="nav-icon">
-                  <ShellIcon name={link.icon} />
-                </span>
-                <span>{link.title}</span>
-              </NavLink>
-            ))}
-          </div>
-        </div>
+    <div className="nav-links sidebar-nav">
+      {APP_LINKS.map((link) => (
+        <NavLink key={link.to} to={link.to} className={({ isActive }) => (isActive ? "active" : "")}>
+          <span className="nav-icon">
+            <ShellIcon name={link.icon} />
+          </span>
+          <span>{link.title}</span>
+        </NavLink>
       ))}
     </div>
   );
@@ -475,11 +406,21 @@ function HomePage() {
 
 function PeoplePage({ viewer }: { viewer: Viewer }) {
   const { data, loading, error, reload } = useResource<PeopleView>("/api/people");
+  const location = useLocation();
   const [busy, setBusy] = useState<string | null>(null);
   const [actionMessage, setActionMessage] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [pendingGroupApprovals, setPendingGroupApprovals] = useState<Record<string, boolean>>({});
   const [inviteRoles, setInviteRoles] = useState<Record<string, "steward" | "caregiver" | "participant">>({});
   const [dependentDrafts, setDependentDrafts] = useState<Record<string, DependentDraft>>({});
+  const requestedGroupCoverageOutcome = new URLSearchParams(location.search).get("group_coverage");
+
+  useEffect(() => {
+    if (!data || !location.hash.startsWith("#coverage-")) return;
+    window.requestAnimationFrame(() => {
+      document.querySelector(location.hash)?.scrollIntoView({ block: "center" });
+    });
+  }, [data, location.hash]);
 
   async function runAction(key: string, path: string, body: unknown, success: string) {
     setBusy(key);
@@ -504,6 +445,7 @@ function PeoplePage({ viewer }: { viewer: Viewer }) {
     body: unknown,
     success: string,
     stepUp: unknown,
+    callbacks?: { onCompleted?: () => void; onStepUpSent?: () => void },
   ) {
     setBusy(key);
     setActionMessage(null);
@@ -512,12 +454,14 @@ function PeoplePage({ viewer }: { viewer: Viewer }) {
       await postJson(path, viewer.csrfToken, body);
       setActionMessage(success);
       await reload();
+      callbacks?.onCompleted?.();
     } catch (reason) {
       if (reason instanceof ApiError && reason.status === 401) {
         try {
           await postJson("/api/safety/request-step-up", viewer.csrfToken, stepUp);
+          callbacks?.onStepUpSent?.();
           setActionMessage(
-            "Check your private iMessage from Florence, open its secure link, then try this action again.",
+            "Check your private iMessage from Florence. The secure confirmation there will finish this action.",
           );
         } catch (stepUpReason) {
           setActionError(
@@ -536,12 +480,40 @@ function PeoplePage({ viewer }: { viewer: Viewer }) {
 
   if (loading) return <PageSkeleton />;
   if (error || !data) return <ErrorCard message={error ?? "Could not load your family."} />;
+  const anchoredConversationId = location.hash.startsWith("#coverage-")
+    ? location.hash.slice("#coverage-".length)
+    : null;
+  const anchoredCoverageGroup = data.households
+    .flatMap((household) => household.coverageGroups)
+    .find((group) => group.conversationId === anchoredConversationId);
+  const groupCoverageOutcome =
+    requestedGroupCoverageOutcome === "approved"
+      ? anchoredCoverageGroup?.viewerApproved || anchoredCoverageGroup?.active
+        ? "approved"
+        : "changed"
+      : requestedGroupCoverageOutcome;
   return (
     <div className="page-stack">
       <Intro
         title="The people Florence coordinates with"
         copy="Use this private page for family membership and permissions. Keep ordinary family conversation in iMessage."
       />
+      {groupCoverageOutcome === "approved" ? (
+        <div className="success-notice" role="status">
+          Your approval is saved for the group shown below. Florence will stay silent there until every
+          current person approves.
+        </div>
+      ) : groupCoverageOutcome === "changed" ? (
+        <div className="error-notice" role="alert">
+          That group changed before approval finished. Review the current people below and approve again if
+          you still want Florence to write there.
+        </div>
+      ) : groupCoverageOutcome === "retry" ? (
+        <div className="error-notice" role="alert">
+          Florence couldn’t save that approval yet. Your private confirmation is still active—tap “Approve
+          this group” below to try once more.
+        </div>
+      ) : null}
       {actionMessage ? (
         <div className="success-notice" role="status">
           {actionMessage}
@@ -862,32 +834,48 @@ function PeoplePage({ viewer }: { viewer: Viewer }) {
             <div className="family-section-heading">
               <div>
                 <h4>Proactive coverage in groups</h4>
-                <p>Florence can open and follow coverage loops only after every current person approves.</p>
+                <p>
+                  Florence stays silent in the group while approval is pending. Each current person approves
+                  privately—no one needs to reply in the group. If anyone joins or leaves, approval resets.
+                </p>
               </div>
             </div>
             {household.coverageGroups.length > 0 ? (
               <div className="coverage-permissions">
                 {household.coverageGroups.map((group) => {
                   const approvalKey = `coverage:${group.conversationId}`;
+                  const awaitingPrivateConfirmation =
+                    pendingGroupApprovals[group.conversationId] === true &&
+                    !group.viewerApproved &&
+                    !group.active;
                   return (
-                    <div className="coverage-permission" key={group.conversationId}>
+                    <div
+                      className="coverage-permission"
+                      id={`coverage-${group.conversationId}`}
+                      key={group.conversationId}
+                    >
                       <div>
                         <strong>{group.label}</strong>
                         <span>
                           {group.active
                             ? "Everyone approved. Florence may help with family coverage here."
-                            : (group.blockedReason ??
-                              `${group.approvedCount} of ${group.requiredCount} people have approved.`)}
+                            : awaitingPrivateConfirmation
+                              ? "Check your private iMessage and tap “Approve this group” to finish."
+                              : (group.blockedReason ??
+                                `${group.approvedCount} of ${group.requiredCount} people have approved.`)}
                         </span>
                       </div>
                       {group.active ? (
                         <span className="status-pill good">Everyone approved</span>
                       ) : group.viewerApproved ? (
                         <span className="status-pill">You approved</span>
+                      ) : awaitingPrivateConfirmation ? (
+                        <span className="status-pill">Check iMessage</span>
                       ) : (
                         <button
                           type="button"
                           className="quiet-button"
+                          aria-label={`${group.label}: approve Florence`}
                           disabled={!group.canApprove || busy === approvalKey}
                           onClick={() =>
                             void runProtectedAction(
@@ -899,7 +887,7 @@ function PeoplePage({ viewer }: { viewer: Viewer }) {
                                 expectedConversationAuthorityVersion: group.conversationAuthorityVersion,
                                 expectedHouseholdControlEpoch: group.householdControlEpoch,
                               },
-                              "Your approval is saved. The group status is updated below.",
+                              `${group.label}: your approval is saved. The group status is updated below.`,
                               {
                                 purpose: "group_coverage",
                                 context: {
@@ -913,10 +901,22 @@ function PeoplePage({ viewer }: { viewer: Viewer }) {
                                   expectedHouseholdControlEpoch: String(group.householdControlEpoch),
                                 },
                               },
+                              {
+                                onCompleted: () =>
+                                  setPendingGroupApprovals((current) => ({
+                                    ...current,
+                                    [group.conversationId]: false,
+                                  })),
+                                onStepUpSent: () =>
+                                  setPendingGroupApprovals((current) => ({
+                                    ...current,
+                                    [group.conversationId]: true,
+                                  })),
+                              },
                             )
                           }
                         >
-                          Approve for me
+                          {busy === approvalKey ? "Sending…" : "Approve this group"}
                         </button>
                       )}
                     </div>
@@ -1086,6 +1086,7 @@ function SourcesPage({ viewer }: { viewer: Viewer }) {
   const [actionMessage, setActionMessage] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [shareDestinations, setShareDestinations] = useState<Record<string, string>>({});
+  const [includeWorkMail, setIncludeWorkMail] = useState(false);
   const location = useLocation();
   const googleStepUpReady =
     viewer.session.assuranceKind === "google_connect" &&
@@ -1235,12 +1236,21 @@ function SourcesPage({ viewer }: { viewer: Viewer }) {
       setBusy(null);
     }
   }
-  async function requestGoogleConnect() {
-    setBusy("google-connect");
+  async function requestGoogleConnect(profile: "personal_family" | "work", includeMail = false) {
+    const busyKey = `google-connect:${profile}`;
+    setBusy(busyKey);
     setActionError(null);
     try {
-      await postJson("/api/safety/request-step-up", viewer.csrfToken, { purpose: "google_connect" });
-      setActionMessage("Check your private iMessage from Florence, then open its secure link.");
+      await postJson("/api/safety/request-step-up", viewer.csrfToken, {
+        purpose: "google_connect",
+        context: {
+          profile,
+          ...(profile === "work" && includeMail ? { mail: "include" } : {}),
+        },
+      });
+      setActionMessage(
+        `Check your private iMessage from Florence to connect your ${profile === "work" ? "work" : "personal"} Google account.`,
+      );
     } catch (reason) {
       setActionError(reason instanceof Error ? reason.message : "Florence could not send the secure link.");
     } finally {
@@ -1310,6 +1320,8 @@ function SourcesPage({ viewer }: { viewer: Viewer }) {
             connection.calendar?.syncState === "needs_attention";
           const reconnectLabel =
             connection.accountKind === "work" ? "Reconnect work Google" : "Reconnect personal Google";
+          const reconnectIncludesWorkMail = connection.accountKind === "work" && connection.mail !== null;
+          const reconnectHref = `/oauth/google/start?profile=${connection.accountKind}${reconnectIncludesWorkMail ? "&mail=include" : ""}`;
           return (
             <article className="source-card" key={connection.id}>
               <div className="source-heading">
@@ -1424,24 +1436,49 @@ function SourcesPage({ viewer }: { viewer: Viewer }) {
                 <div className="source-reconnect">
                   <p>
                     {connection.accountKind === "work"
-                      ? "Reconnect this calendar-only work profile. Florence will not request work email access."
+                      ? connection.mail
+                        ? "Reconnect this work Mail and Calendar profile. Its contents remain private to you."
+                        : "Reconnect this calendar-only work profile. Work Gmail remains optional."
                       : "Reconnect this personal profile to restore its private Mail and Calendar access."}
                   </p>
                   {googleStepUpReady ? (
-                    <a
-                      className="secondary-button"
-                      href={`/oauth/google/start?profile=${connection.accountKind}`}
-                    >
+                    <a className="secondary-button" href={reconnectHref}>
                       {reconnectLabel}
                     </a>
                   ) : (
                     <button
                       type="button"
                       className="secondary-button"
-                      disabled={busy === "google-connect"}
-                      onClick={() => void requestGoogleConnect()}
+                      disabled={busy === `google-connect:${connection.accountKind}`}
+                      onClick={() =>
+                        void requestGoogleConnect(connection.accountKind, reconnectIncludesWorkMail)
+                      }
                     >
                       {reconnectLabel}
+                    </button>
+                  )}
+                </div>
+              ) : null}
+              {connection.status === "active" &&
+              connection.accountKind === "work" &&
+              connection.mail === null ? (
+                <div className="source-reconnect">
+                  <p>
+                    Want Florence to find family logistics in this account too? Work Gmail is optional and
+                    stays private to you.
+                  </p>
+                  {googleStepUpReady ? (
+                    <a className="secondary-button" href="/oauth/google/start?profile=work&mail=include">
+                      Add work Gmail
+                    </a>
+                  ) : (
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      disabled={busy === "google-connect:work"}
+                      onClick={() => void requestGoogleConnect("work", true)}
+                    >
+                      Add work Gmail
                     </button>
                   )}
                 </div>
@@ -1453,30 +1490,61 @@ function SourcesPage({ viewer }: { viewer: Viewer }) {
       {data.connections.length === 0 ? (
         <EmptyState
           title="No private accounts connected"
-          copy="Connect personal Google for Mail and Calendar, or add a work calendar without giving Florence work email access."
+          copy="Connect personal Google for Mail and Calendar. Work Google can be Calendar only or include Gmail—your choice."
         />
       ) : null}
-      {googleStepUpReady ? (
-        <div className="source-connect-actions">
-          <a className="primary-button" href="/oauth/google/start?profile=personal_family">
-            Connect personal Google
-            <small>Mail and Calendar</small>
-          </a>
-          <a className="secondary-button" href="/oauth/google/start?profile=work">
-            Connect work Google
-            <small>Calendar only</small>
-          </a>
-        </div>
-      ) : (
-        <button
-          type="button"
-          className="secondary-button"
-          disabled={busy === "google-connect"}
-          onClick={() => void requestGoogleConnect()}
-        >
-          {data.connections.length === 0 ? "Connect Google" : "Connect another Google account"}
-        </button>
-      )}
+      <div className="source-connect-panel">
+        <label className="work-mail-option">
+          <input
+            type="checkbox"
+            checked={includeWorkMail}
+            onChange={(event) => setIncludeWorkMail(event.target.checked)}
+          />
+          <span>
+            <strong>Include work Gmail</strong>
+            <small>
+              Optional. Florence privately reviews work mail for family logistics. Nothing is shared with your
+              household unless you approve it.
+            </small>
+          </span>
+        </label>
+        {googleStepUpReady ? (
+          <div className="source-connect-actions">
+            <a className="primary-button" href="/oauth/google/start?profile=personal_family">
+              Connect personal Google
+              <small>Mail and Calendar</small>
+            </a>
+            <a
+              className="secondary-button"
+              href={`/oauth/google/start?profile=work${includeWorkMail ? "&mail=include" : ""}`}
+            >
+              Connect work Google
+              <small>{includeWorkMail ? "Mail and Calendar" : "Calendar only"}</small>
+            </a>
+          </div>
+        ) : (
+          <div className="source-connect-actions">
+            <button
+              type="button"
+              className="primary-button"
+              disabled={busy === "google-connect:personal_family"}
+              onClick={() => void requestGoogleConnect("personal_family")}
+            >
+              Connect personal Google
+              <small>Mail and Calendar</small>
+            </button>
+            <button
+              type="button"
+              className="secondary-button"
+              disabled={busy === "google-connect:work"}
+              onClick={() => void requestGoogleConnect("work", includeWorkMail)}
+            >
+              Connect work Google
+              <small>{includeWorkMail ? "Mail and Calendar" : "Calendar only"}</small>
+            </button>
+          </div>
+        )}
+      </div>
       <RoutinesSection viewer={viewer} />
       <SectionHeading title="Private review" count={data.privateReviews.length} />
       <p className="section-explainer">
@@ -1901,7 +1969,11 @@ function RoutinesSection({ viewer }: { viewer: Viewer }) {
                   onChange={(event) => updateForm("standingSelfCoverage", event.target.checked)}
                 />
                 <span>
-                  I normally have this covered. Florence may treat my choice as my standing confirmation.
+                  <strong>Mark me as responsible every time</strong>
+                  <small>
+                    Use this only if you have already agreed to handle every occurrence. Florence will treat
+                    it as covered without asking you again.
+                  </small>
                 </span>
               </label>
             ) : null}

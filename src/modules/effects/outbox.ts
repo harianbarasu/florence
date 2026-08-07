@@ -23,6 +23,11 @@ export interface AuthorizedEffectInput extends AuthorityFence {
   readonly expectedParticipantDigest?: string;
   readonly coverageLoop?: { readonly id: string; readonly version: number };
   readonly invitation?: { readonly id: string; readonly inviteeIdentityAuthorityVersion: number };
+  readonly recipientIdentity?: {
+    readonly id: string;
+    readonly authorityVersion: number;
+    readonly subjectDigest: string;
+  };
   readonly sourceConversation?: {
     readonly id: string;
     readonly authorityVersion: number;
@@ -75,6 +80,8 @@ interface EffectSourceLockTarget {
   readonly authorization_decision_id: string;
   readonly person_id: string | null;
   readonly integration_id: string | null;
+  readonly recipient_identity_id: string | null;
+  readonly source_conversation_id: string | null;
   readonly private_source_frontier_id: string | null;
   readonly private_source_case_key_digest: string | null;
 }
@@ -120,6 +127,20 @@ export class EffectOutbox {
         select id from outbox where idempotency_key = ${input.idempotencyKey}
       `;
       if (existing[0]) return { outboxId: existing[0].id, created: false };
+
+      if (input.recipientIdentity) {
+        const recipients = await transaction<{ readonly id: string }[]>`
+          select id from person_identities
+          where id = ${input.recipientIdentity.id}
+            and status in ('observed', 'pending_claim', 'verified')
+            and authority_version = ${input.recipientIdentity.authorityVersion}
+            and subject_digest = ${input.recipientIdentity.subjectDigest}
+          for share
+        `;
+        if (!recipients[0]) {
+          throw new UnauthorizedError("Outbound recipient identity is no longer exact and current");
+        }
+      }
 
       const integrationFence = input.sourceFrontier
         ? await authorizePrivateSourceFrontier(transaction, input)
@@ -178,6 +199,8 @@ export class EffectOutbox {
           integration_id, integration_control_epoch,
           participant_epoch_id, expected_participant_digest, coverage_loop_id, coverage_loop_version,
           invitation_id, invitee_identity_authority_version,
+          recipient_identity_id, recipient_identity_authority_version,
+          recipient_identity_subject_digest,
           source_conversation_id, source_participant_epoch_id,
           source_expected_participant_digest, source_conversation_authority_version,
           private_source_frontier_id, private_source_frontier_version,
@@ -195,6 +218,9 @@ export class EffectOutbox {
           ${input.expectedParticipantDigest ?? null}, ${input.coverageLoop?.id ?? null},
           ${input.coverageLoop?.version ?? null}, ${input.invitation?.id ?? null},
           ${input.invitation?.inviteeIdentityAuthorityVersion ?? null},
+          ${input.recipientIdentity?.id ?? null},
+          ${input.recipientIdentity?.authorityVersion ?? null},
+          ${input.recipientIdentity?.subjectDigest ?? null},
           ${input.sourceConversation?.id ?? null}, ${input.sourceConversation?.participantEpochId ?? null},
           ${input.sourceConversation?.participantSetDigest ?? null},
           ${input.sourceConversation?.authorityVersion ?? null},
@@ -228,6 +254,7 @@ export class EffectOutbox {
         left join coverage_loops coverage on coverage.id = effect.coverage_loop_id
         left join invitations invitation on invitation.id = effect.invitation_id
         left join person_identities invitee_identity on invitee_identity.id = invitation.invitee_identity_id
+        left join person_identities recipient_identity on recipient_identity.id = effect.recipient_identity_id
         left join households invitation_household on invitation_household.id = invitation.household_id
         left join conversations invitation_source on invitation_source.id = invitation.source_conversation_id
         left join participant_epochs invitation_epoch on invitation_epoch.id = invitation.source_participant_epoch_id
@@ -270,6 +297,11 @@ export class EffectOutbox {
             and invitation_source.current_epoch_id = invitation.source_participant_epoch_id
             and invitation_epoch.ended_at is null
             and invitation_epoch.participant_set_digest = invitation.source_participant_digest
+          ))
+          and (effect.recipient_identity_id is null or (
+            recipient_identity.status in ('observed', 'pending_claim', 'verified')
+            and recipient_identity.authority_version = effect.recipient_identity_authority_version
+            and recipient_identity.subject_digest = effect.recipient_identity_subject_digest
           ))
           and (effect.source_conversation_id is null or (
             source_conversation.status = 'active'
@@ -410,8 +442,8 @@ export class EffectOutbox {
       // lock. The authoritative query below requires these exact same values,
       // so a concurrent cancellation or unsupported fence mutation fails closed.
       const targets = await transaction<EffectSourceLockTarget[]>`
-        select authorization_decision_id, person_id, integration_id, private_source_frontier_id,
-          private_source_case_key_digest
+        select authorization_decision_id, person_id, integration_id, recipient_identity_id,
+          source_conversation_id, private_source_frontier_id, private_source_case_key_digest
         from outbox
         where id = ${effect.outboxId}
           and status = 'leased' and lease_token = ${effect.leaseToken}
@@ -448,6 +480,8 @@ export class EffectOutbox {
         left join coverage_loops coverage on coverage.id = candidate.coverage_loop_id
         left join invitations invitation on invitation.id = candidate.invitation_id
         left join person_identities invitee_identity on invitee_identity.id = invitation.invitee_identity_id
+        left join person_identities recipient_identity
+          on recipient_identity.id = candidate.recipient_identity_id
         left join households invitation_household on invitation_household.id = invitation.household_id
         left join conversations invitation_source on invitation_source.id = invitation.source_conversation_id
         left join participant_epochs invitation_epoch on invitation_epoch.id = invitation.source_participant_epoch_id
@@ -460,6 +494,8 @@ export class EffectOutbox {
           and candidate.authorization_decision_id = ${target.authorization_decision_id}
           and candidate.person_id is not distinct from ${target.person_id}::uuid
           and candidate.integration_id is not distinct from ${target.integration_id}::uuid
+          and candidate.recipient_identity_id is not distinct from ${target.recipient_identity_id}::uuid
+          and candidate.source_conversation_id is not distinct from ${target.source_conversation_id}::uuid
           and candidate.private_source_frontier_id is not distinct from
             ${target.private_source_frontier_id}::uuid
           and candidate.private_source_case_key_digest is not distinct from
@@ -501,6 +537,11 @@ export class EffectOutbox {
             and invitation_epoch.ended_at is null
             and invitation_epoch.participant_set_digest = invitation.source_participant_digest
           ))
+          and (candidate.recipient_identity_id is null or (
+            recipient_identity.status in ('observed', 'pending_claim', 'verified')
+            and recipient_identity.authority_version = candidate.recipient_identity_authority_version
+            and recipient_identity.subject_digest = candidate.recipient_identity_subject_digest
+          ))
           and (candidate.source_conversation_id is null or (
             source_conversation.status = 'active'
             and source_conversation.authority_version = candidate.source_conversation_authority_version
@@ -531,6 +572,15 @@ export class EffectOutbox {
         return { authorized: false };
       }
       const result = await submit();
+      // The provider mutation has crossed the one-way boundary. Persist that
+      // fact before releasing authority locks so a concurrent authority change
+      // cannot mistake this effect for an unsent lease and enqueue a new key.
+      await transaction`
+        update outbox set status = 'submitted',
+          available_at = ${new Date(authorizedAt.getTime() + 60_000)}, updated_at = ${authorizedAt}
+        where id = ${effect.outboxId}
+          and status = 'leased' and lease_token = ${effect.leaseToken}
+      `;
       return { authorized: true, result };
     });
   }
@@ -557,7 +607,7 @@ export class EffectOutbox {
     return inTransaction(this.database, async (transaction) => {
       const effects = await transaction<{ id: string }[]>`
         select id from outbox where id = ${input.effect.outboxId}
-          and status = 'leased' and lease_token = ${input.effect.leaseToken}
+          and status in ('leased', 'submitted') and lease_token = ${input.effect.leaseToken}
         for update
       `;
       if (!effects[0]) return false;
@@ -711,6 +761,7 @@ export class EffectOutbox {
         left join coverage_loops coverage on coverage.id = effect.coverage_loop_id
         left join invitations invitation on invitation.id = effect.invitation_id
         left join person_identities invitee_identity on invitee_identity.id = invitation.invitee_identity_id
+        left join person_identities recipient_identity on recipient_identity.id = effect.recipient_identity_id
         left join households invitation_household on invitation_household.id = invitation.household_id
         left join conversations invitation_source on invitation_source.id = invitation.source_conversation_id
         left join participant_epochs invitation_epoch on invitation_epoch.id = invitation.source_participant_epoch_id
@@ -753,6 +804,11 @@ export class EffectOutbox {
             and invitation_source.current_epoch_id = invitation.source_participant_epoch_id
             and invitation_epoch.ended_at is null
             and invitation_epoch.participant_set_digest = invitation.source_participant_digest
+          ))
+          and (effect.recipient_identity_id is null or (
+            recipient_identity.status in ('observed', 'pending_claim', 'verified')
+            and recipient_identity.authority_version = effect.recipient_identity_authority_version
+            and recipient_identity.subject_digest = effect.recipient_identity_subject_digest
           ))
           and (effect.source_conversation_id is null or (
             source_conversation.status = 'active'
@@ -818,6 +874,8 @@ export class EffectOutbox {
             integration_id, integration_control_epoch,
             participant_epoch_id, expected_participant_digest, coverage_loop_id, coverage_loop_version,
             invitation_id, invitee_identity_authority_version, redrive_root_id, redrive_sequence,
+            recipient_identity_id, recipient_identity_authority_version,
+            recipient_identity_subject_digest,
             source_conversation_id, source_participant_epoch_id,
             source_expected_participant_digest, source_conversation_authority_version,
             private_source_frontier_id, private_source_frontier_version,
@@ -834,7 +892,9 @@ export class EffectOutbox {
             effect.integration_control_epoch, effect.participant_epoch_id,
             effect.expected_participant_digest, effect.coverage_loop_id, effect.coverage_loop_version,
             effect.invitation_id, effect.invitee_identity_authority_version,
-            ${candidate.root_id}, ${nextSequence}, effect.source_conversation_id,
+            ${candidate.root_id}, ${nextSequence}, effect.recipient_identity_id,
+            effect.recipient_identity_authority_version, effect.recipient_identity_subject_digest,
+            effect.source_conversation_id,
             effect.source_participant_epoch_id, effect.source_expected_participant_digest,
             effect.source_conversation_authority_version, effect.private_source_frontier_id,
             effect.private_source_frontier_version, effect.private_source_frontier_digest,
@@ -915,6 +975,14 @@ export class EffectOutbox {
             and source.status = 'active' and source.current_epoch_id = epoch.id
             and epoch.ended_at is null
             and epoch.participant_set_digest = invitation.source_participant_digest
+        ))
+        or (effect.recipient_identity_id is not null and not exists (
+          select 1
+          from person_identities recipient_identity
+          where recipient_identity.id = effect.recipient_identity_id
+            and recipient_identity.status in ('observed', 'pending_claim', 'verified')
+            and recipient_identity.authority_version = effect.recipient_identity_authority_version
+            and recipient_identity.subject_digest = effect.recipient_identity_subject_digest
         ))
         or (effect.source_conversation_id is not null and not exists (
           select 1
@@ -1024,18 +1092,29 @@ async function lockEffectSubmissionAuthority(
   transaction: Transaction,
   target: EffectSourceLockTarget,
 ): Promise<void> {
-  if (target.private_source_frontier_id === null) return;
-  if (target.person_id !== null) {
-    await transaction`select id from people where id = ${target.person_id} for share`;
+  if (target.recipient_identity_id !== null) {
+    await transaction`
+      select id from person_identities where id = ${target.recipient_identity_id} for share
+    `;
   }
-  if (target.integration_id !== null) {
-    await transaction`select id from integrations where id = ${target.integration_id} for share`;
+  if (target.source_conversation_id !== null) {
+    await transaction`
+      select id from conversations where id = ${target.source_conversation_id} for share
+    `;
   }
-  await transaction`
-    select id from private_source_frontiers
-    where id = ${target.private_source_frontier_id}
-    for share
-  `;
+  if (target.private_source_frontier_id !== null) {
+    if (target.person_id !== null) {
+      await transaction`select id from people where id = ${target.person_id} for share`;
+    }
+    if (target.integration_id !== null) {
+      await transaction`select id from integrations where id = ${target.integration_id} for share`;
+    }
+    await transaction`
+      select id from private_source_frontiers
+      where id = ${target.private_source_frontier_id}
+      for share
+    `;
+  }
   // Revocation paths update the decision before waiting on the outbox row.
   // Match that order so authority cannot be revoked during the provider POST.
   await transaction`
@@ -1166,6 +1245,15 @@ function validateEffectScope(input: AuthorizedEffectInput): void {
       input.invitation.inviteeIdentityAuthorityVersion < 1)
   ) {
     throw new Error("Invitation effects require an exact identity authority version");
+  }
+  if (
+    input.recipientIdentity &&
+    (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(input.recipientIdentity.id) ||
+      !Number.isSafeInteger(input.recipientIdentity.authorityVersion) ||
+      input.recipientIdentity.authorityVersion < 1 ||
+      !/^[a-f0-9]{64}$/u.test(input.recipientIdentity.subjectDigest))
+  ) {
+    throw new Error("Recipient identity effects require an exact identity authority fence");
   }
   if (
     input.sourceConversation &&

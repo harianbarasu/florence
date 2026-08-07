@@ -54,6 +54,7 @@ export interface HandoffPreview {
   readonly handoffId: string;
   readonly purpose: HandoffPurpose;
   readonly expiresAt: Date;
+  readonly groupLabel?: string;
 }
 
 export interface AuthenticatedSession {

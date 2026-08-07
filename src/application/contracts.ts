@@ -121,7 +121,16 @@ export type AppEnvelope =
       readonly internalProviderEventId: string;
       readonly response:
         | { readonly kind: "greeting_acknowledgment" }
-        | { readonly kind: "general_answer"; readonly text: string };
+        | {
+            readonly kind: "general_answer";
+            readonly text: string;
+            readonly evidenceSourceRevisionIds: readonly string[];
+            readonly sourceAuthorities: readonly {
+              readonly integrationId: string;
+              readonly integrationControlEpoch: number;
+              readonly status: "active" | "paused" | "reauth_required" | "error";
+            }[];
+          };
     }
   | {
       /** Reconciles an authoritative live audience before an outbound cross-chat action. */

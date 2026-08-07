@@ -116,10 +116,18 @@ export class PostgresWebAuth {
   public async previewHandoff(token: string, now = new Date()): Promise<HandoffPreview> {
     const row = await this.loadHandoff(token);
     assertUsableHandoff(row, now);
+    const context = row.purpose === "group_coverage" ? decryptContext(row, this.secretBox) : {};
+    const groupLabel =
+      typeof context.groupLabel === "string" &&
+      context.groupLabel.length > 0 &&
+      context.groupLabel.length <= 240
+        ? context.groupLabel
+        : null;
     return {
       handoffId: row.id,
       purpose: HandoffPurposeSchema.parse(row.purpose),
       expiresAt: row.expires_at,
+      ...(groupLabel ? { groupLabel } : {}),
     };
   }
 

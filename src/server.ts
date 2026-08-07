@@ -80,6 +80,25 @@ const groupCoverageApprovalBodySchema = z.strictObject({
   expectedConversationAuthorityVersion: z.number().int().positive(),
   expectedHouseholdControlEpoch: z.number().int().positive(),
 });
+const googleStartQuerySchema = z
+  .strictObject({
+    profile: z.enum(["personal_family", "work"]).default("personal_family"),
+    mail: z.literal("include").optional(),
+  })
+  .refine((query) => query.profile === "work" || query.mail === undefined, {
+    message: "The work Gmail option is only valid for a work Google profile",
+    path: ["mail"],
+  });
+const groupCoverageAssuranceContextSchema = z.strictObject({
+  action: z.literal("approve"),
+  conversationId: z.string().uuid(),
+  expectedParticipantEpochId: z.string().uuid(),
+  expectedParticipantSetDigest: z.string().regex(/^[a-f0-9]{64}$/u),
+  expectedConversationAuthorityVersion: z.string().regex(/^[1-9][0-9]*$/u),
+  expectedHouseholdControlEpoch: z.string().regex(/^[1-9][0-9]*$/u),
+  groupLabel: z.string().min(1).max(240),
+  returnPath: z.string().optional(),
+});
 
 export async function createServer(input?: { config?: FlorenceConfig; database?: Database }) {
   const config = input?.config ?? loadConfig();
@@ -221,7 +240,10 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
         }
         throw error;
       }
-      return reply.type("text/html; charset=utf-8").send(handoffPage(token, preview.purpose));
+      return reply
+        .header("Referrer-Policy", "no-referrer")
+        .type("text/html; charset=utf-8")
+        .send(handoffPage(token, preview.purpose, preview.groupLabel));
     },
   );
 
@@ -235,6 +257,30 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
         .parse(request.body);
       const preview = await auth.previewHandoff(body.token);
       const session = await auth.consumeHandoff(body.token);
+      let groupCoverageOutcome: "approved" | "changed" | "retry" | null = null;
+      if (session.assuranceKind === "group_coverage") {
+        try {
+          const approval = groupCoverageApprovalFromSession(session);
+          await application.process({
+            kind: "web.command",
+            actorPersonId: session.personId,
+            command: { kind: "approve_group_coverage_rule", ...approval },
+          });
+          groupCoverageOutcome = "approved";
+        } catch (error) {
+          if (
+            error instanceof ConflictError ||
+            error instanceof NotFoundError ||
+            error instanceof StaleAuthorityError ||
+            error instanceof UnauthorizedError
+          ) {
+            groupCoverageOutcome = "changed";
+          } else {
+            request.log.error({ err: error }, "group coverage approval could not be completed");
+            groupCoverageOutcome = "retry";
+          }
+        }
+      }
       reply.setCookie(sessionCookieName(config), session.sessionToken, {
         path: "/",
         httpOnly: true,
@@ -244,7 +290,7 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
       });
       reply.header("Cache-Control", "no-store");
       return {
-        redirect: completedHandoffRedirect(preview.purpose, session),
+        redirect: completedHandoffRedirect(preview.purpose, session, groupCoverageOutcome),
       };
     },
   );
@@ -260,10 +306,8 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
 
   app.get("/oauth/google/start", async (request, reply) => {
     const principal = await requireStepUpSession(request, config, auth, "google_connect");
-    const query = z
-      .strictObject({ profile: z.enum(["personal_family", "work"]).default("personal_family") })
-      .parse(request.query);
-    const requestedCapabilities = googleCapabilitiesForProfile(query.profile);
+    const query = googleStartQuerySchema.parse(request.query);
+    const requestedCapabilities = googleCapabilitiesForProfile(query.profile, query.mail === "include");
     const pkce = googleOAuth.createPkce();
     const state = randomOpaqueToken(32);
     await application.process({
@@ -675,7 +719,20 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
     const principal = await requireWriteSession(request, config, auth);
     const body = z
       .discriminatedUnion("purpose", [
-        z.strictObject({ purpose: z.enum(["account_controls", "google_connect"]) }),
+        z.strictObject({ purpose: z.literal("account_controls") }),
+        z.strictObject({
+          purpose: z.literal("google_connect"),
+          context: z
+            .strictObject({
+              profile: z.enum(["personal_family", "work"]),
+              mail: z.literal("include").optional(),
+            })
+            .refine((context) => context.profile === "work" || context.mail === undefined, {
+              message: "The work Gmail option is only valid for a work Google profile",
+              path: ["mail"],
+            })
+            .optional(),
+        }),
         z.strictObject({
           purpose: z.literal("household_invitation"),
           context: z.discriminatedUnion("action", [
@@ -723,7 +780,7 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
       command: {
         kind: "request_step_up",
         purpose: body.purpose,
-        context: "context" in body ? body.context : {},
+        context: compactStringContext("context" in body ? body.context : undefined),
       },
     });
   });
@@ -944,12 +1001,13 @@ function verifyExactStepUp(
   purpose: "household_invitation" | "group_coverage" | "private_bridge_standing",
   context: Readonly<Record<string, string>>,
 ): void {
+  const serverContextKeys = new Set(["returnPath", ...(purpose === "group_coverage" ? ["groupLabel"] : [])]);
   if (
     principal.assuranceKind !== purpose ||
     principal.assuranceExpiresAt === null ||
     principal.assuranceExpiresAt <= new Date() ||
     Object.keys(context).length !==
-      Object.keys(principal.assuranceContext).filter((key) => key !== "returnPath").length ||
+      Object.keys(principal.assuranceContext).filter((key) => !serverContextKeys.has(key)).length ||
     Object.entries(context).some(([key, value]) => principal.assuranceContext[key] !== value)
   ) {
     throw new UnauthorizedError("Request a fresh private Florence confirmation for this exact action first");
@@ -983,6 +1041,13 @@ function headerString(value: string | string[] | undefined): string | undefined 
   return Array.isArray(value) ? value[0] : value;
 }
 
+function compactStringContext(value: unknown): Readonly<Record<string, string>> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(
+    Object.entries(value).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+  );
+}
+
 async function exists(target: string): Promise<boolean> {
   try {
     await access(target);
@@ -1000,32 +1065,52 @@ async function readTextOrFallback(target: string, fallback: string): Promise<str
   }
 }
 
-function handoffPage(token: string, purpose: string): string {
+function handoffPage(token: string, purpose: string, groupLabel?: string): string {
   const googleConnect = purpose === "google_connect";
+  const groupCoverage = purpose === "group_coverage";
   const title = googleConnect
     ? "Connect Google"
-    : purpose === "account_controls"
-      ? "Confirm private controls"
-      : "Open Florence";
+    : groupCoverage
+      ? "Approve Florence for this group"
+      : purpose === "account_controls"
+        ? "Confirm private controls"
+        : "Open Florence";
   const explanation = googleConnect
     ? "Continue to Google to choose the account Florence should privately connect to you."
-    : "This link came through your exact private Florence conversation. Continue to open your secure account.";
-  const button = googleConnect ? "Continue to Google" : "Continue securely";
-  return `<!doctype html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>${title}</title><link rel="stylesheet" href="/handoff.css"></head><body><main data-handoff-token="${escapeHtml(token)}" data-handoff-purpose="${escapeHtml(purpose)}"><div class="mark">F</div><h1>${title}</h1><p>${explanation}</p><form><button type="submit">${button}</button></form><div data-status aria-live="polite"></div><small>The link is not used until you tap Continue. It expires shortly and cannot be reused.</small></main><script src="/handoff.js" defer></script></body></html>`;
+    : groupCoverage
+      ? `This confirms your approval for ${escapeHtml(groupLabel ?? "the exact current group")}. Florence remains silent there until every current person approves, and any membership change resets approval.`
+      : "This link came through your exact private Florence conversation. Continue to open your secure account.";
+  const button = googleConnect
+    ? "Continue to Google"
+    : groupCoverage
+      ? "Approve this group"
+      : "Continue securely";
+  return `<!doctype html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>${title}</title><link rel="stylesheet" href="/handoff.css"></head><body><main data-handoff-token="${escapeHtml(token)}" data-handoff-purpose="${escapeHtml(purpose)}"><div class="mark">F</div><h1>${title}</h1><p>${explanation}</p><form><button type="submit">${button}</button></form><div data-status aria-live="polite"></div><small>The link is not used until you tap the button. It expires shortly and cannot be reused.</small></main><script src="/handoff.js" defer></script></body></html>`;
 }
 
-function completedHandoffRedirect(purpose: HandoffPurpose, session: AuthenticatedSession): string {
+function completedHandoffRedirect(
+  purpose: HandoffPurpose,
+  session: AuthenticatedSession,
+  groupCoverageOutcome: "approved" | "changed" | "retry" | null = null,
+): string {
   if (purpose === "invitation") return "/people";
   if (purpose === "private_review") return "/sources";
   if (session.assuranceKind === "google_connect") {
     const profile = session.assuranceContext.profile;
-    return profile === "personal_family" || profile === "work"
-      ? `/oauth/google/start?profile=${profile}`
-      : "/sources?step_up=google_connect";
+    if (profile === "personal_family" || profile === "work") {
+      const mail = profile === "work" && session.assuranceContext.mail === "include" ? "&mail=include" : "";
+      return `/oauth/google/start?profile=${profile}${mail}`;
+    }
+    return "/sources?step_up=google_connect";
   }
   if (session.assuranceKind === "account_controls") return "/safety?step_up=account_controls";
   if (session.assuranceKind === "private_bridge_standing") {
     return "/sources?step_up=private_bridge_standing";
+  }
+  if (session.assuranceKind === "group_coverage") {
+    const context = groupCoverageAssuranceContextSchema.safeParse(session.assuranceContext);
+    const anchor = context.success ? `#coverage-${context.data.conversationId}` : "";
+    return `/people?group_coverage=${groupCoverageOutcome ?? "review"}${anchor}`;
   }
   return "/people";
 }
@@ -1050,6 +1135,20 @@ function sha256Hex(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
-function googleCapabilitiesForProfile(profile: GoogleConnectionProfile): readonly GoogleCapability[] {
-  return profile === "work" ? ["calendar"] : ["mail", "calendar"];
+function googleCapabilitiesForProfile(
+  profile: GoogleConnectionProfile,
+  includeWorkMail = false,
+): readonly GoogleCapability[] {
+  return profile === "work" && !includeWorkMail ? ["calendar"] : ["mail", "calendar"];
+}
+
+function groupCoverageApprovalFromSession(session: AuthenticatedSession) {
+  const context = groupCoverageAssuranceContextSchema.parse(session.assuranceContext);
+  return {
+    conversationId: context.conversationId,
+    expectedParticipantEpochId: context.expectedParticipantEpochId,
+    expectedParticipantSetDigest: context.expectedParticipantSetDigest,
+    expectedConversationAuthorityVersion: Number(context.expectedConversationAuthorityVersion),
+    expectedHouseholdControlEpoch: Number(context.expectedHouseholdControlEpoch),
+  };
 }

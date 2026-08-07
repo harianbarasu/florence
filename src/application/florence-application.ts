@@ -617,7 +617,7 @@ export class FlorenceApplication {
             participant.registrationStatus !== "registered" || participant.consentedAt === null,
         );
         if (hasUnregisteredParticipant) {
-          await this.queuePrivateGroupEnrollmentOffers(transaction, reconciled.conversationId);
+          await this.queuePrivateGroupEnrollmentPrompts(transaction, reconciled.conversationId);
         } else {
           await this.queuePrivateGroupReadyNotices(transaction, reconciled.conversationId, "group-ready");
         }
@@ -751,7 +751,7 @@ export class FlorenceApplication {
             participant.registrationStatus !== "registered" || participant.consentedAt === null,
         );
         if (hasUnregisteredParticipant) {
-          await this.queuePrivateGroupEnrollmentOffers(transaction, reconciled.conversationId);
+          await this.queuePrivateGroupEnrollmentPrompts(transaction, reconciled.conversationId);
         } else {
           await this.queuePrivateGroupReadyNotices(transaction, reconciled.conversationId, "group-ready");
         }
@@ -1348,6 +1348,8 @@ export class FlorenceApplication {
       let text: string;
       let operation: string;
       let idempotencyKey: string;
+      let evidenceSourceRevisionIds: readonly string[] = [];
+      let authorizationExpiresAt = new Date(Date.now() + 5 * 60_000);
       if (input.response.kind === "greeting_acknowledgment") {
         text = "Hi! I’m here. What can I help you with?";
         operation = "private_dm_greeting";
@@ -1359,6 +1361,43 @@ export class FlorenceApplication {
         text = input.response.text.trim();
         if (!text || text.length > 10_000) {
           throw new UnauthorizedError("Private DM answer is outside the allowed bounds");
+        }
+        evidenceSourceRevisionIds =
+          input.response.evidenceSourceRevisionIds.length > 0
+            ? exactEvidenceSourceRevisionIds(input.response.evidenceSourceRevisionIds)
+            : [];
+        await assertPrivateQuestionSourceAuthorities(
+          transaction,
+          source.personId,
+          input.response.sourceAuthorities,
+        );
+        const sourceIntelligence = new PostgresSourceIntelligence(transaction, this.secretBox, {
+          rawRetentionDays: this.config.defaults.rawSourceRetentionDays,
+          privateCandidateRetentionDays: 7,
+        });
+        const evidenceReadAt = new Date();
+        for (const sourceRevisionId of evidenceSourceRevisionIds) {
+          const evidence = await sourceIntelligence
+            .read({
+              kind: "source_revision",
+              sourceRevisionId,
+              scope: { kind: "person", personId: source.personId },
+              asOf: evidenceReadAt.toISOString(),
+            })
+            .catch((error: unknown) => {
+              if (error instanceof NotFoundError || error instanceof UnauthorizedError) {
+                throw new StaleAuthorityError("Private answer evidence changed before commit");
+              }
+              throw error;
+            });
+          if (evidence.kind !== "source_revision") {
+            throw new StaleAuthorityError("Private answer evidence is no longer readable");
+          }
+          const accessExpiresAt = new Date(evidence.accessExpiresAt);
+          if (accessExpiresAt <= new Date(evidenceReadAt.getTime() + 3 * 60_000)) {
+            throw new StaleAuthorityError("Private answer evidence is too close to expiry");
+          }
+          if (accessExpiresAt < authorizationExpiresAt) authorizationExpiresAt = accessExpiresAt;
         }
         operation = "general_answer";
         idempotencyKey = `general-answer:${input.internalProviderEventId}`;
@@ -1372,8 +1411,9 @@ export class FlorenceApplication {
         "direct_response",
         operation,
         null,
-        new Date(Date.now() + 5 * 60_000),
+        authorizationExpiresAt,
         idempotencyKey,
+        evidenceSourceRevisionIds,
       );
       if (!queued) throw new StaleAuthorityError("Private DM response is no longer authorized");
       return { ...queued, personId: source.personId, googleActivationIncluded: false };
@@ -1750,14 +1790,30 @@ export class FlorenceApplication {
     if (!identityId || !personId) return "ignored";
     const promptRows = await transaction<{ prompted: boolean }[]>`
       select exists(
-        select 1 from outbox
-        where idempotency_key like ${`enrollment:${record.routing.providerChatId}:%`}
+        select 1
+        from outbox effect
+        left join outbox root on root.id = effect.redrive_root_id
+        where (
+            (
+              effect.idempotency_key like ${`enrollment:${record.routing.providerChatId}:%`}
+              or root.idempotency_key like ${`enrollment:${record.routing.providerChatId}:%`}
+            )
+            or (
+              (
+                effect.idempotency_key like 'group-enrollment:%'
+                or root.idempotency_key like 'group-enrollment:%'
+              )
+              and effect.recipient_identity_id = ${identityId}
+            )
+          )
+          and effect.status in ('submitted', 'confirmed')
         union all
         select 1
         from invitations invitation
-        join outbox effect
-          on effect.idempotency_key = 'household-enrollment-invitation:' || invitation.id::text
-          and effect.status in ('pending', 'leased', 'retry', 'submitted', 'confirmed')
+        join outbox root
+          on root.idempotency_key = 'household-enrollment-invitation:' || invitation.id::text
+        join outbox effect on (effect.id = root.id or effect.redrive_root_id = root.id)
+          and effect.status in ('submitted', 'confirmed')
         where invitation.invitee_identity_id = ${identityId}
           and invitation.status = 'pending' and invitation.expires_at > now()
       ) as prompted
@@ -1830,6 +1886,7 @@ export class FlorenceApplication {
       order by conversation.id
     `;
     for (const group of affectedGroups) {
+      await this.queuePrivateGroupEnrollmentPrompts(transaction, group.id);
       await this.queuePrivateGroupReadyNotices(transaction, group.id, "group-ready");
     }
     const snapshot = await new PostgresConversationAuthority(transaction).snapshot(
@@ -2542,6 +2599,7 @@ export class FlorenceApplication {
     ruleId: string | null = null,
     authorizationExpiresAt = new Date(Date.now() + 5 * 60_000),
     idempotencyKey = `linq:${operation}:${record.routing.conversationId}:${sha256Hex(text)}`,
+    evidenceSourceRevisionIds: readonly string[] = [],
   ): Promise<{ readonly outboxId: string; readonly created: boolean } | null> {
     if (!snapshot.participantEpochId || !snapshot.participantSetDigest)
       throw new Error("Conversation has no live epoch");
@@ -2566,7 +2624,7 @@ export class FlorenceApplication {
       expectedParticipantDigest: snapshot.participantSetDigest,
       effectKind: "linq.message",
       idempotencyKey,
-      data: { textDigest: sha256Hex(text) },
+      data: { textDigest: sha256Hex(text), evidenceSourceRevisionIds },
       policy: { authorityVersion: snapshot.authorityVersion, operation, sendKind },
       target: {
         providerChatId: record.routing.providerChatId,
@@ -2580,6 +2638,17 @@ export class FlorenceApplication {
       reasonCodes: ["conversation_authority_allowed", operation],
       authorizationExpiresAt,
       conversation: { id: record.routing.conversationId, authorityVersion: snapshot.authorityVersion },
+      ...(evidenceSourceRevisionIds.length > 0
+        ? {
+            sourceConversation: {
+              id: record.routing.conversationId,
+              authorityVersion: snapshot.authorityVersion,
+              participantEpochId: snapshot.participantEpochId,
+              participantSetDigest: snapshot.participantSetDigest,
+            },
+            evidenceSourceRevisionIds,
+          }
+        : {}),
       ...(record.routing.senderPersonId ? await personFence(transaction, record.routing.senderPersonId) : {}),
       ...(household[0]
         ? { household: { id: household[0].id, controlEpoch: Number(household[0].control_epoch) } }
@@ -2999,45 +3068,108 @@ export class FlorenceApplication {
     });
   }
 
-  private async queuePrivateGroupEnrollmentOffers(
+  private async queuePrivateGroupEnrollmentPrompts(
     transaction: Transaction,
     conversationId: string,
   ): Promise<void> {
     const candidates = await transaction<
-      { person_id: string; household_id: string; unregistered_count: number | string }[]
+      {
+        conversation_authority_version: number | string;
+        participant_epoch_id: string;
+        participant_set_digest: string;
+        identity_id: string;
+        identity_authority_version: number | string;
+        identity_subject_digest: string;
+        identity_subject_ciphertext: Buffer;
+        prior_prompt_count: number | string;
+      }[]
     >`
-      select distinct participant.person_id, membership.household_id,
+      select conversation.authority_version as conversation_authority_version,
+        epoch.id as participant_epoch_id, epoch.participant_set_digest,
+        identity.id as identity_id, identity.authority_version as identity_authority_version,
+        identity.subject_digest as identity_subject_digest,
+        identity.subject_ciphertext as identity_subject_ciphertext,
         (
           select count(*)
-          from epoch_participants unregistered
-          where unregistered.participant_epoch_id = epoch.id
-            and (unregistered.registration_status <> 'registered' or unregistered.consented_at is null)
-        ) as unregistered_count
+          from outbox prior
+          where prior.idempotency_key like 'group-enrollment:%'
+            and prior.recipient_identity_id = identity.id
+            and prior.source_conversation_id = conversation.id
+            and prior.source_participant_epoch_id = epoch.id
+        ) as prior_prompt_count
       from conversations conversation
       join participant_epochs epoch on epoch.id = conversation.current_epoch_id and epoch.ended_at is null
       join epoch_participants participant on participant.participant_epoch_id = epoch.id
-        and participant.registration_status = 'registered' and participant.consented_at is not null
-      join people person on person.id = participant.person_id and person.status = 'registered'
-      join household_memberships membership on membership.person_id = participant.person_id
-        and membership.status = 'active'
-      join membership_capabilities capability on capability.membership_id = membership.id
-        and capability.capability = 'membership.invite' and capability.status = 'active'
+        and (participant.registration_status <> 'registered' or participant.consented_at is null)
+      join people person on person.id = participant.person_id and person.status = 'provisional'
+      join person_identities identity on identity.id = participant.person_identity_id
+        and identity.person_id = participant.person_id
+        and identity.status in ('observed', 'pending_claim', 'verified')
       where conversation.id = ${conversationId} and conversation.kind = 'group'
-        and exists(
-          select 1 from epoch_participants unregistered
-          where unregistered.participant_epoch_id = epoch.id
-            and (unregistered.registration_status <> 'registered' or unregistered.consented_at is null)
+        and conversation.status = 'active'
+        and not exists(
+          select 1 from outbox existing
+          left join outbox root on root.id = existing.redrive_root_id
+          where (
+              existing.idempotency_key like 'group-enrollment:%'
+              or root.idempotency_key like 'group-enrollment:%'
+            )
+            and existing.recipient_identity_id = identity.id
+            and (
+              existing.status in ('submitted', 'confirmed')
+              or (
+                existing.status in ('pending', 'leased', 'retry')
+                and existing.source_conversation_id = conversation.id
+                and existing.source_conversation_authority_version = conversation.authority_version
+                and existing.source_participant_epoch_id = epoch.id
+                and existing.source_expected_participant_digest = epoch.participant_set_digest
+              )
+            )
         )
+      order by identity.id
     `;
     for (const candidate of candidates) {
-      const count = Number(candidate.unregistered_count);
-      await this.queuePrivateGroupNotice(transaction, {
-        conversationId,
-        personId: candidate.person_id,
-        householdId: candidate.household_id,
-        noticeKind: "enrollment-offer",
-        message: (link) =>
-          `I’m now in one of your observe-only groups with ${count === 1 ? "one person who hasn’t" : `${count} people who haven’t`} registered. I’ll stay silent there, and any permitted new context stays scoped to that exact participant lineup. If you want me to send ${count === 1 ? "them" : "each of them"} one private enrollment invitation, review the exact group here: ${link}`,
+      const recipient = decryptIdentitySubject(
+        this.secretBox,
+        candidate.identity_id,
+        candidate.identity_subject_ciphertext,
+      );
+      if (!recipient || !isOutboundIdentitySubject(recipient)) continue;
+      const text = `Someone added me to an iMessage group you’re in. I’ll stay silent there. With a private Florence account, I can read what you send me here. I may also privately process messages from every exact group lineup where you and I are or were both present—including still-retained earlier messages—for up to ${this.config.defaults.rawSourceRetentionDays} days, and use that context to help you privately. This never lets me write in a group: every current person must separately approve that exact group. You can change controls or delete data later.\n\nReply yes to agree, or STOP to opt out.`;
+      const promptAttempt = Number(candidate.prior_prompt_count) + 1;
+      await new EffectOutbox(transaction, this.secretBox).authorizeAndEnqueue({
+        sourceConversation: {
+          id: conversationId,
+          authorityVersion: Number(candidate.conversation_authority_version),
+          participantEpochId: candidate.participant_epoch_id,
+          participantSetDigest: candidate.participant_set_digest,
+        },
+        recipientIdentity: {
+          id: candidate.identity_id,
+          authorityVersion: Number(candidate.identity_authority_version),
+          subjectDigest: candidate.identity_subject_digest,
+        },
+        effectKind: "linq.message",
+        idempotencyKey: `group-enrollment:${conversationId}:${candidate.participant_epoch_id}:${candidate.identity_id}:authority-${candidate.conversation_authority_version}:attempt-${promptAttempt}`,
+        data: {
+          classification: "registration_prompt",
+          sourceConversationId: conversationId,
+          recipientIdentityId: candidate.identity_id,
+          textDigest: sha256Hex(text),
+        },
+        policy: { systemEnrollment: true, enrollmentOnly: true, sourceGroupSilent: true },
+        target: {
+          recipientIdentityId: candidate.identity_id,
+          recipientSubjectDigest: candidate.identity_subject_digest,
+        },
+        payload: { recipient, text },
+        reasonCodes: [
+          "exact_current_group_epoch",
+          "cold_added_group_participant",
+          "private_enrollment_only",
+          "source_group_silent",
+        ],
+        authorizationExpiresAt: new Date(Date.now() + 24 * 60 * 60_000),
       });
     }
   }
@@ -3048,8 +3180,8 @@ export class FlorenceApplication {
       readonly conversationId: string;
       readonly personId: string;
       readonly householdId: string;
-      readonly noticeKind: "coverage-active" | "enrollment-offer" | "group-ready";
-      readonly message: (link: string) => string;
+      readonly noticeKind: "coverage-active" | "group-ready";
+      readonly message: (link: string, groupLabel: string) => string;
     },
   ): Promise<void> {
     const routes = await transaction<
@@ -3109,6 +3241,13 @@ export class FlorenceApplication {
     `;
     const route = routes[0];
     if (!route) return;
+    const groupLabel = await this.exactGroupLabel(transaction, input.personId, {
+      conversationId: input.conversationId,
+      participantEpochId: route.group_epoch_id,
+      participantSetDigest: route.group_participant_digest,
+      conversationAuthorityVersion: Number(route.group_authority_version),
+      householdControlEpoch: Number(route.household_control_epoch),
+    });
     const idempotencyKey = `group-${input.noticeKind}:${input.conversationId}:${route.group_epoch_id}:${input.personId}`;
     const existing = await transaction<{ present: boolean }[]>`
       select exists(
@@ -3148,12 +3287,13 @@ export class FlorenceApplication {
             expectedParticipantSetDigest: route.group_participant_digest,
             expectedConversationAuthorityVersion: String(route.group_authority_version),
             expectedHouseholdControlEpoch: String(route.household_control_epoch),
+            groupLabel,
             returnPath: "/people",
           }
         : { returnPath: "/people" },
       expiresInSeconds: 10 * 60,
     });
-    const text = `${input.message(`${this.config.publicBaseUrl}/handoff/${handoff.token}`)}\n\nIf the link expires, text me “settings” for a fresh one.`;
+    const text = `${input.message(`${this.config.publicBaseUrl}/handoff/${handoff.token}`, groupLabel)}\n\nIf the link expires, text me “settings” for a fresh one.`;
     await new EffectOutbox(transaction, this.secretBox).authorizeAndEnqueue({
       actorPersonId: input.personId,
       person: { id: input.personId, controlEpoch: Number(route.person_control_epoch) },
@@ -3241,12 +3381,74 @@ export class FlorenceApplication {
         noticeKind,
         message:
           noticeKind === "coverage-active"
-            ? (link) =>
-                `Coverage help is on for this exact family group. I can now open, follow, and close coverage loops there without assigning blame. If anyone joins or leaves, I’ll turn it off until the new group approves again. Your private controls: ${link}`
-            : (link) =>
-                `Everyone in your family group has registered and the family invitation is complete. I’m still read-only for proactive coverage until each current person approves it privately. Review this exact group: ${link}`,
+            ? (link, groupLabel) =>
+                `Coverage help is on for ${groupLabel}. I can now open, follow, and close coverage loops there without assigning blame. If anyone joins or leaves, I’ll turn it off until the new group approves again. Your private controls: ${link}`
+            : (link, groupLabel) =>
+                `Everyone in ${groupLabel} has registered. I’m still read-only there until each current person privately approves proactive coverage. No one needs to reply in the group. Approve this exact group: ${link}`,
       });
     }
+  }
+
+  private async exactGroupLabel(
+    transaction: Transaction,
+    viewerPersonId: string,
+    scope: {
+      readonly conversationId: string;
+      readonly participantEpochId: string;
+      readonly participantSetDigest: string;
+      readonly conversationAuthorityVersion: number;
+      readonly householdControlEpoch: number;
+    },
+  ): Promise<string> {
+    const rows = await transaction<
+      {
+        person_id: string;
+        display_name_ciphertext: Buffer | null;
+        identity_id: string;
+        subject_ciphertext: Buffer | null;
+      }[]
+    >`
+      select participant.person_id, person.display_name_ciphertext,
+        identity.id as identity_id, identity.subject_ciphertext
+      from conversations conversation
+      join households household on household.id = conversation.household_id
+        and household.control_epoch = ${scope.householdControlEpoch}
+      join household_memberships viewer_membership on viewer_membership.household_id = household.id
+        and viewer_membership.person_id = ${viewerPersonId} and viewer_membership.status = 'active'
+      join membership_capabilities read_grant on read_grant.membership_id = viewer_membership.id
+        and read_grant.capability = 'household.read' and read_grant.status = 'active'
+      join participant_epochs epoch on epoch.id = conversation.current_epoch_id
+        and epoch.id = ${scope.participantEpochId} and epoch.ended_at is null
+        and epoch.participant_set_digest = ${scope.participantSetDigest}
+      join epoch_participants participant on participant.participant_epoch_id = epoch.id
+        and participant.registration_status = 'registered' and participant.consented_at is not null
+      join people person on person.id = participant.person_id and person.status = 'registered'
+      join person_identities identity on identity.id = participant.person_identity_id
+        and identity.person_id = participant.person_id and identity.status = 'verified'
+      where conversation.id = ${scope.conversationId}
+        and conversation.kind = 'group' and conversation.status = 'active'
+        and conversation.authority_version = ${scope.conversationAuthorityVersion}
+        and exists(
+          select 1 from epoch_participants viewer_participant
+          where viewer_participant.participant_epoch_id = epoch.id
+            and viewer_participant.person_id = ${viewerPersonId}
+            and viewer_participant.registration_status = 'registered'
+            and viewer_participant.consented_at is not null
+        )
+      order by case when participant.person_id = ${viewerPersonId} then 0 else 1 end,
+        participant.person_id
+    `;
+    if (rows.length === 0) throw new StaleAuthorityError("That exact group is no longer available");
+    const labels = rows.map((row, index) =>
+      row.person_id === viewerPersonId
+        ? "You"
+        : (decryptPersonName(this.secretBox, row.person_id, row.display_name_ciphertext) ??
+          maskedGroupParticipant(
+            decryptIdentitySubject(this.secretBox, row.identity_id, row.subject_ciphertext),
+            index + 1,
+          )),
+    );
+    return exactGroupLabel(labels);
   }
 
   private async processWebCommand(
@@ -3909,10 +4111,18 @@ export class FlorenceApplication {
           };
         }
         case "request_step_up": {
+          let stepUpContext = command.context ?? {};
+          if (command.purpose === "group_coverage") {
+            const scope = parseGroupCoverageStepUpScope(stepUpContext);
+            stepUpContext = {
+              ...stepUpContext,
+              groupLabel: await this.exactGroupLabel(transaction, actorPersonId, scope),
+            };
+          }
           await new DurableWork(transaction, this.secretBox).enqueue({
             kind: "auth.send_step_up",
-            idempotencyKey: `step-up:${actorPersonId}:${command.purpose}:${JSON.stringify(command.context ?? {})}:${Math.floor(Date.now() / 60_000)}`,
-            payload: { actorPersonId, purpose: command.purpose, context: command.context ?? {} },
+            idempotencyKey: `step-up:${actorPersonId}:${command.purpose}:${JSON.stringify(stepUpContext)}:${Math.floor(Date.now() / 60_000)}`,
+            payload: { actorPersonId, purpose: command.purpose, context: stepUpContext },
             person: { id: actorPersonId, controlEpoch: Number(people[0].control_epoch) },
             maxAttempts: 3,
           });
@@ -4164,6 +4374,63 @@ function isOutboundIdentitySubject(value: string): boolean {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/u.test(value) && value.length <= 320;
 }
 
+function maskedGroupParticipant(subject: string | null, position: number): string {
+  return subject && /^\+[1-9]\d{6,14}$/u.test(subject)
+    ? `participant ending in ${subject.slice(-4)}`
+    : `participant ${position}`;
+}
+
+function exactGroupLabel(participantLabels: readonly string[]): string {
+  const last = participantLabels.at(-1);
+  if (!last) return "this iMessage group";
+  if (participantLabels.length === 1) return `the iMessage group with ${boundedLabel(last)}`;
+  if (participantLabels.length === 2) {
+    return `the iMessage group with ${boundedLabel(participantLabels[0] ?? "You")} and ${boundedLabel(last)}`;
+  }
+  const full = `the iMessage group with ${participantLabels.slice(0, -1).join(", ")}, and ${last}`;
+  if (full.length <= 220) return full;
+  const visible = participantLabels.slice(0, 4).map(boundedLabel);
+  const remaining = participantLabels.length - visible.length;
+  return `the ${participantLabels.length}-person iMessage group with ${visible.join(", ")}${remaining > 0 ? `, and ${remaining} other${remaining === 1 ? "" : "s"}` : ""}`;
+}
+
+function boundedLabel(value: string): string {
+  return value.length <= 36 ? value : `${value.slice(0, 35).trimEnd()}…`;
+}
+
+function parseGroupCoverageStepUpScope(context: Readonly<Record<string, string>>): {
+  readonly conversationId: string;
+  readonly participantEpochId: string;
+  readonly participantSetDigest: string;
+  readonly conversationAuthorityVersion: number;
+  readonly householdControlEpoch: number;
+} {
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+  const conversationAuthorityVersion = Number(context.expectedConversationAuthorityVersion);
+  const householdControlEpoch = Number(context.expectedHouseholdControlEpoch);
+  if (
+    !context.conversationId ||
+    !uuid.test(context.conversationId) ||
+    !context.expectedParticipantEpochId ||
+    !uuid.test(context.expectedParticipantEpochId) ||
+    !context.expectedParticipantSetDigest ||
+    !/^[a-f0-9]{64}$/u.test(context.expectedParticipantSetDigest) ||
+    !Number.isSafeInteger(conversationAuthorityVersion) ||
+    conversationAuthorityVersion < 1 ||
+    !Number.isSafeInteger(householdControlEpoch) ||
+    householdControlEpoch < 1
+  ) {
+    throw new UnauthorizedError("Group approval requires one exact current audience");
+  }
+  return {
+    conversationId: context.conversationId,
+    participantEpochId: context.expectedParticipantEpochId,
+    participantSetDigest: context.expectedParticipantSetDigest,
+    conversationAuthorityVersion,
+    householdControlEpoch,
+  };
+}
+
 function classifyEvent(
   event: Exclude<LinqWebhookEnvelope, { eventType: "linq.ignored" }>,
   chatKind: "direct" | "group",
@@ -4330,6 +4597,50 @@ async function appendAudit(
 
 function sha256Hex(value: string): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+async function assertPrivateQuestionSourceAuthorities(
+  transaction: Transaction,
+  personId: string,
+  authorities: readonly {
+    readonly integrationId: string;
+    readonly integrationControlEpoch: number;
+    readonly status: "active" | "paused" | "reauth_required" | "error";
+  }[],
+): Promise<void> {
+  if (
+    authorities.length > 12 ||
+    new Set(authorities.map((authority) => authority.integrationId)).size !== authorities.length
+  ) {
+    throw new UnauthorizedError("Private source authority set is outside the allowed bounds");
+  }
+  if (authorities.length === 0) return;
+  const rows = await transaction<
+    { readonly id: string; readonly control_epoch: number | string; readonly status: string }[]
+  >`
+    select integration.id, integration.control_epoch, integration.status
+    from integrations integration
+    where integration.id = any(${transaction.array(authorities.map((authority) => authority.integrationId))}::uuid[])
+      and integration.person_id = ${personId} and integration.provider = 'google'
+      and exists(
+        select 1 from integration_capabilities capability
+        where capability.integration_id = integration.id
+          and capability.capability = 'mail' and capability.status = 'active'
+      )
+  `;
+  const currentById = new Map(rows.map((row) => [row.id, row] as const));
+  if (
+    authorities.some((authority) => {
+      const current = currentById.get(authority.integrationId);
+      return (
+        !current ||
+        Number(current.control_epoch) !== authority.integrationControlEpoch ||
+        current.status !== authority.status
+      );
+    })
+  ) {
+    throw new StaleAuthorityError("Private Gmail authority changed before answer commit");
+  }
 }
 
 function exactEvidenceSourceRevisionIds(candidate: readonly string[]): readonly string[] {

@@ -26,7 +26,11 @@ import {
   WorkerAttemptError,
 } from "../modules/orchestration/bounded-worker-runtime.js";
 import type { WorkerJob, WorkerResult, WorkerRuntime } from "../modules/orchestration/contracts.js";
-import { GENERAL_ANSWER_SKILL, PRODUCT_SKILLS } from "../modules/orchestration/skills.js";
+import {
+  GENERAL_ANSWER_SKILL,
+  normalizePrivateSourceReconciliation,
+  PRODUCT_SKILLS,
+} from "../modules/orchestration/skills.js";
 import {
   type AuthorizedHouseholdContextProjection,
   PostgresHouseholdContextProjection,
@@ -39,6 +43,11 @@ import {
 } from "../modules/sources/index.js";
 import type { SecretBox } from "../shared/crypto.js";
 import { ConflictError, NotFoundError, StaleAuthorityError, UnauthorizedError } from "../shared/errors.js";
+import {
+  type PrivateQuestionContext,
+  type PrivateQuestionContextProvider,
+  requestsPrivateMailContext,
+} from "./private-question-context.js";
 
 type Transaction = TransactionSql<Record<string, never>>;
 
@@ -135,6 +144,7 @@ export class FlorenceOrchestrator {
     private readonly workers: WorkerRuntime,
     private readonly attachmentReader: LinqAttachmentReader | null = null,
     private readonly mutationProcessor: ApplicationMutationProcessor | null = null,
+    private readonly privateQuestionContextProvider: PrivateQuestionContextProvider | null = null,
   ) {
     this.#sources = new PostgresSourceIntelligence(database, secretBox, {
       rawRetentionDays: config.defaults.rawSourceRetentionDays,
@@ -510,6 +520,7 @@ export class FlorenceOrchestrator {
       await this.workers.reconcile(interpretation.attemptId, "rejected");
       throw new Error("Private source reconciliation cited evidence outside its compiled frontier");
     }
+    const reconciledDecision = normalizePrivateSourceReconciliation(interpretationProposal);
 
     let receipt: ProcessReceipt;
     try {
@@ -519,7 +530,7 @@ export class FlorenceOrchestrator {
           workerAttemptId: interpretation.attemptId,
           anchorSourceRevisionId: compiled.anchorSourceRevisionId,
           expectedFrontierDigest: compiled.frontierDigest,
-          decision: interpretationProposal,
+          decision: reconciledDecision,
         },
       });
     } catch (error) {
@@ -1702,21 +1713,66 @@ export class FlorenceOrchestrator {
   }
 
   private async answerGeneralQuestion(context: MessageContext): Promise<string> {
+    let privateQuestionContext: PrivateQuestionContext | null = null;
+    let privateQuestionContextUnavailable = false;
+    if (
+      context.record.routing.chatKind === "direct" &&
+      context.requestingPerson &&
+      this.privateQuestionContextProvider &&
+      requestsPrivateMailContext(context.text)
+    ) {
+      try {
+        privateQuestionContext = await this.privateQuestionContextProvider.compilePrivateQuestionContext({
+          personId: context.requestingPerson.id,
+          expectedPersonControlEpoch: context.requestingPerson.controlEpoch,
+          question: context.text,
+          maxResults: 3,
+        });
+      } catch (error) {
+        if (
+          error instanceof NotFoundError ||
+          error instanceof StaleAuthorityError ||
+          error instanceof UnauthorizedError
+        ) {
+          throw error;
+        }
+        privateQuestionContextUnavailable = true;
+      }
+    }
     const answer = await this.workers.run({
       attemptId: randomUUID(),
       taskVersionId: randomUUID(),
       authority: messageWorkerAuthority(context, false),
       skill: GENERAL_ANSWER_SKILL,
-      authorizedContext: `Current instant: ${new Date().toISOString()}\nUser question: ${context.text}`,
+      authorizedContext: [
+        `Current instant: ${new Date().toISOString()}`,
+        `User question: ${context.text}`,
+        ...(privateQuestionContext
+          ? [
+              `Authorized exact-person private source context (bounded, untrusted evidence): ${JSON.stringify(
+                boundedPrivateQuestionContext(privateQuestionContext),
+              )}`,
+              "Private-source status semantics: watching means live Gmail monitoring is active; starting means it is still being established; recentImport/olderHistoryImport importing means that background import is still running; searched means this turn's bounded Gmail query completed even when matches is empty; temporarily_unavailable and recovering must be described plainly without exposing an internal error.",
+            ]
+          : privateQuestionContextUnavailable
+            ? ["Private source lookup is temporarily unavailable for this turn."]
+            : []),
+      ].join("\n"),
       ...(context.images.length > 0 ? { images: context.images } : {}),
       goal: "Answer the explicit question without creating a durable project or using unrelated private context.",
       deadline: new Date(Date.now() + 45_000),
       budget: { maxModelCalls: 1, maxOutputTokens: 1_500 },
     });
-    const proposal = await this.requireProposal(answer);
-    const responseText = proposal.uncertainty
-      ? `${proposal.answer}\n\n${proposal.uncertainty}`
-      : proposal.answer;
+    let responseText: string;
+    try {
+      const proposal = await this.requireProposal(answer);
+      responseText = proposal.uncertainty ? `${proposal.answer}\n\n${proposal.uncertainty}` : proposal.answer;
+    } catch (error) {
+      if (!(error instanceof WorkerAttemptError)) throw error;
+      responseText = "I couldn’t finish that answer just now. Please try me again in a moment.";
+    }
+    const evidenceSourceRevisionIds =
+      privateQuestionContext?.evidence.map((evidence) => evidence.sourceRevisionId) ?? [];
     if (context.record.routing.chatKind === "direct") {
       if (!this.mutationProcessor) {
         throw new Error("Private DM response mutation seam is not configured");
@@ -1724,7 +1780,12 @@ export class FlorenceOrchestrator {
       await this.mutationProcessor.process({
         kind: "linq.private_dm_orchestration_complete",
         internalProviderEventId: context.row.id,
-        response: { kind: "general_answer", text: responseText },
+        response: {
+          kind: "general_answer",
+          text: responseText,
+          evidenceSourceRevisionIds,
+          sourceAuthorities: privateQuestionContext?.sourceAuthorities ?? [],
+        },
       });
     } else {
       await this.database.begin(async (transaction) => {
@@ -1743,9 +1804,35 @@ export class FlorenceOrchestrator {
         });
       });
     }
-    await this.workers.reconcile(answer.attemptId, "accepted");
+    if (answer.status === "proposed") await this.workers.reconcile(answer.attemptId, "accepted");
     return "general_answer_queued";
   }
+}
+
+function boundedPrivateQuestionContext(context: PrivateQuestionContext) {
+  return {
+    provider: context.provider,
+    searchQuery: context.searchQuery,
+    accounts: context.accounts,
+    matches: context.evidence.map((evidence) => ({
+      sourceRevisionId: evidence.sourceRevisionId,
+      occurredAt: evidence.occurredAt,
+      accountKind: evidence.accountKind,
+      from: privateContextString(evidence.content.from, 300),
+      subject: privateContextString(evidence.content.subject, 500),
+      snippet: privateContextString(evidence.content.snippet, 1_000),
+      text: privateContextString(evidence.content.text, 2_500),
+      attachments: Array.isArray(evidence.content.attachments)
+        ? evidence.content.attachments.slice(0, 12)
+        : [],
+    })),
+  };
+}
+
+function privateContextString(value: unknown, maxLength: number): string | null {
+  if (typeof value !== "string") return null;
+  const compact = value.replace(/\s+/gu, " ").trim();
+  return compact ? compact.slice(0, maxLength) : null;
 }
 
 export function isDeterministicStandingProposalFailure(error: unknown): boolean {

@@ -158,19 +158,11 @@ export class GoogleSyncCoordinator {
       }
 
       const outboxIds: string[] = [];
-      if (scope.integrationStatus === "reauth_required" || scope.integrationStatus === "error") {
-        const queued = await this.enqueueAttentionRequired(
-          transaction,
-          scope,
-          route,
-          scope.integrationStatus === "reauth_required" ? "reauth" : "integration-error",
-        );
-        if (queued.created) outboxIds.push(queued.outboxId);
-        return resultFor(outboxIds, queued.created);
-      }
-
-      if (await this.hasCurrentRecentTerminalFailure(transaction, scope)) {
-        const queued = await this.enqueueAttentionRequired(transaction, scope, route, "recent-review-failed");
+      const recentTerminalFailure = await this.hasCurrentRecentTerminalFailure(transaction, scope);
+      const chatDisposition = googleSyncChatDisposition(scope.integrationStatus, recentTerminalFailure);
+      if (chatDisposition === "wait_for_recovery") return notReady();
+      if (chatDisposition === "notify_reauth") {
+        const queued = await this.enqueueAttentionRequired(transaction, scope, route);
         if (queued.created) outboxIds.push(queued.outboxId);
         return resultFor(outboxIds, queued.created);
       }
@@ -840,28 +832,11 @@ export class GoogleSyncCoordinator {
     transaction: Transaction,
     scope: IntegrationScope,
     route: ExactPrivateRoute,
-    reason: "reauth" | "integration-error" | "recent-review-failed",
   ): Promise<{ readonly outboxId: string; readonly created: boolean }> {
-    const phase =
-      reason === "reauth"
-        ? "reauth-required"
-        : reason === "integration-error"
-          ? "sync-error"
-          : "recent-review-failed";
+    const phase = "reauth-required";
     const idempotencyKey = milestoneKey(scope, phase);
     const existing = await existingOutbox(transaction, idempotencyKey);
     if (existing) return { outboxId: existing, created: false };
-
-    if (reason === "recent-review-failed") {
-      return this.enqueueEffect(transaction, {
-        scope,
-        route,
-        idempotencyKey,
-        phase,
-        text: attentionRequiredMessage(scope, null, reason),
-        reasonCodes: ["google_sync_attention_required", reason, "exact_private_dm"],
-      });
-    }
 
     const handoff = await new PostgresWebAuth(
       transaction,
@@ -880,14 +855,14 @@ export class GoogleSyncCoordinator {
       expiresInSeconds: 10 * 60,
     });
     const link = `${this.config.publicBaseUrl}/handoff/${handoff.token}`;
-    const text = attentionRequiredMessage(scope, link, reason);
+    const text = attentionRequiredMessage(scope, link);
     return this.enqueueEffect(transaction, {
       scope,
       route,
       idempotencyKey,
       phase,
       text,
-      reasonCodes: ["google_sync_attention_required", reason, "exact_private_dm"],
+      reasonCodes: ["google_sync_attention_required", "reauth", "exact_private_dm"],
     });
   }
 
@@ -966,6 +941,15 @@ export class GoogleSyncCoordinator {
   }
 }
 
+export function googleSyncChatDisposition(
+  integrationStatus: "active" | "reauth_required" | "error",
+  hasRecentTerminalFailure: boolean,
+): "continue" | "notify_reauth" | "wait_for_recovery" {
+  if (integrationStatus === "reauth_required") return "notify_reauth";
+  if (integrationStatus === "error" || hasRecentTerminalFailure) return "wait_for_recovery";
+  return "continue";
+}
+
 function connectedMessage(scope: IntegrationScope): string {
   const sources = sourceNames(scope);
   if (scope.accountKind === "work" && isCalendarOnly(scope)) {
@@ -982,22 +966,12 @@ function recentCurrentMessage(scope: IntegrationScope): string {
   return `Your recent ${sources} information is current. I’ll keep it up to date as new changes arrive.`;
 }
 
-function attentionRequiredMessage(
-  scope: IntegrationScope,
-  link: string | null,
-  reason: "reauth" | "integration-error" | "recent-review-failed",
-): string {
+function attentionRequiredMessage(scope: IntegrationScope, link: string): string {
   const source =
     scope.accountKind === "work" && isCalendarOnly(scope)
       ? "work Google Calendar"
       : `${scope.accountKind === "work" ? "work" : "personal"} Google account`;
-  if (reason === "recent-review-failed") {
-    return `I hit a problem reviewing part of your recent ${sourceNames(scope)} information. Your ${source} is still connected, and I’ll retry recovery privately. You don’t need to reconnect.`;
-  }
-  if (!link) throw new Error("Google reconnect notice requires a private link");
-  const opening =
-    reason === "reauth" ? `I lost access to your ${source}.` : `I hit a problem syncing your ${source}.`;
-  return `${opening} Reconnect it privately here so I can resume reviewing ${sourceNames(scope)}: ${link}\n\nThis secure link expires in 10 minutes. If it expires, text me “connect Google” for a fresh one.`;
+  return `I lost access to your ${source}. Reconnect it privately here so I can resume reviewing ${sourceNames(scope)}: ${link}\n\nThis secure link expires in 10 minutes. If it expires, text me “connect Google” for a fresh one.`;
 }
 
 function sourceNames(scope: IntegrationScope): string {

@@ -85,32 +85,109 @@ export const coverageResponseInterpretationSchema = z
   })
   .strict();
 
-export const privateSourceReconciliationDecisionSchema = z.discriminatedUnion("kind", [
-  z
-    .object({
-      kind: z.literal("unchanged"),
-      evidence: frontierCitationsSchema,
-    })
-    .strict(),
-  z
-    .object({
-      kind: z.literal("coverage_needed"),
-      requiredOutcome: z.string().min(1).max(500),
-      changedFact: z.string().min(1).max(500).nullable(),
-      timeFacts: z.array(z.string().min(1).max(300)).max(12),
-      uncertainties: z.array(z.string().min(1).max(300)).max(8),
-      sensitivity: z.enum(["ordinary", "personal", "sensitive"]),
-      evidence: frontierCitationsSchema,
-    })
-    .strict(),
-  z
-    .object({
-      kind: z.literal("coverage_cancelled"),
-      reason: z.enum(["cancelled", "superseded"]),
-      evidence: frontierCitationsSchema,
-    })
-    .strict(),
-]);
+/**
+ * Structured-output providers require one strict root object. Keep every key
+ * required and validate the kind-specific contract after decoding instead of
+ * emitting a root oneOf that otherwise-equivalent providers may reject.
+ */
+export const privateSourceReconciliationDecisionSchema = z
+  .object({
+    kind: z.enum(["unchanged", "coverage_needed", "coverage_cancelled"]),
+    requiredOutcome: z.string().min(1).max(500).nullable(),
+    changedFact: z.string().min(1).max(500).nullable(),
+    timeFacts: z.array(z.string().min(1).max(300)).max(12),
+    uncertainties: z.array(z.string().min(1).max(300)).max(8),
+    sensitivity: z.enum(["ordinary", "personal", "sensitive"]).nullable(),
+    reason: z.enum(["cancelled", "superseded"]).nullable(),
+    evidence: frontierCitationsSchema,
+  })
+  .strict()
+  .superRefine((decision, context) => {
+    if (decision.kind === "coverage_needed") {
+      if (decision.requiredOutcome === null || decision.sensitivity === null) {
+        context.addIssue({
+          code: "custom",
+          message: "A coverage need requires an outcome and sensitivity",
+        });
+      }
+      if (decision.reason !== null) {
+        context.addIssue({ code: "custom", message: "A coverage need cannot carry a cancellation reason" });
+      }
+      return;
+    }
+    if (decision.kind === "coverage_cancelled") {
+      if (decision.reason === null) {
+        context.addIssue({ code: "custom", message: "A cancellation requires a reason" });
+      }
+    } else if (decision.reason !== null) {
+      context.addIssue({ code: "custom", message: "An unchanged case cannot carry a cancellation reason" });
+    }
+    if (
+      decision.requiredOutcome !== null ||
+      decision.changedFact !== null ||
+      decision.timeFacts.length > 0 ||
+      decision.uncertainties.length > 0 ||
+      decision.sensitivity !== null
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "Only a coverage need may carry need fields",
+      });
+    }
+  });
+export type PrivateSourceReconciliationDecision = z.infer<typeof privateSourceReconciliationDecisionSchema>;
+
+export type PrivateSourceReconciliationMeaning =
+  | {
+      readonly kind: "unchanged";
+      readonly evidence: z.infer<typeof frontierCitationsSchema>;
+    }
+  | {
+      readonly kind: "coverage_needed";
+      readonly requiredOutcome: string;
+      readonly changedFact: string | null;
+      readonly timeFacts: string[];
+      readonly uncertainties: string[];
+      readonly sensitivity: "ordinary" | "personal" | "sensitive";
+      readonly evidence: z.infer<typeof frontierCitationsSchema>;
+    }
+  | {
+      readonly kind: "coverage_cancelled";
+      readonly reason: "cancelled" | "superseded";
+      readonly evidence: z.infer<typeof frontierCitationsSchema>;
+    };
+
+/** Converts the provider-compatible flat contract into Florence's mutation meaning. */
+export function normalizePrivateSourceReconciliation(
+  decision: PrivateSourceReconciliationDecision,
+): PrivateSourceReconciliationMeaning {
+  switch (decision.kind) {
+    case "unchanged":
+      return { kind: "unchanged", evidence: decision.evidence };
+    case "coverage_cancelled":
+      if (decision.reason === null) {
+        throw new Error("Validated private-source cancellation has no reason");
+      }
+      return {
+        kind: "coverage_cancelled",
+        reason: decision.reason,
+        evidence: decision.evidence,
+      };
+    case "coverage_needed":
+      if (decision.requiredOutcome === null || decision.sensitivity === null) {
+        throw new Error("Validated private-source need is incomplete");
+      }
+      return {
+        kind: "coverage_needed",
+        requiredOutcome: decision.requiredOutcome,
+        changedFact: decision.changedFact,
+        timeFacts: decision.timeFacts,
+        uncertainties: decision.uncertainties,
+        sensitivity: decision.sensitivity,
+        evidence: decision.evidence,
+      };
+  }
+}
 
 export const generalAnswerSchema = z
   .object({
@@ -183,15 +260,15 @@ export const PRODUCT_SKILLS = {
   } satisfies PinnedSkill<typeof coverageResponseInterpretationSchema>,
   privateSourceReconcile: {
     id: "private_source.reconcile",
-    version: 1,
+    version: 2,
     purpose:
       "Reconcile one private Gmail thread, its attachments, and current Calendar evidence into current family coverage meaning.",
-    instructions: `${commonGuardrails}\nThe application sends this skill only after its bounded source case passes explicit completeness checks. The supplied evidence contains every admitted current Gmail message and supported attachment in that case, plus only Calendar events selected by deterministic date and token relevance. Reconcile the supplied case as a unit, ordered by occurredAt. Newer updates, corrections, and cancellations supersede older asks; never revive an older request that current evidence replaced or withdrew. A replacement that still needs family coordination is coverage_needed with only the current outcome. Use coverage_cancelled only when current evidence withdraws or supersedes the prior need without leaving a current replacement need. If there is no current family coverage need and no supplied evidence changes or withdraws an earlier need, return unchanged. Thanks, acknowledgments, signatures, delivery chatter, and unrelated replies are unchanged. Calendar evidence can clarify current schedule facts but never proves that a person accepted responsibility. Every evidence citation must use a sourceRevisionId supplied in this frontier and explain its support; never invent or cite outside evidence. Never choose or infer a person ID, destination, household, conversation, coverage loop, disclosure audience, permission, standing rule, or mutation authority. Return only current private meaning for application validation.`,
+    instructions: `${commonGuardrails}\nThe application sends this skill only after its bounded source case passes explicit completeness checks. The supplied evidence contains every admitted current Gmail message and supported attachment in that case, plus only Calendar events selected by deterministic date and token relevance. Reconcile the supplied case as a unit, ordered by occurredAt. Newer updates, corrections, and cancellations supersede older asks; never revive an older request that current evidence replaced or withdrew. A replacement that still needs family coordination is coverage_needed with only the current outcome. Use coverage_cancelled only when current evidence withdraws or supersedes the prior need without leaving a current replacement need. If there is no current family coverage need and no supplied evidence changes or withdraws an earlier need, return unchanged. Thanks, acknowledgments, signatures, delivery chatter, and unrelated replies are unchanged. Calendar evidence can clarify current schedule facts but never proves that a person accepted responsibility. Every evidence citation must use a sourceRevisionId supplied in this frontier and explain its support; never invent or cite outside evidence. Never choose or infer a person ID, destination, household, conversation, coverage loop, disclosure audience, permission, standing rule, or mutation authority. Every output key is required: use null and empty arrays for fields that do not apply to the selected kind. Return only current private meaning for application validation.`,
     outputSchema: privateSourceReconciliationDecisionSchema,
-    outputSchemaName: "private_source_reconcile_v1",
+    outputSchemaName: "private_source_reconcile_v2",
     riskClass: "high",
     requestedCapabilities: [] as const,
-    evaluationRelease: "private-source-frontier-1",
+    evaluationRelease: "private-source-frontier-2",
   } satisfies PinnedSkill<typeof privateSourceReconciliationDecisionSchema>,
 } as const;
 

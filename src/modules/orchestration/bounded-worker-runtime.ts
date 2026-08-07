@@ -1,7 +1,13 @@
-import type { z } from "zod";
+import { z } from "zod";
 import type { ModelGateway, WorkerJob, WorkerResult, WorkerRuntime } from "./contracts.js";
 
-const RETRYABLE_WORKER_ERROR_CODES = new Set(["deadline_exceeded", "model_failed"]);
+const RETRYABLE_WORKER_ERROR_CODES = new Set([
+  "deadline_exceeded",
+  "model_failed",
+  "model_output_invalid",
+  "model_rate_limited",
+  "model_unavailable",
+]);
 
 /**
  * Provider-neutral failure raised when durable orchestration cannot obtain a
@@ -74,7 +80,7 @@ export class BoundedWorkerRuntime implements WorkerRuntime {
         completedAt: new Date(),
       };
     } catch (error) {
-      const errorCode = isModelTimeout(error) ? "deadline_exceeded" : "model_failed";
+      const errorCode = modelErrorCode(error);
       return failedResult(job, startedAt, this.runtimeRoute, errorCode);
     }
   }
@@ -91,6 +97,33 @@ function isModelTimeout(error: unknown): boolean {
   if (error.name === "AbortError" || error.name === "TimeoutError") return true;
   const code = "code" in error && typeof error.code === "string" ? error.code : null;
   return code === "ETIMEDOUT" || code === "ECONNABORTED";
+}
+
+function modelErrorCode(error: unknown): string {
+  if (isModelTimeout(error)) return "deadline_exceeded";
+  if (error instanceof z.ZodError) return "model_output_invalid";
+  const status = modelErrorStatus(error);
+  if (status === 400 || status === 404 || status === 422) return "model_invalid_request";
+  if (status === 401 || status === 403) return "model_auth_failed";
+  if (status === 408 || status === 429) return status === 429 ? "model_rate_limited" : "model_unavailable";
+  if (status !== null && status >= 500) return "model_unavailable";
+  return "model_failed";
+}
+
+function modelErrorStatus(error: unknown): number | null {
+  if (typeof error !== "object" || error === null) return null;
+  if ("status" in error && typeof error.status === "number") return error.status;
+  if ("code" in error && typeof error.code === "number") return error.code;
+  if (
+    "response" in error &&
+    typeof error.response === "object" &&
+    error.response !== null &&
+    "status" in error.response &&
+    typeof error.response.status === "number"
+  ) {
+    return error.response.status;
+  }
+  return null;
 }
 
 function expiredResult<Schema extends z.ZodType>(

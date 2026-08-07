@@ -26,7 +26,7 @@ describe("governed skill definition identity", () => {
     ).not.toBe(baseline);
   });
 
-  it("backfills the deployed suite with the exact current canonical digests", async () => {
+  it("preserves migrated pins and gives the current provider contract an exact identity", async () => {
     const migration = await readFile(
       new URL("../../migrations/012_skill_definition_governance.sql", import.meta.url),
       "utf8",
@@ -37,12 +37,21 @@ describe("governed skill definition identity", () => {
         match[3],
       ]),
     );
-    const deployedSkills = [...Object.values(PRODUCT_SKILLS), GENERAL_ANSWER_SKILL];
+    const migratedSkills = [
+      ...Object.values(PRODUCT_SKILLS).filter((skill) => skill.id !== "private_source.reconcile"),
+      GENERAL_ANSWER_SKILL,
+    ];
 
-    expect(migratedPins.size).toBe(deployedSkills.length);
-    for (const skill of deployedSkills) {
+    expect(migratedPins.size).toBe(migratedSkills.length + 1);
+    for (const skill of migratedSkills) {
       expect(migratedPins.get(`${skill.id}@${skill.version}`)).toBe(governedSkillDefinitionDigest(skill));
     }
+    expect(migratedPins.get("private_source.reconcile@1")).toBe(
+      "998354d86fdc302e53baf7f9f810b381ff73d21d4c1491b30c2fc286c0122c8e",
+    );
+    expect(governedSkillDefinitionDigest(PRODUCT_SKILLS.privateSourceReconcile)).toBe(
+      "e8ece1f2d9a7dfa56cfb4608b11623476bea9c40f8c5aa6207548b6019d28cac",
+    );
   });
 
   it("binds the canonical input digest to the complete worker authority tuple", () => {

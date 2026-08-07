@@ -4,6 +4,11 @@ import { z } from "zod";
 import type { Database } from "../db/client.js";
 import { type PrivateBridgeSourceFrontier, PrivateSourceBridge } from "../modules/bridges/index.js";
 import {
+  normalizePrivateSourceReconciliation,
+  PRODUCT_SKILLS,
+  privateSourceReconciliationDecisionSchema,
+} from "../modules/orchestration/skills.js";
+import {
   gmailThreadCaseDigest,
   gmailThreadFrontierLockKey,
   type JsonObject,
@@ -1167,13 +1172,14 @@ async function loadAuthorizedWorkerProposal(
     for update of attempt, result
   `;
   const row = rows[0];
+  const governedSkill = PRODUCT_SKILLS.privateSourceReconcile;
   if (!row) throw new UnauthorizedError("Governed private source worker result does not exist");
   if (
     row.attempt_status !== "succeeded" ||
-    row.skill_key !== "private_source.reconcile" ||
-    Number(row.skill_version) !== 1 ||
+    row.skill_key !== governedSkill.id ||
+    Number(row.skill_version) !== governedSkill.version ||
     row.skill_version_status !== "approved" ||
-    row.output_contract !== "private_source_reconcile_v1" ||
+    row.output_contract !== governedSkill.outputSchemaName ||
     row.evaluation_status !== "active" ||
     row.attempt_evaluation_release_id !== row.version_evaluation_release_id ||
     row.active_skill_version_id !== row.attempt_skill_version_id ||
@@ -1197,7 +1203,7 @@ async function loadAuthorizedWorkerProposal(
     if (canonicalDigest(raw) !== row.output_digest) {
       throw new Error("digest mismatch");
     }
-    parsed = ReconciliationDecisionSchema.parse(raw);
+    parsed = normalizePrivateSourceReconciliation(privateSourceReconciliationDecisionSchema.parse(raw));
   } catch {
     throw new UnauthorizedError("Private source worker result could not be authenticated");
   }

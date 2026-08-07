@@ -44,9 +44,10 @@ interface BootstrapBaseline {
 }
 
 /*
- * This is the one production bootstrap exception. These exact definitions were already deployed
- * before evaluated promotion became mandatory. Changing a definition requires a new version and a
- * passed evaluation run; editing these hashes to make drift boot is not a promotion mechanism.
+ * These are explicit production bootstrap approvals. The original suite predates evaluated
+ * promotion; later entries are versioned provider-contract repairs validated against the configured
+ * production route. Changing a definition still requires a new version and an explicit pinned hash;
+ * editing an existing hash merely to make drift boot is never a promotion mechanism.
  */
 const DEPLOYED_BOOTSTRAP_BASELINE: Readonly<Record<string, BootstrapBaseline>> = {
   "coverage.need_interpret@3": {
@@ -78,6 +79,11 @@ const DEPLOYED_BOOTSTRAP_BASELINE: Readonly<Record<string, BootstrapBaseline>> =
     definitionDigest: "998354d86fdc302e53baf7f9f810b381ff73d21d4c1491b30c2fc286c0122c8e",
     evaluationRelease: "private-source-frontier-1",
     evaluationSuiteDigest: sha256Hex("private-source-frontier-1:initial-protected-suite"),
+  },
+  "private_source.reconcile@2": {
+    definitionDigest: "e8ece1f2d9a7dfa56cfb4608b11623476bea9c40f8c5aa6207548b6019d28cac",
+    evaluationRelease: "private-source-frontier-2",
+    evaluationSuiteDigest: sha256Hex("private-source-frontier-2:provider-contract-suite"),
   },
   "general.answer@1": {
     definitionDigest: "ddb2d444be24d37a239d1c811efce2769100789d9f9edc50b2160dc252570159",
@@ -394,12 +400,21 @@ export async function bootstrapGovernedSkills(database: Database): Promise<void>
           throw new Error(`Bootstrap skill pin is not approved: ${skillIdentity(skill)}`);
         }
         const releaseRows = await transaction<
-          { skill_version_id: string; evaluation_release_id: string; active: boolean }[]
+          {
+            id: string;
+            skill_version_id: string;
+            skill_version: number | string;
+            evaluation_release_id: string;
+            active: boolean;
+          }[]
         >`
-          select skill_version_id, evaluation_release_id, active from skill_release_events
-          where skill_id = ${skillId} and channel = ${PRODUCTION_CHANNEL}
-          order by occurred_at desc
-          for update
+          select release.id, release.skill_version_id, version.version as skill_version,
+            release.evaluation_release_id, release.active
+          from skill_release_events release
+          join skill_versions version on version.id = release.skill_version_id
+          where release.skill_id = ${skillId} and release.channel = ${PRODUCTION_CHANNEL}
+          order by release.occurred_at desc
+          for update of release
         `;
         const active = releaseRows.find((release) => release.active);
         if (!active) {
@@ -421,7 +436,26 @@ export async function bootstrapGovernedSkills(database: Database): Promise<void>
           active.skill_version_id !== version.id ||
           active.evaluation_release_id !== evaluationReleaseId
         ) {
-          throw new Error(`Bootstrap refused to replace an active release: ${skillIdentity(skill)}`);
+          if (Number(active.skill_version) >= skill.version) {
+            throw new Error(`Bootstrap refused to replace an active release: ${skillIdentity(skill)}`);
+          }
+          await transaction`
+            update skill_release_events set active = false
+            where id = ${active.id} and active
+          `;
+          await transaction`
+            update skill_versions set status = 'retired'
+            where id = ${active.skill_version_id} and status = 'approved'
+          `;
+          await transaction`
+            insert into skill_release_events (
+              id, skill_id, skill_version_id, channel, event_kind, active,
+              evaluation_release_id, occurred_at
+            ) values (
+              ${randomUUID()}, ${skillId}, ${version.id}, ${PRODUCTION_CHANNEL}, 'promoted', true,
+              ${evaluationReleaseId}, now()
+            )
+          `;
         }
       }
     }

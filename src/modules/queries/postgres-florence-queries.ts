@@ -29,6 +29,24 @@ interface HouseholdRow {
   member_count: number | string;
 }
 
+interface ExactGroupApprovalScope {
+  readonly conversationId: string;
+  readonly participantEpochId: string;
+  readonly participantSetDigest: string;
+  readonly conversationAuthorityVersion: number;
+}
+
+interface ExactGroupParticipantRow {
+  readonly conversation_id: string;
+  readonly conversation_authority_version: number | string;
+  readonly participant_epoch_id: string;
+  readonly participant_set_digest: string;
+  readonly person_id: string;
+  readonly display_name_ciphertext: Buffer | null;
+  readonly identity_id: string;
+  readonly subject_ciphertext: Buffer | null;
+}
+
 // Google work at or below this priority is the live/recent-mail/calendar
 // frontier that must settle before onboarding can call private sources ready.
 const RECENT_SOURCE_PRIORITY_CEILING = 110;
@@ -52,6 +70,74 @@ export class PostgresFlorenceQueries {
       rawRetentionDays,
       privateCandidateRetentionDays: 7,
     });
+  }
+
+  private async exactGroupParticipantLabels(
+    personId: string,
+    scopes: readonly ExactGroupApprovalScope[],
+  ): Promise<ReadonlyMap<string, readonly string[]>> {
+    const scopeByConversationId = new Map(scopes.map((scope) => [scope.conversationId, scope]));
+    if (scopeByConversationId.size === 0) return new Map();
+    const epochIds = [...new Set(scopes.map((scope) => scope.participantEpochId))];
+    const rows = await this.database<ExactGroupParticipantRow[]>`
+      select conversation.id as conversation_id,
+        conversation.authority_version as conversation_authority_version,
+        epoch.id as participant_epoch_id, epoch.participant_set_digest,
+        participant.person_id, person.display_name_ciphertext,
+        participant.person_identity_id as identity_id, identity.subject_ciphertext
+      from epoch_participants participant
+      join participant_epochs epoch on epoch.id = participant.participant_epoch_id
+        and epoch.ended_at is null
+      join conversations conversation on conversation.current_epoch_id = epoch.id
+        and conversation.kind = 'group' and conversation.status = 'active'
+      left join people person on person.id = participant.person_id
+        and person.status = 'registered'
+        and participant.registration_status = 'registered'
+      left join person_identities identity on identity.id = participant.person_identity_id
+        and identity.person_id = participant.person_id
+        and identity.status in ('observed', 'pending_claim', 'verified')
+      where epoch.id = any(${this.database.array(epochIds)}::uuid[])
+        and exists(
+          select 1 from epoch_participants viewer_participant
+          where viewer_participant.participant_epoch_id = epoch.id
+            and viewer_participant.person_id = ${personId}
+        )
+        and exists(
+          select 1 from household_memberships viewer_membership
+          join membership_capabilities read_grant on read_grant.membership_id = viewer_membership.id
+            and read_grant.capability = 'household.read' and read_grant.status = 'active'
+          where viewer_membership.household_id = conversation.household_id
+            and viewer_membership.person_id = ${personId}
+            and viewer_membership.status = 'active'
+        )
+      order by conversation.id,
+        case when participant.person_id = ${personId} then 0 else 1 end,
+        participant.person_id
+    `;
+    const labelsByConversationId = new Map<string, string[]>();
+    for (const row of rows) {
+      const scope = scopeByConversationId.get(row.conversation_id);
+      if (
+        !scope ||
+        scope.participantEpochId !== row.participant_epoch_id ||
+        scope.participantSetDigest !== row.participant_set_digest ||
+        scope.conversationAuthorityVersion !== Number(row.conversation_authority_version)
+      ) {
+        continue;
+      }
+      const labels = labelsByConversationId.get(row.conversation_id) ?? [];
+      const name =
+        row.person_id === personId
+          ? "You"
+          : (decryptPersonName(this.#secretBox, row.person_id, row.display_name_ciphertext) ??
+            exactGroupParticipantFallback(
+              decryptIdentitySubject(this.#secretBox, row.identity_id, row.subject_ciphertext),
+              labels.length + 1,
+            ));
+      labels.push(name);
+      labelsByConversationId.set(row.conversation_id, labels);
+    }
+    return labelsByConversationId;
   }
 
   public async viewer(
@@ -156,8 +242,18 @@ export class PostgresFlorenceQueries {
         loop.last_transition_at
       limit 50
     `;
-    const coverageApprovals = await this.database<{ conversation_id: string; viewer_approved: boolean }[]>`
+    const coverageApprovals = await this.database<
+      {
+        conversation_id: string;
+        conversation_authority_version: number | string;
+        participant_epoch_id: string;
+        participant_set_digest: string;
+        viewer_approved: boolean;
+      }[]
+    >`
       select conversation.id as conversation_id,
+        conversation.authority_version as conversation_authority_version,
+        epoch.id as participant_epoch_id, epoch.participant_set_digest,
         exists(
           select 1
           from conversation_rules proposal
@@ -165,6 +261,8 @@ export class PostgresFlorenceQueries {
             on approval.conversation_rule_id = proposal.id
             and approval.participant_epoch_id = epoch.id
             and approval.participant_set_digest = epoch.participant_set_digest
+            and approval.conversation_authority_version = conversation.authority_version
+            and approval.household_control_epoch = household.control_epoch
             and approval.person_id = ${personId}
           where proposal.conversation_id = conversation.id
             and proposal.rule_key = 'family_coverage_proposal'
@@ -215,6 +313,15 @@ export class PostgresFlorenceQueries {
       order by conversation.updated_at desc, conversation.id
       limit 25
     `;
+    const coverageApprovalParticipants = await this.exactGroupParticipantLabels(
+      personId,
+      coverageApprovals.map((approval) => ({
+        conversationId: approval.conversation_id,
+        participantEpochId: approval.participant_epoch_id,
+        participantSetDigest: approval.participant_set_digest,
+        conversationAuthorityVersion: Number(approval.conversation_authority_version),
+      })),
+    );
     const candidates = await this.database<{ id: string; candidate_kind: string; proposed_at: Date }[]>`
       select id, candidate_kind, proposed_at
       from knowledge_candidates
@@ -321,18 +428,25 @@ export class PostgresFlorenceQueries {
           changedAt: loop.last_transition_at.toISOString(),
         };
       }),
-      ...coverageApprovals.map((approval) => ({
-        id: `coverage-approval:${approval.conversation_id}`,
-        kind: "approval" as const,
-        title: approval.viewer_approved
-          ? "Waiting for the group’s coverage approval"
-          : "Approve Florence for a family group",
-        detail: approval.viewer_approved
-          ? "Your approval is saved. Florence will not write in the group until every current person approves."
-          : "Every current person must approve before Florence can open and follow coverage loops there.",
-        urgency: "soon" as const,
-        href: "/people",
-      })),
+      ...coverageApprovals.flatMap((approval) => {
+        const participantLabels = coverageApprovalParticipants.get(approval.conversation_id);
+        if (!participantLabels || participantLabels.length === 0) return [];
+        const groupLabel = exactGroupLabel(participantLabels);
+        return [
+          {
+            id: `coverage-approval:${approval.conversation_id}`,
+            kind: "approval" as const,
+            title: approval.viewer_approved
+              ? "Waiting for the group’s coverage approval"
+              : "Approve Florence for a family group",
+            detail: approval.viewer_approved
+              ? `${groupLabel}. Your approval is saved. Florence will not write there until every person shown approves.`
+              : `${groupLabel}. Every person shown must approve before Florence can open and follow coverage loops there.`,
+            urgency: "soon" as const,
+            href: "/people",
+          },
+        ];
+      }),
       ...candidates.map((candidate) => ({
         id: candidate.id,
         kind: "private_review" as const,
@@ -863,6 +977,15 @@ export class PostgresFlorenceQueries {
         group by conversation.id, epoch.id, household.id
         order by conversation.updated_at desc
       `;
+      const groupParticipantLabels = await this.exactGroupParticipantLabels(
+        personId,
+        groupRows.map((group) => ({
+          conversationId: group.conversation_id,
+          participantEpochId: group.participant_epoch_id,
+          participantSetDigest: group.participant_set_digest,
+          conversationAuthorityVersion: Number(group.conversation_authority_version),
+        })),
+      );
       households.push({
         id: household.id,
         name: householdIndex === 0 ? "Your family" : `Your family ${householdIndex + 1}`,
@@ -920,29 +1043,33 @@ export class PostgresFlorenceQueries {
             ),
           registered: participant.person_status === "registered",
         })),
-        coverageGroups: groupRows.map((group, groupIndex) => {
+        coverageGroups: groupRows.flatMap((group) => {
+          const participantLabels = groupParticipantLabels.get(group.conversation_id);
+          if (!participantLabels || participantLabels.length === 0) return [];
           const active = group.active;
           const allReady = group.all_ready;
           const viewerApproved = active || group.viewer_approved;
           const requiredCount = Number(group.required_count);
-          return {
-            conversationId: group.conversation_id,
-            participantEpochId: group.participant_epoch_id,
-            participantSetDigest: group.participant_set_digest,
-            conversationAuthorityVersion: Number(group.conversation_authority_version),
-            householdControlEpoch: Number(group.household_control_epoch),
-            label: groupIndex === 0 ? "Family group" : `Family group ${groupIndex + 1}`,
-            active,
-            approvedCount: active ? requiredCount : Number(group.approved_count),
-            requiredCount,
-            viewerApproved,
-            canApprove: allReady && !active && !viewerApproved,
-            blockedReason: !allReady
-              ? "Everyone in this group must finish private registration first."
-              : !active && viewerApproved
-                ? "You approved this. Florence is waiting for everyone else."
-                : null,
-          };
+          return [
+            {
+              conversationId: group.conversation_id,
+              participantEpochId: group.participant_epoch_id,
+              participantSetDigest: group.participant_set_digest,
+              conversationAuthorityVersion: Number(group.conversation_authority_version),
+              householdControlEpoch: Number(group.household_control_epoch),
+              label: exactGroupLabel(participantLabels),
+              active,
+              approvedCount: active ? requiredCount : Number(group.approved_count),
+              requiredCount,
+              viewerApproved,
+              canApprove: allReady && !active && !viewerApproved,
+              blockedReason: !allReady
+                ? "Everyone in this group must finish private registration first."
+                : !active && viewerApproved
+                  ? "You approved this. Florence is waiting for everyone else."
+                  : null,
+            },
+          ];
         }),
       });
     }
@@ -1302,13 +1429,21 @@ export class PostgresFlorenceQueries {
         control_epoch: number | string;
         connected_at: Date;
         updated_at: Date;
+        active_capabilities: string[];
       }[]
     >`
-      select id, status, account_kind, control_epoch, connected_at, updated_at
-      from integrations
-      where person_id = ${personId} and provider = 'google'
-        and status <> 'revoked'
-      order by connected_at
+      select integration.id, integration.status, integration.account_kind,
+        integration.control_epoch, integration.connected_at, integration.updated_at,
+        array(
+          select capability.capability
+          from integration_capabilities capability
+          where capability.integration_id = integration.id and capability.status = 'active'
+          order by capability.capability
+        ) as active_capabilities
+      from integrations integration
+      where integration.person_id = ${personId} and integration.provider = 'google'
+        and integration.status <> 'revoked'
+      order by integration.connected_at
     `;
     const integrationIds = integrations.map((integration) => integration.id);
     const cursors =
@@ -1481,9 +1616,7 @@ export class PostgresFlorenceQueries {
       const accountEmail =
         profile?.kind === "integration_profile" ? profile.accountEmail : "Account email unavailable";
       const accountKind = integration.account_kind === "work" ? "work" : "personal_family";
-      const activeCapabilities = new Set(
-        profile?.kind === "integration_profile" ? profile.integration.activeCapabilities : [],
-      );
+      const activeCapabilities = new Set(integration.active_capabilities);
       const allConnectionCursors = cursors.filter((cursor) => cursor.integration_id === integration.id);
       const connectionCursors = allConnectionCursors.filter(
         (cursor) => cursor.updated_at >= integration.connected_at,
@@ -1654,7 +1787,12 @@ export class PostgresFlorenceQueries {
         label: "Google",
         email: accountEmail,
         accountKind,
-        accountKindLabel: accountKind === "work" ? "Work calendar" : "Personal & family",
+        accountKindLabel:
+          accountKind === "work"
+            ? activeCapabilities.has("mail")
+              ? "Work Mail & Calendar"
+              : "Work Calendar"
+            : "Personal & family",
         status: integration.status,
         statusLabel: childNeedsAttention ? "Needs attention" : integrationStatusLabel(integration.status),
         mail: activeCapabilities.has("mail")
@@ -1994,6 +2132,30 @@ function maskedIdentityLabel(subject: string | null): string {
   const at = subject.lastIndexOf("@");
   if (at > 0) return `Group participant at ${subject.slice(at + 1)}`;
   return "Unregistered group participant";
+}
+
+function exactGroupParticipantFallback(subject: string | null, position: number): string {
+  return subject && /^\+[1-9]\d{6,14}$/u.test(subject)
+    ? `participant ending in ${subject.slice(-4)}`
+    : `participant ${position}`;
+}
+
+function exactGroupLabel(participantLabels: readonly string[]): string {
+  const last = participantLabels.at(-1);
+  if (!last) return "Current family group";
+  if (participantLabels.length === 1) return `Group with ${boundedGroupParticipant(last)}`;
+  if (participantLabels.length === 2) {
+    return `Group with ${boundedGroupParticipant(participantLabels[0] ?? "You")} and ${boundedGroupParticipant(last)}`;
+  }
+  const full = `Group with ${participantLabels.slice(0, -1).join(", ")}, and ${last}`;
+  if (full.length <= 220) return full;
+  const visible = participantLabels.slice(0, 4).map(boundedGroupParticipant);
+  const remaining = participantLabels.length - visible.length;
+  return `${participantLabels.length}-person group with ${visible.join(", ")}${remaining > 0 ? `, and ${remaining} other${remaining === 1 ? "" : "s"}` : ""}`;
+}
+
+function boundedGroupParticipant(value: string): string {
+  return value.length <= 36 ? value : `${value.slice(0, 35).trimEnd()}…`;
 }
 
 function decryptDependentText(

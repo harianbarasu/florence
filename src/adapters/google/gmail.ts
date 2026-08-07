@@ -62,17 +62,21 @@ export class GmailAdapter {
     query: string,
     pageToken?: string,
     requestedPageSize = 100,
+    timeoutMs?: number,
   ): Promise<GmailMessagePage> {
     const maxResults = Number.isFinite(requestedPageSize)
       ? Math.max(1, Math.min(Math.trunc(requestedPageSize), 500))
       : 100;
-    const response = await this.#gmail.users.messages.list({
-      userId: "me",
-      q: query,
-      maxResults,
-      includeSpamTrash: false,
-      ...(pageToken ? { pageToken } : {}),
-    });
+    const response = await this.#gmail.users.messages.list(
+      {
+        userId: "me",
+        q: query,
+        maxResults,
+        includeSpamTrash: false,
+        ...(pageToken ? { pageToken } : {}),
+      },
+      timeoutMs ? { timeout: Math.max(1_000, Math.min(timeoutMs, 30_000)) } : {},
+    );
     return {
       messageIds: (response.data.messages ?? []).flatMap((message) => (message.id ? [message.id] : [])),
       resultSizeEstimate: response.data.resultSizeEstimate ?? 0,
@@ -80,15 +84,22 @@ export class GmailAdapter {
     };
   }
 
-  public async message(messageId: string, metadataOnly = false): Promise<NormalizedGmailMessage> {
-    const response = await this.#gmail.users.messages.get({
-      userId: "me",
-      id: messageId,
-      format: metadataOnly ? "metadata" : "full",
-      ...(metadataOnly
-        ? { metadataHeaders: ["From", "To", "Cc", "Subject", "Message-ID", "Content-Type"] }
-        : {}),
-    });
+  public async message(
+    messageId: string,
+    metadataOnly = false,
+    timeoutMs?: number,
+  ): Promise<NormalizedGmailMessage> {
+    const response = await this.#gmail.users.messages.get(
+      {
+        userId: "me",
+        id: messageId,
+        format: metadataOnly ? "metadata" : "full",
+        ...(metadataOnly
+          ? { metadataHeaders: ["From", "To", "Cc", "Subject", "Message-ID", "Content-Type"] }
+          : {}),
+      },
+      timeoutMs ? { timeout: Math.max(1_000, Math.min(timeoutMs, 30_000)) } : {},
+    );
     return normalizeMessage(response.data);
   }
 

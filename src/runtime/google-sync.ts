@@ -28,6 +28,7 @@ import {
 import { DurableWork } from "../modules/work/index.js";
 import type { SecretBox } from "../shared/crypto.js";
 import { NotFoundError, StaleAuthorityError, UnauthorizedError } from "../shared/errors.js";
+import { type PrivateQuestionContext, privateMailSearchQuery } from "./private-question-context.js";
 
 const GOOGLE_JOB_PRIORITY = {
   activation: 50,
@@ -84,6 +85,39 @@ interface CalendarAuthorityContext {
   readonly work: DurableWork;
 }
 
+interface PrivateGmailAccountRow {
+  readonly id: string;
+  readonly control_epoch: number | string;
+  readonly account_kind: "personal_family" | "work";
+  readonly status: "active" | "paused" | "reauth_required" | "error";
+  readonly connected_at: Date;
+}
+
+interface PrivateGmailCursorRow {
+  readonly integration_id: string;
+  readonly resource_kind: string;
+  readonly state: string;
+  readonly updated_at: Date;
+}
+
+interface PrivateGmailJobRow {
+  readonly integration_id: string;
+  readonly job_kind: string;
+  readonly idempotency_key: string;
+  readonly status: string;
+  readonly updated_at: Date;
+}
+
+interface PrivateGmailSearchResult {
+  readonly integrationId: string;
+  readonly search: "searched" | "not_requested" | "temporarily_unavailable";
+  readonly evidence: readonly PrivateQuestionContext["evidence"][number][];
+  readonly authorityOverride?: {
+    readonly integrationControlEpoch: number;
+    readonly status: PrivateGmailAccountRow["status"];
+  };
+}
+
 export class GoogleSyncService {
   readonly #database: Database;
   readonly #sources: PostgresSourceIntelligence;
@@ -105,6 +139,179 @@ export class GoogleSyncService {
     });
     this.#work = new DurableWork(database, secretBox);
     this.#oauth = new GoogleOAuthAdapter(config.google);
+  }
+
+  public async compilePrivateQuestionContext(input: {
+    readonly personId: string;
+    readonly expectedPersonControlEpoch: number;
+    readonly question: string;
+    readonly maxResults: number;
+  }): Promise<PrivateQuestionContext> {
+    const people = await this.#database<
+      { readonly status: string; readonly control_epoch: number | string }[]
+    >`
+      select status, control_epoch from people where id = ${input.personId}
+    `;
+    const person = people[0];
+    if (
+      person?.status !== "registered" ||
+      Number(person.control_epoch) !== input.expectedPersonControlEpoch
+    ) {
+      throw new StaleAuthorityError("Private source owner authority changed");
+    }
+    const accounts = await this.#database<PrivateGmailAccountRow[]>`
+      select integration.id, integration.control_epoch, integration.account_kind,
+        integration.status, integration.connected_at
+      from integrations integration
+      where integration.person_id = ${input.personId}
+        and integration.provider = 'google'
+        and integration.status in ('active', 'paused', 'reauth_required', 'error')
+        and exists(
+          select 1 from integration_capabilities capability
+          where capability.integration_id = integration.id
+            and capability.capability = 'mail' and capability.status = 'active'
+        )
+      order by integration.connected_at, integration.id
+    `;
+    if (accounts.length === 0) {
+      return {
+        provider: "google",
+        searchQuery: null,
+        sourceAuthorities: [],
+        accounts: [],
+        evidence: [],
+      };
+    }
+    const integrationIds = accounts.map((account) => account.id);
+    const [cursorRows, jobRows] = await Promise.all([
+      this.#database<PrivateGmailCursorRow[]>`
+        select integration_id, resource_kind, state, updated_at
+        from sync_cursors
+        where integration_id = any(${this.#database.array(integrationIds)}::uuid[])
+          and resource_kind in (
+            'gmail_history', 'gmail_backfill:newest_30_days',
+            'gmail_backfill:days_31_to_90', 'gmail_backfill:days_91_to_365',
+            'gmail_backfill:older_history'
+          )
+      `,
+      this.#database<PrivateGmailJobRow[]>`
+        select distinct on (job.integration_id, job.job_kind, job.idempotency_key)
+          job.integration_id, job.job_kind, job.idempotency_key, job.status, job.updated_at
+        from jobs job
+        join integrations integration on integration.id = job.integration_id
+        where job.integration_id = any(${this.#database.array(integrationIds)}::uuid[])
+          and job.integration_control_epoch = integration.control_epoch
+          and job.job_kind in ('google.gmail.bootstrap', 'google.gmail.poll', 'google.gmail.backfill')
+        order by job.integration_id, job.job_kind, job.idempotency_key, job.updated_at desc
+      `,
+    ]);
+    const query = privateMailSearchQuery(input.question);
+    const activeAccounts = accounts.filter((account) => account.status === "active");
+    const perAccountLimit = Math.max(
+      1,
+      Math.min(3, Math.ceil(Math.max(1, input.maxResults) / Math.max(1, activeAccounts.length))),
+    );
+    const searchResults = await Promise.all(
+      activeAccounts.map(async (account): Promise<PrivateGmailSearchResult> => {
+        if (!query) {
+          return { integrationId: account.id, search: "not_requested", evidence: [] };
+        }
+        const payload = {
+          integrationId: account.id,
+          personId: input.personId,
+          integrationControlEpoch: Number(account.control_epoch),
+          personControlEpoch: input.expectedPersonControlEpoch,
+          sourcePriority: GOOGLE_JOB_PRIORITY.activation,
+        };
+        try {
+          const { gmail } = await this.clients(payload, "mail");
+          const page = await gmail.listMessages(query, undefined, perAccountLimit, 8_000);
+          const revisions = await Promise.all(
+            page.messageIds
+              .slice(0, perAccountLimit)
+              .map((messageId) => this.ingestPrivateGmailQuestionHit(gmail, payload, messageId)),
+          );
+          const evidence = (
+            await Promise.all(
+              revisions.flatMap((sourceRevisionId) =>
+                sourceRevisionId
+                  ? [this.readPrivateGmailQuestionEvidence(sourceRevisionId, payload, account.account_kind)]
+                  : [],
+              ),
+            )
+          ).flatMap((item) => (item ? [item] : []));
+          return { integrationId: account.id, search: "searched", evidence };
+        } catch (error) {
+          if (
+            error instanceof NotFoundError ||
+            error instanceof StaleAuthorityError ||
+            error instanceof UnauthorizedError
+          ) {
+            throw error;
+          }
+          if (isGoogleProviderAuthFailure(error)) {
+            const changed = await this.#sources.apply({
+              kind: "set_integration_status",
+              integrationId: account.id,
+              personId: input.personId,
+              expectedControlEpoch: Number(account.control_epoch),
+              status: "reauth_required",
+              changedAt: new Date().toISOString(),
+            });
+            if (changed.kind !== "integration_status_changed") {
+              throw new Error("Google account reauthorization transition did not complete");
+            }
+            return {
+              integrationId: account.id,
+              search: "temporarily_unavailable",
+              evidence: [],
+              authorityOverride: {
+                integrationControlEpoch: changed.controlEpoch,
+                status: "reauth_required",
+              },
+            };
+          }
+          if (isRetryableGoogleError(error)) {
+            return {
+              integrationId: account.id,
+              search: "temporarily_unavailable",
+              evidence: [],
+            };
+          }
+          throw error;
+        }
+      }),
+    );
+    const resultByIntegration = new Map(searchResults.map((result) => [result.integrationId, result]));
+    const effectiveAccounts = accounts.map((account) => {
+      const override = resultByIntegration.get(account.id)?.authorityOverride;
+      return override
+        ? { ...account, control_epoch: override.integrationControlEpoch, status: override.status }
+        : account;
+    });
+    const evidence = searchResults.flatMap((result) => result.evidence);
+    evidence.sort((left, right) => right.occurredAt.localeCompare(left.occurredAt));
+    const boundedEvidence = evidence.slice(0, Math.max(1, Math.min(input.maxResults, 12)));
+    return {
+      provider: "google",
+      searchQuery: query,
+      sourceAuthorities: effectiveAccounts.map((account) => ({
+        integrationId: account.id,
+        integrationControlEpoch: Number(account.control_epoch),
+        status: account.status,
+      })),
+      accounts: effectiveAccounts.map((account) =>
+        privateGmailAccountStatus(
+          account,
+          cursorRows.filter(
+            (cursor) => cursor.integration_id === account.id && cursor.updated_at >= account.connected_at,
+          ),
+          jobRows.filter((job) => job.integration_id === account.id),
+          resultByIntegration.get(account.id)?.search ?? "not_requested",
+        ),
+      ),
+      evidence: boundedEvidence,
+    };
   }
 
   public async bootstrap(payloadCandidate: unknown): Promise<void> {
@@ -1069,6 +1276,88 @@ export class GoogleSyncService {
     });
   }
 
+  /**
+   * An explicit private Gmail question needs the matching message, not an
+   * eager replay of its entire thread and attachment graph. This path keeps
+   * the same admission and encrypted-source boundary as background sync while
+   * remaining bounded enough for an interactive reply.
+   */
+  private async ingestPrivateGmailQuestionHit(
+    gmail: GmailAdapter,
+    payload: Omit<z.infer<typeof GmailMessagePayloadSchema>, "messageId">,
+    messageId: string,
+  ): Promise<string | null> {
+    const messagePayload = { ...payload, messageId };
+    let metadata: NormalizedGmailMessage;
+    try {
+      metadata = await gmail.message(messageId, true, 8_000);
+    } catch (error) {
+      if (googleErrorStatus(error) === 404) {
+        await this.markGmailMessageDeleted(messagePayload, messageId);
+        return null;
+      }
+      throw error;
+    }
+    const correlationDigest = gmailThreadCaseDigest({
+      integrationId: payload.integrationId,
+      threadId: metadata.threadId,
+    });
+    const admission = assessMailMetadata({
+      labelIds: metadata.labelIds,
+      from: metadata.from,
+      subject: metadata.subject,
+      snippet: metadata.snippet,
+      hasAttachments: metadata.hasAttachmentHint,
+    });
+    if (!admission.ingestMetadata) {
+      await this.markGmailMessageDeleted(messagePayload, messageId, correlationDigest);
+      return null;
+    }
+    const fullContentAdmitted = isFullMailContentAdmitted(admission);
+    let message = metadata;
+    if (fullContentAdmitted) {
+      try {
+        message = await gmail.message(messageId, false, 8_000);
+      } catch (error) {
+        if (googleErrorStatus(error) === 404) {
+          await this.markGmailMessageDeleted(messagePayload, messageId, correlationDigest);
+          return null;
+        }
+        throw error;
+      }
+    }
+    const ingested = await this.ingestGmailThreadMessage(
+      messagePayload,
+      message,
+      admission,
+      correlationDigest,
+      fullContentAdmitted,
+    );
+    return ingested.sourceRevisionId;
+  }
+
+  private async readPrivateGmailQuestionEvidence(
+    sourceRevisionId: string,
+    payload: GoogleJobBase,
+    accountKind: PrivateGmailAccountRow["account_kind"],
+  ): Promise<PrivateQuestionContext["evidence"][number] | null> {
+    const revision = await this.#sources.read({
+      kind: "source_revision",
+      sourceRevisionId,
+      scope: { kind: "person", personId: payload.personId },
+      integrationId: payload.integrationId,
+      expectedIntegrationControlEpoch: payload.integrationControlEpoch,
+      asOf: new Date().toISOString(),
+    });
+    if (revision.kind !== "source_revision") return null;
+    return {
+      sourceRevisionId,
+      occurredAt: revision.occurredAt,
+      accountKind,
+      content: revision.content,
+    };
+  }
+
   private async ingestGmailThreadMessage(
     payload: z.infer<typeof GmailMessagePayloadSchema>,
     message: NormalizedGmailMessage,
@@ -1297,6 +1586,61 @@ function googleJobFence(payload: GoogleJobBase) {
   } as const;
 }
 
+function privateGmailAccountStatus(
+  account: PrivateGmailAccountRow,
+  cursors: readonly PrivateGmailCursorRow[],
+  jobs: readonly PrivateGmailJobRow[],
+  search: PrivateQuestionContext["accounts"][number]["search"],
+): PrivateQuestionContext["accounts"][number] {
+  const cursorByResource = new Map(cursors.map((cursor) => [cursor.resource_kind, cursor] as const));
+  const cursor = (resourceKind: string) => cursorByResource.get(resourceKind);
+  const exhausted = (stage: string) => cursor(`gmail_backfill:${stage}`)?.state === "exhausted";
+  const cursorNeedsRecovery = (resourceKind: string) =>
+    ["error", "expired"].includes(cursor(resourceKind)?.state ?? "");
+  const latestJob = (predicate: (job: PrivateGmailJobRow) => boolean) =>
+    jobs.filter(predicate).sort((left, right) => right.updated_at.getTime() - left.updated_at.getTime())[0];
+  const jobNeedsRecovery = (job: PrivateGmailJobRow | undefined, resourceKind: string) => {
+    if (!job || !["attention", "dead"].includes(job.status)) return false;
+    const currentCursor = cursor(resourceKind);
+    return !currentCursor || job.updated_at >= currentCursor.updated_at;
+  };
+  const failedBackfill = (stage: string) =>
+    jobNeedsRecovery(
+      latestJob(
+        (job) => job.job_kind === "google.gmail.backfill" && job.idempotency_key.includes(`:${stage}:`),
+      ),
+      `gmail_backfill:${stage}`,
+    );
+  const recentComplete = exhausted("newest_30_days");
+  const recentRecovering =
+    cursorNeedsRecovery("gmail_backfill:newest_30_days") || failedBackfill("newest_30_days");
+  const olderStages = ["days_31_to_90", "days_91_to_365", "older_history"] as const;
+  const olderComplete = olderStages.every(exhausted);
+  const olderRecovering = olderStages.some(
+    (stage) => cursorNeedsRecovery(`gmail_backfill:${stage}`) || failedBackfill(stage),
+  );
+  const liveCursor = cursor("gmail_history");
+  const liveJobFailed = jobNeedsRecovery(
+    latestJob((job) => job.job_kind === "google.gmail.poll"),
+    "gmail_history",
+  );
+  return {
+    accountKind: account.account_kind,
+    connection: account.status,
+    liveMonitoring:
+      account.status !== "active"
+        ? "unavailable"
+        : liveJobFailed
+          ? "unavailable"
+          : liveCursor?.state === "active"
+            ? "watching"
+            : "starting",
+    recentImport: recentComplete ? "complete" : recentRecovering ? "recovering" : "importing",
+    olderHistoryImport: olderComplete ? "complete" : olderRecovering ? "recovering" : "importing",
+    search,
+  };
+}
+
 function controlEpochKey(payload: GoogleJobBase): string {
   return `e${payload.integrationControlEpoch}`;
 }
@@ -1385,6 +1729,11 @@ function isGoogleProviderAuthFailure(error: unknown): boolean {
   return markers.some((marker) =>
     /(?:^|[^a-z])(?:invalid_grant|invalid_client|unauthorized_client|autherror)(?:[^a-z]|$)/iu.test(marker),
   );
+}
+
+function isRetryableGoogleError(error: unknown): boolean {
+  const status = googleErrorStatus(error);
+  return status === 408 || status === 429 || (status !== undefined && status >= 500);
 }
 
 function googleErrorMarkers(error: unknown): string[] {

@@ -172,10 +172,25 @@ export async function bootstrapGovernedSkills(database: Database): Promise<void>
           )[0];
       const skillVersionId = existingVersion?.id;
       if (!skillVersionId) throw new Error("Skill version bootstrap failed");
-      const active = await transaction<{ id: string }[]>`
-        select id from skill_release_events where skill_id = ${skillId} and channel = 'production' and active
+      const active = await transaction<
+        { id: string; skill_version_id: string; evaluation_release_id: string }[]
+      >`
+        select id, skill_version_id, evaluation_release_id
+        from skill_release_events
+        where skill_id = ${skillId} and channel = 'production' and active
+        for update
       `;
-      if (!active[0]) {
+      const currentRelease = active[0];
+      if (
+        !currentRelease ||
+        currentRelease.skill_version_id !== skillVersionId ||
+        currentRelease.evaluation_release_id !== evaluationReleaseId
+      ) {
+        if (currentRelease) {
+          await transaction`
+            update skill_release_events set active = false where id = ${currentRelease.id}
+          `;
+        }
         await transaction`
           insert into skill_release_events (
             id, skill_id, skill_version_id, channel, event_kind, active,

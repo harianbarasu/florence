@@ -51,7 +51,9 @@ export class GroupRuleOnboarding {
           "Everyone in this group must register before proactive help can be approved",
         );
       }
-      const participantIds = snapshot.participants.map((participant) => participant.personId).sort();
+      const participantIds = [
+        ...new Set(snapshot.participants.map((participant) => participant.personId)),
+      ].sort();
       if (!participantIds.includes(input.actorPersonId)) {
         throw new UnauthorizedError("Only a current group participant can approve this rule");
       }
@@ -149,6 +151,7 @@ export class GroupRuleOnboarding {
         purpose: "Proactively open, remind on, and close family coverage loops in this exact group",
         allowedOperations: [
           "proactive_coverage",
+          "coverage_coordination",
           "coverage_reminder",
           "coverage_state_change",
           "coverage_closure",

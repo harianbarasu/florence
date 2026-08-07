@@ -12,7 +12,9 @@ import { openPrivateBridgePayload, PrivateSourceBridge } from "../modules/bridge
 import {
   type ConversationAuthoritySnapshot,
   evaluateConversationMode,
+  type GroupInvocation,
   GroupRuleOnboarding,
+  leadingGroupInvocation,
   PostgresConversationAuthority,
 } from "../modules/conversations/index.js";
 import { PostgresRoutines, type RoutineRevisionDraft } from "../modules/coordination/index.js";
@@ -34,6 +36,7 @@ import type {
 import { reconcileCoverageTimers } from "./coverage-timer-reconciliation.js";
 
 type Transaction = TransactionSql<Record<string, never>>;
+const MAX_LIVE_GROUP_INVOCATION_AGE_MS = 10 * 60_000;
 
 interface ReconciledConversation {
   readonly conversationId: string;
@@ -54,8 +57,9 @@ interface ReconciledConversation {
 
 export interface StoredLinqEvent {
   readonly schemaVersion: 1;
-  readonly classification: "enrollment" | "stop" | "full" | "receipt" | "routing_only";
+  readonly classification: "enrollment" | "stop" | "full" | "observe_only" | "receipt" | "routing_only";
   readonly enrollmentAction?: "consent" | "other";
+  readonly invocation?: GroupInvocation;
   readonly event?: LinqWebhookEnvelope;
   readonly routing: {
     readonly conversationId: string;
@@ -108,6 +112,8 @@ export class FlorenceApplication {
         return this.admitLinqWebhook(input.event, input.liveChat);
       case "linq.process_event":
         return this.processLinqEvent(input.providerEventId);
+      case "linq.private_invocation_response":
+        return this.commitPrivateGroupInvocationResponse(input.internalProviderEventId, input.responseText);
       case "linq.reconcile_chat":
         return this.reconcileLiveLinqChat(input.liveChat);
       case "timer.process":
@@ -355,8 +361,17 @@ export class FlorenceApplication {
       }
 
       if (liveChat === null) throw new Error("Supported Linq event lost its live chat");
+      if (!hasActiveFlorenceParticipant(liveChat)) {
+        return this.deactivateLinqConversation(transaction, event, liveChat);
+      }
       const reconciled = await this.reconcileLinqConversation(transaction, event, liveChat);
-      if (liveChat.kind === "group" && reconciled.mode === "content_disabled") {
+      if (
+        liveChat.kind === "group" &&
+        reconciled.snapshot.participants.some(
+          (participant) =>
+            participant.registrationStatus !== "registered" || participant.consentedAt === null,
+        )
+      ) {
         await this.queuePrivateGroupEnrollmentOffers(transaction, reconciled.conversationId);
       }
       const ordinaryGroupContentAt =
@@ -384,10 +399,18 @@ export class FlorenceApplication {
       const classification: ReturnType<typeof classifyEvent> = outsideCurrentContentWindow
         ? ({ kind: "routing_only", retainEvent: false } as const)
         : classifyEvent(event, liveChat.kind, reconciled.mode);
+      const invocation =
+        classification.kind === "observe_only" &&
+        event.eventType === "linq.message.received" &&
+        isFreshLiveMessage(event) &&
+        (await this.isExactRegisteredGroupSender(transaction, reconciled))
+          ? await this.resolveObserveOnlyInvocation(transaction, event, reconciled)
+          : null;
       const record: StoredLinqEvent = {
         schemaVersion: 1,
         classification: classification.kind,
         ...(classification.enrollmentAction ? { enrollmentAction: classification.enrollmentAction } : {}),
+        ...(invocation ? { invocation } : {}),
         ...(classification.retainEvent ? { event } : {}),
         routing: {
           conversationId: reconciled.conversationId,
@@ -414,11 +437,17 @@ export class FlorenceApplication {
           kind: "linq.process_event",
           idempotencyKey: `linq:process:${event.providerEventId}`,
           payload: { providerEventId: event.providerEventId },
-          conversation: {
-            id: reconciled.conversationId,
-            authorityVersion: reconciled.snapshot.authorityVersion,
-          },
-          ...(reconciled.householdId && reconciled.householdControlEpoch
+          ...(classification.kind === "observe_only"
+            ? {}
+            : {
+                conversation: {
+                  id: reconciled.conversationId,
+                  authorityVersion: reconciled.snapshot.authorityVersion,
+                },
+              }),
+          ...(classification.kind !== "observe_only" &&
+          reconciled.householdId &&
+          reconciled.householdControlEpoch
             ? { household: { id: reconciled.householdId, controlEpoch: reconciled.householdControlEpoch } }
             : {}),
           maxAttempts: 8,
@@ -450,6 +479,9 @@ export class FlorenceApplication {
 
   private async reconcileLiveLinqChat(liveChat: LinqChatSnapshot): Promise<ProcessReceipt> {
     return this.database.begin(async (transaction) => {
+      if (!hasActiveFlorenceParticipant(liveChat)) {
+        return this.deactivateLinqConversation(transaction, null, liveChat);
+      }
       const reconciled = await this.reconcileLinqConversation(transaction, null, liveChat);
       await appendAudit(transaction, {
         conversationId: reconciled.conversationId,
@@ -471,6 +503,123 @@ export class FlorenceApplication {
         },
       };
     });
+  }
+
+  private async deactivateLinqConversation(
+    transaction: Transaction,
+    event: Exclude<LinqWebhookEnvelope, { eventType: "linq.ignored" }> | null,
+    liveChat: LinqChatSnapshot,
+  ): Promise<ProcessReceipt> {
+    const rows = await transaction<
+      {
+        conversation_id: string;
+        conversation_status: string;
+        current_epoch_id: string | null;
+        epoch_started_at: Date | null;
+        channel_status: string;
+        latest_participant_digest: string | null;
+        latest_participant_checked_at: Date | null;
+      }[]
+    >`
+      select conversation.id as conversation_id, conversation.status as conversation_status,
+        conversation.current_epoch_id, epoch.started_at as epoch_started_at,
+        channel.status as channel_status, channel.latest_participant_digest,
+        channel.latest_participant_checked_at
+      from conversation_channels channel
+      join conversations conversation on conversation.id = channel.conversation_id
+      left join participant_epochs epoch on epoch.id = conversation.current_epoch_id
+      where channel.provider = 'linq'
+        and channel.external_channel_id = ${liveChat.providerChatId}
+      for update of channel, conversation
+    `;
+    const binding = rows[0];
+    if (!binding) {
+      if (event) {
+        const providerEventId = await insertProviderEvent(
+          transaction,
+          this.secretBox,
+          event,
+          sanitizedIgnored(event),
+          "ignored",
+        );
+        return {
+          accepted: true,
+          duplicate: false,
+          disposition: "unbound_removed_chat_ignored",
+          ids: { providerEventId },
+        };
+      }
+      return {
+        accepted: true,
+        duplicate: true,
+        disposition: "unbound_removed_chat_ignored",
+        ids: {},
+      };
+    }
+    const checkedAt = new Date(liveChat.checkedAt);
+    if (
+      binding.latest_participant_checked_at !== null &&
+      (checkedAt < binding.latest_participant_checked_at ||
+        (checkedAt.getTime() === binding.latest_participant_checked_at.getTime() &&
+          binding.latest_participant_digest !== liveChat.activeParticipantDigest))
+    ) {
+      throw new StaleAuthorityError("An older removed-audience snapshot cannot replace a newer one");
+    }
+    const boundary =
+      binding.epoch_started_at && checkedAt < binding.epoch_started_at ? binding.epoch_started_at : checkedAt;
+    if (binding.current_epoch_id) {
+      await transaction`
+        update participant_epochs set ended_at = coalesce(ended_at, ${boundary})
+        where id = ${binding.current_epoch_id}
+      `;
+    }
+    await transaction`
+      update conversation_rules
+      set status = case when status = 'active' then 'superseded' else 'revoked' end,
+        ended_at = coalesce(ended_at, ${boundary})
+      where conversation_id = ${binding.conversation_id}
+        and status in ('active', 'candidate')
+    `;
+    if (binding.channel_status !== "revoked") {
+      await transaction`
+        update conversations
+        set current_epoch_id = null, status = 'paused',
+          authority_version = authority_version + 1,
+          control_epoch = control_epoch + 1, updated_at = ${boundary}
+        where id = ${binding.conversation_id}
+          and status not in ('deletion_fenced', 'deleted')
+      `;
+    }
+    await transaction`
+      update conversation_channels
+      set status = 'revoked', revoked_at = coalesce(revoked_at, ${boundary}),
+        latest_participant_digest = ${liveChat.activeParticipantDigest},
+        latest_participant_checked_at = ${checkedAt}
+      where conversation_id = ${binding.conversation_id}
+        and provider = 'linq' and external_channel_id = ${liveChat.providerChatId}
+    `;
+    const providerEventId = event
+      ? await insertProviderEvent(transaction, this.secretBox, event, sanitizedIgnored(event), "ignored")
+      : null;
+    await appendAudit(transaction, {
+      conversationId: binding.conversation_id,
+      householdId: null,
+      personId: null,
+      eventType: "linq_channel_deactivated",
+      targetType: "conversation",
+      targetId: binding.conversation_id,
+      reasons: ["configured_line_not_active", "participant_epoch_closed", "group_rules_revoked"],
+      manifest: { providerChatId: liveChat.providerChatId },
+    });
+    return {
+      accepted: true,
+      duplicate: binding.channel_status === "revoked",
+      disposition: "linq_channel_deactivated",
+      ids: {
+        conversationId: binding.conversation_id,
+        ...(providerEventId ? { providerEventId } : {}),
+      },
+    };
   }
 
   private async reconcileLinqConversation(
@@ -506,6 +655,7 @@ export class FlorenceApplication {
       provider: "linq",
       externalChannelId: liveChat.providerChatId,
     });
+    const channelWasNew = binding === null;
     if (!binding) {
       const created = await conversations.createConversation({
         householdId: null,
@@ -528,20 +678,93 @@ export class FlorenceApplication {
       });
       if (!binding) throw new Error("New Linq channel binding could not be reloaded");
     }
+    const priorAudience = await transaction<
+      {
+        channel_status: "active" | "paused" | "revoked";
+        conversation_status: "active" | "paused" | "deletion_fenced" | "deleted";
+        conversation_kind: "direct" | "group";
+        latest_participant_digest: string | null;
+        latest_participant_checked_at: Date | null;
+      }[]
+    >`
+      select channel.status as channel_status, conversation.status as conversation_status,
+        conversation.kind as conversation_kind,
+        channel.latest_participant_digest, channel.latest_participant_checked_at
+      from conversation_channels channel
+      join conversations conversation on conversation.id = channel.conversation_id
+      where channel.conversation_id = ${binding.conversationId}
+        and channel.provider = 'linq'
+      for update of channel, conversation
+    `;
+    const previous = priorAudience[0];
+    if (!previous) throw new StaleAuthorityError("The Linq channel binding is no longer active");
+    const checkedAt = new Date(liveChat.checkedAt);
+    if (
+      !channelWasNew &&
+      previous.latest_participant_checked_at !== null &&
+      (checkedAt < previous.latest_participant_checked_at ||
+        (checkedAt.getTime() === previous.latest_participant_checked_at.getTime() &&
+          (previous.latest_participant_digest !== liveChat.activeParticipantDigest ||
+            previous.conversation_kind !== liveChat.kind)))
+    ) {
+      throw new StaleAuthorityError("An older Linq audience snapshot cannot replace a newer one");
+    }
+    if (previous.conversation_status === "deletion_fenced" || previous.conversation_status === "deleted") {
+      throw new StaleAuthorityError("A deleted Florence conversation cannot be reactivated");
+    }
+    const channelReactivated = !channelWasNew && previous.channel_status !== "active";
+    if (channelReactivated) {
+      await transaction`
+        update conversation_channels
+        set status = 'active', revoked_at = null
+        where conversation_id = ${binding.conversationId} and provider = 'linq'
+          and external_channel_id = ${liveChat.providerChatId}
+      `;
+      await transaction`
+        update conversations
+        set status = 'active', control_epoch = control_epoch + 1, updated_at = ${checkedAt}
+        where id = ${binding.conversationId} and status = 'paused'
+      `;
+    }
+    const providerKindChanged = !channelWasNew && previous.conversation_kind !== liveChat.kind;
+    const providerAudienceChanged =
+      !channelWasNew &&
+      (channelReactivated ||
+        previous.latest_participant_digest === null ||
+        previous.latest_participant_checked_at === null ||
+        previous.latest_participant_digest !== liveChat.activeParticipantDigest);
+    if (providerKindChanged) {
+      await transaction`
+        update conversations set kind = ${liveChat.kind}, updated_at = ${checkedAt}
+        where id = ${binding.conversationId}
+      `;
+    }
     const participantIdentityIds = [...observed.values()].map((entry) => entry.identityId).sort();
+    const florenceJoinedAt = liveChat.participants.find(
+      (participant) => participant.status === "active" && participant.isSelf,
+    )?.joinedAt;
+    const epochObservedAt = channelWasNew ? (florenceJoinedAt ?? liveChat.checkedAt) : liveChat.checkedAt;
     const epoch = await conversations.recordParticipantEpoch({
       conversationId: binding.conversationId,
       participantIdentityIds,
       changeReason: event?.eventType.startsWith("linq.participant.")
         ? event.eventType
-        : event === null
-          ? "authoritative_outbound_reconciliation"
-          : "authoritative_chat_reconciliation",
-      observedAt: liveChat.checkedAt,
+        : channelReactivated
+          ? "authoritative_provider_channel_reactivation"
+          : providerKindChanged
+            ? "authoritative_provider_chat_kind_change"
+            : providerAudienceChanged
+              ? "authoritative_provider_audience_change"
+              : event === null
+                ? "authoritative_outbound_reconciliation"
+                : "authoritative_chat_reconciliation",
+      forceNewEpoch: providerAudienceChanged || providerKindChanged,
+      observedAt: epochObservedAt,
     });
     await transaction`
       update conversation_channels
-      set latest_participant_digest = ${liveChat.activeParticipantDigest}
+      set latest_participant_digest = ${liveChat.activeParticipantDigest},
+        latest_participant_checked_at = ${checkedAt}
       where conversation_id = ${binding.conversationId}
         and provider = 'linq' and status = 'active'
     `;
@@ -591,6 +814,60 @@ export class FlorenceApplication {
     };
   }
 
+  private async isExactRegisteredGroupSender(
+    transaction: Transaction,
+    reconciled: ReconciledConversation,
+  ): Promise<boolean> {
+    if (!reconciled.senderIdentityId || !reconciled.senderPersonId) return false;
+    const rows = await transaction<{ eligible: boolean }[]>`
+      select exists(
+        select 1
+        from epoch_participants participant
+        join people person on person.id = participant.person_id and person.status = 'registered'
+        join person_identities identity on identity.id = participant.person_identity_id
+          and identity.person_id = person.id and identity.status = 'verified'
+        join participant_policies policy on policy.conversation_id = ${reconciled.conversationId}
+          and policy.person_id = person.id and policy.status = 'active'
+          and policy.allow_content_processing
+        where participant.participant_epoch_id = ${reconciled.epochId}
+          and participant.person_identity_id = ${reconciled.senderIdentityId}
+          and participant.person_id = ${reconciled.senderPersonId}
+          and participant.registration_status = 'registered'
+          and participant.consented_at is not null
+      ) as eligible
+    `;
+    return rows[0]?.eligible === true;
+  }
+
+  private async resolveObserveOnlyInvocation(
+    transaction: Transaction,
+    event: LinqMessageReceivedEvent,
+    reconciled: ReconciledConversation,
+  ): Promise<GroupInvocation | null> {
+    const text = messageText(event).trim();
+    const leading = leadingGroupInvocation(text);
+    if (leading) return leading;
+    if (!text || !event.message.replyTo) return null;
+
+    const rows = await transaction<{ matching_effects: number | string }[]>`
+      select count(distinct effect.id) as matching_effects
+      from outbox effect
+      join effect_receipts receipt on receipt.outbox_id = effect.id
+        and receipt.provider_receipt_id = ${event.message.replyTo.providerMessageId}
+        and receipt.status in ('submitted', 'confirmed')
+      where effect.effect_kind = 'linq.message'
+        and effect.conversation_id = ${reconciled.conversationId}
+        and effect.participant_epoch_id = ${reconciled.epochId}
+        and effect.expected_participant_digest = ${reconciled.appParticipantDigest}
+        and effect.status in ('submitted', 'confirmed')
+        and not exists(
+          select 1 from effect_receipts terminal
+          where terminal.outbox_id = effect.id and terminal.status in ('failed', 'ambiguous')
+        )
+    `;
+    return Number(rows[0]?.matching_effects ?? 0) === 1 ? { basis: "proven_reply", requestText: text } : null;
+  }
+
   private async processLinqEvent(providerEventId: string): Promise<ProcessReceipt> {
     return this.database.begin(async (transaction) => {
       const rows = await transaction<ProviderEventRow[]>`
@@ -624,6 +901,9 @@ export class FlorenceApplication {
         case "full":
           disposition = await this.handleFullLinqEvent(transaction, row.id, record);
           break;
+        case "observe_only":
+          disposition = await this.handleObserveOnlyLinqEvent(transaction, row.id, record);
+          break;
         case "receipt":
           disposition = await this.handleProviderReceipt(transaction, record);
           break;
@@ -636,6 +916,228 @@ export class FlorenceApplication {
           processed_at = now(), error_code = null where id = ${row.id}
       `;
       return { accepted: true, duplicate: false, disposition, ids: { providerEventId: row.id } };
+    });
+  }
+
+  private async handleObserveOnlyLinqEvent(
+    transaction: Transaction,
+    internalProviderEventId: string,
+    record: StoredLinqEvent,
+  ): Promise<string> {
+    if (record.event?.eventType !== "linq.message.received") return "observed_silently";
+    await new DurableWork(transaction, this.secretBox).enqueue({
+      kind: "orchestrate.linq_observation",
+      idempotencyKey: `orchestrate:linq-observation:${internalProviderEventId}`,
+      payload: { internalProviderEventId },
+      maxAttempts: 5,
+    });
+    return record.invocation ? "private_invocation_queued" : "observation_queued";
+  }
+
+  private async commitPrivateGroupInvocationResponse(
+    internalProviderEventId: string,
+    responseCandidate: string,
+  ): Promise<ProcessReceipt> {
+    const responseText = responseCandidate.trim();
+    if (!responseText || responseText.length > 10_000) {
+      throw new UnauthorizedError("Private group invocation response is outside the allowed bounds");
+    }
+    return this.database.begin(async (transaction) => {
+      const events = await transaction<ProviderEventRow[]>`
+        select id, provider_event_id, envelope_ciphertext, processing_status
+        from provider_events
+        where id = ${internalProviderEventId} and provider = 'linq'
+        for update
+      `;
+      const row = events[0];
+      if (row?.processing_status !== "processed") {
+        throw new StaleAuthorityError("Private group invocation source is no longer processed");
+      }
+      const record = JSON.parse(
+        this.secretBox
+          .decrypt(
+            JSON.parse(row.envelope_ciphertext.toString("utf8")),
+            `provider-event:${row.provider_event_id}`,
+          )
+          .toString("utf8"),
+      ) as StoredLinqEvent;
+      if (
+        record.classification !== "observe_only" ||
+        !record.invocation ||
+        record.routing.chatKind !== "group" ||
+        record.event?.eventType !== "linq.message.received" ||
+        !record.routing.senderIdentityId ||
+        !record.routing.senderPersonId
+      ) {
+        throw new UnauthorizedError("Provider event is not an eligible private group invocation");
+      }
+
+      const sources = await transaction<
+        {
+          group_authority_version: number | string;
+          group_epoch_id: string;
+          group_participant_digest: string;
+          person_control_epoch: number | string;
+          identity_subject_ciphertext: Buffer;
+          household_id: string | null;
+          household_control_epoch: number | string | null;
+        }[]
+      >`
+        select conversation.authority_version as group_authority_version,
+          epoch.id as group_epoch_id, epoch.participant_set_digest as group_participant_digest,
+          person.control_epoch as person_control_epoch,
+          identity.subject_ciphertext as identity_subject_ciphertext,
+          conversation.household_id, household.control_epoch as household_control_epoch
+        from conversations conversation
+        join participant_epochs epoch on epoch.id = conversation.current_epoch_id
+          and epoch.ended_at is null
+        join epoch_participants participant on participant.participant_epoch_id = epoch.id
+          and participant.person_identity_id = ${record.routing.senderIdentityId}
+          and participant.person_id = ${record.routing.senderPersonId}
+          and participant.registration_status = 'registered' and participant.consented_at is not null
+        join people person on person.id = participant.person_id and person.status = 'registered'
+        join person_identities identity on identity.id = participant.person_identity_id
+          and identity.person_id = person.id and identity.status = 'verified'
+          and identity.subject_ciphertext is not null
+        join participant_policies policy on policy.conversation_id = conversation.id
+          and policy.person_id = person.id and policy.status = 'active'
+          and policy.allow_content_processing
+        left join households household on household.id = conversation.household_id
+        where conversation.id = ${record.routing.conversationId}
+          and conversation.kind = 'group' and conversation.status = 'active'
+          and epoch.id = ${record.routing.participantEpochId}
+          and epoch.participant_set_digest = ${record.routing.appParticipantDigest}
+      `;
+      const source = sources[0];
+      if (!source) throw new StaleAuthorityError("Private group invocation audience changed");
+
+      const routes = await transaction<
+        {
+          conversation_id: string;
+          authority_version: number | string;
+          participant_epoch_id: string;
+          participant_set_digest: string;
+          external_channel_id: string;
+          latest_participant_digest: string;
+        }[]
+      >`
+        select direct.id as conversation_id, direct.authority_version,
+          direct_epoch.id as participant_epoch_id,
+          direct_epoch.participant_set_digest, channel.external_channel_id,
+          channel.latest_participant_digest
+        from conversations direct
+        join conversation_channels channel on channel.conversation_id = direct.id
+          and channel.provider = 'linq' and channel.status = 'active'
+          and channel.latest_participant_digest is not null
+        join participant_epochs direct_epoch on direct_epoch.id = direct.current_epoch_id
+          and direct_epoch.ended_at is null
+        join epoch_participants direct_participant
+          on direct_participant.participant_epoch_id = direct_epoch.id
+          and direct_participant.person_identity_id = ${record.routing.senderIdentityId}
+          and direct_participant.person_id = ${record.routing.senderPersonId}
+          and direct_participant.registration_status = 'registered'
+          and direct_participant.consented_at is not null
+        where direct.kind = 'direct' and direct.status = 'active'
+          and (select count(*) from epoch_participants exact
+            where exact.participant_epoch_id = direct_epoch.id) = 1
+        order by direct.updated_at desc, direct.id
+        limit 1
+      `;
+      const route = routes[0];
+      const sourceConversation = {
+        id: record.routing.conversationId,
+        authorityVersion: Number(source.group_authority_version),
+        participantEpochId: source.group_epoch_id,
+        participantSetDigest: source.group_participant_digest,
+      };
+      const commonEffect = {
+        actorPersonId: record.routing.senderPersonId,
+        person: {
+          id: record.routing.senderPersonId,
+          controlEpoch: Number(source.person_control_epoch),
+        },
+        ...(source.household_id && source.household_control_epoch
+          ? {
+              household: {
+                id: source.household_id,
+                controlEpoch: Number(source.household_control_epoch),
+              },
+            }
+          : {}),
+        sourceConversation,
+        effectKind: "linq.message" as const,
+        idempotencyKey: `private-group-invocation:${internalProviderEventId}`,
+        data: {
+          responseDigest: sha256Hex(responseText),
+          invocationBasis: record.invocation.basis,
+        },
+        policy: { exactPrivateRecipient: true, sourceGroupSilent: true },
+        reasonCodes: [
+          "registered_exact_group_sender",
+          "deterministic_group_invocation",
+          "private_response_only",
+        ],
+        authorizationExpiresAt: new Date(Date.now() + 5 * 60_000),
+      };
+
+      if (route) {
+        const authorization = await new PostgresConversationAuthority(transaction).authorizeSend({
+          conversationId: route.conversation_id,
+          expectedParticipantEpochId: route.participant_epoch_id,
+          expectedParticipantSetDigest: route.participant_set_digest,
+          liveParticipantIdentityIds: [record.routing.senderIdentityId],
+          sendKind: "direct_response",
+          operation: "private_group_invocation",
+          ruleId: null,
+        });
+        if (!authorization.allowed) {
+          throw new UnauthorizedError("Exact private conversation does not permit the response");
+        }
+        await new EffectOutbox(transaction, this.secretBox).authorizeAndEnqueue({
+          ...commonEffect,
+          conversation: {
+            id: route.conversation_id,
+            authorityVersion: Number(route.authority_version),
+          },
+          participantEpochId: route.participant_epoch_id,
+          expectedParticipantDigest: route.participant_set_digest,
+          target: {
+            providerChatId: route.external_channel_id,
+            personId: record.routing.senderPersonId,
+          },
+          payload: {
+            providerChatId: route.external_channel_id,
+            expectedProviderParticipantDigest: route.latest_participant_digest,
+            text: responseText,
+          },
+        });
+      } else {
+        const recipient = this.secretBox
+          .decrypt(
+            JSON.parse(source.identity_subject_ciphertext.toString("utf8")),
+            `identity-subject:${record.routing.senderIdentityId}`,
+          )
+          .toString("utf8");
+        if (!/^\+[1-9]\d{6,14}$/u.test(recipient) && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/u.test(recipient)) {
+          throw new UnauthorizedError("Exact sender does not have a safe private Linq route");
+        }
+        const sanitizedFirstMessage = responseText.replace(/https?:\/\/\S+/giu, "[link omitted]").trim();
+        const firstMessageText =
+          sanitizedFirstMessage ||
+          "You addressed me in a group. Text me here and I’ll continue the answer privately.";
+        await new EffectOutbox(transaction, this.secretBox).authorizeAndEnqueue({
+          ...commonEffect,
+          target: { recipient, personId: record.routing.senderPersonId },
+          payload: { recipient, text: firstMessageText },
+        });
+      }
+
+      return {
+        accepted: true,
+        duplicate: false,
+        disposition: "private_group_invocation_response_queued",
+        ids: { providerEventId: internalProviderEventId },
+      };
     });
   }
 
@@ -713,7 +1215,7 @@ export class FlorenceApplication {
         updated_at = ${consentedAt}
       where id = ${personId} and status = 'registered'
     `;
-    await this.consentPersonAcrossCurrentEpochs(transaction, personId, consentedAt);
+    await this.consentPersonAcrossObservedEpochs(transaction, personId, consentedAt);
     const snapshot = await new PostgresConversationAuthority(transaction).snapshot(
       record.routing.conversationId,
     );
@@ -742,10 +1244,11 @@ export class FlorenceApplication {
   /**
    * A verified affirmative reply to Florence's private consent question is the
    * person's explicit registration.
-   * It applies their conservative default to every exact live chat audience they
-   * already belong to; it never enables proactive writing for those chats.
+   * It applies their conservative default to every exact chat audience in which
+   * that verified identity was observed. Still-retained history receives a private
+   * view even if membership has since changed; this never enables group writing.
    */
-  private async consentPersonAcrossCurrentEpochs(
+  private async consentPersonAcrossObservedEpochs(
     transaction: Transaction,
     personId: string,
     consentedAt: Date,
@@ -753,13 +1256,19 @@ export class FlorenceApplication {
     const epochs = await transaction<{ participant_epoch_id: string }[]>`
       select distinct epoch.id as participant_epoch_id
       from participant_epochs epoch
-      join conversations conversation on conversation.current_epoch_id = epoch.id
-        and conversation.status = 'active' and epoch.ended_at is null
+      join conversations conversation on conversation.id = epoch.conversation_id
+        and conversation.status = 'active'
       join epoch_participants participant on participant.participant_epoch_id = epoch.id
+      join person_identities identity on identity.id = participant.person_identity_id
+        and identity.person_id = participant.person_id and identity.status = 'verified'
       where participant.person_id = ${personId}
       order by epoch.id
     `;
     const authority = new PostgresConversationAuthority(transaction);
+    const sources = new PostgresSourceIntelligence(transaction, this.secretBox, {
+      rawRetentionDays: this.config.defaults.rawSourceRetentionDays,
+      privateCandidateRetentionDays: 7,
+    });
     for (const epoch of epochs) {
       await authority.consentToEpoch({
         participantEpochId: epoch.participant_epoch_id,
@@ -771,6 +1280,12 @@ export class FlorenceApplication {
           retentionSeconds: this.config.defaults.rawSourceRetentionDays * 86_400,
         },
         consentedAt: consentedAt.toISOString(),
+      });
+      await sources.apply({
+        kind: "grant_conversation_private_views",
+        participantEpochId: epoch.participant_epoch_id,
+        personId,
+        grantedAt: consentedAt.toISOString(),
       });
     }
   }
@@ -2726,7 +3241,7 @@ function classifyEvent(
   if (event.eventType === "linq.message.received") {
     const command = messageText(event).trim();
     if (command.toUpperCase() === "STOP") return { kind: "stop", retainEvent: false };
-    if (chatKind === "direct" && mode === "content_disabled") {
+    if (chatKind === "direct" && mode === "registration_required") {
       return {
         kind: "enrollment",
         enrollmentAction: isExplicitEnrollmentConsent(command) ? "consent" : "other",
@@ -2734,7 +3249,13 @@ function classifyEvent(
       };
     }
   }
-  if (mode === "content_disabled" || mode === "paused") return { kind: "routing_only", retainEvent: false };
+  if (mode === "paused" || (chatKind === "direct" && mode === "observe_only")) {
+    return { kind: "routing_only", retainEvent: false };
+  }
+  if (chatKind === "group" && mode === "observe_only") {
+    return { kind: "observe_only", retainEvent: true };
+  }
+  if (mode === "registration_required") return { kind: "routing_only", retainEvent: false };
   return { kind: "full", retainEvent: true };
 }
 
@@ -2763,9 +3284,7 @@ async function insertProviderEvent(
   return id;
 }
 
-function sanitizedIgnored(
-  _event: Extract<LinqWebhookEnvelope, { eventType: "linq.ignored" }>,
-): StoredLinqEvent {
+function sanitizedIgnored(_event: LinqWebhookEnvelope): StoredLinqEvent {
   return {
     schemaVersion: 1,
     classification: "routing_only",
@@ -2783,31 +3302,42 @@ function sanitizedIgnored(
   };
 }
 
+function hasActiveFlorenceParticipant(liveChat: LinqChatSnapshot): boolean {
+  return liveChat.configuredLineActive;
+}
+
 function messageText(event: LinqMessageReceivedEvent): string {
   return event.message.parts
     .flatMap((part) => (part.kind === "text" ? [part.text] : part.kind === "link" ? [part.url] : []))
     .join("\n");
 }
 
+function isFreshLiveMessage(event: LinqMessageReceivedEvent): boolean {
+  if (event.message.reconciledAt !== undefined) return false;
+  const age = Date.parse(event.receivedAt) - Date.parse(event.message.sentAt);
+  return Number.isFinite(age) && age >= -60_000 && age <= MAX_LIVE_GROUP_INVOCATION_AGE_MS;
+}
+
 function normalizeHandle(value: string): string {
-  return value
-    .trim()
-    .replace(/[\s()-]/gu, "")
-    .toLowerCase();
+  const normalized = value.trim().toLowerCase();
+  const phone = normalized.replace(/[\s().-]/gu, "");
+  return /^\+[1-9]\d{6,14}$/u.test(phone) ? phone : normalized;
 }
 
 async function inferSharedHousehold(
   transaction: Transaction,
   personIds: readonly string[],
 ): Promise<{ id: string; controlEpoch: number } | null> {
+  const uniquePersonIds = [...new Set(personIds)];
+  if (uniquePersonIds.length === 0) return null;
   const rows = await transaction<{ id: string; control_epoch: number | string }[]>`
     select household.id, household.control_epoch
     from households household
     join household_memberships membership on membership.household_id = household.id
-    where membership.person_id = any(${transaction.array([...personIds])}::uuid[])
+    where membership.person_id = any(${transaction.array(uniquePersonIds)}::uuid[])
       and membership.status = 'active' and household.status in ('onboarding', 'active', 'paused')
     group by household.id
-    having count(distinct membership.person_id) = ${personIds.length}
+    having count(distinct membership.person_id) = ${uniquePersonIds.length}
     order by household.created_at limit 2
   `;
   const only = rows.length === 1 ? rows[0] : undefined;

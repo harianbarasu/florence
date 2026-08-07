@@ -38,6 +38,9 @@ export const SourceScopeSchema = z.discriminatedUnion("kind", [
 ]);
 export type SourceScope = z.infer<typeof SourceScopeSchema>;
 
+export const ConversationSourceAccessModeSchema = z.enum(["unanimously_shared", "independent_private_views"]);
+export type ConversationSourceAccessMode = z.infer<typeof ConversationSourceAccessModeSchema>;
+
 export const SourceArtifactKindSchema = z.enum([
   "mail_message",
   "calendar_event",
@@ -197,6 +200,7 @@ const IngestSourceCommandSchema = z
     origin: SourceOriginSchema,
     resourceDigest: DigestSchema.optional(),
     scope: SourceScopeSchema,
+    conversationAccessMode: ConversationSourceAccessModeSchema.optional(),
     content: JsonObjectSchema,
     occurredAt: InstantSchema,
     capturedAt: InstantSchema,
@@ -215,6 +219,20 @@ const IngestSourceCommandSchema = z
         code: "custom",
         path: ["resourceDigest"],
         message: "Calendar ingestion requires its configured calendar digest",
+      });
+    }
+    if (command.scope.kind === "person" && command.conversationAccessMode !== undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["conversationAccessMode"],
+        message: "Person sources cannot set a conversation access mode",
+      });
+    }
+    if (command.scope.kind === "conversation_epoch" && command.conversationAccessMode === undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["conversationAccessMode"],
+        message: "Conversation sources require an explicit access mode",
       });
     }
   });
@@ -320,6 +338,13 @@ const InvalidateEpochCommandSchema = z.strictObject({
   invalidatedAt: InstantSchema,
 });
 
+const GrantConversationPrivateViewsCommandSchema = z.strictObject({
+  kind: z.literal("grant_conversation_private_views"),
+  participantEpochId: EntityIdSchema,
+  personId: EntityIdSchema,
+  grantedAt: InstantSchema,
+});
+
 const SweepRetentionCommandSchema = z.strictObject({
   kind: z.literal("sweep_retention"),
   asOf: InstantSchema,
@@ -343,6 +368,7 @@ export const SourceCommandSchema = z.discriminatedUnion("kind", [
   ReviewPrivateCandidateCommandSchema,
   MarkSourceDeletedCommandSchema,
   InvalidateEpochCommandSchema,
+  GrantConversationPrivateViewsCommandSchema,
   SweepRetentionCommandSchema,
 ]);
 export type SourceCommand = z.infer<typeof SourceCommandSchema>;
@@ -392,6 +418,7 @@ const ReadSourceRevisionQuerySchema = z
     scope: SourceScopeSchema,
     integrationId: EntityIdSchema.optional(),
     expectedIntegrationControlEpoch: z.number().int().positive().optional(),
+    privateViewerPersonId: EntityIdSchema.optional(),
     asOf: InstantSchema,
   })
   .superRefine((query, context) => {
@@ -402,21 +429,50 @@ const ReadSourceRevisionQuerySchema = z
         message: "Integration-fenced reads require both integration identity and authority epoch",
       });
     }
+    if (query.scope.kind === "person" && query.privateViewerPersonId !== undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["privateViewerPersonId"],
+        message: "Person sources cannot use a conversation private view",
+      });
+    }
   });
 
-const ReadBlobQuerySchema = z.strictObject({
-  kind: z.literal("source_blob"),
-  sourceBlobId: EntityIdSchema,
-  scope: SourceScopeSchema,
-  asOf: InstantSchema,
-});
+const ReadBlobQuerySchema = z
+  .strictObject({
+    kind: z.literal("source_blob"),
+    sourceBlobId: EntityIdSchema,
+    scope: SourceScopeSchema,
+    privateViewerPersonId: EntityIdSchema.optional(),
+    asOf: InstantSchema,
+  })
+  .superRefine((query, context) => {
+    if (query.scope.kind === "person" && query.privateViewerPersonId !== undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["privateViewerPersonId"],
+        message: "Person sources cannot use a conversation private view",
+      });
+    }
+  });
 
-const ReadDerivativeQuerySchema = z.strictObject({
-  kind: z.literal("source_derivative"),
-  sourceDerivativeId: EntityIdSchema,
-  scope: SourceScopeSchema,
-  asOf: InstantSchema,
-});
+const ReadDerivativeQuerySchema = z
+  .strictObject({
+    kind: z.literal("source_derivative"),
+    sourceDerivativeId: EntityIdSchema,
+    scope: SourceScopeSchema,
+    privateViewerPersonId: EntityIdSchema.optional(),
+    asOf: InstantSchema,
+  })
+  .superRefine((query, context) => {
+    if (query.scope.kind === "person" && query.privateViewerPersonId !== undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["privateViewerPersonId"],
+        message: "Person sources cannot use a conversation private view",
+      });
+    }
+  });
 
 const ReadPendingCandidatesQuerySchema = z.strictObject({
   kind: z.literal("pending_private_candidates"),
@@ -515,6 +571,7 @@ export type SourceMutationResult =
       readonly scopeDigest: string;
       readonly retentionUntil: string;
       readonly rawContentStored: boolean;
+      readonly privateViewCount: number;
       readonly duplicate: boolean;
     }
   | {
@@ -556,6 +613,12 @@ export type SourceMutationResult =
       readonly participantEpochId: string;
       readonly invalidatedRevisionCount: number;
       readonly revokedCandidateCount: number;
+    }
+  | {
+      readonly kind: "conversation_private_views_granted";
+      readonly participantEpochId: string;
+      readonly personId: string;
+      readonly privateViewCount: number;
     }
   | {
       readonly kind: "retention_swept";

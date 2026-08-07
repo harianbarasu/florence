@@ -1014,14 +1014,14 @@ p {
   background: var(--sage-soft);
   color: var(--sage);
 }
-.status-pill.content_disabled {
+.status-pill.registration_required {
   background: #f4e8d0;
   color: #8d6726;
 }
 .status-pill.paused {
   background: #eee;
 }
-.status-pill.read_enabled_write_disabled {
+.status-pill.observe_only {
   background: #e5eaf0;
   color: #4c6075;
 }

@@ -32,7 +32,7 @@ import {
 } from "../modules/relationships/index.js";
 import { JsonObjectSchema, PostgresSourceIntelligence, type SourceScope } from "../modules/sources/index.js";
 import type { SecretBox } from "../shared/crypto.js";
-import { NotFoundError, UnauthorizedError } from "../shared/errors.js";
+import { NotFoundError, StaleAuthorityError, UnauthorizedError } from "../shared/errors.js";
 
 type Transaction = TransactionSql<Record<string, never>>;
 
@@ -215,6 +215,82 @@ export class FlorenceOrchestrator {
     }
     await this.workers.reconcile(need.attemptId, "accepted");
     return "quiet_ignore";
+  }
+
+  /**
+   * Persists a cold-added group's exact-epoch message without ever entering the
+   * shared group-response path. A deterministic invocation may be answered only
+   * through the exact registered sender's private view and application seam.
+   */
+  public async processObservedLinqMessage(internalProviderEventId: string): Promise<string> {
+    const context = await this.compileLinqContext(internalProviderEventId, "observe_only");
+    if (!context) return "stale_or_ineligible_observation";
+    const invocation = context.record.invocation;
+    const personId = context.record.routing.senderPersonId;
+    if (!invocation || !personId) return "observation_retained_silently";
+    if (Date.now() - Date.parse(context.event.message.sentAt) > 10 * 60_000) {
+      return "observation_retained_invocation_expired";
+    }
+
+    const scope = {
+      kind: "conversation_epoch" as const,
+      participantEpochId: context.record.routing.participantEpochId,
+    };
+    try {
+      for (const sourceRevisionId of context.evidenceSourceRevisionIds) {
+        await this.#sources.read({
+          kind: "source_revision",
+          sourceRevisionId,
+          scope,
+          privateViewerPersonId: personId,
+          asOf: new Date().toISOString(),
+        });
+      }
+    } catch (error) {
+      if (error instanceof NotFoundError || error instanceof UnauthorizedError) {
+        return "private_view_unavailable";
+      }
+      throw error;
+    }
+    if (!this.mutationProcessor) throw new Error("Private invocation mutation seam is not configured");
+
+    const answer = await this.workers.run({
+      attemptId: randomUUID(),
+      taskVersionId: randomUUID(),
+      skill: GENERAL_ANSWER_SKILL,
+      authorizedContext: [
+        `Current instant: ${new Date().toISOString()}`,
+        `Private request from the exact registered sender: ${invocation.requestText}`,
+        `Authorized content from this same message and its attachments only: ${context.text}`,
+        "The source group is observe-only. Never address the group or imply that anything was shared there.",
+      ].join("\n"),
+      ...(context.images.length > 0 ? { images: context.images } : {}),
+      goal: "Answer this one explicit request for the sender's private Florence conversation.",
+      deadline: new Date(Date.now() + 45_000),
+      budget: { maxModelCalls: 1, maxOutputTokens: 1_500 },
+    });
+    if (answer.status !== "proposed" || !answer.proposal) {
+      await this.workers.reconcile(answer.attemptId, "rejected");
+      return "private_invocation_answer_failed";
+    }
+    const proposal = answer.proposal;
+    const text = proposal.uncertainty ? `${proposal.answer}\n\n${proposal.uncertainty}` : proposal.answer;
+    try {
+      const receipt = await this.mutationProcessor.process({
+        kind: "linq.private_invocation_response",
+        internalProviderEventId,
+        responseText: text,
+      });
+      await this.workers.reconcile(answer.attemptId, "accepted");
+      return receipt.disposition;
+    } catch (error) {
+      if (error instanceof StaleAuthorityError || error instanceof UnauthorizedError) {
+        await this.workers.reconcile(answer.attemptId, "stale");
+        return "private_invocation_stale";
+      }
+      await this.workers.reconcile(answer.attemptId, "rejected");
+      throw error;
+    }
   }
 
   /** Private integrations can propose family meaning, but never disclose it without a bridge approval. */
@@ -451,7 +527,10 @@ export class FlorenceOrchestrator {
       .sort((left, right) => left.label.localeCompare(right.label));
   }
 
-  private async compileLinqContext(internalProviderEventId: string): Promise<MessageContext | null> {
+  private async compileLinqContext(
+    internalProviderEventId: string,
+    expectedClassification: "full" | "observe_only" = "full",
+  ): Promise<MessageContext | null> {
     const rows = await this.database<EventRow[]>`
       select id, provider_event_id, envelope_ciphertext from provider_events
       where id = ${internalProviderEventId} and provider = 'linq' and processing_status = 'processed'
@@ -466,13 +545,19 @@ export class FlorenceOrchestrator {
         )
         .toString("utf8"),
     ) as StoredLinqEvent;
-    if (record.classification !== "full" || record.event?.eventType !== "linq.message.received") return null;
+    if (
+      record.classification !== expectedClassification ||
+      record.event?.eventType !== "linq.message.received" ||
+      (expectedClassification === "observe_only" && record.routing.chatKind !== "group")
+    )
+      return null;
     const conversations = new PostgresConversationAuthority(this.database);
     const snapshot = await conversations.snapshot(record.routing.conversationId);
     if (
-      snapshot.participantEpochId !== record.routing.participantEpochId ||
-      snapshot.participantSetDigest !== record.routing.appParticipantDigest ||
-      snapshot.conversationStatus !== "active"
+      expectedClassification === "full" &&
+      (snapshot.participantEpochId !== record.routing.participantEpochId ||
+        snapshot.participantSetDigest !== record.routing.appParticipantDigest ||
+        snapshot.conversationStatus !== "active")
     )
       return null;
 
@@ -498,6 +583,12 @@ export class FlorenceOrchestrator {
     const scope: SourceScope = ownerPersonId
       ? { kind: "person", personId: ownerPersonId }
       : { kind: "conversation_epoch", participantEpochId: record.routing.participantEpochId };
+    const conversationAccessMode =
+      scope.kind === "conversation_epoch"
+        ? expectedClassification === "observe_only"
+          ? "independent_private_views"
+          : "unanimously_shared"
+        : undefined;
     const retentionUntil = new Date(Date.now() + this.config.defaults.rawSourceRetentionDays * 86_400_000);
     const ingested = await this.#sources.apply({
       kind: "ingest_source",
@@ -509,6 +600,7 @@ export class FlorenceOrchestrator {
         remoteObjectId: event.message.providerMessageId,
       },
       scope,
+      ...(conversationAccessMode ? { conversationAccessMode } : {}),
       content: jsonObject({
         text: messageText,
         sentAt: event.message.sentAt,
@@ -524,6 +616,7 @@ export class FlorenceOrchestrator {
       references: attachmentReferences.slice(0, 5),
       parentSourceRevisionId: ingested.sourceRevisionId,
       scope,
+      conversationAccessMode,
       occurredAt: event.message.sentAt,
       retentionUntil,
     });
@@ -568,6 +661,7 @@ export class FlorenceOrchestrator {
     }[];
     parentSourceRevisionId: string;
     scope: SourceScope;
+    conversationAccessMode: "unanimously_shared" | "independent_private_views" | undefined;
     occurredAt: string;
     retentionUntil: Date;
   }): Promise<
@@ -616,6 +710,7 @@ export class FlorenceOrchestrator {
         artifactKind: "attachment_manifest",
         origin: { system: "linq.attachment", remoteObjectId: downloaded.providerAttachmentId },
         scope: input.scope,
+        ...(input.conversationAccessMode ? { conversationAccessMode: input.conversationAccessMode } : {}),
         content: JsonObjectSchema.parse({
           parentSourceRevisionId: input.parentSourceRevisionId,
           filename: downloaded.filename || reference.filename || "attachment",
@@ -1523,6 +1618,16 @@ async function queueConversationEffect(input: {
 }): Promise<boolean> {
   const { transaction, context, snapshot } = input;
   if (!snapshot.participantEpochId || !snapshot.participantSetDigest) return false;
+  const ruleId =
+    input.ruleId ??
+    (snapshot.conversationKind === "group"
+      ? (snapshot.rules.find(
+          (rule) =>
+            rule.active &&
+            rule.participantSetDigest === snapshot.participantSetDigest &&
+            rule.allowedOperations.includes(input.operation),
+        )?.ruleId ?? null)
+      : null);
   const authority = await new PostgresConversationAuthority(transaction).authorizeSend({
     conversationId: context.record.routing.conversationId,
     expectedParticipantEpochId: snapshot.participantEpochId,
@@ -1530,7 +1635,7 @@ async function queueConversationEffect(input: {
     liveParticipantIdentityIds: [...context.record.routing.liveIdentityIds],
     sendKind: input.sendKind,
     operation: input.operation,
-    ruleId: input.ruleId ?? null,
+    ruleId,
   });
   if (!authority.allowed) return false;
   const person = context.record.routing.senderPersonId

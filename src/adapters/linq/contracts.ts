@@ -39,6 +39,8 @@ export interface LinqChatSnapshot {
   service?: LinqMessagingService;
   health: LinqChatHealth;
   participants: readonly LinqParticipant[];
+  /** True only for exactly one active self handle matching Florence's configured line. */
+  configuredLineActive: boolean;
   activeParticipantDigest: string;
   createdAt: string;
   updatedAt: string;
@@ -89,6 +91,8 @@ export interface LinqMessageReceivedEvent extends LinqEventBase {
     service: LinqMessagingService;
     parts: readonly LinqMessagePart[];
     sentAt: string;
+    /** Present when Linq recovered an older message instead of observing it live. */
+    reconciledAt?: string;
     replyTo?: LinqReplyRef;
   };
 }

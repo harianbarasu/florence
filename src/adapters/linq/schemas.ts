@@ -30,8 +30,8 @@ export const providerChatSchema = z.object({
 
 export const providerChatContextSchema = z.object({
   id: z.string().min(1),
-  is_group: z.boolean(),
-  owner_handle: providerParticipantSchema,
+  is_group: z.boolean().nullish(),
+  owner_handle: providerParticipantSchema.nullish(),
   health_status: providerHealthSchema.optional(),
 });
 
@@ -48,6 +48,7 @@ const providerCurrentMessageSchema = z.object({
   sender_handle: providerParticipantSchema,
   parts: z.array(z.unknown()).max(100),
   reply_to: providerReplySchema.nullish(),
+  reconciled_at: z.string().nullish(),
   sent_at: z.string().min(1),
   service: providerServiceSchema,
 });

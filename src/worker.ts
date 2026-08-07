@@ -201,6 +201,11 @@ async function main(): Promise<void> {
           await orchestrator.processLinqMessage(payload.internalProviderEventId);
           return;
         }
+        case "orchestrate.linq_observation": {
+          const payload = OrchestrateMessagePayloadSchema.parse(job.payload);
+          await orchestrator.processObservedLinqMessage(payload.internalProviderEventId);
+          return;
+        }
         case "orchestrate.private_source": {
           const payload = PrivateSourcePayloadSchema.parse(job.payload);
           await orchestrator.processPrivateSourceRevision(

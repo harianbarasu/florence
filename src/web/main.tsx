@@ -938,7 +938,7 @@ function ChatsPage() {
     <div className="page-stack">
       <Intro
         title="Every chat is its own privacy boundary"
-        copy="Florence only reads and writes when the exact current participants and their settings permit it."
+        copy="Florence can privately retain permitted post-addition context without speaking in the source group. Group writing needs a separate approval for the exact current participants."
       />
       <div className="card-list">
         {data.map((chat) => (
@@ -2053,8 +2053,8 @@ function SafetyPage({ viewer }: { viewer: Viewer }) {
 
 function ChatCard({ chat }: { chat: ChatView }) {
   const labels = {
-    content_disabled: "Waiting for registration",
-    read_enabled_write_disabled: "Reading silently",
+    registration_required: "Finish registration",
+    observe_only: "Observe only",
     trusted_write_enabled: "Active",
     paused: "Paused",
   };
@@ -2082,7 +2082,15 @@ function ChatCard({ chat }: { chat: ChatView }) {
       </div>
       {chat.blockedReason ? <div className="notice">{chat.blockedReason}</div> : null}
       <div className="chat-meta">
-        <span>{chat.retentionDays ? `${chat.retentionDays}-day raw retention` : "No content retained"}</span>
+        <span>
+          {chat.mode === "observe_only" && chat.kind === "group"
+            ? chat.retentionDays
+              ? `Your private view · ${chat.retentionDays}-day raw retention`
+              : "No private source view"
+            : chat.retentionDays
+              ? `${chat.retentionDays}-day raw retention`
+              : "No content retained"}
+        </span>
         <span>{chat.proactive ? "Proactive help on" : "Proactive help off"}</span>
       </div>
     </article>

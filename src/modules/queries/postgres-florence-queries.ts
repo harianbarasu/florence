@@ -191,11 +191,13 @@ export class PostgresFlorenceQueries {
         sequence: number | string;
         epoch_started_at: Date;
         participant_set_digest: string;
-        active_suppression: boolean;
+        hard_suppression: boolean;
+        read_only_suppression: boolean;
         all_registered: boolean;
         all_content_allowed: boolean;
         all_direct_allowed: boolean;
         retention_seconds: number | string | null;
+        exact_write_rule: boolean;
         proactive_rule: boolean;
       }[]
     >`
@@ -205,13 +207,25 @@ export class PostgresFlorenceQueries {
         exists(
           select 1 from channel_suppressions suppression
           where suppression.conversation_id = conversation.id and suppression.active
-            and suppression.kind in ('stop', 'pause', 'read_only', 'deletion_fence', 'safety_hold')
-        ) as active_suppression,
+            and suppression.kind in ('stop', 'pause', 'deletion_fence', 'safety_hold')
+        ) as hard_suppression,
+        exists(
+          select 1 from channel_suppressions suppression
+          where suppression.conversation_id = conversation.id and suppression.active
+            and suppression.kind = 'read_only'
+        ) as read_only_suppression,
         bool_and(participant.registration_status = 'registered' and participant.consented_at is not null)
           as all_registered,
         bool_and(coalesce(policy.allow_content_processing, false)) as all_content_allowed,
         bool_and(coalesce(policy.allow_direct_responses, false)) as all_direct_allowed,
-        min(policy.retention_seconds) as retention_seconds,
+        max(policy.retention_seconds) filter (where participant.person_id = ${personId})
+          as retention_seconds,
+        exists(
+          select 1 from conversation_rules rule
+          where rule.conversation_id = conversation.id and rule.status = 'active'
+            and rule.participant_set_digest = epoch.participant_set_digest
+            and cardinality(rule.allowed_operations) > 0
+        ) as exact_write_rule,
         exists(
           select 1 from conversation_rules rule
           where rule.conversation_id = conversation.id and rule.status = 'active'
@@ -241,15 +255,19 @@ export class PostgresFlorenceQueries {
         order by person_id
       `;
       const mode: ChatView["mode"] =
-        chat.status === "paused" || chat.active_suppression
+        chat.status === "paused" || chat.hard_suppression
           ? "paused"
-          : !chat.all_registered || !chat.all_content_allowed
-            ? "content_disabled"
-            : chat.all_direct_allowed
-              ? "trusted_write_enabled"
-              : "read_enabled_write_disabled";
+          : chat.kind === "direct" && (!chat.all_registered || !chat.all_content_allowed)
+            ? "registration_required"
+            : chat.read_only_suppression ||
+                !chat.all_direct_allowed ||
+                (chat.kind === "group" &&
+                  (!chat.all_registered || !chat.all_content_allowed || !chat.exact_write_rule))
+              ? "observe_only"
+              : "trusted_write_enabled";
       output.push({
         id: chat.id,
+        kind: chat.kind === "direct" ? "direct" : "group",
         title: chat.kind === "direct" ? "Private conversation" : "Family group",
         mode,
         epochId: chat.epoch_id,
@@ -264,13 +282,15 @@ export class PostgresFlorenceQueries {
           chat.retention_seconds === null ? null : Math.floor(Number(chat.retention_seconds) / 86_400),
         proactive: chat.proactive_rule,
         blockedReason:
-          mode === "content_disabled"
-            ? "Florence does not retain or use ordinary messages until every current participant registers and consents."
-            : mode === "read_enabled_write_disabled"
-              ? "Florence can learn from this chat but will not write here under the current shared settings."
-              : mode === "paused"
-                ? "A participant narrowed or paused this chat."
-                : null,
+          mode === "registration_required"
+            ? "Finish private registration and consent before Florence can use or answer ordinary messages here."
+            : mode === "observe_only" && chat.kind === "group"
+              ? "Florence stays silent here. Permitted messages after Florence joined are retained only as independent private context for each registered exact participant; they are never automatically shared with a household or another chat."
+              : mode === "observe_only"
+                ? "Florence will not answer while this private conversation is read-only under your current settings."
+                : mode === "paused"
+                  ? "A participant narrowed or paused this chat."
+                  : null,
       });
     }
     return output;

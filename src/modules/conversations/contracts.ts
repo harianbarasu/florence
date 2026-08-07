@@ -5,8 +5,8 @@ export const DigestSchema = z.string().regex(/^[a-f0-9]{64}$/u);
 export const InstantSchema = z.iso.datetime({ offset: true });
 
 export const ConversationModeSchema = z.enum([
-  "content_disabled",
-  "read_enabled_write_disabled",
+  "registration_required",
+  "observe_only",
   "trusted_write_enabled",
   "paused",
 ]);
@@ -41,6 +41,7 @@ export type ConversationRule = z.infer<typeof ConversationRuleSchema>;
 
 export const ConversationAuthoritySnapshotSchema = z.strictObject({
   conversationId: EntityIdSchema,
+  conversationKind: z.enum(["direct", "group"]),
   conversationStatus: z.enum(["active", "paused", "deletion_fenced", "deleted"]),
   authorityVersion: z.number().int().positive(),
   participantEpochId: EntityIdSchema.nullable(),
@@ -112,6 +113,7 @@ export const RecordParticipantEpochInputSchema = z
     conversationId: EntityIdSchema,
     participantIdentityIds: z.array(EntityIdSchema).min(1).max(100),
     changeReason: z.string().trim().min(1).max(200),
+    forceNewEpoch: z.boolean().default(false),
     observedAt: InstantSchema,
   })
   .refine((input) => new Set(input.participantIdentityIds).size === input.participantIdentityIds.length, {
@@ -191,11 +193,13 @@ export const SendAuthorizationSchema = z.strictObject({
   reason: z.enum([
     "allowed",
     "conversation_paused",
-    "content_disabled",
+    "registration_required",
+    "observe_only",
     "epoch_mismatch",
     "live_participant_mismatch",
     "participant_policy_denied",
     "participant_proactive_paused",
+    "group_write_rule_missing",
     "proactive_rule_missing",
   ]),
   mode: ConversationModeSchema,

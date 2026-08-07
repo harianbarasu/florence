@@ -23,9 +23,10 @@ const suppressionId = "10000000-0000-4000-8000-000000000008";
 const digest = participantSetDigest([identityA, identityB]);
 const consentedAt = "2026-08-05T12:00:00.000Z";
 
-function trustedSnapshot(): ConversationAuthoritySnapshot {
+function trustedSnapshot(conversationKind: "direct" | "group" = "group"): ConversationAuthoritySnapshot {
   return {
     conversationId,
+    conversationKind,
     conversationStatus: "active",
     authorityVersion: 7,
     participantEpochId: epochId,
@@ -64,7 +65,7 @@ function trustedSnapshot(): ConversationAuthoritySnapshot {
         ruleId,
         ruleKey: "coverage_reminder",
         participantSetDigest: digest,
-        allowedOperations: ["coverage_reminder"],
+        allowedOperations: ["coverage_reminder", "reply"],
         active: true,
       },
     ],
@@ -108,7 +109,13 @@ describe("conversation authority", () => {
     missingConsent.participants = missingConsent.participants.map((participant, index) =>
       index === 1 ? { ...participant, consentedAt: null } : participant,
     );
-    expect(evaluateConversationMode(missingConsent)).toBe("content_disabled");
+    expect(evaluateConversationMode(missingConsent)).toBe("observe_only");
+
+    const unregisteredDirect = trustedSnapshot("direct");
+    unregisteredDirect.participants = unregisteredDirect.participants.map((participant, index) =>
+      index === 1 ? { ...participant, consentedAt: null } : participant,
+    );
+    expect(evaluateConversationMode(unregisteredDirect)).toBe("registration_required");
 
     const stopped = trustedSnapshot();
     stopped.activeSuppressions = [{ id: suppressionId, kind: "stop", retentionSeconds: null }];
@@ -149,7 +156,48 @@ describe("conversation authority", () => {
       operation: "daily_brief",
       ruleId,
     });
-    expect(withoutRule).toMatchObject({ allowed: false, reason: "proactive_rule_missing" });
+    expect(withoutRule).toMatchObject({ allowed: false, reason: "group_write_rule_missing" });
+  });
+
+  it("requires a matching exact-audience rule for every group reply", () => {
+    const withoutRule = authorizeSendFromSnapshot(trustedSnapshot(), {
+      conversationId,
+      expectedParticipantEpochId: epochId,
+      expectedParticipantSetDigest: digest,
+      liveParticipantIdentityIds: [identityA, identityB],
+      sendKind: "direct_response",
+      operation: "reply",
+      ruleId: null,
+    });
+    expect(withoutRule).toMatchObject({ allowed: false, reason: "group_write_rule_missing" });
+
+    const withRule = authorizeSendFromSnapshot(trustedSnapshot(), {
+      conversationId,
+      expectedParticipantEpochId: epochId,
+      expectedParticipantSetDigest: digest,
+      liveParticipantIdentityIds: [identityA, identityB],
+      sendKind: "direct_response",
+      operation: "reply",
+      ruleId,
+    });
+    expect(withRule).toMatchObject({ allowed: true, reason: "allowed" });
+  });
+
+  it("keeps eligible direct DMs reply-capable without a group rule", () => {
+    const direct = trustedSnapshot("direct");
+    direct.rules = [];
+    expect(evaluateConversationMode(direct)).toBe("trusted_write_enabled");
+
+    const reply = authorizeSendFromSnapshot(direct, {
+      conversationId,
+      expectedParticipantEpochId: epochId,
+      expectedParticipantSetDigest: digest,
+      liveParticipantIdentityIds: [identityA, identityB],
+      sendKind: "direct_response",
+      operation: "reply",
+      ruleId: null,
+    });
+    expect(reply).toMatchObject({ allowed: true, reason: "allowed" });
   });
 
   it("honors a participant's personal proactive pause without disabling replies or content", () => {
@@ -177,7 +225,7 @@ describe("conversation authority", () => {
       liveParticipantIdentityIds: [identityA, identityB],
       sendKind: "direct_response",
       operation: "reply",
-      ruleId: null,
+      ruleId,
     });
     expect(reply).toMatchObject({ allowed: true, reason: "allowed" });
   });

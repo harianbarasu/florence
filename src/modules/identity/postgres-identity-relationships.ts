@@ -174,6 +174,18 @@ export class PostgresIdentityRelationships implements IdentityRelationships {
         where id = ${input.identityId}
       `;
 
+      if (targetPersonId !== current.person_id) {
+        // Exact epochs are keyed by immutable identities. The attached person may
+        // follow a verified identity claim, including when the same person owns
+        // more than one handle in that historical audience.
+        await transaction`
+          update epoch_participants participant
+          set person_id = ${targetPersonId}
+          where participant.person_identity_id = ${input.identityId}
+            and participant.person_id = ${current.person_id}
+        `;
+      }
+
       if (targetPersonId === current.person_id) {
         await transaction`
           update people

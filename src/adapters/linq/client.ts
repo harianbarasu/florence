@@ -191,6 +191,9 @@ export class LinqClient {
 
   async getChat(providerChatId: string, signal?: AbortSignal): Promise<LinqChatSnapshot> {
     const id = providerIdSchema.parse(providerChatId);
+    // Fence the snapshot by request start, not response completion. A slow older
+    // request must never supersede a newer membership observation.
+    const checkedAt = this.#now().toISOString();
     const raw = await this.#requestJson(`/chats/${encodeURIComponent(id)}`, { method: "GET", signal });
     const parsed = providerChatSchema.safeParse(raw);
     if (!parsed.success) {
@@ -209,20 +212,13 @@ export class LinqClient {
     }
 
     const participants = parsed.data.handles.map(normalizeParticipant);
-    const ownsChat = participants.some(
-      (participant) =>
-        participant.isSelf &&
-        participant.status === "active" &&
-        participant.address === this.#config.phoneNumber,
-    );
-    if (!ownsChat) {
-      throw new LinqApiError("The configured Florence line is not an active participant in this chat", {
-        status: 403,
-        providerCode: "configured_line_not_participant",
-        retryable: false,
-      });
-    }
-
+    const configuredLineActive =
+      participants.filter(
+        (participant) =>
+          participant.isSelf &&
+          participant.status === "active" &&
+          participant.address === this.#config.phoneNumber,
+      ).length === 1;
     return {
       providerChatId: parsed.data.id,
       kind: parsed.data.is_group ? "group" : "direct",
@@ -230,10 +226,11 @@ export class LinqClient {
       ...(parsed.data.service ? { service: normalizeService(parsed.data.service) } : {}),
       health: normalizeHealth(parsed.data.health_status.status),
       participants,
+      configuredLineActive,
       activeParticipantDigest: computeLinqParticipantDigest(participants),
       createdAt: normalizeTimestamp(parsed.data.created_at, "chat created_at"),
       updatedAt: normalizeTimestamp(parsed.data.updated_at, "chat updated_at"),
-      checkedAt: this.#now().toISOString(),
+      checkedAt,
     };
   }
 
@@ -252,6 +249,13 @@ export class LinqClient {
     }
 
     const currentChat = await this.getChat(parsed.data.providerChatId, signal);
+    if (!currentChat.configuredLineActive) {
+      throw new LinqApiError("The configured Florence line is not an active participant in this chat", {
+        status: 403,
+        providerCode: "configured_line_not_participant",
+        retryable: false,
+      });
+    }
     if (currentChat.activeParticipantDigest !== parsed.data.expectedParticipantDigest) {
       throw new LinqAudienceChangedError(
         parsed.data.expectedParticipantDigest,
@@ -352,7 +356,12 @@ export class LinqClient {
     const exactSender = activePeople.filter(
       (participant) => participant.isSelf && participant.address === this.#config.phoneNumber,
     );
-    if (response.data.chat.is_group || exactRecipient.length !== 1 || exactSender.length !== 1) {
+    if (
+      response.data.chat.is_group ||
+      activePeople.length !== 2 ||
+      exactRecipient.length !== 1 ||
+      exactSender.length !== 1
+    ) {
       throw new LinqApiError("Linq created a chat with an unexpected audience", {
         status: 502,
         providerCode: "created_chat_audience_mismatch",

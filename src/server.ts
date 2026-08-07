@@ -666,7 +666,8 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
       .send(
         policyPage("Privacy", [
           "Florence treats every person, private source, and exact group-chat participant epoch as a separate permission boundary.",
-          "If anyone in a group has not registered and consented, Florence stores no ordinary message content, fetches no attachments, makes no model call, and writes nothing in that group.",
+          "From the moment Florence is added to a group, permitted new messages and attachments may be encrypted inside that exact participant epoch. Florence stays completely silent unless every current participant is registered and that exact audience has approved an applicable write rule.",
+          "Each registered exact-chat participant receives an independent private view governed by their own settings. Observed group context is never automatically widened to a household, another chat, or another participant.",
           "Google accounts are private to the person who connects them. Sharing family meaning requires an explicit one-time approval or a narrow standing rule.",
           "You can pause, narrow, export, disconnect, correct, forget, or request deletion from the private control plane.",
         ]),

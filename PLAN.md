@@ -367,9 +367,9 @@ ends the current `ParticipantEpoch` and starts a new immutable epoch.
 | Mode | Condition | Ordinary content processing | Florence may write |
 |---|---|---|---|
 | `observe_only` | Florence is present but this exact current participant epoch has not unanimously authorized writing | Encrypt new post-addition content in the exact chat epoch; registered exact-chat participants may receive independent private source views under their own policies | No |
-| `disabled` | The exact chat or applicable person has stopped/disabled new retention | Retain only routing, dedupe, membership, security, invocation detection, revocation, and opt-out metadata | No |
-| `trusted_write_enabled` | Every participant is registered, the live epoch matches, the participant-policy intersection permits the operation, and an applicable group rule exists for proactivity | Allowed within the epoch and exact grants | Direct answers and rule-authorized proactivity only |
-| `paused` | STOP, participant change, deletion fence, policy conflict, or safety hold | No new ordinary processing | No |
+| `registration_required` | A private DM participant has not completed registration and consent | Retain only enrollment, routing, dedupe, security, revocation, and opt-out metadata | Enrollment and safety responses only |
+| `trusted_write_enabled` | A private DM is eligible, or every group participant is registered and an active exact-current-audience rule permits the operation | Allowed within the epoch and exact grants | Private replies, or only the exact operations approved for the current group audience |
+| `paused` | STOP, deletion fence, policy conflict, or safety hold | No new ordinary processing | No |
 
 Adding Florence designates the exact post-addition chat epoch as an observe-only source. It does not
 authorize Florence to write, react, type, announce enrollment, expose raw content to another chat, or
@@ -409,9 +409,9 @@ system safety policy
 
 Missing authority is a denial. A source or skill can only narrow this set; it cannot widen it.
 
-Registration alone permits neither private-source disclosure nor proactive messaging. A directly
-addressed question in a fully registered group may receive a group-local/public answer under the
-policy intersection. Proactivity additionally requires an established rule for that conversation.
+Registration alone permits neither private-source disclosure nor group writing. In an observe-only
+group, a deterministic invocation routes privately to the exact sender. Any group-local/public
+answer or proactive message requires an applicable exact-current-audience rule for that operation.
 
 Any participant can immediately make a conversation read-only, pause Florence, shorten retention,
 or STOP. That does not let them disable another person's private DM, personal integrations, or other
@@ -812,8 +812,8 @@ provenance becomes unavailable and the record can require reconfirmation.
 
 | Record class | Maximum/default retention |
 |---|---|
-| Unregistered-group ordinary content and attachments | None; no model processing or attachment fetch |
-| Registered private/group raw source | 30 days maximum; groups use the shortest participant cap |
+| Observe-only group ordinary content and attachments | Encrypted in the exact participant epoch for 30 days maximum; each registered exact participant's independent view is bounded by their own shorter policy, and unregistered participants receive no product access |
+| Registered private raw source | 30 days maximum under the person's policy |
 | Raw attachment bytes | Same or shorter than parent source |
 | OCR, chunks, embeddings, and rebuildable summaries | Never outlive source authorization or retention |
 | Private review item | Seven days unless acted upon |

@@ -55,7 +55,7 @@ export function evaluateConversationMode(snapshotCandidate: ConversationAuthorit
   ) {
     return "paused";
   }
-  if (
+  const contentBlocked =
     snapshot.participantEpochId === null ||
     snapshot.participants.length === 0 ||
     snapshot.participants.some(
@@ -64,15 +64,26 @@ export function evaluateConversationMode(snapshotCandidate: ConversationAuthorit
         participant.consentedAt === null ||
         participant.policy === null ||
         !participant.policy.allowContentProcessing,
-    )
-  ) {
-    return "content_disabled";
+    );
+  if (contentBlocked) {
+    return snapshot.conversationKind === "direct" ? "registration_required" : "observe_only";
   }
   if (
     snapshot.activeSuppressions.some((entry) => entry.kind === "read_only") ||
     snapshot.participants.some((participant) => !participant.policy?.allowDirectResponses)
   ) {
-    return "read_enabled_write_disabled";
+    return "observe_only";
+  }
+  if (
+    snapshot.conversationKind === "group" &&
+    !snapshot.rules.some(
+      (rule) =>
+        rule.active &&
+        rule.participantSetDigest === snapshot.participantSetDigest &&
+        rule.allowedOperations.length > 0,
+    )
+  ) {
+    return "observe_only";
   }
   return "trusted_write_enabled";
 }
@@ -94,8 +105,8 @@ export function authorizeSendFromSnapshot(
   } as const;
   if (mode === "paused")
     return SendAuthorizationSchema.parse({ ...base, allowed: false, reason: "conversation_paused" });
-  if (mode === "content_disabled") {
-    return SendAuthorizationSchema.parse({ ...base, allowed: false, reason: "content_disabled" });
+  if (mode === "registration_required") {
+    return SendAuthorizationSchema.parse({ ...base, allowed: false, reason: "registration_required" });
   }
   if (
     snapshot.participantEpochId !== input.expectedParticipantEpochId ||
@@ -106,11 +117,21 @@ export function authorizeSendFromSnapshot(
   if (participantSetDigest(input.liveParticipantIdentityIds) !== snapshot.participantSetDigest) {
     return SendAuthorizationSchema.parse({ ...base, allowed: false, reason: "live_participant_mismatch" });
   }
-  if (
-    mode !== "trusted_write_enabled" ||
-    snapshot.participants.some((participant) => !participant.policy?.allowDirectResponses)
-  ) {
+  if (snapshot.participants.some((participant) => !participant.policy?.allowDirectResponses)) {
     return SendAuthorizationSchema.parse({ ...base, allowed: false, reason: "participant_policy_denied" });
+  }
+  const applicableRule = snapshot.rules.find(
+    (candidate) =>
+      candidate.ruleId === input.ruleId &&
+      candidate.active &&
+      candidate.participantSetDigest === snapshot.participantSetDigest &&
+      candidate.allowedOperations.includes(input.operation),
+  );
+  if (snapshot.conversationKind === "group" && !applicableRule) {
+    return SendAuthorizationSchema.parse({ ...base, allowed: false, reason: "group_write_rule_missing" });
+  }
+  if (mode === "observe_only") {
+    return SendAuthorizationSchema.parse({ ...base, allowed: false, reason: "observe_only" });
   }
   if (
     input.sendKind === "transactional" &&
@@ -133,14 +154,7 @@ export function authorizeSendFromSnapshot(
     if (snapshot.participants.some((participant) => !participant.policy?.allowProactiveWrites)) {
       return SendAuthorizationSchema.parse({ ...base, allowed: false, reason: "participant_policy_denied" });
     }
-    const rule = snapshot.rules.find(
-      (candidate) =>
-        candidate.ruleId === input.ruleId &&
-        candidate.active &&
-        candidate.participantSetDigest === snapshot.participantSetDigest &&
-        candidate.allowedOperations.includes(input.operation),
-    );
-    if (!rule)
+    if (!applicableRule)
       return SendAuthorizationSchema.parse({ ...base, allowed: false, reason: "proactive_rule_missing" });
   }
   return SendAuthorizationSchema.parse({ ...base, allowed: true, reason: "allowed" });

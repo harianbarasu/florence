@@ -6,6 +6,7 @@ import type { EncryptedValue, SecretBox } from "../../shared/crypto.js";
 import { ConflictError, NotFoundError, StaleAuthorityError, UnauthorizedError } from "../../shared/errors.js";
 import {
   type CalendarPrivacyMode,
+  type ConversationSourceAccessMode,
   type IntegrationAccountKind,
   IntegrationAccountKindSchema,
   type IntegrationCapability,
@@ -64,13 +65,15 @@ interface SourceRevisionRow {
   readonly captured_at: Date;
   readonly retention_until: Date;
   readonly revoked_at: Date | null;
+  readonly conversation_access_mode: string | null;
 }
 
 interface ScopeResolution {
   readonly ownerPersonId: string | null;
   readonly participantEpochId: string | null;
   readonly scopeDigest: string;
-  readonly retentionSeconds: number;
+  readonly retentionSeconds: number | null;
+  readonly conversationAccessMode: ConversationSourceAccessMode | null;
 }
 
 interface EncryptedColumn {
@@ -143,6 +146,8 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
         return this.markSourceDeleted(command);
       case "invalidate_conversation_epoch":
         return this.invalidateConversationEpoch(command);
+      case "grant_conversation_private_views":
+        return this.grantConversationPrivateViews(command);
       case "sweep_retention":
         return this.sweepRetention(command);
     }
@@ -872,11 +877,14 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
   ): Promise<SourceMutationResult> {
     return inTransaction(this.database, async (transaction) => {
       const capturedAt = new Date(command.capturedAt);
+      const occurredAt = new Date(command.occurredAt);
       const scope = await resolveScopeForIngestion(
         transaction,
         command.scope,
         command.integrationId,
         command.expectedIntegrationControlEpoch,
+        command.conversationAccessMode,
+        occurredAt,
       );
       if (command.artifactKind === "calendar_event") {
         if (command.integrationId === null || command.resourceDigest === undefined) {
@@ -888,8 +896,14 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
       }
       const requestedRetentionUntil = new Date(command.requestedRetentionUntil);
       const globalCap = new Date(capturedAt.getTime() + this.#rawRetentionMs);
-      const scopeCap = new Date(capturedAt.getTime() + scope.retentionSeconds * 1_000);
-      const retentionUntil = earliestDate(requestedRetentionUntil, globalCap, scopeCap);
+      const retentionUntil =
+        scope.retentionSeconds === null
+          ? earliestDate(requestedRetentionUntil, globalCap)
+          : earliestDate(
+              requestedRetentionUntil,
+              globalCap,
+              new Date(capturedAt.getTime() + scope.retentionSeconds * 1_000),
+            );
       const envelope = {
         artifactKind: command.artifactKind,
         origin: command.origin,
@@ -921,11 +935,14 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
         const latestRows = await transaction<SourceRevisionRow[]>`
           select id, source_object_id, revision_number, owner_person_id, participant_epoch_id,
             scope_digest, content_digest, content_ciphertext, content_key_version,
-            occurred_at, captured_at, retention_until, revoked_at
+            occurred_at, captured_at, retention_until, revoked_at, conversation_access_mode
           from source_revisions
           where source_object_id = ${sourceObjectId} and revision_number = ${latestRevisionNumber}
         `;
         const latest = latestRows[0];
+        if (latest && latest.conversation_access_mode !== scope.conversationAccessMode) {
+          throw new ConflictError("A source object's conversation access mode cannot change");
+        }
         if (
           latest &&
           latest.scope_digest === scope.scopeDigest &&
@@ -935,6 +952,14 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
             latest.retention_until <= latest.captured_at) &&
           objects[0].status === "active"
         ) {
+          const privateViewCount =
+            scope.conversationAccessMode === "independent_private_views"
+              ? await upsertEligiblePrivateViews(
+                  transaction,
+                  latest.id,
+                  requireRow(scope.participantEpochId ?? undefined, "Private source epoch is missing"),
+                )
+              : 0;
           return {
             kind: "source_ingested",
             sourceObjectId,
@@ -944,6 +969,7 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
             scopeDigest: scope.scopeDigest,
             retentionUntil: latest.retention_until.toISOString(),
             rawContentStored: latest.content_ciphertext !== null,
+            privateViewCount,
             duplicate: true,
           };
         }
@@ -976,12 +1002,12 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
         insert into source_revisions (
           id, source_object_id, revision_number, owner_person_id, participant_epoch_id,
           scope_digest, content_digest, content_ciphertext, content_key_version,
-          occurred_at, captured_at, retention_until
+          occurred_at, captured_at, retention_until, conversation_access_mode
         ) values (
           ${sourceRevisionId}, ${sourceObjectId}, ${revisionNumber},
           ${scope.ownerPersonId}, ${scope.participantEpochId}, ${scope.scopeDigest},
           ${contentDigest}, ${content?.ciphertext ?? null}, ${content?.keyVersion ?? null},
-          ${new Date(command.occurredAt)}, ${capturedAt}, ${retentionUntil}
+          ${occurredAt}, ${capturedAt}, ${retentionUntil}, ${scope.conversationAccessMode}
         )
       `;
       await transaction`
@@ -989,6 +1015,14 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
         set status = 'active', latest_revision_number = ${revisionNumber}, updated_at = ${capturedAt}
         where id = ${sourceObjectId}
       `;
+      const privateViewCount =
+        scope.conversationAccessMode === "independent_private_views" && rawContentStored
+          ? await upsertEligiblePrivateViews(
+              transaction,
+              sourceRevisionId,
+              requireRow(scope.participantEpochId ?? undefined, "Private source epoch is missing"),
+            )
+          : 0;
       return {
         kind: "source_ingested",
         sourceObjectId,
@@ -998,6 +1032,7 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
         scopeDigest: scope.scopeDigest,
         retentionUntil: retentionUntil.toISOString(),
         rawContentStored,
+        privateViewCount,
         duplicate: false,
       };
     });
@@ -1425,11 +1460,48 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
     });
   }
 
+  private async grantConversationPrivateViews(
+    command: Extract<SourceCommand, { kind: "grant_conversation_private_views" }>,
+  ): Promise<SourceMutationResult> {
+    return inTransaction(this.database, async (transaction) => {
+      const grantedAt = new Date(command.grantedAt);
+      await requireEligiblePrivateViewer(
+        transaction,
+        command.participantEpochId,
+        command.personId,
+        grantedAt,
+      );
+      const privateViewCount = await upsertPrivateViewsForPerson(
+        transaction,
+        command.participantEpochId,
+        command.personId,
+        grantedAt,
+      );
+      return {
+        kind: "conversation_private_views_granted",
+        participantEpochId: command.participantEpochId,
+        personId: command.personId,
+        privateViewCount,
+      };
+    });
+  }
+
   private async sweepRetention(
     command: Extract<SourceCommand, { kind: "sweep_retention" }>,
   ): Promise<SourceMutationResult> {
     return inTransaction(this.database, async (transaction) => {
       const asOf = new Date(command.asOf);
+      await transaction`
+        delete from source_revision_private_views
+        where (source_revision_id, person_id) in (
+          select source_revision_id, person_id
+          from source_revision_private_views
+          where retention_until <= ${asOf}
+          order by retention_until
+          limit ${command.limit}
+          for update skip locked
+        )
+      `;
       const derivativeRows = await transaction<{ readonly id: string }[]>`
         select id from source_derivatives
         where retention_until <= ${asOf}
@@ -1465,6 +1537,10 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
       `;
       if (revisionRows.length > 0) {
         const revisionIds = revisionRows.map((row) => row.id);
+        await transaction`
+          delete from source_revision_private_views
+          where source_revision_id = any(${transaction.array(revisionIds)}::uuid[])
+        `;
         await transaction`
           delete from source_derivatives
           where parent_source_revision_id = any(${transaction.array(revisionIds)}::uuid[])
@@ -1726,7 +1802,6 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
   ): Promise<SourceReadResult> {
     return inTransaction(this.database, async (transaction) => {
       const asOf = new Date(query.asOf);
-      await revalidateReadScope(transaction, query.scope);
       const revision = await loadReadableRevision(
         transaction,
         query.sourceRevisionId,
@@ -1734,6 +1809,7 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
         asOf,
         false,
       );
+      await authorizeRevisionRead(transaction, revision, query.scope, query.privateViewerPersonId, asOf);
       if (query.integrationId !== undefined) {
         await assertSourceObjectIntegrationEpoch(
           transaction,
@@ -1766,7 +1842,6 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
   ): Promise<SourceReadResult> {
     return inTransaction(this.database, async (transaction) => {
       const asOf = new Date(query.asOf);
-      await revalidateReadScope(transaction, query.scope);
       const rows = await transaction<
         {
           readonly id: string;
@@ -1779,12 +1854,18 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
           readonly owner_person_id: string | null;
           readonly participant_epoch_id: string | null;
           readonly revision_revoked_at: Date | null;
+          readonly revision_captured_at: Date;
+          readonly revision_retention_until: Date;
+          readonly conversation_access_mode: string | null;
         }[]
       >`
         select blob.id, blob.source_revision_id, blob.blob_kind, blob.mime_type,
           blob.content_digest, blob.ciphertext, blob.retention_until,
           revision.owner_person_id, revision.participant_epoch_id,
-          revision.revoked_at as revision_revoked_at
+          revision.revoked_at as revision_revoked_at,
+          revision.captured_at as revision_captured_at,
+          revision.retention_until as revision_retention_until,
+          revision.conversation_access_mode
         from source_blobs blob
         join source_revisions revision on revision.id = blob.source_revision_id
         where blob.id = ${query.sourceBlobId}
@@ -1792,9 +1873,28 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
       const blob = rows[0];
       if (!blob) throw new NotFoundError("Source blob does not exist");
       assertScopeMatchesRow(query.scope, blob);
-      if (blob.revision_revoked_at !== null || blob.retention_until <= asOf) {
+      if (
+        blob.revision_revoked_at !== null ||
+        blob.revision_retention_until <= asOf ||
+        blob.retention_until <= asOf
+      ) {
         throw new NotFoundError("Source blob is no longer retained");
       }
+      await authorizeRevisionRead(
+        transaction,
+        {
+          id: blob.source_revision_id,
+          owner_person_id: blob.owner_person_id,
+          participant_epoch_id: blob.participant_epoch_id,
+          conversation_access_mode: blob.conversation_access_mode,
+          captured_at: blob.revision_captured_at,
+          retention_until: blob.revision_retention_until,
+          revoked_at: blob.revision_revoked_at,
+        },
+        query.scope,
+        query.privateViewerPersonId,
+        asOf,
+      );
       return {
         kind: "source_blob",
         sourceBlobId: blob.id,
@@ -1813,7 +1913,6 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
   ): Promise<SourceReadResult> {
     return inTransaction(this.database, async (transaction) => {
       const asOf = new Date(query.asOf);
-      await revalidateReadScope(transaction, query.scope);
       const rows = await transaction<
         {
           readonly id: string;
@@ -1826,13 +1925,19 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
           readonly content_ciphertext: Buffer;
           readonly retention_until: Date;
           readonly parent_revoked_at: Date | null;
+          readonly parent_captured_at: Date;
+          readonly parent_retention_until: Date;
+          readonly conversation_access_mode: string | null;
         }[]
       >`
         select derivative.id, derivative.parent_source_revision_id,
           derivative.owner_person_id, derivative.participant_epoch_id,
           derivative.kind, derivative.scope_digest, derivative.content_digest,
           derivative.content_ciphertext, derivative.retention_until,
-          parent.revoked_at as parent_revoked_at
+          parent.revoked_at as parent_revoked_at,
+          parent.captured_at as parent_captured_at,
+          parent.retention_until as parent_retention_until,
+          parent.conversation_access_mode
         from source_derivatives derivative
         join source_revisions parent on parent.id = derivative.parent_source_revision_id
         where derivative.id = ${query.sourceDerivativeId}
@@ -1840,9 +1945,28 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
       const derivative = rows[0];
       if (!derivative) throw new NotFoundError("Source derivative does not exist");
       assertScopeMatchesRow(query.scope, derivative);
-      if (derivative.parent_revoked_at !== null || derivative.retention_until <= asOf) {
+      if (
+        derivative.parent_revoked_at !== null ||
+        derivative.parent_retention_until <= asOf ||
+        derivative.retention_until <= asOf
+      ) {
         throw new NotFoundError("Source derivative is no longer retained");
       }
+      await authorizeRevisionRead(
+        transaction,
+        {
+          id: derivative.parent_source_revision_id,
+          owner_person_id: derivative.owner_person_id,
+          participant_epoch_id: derivative.participant_epoch_id,
+          conversation_access_mode: derivative.conversation_access_mode,
+          captured_at: derivative.parent_captured_at,
+          retention_until: derivative.parent_retention_until,
+          revoked_at: derivative.parent_revoked_at,
+        },
+        query.scope,
+        query.privateViewerPersonId,
+        asOf,
+      );
       return {
         kind: "source_derivative",
         sourceDerivativeId: derivative.id,
@@ -2010,8 +2134,13 @@ async function resolveScopeForIngestion(
   scope: SourceScope,
   integrationId: string | null,
   expectedIntegrationControlEpoch: number | null,
+  conversationAccessMode: ConversationSourceAccessMode | undefined,
+  occurredAt: Date,
 ): Promise<ScopeResolution> {
   if (scope.kind === "person") {
+    if (conversationAccessMode !== undefined) {
+      throw new UnauthorizedError("Person sources cannot use a conversation access mode");
+    }
     if ((integrationId === null) !== (expectedIntegrationControlEpoch === null)) {
       throw new UnauthorizedError("Integration identity and authority fence must be supplied together");
     }
@@ -2022,6 +2151,7 @@ async function resolveScopeForIngestion(
         participantEpochId: null,
         scopeDigest: canonicalDigest({ kind: "person", personId: scope.personId }),
         retentionSeconds: 30 * 24 * 60 * 60,
+        conversationAccessMode: null,
       };
     }
     const rows = await transaction<
@@ -2046,12 +2176,21 @@ async function resolveScopeForIngestion(
         integrationControlEpoch: Number(integration.control_epoch),
       }),
       retentionSeconds: 30 * 24 * 60 * 60,
+      conversationAccessMode: null,
     };
   }
   if (integrationId !== null || expectedIntegrationControlEpoch !== null) {
     throw new UnauthorizedError("Conversation evidence cannot use a person integration");
   }
-  return resolveActiveConversationScope(transaction, scope.participantEpochId);
+  if (conversationAccessMode === undefined) {
+    throw new UnauthorizedError("Conversation sources require an explicit access mode");
+  }
+  return resolveActiveConversationScope(
+    transaction,
+    scope.participantEpochId,
+    conversationAccessMode,
+    occurredAt,
+  );
 }
 
 async function loadCalendarPrivacy(
@@ -2200,13 +2339,217 @@ async function invalidateIntegrationArtifacts(
   `;
 }
 
+async function upsertEligiblePrivateViews(
+  transaction: Transaction,
+  sourceRevisionId: string,
+  participantEpochId: string,
+): Promise<number> {
+  const rows = await transaction<{ readonly person_id: string }[]>`
+    with eligible as (
+      select distinct on (revision.id, person.id)
+        revision.id as source_revision_id,
+        revision.participant_epoch_id,
+        participant.person_identity_id,
+        person.id as person_id,
+        person.control_epoch,
+        least(
+          revision.retention_until,
+          revision.captured_at + policy.retention_seconds * interval '1 second'
+        ) as retention_until,
+        greatest(
+          revision.captured_at,
+          participant.consented_at,
+          person.registered_at,
+          identity.verified_at,
+          policy.effective_at
+        ) as granted_at
+      from source_revisions revision
+      join participant_epochs epoch on epoch.id = revision.participant_epoch_id
+      join conversations conversation on conversation.id = epoch.conversation_id
+      join epoch_participants participant
+        on participant.participant_epoch_id = revision.participant_epoch_id
+      join person_identities identity on identity.id = participant.person_identity_id
+      join people person on person.id = identity.person_id
+      join participant_policies policy
+        on policy.conversation_id = conversation.id
+        and policy.person_id = person.id
+        and policy.status = 'active'
+      where revision.id = ${sourceRevisionId}
+        and revision.participant_epoch_id = ${participantEpochId}
+        and revision.conversation_access_mode = 'independent_private_views'
+        and revision.revoked_at is null
+        and revision.content_ciphertext is not null
+        and participant.registration_status = 'registered'
+        and participant.consented_at is not null
+        and identity.status = 'verified'
+        and person.status = 'registered'
+        and person.registered_at is not null
+        and policy.allow_content_processing = true
+        and policy.retention_seconds > 0
+        and conversation.status = 'active'
+        and least(
+          revision.retention_until,
+          revision.captured_at + policy.retention_seconds * interval '1 second'
+        ) > greatest(
+          revision.captured_at,
+          participant.consented_at,
+          person.registered_at,
+          identity.verified_at,
+          policy.effective_at
+        )
+      order by revision.id, person.id, participant.person_identity_id
+    )
+    insert into source_revision_private_views as existing_view (
+      source_revision_id, participant_epoch_id, person_identity_id, person_id, person_control_epoch,
+      status, retention_until, granted_at, revoked_at
+    )
+    select source_revision_id, participant_epoch_id, person_identity_id, person_id,
+      control_epoch, 'active', retention_until, granted_at, null
+    from eligible
+    on conflict (source_revision_id, person_id) do update
+    set person_identity_id = excluded.person_identity_id,
+        person_control_epoch = excluded.person_control_epoch,
+        status = 'active',
+        retention_until = excluded.retention_until,
+        granted_at = case
+          when existing_view.status = 'active'
+            and existing_view.person_control_epoch = excluded.person_control_epoch
+            then least(existing_view.granted_at, excluded.granted_at)
+          else excluded.granted_at
+        end,
+        revoked_at = null
+    returning person_id
+  `;
+  return rows.length;
+}
+
+async function requireEligiblePrivateViewer(
+  transaction: Transaction,
+  participantEpochId: string,
+  personId: string,
+  grantedAt: Date,
+): Promise<void> {
+  const rows = await transaction<{ readonly eligible: number }[]>`
+    select 1 as eligible
+    from epoch_participants participant
+    join participant_epochs epoch on epoch.id = participant.participant_epoch_id
+    join conversations conversation on conversation.id = epoch.conversation_id
+    join person_identities identity on identity.id = participant.person_identity_id
+    join people person on person.id = identity.person_id
+    join participant_policies policy
+      on policy.conversation_id = conversation.id
+      and policy.person_id = person.id
+      and policy.status = 'active'
+    where participant.participant_epoch_id = ${participantEpochId}
+      and identity.person_id = ${personId}
+      and participant.registration_status = 'registered'
+      and participant.consented_at is not null
+      and participant.consented_at <= ${grantedAt}
+      and identity.status = 'verified'
+      and identity.verified_at <= ${grantedAt}
+      and person.status = 'registered'
+      and person.registered_at is not null
+      and person.registered_at <= ${grantedAt}
+      and policy.allow_content_processing = true
+      and policy.retention_seconds > 0
+      and policy.effective_at <= ${grantedAt}
+      and conversation.status = 'active'
+    limit 1
+  `;
+  if (!rows[0]) {
+    throw new UnauthorizedError("Person is not an eligible registered participant in this exact epoch");
+  }
+}
+
+async function upsertPrivateViewsForPerson(
+  transaction: Transaction,
+  participantEpochId: string,
+  personId: string,
+  grantedAt: Date,
+): Promise<number> {
+  const rows = await transaction<{ readonly source_revision_id: string }[]>`
+    with eligible as (
+      select distinct on (revision.id, person.id)
+        revision.id as source_revision_id,
+        revision.participant_epoch_id,
+        participant.person_identity_id,
+        person.id as person_id,
+        person.control_epoch,
+        least(
+          revision.retention_until,
+          revision.captured_at + policy.retention_seconds * interval '1 second'
+        ) as retention_until
+      from source_revisions revision
+      join participant_epochs epoch on epoch.id = revision.participant_epoch_id
+      join conversations conversation on conversation.id = epoch.conversation_id
+      join epoch_participants participant
+        on participant.participant_epoch_id = revision.participant_epoch_id
+      join person_identities identity on identity.id = participant.person_identity_id
+        and identity.person_id = ${personId}
+      join people person on person.id = identity.person_id
+      join participant_policies policy
+        on policy.conversation_id = conversation.id
+        and policy.person_id = person.id
+        and policy.status = 'active'
+      where revision.participant_epoch_id = ${participantEpochId}
+        and revision.conversation_access_mode = 'independent_private_views'
+        and revision.revoked_at is null
+        and revision.content_ciphertext is not null
+        and revision.captured_at <= ${grantedAt}
+        and revision.retention_until > ${grantedAt}
+        and participant.registration_status = 'registered'
+        and participant.consented_at is not null
+        and identity.status = 'verified'
+        and person.status = 'registered'
+        and person.control_epoch > 0
+        and policy.allow_content_processing = true
+        and policy.retention_seconds > 0
+        and conversation.status = 'active'
+        and least(
+          revision.retention_until,
+          revision.captured_at + policy.retention_seconds * interval '1 second'
+        ) > ${grantedAt}
+      order by revision.id, person.id, participant.person_identity_id
+    )
+    insert into source_revision_private_views as existing_view (
+      source_revision_id, participant_epoch_id, person_identity_id, person_id, person_control_epoch,
+      status, retention_until, granted_at, revoked_at
+    )
+    select source_revision_id, participant_epoch_id, person_identity_id, person_id,
+      control_epoch, 'active', retention_until, ${grantedAt}, null
+    from eligible
+    on conflict (source_revision_id, person_id) do update
+    set person_identity_id = excluded.person_identity_id,
+        person_control_epoch = excluded.person_control_epoch,
+        status = 'active',
+        retention_until = excluded.retention_until,
+        granted_at = excluded.granted_at,
+        revoked_at = null
+    returning source_revision_id
+  `;
+  return rows.length;
+}
+
 async function resolveActiveConversationScope(
   transaction: Transaction,
   participantEpochId: string,
+  conversationAccessMode: ConversationSourceAccessMode = "unanimously_shared",
+  occurredAt?: Date,
 ): Promise<ScopeResolution> {
+  // Serialize exact-epoch validation through revision insertion with membership
+  // changes. Conversation authority locks in the same conversation-then-epoch order.
+  const locked = await transaction<{ readonly epoch_id: string }[]>`
+    select epoch.id as epoch_id
+    from participant_epochs epoch
+    join conversations conversation on conversation.id = epoch.conversation_id
+    where epoch.id = ${participantEpochId}
+    for update of conversation, epoch
+  `;
+  if (!locked[0]) throw new NotFoundError("Conversation epoch does not exist");
   const rows = await transaction<
     {
       readonly authority_digest: string;
+      readonly started_at: Date;
       readonly ended_at: Date | null;
       readonly conversation_status: string;
       readonly current_epoch_id: string | null;
@@ -2216,7 +2559,7 @@ async function resolveActiveConversationScope(
       readonly retention_seconds: number | string | null;
     }[]
   >`
-    select epoch.authority_digest, epoch.ended_at,
+    select epoch.authority_digest, epoch.started_at, epoch.ended_at,
       conversation.status as conversation_status,
       conversation.current_epoch_id,
       (select count(*) from epoch_participants participant
@@ -2248,18 +2591,27 @@ async function resolveActiveConversationScope(
   const row = rows[0];
   if (!row) throw new NotFoundError("Conversation epoch does not exist");
   const participantCount = Number(row.participant_count);
+  if (row.conversation_status !== "active") {
+    throw new UnauthorizedError("Conversation source processing is not active");
+  }
   if (
-    row.conversation_status !== "active" ||
-    row.current_epoch_id !== participantEpochId ||
-    row.ended_at !== null
+    occurredAt !== undefined &&
+    (occurredAt < row.started_at || (row.ended_at !== null && occurredAt >= row.ended_at))
+  ) {
+    throw new StaleAuthorityError("Source event did not occur within the exact participant epoch");
+  }
+  if (
+    conversationAccessMode === "unanimously_shared" &&
+    (row.current_epoch_id !== participantEpochId || row.ended_at !== null)
   ) {
     throw new StaleAuthorityError("Conversation epoch is no longer current");
   }
   if (
     participantCount === 0 ||
-    Number(row.registered_count) !== participantCount ||
-    Number(row.permitted_count) !== participantCount ||
-    row.retention_seconds === null
+    (conversationAccessMode === "unanimously_shared" &&
+      (Number(row.registered_count) !== participantCount ||
+        Number(row.permitted_count) !== participantCount ||
+        row.retention_seconds === null))
   ) {
     throw new UnauthorizedError("Conversation content processing is not unanimously authorized");
   }
@@ -2271,16 +2623,94 @@ async function resolveActiveConversationScope(
       participantEpochId,
       authorityDigest: row.authority_digest,
     }),
-    retentionSeconds: Number(row.retention_seconds),
+    retentionSeconds: conversationAccessMode === "unanimously_shared" ? Number(row.retention_seconds) : null,
+    conversationAccessMode,
   };
 }
 
-async function revalidateReadScope(transaction: Transaction, scope: SourceScope): Promise<void> {
+interface RevisionAccessRow {
+  readonly id: string;
+  readonly owner_person_id: string | null;
+  readonly participant_epoch_id: string | null;
+  readonly conversation_access_mode: string | null;
+  readonly captured_at: Date;
+  readonly retention_until: Date;
+  readonly revoked_at: Date | null;
+}
+
+async function authorizeRevisionRead(
+  transaction: Transaction,
+  revision: RevisionAccessRow,
+  scope: SourceScope,
+  privateViewerPersonId: string | undefined,
+  asOf: Date,
+): Promise<void> {
+  assertScopeMatchesRow(scope, revision);
   if (scope.kind === "person") {
+    if (privateViewerPersonId !== undefined || revision.conversation_access_mode !== null) {
+      throw new UnauthorizedError("Person source access cannot use a conversation private view");
+    }
     await requireRegisteredPerson(transaction, scope.personId, false);
     return;
   }
-  await resolveActiveConversationScope(transaction, scope.participantEpochId);
+
+  if (privateViewerPersonId === undefined) {
+    if (revision.conversation_access_mode !== "unanimously_shared") {
+      throw new UnauthorizedError("This conversation source requires an exact private viewer");
+    }
+    await resolveActiveConversationScope(transaction, scope.participantEpochId);
+    return;
+  }
+  if (revision.conversation_access_mode !== "independent_private_views") {
+    throw new UnauthorizedError("A private viewer cannot widen a unanimously shared source");
+  }
+
+  const rows = await transaction<{ readonly authorized: number }[]>`
+    select 1 as authorized
+    from source_revision_private_views private_view
+    join source_revisions source_revision
+      on source_revision.id = private_view.source_revision_id
+      and source_revision.participant_epoch_id = private_view.participant_epoch_id
+    join participant_epochs epoch on epoch.id = private_view.participant_epoch_id
+    join conversations conversation on conversation.id = epoch.conversation_id
+    join epoch_participants participant
+      on participant.participant_epoch_id = private_view.participant_epoch_id
+      and participant.person_identity_id = private_view.person_identity_id
+    join person_identities identity
+      on identity.id = participant.person_identity_id
+      and identity.person_id = private_view.person_id
+    join people person on person.id = private_view.person_id
+    join participant_policies policy
+      on policy.conversation_id = conversation.id
+      and policy.person_id = private_view.person_id
+      and policy.status = 'active'
+    where private_view.source_revision_id = ${revision.id}
+      and private_view.participant_epoch_id = ${scope.participantEpochId}
+      and private_view.person_id = ${privateViewerPersonId}
+      and private_view.status = 'active'
+      and private_view.granted_at <= ${asOf}
+      and private_view.retention_until > ${asOf}
+      and source_revision.revoked_at is null
+      and source_revision.retention_until > ${asOf}
+      and source_revision.conversation_access_mode = 'independent_private_views'
+      and participant.registration_status = 'registered'
+      and participant.consented_at is not null
+      and identity.status = 'verified'
+      and person.status = 'registered'
+      and person.control_epoch = private_view.person_control_epoch
+      and conversation.status = 'active'
+      and policy.allow_content_processing = true
+      and policy.retention_seconds > 0
+      and policy.effective_at <= ${asOf}
+      and least(
+        private_view.retention_until,
+        source_revision.captured_at + policy.retention_seconds * interval '1 second'
+      ) > ${asOf}
+    limit 1
+  `;
+  if (!rows[0]) {
+    throw new UnauthorizedError("No active exact private source view exists for this person");
+  }
 }
 
 async function loadReadableRevision(
@@ -2294,13 +2724,13 @@ async function loadReadableRevision(
     ? await transaction<SourceRevisionRow[]>`
         select id, source_object_id, revision_number, owner_person_id, participant_epoch_id,
           scope_digest, content_digest, content_ciphertext, content_key_version,
-          occurred_at, captured_at, retention_until, revoked_at
+          occurred_at, captured_at, retention_until, revoked_at, conversation_access_mode
         from source_revisions where id = ${revisionId} for update
       `
     : await transaction<SourceRevisionRow[]>`
         select id, source_object_id, revision_number, owner_person_id, participant_epoch_id,
           scope_digest, content_digest, content_ciphertext, content_key_version,
-          occurred_at, captured_at, retention_until, revoked_at
+          occurred_at, captured_at, retention_until, revoked_at, conversation_access_mode
         from source_revisions where id = ${revisionId}
       `;
   const revision = rows[0];
@@ -2333,6 +2763,13 @@ async function invalidateRevisions(
   }
   const mutableRevisionIds = [...revisionIds];
   const revokedCandidateCount = await invalidateRevisionDependents(transaction, mutableRevisionIds);
+  await transaction`
+    update source_revision_private_views
+    set status = 'revoked',
+        revoked_at = greatest(${invalidatedAt}, granted_at)
+    where source_revision_id = any(${transaction.array(mutableRevisionIds)}::uuid[])
+      and status = 'active'
+  `;
   await transaction`
     delete from source_blobs
     where source_revision_id = any(${transaction.array(mutableRevisionIds)}::uuid[])

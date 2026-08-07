@@ -105,8 +105,9 @@ export interface ExceptionItem {
 
 export interface ChatView {
   id: string;
+  kind: "direct" | "group";
   title: string;
-  mode: "content_disabled" | "read_enabled_write_disabled" | "trusted_write_enabled" | "paused";
+  mode: "registration_required" | "observe_only" | "trusted_write_enabled" | "paused";
   epochId: string;
   epochStartedAt: string;
   participants: {

@@ -130,11 +130,15 @@ export class LinqMessageEffectExecutor {
       try {
         const chat = await this.linq.getChat(receipt.providerChatId);
         const recipient = payload.data.recipient.toLocaleLowerCase("en-US");
+        const activeParticipants = chat.participants.filter((participant) => participant.status === "active");
         const humans = chat.participants.filter(
           (participant) => participant.status === "active" && !participant.isSelf,
         );
+        const florence = activeParticipants.filter((participant) => participant.isSelf);
         if (
           chat.kind !== "direct" ||
+          activeParticipants.length !== 2 ||
+          florence.length !== 1 ||
           humans.length !== 1 ||
           humans[0]?.address.toLocaleLowerCase("en-US") !== recipient
         ) {

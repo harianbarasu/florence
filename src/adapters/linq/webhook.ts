@@ -155,6 +155,10 @@ function normalizeChannel(chatId: string, kind: LinqChannelRef["kind"]): LinqCha
   return { providerChatId: chatId, kind };
 }
 
+function normalizeWebhookChannel(chatId: string, isGroup: boolean | null | undefined): LinqChannelRef {
+  return normalizeChannel(chatId, isGroup === true ? "group" : isGroup === false ? "direct" : "unknown");
+}
+
 function normalizePart(input: unknown): LinqMessagePart {
   const text = providerTextPartSchema.safeParse(input);
   if (text.success) {
@@ -239,6 +243,9 @@ export function unwrapLinqWebhook(input: UnwrapLinqWebhookInput): LinqWebhookEnv
     case "message.received": {
       const data = parseData(providerMessageReceivedSchema, base.data);
       const sentAt = toIsoTimestamp(data.sent_at, "message sent_at");
+      const reconciledAt = data.reconciled_at
+        ? toIsoTimestamp(data.reconciled_at, "message reconciled_at")
+        : undefined;
       const replyTo = data.reply_to
         ? {
             providerMessageId: data.reply_to.message_id,
@@ -249,13 +256,14 @@ export function unwrapLinqWebhook(input: UnwrapLinqWebhookInput): LinqWebhookEnv
         ...common,
         eventType: "linq.message.received",
         occurredAt: sentAt,
-        channel: normalizeChannel(data.chat.id, data.chat.is_group ? "group" : "direct"),
+        channel: normalizeWebhookChannel(data.chat.id, data.chat.is_group),
         message: {
           providerMessageId: data.id,
           sender: normalizeParticipant(data.sender_handle),
           service: normalizeService(data.service),
           parts: data.parts.map(normalizePart),
           sentAt,
+          ...(reconciledAt ? { reconciledAt } : {}),
           ...(replyTo ? { replyTo } : {}),
         },
       };
@@ -267,7 +275,7 @@ export function unwrapLinqWebhook(input: UnwrapLinqWebhookInput): LinqWebhookEnv
         ...common,
         eventType: "linq.message.edited",
         occurredAt: editedAt,
-        channel: normalizeChannel(data.chat.id, data.chat.is_group ? "group" : "direct"),
+        channel: normalizeWebhookChannel(data.chat.id, data.chat.is_group),
         edit: {
           providerMessageId: data.id,
           editor: normalizeParticipant(data.sender_handle),
@@ -328,7 +336,7 @@ export function unwrapLinqWebhook(input: UnwrapLinqWebhookInput): LinqWebhookEnv
         ...common,
         eventType: "linq.outbound.sent",
         occurredAt: sentAt,
-        channel: normalizeChannel(data.chat.id, data.chat.is_group ? "group" : "direct"),
+        channel: normalizeWebhookChannel(data.chat.id, data.chat.is_group),
         receipt: {
           providerMessageId: data.id,
           sender: normalizeParticipant(data.sender_handle),

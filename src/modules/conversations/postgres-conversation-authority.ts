@@ -152,12 +152,16 @@ export class PostgresConversationAuthority implements ConversationAuthority {
         throw new UnauthorizedError("A revoked identity cannot join a participant epoch");
       }
       const setDigest = participantSetDigest(input.participantIdentityIds);
+      let currentStartedAt: Date | null = null;
       if (conversation.current_epoch_id) {
-        const current = await transaction<{ readonly participant_set_digest: string }[]>`
-          select participant_set_digest from participant_epochs
+        const current = await transaction<
+          { readonly participant_set_digest: string; readonly started_at: Date }[]
+        >`
+          select participant_set_digest, started_at from participant_epochs
           where id = ${conversation.current_epoch_id}
         `;
-        if (current[0]?.participant_set_digest === setDigest) {
+        currentStartedAt = current[0]?.started_at ?? null;
+        if (!input.forceNewEpoch && current[0]?.participant_set_digest === setDigest) {
           return loadEpoch(transaction, conversation.current_epoch_id);
         }
       }
@@ -168,7 +172,9 @@ export class PostgresConversationAuthority implements ConversationAuthority {
       `;
       const sequence = Number(sequenceRows[0]?.sequence ?? 1);
       const epochId = randomUUID();
-      const observedAt = new Date(input.observedAt);
+      const requestedObservedAt = new Date(input.observedAt);
+      const observedAt =
+        currentStartedAt && requestedObservedAt < currentStartedAt ? currentStartedAt : requestedObservedAt;
       if (conversation.current_epoch_id) {
         await transaction`
           update participant_epochs set ended_at = ${observedAt}
@@ -224,6 +230,13 @@ export class PostgresConversationAuthority implements ConversationAuthority {
         }
       }
       await transaction`
+        update conversation_rules
+        set status = case when status = 'active' then 'superseded' else 'revoked' end,
+          ended_at = coalesce(ended_at, ${observedAt})
+        where conversation_id = ${input.conversationId}
+          and status in ('active', 'candidate')
+      `;
+      await transaction`
         update conversations
         set current_epoch_id = ${epochId}, authority_version = authority_version + 1,
             updated_at = ${observedAt}
@@ -239,12 +252,13 @@ export class PostgresConversationAuthority implements ConversationAuthority {
       const epochs = await transaction<{ readonly conversation_id: string }[]>`
         select epoch.conversation_id
         from participant_epochs epoch
-        join conversations conversation on conversation.current_epoch_id = epoch.id
+        join conversations conversation on conversation.id = epoch.conversation_id
         where epoch.id = ${input.participantEpochId}
+          and conversation.status not in ('deletion_fenced', 'deleted')
         for update of conversation
       `;
       const epoch = epochs[0];
-      if (!epoch) throw new StaleAuthorityError("Consent must target the current participant epoch");
+      if (!epoch) throw new StaleAuthorityError("Consent must target an active observed conversation epoch");
       const participants = await transaction<{ readonly person_id: string }[]>`
         select participant.person_id
         from epoch_participants participant
@@ -256,7 +270,7 @@ export class PostgresConversationAuthority implements ConversationAuthority {
         for update of participant
       `;
       if (!participants[0]) {
-        throw new UnauthorizedError("Only a registered, verified current participant may consent");
+        throw new UnauthorizedError("Only a registered, verified exact participant may consent");
       }
       const consentedAt = new Date(input.consentedAt);
       await transaction`
@@ -266,11 +280,16 @@ export class PostgresConversationAuthority implements ConversationAuthority {
       `;
       const activePolicy = await loadActivePolicy(transaction, epoch.conversation_id, input.personId);
       if (activePolicy === null) {
+        const versions = await transaction<{ readonly latest_version: number | string }[]>`
+          select coalesce(max(version), 0) as latest_version
+          from participant_policies
+          where conversation_id = ${epoch.conversation_id} and person_id = ${input.personId}
+        `;
         await insertPolicy(transaction, {
           conversationId: epoch.conversation_id,
           personId: input.personId,
           actorPersonId: input.personId,
-          version: 1,
+          version: Number(versions[0]?.latest_version ?? 0) + 1,
           policy: input.policy,
           approvalDigest: null,
           changedAt: consentedAt,
@@ -286,7 +305,7 @@ export class PostgresConversationAuthority implements ConversationAuthority {
     return inTransaction(this.database, async (transaction) => {
       await lockConversationVersion(transaction, input.conversationId, input.expectedAuthorityVersion);
       const snapshot = await loadSnapshot(transaction, input.conversationId);
-      const participantIds = snapshot.participants.map((participant) => participant.personId);
+      const participantIds = [...new Set(snapshot.participants.map((participant) => participant.personId))];
       if (!participantIds.includes(input.targetPersonId) || !participantIds.includes(input.actorPersonId)) {
         throw new UnauthorizedError("Policy actors and targets must be current participants");
       }
@@ -376,7 +395,7 @@ export class PostgresConversationAuthority implements ConversationAuthority {
       if (!suppression) throw new NotFoundError("Conversation narrowing does not exist");
       await lockConversationVersion(transaction, suppression.conversation_id, input.expectedAuthorityVersion);
       const snapshot = await loadSnapshot(transaction, suppression.conversation_id);
-      const participantIds = snapshot.participants.map((participant) => participant.personId);
+      const participantIds = [...new Set(snapshot.participants.map((participant) => participant.personId))];
       if (!participantIds.includes(input.actorPersonId))
         throw new UnauthorizedError("Actor is not a current participant");
       requireExactApprovals(participantIds, input.approvedByPersonIds);
@@ -398,15 +417,19 @@ export class PostgresConversationAuthority implements ConversationAuthority {
       const snapshot = await loadSnapshot(transaction, input.conversationId);
       if (snapshot.participantSetDigest === null)
         throw new UnauthorizedError("Conversation has no live epoch");
-      const participantIds = snapshot.participants.map((participant) => participant.personId);
+      const participantIds = [...new Set(snapshot.participants.map((participant) => participant.personId))];
       if (!participantIds.includes(input.actorPersonId))
         throw new UnauthorizedError("Actor is not a current participant");
       requireExactApprovals(participantIds, input.approvedByPersonIds);
-      const previous = await transaction<{ readonly id: string; readonly version: number | string }[]>`
-        select id, version from conversation_rules
+      const previous = await transaction<{ readonly id: string }[]>`
+        select id from conversation_rules
         where conversation_id = ${input.conversationId} and rule_key = ${input.ruleKey}
           and status = 'active'
         for update
+      `;
+      const versions = await transaction<{ readonly latest_version: number | string }[]>`
+        select coalesce(max(version), 0) as latest_version from conversation_rules
+        where conversation_id = ${input.conversationId} and rule_key = ${input.ruleKey}
       `;
       const activatedAt = new Date(input.activatedAt);
       if (previous[0]) {
@@ -422,7 +445,7 @@ export class PostgresConversationAuthority implements ConversationAuthority {
           effective_at, created_at
         ) values (
           ${randomUUID()}, ${input.conversationId}, ${input.ruleKey},
-          ${Number(previous[0]?.version ?? 0) + 1}, 'active', ${input.purpose},
+          ${Number(versions[0]?.latest_version ?? 0) + 1}, 'active', ${input.purpose},
           ${transaction.array(input.allowedOperations)}, ${snapshot.participantSetDigest},
           ${participantApprovalDigest(input.approvedByPersonIds)}, ${input.actorPersonId},
           ${activatedAt}, ${activatedAt}
@@ -498,13 +521,14 @@ async function loadSnapshot(transaction: Transaction, conversationId: string) {
   const conversations = await transaction<
     {
       readonly id: string;
+      readonly kind: string;
       readonly status: string;
       readonly authority_version: number | string;
       readonly current_epoch_id: string | null;
       readonly participant_set_digest: string | null;
     }[]
   >`
-    select conversation.id, conversation.status, conversation.authority_version,
+    select conversation.id, conversation.kind, conversation.status, conversation.authority_version,
       conversation.current_epoch_id, epoch.participant_set_digest
     from conversations conversation
     left join participant_epochs epoch on epoch.id = conversation.current_epoch_id
@@ -558,6 +582,7 @@ async function loadSnapshot(transaction: Transaction, conversationId: string) {
   `;
   return ConversationAuthoritySnapshotSchema.parse({
     conversationId: conversation.id,
+    conversationKind: conversation.kind,
     conversationStatus: conversation.status,
     authorityVersion: Number(conversation.authority_version),
     participantEpochId: conversation.current_epoch_id,

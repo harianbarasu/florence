@@ -34,6 +34,12 @@ export type AppEnvelope =
       readonly providerEventId: string;
     }
   | {
+      /** Commits an ephemeral worker's response through current exact private authority. */
+      readonly kind: "linq.private_invocation_response";
+      readonly internalProviderEventId: string;
+      readonly responseText: string;
+    }
+  | {
       /** Reconciles an authoritative live audience before an outbound cross-chat action. */
       readonly kind: "linq.reconcile_chat";
       readonly liveChat: LinqChatSnapshot;

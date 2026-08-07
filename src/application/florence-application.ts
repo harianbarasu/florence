@@ -7,7 +7,7 @@ import type {
 } from "../adapters/linq/index.js";
 import type { FlorenceConfig } from "../config.js";
 import type { Database } from "../db/client.js";
-import { PostgresWebAuth } from "../modules/auth/index.js";
+import { GOOGLE_CONNECT_HANDOFF_TTL_SECONDS, PostgresWebAuth } from "../modules/auth/index.js";
 import { openPrivateBridgePayload, PrivateSourceBridge } from "../modules/bridges/index.js";
 import {
   type ConversationAuthoritySnapshot,
@@ -102,12 +102,17 @@ interface ProcessedPrivateDmSource {
   readonly personId: string;
 }
 
+interface PrivateDmResponseCommit {
+  readonly outboxId: string;
+  readonly created: boolean;
+  readonly personId: string;
+  readonly googleActivationIncluded: boolean;
+}
+
 type ParentGoogleActivationReason =
   | "household_resolved"
   | "existing_steward_dm"
   | "reengagement_after_expiry";
-
-const PRIVATE_GOOGLE_HANDOFF_SECONDS = 30 * 60;
 
 /**
  * Florence's sole authoritative mutation seam. Provider, timer, browser, worker,
@@ -1298,26 +1303,46 @@ export class FlorenceApplication {
   private async completePrivateDmOrchestration(
     input: Extract<AppEnvelope, { kind: "linq.private_dm_orchestration_complete" }>,
   ): Promise<ProcessReceipt> {
-    const response = await this.database.begin(async (transaction) => {
+    let response: PrivateDmResponseCommit | null = null;
+    let googleActivationFailed = false;
+    if (input.response.kind === "greeting_acknowledgment") {
+      try {
+        response = await this.database.begin(async (transaction) => {
+          const source = await this.requireProcessedPrivateDmSource(
+            transaction,
+            input.internalProviderEventId,
+          );
+          if (!isNaturalPrivateGreeting("direct", messageText(source.event))) {
+            throw new UnauthorizedError("Private DM is not a deterministic greeting");
+          }
+          const googleOffer = await this.queueParentGoogleActivationOffer(
+            transaction,
+            source.personId,
+            "reengagement_after_expiry",
+            source.record,
+            input.internalProviderEventId,
+          );
+          return googleOffer
+            ? {
+                ...googleOffer,
+                personId: source.personId,
+                googleActivationIncluded: true,
+              }
+            : null;
+        });
+      } catch {
+        // Google setup is optional. Re-enter current private authority below so
+        // an activation failure can never erase the underlying DM response.
+        googleActivationFailed = true;
+      }
+    }
+
+    response ??= await this.database.begin(async (transaction) => {
       const source = await this.requireProcessedPrivateDmSource(transaction, input.internalProviderEventId);
       const sourceText = messageText(source.event);
       if (input.response.kind === "greeting_acknowledgment") {
         if (!isNaturalPrivateGreeting("direct", sourceText)) {
           throw new UnauthorizedError("Private DM is not a deterministic greeting");
-        }
-        const googleOffer = await this.queueParentGoogleActivationOffer(
-          transaction,
-          source.personId,
-          "reengagement_after_expiry",
-          source.record,
-          input.internalProviderEventId,
-        );
-        if (googleOffer) {
-          return {
-            ...googleOffer,
-            personId: source.personId,
-            googleActivationIncluded: true,
-          };
         }
       }
       let text: string;
@@ -1356,15 +1381,17 @@ export class FlorenceApplication {
 
     const activationOffered = response.googleActivationIncluded
       ? true
-      : await this.database.begin(async (transaction) => {
-          const source = await this.requireProcessedPrivateDmSource(
-            transaction,
-            input.internalProviderEventId,
-          );
-          if (source.personId !== response.personId) {
-            throw new StaleAuthorityError("Private DM sender changed before activation");
-          }
-          const committed = await transaction<{ readonly created_at: Date }[]>`
+      : googleActivationFailed
+        ? false
+        : await this.database.begin(async (transaction) => {
+            const source = await this.requireProcessedPrivateDmSource(
+              transaction,
+              input.internalProviderEventId,
+            );
+            if (source.personId !== response.personId) {
+              throw new StaleAuthorityError("Private DM sender changed before activation");
+            }
+            const committed = await transaction<{ readonly created_at: Date }[]>`
         select created_at from outbox
         where id = ${response.outboxId}
           and person_id = ${source.personId}
@@ -1374,17 +1401,17 @@ export class FlorenceApplication {
           and status in ('pending', 'leased', 'retry', 'submitted', 'confirmed')
         for share
       `;
-          const committedResponse = committed[0];
-          if (!committedResponse) return false;
+            const committedResponse = committed[0];
+            if (!committedResponse) return false;
 
-          const offered = await this.queueParentGoogleActivationOffer(
-            transaction,
-            source.personId,
-            "existing_steward_dm",
-            source.record,
-          );
-          if (offered) {
-            await transaction`
+            const offered = await this.queueParentGoogleActivationOffer(
+              transaction,
+              source.personId,
+              "existing_steward_dm",
+              source.record,
+            );
+            if (offered) {
+              await transaction`
           update outbox
           set available_at = greatest(
             available_at,
@@ -1392,16 +1419,18 @@ export class FlorenceApplication {
           )
           where idempotency_key = ${`google-parent-activation:${source.personId}`}
         `;
-          }
-          return offered !== null;
-        });
+            }
+            return offered !== null;
+          });
 
     return {
       accepted: true,
       duplicate: !response.created && !activationOffered,
       disposition: activationOffered
         ? "private_dm_response_then_google_activation_queued"
-        : "private_dm_response_queued",
+        : googleActivationFailed
+          ? "private_dm_response_queued_after_google_activation_failure"
+          : "private_dm_response_queued",
       ids: {
         providerEventId: input.internalProviderEventId,
         responseOutboxId: response.outboxId,
@@ -2200,7 +2229,8 @@ export class FlorenceApplication {
               ? "/sources"
               : "/home",
         },
-        expiresInSeconds: normalizedCommand === "connect google" ? PRIVATE_GOOGLE_HANDOFF_SECONDS : 10 * 60,
+        expiresInSeconds:
+          normalizedCommand === "connect google" ? GOOGLE_CONNECT_HANDOFF_TTL_SECONDS : 10 * 60,
       });
       const snapshot = await new PostgresConversationAuthority(transaction).snapshot(
         record.routing.conversationId,
@@ -2722,7 +2752,7 @@ export class FlorenceApplication {
         profile: "personal_family",
         returnPath: "/sources",
       },
-      expiresInSeconds: PRIVATE_GOOGLE_HANDOFF_SECONDS,
+      expiresInSeconds: GOOGLE_CONNECT_HANDOFF_TTL_SECONDS,
     });
     const link = `${this.config.publicBaseUrl}/handoff/${handoff.token}`;
     const text =

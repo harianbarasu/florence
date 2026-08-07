@@ -78,6 +78,19 @@ class PrivateSourceCandidateRouteUnavailableError extends Error {
   }
 }
 
+class InvalidJobPayloadError extends Error {
+  public constructor(public readonly validationError: z.ZodError) {
+    super("The durable job payload does not match its declared contract");
+    this.name = "InvalidJobPayloadError";
+  }
+}
+
+function parseJobPayload<Schema extends z.ZodType>(schema: Schema, payload: unknown): z.output<Schema> {
+  const parsed = schema.safeParse(payload);
+  if (!parsed.success) throw new InvalidJobPayloadError(parsed.error);
+  return parsed.data;
+}
+
 async function main(): Promise<void> {
   const config = loadConfig();
   const database = createDatabase(config, "florence-worker");
@@ -248,22 +261,25 @@ async function main(): Promise<void> {
         return;
       switch (job.kind) {
         case "linq.process_event": {
-          const payload = z.strictObject({ providerEventId: z.string().min(1).max(500) }).parse(job.payload);
+          const payload = parseJobPayload(
+            z.strictObject({ providerEventId: z.string().min(1).max(500) }),
+            job.payload,
+          );
           await application.process({ kind: "linq.process_event", providerEventId: payload.providerEventId });
           return;
         }
         case "orchestrate.linq_message": {
-          const payload = OrchestrateMessagePayloadSchema.parse(job.payload);
+          const payload = parseJobPayload(OrchestrateMessagePayloadSchema, job.payload);
           await orchestrator.processLinqMessage(payload.internalProviderEventId);
           return;
         }
         case "orchestrate.linq_observation": {
-          const payload = OrchestrateMessagePayloadSchema.parse(job.payload);
+          const payload = parseJobPayload(OrchestrateMessagePayloadSchema, job.payload);
           await orchestrator.processObservedLinqMessage(payload.internalProviderEventId);
           return;
         }
         case "orchestrate.private_source": {
-          const payload = PrivateSourcePayloadSchema.parse(job.payload);
+          const payload = parseJobPayload(PrivateSourcePayloadSchema, job.payload);
           const outcome = await orchestrator.processPrivateSourceRevision(
             payload.sourceRevisionId,
             payload.personId,
@@ -276,12 +292,12 @@ async function main(): Promise<void> {
           return;
         }
         case "orchestrate.private_bridge_proposal": {
-          const payload = PrivateBridgePayloadSchema.parse(job.payload);
+          const payload = parseJobPayload(PrivateBridgePayloadSchema, job.payload);
           await orchestrator.proposePrivateBridge(payload.actionIntentId);
           return;
         }
         case "private_source.deliver_candidate_notice": {
-          const payload = PrivateSourceCandidateNoticePayloadSchema.parse(job.payload);
+          const payload = parseJobPayload(PrivateSourceCandidateNoticePayloadSchema, job.payload);
           const release = await application.process({
             kind: "private_source.select_candidate_release",
             ...payload,
@@ -317,7 +333,7 @@ async function main(): Promise<void> {
           return;
         }
         case "private_bridge.commit": {
-          const payload = PrivateBridgePayloadSchema.parse(job.payload);
+          const payload = parseJobPayload(PrivateBridgePayloadSchema, job.payload);
           await application.process({
             kind: "private_bridge.commit",
             actionIntentId: payload.actionIntentId,
@@ -325,28 +341,28 @@ async function main(): Promise<void> {
           return;
         }
         case "google.bootstrap":
-          await google.bootstrap(GoogleBootstrapPayloadSchema.parse(job.payload));
+          await google.bootstrap(parseJobPayload(GoogleBootstrapPayloadSchema, job.payload));
           return;
         case "google.gmail.bootstrap":
-          await google.bootstrapGmail(GmailBootstrapPayloadSchema.parse(job.payload));
+          await google.bootstrapGmail(parseJobPayload(GmailBootstrapPayloadSchema, job.payload));
           return;
         case "google.gmail.poll":
-          await google.pollGmail(GmailPollPayloadSchema.parse(job.payload));
+          await google.pollGmail(parseJobPayload(GmailPollPayloadSchema, job.payload));
           return;
         case "google.gmail.backfill":
-          await google.backfillGmail(GmailBackfillPayloadSchema.parse(job.payload));
+          await google.backfillGmail(parseJobPayload(GmailBackfillPayloadSchema, job.payload));
           return;
         case "google.gmail.message":
-          await google.ingestGmailMessage(GmailMessagePayloadSchema.parse(job.payload));
+          await google.ingestGmailMessage(parseJobPayload(GmailMessagePayloadSchema, job.payload));
           return;
         case "google.calendar.catalog":
-          await google.catalogCalendars(CalendarCatalogPayloadSchema.parse(job.payload));
+          await google.catalogCalendars(parseJobPayload(CalendarCatalogPayloadSchema, job.payload));
           return;
         case "google.calendar.poll":
-          await google.pollCalendar(CalendarPollPayloadSchema.parse(job.payload));
+          await google.pollCalendar(parseJobPayload(CalendarPollPayloadSchema, job.payload));
           return;
         case "auth.send_step_up":
-          await sendStepUp(StepUpPayloadSchema.parse(job.payload));
+          await sendStepUp(parseJobPayload(StepUpPayloadSchema, job.payload));
           return;
         case "maintenance.tick":
           await maintenance();
@@ -872,7 +888,8 @@ function wait(milliseconds: number): Promise<void> {
 }
 
 function errorCode(error: unknown): string {
-  if (error instanceof z.ZodError) return "invalid_job_payload";
+  if (error instanceof InvalidJobPayloadError) return "invalid_job_payload";
+  if (error instanceof z.ZodError) return "runtime_contract_violation";
   if (error instanceof WorkerAttemptError) return error.code;
   if (error instanceof PrivateSourceJobOutcomeError) return error.code;
   if (error instanceof PrivateSourceCandidateRouteUnavailableError)
@@ -895,6 +912,7 @@ function isRetryableJobError(error: unknown): boolean {
   if (error instanceof LinqAudienceChangedError) return false;
   if (error instanceof LinqAttachmentError) return error.code === "download_failed";
   return !(
+    error instanceof InvalidJobPayloadError ||
     error instanceof z.ZodError ||
     error instanceof UnauthorizedError ||
     error instanceof StaleAuthorityError ||

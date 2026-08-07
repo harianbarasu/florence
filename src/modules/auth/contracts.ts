@@ -1,5 +1,9 @@
 import { z } from "zod";
 
+export const DEFAULT_HANDOFF_TTL_SECONDS = 10 * 60;
+export const MAX_STANDARD_HANDOFF_TTL_SECONDS = 15 * 60;
+export const GOOGLE_CONNECT_HANDOFF_TTL_SECONDS = 30 * 60;
+
 export const HandoffPurposeSchema = z.enum([
   "web_sign_in",
   "google_connect",
@@ -12,19 +16,32 @@ export const HandoffPurposeSchema = z.enum([
 ]);
 export type HandoffPurpose = z.infer<typeof HandoffPurposeSchema>;
 
-export const CreateHandoffInputSchema = z.strictObject({
-  personId: z.string().uuid(),
-  privateIdentityId: z.string().uuid(),
-  privateConversationId: z.string().uuid().nullable(),
-  purpose: HandoffPurposeSchema,
-  context: z.record(z.string(), z.unknown()).default({}),
-  expiresInSeconds: z
-    .number()
-    .int()
-    .min(60)
-    .max(15 * 60)
-    .default(10 * 60),
-});
+export const CreateHandoffInputSchema = z
+  .strictObject({
+    personId: z.string().uuid(),
+    privateIdentityId: z.string().uuid(),
+    privateConversationId: z.string().uuid().nullable(),
+    purpose: HandoffPurposeSchema,
+    context: z.record(z.string(), z.unknown()).default({}),
+    expiresInSeconds: z
+      .number()
+      .int()
+      .min(60)
+      .max(GOOGLE_CONNECT_HANDOFF_TTL_SECONDS)
+      .default(DEFAULT_HANDOFF_TTL_SECONDS),
+  })
+  .superRefine((input, context) => {
+    if (input.purpose !== "google_connect" && input.expiresInSeconds > MAX_STANDARD_HANDOFF_TTL_SECONDS) {
+      context.addIssue({
+        code: "too_big",
+        maximum: MAX_STANDARD_HANDOFF_TTL_SECONDS,
+        origin: "number",
+        inclusive: true,
+        path: ["expiresInSeconds"],
+        message: "Only Google connection handoffs may remain valid for longer than 15 minutes",
+      });
+    }
+  });
 export type CreateHandoffInput = z.infer<typeof CreateHandoffInputSchema>;
 
 export interface CreatedHandoff {

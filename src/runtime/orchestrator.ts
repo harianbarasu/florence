@@ -14,7 +14,6 @@ import type { StoredLinqEvent } from "../application/florence-application.js";
 import { PrivateSourceReconciler } from "../application/private-source-reconciler.js";
 import type { FlorenceConfig } from "../config.js";
 import type { Database } from "../db/client.js";
-import { PostgresWebAuth } from "../modules/auth/index.js";
 import { PrivateSourceBridge } from "../modules/bridges/index.js";
 import {
   type ConversationAuthoritySnapshot,
@@ -1402,66 +1401,28 @@ export class FlorenceOrchestrator {
     `;
     if (existing[0]) return `coverage_already_${existing[0].state}`;
     if (context.record.routing.chatKind === "direct") {
-      const personId = context.record.routing.senderPersonId;
-      const identityId = context.record.routing.senderIdentityId;
-      if (!personId || !identityId) return "private_coverage_owner_unavailable";
-      const proposed = await this.#sources.apply({
-        kind: "propose_private_candidate",
-        personId,
-        integrationId: null,
-        expectedIntegrationControlEpoch: null,
-        candidateKind: "coverage_proposal",
-        content: jsonObject({
-          requiredOutcome: interpretation.requiredOutcome,
-          changedFact: interpretation.changedFact,
-          timeFacts: [...interpretation.timeFacts],
-          uncertainties: [...interpretation.uncertainties],
-          sensitivity: interpretation.sensitivity,
-          disclosureStatus: "private_owner_only",
-        }),
-        evidenceSourceRevisionIds: [...context.evidenceSourceRevisionIds],
-        confidence: 0.85,
-        proposedAt: new Date().toISOString(),
-        requestedExpiresAt: new Date(Date.now() + 7 * 86_400_000).toISOString(),
-      });
-      if (proposed.kind !== "private_candidate_proposed") {
-        return "private_coverage_candidate_failed";
+      if (!interpretation.requiredOutcome) return "private_coverage_candidate_failed";
+      if (!this.mutationProcessor) return "coverage_application_unavailable";
+      try {
+        const receipt = await this.mutationProcessor.process({
+          kind: "coverage.apply",
+          proposal: {
+            kind: "private_need_proposed",
+            internalProviderEventId: context.row.id,
+            evidenceSourceRevisionIds: [...context.evidenceSourceRevisionIds],
+            requiredOutcome: interpretation.requiredOutcome,
+            changedFact: interpretation.changedFact,
+            timeFacts: [...interpretation.timeFacts],
+            uncertainties: [...interpretation.uncertainties],
+            sensitivity: interpretation.sensitivity,
+          },
+        });
+        return receipt.disposition;
+      } catch (error) {
+        if (error instanceof StaleAuthorityError) return "coverage_stale_before_commit";
+        if (error instanceof UnauthorizedError) return "coverage_unauthorized_before_commit";
+        throw error;
       }
-      await this.database.begin(async (transaction) => {
-        const idempotencyKey = `private-coverage-review:${proposed.candidateId}`;
-        const alreadyQueued = await transaction<{ readonly present: boolean }[]>`
-          select exists(
-            select 1 from outbox where idempotency_key = ${idempotencyKey}
-          ) as present
-        `;
-        if (alreadyQueued[0]?.present) return;
-        const latest = await new PostgresConversationAuthority(transaction).snapshot(
-          context.record.routing.conversationId,
-        );
-        const handoff = await new PostgresWebAuth(
-          transaction,
-          this.secretBox,
-          this.config.security.tokenKey,
-        ).createHandoff({
-          personId,
-          privateIdentityId: identityId,
-          privateConversationId: context.record.routing.conversationId,
-          purpose: "private_review",
-          context: { returnPath: "/sources", candidateId: proposed.candidateId },
-          expiresInSeconds: 10 * 60,
-        });
-        await queueConversationEffect({
-          transaction,
-          secretBox: this.secretBox,
-          context,
-          snapshot: latest,
-          text: `I can help close that. I won’t say anything to your family until you approve the exact wording and group: ${this.config.publicBaseUrl}/handoff/${handoff.token}\n\nThis private link expires in 10 minutes.`,
-          sendKind: "direct_response",
-          operation: "private_source_review",
-          idempotencyKey,
-        });
-      });
-      return proposed.duplicate ? "private_coverage_review_already_open" : "private_coverage_review_created";
     }
     if (!context.household) {
       const personId = context.record.routing.senderPersonId;

@@ -3,6 +3,7 @@ import type { TransactionSql } from "postgres";
 import type { LinqMessageReceivedEvent, LinqWebhookEnvelope } from "../adapters/linq/index.js";
 import type { FlorenceConfig } from "../config.js";
 import type { Database } from "../db/client.js";
+import { PostgresWebAuth } from "../modules/auth/index.js";
 import {
   type ConversationAuthoritySnapshot,
   evaluateConversationMode,
@@ -14,7 +15,7 @@ import {
   PostgresCoordination,
 } from "../modules/coordination/index.js";
 import { EffectOutbox } from "../modules/effects/index.js";
-import { PostgresSourceIntelligence } from "../modules/sources/index.js";
+import { JsonObjectSchema, PostgresSourceIntelligence } from "../modules/sources/index.js";
 import type { SecretBox } from "../shared/crypto.js";
 import { NotFoundError, StaleAuthorityError, UnauthorizedError } from "../shared/errors.js";
 import type { CoverageProposal, ProcessReceipt } from "./contracts.js";
@@ -123,9 +124,14 @@ export class CoverageCoordinator {
       `;
       const source = await this.reopenSource(transaction, proposal.internalProviderEventId);
       const evidence = await this.reopenEvidence(transaction, source, proposal.evidenceSourceRevisionIds);
-      return proposal.kind === "need_proposed"
-        ? this.applyNeed(transaction, source, evidence, proposal)
-        : this.applySelfResponse(transaction, source, evidence, proposal);
+      switch (proposal.kind) {
+        case "private_need_proposed":
+          return this.applyPrivateNeed(transaction, source, evidence, proposal);
+        case "need_proposed":
+          return this.applyNeed(transaction, source, evidence, proposal);
+        case "self_response_proposed":
+          return this.applySelfResponse(transaction, source, evidence, proposal);
+      }
     });
   }
 
@@ -450,6 +456,155 @@ export class CoverageCoordinator {
         coverageLoopId: loop.loopId,
         outboxId: queued.outboxId,
         ...(timerId ? { timerId } : {}),
+      },
+    };
+  }
+
+  private async applyPrivateNeed(
+    transaction: Transaction,
+    source: ReopenedSource,
+    evidence: EvidenceSet,
+    proposal: Extract<CoverageProposal, { kind: "private_need_proposed" }>,
+  ): Promise<ProcessReceipt> {
+    if (source.record.routing.chatKind !== "direct" || source.snapshot.conversationKind !== "direct") {
+      throw new UnauthorizedError("Private coverage review requires the exact owner's direct chat");
+    }
+    const prior = await transaction<{ readonly id: string; readonly status: string }[]>`
+      select id, status from knowledge_candidates
+      where owner_person_id = ${source.actorPersonId}
+        and scope_kind = 'person' and candidate_kind = 'coverage_proposal'
+        and evidence_refs @> ${transaction.json([evidence.anchorSourceRevisionId])}
+      order by proposed_at, id
+      limit 2
+      for update
+    `;
+    if (prior.length > 1) {
+      throw new StaleAuthorityError("One private message already maps to multiple coverage reviews");
+    }
+    if (prior[0]?.status !== undefined && prior[0].status !== "pending") {
+      return {
+        accepted: true,
+        duplicate: true,
+        disposition: "private_coverage_review_already_reconciled",
+        ids: {
+          providerEventId: source.internalProviderEventId,
+          candidateId: prior[0].id,
+        },
+      };
+    }
+
+    const now = new Date();
+    const sources = new PostgresSourceIntelligence(transaction, this.secretBox, {
+      rawRetentionDays: this.config.defaults.rawSourceRetentionDays,
+      privateCandidateRetentionDays: 7,
+    });
+    const candidateResult = prior[0]
+      ? null
+      : await sources.apply({
+          kind: "propose_private_candidate",
+          personId: source.actorPersonId,
+          integrationId: null,
+          expectedIntegrationControlEpoch: null,
+          candidateKind: "coverage_proposal",
+          content: JsonObjectSchema.parse({
+            requiredOutcome: proposal.requiredOutcome,
+            changedFact: proposal.changedFact,
+            timeFacts: [...proposal.timeFacts],
+            uncertainties: [...proposal.uncertainties],
+            sensitivity: proposal.sensitivity,
+            disclosureStatus: "private_owner_only",
+          }),
+          evidenceSourceRevisionIds: [...evidence.ids],
+          confidence: 0.85,
+          proposedAt: now.toISOString(),
+          requestedExpiresAt: new Date(now.getTime() + 7 * 86_400_000).toISOString(),
+        });
+    if (candidateResult && candidateResult.kind !== "private_candidate_proposed") {
+      throw new StaleAuthorityError("Private coverage review was not created");
+    }
+    const candidateId = prior[0]?.id ?? candidateResult?.candidateId;
+    if (!candidateId) throw new StaleAuthorityError("Private coverage review lost its identity");
+    const idempotencyKey = `private-coverage-review:${candidateId}`;
+    const existingOutbox = await transaction<{ readonly id: string }[]>`
+      select id from outbox where idempotency_key = ${idempotencyKey} limit 1
+    `;
+    if (existingOutbox[0]) {
+      return {
+        accepted: true,
+        duplicate: true,
+        disposition: "private_coverage_review_already_open",
+        ids: {
+          providerEventId: source.internalProviderEventId,
+          candidateId,
+          outboxId: existingOutbox[0].id,
+        },
+      };
+    }
+
+    const authorization = await this.requireSendAuthorization(
+      transaction,
+      source.snapshot,
+      "direct_response",
+      "private_source_review",
+    );
+    const handoff = await new PostgresWebAuth(
+      transaction,
+      this.secretBox,
+      this.config.security.tokenKey,
+    ).createHandoff({
+      personId: source.actorPersonId,
+      privateIdentityId: source.actorIdentityId,
+      privateConversationId: source.record.routing.conversationId,
+      purpose: "private_review",
+      context: { returnPath: "/sources", candidateId },
+      expiresInSeconds: 10 * 60,
+    });
+    const text = `I can help close that. I won’t say anything to your family until you approve the exact wording and group: ${this.config.publicBaseUrl}/handoff/${handoff.token}\n\nThis private link expires in 10 minutes.`;
+    const queued = await new EffectOutbox(transaction, this.secretBox).authorizeAndEnqueue({
+      actorPersonId: source.actorPersonId,
+      person: { id: source.actorPersonId, controlEpoch: source.actorControlEpoch },
+      conversation: {
+        id: source.record.routing.conversationId,
+        authorityVersion: source.snapshot.authorityVersion,
+      },
+      participantEpochId: source.record.routing.participantEpochId,
+      expectedParticipantDigest: source.record.routing.appParticipantDigest,
+      evidenceSourceRevisionIds: [...evidence.ids],
+      effectKind: "linq.message",
+      idempotencyKey,
+      data: { candidateId, sourceEvidenceRevisionIds: [...evidence.ids] },
+      policy: {
+        exactPrivateDm: true,
+        noSourceContent: true,
+        operation: "private_source_review",
+      },
+      target: {
+        providerChatId: source.providerChatId,
+        participantEpochId: source.record.routing.participantEpochId,
+        personId: source.actorPersonId,
+      },
+      payload: {
+        providerChatId: source.providerChatId,
+        expectedProviderParticipantDigest: source.providerParticipantDigest,
+        text,
+      },
+      reasonCodes: ["current_private_coverage_candidate", "exact_private_dm", authorization.reason],
+      authorizationExpiresAt: effectExpiry(
+        now,
+        evidence.accessExpiresAt,
+        new Date(now.getTime() + 10 * 60_000).toISOString(),
+      ),
+    });
+    return {
+      accepted: true,
+      duplicate: !queued.created,
+      disposition: candidateResult?.duplicate
+        ? "private_coverage_review_already_open"
+        : "private_coverage_review_created",
+      ids: {
+        providerEventId: source.internalProviderEventId,
+        candidateId,
+        outboxId: queued.outboxId,
       },
     };
   }
@@ -1078,8 +1233,28 @@ function validateProposal(proposal: CoverageProposal): void {
     }
     return;
   }
+  if (proposal.kind === "private_need_proposed") {
+    if (!proposal.requiredOutcome.trim() || proposal.requiredOutcome.trim().length > 500) {
+      throw new UnauthorizedError("Private coverage outcome is outside the allowed bounds");
+    }
+    if (proposal.changedFact !== null && proposal.changedFact.trim().length > 500) {
+      throw new UnauthorizedError("Private coverage changed fact is outside the allowed bounds");
+    }
+    validateBoundedFacts(proposal.timeFacts, 12, "Private coverage time fact");
+    validateBoundedFacts(proposal.uncertainties, 8, "Private coverage uncertainty");
+    return;
+  }
   if (!Number.isFinite(proposal.confidence) || proposal.confidence < 0 || proposal.confidence > 1) {
     throw new UnauthorizedError("Coverage response confidence must be between zero and one");
+  }
+}
+
+function validateBoundedFacts(values: readonly string[], maximum: number, label: string): void {
+  if (values.length > maximum) throw new UnauthorizedError(`${label} count is outside the allowed bounds`);
+  for (const value of values) {
+    if (!value.trim() || value.trim().length > 300) {
+      throw new UnauthorizedError(`${label} is outside the allowed bounds`);
+    }
   }
 }
 

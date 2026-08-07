@@ -66,6 +66,17 @@ export interface PrivateSourceReconciliationProposal {
 /** A worker may interpret evidence, but it cannot choose mutation authority or a loop target. */
 export type CoverageProposal =
   | {
+      /** A direct-message need remains person-private until its owner approves a bridge. */
+      readonly kind: "private_need_proposed";
+      readonly internalProviderEventId: string;
+      readonly evidenceSourceRevisionIds: readonly string[];
+      readonly requiredOutcome: string;
+      readonly changedFact: string | null;
+      readonly timeFacts: readonly string[];
+      readonly uncertainties: readonly string[];
+      readonly sensitivity: "ordinary" | "personal" | "sensitive";
+    }
+  | {
       readonly kind: "need_proposed";
       readonly internalProviderEventId: string;
       readonly evidenceSourceRevisionIds: readonly string[];

@@ -598,7 +598,7 @@ export class CoverageCoordinator {
       authorizationExpiresAt: effectExpiry(
         now,
         evidence.accessExpiresAt,
-        new Date(now.getTime() + 10 * 60_000).toISOString(),
+        new Date(now.getTime() + 5 * 60_000).toISOString(),
       ),
     });
     return {

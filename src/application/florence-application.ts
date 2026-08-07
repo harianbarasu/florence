@@ -102,7 +102,10 @@ interface ProcessedPrivateDmSource {
   readonly personId: string;
 }
 
-type ParentGoogleActivationReason = "household_resolved" | "existing_steward_dm";
+type ParentGoogleActivationReason =
+  | "household_resolved"
+  | "existing_steward_dm"
+  | "reengagement_after_expiry";
 
 /**
  * Florence's sole authoritative mutation seam. Provider, timer, browser, worker,
@@ -1273,13 +1276,29 @@ export class FlorenceApplication {
     const response = await this.database.begin(async (transaction) => {
       const source = await this.requireProcessedPrivateDmSource(transaction, input.internalProviderEventId);
       const sourceText = messageText(source.event);
-      let text: string;
-      let operation: string;
-      let idempotencyKey: string;
       if (input.response.kind === "greeting_acknowledgment") {
         if (!isNaturalPrivateGreeting("direct", sourceText)) {
           throw new UnauthorizedError("Private DM is not a deterministic greeting");
         }
+        const googleOffer = await this.queueParentGoogleActivationOffer(
+          transaction,
+          source.personId,
+          "reengagement_after_expiry",
+          source.record,
+          input.internalProviderEventId,
+        );
+        if (googleOffer) {
+          return {
+            ...googleOffer,
+            personId: source.personId,
+            googleActivationIncluded: true,
+          };
+        }
+      }
+      let text: string;
+      let operation: string;
+      let idempotencyKey: string;
+      if (input.response.kind === "greeting_acknowledgment") {
         text = "Hi! I’m here. What can I help you with?";
         operation = "private_dm_greeting";
         idempotencyKey = `private-dm-greeting:${input.internalProviderEventId}`;
@@ -1307,15 +1326,20 @@ export class FlorenceApplication {
         idempotencyKey,
       );
       if (!queued) throw new StaleAuthorityError("Private DM response is no longer authorized");
-      return { ...queued, personId: source.personId };
+      return { ...queued, personId: source.personId, googleActivationIncluded: false };
     });
 
-    const activationOffered = await this.database.begin(async (transaction) => {
-      const source = await this.requireProcessedPrivateDmSource(transaction, input.internalProviderEventId);
-      if (source.personId !== response.personId) {
-        throw new StaleAuthorityError("Private DM sender changed before activation");
-      }
-      const committed = await transaction<{ readonly created_at: Date }[]>`
+    const activationOffered = response.googleActivationIncluded
+      ? true
+      : await this.database.begin(async (transaction) => {
+          const source = await this.requireProcessedPrivateDmSource(
+            transaction,
+            input.internalProviderEventId,
+          );
+          if (source.personId !== response.personId) {
+            throw new StaleAuthorityError("Private DM sender changed before activation");
+          }
+          const committed = await transaction<{ readonly created_at: Date }[]>`
         select created_at from outbox
         where id = ${response.outboxId}
           and person_id = ${source.personId}
@@ -1325,17 +1349,17 @@ export class FlorenceApplication {
           and status in ('pending', 'leased', 'retry', 'submitted', 'confirmed')
         for share
       `;
-      const committedResponse = committed[0];
-      if (!committedResponse) return false;
+          const committedResponse = committed[0];
+          if (!committedResponse) return false;
 
-      const offered = await this.queueParentGoogleActivationOffer(
-        transaction,
-        source.personId,
-        "existing_steward_dm",
-        source.record,
-      );
-      if (offered) {
-        await transaction`
+          const offered = await this.queueParentGoogleActivationOffer(
+            transaction,
+            source.personId,
+            "existing_steward_dm",
+            source.record,
+          );
+          if (offered) {
+            await transaction`
           update outbox
           set available_at = greatest(
             available_at,
@@ -1343,9 +1367,9 @@ export class FlorenceApplication {
           )
           where idempotency_key = ${`google-parent-activation:${source.personId}`}
         `;
-      }
-      return offered;
-    });
+          }
+          return offered !== null;
+        });
 
     return {
       accepted: true,
@@ -2075,6 +2099,46 @@ export class FlorenceApplication {
     }
     if (
       record.routing.chatKind === "direct" &&
+      person &&
+      /^(?:not now|no thanks|skip google|don['’]t connect google|do not connect google)$/u.test(
+        normalizedCommand,
+      )
+    ) {
+      const personId = record.routing.senderPersonId;
+      if (!personId) return "ignored";
+      const recentOffers = await transaction<{ readonly present: boolean }[]>`
+        select exists(
+          select 1 from auth_handoffs handoff
+          where handoff.person_id = ${personId} and handoff.purpose = 'google_connect'
+            and handoff.created_at > now() - interval '24 hours'
+        ) and not exists(
+          select 1 from integrations integration
+          where integration.person_id = ${personId} and integration.provider = 'google'
+            and integration.account_kind = 'personal_family'
+            and integration.status <> 'revoked'
+        ) as present
+      `;
+      if (recentOffers[0]?.present) {
+        await transaction`
+          update people set google_activation_suppressed_at = now(), updated_at = now()
+          where id = ${personId} and status = 'registered'
+        `;
+        const snapshot = await new PostgresConversationAuthority(transaction).snapshot(
+          record.routing.conversationId,
+        );
+        await this.queueAuthorizedConversationMessage(
+          transaction,
+          record,
+          snapshot,
+          "No problem—I won’t keep asking. If you change your mind, just say “connect Google.”",
+          "direct_response",
+          "google_activation_suppressed",
+        );
+        return "google_activation_suppressed";
+      }
+    }
+    if (
+      record.routing.chatKind === "direct" &&
       /^(sign in|settings|open florence|connect google|review|open review|send me (?:a|the) review link)$/u.test(
         normalizedCommand,
       )
@@ -2082,6 +2146,12 @@ export class FlorenceApplication {
       const identityId = record.routing.senderIdentityId;
       const personId = record.routing.senderPersonId;
       if (!identityId || !personId) return "ignored";
+      if (normalizedCommand === "connect google") {
+        await transaction`
+          update people set google_activation_suppressed_at = null, updated_at = now()
+          where id = ${personId} and status = 'registered'
+        `;
+      }
       const handoff = await new PostgresWebAuth(
         transaction,
         this.secretBox,
@@ -2097,6 +2167,9 @@ export class FlorenceApplication {
               ? "private_review"
               : "web_sign_in",
         context: {
+          ...(normalizedCommand === "connect google"
+            ? { activation: "parent_google", profile: "personal_family" }
+            : {}),
           returnPath:
             normalizedCommand === "connect google" || /review/u.test(normalizedCommand)
               ? "/sources"
@@ -2111,7 +2184,9 @@ export class FlorenceApplication {
         transaction,
         record,
         snapshot,
-        `Here’s your private, single-use Florence link: ${this.config.publicBaseUrl}/handoff/${handoff.token}`,
+        normalizedCommand === "connect google"
+          ? `Here’s a fresh link to connect your personal Gmail and Calendar: ${this.config.publicBaseUrl}/handoff/${handoff.token}\n\nIt expires in 10 minutes.`
+          : `Here’s your private, single-use Florence link: ${this.config.publicBaseUrl}/handoff/${handoff.token}`,
         "direct_response",
         "private_handoff",
       );
@@ -2469,7 +2544,8 @@ export class FlorenceApplication {
     personId: string,
     reason: ParentGoogleActivationReason,
     currentRecord?: StoredLinqEvent,
-  ): Promise<boolean> {
+    reengagementEventId?: string,
+  ): Promise<{ readonly outboxId: string; readonly created: boolean } | null> {
     const scopes = await transaction<
       {
         household_id: string;
@@ -2485,6 +2561,7 @@ export class FlorenceApplication {
       join people person on person.id = membership.person_id and person.status = 'registered'
       where membership.person_id = ${personId} and membership.role = 'steward'
         and membership.status = 'active'
+        and person.google_activation_suppressed_at is null
         and not exists(
           select 1 from integrations integration
           where integration.person_id = membership.person_id
@@ -2497,15 +2574,38 @@ export class FlorenceApplication {
       for update of person
     `;
     const scope = scopes[0];
-    if (!scope) return false;
+    if (!scope) return null;
 
-    const idempotencyKey = `google-parent-activation:${personId}`;
+    const initialIdempotencyKey = `google-parent-activation:${personId}`;
     const existing = await transaction<{ present: boolean }[]>`
       select exists(
-        select 1 from outbox where idempotency_key = ${idempotencyKey}
+        select 1 from outbox where idempotency_key = ${initialIdempotencyKey}
       ) as present
     `;
-    if (existing[0]?.present) return false;
+    const initialOfferExists = existing[0]?.present === true;
+    if (initialOfferExists) {
+      if (!reengagementEventId || reason !== "reengagement_after_expiry") return null;
+      const latestHandoffs = await transaction<
+        { readonly created_at: Date; readonly expires_at: Date; readonly consumed_at: Date | null }[]
+      >`
+        select created_at, expires_at, consumed_at
+        from auth_handoffs
+        where person_id = ${personId} and purpose = 'google_connect'
+        order by created_at desc limit 1
+      `;
+      const latest = latestHandoffs[0];
+      const now = new Date();
+      if (
+        latest &&
+        ((latest.consumed_at === null && latest.expires_at > now) ||
+          (latest.consumed_at !== null && latest.created_at > new Date(now.getTime() - 15 * 60_000)))
+      ) {
+        return null;
+      }
+    }
+    const idempotencyKey = initialOfferExists
+      ? `google-parent-activation:${personId}:reengagement:${reengagementEventId}`
+      : initialIdempotencyKey;
 
     let route: ExactPrivateRoute | null = null;
     if (
@@ -2567,7 +2667,7 @@ export class FlorenceApplication {
         };
       }
     }
-    if (!route) return false;
+    if (!route) return null;
 
     const sendKind = currentRecord ? "direct_response" : "transactional";
     const authority = await new PostgresConversationAuthority(transaction).authorizeSend({
@@ -2580,7 +2680,7 @@ export class FlorenceApplication {
       ruleId: null,
     });
     if (!authority.allowed || !authority.participantEpochId || !authority.participantSetDigest) {
-      return false;
+      return null;
     }
 
     const handoff = await new PostgresWebAuth(
@@ -2601,10 +2701,12 @@ export class FlorenceApplication {
     });
     const link = `${this.config.publicBaseUrl}/handoff/${handoff.token}`;
     const text =
-      reason === "household_resolved"
-        ? `Your private family space is ready. The best next step is to connect your primary personal Google account so I can privately start reviewing recent Gmail and Calendar: ${link}\n\nWhile that sync runs, you can keep talking with me and add your co-parent, children, and family details. Connecting Google is optional; if you skip it, I won’t keep asking. If the link expires, text me “connect Google” for a fresh one.`
-        : `I’ll keep working on what you just sent. One private setup step can make future family help more useful: connect your primary personal Google account so I can start reviewing recent Gmail and Calendar: ${link}\n\nIt’s optional; if you skip it, I won’t keep asking. If the link expires, text me “connect Google” for a fresh one.`;
-    await new EffectOutbox(transaction, this.secretBox).authorizeAndEnqueue({
+      reason === "reengagement_after_expiry"
+        ? `Hi! Your family space is ready, but Google still isn’t connected. Here’s a fresh link to connect your personal Gmail and Calendar: ${link}\n\nIt expires in 10 minutes. If you’d rather skip this, just say “not now” and I won’t keep asking.`
+        : reason === "household_resolved"
+          ? `Your private family space is ready. The best next step is to connect your primary personal Google account so I can privately start reviewing recent Gmail and Calendar: ${link}\n\nWhile that sync runs, you can keep talking with me and add your co-parent, children, and family details. Connecting Google is optional; if you skip it, I won’t keep asking. If the link expires, text me “connect Google” for a fresh one.`
+          : `I’ll keep working on what you just sent. One private setup step can make future family help more useful: connect your primary personal Google account so I can start reviewing recent Gmail and Calendar: ${link}\n\nIt’s optional; if you skip it, I won’t keep asking. If the link expires, text me “connect Google” for a fresh one.`;
+    const queued = await new EffectOutbox(transaction, this.secretBox).authorizeAndEnqueue({
       actorPersonId: personId,
       person: { id: personId, controlEpoch: Number(scope.person_control_epoch) },
       household: {
@@ -2634,9 +2736,9 @@ export class FlorenceApplication {
         text,
       },
       reasonCodes: ["active_parent_steward", "no_personal_google_connection", "exact_private_dm", reason],
-      authorizationExpiresAt: new Date(Date.now() + 24 * 60 * 60_000),
+      authorizationExpiresAt: handoff.expiresAt,
     });
-    return true;
+    return queued;
   }
 
   private async queueHouseholdInvitationMessage(

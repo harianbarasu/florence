@@ -25,6 +25,10 @@ interface HouseholdRow {
   member_count: number | string;
 }
 
+// Google work at or below this priority is the live/recent-mail/calendar
+// frontier that must settle before onboarding can call private sources ready.
+const RECENT_SOURCE_PRIORITY_CEILING = 110;
+
 /**
  * Scoped control-plane read models. Every query starts from the authenticated
  * person and joins through an active relationship; callers cannot supply a
@@ -202,7 +206,7 @@ export class PostgresFlorenceQueries {
       order by proposed_at desc
       limit 25
     `;
-    const integrations = await this.database<{ count: number | string }[]>`
+    const integrationsNeedingAttention = await this.database<{ count: number | string }[]>`
       select count(*) as count from integrations
       where person_id = ${personId} and status in ('reauth_required', 'error')
     `;
@@ -258,7 +262,7 @@ export class PostgresFlorenceQueries {
         href: "/sources",
       })),
     ];
-    if (Number(integrations[0]?.count ?? 0) > 0) {
+    if (Number(integrationsNeedingAttention[0]?.count ?? 0) > 0) {
       items.push({
         id: "connection-attention",
         kind: "connection",
@@ -273,36 +277,196 @@ export class PostgresFlorenceQueries {
       select count(*) as count from household_memberships
       where person_id = ${personId} and status = 'active'
     `;
-    const integrationCount = await this.database<{ count: number | string }[]>`
-      select count(*) as count from integrations
-      where person_id = ${personId} and status = 'active'
+    const sourceSetupRows = await this.database<
+      {
+        has_active_personal: boolean;
+        has_personal_connection: boolean;
+        personal_requires_reconnect: boolean;
+        personal_ready: boolean;
+      }[]
+    >`
+      select
+        exists(
+          select 1 from integrations integration
+          where integration.person_id = ${personId}
+            and integration.provider = 'google'
+            and integration.account_kind = 'personal_family'
+            and integration.status = 'active'
+        ) as has_active_personal,
+        exists(
+          select 1 from integrations integration
+          where integration.person_id = ${personId}
+            and integration.provider = 'google'
+            and integration.account_kind = 'personal_family'
+            and integration.status <> 'revoked'
+        ) as has_personal_connection,
+        exists(
+          select 1 from integrations integration
+          where integration.person_id = ${personId}
+            and integration.provider = 'google'
+            and integration.account_kind = 'personal_family'
+            and integration.status in ('reauth_required', 'error')
+        ) as personal_requires_reconnect,
+        exists(
+          select 1
+          from integrations integration
+          where integration.person_id = ${personId}
+            and integration.provider = 'google'
+            and integration.account_kind = 'personal_family'
+            and integration.status = 'active'
+            and exists(
+              select 1 from integration_capabilities capability
+              where capability.integration_id = integration.id
+                and capability.capability = 'mail' and capability.status = 'active'
+            )
+            and exists(
+              select 1 from integration_capabilities capability
+              where capability.integration_id = integration.id
+                and capability.capability = 'calendar' and capability.status = 'active'
+            )
+            and exists(
+              select 1 from sync_cursors cursor
+              where cursor.integration_id = integration.id
+                and cursor.resource_kind = 'gmail_history'
+                and cursor.state = 'active'
+                and cursor.updated_at >= integration.connected_at
+            )
+            and exists(
+              select 1 from sync_cursors cursor
+              where cursor.integration_id = integration.id
+                and cursor.resource_kind = 'gmail_backfill:newest_30_days'
+                and cursor.state = 'exhausted'
+                and cursor.updated_at >= integration.connected_at
+            )
+            and exists(
+              select 1 from sync_cursors cursor
+              where cursor.integration_id = integration.id
+                and cursor.resource_kind = 'calendar_catalog'
+                and cursor.state = 'active'
+                and cursor.updated_at >= integration.connected_at
+            )
+            and coalesce((
+              select job.status from jobs job
+              where job.integration_id = integration.id
+                and job.integration_control_epoch = integration.control_epoch
+                and job.job_kind in ('google.bootstrap', 'google.gmail.bootstrap', 'google.gmail.poll')
+              order by job.updated_at desc, job.id desc
+              limit 1
+            ), 'missing') <> 'dead'
+            and coalesce((
+              select job.status from jobs job
+              where job.integration_id = integration.id
+                and job.integration_control_epoch = integration.control_epoch
+                and job.job_kind = 'google.gmail.backfill'
+                and job.idempotency_key like '%:newest_30_days:%'
+              order by job.updated_at desc, job.id desc
+              limit 1
+            ), 'missing') <> 'dead'
+            and coalesce((
+              select job.status from jobs job
+              where job.integration_id = integration.id
+                and job.integration_control_epoch = integration.control_epoch
+                and job.job_kind = 'google.calendar.catalog'
+              order by job.updated_at desc, job.id desc
+              limit 1
+            ), 'missing') <> 'dead'
+            and not exists(
+              select 1
+              from integration_grants grant_row
+              where grant_row.integration_id = integration.id
+                and grant_row.grant_kind = 'calendar_privacy'
+                and grant_row.status = 'active'
+                and grant_row.scope->>'mode' <> 'off'
+                and (
+                  not exists(
+                    select 1 from sync_cursors cursor
+                    where cursor.integration_id = integration.id
+                      and cursor.resource_kind = 'calendar:' || (grant_row.scope->>'calendarIdDigest')
+                      and cursor.state = 'active'
+                      and cursor.updated_at >= integration.connected_at
+                  )
+                  or exists(
+                    select 1 from jobs failed_poll
+                    left join sync_cursors event_cursor
+                      on event_cursor.integration_id = integration.id
+                      and event_cursor.resource_kind =
+                        'calendar:' || (grant_row.scope->>'calendarIdDigest')
+                    where failed_poll.integration_id = integration.id
+                      and failed_poll.integration_control_epoch = integration.control_epoch
+                      and failed_poll.job_kind = 'google.calendar.poll'
+                      and failed_poll.status = 'dead'
+                      and failed_poll.idempotency_key like
+                        'calendar:poll:' || integration.id || ':e' || integration.control_epoch || ':' ||
+                        (grant_row.scope->>'calendarIdDigest') || ':v' || grant_row.version || ':' ||
+                        (grant_row.scope->>'mode') || ':%'
+                      and (event_cursor.updated_at is null or failed_poll.updated_at >= event_cursor.updated_at)
+                  )
+                )
+            )
+            and not exists(
+              select 1 from jobs job
+              where job.integration_id = integration.id
+                and job.integration_control_epoch = integration.control_epoch
+                and job.job_kind in ('google.gmail.message', 'orchestrate.private_source')
+                and job.priority <= ${RECENT_SOURCE_PRIORITY_CEILING}
+                and job.status in ('pending', 'retry', 'leased', 'dead')
+            )
+        ) as personal_ready
     `;
-    const completed =
-      1 +
-      (Number(householdCount[0]?.count ?? 0) > 0 ? 1 : 0) +
-      (Number(integrationCount[0]?.count ?? 0) > 0 ? 1 : 0);
+    const sourceSetup = sourceSetupRows[0] ?? {
+      has_active_personal: false,
+      has_personal_connection: false,
+      personal_requires_reconnect: false,
+      personal_ready: false,
+    };
+    const hasHousehold = Number(householdCount[0]?.count ?? 0) > 0;
+    const completed = 1 + (hasHousehold ? 1 : 0) + (sourceSetup.personal_ready ? 1 : 0);
+    const onboarding: HomeView["onboarding"] = !hasHousehold
+      ? {
+          completed,
+          total: 3,
+          next: "Create or join your family",
+          detail: "Florence needs your private family space before connecting sources.",
+          href: "/people",
+          actionLabel: "Set up your family",
+        }
+      : !sourceSetup.personal_ready
+        ? {
+            completed,
+            total: 3,
+            next: sourceSetup.personal_requires_reconnect
+              ? "Reconnect your personal Google account"
+              : sourceSetup.has_active_personal
+                ? "Reviewing your recent sources"
+                : sourceSetup.has_personal_connection
+                  ? "Review your personal Google connection"
+                  : "Connect your personal Google account",
+            detail: sourceSetup.has_active_personal
+              ? "Florence is reviewing recent mail and every enabled calendar before calling setup complete."
+              : "Your personal Google connection brings recent family mail and calendars into private review.",
+            href: "/sources",
+            actionLabel: sourceSetup.has_active_personal ? "View source progress" : "Open Sources",
+          }
+        : null;
     return {
       monitoring: {
-        status: attentionCount > 0 ? "attention" : completed < 3 ? "learning" : "healthy",
+        status: attentionCount > 0 ? "attention" : onboarding ? "learning" : "healthy",
         label:
           attentionCount > 0
             ? `${attentionCount} thing${attentionCount === 1 ? "" : "s"} need attention`
-            : "Your family is covered",
+            : onboarding
+              ? "Florence is getting ready"
+              : "Your family is covered",
         detail:
           attentionCount > 0
             ? "Florence is following the open loops and will stay quiet about everything else."
-            : "Nothing currently needs a handoff or decision.",
+            : onboarding
+              ? "Setup continues privately while you keep using Florence in iMessage."
+              : "Nothing currently needs a handoff or decision.",
       },
       attentionCount,
       items,
-      onboarding:
-        completed < 3
-          ? {
-              completed,
-              total: 3,
-              next: completed === 1 ? "Create or join your family" : "Connect a private Google account",
-            }
-          : null,
+      onboarding,
     };
   }
 
@@ -1014,12 +1178,13 @@ export class PostgresFlorenceQueries {
       {
         id: string;
         status: string;
+        account_kind: string;
         control_epoch: number | string;
         connected_at: Date;
         updated_at: Date;
       }[]
     >`
-      select id, status, control_epoch, connected_at, updated_at
+      select id, status, account_kind, control_epoch, connected_at, updated_at
       from integrations
       where person_id = ${personId} and provider = 'google'
         and status <> 'revoked'
@@ -1066,6 +1231,8 @@ export class PostgresFlorenceQueries {
               older_status: string | null;
               message_pending: boolean;
               message_dead: boolean;
+              interpretation_pending: boolean;
+              interpretation_dead: boolean;
               calendar_poll_failed: boolean;
             }[]
           >`
@@ -1090,6 +1257,20 @@ export class PostgresFlorenceQueries {
                 and message.job_kind = 'google.gmail.message'
                 and message.status = 'dead'
             ) as message_dead,
+            exists(
+              select 1 from jobs interpretation
+              where interpretation.integration_id = integration.id
+                and interpretation.integration_control_epoch = integration.control_epoch
+                and interpretation.job_kind = 'orchestrate.private_source'
+                and interpretation.status in ('pending', 'retry', 'leased')
+            ) as interpretation_pending,
+            exists(
+              select 1 from jobs interpretation
+              where interpretation.integration_id = integration.id
+                and interpretation.integration_control_epoch = integration.control_epoch
+                and interpretation.job_kind = 'orchestrate.private_source'
+                and interpretation.status = 'dead'
+            ) as interpretation_dead,
             exists(
               select 1
               from integration_grants grant_row
@@ -1179,8 +1360,7 @@ export class PostgresFlorenceQueries {
         .catch(() => null);
       const accountEmail =
         profile?.kind === "integration_profile" ? profile.accountEmail : "Account email unavailable";
-      const accountKind =
-        profile?.kind === "integration_profile" ? profile.integration.accountKind : "personal_family";
+      const accountKind = integration.account_kind === "work" ? "work" : "personal_family";
       const activeCapabilities = new Set(
         profile?.kind === "integration_profile" ? profile.integration.activeCapabilities : [],
       );
@@ -1198,6 +1378,8 @@ export class PostgresFlorenceQueries {
         (jobHealth !== undefined && jobHealth.older_status !== null);
       if (olderHistoryEnabled) backfillKinds.push("older_history");
       const gmailJobFailed = jobHealth?.live_status === "dead";
+      const interpretationPending = jobHealth?.interpretation_pending ?? false;
+      const interpretationDead = jobHealth?.interpretation_dead ?? false;
       const backfillJobStatuses = {
         newest_30_days: jobHealth?.newest_status ?? null,
         days_31_to_90: jobHealth?.middle_status ?? null,
@@ -1242,20 +1424,27 @@ export class PostgresFlorenceQueries {
               : "Mail monitoring is starting";
       const historyState: NonNullable<SourceView["connections"][number]["mail"]>["historyState"] =
         historyMilestones.some((milestone) => milestone.state === "needs_attention") ||
-        jobHealth?.message_dead
+        jobHealth?.message_dead ||
+        interpretationDead
           ? "needs_attention"
-          : historyMilestones.some((milestone) => milestone.state === "running") || jobHealth?.message_pending
+          : historyMilestones.some((milestone) => milestone.state === "running") ||
+              jobHealth?.message_pending ||
+              interpretationPending
             ? "running"
             : historyMilestones.every((milestone) => milestone.state === "complete")
               ? "complete"
               : "waiting";
       const historyLabel =
         historyState === "needs_attention"
-          ? "Some mail needs attention"
+          ? interpretationDead
+            ? "Some imported sources need attention"
+            : "Some mail needs attention"
           : historyState === "running"
-            ? jobHealth?.message_pending
-              ? "Florence is importing queued mail"
-              : "Florence is scanning earlier mail"
+            ? interpretationPending
+              ? "Florence is reviewing imported sources"
+              : jobHealth?.message_pending
+                ? "Florence is importing queued mail"
+                : "Florence is scanning earlier mail"
             : historyState === "complete"
               ? "Earlier mail is imported"
               : integration.status === "paused"
@@ -1312,9 +1501,9 @@ export class PostgresFlorenceQueries {
       const calendarSyncState: NonNullable<SourceView["connections"][number]["calendar"]>["syncState"] =
         integration.status === "paused"
           ? "paused"
-          : calendarAccessFailed || calendarSyncFailed
+          : calendarAccessFailed || calendarSyncFailed || interpretationDead
             ? "needs_attention"
-            : calendarCatalogCursor?.state === "active" && calendarResourcesReady
+            : calendarCatalogCursor?.state === "active" && calendarResourcesReady && !interpretationPending
               ? "ready"
               : "waiting";
       const calendarSyncLabel =
@@ -1323,10 +1512,14 @@ export class PostgresFlorenceQueries {
           : calendarSyncState === "paused"
             ? "Calendar monitoring is paused"
             : calendarSyncState === "needs_attention"
-              ? calendarAccessFailed
-                ? "Calendar needs to be reconnected"
-                : "Some calendar information needs attention"
-              : "Calendar sync is starting";
+              ? interpretationDead
+                ? "Some imported sources need attention"
+                : calendarAccessFailed
+                  ? "Calendar needs to be reconnected"
+                  : "Some calendar information needs attention"
+              : interpretationPending
+                ? "Florence is reviewing imported sources"
+                : "Calendar sync is starting";
       const policyByCalendar = new Map(
         connectionCalendarPolicies.map(
           (policy) => [policy.calendar_id_digest, calendarMode(policy.mode)] as const,

@@ -1091,13 +1091,16 @@ async function requireCurrentEvidence(
   const rows = await executor<{ readonly id: string }[]>`
     select revision.id
     from source_revisions revision
-    join source_objects object on object.id = revision.source_object_id and object.status = 'active'
+    join source_objects object on object.id = revision.source_object_id
     left join integrations integration on integration.id = object.integration_id
     where revision.id = any(${executor.array(ids)}::uuid[])
       and revision.owner_person_id = ${ownerPersonId}
+      and object.status = 'active'
+      and revision.revision_number = object.latest_revision_number
       and revision.revoked_at is null and revision.retention_until > ${now}
       and revision.content_ciphertext is not null
       and (object.integration_id is null or integration.status in ('active', 'paused'))
+    for share of revision, object
   `;
   if (rows.length !== ids.length) {
     throw new StaleAuthorityError("Private source evidence is no longer current and retained");

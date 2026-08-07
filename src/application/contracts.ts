@@ -24,6 +24,13 @@ export interface WebRoutineFields {
   readonly standingSelfCoverage: boolean;
 }
 
+/** A committed OAuth result or settled durable job is enough to observe Google progress. */
+export interface GoogleSyncObservationFields {
+  readonly integrationId: string;
+  readonly personId: string;
+  readonly triggeringJobId: string | null;
+}
+
 /** A worker may interpret evidence, but it cannot choose mutation authority or a loop target. */
 export type CoverageProposal =
   | {
@@ -118,6 +125,7 @@ export type AppEnvelope =
       readonly grantedCapabilities: readonly IntegrationCapability[];
       readonly completedAt: string;
     }
+  | ({ readonly kind: "google.sync.observe" } & GoogleSyncObservationFields)
   | {
       readonly kind: "web.command";
       readonly actorPersonId: string;

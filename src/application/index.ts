@@ -1,3 +1,4 @@
 export * from "./contracts.js";
 export * from "./coverage-coordinator.js";
 export * from "./florence-application.js";
+export * from "./google-sync-coordinator.js";

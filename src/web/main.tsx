@@ -426,16 +426,24 @@ function HomePage() {
       </section>
       {data.onboarding ? (
         <section className="onboarding-card">
-          <div>
+          <div className="onboarding-copy">
             <span className="section-kicker">Set up Florence</span>
             <h2>{data.onboarding.next ?? "You’re ready"}</h2>
+            {data.onboarding.detail ? <p>{data.onboarding.detail}</p> : null}
+            {data.onboarding.href && data.onboarding.actionLabel ? (
+              <NavLink className="onboarding-action" to={data.onboarding.href}>
+                {data.onboarding.actionLabel}
+              </NavLink>
+            ) : null}
           </div>
-          <div className="progress">
-            <span style={{ width: `${(data.onboarding.completed / data.onboarding.total) * 100}%` }} />
+          <div className="onboarding-progress">
+            <div className="progress">
+              <span style={{ width: `${(data.onboarding.completed / data.onboarding.total) * 100}%` }} />
+            </div>
+            <small>
+              {data.onboarding.completed} of {data.onboarding.total} complete
+            </small>
           </div>
-          <small>
-            {data.onboarding.completed} of {data.onboarding.total} complete
-          </small>
         </section>
       ) : null}
       <SectionHeading title="Needs your attention" count={data.attentionCount} />
@@ -1018,10 +1026,11 @@ function SourcesPage({ viewer }: { viewer: Viewer }) {
     const poll = window.setInterval(() => void reload(false), 3_000);
     return () => window.clearInterval(poll);
   }, [data, reload]);
-  const googleSyncStarting = data?.connections.some(
+  const googleSyncIncomplete = data?.connections.some(
     (connection) =>
       connection.status === "active" &&
       (connection.mail?.liveState === "waiting" ||
+        connection.mail?.liveState === "needs_attention" ||
         connection.mail?.historyState === "waiting" ||
         connection.mail?.historyState === "running" ||
         connection.mail?.historyState === "needs_attention" ||
@@ -1029,15 +1038,19 @@ function SourcesPage({ viewer }: { viewer: Viewer }) {
         connection.calendar?.syncState === "needs_attention"),
   );
   useEffect(() => {
-    if (!googleSyncStarting) return;
-    let polls = 0;
+    if (!googleSyncIncomplete) return;
     const poll = window.setInterval(() => {
-      polls += 1;
-      void reload(false);
-      if (polls >= 30) window.clearInterval(poll);
+      if (document.visibilityState === "visible") void reload(false);
     }, 10_000);
-    return () => window.clearInterval(poll);
-  }, [googleSyncStarting, reload]);
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === "visible") void reload(false);
+    };
+    document.addEventListener("visibilitychange", refreshWhenVisible);
+    return () => {
+      window.clearInterval(poll);
+      document.removeEventListener("visibilitychange", refreshWhenVisible);
+    };
+  }, [googleSyncIncomplete, reload]);
   if (loading) return <PageSkeleton />;
   if (error || !data) return <ErrorCard message={error ?? "Could not load sources."} />;
   async function changeCalendar(
@@ -1192,10 +1205,14 @@ function SourcesPage({ viewer }: { viewer: Viewer }) {
       <SectionHeading title="Connections" count={data.connections.length} />
       <div className="card-list">
         {data.connections.map((connection) => {
+          const requiresReconnect = connection.status === "reauth_required" || connection.status === "error";
           const needsAttention =
+            requiresReconnect ||
             connection.mail?.liveState === "needs_attention" ||
             connection.mail?.historyState === "needs_attention" ||
             connection.calendar?.syncState === "needs_attention";
+          const reconnectLabel =
+            connection.accountKind === "work" ? "Reconnect work Google" : "Reconnect personal Google";
           return (
             <article className="source-card" key={connection.id}>
               <div className="source-heading">
@@ -1305,6 +1322,32 @@ function SourcesPage({ viewer }: { viewer: Viewer }) {
                     </div>
                   ) : null}
                 </>
+              ) : null}
+              {requiresReconnect ? (
+                <div className="source-reconnect">
+                  <p>
+                    {connection.accountKind === "work"
+                      ? "Reconnect this calendar-only work profile. Florence will not request work email access."
+                      : "Reconnect this personal profile to restore its private Mail and Calendar access."}
+                  </p>
+                  {googleStepUpReady ? (
+                    <a
+                      className="secondary-button"
+                      href={`/oauth/google/start?profile=${connection.accountKind}`}
+                    >
+                      {reconnectLabel}
+                    </a>
+                  ) : (
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      disabled={busy === "google-connect"}
+                      onClick={() => void requestGoogleConnect()}
+                    >
+                      {reconnectLabel}
+                    </button>
+                  )}
+                </div>
               ) : null}
             </article>
           );

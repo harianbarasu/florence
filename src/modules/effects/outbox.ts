@@ -126,6 +126,7 @@ export class EffectOutbox {
       await transaction`
         insert into outbox (
           id, authorization_decision_id, action_intent_id, household_id, person_id, conversation_id,
+          integration_id, integration_control_epoch,
           participant_epoch_id, expected_participant_digest, coverage_loop_id, coverage_loop_version,
           invitation_id, invitee_identity_authority_version,
           source_conversation_id, source_participant_epoch_id,
@@ -137,7 +138,8 @@ export class EffectOutbox {
         ) values (
           ${outboxId}, ${decisionId}, ${input.actionIntentId ?? null},
           ${input.household?.id ?? null}, ${input.person?.id ?? null},
-          ${input.conversation?.id ?? null}, ${input.participantEpochId ?? null},
+          ${input.conversation?.id ?? null}, ${input.integration?.id ?? null},
+          ${input.integration?.controlEpoch ?? null}, ${input.participantEpochId ?? null},
           ${input.expectedParticipantDigest ?? null}, ${input.coverageLoop?.id ?? null},
           ${input.coverageLoop?.version ?? null}, ${input.invitation?.id ?? null},
           ${input.invitation?.inviteeIdentityAuthorityVersion ?? null},
@@ -165,6 +167,7 @@ export class EffectOutbox {
         left join people person on person.id = effect.person_id
         left join households household on household.id = effect.household_id
         left join conversations conversation on conversation.id = effect.conversation_id
+        left join integrations integration on integration.id = effect.integration_id
         left join participant_epochs epoch on epoch.id = effect.participant_epoch_id
         left join coverage_loops coverage on coverage.id = effect.coverage_loop_id
         left join invitations invitation on invitation.id = effect.invitation_id
@@ -186,6 +189,10 @@ export class EffectOutbox {
             person.status = 'registered' and person.control_epoch = effect.person_control_epoch
           ))
           and (effect.household_id is null or household.control_epoch = effect.household_control_epoch)
+          and (effect.integration_id is null or (
+            integration.status <> 'revoked'
+            and integration.control_epoch = effect.integration_control_epoch
+          ))
           and (effect.conversation_id is null or (
             conversation.status = 'active'
             and conversation.authority_version = effect.conversation_authority_version
@@ -332,6 +339,7 @@ export class EffectOutbox {
         left join people person on person.id = candidate.person_id
         left join households household on household.id = candidate.household_id
         left join conversations conversation on conversation.id = candidate.conversation_id
+        left join integrations integration on integration.id = candidate.integration_id
         left join participant_epochs epoch on epoch.id = candidate.participant_epoch_id
         left join coverage_loops coverage on coverage.id = candidate.coverage_loop_id
         left join invitations invitation on invitation.id = candidate.invitation_id
@@ -354,6 +362,10 @@ export class EffectOutbox {
           and (candidate.household_id is null or (
             household.status in ('onboarding', 'active', 'paused')
             and household.control_epoch = candidate.household_control_epoch
+          ))
+          and (candidate.integration_id is null or (
+            integration.status <> 'revoked'
+            and integration.control_epoch = candidate.integration_control_epoch
           ))
           and (candidate.conversation_id is null or (
             conversation.status = 'active'
@@ -563,6 +575,7 @@ export class EffectOutbox {
         left join people person on person.id = effect.person_id
         left join households household on household.id = effect.household_id
         left join conversations conversation on conversation.id = effect.conversation_id
+        left join integrations integration on integration.id = effect.integration_id
         left join participant_epochs epoch on epoch.id = effect.participant_epoch_id
         left join coverage_loops coverage on coverage.id = effect.coverage_loop_id
         left join invitations invitation on invitation.id = effect.invitation_id
@@ -585,6 +598,10 @@ export class EffectOutbox {
           and (effect.household_id is null or (
             household.status in ('onboarding', 'active', 'paused')
             and household.control_epoch = effect.household_control_epoch
+          ))
+          and (effect.integration_id is null or (
+            integration.status <> 'revoked'
+            and integration.control_epoch = effect.integration_control_epoch
           ))
           and (effect.conversation_id is null or (
             conversation.status = 'active'
@@ -655,6 +672,7 @@ export class EffectOutbox {
         const rows = await transaction<{ id: string }[]>`
           insert into outbox (
             id, authorization_decision_id, action_intent_id, household_id, person_id, conversation_id,
+            integration_id, integration_control_epoch,
             participant_epoch_id, expected_participant_digest, coverage_loop_id, coverage_loop_version,
             invitation_id, invitee_identity_authority_version, redrive_root_id, redrive_sequence,
             source_conversation_id, source_participant_epoch_id,
@@ -666,7 +684,8 @@ export class EffectOutbox {
             created_at, updated_at
           )
           select ${randomUUID()}, ${decisionId}, effect.action_intent_id, effect.household_id,
-            effect.person_id, effect.conversation_id, effect.participant_epoch_id,
+            effect.person_id, effect.conversation_id, effect.integration_id,
+            effect.integration_control_epoch, effect.participant_epoch_id,
             effect.expected_participant_digest, effect.coverage_loop_id, effect.coverage_loop_version,
             effect.invitation_id, effect.invitee_identity_authority_version,
             ${candidate.root_id}, ${nextSequence}, effect.source_conversation_id,
@@ -711,6 +730,11 @@ export class EffectOutbox {
           select 1 from households household where household.id = effect.household_id
             and household.status in ('onboarding', 'active', 'paused')
             and household.control_epoch = effect.household_control_epoch
+        ))
+        or (effect.integration_id is not null and not exists (
+          select 1 from integrations integration where integration.id = effect.integration_id
+            and integration.status <> 'revoked'
+            and integration.control_epoch = effect.integration_control_epoch
         ))
         or (effect.conversation_id is not null and not exists (
           select 1
@@ -777,6 +801,12 @@ function inTransaction<Result>(
 
 function validateEffectScope(input: AuthorizedEffectInput): void {
   const evidenceSourceRevisionIds = [...(input.evidenceSourceRevisionIds ?? [])];
+  if (
+    input.integration &&
+    (!Number.isSafeInteger(input.integration.controlEpoch) || input.integration.controlEpoch < 1)
+  ) {
+    throw new Error("Integration effects require a positive control epoch");
+  }
   if (
     evidenceSourceRevisionIds.length > 32 ||
     new Set(evidenceSourceRevisionIds).size !== evidenceSourceRevisionIds.length ||

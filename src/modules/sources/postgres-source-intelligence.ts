@@ -1221,10 +1221,17 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
           readonly id: string;
           readonly owner_person_id: string | null;
           readonly revoked_at: Date | null;
+          readonly retention_until: Date;
+          readonly content_ciphertext: Buffer | null;
+          readonly revision_number: number | string;
           readonly integration_id: string | null;
+          readonly object_status: string;
+          readonly latest_revision_number: number | string;
         }[]
       >`
-        select revision.id, revision.owner_person_id, revision.revoked_at, object.integration_id
+        select revision.id, revision.owner_person_id, revision.revoked_at,
+          revision.retention_until, revision.content_ciphertext, revision.revision_number,
+          object.integration_id, object.status as object_status, object.latest_revision_number
         from source_revisions revision
         join source_objects object on object.id = revision.source_object_id
         where revision.id = any(${transaction.array(evidenceIds)}::uuid[])
@@ -1232,8 +1239,21 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
       `;
       if (evidenceRows.length !== evidenceIds.length)
         throw new NotFoundError("Candidate evidence is incomplete");
-      if (evidenceRows.some((row) => row.owner_person_id !== command.personId || row.revoked_at !== null)) {
-        throw new UnauthorizedError("Private candidate evidence is not active and person-owned");
+      if (evidenceRows.some((row) => row.owner_person_id !== command.personId)) {
+        throw new UnauthorizedError("Private candidate evidence is not person-owned");
+      }
+      const evidenceCheckedAt = new Date();
+      if (
+        evidenceRows.some(
+          (row) =>
+            row.object_status !== "active" ||
+            Number(row.revision_number) !== Number(row.latest_revision_number) ||
+            row.revoked_at !== null ||
+            row.content_ciphertext === null ||
+            row.retention_until <= evidenceCheckedAt,
+        )
+      ) {
+        throw new StaleAuthorityError("Private candidate evidence is no longer latest and retained");
       }
       if (
         evidenceRows.some((row) =>

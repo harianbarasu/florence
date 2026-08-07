@@ -35,6 +35,7 @@ import type {
 } from "./contracts.js";
 import { CoverageCoordinator } from "./coverage-coordinator.js";
 import { reconcileCoverageTimers } from "./coverage-timer-reconciliation.js";
+import { GoogleSyncCoordinator } from "./google-sync-coordinator.js";
 
 type Transaction = TransactionSql<Record<string, never>>;
 const MAX_LIVE_GROUP_INVOCATION_AGE_MS = 10 * 60_000;
@@ -148,6 +149,8 @@ export class FlorenceApplication {
         return this.beginGoogleOAuth(input);
       case "google.oauth.complete":
         return this.completeGoogleOAuth(input);
+      case "google.sync.observe":
+        return this.observeGoogleSync(input);
       case "private_bridge.proposal": {
         const result = await new PrivateSourceBridge(
           this.database,
@@ -272,6 +275,12 @@ export class FlorenceApplication {
         maxAttempts: 8,
       });
 
+      const milestone = await new GoogleSyncCoordinator(transaction, this.config, this.secretBox).observe({
+        integrationId: connected.integrationId,
+        personId: consumed.personId,
+        triggeringJobId: null,
+      });
+
       return {
         accepted: true,
         duplicate: !bootstrap.created,
@@ -280,10 +289,27 @@ export class FlorenceApplication {
           oauthAttemptId: consumed.oauthAttemptId,
           integrationId: connected.integrationId,
           bootstrapJobId: bootstrap.jobId,
+          ...(milestone.outboxIds[0] ? { milestoneOutboxId: milestone.outboxIds[0] } : {}),
           returnPath: consumed.returnPath,
         },
       };
     });
+  }
+
+  private async observeGoogleSync(
+    input: Extract<AppEnvelope, { kind: "google.sync.observe" }>,
+  ): Promise<ProcessReceipt> {
+    const result = await new GoogleSyncCoordinator(this.database, this.config, this.secretBox).observe(input);
+    return {
+      accepted: true,
+      duplicate: result.outboxIds.length === 0,
+      disposition: result.disposition,
+      ids: {
+        integrationId: input.integrationId,
+        ...(result.outboxIds[0] ? { outboxId: result.outboxIds[0] } : {}),
+        ...(result.outboxIds[1] ? { secondOutboxId: result.outboxIds[1] } : {}),
+      },
+    };
   }
 
   private async materializeRoutines(

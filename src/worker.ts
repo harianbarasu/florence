@@ -163,7 +163,7 @@ async function main(): Promise<void> {
       for (const job of jobs) {
         try {
           await dispatch(job);
-          await work.succeed(job);
+          if (await work.succeed(job)) await observeGoogleSyncMilestone(job);
         } catch (error) {
           let providerAuthFailure = false;
           try {
@@ -174,6 +174,7 @@ async function main(): Promise<void> {
           const retryable = !providerAuthFailure && isRetryableJobError(error);
           const jobErrorCode = providerAuthFailure ? "google_reauth_required" : errorCode(error);
           await work.fail(job, jobErrorCode, { retryable });
+          await observeGoogleSyncMilestone(job);
           process.stderr.write(
             `${JSON.stringify({ level: "error", jobKind: job.kind, errorCode: jobErrorCode })}\n`,
           );
@@ -258,6 +259,32 @@ async function main(): Promise<void> {
           return;
         default:
           throw new Error(`unsupported_job_kind:${job.kind}`);
+      }
+    }
+
+    async function observeGoogleSyncMilestone(job: ClaimedJob): Promise<void> {
+      const person = job.fence.person;
+      const integration = job.fence.integration;
+      if (
+        !person ||
+        !integration ||
+        (!job.kind.startsWith("google.") && job.kind !== "orchestrate.private_source")
+      ) {
+        return;
+      }
+      try {
+        await application.process({
+          kind: "google.sync.observe",
+          integrationId: integration.id,
+          personId: person.id,
+          triggeringJobId: job.id,
+        });
+      } catch {
+        // The provider job is already settled. A later settled job can safely
+        // repeat this idempotent observation without re-running provider work.
+        process.stderr.write(
+          `${JSON.stringify({ level: "error", jobKind: job.kind, errorCode: "google_milestone_observation_failed" })}\n`,
+        );
       }
     }
 
@@ -378,6 +405,7 @@ async function main(): Promise<void> {
       await timers.cancelStale(now);
       await timers.recoverOrphanedClaims(now);
       await seedGoogleRecovery(now);
+      await observeCurrentGoogleSync();
       await sources.apply({ kind: "sweep_retention", asOf: now.toISOString(), limit: 500 });
       await database`
       delete from provider_events where received_at < ${new Date(now.getTime() - config.defaults.rawSourceRetentionDays * 86_400_000)}
@@ -414,6 +442,31 @@ async function main(): Promise<void> {
           });
         }
       });
+    }
+
+    /**
+     * Durable maintenance replays this idempotent phase calculation. Immediate
+     * post-settlement observation is only the low-latency path; a transient
+     * failure there therefore cannot permanently lose a private milestone.
+     */
+    async function observeCurrentGoogleSync(): Promise<void> {
+      const integrations = await database<{ readonly integration_id: string; readonly person_id: string }[]>`
+        select integration.id as integration_id, integration.person_id
+        from integrations integration
+        join people person on person.id = integration.person_id
+          and person.status = 'registered' and person.consented_at is not null
+        where integration.provider = 'google'
+          and integration.status in ('active', 'reauth_required', 'error')
+        order by integration.connected_at, integration.id
+      `;
+      for (const integration of integrations) {
+        await application.process({
+          kind: "google.sync.observe",
+          integrationId: integration.integration_id,
+          personId: integration.person_id,
+          triggeringJobId: null,
+        });
+      }
     }
 
     async function ensureMaintenanceTick(bucket: number): Promise<void> {

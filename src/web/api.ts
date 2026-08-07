@@ -92,6 +92,9 @@ export interface HomeView {
     completed: number;
     total: number;
     next: string | null;
+    detail: string | null;
+    href: string | null;
+    actionLabel: string | null;
   } | null;
 }
 

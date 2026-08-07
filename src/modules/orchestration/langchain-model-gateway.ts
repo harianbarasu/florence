@@ -16,7 +16,6 @@ export class LangChainModelGateway implements ModelGateway {
           apiKey: requireValue(config.model.openai.apiKey, "OPENAI_API_KEY"),
           model: config.model.openai.model,
           configuration: { baseURL: config.model.openai.baseUrl },
-          temperature: 0,
           maxRetries: 2,
         });
         break;

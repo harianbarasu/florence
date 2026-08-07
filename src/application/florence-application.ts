@@ -3873,7 +3873,7 @@ function parseNameResponse(value: string, allowBareName: boolean): string | null
   const normalized = value.trim().replace(/\s+/gu, " ");
   if (!normalized || normalized.length > 100 || /[\r\n]/u.test(normalized)) return null;
   const introduced =
-    /^(?:actually[, ]+)?(?:my name (?:is|['’]s)|i am|i['’]m|call me)(?:\s+actually)?[, ]+(.+)$/iu.exec(
+    /^(?:actually[, ]+)?(?:my name(?: is|['’]s)|i am|i['’]m|call me)(?:\s+actually)?[, ]+(.+)$/iu.exec(
       normalized,
     );
   const candidate = (introduced?.[1] ?? (allowBareName ? normalized : "")).replace(/[.!]+$/gu, "").trim();

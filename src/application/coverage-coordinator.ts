@@ -567,6 +567,12 @@ export class CoverageCoordinator {
         id: source.record.routing.conversationId,
         authorityVersion: source.snapshot.authorityVersion,
       },
+      sourceConversation: {
+        id: source.record.routing.conversationId,
+        authorityVersion: source.snapshot.authorityVersion,
+        participantEpochId: source.record.routing.participantEpochId,
+        participantSetDigest: source.record.routing.appParticipantDigest,
+      },
       participantEpochId: source.record.routing.participantEpochId,
       expectedParticipantDigest: source.record.routing.appParticipantDigest,
       evidenceSourceRevisionIds: [...evidence.ids],

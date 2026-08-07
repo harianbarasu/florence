@@ -18,6 +18,7 @@ export interface AuthorizedEffectInput extends AuthorityFence {
     readonly participantEpochId: string;
     readonly participantSetDigest: string;
   };
+  readonly evidenceSourceRevisionIds?: readonly string[];
   readonly effectKind: "linq.message";
   readonly idempotencyKey: string;
   readonly data: unknown;
@@ -74,6 +75,12 @@ export class EffectOutbox {
     validateEffectScope(input);
     if (input.authorizationExpiresAt <= now)
       throw new Error("Effect authorization must expire in the future");
+    if (
+      (input.evidenceSourceRevisionIds?.length ?? 0) > 0 &&
+      input.authorizationExpiresAt <= new Date(now.getTime() + 3 * 60_000)
+    ) {
+      throw new Error("Evidence-backed effect authorization is too close to expiry");
+    }
     const actionDigest = digest({ effectKind: input.effectKind, idempotencyKey: input.idempotencyKey });
     const dataDigest = digest(input.data);
     const policyDigest = digest(input.policy);
@@ -86,6 +93,21 @@ export class EffectOutbox {
         select id from outbox where idempotency_key = ${input.idempotencyKey}
       `;
       if (existing[0]) return { outboxId: existing[0].id, created: false };
+
+      const evidenceSourceRevisionIds = [...(input.evidenceSourceRevisionIds ?? [])];
+      if (evidenceSourceRevisionIds.length > 0) {
+        const evidence = await transaction<{ readonly authorized: boolean }[]>`
+          select private_source_evidence_set_is_current(
+            ${transaction.array(evidenceSourceRevisionIds)}::uuid[],
+            ${input.sourceConversation?.participantEpochId ?? null}::uuid,
+            ${input.person?.id ?? null}::uuid,
+            ${now}
+          ) as authorized
+        `;
+        if (evidence[0]?.authorized !== true) {
+          throw new Error("Effect source evidence is no longer authorized");
+        }
+      }
 
       const decisionId = randomUUID();
       await transaction`
@@ -108,6 +130,7 @@ export class EffectOutbox {
           invitation_id, invitee_identity_authority_version,
           source_conversation_id, source_participant_epoch_id,
           source_expected_participant_digest, source_conversation_authority_version,
+          evidence_source_revision_ids,
           effect_kind, idempotency_key,
           payload_digest, payload_ciphertext, payload_key_version, status, available_at,
           person_control_epoch, household_control_epoch, conversation_authority_version
@@ -121,6 +144,7 @@ export class EffectOutbox {
           ${input.sourceConversation?.id ?? null}, ${input.sourceConversation?.participantEpochId ?? null},
           ${input.sourceConversation?.participantSetDigest ?? null},
           ${input.sourceConversation?.authorityVersion ?? null},
+          ${transaction.array(evidenceSourceRevisionIds)}::uuid[],
           ${input.effectKind}, ${input.idempotencyKey},
           ${payloadDigest}, ${Buffer.from(JSON.stringify(encrypted), "utf8")}, ${encrypted.kid},
           'pending', ${now}, ${input.person?.controlEpoch ?? null},
@@ -154,6 +178,10 @@ export class EffectOutbox {
           and effect.available_at <= ${now}
           and (effect.status <> 'leased' or effect.lease_expires_at <= ${now})
           and decision.outcome = 'allow' and decision.revoked_at is null and decision.expires_at > ${now}
+          and (
+            cardinality(effect.evidence_source_revision_ids) = 0
+            or decision.expires_at > ${new Date(now.getTime() + 3 * 60_000)}
+          )
           and (effect.person_id is null or (
             person.status = 'registered' and person.control_epoch = effect.person_control_epoch
           ))
@@ -185,6 +213,12 @@ export class EffectOutbox {
             and source_epoch.ended_at is null
             and source_epoch.participant_set_digest = effect.source_expected_participant_digest
           ))
+          and private_source_evidence_set_is_current(
+            effect.evidence_source_revision_ids,
+            effect.source_participant_epoch_id,
+            effect.person_id,
+            ${now}
+          )
         order by effect.available_at, effect.created_at
         for update of effect skip locked
         limit ${Math.max(1, Math.min(limit, 100))}
@@ -310,6 +344,10 @@ export class EffectOutbox {
         where candidate.id = ${effect.outboxId}
           and candidate.status = 'leased' and candidate.lease_token = ${effect.leaseToken}
           and decision.outcome = 'allow' and decision.revoked_at is null and decision.expires_at > ${now}
+          and (
+            cardinality(candidate.evidence_source_revision_ids) = 0
+            or decision.expires_at > ${new Date(now.getTime() + 3 * 60_000)}
+          )
           and (candidate.person_id is null or (
             person.status = 'registered' and person.control_epoch = candidate.person_control_epoch
           ))
@@ -344,6 +382,12 @@ export class EffectOutbox {
             and source_epoch.ended_at is null
             and source_epoch.participant_set_digest = candidate.source_expected_participant_digest
           ))
+          and private_source_evidence_set_is_current(
+            candidate.evidence_source_revision_ids,
+            candidate.source_participant_epoch_id,
+            candidate.person_id,
+            ${now}
+          )
         for update of candidate
       `;
       if (rows[0]) return true;
@@ -531,6 +575,10 @@ export class EffectOutbox {
         where effect.status = 'dead' and effect.last_error_code = 'linq_delivery_failed'
           and effect.action_intent_id is null
           and decision.outcome = 'allow' and decision.revoked_at is null and decision.expires_at > ${now}
+          and (
+            cardinality(effect.evidence_source_revision_ids) = 0
+            or decision.expires_at > ${new Date(now.getTime() + 3 * 60_000)}
+          )
           and (effect.person_id is null or (
             person.status = 'registered' and person.control_epoch = effect.person_control_epoch
           ))
@@ -563,6 +611,12 @@ export class EffectOutbox {
             and source_epoch.ended_at is null
             and source_epoch.participant_set_digest = effect.source_expected_participant_digest
           ))
+          and private_source_evidence_set_is_current(
+            effect.evidence_source_revision_ids,
+            effect.source_participant_epoch_id,
+            effect.person_id,
+            ${now}
+          )
           and not exists (
             select 1 from outbox later
             where later.redrive_root_id = coalesce(effect.redrive_root_id, effect.id)
@@ -605,6 +659,7 @@ export class EffectOutbox {
             invitation_id, invitee_identity_authority_version, redrive_root_id, redrive_sequence,
             source_conversation_id, source_participant_epoch_id,
             source_expected_participant_digest, source_conversation_authority_version,
+            evidence_source_revision_ids,
             effect_kind, idempotency_key, payload_digest, payload_ciphertext, payload_key_version,
             status, attempt_count, reconciliation_attempt_count, available_at,
             person_control_epoch, household_control_epoch, conversation_authority_version,
@@ -616,7 +671,8 @@ export class EffectOutbox {
             effect.invitation_id, effect.invitee_identity_authority_version,
             ${candidate.root_id}, ${nextSequence}, effect.source_conversation_id,
             effect.source_participant_epoch_id, effect.source_expected_participant_digest,
-            effect.source_conversation_authority_version, effect.effect_kind, ${idempotencyKey},
+            effect.source_conversation_authority_version, effect.evidence_source_revision_ids,
+            effect.effect_kind, ${idempotencyKey},
             effect.payload_digest, effect.payload_ciphertext, effect.payload_key_version,
             'pending', 0, 0, ${now}, effect.person_control_epoch, effect.household_control_epoch,
             effect.conversation_authority_version, ${now}, ${now}
@@ -642,6 +698,10 @@ export class EffectOutbox {
           where decision.id = effect.authorization_decision_id
             and decision.outcome = 'allow' and decision.revoked_at is null
             and decision.expires_at > ${now}
+            and (
+              cardinality(effect.evidence_source_revision_ids) = 0
+              or decision.expires_at > ${new Date(now.getTime() + 3 * 60_000)}
+            )
         )
         or (effect.person_id is not null and not exists (
           select 1 from people person where person.id = effect.person_id
@@ -693,6 +753,12 @@ export class EffectOutbox {
             and epoch.ended_at is null
             and epoch.participant_set_digest = effect.source_expected_participant_digest
         ))
+        or not private_source_evidence_set_is_current(
+          effect.evidence_source_revision_ids,
+          effect.source_participant_epoch_id,
+          effect.person_id,
+          ${now}
+        )
       )
       returning id
     `;
@@ -710,6 +776,20 @@ function inTransaction<Result>(
 }
 
 function validateEffectScope(input: AuthorizedEffectInput): void {
+  const evidenceSourceRevisionIds = [...(input.evidenceSourceRevisionIds ?? [])];
+  if (
+    evidenceSourceRevisionIds.length > 32 ||
+    new Set(evidenceSourceRevisionIds).size !== evidenceSourceRevisionIds.length ||
+    evidenceSourceRevisionIds.some(
+      (sourceRevisionId) =>
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(sourceRevisionId),
+    )
+  ) {
+    throw new Error("Effect source evidence must contain at most 32 distinct revision IDs");
+  }
+  if (evidenceSourceRevisionIds.length > 0 && (!input.person || !input.sourceConversation)) {
+    throw new Error("Effect source evidence requires exact viewer and source-conversation fences");
+  }
   if (
     input.coverageLoop &&
     (!Number.isSafeInteger(input.coverageLoop.version) || input.coverageLoop.version < 1)

@@ -168,6 +168,8 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
         return this.readCalendarPrivacy(query);
       case "source_revision":
         return this.readSourceRevision(query);
+      case "private_epoch_context":
+        return this.readPrivateEpochContext(query);
       case "source_blob":
         return this.readSourceBlob(query);
       case "source_derivative":
@@ -922,15 +924,23 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
       await transaction`select pg_advisory_xact_lock(hashtextextended(${`source:${command.origin.system}:${externalObjectId}`}, 0))`;
 
       const objects = await transaction<
-        { readonly id: string; readonly latest_revision_number: number | string; readonly status: string }[]
+        {
+          readonly id: string;
+          readonly latest_revision_number: number | string;
+          readonly status: string;
+          readonly updated_at: Date;
+        }[]
       >`
-        select id, latest_revision_number, status
+        select id, latest_revision_number, status, updated_at
         from source_objects
         where provider = ${command.origin.system} and external_object_id = ${externalObjectId}
         for update
       `;
       const sourceObjectId = objects[0]?.id ?? randomUUID();
       const latestRevisionNumber = Number(objects[0]?.latest_revision_number ?? 0);
+      if (objects[0] && objects[0].status !== "active" && objects[0].updated_at >= occurredAt) {
+        throw new StaleAuthorityError("Source event predates its deletion or revocation fence");
+      }
       if (objects[0]) {
         const latestRows = await transaction<SourceRevisionRow[]>`
           select id, source_object_id, revision_number, owner_person_id, participant_epoch_id,
@@ -1393,9 +1403,21 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
       `;
       const object = objects[0];
       if (!object) {
+        const sourceObjectId = randomUUID();
+        const deletedAt = new Date(command.deletedAt);
+        await transaction`
+          insert into source_objects (
+            id, integration_id, provider, external_object_id, object_kind,
+            status, latest_revision_number, created_at, updated_at
+          ) values (
+            ${sourceObjectId}, ${command.integrationId}, ${command.origin.system},
+            ${externalObjectId}, ${command.artifactKind}, 'deleted', 0,
+            ${deletedAt}, ${deletedAt}
+          )
+        `;
         return {
           kind: "source_deleted",
-          sourceObjectId: null,
+          sourceObjectId,
           invalidatedRevisionCount: 0,
           revokedCandidateCount: 0,
         };
@@ -1411,7 +1433,8 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
         new Date(command.deletedAt),
       );
       await transaction`
-        update source_objects set status = 'deleted', updated_at = ${new Date(command.deletedAt)}
+        update source_objects
+        set status = 'deleted', updated_at = greatest(updated_at, ${new Date(command.deletedAt)})
         where id = ${object.id}
       `;
       return {
@@ -1809,7 +1832,13 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
         asOf,
         false,
       );
-      await authorizeRevisionRead(transaction, revision, query.scope, query.privateViewerPersonId, asOf);
+      const accessExpiresAt = await authorizeRevisionRead(
+        transaction,
+        revision,
+        query.scope,
+        query.privateViewerPersonId,
+        asOf,
+      );
       if (query.integrationId !== undefined) {
         await assertSourceObjectIntegrationEpoch(
           transaction,
@@ -1833,6 +1862,167 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
         occurredAt: revision.occurred_at.toISOString(),
         capturedAt: revision.captured_at.toISOString(),
         retentionUntil: revision.retention_until.toISOString(),
+        accessExpiresAt: accessExpiresAt.toISOString(),
+      };
+    });
+  }
+
+  private async readPrivateEpochContext(
+    query: Extract<SourceQuery, { kind: "private_epoch_context" }>,
+  ): Promise<SourceReadResult> {
+    return inTransaction(this.database, async (transaction) => {
+      const asOf = new Date(query.asOf);
+      const scope = {
+        kind: "conversation_epoch" as const,
+        participantEpochId: query.participantEpochId,
+      };
+      const anchor = await loadReadableRevision(
+        transaction,
+        query.beforeSourceRevisionId,
+        scope,
+        asOf,
+        false,
+      );
+      if (anchor.conversation_access_mode !== "independent_private_views") {
+        throw new UnauthorizedError("Private epoch context requires an independent private-view anchor");
+      }
+      const anchorKinds = await transaction<{ readonly object_kind: string }[]>`
+        select object.object_kind
+        from source_objects object
+        where object.id = ${anchor.source_object_id}
+          and object.status = 'active'
+          and object.latest_revision_number = ${Number(anchor.revision_number)}
+        limit 1
+      `;
+      if (anchorKinds[0]?.object_kind !== "conversation_message") {
+        throw new UnauthorizedError("Private epoch context requires a current conversation-message anchor");
+      }
+      const anchorAccessExpiresAt = await authorizeRevisionRead(
+        transaction,
+        anchor,
+        scope,
+        query.viewerPersonId,
+        asOf,
+      );
+      const currentEpoch = await transaction<{ readonly id: string }[]>`
+        select epoch.id
+        from participant_epochs epoch
+        join conversations conversation on conversation.id = epoch.conversation_id
+        where epoch.id = ${query.participantEpochId}
+          and epoch.ended_at is null
+          and conversation.current_epoch_id = epoch.id
+          and conversation.status = 'active'
+        limit 1
+      `;
+      if (!currentEpoch[0]) {
+        throw new UnauthorizedError("Conversation history is outside the current exact audience");
+      }
+
+      const revisions = await transaction<
+        (SourceRevisionRow & { readonly object_kind: SourceArtifactKind })[]
+      >`
+        select revision.id, revision.source_object_id, revision.revision_number,
+          revision.owner_person_id, revision.participant_epoch_id,
+          revision.scope_digest, revision.content_digest, revision.content_ciphertext,
+          revision.content_key_version, revision.occurred_at, revision.captured_at,
+          revision.retention_until, revision.revoked_at, revision.conversation_access_mode,
+          object.object_kind
+        from source_revisions revision
+        join source_objects object on object.id = revision.source_object_id
+        join source_revision_private_views private_view
+          on private_view.source_revision_id = revision.id
+          and private_view.participant_epoch_id = revision.participant_epoch_id
+        join epoch_participants participant
+          on participant.participant_epoch_id = private_view.participant_epoch_id
+          and participant.person_identity_id = private_view.person_identity_id
+        join person_identities identity
+          on identity.id = participant.person_identity_id
+          and identity.person_id = private_view.person_id
+        join people person on person.id = private_view.person_id
+        join participant_epochs epoch on epoch.id = revision.participant_epoch_id
+        join conversations conversation on conversation.id = epoch.conversation_id
+        join participant_policies policy
+          on policy.conversation_id = conversation.id
+          and policy.person_id = private_view.person_id
+          and policy.status = 'active'
+        where revision.participant_epoch_id = ${query.participantEpochId}
+          and private_view.person_id = ${query.viewerPersonId}
+          and object.object_kind in ('conversation_message', 'attachment_manifest')
+          and object.status = 'active'
+          and object.latest_revision_number = revision.revision_number
+          and revision.occurred_at < ${anchor.occurred_at}
+          and revision.captured_at <= ${asOf}
+          and revision.revoked_at is null
+          and revision.content_ciphertext is not null
+          and revision.retention_until > ${asOf}
+          and revision.conversation_access_mode = 'independent_private_views'
+          and private_view.status = 'active'
+          and private_view.granted_at <= ${asOf}
+          and private_view.retention_until > ${asOf}
+          and participant.registration_status = 'registered'
+          and participant.consented_at is not null
+          and identity.status = 'verified'
+          and person.status = 'registered'
+          and person.control_epoch = private_view.person_control_epoch
+          and epoch.ended_at is null
+          and conversation.current_epoch_id = epoch.id
+          and conversation.status = 'active'
+          and policy.allow_content_processing = true
+          and policy.retention_seconds > 0
+          and policy.effective_at <= ${asOf}
+          and least(
+            private_view.retention_until,
+            revision.captured_at + policy.retention_seconds * interval '1 second'
+          ) > ${asOf}
+        order by revision.occurred_at desc,
+          case object.object_kind when 'attachment_manifest' then 0 else 1 end,
+          revision.captured_at desc, revision.id desc
+        limit ${query.limit}
+      `;
+
+      const opened: {
+        sourceRevisionId: string;
+        artifactKind: SourceArtifactKind;
+        content: ReturnType<typeof JsonObjectSchema.parse>;
+        occurredAt: string;
+        capturedAt: string;
+        accessExpiresAt: string;
+      }[] = [];
+      let openedBytes = 0;
+      let accessExpiresAt = anchorAccessExpiresAt;
+      for (const revision of revisions) {
+        const revisionAccessExpiresAt = await authorizeRevisionRead(
+          transaction,
+          revision,
+          scope,
+          query.viewerPersonId,
+          asOf,
+        );
+        if (revision.content_ciphertext === null) continue;
+        const content = JsonObjectSchema.parse(
+          openJson(this.secretBox, revision.content_ciphertext, sourceRevisionPurpose(revision.id)),
+        );
+        const contentBytes = Buffer.byteLength(canonicalJson(content), "utf8");
+        if (openedBytes + contentBytes > 64 * 1024) continue;
+        openedBytes += contentBytes;
+        if (revisionAccessExpiresAt < accessExpiresAt) accessExpiresAt = revisionAccessExpiresAt;
+        opened.push({
+          sourceRevisionId: revision.id,
+          artifactKind: revision.object_kind,
+          content,
+          occurredAt: revision.occurred_at.toISOString(),
+          capturedAt: revision.captured_at.toISOString(),
+          accessExpiresAt: revisionAccessExpiresAt.toISOString(),
+        });
+      }
+      opened.reverse();
+      return {
+        kind: "private_epoch_context",
+        participantEpochId: query.participantEpochId,
+        viewerPersonId: query.viewerPersonId,
+        beforeSourceRevisionId: query.beforeSourceRevisionId,
+        accessExpiresAt: accessExpiresAt.toISOString(),
+        revisions: opened,
       };
     });
   }
@@ -2644,14 +2834,14 @@ async function authorizeRevisionRead(
   scope: SourceScope,
   privateViewerPersonId: string | undefined,
   asOf: Date,
-): Promise<void> {
+): Promise<Date> {
   assertScopeMatchesRow(scope, revision);
   if (scope.kind === "person") {
     if (privateViewerPersonId !== undefined || revision.conversation_access_mode !== null) {
       throw new UnauthorizedError("Person source access cannot use a conversation private view");
     }
     await requireRegisteredPerson(transaction, scope.personId, false);
-    return;
+    return revision.retention_until;
   }
 
   if (privateViewerPersonId === undefined) {
@@ -2659,14 +2849,18 @@ async function authorizeRevisionRead(
       throw new UnauthorizedError("This conversation source requires an exact private viewer");
     }
     await resolveActiveConversationScope(transaction, scope.participantEpochId);
-    return;
+    return revision.retention_until;
   }
   if (revision.conversation_access_mode !== "independent_private_views") {
     throw new UnauthorizedError("A private viewer cannot widen a unanimously shared source");
   }
 
-  const rows = await transaction<{ readonly authorized: number }[]>`
-    select 1 as authorized
+  const rows = await transaction<{ readonly access_expires_at: Date }[]>`
+    select least(
+      private_view.retention_until,
+      source_revision.retention_until,
+      source_revision.captured_at + policy.retention_seconds * interval '1 second'
+    ) as access_expires_at
     from source_revision_private_views private_view
     join source_revisions source_revision
       on source_revision.id = private_view.source_revision_id
@@ -2711,6 +2905,7 @@ async function authorizeRevisionRead(
   if (!rows[0]) {
     throw new UnauthorizedError("No active exact private source view exists for this person");
   }
+  return rows[0].access_expires_at;
 }
 
 async function loadReadableRevision(

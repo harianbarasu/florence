@@ -438,6 +438,15 @@ const ReadSourceRevisionQuerySchema = z
     }
   });
 
+const ReadPrivateEpochContextQuerySchema = z.strictObject({
+  kind: z.literal("private_epoch_context"),
+  participantEpochId: EntityIdSchema,
+  viewerPersonId: EntityIdSchema,
+  beforeSourceRevisionId: EntityIdSchema,
+  asOf: InstantSchema,
+  limit: z.number().int().min(1).max(24).default(12),
+});
+
 const ReadBlobQuerySchema = z
   .strictObject({
     kind: z.literal("source_blob"),
@@ -488,6 +497,7 @@ export const SourceQuerySchema = z.discriminatedUnion("kind", [
   ReadCursorQuerySchema,
   ReadCalendarPrivacyQuerySchema,
   ReadSourceRevisionQuerySchema,
+  ReadPrivateEpochContextQuerySchema,
   ReadBlobQuerySchema,
   ReadDerivativeQuerySchema,
   ReadPendingCandidatesQuerySchema,
@@ -680,6 +690,22 @@ export type SourceReadResult =
       readonly occurredAt: string;
       readonly capturedAt: string;
       readonly retentionUntil: string;
+      readonly accessExpiresAt: string;
+    }
+  | {
+      readonly kind: "private_epoch_context";
+      readonly participantEpochId: string;
+      readonly viewerPersonId: string;
+      readonly beforeSourceRevisionId: string;
+      readonly accessExpiresAt: string;
+      readonly revisions: readonly {
+        readonly sourceRevisionId: string;
+        readonly artifactKind: SourceArtifactKind;
+        readonly content: JsonObject;
+        readonly occurredAt: string;
+        readonly capturedAt: string;
+        readonly accessExpiresAt: string;
+      }[];
     }
   | {
       readonly kind: "source_blob";

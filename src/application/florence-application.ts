@@ -113,7 +113,11 @@ export class FlorenceApplication {
       case "linq.process_event":
         return this.processLinqEvent(input.providerEventId);
       case "linq.private_invocation_response":
-        return this.commitPrivateGroupInvocationResponse(input.internalProviderEventId, input.responseText);
+        return this.commitPrivateGroupInvocationResponse(
+          input.internalProviderEventId,
+          input.responseText,
+          input.evidenceSourceRevisionIds,
+        );
       case "linq.reconcile_chat":
         return this.reconcileLiveLinqChat(input.liveChat);
       case "timer.process":
@@ -424,6 +428,13 @@ export class FlorenceApplication {
           chatKind: liveChat.kind,
         },
       };
+      // An edit is a source-revocation event, so apply it from the verified raw
+      // webhook before content classification can discard the event and before
+      // the effect worker can claim a response derived from the old text.
+      // Retained edits repeat this idempotently during durable processing.
+      if (event.eventType === "linq.message.edited") {
+        await this.invalidateEditedLinqMessageSource(transaction, event, record.routing);
+      }
       const ignored = classification.kind === "routing_only";
       const eventId = await insertProviderEvent(
         transaction,
@@ -924,6 +935,9 @@ export class FlorenceApplication {
     internalProviderEventId: string,
     record: StoredLinqEvent,
   ): Promise<string> {
+    if (record.event?.eventType === "linq.message.edited") {
+      return this.invalidateEditedLinqMessageSource(transaction, record.event, record.routing);
+    }
     if (record.event?.eventType !== "linq.message.received") return "observed_silently";
     await new DurableWork(transaction, this.secretBox).enqueue({
       kind: "orchestrate.linq_observation",
@@ -937,11 +951,13 @@ export class FlorenceApplication {
   private async commitPrivateGroupInvocationResponse(
     internalProviderEventId: string,
     responseCandidate: string,
+    evidenceSourceRevisionIdsCandidate: readonly string[],
   ): Promise<ProcessReceipt> {
     const responseText = responseCandidate.trim();
     if (!responseText || responseText.length > 10_000) {
       throw new UnauthorizedError("Private group invocation response is outside the allowed bounds");
     }
+    const evidenceSourceRevisionIds = exactEvidenceSourceRevisionIds(evidenceSourceRevisionIdsCandidate);
     return this.database.begin(async (transaction) => {
       const events = await transaction<ProviderEventRow[]>`
         select id, provider_event_id, envelope_ciphertext, processing_status
@@ -1011,6 +1027,40 @@ export class FlorenceApplication {
       const source = sources[0];
       if (!source) throw new StaleAuthorityError("Private group invocation audience changed");
 
+      const evidenceReadAt = new Date();
+      const sourceIntelligence = new PostgresSourceIntelligence(transaction, this.secretBox, {
+        rawRetentionDays: this.config.defaults.rawSourceRetentionDays,
+        privateCandidateRetentionDays: 7,
+      });
+      let evidenceAccessExpiresAt = new Date(Date.now() + 5 * 60_000);
+      for (const sourceRevisionId of evidenceSourceRevisionIds) {
+        const evidence = await sourceIntelligence
+          .read({
+            kind: "source_revision",
+            sourceRevisionId,
+            scope: {
+              kind: "conversation_epoch",
+              participantEpochId: record.routing.participantEpochId,
+            },
+            privateViewerPersonId: record.routing.senderPersonId,
+            asOf: evidenceReadAt.toISOString(),
+          })
+          .catch((error: unknown) => {
+            if (error instanceof NotFoundError || error instanceof UnauthorizedError) {
+              throw new StaleAuthorityError("Private invocation evidence changed before commit");
+            }
+            throw error;
+          });
+        if (evidence.kind !== "source_revision") {
+          throw new UnauthorizedError("Private invocation evidence is no longer readable");
+        }
+        const accessExpiresAt = new Date(evidence.accessExpiresAt);
+        if (accessExpiresAt <= new Date(evidenceReadAt.getTime() + 3 * 60_000)) {
+          throw new StaleAuthorityError("Private invocation evidence is too close to expiry to send");
+        }
+        if (accessExpiresAt < evidenceAccessExpiresAt) evidenceAccessExpiresAt = accessExpiresAt;
+      }
+
       const routes = await transaction<
         {
           conversation_id: string;
@@ -1070,14 +1120,16 @@ export class FlorenceApplication {
         data: {
           responseDigest: sha256Hex(responseText),
           invocationBasis: record.invocation.basis,
+          evidenceSourceRevisionIds,
         },
+        evidenceSourceRevisionIds,
         policy: { exactPrivateRecipient: true, sourceGroupSilent: true },
         reasonCodes: [
           "registered_exact_group_sender",
           "deterministic_group_invocation",
           "private_response_only",
         ],
-        authorizationExpiresAt: new Date(Date.now() + 5 * 60_000),
+        authorizationExpiresAt: evidenceAccessExpiresAt,
       };
 
       if (route) {
@@ -1436,6 +1488,9 @@ export class FlorenceApplication {
   ): Promise<string> {
     const event = record.event;
     if (!event) return "ignored";
+    if (event.eventType === "linq.message.edited") {
+      return this.invalidateEditedLinqMessageSource(transaction, event, record.routing);
+    }
     if (event.eventType !== "linq.message.received") return "observed";
     const text = messageText(event);
     const normalizedCommand = text.trim().toLowerCase();
@@ -1623,6 +1678,36 @@ export class FlorenceApplication {
       deadlineAt: new Date(Date.now() + 5 * 60_000),
     });
     return "orchestration_queued";
+  }
+
+  private async invalidateEditedLinqMessageSource(
+    transaction: Transaction,
+    event: Extract<LinqWebhookEnvelope, { eventType: "linq.message.edited" }>,
+    routing: StoredLinqEvent["routing"],
+  ): Promise<string> {
+    const scope =
+      routing.chatKind === "group"
+        ? {
+            kind: "conversation_epoch" as const,
+            participantEpochId: routing.participantEpochId,
+          }
+        : routing.senderPersonId
+          ? ({ kind: "person" as const, personId: routing.senderPersonId } as const)
+          : null;
+    if (!scope) return "observed_silently";
+    await new PostgresSourceIntelligence(transaction, this.secretBox, {
+      rawRetentionDays: this.config.defaults.rawSourceRetentionDays,
+      privateCandidateRetentionDays: 7,
+    }).apply({
+      kind: "mark_source_deleted",
+      integrationId: null,
+      expectedIntegrationControlEpoch: null,
+      artifactKind: "conversation_message",
+      origin: { system: "linq", remoteObjectId: event.edit.providerMessageId },
+      scope,
+      deletedAt: event.edit.editedAt,
+    });
+    return "message_edit_source_invalidated";
   }
 
   private async handleProviderReceipt(transaction: Transaction, record: StoredLinqEvent): Promise<string> {
@@ -3391,4 +3476,18 @@ async function appendAudit(
 
 function sha256Hex(value: string): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function exactEvidenceSourceRevisionIds(candidate: readonly string[]): readonly string[] {
+  if (candidate.length < 1 || candidate.length > 32) {
+    throw new UnauthorizedError("Private invocation evidence is outside the allowed bounds");
+  }
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+  if (candidate.some((sourceRevisionId) => !uuid.test(sourceRevisionId))) {
+    throw new UnauthorizedError("Private invocation evidence contains an invalid source revision");
+  }
+  if (new Set(candidate).size !== candidate.length) {
+    throw new UnauthorizedError("Private invocation evidence must be distinct");
+  }
+  return [...candidate];
 }

@@ -38,6 +38,7 @@ export type AppEnvelope =
       readonly kind: "linq.private_invocation_response";
       readonly internalProviderEventId: string;
       readonly responseText: string;
+      readonly evidenceSourceRevisionIds: readonly string[];
     }
   | {
       /** Reconciles an authoritative live audience before an outbound cross-chat action. */

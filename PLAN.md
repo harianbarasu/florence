@@ -165,71 +165,68 @@ hard product decisions.
 
 ## Implementation Plan
 
-### Iteration 0 — Exercise the currently working two-phone spine
+### Operating cadence — phone evidence before more product debate
 
-- Run natural DM registration, household creation, exact group enrollment, second-parent invitation,
-  unanimous group approval, an explicit timed pickup gap, a natural acceptance, and named closure on
-  production phones.
-- Use “I can't pick Avery up Wednesday at 3:00” for this first exercise; family-context recovery of
-  an omitted routine time is implemented in the next iteration.
-- **Done when:** one real production loop reaches `covered`, Florence sends no later reminder, and
-  every confusing or broken step is recorded as product evidence.
+- Ship one phoneable end-to-end behavior at a time, normally within one working day.
+- Ask Hari only about choices that alter privacy, who can act, who can see something, or the core
+  customer promise. Make reversible copy, UI, infrastructure, and implementation decisions directly.
+- Keep the test suite lean. Use the smallest automated gate that protects a state or privacy
+  invariant, then test the actual behavior through iMessage and the production web companion.
+- Collect confusion, silence, wrong timing, unwanted interruption, and failed completion as one
+  evidence batch after each phone session. That batch chooses the next slice; speculative questions
+  do not block the current one.
+- A slice is not shipped because code exists. It is shipped only when the production behavior is
+  observable from a parent's phone and has a clear expected result.
 
-### Iteration 1 — Make parent activation and Google syncing feel alive
+### Iteration 0 — Prove the group-native activation wedge
 
-- Offer personal Google once immediately after a parent household is resolved, including a one-time
-  nudge for existing parent stewards without an active connection.
-- Consume the existing allowlisted handoff context and use purpose-specific copy/focus.
-- Project the existing newest-30-day, 31–90-day, one-year, and older-history stages as named web
-  milestones; send connection/current-caught-up/background-history/error milestones privately.
-- Inject authorized dependent aliases, schools, activities, and current routines into interpretation
-  through one read-only context interface. Add other accepted household memories only when a
-  canonical household-scoped producer exists.
-- **Done when:** a parent connects Google from the private Florence flow, sees honest progress, and a
-  routine time omitted from an approved household-group message can be recovered from authorized
-  family context.
+- Register one parent naturally by private DM, add Florence cold to an ordinary group, and keep that
+  group completely silent.
+- Retain only post-addition evidence for the current exact membership. When the registered parent
+  writes a leading “Florence…” request, privately answer from a bounded recent window of that exact
+  group's messages and extracted attachments.
+- Re-authorize the exact evidence, person control epoch, membership epoch, consent, retention, and
+  private route after the ephemeral worker finishes and immediately before enqueueing the DM.
+- **Done when:** a real group can state a changed pickup fact, Florence says nothing there, and a
+  later explicit invocation produces one correct private answer; changing membership prevents the
+  stale answer.
 
-### Iteration 2 — Reconcile evidence before the first interruption
+### Iteration 1 — Close one real coverage loop
 
-- Give each integration a deterministic recent-source readiness projection across live Gmail,
-  newest-first mail, relevant full threads/attachments, Calendar catalog, and initial Calendar sync.
-- Keep candidates internal until that projection is ready. Deduplicate candidates by current family
-  outcome and evidence lineage, then surface at most the highest-value current unresolved item.
-- Bind the private proposal message to its candidate/action intent so a natural reply can approve,
-  dismiss, or clarify the exact item without a magic command.
-- **Done when:** a later cancellation/update suppresses an obsolete first prompt, and the parent can
-  move the surviving item into coordination directly from iMessage.
+- In an approved household group, turn “I can't pick Avery up Wednesday at 3:00” into one explicit
+  coverage request and continue until another actual person accepts.
+- Keep the language neutral, never assign by silence, and suppress later reminders after acceptance.
+- **Done when:** one production-phone loop reaches `covered`, the parent can see its state, and every
+  confusing step becomes evidence for the next copy/behavior pass.
 
-### Iteration 3 — Complete group-source and escalation authority
+### Iteration 2 — Make parent activation and Google syncing feel alive
 
-- Admit and encrypt post-addition messages for every observe-only exact participant epoch without
-  granting group write authority.
-- Add per-person exact-chat source access grants for registered participants and deterministic
-  private invocation routing for the exact sender.
-- Persist versioned, approval-bound reliance membership/provenance and escalate unresolved household
-  loops to all parent stewards before the last responsible moment.
-- **Done when:** a community chat remains entirely silent while informing a registered parent
-  privately, and a subset-audience household loop safely reaches every parent only at its approved
-  escalation boundary.
+- Offer personal Google immediately after household resolution; do not wait for a second parent.
+- Show honest recent-mail/Calendar readiness privately and in mobile web while older history continues
+  in the background. Support additional personal accounts and optional work Calendar accounts.
+- Reconcile latest thread messages, event revisions, and extracted attachments before surfacing one
+  highest-value current risk. Later evidence must update or suppress an obsolete candidate.
+- **Done when:** a parent connects Google from the phone flow, sees real progress, and can move one
+  current source-backed finding into coordination without a magic command.
 
-### Iteration 4 — Tighten the existing web companion and standing behavior
+### Iteration 3 — Learn routines and useful timing
 
-- Refresh viewer state after household mutations; honor exception links; show authorized active-loop
-  meaning and deadline on Home without creating a task dashboard.
-- Render each routine/bridge/chat rule as an exact plain-language sentence and require a fresh
-  private-DM confirmation before future-facing activation.
-- **Done when:** a nontechnical parent can understand, correct, pause, or revoke what Florence will do
-  next without seeing internal agents or schema language.
+- Learn school/activity routines conversationally, ask about uncertainty, and store narrow,
+  human-readable behavior only after explicit future-facing approval.
+- Recover omitted routine facts from authorized family context and interrupt before the useful
+  window, according to each household's preference for routine reminders versus exceptions only.
+- **Done when:** Florence opens the right loop before school/activity timing requires action and does
+  not repeatedly ask about an approved stable routine.
 
-### Iteration 5 — Production verification and learning loop
+### Iteration 4 — Make control and learning legible
 
-- Run the repository's lean verification gates, migrate once per release, deploy the same image to
-  Railway web and worker, and perform targeted connector plus real-phone checks.
-- Instrument loops proposed/opened/acknowledged/reopened/expired, interruption quality, corrections,
+- Use the mobile web companion for identities, connected sources, exact chats, private/shared memory,
+  routines, rules, active loops, corrections, pause/revoke, export, and deletion.
+- Instrument proposed/opened/acknowledged/reopened/expired loops, interruption quality, corrections,
   privacy denials, and time-to-coverage. Review failed traces as candidate skill/harness changes;
   workers never self-promote behavior.
-- **Done when:** the production test script passes repeatedly for two parents, restart/retry creates
-  no duplicate logical effects, and the next iteration is chosen from actual loop evidence.
+- **Done when:** nontechnical parents can understand and correct what Florence knows and will do, and
+  the team can choose the next slice from loop outcomes rather than message or model-call volume.
 
 ## 1. Product thesis
 

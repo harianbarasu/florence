@@ -1741,7 +1741,9 @@ export class FlorenceApplication {
     }
     if (
       record.routing.chatKind === "direct" &&
-      /^(sign in|settings|open florence|connect google)$/u.test(normalizedCommand)
+      /^(sign in|settings|open florence|connect google|review|open review|send me (?:a|the) review link)$/u.test(
+        normalizedCommand,
+      )
     ) {
       const identityId = record.routing.senderIdentityId;
       const personId = record.routing.senderPersonId;
@@ -1754,8 +1756,18 @@ export class FlorenceApplication {
         personId,
         privateIdentityId: identityId,
         privateConversationId: record.routing.conversationId,
-        purpose: normalizedCommand === "connect google" ? "google_connect" : "web_sign_in",
-        context: { returnPath: normalizedCommand === "connect google" ? "/sources" : "/home" },
+        purpose:
+          normalizedCommand === "connect google"
+            ? "google_connect"
+            : /review/u.test(normalizedCommand)
+              ? "private_review"
+              : "web_sign_in",
+        context: {
+          returnPath:
+            normalizedCommand === "connect google" || /review/u.test(normalizedCommand)
+              ? "/sources"
+              : "/home",
+        },
         expiresInSeconds: 10 * 60,
       });
       const snapshot = await new PostgresConversationAuthority(transaction).snapshot(
@@ -3483,6 +3495,8 @@ function parseNameResponse(value: string, allowBareName: boolean): string | null
     "sign in",
     "open florence",
     "connect google",
+    "review",
+    "open review",
   ]);
   if (reserved.has(candidate.toLocaleLowerCase("en-US"))) return null;
   if (!/^[\p{L}\p{M}][\p{L}\p{M}'’ .-]*$/u.test(candidate)) return null;

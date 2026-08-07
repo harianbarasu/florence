@@ -559,7 +559,7 @@ export class CoverageCoordinator {
       context: { returnPath: "/sources", candidateId },
       expiresInSeconds: 10 * 60,
     });
-    const text = `I can help close that. I won’t say anything to your family until you approve the exact wording and group: ${this.config.publicBaseUrl}/handoff/${handoff.token}\n\nThis private link expires in 10 minutes.`;
+    const text = `I can help close that. I won’t say anything to your family until you approve the exact wording and group: ${this.config.publicBaseUrl}/handoff/${handoff.token}\n\nThis private link expires in 10 minutes. If it expires, text me “review” for a fresh one.`;
     const queued = await new EffectOutbox(transaction, this.secretBox).authorizeAndEnqueue({
       actorPersonId: source.actorPersonId,
       person: { id: source.actorPersonId, controlEpoch: source.actorControlEpoch },

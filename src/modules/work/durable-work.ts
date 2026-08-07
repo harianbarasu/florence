@@ -250,6 +250,25 @@ export class DurableWork {
     return rows.length === 1;
   }
 
+  /** Parks expected work without consuming its bounded failure budget. */
+  public async defer(
+    job: Pick<ClaimedJob, "id" | "leaseToken">,
+    reasonCode: string,
+    availableAt: Date,
+    now = new Date(),
+  ): Promise<boolean> {
+    if (availableAt <= now) throw new Error("Deferred work must resume in the future");
+    const rows = await this.database<{ id: string }[]>`
+      update jobs set status = 'retry', available_at = ${availableAt},
+        attempt_count = greatest(0, attempt_count - 1),
+        lease_owner = null, lease_token = null, lease_expires_at = null,
+        last_error_code = ${reasonCode.slice(0, 200)}, updated_at = ${now}
+      where id = ${job.id} and status = 'leased' and lease_token = ${job.leaseToken}
+      returning id
+    `;
+    return rows.length === 1;
+  }
+
   public async fail(
     job: Pick<ClaimedJob, "id" | "leaseToken" | "attemptCount" | "maxAttempts">,
     errorCode: string,

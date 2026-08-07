@@ -78,6 +78,13 @@ class PrivateSourceCandidateRouteUnavailableError extends Error {
   }
 }
 
+class PrivateSourceCandidateWaitingError extends Error {
+  public constructor() {
+    super("Another private source candidate is currently ahead of this one");
+    this.name = "PrivateSourceCandidateWaitingError";
+  }
+}
+
 class InvalidJobPayloadError extends Error {
   public constructor(public readonly validationError: z.ZodError) {
     super("The durable job payload does not match its declared contract");
@@ -205,6 +212,10 @@ async function main(): Promise<void> {
           await dispatch(job);
           if (await work.succeed(job)) await observeGoogleSyncMilestone(job);
         } catch (error) {
+          if (error instanceof PrivateSourceCandidateWaitingError) {
+            await work.defer(job, "private_source_candidate_waiting", new Date(Date.now() + 5 * 60_000));
+            continue;
+          }
           if (error instanceof WorkerAttemptError) {
             const settlement = modelFailureSettlement(job, error);
             if (settlement === "attention") {
@@ -304,7 +315,10 @@ async function main(): Promise<void> {
             ...payload,
           });
           if (release.disposition === "private_source_candidate_notice_obsolete") return;
-          if (!release.accepted) throw new PrivateSourceCandidateRouteUnavailableError();
+          if (release.disposition === "private_source_candidate_waiting_behind_current_winner") {
+            throw new PrivateSourceCandidateWaitingError();
+          }
+          if (!release.accepted) throw new Error("Private source candidate release was not selected");
           try {
             const standingOutcome = await orchestrator.tryApplyStandingPrivateCandidate(
               payload.personId,
@@ -330,6 +344,9 @@ async function main(): Promise<void> {
             kind: "private_source.deliver_candidate_notice",
             ...payload,
           });
+          if (receipt.disposition === "private_source_candidate_waiting_behind_current_winner") {
+            throw new PrivateSourceCandidateWaitingError();
+          }
           if (!receipt.accepted) throw new PrivateSourceCandidateRouteUnavailableError();
           return;
         }

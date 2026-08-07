@@ -29,6 +29,7 @@ import {
 import type { SecretBox } from "../shared/crypto.js";
 
 type Transaction = TransactionSql<Record<string, never>>;
+const INBOUND_RESPONSE_PROCESSING_GRACE_MS = 5 * 60_000;
 
 export type { TimerProcessPayload } from "../modules/work/index.js";
 export { TimerProcessPayloadSchema } from "../modules/work/index.js";
@@ -357,7 +358,13 @@ async function expirePastWindow(
   loop: CoverageLoop,
   now: Date,
 ): Promise<boolean> {
+  const deadline = new Date(loop.timing.lastResponsibleAt);
   if (compareInstants(now.toISOString(), loop.timing.lastResponsibleAt) < 0) return false;
+  const graceEndsAt = new Date(deadline.getTime() + INBOUND_RESPONSE_PROCESSING_GRACE_MS);
+  if (now < graceEndsAt) {
+    await timers.reschedule(timer.id, graceEndsAt);
+    return true;
+  }
   let currentVersion = loop.version;
   if (["provisional", "open", "awaiting_response", "at_risk"].includes(loop.state)) {
     const decision = await coordination.transition({

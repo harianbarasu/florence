@@ -18,11 +18,7 @@ import {
   type ConversationAuthoritySnapshot,
   PostgresConversationAuthority,
 } from "../modules/conversations/index.js";
-import {
-  type CoverageLoop,
-  createCoverageLoop,
-  PostgresCoordination,
-} from "../modules/coordination/index.js";
+import { type CoverageLoop, PostgresCoordination } from "../modules/coordination/index.js";
 import { EffectOutbox } from "../modules/effects/index.js";
 import type { WorkerRuntime } from "../modules/orchestration/contracts.js";
 import { GENERAL_ANSWER_SKILL, PRODUCT_SKILLS } from "../modules/orchestration/skills.js";
@@ -838,17 +834,25 @@ export class FlorenceOrchestrator {
     const providerMessageId = context.event.message.replyTo?.providerMessageId;
     if (!providerMessageId) return null;
     const rows = await this.database<{ readonly coverage_loop_id: string }[]>`
-      select effect.coverage_loop_id
+      select distinct effect.coverage_loop_id
       from effect_receipts receipt
       join outbox effect on effect.id = receipt.outbox_id
       where receipt.provider_receipt_id = ${providerMessageId}
+        and receipt.status in ('submitted', 'confirmed')
+        and effect.status in ('submitted', 'confirmed')
+        and effect.effect_kind = 'linq.message'
         and effect.conversation_id = ${context.record.routing.conversationId}
         and effect.participant_epoch_id = ${context.record.routing.participantEpochId}
+        and effect.expected_participant_digest = ${context.record.routing.appParticipantDigest}
         and effect.coverage_loop_id is not null
-      order by receipt.occurred_at desc
-      limit 1
+        and not exists(
+          select 1 from effect_receipts terminal
+          where terminal.outbox_id = effect.id and terminal.status in ('failed', 'ambiguous')
+        )
+      order by effect.coverage_loop_id
+      limit 2
     `;
-    return rows[0]?.coverage_loop_id ?? null;
+    return rows.length === 1 ? (rows[0]?.coverage_loop_id ?? null) : null;
   }
 
   private async tryExplicitCoverageResponse(
@@ -905,14 +909,14 @@ export class FlorenceOrchestrator {
     ).flatMap((candidate) => (candidate.loop ? [{ row: candidate.row, loop: candidate.loop }] : []));
     if (candidateLoops.length === 0) return null;
 
-    const deterministic = deterministicCoverageResponse(context.text, replyTargetLoopId !== null);
-    let action: "acknowledge" | "decline" | null = deterministic;
-    let target =
-      action && replyTargetLoopId
-        ? chooseDeterministicCoverageTarget(candidateLoops, personId, action, replyTargetLoopId)
-        : null;
+    // Only bypass semantic interpretation when the provider reply proves the exact Florence effect.
+    // A standalone “I can't” can describe a new need rather than decline the sole current loop.
+    const deterministic = replyTargetLoopId ? deterministicCoverageResponse(context.text, true) : null;
+    let response: "acknowledge" | "decline" | "ambiguous" = deterministic ?? "ambiguous";
+    let explicitSelfStatement = deterministic !== null;
+    let confidence = deterministic ? 1 : 0;
     let responseAttemptId: string | null = null;
-    if (!target) {
+    if (!deterministic) {
       const interpreted = await this.workers.run({
         attemptId: randomUUID(),
         taskVersionId: randomUUID(),
@@ -948,197 +952,56 @@ export class FlorenceOrchestrator {
         await this.workers.reconcile(interpreted.attemptId, "accepted");
         return null;
       }
-      action =
-        proposal.disposition === "acknowledge" || proposal.disposition === "decline"
+      explicitSelfStatement = proposal.explicitSelfStatement;
+      confidence = proposal.confidence;
+      response =
+        (proposal.disposition === "acknowledge" || proposal.disposition === "decline") &&
+        explicitSelfStatement &&
+        confidence >= 0.8
           ? proposal.disposition
-          : null;
-      const interpretedAction = action;
-      target =
-        interpretedAction && proposal.targetLoopId
-          ? (candidateLoops.find(
-              ({ loop }) =>
-                loop.loopId === proposal.targetLoopId &&
-                isCoverageResponseEligible(loop, personId, interpretedAction),
-            ) ?? null)
-          : null;
-      const safelyInterpreted =
-        target !== null &&
-        proposal.explicitSelfStatement &&
-        proposal.confidence >= 0.8 &&
-        (replyTargetLoopId === null || target.loop.loopId === replyTargetLoopId);
-      if (!safelyInterpreted) {
-        await this.workers.reconcile(interpreted.attemptId, "rejected");
-        await this.queueCoverageResponseClarification(context, candidateLoops, replyTargetLoopId);
-        return "coverage_response_ambiguous";
-      }
+          : "ambiguous";
     }
 
-    if (!action || !target) return null;
-    if (responseAttemptId) await this.workers.reconcile(responseAttemptId, "accepted");
-    const acknowledges = action === "acknowledge";
-    const declines = action === "decline";
-    const onlyLoop = target.row;
-    const responderLabel =
-      (await this.loadCurrentParticipantLabels([personId])).find((entry) => entry.personId === personId)
-        ?.label ?? "Someone";
-
-    const crossConversation = onlyLoop.destination_conversation_id !== context.record.routing.conversationId;
-    let liveDestination: LinqChatSnapshot | null = null;
-    if (crossConversation) {
-      if (!this.attachmentReader?.getChat || !this.mutationProcessor) {
-        return "coverage_destination_reconciliation_unavailable";
-      }
-      liveDestination = await this.attachmentReader.getChat(onlyLoop.external_channel_id);
-      const reconciled = await this.mutationProcessor.process({
-        kind: "linq.reconcile_chat",
-        liveChat: liveDestination,
-      });
-      if (
-        reconciled.ids.conversationId !== onlyLoop.destination_conversation_id ||
-        liveDestination.kind !== "group"
-      ) {
-        return "coverage_destination_changed";
-      }
+    if (!this.mutationProcessor) {
+      if (responseAttemptId) await this.workers.reconcile(responseAttemptId, "rejected");
+      return "coverage_application_unavailable";
     }
-
-    return this.database.begin(async (transaction) => {
-      const coordination = new PostgresCoordination(transaction, this.secretBox);
-      let current = await coordination.loadForUpdate(onlyLoop.id);
-      if (!current) return "coverage_disappeared";
-      const occurredAt = new Date();
-      const snapshot = await new PostgresConversationAuthority(transaction).snapshot(
-        onlyLoop.destination_conversation_id,
-      );
-      if (
-        snapshot.participantEpochId !== current.destination.participantEpochId ||
-        snapshot.participantSetDigest !== current.destination.participantSetDigest
-      ) {
-        return "coverage_destination_stale";
+    try {
+      const receipt = await this.mutationProcessor.process({
+        kind: "coverage.apply",
+        proposal: {
+          kind: "self_response_proposed",
+          internalProviderEventId: context.row.id,
+          evidenceSourceRevisionIds: [...context.evidenceSourceRevisionIds],
+          response,
+          explicitSelfStatement,
+          confidence,
+        },
+      });
+      if (responseAttemptId) {
+        await this.workers.reconcile(
+          responseAttemptId,
+          receipt.disposition.includes("stale")
+            ? "stale"
+            : receipt.disposition === "coverage_response_clarification_queued"
+              ? "partially_accepted"
+              : receipt.accepted
+                ? "accepted"
+                : "rejected",
+        );
       }
-      if (
-        acknowledges &&
-        current.proposedHolderPersonId === null &&
-        (current.state === "open" || current.state === "at_risk")
-      ) {
-        current = (
-          await coordination.transition({
-            loopId: current.loopId,
-            command: {
-              kind: "request_coverage",
-              transitionId: randomUUID(),
-              expectedVersion: current.version,
-              actorPersonId: personId,
-              requestedPersonId: personId,
-              occurredAt: occurredAt.toISOString(),
-              evidenceRefs: [...context.evidenceSourceRevisionIds],
-            },
-          })
-        ).loop;
+      return receipt.disposition;
+    } catch (error) {
+      if (error instanceof StaleAuthorityError) {
+        if (responseAttemptId) await this.workers.reconcile(responseAttemptId, "stale");
+        return "coverage_response_stale_before_commit";
       }
-      const recordsRisk =
-        declines && current.state === "covered" && current.acknowledgment?.personId === personId;
-      const decision = await coordination.transition({
-        loopId: current.loopId,
-        command: recordsRisk
-          ? {
-              kind: "record_risk",
-              transitionId: randomUUID(),
-              expectedVersion: current.version,
-              actorPersonId: personId,
-              occurredAt: occurredAt.toISOString(),
-              proposedHolderPersonId: null,
-              evidenceRefs: [...context.evidenceSourceRevisionIds],
-            }
-          : acknowledges
-            ? {
-                kind: "acknowledge_coverage",
-                transitionId: randomUUID(),
-                expectedVersion: current.version,
-                actorPersonId: personId,
-                acknowledgment: "explicit_self",
-                visibility:
-                  !crossConversation && context.record.routing.chatKind === "group" ? "shared" : "private",
-                occurredAt: occurredAt.toISOString(),
-                evidenceRefs: [...context.evidenceSourceRevisionIds],
-              }
-            : {
-                kind: "decline_coverage",
-                transitionId: randomUUID(),
-                expectedVersion: current.version,
-                actorPersonId: personId,
-                visibility: "private",
-                occurredAt: occurredAt.toISOString(),
-                evidenceRefs: [...context.evidenceSourceRevisionIds],
-              },
-      });
-      const destinationContext: MessageContext = crossConversation
-        ? {
-            ...context,
-            record: {
-              ...context.record,
-              routing: {
-                conversationId: onlyLoop.destination_conversation_id,
-                participantEpochId: current.destination.participantEpochId,
-                appParticipantDigest: current.destination.participantSetDigest,
-                providerParticipantDigest:
-                  liveDestination?.activeParticipantDigest ??
-                  context.record.routing.providerParticipantDigest,
-                liveIdentityIds: snapshot.participants.map((participant) => participant.personIdentityId),
-                senderIdentityId: null,
-                senderPersonId: personId,
-                providerChatId: onlyLoop.external_channel_id,
-                chatKind: "group",
-              },
-            },
-            snapshot,
-            household: {
-              id: onlyLoop.household_id,
-              controlEpoch: Number(onlyLoop.household_control_epoch),
-              timezone: onlyLoop.household_timezone,
-            },
-          }
-        : { ...context, snapshot };
-      const proactiveRule = crossConversation
-        ? snapshot.rules.find(
-            (rule) =>
-              rule.active &&
-              rule.participantSetDigest === snapshot.participantSetDigest &&
-              rule.allowedOperations.includes("proactive_coverage"),
-          )
-        : null;
-      const queued = await queueConversationEffect({
-        transaction,
-        secretBox: this.secretBox,
-        context: destinationContext,
-        snapshot,
-        text: acknowledges
-          ? crossConversation
-            ? `Covered — ${sentenceFragment(decision.loop.minimumSharedMeaning)}.`
-            : `Covered — ${responderLabel} has ${sentenceFragment(decision.loop.minimumSharedMeaning)}.`
-          : `Coverage is still open: ${decision.loop.minimumSharedMeaning}`,
-        sendKind: crossConversation ? "proactive" : "direct_response",
-        operation: crossConversation
-          ? "proactive_coverage"
-          : acknowledges
-            ? "coverage_closure"
-            : "coverage_state_change",
-        ruleId: proactiveRule?.ruleId ?? null,
-        idempotencyKey: `coverage:${decision.loop.loopId}:v${decision.loop.version}`,
-        coverageLoop: { id: decision.loop.loopId, version: decision.loop.version },
-      });
-      await reconcileCoverageTimers({
-        transaction,
-        loop: decision.loop,
-        snapshot,
-        now: occurredAt,
-        allowReminder: queued,
-      });
-      return acknowledges
-        ? "coverage_acknowledged"
-        : recordsRisk
-          ? "coverage_holder_withdrew_privately"
-          : "coverage_declined";
-    });
+      if (error instanceof UnauthorizedError) {
+        if (responseAttemptId) await this.workers.reconcile(responseAttemptId, "rejected");
+        return "coverage_response_unauthorized_before_commit";
+      }
+      throw error;
+    }
   }
 
   private async queueCoverageResponseClarification(
@@ -1536,92 +1399,42 @@ export class FlorenceOrchestrator {
       proposal.proposedPersonId && currentPeople.includes(proposal.proposedPersonId)
         ? proposal.proposedPersonId
         : soleAlternateCoverageCandidate(context.text, currentPeople, context.record.routing.senderPersonId);
-    const proposedLabel =
-      participantLabels.find((entry) => entry.personId === proposedPersonId)?.label ?? null;
-    const explicitAddress = isExplicitQuestion(context) || /\bflorence\b/iu.test(context.text);
-    const proactiveRule = context.snapshot.rules.find(
-      (rule) =>
-        rule.active &&
-        rule.participantSetDigest === context.snapshot.participantSetDigest &&
-        rule.allowedOperations.includes("proactive_coverage"),
-    );
-    const sendKind =
-      context.record.routing.chatKind === "direct" || explicitAddress ? "direct_response" : "proactive";
-    if (sendKind === "proactive" && !proactiveRule) {
-      await this.workers.reconcile(commitment.attemptId, "rejected");
-      return "coverage_detected_without_group_rule";
-    }
-
     const timing = resolveProposalTiming(proposal, context.household.timezone);
     const unresolved = [...new Set([...interpretation.uncertainties, ...proposal.unresolvedFacts])];
-    const loop = createCoverageLoop({
-      loopId: randomUUID(),
-      householdId: context.household.id,
-      minimumSharedMeaning: proposal.outcome,
-      unresolvedFacts: unresolved,
-      proposedHolderPersonId: proposedPersonId,
-      timing,
-      planVersion: 1,
-      notificationMode: "always",
-      destination: {
-        conversationId: context.record.routing.conversationId,
-        participantEpochId: context.record.routing.participantEpochId,
-        participantSetDigest: context.record.routing.appParticipantDigest,
-        audience: context.record.routing.chatKind === "group" ? "group" : "private",
-      },
-      sourceEvidenceRefs: [...context.evidenceSourceRevisionIds],
-      occurredAt: new Date().toISOString(),
-    });
-    const disposition = await this.database.begin(async (transaction) => {
-      const conversations = new PostgresConversationAuthority(transaction);
-      const latest = await conversations.snapshot(context.record.routing.conversationId);
-      if (
-        latest.participantEpochId !== context.record.routing.participantEpochId ||
-        latest.participantSetDigest !== context.record.routing.appParticipantDigest
-      )
+    if (!this.mutationProcessor) {
+      await this.workers.reconcile(commitment.attemptId, "rejected");
+      return "coverage_application_unavailable";
+    }
+    try {
+      const receipt = await this.mutationProcessor.process({
+        kind: "coverage.apply",
+        proposal: {
+          kind: "need_proposed",
+          internalProviderEventId: context.row.id,
+          evidenceSourceRevisionIds: [...context.evidenceSourceRevisionIds],
+          minimumSharedMeaning: proposal.outcome,
+          unresolvedFacts: unresolved,
+          proposedHolderPersonId: proposedPersonId,
+          timing,
+          consequentialQuestion: proposal.consequentialQuestion,
+        },
+      });
+      await this.workers.reconcile(
+        commitment.attemptId,
+        receipt.disposition.includes("stale") ? "stale" : receipt.accepted ? "accepted" : "rejected",
+      );
+      return receipt.disposition;
+    } catch (error) {
+      if (error instanceof StaleAuthorityError) {
+        await this.workers.reconcile(commitment.attemptId, "stale");
         return "coverage_stale_before_commit";
-      const coordination = new PostgresCoordination(transaction, this.secretBox);
-      let persisted = await coordination.create(loop);
-      if (persisted.state === "open" && proposedPersonId) {
-        persisted = (
-          await coordination.transition({
-            loopId: persisted.loopId,
-            command: {
-              kind: "request_coverage",
-              transitionId: randomUUID(),
-              expectedVersion: persisted.version,
-              actorPersonId: context.record.routing.senderPersonId ?? proposedPersonId,
-              requestedPersonId: proposedPersonId,
-              occurredAt: new Date().toISOString(),
-              evidenceRefs: [...context.evidenceSourceRevisionIds],
-            },
-          })
-        ).loop;
       }
-      const message = coveragePrompt(persisted, proposedLabel, proposal.consequentialQuestion);
-      const queued = await queueConversationEffect({
-        transaction,
-        secretBox: this.secretBox,
-        context,
-        snapshot: latest,
-        text: message,
-        sendKind,
-        operation: sendKind === "proactive" ? "proactive_coverage" : "coverage_coordination",
-        ruleId: sendKind === "proactive" ? (proactiveRule?.ruleId ?? null) : null,
-        idempotencyKey: `coverage:${persisted.loopId}:v${persisted.version}:open`,
-        coverageLoop: { id: persisted.loopId, version: persisted.version },
-      });
-      await reconcileCoverageTimers({
-        transaction,
-        loop: persisted,
-        snapshot: latest,
-        now: new Date(),
-        allowReminder: queued,
-      });
-      return `coverage_${persisted.state}`;
-    });
-    await this.workers.reconcile(commitment.attemptId, disposition.includes("stale") ? "stale" : "accepted");
-    return disposition;
+      if (error instanceof UnauthorizedError) {
+        await this.workers.reconcile(commitment.attemptId, "rejected");
+        return "coverage_unauthorized_before_commit";
+      }
+      throw error;
+    }
   }
 
   private async answerGeneralQuestion(context: MessageContext): Promise<string> {
@@ -1816,39 +1629,6 @@ function deterministicCoverageResponse(
     return "acknowledge";
   }
   return null;
-}
-
-function chooseDeterministicCoverageTarget<
-  Candidate extends { readonly row: CoverageResponseTargetRow; readonly loop: CoverageLoop },
->(
-  candidates: readonly Candidate[],
-  personId: string,
-  action: "acknowledge" | "decline",
-  replyTargetLoopId: string | null,
-): Candidate | null {
-  const eligible = candidates.filter(({ loop }) => isCoverageResponseEligible(loop, personId, action));
-  if (replyTargetLoopId) {
-    return eligible.find(({ loop }) => loop.loopId === replyTargetLoopId) ?? null;
-  }
-  return eligible.length === 1 ? (eligible[0] ?? null) : null;
-}
-
-function isCoverageResponseEligible(
-  loop: CoverageLoop,
-  personId: string,
-  action: "acknowledge" | "decline",
-): boolean {
-  if (action === "acknowledge") {
-    return (
-      (loop.proposedHolderPersonId === personId &&
-        (loop.state === "awaiting_response" || loop.state === "at_risk")) ||
-      (loop.proposedHolderPersonId === null && (loop.state === "open" || loop.state === "at_risk"))
-    );
-  }
-  return (
-    (loop.proposedHolderPersonId === personId && loop.state === "awaiting_response") ||
-    (loop.acknowledgment?.personId === personId && loop.state === "covered")
-  );
 }
 
 async function resolveHousehold(

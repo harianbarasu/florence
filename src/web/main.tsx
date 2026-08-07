@@ -372,9 +372,46 @@ function ShellIcon({ name }: { name: (typeof APP_LINKS)[number]["icon"] | "messa
 }
 
 function HomePage() {
-  const { data, loading, error } = useResource<HomeView>("/api/home");
+  const { data, loading, error, reload } = useResource<HomeView>("/api/home");
+  useEffect(() => {
+    let stopped = false;
+    let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const stopTimer = () => {
+      if (refreshTimer !== null) clearTimeout(refreshTimer);
+      refreshTimer = null;
+    };
+    const scheduleRefresh = () => {
+      stopTimer();
+      if (stopped || document.visibilityState !== "visible") return;
+      refreshTimer = setTimeout(async () => {
+        refreshTimer = null;
+        if (stopped || document.visibilityState !== "visible") return;
+        await reload(false);
+        scheduleRefresh();
+      }, 5_000);
+    };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState !== "visible") {
+        stopTimer();
+        return;
+      }
+      void reload(false).finally(scheduleRefresh);
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    scheduleRefresh();
+    return () => {
+      stopped = true;
+      stopTimer();
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [reload]);
+
   if (loading) return <PageSkeleton />;
   if (error || !data) return <ErrorCard message={error ?? "Could not load Florence."} />;
+  const attentionItems = data.items.filter((item) => item.phase !== "confirmed");
+  const confirmedItems = data.items.filter((item) => item.phase === "confirmed");
   return (
     <div className="page-stack">
       <section className={`monitor-card ${data.monitoring.status}`}>
@@ -401,19 +438,29 @@ function HomePage() {
           </small>
         </section>
       ) : null}
-      <SectionHeading title="Needs your attention" count={data.items.length} />
-      {data.items.length === 0 ? (
+      <SectionHeading title="Needs your attention" count={data.attentionCount} />
+      {attentionItems.length === 0 ? (
         <EmptyState
           title="Nothing needs you right now"
           copy="Florence will stay quiet until something changes."
         />
       ) : (
         <div className="item-list">
-          {data.items.map((item) => (
+          {attentionItems.map((item) => (
             <ExceptionRow key={item.id} item={item} />
           ))}
         </div>
       )}
+      {confirmedItems.length > 0 ? (
+        <>
+          <SectionHeading title="Covered in the last 24 hours" count={confirmedItems.length} />
+          <div className="item-list confirmed-list">
+            {confirmedItems.map((item) => (
+              <ExceptionRow key={item.id} item={item} />
+            ))}
+          </div>
+        </>
+      ) : null}
     </div>
   );
 }
@@ -2147,16 +2194,35 @@ function SectionHeading({ title, count }: { title: string; count: number }) {
   );
 }
 function ExceptionRow({ item }: { item: HomeView["items"][number] }) {
-  return (
-    <article className="exception-row">
+  const phaseLabel =
+    item.phase === "confirmed" ? "Confirmed" : item.phase === "awaiting" ? "Awaiting reply" : "Open";
+  const className = `exception-row${item.phase ? ` coverage-${item.phase}` : ""}`;
+  const content = (
+    <>
       <span className={`urgency-dot ${item.urgency}`} />
       <div>
-        <span className="section-kicker">{item.kind.replace("_", " ")}</span>
+        <div className="exception-meta">
+          <span className={item.phase ? `phase-label ${item.phase}` : "section-kicker"}>
+            {item.phase ? phaseLabel : item.kind.replace("_", " ")}
+          </span>
+          {item.changedAt ? (
+            <span>
+              {item.phase === "confirmed" ? "Confirmed" : "Updated"} {friendlyTime(item.changedAt)}
+            </span>
+          ) : null}
+        </div>
         <h3>{item.title}</h3>
         <p>{item.detail}</p>
       </div>
-      <span className="chevron">›</span>
-    </article>
+      {item.href ? <span className="chevron">›</span> : null}
+    </>
+  );
+  return item.href ? (
+    <a className={className} href={item.href}>
+      {content}
+    </a>
+  ) : (
+    <article className={className}>{content}</article>
   );
 }
 function KnowledgeRow({

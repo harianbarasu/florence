@@ -33,6 +33,7 @@ import type {
   ProcessReceipt,
   WebRoutineFields,
 } from "./contracts.js";
+import { CoverageCoordinator } from "./coverage-coordinator.js";
 import { reconcileCoverageTimers } from "./coverage-timer-reconciliation.js";
 
 type Transaction = TransactionSql<Record<string, never>>;
@@ -178,6 +179,8 @@ export class FlorenceApplication {
           ids: { actionIntentId: input.actionIntentId, loopId: result.loopId },
         };
       }
+      case "coverage.apply":
+        return new CoverageCoordinator(this.database, this.config, this.secretBox).apply(input.proposal);
       case "web.command":
         return this.processWebCommand(input.actorPersonId, input.command);
     }
@@ -461,6 +464,7 @@ export class FlorenceApplication {
           reconciled.householdControlEpoch
             ? { household: { id: reconciled.householdId, controlEpoch: reconciled.householdControlEpoch } }
             : {}),
+          priority: 10,
           maxAttempts: 8,
         });
       }
@@ -1674,6 +1678,7 @@ export class FlorenceApplication {
           await new PostgresConversationAuthority(transaction).snapshot(record.routing.conversationId)
         ).authorityVersion,
       },
+      priority: 20,
       maxAttempts: 5,
       deadlineAt: new Date(Date.now() + 5 * 60_000),
     });

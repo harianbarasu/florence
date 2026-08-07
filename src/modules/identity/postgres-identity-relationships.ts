@@ -517,7 +517,9 @@ export class PostgresIdentityRelationships implements IdentityRelationships {
       `;
       await transaction`
         update households
-        set membership_version = membership_version + 1, updated_at = ${acceptedAt}
+        set membership_version = membership_version + 1,
+            control_epoch = control_epoch + 1,
+            updated_at = ${acceptedAt}
         where id = ${invitation.household_id}
       `;
       return HouseholdMembershipSchema.parse({
@@ -551,6 +553,7 @@ export class PostgresIdentityRelationships implements IdentityRelationships {
       await transaction`
         update households
         set membership_version = membership_version + 1,
+            control_epoch = control_epoch + 1,
             status = case when not exists (
               select 1 from household_memberships
               where household_id = ${input.householdId} and role = 'steward' and status = 'active'
@@ -597,7 +600,9 @@ export class PostgresIdentityRelationships implements IdentityRelationships {
       `;
       await transaction`
         update households
-        set membership_version = membership_version + 1, updated_at = ${suspendedAt}
+        set membership_version = membership_version + 1,
+            control_epoch = control_epoch + 1,
+            updated_at = ${suspendedAt}
         where id = ${input.householdId}
       `;
       return HouseholdMembershipSchema.parse({

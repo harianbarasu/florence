@@ -1,5 +1,6 @@
 import type { LinqChatSnapshot, LinqWebhookEnvelope } from "../adapters/linq/index.js";
 import type { PrivateBridgeProposalInput } from "../modules/bridges/index.js";
+import type { ResolvedTimePlan } from "../modules/coordination/index.js";
 import type { IntegrationAccountKind, IntegrationCapability, JsonObject } from "../modules/sources/index.js";
 import type { TimerProcessPayload } from "../modules/work/index.js";
 
@@ -22,6 +23,27 @@ export interface WebRoutineFields {
   readonly usualPersonId: string | null;
   readonly standingSelfCoverage: boolean;
 }
+
+/** A worker may interpret evidence, but it cannot choose mutation authority or a loop target. */
+export type CoverageProposal =
+  | {
+      readonly kind: "need_proposed";
+      readonly internalProviderEventId: string;
+      readonly evidenceSourceRevisionIds: readonly string[];
+      readonly minimumSharedMeaning: string;
+      readonly unresolvedFacts: readonly string[];
+      readonly proposedHolderPersonId: string | null;
+      readonly timing: ResolvedTimePlan;
+      readonly consequentialQuestion: string | null;
+    }
+  | {
+      readonly kind: "self_response_proposed";
+      readonly internalProviderEventId: string;
+      readonly evidenceSourceRevisionIds: readonly string[];
+      readonly response: "acknowledge" | "decline" | "ambiguous";
+      readonly explicitSelfStatement: boolean;
+      readonly confidence: number;
+    };
 
 export type AppEnvelope =
   | {
@@ -56,6 +78,11 @@ export type AppEnvelope =
   | {
       readonly kind: "private_bridge.commit";
       readonly actionIntentId: string;
+    }
+  | {
+      /** Commits a bounded coverage proposal only after reopening current source authority. */
+      readonly kind: "coverage.apply";
+      readonly proposal: CoverageProposal;
     }
   | {
       readonly kind: "maintenance.materialize_routines";

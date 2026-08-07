@@ -332,8 +332,9 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
       assuranceExpiresAt: principal.assuranceExpiresAt?.toISOString() ?? null,
     });
   });
-  app.get("/api/home", async (request) => {
+  app.get("/api/home", async (request, reply) => {
     const principal = await requireSession(request, config, auth);
+    reply.header("Cache-Control", "private, no-store, max-age=0");
     return queries.home(principal.personId);
   });
   app.get("/api/people", async (request, reply) => {

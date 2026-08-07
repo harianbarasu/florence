@@ -70,7 +70,6 @@ export const outcomeAssessmentSchema = z
 export const coverageResponseInterpretationSchema = z
   .object({
     disposition: z.enum(["acknowledge", "decline", "not_response", "ambiguous"]),
-    targetLoopId: z.string().uuid().nullable(),
     explicitSelfStatement: z.boolean(),
     confidence: z.number().min(0).max(1),
     rationale: z.string().min(1).max(700),
@@ -137,11 +136,11 @@ export const PRODUCT_SKILLS = {
   } satisfies PinnedSkill<typeof outcomeAssessmentSchema>,
   responseInterpret: {
     id: "coverage.response_interpret",
-    version: 1,
-    purpose: "Interpret a person's natural-language response to an exact current coverage loop.",
-    instructions: `${commonGuardrails}\nClassify only the authenticated sender's own explicit response. Natural confirmations such as “sure,” “I'll pick them up,” and “yes, I can do Wednesday” can acknowledge coverage when the supplied loop context makes their target unambiguous. Natural refusals can decline only the sender's own proposed or acknowledged coverage. Questions, tentative language, third-person statements, reactions, and silence are not commitments. Prefer the exact replied-to loop when supplied. If more than one loop could match and the message does not identify one, return ambiguous. Select only a supplied loop ID.`,
+    version: 2,
+    purpose: "Classify a person's natural-language response without choosing or mutating a coverage loop.",
+    instructions: `${commonGuardrails}\nClassify only the authenticated sender's own explicit response. Natural confirmations such as “sure,” “I'll pick them up,” and “yes, I can do Wednesday” can acknowledge coverage only when the supplied context is unambiguous. Natural refusals can decline only the sender's own proposed or acknowledged coverage. Questions, tentative language, third-person statements, reactions, and silence are not commitments. Target selection is deterministic application work: do not select, invent, or return a loop ID. If more than one loop could match and there is no exact replied-to loop, return ambiguous.`,
     outputSchema: coverageResponseInterpretationSchema,
-    outputSchemaName: "coverage_response_interpret_v1",
+    outputSchemaName: "coverage_response_interpret_v2",
     riskClass: "high",
     requestedCapabilities: [] as const,
     evaluationRelease: "coverage-core-2",

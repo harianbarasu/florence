@@ -97,7 +97,7 @@ export class EffectOutbox {
       const evidenceSourceRevisionIds = [...(input.evidenceSourceRevisionIds ?? [])];
       if (evidenceSourceRevisionIds.length > 0) {
         const evidence = await transaction<{ readonly authorized: boolean }[]>`
-          select private_source_evidence_set_is_current(
+          select source_evidence_set_is_current(
             ${transaction.array(evidenceSourceRevisionIds)}::uuid[],
             ${input.sourceConversation?.participantEpochId ?? null}::uuid,
             ${input.person?.id ?? null}::uuid,
@@ -213,7 +213,7 @@ export class EffectOutbox {
             and source_epoch.ended_at is null
             and source_epoch.participant_set_digest = effect.source_expected_participant_digest
           ))
-          and private_source_evidence_set_is_current(
+          and source_evidence_set_is_current(
             effect.evidence_source_revision_ids,
             effect.source_participant_epoch_id,
             effect.person_id,
@@ -382,7 +382,7 @@ export class EffectOutbox {
             and source_epoch.ended_at is null
             and source_epoch.participant_set_digest = candidate.source_expected_participant_digest
           ))
-          and private_source_evidence_set_is_current(
+          and source_evidence_set_is_current(
             candidate.evidence_source_revision_ids,
             candidate.source_participant_epoch_id,
             candidate.person_id,
@@ -611,7 +611,7 @@ export class EffectOutbox {
             and source_epoch.ended_at is null
             and source_epoch.participant_set_digest = effect.source_expected_participant_digest
           ))
-          and private_source_evidence_set_is_current(
+          and source_evidence_set_is_current(
             effect.evidence_source_revision_ids,
             effect.source_participant_epoch_id,
             effect.person_id,
@@ -753,7 +753,7 @@ export class EffectOutbox {
             and epoch.ended_at is null
             and epoch.participant_set_digest = effect.source_expected_participant_digest
         ))
-        or not private_source_evidence_set_is_current(
+        or not source_evidence_set_is_current(
           effect.evidence_source_revision_ids,
           effect.source_participant_epoch_id,
           effect.person_id,

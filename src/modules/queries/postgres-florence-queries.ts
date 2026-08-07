@@ -89,18 +89,111 @@ export class PostgresFlorenceQueries {
 
   public async home(personId: string): Promise<HomeView> {
     const loops = await this.database<
-      { id: string; state: string; updated_at: Date; household_id: string }[]
+      {
+        id: string;
+        state: string;
+        content_ciphertext: Buffer;
+        content_key_version: string;
+        last_transition_at: Date;
+      }[]
     >`
-      select loop.id, loop.state, loop.updated_at, loop.household_id
-      from coverage_loops loop
-      join household_memberships membership on membership.household_id = loop.household_id
+      select loop.id, loop.state, loop.content_ciphertext, loop.content_key_version,
+        loop.last_transition_at
+      from household_memberships membership
+      join membership_capabilities read_grant on read_grant.membership_id = membership.id
+        and read_grant.capability = 'household.read' and read_grant.status = 'active'
+      join households household on household.id = membership.household_id
+        and household.status = 'active'
+      join coverage_loops loop on loop.household_id = household.id
+      join conversations destination on destination.id = loop.destination_conversation_id
+        and destination.household_id = household.id and destination.status = 'active'
+      join participant_epochs epoch on epoch.id = loop.participant_epoch_id
+        and destination.current_epoch_id = epoch.id and epoch.ended_at is null
+        and epoch.participant_set_digest = loop.participant_set_digest
+      join epoch_participants viewer_participant
+        on viewer_participant.participant_epoch_id = epoch.id
+        and viewer_participant.person_id = ${personId}
+        and viewer_participant.registration_status = 'registered'
+        and viewer_participant.consented_at is not null
+      join participant_policies viewer_policy on viewer_policy.conversation_id = destination.id
+        and viewer_policy.person_id = ${personId} and viewer_policy.status = 'active'
+        and viewer_policy.allow_content_processing
       where membership.person_id = ${personId}
         and membership.status = 'active'
-        and loop.state in ('provisional', 'open', 'awaiting_response', 'at_risk')
+        and (
+          loop.state in ('provisional', 'open', 'awaiting_response', 'at_risk')
+          or (loop.state = 'covered' and loop.last_transition_at >= now() - interval '24 hours')
+        )
       order by
-        case loop.state when 'at_risk' then 0 when 'awaiting_response' then 1 else 2 end,
-        loop.updated_at
+        case loop.state
+          when 'at_risk' then 0
+          when 'awaiting_response' then 1
+          when 'open' then 2
+          when 'provisional' then 3
+          else 4
+        end,
+        case when loop.state = 'covered' then loop.last_transition_at end desc,
+        loop.last_transition_at
       limit 50
+    `;
+    const coverageApprovals = await this.database<{ conversation_id: string; viewer_approved: boolean }[]>`
+      select conversation.id as conversation_id,
+        exists(
+          select 1
+          from conversation_rules proposal
+          join conversation_rule_approvals approval
+            on approval.conversation_rule_id = proposal.id
+            and approval.participant_epoch_id = epoch.id
+            and approval.participant_set_digest = epoch.participant_set_digest
+            and approval.person_id = ${personId}
+          where proposal.conversation_id = conversation.id
+            and proposal.rule_key = 'family_coverage_proposal'
+            and proposal.status = 'candidate'
+            and proposal.participant_set_digest = epoch.participant_set_digest
+        ) as viewer_approved
+      from household_memberships membership
+      join membership_capabilities read_grant on read_grant.membership_id = membership.id
+        and read_grant.capability = 'household.read' and read_grant.status = 'active'
+      join households household on household.id = membership.household_id
+        and household.status = 'active'
+      join conversations conversation on conversation.household_id = household.id
+        and conversation.kind = 'group' and conversation.status = 'active'
+      join participant_epochs epoch on epoch.id = conversation.current_epoch_id
+        and epoch.ended_at is null
+      join epoch_participants viewer_participant
+        on viewer_participant.participant_epoch_id = epoch.id
+        and viewer_participant.person_id = ${personId}
+        and viewer_participant.registration_status = 'registered'
+        and viewer_participant.consented_at is not null
+      where membership.person_id = ${personId} and membership.status = 'active'
+        and not exists(
+          select 1
+          from epoch_participants participant
+          left join participant_policies policy on policy.conversation_id = conversation.id
+            and policy.person_id = participant.person_id and policy.status = 'active'
+          where participant.participant_epoch_id = epoch.id
+            and (
+              participant.registration_status <> 'registered'
+              or participant.consented_at is null
+              or policy.id is null
+              or not coalesce(policy.allow_content_processing, false)
+              or not coalesce(policy.allow_direct_responses, false)
+            )
+        )
+        and not exists(
+          select 1 from channel_suppressions suppression
+          where suppression.conversation_id = conversation.id and suppression.active
+            and suppression.kind in ('stop', 'pause', 'read_only', 'deletion_fence', 'safety_hold')
+        )
+        and not exists(
+          select 1 from conversation_rules active_rule
+          where active_rule.conversation_id = conversation.id
+            and active_rule.status = 'active'
+            and active_rule.participant_set_digest = epoch.participant_set_digest
+            and 'proactive_coverage' = any(active_rule.allowed_operations)
+        )
+      order by conversation.updated_at desc, conversation.id
+      limit 25
     `;
     const candidates = await this.database<{ id: string; candidate_kind: string; proposed_at: Date }[]>`
       select id, candidate_kind, proposed_at
@@ -114,17 +207,47 @@ export class PostgresFlorenceQueries {
       where person_id = ${personId} and status in ('reauth_required', 'error')
     `;
     const items: HomeView["items"] = [
-      ...loops.map((loop) => ({
-        id: loop.id,
-        kind: "coverage" as const,
-        title:
-          loop.state === "at_risk"
-            ? "Coverage changed"
-            : loop.state === "awaiting_response"
-              ? "Waiting for an answer"
-              : "Coverage is still open",
-        detail: "Florence is keeping this family commitment visible until someone explicitly takes it.",
-        urgency: loop.state === "at_risk" ? ("now" as const) : ("soon" as const),
+      ...loops.map((loop) => {
+        const phase: NonNullable<HomeView["items"][number]["phase"]> =
+          loop.state === "covered" ? "confirmed" : loop.state === "awaiting_response" ? "awaiting" : "open";
+        const meaning = decryptCoverageMeaning(
+          this.#secretBox,
+          loop.content_ciphertext,
+          loop.content_key_version,
+        );
+        return {
+          id: loop.id,
+          kind: "coverage" as const,
+          phase,
+          title: meaning ?? "Family coverage item",
+          detail:
+            phase === "confirmed"
+              ? "A person explicitly confirmed coverage."
+              : phase === "awaiting"
+                ? "Florence is waiting for an explicit yes."
+                : loop.state === "at_risk"
+                  ? "This needs a confirmed handoff now."
+                  : "No one has explicitly confirmed this yet.",
+          urgency:
+            phase === "confirmed"
+              ? ("routine" as const)
+              : loop.state === "at_risk"
+                ? ("now" as const)
+                : ("soon" as const),
+          changedAt: loop.last_transition_at.toISOString(),
+        };
+      }),
+      ...coverageApprovals.map((approval) => ({
+        id: `coverage-approval:${approval.conversation_id}`,
+        kind: "approval" as const,
+        title: approval.viewer_approved
+          ? "Waiting for the group’s coverage approval"
+          : "Approve Florence for a family group",
+        detail: approval.viewer_approved
+          ? "Your approval is saved. Florence will not write in the group until every current person approves."
+          : "Every current person must approve before Florence can open and follow coverage loops there.",
+        urgency: "soon" as const,
+        href: "/people",
       })),
       ...candidates.map((candidate) => ({
         id: candidate.id,
@@ -145,6 +268,7 @@ export class PostgresFlorenceQueries {
         href: "/sources",
       });
     }
+    const attentionCount = items.filter((item) => item.phase !== "confirmed").length;
     const householdCount = await this.database<{ count: number | string }[]>`
       select count(*) as count from household_memberships
       where person_id = ${personId} and status = 'active'
@@ -159,16 +283,17 @@ export class PostgresFlorenceQueries {
       (Number(integrationCount[0]?.count ?? 0) > 0 ? 1 : 0);
     return {
       monitoring: {
-        status: items.length > 0 ? "attention" : completed < 3 ? "learning" : "healthy",
+        status: attentionCount > 0 ? "attention" : completed < 3 ? "learning" : "healthy",
         label:
-          items.length > 0
-            ? `${items.length} thing${items.length === 1 ? "" : "s"} need attention`
+          attentionCount > 0
+            ? `${attentionCount} thing${attentionCount === 1 ? "" : "s"} need attention`
             : "Your family is covered",
         detail:
-          items.length > 0
+          attentionCount > 0
             ? "Florence is following the open loops and will stay quiet about everything else."
             : "Nothing currently needs a handoff or decision.",
       },
+      attentionCount,
       items,
       onboarding:
         completed < 3
@@ -1566,6 +1691,21 @@ function decryptDependentList(
     );
   } catch {
     return [];
+  }
+}
+
+function decryptCoverageMeaning(secretBox: SecretBox, ciphertext: Buffer, keyVersion: string): string | null {
+  try {
+    const encrypted = JSON.parse(ciphertext.toString("utf8")) as unknown;
+    if (!isRecord(encrypted) || encrypted.kid !== keyVersion) return null;
+    const content = JSON.parse(
+      secretBox.decrypt(encrypted, "coverage-loop-content").toString("utf8"),
+    ) as unknown;
+    if (!isRecord(content) || typeof content.minimumSharedMeaning !== "string") return null;
+    const meaning = content.minimumSharedMeaning.replace(/\s+/gu, " ").trim();
+    return meaning.length > 0 && meaning.length <= 500 ? meaning : null;
+  } catch {
+    return null;
   }
 }
 

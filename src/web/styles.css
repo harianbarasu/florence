@@ -754,6 +754,41 @@ p {
   margin: 0;
   font-size: 12px;
 }
+.exception-row.coverage-confirmed {
+  background: rgba(230, 238, 231, 0.56);
+}
+.confirmed-list .exception-row {
+  box-shadow: none;
+}
+.exception-meta {
+  min-height: 18px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  color: var(--muted);
+  font-size: 10px;
+}
+.phase-label {
+  display: inline-flex;
+  align-items: center;
+  min-height: 18px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: #f3e8c9;
+  color: #765d28;
+  font-size: 9px;
+  font-weight: 750;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.phase-label.open {
+  background: #f6ded6;
+  color: #874934;
+}
+.phase-label.confirmed {
+  background: var(--sage-soft);
+  color: #315440;
+}
 .urgency-dot {
   width: 8px;
   height: 8px;

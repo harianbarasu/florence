@@ -86,6 +86,7 @@ export interface HomeView {
     label: string;
     detail: string;
   };
+  attentionCount: number;
   items: ExceptionItem[];
   onboarding: {
     completed: number;
@@ -97,9 +98,11 @@ export interface HomeView {
 export interface ExceptionItem {
   id: string;
   kind: "coverage" | "approval" | "private_review" | "connection" | "privacy";
+  phase?: "open" | "awaiting" | "confirmed";
   title: string;
   detail: string;
   urgency: "routine" | "soon" | "now";
+  changedAt?: string;
   href?: string;
 }
 
@@ -255,7 +258,11 @@ export class ApiError extends Error {
 }
 
 export async function getJson<T>(path: string): Promise<T> {
-  const response = await fetch(path, { credentials: "same-origin", headers: { Accept: "application/json" } });
+  const response = await fetch(path, {
+    cache: "no-store",
+    credentials: "same-origin",
+    headers: { Accept: "application/json" },
+  });
   if (!response.ok) throw new ApiError(await safeError(response), response.status);
   return (await response.json()) as T;
 }

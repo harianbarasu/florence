@@ -498,6 +498,42 @@ function PeoplePage({ viewer }: { viewer: Viewer }) {
     }
   }
 
+  async function runProtectedAction(
+    key: string,
+    path: string,
+    body: unknown,
+    success: string,
+    stepUp: unknown,
+  ) {
+    setBusy(key);
+    setActionMessage(null);
+    setActionError(null);
+    try {
+      await postJson(path, viewer.csrfToken, body);
+      setActionMessage(success);
+      await reload();
+    } catch (reason) {
+      if (reason instanceof ApiError && reason.status === 401) {
+        try {
+          await postJson("/api/safety/request-step-up", viewer.csrfToken, stepUp);
+          setActionMessage(
+            "Check your private iMessage from Florence, open its secure link, then try this action again.",
+          );
+        } catch (stepUpReason) {
+          setActionError(
+            stepUpReason instanceof Error
+              ? stepUpReason.message
+              : "Florence could not send the private confirmation.",
+          );
+        }
+      } else {
+        setActionError(reason instanceof Error ? reason.message : "Florence could not save that change.");
+      }
+    } finally {
+      setBusy(null);
+    }
+  }
+
   if (loading) return <PageSkeleton />;
   if (error || !data) return <ErrorCard message={error ?? "Could not load your family."} />;
   return (
@@ -579,13 +615,21 @@ function PeoplePage({ viewer }: { viewer: Viewer }) {
                     className="primary-button compact-button"
                     disabled={!invitation.canAct || busy === actionKey}
                     onClick={() =>
-                      void runAction(
+                      void runProtectedAction(
                         actionKey,
                         `/api/invitations/${invitation.id}/${approving ? "approve" : "accept"}`,
                         {},
                         approving
                           ? "Approved. The invitation is ready once every steward has approved."
                           : "You joined the family.",
+                        {
+                          purpose: "household_invitation",
+                          context: {
+                            action: approving ? "approve" : "accept",
+                            householdId: invitation.householdId,
+                            invitationId: invitation.id,
+                          },
+                        },
                       )
                     }
                   >
@@ -777,20 +821,28 @@ function PeoplePage({ viewer }: { viewer: Viewer }) {
                           type="button"
                           className="quiet-button"
                           disabled={busy === inviteKey}
-                          onClick={() =>
-                            void runAction(
-                              inviteKey,
-                              `/api/households/${household.id}/invitations`,
-                              {
-                                conversationId: participant.conversationId,
-                                inviteePersonId: participant.personId,
-                                role,
-                              },
-                              participant.registered
-                                ? `Florence texted ${participant.name} a fresh private family invitation.`
-                                : `Florence privately asked ${participant.name} whether they want to join.`,
-                            )
-                          }
+                          onClick={() => {
+                            const path = `/api/households/${household.id}/invitations`;
+                            const body = {
+                              conversationId: participant.conversationId,
+                              inviteePersonId: participant.personId,
+                              role,
+                            };
+                            const success = participant.registered
+                              ? `Florence texted ${participant.name} a fresh private family invitation.`
+                              : `Florence privately asked ${participant.name} whether they want to join.`;
+                            void (role === "steward"
+                              ? runProtectedAction(inviteKey, path, body, success, {
+                                  purpose: "household_invitation",
+                                  context: {
+                                    action: "invite",
+                                    householdId: household.id,
+                                    conversationId: participant.conversationId,
+                                    inviteePersonId: participant.personId,
+                                  },
+                                })
+                              : runAction(inviteKey, path, body, success));
+                          }}
                         >
                           Invite
                         </button>
@@ -838,11 +890,15 @@ function PeoplePage({ viewer }: { viewer: Viewer }) {
                           className="quiet-button"
                           disabled={!group.canApprove || busy === approvalKey}
                           onClick={() =>
-                            void runAction(
+                            void runProtectedAction(
                               approvalKey,
                               `/api/chats/${group.conversationId}/coverage-rule-approval`,
                               {},
                               "Your approval is saved. The group status is updated below.",
+                              {
+                                purpose: "group_coverage",
+                                context: { action: "approve", conversationId: group.conversationId },
+                              },
                             )
                           }
                         >
@@ -1116,14 +1172,19 @@ function SourcesPage({ viewer }: { viewer: Viewer }) {
   ) {
     setBusy(`approve:${proposal.actionIntentId}:${mode}`);
     setActionError(null);
+    const approval = {
+      actionDigest: proposal.actionDigest,
+      dataDigest: proposal.dataDigest,
+      policyDigest: proposal.policyDigest,
+      targetDigest: proposal.targetDigest,
+      mode,
+    } as const;
     try {
-      await postJson(`/api/sources/private-bridge/${proposal.actionIntentId}/approve`, viewer.csrfToken, {
-        actionDigest: proposal.actionDigest,
-        dataDigest: proposal.dataDigest,
-        policyDigest: proposal.policyDigest,
-        targetDigest: proposal.targetDigest,
-        mode,
-      });
+      await postJson(
+        `/api/sources/private-bridge/${proposal.actionIntentId}/approve`,
+        viewer.csrfToken,
+        approval,
+      );
       setActionMessage(
         mode === "standing"
           ? "Approved. Florence may share only matching future coverage items from that exact source."
@@ -1131,9 +1192,31 @@ function SourcesPage({ viewer }: { viewer: Viewer }) {
       );
       await reload();
     } catch (reason) {
-      setActionError(
-        reason instanceof Error ? reason.message : "That exact sharing approval is no longer current.",
-      );
+      if (mode === "standing" && reason instanceof ApiError && reason.status === 401) {
+        try {
+          await postJson("/api/safety/request-step-up", viewer.csrfToken, {
+            purpose: "private_bridge_standing",
+            context: {
+              action: "approve",
+              actionIntentId: proposal.actionIntentId,
+              ...approval,
+            },
+          });
+          setActionMessage(
+            "Check your private iMessage from Florence, open its secure link, then approve this exact future rule again.",
+          );
+        } catch (stepUpReason) {
+          setActionError(
+            stepUpReason instanceof Error
+              ? stepUpReason.message
+              : "Florence could not send the private confirmation.",
+          );
+        }
+      } else {
+        setActionError(
+          reason instanceof Error ? reason.message : "That exact sharing approval is no longer current.",
+        );
+      }
     } finally {
       setBusy(null);
     }

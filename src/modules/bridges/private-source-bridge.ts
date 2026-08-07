@@ -89,12 +89,14 @@ const IntentDigestFenceSchema = z.strictObject({
 const SourceFrontierFenceSchema = z.strictObject({
   frontierId: z.string().uuid(),
   integrationId: z.string().uuid(),
+  integrationControlEpoch: z.number().int().positive(),
   caseKind: z.literal("gmail_thread"),
   caseKeyDigest: DigestSchema,
   version: z.number().int().positive(),
   frontierDigest: DigestSchema,
   sourceGeneration: z.number().int().nonnegative(),
 });
+export type PrivateBridgeSourceFrontier = z.infer<typeof SourceFrontierFenceSchema>;
 
 const LoopUpdateFenceSchema = z.strictObject({
   existingLoopId: z.string().uuid(),
@@ -104,10 +106,9 @@ const LoopUpdateFenceSchema = z.strictObject({
   priorCandidateContentDigest: DigestSchema,
   sourceActionIntentId: z.string().uuid(),
   sourceActionIntentDigests: IntentDigestFenceSchema,
-  sourceFrontier: SourceFrontierFenceSchema,
 });
 
-const PreparedPayloadSchema = z.strictObject({
+const PreparedPayloadObjectSchema = z.strictObject({
   schemaVersion: z.literal(1),
   phase: z.literal("prepared"),
   candidateId: z.string().uuid(),
@@ -115,19 +116,52 @@ const PreparedPayloadSchema = z.strictObject({
   evidenceSourceRevisionIds: z.array(z.string().uuid()).min(1).max(100),
   evidenceDigest: DigestSchema,
   sourcePattern: SourcePatternSchema.nullable(),
+  sourceFrontier: SourceFrontierFenceSchema.nullable(),
   destination: DestinationSchema,
   personControlEpoch: z.number().int().positive(),
   standingRule: StandingRuleFenceSchema.nullable(),
   loopUpdate: LoopUpdateFenceSchema.nullable(),
 });
 
-const ProposedPayloadSchema = PreparedPayloadSchema.omit({ phase: true }).extend({
-  phase: z.literal("awaiting_approval"),
-  loopId: z.string().uuid(),
-  minimumDisclosure: minimumDisclosureSchema,
-  commitment: commitmentProposalSchema,
-  approvalMode: z.enum(["once", "standing"]).nullable(),
-});
+const PreparedPayloadSchema = PreparedPayloadObjectSchema.superRefine(requirePayloadSourceFrontier);
+
+const ProposedPayloadSchema = PreparedPayloadObjectSchema.omit({ phase: true })
+  .extend({
+    phase: z.literal("awaiting_approval"),
+    loopId: z.string().uuid(),
+    minimumDisclosure: minimumDisclosureSchema,
+    commitment: commitmentProposalSchema,
+    approvalMode: z.enum(["once", "standing"]).nullable(),
+  })
+  .superRefine(requirePayloadSourceFrontier);
+
+function requirePayloadSourceFrontier(
+  payload: Pick<
+    z.infer<typeof PreparedPayloadObjectSchema>,
+    "sourcePattern" | "sourceFrontier" | "loopUpdate"
+  >,
+  context: z.RefinementCtx,
+): void {
+  if ((payload.sourcePattern || payload.loopUpdate) && !payload.sourceFrontier) {
+    context.addIssue({
+      code: "custom",
+      path: ["sourceFrontier"],
+      message: "Integration-backed private source actions require their exact current frontier",
+    });
+    return;
+  }
+  if (
+    payload.sourcePattern &&
+    payload.sourceFrontier &&
+    payload.sourcePattern.integrationId !== payload.sourceFrontier.integrationId
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["sourceFrontier", "integrationId"],
+      message: "Private source pattern and frontier must use the same integration",
+    });
+  }
+}
 
 export const PrivateBridgePayloadSchema = z.discriminatedUnion("phase", [
   PreparedPayloadSchema,
@@ -182,6 +216,7 @@ export interface AcceptedPrivateBridgeLoopReference {
 export interface AcceptedPrivateBridgeWithdrawalInput extends AcceptedPrivateBridgeCandidateInput {
   readonly intent: "cancel" | "supersede";
   readonly evidenceSourceRevisionIds: readonly string[];
+  readonly replacementSourceFrontier: PrivateBridgeSourceFrontier;
   readonly withdrawnAt: Date;
 }
 
@@ -323,16 +358,17 @@ export class PrivateSourceBridge {
     readonly candidateId: string;
     readonly conversationId: string;
     readonly standingRule?: z.infer<typeof StandingRuleFenceSchema> | null;
+    readonly enqueueProposal?: boolean;
   }): Promise<{ actionIntentId: string; duplicate: boolean }> {
     return inTransaction(this.database, async (transaction) => {
       const now = new Date();
-      const discoveredUpdateFrontier = await discoverLoopUpdateSourceFrontier(
+      const discoveredSourceFrontier = await discoverCandidateSourceFrontier(
         transaction,
         input.actorPersonId,
         input.candidateId,
       );
-      if (discoveredUpdateFrontier) {
-        await acquireLoopUpdateSourceLocks(transaction, input.actorPersonId, discoveredUpdateFrontier);
+      if (discoveredSourceFrontier) {
+        await acquireCandidateSourceLocks(transaction, input.actorPersonId, discoveredSourceFrontier);
       }
       const candidate = await loadCandidateForOwner(
         transaction,
@@ -356,7 +392,21 @@ export class PrivateSourceBridge {
         this.rawRetentionDays,
       ).resolveDestination(input.actorPersonId, input.conversationId);
       const evidenceIds = stringArray(candidate.evidence_refs).sort();
-      await requireCurrentEvidence(transaction, input.actorPersonId, evidenceIds, now);
+      const evidenceAuthority = await requireCurrentEvidence(
+        transaction,
+        input.actorPersonId,
+        evidenceIds,
+        now,
+      );
+      const sourceFrontier = evidenceAuthority.integrationId
+        ? await requirePreparedCandidateSourceFrontier(
+            transaction,
+            input.actorPersonId,
+            candidate,
+            evidenceAuthority.integrationId,
+            discoveredSourceFrontier,
+          )
+        : requireDirectCandidateHasNoSourceFrontier(discoveredSourceFrontier);
       const sourcePattern = await this.deriveSourcePattern(input.actorPersonId, evidenceIds);
       const standingRule = input.standingRule ?? null;
       const loopUpdate =
@@ -369,13 +419,6 @@ export class PrivateSourceBridge {
               destination,
             )
           : null;
-      if (
-        loopUpdate &&
-        (!discoveredUpdateFrontier ||
-          !sameSourceFrontierLockTarget(loopUpdate.sourceFrontier, discoveredUpdateFrontier))
-      ) {
-        throw new StaleAuthorityError("Coverage update source frontier changed during preparation");
-      }
       if (loopUpdate && standingRule) {
         throw new ConflictError("An existing coverage loop update always requires one exact approval");
       }
@@ -391,6 +434,7 @@ export class PrivateSourceBridge {
         evidenceSourceRevisionIds: evidenceIds,
         evidenceDigest: canonicalDigest(evidenceIds),
         sourcePattern,
+        sourceFrontier,
         destination,
         personControlEpoch: Number(person.control_epoch),
         standingRule,
@@ -401,6 +445,7 @@ export class PrivateSourceBridge {
         candidateId: candidate.id,
         conversationId: destination.conversationId,
         standingRuleId: standingRule?.ruleId ?? null,
+        sourceFrontier,
         loopUpdate,
       });
       await transaction`
@@ -431,20 +476,22 @@ export class PrivateSourceBridge {
           ${destination.conversationId}, ${destination.participantEpochId},
           'private_source_to_coverage_loop', ${preparedActionDigest},
           ${canonicalDigest({ candidateContentDigest: candidate.content_digest, evidenceIds })},
-          ${canonicalDigest({ ownerApprovalRequired: true, standingRule, loopUpdate })},
+          ${canonicalDigest({ ownerApprovalRequired: true, standingRule, sourceFrontier, loopUpdate })},
           ${destinationDigest(destination)}, ${sealed.ciphertext}, ${sealed.keyVersion}, 'proposed',
           ${Number(person.control_epoch)}, ${destination.householdControlEpoch},
           ${destination.conversationAuthorityVersion}, ${expiresAt}, ${now}, ${now}
         )
       `;
-      await enqueueProposal(
-        transaction,
-        this.secretBox,
-        input.actorPersonId,
-        actionIntentId,
-        payload,
-        expiresAt,
-      );
+      if (input.enqueueProposal !== false) {
+        await enqueueProposal(
+          transaction,
+          this.secretBox,
+          input.actorPersonId,
+          actionIntentId,
+          payload,
+          expiresAt,
+        );
+      }
       return { actionIntentId, duplicate: false };
     });
   }
@@ -493,10 +540,20 @@ export class PrivateSourceBridge {
             ruleRevisionId: rule.current_revision_id,
             ruleVersion: Number(rule.version),
           },
+          enqueueProposal: false,
         });
         return prepared.actionIntentId;
       } catch (error) {
-        if (!(error instanceof StaleAuthorityError || error instanceof ConflictError)) throw error;
+        if (
+          !(
+            error instanceof StaleAuthorityError ||
+            error instanceof UnauthorizedError ||
+            error instanceof NotFoundError ||
+            error instanceof ConflictError
+          )
+        ) {
+          throw error;
+        }
       }
     }
     return null;
@@ -574,11 +631,11 @@ export class PrivateSourceBridge {
         observedIntent.id,
         observedIntent.payload_ciphertext,
       );
-      if (observedPayload.loopUpdate) {
-        await acquireLoopUpdateSourceLocks(
+      if (observedPayload.sourceFrontier) {
+        await acquireCandidateSourceLocks(
           transaction,
           observedIntent.person_id,
-          observedPayload.loopUpdate.sourceFrontier,
+          observedPayload.sourceFrontier,
         );
       }
       const rows = await transaction<IntentRow[]>`
@@ -592,7 +649,7 @@ export class PrivateSourceBridge {
       const intent = rows[0];
       if (!intent) throw new NotFoundError("Private bridge intent does not exist");
       const prepared = openPrivateBridgePayload(this.secretBox, intent.id, intent.payload_ciphertext);
-      requireSameObservedUpdateFrontier(observedPayload, prepared);
+      requireSameObservedSourceFrontier(observedPayload, prepared);
       if (intent.status !== "proposed") {
         if (["awaiting_approval", "approved", "executing", "succeeded"].includes(intent.status)) {
           return {
@@ -766,6 +823,7 @@ export class PrivateSourceBridge {
   ): Promise<AcceptedPrivateBridgeWithdrawalResult> {
     const input = parseAcceptedWithdrawalInput(inputCandidate);
     return inTransaction(this.database, async (transaction) => {
+      await acquireCandidateSourceLocks(transaction, input.ownerPersonId, input.replacementSourceFrontier);
       const exact = await resolveExactAcceptedBridge(transaction, this.secretBox, input, true);
       if (!exact) return { kind: "not_found" };
 
@@ -855,6 +913,7 @@ export class PrivateSourceBridge {
               payload: exact.payload,
               loop: resolvedLoop,
               intent: input.intent,
+              replacementSourceFrontier: input.replacementSourceFrontier,
             })
           : ({ kind: "not_needed" } as const);
 
@@ -915,11 +974,11 @@ export class PrivateSourceBridge {
         observedIntent.id,
         observedIntent.payload_ciphertext,
       );
-      if (observedPayload.loopUpdate) {
-        await acquireLoopUpdateSourceLocks(
+      if (observedPayload.sourceFrontier) {
+        await acquireCandidateSourceLocks(
           transaction,
           observedIntent.person_id,
-          observedPayload.loopUpdate.sourceFrontier,
+          observedPayload.sourceFrontier,
         );
       }
       const rows = await transaction<IntentRow[]>`
@@ -935,7 +994,7 @@ export class PrivateSourceBridge {
         throw new UnauthorizedError("Only the private source owner can approve sharing");
       }
       const payload = openPrivateBridgePayload(this.secretBox, intent.id, intent.payload_ciphertext);
-      requireSameObservedUpdateFrontier(observedPayload, payload);
+      requireSameObservedSourceFrontier(observedPayload, payload);
       if (payload.phase !== "awaiting_approval") throw new ConflictError("Sharing proposal is not ready");
       if (["approved", "executing", "succeeded"].includes(intent.status)) {
         if (
@@ -1005,11 +1064,11 @@ export class PrivateSourceBridge {
         observedIntent.id,
         observedIntent.payload_ciphertext,
       );
-      if (observedPayload.loopUpdate) {
-        await acquireLoopUpdateSourceLocks(
+      if (observedPayload.sourceFrontier) {
+        await acquireCandidateSourceLocks(
           transaction,
           observedIntent.person_id,
-          observedPayload.loopUpdate.sourceFrontier,
+          observedPayload.sourceFrontier,
         );
       }
       const rows = await transaction<IntentRow[]>`
@@ -1023,7 +1082,7 @@ export class PrivateSourceBridge {
       const intent = rows[0];
       if (!intent) throw new NotFoundError("Private bridge intent does not exist");
       const payload = openPrivateBridgePayload(this.secretBox, intent.id, intent.payload_ciphertext);
-      requireSameObservedUpdateFrontier(observedPayload, payload);
+      requireSameObservedSourceFrontier(observedPayload, payload);
       if (payload.phase !== "awaiting_approval")
         throw new ConflictError("Private bridge has no approved meaning");
       if (intent.status === "succeeded") {
@@ -1171,7 +1230,15 @@ export class PrivateSourceBridge {
         actionIntentId: intent.id,
         actorPersonId: intent.person_id,
         person: { id: intent.person_id, controlEpoch: Number(intent.person_control_epoch) },
-        ...(payload.loopUpdate ? { sourceFrontier: payload.loopUpdate.sourceFrontier } : {}),
+        ...(payload.sourceFrontier ? { sourceFrontier: payload.sourceFrontier } : {}),
+        ...(payload.sourceFrontier
+          ? {
+              integration: {
+                id: payload.sourceFrontier.integrationId,
+                controlEpoch: payload.sourceFrontier.integrationControlEpoch,
+              },
+            }
+          : {}),
         household: { id: intent.household_id, controlEpoch: Number(intent.household_control_epoch) },
         conversation: {
           id: intent.conversation_id,
@@ -1239,8 +1306,21 @@ export class PrivateSourceBridge {
     readonly payload: z.infer<typeof ProposedPayloadSchema>;
     readonly loop: CoverageLoop;
     readonly intent: "cancel" | "supersede";
+    readonly replacementSourceFrontier: PrivateBridgeSourceFrontier;
   }): Promise<AcceptedPrivateBridgeCorrection> {
     try {
+      if (
+        !input.payload.sourceFrontier ||
+        !sameSourceFrontierLockTarget(input.payload.sourceFrontier, input.replacementSourceFrontier)
+      ) {
+        return { kind: "not_authorized" };
+      }
+      await requireExactCurrentSourceFrontier(
+        this.database,
+        input.ownerPersonId,
+        input.replacementSourceFrontier,
+        false,
+      );
       const destination = await this.resolveDestination(
         input.ownerPersonId,
         input.loop.destination.conversationId,
@@ -1275,6 +1355,11 @@ export class PrivateSourceBridge {
         {
           actorPersonId: input.ownerPersonId,
           person: { id: input.ownerPersonId, controlEpoch: Number(person.control_epoch) },
+          sourceFrontier: input.replacementSourceFrontier,
+          integration: {
+            id: input.replacementSourceFrontier.integrationId,
+            controlEpoch: input.replacementSourceFrontier.integrationControlEpoch,
+          },
           household: {
             id: destination.householdId,
             controlEpoch: destination.householdControlEpoch,
@@ -1362,11 +1447,19 @@ export class PrivateSourceBridge {
     if (requireApprovedCandidate && !["pending", "accepted"].includes(candidate.status)) {
       throw new StaleAuthorityError("Private bridge source candidate was withdrawn");
     }
-    await requireCurrentEvidence(
+    const evidenceAuthority = await requireCurrentEvidence(
       this.database,
       intent.person_id,
       payload.evidenceSourceRevisionIds,
       new Date(),
+    );
+    await requireCurrentPayloadSourceFrontier(
+      this.database,
+      intent.person_id,
+      candidate,
+      payload.sourceFrontier,
+      evidenceAuthority.integrationId,
+      lockUpdateLoop,
     );
     if (payload.standingRule && payload.sourcePattern) {
       await requireStandingRule(
@@ -1620,10 +1713,10 @@ async function requireCurrentEvidence(
   ownerPersonId: string,
   evidenceIds: readonly string[],
   now: Date,
-): Promise<void> {
+): Promise<{ readonly integrationId: string | null }> {
   const ids = [...new Set(evidenceIds)].sort();
-  const rows = await executor<{ readonly id: string }[]>`
-    select revision.id
+  const rows = await executor<{ readonly id: string; readonly integration_id: string | null }[]>`
+    select revision.id, object.integration_id
     from source_revisions revision
     join source_objects object on object.id = revision.source_object_id
     left join integrations integration on integration.id = object.integration_id
@@ -1639,6 +1732,14 @@ async function requireCurrentEvidence(
   if (rows.length !== ids.length) {
     throw new StaleAuthorityError("Private source evidence is no longer current and retained");
   }
+  const integrationIds = [
+    ...new Set(rows.flatMap((row) => (row.integration_id ? [row.integration_id] : []))),
+  ];
+  const hasIntegrationFreeEvidence = rows.some((row) => row.integration_id === null);
+  if (integrationIds.length > 1 || (integrationIds.length === 1 && hasIntegrationFreeEvidence)) {
+    throw new StaleAuthorityError("Private source evidence crossed integration authority boundaries");
+  }
+  return { integrationId: integrationIds[0] ?? null };
 }
 
 async function loadLatestRouting(
@@ -1735,6 +1836,7 @@ function openingEffectPlan(actionIntentId: string, payload: z.infer<typeof Propo
     data: {
       candidateContentDigest: payload.candidateContentDigest,
       evidenceDigest: payload.evidenceDigest,
+      sourceFrontier: payload.sourceFrontier,
       minimumMeaning: payload.minimumDisclosure.minimumMeaning,
       commitment: payload.commitment,
       loopUpdate,
@@ -2064,12 +2166,6 @@ async function prepareLoopUpdateFence(
   if (!isLiveCoverageState(loop.state)) {
     throw new StaleAuthorityError("Only a live coverage loop can be updated");
   }
-  const sourceFrontier = await loadCurrentCandidateFrontierFence(
-    transaction,
-    ownerPersonId,
-    candidate,
-    false,
-  );
   return LoopUpdateFenceSchema.parse({
     existingLoopId: loop.loopId,
     expectedLoopVersion: loop.version,
@@ -2078,7 +2174,6 @@ async function prepareLoopUpdateFence(
     priorCandidateContentDigest: priorCandidate.content_digest,
     sourceActionIntentId: priorIntent.id,
     sourceActionIntentDigests: intentDigests(priorIntent),
-    sourceFrontier,
   });
 }
 
@@ -2147,15 +2242,6 @@ async function requireCurrentLoopUpdate(
   ) {
     throw new StaleAuthorityError("Coverage loop changed after this update was prepared");
   }
-  const currentFrontier = await loadCurrentCandidateFrontierFence(
-    executor,
-    intent.person_id,
-    candidate,
-    lockLoop,
-  );
-  if (canonicalDigest(currentFrontier) !== canonicalDigest(fence.sourceFrontier)) {
-    throw new StaleAuthorityError("New private source evidence arrived after this update was prepared");
-  }
   return loop;
 }
 
@@ -2164,12 +2250,15 @@ async function loadCurrentCandidateFrontierFence(
   ownerPersonId: string,
   candidate: CandidateRow,
   lock: boolean,
-): Promise<z.infer<typeof SourceFrontierFenceSchema>> {
-  const lockClause = lock ? executor`for update` : executor`for share`;
+): Promise<PrivateBridgeSourceFrontier> {
+  const lockClause = lock
+    ? executor`for update of frontier, integration`
+    : executor`for share of frontier, integration`;
   const rows = await executor<
     {
       readonly id: string;
       readonly integration_id: string;
+      readonly integration_control_epoch: number | string;
       readonly case_kind: string;
       readonly case_key_digest: string;
       readonly version: number | string;
@@ -2180,29 +2269,38 @@ async function loadCurrentCandidateFrontierFence(
       readonly disposition: string;
     }[]
   >`
-    select id, integration_id, case_kind, case_key_digest, version, frontier_digest,
-      source_generation, reconciled_generation, current_candidate_id, disposition
-    from private_source_frontiers
-    where owner_person_id = ${ownerPersonId} and current_candidate_id = ${candidate.id}
-      and disposition = 'candidate'
+    select frontier.id, frontier.integration_id,
+      integration.control_epoch as integration_control_epoch,
+      frontier.case_kind, frontier.case_key_digest, frontier.version, frontier.frontier_digest,
+      frontier.source_generation, frontier.reconciled_generation,
+      frontier.current_candidate_id, frontier.disposition
+    from private_source_frontiers frontier
+    join integrations integration on integration.id = frontier.integration_id
+      and integration.person_id = frontier.owner_person_id
+      and integration.provider = 'google' and integration.status = 'active'
+      and integration.information_current_control_epoch = integration.control_epoch
+    where frontier.owner_person_id = ${ownerPersonId}
+      and frontier.current_candidate_id = ${candidate.id}
+      and frontier.disposition = 'candidate'
     ${lockClause}
   `;
   if (rows.length !== 1) {
-    throw new StaleAuthorityError("Coverage update lost its exact private source frontier");
+    throw new StaleAuthorityError("Private source candidate lost its exact current frontier");
   }
   const row = rows[0];
-  if (!row) throw new StaleAuthorityError("Coverage update source frontier disappeared");
+  if (!row) throw new StaleAuthorityError("Private source candidate frontier disappeared");
   if (
     row.case_kind !== "gmail_thread" ||
     row.current_candidate_id !== candidate.id ||
     row.disposition !== "candidate" ||
     Number(row.source_generation) !== Number(row.reconciled_generation)
   ) {
-    throw new StaleAuthorityError("Coverage update source frontier is no longer clean and current");
+    throw new StaleAuthorityError("Private source candidate frontier is no longer clean and current");
   }
   return SourceFrontierFenceSchema.parse({
     frontierId: row.id,
     integrationId: row.integration_id,
+    integrationControlEpoch: Number(row.integration_control_epoch),
     caseKind: row.case_kind,
     caseKeyDigest: row.case_key_digest,
     version: Number(row.version),
@@ -2211,15 +2309,99 @@ async function loadCurrentCandidateFrontierFence(
   });
 }
 
-async function discoverLoopUpdateSourceFrontier(
+async function requireExactCurrentSourceFrontier(
+  executor: Executor,
+  ownerPersonId: string,
+  expected: PrivateBridgeSourceFrontier,
+  lock: boolean,
+): Promise<void> {
+  const lockClause = lock
+    ? executor`for update of frontier, integration`
+    : executor`for share of frontier, integration`;
+  const rows = await executor<{ readonly id: string }[]>`
+    select frontier.id
+    from private_source_frontiers frontier
+    join integrations integration on integration.id = frontier.integration_id
+      and integration.person_id = frontier.owner_person_id
+      and integration.provider = 'google' and integration.status = 'active'
+    where frontier.id = ${expected.frontierId}
+      and frontier.owner_person_id = ${ownerPersonId}
+      and frontier.integration_id = ${expected.integrationId}
+      and integration.control_epoch = ${expected.integrationControlEpoch}
+      and integration.information_current_control_epoch = ${expected.integrationControlEpoch}
+      and frontier.case_kind = ${expected.caseKind}
+      and frontier.case_key_digest = ${expected.caseKeyDigest}
+      and frontier.version = ${expected.version}
+      and frontier.frontier_digest = ${expected.frontierDigest}
+      and frontier.source_generation = ${expected.sourceGeneration}
+      and frontier.reconciled_generation = ${expected.sourceGeneration}
+      and frontier.disposition in ('candidate', 'quiet')
+    ${lockClause}
+  `;
+  if (rows.length !== 1) {
+    throw new StaleAuthorityError("Replacement private source frontier is no longer exact and current");
+  }
+}
+
+async function requirePreparedCandidateSourceFrontier(
+  executor: Executor,
+  ownerPersonId: string,
+  candidate: CandidateRow,
+  evidenceIntegrationId: string,
+  discovered: PrivateBridgeSourceFrontier | null,
+): Promise<PrivateBridgeSourceFrontier> {
+  if (!discovered || discovered.integrationId !== evidenceIntegrationId) {
+    throw new StaleAuthorityError(
+      "Integration-backed private source candidate lost its exact current frontier",
+    );
+  }
+  const current = await loadCurrentCandidateFrontierFence(executor, ownerPersonId, candidate, false);
+  if (current.integrationId !== evidenceIntegrationId || !sameSourceFrontierLockTarget(current, discovered)) {
+    throw new StaleAuthorityError("Private source candidate frontier changed during preparation");
+  }
+  return current;
+}
+
+function requireDirectCandidateHasNoSourceFrontier(discovered: PrivateBridgeSourceFrontier | null): null {
+  if (discovered) {
+    throw new StaleAuthorityError("Integration-free private source candidate has an invalid frontier");
+  }
+  return null;
+}
+
+async function requireCurrentPayloadSourceFrontier(
+  executor: Executor,
+  ownerPersonId: string,
+  candidate: CandidateRow,
+  expected: PrivateBridgeSourceFrontier | null,
+  evidenceIntegrationId: string | null,
+  lock: boolean,
+): Promise<void> {
+  if (evidenceIntegrationId === null) {
+    if (expected) {
+      throw new StaleAuthorityError("Integration-free private source action carried a foreign frontier");
+    }
+    return;
+  }
+  if (!expected || expected.integrationId !== evidenceIntegrationId) {
+    throw new StaleAuthorityError("Integration-backed private source action lost its exact frontier fence");
+  }
+  const current = await loadCurrentCandidateFrontierFence(executor, ownerPersonId, candidate, lock);
+  if (canonicalDigest(current) !== canonicalDigest(expected)) {
+    throw new StaleAuthorityError("New private source evidence arrived after this action was prepared");
+  }
+}
+
+async function discoverCandidateSourceFrontier(
   executor: Executor,
   ownerPersonId: string,
   candidateId: string,
-): Promise<z.infer<typeof SourceFrontierFenceSchema> | null> {
+): Promise<PrivateBridgeSourceFrontier | null> {
   const rows = await executor<
     {
       readonly id: string;
       readonly integration_id: string;
+      readonly integration_control_epoch: number | string;
       readonly case_kind: string;
       readonly case_key_digest: string;
       readonly version: number | string;
@@ -2229,22 +2411,27 @@ async function discoverLoopUpdateSourceFrontier(
   >`
     select frontier.id, frontier.integration_id, frontier.case_kind,
       frontier.case_key_digest, frontier.version, frontier.frontier_digest,
-      frontier.source_generation
+      frontier.source_generation, integration.control_epoch as integration_control_epoch
     from private_source_frontiers frontier
+    join integrations integration on integration.id = frontier.integration_id
+      and integration.person_id = frontier.owner_person_id
+      and integration.provider = 'google' and integration.status = 'active'
+      and integration.information_current_control_epoch = integration.control_epoch
     join knowledge_candidates candidate on candidate.id = frontier.current_candidate_id
     where candidate.id = ${candidateId} and candidate.owner_person_id = ${ownerPersonId}
       and candidate.scope_kind = 'person'
-      and candidate.candidate_kind = 'coverage_loop_update_review'
+      and candidate.candidate_kind in ('coverage_proposal', 'coverage_loop_update_review')
       and candidate.status = 'pending' and frontier.disposition = 'candidate'
   `;
   if (rows.length > 1) {
-    throw new ConflictError("Coverage update is attached to multiple private source frontiers");
+    throw new ConflictError("Private source candidate is attached to multiple current frontiers");
   }
   const row = rows[0];
   return row
     ? SourceFrontierFenceSchema.parse({
         frontierId: row.id,
         integrationId: row.integration_id,
+        integrationControlEpoch: Number(row.integration_control_epoch),
         caseKind: row.case_kind,
         caseKeyDigest: row.case_key_digest,
         version: Number(row.version),
@@ -2255,8 +2442,8 @@ async function discoverLoopUpdateSourceFrontier(
 }
 
 function sameSourceFrontierLockTarget(
-  left: z.infer<typeof SourceFrontierFenceSchema>,
-  right: z.infer<typeof SourceFrontierFenceSchema>,
+  left: PrivateBridgeSourceFrontier,
+  right: PrivateBridgeSourceFrontier,
 ): boolean {
   return (
     left.frontierId === right.frontierId &&
@@ -2266,22 +2453,19 @@ function sameSourceFrontierLockTarget(
   );
 }
 
-function requireSameObservedUpdateFrontier(
+export function requireSameObservedSourceFrontier(
   observed: PrivateBridgePayload,
   authoritative: PrivateBridgePayload,
 ): void {
-  if (
-    canonicalDigest(observed.loopUpdate?.sourceFrontier ?? null) !==
-    canonicalDigest(authoritative.loopUpdate?.sourceFrontier ?? null)
-  ) {
+  if (canonicalDigest(observed.sourceFrontier) !== canonicalDigest(authoritative.sourceFrontier)) {
     throw new StaleAuthorityError("Private source action changed while acquiring its exact locks");
   }
 }
 
-async function acquireLoopUpdateSourceLocks(
+async function acquireCandidateSourceLocks(
   transaction: Transaction,
   ownerPersonId: string,
-  frontier: z.infer<typeof SourceFrontierFenceSchema>,
+  frontier: PrivateBridgeSourceFrontier,
 ): Promise<void> {
   await transaction`
     select pg_advisory_xact_lock(
@@ -2445,6 +2629,7 @@ function parseAcceptedWithdrawalInput(
     ...candidate,
     intent: z.enum(["cancel", "supersede"]).parse(input.intent),
     evidenceSourceRevisionIds: [...new Set(evidenceSourceRevisionIds)].sort(),
+    replacementSourceFrontier: SourceFrontierFenceSchema.parse(input.replacementSourceFrontier),
     withdrawnAt: new Date(input.withdrawnAt),
   };
 }

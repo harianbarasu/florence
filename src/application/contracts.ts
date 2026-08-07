@@ -267,7 +267,16 @@ export type AppEnvelope =
         | { readonly kind: "revoke_session"; readonly sessionId: string }
         | { readonly kind: "delete_person" }
         | { readonly kind: "pause_person"; readonly paused: boolean }
-        | { readonly kind: "request_step_up"; readonly purpose: "account_controls" | "google_connect" };
+        | {
+            readonly kind: "request_step_up";
+            readonly purpose:
+              | "account_controls"
+              | "google_connect"
+              | "household_invitation"
+              | "group_coverage"
+              | "private_bridge_standing";
+            readonly context?: Readonly<Record<string, string>>;
+          };
     };
 
 export interface ProcessReceipt {

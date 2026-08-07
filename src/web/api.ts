@@ -13,7 +13,13 @@ export interface Viewer {
   }[];
   csrfToken: string;
   session: {
-    assuranceKind: "base" | "google_connect" | "account_controls";
+    assuranceKind:
+      | "base"
+      | "google_connect"
+      | "account_controls"
+      | "household_invitation"
+      | "group_coverage"
+      | "private_bridge_standing";
     assuranceExpiresAt: string | null;
   };
 }

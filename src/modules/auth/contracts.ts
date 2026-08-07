@@ -4,6 +4,9 @@ export const HandoffPurposeSchema = z.enum([
   "web_sign_in",
   "google_connect",
   "account_controls",
+  "household_invitation",
+  "group_coverage",
+  "private_bridge_standing",
   "invitation",
   "private_review",
 ]);
@@ -43,7 +46,8 @@ export interface AuthenticatedSession {
   readonly csrfToken: string;
   readonly idleExpiresAt: Date;
   readonly absoluteExpiresAt: Date;
-  readonly assuranceKind: "base" | "google_connect" | "account_controls";
+  readonly assuranceKind: AssuranceKind;
+  readonly assuranceContext: Record<string, string>;
   readonly assuranceExpiresAt: Date | null;
 }
 
@@ -56,6 +60,15 @@ export interface SessionPrincipal {
   readonly lastSeenAt: Date;
   readonly idleExpiresAt: Date;
   readonly absoluteExpiresAt: Date;
-  readonly assuranceKind: "base" | "google_connect" | "account_controls";
+  readonly assuranceKind: AssuranceKind;
+  readonly assuranceContext: Record<string, string>;
   readonly assuranceExpiresAt: Date | null;
 }
+
+export type AssuranceKind =
+  | "base"
+  | "google_connect"
+  | "account_controls"
+  | "household_invitation"
+  | "group_coverage"
+  | "private_bridge_standing";

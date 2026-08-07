@@ -4,6 +4,7 @@ import type { Database } from "../../db/client.js";
 import { keyedDigest, randomOpaqueToken, type SecretBox, secureDigestEquals } from "../../shared/crypto.js";
 import { ConflictError, NotFoundError, UnauthorizedError } from "../../shared/errors.js";
 import {
+  type AssuranceKind,
   type AuthenticatedSession,
   type CreatedHandoff,
   type CreateHandoffInput,
@@ -24,6 +25,8 @@ interface HandoffRow {
   person_control_epoch: number | string;
   expires_at: Date;
   consumed_at: Date | null;
+  context_ciphertext: Buffer | null;
+  context_key_version: string | null;
 }
 
 interface SessionRow {
@@ -37,7 +40,8 @@ interface SessionRow {
   idle_expires_at: Date;
   absolute_expires_at: Date;
   revoked_at: Date | null;
-  assurance_kind: "base" | "google_connect" | "account_controls";
+  assurance_kind: AssuranceKind;
+  assurance_context: Record<string, string>;
   assurance_expires_at: Date | null;
 }
 
@@ -125,6 +129,7 @@ export class PostgresWebAuth {
     return inTransaction(this.database, async (transaction) => {
       const rows = await transaction<HandoffRow[]>`
         select handoff.id, handoff.person_id, handoff.purpose,
+          handoff.context_ciphertext, handoff.context_key_version,
           handoff.identity_authority_version,
           identity.authority_version as current_identity_authority_version,
           identity.status as identity_status, person.status as person_status,
@@ -148,8 +153,15 @@ export class PostgresWebAuth {
       const sessionDigest = sha256Hex(sessionToken);
       const idleExpiresAt = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
       const absoluteExpiresAt = new Date(now.getTime() + 90 * 24 * 60 * 60 * 1000);
-      const assuranceKind =
-        row.purpose === "google_connect" || row.purpose === "account_controls" ? row.purpose : "base";
+      const assuranceKind: AssuranceKind =
+        row.purpose === "google_connect" ||
+        row.purpose === "account_controls" ||
+        row.purpose === "household_invitation" ||
+        row.purpose === "group_coverage" ||
+        row.purpose === "private_bridge_standing"
+          ? row.purpose
+          : "base";
+      const assuranceContext = assuranceKind === "base" ? {} : decryptContext(row, this.secretBox);
       const assuranceExpiresAt = assuranceKind === "base" ? null : new Date(now.getTime() + 15 * 60_000);
       await transaction`
         update auth_handoffs set consumed_at = ${now}
@@ -157,11 +169,11 @@ export class PostgresWebAuth {
       `;
       await transaction`
         insert into person_sessions (
-          id, person_id, session_digest, person_control_epoch, assurance_kind,
+          id, person_id, session_digest, person_control_epoch, assurance_kind, assurance_context,
           assurance_expires_at, idle_expires_at, absolute_expires_at, last_seen_at, created_at
         ) values (
           ${sessionId}, ${row.person_id}, ${sessionDigest}, ${Number(row.person_control_epoch)},
-          ${assuranceKind}, ${assuranceExpiresAt}, ${idleExpiresAt}, ${absoluteExpiresAt}, ${now}, ${now}
+          ${assuranceKind}, ${transaction.json(assuranceContext)}, ${assuranceExpiresAt}, ${idleExpiresAt}, ${absoluteExpiresAt}, ${now}, ${now}
         )
       `;
       return {
@@ -172,6 +184,7 @@ export class PostgresWebAuth {
         idleExpiresAt,
         absoluteExpiresAt,
         assuranceKind,
+        assuranceContext,
         assuranceExpiresAt,
       };
     });
@@ -184,7 +197,7 @@ export class PostgresWebAuth {
         person.control_epoch as current_control_epoch, person.status as person_status,
         session.created_at, session.last_seen_at, session.idle_expires_at,
         session.absolute_expires_at, session.revoked_at,
-        session.assurance_kind, session.assurance_expires_at
+        session.assurance_kind, session.assurance_context, session.assurance_expires_at
       from person_sessions session
       join people person on person.id = session.person_id
       where session.session_digest = ${sessionDigest}
@@ -222,6 +235,7 @@ export class PostgresWebAuth {
       idleExpiresAt: row.idle_expires_at,
       absoluteExpiresAt: row.absolute_expires_at,
       assuranceKind: row.assurance_kind,
+      assuranceContext: row.assurance_context,
       assuranceExpiresAt: row.assurance_expires_at,
     };
   }
@@ -249,6 +263,7 @@ export class PostgresWebAuth {
   async loadHandoff(token: string): Promise<HandoffRow> {
     const rows = await this.database<HandoffRow[]>`
       select handoff.id, handoff.person_id, handoff.purpose,
+        handoff.context_ciphertext, handoff.context_key_version,
         handoff.identity_authority_version,
         identity.authority_version as current_identity_authority_version,
         identity.status as identity_status, person.status as person_status,
@@ -263,6 +278,15 @@ export class PostgresWebAuth {
     if (!row) throw new NotFoundError("This sign-in link is invalid");
     return row;
   }
+}
+
+function decryptContext(row: HandoffRow, secretBox: SecretBox): Record<string, string> {
+  if (!row.context_ciphertext || !row.context_key_version) return {};
+  const encrypted: unknown = JSON.parse(row.context_ciphertext.toString("utf8"));
+  return JSON.parse(secretBox.decrypt(encrypted, "auth-handoff-context").toString("utf8")) as Record<
+    string,
+    string
+  >;
 }
 
 function inTransaction<Result>(

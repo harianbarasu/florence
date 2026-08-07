@@ -46,7 +46,14 @@ const GOOGLE_JOB_REDRIVE_MAX_GENERATIONS = 3;
 
 const StepUpPayloadSchema = z.strictObject({
   actorPersonId: z.string().uuid(),
-  purpose: z.enum(["account_controls", "google_connect"]),
+  purpose: z.enum([
+    "account_controls",
+    "google_connect",
+    "household_invitation",
+    "group_coverage",
+    "private_bridge_standing",
+  ]),
+  context: z.record(z.string(), z.string()).default({}),
 });
 const OrchestrateMessagePayloadSchema = z.strictObject({ internalProviderEventId: z.string().uuid() });
 const PrivateSourcePayloadSchema = z.strictObject({
@@ -251,6 +258,27 @@ async function main(): Promise<void> {
         }
         case "private_source.deliver_candidate_notice": {
           const payload = PrivateSourceCandidateNoticePayloadSchema.parse(job.payload);
+          try {
+            const standingOutcome = await orchestrator.tryApplyStandingPrivateCandidate(
+              payload.personId,
+              payload.candidateId,
+            );
+            if (standingOutcome === "applied") {
+              return;
+            }
+          } catch (error) {
+            if (
+              error instanceof StaleAuthorityError ||
+              error instanceof UnauthorizedError ||
+              error instanceof NotFoundError
+            ) {
+              // The candidate-delivery job is outside the recent-information
+              // readiness predicate, so it may wait safely for the exact
+              // current frontier without deadlocking initial import.
+              throw new PrivateSourceCandidateRouteUnavailableError();
+            }
+            throw error;
+          }
           const receipt = await application.process({
             kind: "private_source.deliver_candidate_notice",
             ...payload,
@@ -383,7 +411,17 @@ async function main(): Promise<void> {
           privateIdentityId: row.identity_id,
           privateConversationId: row.conversation_id,
           purpose: payload.purpose,
-          context: { returnPath: payload.purpose === "google_connect" ? "/sources" : "/safety" },
+          context: {
+            ...payload.context,
+            returnPath:
+              payload.purpose === "google_connect"
+                ? "/sources"
+                : payload.purpose === "account_controls"
+                  ? "/safety"
+                  : payload.purpose === "private_bridge_standing"
+                    ? "/sources"
+                    : "/people",
+          },
           expiresInSeconds: 10 * 60,
         });
         await new EffectOutbox(transaction, secretBox).authorizeAndEnqueue({
@@ -699,6 +737,65 @@ async function main(): Promise<void> {
             maxAttempts: 8,
           });
         }
+      }
+
+      const dirtyFrontiers = await database<
+        {
+          readonly integration_id: string;
+          readonly integration_control_epoch: number | string;
+          readonly person_id: string;
+          readonly person_control_epoch: number | string;
+          readonly case_key_digest: string;
+          readonly source_generation: number | string;
+          readonly source_revision_id: string;
+        }[]
+      >`
+        select frontier.integration_id, integration.control_epoch as integration_control_epoch,
+          frontier.owner_person_id as person_id, person.control_epoch as person_control_epoch,
+          frontier.case_key_digest, frontier.source_generation,
+          anchor.source_revision_id
+        from private_source_frontiers frontier
+        join integrations integration on integration.id = frontier.integration_id
+          and integration.person_id = frontier.owner_person_id
+          and integration.provider = 'google' and integration.status = 'active'
+        join people person on person.id = frontier.owner_person_id and person.status = 'registered'
+        join lateral (
+          select revision.id as source_revision_id
+          from source_objects object
+          join source_revisions revision on revision.source_object_id = object.id
+            and revision.revision_number = object.latest_revision_number
+          where object.integration_id = frontier.integration_id
+            and object.provider = 'gmail' and object.object_kind = 'mail_message'
+            and object.correlation_digest = frontier.case_key_digest
+            and object.status = 'active'
+            and revision.owner_person_id = frontier.owner_person_id
+            and revision.revoked_at is null and revision.retention_until > ${now}
+            and revision.content_ciphertext is not null
+          order by revision.occurred_at desc, revision.id desc
+          limit 1
+        ) anchor on true
+        where frontier.source_generation > frontier.reconciled_generation
+        order by frontier.updated_at, frontier.id
+        limit 100
+      `;
+      for (const frontier of dirtyFrontiers) {
+        const integrationControlEpoch = Number(frontier.integration_control_epoch);
+        const personControlEpoch = Number(frontier.person_control_epoch);
+        await work.enqueue({
+          kind: "orchestrate.private_source",
+          idempotencyKey: `orchestrate:frontier:${frontier.integration_id}:e${integrationControlEpoch}:${frontier.case_key_digest}:dirty:g${Number(frontier.source_generation)}`,
+          payload: {
+            sourceRevisionId: frontier.source_revision_id,
+            personId: frontier.person_id,
+            integrationId: frontier.integration_id,
+            integrationControlEpoch,
+          },
+          person: { id: frontier.person_id, controlEpoch: personControlEpoch },
+          integration: { id: frontier.integration_id, controlEpoch: integrationControlEpoch },
+          caseKeyDigest: frontier.case_key_digest,
+          priority: 65,
+          maxAttempts: 8,
+        });
       }
     }
 

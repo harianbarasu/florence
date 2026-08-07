@@ -510,14 +510,6 @@ export class FlorenceOrchestrator {
     }
     const candidateId = receipt.ids.candidateId;
     if (candidateId) {
-      const standingIntent = await new PrivateSourceBridge(
-        this.database,
-        this.secretBox,
-        this.config.defaults.rawSourceRetentionDays,
-      ).tryPrepareStandingCandidate(personId, candidateId);
-      if (standingIntent) {
-        return { kind: "reconciled", disposition: "private_candidate_matched_standing_rule" };
-      }
       await this.mutationProcessor.process({
         kind: "private_source.notify_candidate",
         candidateId,
@@ -527,6 +519,82 @@ export class FlorenceOrchestrator {
       });
     }
     return { kind: "reconciled", disposition: receipt.disposition };
+  }
+
+  /**
+   * Runs from candidate-delivery work, which is deliberately outside the
+   * initial-import readiness predicate. This avoids making a recent-source
+   * reconciliation job wait on the very information-current gate it helps
+   * complete, while still giving an approved standing rule first refusal
+   * before any private review notice is sent.
+   */
+  public async tryApplyStandingPrivateCandidate(
+    personId: string,
+    candidateId: string,
+  ): Promise<"not_applicable" | "applied" | "fallback_to_private_review"> {
+    if (!this.mutationProcessor) throw new Error("Private bridge mutation seam is not configured");
+    const bridge = new PrivateSourceBridge(
+      this.database,
+      this.secretBox,
+      this.config.defaults.rawSourceRetentionDays,
+    );
+    const standingIntent = await bridge.tryPrepareStandingCandidate(personId, candidateId);
+    if (standingIntent === null) return "not_applicable";
+
+    let status = await this.loadPrivateBridgeIntentStatus(standingIntent);
+    if (status === "proposed") {
+      let proposalDisposition: string | null = null;
+      try {
+        proposalDisposition = await this.proposePrivateBridge(standingIntent);
+      } catch (error) {
+        // A model/provider failure must not strand the candidate behind a
+        // half-created standing intent. If a concurrent worker already moved
+        // the intent forward, inspect that durable state instead.
+        const cancelled = await bridge.cancelPendingProposal(standingIntent);
+        status = await this.loadPrivateBridgeIntentStatus(standingIntent);
+        if (cancelled || !status) return "fallback_to_private_review";
+        if (["cancelled", "expired", "failed", "ambiguous"].includes(status)) {
+          return "fallback_to_private_review";
+        }
+        if (!["approved", "executing", "succeeded"].includes(status)) throw error;
+      }
+      if (
+        proposalDisposition === "private_bridge_minimum_disclosure_failed" ||
+        proposalDisposition === "private_bridge_commitment_failed"
+      ) {
+        // A legacy queued proposal worker may have won the race while this
+        // attempt failed. Prefer its durable approval/commit over emitting a
+        // duplicate private notice.
+        status = await this.loadPrivateBridgeIntentStatus(standingIntent);
+        if (!status || !["approved", "executing", "succeeded"].includes(status)) {
+          return "fallback_to_private_review";
+        }
+      } else {
+        status = await this.loadPrivateBridgeIntentStatus(standingIntent);
+      }
+    }
+
+    if (status === "succeeded") return "applied";
+    if (status === "approved" || status === "executing") {
+      const receipt = await this.mutationProcessor.process({
+        kind: "private_bridge.commit",
+        actionIntentId: standingIntent,
+      });
+      if (receipt.disposition === "private_bridge_committed") return "applied";
+      if (receipt.disposition === "private_bridge_cancelled_for_fresh_approval") {
+        return "fallback_to_private_review";
+      }
+      throw new Error(`Unexpected standing bridge commit disposition: ${receipt.disposition}`);
+    }
+    return "fallback_to_private_review";
+  }
+
+  private async loadPrivateBridgeIntentStatus(actionIntentId: string): Promise<string | null> {
+    const rows = await this.database<{ readonly status: string }[]>`
+      select status from action_intents
+      where id = ${actionIntentId} and action_kind = 'private_source_to_coverage_loop'
+    `;
+    return rows[0]?.status ?? null;
   }
 
   public async proposePrivateBridge(actionIntentId: string): Promise<string> {

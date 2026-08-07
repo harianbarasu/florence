@@ -2344,13 +2344,40 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
           readonly expires_at: Date | null;
         }[]
       >`
-        select id, candidate_kind, content_digest, content_ciphertext,
-          evidence_refs, confidence, proposed_at, expires_at
-        from knowledge_candidates
-        where scope_kind = 'person' and owner_person_id = ${query.personId}
-          and status = 'pending'
-          and (expires_at is null or expires_at > ${new Date(query.asOf)})
-        order by proposed_at desc
+        select candidate.id, candidate.candidate_kind, candidate.content_digest,
+          candidate.content_ciphertext, candidate.evidence_refs, candidate.confidence,
+          candidate.proposed_at, candidate.expires_at
+        from knowledge_candidates candidate
+        where candidate.scope_kind = 'person'
+          and candidate.owner_person_id = ${query.personId}
+          and candidate.status = 'pending'
+          and (candidate.expires_at is null or candidate.expires_at > ${new Date(query.asOf)})
+          and (
+            -- A direct-chat proposal has no external integration and remains
+            -- immediately reviewable. Integrated candidates must instead be
+            -- the exact clean current frontier after the account-wide initial
+            -- information gate has passed.
+            not exists (
+              select 1
+              from jsonb_array_elements_text(candidate.evidence_refs) evidence(reference_id)
+              join source_revisions revision on revision.id::text = evidence.reference_id
+              join source_objects object on object.id = revision.source_object_id
+              where object.integration_id is not null
+            )
+            or exists (
+              select 1
+              from private_source_frontiers frontier
+              join integrations integration on integration.id = frontier.integration_id
+                and integration.person_id = candidate.owner_person_id
+                and integration.status = 'active'
+                and integration.information_current_control_epoch = integration.control_epoch
+              where frontier.current_candidate_id = candidate.id
+                and frontier.owner_person_id = candidate.owner_person_id
+                and frontier.disposition = 'candidate'
+                and frontier.source_generation = frontier.reconciled_generation
+            )
+          )
+        order by candidate.proposed_at desc
         limit ${query.limit}
       `;
       return {
@@ -2672,6 +2699,16 @@ async function invalidateIntegrationArtifacts(
   artifactKinds: readonly SourceArtifactKind[],
   invalidatedAt: Date,
 ): Promise<void> {
+  if (
+    artifactKinds.some((kind) => ["mail_message", "attachment_manifest", "calendar_event"].includes(kind))
+  ) {
+    await transaction`
+      update private_source_frontiers
+      set source_generation = source_generation + 1,
+        updated_at = greatest(updated_at, ${invalidatedAt})
+      where integration_id = ${integrationId}
+    `;
+  }
   const revisions = await transaction<{ readonly id: string }[]>`
     select revision.id
     from source_objects object

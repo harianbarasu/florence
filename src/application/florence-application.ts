@@ -338,6 +338,7 @@ export class FlorenceApplication {
           on frontier.current_candidate_id = candidate.id
           and frontier.owner_person_id = candidate.owner_person_id
           and frontier.disposition = 'candidate'
+          and frontier.source_generation = frontier.reconciled_generation
         join people person on person.id = candidate.owner_person_id and person.status = 'registered'
         join integrations integration on integration.id = frontier.integration_id
           and integration.person_id = person.id and integration.status = 'active'
@@ -396,16 +397,18 @@ export class FlorenceApplication {
       this.secretBox,
     ).notifyPrivateSourceCandidate(input);
     return {
-      accepted: result.kind !== "route_unavailable",
+      accepted: result.kind !== "route_unavailable" && result.kind !== "not_ready",
       duplicate: result.kind !== "queued" || !result.created,
       disposition:
         result.kind === "route_unavailable"
           ? "private_source_candidate_private_route_unavailable"
-          : result.kind === "obsolete"
-            ? "private_source_candidate_notice_obsolete"
-            : result.created
-              ? "private_source_candidate_private_notice_queued"
-              : "private_source_candidate_private_notice_already_recorded",
+          : result.kind === "not_ready"
+            ? "private_source_candidate_information_not_current"
+            : result.kind === "obsolete"
+              ? "private_source_candidate_notice_obsolete"
+              : result.created
+                ? "private_source_candidate_private_notice_queued"
+                : "private_source_candidate_private_notice_already_recorded",
       ids: {
         candidateId: input.candidateId,
         ...(result.kind === "queued" ? { outboxId: result.outboxId } : {}),
@@ -3315,8 +3318,8 @@ export class FlorenceApplication {
         case "request_step_up": {
           await new DurableWork(transaction, this.secretBox).enqueue({
             kind: "auth.send_step_up",
-            idempotencyKey: `step-up:${actorPersonId}:${command.purpose}:${Math.floor(Date.now() / 60_000)}`,
-            payload: { actorPersonId, purpose: command.purpose },
+            idempotencyKey: `step-up:${actorPersonId}:${command.purpose}:${JSON.stringify(command.context ?? {})}:${Math.floor(Date.now() / 60_000)}`,
+            payload: { actorPersonId, purpose: command.purpose, context: command.context ?? {} },
             person: { id: actorPersonId, controlEpoch: Number(people[0].control_epoch) },
             maxAttempts: 3,
           });

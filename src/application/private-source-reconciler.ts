@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { TransactionSql } from "postgres";
 import { z } from "zod";
 import type { Database } from "../db/client.js";
-import { PrivateSourceBridge } from "../modules/bridges/index.js";
+import { type PrivateBridgeSourceFrontier, PrivateSourceBridge } from "../modules/bridges/index.js";
 import {
   gmailThreadCaseDigest,
   gmailThreadFrontierLockKey,
@@ -54,7 +54,6 @@ const ReconciliationProposalSchema = z.strictObject({
 
 export type PrivateSourceNotReadyReason =
   | "calendar_frontier_pending"
-  | "calendar_privacy_mode_ambiguous"
   | "gmail_thread_frontier_incomplete"
   | "source_evidence_unreadable"
   | "attachment_extraction_incomplete"
@@ -395,20 +394,21 @@ export class PrivateSourceReconciler {
       if (acceptedAnchor) {
         if (proposal.decision.kind === "coverage_cancelled") {
           await revokePendingCandidate();
+          const replacementSourceFrontier = await writeFrontier(transaction, {
+            prior: frontier,
+            current,
+            currentCandidateId: null,
+            disposition: "quiet",
+            reconciledAt,
+          });
           const withdrawn = await bridge.withdrawAcceptedCandidate({
             ownerPersonId: current.ownerPersonId,
             candidateId: acceptedAnchor.candidate.id,
             candidateContentDigest: acceptedAnchor.candidate.content_digest,
             intent: proposal.decision.reason === "cancelled" ? "cancel" : "supersede",
             evidenceSourceRevisionIds,
+            replacementSourceFrontier,
             withdrawnAt: reconciledAt,
-          });
-          await writeFrontier(transaction, {
-            prior: frontier,
-            current,
-            currentCandidateId: null,
-            disposition: "quiet",
-            reconciledAt,
           });
           return finish({
             kind: "cancelled",
@@ -875,14 +875,7 @@ export class PrivateSourceReconciler {
     ) {
       return { kind: "not_ready", reason: "calendar_frontier_pending", retryable: true };
     }
-    if (new Set(grants.map((grant) => grant.mode)).size > 1) {
-      return {
-        kind: "not_ready",
-        reason: "calendar_privacy_mode_ambiguous",
-        retryable: false,
-      };
-    }
-    if (grants.length === 0 || grants[0]?.mode !== "full_private") {
+    if (!grants.some((grant) => grant.mode === "full_private")) {
       return { kind: "ready", evidence: [] };
     }
 
@@ -919,6 +912,12 @@ export class PrivateSourceReconciler {
       if (!data) {
         return { kind: "not_ready", reason: "source_evidence_unreadable", retryable: false };
       }
+      // Busy-only calendars deliberately omit the provider event identifier and
+      // all descriptive fields. They can establish availability, but cannot be
+      // correlated to a private Gmail case without widening their approved
+      // disclosure. Mixed calendar modes are therefore safe: only full-private
+      // projections participate in semantic reconciliation.
+      if (!stringField(data, "remoteEventId")) continue;
       const start = dateField(data, "start");
       const end = dateField(data, "end") ?? start;
       if (!hasCalendarTokenOverlap(threadTokens, data)) continue;
@@ -1195,10 +1194,19 @@ async function writeFrontier(
     readonly disposition: "quiet" | "candidate";
     readonly reconciledAt: Date;
   },
-): Promise<void> {
+): Promise<PrivateBridgeSourceFrontier> {
   const evidenceIds = input.current.evidenceDigests.map((evidence) => evidence.sourceRevisionId).sort();
   if (input.prior) {
-    await transaction`
+    const rows = await transaction<
+      {
+        readonly id: string;
+        readonly integration_id: string;
+        readonly case_key_digest: string;
+        readonly version: number | string;
+        readonly frontier_digest: string;
+        readonly source_generation: number | string;
+      }[]
+    >`
       update private_source_frontiers
       set version = version + 1, frontier_digest = ${input.current.frontierDigest},
         reconciled_generation = source_generation,
@@ -1206,22 +1214,61 @@ async function writeFrontier(
         current_candidate_id = ${input.currentCandidateId}, disposition = ${input.disposition},
         reconciled_at = ${input.reconciledAt}, updated_at = ${input.reconciledAt}
       where id = ${input.prior.id}
+      returning id, integration_id, case_key_digest, version, frontier_digest, source_generation
     `;
-    return;
+    return privateBridgeSourceFrontier(rows[0], input.current.integrationControlEpoch);
   }
-  await transaction`
+  const frontierId = randomUUID();
+  const rows = await transaction<
+    {
+      readonly id: string;
+      readonly integration_id: string;
+      readonly case_key_digest: string;
+      readonly version: number | string;
+      readonly frontier_digest: string;
+      readonly source_generation: number | string;
+    }[]
+  >`
     insert into private_source_frontiers (
       id, owner_person_id, integration_id, case_kind, case_key_digest,
       version, frontier_digest, source_generation, reconciled_generation,
       evidence_source_revision_ids,
       current_candidate_id, disposition, reconciled_at, created_at, updated_at
     ) values (
-      ${randomUUID()}, ${input.current.ownerPersonId}, ${input.current.integrationId},
+      ${frontierId}, ${input.current.ownerPersonId}, ${input.current.integrationId},
       'gmail_thread', ${input.current.caseKeyDigest}, 1, ${input.current.frontierDigest}, 0, 0,
       ${transaction.array(evidenceIds)}::uuid[], ${input.currentCandidateId},
       ${input.disposition}, ${input.reconciledAt}, ${input.reconciledAt}, ${input.reconciledAt}
     )
+    returning id, integration_id, case_key_digest, version, frontier_digest, source_generation
   `;
+  return privateBridgeSourceFrontier(rows[0], input.current.integrationControlEpoch);
+}
+
+function privateBridgeSourceFrontier(
+  row:
+    | {
+        readonly id: string;
+        readonly integration_id: string;
+        readonly case_key_digest: string;
+        readonly version: number | string;
+        readonly frontier_digest: string;
+        readonly source_generation: number | string;
+      }
+    | undefined,
+  integrationControlEpoch: number,
+): PrivateBridgeSourceFrontier {
+  if (!row) throw new StaleAuthorityError("Private source frontier could not be committed");
+  return {
+    frontierId: row.id,
+    integrationId: row.integration_id,
+    integrationControlEpoch,
+    caseKind: "gmail_thread",
+    caseKeyDigest: row.case_key_digest,
+    version: Number(row.version),
+    frontierDigest: row.frontier_digest,
+    sourceGeneration: Number(row.source_generation),
+  };
 }
 
 function requireInstant(value: string): Date {

@@ -228,7 +228,9 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
                 ? "/sources?step_up=google_connect"
                 : session.assuranceKind === "account_controls"
                   ? "/safety?step_up=account_controls"
-                  : "/people",
+                  : session.assuranceKind === "private_bridge_standing"
+                    ? "/sources?step_up=private_bridge_standing"
+                    : "/people",
       };
     },
   );
@@ -373,7 +375,6 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
     });
   });
   app.post("/api/households/:householdId/invitations", async (request) => {
-    const principal = await requireWriteSession(request, config, auth);
     const householdId = z
       .string()
       .uuid()
@@ -385,6 +386,15 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
         role: z.enum(["steward", "caregiver", "participant"]),
       })
       .parse(request.body);
+    const principal =
+      body.role === "steward"
+        ? await requireExactStepUpWriteSession(request, config, auth, "household_invitation", {
+            action: "invite",
+            householdId,
+            conversationId: body.conversationId,
+            inviteePersonId: body.inviteePersonId,
+          })
+        : await requireWriteSession(request, config, auth);
     return application.process({
       kind: "web.command",
       actorPersonId: principal.personId,
@@ -392,11 +402,21 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
     });
   });
   app.post("/api/invitations/:invitationId/approve", async (request) => {
-    const principal = await requireWriteSession(request, config, auth);
     const invitationId = z
       .string()
       .uuid()
       .parse((request.params as { invitationId?: unknown }).invitationId);
+    const principal = await requireWriteSession(request, config, auth);
+    const invitation = await database<{ household_id: string; requested_role: string }[]>`
+      select household_id, requested_role from invitations where id = ${invitationId}
+    `;
+    if (invitation[0]?.requested_role === "steward") {
+      verifyExactStepUp(principal, "household_invitation", {
+        action: "approve",
+        householdId: invitation[0].household_id,
+        invitationId,
+      });
+    }
     return application.process({
       kind: "web.command",
       actorPersonId: principal.personId,
@@ -404,11 +424,21 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
     });
   });
   app.post("/api/invitations/:invitationId/accept", async (request) => {
-    const principal = await requireWriteSession(request, config, auth);
     const invitationId = z
       .string()
       .uuid()
       .parse((request.params as { invitationId?: unknown }).invitationId);
+    const principal = await requireWriteSession(request, config, auth);
+    const invitation = await database<{ household_id: string; requested_role: string }[]>`
+      select household_id, requested_role from invitations where id = ${invitationId}
+    `;
+    if (invitation[0]?.requested_role === "steward") {
+      verifyExactStepUp(principal, "household_invitation", {
+        action: "accept",
+        householdId: invitation[0].household_id,
+        invitationId,
+      });
+    }
     return application.process({
       kind: "web.command",
       actorPersonId: principal.personId,
@@ -441,11 +471,14 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
     });
   });
   app.post("/api/chats/:conversationId/coverage-rule-approval", async (request) => {
-    const principal = await requireWriteSession(request, config, auth);
     const conversationId = z
       .string()
       .uuid()
       .parse((request.params as { conversationId?: unknown }).conversationId);
+    const principal = await requireExactStepUpWriteSession(request, config, auth, "group_coverage", {
+      action: "approve",
+      conversationId,
+    });
     return application.process({
       kind: "web.command",
       actorPersonId: principal.personId,
@@ -547,7 +580,6 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
     });
   });
   app.post("/api/sources/private-bridge/:actionIntentId/approve", async (request) => {
-    const principal = await requireWriteSession(request, config, auth);
     const actionIntentId = z
       .string()
       .uuid()
@@ -562,6 +594,25 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
         mode: z.enum(["once", "standing"]),
       })
       .parse(request.body);
+    const exactStandingContext = {
+      action: "approve",
+      actionIntentId,
+      actionDigest: body.actionDigest,
+      dataDigest: body.dataDigest,
+      policyDigest: body.policyDigest,
+      targetDigest: body.targetDigest,
+      mode: body.mode,
+    } as const;
+    const principal =
+      body.mode === "standing"
+        ? await requireExactStepUpWriteSession(
+            request,
+            config,
+            auth,
+            "private_bridge_standing",
+            exactStandingContext,
+          )
+        : await requireWriteSession(request, config, auth);
     return application.process({
       kind: "web.command",
       actorPersonId: principal.personId,
@@ -604,12 +655,50 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
   app.post("/api/safety/request-step-up", async (request) => {
     const principal = await requireWriteSession(request, config, auth);
     const body = z
-      .strictObject({ purpose: z.enum(["account_controls", "google_connect"]) })
+      .discriminatedUnion("purpose", [
+        z.strictObject({ purpose: z.enum(["account_controls", "google_connect"]) }),
+        z.strictObject({
+          purpose: z.literal("household_invitation"),
+          context: z.discriminatedUnion("action", [
+            z.strictObject({
+              action: z.literal("invite"),
+              householdId: z.string().uuid(),
+              conversationId: z.string().uuid(),
+              inviteePersonId: z.string().uuid(),
+            }),
+            z.strictObject({
+              action: z.enum(["approve", "accept"]),
+              householdId: z.string().uuid(),
+              invitationId: z.string().uuid(),
+            }),
+          ]),
+        }),
+        z.strictObject({
+          purpose: z.literal("group_coverage"),
+          context: z.strictObject({ action: z.literal("approve"), conversationId: z.string().uuid() }),
+        }),
+        z.strictObject({
+          purpose: z.literal("private_bridge_standing"),
+          context: z.strictObject({
+            action: z.literal("approve"),
+            actionIntentId: z.string().uuid(),
+            actionDigest: z.string().regex(/^[a-f0-9]{64}$/u),
+            dataDigest: z.string().regex(/^[a-f0-9]{64}$/u),
+            policyDigest: z.string().regex(/^[a-f0-9]{64}$/u),
+            targetDigest: z.string().regex(/^[a-f0-9]{64}$/u),
+            mode: z.literal("standing"),
+          }),
+        }),
+      ])
       .parse(request.body);
     return application.process({
       kind: "web.command",
       actorPersonId: principal.personId,
-      command: { kind: "request_step_up", purpose: body.purpose },
+      command: {
+        kind: "request_step_up",
+        purpose: body.purpose,
+        context: "context" in body ? body.context : {},
+      },
     });
   });
   app.get("/api/safety/export", async (request, reply) => {
@@ -808,6 +897,37 @@ async function requireStepUpWriteSession(
   const principal = await requireStepUpSession(request, config, auth, purpose);
   auth.verifyCsrf(principal, headerString(request.headers["x-csrf-token"]));
   return principal;
+}
+
+async function requireExactStepUpWriteSession(
+  request: FastifyRequest,
+  config: FlorenceConfig,
+  auth: PostgresWebAuth,
+  purpose: "household_invitation" | "group_coverage" | "private_bridge_standing",
+  context: Readonly<Record<string, string>>,
+): Promise<SessionPrincipal> {
+  verifySameOrigin(request, config);
+  const principal = await requireSession(request, config, auth);
+  auth.verifyCsrf(principal, headerString(request.headers["x-csrf-token"]));
+  verifyExactStepUp(principal, purpose, context);
+  return principal;
+}
+
+function verifyExactStepUp(
+  principal: SessionPrincipal,
+  purpose: "household_invitation" | "group_coverage" | "private_bridge_standing",
+  context: Readonly<Record<string, string>>,
+): void {
+  if (
+    principal.assuranceKind !== purpose ||
+    principal.assuranceExpiresAt === null ||
+    principal.assuranceExpiresAt <= new Date() ||
+    Object.keys(context).length !==
+      Object.keys(principal.assuranceContext).filter((key) => key !== "returnPath").length ||
+    Object.entries(context).some(([key, value]) => principal.assuranceContext[key] !== value)
+  ) {
+    throw new UnauthorizedError("Request a fresh private Florence confirmation for this exact action first");
+  }
 }
 
 function verifySameOrigin(request: FastifyRequest, config: FlorenceConfig): void {

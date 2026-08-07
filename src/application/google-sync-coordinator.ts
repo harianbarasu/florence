@@ -49,6 +49,7 @@ export interface GoogleSyncMilestoneResult {
 
 export type PrivateSourceCandidateNoticeResult =
   | { readonly kind: "obsolete" }
+  | { readonly kind: "not_ready" }
   | { readonly kind: "route_unavailable" }
   | { readonly kind: "queued"; readonly outboxId: string; readonly created: boolean };
 
@@ -136,6 +137,14 @@ export class GoogleSyncCoordinator {
       if (connected.created) outboxIds.push(connected.outboxId);
 
       if (await this.recentInformationIsCurrent(transaction, scope)) {
+        await transaction`
+          update integrations
+          set information_current_control_epoch = control_epoch, updated_at = now()
+          where id = ${scope.integrationId}
+            and person_id = ${scope.personId}
+            and control_epoch = ${scope.integrationControlEpoch}
+            and information_current_control_epoch is distinct from control_epoch
+        `;
         const current = await this.enqueueMilestone(transaction, {
           scope,
           route,
@@ -173,15 +182,26 @@ export class GoogleSyncCoordinator {
         {
           readonly person_control_epoch: number | string;
           readonly integration_control_epoch: number | string;
+          readonly frontier_id: string;
+          readonly frontier_version: number | string;
+          readonly frontier_digest: string;
+          readonly source_generation: number | string;
+          readonly case_key_digest: string;
+          readonly information_is_current: boolean;
         }[]
       >`
         select person.control_epoch as person_control_epoch,
-          integration.control_epoch as integration_control_epoch
+          integration.control_epoch as integration_control_epoch,
+          frontier.id as frontier_id, frontier.version as frontier_version,
+          frontier.frontier_digest, frontier.source_generation, frontier.case_key_digest,
+          integration.information_current_control_epoch = integration.control_epoch
+            as information_is_current
         from knowledge_candidates candidate
         join private_source_frontiers frontier
           on frontier.current_candidate_id = candidate.id
           and frontier.owner_person_id = candidate.owner_person_id
           and frontier.disposition = 'candidate'
+          and frontier.source_generation = frontier.reconciled_generation
         join people person on person.id = candidate.owner_person_id
           and person.status = 'registered'
         join integrations integration on integration.id = frontier.integration_id
@@ -196,6 +216,7 @@ export class GoogleSyncCoordinator {
       `;
       const current = rows[0];
       if (!current) return { kind: "obsolete" };
+      if (!current.information_is_current) return { kind: "not_ready" };
       const route = await this.resolveExactPrivateRoute(transaction, input.personId);
       if (!route) return { kind: "route_unavailable" };
       const authority = await new PostgresConversationAuthority(transaction).authorizeSend({
@@ -226,7 +247,7 @@ export class GoogleSyncCoordinator {
         personId: input.personId,
         privateIdentityId: route.identityId,
         privateConversationId: route.conversationId,
-        purpose: "web_sign_in",
+        purpose: "private_review",
         context: { returnPath: "/sources", candidateId: input.candidateId },
         expiresInSeconds: 10 * 60,
       });
@@ -237,6 +258,14 @@ export class GoogleSyncCoordinator {
         integration: {
           id: input.integrationId,
           controlEpoch: Number(current.integration_control_epoch),
+        },
+        sourceFrontier: {
+          frontierId: current.frontier_id,
+          integrationId: input.integrationId,
+          caseKeyDigest: current.case_key_digest,
+          version: Number(current.frontier_version),
+          frontierDigest: current.frontier_digest,
+          sourceGeneration: Number(current.source_generation),
         },
         conversation: {
           id: route.conversationId,

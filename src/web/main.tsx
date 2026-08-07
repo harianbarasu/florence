@@ -896,6 +896,8 @@ function PeoplePage({ viewer }: { viewer: Viewer }) {
                               {
                                 expectedParticipantEpochId: group.participantEpochId,
                                 expectedParticipantSetDigest: group.participantSetDigest,
+                                expectedConversationAuthorityVersion: group.conversationAuthorityVersion,
+                                expectedHouseholdControlEpoch: group.householdControlEpoch,
                               },
                               "Your approval is saved. The group status is updated below.",
                               {
@@ -905,6 +907,10 @@ function PeoplePage({ viewer }: { viewer: Viewer }) {
                                   conversationId: group.conversationId,
                                   expectedParticipantEpochId: group.participantEpochId,
                                   expectedParticipantSetDigest: group.participantSetDigest,
+                                  expectedConversationAuthorityVersion: String(
+                                    group.conversationAuthorityVersion,
+                                  ),
+                                  expectedHouseholdControlEpoch: String(group.householdControlEpoch),
                                 },
                               },
                             )

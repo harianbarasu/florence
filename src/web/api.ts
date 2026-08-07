@@ -57,6 +57,8 @@ export interface PeopleView {
       conversationId: string;
       participantEpochId: string;
       participantSetDigest: string;
+      conversationAuthorityVersion: number;
+      householdControlEpoch: number;
       label: string;
       active: boolean;
       approvedCount: number;

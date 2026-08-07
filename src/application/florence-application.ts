@@ -2989,6 +2989,8 @@ export class FlorenceApplication {
             conversationId: input.conversationId,
             expectedParticipantEpochId: route.group_epoch_id,
             expectedParticipantSetDigest: route.group_participant_digest,
+            expectedConversationAuthorityVersion: String(route.group_authority_version),
+            expectedHouseholdControlEpoch: String(route.household_control_epoch),
             returnPath: "/people",
           }
         : { returnPath: "/people" },
@@ -3025,7 +3027,7 @@ export class FlorenceApplication {
         text,
       },
       reasonCodes: ["exact_current_group_epoch", "exact_private_recipient", input.noticeKind],
-      authorizationExpiresAt: new Date(Date.now() + 7 * 24 * 60 * 60_000),
+      authorizationExpiresAt: handoff.expiresAt,
     });
   }
 
@@ -3255,6 +3257,8 @@ export class FlorenceApplication {
             actorPersonId,
             expectedParticipantEpochId: command.expectedParticipantEpochId,
             expectedParticipantSetDigest: command.expectedParticipantSetDigest,
+            expectedConversationAuthorityVersion: command.expectedConversationAuthorityVersion,
+            expectedHouseholdControlEpoch: command.expectedHouseholdControlEpoch,
             approvedAt: new Date(),
           });
           if (result.status === "active") {

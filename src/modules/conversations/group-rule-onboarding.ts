@@ -24,14 +24,24 @@ export class GroupRuleOnboarding {
     readonly actorPersonId: string;
     readonly expectedParticipantEpochId: string;
     readonly expectedParticipantSetDigest: string;
+    readonly expectedConversationAuthorityVersion: number;
+    readonly expectedHouseholdControlEpoch: number;
     readonly approvedAt: Date;
   }): Promise<GroupRuleApprovalResult> {
     return inTransaction(this.database, async (transaction) => {
-      const locked = await transaction<{ id: string }[]>`
-        select id from conversations where id = ${input.conversationId}
-          and kind = 'group' and status = 'active' and household_id is not null for update
+      const locked = await transaction<
+        { id: string; household_id: string; household_control_epoch: number | string }[]
+      >`
+        select conversation.id, conversation.household_id,
+          household.control_epoch as household_control_epoch
+        from conversations conversation
+        join households household on household.id = conversation.household_id
+        where conversation.id = ${input.conversationId}
+          and conversation.kind = 'group' and conversation.status = 'active'
+        for update of conversation, household
       `;
-      if (!locked[0]) {
+      const lockedGroup = locked[0];
+      if (!lockedGroup) {
         throw new UnauthorizedError(
           "This chat must belong to your family before proactive help can be approved",
         );
@@ -43,10 +53,12 @@ export class GroupRuleOnboarding {
       }
       if (
         snapshot.participantEpochId !== input.expectedParticipantEpochId ||
-        snapshot.participantSetDigest !== input.expectedParticipantSetDigest
+        snapshot.participantSetDigest !== input.expectedParticipantSetDigest ||
+        snapshot.authorityVersion !== input.expectedConversationAuthorityVersion ||
+        Number(lockedGroup.household_control_epoch) !== input.expectedHouseholdControlEpoch
       ) {
         throw new StaleAuthorityError(
-          "This group changed after the approval link was issued; review the current group again",
+          "This group or family changed after the approval link was issued; review it again",
         );
       }
       if (
@@ -66,6 +78,20 @@ export class GroupRuleOnboarding {
       ].sort();
       if (!participantIds.includes(input.actorPersonId)) {
         throw new UnauthorizedError("Only a current group participant can approve this rule");
+      }
+      const activeMemberships = await transaction<{ person_id: string }[]>`
+        select distinct person_id from household_memberships
+        where household_id = ${lockedGroup.household_id} and status = 'active'
+          and person_id = any(${transaction.array(participantIds)}::uuid[])
+        order by person_id
+      `;
+      if (
+        activeMemberships.length !== participantIds.length ||
+        activeMemberships.some((membership, index) => membership.person_id !== participantIds[index])
+      ) {
+        throw new StaleAuthorityError(
+          "Every current group participant must still be an active member of this family",
+        );
       }
       const alreadyActive = snapshot.rules.some(
         (rule) =>
@@ -114,17 +140,26 @@ export class GroupRuleOnboarding {
       await transaction`
         insert into conversation_rule_approvals (
           conversation_rule_id, participant_epoch_id, person_id,
-          participant_set_digest, approved_at
+          participant_set_digest, conversation_authority_version,
+          household_control_epoch, approved_at
         ) values (
           ${proposalId}, ${snapshot.participantEpochId}, ${input.actorPersonId},
-          ${snapshot.participantSetDigest}, ${input.approvedAt}
-        ) on conflict (conversation_rule_id, person_id) do nothing
+          ${snapshot.participantSetDigest}, ${snapshot.authorityVersion},
+          ${input.expectedHouseholdControlEpoch}, ${input.approvedAt}
+        ) on conflict (conversation_rule_id, person_id) do update set
+          participant_epoch_id = excluded.participant_epoch_id,
+          participant_set_digest = excluded.participant_set_digest,
+          conversation_authority_version = excluded.conversation_authority_version,
+          household_control_epoch = excluded.household_control_epoch,
+          approved_at = excluded.approved_at
       `;
       const approved = await transaction<{ person_id: string }[]>`
         select person_id from conversation_rule_approvals
         where conversation_rule_id = ${proposalId}
           and participant_epoch_id = ${snapshot.participantEpochId}
           and participant_set_digest = ${snapshot.participantSetDigest}
+          and conversation_authority_version = ${snapshot.authorityVersion}
+          and household_control_epoch = ${input.expectedHouseholdControlEpoch}
         order by person_id
       `;
       const approvedIds = approved.map((entry) => entry.person_id);

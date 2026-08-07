@@ -72,6 +72,8 @@ const dependentBodySchema = z.strictObject({
 const groupCoverageApprovalBodySchema = z.strictObject({
   expectedParticipantEpochId: z.string().uuid(),
   expectedParticipantSetDigest: z.string().regex(/^[a-f0-9]{64}$/u),
+  expectedConversationAuthorityVersion: z.number().int().positive(),
+  expectedHouseholdControlEpoch: z.number().int().positive(),
 });
 
 export async function createServer(input?: { config?: FlorenceConfig; database?: Database }) {
@@ -500,6 +502,8 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
       conversationId,
       expectedParticipantEpochId: body.expectedParticipantEpochId,
       expectedParticipantSetDigest: body.expectedParticipantSetDigest,
+      expectedConversationAuthorityVersion: String(body.expectedConversationAuthorityVersion),
+      expectedHouseholdControlEpoch: String(body.expectedHouseholdControlEpoch),
     });
     return application.process({
       kind: "web.command",
@@ -702,6 +706,8 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
             conversationId: z.string().uuid(),
             expectedParticipantEpochId: z.string().uuid(),
             expectedParticipantSetDigest: z.string().regex(/^[a-f0-9]{64}$/u),
+            expectedConversationAuthorityVersion: z.string().regex(/^[1-9][0-9]*$/u),
+            expectedHouseholdControlEpoch: z.string().regex(/^[1-9][0-9]*$/u),
           }),
         }),
         z.strictObject({

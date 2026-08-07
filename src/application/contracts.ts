@@ -239,6 +239,8 @@ export type AppEnvelope =
             readonly conversationId: string;
             readonly expectedParticipantEpochId: string;
             readonly expectedParticipantSetDigest: string;
+            readonly expectedConversationAuthorityVersion: number;
+            readonly expectedHouseholdControlEpoch: number;
           }
         | ({ readonly kind: "create_routine" } & WebRoutineFields)
         | ({

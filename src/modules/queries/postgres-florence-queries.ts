@@ -801,6 +801,8 @@ export class PostgresFlorenceQueries {
           conversation_id: string;
           participant_epoch_id: string;
           participant_set_digest: string;
+          conversation_authority_version: number | string;
+          household_control_epoch: number | string;
           required_count: number | string;
           all_ready: boolean;
           active: boolean;
@@ -812,6 +814,8 @@ export class PostgresFlorenceQueries {
         select conversation.id as conversation_id, conversation.updated_at,
           epoch.id as participant_epoch_id,
           epoch.participant_set_digest,
+          conversation.authority_version as conversation_authority_version,
+          household.control_epoch as household_control_epoch,
           count(distinct participant.person_id) as required_count,
           coalesce(bool_and(
             participant.registration_status = 'registered'
@@ -828,6 +832,7 @@ export class PostgresFlorenceQueries {
           count(distinct approval.person_id) as approved_count,
           coalesce(bool_or(approval.person_id = ${personId}), false) as viewer_approved
         from conversations conversation
+        join households household on household.id = conversation.household_id
         join participant_epochs epoch on epoch.id = conversation.current_epoch_id
           and epoch.ended_at is null
         join epoch_participants participant on participant.participant_epoch_id = epoch.id
@@ -846,6 +851,8 @@ export class PostgresFlorenceQueries {
           on approval.conversation_rule_id = proposal.id
           and approval.participant_epoch_id = epoch.id
           and approval.participant_set_digest = epoch.participant_set_digest
+          and approval.conversation_authority_version = conversation.authority_version
+          and approval.household_control_epoch = household.control_epoch
         where conversation.household_id = ${household.id}
           and conversation.kind = 'group' and conversation.status = 'active'
           and exists(
@@ -853,7 +860,7 @@ export class PostgresFlorenceQueries {
             where viewer_participant.participant_epoch_id = epoch.id
               and viewer_participant.person_id = ${personId}
           )
-        group by conversation.id, epoch.id
+        group by conversation.id, epoch.id, household.id
         order by conversation.updated_at desc
       `;
       households.push({
@@ -922,6 +929,8 @@ export class PostgresFlorenceQueries {
             conversationId: group.conversation_id,
             participantEpochId: group.participant_epoch_id,
             participantSetDigest: group.participant_set_digest,
+            conversationAuthorityVersion: Number(group.conversation_authority_version),
+            householdControlEpoch: Number(group.household_control_epoch),
             label: groupIndex === 0 ? "Family group" : `Family group ${groupIndex + 1}`,
             active,
             approvedCount: active ? requiredCount : Number(group.approved_count),

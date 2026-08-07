@@ -70,6 +70,8 @@ interface CoverageTarget {
   readonly providerChatId: string;
   readonly providerParticipantDigest: string;
   readonly householdControlEpoch: number;
+  readonly relianceAuthorized: boolean;
+  readonly destinationCanWrite: boolean;
 }
 
 interface ProviderEventRow {
@@ -96,6 +98,7 @@ interface CandidateLoopRow {
   readonly household_control_epoch: number | string;
   readonly external_channel_id: string;
   readonly latest_participant_digest: string;
+  readonly reliance_authorized: boolean;
 }
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
@@ -706,8 +709,9 @@ export class CoverageCoordinator {
 
     if (
       proposal.response === "acknowledge" &&
-      loop.proposedHolderPersonId === null &&
-      (loop.state === "open" || loop.state === "at_risk")
+      (loop.proposedHolderPersonId === null ||
+        (target.relianceAuthorized && loop.proposedHolderPersonId !== source.actorPersonId)) &&
+      (loop.state === "open" || loop.state === "at_risk" || loop.state === "awaiting_response")
     ) {
       loop = (
         await coordination.transition({
@@ -773,25 +777,38 @@ export class CoverageCoordinator {
       transition.loop.state === "covered" && transition.loop.acknowledgment?.holderDisclosure === "shared"
         ? await this.openPersonLabel(transaction, transition.loop.acknowledgment.personId)
         : null;
-    const queued = await this.queueDestinationMessage(transaction, {
-      source,
-      snapshot: target.snapshot,
-      providerChatId: target.providerChatId,
-      providerParticipantDigest: target.providerParticipantDigest,
-      householdId: transition.loop.householdId,
-      householdControlEpoch: target.householdControlEpoch,
-      loop: transition.loop,
-      text: neutralTransitionText(transition.loop, holderWithdrew, acknowledgedHolderLabel),
-      sendKind: sameConversation ? "direct_response" : "proactive",
-      operation,
-      idempotencyKey: `coverage:${transition.loop.loopId}:v${transition.loop.version}:${proposal.response}`,
-      authorizationExpiresAt: effectExpiry(
-        processedAt,
-        evidence.accessExpiresAt,
-        proposal.response === "decline" ? transition.loop.timing.lastResponsibleAt : null,
-      ),
-      evidenceIds: evidence.ids,
-    });
+    const responseText = neutralTransitionText(transition.loop, holderWithdrew, acknowledgedHolderLabel);
+    const queued = target.destinationCanWrite
+      ? await this.queueDestinationMessage(transaction, {
+          source,
+          snapshot: target.snapshot,
+          providerChatId: target.providerChatId,
+          providerParticipantDigest: target.providerParticipantDigest,
+          householdId: transition.loop.householdId,
+          householdControlEpoch: target.householdControlEpoch,
+          loop: transition.loop,
+          text: responseText,
+          sendKind: sameConversation ? "direct_response" : "proactive",
+          operation,
+          idempotencyKey: `coverage:${transition.loop.loopId}:v${transition.loop.version}:${proposal.response}`,
+          authorizationExpiresAt: effectExpiry(
+            processedAt,
+            evidence.accessExpiresAt,
+            proposal.response === "decline" ? transition.loop.timing.lastResponsibleAt : null,
+          ),
+          evidenceIds: evidence.ids,
+        })
+      : await this.queuePrivateRelianceStatus(transaction, {
+          source,
+          destinationSnapshot: target.snapshot,
+          householdId: transition.loop.householdId,
+          householdControlEpoch: target.householdControlEpoch,
+          loop: transition.loop,
+          text: responseText,
+          operation,
+          idempotencyKey: `coverage:private-reliance:${transition.loop.loopId}:v${transition.loop.version}:${proposal.response}`,
+          authorizationExpiresAt: new Date(processedAt.getTime() + MAX_EFFECT_LIFETIME_MS),
+        });
     const timerId = await reconcileCoverageTimers({
       transaction,
       loop: transition.loop,
@@ -847,7 +864,10 @@ export class CoverageCoordinator {
     loopId: string,
   ): Promise<readonly CoverageTarget[]> {
     const candidate = await this.loadTarget(transaction, source, loopId);
-    return candidate && responseEligible(candidate.loop, source.actorPersonId, response) ? [candidate] : [];
+    return candidate &&
+      responseEligible(candidate.loop, source.actorPersonId, response, candidate.relianceAuthorized)
+      ? [candidate]
+      : [];
   }
 
   private async loadUniqueEligibleTargets(
@@ -857,7 +877,39 @@ export class CoverageCoordinator {
   ): Promise<readonly CoverageTarget[]> {
     const rows = await transaction<CandidateLoopRow[]>`
       select loop.id, household.control_epoch as household_control_epoch,
-        channel.external_channel_id, channel.latest_participant_digest
+        channel.external_channel_id, channel.latest_participant_digest,
+        exists(
+          select 1
+          from coverage_reliance_audiences reliance
+          join outbox effect on effect.id = reliance.outbox_id
+          where reliance.coverage_loop_id = loop.id
+            and reliance.loop_version = loop.version
+            and reliance.attention_cycle = loop.attention_cycle
+            and reliance.person_id = ${source.actorPersonId}
+            and reliance.membership_id = membership.id
+            and reliance.membership_version = membership.version
+            and reliance.household_control_epoch = household.control_epoch
+            and reliance.person_control_epoch = ${source.actorControlEpoch}
+            and reliance.target_conversation_id = ${source.record.routing.conversationId}
+            and reliance.target_participant_epoch_id = ${source.record.routing.participantEpochId}
+            and reliance.target_participant_set_digest = ${source.record.routing.appParticipantDigest}
+            and reliance.dispatch_state = 'queued'
+            and effect.person_id = reliance.person_id
+            and effect.person_control_epoch = reliance.person_control_epoch
+            and effect.household_id = reliance.household_id
+            and effect.household_control_epoch = reliance.household_control_epoch
+            and effect.conversation_id = reliance.target_conversation_id
+            and effect.conversation_authority_version = reliance.target_conversation_authority_version
+            and effect.participant_epoch_id = reliance.target_participant_epoch_id
+            and effect.expected_participant_digest = reliance.target_participant_set_digest
+            and effect.coverage_loop_id = loop.id
+            and effect.coverage_loop_version = loop.version
+            and effect.source_conversation_id = reliance.source_conversation_id
+            and effect.source_conversation_authority_version = reliance.source_conversation_authority_version
+            and effect.source_participant_epoch_id = reliance.source_participant_epoch_id
+            and effect.source_expected_participant_digest = reliance.source_participant_set_digest
+            and effect.status in ('submitted', 'confirmed')
+        ) as reliance_authorized
       from coverage_loops loop
       join households household on household.id = loop.household_id
         and household.status in ('onboarding', 'active')
@@ -871,7 +923,7 @@ export class CoverageCoordinator {
       join participant_epochs epoch on epoch.id = destination.current_epoch_id
         and epoch.id = loop.participant_epoch_id and epoch.ended_at is null
         and epoch.participant_set_digest = loop.participant_set_digest
-      join epoch_participants participant on participant.participant_epoch_id = epoch.id
+      left join epoch_participants participant on participant.participant_epoch_id = epoch.id
         and participant.person_id = ${source.actorPersonId}
         and participant.registration_status = 'registered' and participant.consented_at is not null
       join conversation_channels channel on channel.conversation_id = destination.id
@@ -882,8 +934,42 @@ export class CoverageCoordinator {
           (${source.record.routing.chatKind === "group"}
             and destination.id = ${source.record.routing.conversationId}
             and epoch.id = ${source.record.routing.participantEpochId}
-            and epoch.participant_set_digest = ${source.record.routing.appParticipantDigest})
-          or (${source.record.routing.chatKind === "direct"})
+            and epoch.participant_set_digest = ${source.record.routing.appParticipantDigest}
+            and participant.person_id = ${source.actorPersonId})
+          or (${source.record.routing.chatKind === "direct"}
+            and membership.role = 'steward'
+            and exists(
+              select 1
+              from coverage_reliance_audiences reliance
+              join outbox effect on effect.id = reliance.outbox_id
+              where reliance.coverage_loop_id = loop.id
+                and reliance.loop_version = loop.version
+                and reliance.attention_cycle = loop.attention_cycle
+                and reliance.person_id = ${source.actorPersonId}
+                and reliance.membership_id = membership.id
+                and reliance.membership_version = membership.version
+                and reliance.household_control_epoch = household.control_epoch
+                and reliance.person_control_epoch = ${source.actorControlEpoch}
+                and reliance.target_conversation_id = ${source.record.routing.conversationId}
+                and reliance.target_participant_epoch_id = ${source.record.routing.participantEpochId}
+                and reliance.target_participant_set_digest = ${source.record.routing.appParticipantDigest}
+                and reliance.dispatch_state = 'queued'
+                and effect.person_id = reliance.person_id
+                and effect.person_control_epoch = reliance.person_control_epoch
+                and effect.household_id = reliance.household_id
+                and effect.household_control_epoch = reliance.household_control_epoch
+                and effect.conversation_id = reliance.target_conversation_id
+                and effect.conversation_authority_version = reliance.target_conversation_authority_version
+                and effect.participant_epoch_id = reliance.target_participant_epoch_id
+                and effect.expected_participant_digest = reliance.target_participant_set_digest
+                and effect.coverage_loop_id = loop.id
+                and effect.coverage_loop_version = loop.version
+                and effect.source_conversation_id = reliance.source_conversation_id
+                and effect.source_conversation_authority_version = reliance.source_conversation_authority_version
+                and effect.source_participant_epoch_id = reliance.source_participant_epoch_id
+                and effect.source_expected_participant_digest = reliance.source_participant_set_digest
+                and effect.status in ('submitted', 'confirmed')
+            ))
         )
       order by loop.last_transition_at desc, loop.id
       limit 9
@@ -891,7 +977,10 @@ export class CoverageCoordinator {
     const eligible: CoverageTarget[] = [];
     for (const row of rows) {
       const candidate = await this.loadTarget(transaction, source, row.id, row);
-      if (candidate && responseEligible(candidate.loop, source.actorPersonId, response)) {
+      if (
+        candidate &&
+        responseEligible(candidate.loop, source.actorPersonId, response, candidate.relianceAuthorized)
+      ) {
         eligible.push(candidate);
       }
       if (eligible.length > 1) break;
@@ -909,7 +998,39 @@ export class CoverageCoordinator {
       ? [known]
       : await transaction<CandidateLoopRow[]>`
           select loop.id, household.control_epoch as household_control_epoch,
-            channel.external_channel_id, channel.latest_participant_digest
+            channel.external_channel_id, channel.latest_participant_digest,
+            exists(
+              select 1
+              from coverage_reliance_audiences reliance
+              join outbox effect on effect.id = reliance.outbox_id
+              where reliance.coverage_loop_id = loop.id
+                and reliance.loop_version = loop.version
+                and reliance.attention_cycle = loop.attention_cycle
+                and reliance.person_id = ${source.actorPersonId}
+                and reliance.membership_id = membership.id
+                and reliance.membership_version = membership.version
+                and reliance.household_control_epoch = household.control_epoch
+                and reliance.person_control_epoch = ${source.actorControlEpoch}
+                and reliance.target_conversation_id = ${source.record.routing.conversationId}
+                and reliance.target_participant_epoch_id = ${source.record.routing.participantEpochId}
+                and reliance.target_participant_set_digest = ${source.record.routing.appParticipantDigest}
+                and reliance.dispatch_state = 'queued'
+                and effect.person_id = reliance.person_id
+                and effect.person_control_epoch = reliance.person_control_epoch
+                and effect.household_id = reliance.household_id
+                and effect.household_control_epoch = reliance.household_control_epoch
+                and effect.conversation_id = reliance.target_conversation_id
+                and effect.conversation_authority_version = reliance.target_conversation_authority_version
+                and effect.participant_epoch_id = reliance.target_participant_epoch_id
+                and effect.expected_participant_digest = reliance.target_participant_set_digest
+                and effect.coverage_loop_id = loop.id
+                and effect.coverage_loop_version = loop.version
+                and effect.source_conversation_id = reliance.source_conversation_id
+                and effect.source_conversation_authority_version = reliance.source_conversation_authority_version
+                and effect.source_participant_epoch_id = reliance.source_participant_epoch_id
+                and effect.source_expected_participant_digest = reliance.source_participant_set_digest
+                and effect.status in ('submitted', 'confirmed')
+            ) as reliance_authorized
           from coverage_loops loop
           join households household on household.id = loop.household_id
             and household.status in ('onboarding', 'active')
@@ -923,13 +1044,54 @@ export class CoverageCoordinator {
           join participant_epochs epoch on epoch.id = destination.current_epoch_id
             and epoch.id = loop.participant_epoch_id and epoch.ended_at is null
             and epoch.participant_set_digest = loop.participant_set_digest
-          join epoch_participants participant on participant.participant_epoch_id = epoch.id
+          left join epoch_participants participant on participant.participant_epoch_id = epoch.id
             and participant.person_id = ${source.actorPersonId}
             and participant.registration_status = 'registered' and participant.consented_at is not null
           join conversation_channels channel on channel.conversation_id = destination.id
             and channel.provider = 'linq' and channel.status = 'active'
             and channel.latest_participant_digest is not null
           where loop.id = ${loopId}
+            and (
+              (${source.record.routing.chatKind === "group"}
+                and destination.id = ${source.record.routing.conversationId}
+                and epoch.id = ${source.record.routing.participantEpochId}
+                and epoch.participant_set_digest = ${source.record.routing.appParticipantDigest}
+                and participant.person_id = ${source.actorPersonId})
+              or (${source.record.routing.chatKind === "direct"}
+                and membership.role = 'steward'
+                and exists(
+                  select 1
+                  from coverage_reliance_audiences reliance
+                  join outbox effect on effect.id = reliance.outbox_id
+                  where reliance.coverage_loop_id = loop.id
+                    and reliance.loop_version = loop.version
+                    and reliance.attention_cycle = loop.attention_cycle
+                    and reliance.person_id = ${source.actorPersonId}
+                    and reliance.membership_id = membership.id
+                    and reliance.membership_version = membership.version
+                    and reliance.household_control_epoch = household.control_epoch
+                    and reliance.person_control_epoch = ${source.actorControlEpoch}
+                    and reliance.target_conversation_id = ${source.record.routing.conversationId}
+                    and reliance.target_participant_epoch_id = ${source.record.routing.participantEpochId}
+                    and reliance.target_participant_set_digest = ${source.record.routing.appParticipantDigest}
+                    and reliance.dispatch_state = 'queued'
+                    and effect.person_id = reliance.person_id
+                    and effect.person_control_epoch = reliance.person_control_epoch
+                    and effect.household_id = reliance.household_id
+                    and effect.household_control_epoch = reliance.household_control_epoch
+                    and effect.conversation_id = reliance.target_conversation_id
+                    and effect.conversation_authority_version = reliance.target_conversation_authority_version
+                    and effect.participant_epoch_id = reliance.target_participant_epoch_id
+                    and effect.expected_participant_digest = reliance.target_participant_set_digest
+                    and effect.coverage_loop_id = loop.id
+                    and effect.coverage_loop_version = loop.version
+                    and effect.source_conversation_id = reliance.source_conversation_id
+                    and effect.source_conversation_authority_version = reliance.source_conversation_authority_version
+                    and effect.source_participant_epoch_id = reliance.source_participant_epoch_id
+                    and effect.source_expected_participant_digest = reliance.source_participant_set_digest
+                    and effect.status in ('submitted', 'confirmed')
+                ))
+            )
           limit 1
         `;
     const row = rows[0];
@@ -952,7 +1114,7 @@ export class CoverageCoordinator {
       snapshot.conversationKind !== "group" ||
       snapshot.participantEpochId !== loop.destination.participantEpochId ||
       snapshot.participantSetDigest !== loop.destination.participantSetDigest ||
-      evaluateConversationMode(snapshot) !== "trusted_write_enabled"
+      (!row.reliance_authorized && evaluateConversationMode(snapshot) !== "trusted_write_enabled")
     ) {
       return null;
     }
@@ -962,6 +1124,8 @@ export class CoverageCoordinator {
       providerChatId: row.external_channel_id,
       providerParticipantDigest: row.latest_participant_digest,
       householdControlEpoch: Number(row.household_control_epoch),
+      relianceAuthorized: row.reliance_authorized,
+      destinationCanWrite: evaluateConversationMode(snapshot) === "trusted_write_enabled",
     };
   }
 
@@ -1196,6 +1360,81 @@ export class CoverageCoordinator {
     });
   }
 
+  private async queuePrivateRelianceStatus(
+    transaction: Transaction,
+    input: {
+      readonly source: ReopenedSource;
+      readonly destinationSnapshot: ConversationAuthoritySnapshot;
+      readonly householdId: string;
+      readonly householdControlEpoch: number;
+      readonly loop: CoverageLoop;
+      readonly text: string;
+      readonly operation: string;
+      readonly idempotencyKey: string;
+      readonly authorizationExpiresAt: Date;
+    },
+  ) {
+    const authorization = await this.requireSendAuthorization(
+      transaction,
+      input.source.snapshot,
+      "direct_response",
+      input.operation,
+    );
+    return new EffectOutbox(transaction, this.secretBox).authorizeAndEnqueue({
+      actorPersonId: input.source.actorPersonId,
+      person: {
+        id: input.source.actorPersonId,
+        controlEpoch: input.source.actorControlEpoch,
+      },
+      household: {
+        id: input.householdId,
+        controlEpoch: input.householdControlEpoch,
+      },
+      conversation: {
+        id: input.source.snapshot.conversationId,
+        authorityVersion: authorization.authorityVersion,
+      },
+      sourceConversation: {
+        id: input.destinationSnapshot.conversationId,
+        authorityVersion: input.destinationSnapshot.authorityVersion,
+        participantEpochId: input.loop.destination.participantEpochId,
+        participantSetDigest: input.loop.destination.participantSetDigest,
+      },
+      participantEpochId: input.source.record.routing.participantEpochId,
+      expectedParticipantDigest: input.source.record.routing.appParticipantDigest,
+      coverageLoop: { id: input.loop.loopId, version: input.loop.version },
+      effectKind: "linq.message",
+      idempotencyKey: input.idempotencyKey,
+      data: {
+        minimumSharedMeaning: input.loop.minimumSharedMeaning,
+        explicitAcceptanceRecorded: input.loop.state === "covered",
+      },
+      policy: {
+        operation: input.operation,
+        sendKind: "direct_response",
+        exactPrivateRelianceDm: true,
+        groupWriteUnavailable: true,
+      },
+      target: {
+        personId: input.source.actorPersonId,
+        providerChatId: input.source.providerChatId,
+        participantEpochId: input.source.record.routing.participantEpochId,
+      },
+      payload: {
+        providerChatId: input.source.providerChatId,
+        expectedProviderParticipantDigest: input.source.providerParticipantDigest,
+        text: input.text,
+      },
+      reasonCodes: [
+        "exact_private_reliance_response",
+        "minimum_shared_meaning_only",
+        "group_write_not_authorized",
+        authorization.reason,
+      ],
+      authorizationExpiresAt: input.authorizationExpiresAt,
+    });
+  }
+
   private async openPersonLabel(transaction: Transaction, personId: string): Promise<string | null> {
     const rows = await transaction<{ readonly display_name_ciphertext: Buffer | null }[]>`
       select display_name_ciphertext from people
@@ -1294,8 +1533,10 @@ function responseEligible(
   loop: CoverageLoop,
   actorPersonId: string,
   response: Extract<CoverageProposal, { kind: "self_response_proposed" }>["response"],
+  relianceAuthorized = false,
 ): boolean {
   const canAcknowledge =
+    (relianceAuthorized && ["open", "awaiting_response", "at_risk"].includes(loop.state)) ||
     ((loop.state === "awaiting_response" || loop.state === "at_risk") &&
       loop.proposedHolderPersonId === actorPersonId) ||
     ((loop.state === "open" || loop.state === "at_risk") && loop.proposedHolderPersonId === null);

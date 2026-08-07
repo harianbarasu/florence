@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import postgres, { type Sql } from "postgres";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
+  PostgresCoordination,
   PostgresRoutines,
   planCoverageOpeningTimer,
   type RoutineRevisionDraft,
@@ -209,6 +210,55 @@ describeDatabase("Postgres routines", () => {
         kind: "standing_routine_self_authorized",
       },
     });
+  });
+
+  it("persists a changed-evidence coverage revision", async () => {
+    fixture = await seedFixture(database);
+    const routines = new PostgresRoutines(database, secretBox);
+    const routineId = randomUUID();
+    await routines.save({
+      kind: "create",
+      routineId,
+      householdId: fixture.householdId,
+      actorPersonId: fixture.actorId,
+      occurredAt: new Date("2026-08-05T16:00:00.000Z"),
+      revision: routineDraft(fixture),
+    });
+    const materialized = await routines.materializeDue({
+      fromLocalDate: "2026-08-05",
+      throughLocalDate: "2026-08-05",
+      materializedAt: new Date("2026-08-05T17:00:00.000Z"),
+    });
+    const original = materialized.coverage.find((entry) => entry.occurrence.routineId === routineId);
+    if (!original) throw new Error("Expected coverage loop for changed-evidence revision");
+
+    const revised = await new PostgresCoordination(database, secretBox).transition({
+      loopId: original.loop.loopId,
+      command: {
+        kind: "revise",
+        transitionId: randomUUID(),
+        expectedVersion: original.loop.version,
+        actorPersonId: fixture.actorId,
+        occurredAt: "2026-08-05T18:00:00.000Z",
+        minimumSharedMeaning: "Wednesday pickup moved to 4 PM",
+        timing: {
+          ...original.loop.timing,
+          eventAt: "2026-08-05T23:00:00.000Z",
+          lastResponsibleAt: "2026-08-05T22:30:00.000Z",
+        },
+        evidenceRefs: ["source-revision:pickup:changed"],
+      },
+    });
+
+    expect(revised).toMatchObject({
+      loop: { state: "open", version: original.loop.version + 1 },
+      transition: { kind: "coverage_revised" },
+    });
+    const persisted = await database<{ readonly transition_kind: string }[]>`
+      select transition_kind from coverage_transitions
+      where coverage_loop_id = ${original.loop.loopId} and to_version = ${revised.loop.version}
+    `;
+    expect(persisted).toEqual([{ transition_kind: "coverage_revised" }]);
   });
 
   it("pauses, resumes, and terminally retires only future routine work", async () => {

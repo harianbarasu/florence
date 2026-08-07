@@ -12,7 +12,7 @@ describe("private model attention", () => {
     const database = (async (strings: TemplateStringsArray, ...values: unknown[]) => {
       const text = strings.join("?");
       captured.push({ text, values });
-      return text.includes("job.job_kind = 'orchestrate.linq_message'")
+      return text.includes("job.job_kind in ('orchestrate.linq_message', 'orchestrate.linq_observation')")
         ? [{ id: jobId, updated_at: updatedAt }]
         : [];
     }) as unknown as Database;
@@ -34,7 +34,10 @@ describe("private model attention", () => {
       changedAt: updatedAt.toISOString(),
     });
     const attentionQuery = captured.find((query) =>
-      query.text.includes("job.job_kind = 'orchestrate.linq_message'"),
+      query.text.includes("job.job_kind in ('orchestrate.linq_message', 'orchestrate.linq_observation')"),
+    );
+    expect(attentionQuery?.text).toContain(
+      "job.job_kind in ('orchestrate.linq_message', 'orchestrate.linq_observation')",
     );
     expect(attentionQuery?.text).toContain("job.status = 'attention'");
     expect(attentionQuery?.text).toContain("job.person_id = ?");

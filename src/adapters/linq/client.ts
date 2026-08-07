@@ -272,6 +272,20 @@ export class LinqClient {
         currentChat.activeParticipantDigest,
       );
     }
+    if (currentChat.health === "opted_out") {
+      throw new LinqApiError("This Linq chat has opted out of messages", {
+        status: 403,
+        providerCode: "chat_opted_out",
+        retryable: false,
+      });
+    }
+    if (currentChat.health === "critical") {
+      throw new LinqApiError("This Linq chat is temporarily unable to receive messages", {
+        status: 503,
+        providerCode: "chat_health_critical",
+        retryable: true,
+      });
+    }
 
     const parts: Array<Record<string, string>> = [];
     if (parsed.data.text) {

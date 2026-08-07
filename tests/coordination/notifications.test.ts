@@ -33,7 +33,7 @@ function requestedLoop() {
 }
 
 describe("notification planning", () => {
-  it("derives one deterministic reminder boundary and falls back to a last-window expiry check", () => {
+  it("derives a deterministic reminder, then a private-steward escalation before expiry", () => {
     const requested = requestedLoop();
     const reminder = planCoverageFollowUpTimer({
       loop: requested,
@@ -45,17 +45,29 @@ describe("notification planning", () => {
       now: requested.timing.earliestUsefulAt,
       remindersAuthorized: true,
     });
+    const escalation = planCoverageFollowUpTimer({
+      loop: requested,
+      now: requested.timing.earliestUsefulAt,
+      remindersAuthorized: false,
+    });
     const expiryOnly = planCoverageFollowUpTimer({
       loop: requested,
       now: requested.timing.earliestUsefulAt,
       remindersAuthorized: false,
+      stewardEscalationStarted: true,
     });
 
     expect(reminder).not.toBeNull();
     expect(replay).toEqual(reminder);
     expect(reminder?.dueAt).not.toBe(requested.timing.earliestUsefulAt);
     expect(reminder?.dueAt).not.toBe(requested.timing.lastResponsibleAt);
-    expect(expiryOnly?.dueAt).toBe(requested.timing.lastResponsibleAt);
+    expect(escalation).toMatchObject({ category: "coverage_steward_escalation" });
+    expect(escalation?.dueAt).not.toBe(requested.timing.earliestUsefulAt);
+    expect(escalation?.dueAt).not.toBe(requested.timing.lastResponsibleAt);
+    expect(expiryOnly).toMatchObject({
+      category: "coverage_steward_escalation",
+      dueAt: requested.timing.lastResponsibleAt,
+    });
   });
 
   it("treats timers as reevaluation requests and rejects stale loop or epoch authority", () => {

@@ -42,7 +42,7 @@ export class BoundedWorkerRuntime implements WorkerRuntime {
     const startedAt = new Date();
     if (job.deadline.getTime() <= startedAt.getTime())
       return expiredResult(job, startedAt, this.runtimeRoute);
-    if (job.budget.maxModelCalls < 1)
+    if (job.budget.maxModelCalls < 1 || job.budget.maxOutputTokens < 1)
       return failedResult(job, startedAt, this.runtimeRoute, "budget_exhausted");
 
     try {
@@ -58,6 +58,7 @@ export class BoundedWorkerRuntime implements WorkerRuntime {
         schema: job.skill.outputSchema,
         schemaName: job.skill.outputSchemaName,
         timeoutMs: Math.max(1, job.deadline.getTime() - Date.now()),
+        maxOutputTokens: job.budget.maxOutputTokens,
         ...(job.images ? { images: job.images } : {}),
       });
       return {

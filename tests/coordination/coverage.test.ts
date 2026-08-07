@@ -116,6 +116,21 @@ describe("coverage state machine", () => {
       acknowledgment: { personId: IDS.holder, kind: "explicit_self" },
     });
     expect(accepted.minimumSharedStatus?.holderPersonId).toBe(IDS.holder);
+
+    const reassigned = transitionCoverage(requested, {
+      kind: "request_coverage",
+      transitionId: IDS.transition3,
+      expectedVersion: 2,
+      actorPersonId: IDS.other,
+      requestedPersonId: IDS.other,
+      occurredAt: "2026-08-05T18:04:00Z",
+      evidenceRefs: ["evidence:explicit-reliance-response"],
+    }).loop;
+    expect(reassigned).toMatchObject({
+      state: "awaiting_response",
+      proposedHolderPersonId: IDS.other,
+      acknowledgment: null,
+    });
   });
 
   it("keeps a private decline and reason out of the minimum shared status", () => {

@@ -95,6 +95,13 @@ interface ExactPrivateRoute {
   readonly providerParticipantDigest: string;
 }
 
+interface ProcessedPrivateDmSource {
+  readonly record: StoredLinqEvent;
+  readonly event: LinqMessageReceivedEvent;
+  readonly snapshot: ConversationAuthoritySnapshot;
+  readonly personId: string;
+}
+
 type ParentGoogleActivationReason = "household_resolved" | "existing_steward_dm";
 
 /**
@@ -122,6 +129,8 @@ export class FlorenceApplication {
           input.responseText,
           input.evidenceSourceRevisionIds,
         );
+      case "linq.private_dm_orchestration_complete":
+        return this.completePrivateDmOrchestration(input);
       case "linq.reconcile_chat":
         return this.reconcileLiveLinqChat(input.liveChat);
       case "timer.process":
@@ -1194,13 +1203,209 @@ export class FlorenceApplication {
       return this.invalidateEditedLinqMessageSource(transaction, record.event, record.routing);
     }
     if (record.event?.eventType !== "linq.message.received") return "observed_silently";
+    let invocationAuthority:
+      | {
+          readonly person: { readonly id: string; readonly controlEpoch: number };
+          readonly conversation: { readonly id: string; readonly authorityVersion: number };
+          readonly deadlineAt: Date;
+        }
+      | undefined;
+    if (record.invocation && record.routing.senderPersonId) {
+      const people = await transaction<{ readonly control_epoch: number | string }[]>`
+        select control_epoch from people
+        where id = ${record.routing.senderPersonId} and status = 'registered'
+        for share
+      `;
+      const snapshot = await new PostgresConversationAuthority(transaction).snapshot(
+        record.routing.conversationId,
+      );
+      if (
+        !people[0] ||
+        snapshot.participantEpochId !== record.routing.participantEpochId ||
+        snapshot.participantSetDigest !== record.routing.appParticipantDigest
+      ) {
+        return "observed_silently";
+      }
+      invocationAuthority = {
+        person: {
+          id: record.routing.senderPersonId,
+          controlEpoch: Number(people[0].control_epoch),
+        },
+        conversation: {
+          id: record.routing.conversationId,
+          authorityVersion: snapshot.authorityVersion,
+        },
+        deadlineAt: new Date(Date.parse(record.event.message.sentAt) + MAX_LIVE_GROUP_INVOCATION_AGE_MS),
+      };
+    }
     await new DurableWork(transaction, this.secretBox).enqueue({
       kind: "orchestrate.linq_observation",
       idempotencyKey: `orchestrate:linq-observation:${internalProviderEventId}`,
       payload: { internalProviderEventId },
+      ...(invocationAuthority ?? {}),
       maxAttempts: 5,
     });
     return record.invocation ? "private_invocation_queued" : "observation_queued";
+  }
+
+  /**
+   * A private conversational response and the one-time source activation are
+   * committed in separate transactions. That makes the response durable before
+   * the activation offer can enter the outbox, while a retry can safely finish
+   * either half through their independent idempotency keys.
+   */
+  private async completePrivateDmOrchestration(
+    input: Extract<AppEnvelope, { kind: "linq.private_dm_orchestration_complete" }>,
+  ): Promise<ProcessReceipt> {
+    const response = await this.database.begin(async (transaction) => {
+      const source = await this.requireProcessedPrivateDmSource(transaction, input.internalProviderEventId);
+      const sourceText = messageText(source.event);
+      let text: string;
+      let operation: string;
+      let idempotencyKey: string;
+      if (input.response.kind === "greeting_acknowledgment") {
+        if (!isNaturalPrivateGreeting("direct", sourceText)) {
+          throw new UnauthorizedError("Private DM is not a deterministic greeting");
+        }
+        text = "Hi! I’m here. What can I help you with?";
+        operation = "private_dm_greeting";
+        idempotencyKey = `private-dm-greeting:${input.internalProviderEventId}`;
+      } else {
+        if (!isExplicitPrivateQuestion(sourceText)) {
+          throw new UnauthorizedError("Private DM is not an explicit question");
+        }
+        text = input.response.text.trim();
+        if (!text || text.length > 10_000) {
+          throw new UnauthorizedError("Private DM answer is outside the allowed bounds");
+        }
+        operation = "general_answer";
+        idempotencyKey = `general-answer:${input.internalProviderEventId}`;
+      }
+
+      const queued = await this.queueAuthorizedConversationMessage(
+        transaction,
+        source.record,
+        source.snapshot,
+        text,
+        "direct_response",
+        operation,
+        null,
+        new Date(Date.now() + 5 * 60_000),
+        idempotencyKey,
+      );
+      if (!queued) throw new StaleAuthorityError("Private DM response is no longer authorized");
+      return { ...queued, personId: source.personId };
+    });
+
+    const activationOffered = await this.database.begin(async (transaction) => {
+      const source = await this.requireProcessedPrivateDmSource(transaction, input.internalProviderEventId);
+      if (source.personId !== response.personId) {
+        throw new StaleAuthorityError("Private DM sender changed before activation");
+      }
+      const committed = await transaction<{ readonly created_at: Date }[]>`
+        select created_at from outbox
+        where id = ${response.outboxId}
+          and person_id = ${source.personId}
+          and conversation_id = ${source.record.routing.conversationId}
+          and participant_epoch_id = ${source.record.routing.participantEpochId}
+          and expected_participant_digest = ${source.record.routing.appParticipantDigest}
+          and status in ('pending', 'leased', 'retry', 'submitted', 'confirmed')
+        for share
+      `;
+      const committedResponse = committed[0];
+      if (!committedResponse) return false;
+
+      const offered = await this.queueParentGoogleActivationOffer(
+        transaction,
+        source.personId,
+        "existing_steward_dm",
+        source.record,
+      );
+      if (offered) {
+        await transaction`
+          update outbox
+          set available_at = greatest(
+            available_at,
+            ${new Date(committedResponse.created_at.getTime() + 1)}
+          )
+          where idempotency_key = ${`google-parent-activation:${source.personId}`}
+        `;
+      }
+      return offered;
+    });
+
+    return {
+      accepted: true,
+      duplicate: !response.created && !activationOffered,
+      disposition: activationOffered
+        ? "private_dm_response_then_google_activation_queued"
+        : "private_dm_response_queued",
+      ids: {
+        providerEventId: input.internalProviderEventId,
+        responseOutboxId: response.outboxId,
+      },
+    };
+  }
+
+  private async requireProcessedPrivateDmSource(
+    transaction: Transaction,
+    internalProviderEventId: string,
+  ): Promise<ProcessedPrivateDmSource> {
+    const rows = await transaction<ProviderEventRow[]>`
+      select id, provider_event_id, envelope_ciphertext, processing_status
+      from provider_events
+      where id = ${internalProviderEventId} and provider = 'linq'
+      for share
+    `;
+    const row = rows[0];
+    if (row?.processing_status !== "processed") {
+      throw new StaleAuthorityError("Private DM source is no longer processed");
+    }
+    const record = JSON.parse(
+      this.secretBox
+        .decrypt(
+          JSON.parse(row.envelope_ciphertext.toString("utf8")),
+          `provider-event:${row.provider_event_id}`,
+        )
+        .toString("utf8"),
+    ) as StoredLinqEvent;
+    const event = record.event;
+    if (
+      record.classification !== "full" ||
+      record.routing.chatKind !== "direct" ||
+      event?.eventType !== "linq.message.received" ||
+      !record.routing.senderIdentityId ||
+      !record.routing.senderPersonId ||
+      record.routing.liveIdentityIds.length !== 1 ||
+      record.routing.liveIdentityIds[0] !== record.routing.senderIdentityId
+    ) {
+      throw new UnauthorizedError("Provider event is not an eligible private DM");
+    }
+
+    const snapshot = await new PostgresConversationAuthority(transaction).snapshot(
+      record.routing.conversationId,
+    );
+    const participant = snapshot.participants.length === 1 ? snapshot.participants[0] : null;
+    if (
+      snapshot.conversationKind !== "direct" ||
+      snapshot.conversationStatus !== "active" ||
+      snapshot.participantEpochId !== record.routing.participantEpochId ||
+      snapshot.participantSetDigest !== record.routing.appParticipantDigest ||
+      participant?.personIdentityId !== record.routing.senderIdentityId ||
+      participant.personId !== record.routing.senderPersonId ||
+      participant.registrationStatus !== "registered" ||
+      participant.consentedAt === null ||
+      participant.policy?.allowContentProcessing !== true ||
+      participant.policy.allowDirectResponses !== true
+    ) {
+      throw new StaleAuthorityError("Private DM authority changed before response");
+    }
+    return {
+      record,
+      event,
+      snapshot,
+      personId: record.routing.senderPersonId,
+    };
   }
 
   private async commitPrivateGroupInvocationResponse(
@@ -1930,14 +2135,6 @@ export class FlorenceApplication {
       );
       return "family_setup_deferred";
     }
-    if (record.routing.chatKind === "direct" && record.routing.senderPersonId && person) {
-      await this.queueParentGoogleActivationOffer(
-        transaction,
-        record.routing.senderPersonId,
-        "existing_steward_dm",
-        record,
-      );
-    }
     await new DurableWork(transaction, this.secretBox).enqueue({
       kind: "orchestrate.linq_message",
       idempotencyKey: `orchestrate:linq:${internalProviderEventId}`,
@@ -2150,7 +2347,8 @@ export class FlorenceApplication {
     operation: string,
     ruleId: string | null = null,
     authorizationExpiresAt = new Date(Date.now() + 5 * 60_000),
-  ): Promise<void> {
+    idempotencyKey = `linq:${operation}:${record.routing.conversationId}:${sha256Hex(text)}`,
+  ): Promise<{ readonly outboxId: string; readonly created: boolean } | null> {
     if (!snapshot.participantEpochId || !snapshot.participantSetDigest)
       throw new Error("Conversation has no live epoch");
     const authority = await new PostgresConversationAuthority(transaction).authorizeSend({
@@ -2162,18 +2360,18 @@ export class FlorenceApplication {
       operation,
       ruleId,
     });
-    if (!authority.allowed) return;
+    if (!authority.allowed) return null;
     const household = await transaction<{ id: string; control_epoch: number | string }[]>`
       select household.id, household.control_epoch
       from conversations conversation join households household on household.id = conversation.household_id
       where conversation.id = ${record.routing.conversationId}
     `;
-    await new EffectOutbox(transaction, this.secretBox).authorizeAndEnqueue({
+    return new EffectOutbox(transaction, this.secretBox).authorizeAndEnqueue({
       ...(record.routing.senderPersonId ? { actorPersonId: record.routing.senderPersonId } : {}),
       participantEpochId: snapshot.participantEpochId,
       expectedParticipantDigest: snapshot.participantSetDigest,
       effectKind: "linq.message",
-      idempotencyKey: `linq:${operation}:${record.routing.conversationId}:${sha256Hex(text)}`,
+      idempotencyKey,
       data: { textDigest: sha256Hex(text) },
       policy: { authorityVersion: snapshot.authorityVersion, operation, sendKind },
       target: {
@@ -3608,6 +3806,17 @@ function isExplicitEnrollmentConsent(value: string): boolean {
   return /^(?:yes(?:,? please)?|yep|yeah|yes,? (?:that sounds good|sounds good|i agree|let's do it)|i (?:agree|consent|do|would like that)|sure(?: thing)?|sounds good|absolutely|okay|ok|sign me up|let's do it)$/u.test(
     normalized,
   );
+}
+
+/** A strict social greeting, never a message that may contain family work. */
+export function isNaturalPrivateGreeting(chatKind: "direct" | "group", value: string): boolean {
+  if (chatKind !== "direct") return false;
+  const normalized = value.trim().replace(/\s+/gu, " ");
+  return /^(?:hi|hello|hey)(?:[ ,]+(?:there|florence))?[!. 👋]*$/iu.test(normalized);
+}
+
+function isExplicitPrivateQuestion(value: string): boolean {
+  return /\?|^(?:who|what|when|where|why|how|can|could|would|should|is|are|do|does)\b/iu.test(value.trim());
 }
 
 function parseNameResponse(value: string, allowBareName: boolean): string | null {

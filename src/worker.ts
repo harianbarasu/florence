@@ -475,6 +475,7 @@ async function main(): Promise<void> {
       await work.cancelStale(now);
       await privateSourceBridge.cancelStaleAuthorityIntents(now);
       await outbox.cancelStale(now);
+      await privateSourceBridge.recoverCancelledUnsubmittedOpenings(now);
       await application.process({
         kind: "maintenance.redrive_effects",
         asOf: now.toISOString(),

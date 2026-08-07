@@ -113,6 +113,17 @@ export type AppEnvelope =
       readonly evidenceSourceRevisionIds: readonly string[];
     }
   | {
+      /**
+       * Commits a private-DM orchestration response, then considers the
+       * person-scoped one-time Google activation offer in a later transaction.
+       */
+      readonly kind: "linq.private_dm_orchestration_complete";
+      readonly internalProviderEventId: string;
+      readonly response:
+        | { readonly kind: "greeting_acknowledgment" }
+        | { readonly kind: "general_answer"; readonly text: string };
+    }
+  | {
       /** Reconciles an authoritative live audience before an outbound cross-chat action. */
       readonly kind: "linq.reconcile_chat";
       readonly liveChat: LinqChatSnapshot;

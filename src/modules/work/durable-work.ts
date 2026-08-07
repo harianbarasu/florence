@@ -353,34 +353,71 @@ export class DurableWork {
   }
 
   public async cancelStale(now = new Date()): Promise<number> {
-    const rows = await this.database<{ id: string }[]>`
-      update jobs job set status = 'cancelled', lease_owner = null, lease_token = null,
-        lease_expires_at = null, last_error_code = 'authority_fence_changed', updated_at = ${now}
-      where job.status in ('pending', 'retry', 'leased') and (
-        (job.deadline_at is not null and job.deadline_at <= ${now})
-        or (job.person_id is not null and not exists (
-          select 1 from people person where person.id = job.person_id
-            and person.status = 'registered' and person.control_epoch = job.person_control_epoch
-        ))
-        or (job.household_id is not null and not exists (
-          select 1 from households household where household.id = job.household_id
-            and household.status in ('onboarding', 'active', 'paused')
-            and household.control_epoch = job.household_control_epoch
-        ))
-        or (job.conversation_id is not null and not exists (
-          select 1 from conversations conversation where conversation.id = job.conversation_id
-            and conversation.status not in ('deletion_fenced', 'deleted')
-            and conversation.authority_version = job.conversation_authority_version
-        ))
-        or (job.integration_id is not null and not exists (
-          select 1 from integrations integration where integration.id = job.integration_id
-            and integration.status = 'active'
-            and integration.control_epoch = job.integration_control_epoch
-        ))
-        or (job.job_kind like 'google.%' and job.integration_id is null)
-      ) returning id
-    `;
-    return rows.length;
+    return inTransaction(this.database, async (transaction) => {
+      const attentionRows = await transaction<{ id: string }[]>`
+        update jobs job set status = 'attention', available_at = ${now},
+          lease_owner = null, lease_token = null, lease_expires_at = null,
+          last_error_code = 'conversation_response_window_expired', updated_at = ${now}
+        where job.status in ('pending', 'retry', 'leased')
+          and job.job_kind in ('orchestrate.linq_message', 'orchestrate.linq_observation')
+          and job.deadline_at is not null and job.deadline_at <= ${now}
+          and job.person_id is not null and job.conversation_id is not null
+          and exists (
+            select 1 from people person where person.id = job.person_id
+              and person.status = 'registered' and person.control_epoch = job.person_control_epoch
+          )
+          and exists (
+            select 1 from conversations conversation where conversation.id = job.conversation_id
+              and conversation.status not in ('deletion_fenced', 'deleted')
+              and conversation.authority_version = job.conversation_authority_version
+          )
+          and (job.household_id is null or exists (
+            select 1 from households household where household.id = job.household_id
+              and household.status in ('onboarding', 'active', 'paused')
+              and household.control_epoch = job.household_control_epoch
+          ))
+          and (job.integration_id is null or exists (
+            select 1 from integrations integration where integration.id = job.integration_id
+              and integration.status = 'active'
+              and integration.control_epoch = job.integration_control_epoch
+          ))
+        returning id
+      `;
+      const cancelledRows = await transaction<{ id: string }[]>`
+        update jobs job set status = 'cancelled', lease_owner = null, lease_token = null,
+          lease_expires_at = null,
+          last_error_code = case
+            when job.deadline_at is not null and job.deadline_at <= ${now}
+              then 'deadline_expired'
+            else 'authority_fence_changed'
+          end,
+          updated_at = ${now}
+        where job.status in ('pending', 'retry', 'leased') and (
+          (job.deadline_at is not null and job.deadline_at <= ${now})
+          or (job.person_id is not null and not exists (
+            select 1 from people person where person.id = job.person_id
+              and person.status = 'registered' and person.control_epoch = job.person_control_epoch
+          ))
+          or (job.household_id is not null and not exists (
+            select 1 from households household where household.id = job.household_id
+              and household.status in ('onboarding', 'active', 'paused')
+              and household.control_epoch = job.household_control_epoch
+          ))
+          or (job.conversation_id is not null and not exists (
+            select 1 from conversations conversation where conversation.id = job.conversation_id
+              and conversation.status not in ('deletion_fenced', 'deleted')
+              and conversation.authority_version = job.conversation_authority_version
+          ))
+          or (job.integration_id is not null and not exists (
+            select 1 from integrations integration where integration.id = job.integration_id
+              and integration.status = 'active'
+              and integration.control_epoch = job.integration_control_epoch
+          ))
+          or (job.job_kind like 'google.%' and job.integration_id is null)
+        ) returning id
+      `;
+      return attentionRows.length + cancelledRows.length;
+    });
   }
 }
 

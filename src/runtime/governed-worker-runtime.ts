@@ -11,6 +11,7 @@ import type {
 import { GENERAL_ANSWER_SKILL, PRODUCT_SKILLS } from "../modules/orchestration/skills.js";
 import { canonicalDigest, canonicalJson } from "../shared/canonical-json.js";
 import type { SecretBox } from "../shared/crypto.js";
+import { StaleAuthorityError } from "../shared/errors.js";
 
 const HARNESS_RELEASE = "florence-bounded-v1";
 const PRODUCT_SKILL_OWNER = "florence-product";
@@ -98,30 +99,31 @@ export class GovernedWorkerRuntime implements WorkerRuntime {
   ): Promise<WorkerResult<z.output<Schema>>> {
     const definitionDigest = governedSkillDefinitionDigest(job.skill);
     const pin = await loadActivePin(this.database, job.skill, definitionDigest);
-    const inputDigest = sha256Hex(
-      canonicalJson({
-        skillId: job.skill.id,
-        skillVersion: job.skill.version,
-        skillDefinitionDigest: definitionDigest,
-        goal: job.goal,
-        authorizedContextDigest: sha256Hex(job.authorizedContext),
-        authorizedImageDigests:
-          job.images?.map((image) => ({
-            mimeType: image.mimeType,
-            sha256: image.sha256,
-          })) ?? [],
-      }),
-    );
+    const authority = workerAuthorityTuple(job.authority);
+    const inputDigest = governedWorkerInputDigest(job);
     const startedAt = new Date();
     await this.database.begin(async (transaction) => {
+      await assertCurrentWorkerAuthority(transaction, job.authority);
       const tasks = await transaction<{ id: string }[]>`
         insert into tasks (
-          id, task_kind, task_version, purpose, input_digest, status, created_at
+          id, household_id, conversation_id, requested_by_person_id,
+          task_kind, task_version, purpose, input_digest, status,
+          person_control_epoch, household_control_epoch, conversation_authority_version,
+          created_at
         ) values (
-          ${job.taskVersionId}, ${job.skill.id}, 1, ${job.skill.purpose}, ${inputDigest},
-          'running', ${startedAt}
+          ${job.taskVersionId}, ${authority.householdId}, ${authority.conversationId},
+          ${authority.requestedByPersonId}, ${job.skill.id}, 1, ${job.skill.purpose},
+          ${inputDigest}, 'running', ${authority.personControlEpoch},
+          ${authority.householdControlEpoch}, ${authority.conversationAuthorityVersion},
+          ${startedAt}
         ) on conflict (id) do update set status = 'running'
           where tasks.input_digest = excluded.input_digest
+            and tasks.requested_by_person_id = excluded.requested_by_person_id
+            and tasks.person_control_epoch = excluded.person_control_epoch
+            and tasks.household_id is not distinct from excluded.household_id
+            and tasks.household_control_epoch is not distinct from excluded.household_control_epoch
+            and tasks.conversation_id is not distinct from excluded.conversation_id
+            and tasks.conversation_authority_version is not distinct from excluded.conversation_authority_version
         returning id
       `;
       if (!tasks[0]) throw new Error("Governed task input differs from its persisted input digest");
@@ -185,10 +187,22 @@ export class GovernedWorkerRuntime implements WorkerRuntime {
           })}, ${new Date(Date.now() + 7 * 86_400_000)}, ${result.completedAt}
         ) on conflict (worker_attempt_id) do nothing
       `;
-      await transaction`
+      const completedTasks = await transaction<{ id: string }[]>`
         update tasks set status = ${result.status === "proposed" ? "completed" : "failed"},
-          completed_at = ${result.completedAt} where id = ${job.taskVersionId}
+          completed_at = ${result.completedAt}
+        where id = ${job.taskVersionId}
+          and input_digest = ${inputDigest}
+          and requested_by_person_id = ${authority.requestedByPersonId}
+          and person_control_epoch = ${authority.personControlEpoch}
+          and household_id is not distinct from ${authority.householdId}::uuid
+          and household_control_epoch is not distinct from ${authority.householdControlEpoch}::bigint
+          and conversation_id is not distinct from ${authority.conversationId}::uuid
+          and conversation_authority_version is not distinct from ${authority.conversationAuthorityVersion}::bigint
+        returning id
       `;
+      if (!completedTasks[0]) {
+        throw new Error("Governed task disappeared or its persisted authority changed");
+      }
     });
     return result;
   }
@@ -201,6 +215,82 @@ export class GovernedWorkerRuntime implements WorkerRuntime {
       update worker_results set reconciliation_status = ${status}, reconciled_at = now()
       where worker_attempt_id = ${attemptId} and reconciliation_status = 'pending'
     `;
+  }
+}
+
+interface WorkerAuthorityTuple {
+  readonly requestedByPersonId: string;
+  readonly personControlEpoch: number;
+  readonly householdId: string | null;
+  readonly householdControlEpoch: number | null;
+  readonly conversationId: string | null;
+  readonly conversationAuthorityVersion: number | null;
+}
+
+function workerAuthorityTuple(authority: WorkerJob["authority"]): WorkerAuthorityTuple {
+  return {
+    requestedByPersonId: authority.person.id,
+    personControlEpoch: authority.person.controlEpoch,
+    householdId: authority.household?.id ?? null,
+    householdControlEpoch: authority.household?.controlEpoch ?? null,
+    conversationId: authority.conversation?.id ?? null,
+    conversationAuthorityVersion: authority.conversation?.authorityVersion ?? null,
+  };
+}
+
+/** Canonical identity of the exact authorized model input, including every authority fence. */
+export function governedWorkerInputDigest(job: WorkerJob): string {
+  return sha256Hex(
+    canonicalJson({
+      skillId: job.skill.id,
+      skillVersion: job.skill.version,
+      skillDefinitionDigest: governedSkillDefinitionDigest(job.skill),
+      authority: workerAuthorityTuple(job.authority),
+      goal: job.goal,
+      authorizedContextDigest: sha256Hex(job.authorizedContext),
+      authorizedImageDigests:
+        job.images?.map((image) => ({
+          mimeType: image.mimeType,
+          sha256: image.sha256,
+        })) ?? [],
+    }),
+  );
+}
+
+async function assertCurrentWorkerAuthority(
+  transaction: postgres.TransactionSql<Record<string, never>>,
+  authority: WorkerJob["authority"],
+): Promise<void> {
+  const people = await transaction<{ id: string }[]>`
+    select id from people
+    where id = ${authority.person.id} and status = 'registered'
+      and control_epoch = ${authority.person.controlEpoch}
+    for share
+  `;
+  if (!people[0]) throw new StaleAuthorityError("Governed worker person authority is stale");
+
+  if (authority.household) {
+    const households = await transaction<{ id: string }[]>`
+      select id from households
+      where id = ${authority.household.id} and status in ('onboarding', 'active', 'paused')
+        and control_epoch = ${authority.household.controlEpoch}
+      for share
+    `;
+    if (!households[0]) {
+      throw new StaleAuthorityError("Governed worker household authority is stale");
+    }
+  }
+
+  if (authority.conversation) {
+    const conversations = await transaction<{ id: string }[]>`
+      select id from conversations
+      where id = ${authority.conversation.id} and status not in ('deletion_fenced', 'deleted')
+        and authority_version = ${authority.conversation.authorityVersion}
+      for share
+    `;
+    if (!conversations[0]) {
+      throw new StaleAuthorityError("Governed worker conversation authority is stale");
+    }
   }
 }
 

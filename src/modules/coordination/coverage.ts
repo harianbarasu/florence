@@ -255,7 +255,7 @@ export function transitionCoverage(
       );
 
     case "request_coverage":
-      requireOneOfStates(loop, ["open", "at_risk"]);
+      requireOneOfStates(loop, ["open", "awaiting_response", "at_risk"]);
       return decision(
         loop,
         command,

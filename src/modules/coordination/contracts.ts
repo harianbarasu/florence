@@ -126,6 +126,7 @@ export type ResolvedTimePlan = z.infer<typeof ResolvedTimePlanSchema>;
 export const NotificationCategorySchema = z.enum([
   "coverage_opening",
   "coverage_reminder",
+  "coverage_steward_escalation",
   "coverage_state_change",
   "coverage_closure",
 ]);
@@ -374,7 +375,7 @@ export const CoverageTimerSchema = z.strictObject({
   attentionCycle: z.number().int().positive(),
   participantEpochId: EntityIdSchema,
   participantSetDigest: z.string().regex(/^[a-f0-9]{64}$/u),
-  category: z.enum(["coverage_opening", "coverage_reminder"]),
+  category: z.enum(["coverage_opening", "coverage_reminder", "coverage_steward_escalation"]),
   dueAt: InstantSchema,
 });
 export type CoverageTimer = z.infer<typeof CoverageTimerSchema>;

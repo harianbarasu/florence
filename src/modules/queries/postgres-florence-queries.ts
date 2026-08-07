@@ -233,7 +233,7 @@ export class PostgresFlorenceQueries {
         and person.status = 'registered'
         and person.control_epoch = job.person_control_epoch
       where job.person_id = ${personId}
-        and job.job_kind = 'orchestrate.linq_message'
+        and job.job_kind in ('orchestrate.linq_message', 'orchestrate.linq_observation')
         and job.status = 'attention'
         and not exists(
           select 1 from jobs recovered
@@ -247,6 +247,40 @@ export class PostgresFlorenceQueries {
       order by job.updated_at desc, job.id desc
       limit 25
     `;
+    const coverageEscalationsNeedingAttention = await this.database<
+      {
+        id: string;
+        coverage_loop_id: string;
+        content_ciphertext: Buffer;
+        content_key_version: string;
+        updated_at: Date;
+      }[]
+    >`
+      select audience.id, audience.coverage_loop_id,
+        loop.content_ciphertext, loop.content_key_version, audience.updated_at
+      from coverage_reliance_audiences audience
+      join coverage_loops loop on loop.id = audience.coverage_loop_id
+        and loop.version = audience.loop_version
+        and loop.attention_cycle = audience.attention_cycle
+        and loop.minimum_shared_meaning_digest = audience.minimum_shared_meaning_digest
+        and loop.state in ('open', 'awaiting_response', 'at_risk')
+      join household_memberships membership on membership.id = audience.membership_id
+        and membership.household_id = audience.household_id
+        and membership.person_id = audience.person_id
+        and membership.role = 'steward' and membership.status = 'active'
+        and membership.version = audience.membership_version
+      join households household on household.id = audience.household_id
+        and household.control_epoch = audience.household_control_epoch
+        and household.status in ('onboarding', 'active')
+      join people person on person.id = audience.person_id
+        and person.control_epoch = audience.person_control_epoch
+        and person.status = 'registered'
+      where audience.person_id = ${personId}
+        and audience.dispatch_state = 'unavailable'
+      order by audience.updated_at desc, audience.id
+      limit 25
+    `;
+    const directlyVisibleLoopIds = new Set(loops.map((loop) => loop.id));
     const items: HomeView["items"] = [
       ...loops.map((loop) => {
         const phase: NonNullable<HomeView["items"][number]["phase"]> =
@@ -315,6 +349,23 @@ export class PostgresFlorenceQueries {
         urgency: "soon" as const,
         changedAt: job.updated_at.toISOString(),
       })),
+      ...coverageEscalationsNeedingAttention
+        .filter((attention) => !directlyVisibleLoopIds.has(attention.coverage_loop_id))
+        .map((attention) => ({
+          id: `coverage-escalation-attention:${attention.id}`,
+          kind: "coverage" as const,
+          phase: "open" as const,
+          title:
+            decryptCoverageMeaning(
+              this.#secretBox,
+              attention.content_ciphertext,
+              attention.content_key_version,
+            ) ?? "Family coverage item",
+          detail:
+            "No one has explicitly confirmed this yet. Florence needs an eligible private chat with you before it can coordinate here.",
+          urgency: "now" as const,
+          changedAt: attention.updated_at.toISOString(),
+        })),
     ];
     if (Number(integrationsNeedingAttention[0]?.count ?? 0) > 0) {
       items.push({

@@ -7,34 +7,21 @@ import type { FlorenceConfig } from "../../config.js";
 import type { ModelGateway, StructuredModelRequest } from "./contracts.js";
 
 export class LangChainModelGateway implements ModelGateway {
-  readonly #model: BaseChatModel;
+  readonly #config: FlorenceConfig;
 
   public constructor(config: FlorenceConfig) {
+    this.#config = config;
+    // Fail during process startup rather than after durable work is claimed.
     switch (config.model.provider) {
       case "openai":
-        this.#model = new ChatOpenAI({
-          apiKey: requireValue(config.model.openai.apiKey, "OPENAI_API_KEY"),
-          model: config.model.openai.model,
-          configuration: { baseURL: config.model.openai.baseUrl },
-          maxRetries: 2,
-        });
+        requireValue(config.model.openai.apiKey, "OPENAI_API_KEY");
         break;
       case "anthropic":
-        this.#model = new ChatAnthropic({
-          anthropicApiKey: requireValue(config.model.anthropic.apiKey, "ANTHROPIC_API_KEY"),
-          model: config.model.anthropic.model,
-          temperature: 0,
-          maxRetries: 2,
-        });
+        requireValue(config.model.anthropic.apiKey, "ANTHROPIC_API_KEY");
         break;
       case "open_weight":
-        this.#model = new ChatOpenAI({
-          apiKey: config.model.openWeight.apiKey ?? "not-required",
-          model: requireValue(config.model.openWeight.model, "OPEN_WEIGHT_MODEL"),
-          configuration: { baseURL: requireValue(config.model.openWeight.baseUrl, "OPEN_WEIGHT_BASE_URL") },
-          temperature: 0,
-          maxRetries: 2,
-        });
+        requireValue(config.model.openWeight.model, "OPEN_WEIGHT_MODEL");
+        requireValue(config.model.openWeight.baseUrl, "OPEN_WEIGHT_BASE_URL");
         break;
     }
   }
@@ -45,7 +32,7 @@ export class LangChainModelGateway implements ModelGateway {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), request.timeoutMs);
     try {
-      const structured = this.#model.withStructuredOutput(request.schema, {
+      const structured = this.#model(request.maxOutputTokens).withStructuredOutput(request.schema, {
         name: request.schemaName,
         includeRaw: false,
       });
@@ -70,6 +57,40 @@ export class LangChainModelGateway implements ModelGateway {
       return request.schema.parse(output);
     } finally {
       clearTimeout(timeout);
+    }
+  }
+
+  #model(maxOutputTokens: number): BaseChatModel {
+    if (!Number.isInteger(maxOutputTokens) || maxOutputTokens < 1) {
+      throw new Error("maxOutputTokens must be a positive integer");
+    }
+    const config = this.#config;
+    switch (config.model.provider) {
+      case "openai":
+        return new ChatOpenAI({
+          apiKey: requireValue(config.model.openai.apiKey, "OPENAI_API_KEY"),
+          model: config.model.openai.model,
+          configuration: { baseURL: config.model.openai.baseUrl },
+          maxTokens: maxOutputTokens,
+          maxRetries: 2,
+        });
+      case "anthropic":
+        return new ChatAnthropic({
+          anthropicApiKey: requireValue(config.model.anthropic.apiKey, "ANTHROPIC_API_KEY"),
+          model: config.model.anthropic.model,
+          temperature: 0,
+          maxTokens: maxOutputTokens,
+          maxRetries: 2,
+        });
+      case "open_weight":
+        return new ChatOpenAI({
+          apiKey: config.model.openWeight.apiKey ?? "not-required",
+          model: requireValue(config.model.openWeight.model, "OPEN_WEIGHT_MODEL"),
+          configuration: { baseURL: requireValue(config.model.openWeight.baseUrl, "OPEN_WEIGHT_BASE_URL") },
+          temperature: 0,
+          maxTokens: maxOutputTokens,
+          maxRetries: 2,
+        });
     }
   }
 }

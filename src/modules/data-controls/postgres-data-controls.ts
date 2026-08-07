@@ -93,6 +93,11 @@ export class PostgresDataControls {
           quiet_hours = '{}'::jsonb, updated_at = ${input.deletedAt}
         where id = ${input.actorPersonId}
       `;
+      // Claim and erase governed scratch immediately after fencing the owner. Cascades synchronously
+      // remove attempts, encrypted results, trace manifests, and any jobs attached to those tasks.
+      await transaction`
+        delete from tasks where requested_by_person_id = ${input.actorPersonId}
+      `;
       await transaction`
         update person_sessions set revoked_at = coalesce(revoked_at, ${input.deletedAt})
         where person_id = ${input.actorPersonId}

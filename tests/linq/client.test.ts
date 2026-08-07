@@ -200,6 +200,32 @@ describe("LinqClient", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it.each([
+    ["OPTED_OUT", "chat_opted_out", false],
+    ["CRITICAL", "chat_health_critical", true],
+  ] as const)("closes the send gate for %s chat health", async (status, providerCode, retryable) => {
+    const fetchMock = vi.fn(async () =>
+      jsonResponse({
+        ...providerChat,
+        health_status: { ...providerChat.health_status, status },
+      }),
+    ) as typeof fetch;
+    const client = new LinqClient(config, { fetch: fetchMock, now: () => fixedNow });
+
+    await expect(
+      client.sendMessage({
+        providerChatId: chatId,
+        expectedParticipantDigest: computeLinqParticipantDigest(normalizedParticipants),
+        idempotencyKey: `effect-${status.toLowerCase()}`,
+        text: "This must not send",
+      }),
+    ).rejects.toMatchObject({
+      name: "LinqApiError",
+      providerCode,
+      retryable,
+    });
+  });
+
   it("downloads only bounded attachments from Linq's allowlisted CDN without forwarding credentials", async () => {
     const bytes = Uint8Array.from([1, 2, 3, 4]);
     const calls: Array<{ url: string; init?: RequestInit }> = [];

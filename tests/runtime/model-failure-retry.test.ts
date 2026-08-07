@@ -16,6 +16,9 @@ function job(): WorkerJob<typeof PRODUCT_SKILLS.needInterpret.outputSchema> {
   return {
     attemptId,
     taskVersionId: "10000000-0000-4000-8000-000000000002",
+    authority: {
+      person: { id: "10000000-0000-4000-8000-000000000003", controlEpoch: 1 },
+    },
     skill: PRODUCT_SKILLS.needInterpret,
     authorizedContext: "An admitted private Florence message.",
     goal: "Interpret the message.",
@@ -26,8 +29,10 @@ function job(): WorkerJob<typeof PRODUCT_SKILLS.needInterpret.outputSchema> {
 
 describe("durable model failure handling", () => {
   it("surfaces a transient gateway failure as a typed retryable worker failure", async () => {
+    let observedMaxOutputTokens: number | null = null;
     const gateway: ModelGateway = {
-      completeStructured: async () => {
+      completeStructured: async (request) => {
+        observedMaxOutputTokens = request.maxOutputTokens;
         throw new Error("temporary provider failure");
       },
     };
@@ -35,6 +40,7 @@ describe("durable model failure handling", () => {
 
     const result = await runtime.run(job());
 
+    expect(observedMaxOutputTokens).toBe(1_000);
     expect(() => requireWorkerProposal(result)).toThrowError(WorkerAttemptError);
     try {
       requireWorkerProposal(result);

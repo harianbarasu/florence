@@ -15,6 +15,7 @@ export interface StructuredModelRequest<Schema extends z.ZodType> {
   schema: Schema;
   schemaName: string;
   timeoutMs: number;
+  maxOutputTokens: number;
   images?: readonly AuthorizedImage[];
 }
 
@@ -39,6 +40,11 @@ export interface PinnedSkill<Schema extends z.ZodType = z.ZodType> {
 export interface WorkerJob<Schema extends z.ZodType = z.ZodType> {
   attemptId: string;
   taskVersionId: string;
+  authority: {
+    readonly person: { readonly id: string; readonly controlEpoch: number };
+    readonly household?: { readonly id: string; readonly controlEpoch: number };
+    readonly conversation?: { readonly id: string; readonly authorityVersion: number };
+  };
   skill: PinnedSkill<Schema>;
   authorizedContext: string;
   images?: readonly AuthorizedImage[];

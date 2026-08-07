@@ -10,7 +10,7 @@ import {
 } from "../adapters/linq/index.js";
 import type { AppEnvelope, ProcessReceipt } from "../application/contracts.js";
 import { reconcileCoverageTimers } from "../application/coverage-timer-reconciliation.js";
-import type { StoredLinqEvent } from "../application/florence-application.js";
+import { isNaturalPrivateGreeting, type StoredLinqEvent } from "../application/florence-application.js";
 import { PrivateSourceReconciler } from "../application/private-source-reconciler.js";
 import type { FlorenceConfig } from "../config.js";
 import type { Database } from "../db/client.js";
@@ -25,7 +25,7 @@ import {
   requireWorkerProposal,
   WorkerAttemptError,
 } from "../modules/orchestration/bounded-worker-runtime.js";
-import type { WorkerResult, WorkerRuntime } from "../modules/orchestration/contracts.js";
+import type { WorkerJob, WorkerResult, WorkerRuntime } from "../modules/orchestration/contracts.js";
 import { GENERAL_ANSWER_SKILL, PRODUCT_SKILLS } from "../modules/orchestration/skills.js";
 import {
   type AuthorizedHouseholdContextProjection,
@@ -71,6 +71,7 @@ interface MessageContext {
   readonly evidenceSourceRevisionIds: readonly string[];
   readonly images: readonly { mimeType: string; dataBase64: string; sha256: string }[];
   readonly snapshot: ConversationAuthoritySnapshot;
+  readonly requestingPerson: { readonly id: string; readonly controlEpoch: number } | null;
   readonly household: { id: string; controlEpoch: number; timezone: string } | null;
 }
 
@@ -163,6 +164,19 @@ export class FlorenceOrchestrator {
     });
     if (!context) return "stale_or_ineligible";
 
+    if (isNaturalPrivateGreeting(context.record.routing.chatKind, context.text)) {
+      if (!this.mutationProcessor) {
+        throw new Error("Private DM response mutation seam is not configured");
+      }
+      await this.mutationProcessor.process({
+        kind: "linq.private_dm_orchestration_complete",
+        internalProviderEventId,
+        response: { kind: "greeting_acknowledgment" },
+      });
+      return "private_greeting_acknowledgment_queued";
+    }
+    if (!context.requestingPerson) return "stale_or_ineligible";
+
     const replyTargetLoopId = await this.loadReplyTargetCoverageLoopId(context);
     const acknowledgment = await this.tryExplicitCoverageResponse(context, replyTargetLoopId);
     if (acknowledgment) return acknowledgment;
@@ -182,6 +196,7 @@ export class FlorenceOrchestrator {
     const need = await this.workers.run({
       attemptId: randomUUID(),
       taskVersionId: randomUUID(),
+      authority: messageWorkerAuthority(context, true),
       skill: PRODUCT_SKILLS.needInterpret,
       authorizedContext: [
         `Current instant: ${new Date().toISOString()}`,
@@ -299,9 +314,8 @@ export class FlorenceOrchestrator {
     if (!context) return "stale_or_ineligible_observation";
     const invocation = context.record.invocation;
     const personId = context.record.routing.senderPersonId;
-    if (!invocation || !personId) return "observation_retained_silently";
-    if (Date.now() - Date.parse(context.event.message.sentAt) > 10 * 60_000) {
-      return "observation_retained_invocation_expired";
+    if (!invocation || !personId || !context.requestingPerson) {
+      return "observation_retained_silently";
     }
 
     const scope = {
@@ -346,6 +360,7 @@ export class FlorenceOrchestrator {
     const answer = await this.workers.run({
       attemptId: randomUUID(),
       taskVersionId: randomUUID(),
+      authority: messageWorkerAuthority(context, false),
       skill: GENERAL_ANSWER_SKILL,
       authorizedContext: [
         `Current instant: ${new Date().toISOString()}`,
@@ -439,10 +454,15 @@ export class FlorenceOrchestrator {
     if (compiled.anchorSourceRevisionId !== sourceRevisionId) {
       throw new Error("Private source frontier anchor changed during compilation");
     }
+    const sourceOwnerAuthority = await loadRegisteredPersonAuthority(this.database, personId);
+    if (!sourceOwnerAuthority) {
+      return { kind: "stale", reason: "source_owner_authority_changed_before_model" };
+    }
 
     const interpretation = await this.workers.run({
       attemptId: randomUUID(),
       taskVersionId: randomUUID(),
+      authority: { person: sourceOwnerAuthority },
       skill: PRODUCT_SKILLS.privateSourceReconcile,
       authorizedContext: [
         `Current instant: ${new Date().toISOString()}`,
@@ -608,10 +628,26 @@ export class FlorenceOrchestrator {
       this.config.defaults.rawSourceRetentionDays,
     );
     const context = await bridge.loadProposalContext(actionIntentId);
+    const ownerAuthority = await loadRegisteredPersonAuthority(this.database, context.ownerPersonId);
+    if (!ownerAuthority) {
+      throw new StaleAuthorityError("Private bridge owner authority changed before model execution");
+    }
+    const workerAuthority = {
+      person: ownerAuthority,
+      household: {
+        id: context.destination.householdId,
+        controlEpoch: context.destination.householdControlEpoch,
+      },
+      conversation: {
+        id: context.destination.conversationId,
+        authorityVersion: context.destination.conversationAuthorityVersion,
+      },
+    } satisfies WorkerJob["authority"];
     const participantLabels = await this.loadCurrentParticipantLabels(context.currentParticipantPersonIds);
     const minimum = await this.workers.run({
       attemptId: randomUUID(),
       taskVersionId: randomUUID(),
+      authority: workerAuthority,
       skill: PRODUCT_SKILLS.minimumDisclosure,
       authorizedContext: [
         `Current instant: ${new Date().toISOString()}`,
@@ -629,6 +665,7 @@ export class FlorenceOrchestrator {
     const commitment = await this.workers.run({
       attemptId: randomUUID(),
       taskVersionId: randomUUID(),
+      authority: workerAuthority,
       skill: PRODUCT_SKILLS.commitmentPropose,
       authorizedContext: [
         `Current instant: ${new Date().toISOString()}`,
@@ -816,6 +853,9 @@ export class FlorenceOrchestrator {
       record.routing.conversationId,
       record.routing.senderPersonId,
     );
+    const requestingPerson = record.routing.senderPersonId
+      ? await loadRegisteredPersonAuthority(this.database, record.routing.senderPersonId)
+      : null;
     return {
       row,
       record,
@@ -828,6 +868,7 @@ export class FlorenceOrchestrator {
       ],
       images: attachments.flatMap((attachment) => (attachment.image ? [attachment.image] : [])),
       snapshot,
+      requestingPerson,
       household,
     };
   }
@@ -984,7 +1025,8 @@ export class FlorenceOrchestrator {
     replyTargetLoopId: string | null,
   ): Promise<string | null> {
     const personId = context.record.routing.senderPersonId;
-    if (!personId) return null;
+    const personAuthority = context.requestingPerson;
+    if (!personId || !personAuthority || personAuthority.id !== personId) return null;
     const loops = await this.database<CoverageResponseTargetRow[]>`
       select loop.id, loop.state, loop.proposed_holder_person_id,
         loop.acknowledged_by_person_id, loop.destination_conversation_id,
@@ -1001,10 +1043,68 @@ export class FlorenceOrchestrator {
         and household.status in ('onboarding', 'active', 'paused')
       join conversation_channels channel on channel.conversation_id = destination.id
         and channel.provider = 'linq' and channel.status = 'active'
+      left join lateral (
+        select true as authorized
+        from coverage_reliance_audiences reliance
+        join household_memberships current_membership
+          on current_membership.id = reliance.membership_id
+          and current_membership.household_id = reliance.household_id
+          and current_membership.person_id = reliance.person_id
+          and current_membership.role = 'steward'
+          and current_membership.status = 'active'
+          and current_membership.version = reliance.membership_version
+        join membership_capabilities current_capability
+          on current_capability.membership_id = current_membership.id
+          and current_capability.capability = 'coordination.coordinate'
+          and current_capability.status = 'active'
+        join people current_person on current_person.id = reliance.person_id
+          and current_person.status = 'registered'
+          and current_person.control_epoch = reliance.person_control_epoch
+        join outbox effect on effect.id = reliance.outbox_id
+        where ${context.record.routing.chatKind === "direct"}
+          and household.status in ('onboarding', 'active')
+          and reliance.coverage_loop_id = loop.id
+          and reliance.loop_version = loop.version
+          and reliance.attention_cycle = loop.attention_cycle
+          and reliance.household_id = loop.household_id
+          and reliance.household_control_epoch = household.control_epoch
+          and reliance.person_id = ${personId}
+          and reliance.person_control_epoch = ${personAuthority.controlEpoch}
+          and reliance.source_conversation_id = loop.destination_conversation_id
+          and reliance.source_participant_epoch_id = loop.participant_epoch_id
+          and reliance.source_participant_set_digest = loop.participant_set_digest
+          and reliance.target_conversation_id = ${context.record.routing.conversationId}
+          and reliance.target_conversation_authority_version = ${context.snapshot.authorityVersion}
+          and reliance.target_participant_epoch_id = ${context.record.routing.participantEpochId}
+          and reliance.target_participant_set_digest = ${context.record.routing.appParticipantDigest}
+          and reliance.target_provider_chat_id = ${context.record.routing.providerChatId}
+          and reliance.target_provider_participant_digest = ${context.record.routing.providerParticipantDigest}
+          and reliance.dispatch_state = 'queued'
+          and effect.effect_kind = 'linq.message'
+          and effect.person_id = reliance.person_id
+          and effect.person_control_epoch = reliance.person_control_epoch
+          and effect.household_id = reliance.household_id
+          and effect.household_control_epoch = reliance.household_control_epoch
+          and effect.conversation_id = reliance.target_conversation_id
+          and effect.conversation_authority_version = reliance.target_conversation_authority_version
+          and effect.participant_epoch_id = reliance.target_participant_epoch_id
+          and effect.expected_participant_digest = reliance.target_participant_set_digest
+          and effect.coverage_loop_id = loop.id
+          and effect.coverage_loop_version = loop.version
+          and effect.source_conversation_id = reliance.source_conversation_id
+          and effect.source_conversation_authority_version = reliance.source_conversation_authority_version
+          and effect.source_participant_epoch_id = reliance.source_participant_epoch_id
+          and effect.source_expected_participant_digest = reliance.source_participant_set_digest
+          and effect.status in ('submitted', 'confirmed')
+        limit 1
+      ) reliance_route on true
       where destination.status = 'active'
-        and exists (
-          select 1 from epoch_participants participant
-          where participant.participant_epoch_id = epoch.id and participant.person_id = ${personId}
+        and (
+          exists (
+            select 1 from epoch_participants participant
+            where participant.participant_epoch_id = epoch.id and participant.person_id = ${personId}
+          )
+          or coalesce(reliance_route.authorized, false)
         )
         and (
           destination.id = ${context.record.routing.conversationId}
@@ -1022,8 +1122,14 @@ export class FlorenceOrchestrator {
           (loop.proposed_holder_person_id = ${personId} and loop.state in ('awaiting_response', 'at_risk'))
           or (loop.proposed_holder_person_id is null and loop.state in ('open', 'at_risk'))
           or (loop.acknowledged_by_person_id = ${personId} and loop.state = 'covered')
+          or (
+            coalesce(reliance_route.authorized, false)
+            and loop.state in ('open', 'awaiting_response', 'at_risk')
+          )
         )
-      order by loop.last_transition_at desc limit 8
+      order by case when loop.id = ${replyTargetLoopId}::uuid then 0 else 1 end,
+        loop.last_transition_at desc
+      limit 8
     `;
     if (loops.length === 0) return null;
 
@@ -1044,6 +1150,7 @@ export class FlorenceOrchestrator {
       const interpreted = await this.workers.run({
         attemptId: randomUUID(),
         taskVersionId: randomUUID(),
+        authority: messageWorkerAuthority(context, true),
         skill: PRODUCT_SKILLS.responseInterpret,
         authorizedContext: [
           `Authenticated sender person ID: ${personId}`,
@@ -1209,6 +1316,7 @@ export class FlorenceOrchestrator {
     const commitment = await this.workers.run({
       attemptId: randomUUID(),
       taskVersionId: randomUUID(),
+      authority: messageWorkerAuthority(context, true),
       skill: PRODUCT_SKILLS.commitmentPropose,
       authorizedContext: [
         `Current instant: ${new Date().toISOString()}`,
@@ -1340,6 +1448,7 @@ export class FlorenceOrchestrator {
     const assessment = await this.workers.run({
       attemptId: randomUUID(),
       taskVersionId: randomUUID(),
+      authority: messageWorkerAuthority(context, true),
       skill: PRODUCT_SKILLS.outcomeAssess,
       authorizedContext: [
         `Current instant: ${new Date().toISOString()}`,
@@ -1505,6 +1614,7 @@ export class FlorenceOrchestrator {
     const commitment = await this.workers.run({
       attemptId: randomUUID(),
       taskVersionId: randomUUID(),
+      authority: messageWorkerAuthority(context, true),
       skill: PRODUCT_SKILLS.commitmentPropose,
       authorizedContext: [
         `Current instant: ${new Date().toISOString()}`,
@@ -1574,6 +1684,7 @@ export class FlorenceOrchestrator {
     const answer = await this.workers.run({
       attemptId: randomUUID(),
       taskVersionId: randomUUID(),
+      authority: messageWorkerAuthority(context, false),
       skill: GENERAL_ANSWER_SKILL,
       authorizedContext: `Current instant: ${new Date().toISOString()}\nUser question: ${context.text}`,
       ...(context.images.length > 0 ? { images: context.images } : {}),
@@ -1582,21 +1693,35 @@ export class FlorenceOrchestrator {
       budget: { maxModelCalls: 1, maxOutputTokens: 1_500 },
     });
     const proposal = await this.requireProposal(answer);
-    await this.database.begin(async (transaction) => {
-      const latest = await new PostgresConversationAuthority(transaction).snapshot(
-        context.record.routing.conversationId,
-      );
-      await queueConversationEffect({
-        transaction,
-        secretBox: this.secretBox,
-        context,
-        snapshot: latest,
-        text: proposal.uncertainty ? `${proposal.answer}\n\n${proposal.uncertainty}` : proposal.answer,
-        sendKind: "direct_response",
-        operation: "general_answer",
-        idempotencyKey: `general-answer:${context.row.id}`,
+    const responseText = proposal.uncertainty
+      ? `${proposal.answer}\n\n${proposal.uncertainty}`
+      : proposal.answer;
+    if (context.record.routing.chatKind === "direct") {
+      if (!this.mutationProcessor) {
+        throw new Error("Private DM response mutation seam is not configured");
+      }
+      await this.mutationProcessor.process({
+        kind: "linq.private_dm_orchestration_complete",
+        internalProviderEventId: context.row.id,
+        response: { kind: "general_answer", text: responseText },
       });
-    });
+    } else {
+      await this.database.begin(async (transaction) => {
+        const latest = await new PostgresConversationAuthority(transaction).snapshot(
+          context.record.routing.conversationId,
+        );
+        await queueConversationEffect({
+          transaction,
+          secretBox: this.secretBox,
+          context,
+          snapshot: latest,
+          text: responseText,
+          sendKind: "direct_response",
+          operation: "general_answer",
+          idempotencyKey: `general-answer:${context.row.id}`,
+        });
+      });
+    }
     await this.workers.reconcile(answer.attemptId, "accepted");
     return "general_answer_queued";
   }
@@ -1767,6 +1892,38 @@ function deterministicCoverageResponse(
     return "acknowledge";
   }
   return null;
+}
+
+function messageWorkerAuthority(context: MessageContext, includeHousehold: boolean): WorkerJob["authority"] {
+  if (!context.requestingPerson) {
+    throw new StaleAuthorityError("Message sender authority changed before model execution");
+  }
+  return {
+    person: context.requestingPerson,
+    ...(includeHousehold && context.household
+      ? {
+          household: {
+            id: context.household.id,
+            controlEpoch: context.household.controlEpoch,
+          },
+        }
+      : {}),
+    conversation: {
+      id: context.record.routing.conversationId,
+      authorityVersion: context.snapshot.authorityVersion,
+    },
+  };
+}
+
+async function loadRegisteredPersonAuthority(
+  database: Database,
+  personId: string,
+): Promise<{ readonly id: string; readonly controlEpoch: number } | null> {
+  const rows = await database<{ readonly control_epoch: number | string }[]>`
+    select control_epoch from people where id = ${personId} and status = 'registered'
+  `;
+  const row = rows[0];
+  return row ? { id: personId, controlEpoch: Number(row.control_epoch) } : null;
 }
 
 async function resolveHousehold(

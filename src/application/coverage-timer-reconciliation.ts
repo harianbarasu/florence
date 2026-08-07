@@ -60,6 +60,7 @@ export async function reconcileCoverageTimers(input: {
     evaluateConversationMode(snapshot) === "trusted_write_enabled" &&
     snapshot.participants.every((participant) => participant.policy?.allowProactiveWrites === true) &&
     hasReminderRule;
+  const stewardEscalationStarted = await hasCurrentStewardEscalation(transaction, loop);
   const timer = input.openingRequired
     ? (planCoverageOpeningTimer({
         loop,
@@ -69,11 +70,13 @@ export async function reconcileCoverageTimers(input: {
         loop,
         now: input.now.toISOString(),
         remindersAuthorized: false,
+        stewardEscalationStarted,
       }))
     : planCoverageFollowUpTimer({
         loop,
         now: input.now.toISOString(),
         remindersAuthorized,
+        stewardEscalationStarted,
       });
   if (!timer) return null;
   return timers.scheduleCoverage({
@@ -81,4 +84,16 @@ export async function reconcileCoverageTimers(input: {
     household: { id: household.id, controlEpoch: Number(household.control_epoch) },
     conversation: { id: snapshot.conversationId, authorityVersion: snapshot.authorityVersion },
   });
+}
+
+async function hasCurrentStewardEscalation(transaction: Transaction, loop: CoverageLoop): Promise<boolean> {
+  const rows = await transaction<{ readonly present: boolean }[]>`
+    select exists(
+      select 1 from coverage_reliance_audiences audience
+      where audience.coverage_loop_id = ${loop.loopId}
+        and audience.loop_version = ${loop.version}
+        and audience.attention_cycle = ${loop.attentionCycle}
+    ) as present
+  `;
+  return rows[0]?.present === true;
 }

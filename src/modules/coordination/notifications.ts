@@ -44,7 +44,7 @@ export type NotificationDecision =
 export function createCoverageTimer(input: {
   readonly timerId: string;
   readonly loop: CoverageLoop;
-  readonly category: "coverage_opening" | "coverage_reminder";
+  readonly category: CoverageTimer["category"];
   readonly dueAt: string;
 }): CoverageTimer {
   const loop = CoverageLoopSchema.parse(input.loop);
@@ -69,15 +69,15 @@ export function createCoverageTimer(input: {
 }
 
 /**
- * Produces the one next durable check for an uncovered loop. Before a reminder
- * has been sent in the current risk cycle, the check sits at the midpoint of
- * the remaining useful window. Otherwise it sits at the last responsible
- * instant so runtime processing can deterministically expire the loop.
+ * Produces the one next durable check for an uncovered loop. A permitted group
+ * reminder runs first; unresolved coverage then moves to exact private steward
+ * escalation before the final check expires the loop.
  */
 export function planCoverageFollowUpTimer(input: {
   readonly loop: CoverageLoop;
   readonly now: string;
   readonly remindersAuthorized: boolean;
+  readonly stewardEscalationStarted?: boolean;
 }): CoverageTimer | null {
   const loop = CoverageLoopSchema.parse(input.loop);
   const now = Temporal.Instant.from(input.now).toString();
@@ -89,13 +89,19 @@ export function planCoverageFollowUpTimer(input: {
     input.remindersAuthorized && loop.notificationMode !== "silent" && !reminderAlreadySent;
   const usefulStart =
     compareInstants(now, loop.timing.earliestUsefulAt) > 0 ? now : loop.timing.earliestUsefulAt;
-  const dueAt = reminderEligible
-    ? midpointWithinWindow(usefulStart, loop.timing.lastResponsibleAt)
-    : loop.timing.lastResponsibleAt;
+  const stewardEscalationStarted = input.stewardEscalationStarted === true;
+  const dueAt =
+    reminderEligible || !stewardEscalationStarted
+      ? midpointWithinWindow(usefulStart, loop.timing.lastResponsibleAt)
+      : loop.timing.lastResponsibleAt;
   return createCoverageTimer({
-    timerId: deterministicCoverageTimerId(loop, "coverage_reminder", dueAt),
+    timerId: deterministicCoverageTimerId(
+      loop,
+      reminderEligible ? "coverage_reminder" : "coverage_steward_escalation",
+      dueAt,
+    ),
     loop,
-    category: "coverage_reminder",
+    category: reminderEligible ? "coverage_reminder" : "coverage_steward_escalation",
     dueAt,
   });
 }
@@ -382,13 +388,13 @@ function midpointWithinWindow(startCandidate: string, endCandidate: string): str
   const startMilliseconds = start.epochMilliseconds;
   const endMilliseconds = end.epochMilliseconds;
   const midpoint = startMilliseconds + Math.floor((endMilliseconds - startMilliseconds) / 2);
-  if (midpoint <= startMilliseconds || midpoint >= endMilliseconds) return end.toString();
+  if (midpoint <= startMilliseconds || midpoint >= endMilliseconds) return start.toString();
   return Temporal.Instant.fromEpochMilliseconds(midpoint).toString();
 }
 
 function deterministicCoverageTimerId(
   loop: CoverageLoop,
-  category: "coverage_opening" | "coverage_reminder",
+  category: CoverageTimer["category"],
   dueAt: string,
 ): string {
   const bytes = createHash("sha256")

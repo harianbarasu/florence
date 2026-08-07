@@ -268,6 +268,12 @@ interface CandidateRow {
   readonly expires_at: Date | null;
 }
 
+interface CancelledOpeningRecoveryRow extends IntentRow {
+  readonly authorization_decision_id: string;
+  readonly coverage_loop_id: string;
+  readonly expected_participant_digest: string;
+}
+
 /**
  * The only bridge from person-scoped source evidence to shared coordination.
  * Raw source content is used only to form a proposal. The destination receives
@@ -773,35 +779,7 @@ export class PrivateSourceBridge {
       if (stale.length === 0) return 0;
 
       const intentIds = stale.map((intent) => intent.id);
-      await transaction`
-        update action_approvals
-        set revoked_at = coalesce(revoked_at, ${cancelledAt})
-        where action_intent_id = any(${transaction.array(intentIds)}::uuid[])
-      `;
-
-      const rules = await transaction<{ readonly id: string; readonly current_revision_id: string }[]>`
-        select rule.id, rule.current_revision_id
-        from bridge_rules rule
-        join bridge_rule_revisions revision on revision.id = rule.current_revision_id
-        where rule.status = 'active'
-          and revision.minimum_meaning_schema->>'createdFromActionIntentId'
-            = any(${transaction.array(intentIds)}::text[])
-        for update of rule
-      `;
-      if (rules.length > 0) {
-        const ruleIds = rules.map((rule) => rule.id);
-        const revisionIds = rules.map((rule) => rule.current_revision_id);
-        await transaction`
-          update bridge_rules
-          set status = 'revoked', version = version + 1, updated_at = ${cancelledAt}
-          where id = any(${transaction.array(ruleIds)}::uuid[]) and status = 'active'
-        `;
-        await transaction`
-          update bridge_rule_revisions
-          set ended_at = coalesce(ended_at, ${cancelledAt})
-          where id = any(${transaction.array(revisionIds)}::uuid[])
-        `;
-      }
+      await revokeBridgeAuthorityForIntents(transaction, intentIds, cancelledAt);
 
       await transaction`
         update disclosure_decisions decision
@@ -848,6 +826,139 @@ export class PrivateSourceBridge {
         });
       }
       return stale.length;
+    });
+  }
+
+  /**
+   * Recovers a loop that was committed locally but whose approved opening could
+   * not leave Florence because that exact group epoch ended first. No provider
+   * receipt may exist: the stale loop is superseded, its private candidate is
+   * returned to review, and all prior approval is revoked. A later opening must
+   * therefore be prepared and approved again against current authority.
+   */
+  public async recoverCancelledUnsubmittedOpenings(recoveredAt = new Date(), limit = 100): Promise<number> {
+    const boundedLimit = Math.max(1, Math.min(limit, 500));
+    return inTransaction(this.database, async (transaction) => {
+      const recoverable = await transaction<CancelledOpeningRecoveryRow[]>`
+        select intent.id, intent.household_id, intent.person_id, intent.conversation_id,
+          intent.participant_epoch_id, intent.action_digest, intent.data_digest,
+          intent.policy_digest, intent.target_digest, intent.payload_ciphertext,
+          intent.status, intent.person_control_epoch, intent.household_control_epoch,
+          intent.conversation_authority_version, intent.expires_at,
+          effect.authorization_decision_id,
+          effect.coverage_loop_id, effect.expected_participant_digest
+        from action_intents intent
+        join outbox effect on effect.action_intent_id = intent.id
+        join people person on person.id = intent.person_id
+          and person.status = 'registered'
+          and person.control_epoch = intent.person_control_epoch
+        join households household on household.id = intent.household_id
+          and household.status in ('onboarding', 'active', 'paused')
+          and household.control_epoch = intent.household_control_epoch
+        join coverage_loops loop on loop.id = effect.coverage_loop_id
+        where intent.action_kind = 'private_source_to_coverage_loop'
+          and intent.status = 'succeeded'
+          and effect.effect_kind = 'linq.message'
+          and effect.idempotency_key = 'private-bridge:' || intent.id::text || ':open'
+          and effect.status = 'cancelled'
+          and effect.last_error_code = 'authority_fence_changed'
+          and effect.attempt_count = 0
+          and effect.conversation_id = intent.conversation_id
+          and effect.participant_epoch_id = intent.participant_epoch_id
+          and effect.coverage_loop_version = loop.version
+          and loop.state in ('provisional', 'open', 'awaiting_response', 'covered', 'at_risk')
+          and not exists (
+            select 1 from effect_receipts receipt where receipt.outbox_id = effect.id
+          )
+          and not exists (
+            select 1
+            from conversations conversation
+            join participant_epochs epoch on epoch.id = conversation.current_epoch_id
+            where conversation.id = effect.conversation_id
+              and conversation.status = 'active'
+              and conversation.current_epoch_id = effect.participant_epoch_id
+              and epoch.ended_at is null
+              and epoch.participant_set_digest = effect.expected_participant_digest
+          )
+        order by effect.updated_at, effect.id
+        for update of intent, effect, loop skip locked
+        limit ${boundedLimit}
+      `;
+      let recovered = 0;
+      for (const row of recoverable) {
+        const payload = openPrivateBridgePayload(this.secretBox, row.id, row.payload_ciphertext);
+        if (
+          payload.phase !== "awaiting_approval" ||
+          payload.loopUpdate !== null ||
+          payload.loopId !== row.coverage_loop_id ||
+          payload.destination.participantSetDigest !== row.expected_participant_digest
+        ) {
+          continue;
+        }
+        const candidates = await transaction<{ readonly id: string }[]>`
+          select id from knowledge_candidates
+          where id = ${payload.candidateId} and owner_person_id = ${row.person_id}
+            and scope_kind = 'person' and candidate_kind = 'coverage_proposal'
+            and content_digest = ${payload.candidateContentDigest}
+            and status = 'accepted' and reviewed_by_person_id = ${row.person_id}
+            and (expires_at is null or expires_at > ${recoveredAt})
+          for update
+        `;
+        if (!candidates[0]) continue;
+
+        const coordination = new PostgresCoordination(transaction, this.secretBox);
+        const loop = await coordination.loadForUpdate(row.coverage_loop_id);
+        if (!loop || !isLiveCoverageState(loop.state)) continue;
+        requireExactAcceptedLoop(row, payload, loop);
+        const superseded = (
+          await coordination.transition({
+            loopId: loop.loopId,
+            command: {
+              kind: "supersede",
+              transitionId: randomUUID(),
+              expectedVersion: loop.version,
+              actorPersonId: null,
+              occurredAt: recoveredAt.toISOString(),
+              evidenceRefs: [],
+            },
+          })
+        ).loop;
+        await new DurableTimers(transaction).supersedeCoverageTimers(superseded.loopId, superseded.version);
+
+        await revokeBridgeAuthorityForIntents(transaction, [row.id], recoveredAt);
+        await transaction`
+          update disclosure_decisions
+          set revoked_at = coalesce(revoked_at, ${recoveredAt})
+          where id = ${row.authorization_decision_id}
+        `;
+        await transaction`
+          update knowledge_candidates
+          set status = 'pending', reviewed_by_person_id = null, reviewed_at = null
+          where id = ${payload.candidateId} and status = 'accepted'
+        `;
+        await transaction`
+          update action_intents set status = 'cancelled', updated_at = ${recoveredAt}
+          where id = ${row.id} and status = 'succeeded'
+        `;
+        await appendBridgeAudit(transaction, {
+          personId: row.person_id,
+          householdId: row.household_id,
+          conversationId: row.conversation_id,
+          targetId: row.id,
+          eventType: "private_source_opening_recovered_unsent",
+          reasons: ["participant_epoch_changed", "provider_never_submitted", "fresh_owner_approval_required"],
+          manifest: {
+            candidateId: payload.candidateId,
+            supersededLoopId: superseded.loopId,
+            supersededLoopVersion: superseded.version,
+            staleParticipantEpochId: row.participant_epoch_id,
+            rawContentDisclosed: false,
+            automaticallyRebound: false,
+          },
+        });
+        recovered += 1;
+      }
+      return recovered;
     });
   }
 
@@ -2868,6 +2979,41 @@ async function appendBridgeAudit(
       ${transaction.array([...input.reasons])},
       ${transaction.json(JSON.parse(canonicalJson(input.manifest)))}, now()
     )
+  `;
+}
+
+async function revokeBridgeAuthorityForIntents(
+  transaction: Transaction,
+  intentIds: readonly string[],
+  revokedAt: Date,
+): Promise<void> {
+  if (intentIds.length === 0) return;
+  await transaction`
+    update action_approvals
+    set revoked_at = coalesce(revoked_at, ${revokedAt})
+    where action_intent_id = any(${transaction.array([...intentIds])}::uuid[])
+  `;
+  const rules = await transaction<{ readonly id: string; readonly current_revision_id: string }[]>`
+    select rule.id, rule.current_revision_id
+    from bridge_rules rule
+    join bridge_rule_revisions revision on revision.id = rule.current_revision_id
+    where rule.status = 'active'
+      and revision.minimum_meaning_schema->>'createdFromActionIntentId'
+        = any(${transaction.array([...intentIds])}::text[])
+    for update of rule
+  `;
+  if (rules.length === 0) return;
+  const ruleIds = rules.map((rule) => rule.id);
+  const revisionIds = rules.map((rule) => rule.current_revision_id);
+  await transaction`
+    update bridge_rules
+    set status = 'revoked', version = version + 1, updated_at = ${revokedAt}
+    where id = any(${transaction.array(ruleIds)}::uuid[]) and status = 'active'
+  `;
+  await transaction`
+    update bridge_rule_revisions
+    set ended_at = coalesce(ended_at, ${revokedAt})
+    where id = any(${transaction.array(revisionIds)}::uuid[])
   `;
 }
 

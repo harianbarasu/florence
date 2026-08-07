@@ -1,12 +1,19 @@
 import { createHash } from "node:crypto";
 import type { TransactionSql } from "postgres";
+import { z } from "zod";
 import type { FlorenceConfig } from "../config.js";
 import type { Database } from "../db/client.js";
 import { PostgresWebAuth } from "../modules/auth/index.js";
 import { PostgresConversationAuthority } from "../modules/conversations/index.js";
 import { EffectOutbox } from "../modules/effects/index.js";
-import type { IntegrationAccountKind, IntegrationCapability } from "../modules/sources/index.js";
+import {
+  type IntegrationAccountKind,
+  type IntegrationCapability,
+  privateSourceIntegrationLockKey,
+} from "../modules/sources/index.js";
+import { canonicalDigest } from "../shared/canonical-json.js";
 import type { SecretBox } from "../shared/crypto.js";
+import { UnauthorizedError } from "../shared/errors.js";
 import type { GoogleSyncObservationFields } from "./contracts.js";
 
 type Transaction = TransactionSql<Record<string, never>>;
@@ -39,6 +46,41 @@ interface ExactPrivateRoute {
   readonly providerParticipantDigest: string;
 }
 
+interface PrivateSourceReleaseCandidateRow {
+  readonly id: string;
+  readonly candidate_kind: "coverage_proposal" | "coverage_loop_update_review";
+  readonly content_digest: string;
+  readonly content_ciphertext: Buffer;
+  readonly confidence: number | string;
+  readonly proposed_at: Date;
+  readonly frontier_id: string;
+  readonly frontier_version: number | string;
+  readonly frontier_digest: string;
+  readonly source_generation: number | string;
+  readonly reconciled_generation: number | string;
+  readonly case_key_digest: string;
+  readonly disposition: "candidate" | "quiet";
+  readonly person_control_epoch: number | string;
+  readonly integration_control_epoch: number | string;
+}
+
+interface RankedPrivateSourceReleaseCandidate extends PrivateSourceReleaseCandidateRow {
+  readonly requiredOutcome: string;
+  readonly urgencyAt: number | null;
+}
+
+type PrivateSourceReleaseSelection =
+  | { readonly kind: "obsolete" }
+  | { readonly kind: "not_ready" }
+  | { readonly kind: "selected"; readonly candidate: RankedPrivateSourceReleaseCandidate };
+
+export interface PrivateSourceReleaseRankInput {
+  readonly candidateId: string;
+  readonly confidence: number;
+  readonly urgencyAt: number | null;
+  readonly proposedAt: number;
+}
+
 export interface GoogleSyncMilestoneResult {
   readonly disposition:
     | "google_sync_milestone_queued"
@@ -53,10 +95,22 @@ export type PrivateSourceCandidateNoticeResult =
   | { readonly kind: "route_unavailable" }
   | { readonly kind: "queued"; readonly outboxId: string; readonly created: boolean };
 
+export type PrivateSourceCandidateReleaseResult =
+  | { readonly kind: "obsolete" }
+  | { readonly kind: "not_ready" }
+  | { readonly kind: "selected" };
+
 const RECENT_GMAIL_CAPTURE_PRIORITY_CEILING = 110;
 // Thread reconciliation is scheduled one bounded step after its capture work.
 const RECENT_GMAIL_RECONCILIATION_PRIORITY_CEILING = RECENT_GMAIL_CAPTURE_PRIORITY_CEILING + 5;
 const EFFECT_AUTHORIZATION_MS = 10 * 60_000;
+const CandidateReleaseContentSchema = z
+  .object({
+    requiredOutcome: z.string().trim().min(1).max(2_000),
+    timeFacts: z.array(z.string().trim().min(1).max(1_000)).max(30),
+    uncertainties: z.array(z.string().trim().min(1).max(1_000)).max(30),
+  })
+  .passthrough();
 
 /**
  * Deep application module for Google lifecycle messages. Callers report only a
@@ -165,58 +219,11 @@ export class GoogleSyncCoordinator {
     readonly integrationId: string;
     readonly expectedIntegrationControlEpoch: number;
   }): Promise<PrivateSourceCandidateNoticeResult> {
-    if (
-      !UUID_PATTERN.test(input.candidateId) ||
-      !UUID_PATTERN.test(input.personId) ||
-      !UUID_PATTERN.test(input.integrationId) ||
-      !Number.isSafeInteger(input.expectedIntegrationControlEpoch) ||
-      input.expectedIntegrationControlEpoch < 1
-    ) {
-      throw new Error("Private source notification fence is invalid");
-    }
+    validatePrivateSourceCandidateFence(input);
     return inTransaction(this.database, async (transaction) => {
-      await transaction`
-        select pg_advisory_xact_lock(hashtextextended(${`private-source-notice:${input.candidateId}`}, 0))
-      `;
-      const rows = await transaction<
-        {
-          readonly person_control_epoch: number | string;
-          readonly integration_control_epoch: number | string;
-          readonly frontier_id: string;
-          readonly frontier_version: number | string;
-          readonly frontier_digest: string;
-          readonly source_generation: number | string;
-          readonly case_key_digest: string;
-          readonly information_is_current: boolean;
-        }[]
-      >`
-        select person.control_epoch as person_control_epoch,
-          integration.control_epoch as integration_control_epoch,
-          frontier.id as frontier_id, frontier.version as frontier_version,
-          frontier.frontier_digest, frontier.source_generation, frontier.case_key_digest,
-          integration.information_current_control_epoch = integration.control_epoch
-            as information_is_current
-        from knowledge_candidates candidate
-        join private_source_frontiers frontier
-          on frontier.current_candidate_id = candidate.id
-          and frontier.owner_person_id = candidate.owner_person_id
-          and frontier.disposition = 'candidate'
-          and frontier.source_generation = frontier.reconciled_generation
-        join people person on person.id = candidate.owner_person_id
-          and person.status = 'registered'
-        join integrations integration on integration.id = frontier.integration_id
-          and integration.person_id = person.id and integration.status = 'active'
-        where candidate.id = ${input.candidateId}
-          and candidate.owner_person_id = ${input.personId}
-          and candidate.scope_kind = 'person' and candidate.status = 'pending'
-          and candidate.expires_at > now()
-          and integration.id = ${input.integrationId}
-          and integration.control_epoch = ${input.expectedIntegrationControlEpoch}
-        for share of candidate, frontier, person, integration
-      `;
-      const current = rows[0];
-      if (!current) return { kind: "obsolete" };
-      if (!current.information_is_current) return { kind: "not_ready" };
+      const release = await this.reopenPrivateSourceRelease(transaction, input);
+      if (release.kind !== "selected") return release;
+      const current = release.candidate;
       const route = await this.resolveExactPrivateRoute(transaction, input.personId);
       if (!route) return { kind: "route_unavailable" };
       const authority = await new PostgresConversationAuthority(transaction).authorizeSend({
@@ -251,7 +258,7 @@ export class GoogleSyncCoordinator {
         context: { returnPath: "/sources", candidateId: input.candidateId },
         expiresInSeconds: 10 * 60,
       });
-      const text = `I found something in your connected account that may need family coordination. Review it privately: ${this.config.publicBaseUrl}/handoff/${handoff.token}\n\nThis secure link expires in 10 minutes. If it expires, text me “settings” for a fresh one.`;
+      const text = `One current family item may need coordination:\n\n${current.requiredOutcome}\n\nReview it privately: ${this.config.publicBaseUrl}/handoff/${handoff.token}\n\nThis secure link expires in 10 minutes. If it expires, text me “settings” for a fresh one.`;
       const queued = await new EffectOutbox(transaction, this.secretBox).authorizeAndEnqueue({
         actorPersonId: input.personId,
         person: { id: input.personId, controlEpoch: Number(current.person_control_epoch) },
@@ -295,11 +302,177 @@ export class GoogleSyncCoordinator {
           expectedProviderParticipantDigest: route.providerParticipantDigest,
           text,
         },
-        reasonCodes: ["current_private_source_candidate", "exact_private_dm", "no_source_content"],
+        reasonCodes: [
+          "current_private_source_candidate",
+          "first_value_release_v1",
+          "exact_private_dm",
+          "no_source_content",
+        ],
         authorizationExpiresAt: new Date(Date.now() + EFFECT_AUTHORIZATION_MS),
       });
       return { kind: "queued", ...queued };
     });
+  }
+
+  /**
+   * Gives durable candidate work first refusal only when it is the deterministic
+   * current winner for this exact person and integration. The worker calls this
+   * before either a standing-rule bridge or a private review notice.
+   */
+  public async selectPrivateSourceCandidate(input: {
+    readonly candidateId: string;
+    readonly personId: string;
+    readonly integrationId: string;
+    readonly expectedIntegrationControlEpoch: number;
+  }): Promise<PrivateSourceCandidateReleaseResult> {
+    validatePrivateSourceCandidateFence(input);
+    return inTransaction(this.database, async (transaction) => {
+      const release = await this.reopenPrivateSourceRelease(transaction, input);
+      return { kind: release.kind };
+    });
+  }
+
+  private async reopenPrivateSourceRelease(
+    transaction: Transaction,
+    input: {
+      readonly candidateId: string;
+      readonly personId: string;
+      readonly integrationId: string;
+      readonly expectedIntegrationControlEpoch: number;
+    },
+  ): Promise<PrivateSourceReleaseSelection> {
+    // The established integration lock serializes this decision with frontier
+    // reconciliation; the narrower lock serializes competing durable release jobs.
+    await transaction`
+      select pg_advisory_xact_lock(
+        hashtextextended(${privateSourceIntegrationLockKey(input.integrationId)}, 0)
+      )
+    `;
+    await transaction`
+      select pg_advisory_xact_lock(
+        hashtextextended(
+          ${`private-source-release:${input.personId}:${input.integrationId}`},
+          0
+        )
+      )
+    `;
+    const authorityRows = await transaction<
+      {
+        readonly information_is_current: boolean;
+      }[]
+    >`
+      select integration.information_current_control_epoch = integration.control_epoch
+        as information_is_current
+      from people person
+      join integrations integration on integration.person_id = person.id
+        and integration.provider = 'google' and integration.status = 'active'
+      where person.id = ${input.personId}
+        and person.status = 'registered' and person.consented_at is not null
+        and integration.id = ${input.integrationId}
+        and integration.control_epoch = ${input.expectedIntegrationControlEpoch}
+      for share of person, integration
+    `;
+    const authority = authorityRows[0];
+    if (!authority) return { kind: "obsolete" };
+    if (!authority.information_is_current) return { kind: "not_ready" };
+
+    const rows = await transaction<PrivateSourceReleaseCandidateRow[]>`
+      select candidate.id, candidate.candidate_kind, candidate.content_digest,
+        candidate.content_ciphertext, candidate.confidence, candidate.proposed_at,
+        frontier.id as frontier_id, frontier.version as frontier_version,
+        frontier.frontier_digest, frontier.source_generation, frontier.reconciled_generation,
+        frontier.case_key_digest, frontier.disposition,
+        person.control_epoch as person_control_epoch,
+        integration.control_epoch as integration_control_epoch
+      from knowledge_candidates candidate
+      join private_source_frontiers frontier
+        on frontier.current_candidate_id = candidate.id
+        and frontier.owner_person_id = candidate.owner_person_id
+        and frontier.integration_id = ${input.integrationId}
+      join people person on person.id = candidate.owner_person_id
+        and person.id = ${input.personId}
+        and person.status = 'registered' and person.consented_at is not null
+      join integrations integration on integration.id = frontier.integration_id
+        and integration.person_id = person.id and integration.provider = 'google'
+        and integration.status = 'active'
+        and integration.control_epoch = ${input.expectedIntegrationControlEpoch}
+        and integration.information_current_control_epoch = integration.control_epoch
+      where candidate.scope_kind = 'person'
+        and candidate.candidate_kind in ('coverage_proposal', 'coverage_loop_update_review')
+        and candidate.status = 'pending' and candidate.expires_at > now()
+      for share of candidate, frontier, person, integration
+    `;
+    const requested = rows.find((row) => row.id === input.candidateId);
+    if (!requested) return { kind: "obsolete" };
+    if (
+      requested.disposition !== "candidate" ||
+      Number(requested.source_generation) !== Number(requested.reconciled_generation)
+    ) {
+      return { kind: "not_ready" };
+    }
+
+    const ranked = rows
+      .filter(
+        (row) =>
+          row.disposition === "candidate" &&
+          Number(row.source_generation) === Number(row.reconciled_generation),
+      )
+      .map((row) => this.openRankedPrivateSourceCandidate(row));
+    // Once the parent has been shown one still-pending item, keep it as the
+    // active first value even if older-history work later discovers another.
+    const released = await transaction<{ readonly idempotency_key: string }[]>`
+      select effect.idempotency_key
+      from outbox effect
+      join disclosure_decisions decision on decision.id = effect.authorization_decision_id
+        and decision.reason_codes @> array['first_value_release_v1']::text[]
+      where effect.person_id = ${input.personId}
+        and effect.integration_id = ${input.integrationId}
+        and effect.integration_control_epoch = ${input.expectedIntegrationControlEpoch}
+        and effect.idempotency_key = any(
+          ${transaction.array(ranked.map((candidate) => `private-source-review:${candidate.id}`))}
+        )
+      order by effect.created_at, effect.id
+      limit 1
+      for share of effect, decision
+    `;
+    const releasedWinnerId = released[0]?.idempotency_key.replace("private-source-review:", "") ?? null;
+    const winnerId =
+      releasedWinnerId ??
+      rankPrivateSourceReleaseCandidates(
+        ranked.map((candidate) => ({
+          candidateId: candidate.id,
+          confidence: Number(candidate.confidence),
+          urgencyAt: candidate.urgencyAt,
+          proposedAt: candidate.proposed_at.getTime(),
+        })),
+      );
+    if (winnerId !== input.candidateId) return { kind: "not_ready" };
+    const winner = ranked.find((candidate) => candidate.id === winnerId);
+    if (!winner) throw new UnauthorizedError("Private source release winner disappeared");
+    return { kind: "selected", candidate: winner };
+  }
+
+  private openRankedPrivateSourceCandidate(
+    row: PrivateSourceReleaseCandidateRow,
+  ): RankedPrivateSourceReleaseCandidate {
+    try {
+      const plaintext = this.secretBox
+        .decrypt(
+          JSON.parse(row.content_ciphertext.toString("utf8")),
+          `florence:knowledge-candidate:${row.id}:content`,
+        )
+        .toString("utf8");
+      const raw = JSON.parse(plaintext) as unknown;
+      if (canonicalDigest(raw) !== row.content_digest) throw new Error("digest mismatch");
+      const content = CandidateReleaseContentSchema.parse(raw);
+      return {
+        ...row,
+        requiredOutcome: content.requiredOutcome.replace(/\s+/gu, " ").trim(),
+        urgencyAt: candidateUrgencyAt(content.timeFacts, row.proposed_at),
+      };
+    } catch {
+      throw new UnauthorizedError("Private source candidate could not be authenticated for release");
+    }
   }
 
   private async reopenIntegration(
@@ -857,6 +1030,81 @@ function validateObservation(input: GoogleSyncObservationFields): void {
   }
 }
 
+function validatePrivateSourceCandidateFence(input: {
+  readonly candidateId: string;
+  readonly personId: string;
+  readonly integrationId: string;
+  readonly expectedIntegrationControlEpoch: number;
+}): void {
+  if (
+    !UUID_PATTERN.test(input.candidateId) ||
+    !UUID_PATTERN.test(input.personId) ||
+    !UUID_PATTERN.test(input.integrationId) ||
+    !Number.isSafeInteger(input.expectedIntegrationControlEpoch) ||
+    input.expectedIntegrationControlEpoch < 1
+  ) {
+    throw new Error("Private source notification fence is invalid");
+  }
+}
+
+/** Deterministic first-value policy; independent job retry order cannot influence the winner. */
+export function rankPrivateSourceReleaseCandidates(
+  candidates: readonly PrivateSourceReleaseRankInput[],
+): string | null {
+  for (const candidate of candidates) {
+    if (
+      !UUID_PATTERN.test(candidate.candidateId) ||
+      !Number.isFinite(candidate.confidence) ||
+      candidate.confidence < 0 ||
+      candidate.confidence > 1 ||
+      (candidate.urgencyAt !== null && !Number.isFinite(candidate.urgencyAt)) ||
+      !Number.isFinite(candidate.proposedAt)
+    ) {
+      throw new UnauthorizedError("Private source candidate rank is invalid");
+    }
+  }
+  return (
+    [...candidates].sort((left, right) => {
+      const confidence = right.confidence - left.confidence;
+      if (confidence !== 0) return confidence;
+      if (left.urgencyAt !== null || right.urgencyAt !== null) {
+        if (left.urgencyAt === null) return 1;
+        if (right.urgencyAt === null) return -1;
+        const urgency = left.urgencyAt - right.urgencyAt;
+        if (urgency !== 0) return urgency;
+      }
+      const recency = right.proposedAt - left.proposedAt;
+      if (recency !== 0) return recency;
+      return left.candidateId.localeCompare(right.candidateId);
+    })[0]?.candidateId ?? null
+  );
+}
+
+function candidateUrgencyAt(timeFacts: readonly string[], proposedAt: Date): number | null {
+  const instants: number[] = [];
+  for (const fact of timeFacts) {
+    for (const match of fact.matchAll(EXPLICIT_DATE_PATTERN)) {
+      const parsed = parseExplicitCandidateDate(match[0]);
+      if (Number.isFinite(parsed)) instants.push(parsed);
+    }
+    const normalized = fact.toLowerCase();
+    if (/\b(?:urgent|asap|immediately|today|tonight)\b/u.test(normalized)) {
+      instants.push(proposedAt.getTime());
+    } else if (/\btomorrow\b/u.test(normalized)) {
+      instants.push(proposedAt.getTime() + 86_400_000);
+    } else if (/\bthis week\b/u.test(normalized)) {
+      instants.push(proposedAt.getTime() + 7 * 86_400_000);
+    }
+  }
+  return instants.length > 0 ? Math.min(...instants) : null;
+}
+
+function parseExplicitCandidateDate(value: string): number {
+  if (/^\d{4}-\d{2}-\d{2}$/u.test(value)) return Date.parse(`${value}T00:00:00Z`);
+  const isoLike = value.replace(" ", "T");
+  return Date.parse(/(?:Z|[+-][0-2]\d:[0-5]\d)$/u.test(isoLike) ? isoLike : `${isoLike}Z`);
+}
+
 function parseAccountKind(value: string): IntegrationAccountKind {
   if (value !== "personal_family" && value !== "work") {
     throw new Error("Google account kind is invalid");
@@ -892,3 +1140,5 @@ function sha256Hex(value: string): string {
 }
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+const EXPLICIT_DATE_PATTERN =
+  /\b\d{4}-\d{2}-\d{2}(?:[T ][0-2]\d:[0-5]\d(?::[0-5]\d(?:\.\d{1,3})?)?(?:Z|[+-][0-2]\d:[0-5]\d)?)?\b/gu;

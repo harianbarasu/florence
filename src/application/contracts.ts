@@ -189,6 +189,14 @@ export type AppEnvelope =
       readonly expectedIntegrationControlEpoch: number;
     }
   | {
+      /** Selects the deterministic current first-value candidate before any release path. */
+      readonly kind: "private_source.select_candidate_release";
+      readonly candidateId: string;
+      readonly personId: string;
+      readonly integrationId: string;
+      readonly expectedIntegrationControlEpoch: number;
+    }
+  | {
       /** Delivers a previously scheduled exact-private candidate handoff. */
       readonly kind: "private_source.deliver_candidate_notice";
       readonly candidateId: string;

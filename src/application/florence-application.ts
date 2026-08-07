@@ -107,6 +107,8 @@ type ParentGoogleActivationReason =
   | "existing_steward_dm"
   | "reengagement_after_expiry";
 
+const PRIVATE_GOOGLE_HANDOFF_SECONDS = 30 * 60;
+
 /**
  * Florence's sole authoritative mutation seam. Provider, timer, browser, worker,
  * and receipt inputs all re-enter here so current scope and authority are checked
@@ -167,6 +169,8 @@ export class FlorenceApplication {
         return this.observeGoogleSync(input);
       case "private_source.notify_candidate":
         return this.schedulePrivateSourceCandidateNotice(input);
+      case "private_source.select_candidate_release":
+        return this.selectPrivateSourceCandidateRelease(input);
       case "private_source.deliver_candidate_notice":
         return this.deliverPrivateSourceCandidateNotice(input);
       case "private_source.reconcile":
@@ -416,7 +420,7 @@ export class FlorenceApplication {
         result.kind === "route_unavailable"
           ? "private_source_candidate_private_route_unavailable"
           : result.kind === "not_ready"
-            ? "private_source_candidate_information_not_current"
+            ? "private_source_candidate_waiting_behind_current_winner"
             : result.kind === "obsolete"
               ? "private_source_candidate_notice_obsolete"
               : result.created
@@ -426,6 +430,27 @@ export class FlorenceApplication {
         candidateId: input.candidateId,
         ...(result.kind === "queued" ? { outboxId: result.outboxId } : {}),
       },
+    };
+  }
+
+  private async selectPrivateSourceCandidateRelease(
+    input: Extract<AppEnvelope, { kind: "private_source.select_candidate_release" }>,
+  ): Promise<ProcessReceipt> {
+    const result = await new GoogleSyncCoordinator(
+      this.database,
+      this.config,
+      this.secretBox,
+    ).selectPrivateSourceCandidate(input);
+    return {
+      accepted: result.kind !== "not_ready",
+      duplicate: result.kind === "obsolete",
+      disposition:
+        result.kind === "selected"
+          ? "private_source_candidate_selected_for_release"
+          : result.kind === "not_ready"
+            ? "private_source_candidate_waiting_behind_current_winner"
+            : "private_source_candidate_notice_obsolete",
+      ids: { candidateId: input.candidateId },
     };
   }
 
@@ -2175,7 +2200,7 @@ export class FlorenceApplication {
               ? "/sources"
               : "/home",
         },
-        expiresInSeconds: 10 * 60,
+        expiresInSeconds: normalizedCommand === "connect google" ? PRIVATE_GOOGLE_HANDOFF_SECONDS : 10 * 60,
       });
       const snapshot = await new PostgresConversationAuthority(transaction).snapshot(
         record.routing.conversationId,
@@ -2185,7 +2210,7 @@ export class FlorenceApplication {
         record,
         snapshot,
         normalizedCommand === "connect google"
-          ? `Here’s a fresh link to connect your personal Gmail and Calendar: ${this.config.publicBaseUrl}/handoff/${handoff.token}\n\nIt expires in 10 minutes.`
+          ? `Here’s a fresh link to connect your personal Gmail and Calendar: ${this.config.publicBaseUrl}/handoff/${handoff.token}\n\nIt’s valid for 30 minutes.`
           : `Here’s your private, single-use Florence link: ${this.config.publicBaseUrl}/handoff/${handoff.token}`,
         "direct_response",
         "private_handoff",
@@ -2697,12 +2722,12 @@ export class FlorenceApplication {
         profile: "personal_family",
         returnPath: "/sources",
       },
-      expiresInSeconds: 10 * 60,
+      expiresInSeconds: PRIVATE_GOOGLE_HANDOFF_SECONDS,
     });
     const link = `${this.config.publicBaseUrl}/handoff/${handoff.token}`;
     const text =
       reason === "reengagement_after_expiry"
-        ? `Hi! Your family space is ready, but Google still isn’t connected. Here’s a fresh link to connect your personal Gmail and Calendar: ${link}\n\nIt expires in 10 minutes. If you’d rather skip this, just say “not now” and I won’t keep asking.`
+        ? `Hi! Your family space is ready, but Google still isn’t connected. Here’s a fresh link to connect your personal Gmail and Calendar: ${link}\n\nIt’s valid for 30 minutes. If you’d rather skip this, just say “not now” and I won’t keep asking.`
         : reason === "household_resolved"
           ? `Your private family space is ready. The best next step is to connect your primary personal Google account so I can privately start reviewing recent Gmail and Calendar: ${link}\n\nWhile that sync runs, you can keep talking with me and add your co-parent, children, and family details. Connecting Google is optional; if you skip it, I won’t keep asking. If the link expires, text me “connect Google” for a fresh one.`
           : `I’ll keep working on what you just sent. One private setup step can make future family help more useful: connect your primary personal Google account so I can start reviewing recent Gmail and Calendar: ${link}\n\nIt’s optional; if you skip it, I won’t keep asking. If the link expires, text me “connect Google” for a fresh one.`;

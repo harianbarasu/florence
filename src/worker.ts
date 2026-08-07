@@ -282,6 +282,12 @@ async function main(): Promise<void> {
         }
         case "private_source.deliver_candidate_notice": {
           const payload = PrivateSourceCandidateNoticePayloadSchema.parse(job.payload);
+          const release = await application.process({
+            kind: "private_source.select_candidate_release",
+            ...payload,
+          });
+          if (release.disposition === "private_source_candidate_notice_obsolete") return;
+          if (!release.accepted) throw new PrivateSourceCandidateRouteUnavailableError();
           try {
             const standingOutcome = await orchestrator.tryApplyStandingPrivateCandidate(
               payload.personId,

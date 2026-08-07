@@ -461,7 +461,7 @@ export class PrivateSourceReconciler {
             disclosureStatus: "private_owner_only",
           }),
           evidenceSourceRevisionIds,
-          confidence: 0.85,
+          confidence: deterministicPrivateCandidateConfidence(proposal.decision),
           proposedAt: reconciledAt.toISOString(),
           requestedExpiresAt: new Date(reconciledAt.getTime() + 7 * 86_400_000).toISOString(),
         });
@@ -516,7 +516,7 @@ export class PrivateSourceReconciler {
           disclosureStatus: "private_owner_only",
         }),
         evidenceSourceRevisionIds,
-        confidence: 0.85,
+        confidence: deterministicPrivateCandidateConfidence(proposal.decision),
         proposedAt: reconciledAt.toISOString(),
         requestedExpiresAt: new Date(reconciledAt.getTime() + 7 * 86_400_000).toISOString(),
       });
@@ -1394,6 +1394,17 @@ function privateBridgeSourceFrontier(
     frontierDigest: row.frontier_digest,
     sourceGeneration: Number(row.source_generation),
   };
+}
+
+function deterministicPrivateCandidateConfidence(
+  decision: Extract<z.infer<typeof ReconciliationDecisionSchema>, { kind: "coverage_needed" }>,
+): number {
+  const evidenceBoost = Math.min(Math.max(decision.evidence.length - 1, 0), 4) * 0.03;
+  const timeFactBoost = Math.min(decision.timeFacts.length, 2) * 0.02;
+  const changedFactBoost = decision.changedFact === null ? 0 : 0.02;
+  const uncertaintyPenalty = Math.min(decision.uncertainties.length, 5) * 0.04;
+  const confidence = 0.76 + evidenceBoost + timeFactBoost + changedFactBoost - uncertaintyPenalty;
+  return Number(Math.min(0.94, Math.max(0.55, confidence)).toFixed(4));
 }
 
 function requireInstant(value: string): Date {

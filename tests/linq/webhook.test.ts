@@ -114,7 +114,7 @@ describe("unwrapLinqWebhook", () => {
     expect(JSON.stringify(result)).not.toContain("short-lived-secret");
   });
 
-  it("supports edits, reactions, participant changes, and sent/failed receipts", () => {
+  it("supports edits, reactions, participant changes, and outbound lifecycle receipts", () => {
     const cases = [
       envelope("message.edited", {
         chat,
@@ -162,6 +162,29 @@ describe("unwrapLinqWebhook", () => {
         sent_at: "2026-02-05T19:52:18Z",
         service: "iMessage",
       }),
+      envelope("message.delivered", {
+        chat,
+        id: "message-outbound",
+        idempotency_key: "effect-one",
+        direction: "outbound",
+        sender_handle: self,
+        parts: [{ type: "text", value: "Can anyone cover pickup?" }],
+        sent_at: "2026-02-05T19:52:18Z",
+        delivered_at: "2026-02-05T19:52:19Z",
+        service: "iMessage",
+      }),
+      envelope("message.read", {
+        chat,
+        id: "message-outbound",
+        idempotency_key: "effect-one",
+        direction: "outbound",
+        sender_handle: self,
+        parts: [{ type: "text", value: "Can anyone cover pickup?" }],
+        sent_at: "2026-02-05T19:52:18Z",
+        delivered_at: "2026-02-05T19:52:19Z",
+        read_at: "2026-02-05T19:52:20Z",
+        service: "iMessage",
+      }),
       envelope("message.failed", {
         chat_id: "chat-one",
         message_id: "message-outbound",
@@ -183,6 +206,8 @@ describe("unwrapLinqWebhook", () => {
       "linq.participant.added",
       "linq.participant.removed",
       "linq.outbound.sent",
+      "linq.outbound.delivered",
+      "linq.outbound.read",
       "linq.outbound.failed",
     ]);
   });

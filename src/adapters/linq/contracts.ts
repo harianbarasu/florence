@@ -8,6 +8,8 @@ export const LINQ_WEBHOOK_EVENT_TYPES = [
   "participant.added",
   "participant.removed",
   "message.sent",
+  "message.delivered",
+  "message.read",
   "message.failed",
 ] as const;
 
@@ -141,6 +143,28 @@ export interface LinqOutboundSentEvent extends LinqEventBase {
   };
 }
 
+export interface LinqOutboundDeliveredEvent extends LinqEventBase {
+  eventType: "linq.outbound.delivered";
+  channel: LinqChannelRef;
+  receipt: {
+    providerMessageId: string;
+    sender: LinqParticipant;
+    deliveredAt: string;
+    idempotencyKey?: string;
+  };
+}
+
+export interface LinqOutboundReadEvent extends LinqEventBase {
+  eventType: "linq.outbound.read";
+  channel: LinqChannelRef;
+  receipt: {
+    providerMessageId: string;
+    sender: LinqParticipant;
+    readAt: string;
+    idempotencyKey?: string;
+  };
+}
+
 export interface LinqOutboundFailedEvent extends LinqEventBase {
   eventType: "linq.outbound.failed";
   channel: LinqChannelRef;
@@ -164,6 +188,8 @@ export type LinqWebhookEnvelope =
   | LinqReactionEvent
   | LinqParticipantChangedEvent
   | LinqOutboundSentEvent
+  | LinqOutboundDeliveredEvent
+  | LinqOutboundReadEvent
   | LinqOutboundFailedEvent
   | LinqIgnoredEvent;
 
@@ -200,6 +226,8 @@ export interface LinqSendReceipt {
   idempotencyKey: string;
   status: "accepted";
   providerDeliveryStatus: LinqProviderDeliveryStatus;
+  /** Known transport for deciding whether `sent` is terminal (SMS) or provisional. */
+  service?: LinqMessagingService;
   submittedAt: string;
   audienceCheckedAt: string;
   participantDigest: string;
@@ -210,6 +238,7 @@ export interface LinqMessageDeliveryReceipt {
   providerChatId: string;
   providerMessageId: string;
   providerDeliveryStatus: LinqProviderDeliveryStatus;
+  service: LinqMessagingService;
   createdAt: string;
   updatedAt: string;
 }

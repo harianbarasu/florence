@@ -1,6 +1,35 @@
 import type { z } from "zod";
 import type { ModelGateway, WorkerJob, WorkerResult, WorkerRuntime } from "./contracts.js";
 
+const RETRYABLE_WORKER_ERROR_CODES = new Set(["deadline_exceeded", "model_failed"]);
+
+/**
+ * Provider-neutral failure raised when durable orchestration cannot obtain a
+ * proposal from one bounded worker attempt. The result remains persistable by
+ * the governed runtime; callers decide whether the enclosing durable job has
+ * enough attempts and time left to retry.
+ */
+export class WorkerAttemptError extends Error {
+  public readonly attemptId: string;
+  public readonly code: string;
+  public readonly retryable: boolean;
+
+  public constructor(result: Pick<WorkerResult, "attemptId" | "status" | "errorCode">) {
+    const resultCode = result.errorCode ?? result.status;
+    super(`Bounded worker attempt did not produce a proposal: ${resultCode}`);
+    this.name = "WorkerAttemptError";
+    this.attemptId = result.attemptId;
+    this.code = `worker_${resultCode.replace(/[^a-z0-9_]+/gu, "_").slice(0, 120)}`;
+    this.retryable = RETRYABLE_WORKER_ERROR_CODES.has(resultCode);
+  }
+}
+
+/** Converts an ephemeral result into a proposal without hiding failed work. */
+export function requireWorkerProposal<Output>(result: WorkerResult<Output>): Output {
+  if (result.status === "proposed" && result.proposal !== undefined) return result.proposal;
+  throw new WorkerAttemptError(result);
+}
+
 export class BoundedWorkerRuntime implements WorkerRuntime {
   public constructor(
     private readonly gateway: ModelGateway,
@@ -44,8 +73,7 @@ export class BoundedWorkerRuntime implements WorkerRuntime {
         completedAt: new Date(),
       };
     } catch (error) {
-      const errorCode =
-        error instanceof Error && error.name === "AbortError" ? "deadline_exceeded" : "model_failed";
+      const errorCode = isModelTimeout(error) ? "deadline_exceeded" : "model_failed";
       return failedResult(job, startedAt, this.runtimeRoute, errorCode);
     }
   }
@@ -55,6 +83,13 @@ export class BoundedWorkerRuntime implements WorkerRuntime {
     _attemptId: string,
     _status: "accepted" | "partially_accepted" | "rejected" | "stale",
   ): Promise<void> {}
+}
+
+function isModelTimeout(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  if (error.name === "AbortError" || error.name === "TimeoutError") return true;
+  const code = "code" in error && typeof error.code === "string" ? error.code : null;
+  return code === "ETIMEDOUT" || code === "ECONNABORTED";
 }
 
 function expiredResult<Schema extends z.ZodType>(

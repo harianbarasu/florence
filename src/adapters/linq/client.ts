@@ -115,6 +115,15 @@ function normalizeParticipant(input: {
   };
 }
 
+function commonActiveService(participants: readonly LinqParticipant[]): LinqMessagingService | undefined {
+  const services = new Set(
+    participants
+      .filter((participant) => participant.status === "active")
+      .map((participant) => participant.service),
+  );
+  return services.size === 1 ? services.values().next().value : undefined;
+}
+
 function normalizeHealth(status: "HEALTHY" | "AT_RISK" | "CRITICAL" | "OPTED_OUT"): LinqChatHealth {
   return status.toLowerCase() as LinqChatHealth;
 }
@@ -301,6 +310,7 @@ export class LinqClient {
         retryable: true,
       });
     }
+    const messageService = currentChat.service ?? commonActiveService(currentChat.participants);
 
     return {
       providerChatId: response.data.chat_id,
@@ -308,6 +318,7 @@ export class LinqClient {
       idempotencyKey: parsed.data.idempotencyKey,
       status: "accepted",
       providerDeliveryStatus: response.data.message.delivery_status,
+      ...(messageService ? { service: messageService } : {}),
       submittedAt: normalizeTimestamp(response.data.message.created_at, "message created_at"),
       audienceCheckedAt: currentChat.checkedAt,
       participantDigest: currentChat.activeParticipantDigest,
@@ -371,12 +382,16 @@ export class LinqClient {
         retryable: false,
       });
     }
+    const messageService = response.data.chat.service
+      ? normalizeService(response.data.chat.service)
+      : exactRecipient[0]?.service;
     return {
       providerChatId: response.data.chat.id,
       providerMessageId: response.data.chat.message.id,
       idempotencyKey: parsed.data.idempotencyKey,
       status: "accepted",
       providerDeliveryStatus: response.data.chat.message.delivery_status,
+      ...(messageService ? { service: messageService } : {}),
       submittedAt: normalizeTimestamp(response.data.chat.message.created_at, "message created_at"),
       audienceCheckedAt: this.#now().toISOString(),
       participantDigest: computeLinqParticipantDigest(participants),
@@ -401,6 +416,7 @@ export class LinqClient {
       providerChatId: response.data.chat_id,
       providerMessageId: response.data.id,
       providerDeliveryStatus: response.data.delivery_status,
+      service: normalizeService(response.data.service),
       createdAt: normalizeTimestamp(response.data.created_at, "message created_at"),
       updatedAt: normalizeTimestamp(response.data.updated_at, "message updated_at"),
     };

@@ -12,10 +12,11 @@ import { FlorenceApplication } from "./application/index.js";
 import { loadConfig } from "./config.js";
 import { createDatabase } from "./db/client.js";
 import { PostgresWebAuth } from "./modules/auth/index.js";
+import { PrivateSourceBridge } from "./modules/bridges/index.js";
 import { PostgresConversationAuthority } from "./modules/conversations/index.js";
 import { CoordinationError } from "./modules/coordination/index.js";
 import { EffectOutbox, LinqMessageEffectExecutor } from "./modules/effects/index.js";
-import { BoundedWorkerRuntime } from "./modules/orchestration/bounded-worker-runtime.js";
+import { BoundedWorkerRuntime, WorkerAttemptError } from "./modules/orchestration/bounded-worker-runtime.js";
 import { LangChainModelGateway } from "./modules/orchestration/langchain-model-gateway.js";
 import { PostgresSourceIntelligence } from "./modules/sources/index.js";
 import { type ClaimedJob, DurableTimers, DurableWork } from "./modules/work/index.js";
@@ -164,6 +165,11 @@ async function main(): Promise<void> {
       rawRetentionDays: config.defaults.rawSourceRetentionDays,
       privateCandidateRetentionDays: 7,
     });
+    const privateSourceBridge = new PrivateSourceBridge(
+      database,
+      secretBox,
+      config.defaults.rawSourceRetentionDays,
+    );
     await bootstrapGovernedSkills(database);
     let lastMaintenanceCheckBucket: number | null = null;
 
@@ -185,6 +191,24 @@ async function main(): Promise<void> {
           await dispatch(job);
           if (await work.succeed(job)) await observeGoogleSyncMilestone(job);
         } catch (error) {
+          if (error instanceof WorkerAttemptError) {
+            const settlement = modelFailureSettlement(job, error);
+            if (settlement === "attention") {
+              if (await work.needsAttention(job, error.code)) await observeGoogleSyncMilestone(job);
+            } else {
+              await work.fail(job, error.code, { retryable: true });
+              await observeGoogleSyncMilestone(job);
+            }
+            process.stderr.write(
+              `${JSON.stringify({
+                level: settlement === "attention" ? "error" : "warn",
+                jobKind: job.kind,
+                errorCode: error.code,
+                settlement,
+              })}\n`,
+            );
+            continue;
+          }
           if (
             error instanceof PrivateSourceJobOutcomeError &&
             error.outcome.kind === "not_ready" &&
@@ -449,6 +473,7 @@ async function main(): Promise<void> {
     async function maintenance(): Promise<void> {
       const now = new Date();
       await work.cancelStale(now);
+      await privateSourceBridge.cancelStaleAuthorityIntents(now);
       await outbox.cancelStale(now);
       await application.process({
         kind: "maintenance.redrive_effects",
@@ -841,6 +866,7 @@ function wait(milliseconds: number): Promise<void> {
 
 function errorCode(error: unknown): string {
   if (error instanceof z.ZodError) return "invalid_job_payload";
+  if (error instanceof WorkerAttemptError) return error.code;
   if (error instanceof PrivateSourceJobOutcomeError) return error.code;
   if (error instanceof PrivateSourceCandidateRouteUnavailableError)
     return "private_source_candidate_route_unavailable";
@@ -856,6 +882,7 @@ function errorCode(error: unknown): string {
 }
 
 function isRetryableJobError(error: unknown): boolean {
+  if (error instanceof WorkerAttemptError) return error.retryable;
   if (error instanceof PrivateSourceJobOutcomeError) return error.retryable;
   if (error instanceof LinqApiError) return error.retryable;
   if (error instanceof LinqAudienceChangedError) return false;
@@ -868,6 +895,25 @@ function isRetryableJobError(error: unknown): boolean {
     error instanceof ConflictError ||
     error instanceof CoordinationError
   );
+}
+
+/**
+ * Keeps a transient worker failure inside the durable job's existing attempt
+ * and deadline envelope. If another backoff would cross either bound, preserve
+ * the admitted work as explicit attention instead of letting it disappear as
+ * dead or deadline-cancelled work.
+ */
+export function modelFailureSettlement(
+  job: Pick<ClaimedJob, "attemptCount" | "maxAttempts" | "deadlineAt">,
+  failure: Pick<WorkerAttemptError, "retryable">,
+  now = new Date(),
+): "retry" | "attention" {
+  if (!failure.retryable || job.attemptCount >= job.maxAttempts) return "attention";
+  const retryDelayMs = Math.min(15 * 60_000, 1_000 * 2 ** Math.max(0, job.attemptCount - 1));
+  if (job.deadlineAt && job.deadlineAt.getTime() <= now.getTime() + retryDelayMs) {
+    return "attention";
+  }
+  return "retry";
 }
 
 async function recordWorkerStart(

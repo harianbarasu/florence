@@ -10,6 +10,7 @@ import type { ClaimedEffect, ClaimedSubmittedEffect, EffectOutbox } from "./outb
 
 const MAX_RECONCILIATION_ATTEMPTS = 8;
 const MAX_RECONCILIATION_AGE_MS = 30 * 60_000;
+const INITIAL_FAILURE_RECONCILIATION_DELAY_MS = 60_000;
 
 const LinqEffectPayloadSchema = z.strictObject({
   providerChatId: z.string().uuid(),
@@ -176,13 +177,31 @@ export class LinqMessageEffectExecutor {
     const status = reconciliationStatus(receipt);
     const exhausted = reconciliationExhausted(effect, now);
     if ((status === "submitted" || status === "failed") && !exhausted) {
+      const errorCode =
+        status === "failed"
+          ? uncertainDeliveryErrorCode(effect.lastErrorCode)
+          : preserveUncertainDeliveryErrorCode(effect.lastErrorCode);
       await this.outbox.recordReconciliation({
         effect,
         status,
         providerReceiptId: effect.providerReceiptId,
         receipt: auditReceipt(receipt, status === "failed" ? "failure_grace" : "unresolved"),
-        ...(status === "failed" ? { errorCode: "linq_delivery_failure_observed" } : {}),
+        ...(errorCode ? { errorCode } : {}),
         nextAttemptAt: nextReconciliationAt(effect.reconciliationAttemptCount, now),
+        now,
+      });
+      return;
+    }
+    if (status === "failed") {
+      // Linq's status lookup does not expose the provider failure code. Since a
+      // 4001 failure may later become delivered, a lookup-only failure can
+      // never prove that a second send is safe.
+      await this.outbox.recordReconciliation({
+        effect,
+        status: "ambiguous",
+        providerReceiptId: effect.providerReceiptId,
+        receipt: auditReceipt(receipt, "deadline_exhausted"),
+        errorCode: "linq_delivery_failure_ambiguous",
         now,
       });
       return;
@@ -192,11 +211,7 @@ export class LinqMessageEffectExecutor {
       status: status === "submitted" ? "ambiguous" : status,
       providerReceiptId: effect.providerReceiptId,
       receipt: auditReceipt(receipt, status === "submitted" ? "deadline_exhausted" : "terminal"),
-      ...(status === "failed"
-        ? { errorCode: "linq_delivery_failed" }
-        : status === "submitted"
-          ? { errorCode: "linq_delivery_unresolved" }
-          : {}),
+      ...(status === "submitted" ? { errorCode: "linq_delivery_unresolved" } : {}),
       now,
     });
   }
@@ -210,6 +225,7 @@ export class LinqMessageEffectExecutor {
     const notFound = error instanceof LinqApiError && error.status === 404;
     const exhausted = reconciliationExhausted(effect, now);
     const terminal = notFound || exhausted;
+    const preservedDeliveryError = preserveUncertainDeliveryErrorCode(effect.lastErrorCode);
     await this.outbox.recordReconciliation({
       effect,
       status: terminal ? "ambiguous" : "submitted",
@@ -225,11 +241,13 @@ export class LinqMessageEffectExecutor {
             }
           : { providerCode: "unexpected_lookup_error", retryable: false }),
       },
-      errorCode: notFound
-        ? "linq_delivery_not_found"
-        : terminal
-          ? "linq_delivery_lookup_exhausted"
-          : "linq_delivery_lookup_deferred",
+      errorCode:
+        preservedDeliveryError ??
+        (notFound
+          ? "linq_delivery_not_found"
+          : terminal
+            ? "linq_delivery_lookup_exhausted"
+            : "linq_delivery_lookup_deferred"),
       ...(terminal ? {} : { nextAttemptAt: nextReconciliationAt(effect.reconciliationAttemptCount, now) }),
       now,
     });
@@ -242,7 +260,12 @@ export class LinqMessageEffectExecutor {
       status,
       providerReceiptId: receipt.providerMessageId,
       receipt,
-      ...(status === "failed" ? { errorCode: "linq_delivery_failed" } : {}),
+      ...(status === "failed"
+        ? {
+            errorCode: "linq_delivery_failure_code_unknown",
+            nextAttemptAt: new Date(Date.now() + INITIAL_FAILURE_RECONCILIATION_DELAY_MS),
+          }
+        : {}),
     });
   }
 }
@@ -262,12 +285,13 @@ class EffectAuthorizationCheckError extends Error {
 }
 
 function reconciliationStatus(
-  receipt: Pick<LinqSendReceipt | LinqMessageDeliveryReceipt, "providerDeliveryStatus">,
+  receipt: Pick<LinqSendReceipt | LinqMessageDeliveryReceipt, "providerDeliveryStatus" | "service">,
 ): "submitted" | "confirmed" | "failed" {
   switch (receipt.providerDeliveryStatus) {
     case "failed":
       return "failed";
     case "sent":
+      return receipt.service === "sms" ? "confirmed" : "submitted";
     case "delivered":
     case "received":
     case "read":
@@ -300,6 +324,7 @@ function auditReceipt(
     providerChatId: receipt.providerChatId,
     providerMessageId: receipt.providerMessageId,
     providerDeliveryStatus: receipt.providerDeliveryStatus,
+    service: receipt.service,
     createdAt: receipt.createdAt,
     updatedAt: receipt.updatedAt,
   };
@@ -307,4 +332,16 @@ function auditReceipt(
 
 function normalizeProviderCode(value: string | number | null): string | number | null {
   return typeof value === "string" ? value.slice(0, 100) : value;
+}
+
+function preserveUncertainDeliveryErrorCode(errorCode: string | null): string | null {
+  return errorCode === "linq_delivery_may_arrive_late" ||
+    errorCode === "linq_delivery_failure_code_unknown" ||
+    errorCode === "linq_delivery_failure_observed"
+    ? errorCode
+    : null;
+}
+
+function uncertainDeliveryErrorCode(errorCode: string | null): string {
+  return preserveUncertainDeliveryErrorCode(errorCode) ?? "linq_delivery_failure_code_unknown";
 }

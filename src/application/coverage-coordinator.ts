@@ -769,6 +769,10 @@ export class CoverageCoordinator {
     const operation = proposal.response === "acknowledge" ? "coverage_closure" : "coverage_state_change";
     const sameConversation =
       source.record.routing.conversationId === transition.loop.destination.conversationId;
+    const acknowledgedHolderLabel =
+      transition.loop.state === "covered" && transition.loop.acknowledgment?.holderDisclosure === "shared"
+        ? await this.openPersonLabel(transaction, transition.loop.acknowledgment.personId)
+        : null;
     const queued = await this.queueDestinationMessage(transaction, {
       source,
       snapshot: target.snapshot,
@@ -777,7 +781,7 @@ export class CoverageCoordinator {
       householdId: transition.loop.householdId,
       householdControlEpoch: target.householdControlEpoch,
       loop: transition.loop,
-      text: neutralTransitionText(transition.loop, holderWithdrew),
+      text: neutralTransitionText(transition.loop, holderWithdrew, acknowledgedHolderLabel),
       sendKind: sameConversation ? "direct_response" : "proactive",
       operation,
       idempotencyKey: `coverage:${transition.loop.loopId}:v${transition.loop.version}:${proposal.response}`,
@@ -830,10 +834,6 @@ export class CoverageCoordinator {
         and effect.participant_epoch_id = ${source.record.routing.participantEpochId}
         and effect.expected_participant_digest = ${source.record.routing.appParticipantDigest}
         and effect.coverage_loop_id is not null
-        and not exists(
-          select 1 from effect_receipts terminal
-          where terminal.outbox_id = effect.id and terminal.status in ('failed', 'ambiguous')
-        )
       order by effect.coverage_loop_id
       limit 2
     `;
@@ -1330,9 +1330,17 @@ function coverageOpeningText(
   return `“${sentenceFragment(loop.minimumSharedMeaning)}” is still uncovered. Who can take it?`;
 }
 
-function neutralTransitionText(loop: CoverageLoop, holderWithdrew: boolean): string {
+function neutralTransitionText(
+  loop: CoverageLoop,
+  holderWithdrew: boolean,
+  acknowledgedHolderLabel: string | null,
+): string {
   const meaning = sentenceFragment(loop.minimumSharedMeaning);
-  if (loop.state === "covered") return `${meaning}. Coverage is recorded.`;
+  if (loop.state === "covered") {
+    return acknowledgedHolderLabel
+      ? `Covered — ${acknowledgedHolderLabel} has ${meaning}.`
+      : `${meaning}. Coverage is recorded.`;
+  }
   if (holderWithdrew || loop.state === "at_risk") {
     return `${meaning}. Coverage needs confirmation again. Is it handled, or should we find someone?`;
   }

@@ -40,6 +40,7 @@ import { PrivateSourceReconciler } from "./private-source-reconciler.js";
 
 type Transaction = TransactionSql<Record<string, never>>;
 const MAX_LIVE_GROUP_INVOCATION_AGE_MS = 10 * 60_000;
+const LINQ_FAILURE_RECONCILIATION_DELAY_MS = 60_000;
 
 interface ReconciledConversation {
   readonly conversationId: string;
@@ -598,6 +599,13 @@ export class FlorenceApplication {
         event.eventType === "linq.message.received" && messageText(event).trim().toUpperCase() === "STOP";
       const outsideCurrentContentWindow =
         !isStopCommand && (belongsToPriorParticipantEpoch || precedesParticipantConsent);
+      if (
+        !outsideCurrentContentWindow &&
+        event.eventType === "linq.message.received" &&
+        event.message.replyTo
+      ) {
+        await this.confirmOutboundByReply(transaction, event, reconciled);
+      }
       const classification: ReturnType<typeof classifyEvent> = outsideCurrentContentWindow
         ? ({ kind: "routing_only", retainEvent: false } as const)
         : classifyEvent(event, liveChat.kind, reconciled.mode);
@@ -1070,12 +1078,60 @@ export class FlorenceApplication {
         and effect.participant_epoch_id = ${reconciled.epochId}
         and effect.expected_participant_digest = ${reconciled.appParticipantDigest}
         and effect.status in ('submitted', 'confirmed')
-        and not exists(
-          select 1 from effect_receipts terminal
-          where terminal.outbox_id = effect.id and terminal.status in ('failed', 'ambiguous')
-        )
     `;
     return Number(rows[0]?.matching_effects ?? 0) === 1 ? { basis: "proven_reply", requestText: text } : null;
+  }
+
+  /** A verified provider reply is stronger delivery proof than a missing or failed receipt webhook. */
+  private async confirmOutboundByReply(
+    transaction: Transaction,
+    event: LinqMessageReceivedEvent,
+    reconciled: ReconciledConversation,
+  ): Promise<void> {
+    const providerMessageId = event.message.replyTo?.providerMessageId;
+    if (!providerMessageId) return;
+    const effects = await transaction<{ readonly id: string; readonly idempotency_key: string }[]>`
+      select distinct effect.id, effect.idempotency_key
+      from outbox effect
+      join effect_receipts receipt on receipt.outbox_id = effect.id
+        and receipt.provider_receipt_id = ${providerMessageId}
+      where effect.effect_kind = 'linq.message'
+        and effect.conversation_id = ${reconciled.conversationId}
+        and effect.participant_epoch_id = ${reconciled.epochId}
+        and effect.expected_participant_digest = ${reconciled.appParticipantDigest}
+        and effect.status <> 'cancelled'
+      order by effect.id
+      limit 2
+    `;
+    if (effects.length !== 1 || !effects[0]) return;
+
+    const occurredAt = new Date(event.message.sentAt);
+    const receiptJson = canonicalJson({
+      kind: "linq_reply_delivery_proof",
+      providerEventId: event.providerEventId,
+      providerMessageId,
+      replyMessageId: event.message.providerMessageId,
+      occurredAt: event.message.sentAt,
+    });
+    const encrypted = this.secretBox.encrypt(receiptJson, "effect-receipt");
+    await transaction`
+      insert into effect_receipts (
+        id, outbox_id, idempotency_key, provider_receipt_id, status,
+        receipt_digest, receipt_ciphertext, receipt_key_version, occurred_at,
+        reconciled_at, error_code
+      ) values (
+        ${randomUUID()}, ${effects[0].id}, ${effects[0].idempotency_key}, ${providerMessageId},
+        'confirmed', ${sha256Hex(receiptJson)},
+        ${Buffer.from(JSON.stringify(encrypted), "utf8")}, ${encrypted.kid},
+        ${occurredAt}, ${occurredAt}, null
+      ) on conflict do nothing
+    `;
+    await transaction`
+      update outbox set status = 'confirmed', available_at = now(),
+        lease_owner = null, lease_token = null, lease_expires_at = null,
+        last_error_code = null, updated_at = now()
+      where id = ${effects[0].id} and status <> 'cancelled'
+    `;
   }
 
   private async processLinqEvent(providerEventId: string): Promise<ProcessReceipt> {
@@ -1693,15 +1749,22 @@ export class FlorenceApplication {
     if (event.eventType !== "linq.message.received") return "observed";
     const text = messageText(event);
     const normalizedCommand = text.trim().toLowerCase();
-    const person =
-      record.routing.chatKind === "direct" && record.routing.senderPersonId
-        ? (
-            await transaction<{ display_name_ciphertext: Buffer | null; onboarding_step: string }[]>`
-              select display_name_ciphertext, onboarding_step from people
-              where id = ${record.routing.senderPersonId} and status = 'registered'
+    const senderPersonId = record.routing.senderPersonId;
+    const registeredSender = senderPersonId
+      ? (
+          await transaction<
+            {
+              display_name_ciphertext: Buffer | null;
+              onboarding_step: string;
+              control_epoch: number | string;
+            }[]
+          >`
+              select display_name_ciphertext, onboarding_step, control_epoch from people
+              where id = ${senderPersonId} and status = 'registered'
             `
-          )[0]
-        : null;
+        )[0]
+      : null;
+    const person = record.routing.chatKind === "direct" ? registeredSender : null;
     const displayName =
       record.routing.chatKind === "direct"
         ? parseNameResponse(text, person?.onboarding_step === "name_pending")
@@ -1885,6 +1948,9 @@ export class FlorenceApplication {
           await new PostgresConversationAuthority(transaction).snapshot(record.routing.conversationId)
         ).authorityVersion,
       },
+      ...(registeredSender && senderPersonId
+        ? { person: { id: senderPersonId, controlEpoch: Number(registeredSender.control_epoch) } }
+        : {}),
       priority: 20,
       maxAttempts: 5,
       deadlineAt: new Date(Date.now() + 5 * 60_000),
@@ -1924,23 +1990,47 @@ export class FlorenceApplication {
 
   private async handleProviderReceipt(transaction: Transaction, record: StoredLinqEvent): Promise<string> {
     const event = record.event;
-    if (!event || (event.eventType !== "linq.outbound.sent" && event.eventType !== "linq.outbound.failed")) {
+    if (
+      !event ||
+      ![
+        "linq.outbound.sent",
+        "linq.outbound.delivered",
+        "linq.outbound.read",
+        "linq.outbound.failed",
+      ].includes(event.eventType)
+    ) {
+      return "observed";
+    }
+    if (
+      event.eventType !== "linq.outbound.sent" &&
+      event.eventType !== "linq.outbound.delivered" &&
+      event.eventType !== "linq.outbound.read" &&
+      event.eventType !== "linq.outbound.failed"
+    ) {
       return "observed";
     }
     const providerMessageId = event.receipt.providerMessageId;
     const providerIdempotencyKey =
-      event.eventType === "linq.outbound.sent" ? (event.receipt.idempotencyKey ?? null) : null;
-    const rows = await transaction<{ outbox_id: string; idempotency_key: string }[]>`
-      select effect.id as outbox_id, effect.idempotency_key
+      event.eventType === "linq.outbound.failed" ? null : (event.receipt.idempotencyKey ?? null);
+    const rows = await transaction<
+      { outbox_id: string; idempotency_key: string; latest_confirmed_at: Date | null }[]
+    >`
+      select effect.id as outbox_id, effect.idempotency_key,
+        max(receipt.occurred_at) filter (where receipt.status = 'confirmed') as latest_confirmed_at
       from outbox effect
       left join effect_receipts receipt on receipt.outbox_id = effect.id
       where receipt.provider_receipt_id = ${providerMessageId}
         or (${providerIdempotencyKey}::text is not null and effect.idempotency_key = ${providerIdempotencyKey})
-      order by (receipt.provider_receipt_id = ${providerMessageId}) desc
+      group by effect.id, effect.idempotency_key
+      order by bool_or(receipt.provider_receipt_id = ${providerMessageId}) desc nulls last
       limit 1
     `;
     if (!rows[0]) return "unmatched_receipt";
     const failed = event.eventType === "linq.outbound.failed";
+    const submitted = event.eventType === "linq.outbound.sent" && event.receipt.sender.service !== "sms";
+    const mayArriveLate = failed && event.receipt.errorCode === "4001";
+    const occurredAt = new Date(event.occurredAt);
+    const failureIsCurrent = rows[0].latest_confirmed_at === null || occurredAt > rows[0].latest_confirmed_at;
     const receiptJson = canonicalJson({
       kind: "linq_delivery_webhook",
       providerEventId: event.providerEventId,
@@ -1957,33 +2047,74 @@ export class FlorenceApplication {
         reconciled_at, error_code
       ) values (
         ${randomUUID()}, ${rows[0].outbox_id}, ${rows[0].idempotency_key}, ${providerMessageId},
-        ${failed ? "failed" : "confirmed"}, ${sha256Hex(receiptJson)},
+        ${failed ? "failed" : submitted ? "submitted" : "confirmed"}, ${sha256Hex(receiptJson)},
         ${Buffer.from(JSON.stringify(encrypted), "utf8")}, ${encrypted.kid},
-        ${new Date(event.occurredAt)}, ${failed ? null : new Date(event.occurredAt)},
+        ${occurredAt}, ${failed || submitted ? null : occurredAt},
         ${failed ? event.receipt.errorCode : null}
       ) on conflict do nothing
     `;
-    if (failed) {
-      // Linq documents message.failed as the terminal delivery outcome. Normalize
-      // the provider code so the fenced redrive worker can recognize it without
-      // losing the provider's original reason in the immutable receipt above.
+    if (mayArriveLate && failureIsCurrent) {
+      // Linq explicitly documents that a 4001 failure can be followed by a
+      // delivered event for the same provider message. Reconcile the original
+      // provider ID; never create a second family message from this uncertainty.
+      await transaction`
+        update outbox set status = 'submitted',
+          available_at = ${new Date(Date.now() + LINQ_FAILURE_RECONCILIATION_DELAY_MS)},
+          lease_owner = null, lease_token = null, lease_expires_at = null,
+          last_error_code = 'linq_delivery_may_arrive_late', updated_at = now()
+        where id = ${rows[0].outbox_id} and status <> 'cancelled'
+      `;
+    } else if (failed && failureIsCurrent) {
       await transaction`
         update outbox set status = 'dead', available_at = now(),
           lease_owner = null, lease_token = null, lease_expires_at = null,
           last_error_code = 'linq_delivery_failed', updated_at = now()
         where id = ${rows[0].outbox_id}
       `;
-    } else {
-      // A delayed sent event must never resurrect an attempt that Linq has
-      // already declared failed or that Florence cancelled for stale authority.
+    } else if (failed) {
+      // A stronger confirmation with a later provider occurrence time already
+      // won. Persist this receipt for audit without regressing delivery state.
+    } else if (submitted) {
+      // iMessage/RCS `sent` is provider acceptance, not proof of delivery.
+      // Keep reconciling the same provider message; a reply can itself prove
+      // receipt without ever authorizing a duplicate send.
+      await transaction`
+        update outbox set status = 'submitted',
+          available_at = ${new Date(Date.now() + LINQ_FAILURE_RECONCILIATION_DELAY_MS)},
+          lease_owner = null, lease_token = null, lease_expires_at = null,
+          updated_at = now()
+        where id = ${rows[0].outbox_id}
+          and status in ('pending', 'retry', 'leased', 'submitted')
+      `;
+    } else if (event.eventType === "linq.outbound.sent") {
+      // SMS has no delivered/read lifecycle, so `sent` is its strongest
+      // transport receipt. It must not resurrect an explicitly failed send.
       await transaction`
         update outbox set status = 'confirmed', available_at = now(),
           lease_owner = null, lease_token = null, lease_expires_at = null,
           last_error_code = null, updated_at = now()
-        where id = ${rows[0].outbox_id} and status not in ('dead', 'cancelled')
+        where id = ${rows[0].outbox_id}
+          and status in ('pending', 'retry', 'leased', 'submitted', 'confirmed')
+      `;
+    } else {
+      // Delivered/read may legitimately follow a provisional 4001 failure, so
+      // any verified positive lifecycle event confirms the original attempt.
+      await transaction`
+        update outbox set status = 'confirmed', available_at = now(),
+          lease_owner = null, lease_token = null, lease_expires_at = null,
+          last_error_code = null, updated_at = now()
+        where id = ${rows[0].outbox_id} and status <> 'cancelled'
       `;
     }
-    return failed ? "delivery_failure_observed" : "delivery_confirmed";
+    return failed && !failureIsCurrent
+      ? "delivery_failure_superseded"
+      : mayArriveLate
+        ? "delivery_failure_reconciling"
+        : failed
+          ? "delivery_failure_observed"
+          : submitted
+            ? "delivery_submitted"
+            : "delivery_confirmed";
   }
 
   private async queueSystemEnrollmentMessage(
@@ -3547,7 +3678,12 @@ function classifyEvent(
   chatKind: "direct" | "group",
   mode: ReturnType<typeof evaluateConversationMode>,
 ): { kind: StoredLinqEvent["classification"]; enrollmentAction?: "consent" | "other"; retainEvent: boolean } {
-  if (event.eventType === "linq.outbound.sent" || event.eventType === "linq.outbound.failed") {
+  if (
+    event.eventType === "linq.outbound.sent" ||
+    event.eventType === "linq.outbound.delivered" ||
+    event.eventType === "linq.outbound.read" ||
+    event.eventType === "linq.outbound.failed"
+  ) {
     return { kind: "receipt", retainEvent: true };
   }
   if (event.eventType === "linq.message.received") {

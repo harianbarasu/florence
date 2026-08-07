@@ -103,10 +103,13 @@ export class PostgresFlorenceQueries {
         content_ciphertext: Buffer;
         content_key_version: string;
         last_transition_at: Date;
+        acknowledged_by_person_id: string | null;
+        acknowledged_name_ciphertext: Buffer | null;
       }[]
     >`
       select loop.id, loop.state, loop.content_ciphertext, loop.content_key_version,
-        loop.last_transition_at
+        loop.last_transition_at, loop.acknowledged_by_person_id,
+        acknowledged_person.display_name_ciphertext as acknowledged_name_ciphertext
       from household_memberships membership
       join membership_capabilities read_grant on read_grant.membership_id = membership.id
         and read_grant.capability = 'household.read' and read_grant.status = 'active'
@@ -123,6 +126,15 @@ export class PostgresFlorenceQueries {
         and viewer_participant.person_id = ${personId}
         and viewer_participant.registration_status = 'registered'
         and viewer_participant.consented_at is not null
+      left join epoch_participants acknowledged_participant
+        on acknowledged_participant.participant_epoch_id = epoch.id
+        and acknowledged_participant.person_id = loop.acknowledged_by_person_id
+        and acknowledged_participant.registration_status = 'registered'
+        and acknowledged_participant.consented_at is not null
+      left join people acknowledged_person
+        on acknowledged_person.id = acknowledged_participant.person_id
+        and acknowledged_person.status = 'registered'
+        and loop.holder_disclosure = 'shared'
       join participant_policies viewer_policy on viewer_policy.conversation_id = destination.id
         and viewer_policy.person_id = ${personId} and viewer_policy.status = 'active'
         and viewer_policy.allow_content_processing
@@ -214,6 +226,27 @@ export class PostgresFlorenceQueries {
       select count(*) as count from integrations
       where person_id = ${personId} and status in ('reauth_required', 'error')
     `;
+    const linqRequestsNeedingAttention = await this.database<{ id: string; updated_at: Date }[]>`
+      select job.id, job.updated_at
+      from jobs job
+      join people person on person.id = job.person_id
+        and person.status = 'registered'
+        and person.control_epoch = job.person_control_epoch
+      where job.person_id = ${personId}
+        and job.job_kind = 'orchestrate.linq_message'
+        and job.status = 'attention'
+        and not exists(
+          select 1 from jobs recovered
+          where recovered.person_id = job.person_id
+            and recovered.person_control_epoch = job.person_control_epoch
+            and recovered.conversation_id = job.conversation_id
+            and recovered.job_kind = job.job_kind
+            and recovered.status = 'succeeded'
+            and recovered.updated_at > job.updated_at
+        )
+      order by job.updated_at desc, job.id desc
+      limit 25
+    `;
     const items: HomeView["items"] = [
       ...loops.map((loop) => {
         const phase: NonNullable<HomeView["items"][number]["phase"]> =
@@ -223,6 +256,13 @@ export class PostgresFlorenceQueries {
           loop.content_ciphertext,
           loop.content_key_version,
         );
+        const acknowledgedHolderLabel = loop.acknowledged_by_person_id
+          ? decryptPersonName(
+              this.#secretBox,
+              loop.acknowledged_by_person_id,
+              loop.acknowledged_name_ciphertext,
+            )
+          : null;
         return {
           id: loop.id,
           kind: "coverage" as const,
@@ -230,7 +270,9 @@ export class PostgresFlorenceQueries {
           title: meaning ?? "Family coverage item",
           detail:
             phase === "confirmed"
-              ? "A person explicitly confirmed coverage."
+              ? acknowledgedHolderLabel && meaning
+                ? `Covered — ${acknowledgedHolderLabel} has ${meaning}.`
+                : "A person explicitly confirmed coverage."
               : phase === "awaiting"
                 ? "Florence is waiting for an explicit yes."
                 : loop.state === "at_risk"
@@ -264,6 +306,14 @@ export class PostgresFlorenceQueries {
         detail: `Private ${candidate.candidate_kind.replaceAll("_", " ")} awaiting your review.`,
         urgency: "routine" as const,
         href: "/sources",
+      })),
+      ...linqRequestsNeedingAttention.map((job) => ({
+        id: `linq-request-attention:${job.id}`,
+        kind: "request" as const,
+        title: "Florence needs you to retry a request",
+        detail: "Send that request again in your private Florence chat so I can finish it.",
+        urgency: "soon" as const,
+        changedAt: job.updated_at.toISOString(),
       })),
     ];
     if (Number(integrationsNeedingAttention[0]?.count ?? 0) > 0) {

@@ -33,16 +33,17 @@ Set each service's Config-as-Code path explicitly in **Settings → Build**. Rai
 `/railway.json`; the worker will not use `/railway.worker.json` automatically. Do not attach a volume to either
 application service. Their filesystems are scratch space and PostgreSQL is canonical.
 
-The existing production project already has all three service records. Do not create or replace PostgreSQL: its
-volume contains pre-rebuild data. Connect `florence-worker-v2` to the same `harianbarasu/florence` GitHub source
-as `api`, select `/railway.worker.json`, and add its missing data-keyring variables before its first deployment.
-Keep the current Railway domain for the first private smoke unless the Google and Linq callback registrations are
-changed in the same release.
+### Current production state
 
-Before the rebuild deploy, replace the `api` service's current `NODE_ENV=development` override with
-`NODE_ENV=production`, set `FLORENCE_POSTGRES_SCHEMA=florence_v4` on both services, and make their database,
-token-key, data-keyring, Linq, Google, and active-model values exact shared/reference variables. The existing
-worker values are not one coherent runtime contract and must not be deployed as-is.
+As verified on 2026-08-07, all three production services are live. `api` and `florence-worker-v2` deploy from
+the canonical `harianbarasu/florence` source, run with `NODE_ENV=production`, and share the same
+`FLORENCE_POSTGRES_SCHEMA=florence_v4` database and runtime contract. The worker uses
+`/railway.worker.json`; the API uses `/railway.json`. Do not create or replace PostgreSQL or reuse the legacy
+`florence` schema.
+
+The operational HTTPS origin is currently `https://florence-production-b9af.up.railway.app`. Keep Google OAuth,
+Linq webhooks, and `FLORENCE_WEB_BASE_URL` on that origin until `harianbarasu.com` has working public DNS and all
+three are changed together. Merely attaching a custom domain in Railway is not a completed DNS cutover.
 
 Both service configs run `node dist/ops/predeploy-production.js` as their only pre-deploy command. It fails
 before touching PostgreSQL unless `NODE_ENV=production`, TLS is required, the full runtime contract is valid,
@@ -146,10 +147,35 @@ docker build --tag florence:release .
 docker run --rm --entrypoint node florence:release --version
 ```
 
-### First rebuild cutover
+### Governed skill promotion
 
-Use this sequence for the first `florence_v4` deployment. It keeps the current API and legacy schema untouched
-until the replacement worker is healthy:
+Skill IDs and versions are immutable production identities. The worker registers a declaration's canonical
+definition digest over its purpose, instructions, input/output schemas, and capabilities. The exact seven-skill
+suite that predates this gate is the only bootstrap baseline. Bootstrap may create its first production release
+on an empty database, but it will never replace, restore, or reactivate release history.
+
+For any new skill or version, startup registers a `candidate` and then exits closed until an operator or an
+application-owned release workflow completes all of these in one auditable promotion:
+
+1. Create the named evaluation release with its real protected-suite digest and leave it `candidate`; attach it
+   to the candidate `skill_versions` row.
+2. Execute that suite and persist at least one exact, passed `evaluation_runs` row for both that skill-version ID
+   and evaluation-release ID. A release name or manually changed status is not evaluation evidence.
+3. In one transaction, mark the evaluation release `active`, mark the skill version `approved`, retire the prior
+   version, deactivate the prior production event, and insert the new active `skill_release_events` `promoted`
+   row referencing those exact IDs. Record the responsible person when an application identity exists.
+4. Restart the worker and confirm it remains live. It verifies the immutable definition digest, exact evaluation
+   release, active production event, and passed evaluation again before every run.
+
+Never edit a definition under an existing ID/version, overwrite a stored definition digest, or edit the frozen
+bootstrap digest map. Create a new version and use the evaluated promotion path. There is intentionally no
+general-purpose skill administration UI in the first release.
+
+### Rebuild cutover recovery reference
+
+The first `florence_v4` cutover is complete. Preserve this sequence only for disaster recovery or a deliberate
+rebuild into a new schema; it keeps the current API and legacy schema untouched until a replacement worker is
+healthy:
 
 1. Take and verify a Railway PostgreSQL backup. Do not delete, rename, reset, or restore over the existing
    database service or legacy `florence` schema.

@@ -54,6 +54,7 @@ export interface ClaimedSubmittedEffect<Payload = unknown> extends ClaimedEffect
   readonly providerReceiptId: string | null;
   readonly submittedAt: Date;
   readonly reconciliationAttemptCount: number;
+  readonly lastErrorCode: string | null;
 }
 
 interface OutboxRow {
@@ -351,14 +352,16 @@ export class EffectOutbox {
       const claimed: ClaimedSubmittedEffect[] = [];
       for (const candidate of candidates) {
         const leaseToken = randomUUID();
-        const rows = await transaction<(OutboxRow & { reconciliation_attempt_count: number })[]>`
+        const rows = await transaction<
+          (OutboxRow & { reconciliation_attempt_count: number; last_error_code: string | null })[]
+        >`
           update outbox set lease_owner = ${workerId}, lease_token = ${leaseToken},
             lease_expires_at = ${leaseUntil},
             reconciliation_attempt_count = reconciliation_attempt_count + 1, updated_at = ${now}
           where id = ${candidate.id} and status = 'submitted'
             and (lease_token is null or lease_expires_at <= ${now})
           returning id, effect_kind, idempotency_key, payload_ciphertext, attempt_count,
-            lease_token, reconciliation_attempt_count
+            lease_token, reconciliation_attempt_count, last_error_code
         `;
         const row = rows[0];
         if (!row) continue;
@@ -384,6 +387,7 @@ export class EffectOutbox {
           providerReceiptId: firstReceipt?.provider_receipt_id ?? null,
           submittedAt: firstReceipt?.submitted_at ?? now,
           reconciliationAttemptCount: row.reconciliation_attempt_count,
+          lastErrorCode: row.last_error_code,
         });
       }
       return claimed;
@@ -537,9 +541,16 @@ export class EffectOutbox {
     providerReceiptId?: string;
     receipt: unknown;
     errorCode?: string;
+    nextAttemptAt?: Date;
     now?: Date;
   }): Promise<boolean> {
     const now = input.now ?? new Date();
+    if (input.nextAttemptAt && input.nextAttemptAt <= now) {
+      throw new Error("A receipt reconciliation time must be in the future");
+    }
+    if (input.nextAttemptAt && input.status !== "submitted" && input.status !== "failed") {
+      throw new Error("Only unresolved or provisionally failed delivery can be rechecked");
+    }
     const receiptJson = canonicalJson(input.receipt);
     const receiptDigest = sha256Hex(receiptJson);
     const encrypted = this.secretBox.encrypt(receiptJson, "effect-receipt");
@@ -559,11 +570,12 @@ export class EffectOutbox {
           ${randomUUID()}, ${input.effect.outboxId}, ${input.effect.idempotencyKey},
           ${input.providerReceiptId ?? null}, ${input.status}, ${receiptDigest},
           ${Buffer.from(JSON.stringify(encrypted), "utf8")}, ${encrypted.kid}, ${now},
-          ${input.status === "submitted" ? null : now}, ${input.errorCode ?? null}
+          ${input.status === "submitted" || input.nextAttemptAt ? null : now}, ${input.errorCode ?? null}
         ) on conflict do nothing
       `;
-      const terminal =
-        input.status === "confirmed"
+      const terminal = input.nextAttemptAt
+        ? "submitted"
+        : input.status === "confirmed"
           ? "confirmed"
           : input.status === "failed"
             ? "dead"
@@ -573,7 +585,7 @@ export class EffectOutbox {
       await transaction`
         update outbox set status = ${terminal}, lease_owner = null, lease_token = null,
           lease_expires_at = null,
-          available_at = ${input.status === "submitted" ? new Date(now.getTime() + 60_000) : now},
+          available_at = ${input.nextAttemptAt ?? (input.status === "submitted" ? new Date(now.getTime() + 60_000) : now)},
           last_error_code = ${input.errorCode ?? null}, updated_at = ${now}
         where id = ${input.effect.outboxId}
       `;
@@ -625,7 +637,7 @@ export class EffectOutbox {
           ${randomUUID()}, ${input.effect.outboxId}, ${input.effect.idempotencyKey},
           ${input.providerReceiptId ?? null}, ${input.status}, ${receiptDigest},
           ${Buffer.from(JSON.stringify(encrypted), "utf8")}, ${encrypted.kid}, ${now},
-          ${input.status === "submitted" ? null : now}, ${input.errorCode ?? null}
+          ${input.status === "submitted" || input.nextAttemptAt ? null : now}, ${input.errorCode ?? null}
         ) on conflict do nothing
       `;
       const terminal = input.nextAttemptAt

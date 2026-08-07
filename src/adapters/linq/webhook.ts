@@ -5,8 +5,10 @@ import { LinqWebhookError } from "./errors.js";
 import {
   providerLinkPartSchema,
   providerMediaPartSchema,
+  providerMessageDeliveredSchema,
   providerMessageEditedSchema,
   providerMessageFailedSchema,
+  providerMessageReadSchema,
   providerMessageReceivedSchema,
   providerMessageSentSchema,
   providerParticipantChangedSchema,
@@ -341,6 +343,38 @@ export function unwrapLinqWebhook(input: UnwrapLinqWebhookInput): LinqWebhookEnv
           providerMessageId: data.id,
           sender: normalizeParticipant(data.sender_handle),
           sentAt,
+          ...(data.idempotency_key ? { idempotencyKey: data.idempotency_key } : {}),
+        },
+      };
+    }
+    case "message.delivered": {
+      const data = parseData(providerMessageDeliveredSchema, base.data);
+      const deliveredAt = toIsoTimestamp(data.delivered_at, "message delivered_at");
+      return {
+        ...common,
+        eventType: "linq.outbound.delivered",
+        occurredAt: deliveredAt,
+        channel: normalizeWebhookChannel(data.chat.id, data.chat.is_group),
+        receipt: {
+          providerMessageId: data.id,
+          sender: normalizeParticipant(data.sender_handle),
+          deliveredAt,
+          ...(data.idempotency_key ? { idempotencyKey: data.idempotency_key } : {}),
+        },
+      };
+    }
+    case "message.read": {
+      const data = parseData(providerMessageReadSchema, base.data);
+      const readAt = toIsoTimestamp(data.read_at, "message read_at");
+      return {
+        ...common,
+        eventType: "linq.outbound.read",
+        occurredAt: readAt,
+        channel: normalizeWebhookChannel(data.chat.id, data.chat.is_group),
+        receipt: {
+          providerMessageId: data.id,
+          sender: normalizeParticipant(data.sender_handle),
+          readAt,
           ...(data.idempotency_key ? { idempotencyKey: data.idempotency_key } : {}),
         },
       };

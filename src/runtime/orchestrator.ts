@@ -21,7 +21,11 @@ import {
 } from "../modules/conversations/index.js";
 import { type CoverageLoop, PostgresCoordination } from "../modules/coordination/index.js";
 import { EffectOutbox } from "../modules/effects/index.js";
-import type { WorkerRuntime } from "../modules/orchestration/contracts.js";
+import {
+  requireWorkerProposal,
+  WorkerAttemptError,
+} from "../modules/orchestration/bounded-worker-runtime.js";
+import type { WorkerResult, WorkerRuntime } from "../modules/orchestration/contracts.js";
 import { GENERAL_ANSWER_SKILL, PRODUCT_SKILLS } from "../modules/orchestration/skills.js";
 import {
   type AuthorizedHouseholdContextProjection,
@@ -34,7 +38,7 @@ import {
   type SourceScope,
 } from "../modules/sources/index.js";
 import type { SecretBox } from "../shared/crypto.js";
-import { NotFoundError, StaleAuthorityError, UnauthorizedError } from "../shared/errors.js";
+import { ConflictError, NotFoundError, StaleAuthorityError, UnauthorizedError } from "../shared/errors.js";
 
 type Transaction = TransactionSql<Record<string, never>>;
 
@@ -137,6 +141,15 @@ export class FlorenceOrchestrator {
     });
   }
 
+  private async requireProposal<Output>(result: WorkerResult<Output>): Promise<Output> {
+    try {
+      return requireWorkerProposal(result);
+    } catch (error) {
+      await this.workers.reconcile(result.attemptId, "rejected");
+      throw error;
+    }
+  }
+
   public async processLinqMessage(internalProviderEventId: string): Promise<string> {
     const context = await this.compileLinqContext(internalProviderEventId).catch((error: unknown) => {
       if (
@@ -202,33 +215,36 @@ export class FlorenceOrchestrator {
       deadline: new Date(Date.now() + 45_000),
       budget: { maxModelCalls: 1, maxOutputTokens: 1_500 },
     });
-    if (need.status !== "proposed" || !need.proposal) {
-      await this.workers.reconcile(need.attemptId, "rejected");
-      return "interpretation_failed";
-    }
+    const needProposal = await this.requireProposal(need);
 
-    if (need.proposal.disposition === "propose_coverage") {
-      const provisionalDisposition = await this.resolveProvisionalCoverage(
-        context,
-        need.proposal,
-        currentCoverage,
-        replyTargetLoopId,
-        householdContext,
-      );
-      const changedFactDisposition = provisionalDisposition
-        ? null
-        : await this.applyChangedFactToCurrentLoop(context, need.proposal, currentCoverage);
-      const disposition =
-        provisionalDisposition ??
-        changedFactDisposition ??
-        (await this.proposeCoverage(context, need.proposal, householdContext));
+    if (needProposal.disposition === "propose_coverage") {
+      let disposition: string;
+      try {
+        const provisionalDisposition = await this.resolveProvisionalCoverage(
+          context,
+          needProposal,
+          currentCoverage,
+          replyTargetLoopId,
+          householdContext,
+        );
+        const changedFactDisposition = provisionalDisposition
+          ? null
+          : await this.applyChangedFactToCurrentLoop(context, needProposal, currentCoverage);
+        disposition =
+          provisionalDisposition ??
+          changedFactDisposition ??
+          (await this.proposeCoverage(context, needProposal, householdContext));
+      } catch (error) {
+        await this.workers.reconcile(need.attemptId, "rejected");
+        throw error;
+      }
       await this.workers.reconcile(
         need.attemptId,
         disposition.includes("failed") ? "rejected" : disposition.includes("stale") ? "stale" : "accepted",
       );
       return disposition;
     }
-    if (need.proposal.disposition === "private_review") {
+    if (needProposal.disposition === "private_review") {
       if (!context.record.routing.senderPersonId) return "private_review_without_owner";
       if (context.record.routing.chatKind !== "direct") {
         await this.workers.reconcile(need.attemptId, "accepted");
@@ -241,9 +257,9 @@ export class FlorenceOrchestrator {
         expectedIntegrationControlEpoch: null,
         candidateKind: "family_message_review",
         content: jsonObject({
-          requiredOutcome: need.proposal.requiredOutcome,
-          changedFact: need.proposal.changedFact,
-          uncertainties: need.proposal.uncertainties,
+          requiredOutcome: needProposal.requiredOutcome,
+          changedFact: needProposal.changedFact,
+          uncertainties: needProposal.uncertainties,
         }),
         evidenceSourceRevisionIds: [...context.evidenceSourceRevisionIds],
         confidence: 0.65,
@@ -344,11 +360,7 @@ export class FlorenceOrchestrator {
       deadline: new Date(Date.now() + 45_000),
       budget: { maxModelCalls: 1, maxOutputTokens: 1_500 },
     });
-    if (answer.status !== "proposed" || !answer.proposal) {
-      await this.workers.reconcile(answer.attemptId, "rejected");
-      return "private_invocation_answer_failed";
-    }
-    const proposal = answer.proposal;
+    const proposal = await this.requireProposal(answer);
     const text = proposal.uncertainty ? `${proposal.answer}\n\n${proposal.uncertainty}` : proposal.answer;
     try {
       const receipt = await this.mutationProcessor.process({
@@ -452,13 +464,8 @@ export class FlorenceOrchestrator {
       deadline: new Date(Date.now() + 60_000),
       budget: { maxModelCalls: 1, maxOutputTokens: 1_800 },
     });
-    if (interpretation.status !== "proposed" || !interpretation.proposal) {
-      await this.workers.reconcile(interpretation.attemptId, "rejected");
-      throw new Error(
-        `Private source reconciliation did not complete: ${interpretation.errorCode ?? interpretation.status}`,
-      );
-    }
-    if (!citationsBelongToFrontier(interpretation.proposal.evidence, compiled.evidence)) {
+    const interpretationProposal = await this.requireProposal(interpretation);
+    if (!citationsBelongToFrontier(interpretationProposal.evidence, compiled.evidence)) {
       await this.workers.reconcile(interpretation.attemptId, "rejected");
       throw new Error("Private source reconciliation cited evidence outside its compiled frontier");
     }
@@ -471,7 +478,7 @@ export class FlorenceOrchestrator {
           workerAttemptId: interpretation.attemptId,
           anchorSourceRevisionId: compiled.anchorSourceRevisionId,
           expectedFrontierDigest: compiled.frontierDigest,
-          decision: interpretation.proposal,
+          decision: interpretationProposal,
         },
       });
     } catch (error) {
@@ -543,35 +550,31 @@ export class FlorenceOrchestrator {
 
     let status = await this.loadPrivateBridgeIntentStatus(standingIntent);
     if (status === "proposed") {
-      let proposalDisposition: string | null = null;
       try {
-        proposalDisposition = await this.proposePrivateBridge(standingIntent);
+        await this.proposePrivateBridge(standingIntent);
       } catch (error) {
-        // A model/provider failure must not strand the candidate behind a
-        // half-created standing intent. If a concurrent worker already moved
-        // the intent forward, inspect that durable state instead.
-        const cancelled = await bridge.cancelPendingProposal(standingIntent);
+        // A concurrent worker may already have moved this exact intent
+        // forward. Inspect durable state before deciding how to settle it.
         status = await this.loadPrivateBridgeIntentStatus(standingIntent);
-        if (cancelled || !status) return "fallback_to_private_review";
-        if (["cancelled", "expired", "failed", "ambiguous"].includes(status)) {
-          return "fallback_to_private_review";
+        if (["approved", "executing", "succeeded"].includes(status ?? "")) {
+          // Continue with the durable winner below.
+        } else {
+          // Transient worker/model failures belong to the enclosing durable
+          // job. Keep the prepared intent valid so that retry resumes the same
+          // action instead of asking its owner to review it again.
+          if (error instanceof WorkerAttemptError) throw error;
+          if (!isDeterministicStandingProposalFailure(error)) throw error;
+
+          const cancelled = await bridge.cancelPendingProposal(standingIntent);
+          status = await this.loadPrivateBridgeIntentStatus(standingIntent);
+          if (cancelled || !status) return "fallback_to_private_review";
+          if (["cancelled", "expired", "failed", "ambiguous"].includes(status)) {
+            return "fallback_to_private_review";
+          }
+          if (!["approved", "executing", "succeeded"].includes(status)) throw error;
         }
-        if (!["approved", "executing", "succeeded"].includes(status)) throw error;
       }
-      if (
-        proposalDisposition === "private_bridge_minimum_disclosure_failed" ||
-        proposalDisposition === "private_bridge_commitment_failed"
-      ) {
-        // A legacy queued proposal worker may have won the race while this
-        // attempt failed. Prefer its durable approval/commit over emitting a
-        // duplicate private notice.
-        status = await this.loadPrivateBridgeIntentStatus(standingIntent);
-        if (!status || !["approved", "executing", "succeeded"].includes(status)) {
-          return "fallback_to_private_review";
-        }
-      } else {
-        status = await this.loadPrivateBridgeIntentStatus(standingIntent);
-      }
+      status = await this.loadPrivateBridgeIntentStatus(standingIntent);
     }
 
     if (status === "succeeded") return "applied";
@@ -622,11 +625,7 @@ export class FlorenceOrchestrator {
       deadline: new Date(Date.now() + 45_000),
       budget: { maxModelCalls: 1, maxOutputTokens: 1_000 },
     });
-    if (minimum.status !== "proposed" || !minimum.proposal) {
-      await this.workers.reconcile(minimum.attemptId, "rejected");
-      await bridge.cancelPendingProposal(actionIntentId);
-      return "private_bridge_minimum_disclosure_failed";
-    }
+    const minimumProposal = await this.requireProposal(minimum);
     const commitment = await this.workers.run({
       attemptId: randomUUID(),
       taskVersionId: randomUUID(),
@@ -637,7 +636,7 @@ export class FlorenceOrchestrator {
         `Current participant person IDs: ${context.currentParticipantPersonIds.join(", ")}`,
         `Current participant label-to-person-ID map: ${JSON.stringify(participantLabels)}`,
         `Exact source revision IDs: ${context.evidenceSourceRevisionIds.join(", ")}`,
-        `Approved-for-review minimum meaning proposal: ${minimum.proposal.minimumMeaning}`,
+        `Approved-for-review minimum meaning proposal: ${minimumProposal.minimumMeaning}`,
         `Private derived candidate: ${JSON.stringify(context.candidate)}`,
         "Do not treat any person as committed. Propose only the open coverage outcome and timing.",
       ].join("\n"),
@@ -645,19 +644,20 @@ export class FlorenceOrchestrator {
       deadline: new Date(Date.now() + 45_000),
       budget: { maxModelCalls: 1, maxOutputTokens: 1_200 },
     });
-    if (commitment.status !== "proposed" || !commitment.proposal) {
+    let commitmentProposal: (typeof PRODUCT_SKILLS.commitmentPropose.outputSchema)["_output"];
+    try {
+      commitmentProposal = await this.requireProposal(commitment);
+    } catch (error) {
       await this.workers.reconcile(minimum.attemptId, "rejected");
-      await this.workers.reconcile(commitment.attemptId, "rejected");
-      await bridge.cancelPendingProposal(actionIntentId);
-      return "private_bridge_commitment_failed";
+      throw error;
     }
     try {
       const receipt = await this.mutationProcessor.process({
         kind: "private_bridge.proposal",
         proposal: {
           actionIntentId,
-          minimumDisclosure: minimum.proposal,
-          commitment: commitment.proposal,
+          minimumDisclosure: minimumProposal,
+          commitment: commitmentProposal,
         },
       });
       await this.workers.reconcile(minimum.attemptId, "accepted");
@@ -666,7 +666,9 @@ export class FlorenceOrchestrator {
     } catch (error) {
       await this.workers.reconcile(minimum.attemptId, "stale");
       await this.workers.reconcile(commitment.attemptId, "stale");
-      await bridge.cancelPendingProposal(actionIntentId);
+      if (isDeterministicStandingProposalFailure(error)) {
+        await bridge.cancelPendingProposal(actionIntentId);
+      }
       throw error;
     }
   }
@@ -971,10 +973,6 @@ export class FlorenceOrchestrator {
         and effect.participant_epoch_id = ${context.record.routing.participantEpochId}
         and effect.expected_participant_digest = ${context.record.routing.appParticipantDigest}
         and effect.coverage_loop_id is not null
-        and not exists(
-          select 1 from effect_receipts terminal
-          where terminal.outbox_id = effect.id and terminal.status in ('failed', 'ambiguous')
-        )
       order by effect.coverage_loop_id
       limit 2
     `;
@@ -1069,11 +1067,7 @@ export class FlorenceOrchestrator {
         budget: { maxModelCalls: 1, maxOutputTokens: 600 },
       });
       responseAttemptId = interpreted.attemptId;
-      if (interpreted.status !== "proposed" || !interpreted.proposal) {
-        await this.workers.reconcile(interpreted.attemptId, "rejected");
-        return null;
-      }
-      const proposal = interpreted.proposal;
+      const proposal = await this.requireProposal(interpreted);
       if (proposal.disposition === "not_response") {
         await this.workers.reconcile(interpreted.attemptId, "accepted");
         return null;
@@ -1243,11 +1237,7 @@ export class FlorenceOrchestrator {
       deadline: new Date(Date.now() + 45_000),
       budget: { maxModelCalls: 1, maxOutputTokens: 1_200 },
     });
-    if (commitment.status !== "proposed" || !commitment.proposal) {
-      await this.workers.reconcile(commitment.attemptId, "rejected");
-      return "coverage_fact_resolution_failed";
-    }
-    const proposal = commitment.proposal;
+    const proposal = await this.requireProposal(commitment);
     const proposedPersonId =
       proposal.proposedPersonId && currentPeople.includes(proposal.proposedPersonId)
         ? proposal.proposedPersonId
@@ -1371,14 +1361,11 @@ export class FlorenceOrchestrator {
       deadline: new Date(Date.now() + 45_000),
       budget: { maxModelCalls: 1, maxOutputTokens: 1_000 },
     });
-    if (assessment.status !== "proposed" || !assessment.proposal) {
-      await this.workers.reconcile(assessment.attemptId, "rejected");
-      return "coverage_change_assessment_failed";
-    }
+    const assessmentProposal = await this.requireProposal(assessment);
     const reopen =
-      assessment.proposal.reopenRecommended &&
+      assessmentProposal.reopenRecommended &&
       ["contradicted", "corrected", "missed", "expired", "superseded"].includes(
-        assessment.proposal.proposedOutcome,
+        assessmentProposal.proposedOutcome,
       );
     if (!reopen) {
       await this.workers.reconcile(assessment.attemptId, "accepted");
@@ -1540,11 +1527,7 @@ export class FlorenceOrchestrator {
       deadline: new Date(Date.now() + 45_000),
       budget: { maxModelCalls: 1, maxOutputTokens: 1_500 },
     });
-    if (commitment.status !== "proposed" || !commitment.proposal) {
-      await this.workers.reconcile(commitment.attemptId, "rejected");
-      return "commitment_failed";
-    }
-    const proposal = commitment.proposal;
+    const proposal = await this.requireProposal(commitment);
     const proposedPersonId =
       proposal.proposedPersonId && currentPeople.includes(proposal.proposedPersonId)
         ? proposal.proposedPersonId
@@ -1598,11 +1581,7 @@ export class FlorenceOrchestrator {
       deadline: new Date(Date.now() + 45_000),
       budget: { maxModelCalls: 1, maxOutputTokens: 1_500 },
     });
-    if (answer.status !== "proposed" || !answer.proposal) {
-      await this.workers.reconcile(answer.attemptId, "rejected");
-      return "general_answer_failed";
-    }
-    const proposal = answer.proposal;
+    const proposal = await this.requireProposal(answer);
     await this.database.begin(async (transaction) => {
       const latest = await new PostgresConversationAuthority(transaction).snapshot(
         context.record.routing.conversationId,
@@ -1621,6 +1600,15 @@ export class FlorenceOrchestrator {
     await this.workers.reconcile(answer.attemptId, "accepted");
     return "general_answer_queued";
   }
+}
+
+export function isDeterministicStandingProposalFailure(error: unknown): boolean {
+  return (
+    error instanceof StaleAuthorityError ||
+    error instanceof UnauthorizedError ||
+    error instanceof NotFoundError ||
+    error instanceof ConflictError
+  );
 }
 
 async function queueConversationEffect(input: {

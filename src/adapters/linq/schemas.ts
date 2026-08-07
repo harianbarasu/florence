@@ -61,6 +61,14 @@ export const providerMessageSentSchema = providerCurrentMessageSchema.extend({
   direction: z.literal("outbound"),
 });
 
+export const providerMessageDeliveredSchema = providerMessageSentSchema.extend({
+  delivered_at: z.string().min(1),
+});
+
+export const providerMessageReadSchema = providerMessageDeliveredSchema.extend({
+  read_at: z.string().min(1),
+});
+
 export const providerMessageEditedSchema = z.object({
   chat: providerChatContextSchema,
   id: z.string().min(1),
@@ -157,6 +165,7 @@ export const providerMessageDeliverySchema = z.object({
   created_at: z.string().min(1),
   updated_at: z.string().min(1),
   delivery_status: z.enum(["pending", "queued", "sent", "delivered", "received", "read", "failed"]),
+  service: providerServiceSchema,
   is_from_me: z.literal(true),
 });
 

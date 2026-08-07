@@ -21,6 +21,7 @@ describe("Linq submitted-message reconciliation", () => {
           created_at: "2026-08-06T12:00:00Z",
           updated_at: "2026-08-06T12:05:00Z",
           delivery_status: "delivered",
+          service: "iMessage",
           is_from_me: true,
         }),
         { status: 200, headers: { "content-type": "application/json" } },
@@ -62,6 +63,7 @@ describe("Linq submitted-message reconciliation", () => {
       providerReceiptId: messageId,
       submittedAt: new Date("2026-08-06T12:00:00Z"),
       reconciliationAttemptCount: 1,
+      lastErrorCode: null,
     };
 
     await executor.reconcile(effect, fixedNow);
@@ -75,6 +77,142 @@ describe("Linq submitted-message reconciliation", () => {
         effect,
         status: "confirmed",
         providerReceiptId: messageId,
+        now: fixedNow,
+      }),
+    );
+  });
+
+  it("keeps an iMessage sent receipt provisional until delivery", async () => {
+    const fetchSpy = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      expect(init?.method).toBe("GET");
+      return new Response(
+        JSON.stringify({
+          id: messageId,
+          chat_id: chatId,
+          created_at: "2026-08-06T12:00:00Z",
+          updated_at: "2026-08-06T12:05:00Z",
+          delivery_status: "sent",
+          service: "iMessage",
+          is_from_me: true,
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    });
+    const linq = new LinqClient(
+      {
+        apiKey: "not-a-real-key",
+        baseUrl: "https://linq.test/api/partner/v3",
+        phoneNumber: "+16462350806",
+        webhookSecret: `whsec_${Buffer.alloc(32, 1).toString("base64")}`,
+        requestTimeoutMs: 5_000,
+        maxAttachmentBytes: 1_024,
+        maxWebhookBytes: 1_024,
+      },
+      { fetch: fetchSpy as typeof fetch, now: () => fixedNow },
+    );
+    const recordReconciliation = vi.fn(async () => true);
+    const executor = new LinqMessageEffectExecutor(linq, {
+      reauthorizeForSubmission: vi.fn(async () => true),
+      recordReceipt: vi.fn(async () => true),
+      recordReconciliation,
+      retry: vi.fn(async () => "retry" as const),
+    } as unknown as Pick<
+      EffectOutbox,
+      "reauthorizeForSubmission" | "recordReceipt" | "recordReconciliation" | "retry"
+    >);
+    const effect: ClaimedSubmittedEffect = {
+      outboxId: "550e8400-e29b-41d4-a716-446655440032",
+      effectKind: "linq.message",
+      idempotencyKey: "coverage-loop-sent",
+      payload: {
+        providerChatId: chatId,
+        expectedProviderParticipantDigest: `linq-v1:${"a".repeat(64)}`,
+        text: "Can anyone cover pickup?",
+      },
+      attemptCount: 1,
+      leaseToken: "550e8400-e29b-41d4-a716-446655440042",
+      providerReceiptId: messageId,
+      submittedAt: new Date("2026-08-06T12:00:00Z"),
+      reconciliationAttemptCount: 1,
+      lastErrorCode: null,
+    };
+
+    await executor.reconcile(effect, fixedNow);
+
+    expect(recordReconciliation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        effect,
+        status: "submitted",
+        providerReceiptId: messageId,
+        nextAttemptAt: expect.any(Date),
+        now: fixedNow,
+      }),
+    );
+  });
+
+  it("makes an exhausted provider failure ambiguous without resending", async () => {
+    const fetchSpy = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      expect(init?.method).toBe("GET");
+      return new Response(
+        JSON.stringify({
+          id: messageId,
+          chat_id: chatId,
+          created_at: "2026-08-06T11:00:00Z",
+          updated_at: "2026-08-06T12:05:00Z",
+          delivery_status: "failed",
+          service: "iMessage",
+          is_from_me: true,
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    });
+    const linq = new LinqClient(
+      {
+        apiKey: "not-a-real-key",
+        baseUrl: "https://linq.test/api/partner/v3",
+        phoneNumber: "+16462350806",
+        webhookSecret: `whsec_${Buffer.alloc(32, 1).toString("base64")}`,
+        requestTimeoutMs: 5_000,
+        maxAttachmentBytes: 1_024,
+        maxWebhookBytes: 1_024,
+      },
+      { fetch: fetchSpy as typeof fetch, now: () => fixedNow },
+    );
+    const recordReconciliation = vi.fn(async () => true);
+    const executor = new LinqMessageEffectExecutor(linq, {
+      reauthorizeForSubmission: vi.fn(async () => true),
+      recordReceipt: vi.fn(async () => true),
+      recordReconciliation,
+      retry: vi.fn(async () => "retry" as const),
+    } as unknown as Pick<
+      EffectOutbox,
+      "reauthorizeForSubmission" | "recordReceipt" | "recordReconciliation" | "retry"
+    >);
+    const effect: ClaimedSubmittedEffect = {
+      outboxId: "550e8400-e29b-41d4-a716-446655440031",
+      effectKind: "linq.message",
+      idempotencyKey: "coverage-loop-2",
+      payload: {
+        providerChatId: chatId,
+        expectedProviderParticipantDigest: `linq-v1:${"a".repeat(64)}`,
+        text: "Can anyone cover pickup?",
+      },
+      attemptCount: 1,
+      leaseToken: "550e8400-e29b-41d4-a716-446655440041",
+      providerReceiptId: messageId,
+      submittedAt: new Date("2026-08-06T11:00:00Z"),
+      reconciliationAttemptCount: 8,
+      lastErrorCode: "linq_delivery_may_arrive_late",
+    };
+
+    await executor.reconcile(effect, fixedNow);
+
+    expect(fetchSpy).toHaveBeenCalledOnce();
+    expect(recordReconciliation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        effect,
+        status: "ambiguous",
+        errorCode: "linq_delivery_failure_ambiguous",
         now: fixedNow,
       }),
     );

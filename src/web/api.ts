@@ -106,7 +106,7 @@ export interface HomeView {
 
 export interface ExceptionItem {
   id: string;
-  kind: "coverage" | "approval" | "private_review" | "connection" | "privacy";
+  kind: "coverage" | "approval" | "private_review" | "connection" | "privacy" | "request";
   phase?: "open" | "awaiting" | "confirmed";
   title: string;
   detail: string;

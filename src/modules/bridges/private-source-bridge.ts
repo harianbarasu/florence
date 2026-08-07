@@ -724,6 +724,134 @@ export class PrivateSourceBridge {
   }
 
   /**
+   * Revokes bridge work whose exact person, household, or conversation authority
+   * no longer exists. The private candidate deliberately remains pending so its
+   * owner can retry against the new destination epoch and approve that new action.
+   */
+  public async cancelStaleAuthorityIntents(cancelledAt = new Date(), limit = 100): Promise<number> {
+    const boundedLimit = Math.max(1, Math.min(limit, 500));
+    return inTransaction(this.database, async (transaction) => {
+      const stale = await transaction<
+        {
+          readonly id: string;
+          readonly person_id: string;
+          readonly household_id: string;
+          readonly conversation_id: string;
+        }[]
+      >`
+        select intent.id, intent.person_id, intent.household_id, intent.conversation_id
+        from action_intents intent
+        where intent.action_kind = 'private_source_to_coverage_loop'
+          and intent.status in ('proposed', 'awaiting_approval', 'approved', 'executing')
+          and (
+            not exists (
+              select 1 from people person
+              where person.id = intent.person_id and person.status = 'registered'
+                and person.control_epoch = intent.person_control_epoch
+            )
+            or not exists (
+              select 1 from households household
+              where household.id = intent.household_id
+                and household.status in ('onboarding', 'active', 'paused')
+                and household.control_epoch = intent.household_control_epoch
+            )
+            or not exists (
+              select 1
+              from conversations conversation
+              join participant_epochs epoch on epoch.id = conversation.current_epoch_id
+              where conversation.id = intent.conversation_id
+                and conversation.status not in ('deletion_fenced', 'deleted')
+                and conversation.authority_version = intent.conversation_authority_version
+                and conversation.current_epoch_id = intent.participant_epoch_id
+                and epoch.ended_at is null
+            )
+          )
+        order by intent.updated_at, intent.id
+        for update of intent skip locked
+        limit ${boundedLimit}
+      `;
+      if (stale.length === 0) return 0;
+
+      const intentIds = stale.map((intent) => intent.id);
+      await transaction`
+        update action_approvals
+        set revoked_at = coalesce(revoked_at, ${cancelledAt})
+        where action_intent_id = any(${transaction.array(intentIds)}::uuid[])
+      `;
+
+      const rules = await transaction<{ readonly id: string; readonly current_revision_id: string }[]>`
+        select rule.id, rule.current_revision_id
+        from bridge_rules rule
+        join bridge_rule_revisions revision on revision.id = rule.current_revision_id
+        where rule.status = 'active'
+          and revision.minimum_meaning_schema->>'createdFromActionIntentId'
+            = any(${transaction.array(intentIds)}::text[])
+        for update of rule
+      `;
+      if (rules.length > 0) {
+        const ruleIds = rules.map((rule) => rule.id);
+        const revisionIds = rules.map((rule) => rule.current_revision_id);
+        await transaction`
+          update bridge_rules
+          set status = 'revoked', version = version + 1, updated_at = ${cancelledAt}
+          where id = any(${transaction.array(ruleIds)}::uuid[]) and status = 'active'
+        `;
+        await transaction`
+          update bridge_rule_revisions
+          set ended_at = coalesce(ended_at, ${cancelledAt})
+          where id = any(${transaction.array(revisionIds)}::uuid[])
+        `;
+      }
+
+      await transaction`
+        update disclosure_decisions decision
+        set revoked_at = coalesce(decision.revoked_at, ${cancelledAt})
+        from outbox effect
+        where effect.action_intent_id = any(${transaction.array(intentIds)}::uuid[])
+          and effect.authorization_decision_id = decision.id
+          and effect.status in ('pending', 'retry', 'leased')
+      `;
+      await transaction`
+        update outbox
+        set status = 'cancelled', lease_owner = null, lease_token = null,
+          lease_expires_at = null, last_error_code = 'private_bridge_authority_changed',
+          updated_at = ${cancelledAt}
+        where action_intent_id = any(${transaction.array(intentIds)}::uuid[])
+          and status in ('pending', 'retry', 'leased')
+      `;
+      await transaction`
+        update jobs
+        set status = 'cancelled', lease_owner = null, lease_token = null,
+          lease_expires_at = null, last_error_code = 'private_bridge_authority_changed',
+          updated_at = ${cancelledAt}
+        where idempotency_key = any(${transaction.array(
+          intentIds.flatMap((id) => [`private-bridge:proposal:${id}`, `private-bridge:commit:${id}`]),
+        )}::text[])
+          and status in ('pending', 'retry', 'leased')
+      `;
+      await transaction`
+        update action_intents
+        set status = 'cancelled', updated_at = ${cancelledAt}
+        where id = any(${transaction.array(intentIds)}::uuid[])
+          and status in ('proposed', 'awaiting_approval', 'approved', 'executing')
+      `;
+
+      for (const intent of stale) {
+        await appendBridgeAudit(transaction, {
+          personId: intent.person_id,
+          householdId: intent.household_id,
+          conversationId: intent.conversation_id,
+          targetId: intent.id,
+          eventType: "private_source_disclosure_cancelled_stale",
+          reasons: ["authority_fence_changed", "fresh_owner_approval_required"],
+          manifest: { rawContentDisclosed: false, retryRequiresCurrentAuthority: true },
+        });
+      }
+      return stale.length;
+    });
+  }
+
+  /**
    * Withdraws only bridge work whose encrypted payload is bound to this exact
    * candidate and content digest. Construct this bridge with the caller's
    * transaction to make withdrawal atomic with candidate replacement.

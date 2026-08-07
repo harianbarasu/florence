@@ -101,6 +101,26 @@ interface CandidateLoopRow {
   readonly reliance_authorized: boolean;
 }
 
+type CoverageReplyRequestKind =
+  | "coverage_opening"
+  | "coverage_notification"
+  | "coverage_steward_escalation"
+  | "coverage_response_clarification"
+  | "coverage_coordination"
+  | "coverage_state_change";
+
+interface ProvenReplyTargetRow {
+  readonly coverage_loop_id: string;
+  readonly coverage_loop_version: number | string;
+  readonly request_kind: string | null;
+}
+
+interface ProvenReplyTarget {
+  readonly loopId: string;
+  readonly loopVersion: number;
+  readonly requestKind: CoverageReplyRequestKind;
+}
+
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const MIN_EFFECT_LIFETIME_MS = 3 * 60_000;
 const MAX_EFFECT_LIFETIME_MS = 24 * 60 * 60_000;
@@ -681,17 +701,17 @@ export class CoverageCoordinator {
       };
     }
 
-    const replyTargetId = await this.loadProvenReplyTarget(transaction, source);
-    const candidates = replyTargetId
-      ? await this.loadExactTarget(transaction, source, proposal.response, replyTargetId)
+    const replyTarget = await this.loadProvenReplyTarget(transaction, source);
+    const candidates = replyTarget
+      ? await this.loadExactTarget(transaction, source, proposal.response, replyTarget)
       : source.event.message.replyTo
         ? []
         : await this.loadUniqueEligibleTargets(transaction, source, proposal.response);
     if (proposal.response === "ambiguous" || candidates.length !== 1) {
-      return this.queueClarification(transaction, source, candidates, replyTargetId);
+      return this.queueClarification(transaction, source, candidates, replyTarget?.loopId ?? null);
     }
     const target = candidates[0];
-    if (!target) return this.queueClarification(transaction, source, [], replyTargetId);
+    if (!target) return this.queueClarification(transaction, source, [], replyTarget?.loopId ?? null);
     const coordination = new PostgresCoordination(transaction, this.secretBox);
     let loop = await coordination.loadForUpdate(target.loop.loopId);
     if (!loop || loop.version !== target.loop.version) {
@@ -836,13 +856,27 @@ export class CoverageCoordinator {
   private async loadProvenReplyTarget(
     transaction: Transaction,
     source: ReopenedSource,
-  ): Promise<string | null> {
+  ): Promise<ProvenReplyTarget | null> {
     const providerMessageId = source.event.message.replyTo?.providerMessageId;
     if (!providerMessageId) return null;
-    const rows = await transaction<{ readonly coverage_loop_id: string }[]>`
-      select distinct effect.coverage_loop_id
+    const rows = await transaction<ProvenReplyTargetRow[]>`
+      select distinct effect.coverage_loop_id, effect.coverage_loop_version,
+        case
+          when 'proactive_coverage' = any(decision.reason_codes) then 'coverage_opening'
+          when 'exact_source_owner_approval' = any(decision.reason_codes)
+            and 'minimum_disclosure' = any(decision.reason_codes) then 'coverage_opening'
+          when 'neutral_coverage_timer' = any(decision.reason_codes) then 'coverage_notification'
+          when 'unresolved_coverage_before_last_responsible' = any(decision.reason_codes)
+            then 'coverage_steward_escalation'
+          when 'coverage_response_ambiguous' = any(decision.reason_codes)
+            then 'coverage_response_clarification'
+          when 'coverage_coordination' = any(decision.reason_codes) then 'coverage_coordination'
+          when 'coverage_state_change' = any(decision.reason_codes) then 'coverage_state_change'
+          else null
+        end as request_kind
       from effect_receipts receipt
       join outbox effect on effect.id = receipt.outbox_id
+      join disclosure_decisions decision on decision.id = effect.authorization_decision_id
       where receipt.provider_receipt_id = ${providerMessageId}
         and receipt.status in ('submitted', 'confirmed')
         and effect.status in ('submitted', 'confirmed')
@@ -851,20 +885,29 @@ export class CoverageCoordinator {
         and effect.participant_epoch_id = ${source.record.routing.participantEpochId}
         and effect.expected_participant_digest = ${source.record.routing.appParticipantDigest}
         and effect.coverage_loop_id is not null
-      order by effect.coverage_loop_id
+      order by effect.coverage_loop_id, effect.coverage_loop_version, request_kind
       limit 2
     `;
-    return rows.length === 1 ? (rows[0]?.coverage_loop_id ?? null) : null;
+    const row = rows.length === 1 ? rows[0] : null;
+    if (!row || !isCoverageReplyRequestKind(row.request_kind)) return null;
+    const loopVersion = Number(row.coverage_loop_version);
+    if (!Number.isSafeInteger(loopVersion) || loopVersion <= 0) return null;
+    return {
+      loopId: row.coverage_loop_id,
+      loopVersion,
+      requestKind: row.request_kind,
+    };
   }
 
   private async loadExactTarget(
     transaction: Transaction,
     source: ReopenedSource,
     response: Extract<CoverageProposal, { kind: "self_response_proposed" }>["response"],
-    loopId: string,
+    replyTarget: ProvenReplyTarget,
   ): Promise<readonly CoverageTarget[]> {
-    const candidate = await this.loadTarget(transaction, source, loopId);
+    const candidate = await this.loadTarget(transaction, source, replyTarget.loopId);
     return candidate &&
+      candidate.loop.version === replyTarget.loopVersion &&
       responseEligible(candidate.loop, source.actorPersonId, response, candidate.relianceAuthorized)
       ? [candidate]
       : [];
@@ -1548,6 +1591,17 @@ function responseEligible(
     : response === "decline"
       ? canDecline
       : canAcknowledge || canDecline;
+}
+
+function isCoverageReplyRequestKind(value: string | null): value is CoverageReplyRequestKind {
+  return (
+    value === "coverage_opening" ||
+    value === "coverage_notification" ||
+    value === "coverage_steward_escalation" ||
+    value === "coverage_response_clarification" ||
+    value === "coverage_coordination" ||
+    value === "coverage_state_change"
+  );
 }
 
 function coverageOpeningText(

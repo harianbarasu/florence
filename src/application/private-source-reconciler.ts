@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { TransactionSql } from "postgres";
 import { z } from "zod";
 import type { Database } from "../db/client.js";
@@ -67,6 +67,13 @@ export interface PrivateSourceFrontierEvidence {
   readonly content: JsonObject;
 }
 
+export interface PrivateSourceFrontierImageEvidence {
+  readonly sourceRevisionId: string;
+  readonly mimeType: string;
+  readonly dataBase64: string;
+  readonly sha256: string;
+}
+
 export type PrivateSourceFrontierCompileResult =
   | { readonly kind: "unavailable"; readonly reason: string }
   | {
@@ -80,6 +87,7 @@ export type PrivateSourceFrontierCompileResult =
       readonly frontierDigest: string;
       readonly newestThreadRevisionId: string;
       readonly evidence: readonly PrivateSourceFrontierEvidence[];
+      readonly images: readonly PrivateSourceFrontierImageEvidence[];
     };
 
 export type PrivateSourceReconciliationResult =
@@ -130,6 +138,16 @@ interface ReadyFrontier extends Extract<PrivateSourceFrontierCompileResult, { ki
   }[];
 }
 
+interface CurrentImageBlobRow {
+  readonly id: string;
+  readonly source_revision_id: string;
+  readonly blob_kind: string;
+  readonly mime_type: string;
+  readonly content_digest: string;
+  readonly byte_length: number | string;
+  readonly ciphertext: Buffer;
+}
+
 interface FrontierRow {
   readonly id: string;
   readonly version: number | string;
@@ -173,6 +191,9 @@ interface AuthorizedWorkerProposal {
 const MAX_PUBLIC_EVIDENCE_ITEMS = 64;
 const MAX_PUBLIC_EVIDENCE_CONTENT_CHARS = 96_000;
 const MAX_PUBLIC_ITEM_CONTENT_CHARS = 12_000;
+const MAX_PRIVATE_SOURCE_IMAGES = 5;
+const MAX_PRIVATE_SOURCE_IMAGE_BYTES = 5 * 1024 * 1024;
+const MAX_PRIVATE_SOURCE_TOTAL_IMAGE_BYTES = 8 * 1024 * 1024;
 
 /**
  * Compiles and reconciles one Gmail-thread case. It owns correlation, frontier
@@ -648,6 +669,13 @@ export class PrivateSourceReconciler {
       readonly row: CurrentRevisionRow;
       readonly data: JsonObject;
     }> = [...mailById.values()];
+    const frontierAttachmentEvidence: Array<{
+      readonly row: CurrentRevisionRow;
+      readonly data: JsonObject;
+    }> = [];
+    const images: PrivateSourceFrontierImageEvidence[] = [];
+    const imageDigests: Array<{ readonly sourceRevisionId: string; readonly contentDigest: string }> = [];
+    let imageBytes = 0;
     const expectedAttachmentKeys = new Set<string>();
     for (const parent of mailById.values()) {
       if (!isFullContentMail(parent.data)) continue;
@@ -657,10 +685,15 @@ export class PrivateSourceReconciler {
       }
       for (const item of inventory) {
         const attachment = JsonObjectSchema.safeParse(item);
-        const partId = attachment.success ? stringField(attachment.data, "partId") : null;
+        if (!attachment.success) {
+          return { kind: "not_ready", reason: "source_evidence_unreadable", retryable: false };
+        }
+        const partId = stringField(attachment.data, "partId");
         if (!partId) {
           return { kind: "not_ready", reason: "source_evidence_unreadable", retryable: false };
         }
+        const mimeType = stringField(attachment.data, "mimeType")?.toLowerCase() ?? "";
+        if (attachment.data.inline === true && mimeType.startsWith("image/")) continue;
         expectedAttachmentKeys.add(`${parent.row.id}:${partId}`);
       }
     }
@@ -683,23 +716,34 @@ export class PrivateSourceReconciler {
       const attachmentKey = `${parent.row.id}:${partId}`;
       if (!expectedAttachmentKeys.has(attachmentKey)) continue;
       currentAttachmentKeys.add(attachmentKey);
-      if (stringField(data, "kind") === "omitted") {
-        return { kind: "not_ready", reason: "attachment_omitted", retryable: false };
-      }
+      frontierAttachmentEvidence.push({ row, data });
       const attachmentKind = stringField(data, "kind");
-      const attachmentMime = stringField(data, "detectedMime") ?? stringField(data, "declaredMime") ?? "";
-      const attachmentText = stringField(data, "text");
-      if (
-        attachmentKind === "unsupported" ||
-        ((attachmentKind === "pdf" || attachmentKind === "image" || attachmentMime.startsWith("image/")) &&
-          !attachmentText?.trim())
-      ) {
-        return {
-          kind: "not_ready",
-          reason: "attachment_extraction_incomplete",
-          retryable: false,
-        };
+      if (attachmentKind === "omitted" || attachmentKind === "unsupported") continue;
+      const attachmentMime = (
+        stringField(data, "detectedMime") ??
+        stringField(data, "declaredMime") ??
+        ""
+      ).toLowerCase();
+      if (attachmentKind === "image" || attachmentMime.startsWith("image/")) {
+        if (data.inline === true || images.length >= MAX_PRIVATE_SOURCE_IMAGES) continue;
+        const loaded = await this.loadBoundedImageEvidence({
+          attachment: row,
+          partId,
+          mimeType: attachmentMime,
+          requestedAt,
+          maximumBytes: Math.min(
+            MAX_PRIVATE_SOURCE_IMAGE_BYTES,
+            MAX_PRIVATE_SOURCE_TOTAL_IMAGE_BYTES - imageBytes,
+          ),
+        });
+        if (!loaded) continue;
+        threadEvidence.push({ row, data });
+        images.push(loaded.image);
+        imageDigests.push({ sourceRevisionId: row.id, contentDigest: loaded.contentDigest });
+        imageBytes += loaded.byteLength;
+        continue;
       }
+      if (!hasSubstantiveExtractedText(attachmentKind, stringField(data, "text"))) continue;
       threadEvidence.push({ row, data });
     }
     if ([...expectedAttachmentKeys].some((key) => !currentAttachmentKeys.has(key))) {
@@ -711,8 +755,9 @@ export class PrivateSourceReconciler {
 
     const calendar = await this.compileCalendarEvidence(anchor, requestedAt, [...mailById.values()]);
     if (calendar.kind === "not_ready") return calendar;
-    const combined = [...threadEvidence, ...calendar.evidence];
-    const completeEvidence = combined
+    const modelEvidence = [...threadEvidence, ...calendar.evidence];
+    const frontierEvidence = [...mailById.values(), ...frontierAttachmentEvidence, ...calendar.evidence];
+    const completeEvidence = modelEvidence
       .sort(
         (left, right) =>
           left.row.occurred_at.getTime() - right.row.occurred_at.getTime() ||
@@ -724,15 +769,17 @@ export class PrivateSourceReconciler {
         occurredAt: row.occurred_at.toISOString(),
         content: data,
       }));
-    const evidenceDigests = combined
+    const evidenceDigests = frontierEvidence
       .map(({ row }) => ({ sourceRevisionId: row.id, contentDigest: row.content_digest }))
       .sort((left, right) => left.sourceRevisionId.localeCompare(right.sourceRevisionId));
+    imageDigests.sort((left, right) => left.sourceRevisionId.localeCompare(right.sourceRevisionId));
     const integrationControlEpoch = Number(anchor.integration_control_epoch);
     const frontierDigest = canonicalDigest({
-      schemaVersion: 1,
+      schemaVersion: 2,
       integrationControlEpoch,
       caseKeyDigest,
       revisions: evidenceDigests,
+      imageBlobs: imageDigests,
     });
     const evidence = boundPublicEvidence(completeEvidence);
     if (evidence === null) {
@@ -744,11 +791,81 @@ export class PrivateSourceReconciler {
       frontierDigest,
       newestThreadRevisionId: newestMail.row.id,
       evidence,
+      images,
       ownerPersonId: anchor.owner_person_id,
       integrationId: anchor.integration_id,
       integrationControlEpoch,
       caseKeyDigest,
       evidenceDigests,
+    };
+  }
+
+  private async loadBoundedImageEvidence(input: {
+    readonly attachment: CurrentRevisionRow;
+    readonly partId: string;
+    readonly mimeType: string;
+    readonly requestedAt: Date;
+    readonly maximumBytes: number;
+  }): Promise<{
+    readonly image: PrivateSourceFrontierImageEvidence;
+    readonly contentDigest: string;
+    readonly byteLength: number;
+  } | null> {
+    if (input.maximumBytes < 1 || !input.mimeType.startsWith("image/")) return null;
+    const rows = await this.database<CurrentImageBlobRow[]>`
+      select blob.id, blob.source_revision_id, blob.blob_kind, blob.mime_type,
+        blob.content_digest, blob.byte_length, blob.ciphertext
+      from source_blobs blob
+      join source_revisions revision on revision.id = blob.source_revision_id
+      join source_objects object on object.id = revision.source_object_id
+      join integrations integration on integration.id = object.integration_id
+      where blob.source_revision_id = ${input.attachment.id}
+        and blob.blob_kind = ${`gmail_attachment:${input.partId}`}
+        and blob.retention_until > ${input.requestedAt}
+        and blob.byte_length between 1 and ${input.maximumBytes}
+        and revision.owner_person_id = ${input.attachment.owner_person_id}
+        and revision.revoked_at is null and revision.retention_until > ${input.requestedAt}
+        and revision.revision_number = object.latest_revision_number
+        and object.integration_id = ${input.attachment.integration_id}
+        and object.provider = 'gmail.attachment'
+        and object.object_kind = 'attachment_manifest' and object.status = 'active'
+        and integration.person_id = revision.owner_person_id
+        and integration.provider = 'google' and integration.status = 'active'
+        and integration.control_epoch = ${Number(input.attachment.integration_control_epoch)}
+      order by blob.created_at desc, blob.id desc
+      limit 2
+      for share of blob, revision, object, integration
+    `;
+    if (rows.length !== 1) return null;
+    const row = rows[0];
+    if (!row || row.source_revision_id !== input.attachment.id) return null;
+    const byteLength = Number(row.byte_length);
+    if (!Number.isSafeInteger(byteLength) || byteLength < 1 || byteLength > input.maximumBytes) {
+      return null;
+    }
+    const mimeType = row.mime_type.toLowerCase();
+    if (mimeType !== input.mimeType || !mimeType.startsWith("image/")) return null;
+    let bytes: Buffer;
+    try {
+      bytes = this.secretBox.decrypt(
+        JSON.parse(row.ciphertext.toString("utf8")),
+        `florence:source-blob:${row.id}:bytes`,
+      );
+    } catch {
+      return null;
+    }
+    if (bytes.length !== byteLength) return null;
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    if (sha256 !== row.content_digest) return null;
+    return {
+      image: {
+        sourceRevisionId: input.attachment.id,
+        mimeType,
+        dataBase64: bytes.toString("base64"),
+        sha256,
+      },
+      contentDigest: row.content_digest,
+      byteLength,
     };
   }
 
@@ -947,6 +1064,7 @@ function publicCompileResult(
     frontierDigest: result.frontierDigest,
     newestThreadRevisionId: result.newestThreadRevisionId,
     evidence: result.evidence,
+    images: result.images,
   };
 }
 
@@ -975,6 +1093,13 @@ function isFullContentMail(content: JsonObject): boolean {
 function stringField(content: JsonObject, key: string): string | null {
   const value = content[key];
   return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function hasSubstantiveExtractedText(kind: string | null, text: string | null): boolean {
+  if (!kind || !text?.trim()) return false;
+  if (kind !== "pdf") return true;
+  const withoutGeneratedPageMarkers = text.replace(/^\s*\[Page \d+\]\s*$/gimu, "").trim();
+  return /[\p{L}\p{N}]/u.test(withoutGeneratedPageMarkers);
 }
 
 function dateField(content: JsonObject, key: string): Date | null {

@@ -9,7 +9,6 @@ export const HandoffPurposeSchema = z.enum([
   "google_connect",
   "account_controls",
   "household_invitation",
-  "group_coverage",
   "private_bridge_standing",
   "invitation",
   "private_review",
@@ -54,7 +53,6 @@ export interface HandoffPreview {
   readonly handoffId: string;
   readonly purpose: HandoffPurpose;
   readonly expiresAt: Date;
-  readonly groupLabel?: string;
 }
 
 export interface AuthenticatedSession {
@@ -88,5 +86,4 @@ export type AssuranceKind =
   | "google_connect"
   | "account_controls"
   | "household_invitation"
-  | "group_coverage"
   | "private_bridge_standing";

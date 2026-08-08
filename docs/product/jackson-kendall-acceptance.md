@@ -34,16 +34,19 @@ Jackson adds Florence and Kendall to an iMessage group. Florence remains complet
 group while it is observe-only. New post-addition messages belong only to that exact chat epoch; they
 do not give Florence write authority or make Kendall a Florence user.
 
-Jackson invites Kendall as a co-steward from his private controls. Kendall receives one private
-message that names Jackson as the inviter, explains Florence without jargon, supports immediate
-`STOP`, and asks for natural consent. Florence does not ask Kendall to repeat family facts Jackson
-already supplied. Kendall reviews those facts, corrects conflicts, and adds missing information or
-non-conflicting aliases.
+Jackson writes a natural introduction such as “Florence, this is my wife Kendall.” With exactly one
+unknown current participant, Florence may treat Jackson's statement only as a relationship proposal;
+it does not establish Kendall's identity or consent. Florence privately asks that exact participant
+whether she is Kendall and whether she wants to join the family as an equal parent. No other unknown
+group participant receives an enrollment message merely because Florence observed the group.
 
-Kendall accepts as an equal parent. Each parent separately approves proactive coverage for the exact
-current family group. Florence tells each person privately when it is ready; she does not post an
-administrative announcement in the group. A later participant change revokes the write rule and
-returns the new exact epoch to observe-only.
+Kendall's private acceptance claims her observed identity and accepts the household relationship in
+one clear flow. Florence does not ask her to repeat family facts Jackson already supplied. Kendall
+reviews those facts, corrects conflicts, and adds missing information or non-conflicting aliases.
+Because every current participant is now a registered member of one family, the exact group becomes
+interactive automatically; neither parent completes a second per-chat approval. Florence posts one
+brief replay-safe activation acknowledgment. A later participant change revokes current write
+authority and recomputes whether the new audience is still an all-household group.
 
 ### 4. Florence knows enough family context
 

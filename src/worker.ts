@@ -47,13 +47,7 @@ const GOOGLE_JOB_REDRIVE_MAX_GENERATIONS = 3;
 
 const StepUpPayloadSchema = z.strictObject({
   actorPersonId: z.string().uuid(),
-  purpose: z.enum([
-    "account_controls",
-    "google_connect",
-    "household_invitation",
-    "group_coverage",
-    "private_bridge_standing",
-  ]),
+  purpose: z.enum(["account_controls", "google_connect", "household_invitation", "private_bridge_standing"]),
   context: z.record(z.string(), z.string()).default({}),
 });
 const OrchestrateMessagePayloadSchema = z.strictObject({ internalProviderEventId: z.string().uuid() });
@@ -488,10 +482,7 @@ async function main(): Promise<void> {
           },
           expiresInSeconds: 10 * 60,
         });
-        const stepUpText =
-          payload.purpose === "group_coverage" && payload.context.groupLabel
-            ? `Privately approve Florence for ${payload.context.groupLabel}. No one needs to reply in the group: ${config.publicBaseUrl}/handoff/${handoff.token}`
-            : `Open your private Florence controls: ${config.publicBaseUrl}/handoff/${handoff.token}`;
+        const stepUpText = `Open your private Florence controls: ${config.publicBaseUrl}/handoff/${handoff.token}`;
         await new EffectOutbox(transaction, secretBox).authorizeAndEnqueue({
           actorPersonId: payload.actorPersonId,
           person: { id: payload.actorPersonId, controlEpoch: Number(row.person_control_epoch) },

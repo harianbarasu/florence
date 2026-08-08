@@ -360,6 +360,12 @@ export class PostgresIdentityRelationships implements IdentityRelationships {
   public async approveInvitation(inputCandidate: ApproveInvitationInput) {
     const input = ApproveInvitationInputSchema.parse(inputCandidate);
     return inTransaction(this.database, async (transaction) => {
+      const locations = await transaction<{ readonly household_id: string }[]>`
+        select household_id from invitations where id = ${input.invitationId}
+      `;
+      const location = locations[0];
+      if (!location) throw new NotFoundError("Invitation does not exist");
+      await lockHousehold(transaction, location.household_id);
       const invitations = await transaction<
         {
           readonly household_id: string;
@@ -375,7 +381,8 @@ export class PostgresIdentityRelationships implements IdentityRelationships {
         from invitations invitation
         join households household on household.id = invitation.household_id
         where invitation.id = ${input.invitationId}
-        for update of invitation, household
+          and invitation.household_id = ${location.household_id}
+        for update of invitation
       `;
       const invitation = invitations[0];
       if (!invitation) throw new NotFoundError("Invitation does not exist");
@@ -407,6 +414,12 @@ export class PostgresIdentityRelationships implements IdentityRelationships {
   public async acceptInvitation(inputCandidate: unknown) {
     const input = AcceptInvitationInputSchema.parse(inputCandidate);
     return inTransaction(this.database, async (transaction) => {
+      const locations = await transaction<{ readonly household_id: string }[]>`
+        select household_id from invitations where id = ${input.invitationId}
+      `;
+      const location = locations[0];
+      if (!location) throw new NotFoundError("Invitation does not exist");
+      await lockHousehold(transaction, location.household_id);
       const invitations = await transaction<
         {
           readonly household_id: string;
@@ -429,7 +442,8 @@ export class PostgresIdentityRelationships implements IdentityRelationships {
         from invitations invitation
         join households household on household.id = invitation.household_id
         where invitation.id = ${input.invitationId}
-        for update of invitation, household
+          and invitation.household_id = ${location.household_id}
+        for update of invitation
       `;
       const invitation = invitations[0];
       if (!invitation) throw new NotFoundError("Invitation does not exist");
@@ -537,6 +551,12 @@ export class PostgresIdentityRelationships implements IdentityRelationships {
   public async leaveHousehold(inputCandidate: LeaveHouseholdInput) {
     const input = LeaveHouseholdInputSchema.parse(inputCandidate);
     return inTransaction(this.database, async (transaction) => {
+      const affectedConversationIds = await lockAffectedFamilyConversations(
+        transaction,
+        input.householdId,
+        input.personId,
+      );
+      await lockHousehold(transaction, input.householdId);
       const membership = await loadActiveMembership(transaction, input.householdId, input.personId, true);
       const leftAt = new Date(input.leftAt);
       const nextVersion = membership.version + 1;
@@ -562,6 +582,14 @@ export class PostgresIdentityRelationships implements IdentityRelationships {
             updated_at = ${leftAt}
         where id = ${input.householdId}
       `;
+      await revokeAffectedFamilyConversationAuthority(transaction, {
+        conversationIds: affectedConversationIds,
+        householdId: input.householdId,
+        actorPersonId: input.personId,
+        affectedPersonId: input.personId,
+        reasonCode: "household_member_left",
+        changedAt: leftAt,
+      });
       return HouseholdMembershipSchema.parse({
         ...membership,
         status: "left",
@@ -574,6 +602,12 @@ export class PostgresIdentityRelationships implements IdentityRelationships {
   public async suspendCaregiver(inputCandidate: SuspendCaregiverInput) {
     const input = SuspendCaregiverInputSchema.parse(inputCandidate);
     return inTransaction(this.database, async (transaction) => {
+      const affectedConversationIds = await lockAffectedFamilyConversations(
+        transaction,
+        input.householdId,
+        input.caregiverPersonId,
+      );
+      await lockHousehold(transaction, input.householdId);
       const steward = await loadActiveMembership(transaction, input.householdId, input.stewardPersonId);
       requireCapability(steward.capabilities, "membership.suspend");
       const caregiver = await loadActiveMembership(
@@ -605,6 +639,14 @@ export class PostgresIdentityRelationships implements IdentityRelationships {
             updated_at = ${suspendedAt}
         where id = ${input.householdId}
       `;
+      await revokeAffectedFamilyConversationAuthority(transaction, {
+        conversationIds: affectedConversationIds,
+        householdId: input.householdId,
+        actorPersonId: input.stewardPersonId,
+        affectedPersonId: input.caregiverPersonId,
+        reasonCode: "caregiver_suspended",
+        changedAt: suspendedAt,
+      });
       return HouseholdMembershipSchema.parse({
         ...caregiver,
         status: "suspended",
@@ -613,6 +655,80 @@ export class PostgresIdentityRelationships implements IdentityRelationships {
       });
     });
   }
+}
+
+async function lockAffectedFamilyConversations(
+  transaction: Transaction,
+  householdId: string,
+  personId: string,
+): Promise<string[]> {
+  const rows = await transaction<{ readonly id: string }[]>`
+    select conversation.id
+    from conversations conversation
+    join participant_epochs epoch on epoch.id = conversation.current_epoch_id
+      and epoch.ended_at is null
+    join epoch_participants participant on participant.participant_epoch_id = epoch.id
+      and participant.person_id = ${personId}
+    where conversation.household_id = ${householdId}
+      and conversation.kind = 'group' and conversation.status = 'active'
+    order by conversation.id
+    for update of conversation
+  `;
+  return [...new Set(rows.map((row) => row.id))];
+}
+
+async function revokeAffectedFamilyConversationAuthority(
+  transaction: Transaction,
+  input: {
+    readonly conversationIds: readonly string[];
+    readonly householdId: string;
+    readonly actorPersonId: string;
+    readonly affectedPersonId: string;
+    readonly reasonCode: "household_member_left" | "caregiver_suspended";
+    readonly changedAt: Date;
+  },
+): Promise<void> {
+  if (input.conversationIds.length === 0) return;
+  await transaction`
+    update conversation_rules
+    set status = case when status = 'active' then 'superseded' else 'revoked' end,
+      ended_at = coalesce(ended_at, ${input.changedAt})
+    where conversation_id = any(${transaction.array([...input.conversationIds])}::uuid[])
+      and rule_key in ('family_coverage', 'family_coverage_proposal')
+      and status in ('active', 'candidate')
+  `;
+  await transaction`
+    update conversations
+    set household_id = null, authority_version = authority_version + 1,
+      updated_at = ${input.changedAt}
+    where id = any(${transaction.array([...input.conversationIds])}::uuid[])
+  `;
+  for (const conversationId of input.conversationIds) {
+    const sequences = await transaction<{ readonly sequence: number | string }[]>`
+      select coalesce(max(sequence), 0) + 1 as sequence
+      from audit_events where household_id = ${input.householdId}
+    `;
+    await transaction`
+      insert into audit_events (
+        id, household_id, person_id, conversation_id, sequence,
+        actor_kind, actor_id, event_type, target_type, target_id,
+        reason_codes, decision_manifest, occurred_at
+      ) values (
+        ${randomUUID()}, ${input.householdId}, ${input.affectedPersonId}, ${conversationId},
+        ${Number(sequences[0]?.sequence ?? 1)}, 'person', ${input.actorPersonId},
+        'family_group_authority_removed', 'conversation', ${conversationId},
+        ${transaction.array([input.reasonCode, "observe_only"])},
+        ${transaction.json({ affectedPersonId: input.affectedPersonId })}, ${input.changedAt}
+      )
+    `;
+  }
+}
+
+async function lockHousehold(transaction: Transaction, householdId: string): Promise<void> {
+  const rows = await transaction<{ readonly id: string }[]>`
+    select id from households where id = ${householdId} for update
+  `;
+  if (!rows[0]) throw new NotFoundError("Household does not exist");
 }
 
 function inTransaction<Result>(

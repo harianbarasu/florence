@@ -78,10 +78,17 @@ interface SubmittedReceiptRow {
 
 interface EffectSourceLockTarget {
   readonly authorization_decision_id: string;
+  readonly household_id: string | null;
   readonly person_id: string | null;
+  readonly conversation_id: string | null;
   readonly integration_id: string | null;
+  readonly coverage_loop_id: string | null;
+  readonly invitation_id: string | null;
   readonly recipient_identity_id: string | null;
   readonly source_conversation_id: string | null;
+  readonly invitation_household_id: string | null;
+  readonly invitation_source_conversation_id: string | null;
+  readonly invitation_invitee_identity_id: string | null;
   readonly private_source_frontier_id: string | null;
   readonly private_source_case_key_digest: string | null;
 }
@@ -442,11 +449,18 @@ export class EffectOutbox {
       // lock. The authoritative query below requires these exact same values,
       // so a concurrent cancellation or unsupported fence mutation fails closed.
       const targets = await transaction<EffectSourceLockTarget[]>`
-        select authorization_decision_id, person_id, integration_id, recipient_identity_id,
-          source_conversation_id, private_source_frontier_id, private_source_case_key_digest
-        from outbox
-        where id = ${effect.outboxId}
-          and status = 'leased' and lease_token = ${effect.leaseToken}
+        select candidate.authorization_decision_id, candidate.household_id,
+          candidate.person_id, candidate.conversation_id, candidate.integration_id,
+          candidate.coverage_loop_id, candidate.invitation_id,
+          candidate.recipient_identity_id, candidate.source_conversation_id,
+          invitation.household_id as invitation_household_id,
+          invitation.source_conversation_id as invitation_source_conversation_id,
+          invitation.invitee_identity_id as invitation_invitee_identity_id,
+          candidate.private_source_frontier_id, candidate.private_source_case_key_digest
+        from outbox candidate
+        left join invitations invitation on invitation.id = candidate.invitation_id
+        where candidate.id = ${effect.outboxId}
+          and candidate.status = 'leased' and candidate.lease_token = ${effect.leaseToken}
       `;
       const target = targets[0];
       if (!target) return { authorized: false };
@@ -492,10 +506,19 @@ export class EffectOutbox {
         where candidate.id = ${effect.outboxId}
           and candidate.status = 'leased' and candidate.lease_token = ${effect.leaseToken}
           and candidate.authorization_decision_id = ${target.authorization_decision_id}
+          and candidate.household_id is not distinct from ${target.household_id}::uuid
           and candidate.person_id is not distinct from ${target.person_id}::uuid
+          and candidate.conversation_id is not distinct from ${target.conversation_id}::uuid
           and candidate.integration_id is not distinct from ${target.integration_id}::uuid
+          and candidate.coverage_loop_id is not distinct from ${target.coverage_loop_id}::uuid
+          and candidate.invitation_id is not distinct from ${target.invitation_id}::uuid
           and candidate.recipient_identity_id is not distinct from ${target.recipient_identity_id}::uuid
           and candidate.source_conversation_id is not distinct from ${target.source_conversation_id}::uuid
+          and invitation.household_id is not distinct from ${target.invitation_household_id}::uuid
+          and invitation.source_conversation_id is not distinct from
+            ${target.invitation_source_conversation_id}::uuid
+          and invitation.invitee_identity_id is not distinct from
+            ${target.invitation_invitee_identity_id}::uuid
           and candidate.private_source_frontier_id is not distinct from
             ${target.private_source_frontier_id}::uuid
           and candidate.private_source_case_key_digest is not distinct from
@@ -1092,23 +1115,69 @@ async function lockEffectSubmissionAuthority(
   transaction: Transaction,
   target: EffectSourceLockTarget,
 ): Promise<void> {
-  if (target.recipient_identity_id !== null) {
+  // A private reply is already serialized on its target DM before it may
+  // advance authority in a source group. Preserve that semantic order here,
+  // then lock any remaining source conversations deterministically.
+  if (target.conversation_id !== null) {
     await transaction`
-      select id from person_identities where id = ${target.recipient_identity_id} for share
+      select id from conversations where id = ${target.conversation_id} for share
     `;
   }
-  if (target.source_conversation_id !== null) {
+  const sourceConversationIds = distinctSortedIds([
+    target.source_conversation_id === target.conversation_id ? null : target.source_conversation_id,
+    target.invitation_source_conversation_id === target.conversation_id
+      ? null
+      : target.invitation_source_conversation_id,
+  ]);
+  if (sourceConversationIds.length > 0) {
     await transaction`
-      select id from conversations where id = ${target.source_conversation_id} for share
+      select id from conversations
+      where id = any(${transaction.array(sourceConversationIds)}::uuid[])
+      order by id
+      for share
     `;
   }
+
+  const householdIds = distinctSortedIds([target.household_id, target.invitation_household_id]);
+  if (householdIds.length > 0) {
+    await transaction`
+      select id from households
+      where id = any(${transaction.array(householdIds)}::uuid[])
+      order by id
+      for share
+    `;
+  }
+
+  if (target.invitation_id !== null) {
+    await transaction`select id from invitations where id = ${target.invitation_id} for share`;
+  }
+
+  const identityIds = distinctSortedIds([
+    target.recipient_identity_id,
+    target.invitation_invitee_identity_id,
+  ]);
+  if (identityIds.length > 0) {
+    await transaction`
+      select id from person_identities
+      where id = any(${transaction.array(identityIds)}::uuid[])
+      order by id
+      for share
+    `;
+  }
+
+  if (target.person_id !== null) {
+    await transaction`select id from people where id = ${target.person_id} for share`;
+  }
+
+  if (target.coverage_loop_id !== null) {
+    await transaction`select id from coverage_loops where id = ${target.coverage_loop_id} for share`;
+  }
+
+  if (target.integration_id !== null) {
+    await transaction`select id from integrations where id = ${target.integration_id} for share`;
+  }
+
   if (target.private_source_frontier_id !== null) {
-    if (target.person_id !== null) {
-      await transaction`select id from people where id = ${target.person_id} for share`;
-    }
-    if (target.integration_id !== null) {
-      await transaction`select id from integrations where id = ${target.integration_id} for share`;
-    }
     await transaction`
       select id from private_source_frontiers
       where id = ${target.private_source_frontier_id}
@@ -1122,6 +1191,10 @@ async function lockEffectSubmissionAuthority(
     where id = ${target.authorization_decision_id}
     for share
   `;
+}
+
+function distinctSortedIds(ids: readonly (string | null)[]): string[] {
+  return [...new Set(ids.filter((id): id is string => id !== null))].sort();
 }
 
 async function cancelLeasedEffect(

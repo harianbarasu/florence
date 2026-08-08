@@ -10,8 +10,6 @@ import {
   participantSetDigest,
 } from "./authority.js";
 import {
-  type ActivateConversationRuleInput,
-  ActivateConversationRuleInputSchema,
   type ApplyNarrowingInput,
   ApplyNarrowingInputSchema,
   type AuthorizeSendInput,
@@ -407,52 +405,6 @@ export class PostgresConversationAuthority implements ConversationAuthority {
       `;
       await incrementAuthority(transaction, suppression.conversation_id, liftedAt);
       return loadSnapshot(transaction, suppression.conversation_id);
-    });
-  }
-
-  public async activateRule(inputCandidate: ActivateConversationRuleInput) {
-    const input = ActivateConversationRuleInputSchema.parse(inputCandidate);
-    return inTransaction(this.database, async (transaction) => {
-      await lockConversationVersion(transaction, input.conversationId, input.expectedAuthorityVersion);
-      const snapshot = await loadSnapshot(transaction, input.conversationId);
-      if (snapshot.participantSetDigest === null)
-        throw new UnauthorizedError("Conversation has no live epoch");
-      const participantIds = [...new Set(snapshot.participants.map((participant) => participant.personId))];
-      if (!participantIds.includes(input.actorPersonId))
-        throw new UnauthorizedError("Actor is not a current participant");
-      requireExactApprovals(participantIds, input.approvedByPersonIds);
-      const previous = await transaction<{ readonly id: string }[]>`
-        select id from conversation_rules
-        where conversation_id = ${input.conversationId} and rule_key = ${input.ruleKey}
-          and status = 'active'
-        for update
-      `;
-      const versions = await transaction<{ readonly latest_version: number | string }[]>`
-        select coalesce(max(version), 0) as latest_version from conversation_rules
-        where conversation_id = ${input.conversationId} and rule_key = ${input.ruleKey}
-      `;
-      const activatedAt = new Date(input.activatedAt);
-      if (previous[0]) {
-        await transaction`
-          update conversation_rules set status = 'superseded', ended_at = ${activatedAt}
-          where id = ${previous[0].id}
-        `;
-      }
-      await transaction`
-        insert into conversation_rules (
-          id, conversation_id, rule_key, version, status, purpose, allowed_operations,
-          participant_set_digest, approval_participant_digest, created_by_person_id,
-          effective_at, created_at
-        ) values (
-          ${randomUUID()}, ${input.conversationId}, ${input.ruleKey},
-          ${Number(versions[0]?.latest_version ?? 0) + 1}, 'active', ${input.purpose},
-          ${transaction.array(input.allowedOperations)}, ${snapshot.participantSetDigest},
-          ${participantApprovalDigest(input.approvedByPersonIds)}, ${input.actorPersonId},
-          ${activatedAt}, ${activatedAt}
-        )
-      `;
-      await incrementAuthority(transaction, input.conversationId, activatedAt);
-      return loadSnapshot(transaction, input.conversationId);
     });
   }
 

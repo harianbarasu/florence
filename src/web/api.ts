@@ -18,7 +18,6 @@ export interface Viewer {
       | "google_connect"
       | "account_controls"
       | "household_invitation"
-      | "group_coverage"
       | "private_bridge_standing";
     assuranceExpiresAt: string | null;
   };
@@ -50,22 +49,11 @@ export interface PeopleView {
     eligibleParticipants: {
       personId: string;
       conversationId: string;
+      identityId: string;
+      participantEpochId: string;
+      participantDigest: string;
       name: string;
       registered: boolean;
-    }[];
-    coverageGroups: {
-      conversationId: string;
-      participantEpochId: string;
-      participantSetDigest: string;
-      conversationAuthorityVersion: number;
-      householdControlEpoch: number;
-      label: string;
-      active: boolean;
-      approvedCount: number;
-      requiredCount: number;
-      viewerApproved: boolean;
-      canApprove: boolean;
-      blockedReason: string | null;
     }[];
   }[];
   invitations: {
@@ -110,7 +98,7 @@ export interface HomeView {
 
 export interface ExceptionItem {
   id: string;
-  kind: "coverage" | "approval" | "private_review" | "connection" | "privacy" | "request";
+  kind: "coverage" | "private_review" | "connection" | "privacy" | "request";
   phase?: "open" | "awaiting" | "confirmed";
   title: string;
   detail: string;
@@ -121,20 +109,14 @@ export interface ExceptionItem {
 
 export interface ChatView {
   id: string;
-  kind: "direct" | "group";
   title: string;
-  mode: "registration_required" | "observe_only" | "trusted_write_enabled" | "paused";
-  epochId: string;
-  epochStartedAt: string;
+  status: "interactive" | "read_only";
+  statusLabel: "Florence can help here" | "Florence is read-only here";
+  reason: string;
   participants: {
     id: string;
     name: string;
-    registered: boolean;
-    consented: boolean;
   }[];
-  retentionDays: number | null;
-  proactive: boolean;
-  blockedReason: string | null;
 }
 
 export interface SourceView {

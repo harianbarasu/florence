@@ -38,7 +38,10 @@ describe("governed skill definition identity", () => {
       ]),
     );
     const migratedSkills = [
-      ...Object.values(PRODUCT_SKILLS).filter((skill) => skill.id !== "private_source.reconcile"),
+      ...Object.values(PRODUCT_SKILLS).filter(
+        (skill) =>
+          skill.id !== "private_source.reconcile" && skill.id !== "relationship.introduction_classify",
+      ),
       GENERAL_ANSWER_SKILL,
     ];
 
@@ -51,6 +54,9 @@ describe("governed skill definition identity", () => {
     );
     expect(governedSkillDefinitionDigest(PRODUCT_SKILLS.privateSourceReconcile)).toBe(
       "e8ece1f2d9a7dfa56cfb4608b11623476bea9c40f8c5aa6207548b6019d28cac",
+    );
+    expect(governedSkillDefinitionDigest(PRODUCT_SKILLS.familyIntroduction)).toBe(
+      "c2361a238120c1400226dff3fe8e0767249cc9636d7159bfc959c75cffdbcfc2",
     );
   });
 

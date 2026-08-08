@@ -83,7 +83,7 @@ function PublicLanding() {
         <PromiseCard
           icon="↗"
           title="Lives where your family talks"
-          copy="Private DMs and the exact groups you authorize."
+          copy="Private DMs and groups containing only your family."
         />
         <PromiseCard
           icon="◌"
@@ -406,21 +406,12 @@ function HomePage() {
 
 function PeoplePage({ viewer }: { viewer: Viewer }) {
   const { data, loading, error, reload } = useResource<PeopleView>("/api/people");
-  const location = useLocation();
   const [busy, setBusy] = useState<string | null>(null);
   const [actionMessage, setActionMessage] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
-  const [pendingGroupApprovals, setPendingGroupApprovals] = useState<Record<string, boolean>>({});
   const [inviteRoles, setInviteRoles] = useState<Record<string, "steward" | "caregiver" | "participant">>({});
+  const [inviteNames, setInviteNames] = useState<Record<string, string>>({});
   const [dependentDrafts, setDependentDrafts] = useState<Record<string, DependentDraft>>({});
-  const requestedGroupCoverageOutcome = new URLSearchParams(location.search).get("group_coverage");
-
-  useEffect(() => {
-    if (!data || !location.hash.startsWith("#coverage-")) return;
-    window.requestAnimationFrame(() => {
-      document.querySelector(location.hash)?.scrollIntoView({ block: "center" });
-    });
-  }, [data, location.hash]);
 
   async function runAction(key: string, path: string, body: unknown, success: string) {
     setBusy(key);
@@ -445,7 +436,6 @@ function PeoplePage({ viewer }: { viewer: Viewer }) {
     body: unknown,
     success: string,
     stepUp: unknown,
-    callbacks?: { onCompleted?: () => void; onStepUpSent?: () => void },
   ) {
     setBusy(key);
     setActionMessage(null);
@@ -454,12 +444,10 @@ function PeoplePage({ viewer }: { viewer: Viewer }) {
       await postJson(path, viewer.csrfToken, body);
       setActionMessage(success);
       await reload();
-      callbacks?.onCompleted?.();
     } catch (reason) {
       if (reason instanceof ApiError && reason.status === 401) {
         try {
           await postJson("/api/safety/request-step-up", viewer.csrfToken, stepUp);
-          callbacks?.onStepUpSent?.();
           setActionMessage(
             "Check your private iMessage from Florence. The secure confirmation there will finish this action.",
           );
@@ -480,40 +468,12 @@ function PeoplePage({ viewer }: { viewer: Viewer }) {
 
   if (loading) return <PageSkeleton />;
   if (error || !data) return <ErrorCard message={error ?? "Could not load your family."} />;
-  const anchoredConversationId = location.hash.startsWith("#coverage-")
-    ? location.hash.slice("#coverage-".length)
-    : null;
-  const anchoredCoverageGroup = data.households
-    .flatMap((household) => household.coverageGroups)
-    .find((group) => group.conversationId === anchoredConversationId);
-  const groupCoverageOutcome =
-    requestedGroupCoverageOutcome === "approved"
-      ? anchoredCoverageGroup?.viewerApproved || anchoredCoverageGroup?.active
-        ? "approved"
-        : "changed"
-      : requestedGroupCoverageOutcome;
   return (
     <div className="page-stack">
       <Intro
         title="The people Florence coordinates with"
-        copy="Use this private page for family membership and permissions. Keep ordinary family conversation in iMessage."
+        copy="Invite the people in your family here. Once someone joins, Florence can help in iMessage groups that contain only members of this family—there is no second group approval."
       />
-      {groupCoverageOutcome === "approved" ? (
-        <div className="success-notice" role="status">
-          Your approval is saved for the group shown below. Florence will stay silent there until every
-          current person approves.
-        </div>
-      ) : groupCoverageOutcome === "changed" ? (
-        <div className="error-notice" role="alert">
-          That group changed before approval finished. Review the current people below and approve again if
-          you still want Florence to write there.
-        </div>
-      ) : groupCoverageOutcome === "retry" ? (
-        <div className="error-notice" role="alert">
-          Florence couldn’t save that approval yet. Your private confirmation is still active—tap “Approve
-          this group” below to try once more.
-        </div>
-      ) : null}
       {actionMessage ? (
         <div className="success-notice" role="status">
           {actionMessage}
@@ -558,7 +518,8 @@ function PeoplePage({ viewer }: { viewer: Viewer }) {
                         <strong>Family context already shared with Florence</strong>
                         <p>
                           Florence already knows these details, so you won’t be asked to enter them again. By
-                          joining, you agree Florence can use them as shared context for this family.
+                          joining, you agree Florence can use them as shared context for this family and help
+                          in groups containing only this family’s members.
                         </p>
                         <div className="family-members">
                           {invitation.sharedContext.children.map((child) => (
@@ -762,8 +723,9 @@ function PeoplePage({ viewer }: { viewer: Viewer }) {
               {household.eligibleParticipants.length > 0 ? (
                 <div className="family-candidates">
                   {household.eligibleParticipants.map((participant) => {
-                    const selectionKey = `${household.id}:${participant.personId}`;
+                    const selectionKey = `${household.id}:${participant.identityId}:${participant.participantEpochId}`;
                     const role = inviteRoles[selectionKey] ?? "steward";
+                    const proposedDisplayName = inviteNames[selectionKey]?.trim() ?? "";
                     const inviteKey = `invite:${selectionKey}`;
                     return (
                       <div className="family-candidate" key={selectionKey}>
@@ -789,20 +751,36 @@ function PeoplePage({ viewer }: { viewer: Viewer }) {
                           <option value="caregiver">Caregiver</option>
                           <option value="participant">Family participant</option>
                         </select>
+                        <input
+                          aria-label={`Name for ${participant.name}`}
+                          placeholder="Their name"
+                          maxLength={80}
+                          value={inviteNames[selectionKey] ?? ""}
+                          onChange={(event) =>
+                            setInviteNames((current) => ({
+                              ...current,
+                              [selectionKey]: event.target.value,
+                            }))
+                          }
+                        />
                         <button
                           type="button"
                           className="quiet-button"
-                          disabled={busy === inviteKey}
+                          disabled={busy === inviteKey || !proposedDisplayName}
                           onClick={() => {
                             const path = `/api/households/${household.id}/invitations`;
                             const body = {
                               conversationId: participant.conversationId,
+                              expectedParticipantEpochId: participant.participantEpochId,
+                              expectedParticipantDigest: participant.participantDigest,
+                              inviteeIdentityId: participant.identityId,
                               inviteePersonId: participant.personId,
+                              proposedDisplayName,
                               role,
                             };
                             const success = participant.registered
-                              ? `Florence texted ${participant.name} a fresh private family invitation.`
-                              : `Florence privately asked ${participant.name} whether they want to join.`;
+                              ? `Florence texted ${proposedDisplayName} a fresh private family invitation.`
+                              : `Florence privately asked ${proposedDisplayName} whether they want to join.`;
                             void (role === "steward"
                               ? runProtectedAction(inviteKey, path, body, success, {
                                   purpose: "household_invitation",
@@ -810,7 +788,11 @@ function PeoplePage({ viewer }: { viewer: Viewer }) {
                                     action: "invite",
                                     householdId: household.id,
                                     conversationId: participant.conversationId,
+                                    expectedParticipantEpochId: participant.participantEpochId,
+                                    expectedParticipantDigest: participant.participantDigest,
+                                    inviteeIdentityId: participant.identityId,
                                     inviteePersonId: participant.personId,
+                                    proposedDisplayName,
                                   },
                                 })
                               : runAction(inviteKey, path, body, success));
@@ -829,106 +811,6 @@ function PeoplePage({ viewer }: { viewer: Viewer }) {
               )}
             </div>
           ) : null}
-
-          <div className="family-subsection">
-            <div className="family-section-heading">
-              <div>
-                <h4>Proactive coverage in groups</h4>
-                <p>
-                  Florence stays silent in the group while approval is pending. Each current person approves
-                  privately—no one needs to reply in the group. If anyone joins or leaves, approval resets.
-                </p>
-              </div>
-            </div>
-            {household.coverageGroups.length > 0 ? (
-              <div className="coverage-permissions">
-                {household.coverageGroups.map((group) => {
-                  const approvalKey = `coverage:${group.conversationId}`;
-                  const awaitingPrivateConfirmation =
-                    pendingGroupApprovals[group.conversationId] === true &&
-                    !group.viewerApproved &&
-                    !group.active;
-                  return (
-                    <div
-                      className="coverage-permission"
-                      id={`coverage-${group.conversationId}`}
-                      key={group.conversationId}
-                    >
-                      <div>
-                        <strong>{group.label}</strong>
-                        <span>
-                          {group.active
-                            ? "Everyone approved. Florence may help with family coverage here."
-                            : awaitingPrivateConfirmation
-                              ? "Check your private iMessage and tap “Approve this group” to finish."
-                              : (group.blockedReason ??
-                                `${group.approvedCount} of ${group.requiredCount} people have approved.`)}
-                        </span>
-                      </div>
-                      {group.active ? (
-                        <span className="status-pill good">Everyone approved</span>
-                      ) : group.viewerApproved ? (
-                        <span className="status-pill">You approved</span>
-                      ) : awaitingPrivateConfirmation ? (
-                        <span className="status-pill">Check iMessage</span>
-                      ) : (
-                        <button
-                          type="button"
-                          className="quiet-button"
-                          aria-label={`${group.label}: approve Florence`}
-                          disabled={!group.canApprove || busy === approvalKey}
-                          onClick={() =>
-                            void runProtectedAction(
-                              approvalKey,
-                              `/api/chats/${group.conversationId}/coverage-rule-approval`,
-                              {
-                                expectedParticipantEpochId: group.participantEpochId,
-                                expectedParticipantSetDigest: group.participantSetDigest,
-                                expectedConversationAuthorityVersion: group.conversationAuthorityVersion,
-                                expectedHouseholdControlEpoch: group.householdControlEpoch,
-                              },
-                              `${group.label}: your approval is saved. The group status is updated below.`,
-                              {
-                                purpose: "group_coverage",
-                                context: {
-                                  action: "approve",
-                                  conversationId: group.conversationId,
-                                  expectedParticipantEpochId: group.participantEpochId,
-                                  expectedParticipantSetDigest: group.participantSetDigest,
-                                  expectedConversationAuthorityVersion: String(
-                                    group.conversationAuthorityVersion,
-                                  ),
-                                  expectedHouseholdControlEpoch: String(group.householdControlEpoch),
-                                },
-                              },
-                              {
-                                onCompleted: () =>
-                                  setPendingGroupApprovals((current) => ({
-                                    ...current,
-                                    [group.conversationId]: false,
-                                  })),
-                                onStepUpSent: () =>
-                                  setPendingGroupApprovals((current) => ({
-                                    ...current,
-                                    [group.conversationId]: true,
-                                  })),
-                              },
-                            )
-                          }
-                        >
-                          {busy === approvalKey ? "Sending…" : "Approve this group"}
-                        </button>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            ) : (
-              <p className="family-empty-line">
-                Family groups will appear here after everyone has joined the family.
-              </p>
-            )}
-          </div>
         </section>
       ))}
     </div>
@@ -1062,8 +944,8 @@ function ChatsPage() {
   return (
     <div className="page-stack">
       <Intro
-        title="Every chat is its own privacy boundary"
-        copy="Florence can privately retain permitted post-addition context without speaking in the source group. Group writing needs a separate approval for the exact current participants."
+        title="Know where Florence can help"
+        copy="A group becomes interactive automatically when everyone in it belongs to one Florence family. Groups with anyone else stay read-only."
       />
       <div className="card-list">
         {data.map((chat) => (
@@ -2322,47 +2204,23 @@ function SafetyPage({ viewer }: { viewer: Viewer }) {
 }
 
 function ChatCard({ chat }: { chat: ChatView }) {
-  const labels = {
-    registration_required: "Finish registration",
-    observe_only: "Observe only",
-    trusted_write_enabled: "Active",
-    paused: "Paused",
-  };
   return (
-    <article className="chat-card">
+    <article className={`chat-card ${chat.status}`}>
       <div className="chat-top">
         <div>
           <h3>{chat.title}</h3>
           <p>
-            {chat.participants.length} participants · epoch {chat.epochId.slice(0, 6)}
+            {chat.participants.length} {chat.participants.length === 1 ? "person" : "people"}
           </p>
         </div>
-        <span className={`status-pill ${chat.mode}`}>{labels[chat.mode]}</span>
+        <span className={`group-status ${chat.status}`}>{chat.statusLabel}</span>
       </div>
-      <div className="participant-stack">
+      <ul className="participant-names" aria-label="People in this group">
         {chat.participants.map((participant) => (
-          <div
-            className={participant.registered && participant.consented ? "participant ready" : "participant"}
-            key={participant.id}
-            title={participant.name}
-          >
-            {participant.name.slice(0, 1).toUpperCase()}
-          </div>
+          <li key={participant.id}>{participant.name}</li>
         ))}
-      </div>
-      {chat.blockedReason ? <div className="notice">{chat.blockedReason}</div> : null}
-      <div className="chat-meta">
-        <span>
-          {chat.mode === "observe_only" && chat.kind === "group"
-            ? chat.retentionDays
-              ? `Your private view · ${chat.retentionDays}-day raw retention`
-              : "No private source view"
-            : chat.retentionDays
-              ? `${chat.retentionDays}-day raw retention`
-              : "No content retained"}
-        </span>
-        <span>{chat.proactive ? "Proactive help on" : "Proactive help off"}</span>
-      </div>
+      </ul>
+      <p className="chat-reason">{chat.reason}</p>
     </article>
   );
 }

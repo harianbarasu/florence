@@ -36,6 +36,12 @@ export interface Citation {
   readonly support: string;
 }
 
+/** Semantic relationship meaning proposed by a bounded worker, never accepted identity or authority. */
+export interface FamilyIntroductionProposal {
+  readonly displayName: string;
+  readonly role: "steward" | "caregiver" | "participant";
+}
+
 /** A model proposal over one app-compiled, person-private source frontier. */
 export interface PrivateSourceReconciliationProposal {
   /** Exact persisted governed-worker attempt whose output is being committed. */
@@ -111,6 +117,13 @@ export type AppEnvelope =
       readonly internalProviderEventId: string;
       readonly responseText: string;
       readonly evidenceSourceRevisionIds: readonly string[];
+    }
+  | {
+      /** Revalidates and applies only bounded relationship meaning from an observe-only invocation. */
+      readonly kind: "linq.family_introduction_proposal";
+      readonly internalProviderEventId: string;
+      readonly sourceRevisionId: string;
+      readonly proposal: FamilyIntroductionProposal;
     }
   | {
       /**
@@ -227,7 +240,11 @@ export type AppEnvelope =
             readonly kind: "invite_household_participant";
             readonly householdId: string;
             readonly conversationId: string;
+            readonly expectedParticipantEpochId: string;
+            readonly expectedParticipantDigest: string;
+            readonly inviteeIdentityId: string;
             readonly inviteePersonId: string;
+            readonly proposedDisplayName: string;
             readonly role: "steward" | "caregiver" | "participant";
           }
         | { readonly kind: "approve_household_invitation"; readonly invitationId: string }
@@ -250,14 +267,6 @@ export type AppEnvelope =
             readonly birthYear: number | null;
             readonly school: string;
             readonly activities: readonly string[];
-          }
-        | {
-            readonly kind: "approve_group_coverage_rule";
-            readonly conversationId: string;
-            readonly expectedParticipantEpochId: string;
-            readonly expectedParticipantSetDigest: string;
-            readonly expectedConversationAuthorityVersion: number;
-            readonly expectedHouseholdControlEpoch: number;
           }
         | ({ readonly kind: "create_routine" } & WebRoutineFields)
         | ({
@@ -308,7 +317,6 @@ export type AppEnvelope =
               | "account_controls"
               | "google_connect"
               | "household_invitation"
-              | "group_coverage"
               | "private_bridge_standing";
             readonly context?: Readonly<Record<string, string>>;
           };

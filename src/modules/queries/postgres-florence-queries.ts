@@ -29,24 +29,6 @@ interface HouseholdRow {
   member_count: number | string;
 }
 
-interface ExactGroupApprovalScope {
-  readonly conversationId: string;
-  readonly participantEpochId: string;
-  readonly participantSetDigest: string;
-  readonly conversationAuthorityVersion: number;
-}
-
-interface ExactGroupParticipantRow {
-  readonly conversation_id: string;
-  readonly conversation_authority_version: number | string;
-  readonly participant_epoch_id: string;
-  readonly participant_set_digest: string;
-  readonly person_id: string;
-  readonly display_name_ciphertext: Buffer | null;
-  readonly identity_id: string;
-  readonly subject_ciphertext: Buffer | null;
-}
-
 // Google work at or below this priority is the live/recent-mail/calendar
 // frontier that must settle before onboarding can call private sources ready.
 const RECENT_SOURCE_PRIORITY_CEILING = 110;
@@ -70,74 +52,6 @@ export class PostgresFlorenceQueries {
       rawRetentionDays,
       privateCandidateRetentionDays: 7,
     });
-  }
-
-  private async exactGroupParticipantLabels(
-    personId: string,
-    scopes: readonly ExactGroupApprovalScope[],
-  ): Promise<ReadonlyMap<string, readonly string[]>> {
-    const scopeByConversationId = new Map(scopes.map((scope) => [scope.conversationId, scope]));
-    if (scopeByConversationId.size === 0) return new Map();
-    const epochIds = [...new Set(scopes.map((scope) => scope.participantEpochId))];
-    const rows = await this.database<ExactGroupParticipantRow[]>`
-      select conversation.id as conversation_id,
-        conversation.authority_version as conversation_authority_version,
-        epoch.id as participant_epoch_id, epoch.participant_set_digest,
-        participant.person_id, person.display_name_ciphertext,
-        participant.person_identity_id as identity_id, identity.subject_ciphertext
-      from epoch_participants participant
-      join participant_epochs epoch on epoch.id = participant.participant_epoch_id
-        and epoch.ended_at is null
-      join conversations conversation on conversation.current_epoch_id = epoch.id
-        and conversation.kind = 'group' and conversation.status = 'active'
-      left join people person on person.id = participant.person_id
-        and person.status = 'registered'
-        and participant.registration_status = 'registered'
-      left join person_identities identity on identity.id = participant.person_identity_id
-        and identity.person_id = participant.person_id
-        and identity.status in ('observed', 'pending_claim', 'verified')
-      where epoch.id = any(${this.database.array(epochIds)}::uuid[])
-        and exists(
-          select 1 from epoch_participants viewer_participant
-          where viewer_participant.participant_epoch_id = epoch.id
-            and viewer_participant.person_id = ${personId}
-        )
-        and exists(
-          select 1 from household_memberships viewer_membership
-          join membership_capabilities read_grant on read_grant.membership_id = viewer_membership.id
-            and read_grant.capability = 'household.read' and read_grant.status = 'active'
-          where viewer_membership.household_id = conversation.household_id
-            and viewer_membership.person_id = ${personId}
-            and viewer_membership.status = 'active'
-        )
-      order by conversation.id,
-        case when participant.person_id = ${personId} then 0 else 1 end,
-        participant.person_id
-    `;
-    const labelsByConversationId = new Map<string, string[]>();
-    for (const row of rows) {
-      const scope = scopeByConversationId.get(row.conversation_id);
-      if (
-        !scope ||
-        scope.participantEpochId !== row.participant_epoch_id ||
-        scope.participantSetDigest !== row.participant_set_digest ||
-        scope.conversationAuthorityVersion !== Number(row.conversation_authority_version)
-      ) {
-        continue;
-      }
-      const labels = labelsByConversationId.get(row.conversation_id) ?? [];
-      const name =
-        row.person_id === personId
-          ? "You"
-          : (decryptPersonName(this.#secretBox, row.person_id, row.display_name_ciphertext) ??
-            exactGroupParticipantFallback(
-              decryptIdentitySubject(this.#secretBox, row.identity_id, row.subject_ciphertext),
-              labels.length + 1,
-            ));
-      labels.push(name);
-      labelsByConversationId.set(row.conversation_id, labels);
-    }
-    return labelsByConversationId;
   }
 
   public async viewer(
@@ -242,86 +156,6 @@ export class PostgresFlorenceQueries {
         loop.last_transition_at
       limit 50
     `;
-    const coverageApprovals = await this.database<
-      {
-        conversation_id: string;
-        conversation_authority_version: number | string;
-        participant_epoch_id: string;
-        participant_set_digest: string;
-        viewer_approved: boolean;
-      }[]
-    >`
-      select conversation.id as conversation_id,
-        conversation.authority_version as conversation_authority_version,
-        epoch.id as participant_epoch_id, epoch.participant_set_digest,
-        exists(
-          select 1
-          from conversation_rules proposal
-          join conversation_rule_approvals approval
-            on approval.conversation_rule_id = proposal.id
-            and approval.participant_epoch_id = epoch.id
-            and approval.participant_set_digest = epoch.participant_set_digest
-            and approval.conversation_authority_version = conversation.authority_version
-            and approval.household_control_epoch = household.control_epoch
-            and approval.person_id = ${personId}
-          where proposal.conversation_id = conversation.id
-            and proposal.rule_key = 'family_coverage_proposal'
-            and proposal.status = 'candidate'
-            and proposal.participant_set_digest = epoch.participant_set_digest
-        ) as viewer_approved
-      from household_memberships membership
-      join membership_capabilities read_grant on read_grant.membership_id = membership.id
-        and read_grant.capability = 'household.read' and read_grant.status = 'active'
-      join households household on household.id = membership.household_id
-        and household.status = 'active'
-      join conversations conversation on conversation.household_id = household.id
-        and conversation.kind = 'group' and conversation.status = 'active'
-      join participant_epochs epoch on epoch.id = conversation.current_epoch_id
-        and epoch.ended_at is null
-      join epoch_participants viewer_participant
-        on viewer_participant.participant_epoch_id = epoch.id
-        and viewer_participant.person_id = ${personId}
-        and viewer_participant.registration_status = 'registered'
-        and viewer_participant.consented_at is not null
-      where membership.person_id = ${personId} and membership.status = 'active'
-        and not exists(
-          select 1
-          from epoch_participants participant
-          left join participant_policies policy on policy.conversation_id = conversation.id
-            and policy.person_id = participant.person_id and policy.status = 'active'
-          where participant.participant_epoch_id = epoch.id
-            and (
-              participant.registration_status <> 'registered'
-              or participant.consented_at is null
-              or policy.id is null
-              or not coalesce(policy.allow_content_processing, false)
-              or not coalesce(policy.allow_direct_responses, false)
-            )
-        )
-        and not exists(
-          select 1 from channel_suppressions suppression
-          where suppression.conversation_id = conversation.id and suppression.active
-            and suppression.kind in ('stop', 'pause', 'read_only', 'deletion_fence', 'safety_hold')
-        )
-        and not exists(
-          select 1 from conversation_rules active_rule
-          where active_rule.conversation_id = conversation.id
-            and active_rule.status = 'active'
-            and active_rule.participant_set_digest = epoch.participant_set_digest
-            and 'proactive_coverage' = any(active_rule.allowed_operations)
-        )
-      order by conversation.updated_at desc, conversation.id
-      limit 25
-    `;
-    const coverageApprovalParticipants = await this.exactGroupParticipantLabels(
-      personId,
-      coverageApprovals.map((approval) => ({
-        conversationId: approval.conversation_id,
-        participantEpochId: approval.participant_epoch_id,
-        participantSetDigest: approval.participant_set_digest,
-        conversationAuthorityVersion: Number(approval.conversation_authority_version),
-      })),
-    );
     const candidates = await this.database<{ id: string; candidate_kind: string; proposed_at: Date }[]>`
       select id, candidate_kind, proposed_at
       from knowledge_candidates
@@ -427,25 +261,6 @@ export class PostgresFlorenceQueries {
                 : ("soon" as const),
           changedAt: loop.last_transition_at.toISOString(),
         };
-      }),
-      ...coverageApprovals.flatMap((approval) => {
-        const participantLabels = coverageApprovalParticipants.get(approval.conversation_id);
-        if (!participantLabels || participantLabels.length === 0) return [];
-        const groupLabel = exactGroupLabel(participantLabels);
-        return [
-          {
-            id: `coverage-approval:${approval.conversation_id}`,
-            kind: "approval" as const,
-            title: approval.viewer_approved
-              ? "Waiting for the group’s coverage approval"
-              : "Approve Florence for a family group",
-            detail: approval.viewer_approved
-              ? `${groupLabel}. Your approval is saved. Florence will not write there until every person shown approves.`
-              : `${groupLabel}. Every person shown must approve before Florence can open and follow coverage loops there.`,
-            urgency: "soon" as const,
-            href: "/people",
-          },
-        ];
       }),
       ...candidates.map((candidate) => ({
         id: candidate.id,
@@ -693,25 +508,19 @@ export class PostgresFlorenceQueries {
     const chats = await this.database<
       {
         id: string;
-        kind: string;
+        household_id: string | null;
         status: string;
         epoch_id: string;
-        sequence: number | string;
-        epoch_started_at: Date;
-        participant_set_digest: string;
         hard_suppression: boolean;
         read_only_suppression: boolean;
         all_registered: boolean;
         all_content_allowed: boolean;
         all_direct_allowed: boolean;
-        retention_seconds: number | string | null;
         exact_write_rule: boolean;
-        proactive_rule: boolean;
       }[]
     >`
-      select conversation.id, conversation.kind, conversation.status,
-        epoch.id as epoch_id, epoch.sequence, epoch.started_at as epoch_started_at,
-        epoch.participant_set_digest,
+      select conversation.id, conversation.household_id, conversation.status,
+        epoch.id as epoch_id,
         exists(
           select 1 from channel_suppressions suppression
           where suppression.conversation_id = conversation.id and suppression.active
@@ -726,26 +535,19 @@ export class PostgresFlorenceQueries {
           as all_registered,
         bool_and(coalesce(policy.allow_content_processing, false)) as all_content_allowed,
         bool_and(coalesce(policy.allow_direct_responses, false)) as all_direct_allowed,
-        max(policy.retention_seconds) filter (where participant.person_id = ${personId})
-          as retention_seconds,
         exists(
           select 1 from conversation_rules rule
           where rule.conversation_id = conversation.id and rule.status = 'active'
+            and rule.rule_key = 'family_coverage'
             and rule.participant_set_digest = epoch.participant_set_digest
             and cardinality(rule.allowed_operations) > 0
-        ) as exact_write_rule,
-        exists(
-          select 1 from conversation_rules rule
-          where rule.conversation_id = conversation.id and rule.status = 'active'
-            and 'proactive_coverage' = any(rule.allowed_operations)
-            and rule.participant_set_digest = epoch.participant_set_digest
-        ) as proactive_rule
+        ) as exact_write_rule
       from conversations conversation
       join participant_epochs epoch on epoch.id = conversation.current_epoch_id and epoch.ended_at is null
       join epoch_participants participant on participant.participant_epoch_id = epoch.id
       left join participant_policies policy on policy.conversation_id = conversation.id
         and policy.person_id = participant.person_id and policy.status = 'active'
-      where exists(
+      where conversation.kind = 'group' and exists(
         select 1 from epoch_participants viewer_participant
         where viewer_participant.participant_epoch_id = epoch.id
           and viewer_participant.person_id = ${personId}
@@ -755,50 +557,123 @@ export class PostgresFlorenceQueries {
     `;
     const output: ChatView[] = [];
     for (const chat of chats) {
-      const participants = await this.database<
-        { person_id: string; registration_status: string; consented_at: Date | null }[]
-      >`
-        select person_id, registration_status, consented_at
-        from epoch_participants where participant_epoch_id = ${chat.epoch_id}
-        order by person_id
+      const commonHouseholds = await this.database<{ household_id: string }[]>`
+        select membership.household_id
+        from household_memberships membership
+        join households household on household.id = membership.household_id
+          and household.status in ('onboarding', 'active')
+        where membership.status = 'active'
+          and membership.person_id in (
+            select participant.person_id from epoch_participants participant
+            where participant.participant_epoch_id = ${chat.epoch_id}
+          )
+        group by membership.household_id
+        having count(distinct membership.person_id) = (
+          select count(distinct participant.person_id) from epoch_participants participant
+          where participant.participant_epoch_id = ${chat.epoch_id}
+        )
+          and exists(
+            select 1 from household_memberships steward
+            where steward.household_id = membership.household_id
+              and steward.status = 'active' and steward.role = 'steward'
+          )
+        order by membership.household_id
+        limit 2
       `;
-      const mode: ChatView["mode"] =
-        chat.status === "paused" || chat.hard_suppression
-          ? "paused"
-          : chat.kind === "direct" && (!chat.all_registered || !chat.all_content_allowed)
-            ? "registration_required"
-            : chat.read_only_suppression ||
-                !chat.all_direct_allowed ||
-                (chat.kind === "group" &&
-                  (!chat.all_registered || !chat.all_content_allowed || !chat.exact_write_rule))
-              ? "observe_only"
-              : "trusted_write_enabled";
+      const commonHouseholdId =
+        commonHouseholds.length === 1 ? (commonHouseholds[0]?.household_id ?? null) : null;
+      const familyHouseholdId = chat.household_id ?? commonHouseholdId;
+      const participants = await this.database<
+        {
+          person_id: string;
+          identity_id: string;
+          registration_status: string;
+          display_name_ciphertext: Buffer | null;
+          subject_ciphertext: Buffer | null;
+          family_member: boolean;
+        }[]
+      >`
+        select participant.person_id, participant.person_identity_id as identity_id,
+          participant.registration_status, person.display_name_ciphertext,
+          identity.subject_ciphertext,
+          exists(
+            select 1 from household_memberships membership
+            where membership.household_id = ${familyHouseholdId}
+              and membership.person_id = participant.person_id
+              and membership.status = 'active'
+          ) as family_member
+        from epoch_participants participant
+        left join people person on person.id = participant.person_id
+          and person.status = 'registered'
+          and participant.registration_status = 'registered'
+        left join person_identities identity on identity.id = participant.person_identity_id
+          and identity.person_id = participant.person_id
+          and identity.status in ('observed', 'pending_claim', 'verified')
+        where participant.participant_epoch_id = ${chat.epoch_id}
+        order by case when participant.person_id = ${personId} then 0 else 1 end,
+          participant.person_id
+      `;
+      const visibleParticipants = participants.map((participant, index) => ({
+        id: participant.person_id,
+        name:
+          participant.person_id === personId
+            ? "You"
+            : (decryptPersonName(
+                this.#secretBox,
+                participant.person_id,
+                participant.display_name_ciphertext,
+              ) ??
+              exactGroupParticipantFallback(
+                decryptIdentitySubject(
+                  this.#secretBox,
+                  participant.identity_id,
+                  participant.subject_ciphertext,
+                ),
+                index + 1,
+              )),
+      }));
+      const allFamilyMembers =
+        chat.household_id !== null && participants.every((participant) => participant.family_member);
+      const interactive =
+        chat.status === "active" &&
+        !chat.hard_suppression &&
+        !chat.read_only_suppression &&
+        chat.all_registered &&
+        chat.all_content_allowed &&
+        chat.all_direct_allowed &&
+        allFamilyMembers &&
+        chat.exact_write_rule;
+      const nonFamilyParticipants = participants.filter((participant) => !participant.family_member);
+      const otherNonFamilyParticipants = nonFamilyParticipants.filter(
+        (participant) => participant.person_id !== personId,
+      );
+      let reason = "Florence is finishing setup here";
+      if (interactive) {
+        reason = "Everyone here is part of your family";
+      } else if (commonHouseholds.length > 1) {
+        reason = "Florence cannot match this group to one family";
+      } else if (
+        otherNonFamilyParticipants.some((participant) => participant.registration_status === "registered")
+      ) {
+        reason = "This chat includes people outside your family";
+      } else if (
+        otherNonFamilyParticipants.some((participant) => participant.registration_status !== "registered")
+      ) {
+        reason = "Someone here has not joined your family yet";
+      } else if (nonFamilyParticipants.length > 0 || chat.household_id === null) {
+        reason = "This chat includes people outside your family";
+      } else if (chat.status === "paused" || chat.hard_suppression) {
+        reason = "Florence is paused for this group";
+      } else if (chat.read_only_suppression || !chat.all_content_allowed || !chat.all_direct_allowed) {
+        reason = "Someone here has made Florence read-only";
+      }
       output.push({
         id: chat.id,
-        kind: chat.kind === "direct" ? "direct" : "group",
-        title: chat.kind === "direct" ? "Private conversation" : "Family group",
-        mode,
-        epochId: chat.epoch_id,
-        epochStartedAt: chat.epoch_started_at.toISOString(),
-        participants: participants.map((participant, index) => ({
-          id: participant.person_id,
-          name: participant.person_id === personId ? "You" : `Person ${index + 1}`,
-          registered: participant.registration_status === "registered",
-          consented: participant.consented_at !== null,
-        })),
-        retentionDays:
-          chat.retention_seconds === null ? null : Math.floor(Number(chat.retention_seconds) / 86_400),
-        proactive: chat.proactive_rule,
-        blockedReason:
-          mode === "registration_required"
-            ? "Finish private registration and consent before Florence can use or answer ordinary messages here."
-            : mode === "observe_only" && chat.kind === "group"
-              ? "Florence stays silent here. Permitted messages after Florence joined are retained only as independent private context for each registered exact participant; they are never automatically shared with a household or another chat."
-              : mode === "observe_only"
-                ? "Florence will not answer while this private conversation is read-only under your current settings."
-                : mode === "paused"
-                  ? "A participant narrowed or paused this chat."
-                  : null,
+        title: exactGroupLabel(visibleParticipants.map((participant) => participant.name)),
+        status: interactive ? "interactive" : "read_only",
+        statusLabel: interactive ? "Florence can help here" : "Florence is read-only here",
+        reason,
+        participants: visibleParticipants,
       });
     }
     return output;
@@ -809,12 +684,14 @@ export class PostgresFlorenceQueries {
       {
         id: string;
         status: string;
+        membership_version: number | string;
         viewer_role: string;
         joined_at: Date;
         capabilities: string[];
       }[]
     >`
-      select household.id, household.status, viewer_membership.role as viewer_role,
+      select household.id, household.status, household.membership_version,
+        viewer_membership.role as viewer_role,
         viewer_membership.joined_at,
         coalesce(array_agg(capability.capability order by capability.capability)
           filter (where capability.status = 'active'), '{}') as capabilities
@@ -869,6 +746,8 @@ export class PostgresFlorenceQueries {
               person_id: string;
               conversation_id: string;
               identity_id: string;
+              participant_epoch_id: string;
+              participant_set_digest: string;
               person_status: string;
               display_name_ciphertext: Buffer | null;
               subject_ciphertext: Buffer | null;
@@ -877,6 +756,8 @@ export class PostgresFlorenceQueries {
             select distinct on (candidate.person_id)
               candidate.person_id, conversation.id as conversation_id,
               identity.id as identity_id,
+              epoch.id as participant_epoch_id,
+              epoch.participant_set_digest,
               person.status as person_status, person.display_name_ciphertext,
               identity.subject_ciphertext
             from conversations conversation
@@ -902,90 +783,40 @@ export class PostgresFlorenceQueries {
                 select 1 from invitations pending_invitation
                 join person_identities invited_identity
                   on invited_identity.id = pending_invitation.invitee_identity_id
+                join conversations pending_source
+                  on pending_source.id = pending_invitation.source_conversation_id
+                  and pending_source.kind = 'group' and pending_source.status = 'active'
+                join participant_epochs pending_epoch on pending_epoch.id = pending_source.current_epoch_id
+                  and pending_epoch.id = pending_invitation.source_participant_epoch_id
+                  and pending_epoch.ended_at is null
+                  and pending_epoch.participant_set_digest = pending_invitation.source_participant_digest
+                join epoch_participants pending_invitee
+                  on pending_invitee.participant_epoch_id = pending_epoch.id
+                  and pending_invitee.person_identity_id = invited_identity.id
+                  and pending_invitee.person_id = invited_identity.person_id
                 where pending_invitation.household_id = ${household.id}
+                  and pending_invitation.household_membership_version = ${household.membership_version}
                   and pending_invitation.status = 'pending'
                   and pending_invitation.expires_at > now()
                   and invited_identity.person_id = candidate.person_id
+                  and (
+                    pending_invitation.source_revision_id is null
+                    or exists(
+                      select 1
+                      from source_revisions source_revision
+                      join source_objects source_object on source_object.id = source_revision.source_object_id
+                        and source_object.status = 'active'
+                        and source_object.latest_revision_number = source_revision.revision_number
+                      where source_revision.id = pending_invitation.source_revision_id
+                        and source_revision.participant_epoch_id = pending_epoch.id
+                        and source_revision.revoked_at is null
+                        and source_revision.retention_until > now()
+                    )
+                  )
               )
             order by candidate.person_id, conversation.updated_at desc
           `
         : [];
-      const groupRows = await this.database<
-        {
-          conversation_id: string;
-          participant_epoch_id: string;
-          participant_set_digest: string;
-          conversation_authority_version: number | string;
-          household_control_epoch: number | string;
-          required_count: number | string;
-          all_ready: boolean;
-          active: boolean;
-          approved_count: number | string;
-          viewer_approved: boolean;
-          updated_at: Date;
-        }[]
-      >`
-        select conversation.id as conversation_id, conversation.updated_at,
-          epoch.id as participant_epoch_id,
-          epoch.participant_set_digest,
-          conversation.authority_version as conversation_authority_version,
-          household.control_epoch as household_control_epoch,
-          count(distinct participant.person_id) as required_count,
-          coalesce(bool_and(
-            participant.registration_status = 'registered'
-            and participant.consented_at is not null
-            and policy.id is not null
-          ), false) as all_ready,
-          exists(
-            select 1 from conversation_rules active_rule
-            where active_rule.conversation_id = conversation.id
-              and active_rule.status = 'active'
-              and active_rule.participant_set_digest = epoch.participant_set_digest
-              and 'proactive_coverage' = any(active_rule.allowed_operations)
-          ) as active,
-          count(distinct approval.person_id) as approved_count,
-          coalesce(bool_or(approval.person_id = ${personId}), false) as viewer_approved
-        from conversations conversation
-        join households household on household.id = conversation.household_id
-        join participant_epochs epoch on epoch.id = conversation.current_epoch_id
-          and epoch.ended_at is null
-        join epoch_participants participant on participant.participant_epoch_id = epoch.id
-        left join participant_policies policy on policy.conversation_id = conversation.id
-          and policy.person_id = participant.person_id and policy.status = 'active'
-        left join lateral (
-          select candidate_rule.id
-          from conversation_rules candidate_rule
-          where candidate_rule.conversation_id = conversation.id
-            and candidate_rule.rule_key = 'family_coverage_proposal'
-            and candidate_rule.status = 'candidate'
-            and candidate_rule.participant_set_digest = epoch.participant_set_digest
-          order by candidate_rule.version desc limit 1
-        ) proposal on true
-        left join conversation_rule_approvals approval
-          on approval.conversation_rule_id = proposal.id
-          and approval.participant_epoch_id = epoch.id
-          and approval.participant_set_digest = epoch.participant_set_digest
-          and approval.conversation_authority_version = conversation.authority_version
-          and approval.household_control_epoch = household.control_epoch
-        where conversation.household_id = ${household.id}
-          and conversation.kind = 'group' and conversation.status = 'active'
-          and exists(
-            select 1 from epoch_participants viewer_participant
-            where viewer_participant.participant_epoch_id = epoch.id
-              and viewer_participant.person_id = ${personId}
-          )
-        group by conversation.id, epoch.id, household.id
-        order by conversation.updated_at desc
-      `;
-      const groupParticipantLabels = await this.exactGroupParticipantLabels(
-        personId,
-        groupRows.map((group) => ({
-          conversationId: group.conversation_id,
-          participantEpochId: group.participant_epoch_id,
-          participantSetDigest: group.participant_set_digest,
-          conversationAuthorityVersion: Number(group.conversation_authority_version),
-        })),
-      );
       households.push({
         id: household.id,
         name: householdIndex === 0 ? "Your family" : `Your family ${householdIndex + 1}`,
@@ -1032,6 +863,9 @@ export class PostgresFlorenceQueries {
         eligibleParticipants: eligibleRows.map((participant) => ({
           personId: participant.person_id,
           conversationId: participant.conversation_id,
+          identityId: participant.identity_id,
+          participantEpochId: participant.participant_epoch_id,
+          participantDigest: participant.participant_set_digest,
           name:
             decryptPersonName(this.#secretBox, participant.person_id, participant.display_name_ciphertext) ??
             maskedIdentityLabel(
@@ -1043,34 +877,6 @@ export class PostgresFlorenceQueries {
             ),
           registered: participant.person_status === "registered",
         })),
-        coverageGroups: groupRows.flatMap((group) => {
-          const participantLabels = groupParticipantLabels.get(group.conversation_id);
-          if (!participantLabels || participantLabels.length === 0) return [];
-          const active = group.active;
-          const allReady = group.all_ready;
-          const viewerApproved = active || group.viewer_approved;
-          const requiredCount = Number(group.required_count);
-          return [
-            {
-              conversationId: group.conversation_id,
-              participantEpochId: group.participant_epoch_id,
-              participantSetDigest: group.participant_set_digest,
-              conversationAuthorityVersion: Number(group.conversation_authority_version),
-              householdControlEpoch: Number(group.household_control_epoch),
-              label: exactGroupLabel(participantLabels),
-              active,
-              approvedCount: active ? requiredCount : Number(group.approved_count),
-              requiredCount,
-              viewerApproved,
-              canApprove: allReady && !active && !viewerApproved,
-              blockedReason: !allReady
-                ? "Everyone in this group must finish private registration first."
-                : !active && viewerApproved
-                  ? "You approved this. Florence is waiting for everyone else."
-                  : null,
-            },
-          ];
-        }),
       });
     }
 
@@ -1097,8 +903,31 @@ export class PostgresFlorenceQueries {
         and household.membership_version = invitation.household_membership_version
       join person_identities invitee_identity on invitee_identity.id = invitation.invitee_identity_id
       join people invitee on invitee.id = invitee_identity.person_id
+      join conversations source_conversation on source_conversation.id = invitation.source_conversation_id
+        and source_conversation.kind = 'group' and source_conversation.status = 'active'
+      join participant_epochs source_epoch on source_epoch.id = source_conversation.current_epoch_id
+        and source_epoch.id = invitation.source_participant_epoch_id
+        and source_epoch.ended_at is null
+        and source_epoch.participant_set_digest = invitation.source_participant_digest
+      join epoch_participants exact_invitee on exact_invitee.participant_epoch_id = source_epoch.id
+        and exact_invitee.person_identity_id = invitee_identity.id
+        and exact_invitee.person_id = invitee_identity.person_id
       where approval.approved_at is null and invitation.status = 'pending'
         and invitation.expires_at > now()
+        and (
+          invitation.source_revision_id is null
+          or exists(
+            select 1
+            from source_revisions source_revision
+            join source_objects source_object on source_object.id = source_revision.source_object_id
+              and source_object.status = 'active'
+              and source_object.latest_revision_number = source_revision.revision_number
+            where source_revision.id = invitation.source_revision_id
+              and source_revision.participant_epoch_id = source_epoch.id
+              and source_revision.revoked_at is null
+              and source_revision.retention_until > now()
+          )
+        )
       order by invitation.created_at
     `;
     const acceptanceRows = await this.database<
@@ -1119,8 +948,31 @@ export class PostgresFlorenceQueries {
         and household.membership_version = invitation.household_membership_version
       join person_identities invitee_identity on invitee_identity.id = invitation.invitee_identity_id
         and invitee_identity.person_id = ${personId} and invitee_identity.status = 'verified'
+      join conversations source_conversation on source_conversation.id = invitation.source_conversation_id
+        and source_conversation.kind = 'group' and source_conversation.status = 'active'
+      join participant_epochs source_epoch on source_epoch.id = source_conversation.current_epoch_id
+        and source_epoch.id = invitation.source_participant_epoch_id
+        and source_epoch.ended_at is null
+        and source_epoch.participant_set_digest = invitation.source_participant_digest
+      join epoch_participants exact_invitee on exact_invitee.participant_epoch_id = source_epoch.id
+        and exact_invitee.person_identity_id = invitee_identity.id
+        and exact_invitee.person_id = invitee_identity.person_id
       left join invitation_approvals approval on approval.invitation_id = invitation.id
       where invitation.status = 'pending' and invitation.expires_at > now()
+        and (
+          invitation.source_revision_id is null
+          or exists(
+            select 1
+            from source_revisions source_revision
+            join source_objects source_object on source_object.id = source_revision.source_object_id
+              and source_object.status = 'active'
+              and source_object.latest_revision_number = source_revision.revision_number
+            where source_revision.id = invitation.source_revision_id
+              and source_revision.participant_epoch_id = source_epoch.id
+              and source_revision.revoked_at is null
+              and source_revision.retention_until > now()
+          )
+        )
       group by invitation.id
       order by invitation.created_at
     `;
@@ -1145,6 +997,15 @@ export class PostgresFlorenceQueries {
         and invitee_identity.person_id = ${personId} and invitee_identity.status = 'verified'
       join people invitee on invitee.id = invitee_identity.person_id
         and invitee.status = 'registered'
+      join conversations source_conversation on source_conversation.id = invitation.source_conversation_id
+        and source_conversation.kind = 'group' and source_conversation.status = 'active'
+      join participant_epochs source_epoch on source_epoch.id = source_conversation.current_epoch_id
+        and source_epoch.id = invitation.source_participant_epoch_id
+        and source_epoch.ended_at is null
+        and source_epoch.participant_set_digest = invitation.source_participant_digest
+      join epoch_participants exact_invitee on exact_invitee.participant_epoch_id = source_epoch.id
+        and exact_invitee.person_identity_id = invitee_identity.id
+        and exact_invitee.person_id = invitee_identity.person_id
       join household_memberships dependent_membership
         on dependent_membership.household_id = invitation.household_id
         and dependent_membership.role = 'dependent'
@@ -1153,6 +1014,20 @@ export class PostgresFlorenceQueries {
         and dependent_person.status = 'provisional'
       left join dependent_profiles profile on profile.person_id = dependent_person.id
       where invitation.status = 'pending' and invitation.expires_at > now()
+        and (
+          invitation.source_revision_id is null
+          or exists(
+            select 1
+            from source_revisions source_revision
+            join source_objects source_object on source_object.id = source_revision.source_object_id
+              and source_object.status = 'active'
+              and source_object.latest_revision_number = source_revision.revision_number
+            where source_revision.id = invitation.source_revision_id
+              and source_revision.participant_epoch_id = source_epoch.id
+              and source_revision.revoked_at is null
+              and source_revision.retention_until > now()
+          )
+        )
       order by invitation.created_at, dependent_membership.joined_at
     `;
     const sharedChildrenByInvitation = new Map<
@@ -2142,7 +2017,7 @@ function exactGroupParticipantFallback(subject: string | null, position: number)
 
 function exactGroupLabel(participantLabels: readonly string[]): string {
   const last = participantLabels.at(-1);
-  if (!last) return "Current family group";
+  if (!last) return "Current iMessage group";
   if (participantLabels.length === 1) return `Group with ${boundedGroupParticipant(last)}`;
   if (participantLabels.length === 2) {
     return `Group with ${boundedGroupParticipant(participantLabels[0] ?? "You")} and ${boundedGroupParticipant(last)}`;

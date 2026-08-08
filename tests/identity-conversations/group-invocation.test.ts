@@ -10,6 +10,12 @@ describe("observe-only group invocation", () => {
     expect(leadingGroupInvocation("Hey Florence, what time is pickup?")?.requestText).toBe(
       "what time is pickup?",
     );
+    expect(leadingGroupInvocation("Florence here is my wife Kendall")?.requestText).toBe(
+      "here is my wife Kendall",
+    );
+    expect(leadingGroupInvocation("Florence this is our babysitter Jenny")?.requestText).toBe(
+      "this is our babysitter Jenny",
+    );
   });
 
   it("rejects mentions, name-only messages, and ordinary leading-name statements", () => {

@@ -1032,7 +1032,7 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
           latest &&
           (latest.scope_digest !== scope.scopeDigest || latest.content_digest !== contentDigest)
         ) {
-          await invalidateRevisionDependents(transaction, [latest.id]);
+          await invalidateRevisionDependents(transaction, [latest.id], capturedAt);
         }
       } else {
         await transaction`
@@ -3159,7 +3159,11 @@ async function invalidateRevisions(
     return { invalidatedRevisionCount: 0, revokedCandidateCount: 0 };
   }
   const mutableRevisionIds = [...revisionIds];
-  const revokedCandidateCount = await invalidateRevisionDependents(transaction, mutableRevisionIds);
+  const revokedCandidateCount = await invalidateRevisionDependents(
+    transaction,
+    mutableRevisionIds,
+    invalidatedAt,
+  );
   await transaction`
     update source_revision_private_views
     set status = 'revoked',
@@ -3187,12 +3191,19 @@ async function invalidateRevisions(
 async function invalidateRevisionDependents(
   transaction: Transaction,
   revisionIds: readonly string[],
+  invalidatedAt: Date,
 ): Promise<number> {
   if (revisionIds.length === 0) return 0;
   const mutableRevisionIds = [...revisionIds];
   await transaction`
     delete from source_derivatives
     where parent_source_revision_id = any(${transaction.array(mutableRevisionIds)}::uuid[])
+  `;
+  await transaction`
+    update invitations
+    set status = 'revoked', updated_at = greatest(updated_at, ${invalidatedAt})
+    where status = 'pending'
+      and source_revision_id = any(${transaction.array(mutableRevisionIds)}::uuid[])
   `;
   const revokedCandidates = await transaction<{ readonly id: string }[]>`
     update knowledge_candidates candidate

@@ -12,15 +12,15 @@ import { openPrivateBridgePayload, PrivateSourceBridge } from "../modules/bridge
 import {
   type ConversationAuthoritySnapshot,
   evaluateConversationMode,
+  FamilyGroupAuthority,
   type GroupInvocation,
-  GroupRuleOnboarding,
   leadingGroupInvocation,
   PostgresConversationAuthority,
 } from "../modules/conversations/index.js";
 import { PostgresRoutines, type RoutineRevisionDraft } from "../modules/coordination/index.js";
 import { PostgresDataControls } from "../modules/data-controls/index.js";
 import { EffectOutbox } from "../modules/effects/index.js";
-import { PostgresIdentityRelationships } from "../modules/identity/index.js";
+import { type HouseholdMembership, PostgresIdentityRelationships } from "../modules/identity/index.js";
 import { HouseholdOnboarding } from "../modules/relationships/index.js";
 import { type IntegrationCapability, PostgresSourceIntelligence } from "../modules/sources/index.js";
 import { DurableWork } from "../modules/work/index.js";
@@ -62,7 +62,9 @@ interface ReconciledConversation {
 export interface StoredLinqEvent {
   readonly schemaVersion: 1;
   readonly classification: "enrollment" | "stop" | "full" | "observe_only" | "receipt" | "routing_only";
-  readonly enrollmentAction?: "consent" | "other";
+  readonly enrollmentAction?: "consent" | "decline_invitation" | "other";
+  /** Provider occurrence time for an inbound message, retained even when its content is not. */
+  readonly messageOccurredAt?: string;
   readonly invocation?: GroupInvocation;
   readonly event?: LinqWebhookEnvelope;
   readonly routing: {
@@ -109,6 +111,11 @@ interface PrivateDmResponseCommit {
   readonly googleActivationIncluded: boolean;
 }
 
+interface LatestRelevantPrivateEffect {
+  readonly kind: "enrollment" | "family_invitation" | "other";
+  readonly invitationId: string | null;
+}
+
 type ParentGoogleActivationReason =
   | "household_resolved"
   | "existing_steward_dm"
@@ -138,6 +145,12 @@ export class FlorenceApplication {
           input.internalProviderEventId,
           input.responseText,
           input.evidenceSourceRevisionIds,
+        );
+      case "linq.family_introduction_proposal":
+        return this.commitFamilyIntroductionProposal(
+          input.internalProviderEventId,
+          input.sourceRevisionId,
+          input.proposal,
         );
       case "linq.private_dm_orchestration_complete":
         return this.completePrivateDmOrchestration(input);
@@ -611,17 +624,6 @@ export class FlorenceApplication {
         return this.deactivateLinqConversation(transaction, event, liveChat);
       }
       const reconciled = await this.reconcileLinqConversation(transaction, event, liveChat);
-      if (liveChat.kind === "group") {
-        const hasUnregisteredParticipant = reconciled.snapshot.participants.some(
-          (participant) =>
-            participant.registrationStatus !== "registered" || participant.consentedAt === null,
-        );
-        if (hasUnregisteredParticipant) {
-          await this.queuePrivateGroupEnrollmentPrompts(transaction, reconciled.conversationId);
-        } else {
-          await this.queuePrivateGroupReadyNotices(transaction, reconciled.conversationId, "group-ready");
-        }
-      }
       const ordinaryGroupContentAt =
         liveChat.kind !== "group"
           ? null
@@ -664,6 +666,7 @@ export class FlorenceApplication {
         schemaVersion: 1,
         classification: classification.kind,
         ...(classification.enrollmentAction ? { enrollmentAction: classification.enrollmentAction } : {}),
+        ...(event.eventType === "linq.message.received" ? { messageOccurredAt: event.message.sentAt } : {}),
         ...(invocation ? { invocation } : {}),
         ...(classification.retainEvent ? { event } : {}),
         routing: {
@@ -745,17 +748,6 @@ export class FlorenceApplication {
         return this.deactivateLinqConversation(transaction, null, liveChat);
       }
       const reconciled = await this.reconcileLinqConversation(transaction, null, liveChat);
-      if (liveChat.kind === "group") {
-        const hasUnregisteredParticipant = reconciled.snapshot.participants.some(
-          (participant) =>
-            participant.registrationStatus !== "registered" || participant.consentedAt === null,
-        );
-        if (hasUnregisteredParticipant) {
-          await this.queuePrivateGroupEnrollmentPrompts(transaction, reconciled.conversationId);
-        } else {
-          await this.queuePrivateGroupReadyNotices(transaction, reconciled.conversationId, "group-ready");
-        }
-      }
       await appendAudit(transaction, {
         conversationId: reconciled.conversationId,
         householdId: reconciled.householdId,
@@ -1041,16 +1033,14 @@ export class FlorenceApplication {
       where conversation_id = ${binding.conversationId}
         and provider = 'linq' and status = 'active'
     `;
-    const snapshot = await conversations.snapshot(binding.conversationId);
-    const people = [...observed.values()].map((entry) => entry.personId);
-    const household = await inferSharedHousehold(transaction, people);
-    if (household) {
-      await transaction`
-        update conversations set household_id = coalesce(household_id, ${household.id})
-        where id = ${binding.conversationId}
-          and (household_id is null or household_id = ${household.id})
-      `;
-    }
+    const familyAuthority =
+      liveChat.kind === "group"
+        ? await new FamilyGroupAuthority(transaction).reconcile({
+            conversationId: binding.conversationId,
+            occurredAt: checkedAt,
+          })
+        : null;
+    const snapshot = familyAuthority?.snapshot ?? (await conversations.snapshot(binding.conversationId));
     const sender =
       event === null
         ? null
@@ -1082,8 +1072,8 @@ export class FlorenceApplication {
       senderPersonId: sender?.personId ?? null,
       snapshot,
       mode: evaluateConversationMode(snapshot),
-      householdId: household?.id ?? null,
-      householdControlEpoch: household?.controlEpoch ?? null,
+      householdId: familyAuthority?.householdId ?? null,
+      householdControlEpoch: familyAuthority?.householdControlEpoch ?? null,
     };
   }
 
@@ -1614,6 +1604,7 @@ export class FlorenceApplication {
           and conversation.kind = 'group' and conversation.status = 'active'
           and epoch.id = ${record.routing.participantEpochId}
           and epoch.participant_set_digest = ${record.routing.appParticipantDigest}
+        for update of conversation
       `;
       const source = sources[0];
       if (!source) throw new StaleAuthorityError("Private group invocation audience changed");
@@ -1784,45 +1775,424 @@ export class FlorenceApplication {
     });
   }
 
+  /**
+   * Commits only the relationship meaning proposed by the ephemeral worker.
+   * The application reopens the exact group, chooses the sole non-household
+   * participant, checks the inviter's relationship-local grants, and sends two
+   * independent private messages. The source group remains completely silent.
+   */
+  private async commitFamilyIntroductionProposal(
+    internalProviderEventId: string,
+    sourceRevisionId: string,
+    proposalCandidate: Extract<AppEnvelope, { kind: "linq.family_introduction_proposal" }>["proposal"],
+  ): Promise<ProcessReceipt> {
+    const displayName = proposalCandidate.displayName.trim();
+    if (!displayName || displayName.length > 80) {
+      throw new UnauthorizedError("Family introduction name is outside the allowed bounds");
+    }
+    if (!["steward", "caregiver", "participant"].includes(proposalCandidate.role)) {
+      throw new UnauthorizedError("Family introduction role is not supported");
+    }
+
+    return this.database.begin(async (transaction) => {
+      const events = await transaction<ProviderEventRow[]>`
+        select id, provider_event_id, envelope_ciphertext, processing_status
+        from provider_events
+        where id = ${internalProviderEventId} and provider = 'linq'
+        for update
+      `;
+      const row = events[0];
+      if (row?.processing_status !== "processed") {
+        throw new StaleAuthorityError("Family introduction source is no longer processed");
+      }
+      const record = JSON.parse(
+        this.secretBox
+          .decrypt(
+            JSON.parse(row.envelope_ciphertext.toString("utf8")),
+            `provider-event:${row.provider_event_id}`,
+          )
+          .toString("utf8"),
+      ) as StoredLinqEvent;
+      if (
+        record.classification !== "observe_only" ||
+        (record.invocation?.basis !== "leading_address" && record.invocation?.basis !== "proven_reply") ||
+        record.routing.chatKind !== "group" ||
+        record.event?.eventType !== "linq.message.received" ||
+        !record.routing.senderIdentityId ||
+        !record.routing.senderPersonId
+      ) {
+        throw new UnauthorizedError("Provider event is not an eligible family introduction");
+      }
+      const expectedSourceObjectId = `conversation_message:${canonicalDigest({
+        integrationId: null,
+        scope: {
+          kind: "conversation_epoch",
+          participantEpochId: record.routing.participantEpochId,
+        },
+        artifactKind: "conversation_message",
+        system: "linq",
+        remoteObjectId: record.event.message.providerMessageId,
+      })}`;
+
+      const sources = await transaction<
+        {
+          conversation_authority_version: number | string;
+          participant_epoch_id: string;
+          participant_set_digest: string;
+          sender_identity_authority_version: number | string;
+          sender_subject_digest: string;
+          sender_subject_ciphertext: Buffer;
+        }[]
+      >`
+        select conversation.authority_version as conversation_authority_version,
+          epoch.id as participant_epoch_id, epoch.participant_set_digest,
+          identity.authority_version as sender_identity_authority_version,
+          identity.subject_digest as sender_subject_digest,
+          identity.subject_ciphertext as sender_subject_ciphertext
+        from conversations conversation
+        join conversation_channels channel on channel.conversation_id = conversation.id
+          and channel.provider = 'linq' and channel.status = 'active'
+          and channel.external_channel_id = ${record.routing.providerChatId}
+          and channel.latest_participant_digest = ${record.routing.providerParticipantDigest}
+        join participant_epochs epoch on epoch.id = conversation.current_epoch_id
+          and epoch.ended_at is null
+        join source_revisions source_revision on source_revision.id = ${sourceRevisionId}
+          and source_revision.participant_epoch_id = epoch.id
+          and source_revision.revoked_at is null
+          and source_revision.content_ciphertext is not null
+          and source_revision.retention_until > now()
+        join source_objects source_object on source_object.id = source_revision.source_object_id
+          and source_object.provider = 'linq'
+          and source_object.object_kind = 'conversation_message'
+          and source_object.external_object_id = ${expectedSourceObjectId}
+          and source_object.status = 'active'
+          and source_object.latest_revision_number = source_revision.revision_number
+        join epoch_participants participant on participant.participant_epoch_id = epoch.id
+          and participant.person_identity_id = ${record.routing.senderIdentityId}
+          and participant.person_id = ${record.routing.senderPersonId}
+          and participant.registration_status = 'registered' and participant.consented_at is not null
+        join people person on person.id = participant.person_id and person.status = 'registered'
+        join person_identities identity on identity.id = participant.person_identity_id
+          and identity.person_id = person.id and identity.status = 'verified'
+          and identity.subject_ciphertext is not null
+        join participant_policies policy on policy.conversation_id = conversation.id
+          and policy.person_id = person.id and policy.status = 'active'
+          and policy.allow_content_processing and policy.allow_direct_responses
+        where conversation.id = ${record.routing.conversationId}
+          and conversation.kind = 'group' and conversation.status = 'active'
+          and epoch.id = ${record.routing.participantEpochId}
+          and epoch.participant_set_digest = ${record.routing.appParticipantDigest}
+        for update of conversation
+      `;
+      const source = sources[0];
+      if (!source) throw new StaleAuthorityError("Family introduction audience changed");
+
+      const households = await transaction<
+        {
+          household_id: string;
+        }[]
+      >`
+        select household.id as household_id
+        from household_memberships membership
+        join households household on household.id = membership.household_id
+          and household.status in ('onboarding', 'active')
+        join membership_capabilities invitation_grant
+          on invitation_grant.membership_id = membership.id
+          and invitation_grant.capability = 'membership.invite'
+          and invitation_grant.status = 'active'
+        where membership.person_id = ${record.routing.senderPersonId}
+          and membership.status = 'active'
+          and (
+            ${proposalCandidate.role} <> 'steward'
+            or exists(
+              select 1 from membership_capabilities govern_grant
+              where govern_grant.membership_id = membership.id
+                and govern_grant.capability = 'household.govern'
+                and govern_grant.status = 'active'
+            )
+          )
+          and (
+            select count(distinct participant.person_id)
+            from epoch_participants participant
+            where participant.participant_epoch_id = ${record.routing.participantEpochId}
+              and participant.person_id <> ${record.routing.senderPersonId}
+              and not exists(
+                select 1 from household_memberships current_member
+                where current_member.household_id = household.id
+                  and current_member.person_id = participant.person_id
+                  and current_member.status = 'active'
+              )
+          ) = 1
+          and not exists(
+            select 1
+            from epoch_participants participant
+            where participant.participant_epoch_id = ${record.routing.participantEpochId}
+              and exists(
+                select 1 from household_memberships current_member
+                where current_member.household_id = household.id
+                  and current_member.person_id = participant.person_id
+                  and current_member.status = 'active'
+              )
+              and (
+                participant.registration_status <> 'registered'
+                or participant.consented_at is null
+              )
+          )
+        order by household.id
+        limit 2
+      `;
+      const household = households.length === 1 ? households[0] : null;
+      if (!household) {
+        throw new UnauthorizedError(
+          "The sender does not have one unambiguous family relationship for this introduction",
+        );
+      }
+      const currentHouseholds = await transaction<
+        {
+          household_control_epoch: number | string;
+          household_membership_version: number | string;
+        }[]
+      >`
+        select control_epoch as household_control_epoch,
+          membership_version as household_membership_version
+        from households
+        where id = ${household.household_id} and status in ('onboarding', 'active')
+        for update
+      `;
+      const currentHousehold = currentHouseholds[0];
+      if (!currentHousehold) {
+        throw new StaleAuthorityError("The family changed before the introduction was saved");
+      }
+
+      const targets = await transaction<
+        {
+          person_id: string;
+          identity_id: string;
+          identity_authority_version: number | string;
+          subject_digest: string;
+        }[]
+      >`
+        select participant.person_id, identity.id as identity_id,
+          identity.authority_version as identity_authority_version,
+          identity.subject_digest
+        from epoch_participants participant
+        join people person on person.id = participant.person_id
+          and person.status in ('provisional', 'registered')
+        join person_identities identity on identity.id = participant.person_identity_id
+          and identity.person_id = participant.person_id
+          and identity.status in ('observed', 'verified')
+        where participant.participant_epoch_id = ${record.routing.participantEpochId}
+          and participant.person_id <> ${record.routing.senderPersonId}
+          and not exists(
+            select 1 from household_memberships current_member
+            where current_member.household_id = ${household.household_id}
+              and current_member.person_id = participant.person_id
+              and current_member.status = 'active'
+          )
+        order by identity.id
+        limit 2
+      `;
+      const target = targets.length === 1 ? targets[0] : null;
+      if (!target) {
+        throw new StaleAuthorityError("The exact introduced participant is no longer unambiguous");
+      }
+
+      const invitationResult = await new HouseholdOnboarding(
+        transaction,
+        this.secretBox,
+      ).inviteCurrentParticipant({
+        actorPersonId: record.routing.senderPersonId,
+        householdId: household.household_id,
+        conversationId: record.routing.conversationId,
+        expectedParticipantEpochId: record.routing.participantEpochId,
+        expectedParticipantDigest: source.participant_set_digest,
+        inviteeIdentityId: target.identity_id,
+        inviteePersonId: target.person_id,
+        proposedDisplayName: displayName,
+        role: proposalCandidate.role,
+        sourceRevisionId,
+        createdAt: new Date(record.event.message.sentAt),
+      });
+      const invitationId = invitationResult.invitation.invitationId;
+      const duplicate = invitationResult.duplicate;
+
+      const readiness = await transaction<{ ready: boolean }[]>`
+        select not exists(
+          select 1 from invitation_approvals approval
+          where approval.invitation_id = invitation.id and approval.approved_at is null
+        ) as ready
+        from invitations invitation where invitation.id = ${invitationId}
+      `;
+      const ready = readiness[0]?.ready === true;
+      if (ready) await this.queueHouseholdInvitationMessage(transaction, invitationId);
+
+      const senderRecipient = this.secretBox
+        .decrypt(
+          JSON.parse(source.sender_subject_ciphertext.toString("utf8")),
+          `identity-subject:${record.routing.senderIdentityId}`,
+        )
+        .toString("utf8");
+      if (!isOutboundIdentitySubject(senderRecipient)) {
+        throw new UnauthorizedError("Exact sender does not have a safe private Florence route");
+      }
+      const responseText = duplicate
+        ? `There’s already a private family invitation pending for this person. I won’t send another one. I’ll stay silent in the group unless that exact invitation is accepted and everyone there belongs to the family.`
+        : ready
+          ? `I privately asked ${displayName} to confirm the invitation. I’ll stay silent in the group until they do.`
+          : `I recorded ${displayName} as a proposed ${relationshipLabel(proposalCandidate.role)}. The other current family stewards need to approve before I contact them privately.`;
+      await new EffectOutbox(transaction, this.secretBox).authorizeAndEnqueue({
+        actorPersonId: record.routing.senderPersonId,
+        person: {
+          id: record.routing.senderPersonId,
+          controlEpoch: (await personFence(transaction, record.routing.senderPersonId)).person.controlEpoch,
+        },
+        household: {
+          id: household.household_id,
+          controlEpoch: Number(currentHousehold.household_control_epoch),
+        },
+        recipientIdentity: {
+          id: record.routing.senderIdentityId,
+          authorityVersion: Number(source.sender_identity_authority_version),
+          subjectDigest: source.sender_subject_digest,
+        },
+        sourceConversation: {
+          id: record.routing.conversationId,
+          authorityVersion: Number(source.conversation_authority_version),
+          participantEpochId: source.participant_epoch_id,
+          participantSetDigest: source.participant_set_digest,
+        },
+        evidenceSourceRevisionIds: [sourceRevisionId],
+        effectKind: "linq.message",
+        idempotencyKey: `family-introduction-private-ack:${internalProviderEventId}`,
+        data: { invitationId, responseDigest: sha256Hex(responseText) },
+        policy: { exactPrivateRecipient: true, sourceGroupSilent: true },
+        target: {
+          recipient: senderRecipient,
+          personId: record.routing.senderPersonId,
+          recipientIdentityId: record.routing.senderIdentityId,
+        },
+        payload: { recipient: senderRecipient, text: responseText },
+        reasonCodes: [
+          "registered_exact_group_sender",
+          "explicit_family_introduction",
+          "private_response_only",
+        ],
+        authorizationExpiresAt: new Date(Date.now() + 24 * 60 * 60_000),
+      });
+
+      return {
+        accepted: true,
+        duplicate,
+        disposition: ready
+          ? duplicate
+            ? "family_invitation_already_pending"
+            : "family_invitation_sent_privately"
+          : "family_invitation_awaiting_stewards",
+        ids: {
+          providerEventId: internalProviderEventId,
+          invitationId,
+          householdId: household.household_id,
+        },
+      };
+    });
+  }
+
+  /**
+   * Returns the one logical Florence message most recently delivered before
+   * this inbound response. Provider receipt time, rather than queue time,
+   * determines the order. Equal-time effects are ambiguous and fail closed.
+   */
+  private async latestRelevantPrivateEffect(
+    transaction: Transaction,
+    record: StoredLinqEvent,
+    identityId: string,
+  ): Promise<LatestRelevantPrivateEffect | null> {
+    if (record.routing.chatKind !== "direct" || !record.messageOccurredAt) return null;
+    const responseOccurredAt = new Date(record.messageOccurredAt);
+    if (!Number.isFinite(responseOccurredAt.getTime())) return null;
+    const enrollmentPrefix = `enrollment:${record.routing.providerChatId}:%`;
+    const effects = await transaction<
+      {
+        logical_effect_id: string;
+        logical_idempotency_key: string;
+        invitation_id: string | null;
+      }[]
+    >`
+      with logical_deliveries as (
+        select coalesce(effect.redrive_root_id, effect.id) as logical_effect_id,
+          coalesce(root_effect.idempotency_key, effect.idempotency_key)
+            as logical_idempotency_key,
+          coalesce(root_effect.invitation_id, effect.invitation_id) as invitation_id,
+          min(receipt.occurred_at) as delivered_at
+        from outbox effect
+        left join outbox root_effect on root_effect.id = effect.redrive_root_id
+        join effect_receipts receipt on receipt.outbox_id = effect.id
+          and receipt.status = 'confirmed'
+          and receipt.occurred_at <= ${responseOccurredAt}
+        left join invitations effect_invitation
+          on effect_invitation.id = coalesce(root_effect.invitation_id, effect.invitation_id)
+        where effect.effect_kind = 'linq.message'
+          and (
+            coalesce(root_effect.conversation_id, effect.conversation_id) =
+              ${record.routing.conversationId}
+            or coalesce(root_effect.idempotency_key, effect.idempotency_key)
+              like ${enrollmentPrefix}
+            or effect_invitation.invitee_identity_id = ${identityId}
+          )
+        group by coalesce(effect.redrive_root_id, effect.id),
+          coalesce(root_effect.idempotency_key, effect.idempotency_key),
+          coalesce(root_effect.invitation_id, effect.invitation_id)
+      )
+      select logical_effect_id, logical_idempotency_key, invitation_id
+      from logical_deliveries
+      where delivered_at = (select max(delivered_at) from logical_deliveries)
+      order by logical_effect_id
+      limit 2
+    `;
+    if (effects.length !== 1 || !effects[0]) return null;
+    const effect = effects[0];
+    if (
+      effect.invitation_id &&
+      (effect.logical_idempotency_key === `household-enrollment-invitation:${effect.invitation_id}` ||
+        effect.logical_idempotency_key === `household-invitation:${effect.invitation_id}`)
+    ) {
+      return { kind: "family_invitation", invitationId: effect.invitation_id };
+    }
+    const enrollmentKeyPrefix = `enrollment:${record.routing.providerChatId}:`;
+    const enrollmentKeySuffix = effect.logical_idempotency_key.startsWith(enrollmentKeyPrefix)
+      ? effect.logical_idempotency_key.slice(enrollmentKeyPrefix.length)
+      : null;
+    return enrollmentKeySuffix && /^[a-f0-9]{64}$/u.test(enrollmentKeySuffix)
+      ? { kind: "enrollment", invitationId: null }
+      : { kind: "other", invitationId: null };
+  }
+
   private async handleEnrollment(transaction: Transaction, record: StoredLinqEvent): Promise<string> {
     const identityId = record.routing.senderIdentityId;
     const personId = record.routing.senderPersonId;
     if (!identityId || !personId) return "ignored";
-    const promptRows = await transaction<{ prompted: boolean }[]>`
-      select exists(
-        select 1
-        from outbox effect
-        left join outbox root on root.id = effect.redrive_root_id
-        where (
-            (
-              effect.idempotency_key like ${`enrollment:${record.routing.providerChatId}:%`}
-              or root.idempotency_key like ${`enrollment:${record.routing.providerChatId}:%`}
+    const latestEffect = await this.latestRelevantPrivateEffect(transaction, record, identityId);
+    if (record.enrollmentAction === "decline_invitation") {
+      const declined =
+        latestEffect?.kind === "family_invitation" && latestEffect.invitationId
+          ? await this.declineExactPendingFamilyInvitation(
+              transaction,
+              record,
+              identityId,
+              false,
+              latestEffect.invitationId,
             )
-            or (
-              (
-                effect.idempotency_key like 'group-enrollment:%'
-                or root.idempotency_key like 'group-enrollment:%'
-              )
-              and effect.recipient_identity_id = ${identityId}
-            )
-          )
-          and effect.status in ('submitted', 'confirmed')
-        union all
-        select 1
-        from invitations invitation
-        join outbox root
-          on root.idempotency_key = 'household-enrollment-invitation:' || invitation.id::text
-        join outbox effect on (effect.id = root.id or effect.redrive_root_id = root.id)
-          and effect.status in ('submitted', 'confirmed')
-        where invitation.invitee_identity_id = ${identityId}
-          and invitation.status = 'pending' and invitation.expires_at > now()
-      ) as prompted
-    `;
-    if (record.enrollmentAction !== "consent" || !promptRows[0]?.prompted) {
+          : null;
+      if (declined) return declined;
+    }
+    if (
+      record.enrollmentAction !== "consent" ||
+      (latestEffect?.kind !== "enrollment" && latestEffect?.kind !== "family_invitation")
+    ) {
       await this.queueSystemEnrollmentMessage(
         transaction,
         record,
-        `Hi—I’m Florence, a family Chief of Staff. I can read what you send me and help your family keep logistics covered. When I’m added to a group, new messages may be retained as private context for that exact participant lineup, but I stay silent there unless every current participant registers and approves writing in that exact group. Permitted raw context is kept for up to ${this.config.defaults.rawSourceRetentionDays} days; you can change controls or delete data later. Privacy: ${this.config.publicBaseUrl}/privacy\n\nWould you like to create your private Florence account? Reply yes to agree. You can text STOP any time.`,
+        `Hi—I’m Florence, a family Chief of Staff. I can read what you send me and help your family keep logistics covered. When I’m added to a group, new messages may be retained as private context for that exact participant lineup, but I stay silent there unless every current person is a registered member of the same Florence family and their settings permit writing. Permitted raw context is kept for up to ${this.config.defaults.rawSourceRetentionDays} days; you can change controls or delete data later. Privacy: ${this.config.publicBaseUrl}/privacy\n\nWould you like to create your private Florence account? Reply yes to agree. You can text STOP any time.`,
       );
       return "enrollment_prompted";
     }
@@ -1875,20 +2245,17 @@ export class FlorenceApplication {
       where id = ${personId} and status = 'registered'
     `;
     await this.consentPersonAcrossObservedEpochs(transaction, personId, consentedAt);
-    const affectedGroups = await transaction<{ id: string }[]>`
-      select distinct conversation.id
-      from conversations conversation
-      join participant_epochs epoch on epoch.id = conversation.current_epoch_id
-        and epoch.ended_at is null
-      join epoch_participants participant on participant.participant_epoch_id = epoch.id
-        and participant.person_id = ${personId}
-      where conversation.kind = 'group' and conversation.status = 'active'
-      order by conversation.id
-    `;
-    for (const group of affectedGroups) {
-      await this.queuePrivateGroupEnrollmentPrompts(transaction, group.id);
-      await this.queuePrivateGroupReadyNotices(transaction, group.id, "group-ready");
-    }
+    const invitationAcceptance =
+      latestEffect.kind === "family_invitation" && latestEffect.invitationId
+        ? await this.acceptExactPendingFamilyInvitation(
+            transaction,
+            record,
+            personId,
+            identityId,
+            latestEffect.invitationId,
+          )
+        : null;
+    if (invitationAcceptance) return invitationAcceptance;
     const snapshot = await new PostgresConversationAuthority(transaction).snapshot(
       record.routing.conversationId,
     );
@@ -1912,6 +2279,548 @@ export class FlorenceApplication {
       );
     }
     return "registered";
+  }
+
+  /**
+   * A natural private decline applies only to the single invitation Florence
+   * most recently delivered in this exact DM. It does not stop Florence,
+   * unregister the person, or change any broader privacy setting.
+   */
+  private async declineExactPendingFamilyInvitation(
+    transaction: Transaction,
+    record: StoredLinqEvent,
+    identityId: string,
+    registeredPerson: boolean,
+    invitationId: string,
+  ): Promise<string | null> {
+    if (record.routing.chatKind !== "direct") return null;
+    const invitations = await transaction<{ invitation_id: string }[]>`
+      select invitation.id as invitation_id
+      from invitations invitation
+      where invitation.id = ${invitationId}
+        and invitation.invitee_identity_id = ${identityId}
+        and invitation.status = 'pending'
+      for update of invitation
+    `;
+    if (invitations.length !== 1 || !invitations[0]) return null;
+    await transaction`
+      update invitations set status = 'declined', updated_at = now()
+      where id = ${invitationId} and status = 'pending'
+    `;
+    const responseText = registeredPerson
+      ? "Got it—I declined that family invitation. Your Florence account and settings are unchanged."
+      : "Got it—I declined that family invitation. I didn’t create or stop a Florence account.";
+    if (registeredPerson) {
+      const snapshot = await new PostgresConversationAuthority(transaction).snapshot(
+        record.routing.conversationId,
+      );
+      await this.queueAuthorizedConversationMessage(
+        transaction,
+        record,
+        snapshot,
+        responseText,
+        "direct_response",
+        "family_invitation_declined",
+        null,
+        new Date(Date.now() + 24 * 60 * 60_000),
+        `family-invitation-declined:${invitationId}`,
+      );
+    } else {
+      await this.queueSystemEnrollmentMessage(
+        transaction,
+        record,
+        responseText,
+        `enrollment:${record.routing.providerChatId}:family-invitation-declined:${invitationId}`,
+      );
+    }
+    return "family_invitation_declined";
+  }
+
+  /**
+   * A delivered invitation can become invalid while its private prompt is
+   * still visible. An affirmative still completes registration, but it cannot
+   * revive stale household or group authority. Explain that outcome instead
+   * of silently falling through to ordinary onboarding.
+   */
+  private async rejectStaleDeliveredFamilyInvitation(
+    transaction: Transaction,
+    record: StoredLinqEvent,
+    personId: string,
+    identityId: string,
+    invitationId: string,
+  ): Promise<string | null> {
+    if (record.routing.chatKind !== "direct") return null;
+    const locations = await transaction<
+      {
+        household_id: string;
+        source_conversation_id: string;
+        source_revision_id: string | null;
+      }[]
+    >`
+      select invitation.household_id, invitation.source_conversation_id,
+        invitation.source_revision_id
+      from invitations invitation
+      where invitation.id = ${invitationId}
+        and invitation.invitee_identity_id = ${identityId}
+    `;
+    const location = locations[0];
+    if (!location) {
+      return this.rejectStaleDeliveredFamilyInvitation(
+        transaction,
+        record,
+        personId,
+        identityId,
+        invitationId,
+      );
+    }
+    await transaction`
+      select id from conversations
+      where id = ${location.source_conversation_id}
+      for update
+    `;
+    await transaction`
+      select id from households
+      where id = ${location.household_id}
+      for update
+    `;
+    const lockedInvitations = await transaction<{ readonly id: string }[]>`
+      select id from invitations
+      where id = ${invitationId}
+        and household_id = ${location.household_id}
+        and source_conversation_id = ${location.source_conversation_id}
+      for update
+    `;
+    if (!lockedInvitations[0]) {
+      throw new StaleAuthorityError("The family invitation changed before it could be accepted");
+    }
+    if (location.source_revision_id) {
+      await transaction`
+        select id from source_revisions
+        where id = ${location.source_revision_id}
+        for update
+      `;
+    }
+    const invitations = await transaction<
+      {
+        invitation_id: string;
+        status: "pending" | "revoked" | "expired";
+        expires_at: Date;
+        inviter_person_id: string | null;
+        inviter_name_ciphertext: Buffer | null;
+      }[]
+    >`
+      select invitation.id as invitation_id, invitation.status,
+        invitation.expires_at,
+        inviter_membership.person_id as inviter_person_id,
+        inviter.display_name_ciphertext as inviter_name_ciphertext
+      from invitations invitation
+      left join household_memberships inviter_membership
+        on inviter_membership.id = invitation.invited_by_membership_id
+      left join people inviter on inviter.id = inviter_membership.person_id
+      where invitation.id = ${invitationId}
+        and invitation.invitee_identity_id = ${identityId}
+        and invitation.status in ('pending', 'revoked', 'expired')
+        and (
+          invitation.status <> 'pending'
+          or invitation.expires_at <= now()
+          or invitation.proposed_display_name_ciphertext is null
+          or not exists(
+            select 1
+            from households current_household
+            join household_memberships current_inviter_membership
+              on current_inviter_membership.id = invitation.invited_by_membership_id
+              and current_inviter_membership.household_id = current_household.id
+              and current_inviter_membership.status = 'active'
+            join people current_inviter on current_inviter.id = current_inviter_membership.person_id
+              and current_inviter.status = 'registered'
+            join person_identities current_invitee_identity
+              on current_invitee_identity.id = invitation.invitee_identity_id
+              and current_invitee_identity.id = ${identityId}
+              and current_invitee_identity.person_id = ${personId}
+              and current_invitee_identity.status = 'verified'
+            join conversations source_conversation
+              on source_conversation.id = invitation.source_conversation_id
+              and source_conversation.kind = 'group' and source_conversation.status = 'active'
+            join participant_epochs source_epoch on source_epoch.id = source_conversation.current_epoch_id
+              and source_epoch.id = invitation.source_participant_epoch_id
+              and source_epoch.ended_at is null
+              and source_epoch.participant_set_digest = invitation.source_participant_digest
+            join epoch_participants exact_invitee
+              on exact_invitee.participant_epoch_id = source_epoch.id
+              and exact_invitee.person_identity_id = current_invitee_identity.id
+              and exact_invitee.person_id = current_invitee_identity.person_id
+            where current_household.id = invitation.household_id
+              and current_household.status in ('onboarding', 'active')
+              and current_household.membership_version = invitation.household_membership_version
+              and (
+                invitation.source_revision_id is null
+                or exists(
+                  select 1
+                  from source_revisions source_revision
+                  join source_objects source_object on source_object.id = source_revision.source_object_id
+                    and source_object.status = 'active'
+                    and source_object.latest_revision_number = source_revision.revision_number
+                  where source_revision.id = invitation.source_revision_id
+                    and source_revision.participant_epoch_id = source_epoch.id
+                    and source_revision.revoked_at is null
+                    and source_revision.content_ciphertext is not null
+                    and source_revision.retention_until > now()
+                )
+              )
+              and not exists(
+                select 1 from invitation_approvals approval
+                where approval.invitation_id = invitation.id and approval.approved_at is null
+              )
+          )
+        )
+      order by invitation.created_at desc, invitation.id desc
+      limit 2
+      for update of invitation
+    `;
+    if (invitations.length === 0) return null;
+    const invitationIds = invitations.map((invitation) => invitation.invitation_id);
+    await transaction`
+      update invitations
+      set status = case when expires_at <= now() then 'expired' else 'revoked' end,
+        updated_at = now()
+      where id = any(${transaction.array(invitationIds)}::uuid[]) and status = 'pending'
+    `;
+    const invitation = invitations.length === 1 ? invitations[0] : null;
+    const inviterName =
+      invitation?.inviter_person_id && invitation.inviter_name_ciphertext
+        ? decryptPersonName(this.secretBox, invitation.inviter_person_id, invitation.inviter_name_ciphertext)
+        : null;
+    const reintroduction = inviterName
+      ? `Ask ${inviterName} to introduce you again in the current family group.`
+      : "Ask the person who invited you to introduce you again in the current family group.";
+    const snapshot = await new PostgresConversationAuthority(transaction).snapshot(
+      record.routing.conversationId,
+    );
+    await this.queueAuthorizedConversationMessage(
+      transaction,
+      record,
+      snapshot,
+      `Your Florence account is active, but that family invitation is no longer current because the family or group changed. ${reintroduction}`,
+      "direct_response",
+      "family_invitation_stale",
+      null,
+      new Date(Date.now() + 24 * 60 * 60_000),
+      `family-invitation-stale:${sha256Hex(invitationIds.sort().join(":"))}`,
+    );
+    return "family_invitation_stale";
+  }
+
+  /** The caller locks the source conversation before this second, authoritative read. */
+  private async familyInvitationIsCurrentForPerson(
+    transaction: Transaction,
+    invitationId: string,
+    personId: string,
+  ): Promise<boolean> {
+    const rows = await transaction<{ current: boolean }[]>`
+      select exists(
+        select 1
+        from invitations invitation
+        join households household on household.id = invitation.household_id
+          and household.status in ('onboarding', 'active')
+          and household.membership_version = invitation.household_membership_version
+        join household_memberships inviter_membership
+          on inviter_membership.id = invitation.invited_by_membership_id
+          and inviter_membership.household_id = household.id
+          and inviter_membership.status = 'active'
+        join people inviter on inviter.id = inviter_membership.person_id
+          and inviter.status = 'registered'
+        join person_identities invitee_identity on invitee_identity.id = invitation.invitee_identity_id
+          and invitee_identity.person_id = ${personId}
+          and invitee_identity.status = 'verified'
+        join conversations source_conversation on source_conversation.id = invitation.source_conversation_id
+          and source_conversation.kind = 'group' and source_conversation.status = 'active'
+        join participant_epochs source_epoch on source_epoch.id = source_conversation.current_epoch_id
+          and source_epoch.id = invitation.source_participant_epoch_id
+          and source_epoch.ended_at is null
+          and source_epoch.participant_set_digest = invitation.source_participant_digest
+        join epoch_participants exact_invitee on exact_invitee.participant_epoch_id = source_epoch.id
+          and exact_invitee.person_identity_id = invitee_identity.id
+          and exact_invitee.person_id = invitee_identity.person_id
+        where invitation.id = ${invitationId}
+          and invitation.status = 'pending' and invitation.expires_at > now()
+          and invitation.proposed_display_name_ciphertext is not null
+          and (
+            invitation.source_revision_id is null
+            or exists(
+              select 1
+              from source_revisions source_revision
+              join source_objects source_object on source_object.id = source_revision.source_object_id
+                and source_object.status = 'active'
+                and source_object.latest_revision_number = source_revision.revision_number
+              where source_revision.id = invitation.source_revision_id
+                and source_revision.participant_epoch_id = source_epoch.id
+                and source_revision.revoked_at is null
+                and source_revision.content_ciphertext is not null
+                and source_revision.retention_until > now()
+            )
+          )
+          and not exists(
+            select 1 from invitation_approvals approval
+            where approval.invitation_id = invitation.id and approval.approved_at is null
+          )
+      ) as current
+    `;
+    return rows[0]?.current === true;
+  }
+
+  /**
+   * One exact private yes both confirms the observed identity and accepts the
+   * one current relationship invitation. It never guesses between invitations,
+   * and it activates only the invitation's still-current source group.
+   */
+  private async acceptExactPendingFamilyInvitation(
+    transaction: Transaction,
+    record: StoredLinqEvent,
+    personId: string,
+    identityId: string,
+    invitationId: string,
+  ): Promise<string | null> {
+    if (record.routing.chatKind !== "direct") return null;
+    const invitations = await transaction<
+      {
+        invitation_id: string;
+        household_id: string;
+        source_conversation_id: string;
+        proposed_display_name_ciphertext: Buffer;
+        requested_role: "steward" | "caregiver" | "participant";
+        inviter_person_id: string;
+        inviter_name_ciphertext: Buffer | null;
+      }[]
+    >`
+      select invitation.id as invitation_id, invitation.household_id,
+        invitation.source_conversation_id,
+        invitation.proposed_display_name_ciphertext,
+        invitation.requested_role,
+        inviter_membership.person_id as inviter_person_id,
+        inviter.display_name_ciphertext as inviter_name_ciphertext
+      from invitations invitation
+      join households household on household.id = invitation.household_id
+        and household.status in ('onboarding', 'active')
+        and household.membership_version = invitation.household_membership_version
+      join household_memberships inviter_membership
+        on inviter_membership.id = invitation.invited_by_membership_id
+        and inviter_membership.status = 'active'
+      join people inviter on inviter.id = inviter_membership.person_id
+        and inviter.status = 'registered'
+      join person_identities invitee_identity on invitee_identity.id = invitation.invitee_identity_id
+        and invitee_identity.person_id = ${personId}
+        and invitee_identity.id = ${identityId}
+        and invitee_identity.status = 'verified'
+      join conversations source_conversation on source_conversation.id = invitation.source_conversation_id
+        and source_conversation.kind = 'group' and source_conversation.status = 'active'
+      join participant_epochs source_epoch on source_epoch.id = source_conversation.current_epoch_id
+        and source_epoch.id = invitation.source_participant_epoch_id
+        and source_epoch.ended_at is null
+        and source_epoch.participant_set_digest = invitation.source_participant_digest
+      join epoch_participants exact_invitee on exact_invitee.participant_epoch_id = source_epoch.id
+        and exact_invitee.person_identity_id = invitee_identity.id
+        and exact_invitee.person_id = invitee_identity.person_id
+      where invitation.id = ${invitationId}
+        and invitation.status = 'pending' and invitation.expires_at > now()
+        and invitation.proposed_display_name_ciphertext is not null
+        and not exists(
+          select 1 from invitation_approvals approval
+          where approval.invitation_id = invitation.id and approval.approved_at is null
+        )
+      order by invitation.created_at, invitation.id
+      limit 2
+    `;
+    if (invitations.length === 0) {
+      return this.rejectStaleDeliveredFamilyInvitation(
+        transaction,
+        record,
+        personId,
+        identityId,
+        invitationId,
+      );
+    }
+    const snapshot = await new PostgresConversationAuthority(transaction).snapshot(
+      record.routing.conversationId,
+    );
+    if (invitations.length !== 1 || !invitations[0]) {
+      await this.queueAuthorizedConversationMessage(
+        transaction,
+        record,
+        snapshot,
+        "I found more than one current family invitation, so I didn’t guess. Open your private settings to choose the right one.",
+        "direct_response",
+        "family_invitation_choice_required",
+      );
+      return "family_invitation_choice_required";
+    }
+    const invitation = invitations[0];
+    const acceptedAt = new Date();
+    if (!(await this.familyInvitationIsCurrentForPerson(transaction, invitation.invitation_id, personId))) {
+      const staleDisposition = await this.rejectStaleDeliveredFamilyInvitation(
+        transaction,
+        record,
+        personId,
+        identityId,
+        invitationId,
+      );
+      if (staleDisposition) return staleDisposition;
+      throw new StaleAuthorityError("The family invitation changed before it could be accepted");
+    }
+    const proposedDisplayName = this.secretBox
+      .decrypt(
+        JSON.parse(invitation.proposed_display_name_ciphertext.toString("utf8")),
+        `invitation-proposed-display-name:${invitation.invitation_id}`,
+      )
+      .toString("utf8");
+    const people = await transaction<{ display_name_ciphertext: Buffer | null }[]>`
+      select display_name_ciphertext from people
+      where id = ${personId} and status = 'registered'
+      for update
+    `;
+    if (!people[0]) throw new StaleAuthorityError("Invitation identity is no longer registered");
+    if (people[0].display_name_ciphertext === null) {
+      const encryptedName = this.secretBox.encrypt(proposedDisplayName, `person-display-name:${personId}`);
+      await transaction`
+        update people
+        set display_name_ciphertext = ${Buffer.from(JSON.stringify(encryptedName), "utf8")},
+          display_name_key_version = ${encryptedName.kid}, onboarding_step = 'complete',
+          updated_at = ${acceptedAt}
+        where id = ${personId} and status = 'registered'
+      `;
+    } else {
+      await transaction`
+        update people set onboarding_step = 'complete', updated_at = ${acceptedAt}
+        where id = ${personId} and status = 'registered'
+      `;
+    }
+
+    const membership = await new HouseholdOnboarding(transaction, this.secretBox).acceptInvitation({
+      actorPersonId: personId,
+      invitationId: invitation.invitation_id,
+      acceptedAt,
+    });
+    await transaction`
+      update households set status = 'active', updated_at = ${acceptedAt}
+      where id = ${membership.householdId} and status = 'onboarding'
+    `;
+    const familyAuthority = await new FamilyGroupAuthority(transaction).reconcile({
+      conversationId: invitation.source_conversation_id,
+      occurredAt: acceptedAt,
+    });
+    const inviterName =
+      decryptPersonName(this.secretBox, invitation.inviter_person_id, invitation.inviter_name_ciphertext) ??
+      "Your family member";
+    await this.queueAuthorizedConversationMessage(
+      transaction,
+      record,
+      snapshot,
+      `You’re all set. You joined ${inviterName}’s Florence family as ${relationshipLabel(invitation.requested_role)}. I’ll reuse the family details already there instead of asking you to repeat them.`,
+      "direct_response",
+      "family_invitation_accepted",
+      null,
+      new Date(Date.now() + 24 * 60 * 60_000),
+      `family-invitation-accepted:${invitation.invitation_id}`,
+    );
+    if (familyAuthority.activatedNow && familyAuthority.ruleId && familyAuthority.householdId) {
+      await this.queueFamilyGroupActivationAcknowledgement(transaction, {
+        invitationId: invitation.invitation_id,
+        actorPersonId: personId,
+        conversationId: invitation.source_conversation_id,
+        householdId: familyAuthority.householdId,
+        householdControlEpoch: familyAuthority.householdControlEpoch,
+        participantEpochId: familyAuthority.participantEpochId,
+        participantSetDigest: familyAuthority.participantSetDigest,
+        ruleId: familyAuthority.ruleId,
+        snapshot: familyAuthority.snapshot,
+      });
+    }
+    return "household_invitation_accepted";
+  }
+
+  private async queueFamilyGroupActivationAcknowledgement(
+    transaction: Transaction,
+    input: {
+      readonly invitationId: string;
+      readonly actorPersonId: string;
+      readonly conversationId: string;
+      readonly householdId: string;
+      readonly householdControlEpoch: number | null;
+      readonly participantEpochId: string;
+      readonly participantSetDigest: string;
+      readonly ruleId: string;
+      readonly snapshot: ConversationAuthoritySnapshot;
+    },
+  ): Promise<void> {
+    if (input.householdControlEpoch === null) return;
+    const audience = await transaction<
+      {
+        identity_id: string;
+        external_channel_id: string;
+        latest_participant_digest: string;
+      }[]
+    >`
+      select participant.person_identity_id as identity_id,
+        channel.external_channel_id, channel.latest_participant_digest
+      from conversations conversation
+      join conversation_channels channel on channel.conversation_id = conversation.id
+        and channel.provider = 'linq' and channel.status = 'active'
+        and channel.latest_participant_digest is not null
+      join participant_epochs epoch on epoch.id = conversation.current_epoch_id
+        and epoch.id = ${input.participantEpochId} and epoch.ended_at is null
+        and epoch.participant_set_digest = ${input.participantSetDigest}
+      join epoch_participants participant on participant.participant_epoch_id = epoch.id
+      where conversation.id = ${input.conversationId}
+        and conversation.household_id = ${input.householdId}
+        and conversation.kind = 'group' and conversation.status = 'active'
+      order by participant.person_identity_id
+    `;
+    const first = audience[0];
+    if (!first || audience.length !== input.snapshot.participants.length) return;
+    const authorization = await new PostgresConversationAuthority(transaction).authorizeSend({
+      conversationId: input.conversationId,
+      expectedParticipantEpochId: input.participantEpochId,
+      expectedParticipantSetDigest: input.participantSetDigest,
+      liveParticipantIdentityIds: audience.map((participant) => participant.identity_id),
+      sendKind: "transactional",
+      operation: "family_group_activation",
+      ruleId: input.ruleId,
+    });
+    if (!authorization.allowed) return;
+    const text = "I’m all set. I can help coordinate family logistics here now.";
+    await new EffectOutbox(transaction, this.secretBox).authorizeAndEnqueue({
+      actorPersonId: input.actorPersonId,
+      ...(await personFence(transaction, input.actorPersonId)),
+      household: { id: input.householdId, controlEpoch: input.householdControlEpoch },
+      conversation: {
+        id: input.conversationId,
+        authorityVersion: authorization.authorityVersion,
+      },
+      participantEpochId: input.participantEpochId,
+      expectedParticipantDigest: input.participantSetDigest,
+      effectKind: "linq.message",
+      idempotencyKey: `group-activation:${input.invitationId}:${input.participantEpochId}`,
+      data: { invitationId: input.invitationId, textDigest: sha256Hex(text) },
+      policy: {
+        exactCurrentAudience: true,
+        standingHouseholdMembership: true,
+        operation: "family_group_activation",
+      },
+      target: {
+        providerChatId: first.external_channel_id,
+        participantEpochId: input.participantEpochId,
+      },
+      payload: {
+        providerChatId: first.external_channel_id,
+        expectedProviderParticipantDigest: first.latest_participant_digest,
+        text,
+      },
+      reasonCodes: [
+        "exact_current_group_epoch",
+        "all_current_participants_active_household_members",
+        "standing_household_membership",
+      ],
+      authorizationExpiresAt: new Date(Date.now() + 5 * 60_000),
+    });
   }
 
   /**
@@ -2045,6 +2954,16 @@ export class FlorenceApplication {
     const personId = record.routing.senderPersonId;
     if (!personId) return "ignored";
     if (record.routing.chatKind === "direct") {
+      const affectedConversations = await transaction<{ conversation_id: string }[]>`
+        select conversation.id as conversation_id
+        from conversations conversation
+        join participant_epochs epoch on epoch.id = conversation.current_epoch_id
+          and epoch.ended_at is null
+        join epoch_participants participant on participant.participant_epoch_id = epoch.id
+        where participant.person_id = ${personId}
+        order by conversation.id
+        for update of conversation
+      `;
       if (record.routing.senderIdentityId) {
         await transaction`
           update invitations set status = 'declined', updated_at = now()
@@ -2056,15 +2975,6 @@ export class FlorenceApplication {
           authority_version = authority_version + 1, onboarding_step = 'consent_pending',
           updated_at = now()
         where id = ${personId} and status not in ('deleted', 'merged')
-      `;
-      const affectedConversations = await transaction<{ conversation_id: string }[]>`
-        select conversation.id as conversation_id
-        from conversations conversation
-        join participant_epochs epoch on epoch.id = conversation.current_epoch_id
-          and epoch.ended_at is null
-        join epoch_participants participant on participant.participant_epoch_id = epoch.id
-        where participant.person_id = ${personId}
-        for update of conversation
       `;
       await transaction`
         update epoch_participants participant
@@ -2131,6 +3041,53 @@ export class FlorenceApplication {
         )[0]
       : null;
     const person = record.routing.chatKind === "direct" ? registeredSender : null;
+    if (
+      record.routing.chatKind === "direct" &&
+      person &&
+      record.routing.senderIdentityId &&
+      isExplicitFamilyInvitationDecline(text)
+    ) {
+      const latestEffect = await this.latestRelevantPrivateEffect(
+        transaction,
+        record,
+        record.routing.senderIdentityId,
+      );
+      const declined =
+        latestEffect?.kind === "family_invitation" && latestEffect.invitationId
+          ? await this.declineExactPendingFamilyInvitation(
+              transaction,
+              record,
+              record.routing.senderIdentityId,
+              true,
+              latestEffect.invitationId,
+            )
+          : null;
+      if (declined) return declined;
+    }
+    if (
+      record.routing.chatKind === "direct" &&
+      person &&
+      record.routing.senderPersonId &&
+      record.routing.senderIdentityId &&
+      isExplicitEnrollmentConsent(text)
+    ) {
+      const latestEffect = await this.latestRelevantPrivateEffect(
+        transaction,
+        record,
+        record.routing.senderIdentityId,
+      );
+      const invitationAcceptance =
+        latestEffect?.kind === "family_invitation" && latestEffect.invitationId
+          ? await this.acceptExactPendingFamilyInvitation(
+              transaction,
+              record,
+              record.routing.senderPersonId,
+              record.routing.senderIdentityId,
+              latestEffect.invitationId,
+            )
+          : null;
+      if (invitationAcceptance) return invitationAcceptance;
+    }
     const naturalGreeting = isNaturalPrivateGreeting(record.routing.chatKind, text);
     const displayName =
       record.routing.chatKind === "direct" && !naturalGreeting
@@ -2353,7 +3310,7 @@ export class FlorenceApplication {
           transaction,
           record,
           snapshot,
-          `Done—your private family space is ready. Add me to a group with your co-parent or caregiver; I’ll stay silent there unless every current participant registers and approves writing in that exact group. Add your children and the family context you want me to know here: ${this.config.publicBaseUrl}/handoff/${handoff.token}\n\nIf the link expires, text me “settings” for a fresh one.`,
+          `Done—your private family space is ready. Add me to a group with your co-parent or caregiver; once each current person has joined this Florence family, I can coordinate there automatically. Other groups stay read-only. Add your children and the family context you want me to know here: ${this.config.publicBaseUrl}/handoff/${handoff.token}\n\nIf the link expires, text me “settings” for a fresh one.`,
           "direct_response",
           "family_created",
           null,
@@ -2569,10 +3526,13 @@ export class FlorenceApplication {
     transaction: Transaction,
     record: StoredLinqEvent,
     text: string,
+    idempotencyKey = `enrollment:${record.routing.providerChatId}:${sha256Hex(
+      `${record.messageOccurredAt ?? "no-message-time"}:${text}`,
+    )}`,
   ): Promise<void> {
     await new EffectOutbox(transaction, this.secretBox).authorizeAndEnqueue({
       effectKind: "linq.message",
-      idempotencyKey: `enrollment:${record.routing.providerChatId}:${sha256Hex(text)}`,
+      idempotencyKey,
       data: { classification: "registration_prompt" },
       policy: { systemEnrollment: true, exactPrivateDm: record.routing.chatKind === "direct" },
       target: {
@@ -2883,7 +3843,13 @@ export class FlorenceApplication {
         invitee_identity_authority_version: number | string;
         invitee_subject_digest: string;
         invitee_subject_ciphertext: Buffer | null;
+        proposed_display_name_ciphertext: Buffer;
         requested_role: "steward" | "caregiver" | "participant";
+        source_conversation_id: string;
+        source_conversation_authority_version: number | string;
+        source_participant_epoch_id: string;
+        source_participant_digest: string;
+        source_revision_id: string | null;
         expires_at: Date;
         ready: boolean;
       }[]
@@ -2899,7 +3865,14 @@ export class FlorenceApplication {
         invitee_identity.authority_version as invitee_identity_authority_version,
         invitee_identity.subject_digest as invitee_subject_digest,
         invitee_identity.subject_ciphertext as invitee_subject_ciphertext,
-        invitation.requested_role, invitation.expires_at,
+        invitation.proposed_display_name_ciphertext,
+        invitation.requested_role,
+        source_conversation.id as source_conversation_id,
+        source_conversation.authority_version as source_conversation_authority_version,
+        source_epoch.id as source_participant_epoch_id,
+        source_epoch.participant_set_digest as source_participant_digest,
+        invitation.source_revision_id,
+        invitation.expires_at,
         not exists(
           select 1 from invitation_approvals approval
           where approval.invitation_id = invitation.id and approval.approved_at is null
@@ -2914,8 +3887,33 @@ export class FlorenceApplication {
         and invitee_identity.status in ('observed', 'verified')
       join people invitee on invitee.id = invitee_identity.person_id
         and invitee.status in ('provisional', 'registered')
+      join conversations source_conversation on source_conversation.id = invitation.source_conversation_id
+        and source_conversation.kind = 'group' and source_conversation.status = 'active'
+      join participant_epochs source_epoch on source_epoch.id = source_conversation.current_epoch_id
+        and source_epoch.id = invitation.source_participant_epoch_id
+        and source_epoch.ended_at is null
+        and source_epoch.participant_set_digest = invitation.source_participant_digest
+      join epoch_participants source_invitee on source_invitee.participant_epoch_id = source_epoch.id
+        and source_invitee.person_identity_id = invitee_identity.id
+        and source_invitee.person_id = invitee_identity.person_id
       where invitation.id = ${invitationId} and invitation.status = 'pending'
+        and invitation.proposed_display_name_ciphertext is not null
         and invitation.expires_at > now()
+        and (
+          invitation.source_revision_id is null
+          or exists(
+            select 1
+            from source_revisions source_revision
+            join source_objects source_object on source_object.id = source_revision.source_object_id
+              and source_object.status = 'active'
+              and source_object.latest_revision_number = source_revision.revision_number
+            where source_revision.id = invitation.source_revision_id
+              and source_revision.participant_epoch_id = source_epoch.id
+              and source_revision.revoked_at is null
+              and source_revision.content_ciphertext is not null
+              and source_revision.retention_until > now() + interval '3 minutes'
+          )
+        )
     `;
     const invitation = invitations[0];
     if (!invitation?.ready) return;
@@ -2924,10 +3922,16 @@ export class FlorenceApplication {
       "Someone in your shared Florence group";
     const role =
       invitation.requested_role === "steward"
-        ? "a parent / steward"
+        ? "a co-parent"
         : invitation.requested_role === "caregiver"
           ? "a caregiver"
           : "a family participant";
+    const proposedDisplayName = this.secretBox
+      .decrypt(
+        JSON.parse(invitation.proposed_display_name_ciphertext.toString("utf8")),
+        `invitation-proposed-display-name:${invitationId}`,
+      )
+      .toString("utf8");
 
     if (
       invitation.invitee_person_status !== "registered" ||
@@ -2941,7 +3945,7 @@ export class FlorenceApplication {
       if (!recipient || !isOutboundIdentitySubject(recipient)) {
         throw new NotFoundError("Florence cannot safely open a private chat with that group participant");
       }
-      const text = `${inviterName} invited you to Florence as ${role}. Florence is a private family Chief of Staff. I won’t use or share your private messages unless you opt in, and groups stay observe-only unless every current participant registers and approves writing in that exact group. Would you like to create your private Florence account and review the invitation? Reply yes to agree, or STOP to decline.`;
+      const text = `${inviterName} says you’re ${proposedDisplayName} and invited you to join their Florence family as ${role}. Is that right? Reply yes to create your private account and join the family, or no if that isn’t right. I’ll stay silent in the group until you confirm. You can text STOP any time to stop Florence.`;
       await new EffectOutbox(transaction, this.secretBox).authorizeAndEnqueue({
         actorPersonId: invitation.inviter_person_id,
         person: {
@@ -2956,6 +3960,15 @@ export class FlorenceApplication {
           id: invitationId,
           inviteeIdentityAuthorityVersion: Number(invitation.invitee_identity_authority_version),
         },
+        sourceConversation: {
+          id: invitation.source_conversation_id,
+          authorityVersion: Number(invitation.source_conversation_authority_version),
+          participantEpochId: invitation.source_participant_epoch_id,
+          participantSetDigest: invitation.source_participant_digest,
+        },
+        ...(invitation.source_revision_id
+          ? { evidenceSourceRevisionIds: [invitation.source_revision_id] }
+          : {}),
         effectKind: "linq.message",
         idempotencyKey: `household-enrollment-invitation:${invitationId}`,
         data: {
@@ -3023,19 +4036,7 @@ export class FlorenceApplication {
     if (!authority.allowed) {
       throw new UnauthorizedError("That person’s private Florence settings do not allow an invitation");
     }
-    const handoff = await new PostgresWebAuth(
-      transaction,
-      this.secretBox,
-      this.config.security.tokenKey,
-    ).createHandoff({
-      personId: invitation.invitee_person_id,
-      privateIdentityId: route.identity_id,
-      privateConversationId: route.conversation_id,
-      purpose: "invitation",
-      context: { invitationId, returnPath: "/people" },
-      expiresInSeconds: 10 * 60,
-    });
-    const text = `${inviterName} invited you to join their Florence family as ${role}. I won’t ask you to repeat family details they already shared. Review and accept privately: ${this.config.publicBaseUrl}/handoff/${handoff.token}\n\nIf the link expires, text me “settings” for a fresh one.`;
+    const text = `${inviterName} invited you to join their Florence family as ${role} and said you’re ${proposedDisplayName}. Is that right? Reply yes to join, or no if that isn’t right. I won’t ask you to repeat family details they already shared, and I’ll stay silent in the group until you confirm.`;
     await new EffectOutbox(transaction, this.secretBox).authorizeAndEnqueue({
       actorPersonId: invitation.inviter_person_id,
       ...(await personFence(transaction, invitation.invitee_person_id)),
@@ -3047,6 +4048,15 @@ export class FlorenceApplication {
         id: invitationId,
         inviteeIdentityAuthorityVersion: Number(invitation.invitee_identity_authority_version),
       },
+      sourceConversation: {
+        id: invitation.source_conversation_id,
+        authorityVersion: Number(invitation.source_conversation_authority_version),
+        participantEpochId: invitation.source_participant_epoch_id,
+        participantSetDigest: invitation.source_participant_digest,
+      },
+      ...(invitation.source_revision_id
+        ? { evidenceSourceRevisionIds: [invitation.source_revision_id] }
+        : {}),
       conversation: { id: route.conversation_id, authorityVersion: Number(route.authority_version) },
       participantEpochId: route.participant_epoch_id,
       expectedParticipantDigest: route.participant_set_digest,
@@ -3066,389 +4076,6 @@ export class FlorenceApplication {
       reasonCodes: ["registered_exact_private_invitee", "household_invitation"],
       authorizationExpiresAt: invitation.expires_at,
     });
-  }
-
-  private async queuePrivateGroupEnrollmentPrompts(
-    transaction: Transaction,
-    conversationId: string,
-  ): Promise<void> {
-    const candidates = await transaction<
-      {
-        conversation_authority_version: number | string;
-        participant_epoch_id: string;
-        participant_set_digest: string;
-        identity_id: string;
-        identity_authority_version: number | string;
-        identity_subject_digest: string;
-        identity_subject_ciphertext: Buffer;
-        prior_prompt_count: number | string;
-      }[]
-    >`
-      select conversation.authority_version as conversation_authority_version,
-        epoch.id as participant_epoch_id, epoch.participant_set_digest,
-        identity.id as identity_id, identity.authority_version as identity_authority_version,
-        identity.subject_digest as identity_subject_digest,
-        identity.subject_ciphertext as identity_subject_ciphertext,
-        (
-          select count(*)
-          from outbox prior
-          where prior.idempotency_key like 'group-enrollment:%'
-            and prior.recipient_identity_id = identity.id
-            and prior.source_conversation_id = conversation.id
-            and prior.source_participant_epoch_id = epoch.id
-        ) as prior_prompt_count
-      from conversations conversation
-      join participant_epochs epoch on epoch.id = conversation.current_epoch_id and epoch.ended_at is null
-      join epoch_participants participant on participant.participant_epoch_id = epoch.id
-        and (participant.registration_status <> 'registered' or participant.consented_at is null)
-      join people person on person.id = participant.person_id and person.status = 'provisional'
-      join person_identities identity on identity.id = participant.person_identity_id
-        and identity.person_id = participant.person_id
-        and identity.status in ('observed', 'pending_claim', 'verified')
-      where conversation.id = ${conversationId} and conversation.kind = 'group'
-        and conversation.status = 'active'
-        and not exists(
-          select 1 from outbox existing
-          left join outbox root on root.id = existing.redrive_root_id
-          where (
-              existing.idempotency_key like 'group-enrollment:%'
-              or root.idempotency_key like 'group-enrollment:%'
-            )
-            and existing.recipient_identity_id = identity.id
-            and (
-              existing.status in ('submitted', 'confirmed')
-              or (
-                existing.status in ('pending', 'leased', 'retry')
-                and existing.source_conversation_id = conversation.id
-                and existing.source_conversation_authority_version = conversation.authority_version
-                and existing.source_participant_epoch_id = epoch.id
-                and existing.source_expected_participant_digest = epoch.participant_set_digest
-              )
-            )
-        )
-      order by identity.id
-    `;
-    for (const candidate of candidates) {
-      const recipient = decryptIdentitySubject(
-        this.secretBox,
-        candidate.identity_id,
-        candidate.identity_subject_ciphertext,
-      );
-      if (!recipient || !isOutboundIdentitySubject(recipient)) continue;
-      const text = `Someone added me to an iMessage group you’re in. I’ll stay silent there. With a private Florence account, I can read what you send me here. I may also privately process messages from every exact group lineup where you and I are or were both present—including still-retained earlier messages—for up to ${this.config.defaults.rawSourceRetentionDays} days, and use that context to help you privately. This never lets me write in a group: every current person must separately approve that exact group. You can change controls or delete data later.\n\nReply yes to agree, or STOP to opt out.`;
-      const promptAttempt = Number(candidate.prior_prompt_count) + 1;
-      await new EffectOutbox(transaction, this.secretBox).authorizeAndEnqueue({
-        sourceConversation: {
-          id: conversationId,
-          authorityVersion: Number(candidate.conversation_authority_version),
-          participantEpochId: candidate.participant_epoch_id,
-          participantSetDigest: candidate.participant_set_digest,
-        },
-        recipientIdentity: {
-          id: candidate.identity_id,
-          authorityVersion: Number(candidate.identity_authority_version),
-          subjectDigest: candidate.identity_subject_digest,
-        },
-        effectKind: "linq.message",
-        idempotencyKey: `group-enrollment:${conversationId}:${candidate.participant_epoch_id}:${candidate.identity_id}:authority-${candidate.conversation_authority_version}:attempt-${promptAttempt}`,
-        data: {
-          classification: "registration_prompt",
-          sourceConversationId: conversationId,
-          recipientIdentityId: candidate.identity_id,
-          textDigest: sha256Hex(text),
-        },
-        policy: { systemEnrollment: true, enrollmentOnly: true, sourceGroupSilent: true },
-        target: {
-          recipientIdentityId: candidate.identity_id,
-          recipientSubjectDigest: candidate.identity_subject_digest,
-        },
-        payload: { recipient, text },
-        reasonCodes: [
-          "exact_current_group_epoch",
-          "cold_added_group_participant",
-          "private_enrollment_only",
-          "source_group_silent",
-        ],
-        authorizationExpiresAt: new Date(Date.now() + 24 * 60 * 60_000),
-      });
-    }
-  }
-
-  private async queuePrivateGroupNotice(
-    transaction: Transaction,
-    input: {
-      readonly conversationId: string;
-      readonly personId: string;
-      readonly householdId: string;
-      readonly noticeKind: "coverage-active" | "group-ready";
-      readonly message: (link: string, groupLabel: string) => string;
-    },
-  ): Promise<void> {
-    const routes = await transaction<
-      {
-        group_authority_version: number | string;
-        group_epoch_id: string;
-        group_participant_digest: string;
-        household_control_epoch: number | string;
-        person_control_epoch: number | string;
-        direct_conversation_id: string;
-        direct_authority_version: number | string;
-        direct_epoch_id: string;
-        direct_participant_digest: string;
-        direct_identity_id: string;
-        external_channel_id: string;
-        latest_participant_digest: string;
-      }[]
-    >`
-      select group_conversation.authority_version as group_authority_version,
-        group_epoch.id as group_epoch_id,
-        group_epoch.participant_set_digest as group_participant_digest,
-        household.control_epoch as household_control_epoch,
-        person.control_epoch as person_control_epoch,
-        direct.id as direct_conversation_id,
-        direct.authority_version as direct_authority_version,
-        direct_epoch.id as direct_epoch_id,
-        direct_epoch.participant_set_digest as direct_participant_digest,
-        direct_participant.person_identity_id as direct_identity_id,
-        channel.external_channel_id, channel.latest_participant_digest
-      from conversations group_conversation
-      join participant_epochs group_epoch on group_epoch.id = group_conversation.current_epoch_id
-        and group_epoch.ended_at is null
-      join epoch_participants group_participant on group_participant.participant_epoch_id = group_epoch.id
-        and group_participant.person_id = ${input.personId}
-        and group_participant.registration_status = 'registered'
-        and group_participant.consented_at is not null
-      join people person on person.id = group_participant.person_id and person.status = 'registered'
-      join household_memberships membership on membership.household_id = ${input.householdId}
-        and membership.person_id = person.id and membership.status = 'active'
-      join households household on household.id = membership.household_id
-        and household.status in ('onboarding', 'active', 'paused')
-      join conversations direct on direct.kind = 'direct' and direct.status = 'active'
-      join conversation_channels channel on channel.conversation_id = direct.id
-        and channel.provider = 'linq' and channel.status = 'active'
-        and channel.latest_participant_digest is not null
-      join participant_epochs direct_epoch on direct_epoch.id = direct.current_epoch_id
-        and direct_epoch.ended_at is null
-      join epoch_participants direct_participant on direct_participant.participant_epoch_id = direct_epoch.id
-        and direct_participant.person_id = person.id
-        and direct_participant.registration_status = 'registered'
-        and direct_participant.consented_at is not null
-      where group_conversation.id = ${input.conversationId}
-        and group_conversation.kind = 'group' and group_conversation.status = 'active'
-        and (select count(*) from epoch_participants exact
-          where exact.participant_epoch_id = direct_epoch.id) = 1
-      order by direct.updated_at desc limit 1
-    `;
-    const route = routes[0];
-    if (!route) return;
-    const groupLabel = await this.exactGroupLabel(transaction, input.personId, {
-      conversationId: input.conversationId,
-      participantEpochId: route.group_epoch_id,
-      participantSetDigest: route.group_participant_digest,
-      conversationAuthorityVersion: Number(route.group_authority_version),
-      householdControlEpoch: Number(route.household_control_epoch),
-    });
-    const idempotencyKey = `group-${input.noticeKind}:${input.conversationId}:${route.group_epoch_id}:${input.personId}`;
-    const existing = await transaction<{ present: boolean }[]>`
-      select exists(
-        select 1 from outbox
-        where idempotency_key = ${idempotencyKey}
-          or redrive_root_id = (
-            select id from outbox where idempotency_key = ${idempotencyKey}
-          )
-      ) as present
-    `;
-    if (existing[0]?.present) return;
-    const directAuthority = await new PostgresConversationAuthority(transaction).authorizeSend({
-      conversationId: route.direct_conversation_id,
-      expectedParticipantEpochId: route.direct_epoch_id,
-      expectedParticipantSetDigest: route.direct_participant_digest,
-      liveParticipantIdentityIds: [route.direct_identity_id],
-      sendKind: "transactional",
-      operation: "private_group_notice",
-      ruleId: null,
-    });
-    if (!directAuthority.allowed) return;
-    const isGroupCoverageApproval = input.noticeKind === "group-ready";
-    const handoff = await new PostgresWebAuth(
-      transaction,
-      this.secretBox,
-      this.config.security.tokenKey,
-    ).createHandoff({
-      personId: input.personId,
-      privateIdentityId: route.direct_identity_id,
-      privateConversationId: route.direct_conversation_id,
-      purpose: isGroupCoverageApproval ? "group_coverage" : "web_sign_in",
-      context: isGroupCoverageApproval
-        ? {
-            action: "approve",
-            conversationId: input.conversationId,
-            expectedParticipantEpochId: route.group_epoch_id,
-            expectedParticipantSetDigest: route.group_participant_digest,
-            expectedConversationAuthorityVersion: String(route.group_authority_version),
-            expectedHouseholdControlEpoch: String(route.household_control_epoch),
-            groupLabel,
-            returnPath: "/people",
-          }
-        : { returnPath: "/people" },
-      expiresInSeconds: 10 * 60,
-    });
-    const text = `${input.message(`${this.config.publicBaseUrl}/handoff/${handoff.token}`, groupLabel)}\n\nIf the link expires, text me “settings” for a fresh one.`;
-    await new EffectOutbox(transaction, this.secretBox).authorizeAndEnqueue({
-      actorPersonId: input.personId,
-      person: { id: input.personId, controlEpoch: Number(route.person_control_epoch) },
-      household: { id: input.householdId, controlEpoch: Number(route.household_control_epoch) },
-      conversation: {
-        id: route.direct_conversation_id,
-        authorityVersion: Number(route.direct_authority_version),
-      },
-      participantEpochId: route.direct_epoch_id,
-      expectedParticipantDigest: route.direct_participant_digest,
-      sourceConversation: {
-        id: input.conversationId,
-        authorityVersion: Number(route.group_authority_version),
-        participantEpochId: route.group_epoch_id,
-        participantSetDigest: route.group_participant_digest,
-      },
-      effectKind: "linq.message",
-      idempotencyKey,
-      data: { noticeKind: input.noticeKind, textDigest: sha256Hex(text) },
-      policy: { exactPrivateDm: true, transactionalGroupNotice: true },
-      target: {
-        providerChatId: route.external_channel_id,
-        personId: input.personId,
-      },
-      payload: {
-        providerChatId: route.external_channel_id,
-        expectedProviderParticipantDigest: route.latest_participant_digest,
-        text,
-      },
-      reasonCodes: ["exact_current_group_epoch", "exact_private_recipient", input.noticeKind],
-      authorizationExpiresAt: handoff.expiresAt,
-    });
-  }
-
-  private async queuePrivateGroupReadyNotices(
-    transaction: Transaction,
-    conversationId: string,
-    noticeKind: "coverage-active" | "group-ready",
-  ): Promise<void> {
-    const groups = await transaction<{ household_id: string }[]>`
-      select household_id from conversations
-      where id = ${conversationId} and kind = 'group' and status = 'active'
-        and household_id is not null
-    `;
-    const group = groups[0];
-    if (!group) return;
-    const snapshot = await new PostgresConversationAuthority(transaction).snapshot(conversationId);
-    if (!snapshot.participantEpochId || !snapshot.participantSetDigest) return;
-    if (
-      snapshot.participants.length === 0 ||
-      snapshot.participants.some(
-        (participant) =>
-          participant.registrationStatus !== "registered" ||
-          participant.consentedAt === null ||
-          participant.policy === null,
-      )
-    )
-      return;
-    const participantIds = [
-      ...new Set(snapshot.participants.map((participant) => participant.personId)),
-    ].sort();
-    const memberships = await transaction<{ person_id: string }[]>`
-      select person_id from household_memberships
-      where household_id = ${group.household_id} and status = 'active'
-        and person_id = any(${transaction.array(participantIds)}::uuid[])
-      order by person_id
-    `;
-    if (memberships.length !== participantIds.length) return;
-    const coverageActive = snapshot.rules.some(
-      (rule) =>
-        rule.active &&
-        rule.participantSetDigest === snapshot.participantSetDigest &&
-        rule.allowedOperations.includes("proactive_coverage"),
-    );
-    if (
-      (noticeKind === "group-ready" && coverageActive) ||
-      (noticeKind === "coverage-active" && !coverageActive)
-    )
-      return;
-    for (const personId of participantIds) {
-      await this.queuePrivateGroupNotice(transaction, {
-        conversationId,
-        personId,
-        householdId: group.household_id,
-        noticeKind,
-        message:
-          noticeKind === "coverage-active"
-            ? (link, groupLabel) =>
-                `Coverage help is on for ${groupLabel}. I can now open, follow, and close coverage loops there without assigning blame. If anyone joins or leaves, I’ll turn it off until the new group approves again. Your private controls: ${link}`
-            : (link, groupLabel) =>
-                `Everyone in ${groupLabel} has registered. I’m still read-only there until each current person privately approves proactive coverage. No one needs to reply in the group. Approve this exact group: ${link}`,
-      });
-    }
-  }
-
-  private async exactGroupLabel(
-    transaction: Transaction,
-    viewerPersonId: string,
-    scope: {
-      readonly conversationId: string;
-      readonly participantEpochId: string;
-      readonly participantSetDigest: string;
-      readonly conversationAuthorityVersion: number;
-      readonly householdControlEpoch: number;
-    },
-  ): Promise<string> {
-    const rows = await transaction<
-      {
-        person_id: string;
-        display_name_ciphertext: Buffer | null;
-        identity_id: string;
-        subject_ciphertext: Buffer | null;
-      }[]
-    >`
-      select participant.person_id, person.display_name_ciphertext,
-        identity.id as identity_id, identity.subject_ciphertext
-      from conversations conversation
-      join households household on household.id = conversation.household_id
-        and household.control_epoch = ${scope.householdControlEpoch}
-      join household_memberships viewer_membership on viewer_membership.household_id = household.id
-        and viewer_membership.person_id = ${viewerPersonId} and viewer_membership.status = 'active'
-      join membership_capabilities read_grant on read_grant.membership_id = viewer_membership.id
-        and read_grant.capability = 'household.read' and read_grant.status = 'active'
-      join participant_epochs epoch on epoch.id = conversation.current_epoch_id
-        and epoch.id = ${scope.participantEpochId} and epoch.ended_at is null
-        and epoch.participant_set_digest = ${scope.participantSetDigest}
-      join epoch_participants participant on participant.participant_epoch_id = epoch.id
-        and participant.registration_status = 'registered' and participant.consented_at is not null
-      join people person on person.id = participant.person_id and person.status = 'registered'
-      join person_identities identity on identity.id = participant.person_identity_id
-        and identity.person_id = participant.person_id and identity.status = 'verified'
-      where conversation.id = ${scope.conversationId}
-        and conversation.kind = 'group' and conversation.status = 'active'
-        and conversation.authority_version = ${scope.conversationAuthorityVersion}
-        and exists(
-          select 1 from epoch_participants viewer_participant
-          where viewer_participant.participant_epoch_id = epoch.id
-            and viewer_participant.person_id = ${viewerPersonId}
-            and viewer_participant.registration_status = 'registered'
-            and viewer_participant.consented_at is not null
-        )
-      order by case when participant.person_id = ${viewerPersonId} then 0 else 1 end,
-        participant.person_id
-    `;
-    if (rows.length === 0) throw new StaleAuthorityError("That exact group is no longer available");
-    const labels = rows.map((row, index) =>
-      row.person_id === viewerPersonId
-        ? "You"
-        : (decryptPersonName(this.secretBox, row.person_id, row.display_name_ciphertext) ??
-          maskedGroupParticipant(
-            decryptIdentitySubject(this.secretBox, row.identity_id, row.subject_ciphertext),
-            index + 1,
-          )),
-    );
-    return exactGroupLabel(labels);
   }
 
   private async processWebCommand(
@@ -3489,21 +4116,27 @@ export class FlorenceApplication {
           };
         }
         case "invite_household_participant": {
-          const invitation = await new HouseholdOnboarding(
+          const invitationResult = await new HouseholdOnboarding(
             transaction,
             this.secretBox,
           ).inviteCurrentParticipant({
             actorPersonId,
             householdId: command.householdId,
             conversationId: command.conversationId,
+            expectedParticipantEpochId: command.expectedParticipantEpochId,
+            expectedParticipantDigest: command.expectedParticipantDigest,
+            inviteeIdentityId: command.inviteeIdentityId,
             inviteePersonId: command.inviteePersonId,
+            proposedDisplayName: command.proposedDisplayName,
             role: command.role,
+            sourceRevisionId: null,
             createdAt: new Date(),
           });
+          const invitation = invitationResult.invitation;
           await this.queueHouseholdInvitationMessage(transaction, invitation.invitationId);
           return {
             accepted: true,
-            duplicate: false,
+            duplicate: invitationResult.duplicate,
             disposition:
               invitation.approvedByPersonIds.length === invitation.requiredApproverPersonIds.length
                 ? "household_invitation_ready"
@@ -3529,39 +4162,57 @@ export class FlorenceApplication {
           };
         }
         case "accept_household_invitation": {
-          const membership = await new HouseholdOnboarding(transaction, this.secretBox).acceptInvitation({
-            actorPersonId,
-            invitationId: command.invitationId,
-            acceptedAt: new Date(),
-          });
-          const linkedGroups = await transaction<{ id: string }[]>`
-            update conversations conversation
-            set household_id = ${membership.householdId}, authority_version = authority_version + 1,
-              updated_at = now()
-            where conversation.kind = 'group' and conversation.household_id is null
-              and exists(
-                select 1 from epoch_participants actor
-                where actor.participant_epoch_id = conversation.current_epoch_id
-                  and actor.person_id = ${actorPersonId}
-              )
-              and not exists(
-                select 1 from epoch_participants participant
-                where participant.participant_epoch_id = conversation.current_epoch_id
-                  and not exists(
-                    select 1 from household_memberships member
-                    where member.household_id = ${membership.householdId}
-                      and member.person_id = participant.person_id and member.status = 'active'
-                  )
-              )
-            returning conversation.id
+          const invitationSources = await transaction<
+            {
+              source_conversation_id: string | null;
+              status: string;
+            }[]
+          >`
+            select source_conversation_id, status from invitations
+            where id = ${command.invitationId}
           `;
+          const invitationSource = invitationSources[0];
+          if (!invitationSource) throw new NotFoundError("Family invitation does not exist");
+          const sourceConversationId = invitationSource.source_conversation_id;
+          let membership: HouseholdMembership;
+          try {
+            membership = await new HouseholdOnboarding(transaction, this.secretBox).acceptInvitation({
+              actorPersonId,
+              invitationId: command.invitationId,
+              acceptedAt: new Date(),
+            });
+          } catch (error) {
+            if (!(error instanceof ConflictError) && !(error instanceof NotFoundError)) throw error;
+            return {
+              accepted: true,
+              duplicate: invitationSource.status !== "pending",
+              disposition: "household_invitation_stale",
+              ids: { invitationId: command.invitationId },
+            };
+          }
           await transaction`
             update households set status = 'active', updated_at = now()
             where id = ${membership.householdId} and status = 'onboarding'
           `;
           await this.queueParentGoogleActivationOffer(transaction, actorPersonId, "household_resolved");
-          for (const group of linkedGroups) {
-            await this.queuePrivateGroupReadyNotices(transaction, group.id, "group-ready");
+          if (sourceConversationId) {
+            const authority = await new FamilyGroupAuthority(transaction).reconcile({
+              conversationId: sourceConversationId,
+              occurredAt: new Date(),
+            });
+            if (authority.activatedNow && authority.ruleId && authority.householdId) {
+              await this.queueFamilyGroupActivationAcknowledgement(transaction, {
+                invitationId: command.invitationId,
+                actorPersonId,
+                conversationId: sourceConversationId,
+                householdId: authority.householdId,
+                householdControlEpoch: authority.householdControlEpoch,
+                participantEpochId: authority.participantEpochId,
+                participantSetDigest: authority.participantSetDigest,
+                ruleId: authority.ruleId,
+                snapshot: authority.snapshot,
+              });
+            }
           }
           return {
             accepted: true,
@@ -3608,29 +4259,6 @@ export class FlorenceApplication {
             duplicate: false,
             disposition: "dependent_updated",
             ids: { dependentPersonId: command.dependentPersonId },
-          };
-        }
-        case "approve_group_coverage_rule": {
-          const result = await new GroupRuleOnboarding(transaction).approveFamilyCoverage({
-            conversationId: command.conversationId,
-            actorPersonId,
-            expectedParticipantEpochId: command.expectedParticipantEpochId,
-            expectedParticipantSetDigest: command.expectedParticipantSetDigest,
-            expectedConversationAuthorityVersion: command.expectedConversationAuthorityVersion,
-            expectedHouseholdControlEpoch: command.expectedHouseholdControlEpoch,
-            approvedAt: new Date(),
-          });
-          if (result.status === "active") {
-            await this.queuePrivateGroupReadyNotices(transaction, result.conversationId, "coverage-active");
-          }
-          return {
-            accepted: true,
-            duplicate: result.status === "active" && result.approvedCount === result.requiredCount,
-            disposition:
-              result.status === "active"
-                ? "group_coverage_rule_active"
-                : "group_coverage_rule_awaiting_participants",
-            ids: { conversationId: result.conversationId },
           };
         }
         case "create_routine": {
@@ -4111,14 +4739,7 @@ export class FlorenceApplication {
           };
         }
         case "request_step_up": {
-          let stepUpContext = command.context ?? {};
-          if (command.purpose === "group_coverage") {
-            const scope = parseGroupCoverageStepUpScope(stepUpContext);
-            stepUpContext = {
-              ...stepUpContext,
-              groupLabel: await this.exactGroupLabel(transaction, actorPersonId, scope),
-            };
-          }
+          const stepUpContext = command.context ?? {};
           await new DurableWork(transaction, this.secretBox).enqueue({
             kind: "auth.send_step_up",
             idempotencyKey: `step-up:${actorPersonId}:${command.purpose}:${JSON.stringify(stepUpContext)}:${Math.floor(Date.now() / 60_000)}`,
@@ -4282,6 +4903,16 @@ function isExplicitEnrollmentConsent(value: string): boolean {
   );
 }
 
+function isExplicitFamilyInvitationDecline(value: string): boolean {
+  const normalized = value
+    .trim()
+    .toLocaleLowerCase("en-US")
+    .replace(/[’]/gu, "'")
+    .replace(/[.!]+$/gu, "")
+    .replace(/\s+/gu, " ");
+  return /^(?:no|not me|that (?:isn't|is not) me|decline)$/u.test(normalized);
+}
+
 /** A strict social greeting, never a message that may contain family work. */
 export function isNaturalPrivateGreeting(chatKind: "direct" | "group", value: string): boolean {
   if (chatKind !== "direct") return false;
@@ -4374,68 +5005,15 @@ function isOutboundIdentitySubject(value: string): boolean {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/u.test(value) && value.length <= 320;
 }
 
-function maskedGroupParticipant(subject: string | null, position: number): string {
-  return subject && /^\+[1-9]\d{6,14}$/u.test(subject)
-    ? `participant ending in ${subject.slice(-4)}`
-    : `participant ${position}`;
-}
-
-function exactGroupLabel(participantLabels: readonly string[]): string {
-  const last = participantLabels.at(-1);
-  if (!last) return "this iMessage group";
-  if (participantLabels.length === 1) return `the iMessage group with ${boundedLabel(last)}`;
-  if (participantLabels.length === 2) {
-    return `the iMessage group with ${boundedLabel(participantLabels[0] ?? "You")} and ${boundedLabel(last)}`;
-  }
-  const full = `the iMessage group with ${participantLabels.slice(0, -1).join(", ")}, and ${last}`;
-  if (full.length <= 220) return full;
-  const visible = participantLabels.slice(0, 4).map(boundedLabel);
-  const remaining = participantLabels.length - visible.length;
-  return `the ${participantLabels.length}-person iMessage group with ${visible.join(", ")}${remaining > 0 ? `, and ${remaining} other${remaining === 1 ? "" : "s"}` : ""}`;
-}
-
-function boundedLabel(value: string): string {
-  return value.length <= 36 ? value : `${value.slice(0, 35).trimEnd()}…`;
-}
-
-function parseGroupCoverageStepUpScope(context: Readonly<Record<string, string>>): {
-  readonly conversationId: string;
-  readonly participantEpochId: string;
-  readonly participantSetDigest: string;
-  readonly conversationAuthorityVersion: number;
-  readonly householdControlEpoch: number;
-} {
-  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
-  const conversationAuthorityVersion = Number(context.expectedConversationAuthorityVersion);
-  const householdControlEpoch = Number(context.expectedHouseholdControlEpoch);
-  if (
-    !context.conversationId ||
-    !uuid.test(context.conversationId) ||
-    !context.expectedParticipantEpochId ||
-    !uuid.test(context.expectedParticipantEpochId) ||
-    !context.expectedParticipantSetDigest ||
-    !/^[a-f0-9]{64}$/u.test(context.expectedParticipantSetDigest) ||
-    !Number.isSafeInteger(conversationAuthorityVersion) ||
-    conversationAuthorityVersion < 1 ||
-    !Number.isSafeInteger(householdControlEpoch) ||
-    householdControlEpoch < 1
-  ) {
-    throw new UnauthorizedError("Group approval requires one exact current audience");
-  }
-  return {
-    conversationId: context.conversationId,
-    participantEpochId: context.expectedParticipantEpochId,
-    participantSetDigest: context.expectedParticipantSetDigest,
-    conversationAuthorityVersion,
-    householdControlEpoch,
-  };
-}
-
 function classifyEvent(
   event: Exclude<LinqWebhookEnvelope, { eventType: "linq.ignored" }>,
   chatKind: "direct" | "group",
   mode: ReturnType<typeof evaluateConversationMode>,
-): { kind: StoredLinqEvent["classification"]; enrollmentAction?: "consent" | "other"; retainEvent: boolean } {
+): {
+  kind: StoredLinqEvent["classification"];
+  enrollmentAction?: "consent" | "decline_invitation" | "other";
+  retainEvent: boolean;
+} {
   if (
     event.eventType === "linq.outbound.sent" ||
     event.eventType === "linq.outbound.delivered" ||
@@ -4450,7 +5028,11 @@ function classifyEvent(
     if (chatKind === "direct" && mode === "registration_required") {
       return {
         kind: "enrollment",
-        enrollmentAction: isExplicitEnrollmentConsent(command) ? "consent" : "other",
+        enrollmentAction: isExplicitEnrollmentConsent(command)
+          ? "consent"
+          : isExplicitFamilyInvitationDecline(command)
+            ? "decline_invitation"
+            : "other",
         retainEvent: false,
       };
     }
@@ -4530,24 +5112,10 @@ function normalizeHandle(value: string): string {
   return /^\+[1-9]\d{6,14}$/u.test(phone) ? phone : normalized;
 }
 
-async function inferSharedHousehold(
-  transaction: Transaction,
-  personIds: readonly string[],
-): Promise<{ id: string; controlEpoch: number } | null> {
-  const uniquePersonIds = [...new Set(personIds)];
-  if (uniquePersonIds.length === 0) return null;
-  const rows = await transaction<{ id: string; control_epoch: number | string }[]>`
-    select household.id, household.control_epoch
-    from households household
-    join household_memberships membership on membership.household_id = household.id
-    where membership.person_id = any(${transaction.array(uniquePersonIds)}::uuid[])
-      and membership.status = 'active' and household.status in ('onboarding', 'active', 'paused')
-    group by household.id
-    having count(distinct membership.person_id) = ${uniquePersonIds.length}
-    order by household.created_at limit 2
-  `;
-  const only = rows.length === 1 ? rows[0] : undefined;
-  return only ? { id: only.id, controlEpoch: Number(only.control_epoch) } : null;
+function relationshipLabel(role: "steward" | "caregiver" | "participant"): string {
+  if (role === "steward") return "co-parent";
+  if (role === "caregiver") return "caregiver";
+  return "family participant";
 }
 
 async function personFence(

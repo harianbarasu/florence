@@ -6,7 +6,7 @@ export interface GroupInvocation {
 }
 
 const NATURAL_REQUEST_START =
-  /^(?:please\b|can\b|could\b|would\b|will\b|what\b|when\b|where\b|why\b|how\b|who\b|which\b|tell\b|find\b|help\b|remind\b|create\b|add\b|check\b|look\b|plan\b|summarize\b|explain\b|i\b|we\b)/iu;
+  /^(?:please\b|can\b|could\b|would\b|will\b|what\b|when\b|where\b|why\b|how\b|who\b|which\b|tell\b|find\b|help\b|remind\b|create\b|add\b|check\b|look\b|plan\b|summarize\b|explain\b|introduce\b|meet\b|this\b|here\b|i\b|we\b)/iu;
 const NATURAL_QUESTION = /^(?:do|does|did|is|are|was|were|should)\b[\s\S]*\?$/iu;
 
 /**

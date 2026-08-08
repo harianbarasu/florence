@@ -367,6 +367,9 @@ export class FlorenceOrchestrator {
       context.record.routing.senderIdentityId,
     );
 
+    const introductionDisposition = await this.tryFamilyIntroductionProposal(context, invocation.requestText);
+    if (introductionDisposition) return introductionDisposition;
+
     const answer = await this.workers.run({
       attemptId: randomUUID(),
       taskVersionId: randomUUID(),
@@ -407,6 +410,89 @@ export class FlorenceOrchestrator {
         return "private_invocation_stale";
       }
       await this.workers.reconcile(answer.attemptId, "rejected");
+      throw error;
+    }
+  }
+
+  /**
+   * Lets a bounded worker propose only relationship meaning. Exact participant,
+   * household, identity, invitation, and effect decisions remain in the app.
+   */
+  private async tryFamilyIntroductionProposal(
+    context: MessageContext,
+    requestText: string,
+  ): Promise<string | null> {
+    let classification: WorkerResult<(typeof PRODUCT_SKILLS.familyIntroduction.outputSchema)["_output"]>;
+    try {
+      classification = await this.workers.run({
+        attemptId: randomUUID(),
+        taskVersionId: randomUUID(),
+        authority: messageWorkerAuthority(context, false),
+        skill: PRODUCT_SKILLS.familyIntroduction,
+        authorizedContext: [
+          `Exact registered sender's leading-Florence request: ${requestText}`,
+          "This is an observe-only group. Classify only the supplied request and propose no action.",
+        ].join("\n"),
+        goal: "Classify whether this exact request explicitly introduces one named family participant.",
+        deadline: new Date(Date.now() + 45_000),
+        budget: { maxModelCalls: 1, maxOutputTokens: 250 },
+      });
+    } catch (error) {
+      // Provider/model failures normally return a failed WorkerResult. Preserve
+      // authority failures and infrastructure errors instead of bypassing them.
+      if (error instanceof WorkerAttemptError) return null;
+      throw error;
+    }
+
+    let proposal: (typeof PRODUCT_SKILLS.familyIntroduction.outputSchema)["_output"];
+    try {
+      proposal = await this.requireProposal(classification);
+    } catch (error) {
+      if (error instanceof WorkerAttemptError) return null;
+      throw error;
+    }
+
+    if (proposal.kind === "other") {
+      await this.workers.reconcile(classification.attemptId, "accepted");
+      return null;
+    }
+    if (proposal.displayName === null || proposal.role === null) {
+      await this.workers.reconcile(classification.attemptId, "rejected");
+      return null;
+    }
+    if (!this.mutationProcessor) {
+      await this.workers.reconcile(classification.attemptId, "rejected");
+      throw new Error("Family introduction mutation seam is not configured");
+    }
+
+    try {
+      const receipt = await this.mutationProcessor.process({
+        kind: "linq.family_introduction_proposal",
+        internalProviderEventId: context.row.id,
+        sourceRevisionId: context.sourceRevisionId,
+        proposal: {
+          displayName: proposal.displayName,
+          role: proposal.role,
+        },
+      });
+      await this.workers.reconcile(
+        classification.attemptId,
+        receipt.disposition.includes("stale") ? "stale" : receipt.accepted ? "accepted" : "rejected",
+      );
+      return receipt.disposition;
+    } catch (error) {
+      if (error instanceof StaleAuthorityError) {
+        await this.workers.reconcile(classification.attemptId, "stale");
+        return null;
+      }
+      await this.workers.reconcile(classification.attemptId, "rejected");
+      if (
+        error instanceof UnauthorizedError ||
+        error instanceof NotFoundError ||
+        error instanceof ConflictError
+      ) {
+        return null;
+      }
       throw error;
     }
   }

@@ -50,6 +50,11 @@ interface BootstrapBaseline {
  * editing an existing hash merely to make drift boot is never a promotion mechanism.
  */
 const DEPLOYED_BOOTSTRAP_BASELINE: Readonly<Record<string, BootstrapBaseline>> = {
+  "relationship.introduction_classify@1": {
+    definitionDigest: "c2361a238120c1400226dff3fe8e0767249cc9636d7159bfc959c75cffdbcfc2",
+    evaluationRelease: "family-introduction-1",
+    evaluationSuiteDigest: sha256Hex("family-introduction-1:initial-protected-suite"),
+  },
   "coverage.need_interpret@3": {
     definitionDigest: "11672c7a656c3ef49449816c12d54bb78b2c915b86761c71e9a0866fafe7eeb7",
     evaluationRelease: "coverage-core-3",

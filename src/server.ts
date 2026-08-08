@@ -74,12 +74,6 @@ const dependentBodySchema = z.strictObject({
   school: z.string().trim().max(160).default(""),
   activities: z.array(z.string().trim().min(1).max(120)).max(24).default([]),
 });
-const groupCoverageApprovalBodySchema = z.strictObject({
-  expectedParticipantEpochId: z.string().uuid(),
-  expectedParticipantSetDigest: z.string().regex(/^[a-f0-9]{64}$/u),
-  expectedConversationAuthorityVersion: z.number().int().positive(),
-  expectedHouseholdControlEpoch: z.number().int().positive(),
-});
 const googleStartQuerySchema = z
   .strictObject({
     profile: z.enum(["personal_family", "work"]).default("personal_family"),
@@ -89,17 +83,6 @@ const googleStartQuerySchema = z
     message: "The work Gmail option is only valid for a work Google profile",
     path: ["mail"],
   });
-const groupCoverageAssuranceContextSchema = z.strictObject({
-  action: z.literal("approve"),
-  conversationId: z.string().uuid(),
-  expectedParticipantEpochId: z.string().uuid(),
-  expectedParticipantSetDigest: z.string().regex(/^[a-f0-9]{64}$/u),
-  expectedConversationAuthorityVersion: z.string().regex(/^[1-9][0-9]*$/u),
-  expectedHouseholdControlEpoch: z.string().regex(/^[1-9][0-9]*$/u),
-  groupLabel: z.string().min(1).max(240),
-  returnPath: z.string().optional(),
-});
-
 export async function createServer(input?: { config?: FlorenceConfig; database?: Database }) {
   const config = input?.config ?? loadConfig();
   const database = input?.database ?? createDatabase(config, "florence-web");
@@ -243,7 +226,7 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
       return reply
         .header("Referrer-Policy", "no-referrer")
         .type("text/html; charset=utf-8")
-        .send(handoffPage(token, preview.purpose, preview.groupLabel));
+        .send(handoffPage(token, preview.purpose));
     },
   );
 
@@ -257,30 +240,6 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
         .parse(request.body);
       const preview = await auth.previewHandoff(body.token);
       const session = await auth.consumeHandoff(body.token);
-      let groupCoverageOutcome: "approved" | "changed" | "retry" | null = null;
-      if (session.assuranceKind === "group_coverage") {
-        try {
-          const approval = groupCoverageApprovalFromSession(session);
-          await application.process({
-            kind: "web.command",
-            actorPersonId: session.personId,
-            command: { kind: "approve_group_coverage_rule", ...approval },
-          });
-          groupCoverageOutcome = "approved";
-        } catch (error) {
-          if (
-            error instanceof ConflictError ||
-            error instanceof NotFoundError ||
-            error instanceof StaleAuthorityError ||
-            error instanceof UnauthorizedError
-          ) {
-            groupCoverageOutcome = "changed";
-          } else {
-            request.log.error({ err: error }, "group coverage approval could not be completed");
-            groupCoverageOutcome = "retry";
-          }
-        }
-      }
       reply.setCookie(sessionCookieName(config), session.sessionToken, {
         path: "/",
         httpOnly: true,
@@ -290,7 +249,7 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
       });
       reply.header("Cache-Control", "no-store");
       return {
-        redirect: completedHandoffRedirect(preview.purpose, session, groupCoverageOutcome),
+        redirect: completedHandoffRedirect(preview.purpose, session),
       };
     },
   );
@@ -440,7 +399,11 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
     const body = z
       .strictObject({
         conversationId: z.string().uuid(),
+        expectedParticipantEpochId: z.string().uuid(),
+        expectedParticipantDigest: z.string().regex(/^[a-f0-9]{64}$/u),
+        inviteeIdentityId: z.string().uuid(),
         inviteePersonId: z.string().uuid(),
+        proposedDisplayName: z.string().trim().min(1).max(80),
         role: z.enum(["steward", "caregiver", "participant"]),
       })
       .parse(request.body);
@@ -450,7 +413,11 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
             action: "invite",
             householdId,
             conversationId: body.conversationId,
+            expectedParticipantEpochId: body.expectedParticipantEpochId,
+            expectedParticipantDigest: body.expectedParticipantDigest,
+            inviteeIdentityId: body.inviteeIdentityId,
             inviteePersonId: body.inviteePersonId,
+            proposedDisplayName: body.proposedDisplayName,
           })
         : await requireWriteSession(request, config, auth);
     return application.process({
@@ -481,7 +448,7 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
       command: { kind: "approve_household_invitation", invitationId },
     });
   });
-  app.post("/api/invitations/:invitationId/accept", async (request) => {
+  app.post("/api/invitations/:invitationId/accept", async (request, reply) => {
     const invitationId = z
       .string()
       .uuid()
@@ -497,11 +464,18 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
         invitationId,
       });
     }
-    return application.process({
+    const receipt = await application.process({
       kind: "web.command",
       actorPersonId: principal.personId,
       command: { kind: "accept_household_invitation", invitationId },
     });
+    if (receipt.disposition === "household_invitation_stale") {
+      return reply.code(409).send({
+        error:
+          "This family invitation is no longer current because the group or family changed. Ask for a fresh introduction.",
+      });
+    }
+    return receipt;
   });
   app.post("/api/households/:householdId/dependents", async (request) => {
     const principal = await requireWriteSession(request, config, auth);
@@ -526,26 +500,6 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
       kind: "web.command",
       actorPersonId: principal.personId,
       command: { kind: "update_dependent", ...params, ...body },
-    });
-  });
-  app.post("/api/chats/:conversationId/coverage-rule-approval", async (request) => {
-    const conversationId = z
-      .string()
-      .uuid()
-      .parse((request.params as { conversationId?: unknown }).conversationId);
-    const body = groupCoverageApprovalBodySchema.parse(request.body);
-    const principal = await requireExactStepUpWriteSession(request, config, auth, "group_coverage", {
-      action: "approve",
-      conversationId,
-      expectedParticipantEpochId: body.expectedParticipantEpochId,
-      expectedParticipantSetDigest: body.expectedParticipantSetDigest,
-      expectedConversationAuthorityVersion: String(body.expectedConversationAuthorityVersion),
-      expectedHouseholdControlEpoch: String(body.expectedHouseholdControlEpoch),
-    });
-    return application.process({
-      kind: "web.command",
-      actorPersonId: principal.personId,
-      command: { kind: "approve_group_coverage_rule", conversationId, ...body },
     });
   });
   app.post("/api/routines", async (request) => {
@@ -740,7 +694,11 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
               action: z.literal("invite"),
               householdId: z.string().uuid(),
               conversationId: z.string().uuid(),
+              expectedParticipantEpochId: z.string().uuid(),
+              expectedParticipantDigest: z.string().regex(/^[a-f0-9]{64}$/u),
+              inviteeIdentityId: z.string().uuid(),
               inviteePersonId: z.string().uuid(),
+              proposedDisplayName: z.string().trim().min(1).max(80),
             }),
             z.strictObject({
               action: z.enum(["approve", "accept"]),
@@ -748,17 +706,6 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
               invitationId: z.string().uuid(),
             }),
           ]),
-        }),
-        z.strictObject({
-          purpose: z.literal("group_coverage"),
-          context: z.strictObject({
-            action: z.literal("approve"),
-            conversationId: z.string().uuid(),
-            expectedParticipantEpochId: z.string().uuid(),
-            expectedParticipantSetDigest: z.string().regex(/^[a-f0-9]{64}$/u),
-            expectedConversationAuthorityVersion: z.string().regex(/^[1-9][0-9]*$/u),
-            expectedHouseholdControlEpoch: z.string().regex(/^[1-9][0-9]*$/u),
-          }),
         }),
         z.strictObject({
           purpose: z.literal("private_bridge_standing"),
@@ -841,7 +788,7 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
       .send(
         policyPage("Privacy", [
           "Florence treats every person, private source, and exact group-chat participant epoch as a separate permission boundary.",
-          "From the moment Florence is added to a group, permitted new messages and attachments may be encrypted inside that exact participant epoch. Florence stays completely silent unless every current participant is registered and that exact audience has approved an applicable write rule.",
+          "From the moment Florence is added to a group, permitted new messages and attachments may be encrypted inside that exact participant epoch. Florence stays completely silent unless every current person is a registered active member of the same Florence family and their applicable settings permit writing.",
           "Each registered exact-chat participant receives an independent private view governed by their own settings. Observed group context is never automatically widened to a household, another chat, or another participant.",
           "Google accounts are private to the person who connects them. Sharing family meaning requires an explicit one-time approval or a narrow standing rule.",
           "You can pause, narrow, export, disconnect, correct, forget, or request deletion from the private control plane.",
@@ -986,7 +933,7 @@ async function requireExactStepUpWriteSession(
   request: FastifyRequest,
   config: FlorenceConfig,
   auth: PostgresWebAuth,
-  purpose: "household_invitation" | "group_coverage" | "private_bridge_standing",
+  purpose: "household_invitation" | "private_bridge_standing",
   context: Readonly<Record<string, string>>,
 ): Promise<SessionPrincipal> {
   verifySameOrigin(request, config);
@@ -998,10 +945,10 @@ async function requireExactStepUpWriteSession(
 
 function verifyExactStepUp(
   principal: SessionPrincipal,
-  purpose: "household_invitation" | "group_coverage" | "private_bridge_standing",
+  purpose: "household_invitation" | "private_bridge_standing",
   context: Readonly<Record<string, string>>,
 ): void {
-  const serverContextKeys = new Set(["returnPath", ...(purpose === "group_coverage" ? ["groupLabel"] : [])]);
+  const serverContextKeys = new Set(["returnPath"]);
   if (
     principal.assuranceKind !== purpose ||
     principal.assuranceExpiresAt === null ||
@@ -1065,34 +1012,21 @@ async function readTextOrFallback(target: string, fallback: string): Promise<str
   }
 }
 
-function handoffPage(token: string, purpose: string, groupLabel?: string): string {
+function handoffPage(token: string, purpose: string): string {
   const googleConnect = purpose === "google_connect";
-  const groupCoverage = purpose === "group_coverage";
   const title = googleConnect
     ? "Connect Google"
-    : groupCoverage
-      ? "Approve Florence for this group"
-      : purpose === "account_controls"
-        ? "Confirm private controls"
-        : "Open Florence";
+    : purpose === "account_controls"
+      ? "Confirm private controls"
+      : "Open Florence";
   const explanation = googleConnect
     ? "Continue to Google to choose the account Florence should privately connect to you."
-    : groupCoverage
-      ? `This confirms your approval for ${escapeHtml(groupLabel ?? "the exact current group")}. Florence remains silent there until every current person approves, and any membership change resets approval.`
-      : "This link came through your exact private Florence conversation. Continue to open your secure account.";
-  const button = googleConnect
-    ? "Continue to Google"
-    : groupCoverage
-      ? "Approve this group"
-      : "Continue securely";
+    : "This link came through your exact private Florence conversation. Continue to open your secure account.";
+  const button = googleConnect ? "Continue to Google" : "Continue securely";
   return `<!doctype html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>${title}</title><link rel="stylesheet" href="/handoff.css"></head><body><main data-handoff-token="${escapeHtml(token)}" data-handoff-purpose="${escapeHtml(purpose)}"><div class="mark">F</div><h1>${title}</h1><p>${explanation}</p><form><button type="submit">${button}</button></form><div data-status aria-live="polite"></div><small>The link is not used until you tap the button. It expires shortly and cannot be reused.</small></main><script src="/handoff.js" defer></script></body></html>`;
 }
 
-function completedHandoffRedirect(
-  purpose: HandoffPurpose,
-  session: AuthenticatedSession,
-  groupCoverageOutcome: "approved" | "changed" | "retry" | null = null,
-): string {
+function completedHandoffRedirect(purpose: HandoffPurpose, session: AuthenticatedSession): string {
   if (purpose === "invitation") return "/people";
   if (purpose === "private_review") return "/sources";
   if (session.assuranceKind === "google_connect") {
@@ -1106,11 +1040,6 @@ function completedHandoffRedirect(
   if (session.assuranceKind === "account_controls") return "/safety?step_up=account_controls";
   if (session.assuranceKind === "private_bridge_standing") {
     return "/sources?step_up=private_bridge_standing";
-  }
-  if (session.assuranceKind === "group_coverage") {
-    const context = groupCoverageAssuranceContextSchema.safeParse(session.assuranceContext);
-    const anchor = context.success ? `#coverage-${context.data.conversationId}` : "";
-    return `/people?group_coverage=${groupCoverageOutcome ?? "review"}${anchor}`;
   }
   return "/people";
 }
@@ -1140,15 +1069,4 @@ function googleCapabilitiesForProfile(
   includeWorkMail = false,
 ): readonly GoogleCapability[] {
   return profile === "work" && !includeWorkMail ? ["calendar"] : ["mail", "calendar"];
-}
-
-function groupCoverageApprovalFromSession(session: AuthenticatedSession) {
-  const context = groupCoverageAssuranceContextSchema.parse(session.assuranceContext);
-  return {
-    conversationId: context.conversationId,
-    expectedParticipantEpochId: context.expectedParticipantEpochId,
-    expectedParticipantSetDigest: context.expectedParticipantSetDigest,
-    expectedConversationAuthorityVersion: Number(context.expectedConversationAuthorityVersion),
-    expectedHouseholdControlEpoch: Number(context.expectedHouseholdControlEpoch),
-  };
 }

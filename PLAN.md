@@ -57,19 +57,25 @@ hard product decisions.
 - **User steps:** none are required in the group. Florence silently captures new messages from the
   exact participant epoch beginning when she is added. Every currently registered Florence user in
   that exact chat receives an independent private source view; unregistered participants receive no
-  product access merely by being observed. If a sender deterministically invokes Florence with a
-  leading “Florence” address, or replies to a Florence-owned message proven by a local receipt,
-  Florence continues privately with that exact sender. The source group remains silent.
+  product access or unsolicited enrollment message merely by being observed. If a sender
+  deterministically invokes Florence with a leading “Florence” address, or replies to a
+  Florence-owned message proven by a local receipt, Florence continues privately with that exact
+  sender. A registered parent may use that invocation to propose one exact current participant as a
+  co-parent, family member, or caregiver. Florence asks only that proposed person to confirm their
+  own identity and relationship privately.
 - **Visible states:** the group itself sees no Florence message, reaction, typing indicator,
   enrollment copy, error, or administrative announcement while observe-only. Registered users can
-  inspect the source privately. A household may separately authorize an exact current group as
-  interactive only after every current participant has registered and explicitly approved writing.
+  inspect the source privately. When every current participant is a registered active member of one
+  common household and their policies permit writing, Florence automatically treats the exact group
+  as a family coordination group. Accepted household membership is standing consent; there is no
+  second per-chat approval ceremony.
 - **Partial and error behavior:** ambiguous mentions do nothing. Failure to open the exact sender's
   private DM creates no group output. Participant changes create a new epoch and immediately revoke
   prior write approval; ingestion continues for the new observe-only epoch while Florence
   re-evaluates private access.
-- **Success:** Florence learns useful context from the ambient family firehose without ever writing
-  to the cold-added group or widening raw chat content beyond exact, individually authorized access.
+- **Success:** Florence learns useful context from the ambient family firehose without writing in
+  community groups or widening raw chat content beyond exact, individually authorized access, while
+  an all-household group becomes interactive immediately after the final relationship is confirmed.
 - **Recovery:** STOP or disabled mode halts new content retention for the requester or exact chat as
   applicable. Deletion and revocation fence all later retrieval and effects.
 - **Existing code reused:** provider-chat reconciliation, immutable participant epochs, encrypted
@@ -129,8 +135,11 @@ hard product decisions.
    it never creates separate accounts for every chat or family.
 4. **Cold addition means ingestion intent, not write authority.** From the moment Florence is added,
    the exact chat becomes an observe-only source. Florence never writes there by default.
-5. **Interactive writing is exact and unanimous.** Every current participant must be a registered
-   Florence user and explicitly approve that exact membership. Membership changes revoke approval.
+5. **Family writing follows explicit relationships.** Every current participant must be a registered
+   active member of one common Florence household and every applicable participant policy must
+   permit writing. Accepting household membership is standing consent for all-household groups;
+   there is no second per-chat vote. Membership changes revoke current write authority and force a
+   fresh eligibility decision for the new exact audience.
 6. **Observe-only means visually absent.** No messages, reactions, typing indicators, enrollment
    announcements, or errors appear in the source group.
 7. **Group invocation is deterministic.** Only a leading Florence address or a verified reply to
@@ -182,6 +191,10 @@ hard product decisions.
 
 - Register one parent naturally by private DM, add Florence cold to an ordinary group, and keep that
   group completely silent.
+- Let that parent explicitly introduce the sole unknown participant as a co-parent or caregiver.
+  Florence privately asks that exact person to confirm. Their acceptance claims the observed
+  identity, joins the existing family without repeating shared details, and activates only the exact
+  all-household group with one replay-safe acknowledgment.
 - Retain only post-addition evidence for the current exact membership. When the registered parent
   writes a leading “Florence…” request, privately answer from a bounded recent window of that exact
   group's messages and extracted attachments.
@@ -363,9 +376,9 @@ ends the current `ParticipantEpoch` and starts a new immutable epoch.
 
 | Mode | Condition | Ordinary content processing | Florence may write |
 |---|---|---|---|
-| `observe_only` | Florence is present but this exact current participant epoch has not unanimously authorized writing | Encrypt new post-addition content in the exact chat epoch; registered exact-chat participants may receive independent private source views under their own policies | No |
+| `observe_only` | Florence is present but the current people are not all registered active members of one common household, or an applicable policy keeps the chat read-only | Encrypt new post-addition content in the exact chat epoch; registered exact-chat participants may receive independent private source views under their own policies | No |
 | `registration_required` | A private DM participant has not completed registration and consent | Retain only enrollment, routing, dedupe, security, revocation, and opt-out metadata | Enrollment and safety responses only |
-| `trusted_write_enabled` | A private DM is eligible, or every group participant is registered and an active exact-current-audience rule permits the operation | Allowed within the epoch and exact grants | Private replies, or only the exact operations approved for the current group audience |
+| `trusted_write_enabled` | A private DM is eligible, or every group participant is a registered active member of one common household and an exact-current-audience rule permits the operation | Allowed within the epoch and exact grants | Private replies, or only the operations derived for the current all-household audience |
 | `paused` | STOP, deletion fence, policy conflict, or safety hold | No new ordinary processing | No |
 
 Adding Florence designates the exact post-addition chat epoch as an observe-only source. It does not
@@ -453,13 +466,15 @@ clearer there. It is resumable and useful before every optional field is complet
    Calendar reconciliation can begin. Caregiver connections remain optional and contextual.
 4. While sync runs, represent dependents, aliases, schools, activities, and important places without
    creating child accounts; capture the few routines that are not listed elsewhere.
-5. Invite co-stewards and caregivers through exact private invitations. An invited co-steward reviews
-   existing household facts and supplies only corrections or additions rather than repeating intake.
+5. Introduce co-stewards and caregivers from an exact observed group. Florence privately asks only
+   that person to confirm their identity and relationship. An invited co-steward reviews existing
+   household facts and supplies only corrections or additions rather than repeating intake.
 6. Add optional personal accounts and work Calendars, and select each Calendar's private processing
    level. Declining an account never blocks ordinary Florence use.
 7. Add Florence to one or more chats and privately inspect their source and write status.
-8. Establish a narrow household-group proactivity rule once every current participant is registered
-   and that exact membership has approved writing.
+8. As soon as every current participant is a registered active member of the same household and
+   their policies permit it, derive the narrow exact-audience write rule automatically from standing
+   household membership. Do not ask for a second per-chat approval.
 9. Begin in exceptions-first learning mode; Florence proposes one future-facing rule after a
    successful example, then stops asking for matching situations once it is approved.
 
@@ -1220,7 +1235,7 @@ Automated verification is necessary evidence, not the product itself. Keep it fo
 |---|---|---|---|
 | Build/schema | lint, typecheck, small test suite, build, fresh migration twice | health/readiness after deploy and restart | all green; no secret or stale process |
 | Identity/auth | single-use handoff, CSRF, expiry, session revocation, step-up | register two adults and one caregiver from real DMs | one global person each; exact sessions/roles |
-| Linq gate | signature-before-parse, dedupe, STOP, epoch mismatch, send idempotency | cold-added observe-only group, deterministic private invocation, later exact write approval, then add/remove participant | post-addition context stays exact/private; zero observe-only group output; write approval revokes on membership change; one logical send |
+| Linq gate | signature-before-parse, dedupe, STOP, epoch mismatch, send idempotency | cold-added observe-only group, deterministic private introduction, exact invitee confirmation, then add/remove participant | post-addition context stays exact/private; zero observe-only group output; relationship-derived authority revokes on membership change; one logical send |
 | Coverage | state/time/no-blame contracts | real pickup/activity loop, acknowledgment, change, and closure | no silence-as-owner; useful timing; correct reopen |
 | Gmail | private admission, cursors, independent backfill, replay/recovery, revocation | connect personal/work accounts; send synthetic school mail and PDF | one private finding; resumable import; zero group leakage |
 | Calendar | catalog/modes/sync-token recovery | sync two accounts; edit/delete an event | correct private/full/free-busy projections |
@@ -1235,8 +1250,9 @@ Before declaring the product usable, perform the full real flow:
 3. A caregiver registers and joins only the granted household/conversations.
 4. A cold-added group containing an unregistered handle proves exact-epoch ingestion and zero group
    output; a deterministic Florence invocation continues only in the sender's private DM.
-5. After all register and establish the exact rule, Florence may answer and coordinate in that
-   current group without exposing another source's raw content.
+5. The parent explicitly introduces the exact unknown participant. That person's private
+   confirmation joins the household and automatically activates the current all-household group;
+   Florence may then answer and coordinate without exposing another source's raw content.
 6. A Gmail/PDF or Calendar source produces a private candidate; irrelevant mail remains silent.
 7. One exact approval promotes minimum family meaning; a narrow standing rule handles the next
    matching item without asking again.

@@ -160,18 +160,6 @@ export const LiftNarrowingInputSchema = z.strictObject({
 });
 export type LiftNarrowingInput = z.infer<typeof LiftNarrowingInputSchema>;
 
-export const ActivateConversationRuleInputSchema = z.strictObject({
-  conversationId: EntityIdSchema,
-  actorPersonId: EntityIdSchema,
-  ruleKey: z.string().trim().min(1).max(100),
-  purpose: z.string().trim().min(1).max(300),
-  allowedOperations: z.array(z.string().trim().min(1).max(100)).min(1).max(50),
-  approvedByPersonIds: z.array(EntityIdSchema).min(1).max(100),
-  expectedAuthorityVersion: z.number().int().positive(),
-  activatedAt: InstantSchema,
-});
-export type ActivateConversationRuleInput = z.infer<typeof ActivateConversationRuleInputSchema>;
-
 export const AuthorizeSendInputSchema = z
   .strictObject({
     conversationId: EntityIdSchema,
@@ -221,6 +209,5 @@ export interface ConversationAuthority {
   setParticipantPolicy(input: SetParticipantPolicyInput): Promise<ConversationAuthoritySnapshot>;
   applyNarrowing(input: ApplyNarrowingInput): Promise<ConversationAuthoritySnapshot>;
   liftNarrowing(input: LiftNarrowingInput): Promise<ConversationAuthoritySnapshot>;
-  activateRule(input: ActivateConversationRuleInput): Promise<ConversationAuthoritySnapshot>;
   authorizeSend(input: AuthorizeSendInput): Promise<SendAuthorization>;
 }

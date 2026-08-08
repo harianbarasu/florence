@@ -8,6 +8,13 @@ export interface ApplicationTimerProcessor {
   process(payload: TimerProcessPayload): Promise<unknown>;
 }
 
+export interface ExpectedConversationAuthority {
+  readonly id: string;
+  readonly authorityVersion: number;
+  readonly participantEpochId: string;
+  readonly participantSetDigest: string;
+}
+
 export interface WebRoutineFields {
   readonly destinationConversationId: string;
   readonly title: string;
@@ -117,6 +124,18 @@ export type AppEnvelope =
       readonly internalProviderEventId: string;
       readonly responseText: string;
       readonly evidenceSourceRevisionIds: readonly string[];
+      readonly expectedPerson: { readonly id: string; readonly controlEpoch: number };
+      readonly expectedConversation: ExpectedConversationAuthority;
+    }
+  | {
+      /** Commits an explicit invocation response through current writable group authority. */
+      readonly kind: "linq.group_invocation_response";
+      readonly internalProviderEventId: string;
+      readonly responseText: string;
+      readonly evidenceSourceRevisionIds: readonly string[];
+      readonly expectedPerson: { readonly id: string; readonly controlEpoch: number };
+      readonly expectedConversation: ExpectedConversationAuthority;
+      readonly expectedHousehold?: { readonly id: string; readonly controlEpoch: number };
     }
   | {
       /** Revalidates and applies only bounded relationship meaning from an observe-only invocation. */
@@ -138,6 +157,9 @@ export type AppEnvelope =
             readonly kind: "general_answer";
             readonly text: string;
             readonly evidenceSourceRevisionIds: readonly string[];
+            readonly expectedPerson: { readonly id: string; readonly controlEpoch: number };
+            readonly expectedConversation: ExpectedConversationAuthority;
+            readonly expectedHousehold?: { readonly id: string; readonly controlEpoch: number };
             readonly sourceAuthorities: readonly {
               readonly integrationId: string;
               readonly integrationControlEpoch: number;

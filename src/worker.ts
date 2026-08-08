@@ -44,6 +44,11 @@ const GOOGLE_JOB_REDRIVE_LIMIT = 20;
 const GOOGLE_JOB_REDRIVE_LOOKBACK_MS = 7 * 24 * 60 * 60_000;
 const GOOGLE_JOB_REDRIVE_BUCKET_MS = 60 * 60_000;
 const GOOGLE_JOB_REDRIVE_MAX_GENERATIONS = 3;
+const CONVERSATION_JOB_REDRIVE_NAMESPACE = "job-redrive:conversation";
+const CONVERSATION_JOB_REDRIVE_BUCKET_MS = 60 * 60_000;
+// More than the maximum hourly generations inside the retained source window;
+// authority or source retention, never an arbitrary retry count, ends the obligation.
+const CONVERSATION_JOB_REDRIVE_MAX_GENERATIONS = 1_000;
 
 const StepUpPayloadSchema = z.strictObject({
   actorPersonId: z.string().uuid(),
@@ -76,6 +81,13 @@ class PrivateSourceCandidateWaitingError extends Error {
   public constructor() {
     super("Another private source candidate is currently ahead of this one");
     this.name = "PrivateSourceCandidateWaitingError";
+  }
+}
+
+class ConversationResponsePendingError extends Error {
+  public constructor() {
+    super("Conversation response is waiting for provider acceptance");
+    this.name = "ConversationResponsePendingError";
   }
 }
 
@@ -206,6 +218,10 @@ async function main(): Promise<void> {
           await dispatch(job);
           if (await work.succeed(job)) await observeGoogleSyncMilestone(job);
         } catch (error) {
+          if (error instanceof ConversationResponsePendingError) {
+            await work.defer(job, "conversation_response_pending", new Date(Date.now() + 2_000));
+            continue;
+          }
           if (error instanceof PrivateSourceCandidateWaitingError) {
             await work.defer(job, "private_source_candidate_waiting", new Date(Date.now() + 5 * 60_000));
             continue;
@@ -276,12 +292,14 @@ async function main(): Promise<void> {
         }
         case "orchestrate.linq_message": {
           const payload = parseJobPayload(OrchestrateMessagePayloadSchema, job.payload);
-          await orchestrator.processLinqMessage(payload.internalProviderEventId);
+          const completion = await orchestrator.processLinqMessage(payload.internalProviderEventId);
+          await requireDurableConversationCompletion(database, completion, "Conversation turn");
           return;
         }
         case "orchestrate.linq_observation": {
           const payload = parseJobPayload(OrchestrateMessagePayloadSchema, job.payload);
-          await orchestrator.processObservedLinqMessage(payload.internalProviderEventId);
+          const completion = await orchestrator.processObservedLinqMessage(payload.internalProviderEventId);
+          await requireDurableConversationCompletion(database, completion, "Observed invocation");
           return;
         }
         case "orchestrate.private_source": {
@@ -516,6 +534,26 @@ async function main(): Promise<void> {
         asOf: now.toISOString(),
         limit: 20,
       });
+      for (const kind of [
+        "linq.process_event",
+        "orchestrate.linq_message",
+        "orchestrate.linq_observation",
+      ] as const) {
+        await work.redriveDeadCurrentAuthority({
+          kind,
+          idempotencyNamespace: `${CONVERSATION_JOB_REDRIVE_NAMESPACE}:${kind}`,
+          now,
+          limit: 20,
+          lookbackMs: config.defaults.rawSourceRetentionDays * 86_400_000,
+          bucketMs: CONVERSATION_JOB_REDRIVE_BUCKET_MS,
+          maxGenerations: CONVERSATION_JOB_REDRIVE_MAX_GENERATIONS,
+          attentionErrorCodes:
+            kind === "linq.process_event"
+              ? []
+              : ["conversation_response_window_expired", "worker_model_failed"],
+          clearDeadlineOnRedrive: true,
+        });
+      }
       await work.redriveDeadCurrentAuthority({
         kind: "google.gmail.message",
         idempotencyNamespace: "job-redrive:google-gmail-message",
@@ -953,6 +991,41 @@ export function modelFailureSettlement(
     return "attention";
   }
   return "retry";
+}
+
+export async function requireDurableConversationCompletion(
+  database: ReturnType<typeof createDatabase>,
+  completion: Awaited<ReturnType<FlorenceOrchestrator["processLinqMessage"]>>,
+  label: string,
+): Promise<void> {
+  switch (completion.kind) {
+    case "responded": {
+      if (!completion.outboxEffectId) {
+        throw new Error(`${label} completed without a durable response effect`);
+      }
+      const effects = await database<{ readonly status: string }[]>`
+        select status from outbox where id = ${completion.outboxEffectId}
+      `;
+      const status = effects[0]?.status;
+      if (status === "submitted" || status === "confirmed" || status === "ambiguous") return;
+      if (status === "pending" || status === "leased" || status === "retry") {
+        throw new ConversationResponsePendingError();
+      }
+      throw new Error(`${label} response effect is no longer deliverable`);
+    }
+    case "silent":
+      switch (completion.reason) {
+        case "passive_group":
+        case "uninvoked_group":
+        case "stop":
+        case "revoked":
+          return;
+        default:
+          throw new Error(`${label} completed with an unknown silence reason`);
+      }
+    default:
+      throw new Error(`${label} completed without a recognized durable outcome`);
+  }
 }
 
 async function recordWorkerStart(

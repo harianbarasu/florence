@@ -237,21 +237,22 @@ export class GoogleSyncCoordinator {
         return { kind: "route_unavailable" };
       }
       const idempotencyKey = `private-source-review:${input.candidateId}`;
-      const existing = await existingOutbox(transaction, idempotencyKey);
-      if (existing) return { kind: "queued", outboxId: existing, created: false };
-      const handoff = await new PostgresWebAuth(
-        transaction,
-        this.secretBox,
-        this.config.security.tokenKey,
-      ).createHandoff({
-        personId: input.personId,
-        privateIdentityId: route.identityId,
-        privateConversationId: route.conversationId,
-        purpose: "private_review",
-        context: { returnPath: "/sources", candidateId: input.candidateId },
-        expiresInSeconds: 10 * 60,
-      });
-      const text = `One current family item may need coordination:\n\n${current.requiredOutcome}\n\nReview it privately: ${this.config.publicBaseUrl}/handoff/${handoff.token}\n\nThis secure link expires in 10 minutes. If it expires, text me “settings” for a fresh one.`;
+      let text = await recoverPriorMessageText(transaction, this.secretBox, idempotencyKey);
+      if (text === null) {
+        const handoff = await new PostgresWebAuth(
+          transaction,
+          this.secretBox,
+          this.config.security.tokenKey,
+        ).createHandoff({
+          personId: input.personId,
+          privateIdentityId: route.identityId,
+          privateConversationId: route.conversationId,
+          purpose: "private_review",
+          context: { returnPath: "/sources", candidateId: input.candidateId },
+          expiresInSeconds: 10 * 60,
+        });
+        text = `One current family item may need coordination:\n\n${current.requiredOutcome}\n\nReview it privately: ${this.config.publicBaseUrl}/handoff/${handoff.token}\n\nThis secure link expires in 10 minutes. If it expires, text me “settings” for a fresh one.`;
+      }
       const queued = await new EffectOutbox(transaction, this.secretBox).authorizeAndEnqueue({
         actorPersonId: input.personId,
         person: { id: input.personId, controlEpoch: Number(current.person_control_epoch) },
@@ -846,27 +847,26 @@ export class GoogleSyncCoordinator {
   ): Promise<{ readonly outboxId: string; readonly created: boolean }> {
     const phase = "reauth-required";
     const idempotencyKey = milestoneKey(scope, phase);
-    const existing = await existingOutbox(transaction, idempotencyKey);
-    if (existing) return { outboxId: existing, created: false };
-
-    const handoff = await new PostgresWebAuth(
-      transaction,
-      this.secretBox,
-      this.config.security.tokenKey,
-    ).createHandoff({
-      personId: scope.personId,
-      privateIdentityId: route.identityId,
-      privateConversationId: route.conversationId,
-      purpose: "google_connect",
-      context: {
-        returnPath: "/sources",
-        integrationId: scope.integrationId,
-        reconnect: true,
-      },
-      expiresInSeconds: 10 * 60,
-    });
-    const link = `${this.config.publicBaseUrl}/handoff/${handoff.token}`;
-    const text = attentionRequiredMessage(scope, link);
+    let text = await recoverPriorMessageText(transaction, this.secretBox, idempotencyKey);
+    if (text === null) {
+      const handoff = await new PostgresWebAuth(
+        transaction,
+        this.secretBox,
+        this.config.security.tokenKey,
+      ).createHandoff({
+        personId: scope.personId,
+        privateIdentityId: route.identityId,
+        privateConversationId: route.conversationId,
+        purpose: "google_connect",
+        context: {
+          returnPath: "/sources",
+          integrationId: scope.integrationId,
+          reconnect: true,
+        },
+        expiresInSeconds: 10 * 60,
+      });
+      text = attentionRequiredMessage(scope, `${this.config.publicBaseUrl}/handoff/${handoff.token}`);
+    }
     return this.enqueueEffect(transaction, {
       scope,
       route,
@@ -887,8 +887,6 @@ export class GoogleSyncCoordinator {
     },
   ): Promise<{ readonly outboxId: string; readonly created: boolean }> {
     const idempotencyKey = milestoneKey(input.scope, input.phase);
-    const existing = await existingOutbox(transaction, idempotencyKey);
-    if (existing) return { outboxId: existing, created: false };
     return this.enqueueEffect(transaction, {
       ...input,
       idempotencyKey,
@@ -1028,11 +1026,27 @@ function milestoneKey(scope: IntegrationScope, phase: string): string {
   return `google-sync:${phase}:${scope.integrationId}:e${scope.integrationControlEpoch}`;
 }
 
-async function existingOutbox(transaction: Transaction, idempotencyKey: string): Promise<string | null> {
-  const rows = await transaction<{ readonly id: string }[]>`
-    select id from outbox where idempotency_key = ${idempotencyKey}
+// One-time handoff tokens are not reproducible. Recover only the prior content;
+// EffectOutbox still decides whether the exact effect is reusable and authorized.
+async function recoverPriorMessageText(
+  transaction: Transaction,
+  secretBox: SecretBox,
+  idempotencyKey: string,
+): Promise<string | null> {
+  const rows = await transaction<{ readonly payload_ciphertext: Buffer }[]>`
+    select payload_ciphertext from outbox where idempotency_key = ${idempotencyKey}
   `;
-  return rows[0]?.id ?? null;
+  const ciphertext = rows[0]?.payload_ciphertext;
+  if (!ciphertext) return null;
+  const payload = JSON.parse(
+    secretBox.decrypt(JSON.parse(ciphertext.toString("utf8")), "effect-payload").toString("utf8"),
+  ) as unknown;
+  if (!isMessagePayload(payload)) throw new UnauthorizedError("Prior Google notice payload is invalid");
+  return payload.text;
+}
+
+function isMessagePayload(value: unknown): value is { readonly text: string } {
+  return typeof value === "object" && value !== null && "text" in value && typeof value.text === "string";
 }
 
 function resultFor(outboxIds: readonly string[], created: boolean): GoogleSyncMilestoneResult {

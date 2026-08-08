@@ -57,7 +57,7 @@ describe("family introduction worker proposal", () => {
       accepted: true,
       duplicate: false,
       disposition: "family_introduction_invitation_queued",
-      ids: {},
+      ids: { responseOutboxId: "10000000-0000-4000-8000-000000000005" },
     });
     const orchestrator = introductionOrchestrator({ run, reconcile }, process);
 
@@ -66,7 +66,11 @@ describe("family introduction worker proposal", () => {
         introductionContext(),
         "this is my wife Kendall",
       ),
-    ).resolves.toBe("family_introduction_invitation_queued");
+    ).resolves.toEqual({
+      outboxEffectId: "10000000-0000-4000-8000-000000000005",
+      duplicate: false,
+      route: "exact_private",
+    });
 
     const job = run.mock.calls[0]?.[0] as WorkerJob;
     expect(job.skill).toBe(PRODUCT_SKILLS.familyIntroduction);

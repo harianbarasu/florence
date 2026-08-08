@@ -60,6 +60,11 @@ const DEPLOYED_BOOTSTRAP_BASELINE: Readonly<Record<string, BootstrapBaseline>> =
     evaluationRelease: "coverage-core-3",
     evaluationSuiteDigest: sha256Hex("coverage-core-3:initial-protected-suite"),
   },
+  "coverage.need_interpret@4": {
+    definitionDigest: "e0dbb77250ac82997175fb60a3234a7c43e18e1e46a6153362e8ef25dbcf4260",
+    evaluationRelease: "coverage-core-4",
+    evaluationSuiteDigest: sha256Hex("coverage-core-4:initial-protected-suite"),
+  },
   "coverage.commitment_propose@3": {
     definitionDigest: "35a1dc39d5665b172b2629c32942e64977d52740f97a45ce6dbb74cc26b2660e",
     evaluationRelease: "coverage-core-3",

@@ -8,7 +8,7 @@ import type { ModelGateway, WorkerJob } from "../../src/modules/orchestration/co
 import { PRODUCT_SKILLS } from "../../src/modules/orchestration/skills.js";
 import { isDeterministicStandingProposalFailure } from "../../src/runtime/orchestrator.js";
 import { StaleAuthorityError } from "../../src/shared/errors.js";
-import { modelFailureSettlement } from "../../src/worker.js";
+import { modelFailureSettlement, requireDurableConversationCompletion } from "../../src/worker.js";
 
 const attemptId = "10000000-0000-4000-8000-000000000001";
 
@@ -82,5 +82,22 @@ describe("durable model failure handling", () => {
 
     expect(isDeterministicStandingProposalFailure(failure)).toBe(false);
     expect(isDeterministicStandingProposalFailure(new StaleAuthorityError("authority changed"))).toBe(true);
+  });
+
+  it("keeps a reply job open until the provider accepts its outbox effect", async () => {
+    const completion = {
+      kind: "responded" as const,
+      route: "source_chat" as const,
+      outboxEffectId: "10000000-0000-4000-8000-000000000004",
+      duplicate: false,
+    };
+    const database = (status: string) => (async () => [{ status }]) as never;
+
+    await expect(
+      requireDurableConversationCompletion(database("pending"), completion, "Conversation turn"),
+    ).rejects.toThrow(/waiting for provider acceptance/iu);
+    await expect(
+      requireDurableConversationCompletion(database("submitted"), completion, "Conversation turn"),
+    ).resolves.toBeUndefined();
   });
 });

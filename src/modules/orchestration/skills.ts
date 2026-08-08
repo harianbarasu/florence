@@ -19,7 +19,7 @@ const frontierCitationsSchema = z
 
 export const needInterpretationSchema = z
   .object({
-    disposition: z.enum(["ignore", "private_review", "propose_coverage"]),
+    disposition: z.enum(["no_coverage_need", "private_review", "propose_coverage"]),
     requiredOutcome: z.string().min(1).max(500).nullable(),
     changedFact: z.string().max(500).nullable(),
     evidence: z.array(evidenceReferenceSchema).min(1).max(12),
@@ -29,7 +29,16 @@ export const needInterpretationSchema = z
     priorLoopId: z.string().uuid().nullable(),
     rationale: z.string().min(1).max(1_000),
   })
-  .strict();
+  .strict()
+  .superRefine((interpretation, context) => {
+    if (interpretation.disposition === "propose_coverage" && interpretation.requiredOutcome === null) {
+      context.addIssue({
+        code: "custom",
+        path: ["requiredOutcome"],
+        message: "A coverage proposal requires an outcome",
+      });
+    }
+  });
 
 export const commitmentProposalSchema = z
   .object({
@@ -246,14 +255,14 @@ export const PRODUCT_SKILLS = {
   } satisfies PinnedSkill<typeof familyIntroductionProposalSchema>,
   needInterpret: {
     id: "coverage.need_interpret",
-    version: 3,
+    version: 4,
     purpose: "Decide whether authorized evidence contains a current family coverage need.",
-    instructions: `${commonGuardrails}\nIdentify the actual required outcome, changed facts, time facts, sensitivity, and consequential uncertainty. An uncertainty is only a missing real-world fact that blocks identifying or safely opening the coverage need. The fact that somebody must later self-acknowledge is workflow, not an uncertainty. An unknown assignee does not block opening a loop. Do not require ordinary unstated logistics such as a pickup address or authorized-pickup contact when the child, task, and date or time already identify the need, unless the supplied evidence signals a genuine ambiguity or safety dependency. When a message answers an unresolved fact for a supplied current loop, select that exact priorLoopId and put the supplied answer in changedFact instead of proposing a duplicate loop. Prefer an exact replied-to loop when supplied. Ordinary conversation and unrelated work should be ignored.`,
+    instructions: `${commonGuardrails}\nIdentify the actual required outcome, changed facts, time facts, sensitivity, and consequential uncertainty. An uncertainty is only a missing real-world fact that blocks identifying or safely opening the coverage need. The fact that somebody must later self-acknowledge is workflow, not an uncertainty. An unknown assignee does not block opening a loop. Do not require ordinary unstated logistics such as a pickup address or authorized-pickup contact when the child, task, and date or time already identify the need, unless the supplied evidence signals a genuine ambiguity or safety dependency. When a message answers an unresolved fact for a supplied current loop, select that exact priorLoopId and put the supplied answer in changedFact instead of proposing a duplicate loop. Prefer an exact replied-to loop when supplied. Return no_coverage_need for ordinary conversation or unrelated work; that is only a coverage-domain result and never a recommendation to silence Florence.`,
     outputSchema: needInterpretationSchema,
-    outputSchemaName: "coverage_need_interpret_v2",
+    outputSchemaName: "coverage_need_interpret_v3",
     riskClass: "medium",
     requestedCapabilities: [] as const,
-    evaluationRelease: "coverage-core-3",
+    evaluationRelease: "coverage-core-4",
   } satisfies PinnedSkill<typeof needInterpretationSchema>,
   commitmentPropose: {
     id: "coverage.commitment_propose",

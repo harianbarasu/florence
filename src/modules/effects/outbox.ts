@@ -3,7 +3,7 @@ import type { TransactionSql } from "postgres";
 import type { Database } from "../../db/client.js";
 import { canonicalJson } from "../../shared/canonical-json.js";
 import type { SecretBox } from "../../shared/crypto.js";
-import { UnauthorizedError } from "../../shared/errors.js";
+import { ConflictError, UnauthorizedError } from "../../shared/errors.js";
 import { gmailThreadFrontierLockKey, privateSourceIntegrationLockKey } from "../sources/policy.js";
 import type { AuthorityFence } from "../work/index.js";
 
@@ -76,6 +76,62 @@ interface SubmittedReceiptRow {
   submitted_at: Date;
 }
 
+type DeliverableEffectStatus = "pending" | "leased" | "retry" | "submitted" | "confirmed";
+
+interface ExistingEffectRow {
+  readonly id: string;
+  readonly status: DeliverableEffectStatus | "ambiguous" | "dead" | "cancelled";
+  readonly effect_kind: "linq.message";
+  readonly action_intent_id: string | null;
+  readonly household_id: string | null;
+  readonly household_control_epoch: number | string | null;
+  readonly person_id: string | null;
+  readonly person_control_epoch: number | string | null;
+  readonly conversation_id: string | null;
+  readonly conversation_authority_version: number | string | null;
+  readonly participant_epoch_id: string | null;
+  readonly expected_participant_digest: string | null;
+  readonly integration_id: string | null;
+  readonly integration_control_epoch: number | string | null;
+  readonly coverage_loop_id: string | null;
+  readonly coverage_loop_version: number | string | null;
+  readonly invitation_id: string | null;
+  readonly invitee_identity_authority_version: number | string | null;
+  readonly recipient_identity_id: string | null;
+  readonly recipient_identity_authority_version: number | string | null;
+  readonly recipient_identity_subject_digest: string | null;
+  readonly source_conversation_id: string | null;
+  readonly source_participant_epoch_id: string | null;
+  readonly source_expected_participant_digest: string | null;
+  readonly source_conversation_authority_version: number | string | null;
+  readonly private_source_frontier_id: string | null;
+  readonly private_source_frontier_version: number | string | null;
+  readonly private_source_frontier_digest: string | null;
+  readonly private_source_generation: number | string | null;
+  readonly private_source_case_key_digest: string | null;
+  readonly evidence_source_revision_ids: readonly string[];
+  readonly payload_digest: string;
+  readonly actor_person_id: string | null;
+  readonly decision_household_id: string | null;
+  readonly decision_conversation_id: string | null;
+  readonly decision_participant_epoch_id: string | null;
+  readonly action_digest: string;
+  readonly data_digest: string;
+  readonly policy_digest: string;
+  readonly target_digest: string;
+  readonly reason_codes: readonly string[];
+  readonly decision_outcome: "allow" | "deny";
+  readonly decision_revoked_at: Date | null;
+  readonly decision_expires_at: Date;
+}
+
+interface EffectDigests {
+  readonly actionDigest: string;
+  readonly dataDigest: string;
+  readonly policyDigest: string;
+  readonly targetDigest: string;
+}
+
 interface EffectSourceLockTarget {
   readonly authorization_decision_id: string;
   readonly household_id: string | null;
@@ -130,10 +186,47 @@ export class EffectOutbox {
     };
     const encrypted = this.secretBox.encrypt(payloadJson, "effect-payload");
     return inTransaction(this.database, async (transaction) => {
-      const existing = await transaction<{ id: string }[]>`
-        select id from outbox where idempotency_key = ${input.idempotencyKey}
+      const existingRows = await transaction<ExistingEffectRow[]>`
+        select effect.id, effect.status, effect.effect_kind, effect.action_intent_id,
+          effect.household_id, effect.household_control_epoch,
+          effect.person_id, effect.person_control_epoch,
+          effect.conversation_id, effect.conversation_authority_version,
+          effect.participant_epoch_id, effect.expected_participant_digest,
+          effect.integration_id, effect.integration_control_epoch,
+          effect.coverage_loop_id, effect.coverage_loop_version,
+          effect.invitation_id, effect.invitee_identity_authority_version,
+          effect.recipient_identity_id, effect.recipient_identity_authority_version,
+          effect.recipient_identity_subject_digest,
+          effect.source_conversation_id, effect.source_participant_epoch_id,
+          effect.source_expected_participant_digest,
+          effect.source_conversation_authority_version,
+          effect.private_source_frontier_id, effect.private_source_frontier_version,
+          effect.private_source_frontier_digest, effect.private_source_generation,
+          effect.private_source_case_key_digest, effect.evidence_source_revision_ids,
+          effect.payload_digest, decision.actor_person_id,
+          decision.household_id as decision_household_id,
+          decision.conversation_id as decision_conversation_id,
+          decision.participant_epoch_id as decision_participant_epoch_id,
+          decision.action_digest, decision.data_digest, decision.policy_digest,
+          decision.target_digest, decision.reason_codes,
+          decision.outcome as decision_outcome, decision.revoked_at as decision_revoked_at,
+          decision.expires_at as decision_expires_at
+        from outbox effect
+        join disclosure_decisions decision on decision.id = effect.authorization_decision_id
+        where effect.idempotency_key = ${input.idempotencyKey}
       `;
-      if (existing[0]) return { outboxId: existing[0].id, created: false };
+      const existing = existingRows[0];
+      if (existing && !sameEffectIdentity(existing, input, payloadDigest, effectDigests)) {
+        throw new ConflictError("Effect idempotency key is already bound to a different effect");
+      }
+      if (existing?.status === "submitted" || existing?.status === "confirmed") {
+        return { outboxId: existing.id, created: false };
+      }
+      if (existing && !isActiveEffect(existing, now)) {
+        throw new ConflictError(
+          "Effect idempotency key belongs to an inactive effect; use delivery recovery",
+        );
+      }
 
       if (input.recipientIdentity) {
         const recipients = await transaction<{ readonly id: string }[]>`
@@ -152,6 +245,14 @@ export class EffectOutbox {
       const integrationFence = input.sourceFrontier
         ? await authorizePrivateSourceFrontier(transaction, input)
         : input.integration;
+
+      if (
+        existing &&
+        (existing.integration_id !== (integrationFence?.id ?? null) ||
+          !sameVersion(existing.integration_control_epoch, integrationFence?.controlEpoch))
+      ) {
+        throw new ConflictError("Effect idempotency key is already bound to a different effect");
+      }
 
       if (input.actionIntentId) {
         const approvedDigests = await loadCurrentActionIntentDigests(
@@ -184,6 +285,8 @@ export class EffectOutbox {
           throw new Error("Effect source evidence is no longer authorized");
         }
       }
+
+      if (existing) return { outboxId: existing.id, created: false };
 
       const decisionId = randomUUID();
       await transaction`
@@ -792,7 +895,12 @@ export class EffectOutbox {
         left join participant_epochs source_epoch on source_epoch.id = effect.source_participant_epoch_id
         left join private_source_frontiers source_frontier
           on source_frontier.id = effect.private_source_frontier_id
-        where effect.status = 'dead' and effect.last_error_code = 'linq_delivery_failed'
+        where effect.status = 'dead'
+          and (
+            effect.last_error_code = 'linq_delivery_failed'
+            or effect.last_error_code = 'linq_send_failed'
+            or effect.last_error_code like 'linq_send_failed:%'
+          )
           and effect.action_intent_id is null
           and decision.outcome = 'allow' and decision.revoked_at is null and decision.expires_at > ${now}
           and (
@@ -1265,6 +1373,89 @@ function inTransaction<Result>(
   return "begin" in executor
     ? (executor.begin(operation) as unknown as Promise<Result>)
     : operation(executor);
+}
+
+function sameEffectIdentity(
+  existing: ExistingEffectRow,
+  input: AuthorizedEffectInput,
+  payloadDigest: string,
+  effectDigests: EffectDigests,
+): boolean {
+  const expectedIntegrationId = input.integration?.id ?? input.sourceFrontier?.integrationId ?? null;
+  return (
+    existing.effect_kind === input.effectKind &&
+    existing.action_intent_id === (input.actionIntentId ?? null) &&
+    existing.household_id === (input.household?.id ?? null) &&
+    sameVersion(existing.household_control_epoch, input.household?.controlEpoch) &&
+    existing.person_id === (input.person?.id ?? null) &&
+    sameVersion(existing.person_control_epoch, input.person?.controlEpoch) &&
+    existing.conversation_id === (input.conversation?.id ?? null) &&
+    sameVersion(existing.conversation_authority_version, input.conversation?.authorityVersion) &&
+    existing.participant_epoch_id === (input.participantEpochId ?? null) &&
+    existing.expected_participant_digest === (input.expectedParticipantDigest ?? null) &&
+    existing.integration_id === expectedIntegrationId &&
+    (input.integration === undefined ||
+      sameVersion(existing.integration_control_epoch, input.integration.controlEpoch)) &&
+    existing.coverage_loop_id === (input.coverageLoop?.id ?? null) &&
+    sameVersion(existing.coverage_loop_version, input.coverageLoop?.version) &&
+    existing.invitation_id === (input.invitation?.id ?? null) &&
+    sameVersion(
+      existing.invitee_identity_authority_version,
+      input.invitation?.inviteeIdentityAuthorityVersion,
+    ) &&
+    existing.recipient_identity_id === (input.recipientIdentity?.id ?? null) &&
+    sameVersion(existing.recipient_identity_authority_version, input.recipientIdentity?.authorityVersion) &&
+    existing.recipient_identity_subject_digest === (input.recipientIdentity?.subjectDigest ?? null) &&
+    existing.source_conversation_id === (input.sourceConversation?.id ?? null) &&
+    existing.source_participant_epoch_id === (input.sourceConversation?.participantEpochId ?? null) &&
+    existing.source_expected_participant_digest ===
+      (input.sourceConversation?.participantSetDigest ?? null) &&
+    sameVersion(existing.source_conversation_authority_version, input.sourceConversation?.authorityVersion) &&
+    existing.private_source_frontier_id === (input.sourceFrontier?.frontierId ?? null) &&
+    sameVersion(existing.private_source_frontier_version, input.sourceFrontier?.version) &&
+    existing.private_source_frontier_digest === (input.sourceFrontier?.frontierDigest ?? null) &&
+    sameVersion(existing.private_source_generation, input.sourceFrontier?.sourceGeneration) &&
+    existing.private_source_case_key_digest === (input.sourceFrontier?.caseKeyDigest ?? null) &&
+    sameStringSet(existing.evidence_source_revision_ids, input.evidenceSourceRevisionIds ?? []) &&
+    existing.payload_digest === payloadDigest &&
+    existing.actor_person_id === (input.actorPersonId ?? null) &&
+    existing.decision_household_id === (input.household?.id ?? null) &&
+    existing.decision_conversation_id === (input.conversation?.id ?? null) &&
+    existing.decision_participant_epoch_id === (input.participantEpochId ?? null) &&
+    existing.action_digest === effectDigests.actionDigest &&
+    existing.data_digest === effectDigests.dataDigest &&
+    existing.policy_digest === effectDigests.policyDigest &&
+    existing.target_digest === effectDigests.targetDigest &&
+    sameStringSet(existing.reason_codes, input.reasonCodes)
+  );
+}
+
+function isActiveEffect(existing: ExistingEffectRow, now: Date): boolean {
+  if (existing.status !== "pending" && existing.status !== "leased" && existing.status !== "retry") {
+    return false;
+  }
+  if (
+    existing.decision_outcome !== "allow" ||
+    existing.decision_revoked_at !== null ||
+    existing.decision_expires_at <= now
+  ) {
+    return false;
+  }
+  return (
+    existing.evidence_source_revision_ids.length === 0 ||
+    existing.decision_expires_at > new Date(now.getTime() + 3 * 60_000)
+  );
+}
+
+function sameVersion(actual: number | string | null, expected: number | undefined): boolean {
+  return expected === undefined ? actual === null : actual !== null && Number(actual) === expected;
+}
+
+function sameStringSet(left: readonly string[], right: readonly string[]): boolean {
+  if (left.length !== right.length) return false;
+  const sortedLeft = [...left].sort();
+  const sortedRight = [...right].sort();
+  return sortedLeft.every((value, index) => value === sortedRight[index]);
 }
 
 function validateEffectScope(input: AuthorizedEffectInput): void {

@@ -167,27 +167,6 @@ export class PostgresFlorenceQueries {
       select count(*) as count from integrations
       where person_id = ${personId} and status in ('reauth_required', 'error')
     `;
-    const linqRequestsNeedingAttention = await this.database<{ id: string; updated_at: Date }[]>`
-      select job.id, job.updated_at
-      from jobs job
-      join people person on person.id = job.person_id
-        and person.status = 'registered'
-        and person.control_epoch = job.person_control_epoch
-      where job.person_id = ${personId}
-        and job.job_kind in ('orchestrate.linq_message', 'orchestrate.linq_observation')
-        and job.status = 'attention'
-        and not exists(
-          select 1 from jobs recovered
-          where recovered.person_id = job.person_id
-            and recovered.person_control_epoch = job.person_control_epoch
-            and recovered.conversation_id = job.conversation_id
-            and recovered.job_kind = job.job_kind
-            and recovered.status = 'succeeded'
-            and recovered.updated_at > job.updated_at
-        )
-      order by job.updated_at desc, job.id desc
-      limit 25
-    `;
     const coverageEscalationsNeedingAttention = await this.database<
       {
         id: string;
@@ -269,14 +248,6 @@ export class PostgresFlorenceQueries {
         detail: `Private ${candidate.candidate_kind.replaceAll("_", " ")} awaiting your review.`,
         urgency: "routine" as const,
         href: "/sources",
-      })),
-      ...linqRequestsNeedingAttention.map((job) => ({
-        id: `linq-request-attention:${job.id}`,
-        kind: "request" as const,
-        title: "Florence needs you to retry a request",
-        detail: "Send that request again in your private Florence chat so I can finish it.",
-        urgency: "soon" as const,
-        changedAt: job.updated_at.toISOString(),
       })),
       ...coverageEscalationsNeedingAttention
         .filter((attention) => !directlyVisibleLoopIds.has(attention.coverage_loop_id))

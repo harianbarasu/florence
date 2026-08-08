@@ -22,6 +22,7 @@ const FAMILY_GROUP_OPERATIONS = [
   "coverage_state_change",
   "coverage_closure",
   "family_group_activation",
+  "general_answer",
 ] as const;
 
 export interface FamilyGroupAuthorityResult {

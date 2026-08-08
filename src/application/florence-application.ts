@@ -16,6 +16,7 @@ import {
   type GroupInvocation,
   leadingGroupInvocation,
   PostgresConversationAuthority,
+  provenReplyGroupInvocation,
 } from "../modules/conversations/index.js";
 import { PostgresRoutines, type RoutineRevisionDraft } from "../modules/coordination/index.js";
 import { PostgresDataControls } from "../modules/data-controls/index.js";
@@ -30,6 +31,7 @@ import { ConflictError, NotFoundError, StaleAuthorityError, UnauthorizedError } 
 import type {
   AppEnvelope,
   ApplicationTimerProcessor,
+  ExpectedConversationAuthority,
   ProcessReceipt,
   WebRoutineFields,
 } from "./contracts.js";
@@ -104,13 +106,6 @@ interface ProcessedPrivateDmSource {
   readonly personId: string;
 }
 
-interface PrivateDmResponseCommit {
-  readonly outboxId: string;
-  readonly created: boolean;
-  readonly personId: string;
-  readonly googleActivationIncluded: boolean;
-}
-
 interface LatestRelevantPrivateEffect {
   readonly kind: "enrollment" | "family_invitation" | "other";
   readonly invitationId: string | null;
@@ -145,6 +140,17 @@ export class FlorenceApplication {
           input.internalProviderEventId,
           input.responseText,
           input.evidenceSourceRevisionIds,
+          input.expectedPerson,
+          input.expectedConversation,
+        );
+      case "linq.group_invocation_response":
+        return this.commitWritableGroupInvocationResponse(
+          input.internalProviderEventId,
+          input.responseText,
+          input.evidenceSourceRevisionIds,
+          input.expectedPerson,
+          input.expectedConversation,
+          input.expectedHousehold ?? null,
         );
       case "linq.family_introduction_proposal":
         return this.commitFamilyIntroductionProposal(
@@ -656,11 +662,12 @@ export class FlorenceApplication {
         ? ({ kind: "routing_only", retainEvent: false } as const)
         : classifyEvent(event, liveChat.kind, reconciled.mode);
       const invocation =
-        classification.kind === "observe_only" &&
+        liveChat.kind === "group" &&
+        (classification.kind === "full" || classification.kind === "observe_only") &&
         event.eventType === "linq.message.received" &&
         isFreshLiveMessage(event) &&
         (await this.isExactRegisteredGroupSender(transaction, reconciled))
-          ? await this.resolveObserveOnlyInvocation(transaction, event, reconciled)
+          ? await this.resolveGroupInvocation(transaction, event, reconciled)
           : null;
       const record: StoredLinqEvent = {
         schemaVersion: 1,
@@ -1102,7 +1109,7 @@ export class FlorenceApplication {
     return rows[0]?.eligible === true;
   }
 
-  private async resolveObserveOnlyInvocation(
+  private async resolveGroupInvocation(
     transaction: Transaction,
     event: LinqMessageReceivedEvent,
     reconciled: ReconciledConversation,
@@ -1124,7 +1131,7 @@ export class FlorenceApplication {
         and effect.expected_participant_digest = ${reconciled.appParticipantDigest}
         and effect.status in ('submitted', 'confirmed')
     `;
-    return Number(rows[0]?.matching_effects ?? 0) === 1 ? { basis: "proven_reply", requestText: text } : null;
+    return Number(rows[0]?.matching_effects ?? 0) === 1 ? provenReplyGroupInvocation(text) : null;
   }
 
   /** A verified provider reply is stronger delivery proof than a missing or failed receipt webhook. */
@@ -1243,7 +1250,6 @@ export class FlorenceApplication {
       | {
           readonly person: { readonly id: string; readonly controlEpoch: number };
           readonly conversation: { readonly id: string; readonly authorityVersion: number };
-          readonly deadlineAt: Date;
         }
       | undefined;
     if (record.invocation && record.routing.senderPersonId) {
@@ -1271,9 +1277,10 @@ export class FlorenceApplication {
           id: record.routing.conversationId,
           authorityVersion: snapshot.authorityVersion,
         },
-        deadlineAt: new Date(Date.parse(record.event.message.sentAt) + MAX_LIVE_GROUP_INVOCATION_AGE_MS),
       };
     }
+    // Invocation freshness is decided before admission. Once admitted, its
+    // private reply obligation survives worker outages until authority revokes it.
     await new DurableWork(transaction, this.secretBox).enqueue({
       kind: "orchestrate.linq_observation",
       idempotencyKey: `orchestrate:linq-observation:${internalProviderEventId}`,
@@ -1293,41 +1300,7 @@ export class FlorenceApplication {
   private async completePrivateDmOrchestration(
     input: Extract<AppEnvelope, { kind: "linq.private_dm_orchestration_complete" }>,
   ): Promise<ProcessReceipt> {
-    let response: PrivateDmResponseCommit | null = null;
-    let googleActivationFailed = false;
-    if (input.response.kind === "greeting_acknowledgment") {
-      try {
-        response = await this.database.begin(async (transaction) => {
-          const source = await this.requireProcessedPrivateDmSource(
-            transaction,
-            input.internalProviderEventId,
-          );
-          if (!isNaturalPrivateGreeting("direct", messageText(source.event))) {
-            throw new UnauthorizedError("Private DM is not a deterministic greeting");
-          }
-          const googleOffer = await this.queueParentGoogleActivationOffer(
-            transaction,
-            source.personId,
-            "reengagement_after_expiry",
-            source.record,
-            input.internalProviderEventId,
-          );
-          return googleOffer
-            ? {
-                ...googleOffer,
-                personId: source.personId,
-                googleActivationIncluded: true,
-              }
-            : null;
-        });
-      } catch {
-        // Google setup is optional. Re-enter current private authority below so
-        // an activation failure can never erase the underlying DM response.
-        googleActivationFailed = true;
-      }
-    }
-
-    response ??= await this.database.begin(async (transaction) => {
+    const response = await this.database.begin(async (transaction) => {
       const source = await this.requireProcessedPrivateDmSource(transaction, input.internalProviderEventId);
       const sourceText = messageText(source.event);
       if (input.response.kind === "greeting_acknowledgment") {
@@ -1339,7 +1312,9 @@ export class FlorenceApplication {
       let operation: string;
       let idempotencyKey: string;
       let evidenceSourceRevisionIds: readonly string[] = [];
-      let authorizationExpiresAt = new Date(Date.now() + 5 * 60_000);
+      let authorizationExpiresAt = new Date(
+        Date.now() + this.config.defaults.rawSourceRetentionDays * 86_400_000,
+      );
       if (input.response.kind === "greeting_acknowledgment") {
         text = "Hi! I’m here. What can I help you with?";
         operation = "private_dm_greeting";
@@ -1351,6 +1326,19 @@ export class FlorenceApplication {
         if (!text || text.length > 10_000) {
           throw new UnauthorizedError("Private DM answer is outside the allowed bounds");
         }
+        assertExpectedConversationAuthority(
+          input.response.expectedConversation,
+          source.snapshot.conversationId,
+          source.snapshot.authorityVersion,
+          source.snapshot.participantEpochId,
+          source.snapshot.participantSetDigest,
+        );
+        await assertExpectedResponseAuthority(
+          transaction,
+          source.record,
+          input.response.expectedPerson,
+          input.response.expectedHousehold ?? null,
+        );
         evidenceSourceRevisionIds =
           input.response.evidenceSourceRevisionIds.length > 0
             ? exactEvidenceSourceRevisionIds(input.response.evidenceSourceRevisionIds)
@@ -1405,22 +1393,17 @@ export class FlorenceApplication {
         evidenceSourceRevisionIds,
       );
       if (!queued) throw new StaleAuthorityError("Private DM response is no longer authorized");
-      return { ...queued, personId: source.personId, googleActivationIncluded: false };
+      return { ...queued, personId: source.personId };
     });
 
-    const activationOffered = response.googleActivationIncluded
-      ? true
-      : googleActivationFailed
-        ? false
-        : await this.database.begin(async (transaction) => {
-            const source = await this.requireProcessedPrivateDmSource(
-              transaction,
-              input.internalProviderEventId,
-            );
-            if (source.personId !== response.personId) {
-              throw new StaleAuthorityError("Private DM sender changed before activation");
-            }
-            const committed = await transaction<{ readonly created_at: Date }[]>`
+    let googleActivationFailed = false;
+    const activationOffered = await this.database
+      .begin(async (transaction) => {
+        const source = await this.requireProcessedPrivateDmSource(transaction, input.internalProviderEventId);
+        if (source.personId !== response.personId) {
+          throw new StaleAuthorityError("Private DM sender changed before activation");
+        }
+        const committed = await transaction<{ readonly created_at: Date }[]>`
         select created_at from outbox
         where id = ${response.outboxId}
           and person_id = ${source.personId}
@@ -1430,17 +1413,17 @@ export class FlorenceApplication {
           and status in ('pending', 'leased', 'retry', 'submitted', 'confirmed')
         for share
       `;
-            const committedResponse = committed[0];
-            if (!committedResponse) return false;
+        const committedResponse = committed[0];
+        if (!committedResponse) return false;
 
-            const offered = await this.queueParentGoogleActivationOffer(
-              transaction,
-              source.personId,
-              "existing_steward_dm",
-              source.record,
-            );
-            if (offered) {
-              await transaction`
+        const offered = await this.queueParentGoogleActivationOffer(
+          transaction,
+          source.personId,
+          "existing_steward_dm",
+          source.record,
+        );
+        if (offered) {
+          await transaction`
           update outbox
           set available_at = greatest(
             available_at,
@@ -1448,9 +1431,13 @@ export class FlorenceApplication {
           )
           where idempotency_key = ${`google-parent-activation:${source.personId}`}
         `;
-            }
-            return offered !== null;
-          });
+        }
+        return offered !== null;
+      })
+      .catch(() => {
+        googleActivationFailed = true;
+        return false;
+      });
 
     return {
       accepted: true,
@@ -1532,6 +1519,8 @@ export class FlorenceApplication {
     internalProviderEventId: string,
     responseCandidate: string,
     evidenceSourceRevisionIdsCandidate: readonly string[],
+    expectedPerson: { readonly id: string; readonly controlEpoch: number },
+    expectedConversation: ExpectedConversationAuthority,
   ): Promise<ProcessReceipt> {
     const responseText = responseCandidate.trim();
     if (!responseText || responseText.length > 10_000) {
@@ -1607,13 +1596,28 @@ export class FlorenceApplication {
       `;
       const source = sources[0];
       if (!source) throw new StaleAuthorityError("Private group invocation audience changed");
+      assertExpectedConversationAuthority(
+        expectedConversation,
+        record.routing.conversationId,
+        Number(source.group_authority_version),
+        source.group_epoch_id,
+        source.group_participant_digest,
+      );
+      if (
+        record.routing.senderPersonId !== expectedPerson.id ||
+        Number(source.person_control_epoch) !== expectedPerson.controlEpoch
+      ) {
+        throw new StaleAuthorityError("Private group invocation person authority changed");
+      }
 
       const evidenceReadAt = new Date();
       const sourceIntelligence = new PostgresSourceIntelligence(transaction, this.secretBox, {
         rawRetentionDays: this.config.defaults.rawSourceRetentionDays,
         privateCandidateRetentionDays: 7,
       });
-      let evidenceAccessExpiresAt = new Date(Date.now() + 5 * 60_000);
+      let evidenceAccessExpiresAt = new Date(
+        Date.now() + this.config.defaults.rawSourceRetentionDays * 86_400_000,
+      );
       for (const sourceRevisionId of evidenceSourceRevisionIds) {
         const evidence = await sourceIntelligence
           .read({
@@ -1713,6 +1717,7 @@ export class FlorenceApplication {
         authorizationExpiresAt: evidenceAccessExpiresAt,
       };
 
+      let responseEffect: { readonly outboxId: string; readonly created: boolean };
       if (route) {
         const authorization = await new PostgresConversationAuthority(transaction).authorizeSend({
           conversationId: route.conversation_id,
@@ -1726,7 +1731,7 @@ export class FlorenceApplication {
         if (!authorization.allowed) {
           throw new UnauthorizedError("Exact private conversation does not permit the response");
         }
-        await new EffectOutbox(transaction, this.secretBox).authorizeAndEnqueue({
+        responseEffect = await new EffectOutbox(transaction, this.secretBox).authorizeAndEnqueue({
           ...commonEffect,
           conversation: {
             id: route.conversation_id,
@@ -1758,7 +1763,7 @@ export class FlorenceApplication {
         const firstMessageText =
           sanitizedFirstMessage ||
           "You addressed me in a group. Text me here and I’ll continue the answer privately.";
-        await new EffectOutbox(transaction, this.secretBox).authorizeAndEnqueue({
+        responseEffect = await new EffectOutbox(transaction, this.secretBox).authorizeAndEnqueue({
           ...commonEffect,
           target: { recipient, personId: record.routing.senderPersonId },
           payload: { recipient, text: firstMessageText },
@@ -1767,9 +1772,108 @@ export class FlorenceApplication {
 
       return {
         accepted: true,
-        duplicate: false,
+        duplicate: !responseEffect.created,
         disposition: "private_group_invocation_response_queued",
-        ids: { providerEventId: internalProviderEventId },
+        ids: {
+          providerEventId: internalProviderEventId,
+          responseOutboxId: responseEffect.outboxId,
+        },
+      };
+    });
+  }
+
+  private async commitWritableGroupInvocationResponse(
+    internalProviderEventId: string,
+    responseCandidate: string,
+    evidenceSourceRevisionIdsCandidate: readonly string[],
+    expectedPerson: { readonly id: string; readonly controlEpoch: number },
+    expectedConversation: ExpectedConversationAuthority,
+    expectedHousehold: { readonly id: string; readonly controlEpoch: number } | null,
+  ): Promise<ProcessReceipt> {
+    const responseText = responseCandidate.trim();
+    if (!responseText || responseText.length > 10_000) {
+      throw new UnauthorizedError("Group invocation response is outside the allowed bounds");
+    }
+    const evidenceSourceRevisionIds = exactEvidenceSourceRevisionIds(evidenceSourceRevisionIdsCandidate);
+    return this.database.begin(async (transaction) => {
+      const events = await transaction<ProviderEventRow[]>`
+        select id, provider_event_id, envelope_ciphertext, processing_status
+        from provider_events
+        where id = ${internalProviderEventId} and provider = 'linq'
+        for update
+      `;
+      const row = events[0];
+      if (row?.processing_status !== "processed") {
+        throw new StaleAuthorityError("Group invocation source is no longer processed");
+      }
+      const record = JSON.parse(
+        this.secretBox
+          .decrypt(
+            JSON.parse(row.envelope_ciphertext.toString("utf8")),
+            `provider-event:${row.provider_event_id}`,
+          )
+          .toString("utf8"),
+      ) as StoredLinqEvent;
+      if (
+        record.classification !== "full" ||
+        !record.invocation ||
+        record.routing.chatKind !== "group" ||
+        record.event?.eventType !== "linq.message.received" ||
+        !record.routing.senderIdentityId ||
+        !record.routing.senderPersonId
+      ) {
+        throw new UnauthorizedError("Provider event is not an eligible writable group invocation");
+      }
+
+      const snapshot = await new PostgresConversationAuthority(transaction).snapshot(
+        record.routing.conversationId,
+      );
+      const sender = snapshot.participants.find(
+        (participant) =>
+          participant.personIdentityId === record.routing.senderIdentityId &&
+          participant.personId === record.routing.senderPersonId,
+      );
+      if (
+        snapshot.conversationKind !== "group" ||
+        snapshot.conversationStatus !== "active" ||
+        snapshot.participantEpochId !== record.routing.participantEpochId ||
+        snapshot.participantSetDigest !== record.routing.appParticipantDigest ||
+        sender?.registrationStatus !== "registered" ||
+        sender.consentedAt === null ||
+        sender.policy?.allowContentProcessing !== true ||
+        sender.policy.allowDirectResponses !== true
+      ) {
+        throw new StaleAuthorityError("Writable group invocation authority changed before response");
+      }
+      assertExpectedConversationAuthority(
+        expectedConversation,
+        snapshot.conversationId,
+        snapshot.authorityVersion,
+        snapshot.participantEpochId,
+        snapshot.participantSetDigest,
+      );
+      await assertExpectedResponseAuthority(transaction, record, expectedPerson, expectedHousehold);
+
+      const responseEffect = await this.queueAuthorizedConversationMessage(
+        transaction,
+        record,
+        snapshot,
+        responseText,
+        "direct_response",
+        "general_answer",
+        null,
+        new Date(Date.now() + this.config.defaults.rawSourceRetentionDays * 86_400_000),
+        `general-answer:${internalProviderEventId}`,
+        evidenceSourceRevisionIds,
+      );
+      return {
+        accepted: true,
+        duplicate: !responseEffect.created,
+        disposition: "group_invocation_response_queued",
+        ids: {
+          providerEventId: internalProviderEventId,
+          responseOutboxId: responseEffect.outboxId,
+        },
       };
     });
   }
@@ -2039,7 +2143,7 @@ export class FlorenceApplication {
         : ready
           ? `I privately asked ${displayName} to confirm the invitation. I’ll stay silent in the group until they do.`
           : `I recorded ${displayName} as a proposed ${relationshipLabel(proposalCandidate.role)}. The other current family stewards need to approve before I contact them privately.`;
-      await new EffectOutbox(transaction, this.secretBox).authorizeAndEnqueue({
+      const responseEffect = await new EffectOutbox(transaction, this.secretBox).authorizeAndEnqueue({
         actorPersonId: record.routing.senderPersonId,
         person: {
           id: record.routing.senderPersonId,
@@ -2091,6 +2195,7 @@ export class FlorenceApplication {
           providerEventId: internalProviderEventId,
           invitationId,
           householdId: household.household_id,
+          responseOutboxId: responseEffect.outboxId,
         },
       };
     });
@@ -3342,6 +3447,8 @@ export class FlorenceApplication {
       );
       return "family_setup_deferred";
     }
+    // Every admitted conversational job must reach a durable reply or an
+    // explicit silence reason. Authority may revoke it; latency may not expire it.
     await new DurableWork(transaction, this.secretBox).enqueue({
       kind: "orchestrate.linq_message",
       idempotencyKey: `orchestrate:linq:${internalProviderEventId}`,
@@ -3357,7 +3464,6 @@ export class FlorenceApplication {
         : {}),
       priority: 20,
       maxAttempts: 5,
-      deadlineAt: new Date(Date.now() + 5 * 60_000),
     });
     return "orchestration_queued";
   }
@@ -3557,11 +3663,11 @@ export class FlorenceApplication {
     operation: string,
     ruleId: string | null = null,
     authorizationExpiresAt = new Date(Date.now() + 5 * 60_000),
-    idempotencyKey = `linq:${operation}:${record.routing.conversationId}:${sha256Hex(text)}`,
+    idempotencyKey = `linq:${operation}:${record.routing.conversationId}:${record.event?.providerEventId ?? sha256Hex(`${record.messageOccurredAt ?? "no-message-time"}:${text}`)}`,
     evidenceSourceRevisionIds: readonly string[] = [],
-  ): Promise<{ readonly outboxId: string; readonly created: boolean } | null> {
+  ): Promise<{ readonly outboxId: string; readonly created: boolean }> {
     if (!snapshot.participantEpochId || !snapshot.participantSetDigest)
-      throw new Error("Conversation has no live epoch");
+      throw new StaleAuthorityError("Conversation has no live epoch");
     const authority = await new PostgresConversationAuthority(transaction).authorizeSend({
       conversationId: record.routing.conversationId,
       expectedParticipantEpochId: snapshot.participantEpochId,
@@ -3569,9 +3675,20 @@ export class FlorenceApplication {
       liveParticipantIdentityIds: [...record.routing.liveIdentityIds],
       sendKind,
       operation,
-      ruleId,
+      ruleId:
+        ruleId ??
+        (snapshot.conversationKind === "group"
+          ? (snapshot.rules.find(
+              (candidate) =>
+                candidate.active &&
+                candidate.participantSetDigest === snapshot.participantSetDigest &&
+                candidate.allowedOperations.includes(operation),
+            )?.ruleId ?? null)
+          : null),
     });
-    if (!authority.allowed) return null;
+    if (!authority.allowed) {
+      throw new StaleAuthorityError("Conversation response is no longer authorized");
+    }
     const household = await transaction<{ id: string; control_epoch: number | string }[]>`
       select household.id, household.control_epoch
       from conversations conversation join households household on household.id = conversation.household_id
@@ -5160,6 +5277,53 @@ async function appendAudit(
 
 function sha256Hex(value: string): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function assertExpectedConversationAuthority(
+  expected: ExpectedConversationAuthority,
+  conversationId: string,
+  authorityVersion: number,
+  participantEpochId: string | null,
+  participantSetDigest: string | null,
+): void {
+  if (
+    expected.id !== conversationId ||
+    expected.authorityVersion !== authorityVersion ||
+    expected.participantEpochId !== participantEpochId ||
+    expected.participantSetDigest !== participantSetDigest
+  ) {
+    throw new StaleAuthorityError("Conversation authority changed after model execution");
+  }
+}
+
+async function assertExpectedResponseAuthority(
+  transaction: Transaction,
+  record: StoredLinqEvent,
+  expectedPerson: { readonly id: string; readonly controlEpoch: number },
+  expectedHousehold: { readonly id: string; readonly controlEpoch: number } | null,
+): Promise<void> {
+  if (record.routing.senderPersonId !== expectedPerson.id) {
+    throw new StaleAuthorityError("Response person changed after model execution");
+  }
+  const people = await transaction<{ readonly id: string }[]>`
+    select id from people
+    where id = ${expectedPerson.id} and status = 'registered'
+      and control_epoch = ${expectedPerson.controlEpoch}
+    for share
+  `;
+  if (!people[0]) throw new StaleAuthorityError("Response person authority changed");
+  if (!expectedHousehold) return;
+  const households = await transaction<{ readonly id: string }[]>`
+    select household.id
+    from conversations conversation
+    join households household on household.id = conversation.household_id
+    where conversation.id = ${record.routing.conversationId}
+      and household.id = ${expectedHousehold.id}
+      and household.control_epoch = ${expectedHousehold.controlEpoch}
+      and household.status in ('onboarding', 'active', 'paused')
+    for share of household
+  `;
+  if (!households[0]) throw new StaleAuthorityError("Response household authority changed");
 }
 
 async function assertPrivateQuestionSourceAuthorities(

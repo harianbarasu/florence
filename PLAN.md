@@ -336,6 +336,10 @@ a relationship without another steward's permission.
 Every admitted private DM turn receives a bounded conversational response, even when it does not
 create or change a family coverage loop. This promise never widens group authority: observe-only
 groups remain silent, and trusted groups still use their exact invocation and participation rules.
+Coverage and other specialists may return no domain action, but they never decide whether Florence
+answers. A reply-required job succeeds only after the application returns the exact durable outbox
+effect; model failure selects a bounded response, while only passive content, STOP, or revoked
+authority may complete silently.
 
 Florence may answer non-parenting and general questions when explicitly asked. Such answers use
 public knowledge and content supplied in the request by default. They do not silently retrieve

@@ -10,7 +10,7 @@ const NATURAL_REQUEST_START =
 const NATURAL_QUESTION = /^(?:do|does|did|is|are|was|were|should)\b[\s\S]*\?$/iu;
 
 /**
- * A deliberately narrow, deterministic invocation for a silent group. A mere
+ * A deliberately narrow, deterministic invocation for any group. A mere
  * mention of Florence never invokes the agent; the name must lead the message
  * and be followed by either explicit punctuation or natural request language.
  */
@@ -26,4 +26,11 @@ export function leadingGroupInvocation(text: string): GroupInvocation | null {
     explicit || (NATURAL_REQUEST_START.test(natural) || NATURAL_QUESTION.test(natural) ? natural : "");
   if (!requestText || requestText.length > 10_000) return null;
   return { basis: "leading_address", requestText };
+}
+
+/** A reply is an invocation only after the application proves its exact local target. */
+export function provenReplyGroupInvocation(text: string): GroupInvocation | null {
+  const requestText = text.trim();
+  if (!requestText || requestText.length > 10_000) return null;
+  return { basis: "proven_reply", requestText };
 }

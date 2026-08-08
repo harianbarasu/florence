@@ -548,41 +548,28 @@ export class CoverageCoordinator {
     const candidateId = prior[0]?.id ?? candidateResult?.candidateId;
     if (!candidateId) throw new StaleAuthorityError("Private coverage review lost its identity");
     const idempotencyKey = `private-coverage-review:${candidateId}`;
-    const existingOutbox = await transaction<{ readonly id: string }[]>`
-      select id from outbox where idempotency_key = ${idempotencyKey} limit 1
-    `;
-    if (existingOutbox[0]) {
-      return {
-        accepted: true,
-        duplicate: true,
-        disposition: "private_coverage_review_already_open",
-        ids: {
-          providerEventId: source.internalProviderEventId,
-          candidateId,
-          outboxId: existingOutbox[0].id,
-        },
-      };
-    }
-
     const authorization = await this.requireSendAuthorization(
       transaction,
       source.snapshot,
       "direct_response",
       "private_source_review",
     );
-    const handoff = await new PostgresWebAuth(
-      transaction,
-      this.secretBox,
-      this.config.security.tokenKey,
-    ).createHandoff({
-      personId: source.actorPersonId,
-      privateIdentityId: source.actorIdentityId,
-      privateConversationId: source.record.routing.conversationId,
-      purpose: "private_review",
-      context: { returnPath: "/sources", candidateId },
-      expiresInSeconds: 10 * 60,
-    });
-    const text = `I can help close that. I won’t say anything to your family until you approve the exact wording and group: ${this.config.publicBaseUrl}/handoff/${handoff.token}\n\nThis private link expires in 10 minutes. If it expires, text me “review” for a fresh one.`;
+    let text = await recoverPriorMessageText(transaction, this.secretBox, idempotencyKey);
+    if (text === null) {
+      const handoff = await new PostgresWebAuth(
+        transaction,
+        this.secretBox,
+        this.config.security.tokenKey,
+      ).createHandoff({
+        personId: source.actorPersonId,
+        privateIdentityId: source.actorIdentityId,
+        privateConversationId: source.record.routing.conversationId,
+        purpose: "private_review",
+        context: { returnPath: "/sources", candidateId },
+        expiresInSeconds: 10 * 60,
+      });
+      text = `I can help close that. I won’t say anything to your family until you approve the exact wording and group: ${this.config.publicBaseUrl}/handoff/${handoff.token}\n\nThis private link expires in 10 minutes. If it expires, text me “review” for a fresh one.`;
+    }
     const queued = await new EffectOutbox(transaction, this.secretBox).authorizeAndEnqueue({
       actorPersonId: source.actorPersonId,
       person: { id: source.actorPersonId, controlEpoch: source.actorControlEpoch },
@@ -627,9 +614,9 @@ export class CoverageCoordinator {
     return {
       accepted: true,
       duplicate: !queued.created,
-      disposition: candidateResult?.duplicate
-        ? "private_coverage_review_already_open"
-        : "private_coverage_review_created",
+      disposition: queued.created
+        ? "private_coverage_review_created"
+        : "private_coverage_review_already_open",
       ids: {
         providerEventId: source.internalProviderEventId,
         candidateId,
@@ -649,29 +636,6 @@ export class CoverageCoordinator {
     }
     if (source.record.routing.chatKind === "group" && !source.mayCoordinateCoverage) {
       throw new UnauthorizedError("This person cannot coordinate coverage for the family");
-    }
-
-    const priorClarifications = await transaction<
-      { readonly id: string; readonly coverage_loop_id: string | null }[]
-    >`
-      select id, coverage_loop_id from outbox
-      where idempotency_key = ${`coverage:clarify:${source.internalProviderEventId}`}
-      limit 1
-    `;
-    const priorClarification = priorClarifications[0];
-    if (priorClarification) {
-      return {
-        accepted: true,
-        duplicate: true,
-        disposition: "coverage_response_clarification_queued",
-        ids: {
-          providerEventId: source.internalProviderEventId,
-          outboxId: priorClarification.id,
-          ...(priorClarification.coverage_loop_id
-            ? { coverageLoopId: priorClarification.coverage_loop_id }
-            : {}),
-        },
-      };
     }
 
     const priorTransitions = await transaction<
@@ -1495,6 +1459,29 @@ export class CoverageCoordinator {
       return null;
     }
   }
+}
+
+// One-time handoff tokens are not reproducible. Recover only the prior content;
+// EffectOutbox still decides whether the exact effect is reusable and authorized.
+async function recoverPriorMessageText(
+  transaction: Transaction,
+  secretBox: SecretBox,
+  idempotencyKey: string,
+): Promise<string | null> {
+  const rows = await transaction<{ readonly payload_ciphertext: Buffer }[]>`
+    select payload_ciphertext from outbox where idempotency_key = ${idempotencyKey}
+  `;
+  const ciphertext = rows[0]?.payload_ciphertext;
+  if (!ciphertext) return null;
+  const payload = JSON.parse(
+    secretBox.decrypt(JSON.parse(ciphertext.toString("utf8")), "effect-payload").toString("utf8"),
+  ) as unknown;
+  if (!isMessagePayload(payload)) throw new UnauthorizedError("Prior coverage notice payload is invalid");
+  return payload.text;
+}
+
+function isMessagePayload(value: unknown): value is { readonly text: string } {
+  return typeof value === "object" && value !== null && "text" in value && typeof value.text === "string";
 }
 
 function validateProposal(proposal: CoverageProposal): void {

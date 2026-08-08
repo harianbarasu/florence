@@ -3,6 +3,7 @@ import type { TransactionSql } from "postgres";
 import type { Database } from "../../db/client.js";
 import { canonicalJson } from "../../shared/canonical-json.js";
 import type { SecretBox } from "../../shared/crypto.js";
+import { ConflictError } from "../../shared/errors.js";
 
 export interface AuthorityFence {
   readonly person?: { id: string; controlEpoch: number };
@@ -46,6 +47,8 @@ export interface DeadJobRedriveInput {
   readonly maxGenerations: number;
   readonly requireIntegrationFence?: boolean;
   readonly attentionErrorCodes?: readonly string[];
+  /** Explicitly retires the original bounded window when recovery creates a new job generation. */
+  readonly clearDeadlineOnRedrive?: boolean;
 }
 
 interface JobRow {
@@ -90,6 +93,27 @@ interface DeadJobRow {
   case_key_digest: string | null;
 }
 
+interface ExistingJobRow {
+  id: string;
+  status: "pending" | "leased" | "retry" | "succeeded" | "attention" | "dead" | "cancelled";
+  job_kind: string;
+  household_id: string | null;
+  person_id: string | null;
+  conversation_id: string | null;
+  integration_id: string | null;
+  task_id: string | null;
+  payload_digest: string;
+  max_attempts: number;
+  priority: number;
+  deadline_at: Date | null;
+  person_control_epoch: number | string | null;
+  household_control_epoch: number | string | null;
+  conversation_authority_version: number | string | null;
+  integration_control_epoch: number | string | null;
+  case_key_digest: string | null;
+  authority_current: boolean;
+}
+
 type Transaction = TransactionSql<Record<string, never>>;
 type Executor = Database | Transaction;
 
@@ -110,30 +134,39 @@ export class DurableWork {
     const payloadJson = canonicalJson(input.payload);
     const digest = sha256Hex(payloadJson);
     const encrypted = this.secretBox.encrypt(payloadJson, "durable-job-payload");
-    const rows = await this.database<{ id: string; inserted: boolean }[]>`
-      insert into jobs (
-        id, job_kind, household_id, person_id, conversation_id, integration_id, task_id,
-        idempotency_key, payload_digest, payload_ciphertext, payload_key_version,
-        status, max_attempts, priority, available_at, deadline_at,
-        person_control_epoch, household_control_epoch, conversation_authority_version,
-        integration_control_epoch, case_key_digest
-      ) values (
-        ${randomUUID()}, ${input.kind}, ${input.household?.id ?? null}, ${input.person?.id ?? null},
-        ${input.conversation?.id ?? null}, ${input.integration?.id ?? null},
-        ${input.taskId ?? null}, ${input.idempotencyKey}, ${digest},
-        ${Buffer.from(JSON.stringify(encrypted), "utf8")}, ${encrypted.kid},
-        'pending', ${input.maxAttempts ?? 8}, ${input.priority ?? DEFAULT_PRIORITY},
-        ${input.availableAt ?? new Date()},
-        ${input.deadlineAt ?? null}, ${input.person?.controlEpoch ?? null},
-        ${input.household?.controlEpoch ?? null}, ${input.conversation?.authorityVersion ?? null},
-        ${input.integration?.controlEpoch ?? null}, ${input.caseKeyDigest ?? null}
-      )
-      on conflict (idempotency_key) do update set idempotency_key = jobs.idempotency_key
-      returning id, (xmax = 0) as inserted
-    `;
-    const row = rows[0];
-    if (!row) throw new Error("Job enqueue returned no row");
-    return { jobId: row.id, created: row.inserted };
+    const now = new Date();
+    return inTransaction(this.database, async (transaction) => {
+      const existing = await findExistingJob(transaction, input.idempotencyKey);
+      if (existing) return reuseExistingJob(existing, input, digest, now);
+
+      const rows = await transaction<{ id: string }[]>`
+        insert into jobs (
+          id, job_kind, household_id, person_id, conversation_id, integration_id, task_id,
+          idempotency_key, payload_digest, payload_ciphertext, payload_key_version,
+          status, max_attempts, priority, available_at, deadline_at,
+          person_control_epoch, household_control_epoch, conversation_authority_version,
+          integration_control_epoch, case_key_digest
+        ) values (
+          ${randomUUID()}, ${input.kind}, ${input.household?.id ?? null}, ${input.person?.id ?? null},
+          ${input.conversation?.id ?? null}, ${input.integration?.id ?? null},
+          ${input.taskId ?? null}, ${input.idempotencyKey}, ${digest},
+          ${Buffer.from(JSON.stringify(encrypted), "utf8")}, ${encrypted.kid},
+          'pending', ${input.maxAttempts ?? 8}, ${input.priority ?? DEFAULT_PRIORITY},
+          ${input.availableAt ?? now},
+          ${input.deadlineAt ?? null}, ${input.person?.controlEpoch ?? null},
+          ${input.household?.controlEpoch ?? null}, ${input.conversation?.authorityVersion ?? null},
+          ${input.integration?.controlEpoch ?? null}, ${input.caseKeyDigest ?? null}
+        )
+        on conflict (idempotency_key) do nothing
+        returning id
+      `;
+      const inserted = rows[0];
+      if (inserted) return { jobId: inserted.id, created: true };
+
+      const raced = await findExistingJob(transaction, input.idempotencyKey);
+      if (!raced) throw new Error("Job enqueue conflict returned no existing row");
+      return reuseExistingJob(raced, input, digest, now);
+    });
   }
 
   public async claim(workerId: string, limit = 10, now = new Date()): Promise<ClaimedJob[]> {
@@ -325,7 +358,7 @@ export class DurableWork {
           )
           and (${input.requireIntegrationFence !== true} or job.integration_id is not null)
           and job.updated_at >= ${lookbackStart}
-          and (job.deadline_at is null or job.deadline_at > ${now})
+          and (${input.clearDeadlineOnRedrive === true} or job.deadline_at is null or job.deadline_at > ${now})
           and job.idempotency_key not like ${currentBucketPattern}
           and job.idempotency_key not like ${exhaustedGenerationPattern}
           and (job.person_id is null or (
@@ -363,7 +396,8 @@ export class DurableWork {
             ${candidate.conversation_id}, ${candidate.integration_id}, ${candidate.task_id},
             ${identity.idempotencyKey}, ${candidate.payload_digest}, ${candidate.payload_ciphertext},
             ${candidate.payload_key_version}, 'pending', ${candidate.max_attempts},
-            ${candidate.priority}, ${now}, ${candidate.deadline_at},
+            ${candidate.priority}, ${now},
+            ${input.clearDeadlineOnRedrive === true ? null : candidate.deadline_at},
             ${candidate.person_control_epoch}, ${candidate.household_control_epoch},
             ${candidate.conversation_authority_version}, ${candidate.integration_control_epoch},
             ${candidate.case_key_digest}
@@ -465,6 +499,92 @@ function inTransaction<Result>(
     : operation(executor);
 }
 
+async function findExistingJob(
+  transaction: Transaction,
+  idempotencyKey: string,
+): Promise<ExistingJobRow | null> {
+  const rows = await transaction<ExistingJobRow[]>`
+    select job.id, job.status, job.job_kind, job.household_id, job.person_id,
+      job.conversation_id, job.integration_id, job.task_id, job.payload_digest,
+      job.max_attempts, job.priority, job.deadline_at, job.person_control_epoch,
+      job.household_control_epoch, job.conversation_authority_version,
+      job.integration_control_epoch, job.case_key_digest,
+      (
+        (job.job_kind not like 'google.%' or job.integration_id is not null)
+        and (job.person_id is null or exists (
+          select 1 from people person where person.id = job.person_id
+            and person.status = 'registered' and person.control_epoch = job.person_control_epoch
+        ))
+        and (job.household_id is null or exists (
+          select 1 from households household where household.id = job.household_id
+            and household.status in ('onboarding', 'active', 'paused')
+            and household.control_epoch = job.household_control_epoch
+        ))
+        and (job.conversation_id is null or exists (
+          select 1 from conversations conversation where conversation.id = job.conversation_id
+            and conversation.status not in ('deletion_fenced', 'deleted')
+            and conversation.authority_version = job.conversation_authority_version
+        ))
+        and (job.integration_id is null or exists (
+          select 1 from integrations integration where integration.id = job.integration_id
+            and integration.status = 'active'
+            and integration.control_epoch = job.integration_control_epoch
+        ))
+      ) as authority_current
+    from jobs job
+    where job.idempotency_key = ${idempotencyKey}
+    for update
+  `;
+  return rows[0] ?? null;
+}
+
+function reuseExistingJob(
+  existing: ExistingJobRow,
+  input: EnqueueJobInput,
+  payloadDigest: string,
+  now: Date,
+): { jobId: string; created: false } {
+  if (!sameJobIdentity(existing, input, payloadDigest)) {
+    throw new ConflictError("Job idempotency key is already bound to different work");
+  }
+  if (
+    existing.authority_current !== true ||
+    !["pending", "leased", "retry", "succeeded"].includes(existing.status) ||
+    (existing.status !== "succeeded" && existing.deadline_at !== null && existing.deadline_at <= now)
+  ) {
+    throw new ConflictError("Job idempotency key belongs to inactive work; use the explicit recovery path");
+  }
+  return { jobId: existing.id, created: false };
+}
+
+function sameJobIdentity(existing: ExistingJobRow, input: EnqueueJobInput, payloadDigest: string): boolean {
+  return (
+    existing.job_kind === input.kind &&
+    existing.payload_digest === payloadDigest &&
+    existing.household_id === (input.household?.id ?? null) &&
+    sameVersion(existing.household_control_epoch, input.household?.controlEpoch) &&
+    existing.person_id === (input.person?.id ?? null) &&
+    sameVersion(existing.person_control_epoch, input.person?.controlEpoch) &&
+    existing.conversation_id === (input.conversation?.id ?? null) &&
+    sameVersion(existing.conversation_authority_version, input.conversation?.authorityVersion) &&
+    existing.integration_id === (input.integration?.id ?? null) &&
+    sameVersion(existing.integration_control_epoch, input.integration?.controlEpoch) &&
+    existing.task_id === (input.taskId ?? null) &&
+    existing.max_attempts === (input.maxAttempts ?? 8) &&
+    existing.priority === (input.priority ?? DEFAULT_PRIORITY) &&
+    sameInstant(existing.deadline_at, input.deadlineAt) &&
+    existing.case_key_digest === (input.caseKeyDigest ?? null)
+  );
+}
+
+function sameVersion(existing: number | string | null, expected: number | undefined): boolean {
+  return existing === null ? expected === undefined : Number(existing) === expected;
+}
+
+function sameInstant(existing: Date | null, expected: Date | undefined): boolean {
+  return existing === null ? expected === undefined : existing.getTime() === expected?.getTime();
+}
+
 function validateFence(input: AuthorityFence): void {
   for (const entry of [input.person, input.household, input.conversation, input.integration]) {
     if (
@@ -510,6 +630,9 @@ function validateRedriveInput(input: DeadJobRedriveInput): void {
   if ((input.limit ?? 20) > 100) throw new Error("Redrive limit cannot exceed 100");
   if ((input.attentionErrorCodes?.length ?? 0) > 20) {
     throw new Error("Redrive attention error-code list is too large");
+  }
+  if (input.clearDeadlineOnRedrive !== undefined && typeof input.clearDeadlineOnRedrive !== "boolean") {
+    throw new Error("Redrive deadline policy is invalid");
   }
   for (const code of input.attentionErrorCodes ?? []) {
     if (!/^[a-z0-9][a-z0-9_:-]{0,119}$/u.test(code)) {

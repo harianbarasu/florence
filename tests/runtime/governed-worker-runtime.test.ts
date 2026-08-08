@@ -40,17 +40,25 @@ describe("governed skill definition identity", () => {
     const migratedSkills = [
       ...Object.values(PRODUCT_SKILLS).filter(
         (skill) =>
-          skill.id !== "private_source.reconcile" && skill.id !== "relationship.introduction_classify",
+          skill.id !== "private_source.reconcile" &&
+          skill.id !== "relationship.introduction_classify" &&
+          skill.id !== "coverage.need_interpret",
       ),
       GENERAL_ANSWER_SKILL,
     ];
 
-    expect(migratedPins.size).toBe(migratedSkills.length + 1);
+    expect(migratedPins.size).toBe(migratedSkills.length + 2);
     for (const skill of migratedSkills) {
       expect(migratedPins.get(`${skill.id}@${skill.version}`)).toBe(governedSkillDefinitionDigest(skill));
     }
     expect(migratedPins.get("private_source.reconcile@1")).toBe(
       "998354d86fdc302e53baf7f9f810b381ff73d21d4c1491b30c2fc286c0122c8e",
+    );
+    expect(migratedPins.get("coverage.need_interpret@3")).toBe(
+      "11672c7a656c3ef49449816c12d54bb78b2c915b86761c71e9a0866fafe7eeb7",
+    );
+    expect(governedSkillDefinitionDigest(PRODUCT_SKILLS.needInterpret)).toBe(
+      "e0dbb77250ac82997175fb60a3234a7c43e18e1e46a6153362e8ef25dbcf4260",
     );
     expect(governedSkillDefinitionDigest(PRODUCT_SKILLS.privateSourceReconcile)).toBe(
       "e8ece1f2d9a7dfa56cfb4608b11623476bea9c40f8c5aa6207548b6019d28cac",

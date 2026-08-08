@@ -97,7 +97,9 @@ export class LinqMessageEffectExecutor {
           : audienceChanged
             ? "linq_audience_changed"
             : error instanceof LinqApiError
-              ? String(error.providerCode ?? "linq_api_error")
+              ? error.retryable
+                ? String(error.providerCode ?? "linq_api_error")
+                : `linq_send_failed:${String(error.providerCode ?? "linq_api_error")}`
               : "linq_send_failed",
         retryable && !audienceChanged,
       );

@@ -44,7 +44,11 @@ const GOOGLE_JOB_REDRIVE_LIMIT = 20;
 const GOOGLE_JOB_REDRIVE_LOOKBACK_MS = 7 * 24 * 60 * 60_000;
 const GOOGLE_JOB_REDRIVE_BUCKET_MS = 60 * 60_000;
 const GOOGLE_JOB_REDRIVE_MAX_GENERATIONS = 3;
-const CONVERSATION_JOB_REDRIVE_NAMESPACE = "job-redrive:conversation";
+const CONVERSATION_JOB_REDRIVE_NAMESPACES = {
+  "linq.process_event": "job-redrive:conversation:linq-process-event",
+  "orchestrate.linq_message": "job-redrive:conversation:orchestrate-linq-message",
+  "orchestrate.linq_observation": "job-redrive:conversation:orchestrate-linq-observation",
+} as const;
 const CONVERSATION_JOB_REDRIVE_BUCKET_MS = 60 * 60_000;
 // More than the maximum hourly generations inside the retained source window;
 // authority or source retention, never an arbitrary retry count, ends the obligation.
@@ -541,7 +545,7 @@ async function main(): Promise<void> {
       ] as const) {
         await work.redriveDeadCurrentAuthority({
           kind,
-          idempotencyNamespace: `${CONVERSATION_JOB_REDRIVE_NAMESPACE}:${kind}`,
+          idempotencyNamespace: CONVERSATION_JOB_REDRIVE_NAMESPACES[kind],
           now,
           limit: 20,
           lookbackMs: config.defaults.rawSourceRetentionDays * 86_400_000,

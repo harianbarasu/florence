@@ -1831,7 +1831,7 @@ export class FlorenceOrchestrator {
     const answer = await this.workers.run({
       attemptId: randomUUID(),
       taskVersionId: randomUUID(),
-      authority: messageWorkerAuthority(context, false),
+      authority: messageWorkerAuthority(context, householdContext !== null),
       skill: GENERAL_ANSWER_SKILL,
       authorizedContext: [
         `Current instant: ${new Date().toISOString()}`,

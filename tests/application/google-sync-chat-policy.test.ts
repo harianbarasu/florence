@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   googleSyncChatDisposition,
+  googleSyncTriggerBlocksReadiness,
   privateSourceJobBlocksGoogleReadiness,
 } from "../../src/application/google-sync-coordinator.js";
 
@@ -27,5 +28,32 @@ describe("Google sync chat policy", () => {
       privateSourceJobBlocksGoogleReadiness("dead", boundedError),
       privateSourceJobBlocksGoogleReadiness("succeeded", null),
     ]).toEqual([false, false, false]);
+  });
+
+  it("lets the exact settled model-frontier trigger advance while every other trigger blocks", () => {
+    const boundedError = "private_source_not_ready_model_frontier_incomplete";
+    const trigger = (
+      status: string,
+      lastErrorCode: string | null,
+      jobKind = "orchestrate.private_source",
+    ) => ({
+      status,
+      jobKind,
+      lastErrorCode,
+      integrationControlEpoch: 4,
+    });
+
+    expect([
+      googleSyncTriggerBlocksReadiness(trigger("attention", boundedError), 4),
+      googleSyncTriggerBlocksReadiness(trigger("dead", boundedError), 4),
+    ]).toEqual([false, false]);
+    expect([
+      googleSyncTriggerBlocksReadiness(trigger("retry", boundedError), 4),
+      googleSyncTriggerBlocksReadiness(trigger("attention", "private_source_failed"), 4),
+      googleSyncTriggerBlocksReadiness(trigger("cancelled", boundedError), 4),
+      googleSyncTriggerBlocksReadiness(trigger("attention", boundedError, "google.gmail.message"), 4),
+      googleSyncTriggerBlocksReadiness(trigger("attention", boundedError), 5),
+    ]).toEqual([true, true, true, true, true]);
+    expect(googleSyncTriggerBlocksReadiness(trigger("succeeded", null), 4)).toBe(false);
   });
 });

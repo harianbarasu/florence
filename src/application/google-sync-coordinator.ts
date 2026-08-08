@@ -33,6 +33,7 @@ interface IntegrationScope {
 interface TriggerJob {
   readonly status: string;
   readonly jobKind: string;
+  readonly lastErrorCode: string | null;
   readonly integrationControlEpoch: number;
 }
 
@@ -170,10 +171,7 @@ export class GoogleSyncCoordinator {
         return resultFor(outboxIds, queued.created);
       }
 
-      if (
-        trigger !== null &&
-        (trigger.status !== "succeeded" || trigger.integrationControlEpoch !== scope.integrationControlEpoch)
-      ) {
+      if (trigger !== null && googleSyncTriggerBlocksReadiness(trigger, scope.integrationControlEpoch)) {
         return notReady();
       }
 
@@ -529,11 +527,12 @@ export class GoogleSyncCoordinator {
       {
         readonly status: string;
         readonly job_kind: string;
+        readonly last_error_code: string | null;
         readonly person_control_epoch: number | string;
         readonly integration_control_epoch: number | string;
       }[]
     >`
-      select status, job_kind, person_control_epoch, integration_control_epoch
+      select status, job_kind, last_error_code, person_control_epoch, integration_control_epoch
       from jobs
       where id = ${input.triggeringJobId}
         and person_id = ${scope.personId}
@@ -550,6 +549,7 @@ export class GoogleSyncCoordinator {
       ? {
           status: row.status,
           jobKind: row.job_kind,
+          lastErrorCode: row.last_error_code,
           integrationControlEpoch: Number(row.integration_control_epoch),
         }
       : null;
@@ -962,10 +962,30 @@ export function googleSyncChatDisposition(
 }
 
 export function privateSourceJobBlocksGoogleReadiness(status: string, lastErrorCode: string | null): boolean {
-  if (status === "pending" || status === "retry" || status === "leased") return true;
-  return (
+  if (status === "succeeded") return false;
+  if (
     (status === "attention" || status === "dead") &&
-    lastErrorCode !== PRIVATE_SOURCE_MODEL_FRONTIER_INCOMPLETE_ERROR
+    lastErrorCode === PRIVATE_SOURCE_MODEL_FRONTIER_INCOMPLETE_ERROR
+  ) {
+    return false;
+  }
+  return true;
+}
+
+export function googleSyncTriggerBlocksReadiness(
+  trigger: {
+    readonly status: string;
+    readonly jobKind: string;
+    readonly lastErrorCode: string | null;
+    readonly integrationControlEpoch: number;
+  },
+  expectedIntegrationControlEpoch: number,
+): boolean {
+  if (trigger.integrationControlEpoch !== expectedIntegrationControlEpoch) return true;
+  if (trigger.status === "succeeded") return false;
+  return (
+    trigger.jobKind !== "orchestrate.private_source" ||
+    privateSourceJobBlocksGoogleReadiness(trigger.status, trigger.lastErrorCode)
   );
 }
 

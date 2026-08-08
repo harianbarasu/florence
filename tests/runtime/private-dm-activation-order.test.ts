@@ -154,6 +154,67 @@ describe("private DM activation ordering", () => {
     expect(queue).toHaveBeenCalledOnce();
     expect(queue.mock.calls[0]?.[5]).toBe("general_answer");
   });
+
+  it("fences household context supplied to a conversational answer", async () => {
+    const personId = "10000000-0000-4000-8000-000000000021";
+    const householdId = "10000000-0000-4000-8000-000000000022";
+    const conversationId = "10000000-0000-4000-8000-000000000023";
+    const run = vi.fn().mockResolvedValue(
+      workerResult(GENERAL_ANSWER_SKILL, {
+        answer: "Keep the current school routine.",
+        uncertainty: null,
+      }),
+    );
+    const workers: WorkerRuntime = {
+      run: run as WorkerRuntime["run"],
+      reconcile: vi.fn().mockResolvedValue(undefined),
+    };
+    const orchestrator = new FlorenceOrchestrator(
+      null as never,
+      { defaults: { rawSourceRetentionDays: 30 } } as never,
+      null as never,
+      workers,
+      null,
+      { process: vi.fn().mockResolvedValue({ accepted: true }) },
+    );
+    const context = {
+      row: { id: "10000000-0000-4000-8000-000000000024" },
+      record: {
+        routing: {
+          chatKind: "direct",
+          senderPersonId: personId,
+          conversationId,
+        },
+      },
+      text: "ok what should we keep doing",
+      evidenceSourceRevisionIds: [],
+      images: [],
+      snapshot: { authorityVersion: 3 },
+      requestingPerson: { id: personId, controlEpoch: 5 },
+      household: { id: householdId, controlEpoch: 7, timezone: "America/Los_Angeles" },
+    };
+    const householdContext = {
+      householdId,
+      representedChildren: [],
+      activeRoutines: [],
+      truncated: { representedChildren: false, activeRoutines: false },
+    };
+
+    await expect(
+      (
+        orchestrator as unknown as {
+          answerGeneralQuestion(inputContext: unknown, authorizedHouseholdContext: unknown): Promise<string>;
+        }
+      ).answerGeneralQuestion(context, householdContext),
+    ).resolves.toBe("general_answer_queued");
+    expect(run.mock.calls[0]?.[0]).toMatchObject({
+      authority: {
+        person: { id: personId, controlEpoch: 5 },
+        household: { id: householdId, controlEpoch: 7 },
+        conversation: { id: conversationId, authorityVersion: 3 },
+      },
+    });
+  });
 });
 
 function workerResult<Output>(

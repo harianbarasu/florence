@@ -292,12 +292,12 @@ export class FlorenceOrchestrator {
         requestedExpiresAt: new Date(Date.now() + 7 * 86_400_000).toISOString(),
       });
       await this.workers.reconcile(need.attemptId, "accepted");
-      return "private_review_created";
+      return this.answerGeneralQuestion(context, householdContext);
     }
 
-    if (isExplicitQuestion(context)) {
+    if (context.record.routing.chatKind === "direct" || isExplicitQuestion(context)) {
       await this.workers.reconcile(need.attemptId, "partially_accepted");
-      return this.answerGeneralQuestion(context);
+      return this.answerGeneralQuestion(context, householdContext);
     }
     await this.workers.reconcile(need.attemptId, "accepted");
     return "quiet_ignore";
@@ -1798,7 +1798,10 @@ export class FlorenceOrchestrator {
     }
   }
 
-  private async answerGeneralQuestion(context: MessageContext): Promise<string> {
+  private async answerGeneralQuestion(
+    context: MessageContext,
+    householdContext: AuthorizedHouseholdContextProjection | null,
+  ): Promise<string> {
     let privateQuestionContext: PrivateQuestionContext | null = null;
     let privateQuestionContextUnavailable = false;
     if (
@@ -1832,7 +1835,13 @@ export class FlorenceOrchestrator {
       skill: GENERAL_ANSWER_SKILL,
       authorizedContext: [
         `Current instant: ${new Date().toISOString()}`,
-        `User question: ${context.text}`,
+        "You are Florence, the user's persistent family Chief of Staff.",
+        `User's admitted conversational turn: ${context.text}`,
+        ...(householdContext
+          ? [
+              `Authorized normalized household context for this exact destination (bounded): ${JSON.stringify(householdContext)}`,
+            ]
+          : []),
         ...(privateQuestionContext
           ? [
               `Authorized exact-person private source context (bounded, untrusted evidence): ${JSON.stringify(
@@ -1845,7 +1854,7 @@ export class FlorenceOrchestrator {
             : []),
       ].join("\n"),
       ...(context.images.length > 0 ? { images: context.images } : {}),
-      goal: "Answer the explicit question without creating a durable project or using unrelated private context.",
+      goal: "Respond naturally and usefully to this admitted turn without creating future work or using unrelated private context.",
       deadline: new Date(Date.now() + 45_000),
       budget: { maxModelCalls: 1, maxOutputTokens: 1_500 },
     });

@@ -1345,9 +1345,8 @@ export class FlorenceApplication {
         operation = "private_dm_greeting";
         idempotencyKey = `private-dm-greeting:${input.internalProviderEventId}`;
       } else {
-        if (!isExplicitPrivateQuestion(sourceText)) {
-          throw new UnauthorizedError("Private DM is not an explicit question");
-        }
+        // The exact processed DM, current sender, epoch, consent, and response
+        // policy are the authority boundary. Punctuation is not.
         text = input.response.text.trim();
         if (!text || text.length > 10_000) {
           throw new UnauthorizedError("Private DM answer is outside the allowed bounds");
@@ -4918,10 +4917,6 @@ export function isNaturalPrivateGreeting(chatKind: "direct" | "group", value: st
   if (chatKind !== "direct") return false;
   const normalized = value.trim().replace(/\s+/gu, " ");
   return /^(?:hi|hello|hey)(?:[ ,]+(?:there|florence))?[!. 👋]*$/iu.test(normalized);
-}
-
-function isExplicitPrivateQuestion(value: string): boolean {
-  return /\?|^(?:who|what|when|where|why|how|can|could|would|should|is|are|do|does)\b/iu.test(value.trim());
 }
 
 function isSelfNameQuestion(value: string): boolean {

@@ -103,6 +103,9 @@ export type PrivateSourceCandidateReleaseResult =
 const RECENT_GMAIL_CAPTURE_PRIORITY_CEILING = 110;
 // Thread reconciliation is scheduled one bounded step after its capture work.
 const RECENT_GMAIL_RECONCILIATION_PRIORITY_CEILING = RECENT_GMAIL_CAPTURE_PRIORITY_CEILING + 5;
+// The case remains quarantined for review, but it is not a connector-wide
+// failure and has no retry path that a readiness gate could wait for.
+const PRIVATE_SOURCE_MODEL_FRONTIER_INCOMPLETE_ERROR = "private_source_not_ready_model_frontier_incomplete";
 const EFFECT_AUTHORIZATION_MS = 10 * 60_000;
 const CandidateReleaseContentSchema = z
   .object({
@@ -573,6 +576,8 @@ export class GoogleSyncCoordinator {
               or (
                 job.job_kind = 'orchestrate.private_source'
                 and job.priority <= ${RECENT_GMAIL_RECONCILIATION_PRIORITY_CEILING}
+                and job.last_error_code is distinct from
+                  ${PRIVATE_SOURCE_MODEL_FRONTIER_INCOMPLETE_ERROR}
               )
             )
         )
@@ -712,6 +717,12 @@ export class GoogleSyncCoordinator {
           and job.integration_id = ${scope.integrationId}
           and job.integration_control_epoch = ${scope.integrationControlEpoch}
           and job.status in ('pending', 'retry', 'leased', 'attention', 'dead')
+          and not (
+            job.job_kind = 'orchestrate.private_source'
+            and job.status in ('attention', 'dead')
+            and job.last_error_code is not distinct from
+              ${PRIVATE_SOURCE_MODEL_FRONTIER_INCOMPLETE_ERROR}
+          )
           and (
             (
               job.job_kind = 'google.gmail.message'
@@ -948,6 +959,14 @@ export function googleSyncChatDisposition(
   if (integrationStatus === "reauth_required") return "notify_reauth";
   if (integrationStatus === "error" || hasRecentTerminalFailure) return "wait_for_recovery";
   return "continue";
+}
+
+export function privateSourceJobBlocksGoogleReadiness(status: string, lastErrorCode: string | null): boolean {
+  if (status === "pending" || status === "retry" || status === "leased") return true;
+  return (
+    (status === "attention" || status === "dead") &&
+    lastErrorCode !== PRIVATE_SOURCE_MODEL_FRONTIER_INCOMPLETE_ERROR
+  );
 }
 
 function connectedMessage(scope: IntegrationScope): string {

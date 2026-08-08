@@ -333,6 +333,10 @@ a relationship without another steward's permission.
 3. **Mobile web companion** — onboarding, authority, inspectability, integrations, privacy, and
    exceptional items requiring review. It is not a second chat client or family planner.
 
+Every admitted private DM turn receives a bounded conversational response, even when it does not
+create or change a family coverage loop. This promise never widens group authority: observe-only
+groups remain silent, and trusted groups still use their exact invocation and participation rules.
+
 Florence may answer non-parenting and general questions when explicitly asked. Such answers use
 public knowledge and content supplied in the request by default. They do not silently retrieve
 private sources, create durable family state, or begin proactive work. If a request becomes

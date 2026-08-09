@@ -1,6 +1,7 @@
 import type { LinqChatSnapshot, LinqWebhookEnvelope } from "../adapters/linq/index.js";
 import type { PrivateBridgeProposalInput } from "../modules/bridges/index.js";
 import type { ResolvedTimePlan } from "../modules/coordination/index.js";
+import type { FamilyOnboardingStepKind } from "../modules/relationships/index.js";
 import type { IntegrationAccountKind, IntegrationCapability, JsonObject } from "../modules/sources/index.js";
 import type { TimerProcessPayload } from "../modules/work/index.js";
 
@@ -162,15 +163,7 @@ export type AppEnvelope =
             readonly expectedHousehold?: { readonly id: string; readonly controlEpoch: number };
             readonly guidance?: {
               readonly stateDigest: string;
-              readonly step:
-                | "create_household"
-                | "choose_household"
-                | "connect_google"
-                | "reconnect_google"
-                | "add_first_child"
-                | "add_first_routine"
-                | "wait_for_google"
-                | "ready";
+              readonly step: FamilyOnboardingStepKind;
               readonly useRecommendedNextStep: boolean;
             };
             readonly sourceAuthorities: readonly {
@@ -188,6 +181,14 @@ export type AppEnvelope =
   | {
       readonly kind: "timer.process";
       readonly timer: TimerProcessPayload;
+    }
+  | {
+      readonly kind: "onboarding.reminder_due";
+      readonly personId: string;
+      readonly expectedPersonControlEpoch: number;
+      readonly expectedOnboardingVersion: number;
+      readonly targetStage: 1 | 2;
+      readonly dueAt: string;
     }
   | {
       readonly kind: "private_bridge.proposal";
@@ -272,6 +273,48 @@ export type AppEnvelope =
       readonly command:
         | { readonly kind: "create_household" }
         | {
+            readonly kind: "confirm_onboarding_profile";
+            readonly displayName: string;
+            readonly timeZone: string;
+          }
+        | { readonly kind: "select_onboarding_household"; readonly householdId: string }
+        | {
+            readonly kind: "set_onboarding_coordinator";
+            readonly householdId: string;
+            readonly expectedMembershipVersion: number;
+            readonly expectedIntakeVersion: number;
+            readonly disposition: "just_me" | "invite_later" | "proposed";
+            readonly proposedName: string | null;
+          }
+        | {
+            readonly kind: "mark_onboarding_children_reviewed";
+            readonly householdId: string;
+            readonly expectedMembershipVersion: number;
+            readonly expectedIntakeVersion: number;
+          }
+        | {
+            readonly kind: "defer_onboarding_coordinator_invite";
+            readonly householdId: string;
+            readonly expectedMembershipVersion: number;
+            readonly expectedIntakeVersion: number;
+          }
+        | {
+            readonly kind: "review_onboarding_shared_context";
+            readonly householdId: string;
+            readonly expectedMembershipVersion: number;
+            readonly expectedIntakeVersion: number;
+            readonly expectedMembershipOnboardingVersion: number;
+          }
+        | { readonly kind: "skip_onboarding_google" }
+        | {
+            readonly kind: "complete_onboarding";
+            readonly householdId: string;
+            readonly expectedMembershipVersion: number;
+            readonly expectedProfileReviewVersion: number;
+            readonly expectedIntakeVersion: number;
+            readonly expectedMembershipOnboardingVersion: number;
+          }
+        | {
             readonly kind: "invite_household_participant";
             readonly householdId: string;
             readonly conversationId: string;
@@ -297,6 +340,8 @@ export type AppEnvelope =
             readonly kind: "update_dependent";
             readonly householdId: string;
             readonly dependentPersonId: string;
+            readonly expectedRosterVersion: number;
+            readonly expectedIntakeVersion: number;
             readonly displayName: string;
             readonly aliases: readonly string[];
             readonly birthYear: number | null;

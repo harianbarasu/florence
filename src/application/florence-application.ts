@@ -9,7 +9,7 @@ import type { FlorenceConfig } from "../config.js";
 import type { Database } from "../db/client.js";
 import {
   GOOGLE_CONNECT_HANDOFF_TTL_SECONDS,
-  MAX_STANDARD_HANDOFF_TTL_SECONDS,
+  ONBOARDING_HANDOFF_TTL_SECONDS,
   PostgresWebAuth,
 } from "../modules/auth/index.js";
 import { openPrivateBridgePayload, PrivateSourceBridge } from "../modules/bridges/index.js";
@@ -26,6 +26,10 @@ import { PostgresRoutines, type RoutineRevisionDraft } from "../modules/coordina
 import { PostgresDataControls } from "../modules/data-controls/index.js";
 import { EffectOutbox } from "../modules/effects/index.js";
 import { type HouseholdMembership, PostgresIdentityRelationships } from "../modules/identity/index.js";
+import {
+  type FamilyOnboardingProjection,
+  PostgresFamilyOnboarding,
+} from "../modules/relationships/family-onboarding.js";
 import { HouseholdOnboarding } from "../modules/relationships/index.js";
 import { type IntegrationCapability, PostgresSourceIntelligence } from "../modules/sources/index.js";
 import { DurableWork } from "../modules/work/index.js";
@@ -42,6 +46,7 @@ import type {
 import { CoverageCoordinator } from "./coverage-coordinator.js";
 import { reconcileCoverageTimers } from "./coverage-timer-reconciliation.js";
 import { GoogleSyncCoordinator } from "./google-sync-coordinator.js";
+import { decideOnboardingReminder, type OnboardingReminderStep } from "./onboarding-reminder-policy.js";
 import {
   PostgresPrivateOnboardingGuidance,
   type PrivateOnboardingGuidance,
@@ -121,10 +126,7 @@ interface LatestRelevantPrivateEffect {
   readonly invitationId: string | null;
 }
 
-type ParentGoogleActivationReason =
-  | "household_resolved"
-  | "existing_steward_dm"
-  | "reengagement_after_expiry";
+type ParentOnboardingReason = "registration" | "household_resolved" | "invitation_accepted" | "resume";
 
 /**
  * Florence's sole authoritative mutation seam. Provider, timer, browser, worker,
@@ -181,6 +183,8 @@ export class FlorenceApplication {
           disposition: "timer_processed",
           ids: { timerId: input.timer.id },
         };
+      case "onboarding.reminder_due":
+        return this.processOnboardingReminder(input);
       case "maintenance.materialize_routines":
         return this.materializeRoutines(input);
       case "maintenance.redrive_effects": {
@@ -338,6 +342,9 @@ export class FlorenceApplication {
         personId: consumed.personId,
         triggeringJobId: null,
       });
+      if (consumed.returnPath === "/onboarding") {
+        await this.noteOnboardingProgress(transaction, consumed.personId, new Date(input.completedAt));
+      }
 
       return {
         accepted: true,
@@ -1301,6 +1308,436 @@ export class FlorenceApplication {
     return record.invocation ? "private_invocation_queued" : "observation_queued";
   }
 
+  private async resolveExactPrivateRoute(
+    transaction: Transaction,
+    personId: string,
+    currentRecord?: StoredLinqEvent,
+  ): Promise<ExactPrivateRoute | null> {
+    if (
+      currentRecord?.routing.chatKind === "direct" &&
+      currentRecord.routing.senderPersonId === personId &&
+      currentRecord.routing.senderIdentityId !== null &&
+      currentRecord.routing.liveIdentityIds.length === 1 &&
+      currentRecord.routing.liveIdentityIds[0] === currentRecord.routing.senderIdentityId
+    ) {
+      return {
+        conversationId: currentRecord.routing.conversationId,
+        participantEpochId: currentRecord.routing.participantEpochId,
+        participantSetDigest: currentRecord.routing.appParticipantDigest,
+        liveIdentityIds: [...currentRecord.routing.liveIdentityIds],
+        privateIdentityId: currentRecord.routing.senderIdentityId,
+        providerChatId: currentRecord.routing.providerChatId,
+        providerParticipantDigest: currentRecord.routing.providerParticipantDigest,
+      };
+    }
+    if (currentRecord) return null;
+    const routes = await transaction<
+      {
+        conversation_id: string;
+        participant_epoch_id: string;
+        participant_set_digest: string;
+        identity_id: string;
+        external_channel_id: string;
+        latest_participant_digest: string | null;
+      }[]
+    >`
+      select conversation.id as conversation_id, epoch.id as participant_epoch_id,
+        epoch.participant_set_digest, participant.person_identity_id as identity_id,
+        channel.external_channel_id, channel.latest_participant_digest
+      from conversations conversation
+      join conversation_channels channel on channel.conversation_id = conversation.id
+        and channel.provider = 'linq' and channel.status = 'active'
+      join participant_epochs epoch on epoch.id = conversation.current_epoch_id
+        and epoch.ended_at is null
+      join epoch_participants participant on participant.participant_epoch_id = epoch.id
+        and participant.person_id = ${personId}
+        and participant.registration_status = 'registered' and participant.consented_at is not null
+      join person_identities identity on identity.id = participant.person_identity_id
+        and identity.status = 'verified'
+      where conversation.kind = 'direct' and conversation.status = 'active'
+        and (select count(*) from epoch_participants exact_participant
+          where exact_participant.participant_epoch_id = epoch.id) = 1
+      order by conversation.updated_at desc, conversation.id
+      limit 1
+    `;
+    const saved = routes[0];
+    if (!saved?.latest_participant_digest) return null;
+    return {
+      conversationId: saved.conversation_id,
+      participantEpochId: saved.participant_epoch_id,
+      participantSetDigest: saved.participant_set_digest,
+      liveIdentityIds: [saved.identity_id],
+      privateIdentityId: saved.identity_id,
+      providerChatId: saved.external_channel_id,
+      providerParticipantDigest: saved.latest_participant_digest,
+    };
+  }
+
+  /** Makes an accepted relationship the exact family whose onboarding state governs this person. */
+  private async selectAcceptedOnboardingHousehold(
+    transaction: Transaction,
+    personId: string,
+    householdId: string,
+    selectedAt: Date,
+  ): Promise<void> {
+    const onboarding = new PostgresFamilyOnboarding(this.secretBox);
+    const projection = await onboarding.project(transaction, {
+      actorPersonId: personId,
+      personId,
+    });
+    await onboarding.selectHousehold(transaction, {
+      actorPersonId: personId,
+      personId,
+      householdId,
+      expectedPersonOnboardingVersion: projection.profile.onboardingVersion,
+      selectedAt,
+    });
+  }
+
+  private async requireConfirmedPersonTimeZone(transaction: Transaction, personId: string): Promise<string> {
+    const rows = await transaction<{ readonly timezone: string | null }[]>`
+      select person.timezone
+      from people person
+      join person_onboarding onboarding on onboarding.person_id = person.id
+        and onboarding.profile_review_version > 0
+        and onboarding.reviewed_person_authority_version = person.authority_version
+      where person.id = ${personId} and person.status = 'registered'
+      for share of person, onboarding
+    `;
+    const timeZone = rows[0]?.timezone;
+    if (!timeZone || !validTimeZone(timeZone)) {
+      throw new ConflictError("Confirm your time zone before creating a Florence family");
+    }
+    return timeZone;
+  }
+
+  /** Queues one exact-private entry into the canonical family onboarding journey. */
+  private async queueParentOnboardingOffer(
+    transaction: Transaction,
+    personId: string,
+    reason: ParentOnboardingReason,
+    currentRecord?: StoredLinqEvent,
+    resumeKey?: string,
+  ): Promise<{ readonly outboxId: string; readonly created: boolean } | null> {
+    const people = await transaction<{ readonly control_epoch: number | string }[]>`
+      select person.control_epoch
+      from people person
+      where person.id = ${personId} and person.status = 'registered'
+        and not exists (
+          select 1 from person_onboarding selection
+          join household_memberships membership
+            on membership.person_id = selection.person_id
+            and membership.household_id = selection.selected_household_id
+            and membership.status = 'active' and membership.role <> 'dependent'
+          join households household on household.id = membership.household_id
+            and household.status in ('onboarding', 'active')
+          join membership_capabilities read_capability on read_capability.membership_id = membership.id
+            and read_capability.capability = 'household.read' and read_capability.status = 'active'
+          join membership_onboarding onboarding on onboarding.membership_id = membership.id
+          where selection.person_id = person.id and onboarding.completed_at is not null
+        )
+      for update of person
+    `;
+    const person = people[0];
+    if (!person) return null;
+    const route = await this.resolveExactPrivateRoute(transaction, personId, currentRecord);
+    if (!route) return null;
+    const sendKind = currentRecord ? "direct_response" : "transactional";
+    const authority = await new PostgresConversationAuthority(transaction).authorizeSend({
+      conversationId: route.conversationId,
+      expectedParticipantEpochId: route.participantEpochId,
+      expectedParticipantSetDigest: route.participantSetDigest,
+      liveParticipantIdentityIds: [...route.liveIdentityIds],
+      sendKind,
+      operation: "family_onboarding",
+      ruleId: null,
+    });
+    if (!authority.allowed || !authority.participantEpochId || !authority.participantSetDigest) {
+      return null;
+    }
+    const idempotencyKey =
+      reason === "resume" && resumeKey
+        ? `parent-onboarding:${personId}:resume:${resumeKey}`
+        : reason === "invitation_accepted" && resumeKey
+          ? `parent-onboarding:${personId}:invitation:${resumeKey}`
+          : `parent-onboarding:${personId}:initial`;
+    const existing = await transaction<{ readonly present: boolean }[]>`
+      select exists(
+        select 1 from outbox
+        where idempotency_key = ${idempotencyKey}
+          and status in ('pending', 'leased', 'retry', 'submitted', 'confirmed')
+      ) as present
+    `;
+    if (existing[0]?.present) return null;
+    const handoff = await new PostgresWebAuth(
+      transaction,
+      this.secretBox,
+      this.config.security.tokenKey,
+    ).createHandoff({
+      personId,
+      privateIdentityId: route.privateIdentityId,
+      privateConversationId: route.conversationId,
+      purpose: "onboarding",
+      context: { returnPath: "/onboarding" },
+      expiresInSeconds: ONBOARDING_HANDOFF_TTL_SECONDS,
+    });
+    const link = `${this.config.publicBaseUrl}/handoff/${handoff.token}`;
+    const text =
+      reason === "resume"
+        ? `I saved where you left off. Continue your private family setup here: ${link}\n\nIt takes you back to the exact next step. If the link expires, ask me to continue setup.`
+        : reason === "invitation_accepted"
+          ? `You’re all set—your Florence family membership is active. I’ll reuse the family details already there instead of asking you to repeat them.\n\nFinish your private setup here: ${link}\n\nI save each step, so you can leave and come back. If the link expires, ask me to continue setup.`
+          : `Let’s set Florence up around your actual family. I’ll confirm you, learn who helps coordinate, and capture the children, schools, and activities I should recognize. Then you can connect Gmail and Calendar—or use Florence without them.\n\nStart here: ${link}\n\nI save each step, so you can leave and come back. If the link expires, ask me to continue setup.`;
+    const queued = await new EffectOutbox(transaction, this.secretBox).authorizeAndEnqueue({
+      actorPersonId: personId,
+      person: { id: personId, controlEpoch: Number(person.control_epoch) },
+      conversation: { id: route.conversationId, authorityVersion: authority.authorityVersion },
+      participantEpochId: authority.participantEpochId,
+      expectedParticipantDigest: authority.participantSetDigest,
+      effectKind: "linq.message",
+      idempotencyKey,
+      data: { reason, textDigest: sha256Hex(text) },
+      policy: { exactPrivateDm: true, operation: "family_onboarding", sendKind },
+      target: {
+        providerChatId: route.providerChatId,
+        personId,
+        participantEpochId: authority.participantEpochId,
+      },
+      payload: {
+        providerChatId: route.providerChatId,
+        expectedProviderParticipantDigest: route.providerParticipantDigest,
+        text,
+      },
+      reasonCodes: ["registered_private_person", "family_onboarding_incomplete", reason],
+      authorizationExpiresAt: handoff.expiresAt,
+    });
+    if (queued.created) {
+      const onboarding = new PostgresFamilyOnboarding(this.secretBox);
+      await onboarding.touchProgress(transaction, {
+        actorPersonId: personId,
+        personId,
+        expectedPersonControlEpoch: Number(person.control_epoch),
+        progressedAt: new Date(),
+      });
+      await this.reconcileOnboardingReminder(transaction, personId, new Date());
+    }
+    return queued;
+  }
+
+  private async processOnboardingReminder(
+    input: Extract<AppEnvelope, { kind: "onboarding.reminder_due" }>,
+  ): Promise<ProcessReceipt> {
+    return this.database.begin(async (transaction) => {
+      const onboarding = new PostgresFamilyOnboarding(this.secretBox);
+      const projection = await onboarding.project(transaction, {
+        actorPersonId: input.personId,
+        personId: input.personId,
+      });
+      if (
+        projection.profile.controlEpoch !== input.expectedPersonControlEpoch ||
+        projection.profile.onboardingVersion !== input.expectedOnboardingVersion
+      ) {
+        await this.reconcileOnboardingReminder(transaction, input.personId, new Date());
+        return {
+          accepted: true,
+          duplicate: true,
+          disposition: "onboarding_reminder_superseded",
+          ids: { personId: input.personId },
+        };
+      }
+      const route = await this.resolveExactPrivateRoute(transaction, input.personId);
+      const privateAuthority = route ? await this.onboardingReminderAuthority(transaction, route) : null;
+      const nextStep = onboardingReminderStep(projection);
+      const decision = decideOnboardingReminder({
+        onboardingComplete: projection.nextStep.kind === "complete",
+        reminderStage: reminderStage(projection.profile.remindersSent),
+        savedNextStep: nextStep,
+        lastProgressedAt: projection.profile.lastProgressedAt ?? input.dueAt,
+        lastRemindedAt: projection.profile.lastRemindedAt,
+        timeZone: projection.profile.timezone ?? this.config.defaults.timezone,
+        suppressedAt: projection.profile.remindersSuppressedAt,
+        privateRouteAvailable: route !== null,
+        privateAuthority: route === null ? "absent" : privateAuthority ? "current" : "invalid",
+        now: new Date().toISOString(),
+      });
+      if (decision.kind === "suppress") {
+        return {
+          accepted: true,
+          duplicate: false,
+          disposition: `onboarding_reminder_${decision.reason}`,
+          ids: { personId: input.personId },
+        };
+      }
+      if (decision.kind === "schedule") {
+        await this.enqueueOnboardingReminder(transaction, projection, decision.stage, decision.dueAt);
+        return {
+          accepted: true,
+          duplicate: false,
+          disposition: "onboarding_reminder_rescheduled",
+          ids: { personId: input.personId, stage: String(decision.stage) },
+        };
+      }
+      if (!route || !privateAuthority) {
+        throw new StaleAuthorityError("Private onboarding reminder authority changed");
+      }
+      if (!privateAuthority.participantEpochId || !privateAuthority.participantSetDigest) {
+        throw new StaleAuthorityError("Private onboarding reminder has no current audience");
+      }
+      const recorded = await onboarding.recordReminderSent(transaction, {
+        personId: input.personId,
+        expectedPersonControlEpoch: projection.profile.controlEpoch,
+        expectedPersonOnboardingVersion: projection.profile.onboardingVersion,
+        sentAt: new Date(),
+      });
+      const handoff = await new PostgresWebAuth(
+        transaction,
+        this.secretBox,
+        this.config.security.tokenKey,
+      ).createHandoff({
+        personId: input.personId,
+        privateIdentityId: route.privateIdentityId,
+        privateConversationId: route.conversationId,
+        purpose: "onboarding",
+        context: { returnPath: "/onboarding" },
+        expiresInSeconds: ONBOARDING_HANDOFF_TTL_SECONDS,
+      });
+      const text = `${decision.copy.lead} ${decision.copy.progress} ${decision.copy.nextStep}\n\n${decision.copy.action} ${this.config.publicBaseUrl}/handoff/${handoff.token}`;
+      const queued = await new EffectOutbox(transaction, this.secretBox).authorizeAndEnqueue({
+        actorPersonId: input.personId,
+        person: { id: input.personId, controlEpoch: projection.profile.controlEpoch },
+        conversation: {
+          id: route.conversationId,
+          authorityVersion: privateAuthority.authorityVersion,
+        },
+        participantEpochId: privateAuthority.participantEpochId,
+        expectedParticipantDigest: privateAuthority.participantSetDigest,
+        effectKind: "linq.message",
+        idempotencyKey: `onboarding-reminder:${input.personId}:stage:${decision.stage}`,
+        data: { stage: decision.stage, textDigest: sha256Hex(text) },
+        policy: {
+          exactPrivateDm: true,
+          operation: "family_onboarding_reminder",
+          sendKind: "transactional",
+        },
+        target: {
+          providerChatId: route.providerChatId,
+          personId: input.personId,
+          participantEpochId: privateAuthority.participantEpochId,
+        },
+        payload: {
+          providerChatId: route.providerChatId,
+          expectedProviderParticipantDigest: route.providerParticipantDigest,
+          text,
+        },
+        reasonCodes: ["onboarding_incomplete", "bounded_private_reminder"],
+        authorizationExpiresAt: handoff.expiresAt,
+      });
+      const current = await onboarding.project(transaction, {
+        actorPersonId: input.personId,
+        personId: input.personId,
+      });
+      if (current.profile.onboardingVersion !== recorded.version) {
+        throw new StaleAuthorityError("Onboarding reminder state changed during commit");
+      }
+      await this.reconcileOnboardingReminder(transaction, input.personId, new Date());
+      return {
+        accepted: true,
+        duplicate: !queued.created,
+        disposition: "onboarding_reminder_queued",
+        ids: { personId: input.personId, stage: String(decision.stage), outboxId: queued.outboxId },
+      };
+    });
+  }
+
+  private async reconcileOnboardingReminder(
+    transaction: Transaction,
+    personId: string,
+    now: Date,
+  ): Promise<void> {
+    const onboarding = new PostgresFamilyOnboarding(this.secretBox);
+    const projection = await onboarding.project(transaction, {
+      actorPersonId: personId,
+      personId,
+    });
+    const nextStep = onboardingReminderStep(projection);
+    if (!nextStep || projection.nextStep.kind === "complete" || !projection.profile.lastProgressedAt) return;
+    const route = await this.resolveExactPrivateRoute(transaction, personId);
+    const authority = route ? await this.onboardingReminderAuthority(transaction, route) : null;
+    const decision = decideOnboardingReminder({
+      onboardingComplete: false,
+      reminderStage: reminderStage(projection.profile.remindersSent),
+      savedNextStep: nextStep,
+      lastProgressedAt: projection.profile.lastProgressedAt,
+      lastRemindedAt: projection.profile.lastRemindedAt,
+      timeZone: projection.profile.timezone ?? this.config.defaults.timezone,
+      suppressedAt: projection.profile.remindersSuppressedAt,
+      privateRouteAvailable: route !== null,
+      privateAuthority: route === null ? "absent" : authority ? "current" : "invalid",
+      now: now.toISOString(),
+    });
+    if (decision.kind === "schedule" || decision.kind === "send") {
+      await this.enqueueOnboardingReminder(transaction, projection, decision.stage, decision.dueAt);
+    }
+  }
+
+  private async noteOnboardingProgress(
+    transaction: Transaction,
+    personId: string,
+    progressedAt: Date,
+  ): Promise<void> {
+    const onboarding = new PostgresFamilyOnboarding(this.secretBox);
+    const projection = await onboarding.project(transaction, {
+      actorPersonId: personId,
+      personId,
+    });
+    if (projection.nextStep.kind === "complete") return;
+    await onboarding.touchProgress(transaction, {
+      actorPersonId: personId,
+      personId,
+      expectedPersonControlEpoch: projection.profile.controlEpoch,
+      progressedAt,
+    });
+    await this.reconcileOnboardingReminder(transaction, personId, progressedAt);
+  }
+
+  private async enqueueOnboardingReminder(
+    transaction: Transaction,
+    projection: FamilyOnboardingProjection,
+    stage: 1 | 2,
+    dueAt: string,
+  ): Promise<void> {
+    await new DurableWork(transaction, this.secretBox).enqueue({
+      kind: "onboarding.reminder",
+      idempotencyKey: `onboarding-reminder:${projection.personId}:v${projection.profile.onboardingVersion}:stage${stage}:${sha256Hex(dueAt).slice(0, 12)}`,
+      payload: {
+        personId: projection.personId,
+        expectedPersonControlEpoch: projection.profile.controlEpoch,
+        expectedOnboardingVersion: projection.profile.onboardingVersion,
+        targetStage: stage,
+        dueAt,
+      },
+      person: { id: projection.personId, controlEpoch: projection.profile.controlEpoch },
+      availableAt: new Date(dueAt),
+      maxAttempts: 8,
+      priority: 45,
+    });
+  }
+
+  private async onboardingReminderAuthority(transaction: Transaction, route: ExactPrivateRoute) {
+    const authority = await new PostgresConversationAuthority(transaction).authorizeSend({
+      conversationId: route.conversationId,
+      expectedParticipantEpochId: route.participantEpochId,
+      expectedParticipantSetDigest: route.participantSetDigest,
+      liveParticipantIdentityIds: [...route.liveIdentityIds],
+      sendKind: "transactional",
+      operation: "family_onboarding_reminder",
+      ruleId: null,
+    });
+    return authority.allowed && authority.participantEpochId && authority.participantSetDigest
+      ? authority
+      : null;
+  }
+
   /**
    * A private conversational response and the one-time source activation are
    * committed in separate transactions. That makes the response durable before
@@ -1323,7 +1760,6 @@ export class FlorenceApplication {
       let idempotencyKey = `general-answer:${input.internalProviderEventId}`;
       let evidenceSourceRevisionIds: readonly string[] = [];
       let responseHousehold: { readonly id: string; readonly controlEpoch: number } | null = null;
-      let guidanceHandledGoogleActivation = false;
       let authorizationExpiresAt = new Date(
         Date.now() + this.config.defaults.rawSourceRetentionDays * 86_400_000,
       );
@@ -1362,7 +1798,10 @@ export class FlorenceApplication {
           input.response.sourceAuthorities,
         );
         if (input.response.guidance) {
-          const guidance = await new PostgresPrivateOnboardingGuidance(transaction).projectPrivateGuidance({
+          const guidance = await new PostgresPrivateOnboardingGuidance(
+            transaction,
+            this.secretBox,
+          ).projectPrivateGuidance({
             personId: source.personId,
             expectedPersonControlEpoch: input.response.expectedPerson.controlEpoch,
           });
@@ -1400,7 +1839,6 @@ export class FlorenceApplication {
             } else if (guidance.recommendedNextStep.action !== "none") {
               text = await this.appendPrivateGuidanceHandoff(transaction, source, text, guidance);
             }
-            guidanceHandledGoogleActivation = guidance.recommendedNextStep.action === "google_handoff";
           }
         }
         const sourceIntelligence = new PostgresSourceIntelligence(transaction, this.secretBox, {
@@ -1448,22 +1886,17 @@ export class FlorenceApplication {
         responseHousehold,
       );
       if (!queued) throw new StaleAuthorityError("Private DM response is no longer authorized");
-      return { ...queued, personId: source.personId, guidanceHandledGoogleActivation };
+      return { ...queued, personId: source.personId };
     });
 
-    let googleActivationFailed = false;
-    const activationOffered = response.guidanceHandledGoogleActivation
-      ? false
-      : await this.database
-          .begin(async (transaction) => {
-            const source = await this.requireProcessedPrivateDmSource(
-              transaction,
-              input.internalProviderEventId,
-            );
-            if (source.personId !== response.personId) {
-              throw new StaleAuthorityError("Private DM sender changed before activation");
-            }
-            const committed = await transaction<{ readonly created_at: Date }[]>`
+    let onboardingOfferFailed = false;
+    const onboardingOffered = await this.database
+      .begin(async (transaction) => {
+        const source = await this.requireProcessedPrivateDmSource(transaction, input.internalProviderEventId);
+        if (source.personId !== response.personId) {
+          throw new StaleAuthorityError("Private DM sender changed before activation");
+        }
+        const committed = await transaction<{ readonly created_at: Date }[]>`
         select created_at from outbox
         where id = ${response.outboxId}
           and person_id = ${source.personId}
@@ -1473,39 +1906,39 @@ export class FlorenceApplication {
           and status in ('pending', 'leased', 'retry', 'submitted', 'confirmed')
         for share
       `;
-            const committedResponse = committed[0];
-            if (!committedResponse) return false;
+        const committedResponse = committed[0];
+        if (!committedResponse) return false;
 
-            const offered = await this.queueParentGoogleActivationOffer(
-              transaction,
-              source.personId,
-              "existing_steward_dm",
-              source.record,
-            );
-            if (offered) {
-              await transaction`
+        const offered = await this.queueParentOnboardingOffer(
+          transaction,
+          source.personId,
+          "registration",
+          source.record,
+        );
+        if (offered) {
+          await transaction`
           update outbox
           set available_at = greatest(
             available_at,
             ${new Date(committedResponse.created_at.getTime() + 1)}
           )
-          where idempotency_key = ${`google-parent-activation:${source.personId}`}
+          where idempotency_key = ${`parent-onboarding:${source.personId}:initial`}
         `;
-            }
-            return offered !== null;
-          })
-          .catch(() => {
-            googleActivationFailed = true;
-            return false;
-          });
+        }
+        return offered !== null;
+      })
+      .catch(() => {
+        onboardingOfferFailed = true;
+        return false;
+      });
 
     return {
       accepted: true,
-      duplicate: !response.created && !activationOffered,
-      disposition: activationOffered
-        ? "private_dm_response_then_google_activation_queued"
-        : googleActivationFailed
-          ? "private_dm_response_queued_after_google_activation_failure"
+      duplicate: !response.created && !onboardingOffered,
+      disposition: onboardingOffered
+        ? "private_dm_response_then_onboarding_queued"
+        : onboardingOfferFailed
+          ? "private_dm_response_queued_after_onboarding_failure"
           : "private_dm_response_queued",
       ids: {
         providerEventId: input.internalProviderEventId,
@@ -1521,11 +1954,9 @@ export class FlorenceApplication {
     guidance: PrivateOnboardingGuidance,
   ): Promise<string> {
     const identityId = source.record.routing.senderIdentityId;
-    const returnPath = guidance.recommendedNextStep.returnPath;
-    if (!identityId || !returnPath || source.record.routing.chatKind !== "direct") {
+    if (!identityId || source.record.routing.chatKind !== "direct") {
       throw new StaleAuthorityError("Private guidance no longer has an exact action route");
     }
-    const googleAction = guidance.recommendedNextStep.action === "google_handoff";
     const handoff = await new PostgresWebAuth(
       transaction,
       this.secretBox,
@@ -1534,16 +1965,12 @@ export class FlorenceApplication {
       personId: source.personId,
       privateIdentityId: identityId,
       privateConversationId: source.record.routing.conversationId,
-      purpose: googleAction ? "google_connect" : "web_sign_in",
-      context: {
-        onboarding: true,
-        returnPath,
-        ...(googleAction ? { activation: "parent_google", profile: "personal_family" } : {}),
-      },
-      expiresInSeconds: googleAction ? GOOGLE_CONNECT_HANDOFF_TTL_SECONDS : MAX_STANDARD_HANDOFF_TTL_SECONDS,
+      purpose: "onboarding",
+      context: { returnPath: "/onboarding" },
+      expiresInSeconds: ONBOARDING_HANDOFF_TTL_SECONDS,
     });
     const link = `${this.config.publicBaseUrl}/handoff/${handoff.token}`;
-    return `${text}\n\n${privateGuidanceActionCopy(guidance.recommendedNextStep.kind)} ${link}\n\nIf the link expires, text me “settings” for a fresh one.`;
+    return `${text}\n\n${privateGuidanceActionCopy(guidance.recommendedNextStep.kind)} ${link}\n\nI save each step. If the link expires, ask me to continue setup.`;
   }
 
   private async requireProcessedPrivateDmSource(
@@ -2363,6 +2790,40 @@ export class FlorenceApplication {
       : { kind: "other", invitationId: null };
   }
 
+  private async latestPrivateOnboardingPromptWasDelivered(
+    transaction: Transaction,
+    record: StoredLinqEvent,
+  ): Promise<boolean> {
+    if (record.routing.chatKind !== "direct" || !record.messageOccurredAt) return false;
+    const responseOccurredAt = new Date(record.messageOccurredAt);
+    if (!Number.isFinite(responseOccurredAt.getTime())) return false;
+    const effects = await transaction<{ readonly idempotency_key: string }[]>`
+      with delivered as (
+        select coalesce(root_effect.idempotency_key, effect.idempotency_key) as idempotency_key,
+          coalesce(effect.redrive_root_id, effect.id) as logical_effect_id,
+          min(receipt.occurred_at) as delivered_at
+        from outbox effect
+        left join outbox root_effect on root_effect.id = effect.redrive_root_id
+        join effect_receipts receipt on receipt.outbox_id = effect.id
+          and receipt.status = 'confirmed' and receipt.occurred_at <= ${responseOccurredAt}
+        where effect.effect_kind = 'linq.message'
+          and coalesce(root_effect.conversation_id, effect.conversation_id) =
+            ${record.routing.conversationId}
+        group by coalesce(root_effect.idempotency_key, effect.idempotency_key),
+          coalesce(effect.redrive_root_id, effect.id)
+      )
+      select idempotency_key from delivered
+      where delivered_at = (select max(delivered_at) from delivered)
+      order by logical_effect_id
+      limit 2
+    `;
+    if (effects.length !== 1 || !effects[0]) return false;
+    return (
+      effects[0].idempotency_key.startsWith(`parent-onboarding:${record.routing.senderPersonId}:`) ||
+      effects[0].idempotency_key.startsWith(`onboarding-reminder:${record.routing.senderPersonId}:stage:`)
+    );
+  }
+
   private async handleEnrollment(transaction: Transaction, record: StoredLinqEvent): Promise<string> {
     const identityId = record.routing.senderIdentityId;
     const personId = record.routing.senderPersonId;
@@ -2456,10 +2917,10 @@ export class FlorenceApplication {
       record.routing.conversationId,
     );
     const knownName = decryptPersonName(this.secretBox, personId, current.display_name_ciphertext);
-    const googleOffered = knownName
-      ? await this.queueParentGoogleActivationOffer(transaction, personId, "household_resolved", record)
+    const onboardingOffered = knownName
+      ? await this.queueParentOnboardingOffer(transaction, personId, "registration", record)
       : false;
-    if (!googleOffered) {
+    if (!onboardingOffered) {
       const welcome = knownName
         ? await this.returningEnrollmentWelcome(transaction, record, knownName)
         : "You’re in. I’m Florence—what should I call you?";
@@ -2561,13 +3022,21 @@ export class FlorenceApplication {
     `;
     const location = locations[0];
     if (!location) {
-      return this.rejectStaleDeliveredFamilyInvitation(
+      const snapshot = await new PostgresConversationAuthority(transaction).snapshot(
+        record.routing.conversationId,
+      );
+      await this.queueAuthorizedConversationMessage(
         transaction,
         record,
-        personId,
-        identityId,
-        invitationId,
+        snapshot,
+        "Your Florence account is active, but that family invitation is no longer available. Ask the person who invited you to introduce you again in the current family group.",
+        "direct_response",
+        "family_invitation_stale",
+        null,
+        new Date(Date.now() + 24 * 60 * 60_000),
+        `family-invitation-stale:${sha256Hex(invitationId)}`,
       );
+      return "family_invitation_stale";
     }
     await transaction`
       select id from conversations
@@ -2899,24 +3368,34 @@ export class FlorenceApplication {
       update households set status = 'active', updated_at = ${acceptedAt}
       where id = ${membership.householdId} and status = 'onboarding'
     `;
+    await this.selectAcceptedOnboardingHousehold(transaction, personId, membership.householdId, acceptedAt);
     const familyAuthority = await new FamilyGroupAuthority(transaction).reconcile({
       conversationId: invitation.source_conversation_id,
       occurredAt: acceptedAt,
     });
-    const inviterName =
-      decryptPersonName(this.secretBox, invitation.inviter_person_id, invitation.inviter_name_ciphertext) ??
-      "Your family member";
-    await this.queueAuthorizedConversationMessage(
+    const onboardingOffered = await this.queueParentOnboardingOffer(
       transaction,
+      personId,
+      "invitation_accepted",
       record,
-      snapshot,
-      `You’re all set. You joined ${inviterName}’s Florence family as ${relationshipLabel(invitation.requested_role)}. I’ll reuse the family details already there instead of asking you to repeat them.`,
-      "direct_response",
-      "family_invitation_accepted",
-      null,
-      new Date(Date.now() + 24 * 60 * 60_000),
-      `family-invitation-accepted:${invitation.invitation_id}`,
+      invitation.invitation_id,
     );
+    if (!onboardingOffered) {
+      const inviterName =
+        decryptPersonName(this.secretBox, invitation.inviter_person_id, invitation.inviter_name_ciphertext) ??
+        "Your family member";
+      await this.queueAuthorizedConversationMessage(
+        transaction,
+        record,
+        snapshot,
+        `You’re all set. You joined ${inviterName}’s Florence family as ${relationshipLabel(invitation.requested_role)}. I’ll reuse the family details already there instead of asking you to repeat them.`,
+        "direct_response",
+        "family_invitation_accepted",
+        null,
+        new Date(Date.now() + 24 * 60 * 60_000),
+        `family-invitation-accepted:${invitation.invitation_id}`,
+      );
+    }
     if (familyAuthority.activatedNow && familyAuthority.ruleId && familyAuthority.householdId) {
       await this.queueFamilyGroupActivationAcknowledgement(transaction, {
         invitationId: invitation.invitation_id,
@@ -3303,13 +3782,13 @@ export class FlorenceApplication {
       const snapshot = await new PostgresConversationAuthority(transaction).snapshot(
         record.routing.conversationId,
       );
-      const googleOffered = await this.queueParentGoogleActivationOffer(
+      const onboardingOffered = await this.queueParentOnboardingOffer(
         transaction,
         personId,
         "household_resolved",
         record,
       );
-      if (!googleOffered) {
+      if (!onboardingOffered) {
         const nextStep = await this.returningEnrollmentWelcome(transaction, record, displayName);
         await this.queueAuthorizedConversationMessage(
           transaction,
@@ -3360,6 +3839,84 @@ export class FlorenceApplication {
         "profile_name_recalled",
       );
       return "profile_name_recalled";
+    }
+    if (
+      record.routing.chatKind === "direct" &&
+      person &&
+      (/^(?:stop reminding me (?:about|to finish) (?:setup|onboarding)|don['’]t remind me (?:about|to finish) (?:setup|onboarding))$/u.test(
+        normalizedCommand,
+      ) ||
+        (/^(?:not now|later)$/u.test(normalizedCommand) &&
+          (await this.latestPrivateOnboardingPromptWasDelivered(transaction, record))))
+    ) {
+      const personId = record.routing.senderPersonId;
+      if (!personId) return "ignored";
+      const onboarding = new PostgresFamilyOnboarding(this.secretBox);
+      const projection = await onboarding.project(transaction, {
+        actorPersonId: personId,
+        personId,
+      });
+      await onboarding.suppressReminders(transaction, {
+        actorPersonId: personId,
+        personId,
+        expectedPersonOnboardingVersion: projection.profile.onboardingVersion,
+        suppressedAt: new Date(),
+      });
+      const snapshot = await new PostgresConversationAuthority(transaction).snapshot(
+        record.routing.conversationId,
+      );
+      await this.queueAuthorizedConversationMessage(
+        transaction,
+        record,
+        snapshot,
+        "No problem—I saved your setup and won’t remind you again. Ask me to continue setup whenever you’re ready.",
+        "direct_response",
+        "onboarding_reminders_suppressed",
+        null,
+        new Date(Date.now() + 24 * 60 * 60_000),
+      );
+      return "onboarding_reminders_suppressed";
+    }
+    if (
+      record.routing.chatKind === "direct" &&
+      person &&
+      /^(?:continue|finish|resume) (?:my )?(?:setup|onboarding)$|^set up florence$/u.test(normalizedCommand)
+    ) {
+      const personId = record.routing.senderPersonId;
+      if (!personId) return "ignored";
+      const resumeKey =
+        record.event?.providerEventId ?? sha256Hex(`${record.messageOccurredAt ?? "unknown"}:${text}`);
+      const onboarding = new PostgresFamilyOnboarding(this.secretBox);
+      const projection = await onboarding.project(transaction, {
+        actorPersonId: personId,
+        personId,
+      });
+      if (projection.nextStep.kind === "complete") {
+        const snapshot = await new PostgresConversationAuthority(transaction).snapshot(
+          record.routing.conversationId,
+        );
+        await this.queueAuthorizedConversationMessage(
+          transaction,
+          record,
+          snapshot,
+          "You’re already set up—what can I help with?",
+          "direct_response",
+          "onboarding_already_complete",
+          null,
+          new Date(Date.now() + 24 * 60 * 60_000),
+          `onboarding-already-complete:${personId}:${resumeKey}`,
+        );
+        return "onboarding_already_complete_replied";
+      }
+      await this.noteOnboardingProgress(transaction, personId, new Date());
+      const offered = await this.queueParentOnboardingOffer(
+        transaction,
+        personId,
+        "resume",
+        record,
+        resumeKey,
+      );
+      return offered ? "onboarding_resumed" : "onboarding_resume_unavailable";
     }
     if (
       record.routing.chatKind === "direct" &&
@@ -3470,9 +4027,10 @@ export class FlorenceApplication {
         where person_id = ${personId} and status = 'active' limit 1
       `;
       if (!existing[0]) {
+        const timeZone = await this.requireConfirmedPersonTimeZone(transaction, personId);
         await new PostgresIdentityRelationships(transaction).createHousehold({
           founderPersonId: personId,
-          timezone: this.config.defaults.timezone,
+          timezone: timeZone,
           createdAt: new Date().toISOString(),
         });
       }
@@ -3483,13 +4041,13 @@ export class FlorenceApplication {
       const snapshot = await new PostgresConversationAuthority(transaction).snapshot(
         record.routing.conversationId,
       );
-      const googleOffered = await this.queueParentGoogleActivationOffer(
+      const onboardingOffered = await this.queueParentOnboardingOffer(
         transaction,
         personId,
-        "household_resolved",
+        "registration",
         record,
       );
-      if (!googleOffered) {
+      if (!onboardingOffered) {
         const handoff = await new PostgresWebAuth(
           transaction,
           this.secretBox,
@@ -3499,14 +4057,14 @@ export class FlorenceApplication {
           privateIdentityId: identityId,
           privateConversationId: record.routing.conversationId,
           purpose: "web_sign_in",
-          context: { onboarding: true, returnPath: "/people" },
+          context: { onboarding: true, returnPath: "/onboarding" },
           expiresInSeconds: 10 * 60,
         });
         await this.queueAuthorizedConversationMessage(
           transaction,
           record,
           snapshot,
-          `Done—your private family space is ready. Add me to a group with your co-parent or caregiver; once each current person has joined this Florence family, I can coordinate there automatically. Other groups stay read-only. Add your children and the family context you want me to know here: ${this.config.publicBaseUrl}/handoff/${handoff.token}\n\nIf the link expires, text me “settings” for a fresh one.`,
+          `Done—your private family space is ready. Continue the family setup I saved for you here: ${this.config.publicBaseUrl}/handoff/${handoff.token}\n\nIf the link expires, ask me to continue setup.`,
           "direct_response",
           "family_created",
           null,
@@ -3835,215 +4393,6 @@ export class FlorenceApplication {
     });
   }
 
-  /**
-   * Offers the first parent-owned source exactly once. The outbox key is also
-   * the durable "do not nag" receipt: ignoring or declining this generic offer
-   * never creates a later generic resend. Work and additional Google accounts
-   * remain independent connections; only an existing personal connection
-   * suppresses this activation step.
-   */
-  private async queueParentGoogleActivationOffer(
-    transaction: Transaction,
-    personId: string,
-    reason: ParentGoogleActivationReason,
-    currentRecord?: StoredLinqEvent,
-    reengagementEventId?: string,
-  ): Promise<{ readonly outboxId: string; readonly created: boolean } | null> {
-    const scopes = await transaction<
-      {
-        household_id: string;
-        household_control_epoch: number | string;
-        person_control_epoch: number | string;
-      }[]
-    >`
-      select membership.household_id, household.control_epoch as household_control_epoch,
-        person.control_epoch as person_control_epoch
-      from household_memberships membership
-      join households household on household.id = membership.household_id
-        and household.status in ('onboarding', 'active')
-      join people person on person.id = membership.person_id and person.status = 'registered'
-      where membership.person_id = ${personId} and membership.role = 'steward'
-        and membership.status = 'active'
-        and person.google_activation_suppressed_at is null
-        and not exists(
-          select 1 from integrations integration
-          where integration.person_id = membership.person_id
-            and integration.provider = 'google'
-            and integration.account_kind = 'personal_family'
-            and integration.status <> 'revoked'
-        )
-      order by membership.joined_at, membership.id
-      limit 1
-      for update of person
-    `;
-    const scope = scopes[0];
-    if (!scope) return null;
-
-    const initialIdempotencyKey = `google-parent-activation:${personId}`;
-    const existing = await transaction<{ present: boolean }[]>`
-      select exists(
-        select 1 from outbox where idempotency_key = ${initialIdempotencyKey}
-      ) as present
-    `;
-    const initialOfferExists = existing[0]?.present === true;
-    if (initialOfferExists) {
-      if (!reengagementEventId || reason !== "reengagement_after_expiry") return null;
-      const latestHandoffs = await transaction<
-        { readonly created_at: Date; readonly expires_at: Date; readonly consumed_at: Date | null }[]
-      >`
-        select created_at, expires_at, consumed_at
-        from auth_handoffs
-        where person_id = ${personId} and purpose = 'google_connect'
-        order by created_at desc limit 1
-      `;
-      const latest = latestHandoffs[0];
-      const now = new Date();
-      if (
-        latest &&
-        ((latest.consumed_at === null && latest.expires_at > now) ||
-          (latest.consumed_at !== null && latest.created_at > new Date(now.getTime() - 15 * 60_000)))
-      ) {
-        return null;
-      }
-    }
-    const idempotencyKey = initialOfferExists
-      ? `google-parent-activation:${personId}:reengagement:${reengagementEventId}`
-      : initialIdempotencyKey;
-
-    let route: ExactPrivateRoute | null = null;
-    if (
-      currentRecord?.routing.chatKind === "direct" &&
-      currentRecord.routing.senderPersonId === personId &&
-      currentRecord.routing.senderIdentityId !== null &&
-      currentRecord.routing.liveIdentityIds.length === 1 &&
-      currentRecord.routing.liveIdentityIds[0] === currentRecord.routing.senderIdentityId
-    ) {
-      route = {
-        conversationId: currentRecord.routing.conversationId,
-        participantEpochId: currentRecord.routing.participantEpochId,
-        participantSetDigest: currentRecord.routing.appParticipantDigest,
-        liveIdentityIds: [...currentRecord.routing.liveIdentityIds],
-        privateIdentityId: currentRecord.routing.senderIdentityId,
-        providerChatId: currentRecord.routing.providerChatId,
-        providerParticipantDigest: currentRecord.routing.providerParticipantDigest,
-      };
-    } else if (!currentRecord) {
-      const routes = await transaction<
-        {
-          conversation_id: string;
-          participant_epoch_id: string;
-          participant_set_digest: string;
-          identity_id: string;
-          external_channel_id: string;
-          latest_participant_digest: string | null;
-        }[]
-      >`
-        select conversation.id as conversation_id, epoch.id as participant_epoch_id,
-          epoch.participant_set_digest, participant.person_identity_id as identity_id,
-          channel.external_channel_id, channel.latest_participant_digest
-        from conversations conversation
-        join conversation_channels channel on channel.conversation_id = conversation.id
-          and channel.provider = 'linq' and channel.status = 'active'
-        join participant_epochs epoch on epoch.id = conversation.current_epoch_id
-          and epoch.ended_at is null
-        join epoch_participants participant on participant.participant_epoch_id = epoch.id
-          and participant.person_id = ${personId}
-          and participant.registration_status = 'registered' and participant.consented_at is not null
-        join person_identities identity on identity.id = participant.person_identity_id
-          and identity.status = 'verified'
-        where conversation.kind = 'direct' and conversation.status = 'active'
-          and (select count(*) from epoch_participants exact_participant
-            where exact_participant.participant_epoch_id = epoch.id) = 1
-        order by conversation.updated_at desc, conversation.id
-        limit 1
-      `;
-      const saved = routes[0];
-      if (saved?.latest_participant_digest) {
-        route = {
-          conversationId: saved.conversation_id,
-          participantEpochId: saved.participant_epoch_id,
-          participantSetDigest: saved.participant_set_digest,
-          liveIdentityIds: [saved.identity_id],
-          privateIdentityId: saved.identity_id,
-          providerChatId: saved.external_channel_id,
-          providerParticipantDigest: saved.latest_participant_digest,
-        };
-      }
-    }
-    if (!route) return null;
-
-    const sendKind = currentRecord ? "direct_response" : "transactional";
-    const authority = await new PostgresConversationAuthority(transaction).authorizeSend({
-      conversationId: route.conversationId,
-      expectedParticipantEpochId: route.participantEpochId,
-      expectedParticipantSetDigest: route.participantSetDigest,
-      liveParticipantIdentityIds: [...route.liveIdentityIds],
-      sendKind,
-      operation: "parent_google_activation",
-      ruleId: null,
-    });
-    if (!authority.allowed || !authority.participantEpochId || !authority.participantSetDigest) {
-      return null;
-    }
-
-    const handoff = await new PostgresWebAuth(
-      transaction,
-      this.secretBox,
-      this.config.security.tokenKey,
-    ).createHandoff({
-      personId,
-      privateIdentityId: route.privateIdentityId,
-      privateConversationId: route.conversationId,
-      purpose: "google_connect",
-      context: {
-        activation: "parent_google",
-        profile: "personal_family",
-        returnPath: "/sources",
-      },
-      expiresInSeconds: GOOGLE_CONNECT_HANDOFF_TTL_SECONDS,
-    });
-    const link = `${this.config.publicBaseUrl}/handoff/${handoff.token}`;
-    const text =
-      reason === "reengagement_after_expiry"
-        ? `Hi! Your family space is ready, but Google still isn’t connected. Here’s a fresh link to connect your personal Gmail and Calendar: ${link}\n\nIt’s valid for 30 minutes. If you’d rather skip this, just say “not now” and I won’t keep asking.`
-        : reason === "household_resolved"
-          ? `Your private family space is ready. The best next step is to connect your primary personal Google account so I can privately start reviewing recent Gmail and Calendar: ${link}\n\nWhile that sync runs, you can keep talking with me and add your co-parent, children, and family details. Connecting Google is optional; if you skip it, I won’t keep asking. If the link expires, text me “connect Google” for a fresh one.`
-          : `I’ll keep working on what you just sent. One private setup step can make future family help more useful: connect your primary personal Google account so I can start reviewing recent Gmail and Calendar: ${link}\n\nIt’s optional; if you skip it, I won’t keep asking. If the link expires, text me “connect Google” for a fresh one.`;
-    const queued = await new EffectOutbox(transaction, this.secretBox).authorizeAndEnqueue({
-      actorPersonId: personId,
-      person: { id: personId, controlEpoch: Number(scope.person_control_epoch) },
-      household: {
-        id: scope.household_id,
-        controlEpoch: Number(scope.household_control_epoch),
-      },
-      conversation: { id: route.conversationId, authorityVersion: authority.authorityVersion },
-      participantEpochId: authority.participantEpochId,
-      expectedParticipantDigest: authority.participantSetDigest,
-      effectKind: "linq.message",
-      idempotencyKey,
-      data: { accountKind: "personal_family", reason, textDigest: sha256Hex(text) },
-      policy: {
-        exactPrivateDm: true,
-        operation: "parent_google_activation",
-        optional: true,
-        sendKind,
-      },
-      target: {
-        providerChatId: route.providerChatId,
-        personId,
-        participantEpochId: authority.participantEpochId,
-      },
-      payload: {
-        providerChatId: route.providerChatId,
-        expectedProviderParticipantDigest: route.providerParticipantDigest,
-        text,
-      },
-      reasonCodes: ["active_parent_steward", "no_personal_google_connection", "exact_private_dm", reason],
-      authorizationExpiresAt: handoff.expiresAt,
-    });
-    return queued;
-  }
-
   private async queueHouseholdInvitationMessage(
     transaction: Transaction,
     invitationId: string,
@@ -4302,18 +4651,258 @@ export class FlorenceApplication {
     command: Extract<AppEnvelope, { kind: "web.command" }>["command"],
   ): Promise<ProcessReceipt> {
     return this.database.begin(async (transaction) => {
-      const people = await transaction<{ status: string; control_epoch: number | string }[]>`
-        select status, control_epoch from people where id = ${actorPersonId} for update
+      const people = await transaction<
+        { status: string; control_epoch: number | string; authority_version: number | string }[]
+      >`
+        select status, control_epoch, authority_version
+        from people where id = ${actorPersonId} for update
       `;
       if (people[0]?.status !== "registered") throw new Error("Web command actor is not registered");
+      const onboarding = new PostgresFamilyOnboarding(this.secretBox);
       switch (command.kind) {
+        case "confirm_onboarding_profile": {
+          const displayName = command.displayName.trim();
+          const timeZone = command.timeZone.trim();
+          if (!displayName || displayName.length > 80) {
+            throw new ConflictError("Add the name Florence should use before continuing");
+          }
+          if (!validTimeZone(timeZone)) {
+            throw new ConflictError("Choose a valid time zone before continuing");
+          }
+          const projection = await onboarding.project(transaction, {
+            actorPersonId,
+            personId: actorPersonId,
+          });
+          const encryptedName = this.secretBox.encrypt(displayName, `person-display-name:${actorPersonId}`);
+          const updated = await transaction<{ readonly authority_version: number | string }[]>`
+            update people
+            set display_name_ciphertext = ${Buffer.from(JSON.stringify(encryptedName), "utf8")},
+              display_name_key_version = ${encryptedName.kid}, timezone = ${timeZone},
+              updated_at = now()
+            where id = ${actorPersonId} and status = 'registered'
+              and authority_version = ${projection.profile.authorityVersion}
+            returning authority_version
+          `;
+          if (!updated[0]) throw new ConflictError("Your profile changed before it was saved");
+          const result = await onboarding.confirmProfile(transaction, {
+            actorPersonId,
+            personId: actorPersonId,
+            expectedPersonAuthorityVersion: projection.profile.authorityVersion,
+            expectedProfileReviewVersion: projection.profile.reviewVersion,
+            confirmedAt: new Date(),
+          });
+          await this.reconcileOnboardingReminder(transaction, actorPersonId, new Date());
+          return {
+            accepted: true,
+            duplicate: false,
+            disposition: "onboarding_profile_confirmed",
+            ids: { version: String(result.version) },
+          };
+        }
+        case "select_onboarding_household": {
+          const projection = await onboarding.project(transaction, {
+            actorPersonId,
+            personId: actorPersonId,
+          });
+          const result = await onboarding.selectHousehold(transaction, {
+            actorPersonId,
+            personId: actorPersonId,
+            householdId: command.householdId,
+            expectedPersonOnboardingVersion: projection.profile.onboardingVersion,
+            selectedAt: new Date(),
+          });
+          await this.reconcileOnboardingReminder(transaction, actorPersonId, new Date());
+          return {
+            accepted: true,
+            duplicate: false,
+            disposition: "onboarding_household_selected",
+            ids: { householdId: command.householdId, version: String(result.version) },
+          };
+        }
+        case "set_onboarding_coordinator": {
+          const projection = await onboarding.project(transaction, {
+            actorPersonId,
+            personId: actorPersonId,
+          });
+          const household = requireOnboardingHousehold(projection, command.householdId);
+          if (
+            household.membershipVersion !== command.expectedMembershipVersion ||
+            household.intakeVersion !== command.expectedIntakeVersion
+          ) {
+            throw new ConflictError("Your family setup changed before it was saved");
+          }
+          const result = await onboarding.setCoordinator(transaction, {
+            actorPersonId,
+            personId: actorPersonId,
+            householdId: command.householdId,
+            expectedMembershipVersion: command.expectedMembershipVersion,
+            expectedIntakeVersion: command.expectedIntakeVersion,
+            disposition: command.disposition,
+            ...(command.proposedName ? { proposedCoordinatorName: command.proposedName } : {}),
+            answeredAt: new Date(),
+          });
+          await this.reconcileOnboardingReminder(transaction, actorPersonId, new Date());
+          return {
+            accepted: true,
+            duplicate: false,
+            disposition: "onboarding_coordinator_recorded",
+            ids: { householdId: command.householdId, version: String(result.version) },
+          };
+        }
+        case "mark_onboarding_children_reviewed": {
+          const projection = await onboarding.project(transaction, {
+            actorPersonId,
+            personId: actorPersonId,
+          });
+          const household = requireOnboardingHousehold(projection, command.householdId);
+          if (
+            household.membershipVersion !== command.expectedMembershipVersion ||
+            household.intakeVersion !== command.expectedIntakeVersion
+          ) {
+            throw new ConflictError("Your child list changed before it was confirmed");
+          }
+          const result = await onboarding.markChildRosterReviewed(transaction, {
+            actorPersonId,
+            personId: actorPersonId,
+            householdId: command.householdId,
+            expectedMembershipVersion: command.expectedMembershipVersion,
+            expectedIntakeVersion: command.expectedIntakeVersion,
+            reviewedAt: new Date(),
+          });
+          await this.reconcileOnboardingReminder(transaction, actorPersonId, new Date());
+          return {
+            accepted: true,
+            duplicate: false,
+            disposition: "onboarding_children_reviewed",
+            ids: { householdId: command.householdId, version: String(result.version) },
+          };
+        }
+        case "defer_onboarding_coordinator_invite": {
+          const projection = await onboarding.project(transaction, {
+            actorPersonId,
+            personId: actorPersonId,
+          });
+          const household = requireOnboardingHousehold(projection, command.householdId);
+          if (
+            household.membershipVersion !== command.expectedMembershipVersion ||
+            household.intakeVersion !== command.expectedIntakeVersion
+          ) {
+            throw new ConflictError("Your coordinator step changed before it was deferred");
+          }
+          const result = await onboarding.deferCoordinatorInvite(transaction, {
+            actorPersonId,
+            personId: actorPersonId,
+            householdId: command.householdId,
+            expectedMembershipVersion: command.expectedMembershipVersion,
+            expectedIntakeVersion: command.expectedIntakeVersion,
+            deferredAt: new Date(),
+          });
+          await this.reconcileOnboardingReminder(transaction, actorPersonId, new Date());
+          return {
+            accepted: true,
+            duplicate: false,
+            disposition: "onboarding_coordinator_invite_deferred",
+            ids: { householdId: command.householdId, version: String(result.version) },
+          };
+        }
+        case "review_onboarding_shared_context": {
+          const projection = await onboarding.project(transaction, {
+            actorPersonId,
+            personId: actorPersonId,
+          });
+          const household = requireOnboardingHousehold(projection, command.householdId);
+          if (
+            household.membershipVersion !== command.expectedMembershipVersion ||
+            household.intakeVersion !== command.expectedIntakeVersion ||
+            household.membershipOnboardingVersion !== command.expectedMembershipOnboardingVersion
+          ) {
+            throw new ConflictError("The family summary changed before you confirmed it");
+          }
+          const result = await onboarding.reviewSharedContext(transaction, {
+            actorPersonId,
+            personId: actorPersonId,
+            householdId: command.householdId,
+            expectedMembershipVersion: command.expectedMembershipVersion,
+            expectedIntakeVersion: command.expectedIntakeVersion,
+            expectedMembershipOnboardingVersion: command.expectedMembershipOnboardingVersion,
+            reviewedAt: new Date(),
+          });
+          await this.reconcileOnboardingReminder(transaction, actorPersonId, new Date());
+          return {
+            accepted: true,
+            duplicate: false,
+            disposition: "onboarding_shared_context_reviewed",
+            ids: { householdId: command.householdId, version: String(result.version) },
+          };
+        }
+        case "skip_onboarding_google": {
+          const projection = await onboarding.project(transaction, {
+            actorPersonId,
+            personId: actorPersonId,
+          });
+          const updated = await transaction<{ readonly id: string }[]>`
+            update people
+            set google_activation_suppressed_at = now(), updated_at = now()
+            where id = ${actorPersonId} and status = 'registered'
+              and control_epoch = ${projection.profile.controlEpoch}
+            returning id
+          `;
+          if (!updated[0]) throw new ConflictError("Your Google choice changed before it was saved");
+          const result = await onboarding.touchProgress(transaction, {
+            actorPersonId,
+            personId: actorPersonId,
+            expectedPersonControlEpoch: projection.profile.controlEpoch,
+            progressedAt: new Date(),
+          });
+          await this.reconcileOnboardingReminder(transaction, actorPersonId, new Date());
+          return {
+            accepted: true,
+            duplicate: false,
+            disposition: "onboarding_google_skipped",
+            ids: { version: String(result.version) },
+          };
+        }
+        case "complete_onboarding": {
+          const projection = await onboarding.project(transaction, {
+            actorPersonId,
+            personId: actorPersonId,
+          });
+          const household = requireOnboardingHousehold(projection, command.householdId);
+          if (
+            household.membershipVersion !== command.expectedMembershipVersion ||
+            projection.profile.reviewVersion !== command.expectedProfileReviewVersion ||
+            household.intakeVersion !== command.expectedIntakeVersion ||
+            household.membershipOnboardingVersion !== command.expectedMembershipOnboardingVersion
+          ) {
+            throw new ConflictError("Your final setup review changed before it was confirmed");
+          }
+          const result = await onboarding.completeMembership(transaction, {
+            actorPersonId,
+            personId: actorPersonId,
+            householdId: command.householdId,
+            expectedMembershipVersion: command.expectedMembershipVersion,
+            expectedProfileReviewVersion: command.expectedProfileReviewVersion,
+            expectedIntakeVersion: command.expectedIntakeVersion,
+            expectedMembershipOnboardingVersion: command.expectedMembershipOnboardingVersion,
+            completedAt: new Date(),
+          });
+          return {
+            accepted: true,
+            duplicate: projection.nextStep.kind === "complete",
+            disposition: "onboarding_completed",
+            ids: {
+              householdId: command.householdId,
+              membershipId: household.membershipId,
+              version: String(result.version),
+            },
+          };
+        }
         case "create_household": {
           const existing = await transaction<{ id: string }[]>`
             select household_id as id from household_memberships
             where person_id = ${actorPersonId} and status = 'active' limit 1
           `;
           if (existing[0]) {
-            await this.queueParentGoogleActivationOffer(transaction, actorPersonId, "household_resolved");
             return {
               accepted: true,
               duplicate: true,
@@ -4321,12 +4910,26 @@ export class FlorenceApplication {
               ids: { householdId: existing[0].id },
             };
           }
+          const timeZone = await this.requireConfirmedPersonTimeZone(transaction, actorPersonId);
           const result = await new PostgresIdentityRelationships(transaction).createHousehold({
             founderPersonId: actorPersonId,
-            timezone: this.config.defaults.timezone,
+            timezone: timeZone,
             createdAt: new Date().toISOString(),
           });
-          await this.queueParentGoogleActivationOffer(transaction, actorPersonId, "household_resolved");
+          const projection = await onboarding.project(transaction, {
+            actorPersonId,
+            personId: actorPersonId,
+          });
+          if (projection.profile.onboardingVersion > 0) {
+            await onboarding.selectHousehold(transaction, {
+              actorPersonId,
+              personId: actorPersonId,
+              householdId: result.householdId,
+              expectedPersonOnboardingVersion: projection.profile.onboardingVersion,
+              selectedAt: new Date(),
+            });
+            await this.reconcileOnboardingReminder(transaction, actorPersonId, new Date());
+          }
           return {
             accepted: true,
             duplicate: false,
@@ -4353,6 +4956,7 @@ export class FlorenceApplication {
           });
           const invitation = invitationResult.invitation;
           await this.queueHouseholdInvitationMessage(transaction, invitation.invitationId);
+          await this.noteOnboardingProgress(transaction, actorPersonId, new Date());
           return {
             accepted: true,
             duplicate: invitationResult.duplicate,
@@ -4393,12 +4997,13 @@ export class FlorenceApplication {
           const invitationSource = invitationSources[0];
           if (!invitationSource) throw new NotFoundError("Family invitation does not exist");
           const sourceConversationId = invitationSource.source_conversation_id;
+          const acceptedAt = new Date();
           let membership: HouseholdMembership;
           try {
             membership = await new HouseholdOnboarding(transaction, this.secretBox).acceptInvitation({
               actorPersonId,
               invitationId: command.invitationId,
-              acceptedAt: new Date(),
+              acceptedAt,
             });
           } catch (error) {
             if (!(error instanceof ConflictError) && !(error instanceof NotFoundError)) throw error;
@@ -4410,14 +5015,26 @@ export class FlorenceApplication {
             };
           }
           await transaction`
-            update households set status = 'active', updated_at = now()
+            update households set status = 'active', updated_at = ${acceptedAt}
             where id = ${membership.householdId} and status = 'onboarding'
           `;
-          await this.queueParentGoogleActivationOffer(transaction, actorPersonId, "household_resolved");
+          await this.selectAcceptedOnboardingHousehold(
+            transaction,
+            actorPersonId,
+            membership.householdId,
+            acceptedAt,
+          );
+          await this.queueParentOnboardingOffer(
+            transaction,
+            actorPersonId,
+            "invitation_accepted",
+            undefined,
+            command.invitationId,
+          );
           if (sourceConversationId) {
             const authority = await new FamilyGroupAuthority(transaction).reconcile({
               conversationId: sourceConversationId,
-              occurredAt: new Date(),
+              occurredAt: acceptedAt,
             });
             if (authority.activatedNow && authority.ruleId && authority.householdId) {
               await this.queueFamilyGroupActivationAcknowledgement(transaction, {
@@ -4441,6 +5058,8 @@ export class FlorenceApplication {
           };
         }
         case "add_dependent": {
+          const changedAt = new Date();
+          const roster = await lockDependentRoster(transaction, command.householdId);
           const dependent = await new HouseholdOnboarding(transaction, this.secretBox).addDependent({
             actorPersonId,
             householdId: command.householdId,
@@ -4449,8 +5068,17 @@ export class FlorenceApplication {
             birthYear: command.birthYear,
             school: command.school,
             activities: command.activities,
-            createdAt: new Date(),
+            createdAt: changedAt,
           });
+          await refreshDependentRosterReview(transaction, {
+            householdId: command.householdId,
+            actorPersonId,
+            expectedRosterVersion: roster.rosterVersion + 1,
+            expectedIntakeVersion: roster.intakeVersion,
+            wasReviewed: roster.reviewed,
+            changedAt,
+          });
+          await this.noteOnboardingProgress(transaction, actorPersonId, changedAt);
           return {
             accepted: true,
             duplicate: false,
@@ -4462,6 +5090,12 @@ export class FlorenceApplication {
           };
         }
         case "update_dependent": {
+          const changedAt = new Date();
+          const roster = await lockDependentRoster(transaction, command.householdId);
+          assertDependentEditVersions(roster, {
+            rosterVersion: command.expectedRosterVersion,
+            intakeVersion: command.expectedIntakeVersion,
+          });
           await new HouseholdOnboarding(transaction, this.secretBox).updateDependent({
             actorPersonId,
             householdId: command.householdId,
@@ -4471,8 +5105,17 @@ export class FlorenceApplication {
             birthYear: command.birthYear,
             school: command.school,
             activities: command.activities,
-            updatedAt: new Date(),
+            updatedAt: changedAt,
           });
+          await refreshDependentRosterReview(transaction, {
+            householdId: command.householdId,
+            actorPersonId,
+            expectedRosterVersion: roster.rosterVersion,
+            expectedIntakeVersion: roster.intakeVersion,
+            wasReviewed: roster.reviewed,
+            changedAt,
+          });
+          await this.noteOnboardingProgress(transaction, actorPersonId, changedAt);
           return {
             accepted: true,
             duplicate: false,
@@ -5317,20 +5960,25 @@ function messageText(event: LinqMessageReceivedEvent): string {
 
 function privateGuidanceActionCopy(step: PrivateOnboardingGuidance["recommendedNextStep"]["kind"]): string {
   switch (step) {
+    case "confirm_profile":
+      return "Confirm the details Florence should use for you here:";
     case "create_household":
       return "Set up your private Florence family here:";
     case "choose_household":
       return "Choose the family you want to continue with here:";
-    case "connect_google":
-      return "Connect your personal Google account privately here:";
-    case "reconnect_google":
-      return "Review or reconnect your personal Google account privately here:";
-    case "add_first_child":
-      return "Add your first child and the family context Florence should know privately here:";
-    case "add_first_routine":
-      return "Add the first recurring family routine you want Florence to help cover here:";
-    case "wait_for_google":
-    case "ready":
+    case "coordinator":
+      return "Tell Florence who else helps coordinate your family here:";
+    case "children":
+      return "Add the children and family context Florence should know here:";
+    case "coordinator_invite":
+      return "Continue your co-parent or caregiver setup here:";
+    case "review_shared_context":
+      return "Review the family details already shared with Florence here:";
+    case "google":
+      return "Continue setup and choose whether to connect your personal Google account here:";
+    case "review":
+      return "Review your Florence family setup here:";
+    case "complete":
       throw new UnauthorizedError("This private guidance step has no handoff action");
   }
 }
@@ -5546,4 +6194,154 @@ function exactEvidenceSourceRevisionIds(candidate: readonly string[]): readonly 
     throw new UnauthorizedError("Private invocation evidence must be distinct");
   }
   return [...candidate];
+}
+
+function requireOnboardingHousehold(
+  projection: FamilyOnboardingProjection,
+  householdId: string,
+): NonNullable<FamilyOnboardingProjection["household"]> {
+  const household = projection.household;
+  if (!household || household.householdId !== householdId) {
+    throw new UnauthorizedError("That family is not your current onboarding family");
+  }
+  return household;
+}
+
+interface LockedDependentRoster {
+  readonly rosterVersion: number;
+  readonly intakeVersion: number;
+  readonly reviewed: boolean;
+}
+
+async function lockDependentRoster(
+  transaction: Transaction,
+  householdId: string,
+): Promise<LockedDependentRoster> {
+  const rows = await transaction<
+    {
+      readonly membership_version: number | string;
+      readonly intake_version: number | string;
+      readonly reviewed: boolean;
+    }[]
+  >`
+    select household.membership_version, intake.version as intake_version,
+      intake.child_roster_reviewed_at is not null as reviewed
+    from households household
+    join household_onboarding_intakes intake on intake.household_id = household.id
+    where household.id = ${householdId}
+      and household.status in ('onboarding', 'active', 'paused')
+    for update of household, intake
+  `;
+  const row = rows[0];
+  if (!row) throw new NotFoundError("That family’s child details are not available");
+  return {
+    rosterVersion: Number(row.membership_version),
+    intakeVersion: Number(row.intake_version),
+    reviewed: row.reviewed,
+  };
+}
+
+export function assertDependentEditVersions(
+  current: { readonly rosterVersion: number; readonly intakeVersion: number },
+  expected: { readonly rosterVersion: number; readonly intakeVersion: number },
+): void {
+  if (current.rosterVersion !== expected.rosterVersion || current.intakeVersion !== expected.intakeVersion) {
+    throw new ConflictError(
+      "Those child details changed while you were editing. Review the latest family details and try again.",
+    );
+  }
+}
+
+export function dependentRosterReviewAfterMutation(input: {
+  readonly wasReviewed: boolean;
+  readonly actorPersonId: string;
+  readonly rosterVersion: number;
+  readonly changedAt: Date;
+}): {
+  readonly reviewedByPersonId: string | null;
+  readonly reviewedAt: Date | null;
+  readonly rosterVersion: number | null;
+} {
+  return input.wasReviewed
+    ? {
+        reviewedByPersonId: input.actorPersonId,
+        reviewedAt: input.changedAt,
+        rosterVersion: input.rosterVersion,
+      }
+    : { reviewedByPersonId: null, reviewedAt: null, rosterVersion: null };
+}
+
+async function refreshDependentRosterReview(
+  transaction: Transaction,
+  input: {
+    readonly householdId: string;
+    readonly actorPersonId: string;
+    readonly expectedRosterVersion: number;
+    readonly expectedIntakeVersion: number;
+    readonly wasReviewed: boolean;
+    readonly changedAt: Date;
+  },
+): Promise<void> {
+  const review = dependentRosterReviewAfterMutation({
+    wasReviewed: input.wasReviewed,
+    actorPersonId: input.actorPersonId,
+    rosterVersion: input.expectedRosterVersion,
+    changedAt: input.changedAt,
+  });
+  const rows = await transaction<{ readonly version: number | string }[]>`
+    update household_onboarding_intakes intake
+    set child_roster_reviewed_by_person_id = ${review.reviewedByPersonId},
+      child_roster_reviewed_at = ${review.reviewedAt},
+      child_roster_household_membership_version = ${review.rosterVersion},
+      version = version + 1,
+      updated_at = ${input.changedAt}
+    where intake.household_id = ${input.householdId}
+      and intake.version = ${input.expectedIntakeVersion}
+      and exists(
+        select 1 from households household
+        where household.id = intake.household_id
+          and household.membership_version = ${input.expectedRosterVersion}
+      )
+    returning version
+  `;
+  if (!rows[0]) {
+    throw new ConflictError(
+      "Those child details changed while you were editing. Review the latest family details and try again.",
+    );
+  }
+}
+
+function validTimeZone(candidate: string): boolean {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: candidate }).format(0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function reminderStage(candidate: number): 0 | 1 | 2 {
+  return candidate <= 0 ? 0 : candidate === 1 ? 1 : 2;
+}
+
+function onboardingReminderStep(projection: FamilyOnboardingProjection): OnboardingReminderStep | null {
+  switch (projection.nextStep.kind) {
+    case "confirm_profile":
+      return "profile";
+    case "create_household":
+    case "choose_household":
+    case "coordinator":
+      return "family";
+    case "children":
+      return "children";
+    case "coordinator_invite":
+      return "invite";
+    case "review_shared_context":
+    case "review":
+      return "review";
+    case "google":
+      return "google";
+    case "complete":
+      return null;
+  }
 }

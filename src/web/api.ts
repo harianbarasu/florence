@@ -11,16 +11,89 @@ export interface Viewer {
     role: string;
     memberCount: number;
   }[];
+  onboardingCompleted: boolean;
   csrfToken: string;
   session: {
     assuranceKind:
       | "base"
+      | "onboarding"
       | "google_connect"
       | "account_controls"
       | "household_invitation"
       | "private_bridge_standing";
     assuranceExpiresAt: string | null;
   };
+}
+
+export type OnboardingStep =
+  | "confirm_profile"
+  | "create_household"
+  | "choose_household"
+  | "coordinator"
+  | "children"
+  | "coordinator_invite"
+  | "review_shared_context"
+  | "google"
+  | "review"
+  | "complete";
+
+export interface OnboardingView {
+  completed: boolean;
+  branch: "starter" | "invited_adult" | "caregiver";
+  step: OnboardingStep;
+  progress: {
+    current: number;
+    total: number;
+  };
+  person: {
+    name: string;
+    timeZone: string;
+    profileReviewed: boolean;
+    profileReviewVersion: number;
+  };
+  household: {
+    id: string;
+    name: string;
+    versions: {
+      membership: number;
+      roster: number;
+      intake: number;
+      membershipOnboarding: number;
+    };
+    sharedIntakeComplete: boolean;
+    coordinator: {
+      disposition: "undecided" | "solo" | "deferred" | "proposed" | "pending" | "active";
+      proposedName: string | null;
+    };
+    children: {
+      id: string;
+      name: string;
+      aliases: string[];
+      birthYear: number | null;
+      school: string | null;
+      activities: string[];
+    }[];
+  } | null;
+  householdChoices: {
+    id: string;
+    name: string;
+    role: string;
+    sharedIntakeComplete: boolean;
+  }[];
+  google: {
+    decision: "undecided" | "connected" | "skipped";
+    accountEmail: string | null;
+    status: string | null;
+  };
+  eligibleInvitees: {
+    personId: string;
+    identityId: string;
+    conversationId: string;
+    participantEpochId: string;
+    participantDigest: string;
+    name: string;
+    registered: boolean;
+  }[];
 }
 
 export type FamilyRole = "steward" | "caregiver" | "participant" | "dependent";
@@ -30,6 +103,8 @@ export interface PeopleView {
     id: string;
     name: string;
     status: string;
+    rosterVersion: number;
+    intakeVersion: number;
     viewerRole: FamilyRole;
     canInvite: boolean;
     canAddDependent: boolean;
@@ -66,15 +141,6 @@ export interface PeopleView {
     canAct: boolean;
     detail: string;
     expiresAt: string;
-    sharedContext: {
-      children: {
-        preferredName: string;
-        aliases: string[];
-        birthYear: number | null;
-        school: string;
-        activities: string[];
-      }[];
-    } | null;
   }[];
 }
 

@@ -2134,7 +2134,7 @@ export class FlorenceOrchestrator {
         ...(context.images.length > 0 ? { images: context.images } : {}),
         goal:
           context.record.routing.chatKind === "direct"
-            ? "Respond naturally and usefully without creating unauthorized future work or using unrelated private context. If this is an open-ended request for what to do next or what Florence can help with, lead like a Chief of Staff: use the supplied current setup, choose one highest-value concrete next step, explain briefly how Florence can help, and ask one easy question that advances it. Do not give a generic acknowledgment or a feature checklist."
+            ? "Respond naturally and usefully without creating unauthorized future work or using unrelated private context. If this is an open-ended request for what to do next or what Florence can help with, lead like a Chief of Staff: present the one app-selected next setup step exactly as supplied, explain briefly how Florence can help, and ask one easy question that advances it. Never substitute or reorder setup steps. Do not give a generic acknowledgment or a feature checklist."
             : "Respond naturally and usefully to this admitted turn without creating future work or using unrelated private context.",
         deadline: new Date(Date.now() + 45_000),
         budget: { maxModelCalls: 1, maxOutputTokens: 1_500 },
@@ -2335,12 +2335,7 @@ function boundedPrivateGuidanceContext(context: PrivateOnboardingGuidance) {
   return {
     currentWork: context.currentWork,
     householdCount: context.householdCount,
-    household: context.household
-      ? {
-          dependentCount: context.household.dependentCount,
-          activeRoutineCount: context.household.activeRoutineCount,
-        }
-      : null,
+    hasSelectedHousehold: context.household !== null,
     recommendedNextStep: context.recommendedNextStep,
   };
 }

@@ -73,6 +73,13 @@ const PrivateSourceCandidateNoticePayloadSchema = z.strictObject({
   integrationId: z.string().uuid(),
   expectedIntegrationControlEpoch: z.number().int().positive(),
 });
+const OnboardingReminderPayloadSchema = z.strictObject({
+  personId: z.string().uuid(),
+  expectedPersonControlEpoch: z.number().int().positive(),
+  expectedOnboardingVersion: z.number().int().positive(),
+  targetStage: z.union([z.literal(1), z.literal(2)]),
+  dueAt: z.iso.datetime({ offset: true }),
+});
 
 class PrivateSourceCandidateRouteUnavailableError extends Error {
   public constructor() {
@@ -191,7 +198,7 @@ async function main(): Promise<void> {
       linq,
       application,
       google,
-      new PostgresPrivateOnboardingGuidance(database),
+      new PostgresPrivateOnboardingGuidance(database, secretBox),
     );
     const sources = new PostgresSourceIntelligence(database, secretBox, {
       rawRetentionDays: config.defaults.rawSourceRetentionDays,
@@ -323,6 +330,11 @@ async function main(): Promise<void> {
         case "orchestrate.private_bridge_proposal": {
           const payload = parseJobPayload(PrivateBridgePayloadSchema, job.payload);
           await orchestrator.proposePrivateBridge(payload.actionIntentId);
+          return;
+        }
+        case "onboarding.reminder": {
+          const payload = parseJobPayload(OnboardingReminderPayloadSchema, job.payload);
+          await application.process({ kind: "onboarding.reminder_due", ...payload });
           return;
         }
         case "private_source.deliver_candidate_notice": {
@@ -559,6 +571,15 @@ async function main(): Promise<void> {
           clearDeadlineOnRedrive: true,
         });
       }
+      await work.redriveDeadCurrentAuthority({
+        kind: "onboarding.reminder",
+        idempotencyNamespace: "job-redrive:onboarding-reminder",
+        now,
+        limit: 20,
+        lookbackMs: 7 * 24 * 60 * 60_000,
+        bucketMs: 60 * 60_000,
+        maxGenerations: 168,
+      });
       await work.redriveDeadCurrentAuthority({
         kind: "google.gmail.message",
         idempotencyNamespace: "job-redrive:google-gmail-message",

@@ -21,6 +21,7 @@ interface PersonRow {
   id: string;
   timezone: string | null;
   display_name_ciphertext: Buffer | null;
+  onboarding_completed: boolean;
 }
 
 interface HouseholdRow {
@@ -60,8 +61,22 @@ export class PostgresFlorenceQueries {
     session: Viewer["session"] = { assuranceKind: "base", assuranceExpiresAt: null },
   ): Promise<Viewer> {
     const people = await this.database<PersonRow[]>`
-      select id, timezone, display_name_ciphertext from people
-      where id = ${personId} and status = 'registered'
+      select person.id, person.timezone, person.display_name_ciphertext,
+        exists(
+          select 1 from person_onboarding selection
+          join household_memberships membership
+            on membership.person_id = selection.person_id
+            and membership.household_id = selection.selected_household_id
+            and membership.status = 'active' and membership.role <> 'dependent'
+          join households household on household.id = membership.household_id
+            and household.status in ('onboarding', 'active')
+          join membership_capabilities read_capability on read_capability.membership_id = membership.id
+            and read_capability.capability = 'household.read' and read_capability.status = 'active'
+          join membership_onboarding onboarding on onboarding.membership_id = membership.id
+          where selection.person_id = person.id and onboarding.completed_at is not null
+        ) as onboarding_completed
+      from people person
+      where person.id = ${personId} and person.status = 'registered'
     `;
     const person = people[0];
     if (!person) throw new Error("Registered person does not exist");
@@ -90,6 +105,7 @@ export class PostgresFlorenceQueries {
         role: household.role,
         memberCount: Number(household.member_count),
       })),
+      onboardingCompleted: person.onboarding_completed,
       session,
       csrfToken,
     };
@@ -698,19 +714,27 @@ export class PostgresFlorenceQueries {
           school_ciphertext: Buffer | null;
           activities_ciphertext: Buffer | null;
           joined_at: Date;
+          roster_version: number | string;
+          intake_version: number | string;
         }[]
       >`
         select member.person_id, member.role, person.status as person_status,
           person.display_name_ciphertext, profile.aliases_ciphertext,
           profile.birth_year, profile.school_ciphertext,
-          profile.activities_ciphertext, member.joined_at
+          profile.activities_ciphertext, member.joined_at,
+          household.membership_version as roster_version,
+          coalesce(intake.version, 0) as intake_version
         from household_memberships member
+        join households household on household.id = member.household_id
+        left join household_onboarding_intakes intake on intake.household_id = household.id
         join people person on person.id = member.person_id
         left join dependent_profiles profile on profile.person_id = person.id
         where member.household_id = ${household.id} and member.status = 'active'
         order by case member.role when 'steward' then 0 when 'caregiver' then 1
           when 'participant' then 2 else 3 end, member.joined_at
       `;
+      const rosterAuthority = memberRows[0];
+      if (!rosterAuthority) throw new Error("Family roster authority is unavailable");
       const eligibleRows = canInvite
         ? await this.database<
             {
@@ -792,6 +816,8 @@ export class PostgresFlorenceQueries {
         id: household.id,
         name: householdIndex === 0 ? "Your family" : `Your family ${householdIndex + 1}`,
         status: household.status,
+        rosterVersion: Number(rosterAuthority.roster_version),
+        intakeVersion: Number(rosterAuthority.intake_version),
         viewerRole: relationshipRole(household.viewer_role),
         canInvite,
         canAddDependent,
@@ -908,10 +934,14 @@ export class PostgresFlorenceQueries {
         requested_role: string;
         expires_at: Date;
         remaining_approvals: number | string;
+        inviter_person_id: string;
+        inviter_name_ciphertext: Buffer | null;
       }[]
     >`
       select invitation.id as invitation_id, invitation.household_id,
         invitation.requested_role, invitation.expires_at,
+        inviter.person_id as inviter_person_id,
+        inviter_person.display_name_ciphertext as inviter_name_ciphertext,
         count(approval.approver_membership_id)
           filter (where approval.approved_at is null) as remaining_approvals
       from invitations invitation
@@ -919,6 +949,10 @@ export class PostgresFlorenceQueries {
         and household.membership_version = invitation.household_membership_version
       join person_identities invitee_identity on invitee_identity.id = invitation.invitee_identity_id
         and invitee_identity.person_id = ${personId} and invitee_identity.status = 'verified'
+      join household_memberships inviter on inviter.id = invitation.invited_by_membership_id
+        and inviter.household_id = invitation.household_id and inviter.status = 'active'
+      join people inviter_person on inviter_person.id = inviter.person_id
+        and inviter_person.status = 'registered'
       join conversations source_conversation on source_conversation.id = invitation.source_conversation_id
         and source_conversation.kind = 'group' and source_conversation.status = 'active'
       join participant_epochs source_epoch on source_epoch.id = source_conversation.current_epoch_id
@@ -944,85 +978,9 @@ export class PostgresFlorenceQueries {
               and source_revision.retention_until > now()
           )
         )
-      group by invitation.id
+      group by invitation.id, inviter.person_id, inviter_person.display_name_ciphertext
       order by invitation.created_at
     `;
-    const invitationContextRows = await this.database<
-      {
-        invitation_id: string;
-        person_id: string;
-        display_name_ciphertext: Buffer | null;
-        aliases_ciphertext: Buffer | null;
-        birth_year: number | null;
-        school_ciphertext: Buffer | null;
-        activities_ciphertext: Buffer | null;
-      }[]
-    >`
-      select invitation.id as invitation_id, dependent_person.id as person_id,
-        dependent_person.display_name_ciphertext, profile.aliases_ciphertext,
-        profile.birth_year, profile.school_ciphertext, profile.activities_ciphertext
-      from invitations invitation
-      join households household on household.id = invitation.household_id
-        and household.membership_version = invitation.household_membership_version
-      join person_identities invitee_identity on invitee_identity.id = invitation.invitee_identity_id
-        and invitee_identity.person_id = ${personId} and invitee_identity.status = 'verified'
-      join people invitee on invitee.id = invitee_identity.person_id
-        and invitee.status = 'registered'
-      join conversations source_conversation on source_conversation.id = invitation.source_conversation_id
-        and source_conversation.kind = 'group' and source_conversation.status = 'active'
-      join participant_epochs source_epoch on source_epoch.id = source_conversation.current_epoch_id
-        and source_epoch.id = invitation.source_participant_epoch_id
-        and source_epoch.ended_at is null
-        and source_epoch.participant_set_digest = invitation.source_participant_digest
-      join epoch_participants exact_invitee on exact_invitee.participant_epoch_id = source_epoch.id
-        and exact_invitee.person_identity_id = invitee_identity.id
-        and exact_invitee.person_id = invitee_identity.person_id
-      join household_memberships dependent_membership
-        on dependent_membership.household_id = invitation.household_id
-        and dependent_membership.role = 'dependent'
-        and dependent_membership.status = 'active'
-      join people dependent_person on dependent_person.id = dependent_membership.person_id
-        and dependent_person.status = 'provisional'
-      left join dependent_profiles profile on profile.person_id = dependent_person.id
-      where invitation.status = 'pending' and invitation.expires_at > now()
-        and (
-          invitation.source_revision_id is null
-          or exists(
-            select 1
-            from source_revisions source_revision
-            join source_objects source_object on source_object.id = source_revision.source_object_id
-              and source_object.status = 'active'
-              and source_object.latest_revision_number = source_revision.revision_number
-            where source_revision.id = invitation.source_revision_id
-              and source_revision.participant_epoch_id = source_epoch.id
-              and source_revision.revoked_at is null
-              and source_revision.retention_until > now()
-          )
-        )
-      order by invitation.created_at, dependent_membership.joined_at
-    `;
-    const sharedChildrenByInvitation = new Map<
-      string,
-      NonNullable<PeopleView["invitations"][number]["sharedContext"]>["children"]
-    >();
-    for (const child of invitationContextRows) {
-      const children = sharedChildrenByInvitation.get(child.invitation_id) ?? [];
-      children.push({
-        preferredName:
-          decryptPersonName(this.#secretBox, child.person_id, child.display_name_ciphertext) ?? "Child",
-        aliases: decryptDependentList(this.#secretBox, child.person_id, "aliases", child.aliases_ciphertext),
-        birthYear: child.birth_year === null ? null : Number(child.birth_year),
-        school:
-          decryptDependentText(this.#secretBox, child.person_id, "school", child.school_ciphertext) ?? "",
-        activities: decryptDependentList(
-          this.#secretBox,
-          child.person_id,
-          "activities",
-          child.activities_ciphertext,
-        ),
-      });
-      sharedChildrenByInvitation.set(child.invitation_id, children);
-    }
     const householdNames = new Map(households.map((household) => [household.id, household.name]));
     return {
       households,
@@ -1042,16 +1000,20 @@ export class PostgresFlorenceQueries {
           canAct: true,
           detail: "A co-steward must be approved by every current steward.",
           expiresAt: invitation.expires_at.toISOString(),
-          sharedContext: null,
         })),
         ...acceptanceRows.map((invitation) => {
           const ready = Number(invitation.remaining_approvals) === 0;
-          const children = sharedChildrenByInvitation.get(invitation.invitation_id) ?? [];
+          const inviterName =
+            decryptPersonName(
+              this.#secretBox,
+              invitation.inviter_person_id,
+              invitation.inviter_name_ciphertext,
+            ) ?? "A family member";
           return {
             id: invitation.invitation_id,
             householdId: invitation.household_id,
             householdName: householdNames.get(invitation.household_id) ?? "A family",
-            personName: "You",
+            personName: inviterName,
             role: invitationRole(invitation.requested_role),
             action: "accept" as const,
             canAct: ready,
@@ -1059,7 +1021,6 @@ export class PostgresFlorenceQueries {
               ? "This family is ready for you to join."
               : "The family’s current stewards are still approving this invitation.",
             expiresAt: invitation.expires_at.toISOString(),
-            sharedContext: children.length > 0 ? { children } : null,
           };
         }),
       ],

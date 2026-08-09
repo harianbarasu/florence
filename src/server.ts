@@ -17,14 +17,18 @@ import { createDatabase, type Database, verifyDatabase } from "./db/client.js";
 import {
   type AuthenticatedSession,
   type HandoffPurpose,
+  type HouseholdInvitationStepUpContext,
+  HouseholdInvitationStepUpContextSchema,
   PostgresWebAuth,
   type SessionPrincipal,
 } from "./modules/auth/index.js";
 import { PostgresDataExporter } from "./modules/data-controls/index.js";
 import { PostgresFlorenceQueries } from "./modules/queries/index.js";
+import { type FamilyOnboardingProjection, PostgresFamilyOnboarding } from "./modules/relationships/index.js";
 import { PostgresSourceIntelligence } from "./modules/sources/index.js";
 import { randomOpaqueToken, SecretBox } from "./shared/crypto.js";
 import { ConflictError, NotFoundError, StaleAuthorityError, UnauthorizedError } from "./shared/errors.js";
+import type { OnboardingView, PeopleView } from "./web/api.js";
 
 const SESSION_COOKIE_PRODUCTION = "__Host-florence_session";
 const SESSION_COOKIE_DEVELOPMENT = "florence_session";
@@ -74,10 +78,16 @@ const dependentBodySchema = z.strictObject({
   school: z.string().trim().max(160).default(""),
   activities: z.array(z.string().trim().min(1).max(120)).max(24).default([]),
 });
+const updateDependentBodySchema = z.strictObject({
+  ...dependentBodySchema.shape,
+  expectedRosterVersion: z.number().int().positive(),
+  expectedIntakeVersion: z.number().int().nonnegative(),
+});
 const googleStartQuerySchema = z
   .strictObject({
     profile: z.enum(["personal_family", "work"]).default("personal_family"),
     mail: z.literal("include").optional(),
+    from: z.enum(["onboarding", "sources"]).default("sources"),
   })
   .refine((query) => query.profile === "work" || query.mail === undefined, {
     message: "The work Gmail option is only valid for a work Google profile",
@@ -89,6 +99,7 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
   const secretBox = new SecretBox(config.security.activeDataKeyId, config.security.dataKeyringJson);
   const auth = new PostgresWebAuth(database, secretBox, config.security.tokenKey);
   const queries = new PostgresFlorenceQueries(database, secretBox, config.defaults.rawSourceRetentionDays);
+  const familyOnboarding = new PostgresFamilyOnboarding(secretBox);
   const application = new FlorenceApplication(database, config, secretBox);
   const googleOAuth = new GoogleOAuthAdapter(config.google);
   const sources = new PostgresSourceIntelligence(database, secretBox, {
@@ -264,8 +275,8 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
   });
 
   app.get("/oauth/google/start", async (request, reply) => {
-    const principal = await requireStepUpSession(request, config, auth, "google_connect");
     const query = googleStartQuerySchema.parse(request.query);
+    const principal = await requireGoogleStartSession(request, config, auth, query.from);
     const requestedCapabilities = googleCapabilitiesForProfile(query.profile, query.mail === "include");
     const pkce = googleOAuth.createPkce();
     const state = randomOpaqueToken(32);
@@ -275,7 +286,7 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
       initiatingSessionId: principal.sessionId,
       stateDigest: sha256Hex(state),
       pkceVerifier: pkce.verifier,
-      returnPath: "/sources",
+      returnPath: query.from === "onboarding" ? "/onboarding" : "/sources",
       requestedCapabilities,
       accountKind: query.profile,
       expectedPersonControlEpoch: principal.controlEpoch,
@@ -353,27 +364,193 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
       assuranceExpiresAt: principal.assuranceExpiresAt?.toISOString() ?? null,
     });
   });
+  app.get("/api/onboarding", async (request, reply) => {
+    const principal = await requireSession(request, config, auth);
+    const projection = await database.begin(
+      "isolation level repeatable read read only",
+      async (transaction) =>
+        familyOnboarding.project(transaction, {
+          actorPersonId: principal.personId,
+          personId: principal.personId,
+        }),
+    );
+    const [people, intakeCompletion, google] = await Promise.all([
+      queries.people(principal.personId),
+      readHouseholdIntakeCompletion(
+        database,
+        projection.householdChoices.map((choice) => choice.householdId),
+      ),
+      readOnboardingGoogle(database, sources, principal.personId, projection),
+    ]);
+    reply.header("Cache-Control", "private, no-store, max-age=0");
+    return projectOnboardingView(projection, people, intakeCompletion, google);
+  });
+  app.post("/api/onboarding/profile", async (request) => {
+    const principal = await requireWriteSession(request, config, auth);
+    const body = z
+      .strictObject({
+        displayName: z.string().trim().min(1).max(80),
+        timeZone: z.string().trim().min(1).max(100),
+      })
+      .parse(request.body);
+    return application.process({
+      kind: "web.command",
+      actorPersonId: principal.personId,
+      command: { kind: "confirm_onboarding_profile", ...body },
+    });
+  });
+  app.post("/api/onboarding/select-household", async (request) => {
+    const principal = await requireWriteSession(request, config, auth);
+    const body = z.strictObject({ householdId: z.string().uuid() }).parse(request.body);
+    return application.process({
+      kind: "web.command",
+      actorPersonId: principal.personId,
+      command: { kind: "select_onboarding_household", householdId: body.householdId },
+    });
+  });
+  app.post("/api/onboarding/coordinator", async (request) => {
+    const principal = await requireWriteSession(request, config, auth);
+    const body = z
+      .strictObject({
+        householdId: z.string().uuid(),
+        expectedMembershipVersion: z.number().int().positive(),
+        expectedIntakeVersion: z.number().int().nonnegative(),
+        disposition: z.enum(["solo", "deferred", "proposed"]),
+        proposedName: z.string().trim().min(1).max(80).nullable().default(null),
+      })
+      .superRefine((value, context) => {
+        if (value.disposition === "proposed" && value.proposedName === null) {
+          context.addIssue({
+            code: "custom",
+            message: "Tell Florence what to call the person you plan to invite",
+            path: ["proposedName"],
+          });
+        }
+        if (value.disposition !== "proposed" && value.proposedName !== null) {
+          context.addIssue({
+            code: "custom",
+            message: "Only a proposed coordinator can have a name",
+            path: ["proposedName"],
+          });
+        }
+      })
+      .parse(request.body);
+    return application.process({
+      kind: "web.command",
+      actorPersonId: principal.personId,
+      command: {
+        kind: "set_onboarding_coordinator",
+        householdId: body.householdId,
+        expectedMembershipVersion: body.expectedMembershipVersion,
+        expectedIntakeVersion: body.expectedIntakeVersion,
+        disposition:
+          body.disposition === "solo"
+            ? "just_me"
+            : body.disposition === "deferred"
+              ? "invite_later"
+              : "proposed",
+        proposedName: body.proposedName,
+      },
+    });
+  });
+  app.post("/api/onboarding/children-reviewed", async (request) => {
+    const principal = await requireWriteSession(request, config, auth);
+    const body = z
+      .strictObject({
+        householdId: z.string().uuid(),
+        expectedMembershipVersion: z.number().int().positive(),
+        expectedIntakeVersion: z.number().int().positive(),
+      })
+      .parse(request.body);
+    return application.process({
+      kind: "web.command",
+      actorPersonId: principal.personId,
+      command: { kind: "mark_onboarding_children_reviewed", ...body },
+    });
+  });
+  app.post("/api/onboarding/coordinator-defer", async (request) => {
+    const principal = await requireWriteSession(request, config, auth);
+    const body = z
+      .strictObject({
+        householdId: z.string().uuid(),
+        expectedMembershipVersion: z.number().int().positive(),
+        expectedIntakeVersion: z.number().int().positive(),
+      })
+      .parse(request.body);
+    return application.process({
+      kind: "web.command",
+      actorPersonId: principal.personId,
+      command: { kind: "defer_onboarding_coordinator_invite", ...body },
+    });
+  });
+  app.post("/api/onboarding/shared-review", async (request) => {
+    const principal = await requireWriteSession(request, config, auth);
+    const body = z
+      .strictObject({
+        householdId: z.string().uuid(),
+        expectedMembershipVersion: z.number().int().positive(),
+        expectedIntakeVersion: z.number().int().positive(),
+        expectedMembershipOnboardingVersion: z.number().int().nonnegative(),
+      })
+      .parse(request.body);
+    return application.process({
+      kind: "web.command",
+      actorPersonId: principal.personId,
+      command: { kind: "review_onboarding_shared_context", ...body },
+    });
+  });
+  app.post("/api/onboarding/google-skip", async (request) => {
+    const principal = await requireWriteSession(request, config, auth);
+    z.strictObject({}).parse(request.body);
+    return application.process({
+      kind: "web.command",
+      actorPersonId: principal.personId,
+      command: { kind: "skip_onboarding_google" },
+    });
+  });
+  app.post("/api/onboarding/complete", async (request) => {
+    const principal = await requireWriteSession(request, config, auth);
+    const body = z
+      .strictObject({
+        householdId: z.string().uuid(),
+        expectedMembershipVersion: z.number().int().positive(),
+        expectedIntakeVersion: z.number().int().positive(),
+        expectedMembershipOnboardingVersion: z.number().int().nonnegative(),
+        expectedProfileReviewVersion: z.number().int().positive(),
+      })
+      .parse(request.body);
+    return application.process({
+      kind: "web.command",
+      actorPersonId: principal.personId,
+      command: { kind: "complete_onboarding", ...body },
+    });
+  });
   app.get("/api/home", async (request, reply) => {
     const principal = await requireSession(request, config, auth);
+    await requireCompletedOnboarding(database, principal.personId);
     reply.header("Cache-Control", "private, no-store, max-age=0");
     return queries.home(principal.personId);
   });
   app.get("/api/people", async (request, reply) => {
     const principal = await requireSession(request, config, auth);
+    await requireCompletedOnboarding(database, principal.personId);
     reply.header("Cache-Control", "private, no-store, max-age=0");
     return queries.people(principal.personId);
   });
   app.get("/api/chats", async (request) => {
     const principal = await requireSession(request, config, auth);
+    await requireCompletedOnboarding(database, principal.personId);
     return queries.chats(principal.personId);
   });
   app.get("/api/sources", async (request, reply) => {
     const principal = await requireSession(request, config, auth);
+    await requireCompletedOnboarding(database, principal.personId);
     reply.header("Cache-Control", "private, no-store, max-age=0");
     return queries.sources(principal.personId);
   });
   app.get("/api/routines", async (request, reply) => {
     const principal = await requireSession(request, config, auth);
+    await requireCompletedOnboarding(database, principal.personId);
     reply.header("Cache-Control", "private, no-store, max-age=0");
     return queries.routines(principal.personId);
   });
@@ -418,6 +595,7 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
             inviteeIdentityId: body.inviteeIdentityId,
             inviteePersonId: body.inviteePersonId,
             proposedDisplayName: body.proposedDisplayName,
+            role: "steward",
           })
         : await requireWriteSession(request, config, auth);
     return application.process({
@@ -454,16 +632,15 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
       .uuid()
       .parse((request.params as { invitationId?: unknown }).invitationId);
     const principal = await requireWriteSession(request, config, auth);
-    const invitation = await database<{ household_id: string; requested_role: string }[]>`
-      select household_id, requested_role from invitations where id = ${invitationId}
+    const invitation = await database<{ household_id: string }[]>`
+      select household_id from invitations where id = ${invitationId}
     `;
-    if (invitation[0]?.requested_role === "steward") {
-      verifyExactStepUp(principal, "household_invitation", {
-        action: "accept",
-        householdId: invitation[0].household_id,
-        invitationId,
-      });
-    }
+    if (!invitation[0]) throw new NotFoundError("Family invitation does not exist");
+    verifyExactStepUp(principal, "household_invitation", {
+      action: "accept",
+      householdId: invitation[0].household_id,
+      invitationId,
+    });
     const receipt = await application.process({
       kind: "web.command",
       actorPersonId: principal.personId,
@@ -495,7 +672,7 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
     const params = z
       .strictObject({ householdId: z.string().uuid(), dependentPersonId: z.string().uuid() })
       .parse(request.params);
-    const body = dependentBodySchema.parse(request.body);
+    const body = updateDependentBodySchema.parse(request.body);
     return application.process({
       kind: "web.command",
       actorPersonId: principal.personId,
@@ -680,6 +857,7 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
             .strictObject({
               profile: z.enum(["personal_family", "work"]),
               mail: z.literal("include").optional(),
+              returnPath: z.literal("/onboarding").optional(),
             })
             .refine((context) => context.profile === "work" || context.mail === undefined, {
               message: "The work Gmail option is only valid for a work Google profile",
@@ -689,23 +867,7 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
         }),
         z.strictObject({
           purpose: z.literal("household_invitation"),
-          context: z.discriminatedUnion("action", [
-            z.strictObject({
-              action: z.literal("invite"),
-              householdId: z.string().uuid(),
-              conversationId: z.string().uuid(),
-              expectedParticipantEpochId: z.string().uuid(),
-              expectedParticipantDigest: z.string().regex(/^[a-f0-9]{64}$/u),
-              inviteeIdentityId: z.string().uuid(),
-              inviteePersonId: z.string().uuid(),
-              proposedDisplayName: z.string().trim().min(1).max(80),
-            }),
-            z.strictObject({
-              action: z.enum(["approve", "accept"]),
-              householdId: z.string().uuid(),
-              invitationId: z.string().uuid(),
-            }),
-          ]),
+          context: HouseholdInvitationStepUpContextSchema,
         }),
         z.strictObject({
           purpose: z.literal("private_bridge_standing"),
@@ -730,6 +892,61 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
         context: compactStringContext("context" in body ? body.context : undefined),
       },
     });
+  });
+  app.get("/api/pending-action", async (request, reply) => {
+    const principal = await requireSession(request, config, auth);
+    const action = requirePendingHouseholdInvitationAction(principal);
+    reply.header("Cache-Control", "private, no-store, max-age=0");
+    if (action.action === "invite") {
+      return {
+        purpose: "household_invitation" as const,
+        action: action.action,
+        title: `Invite ${action.proposedDisplayName} as a parent?`,
+        detail:
+          "Florence will send a private family invitation. They will still confirm their own identity and choose whether to join.",
+        confirmLabel: "Send invitation",
+        cancelPath: "/people",
+      };
+    }
+    const people = await queries.people(principal.personId);
+    const invitation = people.invitations.find(
+      (candidate) => candidate.id === action.invitationId && candidate.action === action.action,
+    );
+    if (!invitation || invitation.householdId !== action.householdId || !invitation.canAct) {
+      throw new ConflictError("This family invitation is no longer current");
+    }
+    const accepting = action.action === "accept";
+    return {
+      purpose: "household_invitation" as const,
+      action: action.action,
+      title: accepting
+        ? `Join ${invitation.personName}’s family?`
+        : `Approve ${invitation.personName} as ${familyRoleLabel(invitation.role)}?`,
+      detail: accepting
+        ? "Florence will add you to this family after you confirm. Your private accounts and sources remain yours."
+        : "This is your exact approval for this person to join as a co-steward.",
+      confirmLabel: accepting ? "Join family" : "Approve invitation",
+      cancelPath: "/people",
+    };
+  });
+  app.post("/api/pending-action/confirm", async (request, reply) => {
+    const principal = await requireWriteSession(request, config, auth);
+    z.strictObject({}).parse(request.body);
+    const action = requirePendingHouseholdInvitationAction(principal);
+    verifyExactStepUp(principal, "household_invitation", action);
+    const receipt = await confirmHouseholdInvitationAction({
+      action,
+      actorPersonId: principal.personId,
+      application,
+      database,
+    });
+    if (receipt.disposition === "household_invitation_stale") {
+      return reply.code(409).send({
+        error:
+          "This family invitation is no longer current because the group or family changed. Ask for a fresh introduction.",
+      });
+    }
+    return { receipt, redirect: "/people" };
   });
   app.get("/api/safety/export", async (request, reply) => {
     const principal = await requireStepUpSession(request, config, auth, "account_controls");
@@ -879,6 +1096,289 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(im
   });
 }
 
+async function readHouseholdIntakeCompletion(
+  database: Database,
+  householdIds: readonly string[],
+): Promise<ReadonlyMap<string, boolean>> {
+  if (householdIds.length === 0) return new Map();
+  const rows = await database<{ readonly household_id: string; readonly completed: boolean }[]>`
+    select household_id, child_roster_reviewed_at is not null as completed
+    from household_onboarding_intakes
+    where household_id = any(${database.array([...householdIds])}::uuid[])
+  `;
+  return new Map(rows.map((row) => [row.household_id, row.completed] as const));
+}
+
+async function readOnboardingGoogle(
+  database: Database,
+  sources: PostgresSourceIntelligence,
+  personId: string,
+  projection: FamilyOnboardingProjection,
+): Promise<OnboardingView["google"]> {
+  const rows = await database<
+    {
+      readonly id: string;
+      readonly status: string;
+      readonly control_epoch: number | string;
+    }[]
+  >`
+    select id, status, control_epoch
+    from integrations
+    where person_id = ${personId} and provider = 'google'
+      and account_kind = 'personal_family' and status <> 'revoked'
+    order by connected_at desc, id desc
+    limit 1
+  `;
+  const connection = rows[0];
+  let accountEmail: string | null = null;
+  if (connection) {
+    const profile = await sources
+      .read({
+        kind: "integration_profile",
+        integrationId: connection.id,
+        personId,
+        expectedControlEpoch: Number(connection.control_epoch),
+      })
+      .catch(() => null);
+    if (profile?.kind === "integration_profile") accountEmail = profile.accountEmail;
+  }
+  const decision =
+    projection.household?.googleDecision === "connected"
+      ? "connected"
+      : projection.household?.googleDecision === "limited"
+        ? "skipped"
+        : "undecided";
+  return {
+    decision,
+    accountEmail,
+    status: connection?.status ?? null,
+  };
+}
+
+function projectOnboardingView(
+  projection: FamilyOnboardingProjection,
+  people: PeopleView,
+  intakeCompletion: ReadonlyMap<string, boolean>,
+  google: OnboardingView["google"],
+): OnboardingView {
+  const selectedPeople = projection.household
+    ? people.households.find((household) => household.id === projection.household?.householdId)
+    : undefined;
+  const branch = onboardingBranch(projection);
+  const step = projection.nextStep.kind;
+  const household = projection.household;
+  if (household && !selectedPeople) {
+    throw new UnauthorizedError("That family is no longer available for onboarding");
+  }
+  const hasOtherActiveAdult =
+    selectedPeople?.members.some((member) => !member.self && member.role !== "dependent") ?? false;
+  return {
+    completed: household?.completed ?? false,
+    branch,
+    step,
+    progress: onboardingProgress(branch, step),
+    person: {
+      name: projection.profile.displayName ?? "",
+      timeZone: projection.profile.timezone ?? "America/Los_Angeles",
+      profileReviewed: projection.profile.reviewVersion > 0,
+      profileReviewVersion: projection.profile.reviewVersion,
+    },
+    household:
+      household && selectedPeople
+        ? {
+            id: household.householdId,
+            name: selectedPeople.name,
+            versions: {
+              membership: household.membershipVersion,
+              roster: selectedPeople.rosterVersion,
+              intake: household.intakeVersion,
+              membershipOnboarding: household.membershipOnboardingVersion,
+            },
+            sharedIntakeComplete: household.childRosterReviewed,
+            coordinator: {
+              disposition: onboardingCoordinatorDisposition(household, hasOtherActiveAdult),
+              proposedName: household.proposedCoordinatorName,
+            },
+            children: household.children.map((child) => ({
+              id: child.personId,
+              name: child.displayName,
+              aliases: [...child.aliases],
+              birthYear: child.birthYear,
+              school: child.school || null,
+              activities: [...child.activities],
+            })),
+          }
+        : null,
+    householdChoices: projection.householdChoices.map((choice) => {
+      const matchingPeople = people.households.find(
+        (householdChoice) => householdChoice.id === choice.householdId,
+      );
+      return {
+        id: choice.householdId,
+        name: matchingPeople?.name ?? "Your family",
+        role: choice.role,
+        sharedIntakeComplete: intakeCompletion.get(choice.householdId) ?? false,
+      };
+    }),
+    google,
+    eligibleInvitees: (selectedPeople?.eligibleParticipants ?? []).map((participant) => ({
+      personId: participant.personId,
+      identityId: participant.identityId,
+      conversationId: participant.conversationId,
+      participantEpochId: participant.participantEpochId,
+      participantDigest: participant.participantDigest,
+      name: participant.name,
+      registered: participant.registered,
+    })),
+  };
+}
+
+function onboardingBranch(projection: FamilyOnboardingProjection): OnboardingView["branch"] {
+  const selected = projection.household;
+  if (selected?.role !== "steward") return selected ? "caregiver" : "starter";
+  const anotherPersonAddedSharedContext =
+    selected.childRosterReviewedByPersonId !== null &&
+    selected.childRosterReviewedByPersonId !== projection.personId;
+  return anotherPersonAddedSharedContext ? "invited_adult" : "starter";
+}
+
+function onboardingCoordinatorDisposition(
+  household: NonNullable<FamilyOnboardingProjection["household"]>,
+  hasOtherActiveAdult: boolean,
+): NonNullable<OnboardingView["household"]>["coordinator"]["disposition"] {
+  if (household.coordinatorDisposition === "unanswered") return "undecided";
+  if (household.coordinatorDisposition === "just_me") return "solo";
+  if (household.coordinatorDisposition === "invite_later" || household.coordinatorInviteDeferred) {
+    return "deferred";
+  }
+  if (hasOtherActiveAdult) return "active";
+  if (household.coordinatorInvitationResolved) return "pending";
+  return "proposed";
+}
+
+function onboardingProgress(
+  branch: OnboardingView["branch"],
+  step: OnboardingView["step"],
+): OnboardingView["progress"] {
+  if (branch === "invited_adult" || branch === "caregiver") {
+    const current =
+      step === "confirm_profile"
+        ? 1
+        : step === "google"
+          ? 3
+          : step === "review" || step === "complete"
+            ? 4
+            : 2;
+    return { current, total: 4 };
+  }
+  const current =
+    step === "confirm_profile"
+      ? 1
+      : step === "create_household" || step === "choose_household" || step === "coordinator"
+        ? 2
+        : step === "children"
+          ? 3
+          : step === "coordinator_invite" || step === "review_shared_context"
+            ? 4
+            : step === "google"
+              ? 5
+              : 6;
+  return { current, total: 6 };
+}
+
+function requirePendingHouseholdInvitationAction(
+  principal: SessionPrincipal,
+): HouseholdInvitationStepUpContext {
+  if (
+    principal.assuranceKind !== "household_invitation" ||
+    principal.assuranceExpiresAt === null ||
+    principal.assuranceExpiresAt <= new Date()
+  ) {
+    throw new UnauthorizedError("Open a fresh private Florence confirmation for this action");
+  }
+  const exactContext = Object.fromEntries(
+    Object.entries(principal.assuranceContext).filter(([key]) => key !== "returnPath"),
+  );
+  const parsed = HouseholdInvitationStepUpContextSchema.safeParse(exactContext);
+  if (!parsed.success) {
+    throw new UnauthorizedError("This private Florence confirmation no longer matches an action");
+  }
+  verifyExactStepUp(principal, "household_invitation", parsed.data);
+  return parsed.data;
+}
+
+async function confirmHouseholdInvitationAction(input: {
+  readonly action: HouseholdInvitationStepUpContext;
+  readonly actorPersonId: string;
+  readonly application: FlorenceApplication;
+  readonly database: Database;
+}) {
+  const { action, actorPersonId, application, database } = input;
+  if (action.action === "invite") {
+    return application.process({
+      kind: "web.command",
+      actorPersonId,
+      command: {
+        kind: "invite_household_participant",
+        householdId: action.householdId,
+        conversationId: action.conversationId,
+        expectedParticipantEpochId: action.expectedParticipantEpochId,
+        expectedParticipantDigest: action.expectedParticipantDigest,
+        inviteeIdentityId: action.inviteeIdentityId,
+        inviteePersonId: action.inviteePersonId,
+        proposedDisplayName: action.proposedDisplayName,
+        role: action.role,
+      },
+    });
+  }
+
+  const invitations = await database<{ household_id: string; requested_role: string }[]>`
+    select household_id, requested_role from invitations where id = ${action.invitationId}
+  `;
+  const invitation = invitations[0];
+  if (!invitation || invitation.household_id !== action.householdId) {
+    throw new ConflictError("This family invitation is no longer current");
+  }
+  if (action.action === "approve" && invitation.requested_role !== "steward") {
+    throw new UnauthorizedError("This invitation does not require a co-steward approval");
+  }
+  return application.process({
+    kind: "web.command",
+    actorPersonId,
+    command:
+      action.action === "approve"
+        ? { kind: "approve_household_invitation", invitationId: action.invitationId }
+        : { kind: "accept_household_invitation", invitationId: action.invitationId },
+  });
+}
+
+function familyRoleLabel(role: PeopleView["invitations"][number]["role"]): string {
+  if (role === "steward") return "a parent / steward";
+  if (role === "caregiver") return "a caregiver";
+  return "a family participant";
+}
+
+async function requireCompletedOnboarding(database: Database, personId: string): Promise<void> {
+  const rows = await database<{ readonly completed: boolean }[]>`
+    select exists(
+      select 1 from person_onboarding selection
+      join household_memberships membership
+        on membership.person_id = selection.person_id
+        and membership.household_id = selection.selected_household_id
+        and membership.status = 'active' and membership.role <> 'dependent'
+      join households household on household.id = membership.household_id
+        and household.status in ('onboarding', 'active')
+      join membership_capabilities read_capability on read_capability.membership_id = membership.id
+        and read_capability.capability = 'household.read' and read_capability.status = 'active'
+      join membership_onboarding onboarding on onboarding.membership_id = membership.id
+      where selection.person_id = ${personId} and onboarding.completed_at is not null
+    ) as completed
+  `;
+  if (!rows[0]?.completed) {
+    throw new ConflictError("Finish your private Florence setup before opening this section");
+  }
+}
+
 async function requireSession(
   request: FastifyRequest,
   config: FlorenceConfig,
@@ -912,6 +1412,22 @@ async function requireStepUpSession(
     principal.assuranceExpiresAt === null ||
     principal.assuranceExpiresAt <= new Date()
   ) {
+    throw new UnauthorizedError("Request a fresh private Florence confirmation first");
+  }
+  return principal;
+}
+
+async function requireGoogleStartSession(
+  request: FastifyRequest,
+  config: FlorenceConfig,
+  auth: PostgresWebAuth,
+  from: "onboarding" | "sources",
+): Promise<SessionPrincipal> {
+  const principal = await requireSession(request, config, auth);
+  const allowed =
+    principal.assuranceKind === "google_connect" ||
+    (from === "onboarding" && principal.assuranceKind === "onboarding");
+  if (!allowed || principal.assuranceExpiresAt === null || principal.assuranceExpiresAt <= new Date()) {
     throw new UnauthorizedError("Request a fresh private Florence confirmation first");
   }
   return principal;
@@ -1014,19 +1530,27 @@ async function readTextOrFallback(target: string, fallback: string): Promise<str
 
 function handoffPage(token: string, purpose: string): string {
   const googleConnect = purpose === "google_connect";
-  const title = googleConnect
-    ? "Connect Google"
-    : purpose === "account_controls"
-      ? "Confirm private controls"
-      : "Open Florence";
-  const explanation = googleConnect
-    ? "Continue to Google to choose the account Florence should privately connect to you."
-    : "This link came through your exact private Florence conversation. Continue to open your secure account.";
-  const button = googleConnect ? "Continue to Google" : "Continue securely";
-  return `<!doctype html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>${title}</title><link rel="stylesheet" href="/handoff.css"></head><body><main data-handoff-token="${escapeHtml(token)}" data-handoff-purpose="${escapeHtml(purpose)}"><div class="mark">F</div><h1>${title}</h1><p>${explanation}</p><form><button type="submit">${button}</button></form><div data-status aria-live="polite"></div><small>The link is not used until you tap the button. It expires shortly and cannot be reused.</small></main><script src="/handoff.js" defer></script></body></html>`;
+  const onboarding = purpose === "onboarding";
+  const title = onboarding
+    ? "Set up Florence"
+    : googleConnect
+      ? "Connect Google"
+      : purpose === "account_controls"
+        ? "Confirm private controls"
+        : "Open Florence";
+  const explanation = onboarding
+    ? "Continue your private family setup. Florence will resume exactly where you left off."
+    : googleConnect
+      ? "Continue to Google to choose the account Florence should privately connect to you."
+      : "This link came through your exact private Florence conversation. Continue to open your secure account.";
+  const button = onboarding ? "Continue setup" : googleConnect ? "Continue to Google" : "Continue securely";
+  const expiry = onboarding ? "It remains available for one day" : "It expires shortly";
+  return `<!doctype html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>${title}</title><link rel="stylesheet" href="/handoff.css"></head><body><main data-handoff-token="${escapeHtml(token)}" data-handoff-purpose="${escapeHtml(purpose)}"><div class="mark">F</div><h1>${title}</h1><p>${explanation}</p><form><button type="submit">${button}</button></form><div data-status aria-live="polite"></div><small>The link is not used until you tap the button. ${expiry} and cannot be reused.</small></main><script src="/handoff.js" defer></script></body></html>`;
 }
 
 export function completedHandoffRedirect(purpose: HandoffPurpose, session: AuthenticatedSession): string {
+  if (purpose === "onboarding") return "/onboarding";
+  if (purpose === "household_invitation") return "/confirm-action";
   if (purpose === "invitation") return "/people";
   if (purpose === "private_review") return "/sources";
   if (purpose === "web_sign_in") {
@@ -1036,7 +1560,8 @@ export function completedHandoffRedirect(purpose: HandoffPurpose, session: Authe
     const profile = session.assuranceContext.profile;
     if (profile === "personal_family" || profile === "work") {
       const mail = profile === "work" && session.assuranceContext.mail === "include" ? "&mail=include" : "";
-      return `/oauth/google/start?profile=${profile}${mail}`;
+      const from = session.assuranceContext.returnPath === "/onboarding" ? "&from=onboarding" : "";
+      return `/oauth/google/start?profile=${profile}${mail}${from}`;
     }
     return "/sources?step_up=google_connect";
   }
@@ -1048,7 +1573,7 @@ export function completedHandoffRedirect(purpose: HandoffPurpose, session: Authe
 }
 
 function unavailableHandoffPage(florencePhone: string): string {
-  return `<!doctype html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>Get a fresh Florence link</title><link rel="stylesheet" href="/handoff.css"></head><body><main><div class="mark">F</div><h1>This private link is no longer available</h1><p>Florence links are single-use and expire quickly. Nothing is wrong with your account.</p><p>Text <strong>connect Google</strong> to connect Gmail and Calendar, or <strong>settings</strong> for your private controls.</p><a href="sms:${escapeHtml(florencePhone)}">Text Florence</a></main></body></html>`;
+  return `<!doctype html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>Get a fresh Florence link</title><link rel="stylesheet" href="/handoff.css"></head><body><main><div class="mark">F</div><h1>This private link is no longer available</h1><p>Florence links are single-use. Nothing is wrong with your account.</p><p>Text <strong>continue setup</strong> to resume onboarding, <strong>connect Google</strong> for Gmail and Calendar, or <strong>settings</strong> for private controls.</p><a href="sms:${escapeHtml(florencePhone)}">Text Florence</a></main></body></html>`;
 }
 
 function policyPage(title: string, paragraphs: readonly string[]): string {

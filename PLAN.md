@@ -25,30 +25,36 @@ These three flows are the product spine. Reversible details are implementation d
 changed from real usage; privacy, audience, authority, and the meaning of a safely closed loop remain
 hard product decisions.
 
-### Flow 1 — A parent privately activates Florence and connects Google
+### Flow 1 — A parent privately activates and teaches Florence their family
 
 - **Trigger:** a parent sends any natural first private iMessage to Florence, or an existing parent
   without a connected source sends their next private message.
-- **User steps:** Florence establishes private consent and identity, creates or resolves the
-  household, then sends a single-use mobile-web handoff for the parent's primary personal Google
-  account. Gmail and Calendar begin syncing immediately. While that work runs, Florence learns or
-  confirms children, aliases, schools, activities, and routines and allows the parent to invite an
-  equal co-parent.
-- **Visible states:** private connection confirmation; “reviewing recent email and calendar”; recent
-  sources reconciled; older history continuing in the background; exact reconnect action if a
-  capability fails. Detailed account, calendar, stage, and error state lives on `/sources`.
+- **User steps:** Florence establishes private consent and identity, then sends one resumable
+  mobile-web onboarding handoff. The parent confirms their prefilled profile, describes who else
+  helps coordinate the family, creates or resolves the household, and enters the children, aliases,
+  schools, and activities Florence should recognize. The parent may then bind an equal co-parent
+  from one exact observed iMessage group. Personal Google is offered after the family context is
+  saved, with an explicit limited-mode choice. Every accepted step is durable and resumes on any
+  browser or a fresh private link.
+- **Visible states:** one focused onboarding decision per screen; saved progress; proposed, pending,
+  or accepted co-parent; Google connected, syncing, or skipped; and a final family review. The normal
+  web cockpit and navigation remain hidden until this person completes onboarding. Detailed source
+  and account controls appear only after launch.
 - **Partial and error behavior:** declining Google does not block Florence and does not create generic
   nagging. Florence offers it again only when it directly enables requested help. Mail and Calendar
   capabilities fail independently. A work account defaults to Calendar-only unless the person
   explicitly grants mail.
-- **Success:** recent mail and Calendar reach a known high-water mark without exposing either source
-  to a household, and the parent understands that Florence is actively monitoring.
-- **Recovery:** OAuth cancellation changes nothing; an expired handoff is replaced from the private
-  DM; reauthorization resumes the same person-owned integration under a new control epoch.
-- **Existing code reused:** private Linq registration, `PostgresWebAuth`, Google OAuth,
-  `PostgresSourceIntelligence`, `GoogleSyncService`, staged jobs/cursors, and the `/sources` account
-  cards. The true gaps are prompt timing, private milestone delivery, and an explicit recent-source
-  reconciliation gate.
+- **Success:** one parent completes the shared family intake once; every invited adult reuses those
+  facts and completes only their own identity and Google decision. The starter never waits for an
+  invitee or a background sync before entering Florence.
+- **Recovery:** every step saves server-side. OAuth cancellation returns to the same step; an expired
+  handoff is replaced from the private DM; a pending invitation does not block launch; and Florence
+  sends at most two context-aware private reminders before going quiet.
+- **Existing code reused:** private Linq registration, `PostgresWebAuth`, person and relationship
+  records, encrypted dependent profiles, exact-participant invitations, Google OAuth,
+  `PostgresSourceIntelligence`, and staged sync jobs. The true gaps are explicit shared and
+  per-person onboarding progress, the gated responsive journey, resumable routing, and bounded
+  reminder timers.
 
 ### Flow 2 — Florence is cold-added to any group
 
@@ -124,6 +130,7 @@ hard product decisions.
 | Standing behavior | Typed conversation rules, private bridge rules, and routine revisions | Plain-language projection and future-facing step-up | Do not add one generic rule-builder table |
 | Delivery | Effects module; action intents, disclosure decisions, outbox and receipts | Reliance is not equivalent to receipt delivery | Persist reliance authority; never infer it from sent/read state |
 | Web companion | `PostgresFlorenceQueries` read model and existing `/home`, `/people`, `/chats`, `/sources`, `/safety` routes | Purposeful handoff focus, named sync milestones, authorized loop meaning, clearer rule copy | Keep the current information architecture |
+| Family onboarding | Identity and relationship records plus encrypted dependent profiles, exact invitations, Google handoffs, and person sessions | No canonical shared-intake review, per-adult completion, ordered resume projection, or gated journey | Add one relationship-owned onboarding module and narrow intake state; do not repurpose DM enrollment or household lifecycle status |
 
 ## Decision Log
 
@@ -148,10 +155,12 @@ hard product decisions.
    private source view. Household use requires explicit promotion or a narrow standing bridge.
 9. **Minimum meaning may bridge.** A loop can widen “Wednesday pickup needs coverage” without
    revealing that Jenny privately said she is unavailable.
-10. **Google starts with the first parent.** Florence does not wait for the co-parent. The second
-    parent reviews existing family context and adds only corrections or missing facts.
-11. **Personal Google comes first.** It is the first mobile-web step after household resolution;
-    work Calendar and additional accounts are optional later connections.
+10. **Family context is entered once.** The first steward to finish children, school, and activity
+    intake completes that shared household step. Every later steward reuses it and adds only genuine
+    corrections; nobody repeats the roster merely to unlock their own account.
+11. **Every adult completes a private branch.** Each adult confirms their own profile and connects or
+    explicitly skips their own Google account before seeing the normal web cockpit. Another adult's
+    invitation, acceptance, or Google sync never blocks the starter.
 12. **Initial import does not speak from partial evidence.** Candidates remain silent until current
     sources are reconciled. Florence gives private milestone updates and detailed web progress.
 13. **First value is one current coordination risk.** Do not manufacture an inbox digest or prompt
@@ -171,6 +180,18 @@ hard product decisions.
     bounded ephemeral workers and governed skills behind provider-neutral seams.
 20. **The product metric is loops safely closed.** Messages, tasks, model calls, and pings are input
     metrics, not the outcome.
+21. **Onboarding is a journey, not a settings page.** Before personal completion, authenticated app
+    routes render one full-screen resumable onboarding flow with no cockpit navigation. Existing
+    People and Sources pages are post-onboarding management surfaces.
+22. **Google follows family meaning.** Personal Gmail and Calendar are offered after Florence knows
+    the children and family entities they will help recognize. Connecting or explicitly choosing
+    limited mode completes the decision; background sync never blocks launch.
+23. **Co-parent identity is exact.** A typed name records intent but grants no membership or
+    disclosure. The real invitation is bound only after child intake to one exact current observed
+    iMessage participant, who privately confirms their own identity and relationship.
+24. **Onboarding reminders are bounded.** Florence privately resumes the exact saved step the next
+    day and once more roughly three days later. She then waits for renewed family-help intent, and
+    any “not now” instruction suppresses proactive reminders immediately.
 
 ## Implementation Plan
 
@@ -186,6 +207,30 @@ hard product decisions.
   do not block the current one.
 - A slice is not shipped because code exists. It is shipped only when the production behavior is
   observable from a parent's phone and has a clear expected result.
+
+### Current tranche — Replace settings-first activation with family onboarding
+
+- Add a relationship-owned onboarding projection that returns exactly one legal next step from the
+  current person, household intake, invitations, dependents, and private Google state.
+- Persist explicit shared household intake and per-adult completion. Reuse canonical family records;
+  do not overload `people.onboarding_step` or `households.status`, which have different authority
+  meanings.
+- Route the first and every later setup handoff to `/onboarding`. Render no cockpit navigation before
+  this person's completion, and return OAuth to the same canonical step.
+- Build one responsive flow for mobile and desktop: confirm self; co-parent intent; repeatable child
+  roster; each child's school and activities; exact-participant invitation or defer; Google connect
+  or limited mode; final review and launch.
+- Reuse shared intake for every adult. The first steward who confirms the child roster satisfies that
+  household step; invited adults never re-enter it and complete only their private branch.
+- Schedule two private, context-aware resume reminders at safe local times. Recheck incomplete state
+  and suppression at execution; never remind a group or blame another adult.
+- Keep every mutation behind `FlorenceApplication.process()`, protect shared edits with expected
+  versions, and fail closed on stale relationship or invitation authority.
+- **Done when:** Jackson can start on his phone, leave and resume on another device, add Kendall's
+  intent and the children once, connect or skip Google, and enter Today without waiting; Kendall can
+  later claim the relationship, see the existing family summary, make only her own Google decision,
+  and enter Today; neither sees the cockpit early, and bounded reminders stop after completion or
+  “not now.”
 
 ### Iteration 0 — Prove the group-native activation wedge
 
@@ -214,7 +259,8 @@ hard product decisions.
 
 ### Iteration 2 — Make parent activation and Google syncing feel alive
 
-- Offer personal Google immediately after household resolution; do not wait for a second parent.
+- Offer personal Google after the shared family intake explains what Gmail and Calendar unlock; do
+  not wait for a second parent and do not block launch on background synchronization.
 - Show honest recent-mail/Calendar readiness privately and in mobile web while older history continues
   in the background. Support additional personal accounts and optional work Calendar accounts.
 - Reconcile latest thread messages, event revisions, and extracted attachments before surfacing one
@@ -466,25 +512,35 @@ Google accounts never creates several Florence people.
 ### Progressive hybrid onboarding
 
 Onboarding begins in iMessage and moves to mobile web when structured or sensitive choices are
-clearer there. It is resumable and useful before every optional field is complete.
+clearer there. It is a canonical, resumable journey—not a loose checklist inferred from optional
+fields and not a repurposed settings page.
 
-1. Register the global person and confirm name, timezone, quiet hours, consent, and recovery phone.
-2. Create or join a household.
-3. For a parent steward, connect the primary personal Google account immediately so recent Gmail and
-   Calendar reconciliation can begin. Caregiver connections remain optional and contextual.
-4. While sync runs, represent dependents, aliases, schools, activities, and important places without
-   creating child accounts; capture the few routines that are not listed elsewhere.
-5. Introduce co-stewards and caregivers from an exact observed group. Florence privately asks only
-   that person to confirm their identity and relationship. An invited co-steward reviews existing
-   household facts and supplies only corrections or additions rather than repeating intake.
-6. Add optional personal accounts and work Calendars, and select each Calendar's private processing
-   level. Declining an account never blocks ordinary Florence use.
-7. Add Florence to one or more chats and privately inspect their source and write status.
-8. As soon as every current participant is a registered active member of the same household and
-   their policies permit it, derive the narrow exact-audience write rule automatically from standing
-   household membership. Do not ask for a second per-chat approval.
-9. Begin in exceptions-first learning mode; Florence proposes one future-facing rule after a
-   successful example, then stops asking for matching situations once it is approved.
+1. Register the global person in iMessage and open one private web handoff at the exact next step.
+2. Confirm the person's prefilled preferred name, relationship, and local time zone without asking
+   again for the already verified phone number.
+3. Create or join the relevant household and answer who else helps coordinate it. A typed co-parent
+   name records intent only; “just me” and “invite later” are valid explicit answers.
+4. Add each child through a repeatable focused card, then explicitly confirm that the roster is
+   complete. Capture only useful recognition fields: name, aliases, birth year or age band, school,
+   and activities. Optional facts accept “not applicable,” “unknown,” or “add later.”
+5. After the roster is saved, bind any real co-parent or caregiver invitation to one exact current
+   observed iMessage participant. The invitee confirms privately. Pending acceptance never blocks
+   the starter, and the invitation is regenerated if shared family context changes before acceptance.
+6. Offer the person's primary personal Google account in terms of the family value it unlocks.
+   Connecting Gmail and Calendar or explicitly choosing limited mode completes the step; source sync
+   continues in the background. Work and additional accounts stay contextual post-onboarding.
+7. Review the current family summary and launch Florence. This records the exact reviewed setup,
+   unlocks the cockpit for that person, and privately confirms what Florence will do next.
+8. An invited co-steward follows a shorter branch: confirm self, see the already-completed family
+   summary, correct only genuine gaps, make their own Google choice, and launch. Caregivers receive
+   only the relationship-specific setup their authority requires.
+9. After launch, add Florence to chats and derive write authority only from the exact current
+   participant set, active household relationships, and live policy. Onboarding completion never
+   widens source disclosure or group writing.
+
+Every Continue action commits through `FlorenceApplication.process()`. Reloads, new devices, fresh
+private links, and OAuth callbacks reproject the canonical next step. Browser-local state and chat
+history are never the onboarding system of record.
 
 An open-ended private follow-up such as “what should we keep doing?” is a request for Chief-of-Staff
 guidance, not a generic help prompt. Florence uses the person's current integration status and the
@@ -528,7 +584,11 @@ panel.
 
 ### Home
 
-Show onboarding progress when incomplete. Otherwise show only:
+An incomplete person never enters Home: authenticated cockpit routes redirect to the canonical
+full-screen onboarding step without rendering the sidebar or bottom navigation. Privacy, account
+recovery, disconnection, deletion, and ordinary private iMessage conversation remain available.
+
+After onboarding, show only:
 
 - uncovered or at-risk loops requiring this person's input;
 - pending approvals or private-source reviews;

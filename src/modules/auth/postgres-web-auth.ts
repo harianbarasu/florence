@@ -154,6 +154,7 @@ export class PostgresWebAuth {
       const idleExpiresAt = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
       const absoluteExpiresAt = new Date(now.getTime() + 90 * 24 * 60 * 60 * 1000);
       const assuranceKind: AssuranceKind =
+        row.purpose === "onboarding" ||
         row.purpose === "google_connect" ||
         row.purpose === "account_controls" ||
         row.purpose === "household_invitation" ||
@@ -166,7 +167,10 @@ export class PostgresWebAuth {
             ? webSignInAssuranceContext(decryptContext(row, this.secretBox))
             : {}
           : decryptContext(row, this.secretBox);
-      const assuranceExpiresAt = assuranceKind === "base" ? null : new Date(now.getTime() + 15 * 60_000);
+      const assuranceExpiresAt =
+        assuranceKind === "base"
+          ? null
+          : new Date(now.getTime() + (assuranceKind === "onboarding" ? 60 : 15) * 60_000);
       await transaction`
         update auth_handoffs set consumed_at = ${now}
         where id = ${row.id} and consumed_at is null
@@ -295,7 +299,9 @@ function decryptContext(row: HandoffRow, secretBox: SecretBox): Record<string, s
 
 function webSignInAssuranceContext(context: Readonly<Record<string, string>>): Record<string, string> {
   const returnPath = context.returnPath;
-  return returnPath === "/people" || returnPath === "/sources" ? { returnPath } : {};
+  return returnPath === "/onboarding" || returnPath === "/people" || returnPath === "/sources"
+    ? { returnPath }
+    : {};
 }
 
 function inTransaction<Result>(

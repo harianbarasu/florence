@@ -3,9 +3,11 @@ import { z } from "zod";
 export const DEFAULT_HANDOFF_TTL_SECONDS = 10 * 60;
 export const MAX_STANDARD_HANDOFF_TTL_SECONDS = 15 * 60;
 export const GOOGLE_CONNECT_HANDOFF_TTL_SECONDS = 30 * 60;
+export const ONBOARDING_HANDOFF_TTL_SECONDS = 24 * 60 * 60;
 
 export const HandoffPurposeSchema = z.enum([
   "web_sign_in",
+  "onboarding",
   "google_connect",
   "account_controls",
   "household_invitation",
@@ -26,22 +28,56 @@ export const CreateHandoffInputSchema = z
       .number()
       .int()
       .min(60)
-      .max(GOOGLE_CONNECT_HANDOFF_TTL_SECONDS)
+      .max(ONBOARDING_HANDOFF_TTL_SECONDS)
       .default(DEFAULT_HANDOFF_TTL_SECONDS),
   })
   .superRefine((input, context) => {
-    if (input.purpose !== "google_connect" && input.expiresInSeconds > MAX_STANDARD_HANDOFF_TTL_SECONDS) {
+    if (input.purpose === "google_connect" && input.expiresInSeconds > GOOGLE_CONNECT_HANDOFF_TTL_SECONDS) {
+      context.addIssue({
+        code: "too_big",
+        maximum: GOOGLE_CONNECT_HANDOFF_TTL_SECONDS,
+        origin: "number",
+        inclusive: true,
+        path: ["expiresInSeconds"],
+        message: "Google connection handoffs expire within 30 minutes",
+      });
+    }
+    if (
+      input.purpose !== "google_connect" &&
+      input.purpose !== "onboarding" &&
+      input.expiresInSeconds > MAX_STANDARD_HANDOFF_TTL_SECONDS
+    ) {
       context.addIssue({
         code: "too_big",
         maximum: MAX_STANDARD_HANDOFF_TTL_SECONDS,
         origin: "number",
         inclusive: true,
         path: ["expiresInSeconds"],
-        message: "Only Google connection handoffs may remain valid for longer than 15 minutes",
+        message: "Only onboarding and Google connection handoffs may remain valid for longer than 15 minutes",
       });
     }
   });
 export type CreateHandoffInput = z.infer<typeof CreateHandoffInputSchema>;
+
+export const HouseholdInvitationStepUpContextSchema = z.discriminatedUnion("action", [
+  z.strictObject({
+    action: z.literal("invite"),
+    householdId: z.string().uuid(),
+    conversationId: z.string().uuid(),
+    expectedParticipantEpochId: z.string().uuid(),
+    expectedParticipantDigest: z.string().regex(/^[a-f0-9]{64}$/u),
+    inviteeIdentityId: z.string().uuid(),
+    inviteePersonId: z.string().uuid(),
+    proposedDisplayName: z.string().trim().min(1).max(80),
+    role: z.literal("steward"),
+  }),
+  z.strictObject({
+    action: z.enum(["approve", "accept"]),
+    householdId: z.string().uuid(),
+    invitationId: z.string().uuid(),
+  }),
+]);
+export type HouseholdInvitationStepUpContext = z.infer<typeof HouseholdInvitationStepUpContextSchema>;
 
 export interface CreatedHandoff {
   readonly handoffId: string;
@@ -83,6 +119,7 @@ export interface SessionPrincipal {
 
 export type AssuranceKind =
   | "base"
+  | "onboarding"
   | "google_connect"
   | "account_controls"
   | "household_invitation"

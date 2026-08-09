@@ -76,18 +76,16 @@ describe("private DM activation ordering", () => {
     const householdId = "10000000-0000-4000-8000-000000000021";
     const guidance = {
       stateDigest: "e".repeat(64),
-      currentWork: "google_syncing" as const,
+      currentWork: "onboarding_incomplete" as const,
       householdCount: 1,
       household: {
         id: householdId,
         controlEpoch: 4,
-        dependentCount: 0,
-        activeRoutineCount: 0,
       },
       recommendedNextStep: {
-        kind: "add_first_child" as const,
-        action: "people_handoff" as const,
-        returnPath: "/people" as const,
+        kind: "children" as const,
+        action: "onboarding_handoff" as const,
+        returnPath: "/onboarding" as const,
       },
     };
     const run = vi
@@ -169,7 +167,6 @@ describe("private DM activation ordering", () => {
         }),
       },
       queueAuthorizedConversationMessage: { value: queue },
-      queueParentGoogleActivationOffer: { value: vi.fn().mockResolvedValue(null) },
     });
     vi.spyOn(PostgresPrivateOnboardingGuidance.prototype, "projectPrivateGuidance").mockResolvedValue(
       guidance,
@@ -330,7 +327,8 @@ describe("private DM activation ordering", () => {
     const conversationId = "10000000-0000-4000-8000-000000000023";
     const run = vi.fn().mockResolvedValue(
       workerResult(GENERAL_ANSWER_SKILL, {
-        answer: "Google is already reviewing your recent information. Next, let’s add your first child.",
+        answer:
+          "Next, let’s add the children and family details I should know. I’ll ask about Google only after that family setup is saved.",
         uncertainty: null,
         useRecommendedNextStep: true,
       }),
@@ -348,18 +346,16 @@ describe("private DM activation ordering", () => {
     const compilePrivateQuestionContext = vi.fn();
     const projectPrivateGuidance = vi.fn().mockResolvedValue({
       stateDigest: "e".repeat(64),
-      currentWork: "google_syncing",
+      currentWork: "onboarding_incomplete",
       householdCount: 1,
       household: {
         id: householdId,
         controlEpoch: 7,
-        dependentCount: 0,
-        activeRoutineCount: 0,
       },
       recommendedNextStep: {
-        kind: "add_first_child",
-        action: "people_handoff",
-        returnPath: "/people",
+        kind: "children",
+        action: "onboarding_handoff",
+        returnPath: "/onboarding",
       },
     });
     const orchestrator = new FlorenceOrchestrator(
@@ -418,8 +414,8 @@ describe("private DM activation ordering", () => {
       expectedPersonControlEpoch: 5,
     });
     const answerJob = run.mock.calls[0]?.[0];
-    expect(answerJob?.authorizedContext).toContain('"currentWork":"google_syncing"');
-    expect(answerJob?.authorizedContext).toContain('"kind":"add_first_child"');
+    expect(answerJob?.authorizedContext).toContain('"currentWork":"onboarding_incomplete"');
+    expect(answerJob?.authorizedContext).toContain('"kind":"children"');
     expect(answerJob?.goal).toContain("lead like a Chief of Staff");
     expect(process).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -427,7 +423,7 @@ describe("private DM activation ordering", () => {
           sourceAuthorities: [],
           guidance: {
             stateDigest: "e".repeat(64),
-            step: "add_first_child",
+            step: "children",
             useRecommendedNextStep: true,
           },
         }),

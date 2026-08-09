@@ -13,6 +13,7 @@ import {
   type SourceView,
   type Viewer,
 } from "./api.js";
+import { OnboardingPage, OnboardingSafetyPage } from "./onboarding.js";
 import "./styles.css";
 
 function FlorenceApp() {
@@ -32,8 +33,34 @@ function FlorenceApp() {
   if (loading) return <LoadingScreen />;
   if (!viewer || unauthorized) return <PublicLanding />;
 
+  const finishOnboarding = () =>
+    setViewer((current) => (current ? { ...current, onboardingCompleted: true } : current));
+
+  if (!viewer.onboardingCompleted) {
+    return (
+      <Routes>
+        <Route path="/confirm-action" element={<PendingActionPage viewer={viewer} />} />
+        <Route
+          path="/onboarding"
+          element={<OnboardingPage viewer={viewer} onCompleted={finishOnboarding} />}
+        />
+        <Route
+          path="/safety"
+          element={
+            <OnboardingSafetyPage>
+              <SafetyPage viewer={viewer} />
+            </OnboardingSafetyPage>
+          }
+        />
+        <Route path="*" element={<Navigate to="/onboarding" replace />} />
+      </Routes>
+    );
+  }
+
   return (
     <Routes>
+      <Route path="/onboarding" element={<Navigate to="/home" replace />} />
+      <Route path="/confirm-action" element={<PendingActionPage viewer={viewer} />} />
       <Route element={<AppShell viewer={viewer} />}>
         <Route index element={<Navigate to="/home" replace />} />
         <Route path="/home" element={<HomePage />} />
@@ -44,6 +71,99 @@ function FlorenceApp() {
       </Route>
       <Route path="*" element={<Navigate to="/home" replace />} />
     </Routes>
+  );
+}
+
+interface PendingActionView {
+  purpose: "household_invitation";
+  action: "invite" | "approve" | "accept";
+  title: string;
+  detail: string;
+  confirmLabel: string;
+  cancelPath: string;
+}
+
+function PendingActionPage({ viewer }: { viewer: Viewer }) {
+  const { data, loading, error } = useResource<PendingActionView>("/api/pending-action");
+  const [busy, setBusy] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  async function confirm() {
+    setBusy(true);
+    setActionError(null);
+    try {
+      const result = await postJson<{ redirect: string }>(
+        "/api/pending-action/confirm",
+        viewer.csrfToken,
+        {},
+      );
+      window.location.assign(result.redirect);
+    } catch (reason) {
+      setActionError(
+        reason instanceof ApiError && reason.status === 409
+          ? "This family action changed before you confirmed it. Nothing was changed."
+          : reason instanceof ApiError && reason.status === 401
+            ? "This private confirmation expired. Return to Florence and request it again."
+            : "Florence couldn’t complete this action. Nothing was changed—please try again.",
+      );
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="onboarding-shell">
+      <header className="onboarding-topbar">
+        <Brand />
+        <a href={data?.cancelPath ?? "/people"}>Cancel</a>
+      </header>
+      <main className="onboarding-main">
+        <section className="onboarding-card-main">
+          {loading ? (
+            <div className="onboarding-form">
+              <p>Loading your exact confirmation…</p>
+            </div>
+          ) : error || !data ? (
+            <div className="onboarding-form">
+              <div className="onboarding-heading">
+                <span>Private confirmation</span>
+                <h1>This action is no longer available</h1>
+                <p>The confirmation may have expired or the family may have changed.</p>
+              </div>
+              <a className="onboarding-primary-button" href="/people">
+                Back to family
+              </a>
+            </div>
+          ) : (
+            <div className="onboarding-form">
+              <div className="onboarding-heading">
+                <span>Private confirmation</span>
+                <h1>{data.title}</h1>
+                <p>{data.detail}</p>
+              </div>
+              {actionError ? (
+                <div className="error-notice" role="alert">
+                  {actionError}
+                </div>
+              ) : null}
+              <button
+                type="button"
+                className="onboarding-primary-button"
+                disabled={busy}
+                onClick={() => void confirm()}
+              >
+                {busy ? "Confirming…" : data.confirmLabel}
+              </button>
+              <a className="onboarding-secondary-button" href={data.cancelPath}>
+                Not now
+              </a>
+              <p className="onboarding-save-note">
+                Opening the link did not change anything. This button confirms only the action shown here.
+              </p>
+            </div>
+          )}
+        </section>
+      </main>
+    </div>
   );
 }
 
@@ -413,7 +533,13 @@ function PeoplePage({ viewer }: { viewer: Viewer }) {
   const [inviteNames, setInviteNames] = useState<Record<string, string>>({});
   const [dependentDrafts, setDependentDrafts] = useState<Record<string, DependentDraft>>({});
 
-  async function runAction(key: string, path: string, body: unknown, success: string) {
+  async function runAction(
+    key: string,
+    path: string,
+    body: unknown,
+    success: string,
+    onConflict?: () => void,
+  ) {
     setBusy(key);
     setActionMessage(null);
     setActionError(null);
@@ -423,7 +549,13 @@ function PeoplePage({ viewer }: { viewer: Viewer }) {
       await reload();
       return true;
     } catch (reason) {
-      setActionError(reason instanceof Error ? reason.message : "Florence could not save that change.");
+      if (reason instanceof ApiError && reason.status === 409) {
+        await reload();
+        onConflict?.();
+        setActionError(`${reason.message} Florence refreshed the latest family details.`);
+      } else {
+        setActionError(reason instanceof Error ? reason.message : "Florence could not save that change.");
+      }
       return false;
     } finally {
       setBusy(null);
@@ -449,7 +581,7 @@ function PeoplePage({ viewer }: { viewer: Viewer }) {
         try {
           await postJson("/api/safety/request-step-up", viewer.csrfToken, stepUp);
           setActionMessage(
-            "Check your private iMessage from Florence. The secure confirmation there will finish this action.",
+            "Check your private iMessage from Florence. Open the secure link, review this exact action, and confirm it there.",
           );
         } catch (stepUpReason) {
           setActionError(
@@ -510,38 +642,9 @@ function PeoplePage({ viewer }: { viewer: Viewer }) {
                     <h3>
                       {approving
                         ? `${invitation.personName} as ${roleLabel(invitation.role)}`
-                        : `Join ${invitation.householdName} as ${roleLabel(invitation.role)}`}
+                        : `Join ${invitation.personName}’s family as ${roleLabel(invitation.role)}`}
                     </h3>
                     <p>{invitation.detail}</p>
-                    {!approving && invitation.sharedContext ? (
-                      <div>
-                        <strong>Family context already shared with Florence</strong>
-                        <p>
-                          Florence already knows these details, so you won’t be asked to enter them again. By
-                          joining, you agree Florence can use them as shared context for this family and help
-                          in groups containing only this family’s members.
-                        </p>
-                        <div className="family-members">
-                          {invitation.sharedContext.children.map((child) => (
-                            <div
-                              className="family-person"
-                              key={`${child.preferredName}:${child.birthYear ?? ""}:${child.school}`}
-                            >
-                              <Avatar name={child.preferredName} />
-                              <div>
-                                <strong>{child.preferredName}</strong>
-                                <span>{invitationChildSummary(child)}</span>
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                        <p>
-                          {invitation.role === "steward"
-                            ? "After you join, you can correct these details from this page."
-                            : "After you join, these details stay visible here and a family steward can correct them."}
-                        </p>
-                      </div>
-                    ) : null}
                   </div>
                   <button
                     type="button"
@@ -640,8 +743,18 @@ function PeoplePage({ viewer }: { viewer: Viewer }) {
                               void runAction(
                                 editKey,
                                 `/api/households/${household.id}/dependents/${member.id}`,
-                                dependentPayload(draft),
+                                {
+                                  ...dependentPayload(draft),
+                                  expectedRosterVersion: household.rosterVersion,
+                                  expectedIntakeVersion: household.intakeVersion,
+                                },
                                 `${draft.displayName.trim()}’s details are updated for the whole family.`,
+                                () =>
+                                  setDependentDrafts((current) => {
+                                    const next = { ...current };
+                                    delete next[member.id];
+                                    return next;
+                                  }),
                               );
                             }}
                           >
@@ -793,6 +906,7 @@ function PeoplePage({ viewer }: { viewer: Viewer }) {
                                     inviteeIdentityId: participant.identityId,
                                     inviteePersonId: participant.personId,
                                     proposedDisplayName,
+                                    role: "steward",
                                   },
                                 })
                               : runAction(inviteKey, path, body, success));
@@ -870,18 +984,6 @@ function dependentContextSummary(
     context.activities.length ? context.activities.join(", ") : null,
   ].filter((entry): entry is string => Boolean(entry));
   return facts.length ? facts.join(" · ") : "Add school, aliases, or activities when useful.";
-}
-
-function invitationChildSummary(
-  child: NonNullable<PeopleView["invitations"][number]["sharedContext"]>["children"][number],
-): string {
-  const facts = [
-    child.aliases.length ? `Also called ${child.aliases.join(", ")}` : null,
-    child.birthYear ? `Born ${child.birthYear}` : null,
-    child.school ? `School: ${child.school}` : null,
-    child.activities.length ? `Activities: ${child.activities.join(", ")}` : null,
-  ].filter((entry): entry is string => Boolean(entry));
-  return facts.length ? facts.join(" · ") : "Preferred name";
 }
 
 function DependentFields({

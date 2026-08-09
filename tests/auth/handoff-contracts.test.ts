@@ -58,4 +58,25 @@ describe("handoff expiry contracts", () => {
     ).toBe("/people");
     expect(completedHandoffRedirect("web_sign_in", { ...session, assuranceContext: {} })).toBe("/people");
   });
+
+  it("continues an exact family action on a dedicated confirmation page", () => {
+    const session = {
+      sessionId: "10000000-0000-4000-8000-000000000004",
+      personId: baseInput.personId,
+      sessionToken: "session-token",
+      csrfToken: "csrf-token",
+      idleExpiresAt: new Date("2026-08-08T02:00:00.000Z"),
+      absoluteExpiresAt: new Date("2026-08-09T02:00:00.000Z"),
+      assuranceKind: "household_invitation" as const,
+      assuranceContext: {
+        action: "accept",
+        householdId: "10000000-0000-4000-8000-000000000005",
+        invitationId: "10000000-0000-4000-8000-000000000006",
+        returnPath: "/people",
+      },
+      assuranceExpiresAt: new Date("2026-08-08T01:15:00.000Z"),
+    };
+
+    expect(completedHandoffRedirect("household_invitation", session)).toBe("/confirm-action");
+  });
 });

@@ -1,146 +1,114 @@
 import { describe, expect, it } from "vitest";
 import { projectGuidance } from "../../src/application/private-onboarding-guidance.js";
+import type {
+  FamilyOnboardingHousehold,
+  FamilyOnboardingProjection,
+} from "../../src/modules/relationships/index.js";
+
+const personId = "10000000-0000-4000-8000-000000000001";
+const householdId = "10000000-0000-4000-8000-000000000002";
+const membershipId = "10000000-0000-4000-8000-000000000003";
+
+function household(overrides: Partial<FamilyOnboardingHousehold> = {}): FamilyOnboardingHousehold {
+  return {
+    householdId,
+    membershipId,
+    membershipVersion: 5,
+    role: "steward",
+    timezone: "America/Los_Angeles",
+    intakeVersion: 0,
+    coordinatorDisposition: "unanswered",
+    proposedCoordinatorName: null,
+    coordinatorInvitationResolved: false,
+    coordinatorInviteDeferred: false,
+    childRosterReviewed: false,
+    childRosterReviewedByPersonId: null,
+    children: [],
+    sharedContextReviewed: false,
+    membershipOnboardingVersion: 0,
+    googleDecision: null,
+    completed: false,
+    ...overrides,
+  };
+}
+
+function projection(
+  nextStep: FamilyOnboardingProjection["nextStep"],
+  overrides: Partial<FamilyOnboardingProjection> = {},
+): FamilyOnboardingProjection {
+  const selected = household();
+  return {
+    personId,
+    profile: {
+      displayName: "Hari",
+      timezone: "America/Los_Angeles",
+      authorityVersion: 2,
+      controlEpoch: 3,
+      reviewVersion: 1,
+      onboardingVersion: 4,
+      selectedHouseholdId: householdId,
+      remindersSent: 0,
+      lastRemindedAt: null,
+      remindersSuppressedAt: null,
+      lastProgressedAt: "2026-08-08T12:00:00.000Z",
+    },
+    householdChoices: [
+      {
+        householdId,
+        membershipId,
+        role: "steward",
+        timezone: "America/Los_Angeles",
+      },
+    ],
+    household: selected,
+    nextStep,
+    ...overrides,
+  };
+}
 
 describe("private onboarding guidance", () => {
-  const oneHousehold = [
-    {
-      householdId: "10000000-0000-4000-8000-000000000002",
+  it("uses canonical family intake before optional Google for open-ended guidance", () => {
+    const result = projectGuidance({
+      personControlEpoch: 3,
+      projection: projection({ kind: "coordinator", householdId, expectedVersion: 0 }),
       householdControlEpoch: 4,
-      membershipVersion: 5,
-      canGovern: true,
-      canCoordinate: true,
-    },
-  ];
-  const completeSetup = {
-    dependentCount: 1,
-    activeRoutineCount: 1,
-  };
-
-  it("chooses one current next step without selecting an arbitrary household", () => {
-    const syncingGoogle = [
-      {
-        id: "10000000-0000-4000-8000-000000000001",
-        status: "active" as const,
-        controlEpoch: 2,
-        informationCurrentControlEpoch: null,
-        capabilities: ["calendar", "mail"],
-      },
-    ];
-    expect(
-      projectGuidance({
-        personControlEpoch: 3,
-        googleActivationSuppressed: false,
-        memberships: oneHousehold,
-        householdSetup: {
-          dependentCount: 0,
-          activeRoutineCount: 0,
-        },
-        integrations: syncingGoogle,
-      }).recommendedNextStep,
-    ).toEqual({ kind: "add_first_child", action: "people_handoff", returnPath: "/people" });
-
-    expect(
-      projectGuidance({
-        personControlEpoch: 3,
-        googleActivationSuppressed: false,
-        memberships: [
-          ...oneHousehold,
-          {
-            householdId: "10000000-0000-4000-8000-000000000003",
-            householdControlEpoch: 1,
-            membershipVersion: 1,
-            canGovern: true,
-            canCoordinate: true,
-          },
-        ],
-        householdSetup: null,
-        integrations: syncingGoogle,
-      }).recommendedNextStep,
-    ).toEqual({ kind: "choose_household", action: "none", returnPath: null });
-  });
-
-  it("aggregates every Google account conservatively", () => {
-    const result = projectGuidance({
-      personControlEpoch: 3,
-      googleActivationSuppressed: false,
-      memberships: oneHousehold,
-      householdSetup: completeSetup,
-      integrations: [
-        {
-          id: "10000000-0000-4000-8000-000000000001",
-          status: "active",
-          controlEpoch: 2,
-          informationCurrentControlEpoch: 2,
-          capabilities: ["calendar", "mail"],
-        },
-        {
-          id: "10000000-0000-4000-8000-000000000004",
-          status: "reauth_required",
-          controlEpoch: 1,
-          informationCurrentControlEpoch: null,
-          capabilities: ["mail"],
-        },
-      ],
     });
 
-    expect(result.currentWork).toBe("google_attention");
     expect(result.recommendedNextStep).toEqual({
-      kind: "reconnect_google",
-      action: "google_handoff",
-      returnPath: "/sources",
+      kind: "coordinator",
+      action: "onboarding_handoff",
+      returnPath: "/onboarding",
+    });
+    expect(result.currentWork).toBe("onboarding_incomplete");
+  });
+
+  it("hands every incomplete canonical step to the same resumable wizard", () => {
+    const result = projectGuidance({
+      personControlEpoch: 3,
+      projection: projection({ kind: "children", householdId, expectedVersion: 2 }),
+      householdControlEpoch: 4,
+    });
+
+    expect(result.recommendedNextStep).toEqual({
+      kind: "children",
+      action: "onboarding_handoff",
+      returnPath: "/onboarding",
     });
   });
 
-  it("does not call all active accounts current while one is syncing", () => {
+  it("does not append an onboarding action after the selected membership is complete", () => {
+    const completeHousehold = household({ completed: true, membershipOnboardingVersion: 2 });
     const result = projectGuidance({
       personControlEpoch: 3,
-      googleActivationSuppressed: false,
-      memberships: oneHousehold,
-      householdSetup: completeSetup,
-      integrations: [
-        {
-          id: "10000000-0000-4000-8000-000000000001",
-          status: "active",
-          controlEpoch: 2,
-          informationCurrentControlEpoch: 2,
-          capabilities: ["mail"],
-        },
-        {
-          id: "10000000-0000-4000-8000-000000000004",
-          status: "active",
-          controlEpoch: 3,
-          informationCurrentControlEpoch: null,
-          capabilities: ["calendar"],
-        },
-      ],
+      projection: projection({ kind: "complete", householdId }, { household: completeHousehold }),
+      householdControlEpoch: 4,
     });
 
-    expect(result.currentWork).toBe("google_syncing");
     expect(result.recommendedNextStep).toEqual({
-      kind: "wait_for_google",
+      kind: "complete",
       action: "none",
       returnPath: null,
     });
-  });
-
-  it("counts a partial active Google grant as connected", () => {
-    const result = projectGuidance({
-      personControlEpoch: 3,
-      googleActivationSuppressed: false,
-      memberships: oneHousehold,
-      householdSetup: completeSetup,
-      integrations: [
-        {
-          id: "10000000-0000-4000-8000-000000000001",
-          status: "active",
-          controlEpoch: 2,
-          informationCurrentControlEpoch: 2,
-          capabilities: ["calendar"],
-        },
-      ],
-    });
-
-    expect(result.currentWork).toBe("google_current");
-    expect(result.recommendedNextStep).toEqual({ kind: "ready", action: "none", returnPath: null });
+    expect(result.currentWork).toBeNull();
   });
 });

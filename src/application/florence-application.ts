@@ -22,7 +22,21 @@ import {
   PostgresConversationAuthority,
   provenReplyGroupInvocation,
 } from "../modules/conversations/index.js";
-import { PostgresRoutines, type RoutineRevisionDraft } from "../modules/coordination/index.js";
+import {
+  buildRoutinePatternCandidate,
+  deterministicRoutinePatternConfirmation,
+  PostgresConversationalRoutines,
+  PostgresRoutines,
+  type RoutinePatternCandidateContent,
+  RoutinePatternCandidateContentSchema,
+  type RoutinePatternRevisionTarget,
+  RoutineRecurrenceSchema,
+  type RoutineRevisionDraft,
+  routinePatternAcknowledgment,
+  routinePatternDeclineAcknowledgment,
+  routinePatternPrompt,
+  SemanticTimePlanSchema,
+} from "../modules/coordination/index.js";
 import { PostgresDataControls } from "../modules/data-controls/index.js";
 import { EffectOutbox } from "../modules/effects/index.js";
 import { type HouseholdMembership, PostgresIdentityRelationships } from "../modules/identity/index.js";
@@ -31,7 +45,11 @@ import {
   PostgresFamilyOnboarding,
 } from "../modules/relationships/family-onboarding.js";
 import { HouseholdOnboarding } from "../modules/relationships/index.js";
-import { type IntegrationCapability, PostgresSourceIntelligence } from "../modules/sources/index.js";
+import {
+  type IntegrationCapability,
+  PostgresSourceIntelligence,
+  sourceExternalObjectId,
+} from "../modules/sources/index.js";
 import { DurableWork } from "../modules/work/index.js";
 import { canonicalDigest, canonicalJson } from "../shared/canonical-json.js";
 import type { SecretBox } from "../shared/crypto.js";
@@ -124,6 +142,49 @@ interface ProcessedPrivateDmSource {
 interface LatestRelevantPrivateEffect {
   readonly kind: "enrollment" | "family_invitation" | "other";
   readonly invitationId: string | null;
+  readonly invitationApprovalGeneration: number | null;
+}
+
+export type FamilyInvitationApprovalReadiness = "ready" | "waiting";
+
+export function familyInvitationApprovalReadiness(
+  pendingApprovalCount: number,
+): FamilyInvitationApprovalReadiness {
+  return pendingApprovalCount > 0 ? "waiting" : "ready";
+}
+
+export function householdInvitationPromptIdempotencyKey(
+  inviteeKind: "enrollment" | "registered",
+  invitationId: string,
+  approvalGeneration: number,
+): string {
+  if (!Number.isSafeInteger(approvalGeneration) || approvalGeneration < 1) {
+    throw new Error("Invitation approval generation must be a positive integer");
+  }
+  const prefix = inviteeKind === "enrollment" ? "household-enrollment-invitation" : "household-invitation";
+  return `${prefix}:${invitationId}:approval-generation:${approvalGeneration}`;
+}
+
+export function isHouseholdInvitationPromptIdempotencyKey(
+  idempotencyKey: string,
+  invitationId: string,
+): boolean {
+  return householdInvitationPromptApprovalGeneration(idempotencyKey, invitationId) !== null;
+}
+
+export function householdInvitationPromptApprovalGeneration(
+  idempotencyKey: string,
+  invitationId: string,
+): number | null {
+  for (const prefix of ["household-enrollment-invitation", "household-invitation"] as const) {
+    const expectedPrefix = `${prefix}:${invitationId}:approval-generation:`;
+    const generation = idempotencyKey.startsWith(expectedPrefix)
+      ? idempotencyKey.slice(expectedPrefix.length)
+      : "";
+    const parsed = Number(generation);
+    if (/^[1-9]\d*$/u.test(generation) && Number.isSafeInteger(parsed)) return parsed;
+  }
+  return null;
 }
 
 type ParentOnboardingReason = "registration" | "household_resolved" | "invitation_accepted" | "resume";
@@ -170,6 +231,10 @@ export class FlorenceApplication {
           input.sourceRevisionId,
           input.proposal,
         );
+      case "linq.routine_pattern_proposal":
+        return this.commitRoutinePatternProposal(input);
+      case "linq.routine_pattern_confirmation":
+        return this.commitRoutinePatternConfirmation(input);
       case "linq.private_dm_orchestration_complete":
         return this.completePrivateDmOrchestration(input);
       case "linq.reconcile_chat":
@@ -1433,8 +1498,8 @@ export class FlorenceApplication {
             and household.status in ('onboarding', 'active')
           join membership_capabilities read_capability on read_capability.membership_id = membership.id
             and read_capability.capability = 'household.read' and read_capability.status = 'active'
-          join membership_onboarding onboarding on onboarding.membership_id = membership.id
-          where selection.person_id = person.id and onboarding.completed_at is not null
+          where selection.person_id = person.id
+            and family_membership_onboarding_is_current(membership.id)
         )
       for update of person
     `;
@@ -1605,6 +1670,7 @@ export class FlorenceApplication {
       const queued = await new EffectOutbox(transaction, this.secretBox).authorizeAndEnqueue({
         actorPersonId: input.personId,
         person: { id: input.personId, controlEpoch: projection.profile.controlEpoch },
+        personOnboarding: { version: recorded.version },
         conversation: {
           id: route.conversationId,
           authorityVersion: privateAuthority.authorityVersion,
@@ -2398,6 +2464,524 @@ export class FlorenceApplication {
   }
 
   /**
+   * Persists a worker's recurring meaning as a pending exact-chat candidate and
+   * asks the proposed holder. No routine or standing authorization exists yet.
+   */
+  private async commitRoutinePatternProposal(
+    input: Extract<AppEnvelope, { kind: "linq.routine_pattern_proposal" }>,
+  ): Promise<ProcessReceipt> {
+    return this.database.begin(async (transaction) => {
+      const { row, record } = await loadProcessedLinqMessageForUpdate(
+        transaction,
+        this.secretBox,
+        input.internalProviderEventId,
+      );
+      if (
+        record.classification !== "full" ||
+        record.routing.chatKind !== "group" ||
+        record.event?.eventType !== "linq.message.received" ||
+        !record.routing.senderPersonId
+      ) {
+        throw new UnauthorizedError("Routine patterns require a writable registered family group");
+      }
+      const snapshot = await new PostgresConversationAuthority(transaction).snapshot(
+        record.routing.conversationId,
+      );
+      if (
+        snapshot.conversationKind !== "group" ||
+        snapshot.conversationStatus !== "active" ||
+        snapshot.participantEpochId !== record.routing.participantEpochId ||
+        snapshot.participantSetDigest !== record.routing.appParticipantDigest ||
+        evaluateConversationMode(snapshot) !== "trusted_write_enabled"
+      ) {
+        throw new StaleAuthorityError("Routine-pattern group authority changed before commit");
+      }
+      const householdRows = await transaction<
+        { readonly id: string; readonly control_epoch: number | string; readonly timezone: string }[]
+      >`
+        select household.id, household.control_epoch, household.timezone
+        from conversations conversation
+        join households household on household.id = conversation.household_id
+          and household.status = 'active'
+        where conversation.id = ${record.routing.conversationId}
+        for update of household
+      `;
+      const household = householdRows[0];
+      if (!household) throw new StaleAuthorityError("Routine-pattern family is not active");
+
+      const holderRows = await transaction<
+        {
+          readonly person_control_epoch: number | string;
+          readonly membership_id: string;
+          readonly membership_version: number | string;
+        }[]
+      >`
+        select person.control_epoch as person_control_epoch, membership.id as membership_id,
+          membership.version as membership_version
+        from epoch_participants participant
+        join people person on person.id = participant.person_id and person.status = 'registered'
+        join household_memberships membership on membership.household_id = ${household.id}
+          and membership.person_id = person.id and membership.status = 'active'
+          and membership.role <> 'dependent'
+        join membership_capabilities originator on originator.membership_id = membership.id
+          and originator.capability = 'coordination.originate' and originator.status = 'active'
+        where participant.participant_epoch_id = ${record.routing.participantEpochId}
+          and participant.person_id = ${input.proposal.proposedHolderPersonId}
+          and participant.registration_status = 'registered' and participant.consented_at is not null
+      `;
+      const holder = holderRows[0];
+      if (!holder) throw new UnauthorizedError("Proposed routine holder is not an eligible current member");
+
+      const sourceRevisionId = await loadLinqMessageSourceRevisionId(
+        transaction,
+        record.event.message.providerMessageId,
+        record.routing.participantEpochId,
+      );
+      const proposedEvidenceIds = [
+        ...new Set(input.proposal.evidence.map((entry) => entry.sourceRevisionId)),
+      ];
+      if (proposedEvidenceIds.length !== 1 || proposedEvidenceIds[0] !== sourceRevisionId) {
+        throw new UnauthorizedError("Routine proposal did not cite its exact source message");
+      }
+      const evidence = await transaction<{ readonly current: boolean; readonly retention_until: Date }[]>`
+        select source_evidence_set_is_current(
+          ${transaction.array(proposedEvidenceIds)}::uuid[],
+          ${record.routing.participantEpochId}::uuid,
+          ${record.routing.senderPersonId}::uuid,
+          now()
+        ) as current,
+        min(revision.retention_until) as retention_until
+        from source_revisions revision
+        where revision.id = any(${transaction.array(proposedEvidenceIds)}::uuid[])
+      `;
+      if (evidence[0]?.current !== true || !evidence[0].retention_until) {
+        throw new StaleAuthorityError("Routine proposal evidence is no longer current");
+      }
+
+      const sourceMessage = linqMessageText(record.event);
+      const candidateBase = buildRoutinePatternCandidate({
+        sourceMessage,
+        proposal: input.proposal,
+        household: { id: household.id, controlEpoch: Number(household.control_epoch) },
+        destination: {
+          conversationId: record.routing.conversationId,
+          participantEpochId: record.routing.participantEpochId,
+          participantSetDigest: record.routing.appParticipantDigest,
+          audience: "group",
+          authorityVersion: snapshot.authorityVersion,
+        },
+        holder: {
+          personId: input.proposal.proposedHolderPersonId,
+          personControlEpoch: Number(holder.person_control_epoch),
+          membershipId: holder.membership_id,
+          membershipVersion: Number(holder.membership_version),
+        },
+        sourceRevisionIds: proposedEvidenceIds,
+        timePlanFallbackTimeZone: household.timezone,
+        now: new Date(),
+      });
+      if (!candidateBase) {
+        return {
+          accepted: false,
+          duplicate: false,
+          disposition: "routine_pattern_not_specific_enough",
+          ids: { providerEventId: row.id },
+        };
+      }
+
+      const revisionTarget = await selectRoutinePatternRevisionTarget(
+        transaction,
+        this.secretBox,
+        candidateBase,
+        sourceMessage,
+      );
+      if (revisionTarget === "ambiguous") {
+        return {
+          accepted: false,
+          duplicate: false,
+          disposition: "routine_pattern_existing_routine_ambiguous",
+          ids: { providerEventId: row.id },
+        };
+      }
+      const candidateContent = RoutinePatternCandidateContentSchema.parse({
+        ...candidateBase,
+        revisionTarget,
+      });
+
+      const proposedAt = new Date();
+      const expiresAt = new Date(
+        Math.min(proposedAt.getTime() + 7 * 86_400_000, evidence[0].retention_until.getTime()),
+      );
+      if (expiresAt <= new Date(proposedAt.getTime() + 3 * 60_000)) {
+        throw new StaleAuthorityError("Routine proposal evidence is too close to expiry");
+      }
+      const repository = new PostgresConversationalRoutines(transaction, this.secretBox);
+      const proposed = await repository.propose({
+        candidateId: randomUUID(),
+        content: candidateContent,
+        proposedAt,
+        expiresAt,
+      });
+      if (proposed.candidate.status !== "pending") {
+        return {
+          accepted: proposed.candidate.status === "accepted",
+          duplicate: true,
+          disposition: `routine_pattern_already_${proposed.candidate.status}`,
+          ids: { candidateId: proposed.candidate.candidateId },
+        };
+      }
+
+      const persistedContent = proposed.candidate.content;
+      const holderDisplayName = await loadPersonDisplayName(
+        transaction,
+        this.secretBox,
+        persistedContent.holder.personId,
+      );
+      const prompt = await this.queueAuthorizedConversationMessage(
+        transaction,
+        record,
+        snapshot,
+        routinePatternPrompt(persistedContent, holderDisplayName),
+        "proactive",
+        "proactive_coverage",
+        null,
+        new Date(Date.now() + 24 * 60 * 60_000),
+        `routine-pattern-prompt:${proposed.candidate.candidateId}`,
+        persistedContent.sourceRevisionIds,
+        persistedContent.household,
+      );
+      await transaction`
+        update outbox set routine_pattern_candidate_id = ${proposed.candidate.candidateId}
+        where id = ${prompt.outboxId}
+          and (routine_pattern_candidate_id is null
+            or routine_pattern_candidate_id = ${proposed.candidate.candidateId})
+      `;
+      return {
+        accepted: true,
+        duplicate: !proposed.created && !prompt.created,
+        disposition: "routine_pattern_confirmation_queued",
+        ids: {
+          candidateId: proposed.candidate.candidateId,
+          responseOutboxId: prompt.outboxId,
+        },
+      };
+    });
+  }
+
+  /** Exact prompt receipt + exact holder response is the only promotion path. */
+  private async commitRoutinePatternConfirmation(
+    input: Extract<AppEnvelope, { kind: "linq.routine_pattern_confirmation" }>,
+  ): Promise<ProcessReceipt> {
+    return this.database.begin(async (transaction) => {
+      const { row, record } = await loadProcessedLinqMessageForUpdate(
+        transaction,
+        this.secretBox,
+        input.internalProviderEventId,
+      );
+      if (
+        record.classification !== "full" ||
+        record.routing.chatKind !== "group" ||
+        record.event?.eventType !== "linq.message.received" ||
+        !record.routing.senderPersonId ||
+        !record.event.message.replyTo?.providerMessageId
+      ) {
+        throw new UnauthorizedError("Routine confirmation is not an exact writable-group reply");
+      }
+      const promptRows = await transaction<{ readonly id: string }[]>`
+        select distinct effect.id
+        from effect_receipts receipt
+        join outbox effect on effect.id = receipt.outbox_id
+        where receipt.provider_receipt_id = ${record.event.message.replyTo.providerMessageId}
+          and receipt.status in ('submitted', 'confirmed')
+          and effect.status in ('submitted', 'confirmed')
+          and effect.effect_kind = 'linq.message'
+          and effect.routine_pattern_candidate_id = ${input.candidateId}
+          and effect.conversation_id = ${record.routing.conversationId}
+        limit 2
+      `;
+      if (promptRows.length !== 1) {
+        throw new UnauthorizedError("Routine confirmation does not target one exact delivered prompt");
+      }
+
+      const repository = new PostgresConversationalRoutines(transaction, this.secretBox);
+      const candidate = await repository.loadForUpdate(input.candidateId);
+      if (candidate.status === "accepted") {
+        const routineId = candidate.content.revisionTarget?.routineId ?? candidate.candidateId;
+        const existing = await transaction<{ readonly id: string }[]>`
+          select id from routines where id = ${routineId}
+        `;
+        return {
+          accepted: existing.length === 1,
+          duplicate: true,
+          disposition:
+            existing.length === 1
+              ? "routine_pattern_already_accepted"
+              : "routine_pattern_inconsistent_acceptance",
+          ids: { candidateId: candidate.candidateId, ...(existing[0] ? { routineId: existing[0].id } : {}) },
+        };
+      }
+      if (candidate.status !== "pending" || !candidate.expiresAt || candidate.expiresAt <= new Date()) {
+        return {
+          accepted: false,
+          duplicate: candidate.status !== "pending",
+          disposition: "routine_pattern_stale",
+          ids: { candidateId: candidate.candidateId },
+        };
+      }
+
+      const content = candidate.content;
+      const snapshot = await new PostgresConversationAuthority(transaction).snapshot(
+        record.routing.conversationId,
+      );
+      if (
+        content.destination.conversationId !== record.routing.conversationId ||
+        content.destination.participantEpochId !== record.routing.participantEpochId ||
+        content.destination.participantSetDigest !== record.routing.appParticipantDigest ||
+        content.destination.authorityVersion !== snapshot.authorityVersion ||
+        snapshot.participantEpochId !== record.routing.participantEpochId ||
+        snapshot.participantSetDigest !== record.routing.appParticipantDigest ||
+        evaluateConversationMode(snapshot) !== "trusted_write_enabled"
+      ) {
+        return {
+          accepted: false,
+          duplicate: false,
+          disposition: "routine_pattern_stale_authority",
+          ids: { candidateId: candidate.candidateId },
+        };
+      }
+
+      const confirmationSourceRevisionId = await loadLinqMessageSourceRevisionId(
+        transaction,
+        record.event.message.providerMessageId,
+        record.routing.participantEpochId,
+      );
+      if (record.routing.senderPersonId !== content.holder.personId) {
+        const holderDisplayName = await loadPersonDisplayName(
+          transaction,
+          this.secretBox,
+          content.holder.personId,
+        );
+        const response = await this.queueAuthorizedConversationMessage(
+          transaction,
+          record,
+          snapshot,
+          `I need ${holderDisplayName ?? "the proposed routine holder"} to confirm this repeating responsibility themselves.`,
+          "direct_response",
+          "coverage_coordination",
+          null,
+          new Date(Date.now() + this.config.defaults.rawSourceRetentionDays * 86_400_000),
+          `routine-pattern-third-party:${candidate.candidateId}:${row.id}`,
+          [confirmationSourceRevisionId],
+          content.household,
+        );
+        return {
+          accepted: false,
+          duplicate: !response.created,
+          disposition: "routine_pattern_holder_confirmation_required",
+          ids: { candidateId: candidate.candidateId, responseOutboxId: response.outboxId },
+        };
+      }
+
+      const currentHolder = await transaction<{ readonly current: boolean }[]>`
+        select exists(
+          select 1
+          from people person
+          join household_memberships membership on membership.person_id = person.id
+            and membership.id = ${content.holder.membershipId}
+            and membership.household_id = ${content.household.id}
+            and membership.status = 'active'
+            and membership.version = ${content.holder.membershipVersion}
+          join membership_capabilities originator on originator.membership_id = membership.id
+            and originator.capability = 'coordination.originate' and originator.status = 'active'
+          join households household on household.id = membership.household_id
+            and household.status = 'active' and household.control_epoch = ${content.household.controlEpoch}
+          where person.id = ${content.holder.personId} and person.status = 'registered'
+            and person.control_epoch = ${content.holder.personControlEpoch}
+        ) as current
+      `;
+      const allEvidenceIds = [...new Set([...content.sourceRevisionIds, confirmationSourceRevisionId])];
+      const currentEvidence = await transaction<{ readonly current: boolean }[]>`
+        select source_evidence_set_is_current(
+          ${transaction.array(allEvidenceIds)}::uuid[],
+          ${content.destination.participantEpochId}::uuid,
+          ${content.holder.personId}::uuid,
+          now()
+        ) as current
+      `;
+      if (currentHolder[0]?.current !== true || currentEvidence[0]?.current !== true) {
+        await repository.review({
+          candidateId: candidate.candidateId,
+          reviewerPersonId: content.holder.personId,
+          status: "revoked",
+          reviewedAt: new Date(),
+        });
+        return {
+          accepted: false,
+          duplicate: false,
+          disposition: "routine_pattern_stale_evidence_or_membership",
+          ids: { candidateId: candidate.candidateId },
+        };
+      }
+
+      const message = linqMessageText(record.event);
+      const response = deterministicRoutinePatternConfirmation(message);
+      if (response === "ambiguous") {
+        const holderDisplayName = await loadPersonDisplayName(
+          transaction,
+          this.secretBox,
+          content.holder.personId,
+        );
+        const clarification = await this.queueAuthorizedConversationMessage(
+          transaction,
+          record,
+          snapshot,
+          routinePatternPrompt(content, holderDisplayName),
+          "direct_response",
+          "coverage_coordination",
+          null,
+          new Date(Date.now() + 24 * 60 * 60_000),
+          `routine-pattern-clarify:${candidate.candidateId}:${row.id}`,
+          allEvidenceIds,
+          content.household,
+        );
+        await transaction`
+          update outbox set routine_pattern_candidate_id = ${candidate.candidateId}
+          where id = ${clarification.outboxId}
+            and (routine_pattern_candidate_id is null
+              or routine_pattern_candidate_id = ${candidate.candidateId})
+        `;
+        return {
+          accepted: false,
+          duplicate: !clarification.created,
+          disposition: "routine_pattern_confirmation_clarification_queued",
+          ids: { candidateId: candidate.candidateId, responseOutboxId: clarification.outboxId },
+        };
+      }
+      if (response === "reject") {
+        await repository.review({
+          candidateId: candidate.candidateId,
+          reviewerPersonId: content.holder.personId,
+          status: "rejected",
+          reviewedAt: new Date(),
+        });
+        const acknowledgment = await this.queueAuthorizedConversationMessage(
+          transaction,
+          record,
+          snapshot,
+          routinePatternDeclineAcknowledgment(content),
+          "direct_response",
+          "coverage_coordination",
+          null,
+          new Date(Date.now() + this.config.defaults.rawSourceRetentionDays * 86_400_000),
+          `routine-pattern-rejected:${candidate.candidateId}`,
+          allEvidenceIds,
+          content.household,
+        );
+        return {
+          accepted: true,
+          duplicate: !acknowledgment.created,
+          disposition: "routine_pattern_rejected",
+          ids: { candidateId: candidate.candidateId, responseOutboxId: acknowledgment.outboxId },
+        };
+      }
+
+      const promotionTarget = await loadRoutinePatternPromotionTarget(transaction, content);
+      if (promotionTarget === "stale") {
+        await repository.review({
+          candidateId: candidate.candidateId,
+          reviewerPersonId: content.holder.personId,
+          status: "revoked",
+          reviewedAt: new Date(),
+        });
+        return {
+          accepted: false,
+          duplicate: false,
+          disposition: "routine_pattern_revision_target_stale",
+          ids: { candidateId: candidate.candidateId },
+        };
+      }
+
+      const occurredAt = new Date();
+      await repository.review({
+        candidateId: candidate.candidateId,
+        reviewerPersonId: content.holder.personId,
+        status: "accepted",
+        reviewedAt: occurredAt,
+      });
+      const revision: RoutineRevisionDraft = {
+        title: content.title,
+        minimumSharedMeaning: content.minimumSharedMeaning,
+        recurrence: content.recurrence,
+        timePlan: content.timePlan,
+        notificationMode: content.notificationMode,
+        destination: {
+          conversationId: content.destination.conversationId,
+          participantEpochId: content.destination.participantEpochId,
+          participantSetDigest: content.destination.participantSetDigest,
+          audience: content.destination.audience,
+        },
+        proposedHolderPersonId: content.holder.personId,
+        standingCoverage: {
+          holderPersonId: content.holder.personId,
+          authorizedByPersonId: content.holder.personId,
+          authorizationKind: promotionTarget.kind === "revise" ? "approved" : "created",
+          authorizedAt: occurredAt.toISOString(),
+        },
+        sourceRevisionRefs: mergeRoutinePatternEvidence(
+          promotionTarget.kind === "revise" ? promotionTarget.sourceRevisionRefs : [],
+          allEvidenceIds,
+        ),
+        effectiveFrom: content.recurrence.startsOn,
+        effectiveThrough: content.recurrence.endsOn,
+      };
+      const routines = new PostgresRoutines(transaction, this.secretBox);
+      const saved =
+        promotionTarget.kind === "revise"
+          ? await routines.save({
+              kind: "revise",
+              routineId: promotionTarget.routineId,
+              householdId: content.household.id,
+              expectedVersion: promotionTarget.expectedVersion,
+              actorPersonId: content.holder.personId,
+              occurredAt,
+              revision,
+            })
+          : await routines.save({
+              kind: "create",
+              routineId: candidate.candidateId,
+              householdId: content.household.id,
+              actorPersonId: content.holder.personId,
+              occurredAt,
+              revision,
+            });
+      const acknowledgment = await this.queueAuthorizedConversationMessage(
+        transaction,
+        record,
+        snapshot,
+        routinePatternAcknowledgment(content),
+        "direct_response",
+        "coverage_coordination",
+        null,
+        new Date(Date.now() + this.config.defaults.rawSourceRetentionDays * 86_400_000),
+        `routine-pattern-accepted:${candidate.candidateId}`,
+        allEvidenceIds,
+        content.household,
+      );
+      return {
+        accepted: true,
+        duplicate: !acknowledgment.created,
+        disposition:
+          promotionTarget.kind === "revise" ? "routine_pattern_revised" : "routine_pattern_accepted",
+        ids: {
+          candidateId: candidate.candidateId,
+          routineId: saved.routine.routineId,
+          responseOutboxId: acknowledgment.outboxId,
+        },
+      };
+    });
+  }
+
+  /**
    * Commits only the relationship meaning proposed by the ephemeral worker.
    * The application reopens the exact group, chooses the sole non-household
    * participant, checks the inviter's relationship-local grants, and sends two
@@ -2445,16 +3029,15 @@ export class FlorenceApplication {
       ) {
         throw new UnauthorizedError("Provider event is not an eligible family introduction");
       }
-      const expectedSourceObjectId = `conversation_message:${canonicalDigest({
+      const expectedSourceObjectId = sourceExternalObjectId({
         integrationId: null,
         scope: {
           kind: "conversation_epoch",
           participantEpochId: record.routing.participantEpochId,
         },
         artifactKind: "conversation_message",
-        system: "linq",
-        remoteObjectId: record.event.message.providerMessageId,
-      })}`;
+        origin: { system: "linq", remoteObjectId: record.event.message.providerMessageId },
+      });
 
       const sources = await transaction<
         {
@@ -2774,20 +3357,23 @@ export class FlorenceApplication {
     `;
     if (effects.length !== 1 || !effects[0]) return null;
     const effect = effects[0];
-    if (
-      effect.invitation_id &&
-      (effect.logical_idempotency_key === `household-enrollment-invitation:${effect.invitation_id}` ||
-        effect.logical_idempotency_key === `household-invitation:${effect.invitation_id}`)
-    ) {
-      return { kind: "family_invitation", invitationId: effect.invitation_id };
+    const invitationApprovalGeneration = effect.invitation_id
+      ? householdInvitationPromptApprovalGeneration(effect.logical_idempotency_key, effect.invitation_id)
+      : null;
+    if (effect.invitation_id && invitationApprovalGeneration !== null) {
+      return {
+        kind: "family_invitation",
+        invitationId: effect.invitation_id,
+        invitationApprovalGeneration,
+      };
     }
     const enrollmentKeyPrefix = `enrollment:${record.routing.providerChatId}:`;
     const enrollmentKeySuffix = effect.logical_idempotency_key.startsWith(enrollmentKeyPrefix)
       ? effect.logical_idempotency_key.slice(enrollmentKeyPrefix.length)
       : null;
     return enrollmentKeySuffix && /^[a-f0-9]{64}$/u.test(enrollmentKeySuffix)
-      ? { kind: "enrollment", invitationId: null }
-      : { kind: "other", invitationId: null };
+      ? { kind: "enrollment", invitationId: null, invitationApprovalGeneration: null }
+      : { kind: "other", invitationId: null, invitationApprovalGeneration: null };
   }
 
   private async latestPrivateOnboardingPromptWasDelivered(
@@ -2903,13 +3489,16 @@ export class FlorenceApplication {
     `;
     await this.consentPersonAcrossObservedEpochs(transaction, personId, consentedAt);
     const invitationAcceptance =
-      latestEffect.kind === "family_invitation" && latestEffect.invitationId
+      latestEffect.kind === "family_invitation" &&
+      latestEffect.invitationId &&
+      latestEffect.invitationApprovalGeneration !== null
         ? await this.acceptExactPendingFamilyInvitation(
             transaction,
             record,
             personId,
             identityId,
             latestEffect.invitationId,
+            latestEffect.invitationApprovalGeneration,
           )
         : null;
     if (invitationAcceptance) return invitationAcceptance;
@@ -3132,10 +3721,6 @@ export class FlorenceApplication {
                     and source_revision.retention_until > now()
                 )
               )
-              and not exists(
-                select 1 from invitation_approvals approval
-                where approval.invitation_id = invitation.id and approval.approved_at is null
-              )
           )
         )
       order by invitation.created_at desc, invitation.id desc
@@ -3175,15 +3760,20 @@ export class FlorenceApplication {
     return "family_invitation_stale";
   }
 
-  /** The caller locks the source conversation before this second, authoritative read. */
-  private async familyInvitationIsCurrentForPerson(
+  /** Rechecks the exact source, household, invitee, evidence, and current approval set. */
+  private async currentFamilyInvitationApprovalState(
     transaction: Transaction,
     invitationId: string,
     personId: string,
-  ): Promise<boolean> {
-    const rows = await transaction<{ current: boolean }[]>`
-      select exists(
-        select 1
+  ): Promise<{
+    readonly readiness: FamilyInvitationApprovalReadiness;
+    readonly approvalGeneration: number;
+  } | null> {
+    const rows = await transaction<
+      { pending_approval_count: number | string; household_membership_version: number | string }[]
+    >`
+      with current_invitation as (
+        select invitation.id, invitation.household_membership_version
         from invitations invitation
         join households household on household.id = invitation.household_id
           and household.status in ('onboarding', 'active')
@@ -3224,13 +3814,52 @@ export class FlorenceApplication {
                 and source_revision.retention_until > now()
             )
           )
-          and not exists(
-            select 1 from invitation_approvals approval
-            where approval.invitation_id = invitation.id and approval.approved_at is null
-          )
-      ) as current
+      )
+      select count(approval.approver_membership_id) filter (where approval.approved_at is null)
+        as pending_approval_count, current_invitation.household_membership_version
+      from current_invitation
+      left join invitation_approvals approval on approval.invitation_id = current_invitation.id
+      group by current_invitation.id, current_invitation.household_membership_version
     `;
-    return rows[0]?.current === true;
+    const row = rows[0];
+    return row
+      ? {
+          readiness: familyInvitationApprovalReadiness(Number(row.pending_approval_count)),
+          approvalGeneration: Number(row.household_membership_version),
+        }
+      : null;
+  }
+
+  private async queueFamilyInvitationAwaitingStewardApproval(
+    transaction: Transaction,
+    record: StoredLinqEvent,
+    snapshot: ConversationAuthoritySnapshot,
+  ): Promise<string> {
+    await this.queueAuthorizedConversationMessage(
+      transaction,
+      record,
+      snapshot,
+      "That family invitation is still waiting for approval from the current family stewards. I haven’t joined you to the family yet. I’ll send you a fresh confirmation as soon as every required steward approves.",
+      "direct_response",
+      "family_invitation_awaiting_stewards",
+    );
+    return "family_invitation_awaiting_stewards";
+  }
+
+  private async queueSupersededFamilyInvitationConfirmation(
+    transaction: Transaction,
+    record: StoredLinqEvent,
+    snapshot: ConversationAuthoritySnapshot,
+  ): Promise<string> {
+    await this.queueAuthorizedConversationMessage(
+      transaction,
+      record,
+      snapshot,
+      "That confirmation belongs to an earlier family approval set, so I didn’t use it. Please reply to the fresh family invitation after it arrives.",
+      "direct_response",
+      "family_invitation_confirmation_superseded",
+    );
+    return "family_invitation_confirmation_superseded";
   }
 
   /**
@@ -3244,6 +3873,7 @@ export class FlorenceApplication {
     personId: string,
     identityId: string,
     invitationId: string,
+    expectedApprovalGeneration: number,
   ): Promise<string | null> {
     if (record.routing.chatKind !== "direct") return null;
     const invitations = await transaction<
@@ -3288,10 +3918,6 @@ export class FlorenceApplication {
       where invitation.id = ${invitationId}
         and invitation.status = 'pending' and invitation.expires_at > now()
         and invitation.proposed_display_name_ciphertext is not null
-        and not exists(
-          select 1 from invitation_approvals approval
-          where approval.invitation_id = invitation.id and approval.approved_at is null
-        )
       order by invitation.created_at, invitation.id
       limit 2
     `;
@@ -3320,17 +3946,49 @@ export class FlorenceApplication {
     }
     const invitation = invitations[0];
     const acceptedAt = new Date();
-    if (!(await this.familyInvitationIsCurrentForPerson(transaction, invitation.invitation_id, personId))) {
-      const staleDisposition = await this.rejectStaleDeliveredFamilyInvitation(
+    let membership: HouseholdMembership;
+    try {
+      membership = await new HouseholdOnboarding(transaction, this.secretBox).acceptInvitation({
+        actorPersonId: personId,
+        invitationId: invitation.invitation_id,
+        expectedHouseholdMembershipVersion: expectedApprovalGeneration,
+        acceptedAt,
+      });
+    } catch (error) {
+      if (
+        !(error instanceof UnauthorizedError) &&
+        !(error instanceof ConflictError) &&
+        !(error instanceof NotFoundError)
+      ) {
+        throw error;
+      }
+      const refreshedApprovalState = await this.currentFamilyInvitationApprovalState(
         transaction,
-        record,
+        invitation.invitation_id,
         personId,
-        identityId,
-        invitationId,
       );
-      if (staleDisposition) return staleDisposition;
-      throw new StaleAuthorityError("The family invitation changed before it could be accepted");
+      if (refreshedApprovalState?.readiness === "waiting") {
+        return this.queueFamilyInvitationAwaitingStewardApproval(transaction, record, snapshot);
+      }
+      if (
+        refreshedApprovalState?.readiness === "ready" &&
+        refreshedApprovalState.approvalGeneration !== expectedApprovalGeneration
+      ) {
+        return this.queueSupersededFamilyInvitationConfirmation(transaction, record, snapshot);
+      }
+      if (!refreshedApprovalState) {
+        const staleDisposition = await this.rejectStaleDeliveredFamilyInvitation(
+          transaction,
+          record,
+          personId,
+          identityId,
+          invitationId,
+        );
+        if (staleDisposition) return staleDisposition;
+      }
+      throw error;
     }
+
     const proposedDisplayName = this.secretBox
       .decrypt(
         JSON.parse(invitation.proposed_display_name_ciphertext.toString("utf8")),
@@ -3359,11 +4017,6 @@ export class FlorenceApplication {
       `;
     }
 
-    const membership = await new HouseholdOnboarding(transaction, this.secretBox).acceptInvitation({
-      actorPersonId: personId,
-      invitationId: invitation.invitation_id,
-      acceptedAt,
-    });
     await transaction`
       update households set status = 'active', updated_at = ${acceptedAt}
       where id = ${membership.householdId} and status = 'onboarding'
@@ -3752,13 +4405,16 @@ export class FlorenceApplication {
         record.routing.senderIdentityId,
       );
       const invitationAcceptance =
-        latestEffect?.kind === "family_invitation" && latestEffect.invitationId
+        latestEffect?.kind === "family_invitation" &&
+        latestEffect.invitationId &&
+        latestEffect.invitationApprovalGeneration !== null
           ? await this.acceptExactPendingFamilyInvitation(
               transaction,
               record,
               record.routing.senderPersonId,
               record.routing.senderIdentityId,
               latestEffect.invitationId,
+              latestEffect.invitationApprovalGeneration,
             )
           : null;
       if (invitationAcceptance) return invitationAcceptance;
@@ -4418,6 +5074,7 @@ export class FlorenceApplication {
         source_participant_epoch_id: string;
         source_participant_digest: string;
         source_revision_id: string | null;
+        household_membership_version: number | string;
         expires_at: Date;
         ready: boolean;
       }[]
@@ -4440,6 +5097,7 @@ export class FlorenceApplication {
         source_epoch.id as source_participant_epoch_id,
         source_epoch.participant_set_digest as source_participant_digest,
         invitation.source_revision_id,
+        invitation.household_membership_version,
         invitation.expires_at,
         not exists(
           select 1 from invitation_approvals approval
@@ -4514,6 +5172,12 @@ export class FlorenceApplication {
         throw new NotFoundError("Florence cannot safely open a private chat with that group participant");
       }
       const text = `${inviterName} says you’re ${proposedDisplayName} and invited you to join their Florence family as ${role}. Is that right? Reply yes to create your private account and join the family, or no if that isn’t right. I’ll stay silent in the group until you confirm. You can text STOP any time to stop Florence.`;
+      const idempotencyKey = householdInvitationPromptIdempotencyKey(
+        "enrollment",
+        invitationId,
+        Number(invitation.household_membership_version),
+      );
+      await this.cancelSupersededHouseholdInvitationPrompts(transaction, invitationId, idempotencyKey);
       await new EffectOutbox(transaction, this.secretBox).authorizeAndEnqueue({
         actorPersonId: invitation.inviter_person_id,
         person: {
@@ -4538,7 +5202,7 @@ export class FlorenceApplication {
           ? { evidenceSourceRevisionIds: [invitation.source_revision_id] }
           : {}),
         effectKind: "linq.message",
-        idempotencyKey: `household-enrollment-invitation:${invitationId}`,
+        idempotencyKey,
         data: {
           invitationId,
           inviteeIdentityId: invitation.invitee_identity_id,
@@ -4605,6 +5269,12 @@ export class FlorenceApplication {
       throw new UnauthorizedError("That person’s private Florence settings do not allow an invitation");
     }
     const text = `${inviterName} invited you to join their Florence family as ${role} and said you’re ${proposedDisplayName}. Is that right? Reply yes to join, or no if that isn’t right. I won’t ask you to repeat family details they already shared, and I’ll stay silent in the group until you confirm.`;
+    const idempotencyKey = householdInvitationPromptIdempotencyKey(
+      "registered",
+      invitationId,
+      Number(invitation.household_membership_version),
+    );
+    await this.cancelSupersededHouseholdInvitationPrompts(transaction, invitationId, idempotencyKey);
     await new EffectOutbox(transaction, this.secretBox).authorizeAndEnqueue({
       actorPersonId: invitation.inviter_person_id,
       ...(await personFence(transaction, invitation.invitee_person_id)),
@@ -4629,7 +5299,7 @@ export class FlorenceApplication {
       participantEpochId: route.participant_epoch_id,
       expectedParticipantDigest: route.participant_set_digest,
       effectKind: "linq.message",
-      idempotencyKey: `household-invitation:${invitationId}`,
+      idempotencyKey,
       data: { invitationId, textDigest: sha256Hex(text) },
       policy: { exactPrivateDm: true, operation: "household_invitation" },
       target: {
@@ -4644,6 +5314,25 @@ export class FlorenceApplication {
       reasonCodes: ["registered_exact_private_invitee", "household_invitation"],
       authorizationExpiresAt: invitation.expires_at,
     });
+  }
+
+  private async cancelSupersededHouseholdInvitationPrompts(
+    transaction: Transaction,
+    invitationId: string,
+    currentLogicalIdempotencyKey: string,
+  ): Promise<void> {
+    await transaction`
+      update outbox effect
+      set status = 'cancelled', lease_owner = null, lease_token = null,
+        lease_expires_at = null,
+        last_error_code = 'superseded_invitation_approval_generation', updated_at = now()
+      where effect.invitation_id = ${invitationId}
+        and effect.status in ('pending', 'retry', 'leased', 'dead')
+        and coalesce(
+          (select root.idempotency_key from outbox root where root.id = effect.redrive_root_id),
+          effect.idempotency_key
+        ) <> ${currentLogicalIdempotencyKey}
+    `;
   }
 
   private async processWebCommand(
@@ -4719,7 +5408,7 @@ export class FlorenceApplication {
             ids: { householdId: command.householdId, version: String(result.version) },
           };
         }
-        case "set_onboarding_coordinator": {
+        case "save_onboarding_adult_roster": {
           const projection = await onboarding.project(transaction, {
             actorPersonId,
             personId: actorPersonId,
@@ -4731,21 +5420,20 @@ export class FlorenceApplication {
           ) {
             throw new ConflictError("Your family setup changed before it was saved");
           }
-          const result = await onboarding.setCoordinator(transaction, {
+          const result = await onboarding.saveAdultRoster(transaction, {
             actorPersonId,
             personId: actorPersonId,
             householdId: command.householdId,
             expectedMembershipVersion: command.expectedMembershipVersion,
             expectedIntakeVersion: command.expectedIntakeVersion,
-            disposition: command.disposition,
-            ...(command.proposedName ? { proposedCoordinatorName: command.proposedName } : {}),
-            answeredAt: new Date(),
+            adults: command.adults,
+            reviewedAt: new Date(),
           });
           await this.reconcileOnboardingReminder(transaction, actorPersonId, new Date());
           return {
             accepted: true,
             duplicate: false,
-            disposition: "onboarding_coordinator_recorded",
+            disposition: "onboarding_adult_roster_saved",
             ids: { householdId: command.householdId, version: String(result.version) },
           };
         }
@@ -4774,34 +5462,6 @@ export class FlorenceApplication {
             accepted: true,
             duplicate: false,
             disposition: "onboarding_children_reviewed",
-            ids: { householdId: command.householdId, version: String(result.version) },
-          };
-        }
-        case "defer_onboarding_coordinator_invite": {
-          const projection = await onboarding.project(transaction, {
-            actorPersonId,
-            personId: actorPersonId,
-          });
-          const household = requireOnboardingHousehold(projection, command.householdId);
-          if (
-            household.membershipVersion !== command.expectedMembershipVersion ||
-            household.intakeVersion !== command.expectedIntakeVersion
-          ) {
-            throw new ConflictError("Your coordinator step changed before it was deferred");
-          }
-          const result = await onboarding.deferCoordinatorInvite(transaction, {
-            actorPersonId,
-            personId: actorPersonId,
-            householdId: command.householdId,
-            expectedMembershipVersion: command.expectedMembershipVersion,
-            expectedIntakeVersion: command.expectedIntakeVersion,
-            deferredAt: new Date(),
-          });
-          await this.reconcileOnboardingReminder(transaction, actorPersonId, new Date());
-          return {
-            accepted: true,
-            duplicate: false,
-            disposition: "onboarding_coordinator_invite_deferred",
             ids: { householdId: command.householdId, version: String(result.version) },
           };
         }
@@ -4938,6 +5598,26 @@ export class FlorenceApplication {
           };
         }
         case "invite_household_participant": {
+          const onboardingAdultIntentId = command.onboardingAdultIntentId ?? null;
+          const onboardingAdultIntentVersion = command.onboardingAdultIntentVersion ?? null;
+          if ((onboardingAdultIntentId === null) !== (onboardingAdultIntentVersion === null)) {
+            throw new ConflictError("The onboarding adult version no longer matches this invitation");
+          }
+          const createdAt = new Date();
+          let adultIntentMembershipVersion: number | null = null;
+          let adultIntentRole: "steward" | "caregiver" | null = null;
+          if (onboardingAdultIntentId) {
+            if (command.role === "participant") {
+              throw new ConflictError("An onboarding adult must be a parent or caregiver");
+            }
+            const projection = await onboarding.project(transaction, {
+              actorPersonId,
+              personId: actorPersonId,
+            });
+            const household = requireOnboardingHousehold(projection, command.householdId);
+            adultIntentMembershipVersion = household.membershipVersion;
+            adultIntentRole = command.role;
+          }
           const invitationResult = await new HouseholdOnboarding(
             transaction,
             this.secretBox,
@@ -4952,9 +5632,39 @@ export class FlorenceApplication {
             proposedDisplayName: command.proposedDisplayName,
             role: command.role,
             sourceRevisionId: null,
-            createdAt: new Date(),
+            createdAt,
           });
           const invitation = invitationResult.invitation;
+          if (
+            onboardingAdultIntentId &&
+            onboardingAdultIntentVersion !== null &&
+            adultIntentMembershipVersion !== null &&
+            adultIntentRole !== null
+          ) {
+            const prepared = await onboarding.prepareAdultIntentInvitation(transaction, {
+              actorPersonId,
+              personId: actorPersonId,
+              householdId: command.householdId,
+              expectedMembershipVersion: adultIntentMembershipVersion,
+              adultIntentId: onboardingAdultIntentId,
+              expectedIntentVersion: onboardingAdultIntentVersion,
+              proposedDisplayName: command.proposedDisplayName,
+              role: adultIntentRole,
+              matchedPersonId: command.inviteePersonId,
+              preparedAt: createdAt,
+            });
+            await onboarding.bindAdultIntentInvitation(transaction, {
+              actorPersonId,
+              personId: actorPersonId,
+              householdId: command.householdId,
+              expectedMembershipVersion: adultIntentMembershipVersion,
+              adultIntentId: onboardingAdultIntentId,
+              expectedIntentVersion: prepared.intentVersion,
+              matchedPersonId: command.inviteePersonId,
+              invitationId: invitation.invitationId,
+              boundAt: createdAt,
+            });
+          }
           await this.queueHouseholdInvitationMessage(transaction, invitation.invitationId);
           await this.noteOnboardingProgress(transaction, actorPersonId, new Date());
           return {
@@ -4989,9 +5699,10 @@ export class FlorenceApplication {
             {
               source_conversation_id: string | null;
               status: string;
+              household_membership_version: number | string;
             }[]
           >`
-            select source_conversation_id, status from invitations
+            select source_conversation_id, status, household_membership_version from invitations
             where id = ${command.invitationId}
           `;
           const invitationSource = invitationSources[0];
@@ -5003,6 +5714,7 @@ export class FlorenceApplication {
             membership = await new HouseholdOnboarding(transaction, this.secretBox).acceptInvitation({
               actorPersonId,
               invitationId: command.invitationId,
+              expectedHouseholdMembershipVersion: Number(invitationSource.household_membership_version),
               acceptedAt,
             });
           } catch (error) {
@@ -5616,6 +6328,323 @@ export class FlorenceApplication {
   }
 }
 
+async function loadProcessedLinqMessageForUpdate(
+  transaction: Transaction,
+  secretBox: SecretBox,
+  internalProviderEventId: string,
+): Promise<{ readonly row: ProviderEventRow; readonly record: StoredLinqEvent }> {
+  const rows = await transaction<ProviderEventRow[]>`
+    select id, provider_event_id, envelope_ciphertext, processing_status
+    from provider_events
+    where id = ${internalProviderEventId} and provider = 'linq'
+    for update
+  `;
+  const row = rows[0];
+  if (row?.processing_status !== "processed") {
+    throw new StaleAuthorityError("Linq source is no longer processed");
+  }
+  const record = JSON.parse(
+    secretBox
+      .decrypt(
+        JSON.parse(row.envelope_ciphertext.toString("utf8")),
+        `provider-event:${row.provider_event_id}`,
+      )
+      .toString("utf8"),
+  ) as StoredLinqEvent;
+  return { row, record };
+}
+
+async function loadLinqMessageSourceRevisionId(
+  transaction: Transaction,
+  providerMessageId: string,
+  participantEpochId: string,
+): Promise<string> {
+  const externalObjectId = sourceExternalObjectId({
+    integrationId: null,
+    scope: { kind: "conversation_epoch", participantEpochId },
+    artifactKind: "conversation_message",
+    origin: { system: "linq", remoteObjectId: providerMessageId },
+  });
+  const rows = await transaction<{ readonly id: string }[]>`
+    select revision.id
+    from source_objects object
+    join source_revisions revision on revision.source_object_id = object.id
+      and revision.revision_number = object.latest_revision_number
+    where object.provider = 'linq' and object.external_object_id = ${externalObjectId}
+      and object.object_kind = 'conversation_message' and object.status = 'active'
+      and revision.participant_epoch_id = ${participantEpochId}
+      and revision.revoked_at is null and revision.content_ciphertext is not null
+    order by revision.revision_number desc
+    limit 1
+  `;
+  if (!rows[0]) throw new StaleAuthorityError("Linq message evidence is no longer current");
+  return rows[0].id;
+}
+
+function linqMessageText(event: LinqMessageReceivedEvent): string {
+  return event.message.parts
+    .flatMap((part) => (part.kind === "text" ? [part.text] : part.kind === "link" ? [part.url] : []))
+    .join("\n")
+    .trim();
+}
+
+async function loadPersonDisplayName(
+  transaction: Transaction,
+  secretBox: SecretBox,
+  personId: string,
+): Promise<string | null> {
+  const rows = await transaction<{ readonly display_name_ciphertext: Buffer | null }[]>`
+    select display_name_ciphertext from people where id = ${personId} and status = 'registered'
+  `;
+  const ciphertext = rows[0]?.display_name_ciphertext;
+  if (!ciphertext) return null;
+  try {
+    const value = secretBox
+      .decrypt(JSON.parse(ciphertext.toString("utf8")), `person-display-name:${personId}`)
+      .toString("utf8")
+      .replace(/\s+/gu, " ")
+      .trim();
+    return value && value.length <= 80 ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+interface RoutinePatternTargetRow {
+  readonly routine_id: string;
+  readonly version: number | string;
+  readonly current_revision: number | string;
+  readonly recurrence: unknown;
+  readonly semantic_time_plan: unknown;
+  readonly source_revision_refs: unknown;
+  readonly content_ciphertext: Buffer;
+  readonly content_key_version: string;
+}
+
+type RoutinePatternPromotionTarget =
+  | { readonly kind: "create" }
+  | {
+      readonly kind: "revise";
+      readonly routineId: string;
+      readonly expectedVersion: number;
+      readonly sourceRevisionRefs: readonly string[];
+    };
+
+/**
+ * Picks a revision target only from canonical standing routines. The worker's
+ * title and prose never participate. Exact schedule overlap is deterministic;
+ * a source-authored change cue may select one sole schedule-related routine.
+ */
+async function selectRoutinePatternRevisionTarget(
+  transaction: Transaction,
+  secretBox: SecretBox,
+  candidate: RoutinePatternCandidateContent,
+  sourceMessage: string,
+): Promise<RoutinePatternRevisionTarget | null | "ambiguous"> {
+  const rows = await loadEligibleRoutinePatternTargets(transaction, candidate, false);
+  const parsed = rows.map((row) => ({
+    row,
+    recurrence: RoutineRecurrenceSchema.safeParse(row.recurrence),
+    timePlan: SemanticTimePlanSchema.safeParse(row.semantic_time_plan),
+  }));
+  if (parsed.some((entry) => !entry.recurrence.success || !entry.timePlan.success)) {
+    return "ambiguous";
+  }
+
+  const isExplicitChange = hasExplicitRoutineChangeCue(sourceMessage);
+  const exactOverlaps = parsed.filter(
+    (entry) =>
+      entry.recurrence.success &&
+      entry.timePlan.success &&
+      routinePatternSchedulesExactlyOverlap(candidate, entry.recurrence.data, entry.timePlan.data),
+  );
+  if (!isExplicitChange) return exactOverlaps.length > 0 ? "ambiguous" : null;
+  if (exactOverlaps.length > 1) return "ambiguous";
+  if (exactOverlaps[0]) return routinePatternRevisionTarget(exactOverlaps[0].row, secretBox);
+
+  const related = parsed.filter(
+    (entry) =>
+      entry.recurrence.success &&
+      entry.timePlan.success &&
+      routinePatternSchedulesAreRelated(candidate, entry.recurrence.data, entry.timePlan.data),
+  );
+  if (related.length > 1) return "ambiguous";
+  if (related[0]) return routinePatternRevisionTarget(related[0].row, secretBox);
+  return rows.length > 0 ? "ambiguous" : null;
+}
+
+/** Reopens and locks the app-selected target before the exact holder's approval commits. */
+async function loadRoutinePatternPromotionTarget(
+  transaction: Transaction,
+  candidate: RoutinePatternCandidateContent,
+): Promise<RoutinePatternPromotionTarget | "stale"> {
+  if (!candidate.revisionTarget) {
+    const rows = await loadEligibleRoutinePatternTargets(transaction, candidate, true);
+    const exactOverlaps = rows.filter((row) => {
+      const recurrence = RoutineRecurrenceSchema.safeParse(row.recurrence);
+      const timePlan = SemanticTimePlanSchema.safeParse(row.semantic_time_plan);
+      return (
+        recurrence.success &&
+        timePlan.success &&
+        routinePatternSchedulesExactlyOverlap(candidate, recurrence.data, timePlan.data)
+      );
+    });
+    return exactOverlaps.length === 0 ? { kind: "create" } : "stale";
+  }
+
+  const rows = await loadEligibleRoutinePatternTargets(
+    transaction,
+    candidate,
+    true,
+    candidate.revisionTarget.routineId,
+  );
+  const row = rows[0];
+  if (
+    rows.length !== 1 ||
+    !row ||
+    Number(row.version) !== candidate.revisionTarget.expectedVersion ||
+    Number(row.current_revision) !== candidate.revisionTarget.expectedCurrentRevision
+  ) {
+    return "stale";
+  }
+  return {
+    kind: "revise",
+    routineId: row.routine_id,
+    expectedVersion: Number(row.version),
+    sourceRevisionRefs: parseRoutinePatternEvidenceRefs(row.source_revision_refs),
+  };
+}
+
+async function loadEligibleRoutinePatternTargets(
+  transaction: Transaction,
+  candidate: RoutinePatternCandidateContent,
+  forUpdate: boolean,
+  routineId: string | null = null,
+): Promise<readonly RoutinePatternTargetRow[]> {
+  const rows = forUpdate
+    ? await transaction<RoutinePatternTargetRow[]>`
+      select routine.id as routine_id, routine.version, routine.current_revision,
+        revision.recurrence, revision.semantic_time_plan, revision.source_revision_refs,
+        revision.content_ciphertext, revision.content_key_version
+      from routines routine
+      join routine_revisions revision on revision.routine_id = routine.id
+        and revision.revision = routine.current_revision
+      where routine.household_id = ${candidate.household.id} and routine.status = 'active'
+        and (${routineId}::uuid is null or routine.id = ${routineId})
+        and revision.destination_conversation_id = ${candidate.destination.conversationId}
+        and revision.participant_epoch_id = ${candidate.destination.participantEpochId}
+        and revision.participant_set_digest = ${candidate.destination.participantSetDigest}
+        and revision.proposed_holder_person_id = ${candidate.holder.personId}
+        and revision.standing_holder_person_id = ${candidate.holder.personId}
+        and revision.standing_authorized_by_person_id = ${candidate.holder.personId}
+      order by routine.id
+      for update of routine
+    `
+    : await transaction<RoutinePatternTargetRow[]>`
+      select routine.id as routine_id, routine.version, routine.current_revision,
+        revision.recurrence, revision.semantic_time_plan, revision.source_revision_refs,
+        revision.content_ciphertext, revision.content_key_version
+      from routines routine
+      join routine_revisions revision on revision.routine_id = routine.id
+        and revision.revision = routine.current_revision
+      where routine.household_id = ${candidate.household.id} and routine.status = 'active'
+        and (${routineId}::uuid is null or routine.id = ${routineId})
+        and revision.destination_conversation_id = ${candidate.destination.conversationId}
+        and revision.participant_epoch_id = ${candidate.destination.participantEpochId}
+        and revision.participant_set_digest = ${candidate.destination.participantSetDigest}
+        and revision.proposed_holder_person_id = ${candidate.holder.personId}
+        and revision.standing_holder_person_id = ${candidate.holder.personId}
+        and revision.standing_authorized_by_person_id = ${candidate.holder.personId}
+      order by routine.id
+    `;
+  return rows;
+}
+
+function routinePatternRevisionTarget(
+  row: RoutinePatternTargetRow,
+  secretBox: SecretBox,
+): RoutinePatternRevisionTarget {
+  const encrypted = JSON.parse(row.content_ciphertext.toString("utf8")) as { readonly kid?: unknown };
+  if (encrypted.kid !== row.content_key_version) {
+    throw new ConflictError("Routine revision encryption metadata does not match");
+  }
+  const content = JSON.parse(
+    secretBox
+      .decrypt(encrypted, `routine-revision-content:${row.routine_id}:${Number(row.current_revision)}`)
+      .toString("utf8"),
+  ) as { readonly title?: unknown };
+  if (typeof content.title !== "string" || !content.title.trim() || content.title.trim().length > 200) {
+    throw new ConflictError("Routine revision title is malformed");
+  }
+  return {
+    routineId: row.routine_id,
+    expectedVersion: Number(row.version),
+    expectedCurrentRevision: Number(row.current_revision),
+    canonicalTitle: content.title.trim(),
+  };
+}
+
+function routinePatternSchedulesExactlyOverlap(
+  candidate: RoutinePatternCandidateContent,
+  recurrence: ReturnType<typeof RoutineRecurrenceSchema.parse>,
+  timePlan: ReturnType<typeof SemanticTimePlanSchema.parse>,
+): boolean {
+  return (
+    recurrence.kind === "weekly" &&
+    timePlan.event?.kind === "local_clock" &&
+    candidate.recurrence.kind === "weekly" &&
+    candidate.timePlan.event?.kind === "local_clock" &&
+    timePlan.timeZone === candidate.timePlan.timeZone &&
+    timePlan.event.time === candidate.timePlan.event.time &&
+    recurrence.weekdays.some((weekday) => candidate.recurrence.weekdays.includes(weekday))
+  );
+}
+
+function routinePatternSchedulesAreRelated(
+  candidate: RoutinePatternCandidateContent,
+  recurrence: ReturnType<typeof RoutineRecurrenceSchema.parse>,
+  timePlan: ReturnType<typeof SemanticTimePlanSchema.parse>,
+): boolean {
+  if (
+    recurrence.kind !== "weekly" ||
+    timePlan.event?.kind !== "local_clock" ||
+    candidate.recurrence.kind !== "weekly" ||
+    candidate.timePlan.event?.kind !== "local_clock" ||
+    timePlan.timeZone !== candidate.timePlan.timeZone
+  ) {
+    return false;
+  }
+  return (
+    timePlan.event.time === candidate.timePlan.event.time ||
+    recurrence.weekdays.some((weekday) => candidate.recurrence.weekdays.includes(weekday))
+  );
+}
+
+function hasExplicitRoutineChangeCue(sourceMessage: string): boolean {
+  const normalized = sourceMessage.toLowerCase().replace(/\s+/gu, " ").trim();
+  return (
+    /\b(?:instead of|used to|no longer)\b/u.test(normalized) ||
+    /\b(?:change(?:d)?|switch(?:ed)?|move(?:d)?)\b[^.?!]{0,80}\b(?:from|to)\b/u.test(normalized) ||
+    /\bnow\b[^.?!]{0,100}\b(?:every|each|mondays|tuesdays|wednesdays|thursdays|fridays|saturdays|sundays)\b/u.test(
+      normalized,
+    )
+  );
+}
+
+function parseRoutinePatternEvidenceRefs(value: unknown): readonly string[] {
+  if (!Array.isArray(value) || !value.every((entry) => typeof entry === "string")) {
+    throw new ConflictError("Routine evidence references are malformed");
+  }
+  return [...new Set(value)];
+}
+
+function mergeRoutinePatternEvidence(previous: readonly string[], current: readonly string[]): string[] {
+  const required = [...new Set(current)];
+  if (required.length > 100) throw new ConflictError("Routine confirmation evidence exceeds bounds");
+  const retainedPrevious = [...new Set(previous)].filter((entry) => !required.includes(entry));
+  return [...retainedPrevious.slice(-(100 - required.length)), ...required];
+}
+
 async function resolveRoutineDestination(
   transaction: Transaction,
   actorPersonId: string,
@@ -5966,12 +6995,10 @@ function privateGuidanceActionCopy(step: PrivateOnboardingGuidance["recommendedN
       return "Set up your private Florence family here:";
     case "choose_household":
       return "Choose the family you want to continue with here:";
-    case "coordinator":
+    case "adults":
       return "Tell Florence who else helps coordinate your family here:";
     case "children":
       return "Add the children and family context Florence should know here:";
-    case "coordinator_invite":
-      return "Continue your co-parent or caregiver setup here:";
     case "review_shared_context":
       return "Review the family details already shared with Florence here:";
     case "google":
@@ -6330,12 +7357,10 @@ function onboardingReminderStep(projection: FamilyOnboardingProjection): Onboard
       return "profile";
     case "create_household":
     case "choose_household":
-    case "coordinator":
+    case "adults":
       return "family";
     case "children":
       return "children";
-    case "coordinator_invite":
-      return "invite";
     case "review_shared_context":
     case "review":
       return "review";

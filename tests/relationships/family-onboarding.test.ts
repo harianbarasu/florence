@@ -17,10 +17,9 @@ function household(overrides: Partial<FamilyOnboardingHousehold> = {}): FamilyOn
     role: "steward",
     timezone: "America/Los_Angeles",
     intakeVersion: 0,
-    coordinatorDisposition: "unanswered",
-    proposedCoordinatorName: null,
-    coordinatorInvitationResolved: false,
-    coordinatorInviteDeferred: false,
+    adultRosterReviewed: false,
+    adultRosterReviewedByPersonId: null,
+    adults: [],
     childRosterReviewed: false,
     childRosterReviewedByPersonId: null,
     children: [],
@@ -96,15 +95,26 @@ describe("family onboarding policy", () => {
     ).toEqual({ kind: "choose_household" });
   });
 
-  it("orders the starter journey and lets a pending or deferred coordinator invite unblock it", () => {
-    expect(projectFamilyOnboardingStep(state()).kind).toBe("coordinator");
+  it("orders the starter journey without making invitations gate setup", () => {
+    expect(projectFamilyOnboardingStep(state()).kind).toBe("adults");
     expect(
       projectFamilyOnboardingStep(
         state({
           selectedHousehold: household({
             intakeVersion: 1,
-            coordinatorDisposition: "proposed",
-            proposedCoordinatorName: "Kendall",
+            adultRosterReviewed: true,
+            adultRosterReviewedByPersonId: personId,
+            adults: [
+              {
+                id: "10000000-0000-4000-8000-000000000007",
+                version: 1,
+                displayName: "Kendall",
+                role: "steward",
+                matchedPersonId: null,
+                invitationId: null,
+                status: "not_invited",
+              },
+            ],
           }),
         }),
       ).kind,
@@ -114,22 +124,19 @@ describe("family onboarding policy", () => {
         state({
           selectedHousehold: household({
             intakeVersion: 2,
-            coordinatorDisposition: "proposed",
-            proposedCoordinatorName: "Kendall",
-            childRosterReviewed: true,
-            childRosterReviewedByPersonId: personId,
-          }),
-        }),
-      ).kind,
-    ).toBe("coordinator_invite");
-    expect(
-      projectFamilyOnboardingStep(
-        state({
-          selectedHousehold: household({
-            intakeVersion: 3,
-            coordinatorDisposition: "proposed",
-            proposedCoordinatorName: "Kendall",
-            coordinatorInvitationResolved: true,
+            adultRosterReviewed: true,
+            adultRosterReviewedByPersonId: personId,
+            adults: [
+              {
+                id: "10000000-0000-4000-8000-000000000007",
+                version: 1,
+                displayName: "Kendall",
+                role: "steward",
+                matchedPersonId: null,
+                invitationId: null,
+                status: "not_invited",
+              },
+            ],
             childRosterReviewed: true,
             childRosterReviewedByPersonId: personId,
           }),
@@ -142,9 +149,9 @@ describe("family onboarding policy", () => {
     const shared = household({
       role: "steward",
       intakeVersion: 4,
-      coordinatorDisposition: "proposed",
-      proposedCoordinatorName: "Kendall",
-      coordinatorInvitationResolved: true,
+      adultRosterReviewed: true,
+      adultRosterReviewedByPersonId: "10000000-0000-4000-8000-000000000006",
+      adults: [],
       childRosterReviewed: true,
       childRosterReviewedByPersonId: "10000000-0000-4000-8000-000000000006",
     });
@@ -174,5 +181,34 @@ describe("family onboarding policy", () => {
         }),
       ).kind,
     ).toBe("review");
+  });
+
+  it("keeps an early caregiver on a private branch until shared context is ready", () => {
+    const earlyCaregiver = household({
+      role: "caregiver",
+      intakeVersion: 1,
+      adultRosterReviewed: true,
+      adultRosterReviewedByPersonId: "10000000-0000-4000-8000-000000000006",
+      childRosterReviewed: false,
+      childRosterReviewedByPersonId: null,
+    });
+
+    expect(projectFamilyOnboardingStep(state({ selectedHousehold: earlyCaregiver })).kind).toBe("google");
+    expect(
+      projectFamilyOnboardingStep(
+        state({
+          selectedHousehold: { ...earlyCaregiver, googleDecision: "limited" },
+        }),
+      ).kind,
+    ).toBe("review");
+
+    const sharedContextReady = {
+      ...earlyCaregiver,
+      childRosterReviewed: true,
+      childRosterReviewedByPersonId: "10000000-0000-4000-8000-000000000006",
+    };
+    expect(projectFamilyOnboardingStep(state({ selectedHousehold: sharedContextReady })).kind).toBe(
+      "review_shared_context",
+    );
   });
 });

@@ -29,9 +29,8 @@ export type OnboardingStep =
   | "confirm_profile"
   | "create_household"
   | "choose_household"
-  | "coordinator"
+  | "adults"
   | "children"
-  | "coordinator_invite"
   | "review_shared_context"
   | "google"
   | "review"
@@ -61,10 +60,16 @@ export interface OnboardingView {
       membershipOnboarding: number;
     };
     sharedIntakeComplete: boolean;
-    coordinator: {
-      disposition: "undecided" | "solo" | "deferred" | "proposed" | "pending" | "active";
-      proposedName: string | null;
-    };
+    adultRosterReviewed: boolean;
+    adults: {
+      id: string;
+      version: number;
+      displayName: string;
+      role: "steward" | "caregiver";
+      matchedPersonId: string | null;
+      invitationId: string | null;
+      progress: "not_connected" | "awaiting_steward_approval" | "awaiting_acceptance" | "joined";
+    }[];
     children: {
       id: string;
       name: string;
@@ -108,6 +113,14 @@ export interface PeopleView {
     viewerRole: FamilyRole;
     canInvite: boolean;
     canAddDependent: boolean;
+    plannedAdults: {
+      id: string;
+      version: number;
+      displayName: string;
+      role: "steward" | "caregiver";
+      matchedPersonId: string | null;
+      progress: "not_connected" | "awaiting_steward_approval" | "awaiting_acceptance" | "joined";
+    }[];
     members: {
       id: string;
       name: string;

@@ -19,6 +19,7 @@ export interface PrivateSourceEffectFrontier {
 export interface AuthorizedEffectInput extends AuthorityFence {
   readonly actionIntentId?: string;
   readonly actorPersonId?: string;
+  readonly personOnboarding?: { readonly version: number };
   readonly participantEpochId?: string;
   readonly expectedParticipantDigest?: string;
   readonly coverageLoop?: { readonly id: string; readonly version: number };
@@ -87,6 +88,7 @@ interface ExistingEffectRow {
   readonly household_control_epoch: number | string | null;
   readonly person_id: string | null;
   readonly person_control_epoch: number | string | null;
+  readonly person_onboarding_version: number | string | null;
   readonly conversation_id: string | null;
   readonly conversation_authority_version: number | string | null;
   readonly participant_epoch_id: string | null;
@@ -136,6 +138,7 @@ interface EffectSourceLockTarget {
   readonly authorization_decision_id: string;
   readonly household_id: string | null;
   readonly person_id: string | null;
+  readonly person_onboarding_version: number | string | null;
   readonly conversation_id: string | null;
   readonly integration_id: string | null;
   readonly coverage_loop_id: string | null;
@@ -189,7 +192,7 @@ export class EffectOutbox {
       const existingRows = await transaction<ExistingEffectRow[]>`
         select effect.id, effect.status, effect.effect_kind, effect.action_intent_id,
           effect.household_id, effect.household_control_epoch,
-          effect.person_id, effect.person_control_epoch,
+          effect.person_id, effect.person_control_epoch, effect.person_onboarding_version,
           effect.conversation_id, effect.conversation_authority_version,
           effect.participant_epoch_id, effect.expected_participant_digest,
           effect.integration_id, effect.integration_control_epoch,
@@ -319,7 +322,8 @@ export class EffectOutbox {
           evidence_source_revision_ids,
           effect_kind, idempotency_key,
           payload_digest, payload_ciphertext, payload_key_version, status, available_at,
-          person_control_epoch, household_control_epoch, conversation_authority_version
+          person_control_epoch, person_onboarding_version,
+          household_control_epoch, conversation_authority_version
         ) values (
           ${outboxId}, ${decisionId}, ${input.actionIntentId ?? null},
           ${input.household?.id ?? null}, ${input.person?.id ?? null},
@@ -342,6 +346,7 @@ export class EffectOutbox {
           ${input.effectKind}, ${input.idempotencyKey},
           ${payloadDigest}, ${Buffer.from(JSON.stringify(encrypted), "utf8")}, ${encrypted.kid},
           'pending', ${now}, ${input.person?.controlEpoch ?? null},
+          ${input.personOnboarding?.version ?? null},
           ${input.household?.controlEpoch ?? null}, ${input.conversation?.authorityVersion ?? null}
         )
       `;
@@ -376,12 +381,22 @@ export class EffectOutbox {
           and effect.available_at <= ${now}
           and (effect.status <> 'leased' or effect.lease_expires_at <= ${now})
           and decision.outcome = 'allow' and decision.revoked_at is null and decision.expires_at > ${now}
+          and (effect.routine_pattern_candidate_id is null or exists (
+            select 1 from knowledge_candidates routine_candidate
+            where routine_candidate.id = effect.routine_pattern_candidate_id
+              and routine_candidate.scope_kind = 'conversation'
+              and routine_candidate.candidate_kind = 'routine_pattern'
+              and routine_candidate.status = 'pending' and routine_candidate.expires_at > ${now}
+          ))
           and (
             cardinality(effect.evidence_source_revision_ids) = 0
             or decision.expires_at > ${new Date(now.getTime() + 3 * 60_000)}
           )
           and (effect.person_id is null or (
             person.status = 'registered' and person.control_epoch = effect.person_control_epoch
+          ))
+          and (effect.person_onboarding_version is null or person_onboarding_fence_is_current(
+            effect.person_id, effect.person_onboarding_version
           ))
           and (effect.household_id is null or household.control_epoch = effect.household_control_epoch)
           and (effect.integration_id is null or (
@@ -407,6 +422,10 @@ export class EffectOutbox {
             and invitation_source.current_epoch_id = invitation.source_participant_epoch_id
             and invitation_epoch.ended_at is null
             and invitation_epoch.participant_set_digest = invitation.source_participant_digest
+            and not exists (
+              select 1 from invitation_approvals approval
+              where approval.invitation_id = invitation.id and approval.approved_at is null
+            )
           ))
           and (effect.recipient_identity_id is null or (
             recipient_identity.status in ('observed', 'pending_claim', 'verified')
@@ -548,12 +567,14 @@ export class EffectOutbox {
     now?: Date,
   ): Promise<GuardedSubmissionResult<Result>> {
     return inTransaction(this.database, async (transaction) => {
+      const authorizedAt = now ?? new Date();
       // Discover advisory-lock identity without first taking the outbox row
       // lock. The authoritative query below requires these exact same values,
       // so a concurrent cancellation or unsupported fence mutation fails closed.
       const targets = await transaction<EffectSourceLockTarget[]>`
         select candidate.authorization_decision_id, candidate.household_id,
-          candidate.person_id, candidate.conversation_id, candidate.integration_id,
+          candidate.person_id, candidate.person_onboarding_version,
+          candidate.conversation_id, candidate.integration_id,
           candidate.coverage_loop_id, candidate.invitation_id,
           candidate.recipient_identity_id, candidate.source_conversation_id,
           invitation.household_id as invitation_household_id,
@@ -584,7 +605,6 @@ export class EffectOutbox {
         });
       }
       await lockEffectSubmissionAuthority(transaction, target);
-      const authorizedAt = now ?? new Date();
       const rows = await transaction<{ readonly id: string }[]>`
         select candidate.id
         from outbox candidate
@@ -611,6 +631,8 @@ export class EffectOutbox {
           and candidate.authorization_decision_id = ${target.authorization_decision_id}
           and candidate.household_id is not distinct from ${target.household_id}::uuid
           and candidate.person_id is not distinct from ${target.person_id}::uuid
+          and candidate.person_onboarding_version is not distinct from
+            ${target.person_onboarding_version}::bigint
           and candidate.conversation_id is not distinct from ${target.conversation_id}::uuid
           and candidate.integration_id is not distinct from ${target.integration_id}::uuid
           and candidate.coverage_loop_id is not distinct from ${target.coverage_loop_id}::uuid
@@ -628,12 +650,23 @@ export class EffectOutbox {
             ${target.private_source_case_key_digest}::text
           and decision.outcome = 'allow' and decision.revoked_at is null
           and decision.expires_at > ${authorizedAt}
+          and (candidate.routine_pattern_candidate_id is null or exists (
+            select 1 from knowledge_candidates routine_candidate
+            where routine_candidate.id = candidate.routine_pattern_candidate_id
+              and routine_candidate.scope_kind = 'conversation'
+              and routine_candidate.candidate_kind = 'routine_pattern'
+              and routine_candidate.status = 'pending'
+              and routine_candidate.expires_at > ${authorizedAt}
+          ))
           and (
             cardinality(candidate.evidence_source_revision_ids) = 0
             or decision.expires_at > ${new Date(authorizedAt.getTime() + 3 * 60_000)}
           )
           and (candidate.person_id is null or (
             person.status = 'registered' and person.control_epoch = candidate.person_control_epoch
+          ))
+          and (candidate.person_onboarding_version is null or person_onboarding_fence_is_current(
+            candidate.person_id, candidate.person_onboarding_version
           ))
           and (candidate.household_id is null or (
             household.status in ('onboarding', 'active', 'paused')
@@ -662,6 +695,10 @@ export class EffectOutbox {
             and invitation_source.current_epoch_id = invitation.source_participant_epoch_id
             and invitation_epoch.ended_at is null
             and invitation_epoch.participant_set_digest = invitation.source_participant_digest
+            and not exists (
+              select 1 from invitation_approvals approval
+              where approval.invitation_id = invitation.id and approval.approved_at is null
+            )
           ))
           and (candidate.recipient_identity_id is null or (
             recipient_identity.status in ('observed', 'pending_claim', 'verified')
@@ -903,12 +940,22 @@ export class EffectOutbox {
           )
           and effect.action_intent_id is null
           and decision.outcome = 'allow' and decision.revoked_at is null and decision.expires_at > ${now}
+          and (effect.routine_pattern_candidate_id is null or exists (
+            select 1 from knowledge_candidates routine_candidate
+            where routine_candidate.id = effect.routine_pattern_candidate_id
+              and routine_candidate.scope_kind = 'conversation'
+              and routine_candidate.candidate_kind = 'routine_pattern'
+              and routine_candidate.status = 'pending' and routine_candidate.expires_at > ${now}
+          ))
           and (
             cardinality(effect.evidence_source_revision_ids) = 0
             or decision.expires_at > ${new Date(now.getTime() + 3 * 60_000)}
           )
           and (effect.person_id is null or (
             person.status = 'registered' and person.control_epoch = effect.person_control_epoch
+          ))
+          and (effect.person_onboarding_version is null or person_onboarding_fence_is_current(
+            effect.person_id, effect.person_onboarding_version
           ))
           and (effect.household_id is null or (
             household.status in ('onboarding', 'active', 'paused')
@@ -935,6 +982,10 @@ export class EffectOutbox {
             and invitation_source.current_epoch_id = invitation.source_participant_epoch_id
             and invitation_epoch.ended_at is null
             and invitation_epoch.participant_set_digest = invitation.source_participant_digest
+            and not exists (
+              select 1 from invitation_approvals approval
+              where approval.invitation_id = invitation.id and approval.approved_at is null
+            )
           ))
           and (effect.recipient_identity_id is null or (
             recipient_identity.status in ('observed', 'pending_claim', 'verified')
@@ -1012,10 +1063,11 @@ export class EffectOutbox {
             private_source_frontier_id, private_source_frontier_version,
             private_source_frontier_digest, private_source_generation,
             private_source_case_key_digest,
-            evidence_source_revision_ids,
+            evidence_source_revision_ids, routine_pattern_candidate_id,
             effect_kind, idempotency_key, payload_digest, payload_ciphertext, payload_key_version,
             status, attempt_count, reconciliation_attempt_count, available_at,
-            person_control_epoch, household_control_epoch, conversation_authority_version,
+            person_control_epoch, person_onboarding_version,
+            household_control_epoch, conversation_authority_version,
             created_at, updated_at
           )
           select ${randomUUID()}, ${decisionId}, effect.action_intent_id, effect.household_id,
@@ -1030,10 +1082,11 @@ export class EffectOutbox {
             effect.source_conversation_authority_version, effect.private_source_frontier_id,
             effect.private_source_frontier_version, effect.private_source_frontier_digest,
             effect.private_source_generation, effect.private_source_case_key_digest,
-            effect.evidence_source_revision_ids,
+            effect.evidence_source_revision_ids, effect.routine_pattern_candidate_id,
             effect.effect_kind, ${idempotencyKey},
             effect.payload_digest, effect.payload_ciphertext, effect.payload_key_version,
-            'pending', 0, 0, ${now}, effect.person_control_epoch, effect.household_control_epoch,
+            'pending', 0, 0, ${now}, effect.person_control_epoch,
+            effect.person_onboarding_version, effect.household_control_epoch,
             effect.conversation_authority_version, ${now}, ${now}
           from outbox effect
           where effect.id = ${candidate.id} and effect.status = 'dead'
@@ -1048,7 +1101,8 @@ export class EffectOutbox {
 
   /** Removes effects that can no longer be claimed so queue health reflects reality. */
   public async cancelStale(now = new Date()): Promise<number> {
-    const rows = await this.database<{ readonly id: string }[]>`
+    return inTransaction(this.database, async (transaction) => {
+      const rows = await transaction<{ readonly id: string }[]>`
       update outbox effect set status = 'cancelled', lease_owner = null, lease_token = null,
         lease_expires_at = null, last_error_code = 'authority_fence_changed', updated_at = ${now}
       where effect.status in ('pending', 'retry', 'leased') and (
@@ -1065,6 +1119,9 @@ export class EffectOutbox {
         or (effect.person_id is not null and not exists (
           select 1 from people person where person.id = effect.person_id
             and person.status = 'registered' and person.control_epoch = effect.person_control_epoch
+        ))
+        or (effect.person_onboarding_version is not null and not person_onboarding_fence_is_current(
+          effect.person_id, effect.person_onboarding_version
         ))
         or (effect.household_id is not null and not exists (
           select 1 from households household where household.id = effect.household_id
@@ -1106,6 +1163,10 @@ export class EffectOutbox {
             and source.status = 'active' and source.current_epoch_id = epoch.id
             and epoch.ended_at is null
             and epoch.participant_set_digest = invitation.source_participant_digest
+            and not exists (
+              select 1 from invitation_approvals approval
+              where approval.invitation_id = invitation.id and approval.approved_at is null
+            )
         ))
         or (effect.recipient_identity_id is not null and not exists (
           select 1
@@ -1138,6 +1199,13 @@ export class EffectOutbox {
             and source_frontier.source_generation = effect.private_source_generation
             and source_frontier.reconciled_generation = effect.private_source_generation
         ))
+        or (effect.routine_pattern_candidate_id is not null and not exists (
+          select 1 from knowledge_candidates routine_candidate
+          where routine_candidate.id = effect.routine_pattern_candidate_id
+            and routine_candidate.scope_kind = 'conversation'
+            and routine_candidate.candidate_kind = 'routine_pattern'
+            and routine_candidate.status = 'pending' and routine_candidate.expires_at > ${now}
+        ))
         or not source_evidence_set_is_current(
           effect.evidence_source_revision_ids,
           effect.source_participant_epoch_id,
@@ -1146,8 +1214,9 @@ export class EffectOutbox {
         )
       )
       returning id
-    `;
-    return rows.length;
+      `;
+      return rows.length;
+    });
   }
 }
 
@@ -1276,6 +1345,13 @@ async function lockEffectSubmissionAuthority(
   if (target.person_id !== null) {
     await transaction`select id from people where id = ${target.person_id} for share`;
   }
+  if (target.person_id !== null && target.person_onboarding_version !== null) {
+    await transaction`
+      select person_id from person_onboarding
+      where person_id = ${target.person_id}
+      for share
+    `;
+  }
 
   if (target.coverage_loop_id !== null) {
     await transaction`select id from coverage_loops where id = ${target.coverage_loop_id} for share`;
@@ -1389,6 +1465,7 @@ function sameEffectIdentity(
     sameVersion(existing.household_control_epoch, input.household?.controlEpoch) &&
     existing.person_id === (input.person?.id ?? null) &&
     sameVersion(existing.person_control_epoch, input.person?.controlEpoch) &&
+    sameVersion(existing.person_onboarding_version, input.personOnboarding?.version) &&
     existing.conversation_id === (input.conversation?.id ?? null) &&
     sameVersion(existing.conversation_authority_version, input.conversation?.authorityVersion) &&
     existing.participant_epoch_id === (input.participantEpochId ?? null) &&
@@ -1460,6 +1537,14 @@ function sameStringSet(left: readonly string[], right: readonly string[]): boole
 
 function validateEffectScope(input: AuthorizedEffectInput): void {
   const evidenceSourceRevisionIds = [...(input.evidenceSourceRevisionIds ?? [])];
+  if (
+    input.personOnboarding &&
+    (!input.person ||
+      !Number.isSafeInteger(input.personOnboarding.version) ||
+      input.personOnboarding.version < 1)
+  ) {
+    throw new Error("Onboarding reminder effects require an exact person and positive version");
+  }
   if (
     input.integration &&
     (!Number.isSafeInteger(input.integration.controlEpoch) || input.integration.controlEpoch < 1)

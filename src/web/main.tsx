@@ -531,6 +531,7 @@ function PeoplePage({ viewer }: { viewer: Viewer }) {
   const [actionError, setActionError] = useState<string | null>(null);
   const [inviteRoles, setInviteRoles] = useState<Record<string, "steward" | "caregiver" | "participant">>({});
   const [inviteNames, setInviteNames] = useState<Record<string, string>>({});
+  const [plannedAdultSelections, setPlannedAdultSelections] = useState<Record<string, string>>({});
   const [dependentDrafts, setDependentDrafts] = useState<Record<string, DependentDraft>>({});
 
   async function runAction(
@@ -779,6 +780,125 @@ function PeoplePage({ viewer }: { viewer: Viewer }) {
               })}
             </div>
           </div>
+
+          {household.canInvite && household.plannedAdults.some((adult) => adult.progress !== "joined") ? (
+            <div className="family-subsection">
+              <div className="family-section-heading">
+                <div>
+                  <h4>Connect the people you listed</h4>
+                  <p>
+                    Florence only connects a name after you choose their exact identity from a shared iMessage
+                    group. You can leave anyone for later.
+                  </p>
+                </div>
+              </div>
+              <div className="family-candidates">
+                {household.plannedAdults
+                  .filter((adult) => adult.progress !== "joined")
+                  .map((adult) => {
+                    const actionKey = `planned-adult:${adult.id}`;
+                    const selectedIdentityId = plannedAdultSelections[adult.id] ?? "";
+                    const availableParticipants = household.eligibleParticipants.filter(
+                      (candidate) =>
+                        !household.plannedAdults.some(
+                          (other) => other.id !== adult.id && other.matchedPersonId === candidate.personId,
+                        ),
+                    );
+                    const participant = availableParticipants.find(
+                      (candidate) => candidate.identityId === selectedIdentityId,
+                    );
+                    if (adult.progress !== "not_connected") {
+                      return (
+                        <div className="family-candidate" key={adult.id}>
+                          <div>
+                            <strong>{adult.displayName}</strong>
+                            <span>
+                              {adult.role === "steward" ? "Parent or co-parent" : "Babysitter or caregiver"}
+                            </span>
+                          </div>
+                          <span className="status-pill">
+                            {adult.progress === "awaiting_steward_approval"
+                              ? "Waiting for parent approval"
+                              : "Invitation sent"}
+                          </span>
+                        </div>
+                      );
+                    }
+                    return (
+                      <div className="family-candidate" key={adult.id}>
+                        <div>
+                          <strong>{adult.displayName}</strong>
+                          <span>
+                            {adult.role === "steward" ? "Parent or co-parent" : "Babysitter or caregiver"}
+                          </span>
+                        </div>
+                        <select
+                          aria-label={`Exact iMessage identity for ${adult.displayName}`}
+                          value={selectedIdentityId}
+                          onChange={(event) =>
+                            setPlannedAdultSelections((current) => ({
+                              ...current,
+                              [adult.id]: event.target.value,
+                            }))
+                          }
+                        >
+                          <option value="">Choose from a shared group</option>
+                          {availableParticipants.map((candidate) => (
+                            <option key={`${adult.id}:${candidate.identityId}`} value={candidate.identityId}>
+                              {candidate.name}
+                            </option>
+                          ))}
+                        </select>
+                        <button
+                          type="button"
+                          className="quiet-button"
+                          disabled={!participant || busy === actionKey}
+                          onClick={() => {
+                            if (!participant) return;
+                            const path = `/api/onboarding/adults/${adult.id}/invite`;
+                            const body = {
+                              householdId: household.id,
+                              conversationId: participant.conversationId,
+                              expectedParticipantEpochId: participant.participantEpochId,
+                              expectedParticipantDigest: participant.participantDigest,
+                              inviteeIdentityId: participant.identityId,
+                              inviteePersonId: participant.personId,
+                              expectedIntentVersion: adult.version,
+                            };
+                            const success = `Florence privately invited ${adult.displayName}.`;
+                            void (adult.role === "steward"
+                              ? runProtectedAction(actionKey, path, body, success, {
+                                  purpose: "household_invitation",
+                                  context: {
+                                    action: "invite",
+                                    householdId: household.id,
+                                    onboardingAdultIntentId: adult.id,
+                                    onboardingAdultIntentVersion: String(adult.version),
+                                    conversationId: participant.conversationId,
+                                    expectedParticipantEpochId: participant.participantEpochId,
+                                    expectedParticipantDigest: participant.participantDigest,
+                                    inviteeIdentityId: participant.identityId,
+                                    inviteePersonId: participant.personId,
+                                    proposedDisplayName: adult.displayName,
+                                    role: "steward",
+                                  },
+                                })
+                              : runAction(actionKey, path, body, success));
+                          }}
+                        >
+                          Connect
+                        </button>
+                      </div>
+                    );
+                  })}
+              </div>
+              {household.eligibleParticipants.length === 0 ? (
+                <p className="family-empty-line">
+                  Add Florence to an iMessage group with this person, then return here.
+                </p>
+              ) : null}
+            </div>
+          ) : null}
 
           {household.canAddDependent ? (
             <form

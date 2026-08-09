@@ -408,48 +408,92 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
       command: { kind: "select_onboarding_household", householdId: body.householdId },
     });
   });
-  app.post("/api/onboarding/coordinator", async (request) => {
+  app.post("/api/onboarding/adults", async (request) => {
     const principal = await requireWriteSession(request, config, auth);
     const body = z
       .strictObject({
         householdId: z.string().uuid(),
         expectedMembershipVersion: z.number().int().positive(),
         expectedIntakeVersion: z.number().int().nonnegative(),
-        disposition: z.enum(["solo", "deferred", "proposed"]),
-        proposedName: z.string().trim().min(1).max(80).nullable().default(null),
-      })
-      .superRefine((value, context) => {
-        if (value.disposition === "proposed" && value.proposedName === null) {
-          context.addIssue({
-            code: "custom",
-            message: "Tell Florence what to call the person you plan to invite",
-            path: ["proposedName"],
-          });
-        }
-        if (value.disposition !== "proposed" && value.proposedName !== null) {
-          context.addIssue({
-            code: "custom",
-            message: "Only a proposed coordinator can have a name",
-            path: ["proposedName"],
-          });
-        }
+        adults: z
+          .array(
+            z.strictObject({
+              id: z.string().uuid().optional(),
+              displayName: z.string().trim().min(1).max(80),
+              role: z.enum(["steward", "caregiver"]),
+            }),
+          )
+          .max(16),
       })
       .parse(request.body);
     return application.process({
       kind: "web.command",
       actorPersonId: principal.personId,
       command: {
-        kind: "set_onboarding_coordinator",
+        kind: "save_onboarding_adult_roster",
+        ...body,
+      },
+    });
+  });
+  app.post("/api/onboarding/adults/:intentId/invite", async (request) => {
+    const intentId = z
+      .string()
+      .uuid()
+      .parse((request.params as { intentId?: unknown }).intentId);
+    const body = z
+      .strictObject({
+        householdId: z.string().uuid(),
+        conversationId: z.string().uuid(),
+        expectedParticipantEpochId: z.string().uuid(),
+        expectedParticipantDigest: z.string().regex(/^[a-f0-9]{64}$/u),
+        inviteeIdentityId: z.string().uuid(),
+        inviteePersonId: z.string().uuid(),
+        expectedIntentVersion: z.number().int().positive(),
+      })
+      .parse(request.body);
+    const principal = await requireWriteSession(request, config, auth);
+    const projection = await database.begin(
+      "isolation level repeatable read read only",
+      async (transaction) =>
+        familyOnboarding.project(transaction, {
+          actorPersonId: principal.personId,
+          personId: principal.personId,
+        }),
+    );
+    const household = projection.household;
+    if (!household || household.householdId !== body.householdId) {
+      throw new UnauthorizedError("That family is no longer available for onboarding");
+    }
+    const adult = household.adults.find((candidate) => candidate.id === intentId);
+    if (!adult) throw new NotFoundError("That family adult is no longer part of setup");
+    if (adult.version !== body.expectedIntentVersion) {
+      throw new ConflictError("That family adult changed before the invitation was prepared");
+    }
+    if (adult.role === "steward") {
+      verifyExactStepUp(principal, "household_invitation", {
+        action: "invite",
         householdId: body.householdId,
-        expectedMembershipVersion: body.expectedMembershipVersion,
-        expectedIntakeVersion: body.expectedIntakeVersion,
-        disposition:
-          body.disposition === "solo"
-            ? "just_me"
-            : body.disposition === "deferred"
-              ? "invite_later"
-              : "proposed",
-        proposedName: body.proposedName,
+        onboardingAdultIntentId: intentId,
+        onboardingAdultIntentVersion: String(body.expectedIntentVersion),
+        conversationId: body.conversationId,
+        expectedParticipantEpochId: body.expectedParticipantEpochId,
+        expectedParticipantDigest: body.expectedParticipantDigest,
+        inviteeIdentityId: body.inviteeIdentityId,
+        inviteePersonId: body.inviteePersonId,
+        proposedDisplayName: adult.displayName,
+        role: "steward",
+      });
+    }
+    return application.process({
+      kind: "web.command",
+      actorPersonId: principal.personId,
+      command: {
+        kind: "invite_household_participant",
+        ...body,
+        proposedDisplayName: adult.displayName,
+        role: adult.role,
+        onboardingAdultIntentId: intentId,
+        onboardingAdultIntentVersion: body.expectedIntentVersion,
       },
     });
   });
@@ -466,21 +510,6 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
       kind: "web.command",
       actorPersonId: principal.personId,
       command: { kind: "mark_onboarding_children_reviewed", ...body },
-    });
-  });
-  app.post("/api/onboarding/coordinator-defer", async (request) => {
-    const principal = await requireWriteSession(request, config, auth);
-    const body = z
-      .strictObject({
-        householdId: z.string().uuid(),
-        expectedMembershipVersion: z.number().int().positive(),
-        expectedIntakeVersion: z.number().int().positive(),
-      })
-      .parse(request.body);
-    return application.process({
-      kind: "web.command",
-      actorPersonId: principal.personId,
-      command: { kind: "defer_onboarding_coordinator_invite", ...body },
     });
   });
   app.post("/api/onboarding/shared-review", async (request) => {
@@ -514,7 +543,7 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
       .strictObject({
         householdId: z.string().uuid(),
         expectedMembershipVersion: z.number().int().positive(),
-        expectedIntakeVersion: z.number().int().positive(),
+        expectedIntakeVersion: z.number().int().nonnegative(),
         expectedMembershipOnboardingVersion: z.number().int().nonnegative(),
         expectedProfileReviewVersion: z.number().int().positive(),
       })
@@ -534,8 +563,17 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
   app.get("/api/people", async (request, reply) => {
     const principal = await requireSession(request, config, auth);
     await requireCompletedOnboarding(database, principal.personId);
+    const [people, projection] = await Promise.all([
+      queries.people(principal.personId),
+      database.begin("isolation level repeatable read read only", async (transaction) =>
+        familyOnboarding.project(transaction, {
+          actorPersonId: principal.personId,
+          personId: principal.personId,
+        }),
+      ),
+    ]);
     reply.header("Cache-Control", "private, no-store, max-age=0");
-    return queries.people(principal.personId);
+    return projectPeopleAdultIntents(people, projection);
   });
   app.get("/api/chats", async (request) => {
     const principal = await requireSession(request, config, auth);
@@ -596,6 +634,8 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
             inviteePersonId: body.inviteePersonId,
             proposedDisplayName: body.proposedDisplayName,
             role: "steward",
+            onboardingAdultIntentId: "",
+            onboardingAdultIntentVersion: "",
           })
         : await requireWriteSession(request, config, auth);
     return application.process({
@@ -946,7 +986,10 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
           "This family invitation is no longer current because the group or family changed. Ask for a fresh introduction.",
       });
     }
-    return { receipt, redirect: "/people" };
+    return {
+      receipt,
+      redirect: "/people",
+    };
   });
   app.get("/api/safety/export", async (request, reply) => {
     const principal = await requireStepUpSession(request, config, auth, "account_controls");
@@ -1167,11 +1210,13 @@ function projectOnboardingView(
   const branch = onboardingBranch(projection);
   const step = projection.nextStep.kind;
   const household = projection.household;
+  const mayReadSharedIntake =
+    household?.role === "steward" ||
+    household?.sharedContextReviewed === true ||
+    step === "review_shared_context";
   if (household && !selectedPeople) {
     throw new UnauthorizedError("That family is no longer available for onboarding");
   }
-  const hasOtherActiveAdult =
-    selectedPeople?.members.some((member) => !member.self && member.role !== "dependent") ?? false;
   return {
     completed: household?.completed ?? false,
     branch,
@@ -1195,18 +1240,28 @@ function projectOnboardingView(
               membershipOnboarding: household.membershipOnboardingVersion,
             },
             sharedIntakeComplete: household.childRosterReviewed,
-            coordinator: {
-              disposition: onboardingCoordinatorDisposition(household, hasOtherActiveAdult),
-              proposedName: household.proposedCoordinatorName,
-            },
-            children: household.children.map((child) => ({
-              id: child.personId,
-              name: child.displayName,
-              aliases: [...child.aliases],
-              birthYear: child.birthYear,
-              school: child.school || null,
-              activities: [...child.activities],
-            })),
+            adultRosterReviewed: household.adultRosterReviewed,
+            adults: mayReadSharedIntake
+              ? household.adults.map((adult) => ({
+                  id: adult.id,
+                  version: adult.version,
+                  displayName: adult.displayName,
+                  role: adult.role,
+                  matchedPersonId: adult.matchedPersonId,
+                  invitationId: adult.invitationId,
+                  progress: onboardingAdultProgress(adult, people),
+                }))
+              : [],
+            children: mayReadSharedIntake
+              ? household.children.map((child) => ({
+                  id: child.personId,
+                  name: child.displayName,
+                  aliases: [...child.aliases],
+                  birthYear: child.birthYear,
+                  school: child.school || null,
+                  activities: [...child.activities],
+                }))
+              : [],
           }
         : null,
     householdChoices: projection.householdChoices.map((choice) => {
@@ -1233,6 +1288,32 @@ function projectOnboardingView(
   };
 }
 
+export function projectPeopleAdultIntents(
+  people: PeopleView,
+  projection: FamilyOnboardingProjection,
+): PeopleView {
+  const selected = projection.household;
+  if (!selected) return people;
+  return {
+    ...people,
+    households: people.households.map((household) =>
+      household.id === selected.householdId && household.canInvite
+        ? {
+            ...household,
+            plannedAdults: selected.adults.map((adult) => ({
+              id: adult.id,
+              version: adult.version,
+              displayName: adult.displayName,
+              role: adult.role,
+              matchedPersonId: adult.matchedPersonId,
+              progress: onboardingAdultProgress(adult, people),
+            })),
+          }
+        : household,
+    ),
+  };
+}
+
 function onboardingBranch(projection: FamilyOnboardingProjection): OnboardingView["branch"] {
   const selected = projection.household;
   if (selected?.role !== "steward") return selected ? "caregiver" : "starter";
@@ -1242,18 +1323,17 @@ function onboardingBranch(projection: FamilyOnboardingProjection): OnboardingVie
   return anotherPersonAddedSharedContext ? "invited_adult" : "starter";
 }
 
-function onboardingCoordinatorDisposition(
-  household: NonNullable<FamilyOnboardingProjection["household"]>,
-  hasOtherActiveAdult: boolean,
-): NonNullable<OnboardingView["household"]>["coordinator"]["disposition"] {
-  if (household.coordinatorDisposition === "unanswered") return "undecided";
-  if (household.coordinatorDisposition === "just_me") return "solo";
-  if (household.coordinatorDisposition === "invite_later" || household.coordinatorInviteDeferred) {
-    return "deferred";
+function onboardingAdultProgress(
+  adult: NonNullable<FamilyOnboardingProjection["household"]>["adults"][number],
+  people: PeopleView,
+): NonNullable<OnboardingView["household"]>["adults"][number]["progress"] {
+  if (adult.status === "joined") return "joined";
+  if (adult.status === "not_invited") return "not_connected";
+  const invitation = people.invitations.find((candidate) => candidate.id === adult.invitationId);
+  if (adult.role === "steward" && invitation?.action === "approve") {
+    return "awaiting_steward_approval";
   }
-  if (hasOtherActiveAdult) return "active";
-  if (household.coordinatorInvitationResolved) return "pending";
-  return "proposed";
+  return "awaiting_acceptance";
 }
 
 function onboardingProgress(
@@ -1274,16 +1354,16 @@ function onboardingProgress(
   const current =
     step === "confirm_profile"
       ? 1
-      : step === "create_household" || step === "choose_household" || step === "coordinator"
+      : step === "create_household" || step === "choose_household" || step === "adults"
         ? 2
         : step === "children"
           ? 3
-          : step === "coordinator_invite" || step === "review_shared_context"
+          : step === "review_shared_context"
             ? 4
             : step === "google"
-              ? 5
-              : 6;
-  return { current, total: 6 };
+              ? 4
+              : 5;
+  return { current, total: 5 };
 }
 
 function requirePendingHouseholdInvitationAction(
@@ -1328,6 +1408,10 @@ async function confirmHouseholdInvitationAction(input: {
         inviteePersonId: action.inviteePersonId,
         proposedDisplayName: action.proposedDisplayName,
         role: action.role,
+        onboardingAdultIntentId: action.onboardingAdultIntentId || null,
+        onboardingAdultIntentVersion: action.onboardingAdultIntentVersion
+          ? Number(action.onboardingAdultIntentVersion)
+          : null,
       },
     });
   }
@@ -1370,8 +1454,8 @@ async function requireCompletedOnboarding(database: Database, personId: string):
         and household.status in ('onboarding', 'active')
       join membership_capabilities read_capability on read_capability.membership_id = membership.id
         and read_capability.capability = 'household.read' and read_capability.status = 'active'
-      join membership_onboarding onboarding on onboarding.membership_id = membership.id
-      where selection.person_id = ${personId} and onboarding.completed_at is not null
+      where selection.person_id = ${personId}
+        and family_membership_onboarding_is_current(membership.id)
     ) as completed
   `;
   if (!rows[0]?.completed) {

@@ -17,10 +17,9 @@ function household(overrides: Partial<FamilyOnboardingHousehold> = {}): FamilyOn
     role: "steward",
     timezone: "America/Los_Angeles",
     intakeVersion: 0,
-    coordinatorDisposition: "unanswered",
-    proposedCoordinatorName: null,
-    coordinatorInvitationResolved: false,
-    coordinatorInviteDeferred: false,
+    adultRosterReviewed: false,
+    adultRosterReviewedByPersonId: null,
+    adults: [],
     childRosterReviewed: false,
     childRosterReviewedByPersonId: null,
     children: [],
@@ -70,12 +69,12 @@ describe("private onboarding guidance", () => {
   it("uses canonical family intake before optional Google for open-ended guidance", () => {
     const result = projectGuidance({
       personControlEpoch: 3,
-      projection: projection({ kind: "coordinator", householdId, expectedVersion: 0 }),
+      projection: projection({ kind: "adults", householdId, expectedVersion: 0 }),
       householdControlEpoch: 4,
     });
 
     expect(result.recommendedNextStep).toEqual({
-      kind: "coordinator",
+      kind: "adults",
       action: "onboarding_handoff",
       returnPath: "/onboarding",
     });

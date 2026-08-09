@@ -72,8 +72,8 @@ export class PostgresFlorenceQueries {
             and household.status in ('onboarding', 'active')
           join membership_capabilities read_capability on read_capability.membership_id = membership.id
             and read_capability.capability = 'household.read' and read_capability.status = 'active'
-          join membership_onboarding onboarding on onboarding.membership_id = membership.id
-          where selection.person_id = person.id and onboarding.completed_at is not null
+          where selection.person_id = person.id
+            and family_membership_onboarding_is_current(membership.id)
         ) as onboarding_completed
       from people person
       where person.id = ${personId} and person.status = 'registered'
@@ -716,6 +716,7 @@ export class PostgresFlorenceQueries {
           joined_at: Date;
           roster_version: number | string;
           intake_version: number | string;
+          viewer_shared_context_reviewed: boolean;
         }[]
       >`
         select member.person_id, member.role, person.status as person_status,
@@ -723,7 +724,20 @@ export class PostgresFlorenceQueries {
           profile.birth_year, profile.school_ciphertext,
           profile.activities_ciphertext, member.joined_at,
           household.membership_version as roster_version,
-          coalesce(intake.version, 0) as intake_version
+          coalesce(intake.version, 0) as intake_version,
+          coalesce(
+            intake.child_roster_reviewed_at is not null and exists(
+              select 1
+              from household_memberships viewer_context_membership
+              join membership_onboarding viewer_context
+                on viewer_context.membership_id = viewer_context_membership.id
+              where viewer_context_membership.household_id = household.id
+                and viewer_context_membership.person_id = ${personId}
+                and viewer_context_membership.status = 'active'
+                and viewer_context.shared_context_household_intake_version = intake.version
+            ),
+            false
+          ) as viewer_shared_context_reviewed
         from household_memberships member
         join households household on household.id = member.household_id
         left join household_onboarding_intakes intake on intake.household_id = household.id
@@ -735,6 +749,10 @@ export class PostgresFlorenceQueries {
       `;
       const rosterAuthority = memberRows[0];
       if (!rosterAuthority) throw new Error("Family roster authority is unavailable");
+      const visibleMemberRows =
+        household.viewer_role !== "steward" && !rosterAuthority.viewer_shared_context_reviewed
+          ? memberRows.filter((member) => member.role !== "dependent")
+          : memberRows;
       const eligibleRows = canInvite
         ? await this.database<
             {
@@ -821,7 +839,11 @@ export class PostgresFlorenceQueries {
         viewerRole: relationshipRole(household.viewer_role),
         canInvite,
         canAddDependent,
-        members: memberRows.map((member) => ({
+        // Exact adult-intent state is projected by the onboarding authority in
+        // the authenticated /api/people route. The scoped people query owns
+        // only the household roster and exact eligible group participants.
+        plannedAdults: [],
+        members: visibleMemberRows.map((member) => ({
           id: member.person_id,
           name:
             member.person_id === personId

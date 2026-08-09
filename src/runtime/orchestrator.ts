@@ -23,7 +23,13 @@ import {
   type ConversationAuthoritySnapshot,
   PostgresConversationAuthority,
 } from "../modules/conversations/index.js";
-import { type CoverageLoop, PostgresCoordination } from "../modules/coordination/index.js";
+import {
+  type CoverageLoop,
+  isConversationRoutinePatternMessage,
+  PostgresConversationalRoutines,
+  PostgresCoordination,
+  selectCurrentRoutinePatternHolder,
+} from "../modules/coordination/index.js";
 import { EffectOutbox } from "../modules/effects/index.js";
 import {
   requireWorkerProposal,
@@ -241,6 +247,15 @@ export class FlorenceOrchestrator {
       };
     }
 
+    const replyTargetRoutineCandidateId = await this.loadReplyTargetRoutinePatternCandidateId(context);
+    if (replyTargetRoutineCandidateId) {
+      const routineResponse = await this.tryRoutinePatternConfirmation(
+        context,
+        replyTargetRoutineCandidateId,
+      );
+      if (routineResponse) return routineResponse;
+    }
+
     const replyTargetLoopId = await this.loadReplyTargetCoverageLoopId(context);
     const acknowledgment = await this.tryExplicitCoverageResponse(context, replyTargetLoopId);
     if (acknowledgment) return acknowledgment;
@@ -295,6 +310,19 @@ export class FlorenceOrchestrator {
       budget: { maxModelCalls: 1, maxOutputTokens: 1_500 },
     });
     const needProposal = await this.requireProposal(need);
+
+    const routinePatternDisposition = await this.tryConversationRoutinePattern(
+      context,
+      needProposal,
+      householdContext,
+    );
+    if (routinePatternDisposition) {
+      await this.workers.reconcile(
+        need.attemptId,
+        routinePatternDisposition.includes("stale") ? "stale" : "accepted",
+      );
+      return routinePatternDisposition;
+    }
 
     if (needProposal.disposition === "propose_coverage") {
       let disposition: string;
@@ -1335,6 +1363,167 @@ export class FlorenceOrchestrator {
       if (canAttachImage) imageBytes += bytes.length;
     }
     return output;
+  }
+
+  private async loadReplyTargetRoutinePatternCandidateId(context: MessageContext): Promise<string | null> {
+    if (context.event?.eventType !== "linq.message.received") return null;
+    const providerMessageId = context.event.message.replyTo?.providerMessageId;
+    if (!providerMessageId) return null;
+    const rows = await this.database<{ readonly candidate_id: string }[]>`
+      select distinct effect.routine_pattern_candidate_id as candidate_id
+      from effect_receipts receipt
+      join outbox effect on effect.id = receipt.outbox_id
+      join knowledge_candidates candidate on candidate.id = effect.routine_pattern_candidate_id
+        and candidate.scope_kind = 'conversation' and candidate.candidate_kind = 'routine_pattern'
+      where receipt.provider_receipt_id = ${providerMessageId}
+        and receipt.status in ('submitted', 'confirmed')
+        and effect.status in ('submitted', 'confirmed')
+        and effect.effect_kind = 'linq.message'
+        and effect.conversation_id = ${context.record.routing.conversationId}
+        and effect.participant_epoch_id = ${context.record.routing.participantEpochId}
+        and effect.expected_participant_digest = ${context.record.routing.appParticipantDigest}
+        and candidate.status = 'pending' and candidate.expires_at > now()
+      order by effect.routine_pattern_candidate_id
+      limit 2
+    `;
+    return rows.length === 1 ? (rows[0]?.candidate_id ?? null) : null;
+  }
+
+  private async tryRoutinePatternConfirmation(
+    context: MessageContext,
+    candidateId: string,
+  ): Promise<string | null> {
+    const personId = context.record.routing.senderPersonId;
+    if (!personId || !context.requestingPerson || !this.mutationProcessor) return null;
+    const candidate = await new PostgresConversationalRoutines(this.database, this.secretBox).load(
+      candidateId,
+    );
+    if (candidate.status !== "pending") return null;
+
+    try {
+      const receipt = await this.mutationProcessor.process({
+        kind: "linq.routine_pattern_confirmation",
+        internalProviderEventId: context.row.id,
+        candidateId,
+      });
+      return receipt.disposition;
+    } catch (error) {
+      if (error instanceof StaleAuthorityError || error instanceof UnauthorizedError) {
+        return "routine_pattern_confirmation_stale";
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * First release deliberately stays in one exact writable household epoch.
+   * If the proposed holder is absent, Florence creates no candidate and sends
+   * no cross-chat prompt; ordinary coverage coordination continues unchanged.
+   */
+  private async tryConversationRoutinePattern(
+    context: MessageContext,
+    interpretation: (typeof PRODUCT_SKILLS.needInterpret.outputSchema)["_output"],
+    householdContext: AuthorizedHouseholdContextProjection | null,
+  ): Promise<string | null> {
+    if (
+      context.record.routing.chatKind !== "group" ||
+      !context.household ||
+      !context.requestingPerson ||
+      !isConversationRoutinePatternMessage(context.text)
+    ) {
+      return null;
+    }
+    const currentPeople = context.snapshot.participants.flatMap((participant) =>
+      participant.personId ? [participant.personId] : [],
+    );
+    if (currentPeople.length < 2) return null;
+    const labels = await this.loadCurrentParticipantLabels(currentPeople);
+    let commitment: WorkerResult<(typeof PRODUCT_SKILLS.commitmentPropose.outputSchema)["_output"]>;
+    let proposal: (typeof PRODUCT_SKILLS.commitmentPropose.outputSchema)["_output"];
+    try {
+      commitment = await this.workers.run({
+        attemptId: randomUUID(),
+        taskVersionId: randomUUID(),
+        authority: messageWorkerAuthority(context, true),
+        skill: PRODUCT_SKILLS.commitmentPropose,
+        authorizedContext: [
+          `Current instant: ${new Date().toISOString()}`,
+          `Household time zone: ${context.household.timezone}`,
+          `Current exact destination participant person IDs: ${currentPeople.join(", ")}`,
+          `Current participant label-to-person-ID map: ${JSON.stringify(labels)}`,
+          ...(householdContext
+            ? [
+                `Authorized normalized household context for this exact destination (bounded): ${JSON.stringify(householdContext)}`,
+              ]
+            : []),
+          `Coverage interpretation: ${JSON.stringify({
+            requiredOutcome: interpretation.requiredOutcome,
+            timeFacts: interpretation.timeFacts,
+            uncertainties: interpretation.uncertainties,
+          })}`,
+          "The original message itself contains a recurring weekly cue. Propose the recurring responsibility's minimum shared meaning, exact current-participant holder, and wall-clock timing. Do not claim it is accepted.",
+          `Message: ${context.text}`,
+          `Exact source revision ID: ${context.sourceRevisionId}`,
+        ].join("\n"),
+        ...(context.images.length > 0 ? { images: context.images } : {}),
+        goal: "Propose bounded recurring responsibility semantics for holder confirmation; do not create coverage or a routine.",
+        deadline: new Date(Date.now() + 45_000),
+        budget: { maxModelCalls: 1, maxOutputTokens: 1_200 },
+      });
+      proposal = await this.requireProposal(commitment);
+    } catch (error) {
+      if (error instanceof WorkerAttemptError) return null;
+      throw error;
+    }
+    const proposedHolderPersonId = selectCurrentRoutinePatternHolder(
+      proposal.proposedPersonId,
+      currentPeople,
+    );
+    if (!proposedHolderPersonId) {
+      await this.workers.reconcile(commitment.attemptId, "accepted");
+      return null;
+    }
+    const sourceEvidence = proposal.evidence.find(
+      (citation) => citation.sourceRevisionId === context.sourceRevisionId,
+    );
+    if (!sourceEvidence) {
+      await this.workers.reconcile(commitment.attemptId, "rejected");
+      return null;
+    }
+    if (!this.mutationProcessor) {
+      await this.workers.reconcile(commitment.attemptId, "rejected");
+      return null;
+    }
+    try {
+      const receipt = await this.mutationProcessor.process({
+        kind: "linq.routine_pattern_proposal",
+        internalProviderEventId: context.row.id,
+        proposal: {
+          title: proposal.outcome.slice(0, 200),
+          minimumSharedMeaning: proposal.outcome,
+          semanticTiming: proposal.semanticTiming,
+          timeZone: proposal.timeZone,
+          eventAt: proposal.eventAt,
+          deadlineAt: proposal.deadlineAt,
+          proposedHolderPersonId,
+          evidence: [sourceEvidence],
+          uncertainties: proposal.unresolvedFacts,
+          confidence: proposal.confidence,
+        },
+      });
+      await this.workers.reconcile(
+        commitment.attemptId,
+        receipt.disposition.includes("stale") ? "stale" : "accepted",
+      );
+      return receipt.disposition === "routine_pattern_not_specific_enough" ? null : receipt.disposition;
+    } catch (error) {
+      await this.workers.reconcile(
+        commitment.attemptId,
+        error instanceof StaleAuthorityError ? "stale" : "rejected",
+      );
+      if (error instanceof StaleAuthorityError || error instanceof UnauthorizedError) return null;
+      throw error;
+    }
   }
 
   private async loadReplyTargetCoverageLoopId(context: MessageContext): Promise<string | null> {

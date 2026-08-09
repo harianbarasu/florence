@@ -78,6 +78,7 @@ function existingEffect(input: AuthorizedEffectInput, status: string) {
     household_control_epoch: null,
     person_id: null,
     person_control_epoch: null,
+    person_onboarding_version: null,
     conversation_id: null,
     conversation_authority_version: null,
     participant_epoch_id: null,

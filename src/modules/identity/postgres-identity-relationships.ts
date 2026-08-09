@@ -536,6 +536,15 @@ export class PostgresIdentityRelationships implements IdentityRelationships {
             updated_at = ${acceptedAt}
         where id = ${invitation.household_id}
       `;
+      await rebaseCurrentPendingInvitationsAfterMembershipAcceptance(transaction, {
+        householdId: invitation.household_id,
+        previousMembershipVersion: Number(invitation.current_membership_version),
+        nextMembershipVersion: Number(invitation.current_membership_version) + 1,
+        acceptedInvitationId: input.invitationId,
+        acceptedMembershipId: membershipId,
+        acceptedMembershipRole: invitation.requested_role,
+        acceptedAt,
+      });
       return HouseholdMembershipSchema.parse({
         membershipId,
         householdId: invitation.household_id,
@@ -783,6 +792,120 @@ async function loadActiveMembership(
     capabilities: membership.capabilities,
     version: Number(membership.version),
   });
+}
+
+/**
+ * Accepting one independently prepared adult must not invalidate every other
+ * exact-current adult invitation. Rebase only invitations whose inviter,
+ * target, source epoch, evidence, expiry, and delegated grants are still
+ * current. A newly joined steward becomes an additional required approver for
+ * any other pending co-steward invitation.
+ */
+async function rebaseCurrentPendingInvitationsAfterMembershipAcceptance(
+  transaction: Transaction,
+  input: {
+    readonly householdId: string;
+    readonly previousMembershipVersion: number;
+    readonly nextMembershipVersion: number;
+    readonly acceptedInvitationId: string;
+    readonly acceptedMembershipId: string;
+    readonly acceptedMembershipRole: string;
+    readonly acceptedAt: Date;
+  },
+): Promise<void> {
+  const rebased = await transaction<{ readonly invitation_id: string; readonly requested_role: string }[]>`
+    update invitations invitation
+    set household_membership_version = ${input.nextMembershipVersion},
+      updated_at = ${input.acceptedAt}
+    from household_memberships inviter
+    where invitation.household_id = ${input.householdId}
+      and invitation.id <> ${input.acceptedInvitationId}
+      and invitation.status = 'pending'
+      and invitation.expires_at > ${input.acceptedAt}
+      and invitation.household_membership_version = ${input.previousMembershipVersion}
+      and inviter.id = invitation.invited_by_membership_id
+      and inviter.household_id = invitation.household_id
+      and inviter.status = 'active'
+      and exists(
+        select 1 from membership_capabilities invite_grant
+        where invite_grant.membership_id = inviter.id
+          and invite_grant.capability = 'membership.invite'
+          and invite_grant.status = 'active'
+      )
+      and (
+        invitation.requested_role <> 'steward'
+        or exists(
+          select 1 from membership_capabilities govern_grant
+          where govern_grant.membership_id = inviter.id
+            and govern_grant.capability = 'household.govern'
+            and govern_grant.status = 'active'
+        )
+      )
+      and not exists(
+        select 1
+        from unnest(invitation.requested_capabilities) requested(capability)
+        where not exists(
+          select 1 from membership_capabilities delegated
+          where delegated.membership_id = inviter.id
+            and delegated.capability = requested.capability
+            and delegated.status = 'active'
+        )
+      )
+      and invitation.invitee_identity_id is not null
+      and exists(
+        select 1
+        from person_identities invitee_identity
+        join epoch_participants invitee_participant
+          on invitee_participant.person_identity_id = invitee_identity.id
+          and invitee_participant.person_id = invitee_identity.person_id
+          and invitee_participant.participant_epoch_id = invitation.source_participant_epoch_id
+        join conversations source_conversation
+          on source_conversation.id = invitation.source_conversation_id
+          and source_conversation.kind = 'group'
+          and source_conversation.status = 'active'
+          and source_conversation.current_epoch_id = invitation.source_participant_epoch_id
+        join participant_epochs source_epoch
+          on source_epoch.id = source_conversation.current_epoch_id
+          and source_epoch.ended_at is null
+          and source_epoch.participant_set_digest = invitation.source_participant_digest
+        where invitee_identity.id = invitation.invitee_identity_id
+          and invitee_identity.subject_digest = invitation.invitee_subject_digest
+          and invitee_identity.status in ('observed', 'verified')
+      )
+      and (
+        invitation.source_revision_id is null
+        or exists(
+          select 1
+          from source_revisions source_revision
+          join source_objects source_object on source_object.id = source_revision.source_object_id
+            and source_object.status = 'active'
+            and source_object.latest_revision_number = source_revision.revision_number
+          where source_revision.id = invitation.source_revision_id
+            and source_revision.participant_epoch_id = invitation.source_participant_epoch_id
+            and source_revision.revoked_at is null
+            and source_revision.retention_until > ${input.acceptedAt}
+        )
+      )
+      and not exists(
+        select 1
+        from person_identities invitee_identity
+        join household_memberships existing_member
+          on existing_member.person_id = invitee_identity.person_id
+          and existing_member.household_id = invitation.household_id
+          and existing_member.status = 'active'
+        where invitee_identity.id = invitation.invitee_identity_id
+      )
+    returning invitation.id as invitation_id, invitation.requested_role
+  `;
+  if (input.acceptedMembershipRole !== "steward") return;
+  for (const invitation of rebased) {
+    if (invitation.requested_role !== "steward") continue;
+    await transaction`
+      insert into invitation_approvals (invitation_id, approver_membership_id, approved_at)
+      values (${invitation.invitation_id}, ${input.acceptedMembershipId}, null)
+      on conflict (invitation_id, approver_membership_id) do nothing
+    `;
+  }
 }
 
 async function loadInvitation(transaction: Transaction, invitationId: string) {

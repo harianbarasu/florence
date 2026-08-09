@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { TransactionSql } from "postgres";
 import { z } from "zod";
 import type { SecretBox } from "../../shared/crypto.js";
@@ -7,17 +8,15 @@ export type FamilyOnboardingTransaction = TransactionSql<Record<string, never>>;
 
 const MAX_HOUSEHOLDS = 8;
 const MAX_CHILDREN = 16;
-
-export const CoordinatorDispositionSchema = z.enum(["unanswered", "just_me", "invite_later", "proposed"]);
-export type CoordinatorDisposition = z.infer<typeof CoordinatorDispositionSchema>;
+const MAX_ADULT_INTENTS = 16;
+const AdultIntentRoleSchema = z.enum(["steward", "caregiver"]);
 
 export type FamilyOnboardingStepKind =
   | "confirm_profile"
   | "create_household"
   | "choose_household"
-  | "coordinator"
+  | "adults"
   | "children"
-  | "coordinator_invite"
   | "review_shared_context"
   | "google"
   | "review"
@@ -39,6 +38,17 @@ export interface FamilyOnboardingChild {
   readonly activities: readonly string[];
 }
 
+export interface FamilyOnboardingAdultIntent {
+  readonly id: string;
+  readonly version: number;
+  readonly displayName: string;
+  readonly role: "steward" | "caregiver";
+  readonly matchedPersonId: string | null;
+  readonly invitationId: string | null;
+  /** Derived from canonical invitations and memberships; never stored on the intent. */
+  readonly status: "not_invited" | "invited" | "joined";
+}
+
 export interface FamilyOnboardingHousehold {
   readonly householdId: string;
   readonly membershipId: string;
@@ -46,10 +56,9 @@ export interface FamilyOnboardingHousehold {
   readonly role: "steward" | "caregiver" | "participant";
   readonly timezone: string;
   readonly intakeVersion: number;
-  readonly coordinatorDisposition: CoordinatorDisposition;
-  readonly proposedCoordinatorName: string | null;
-  readonly coordinatorInvitationResolved: boolean;
-  readonly coordinatorInviteDeferred: boolean;
+  readonly adultRosterReviewed: boolean;
+  readonly adultRosterReviewedByPersonId: string | null;
+  readonly adults: readonly FamilyOnboardingAdultIntent[];
   readonly childRosterReviewed: boolean;
   readonly childRosterReviewedByPersonId: string | null;
   readonly children: readonly FamilyOnboardingChild[];
@@ -83,13 +92,8 @@ export type FamilyOnboardingNextStep =
   | { readonly kind: "confirm_profile" }
   | { readonly kind: "create_household" }
   | { readonly kind: "choose_household" }
-  | { readonly kind: "coordinator"; readonly householdId: string; readonly expectedVersion: number }
+  | { readonly kind: "adults"; readonly householdId: string; readonly expectedVersion: number }
   | { readonly kind: "children"; readonly householdId: string; readonly expectedVersion: number }
-  | {
-      readonly kind: "coordinator_invite";
-      readonly householdId: string;
-      readonly expectedVersion: number;
-    }
   | {
       readonly kind: "review_shared_context";
       readonly householdId: string;
@@ -131,9 +135,34 @@ export function projectFamilyOnboardingStep(state: FamilyOnboardingPolicyState):
   }
   const household = state.selectedHousehold;
   if (household.completed) return { kind: "complete", householdId: household.householdId };
-  if (household.coordinatorDisposition === "unanswered") {
+  // Supporting adults complete only their private branch. They can review
+  // shared context once a steward has finished it, but they never receive
+  // onboarding steps that mutate the household's adult or child rosters.
+  if (household.role !== "steward") {
+    if (
+      household.childRosterReviewed &&
+      household.childRosterReviewedByPersonId !== state.personId &&
+      !household.sharedContextReviewed
+    ) {
+      return {
+        kind: "review_shared_context",
+        householdId: household.householdId,
+        expectedVersion: household.membershipOnboardingVersion,
+      };
+    }
+    if (household.googleDecision === null) {
+      return { kind: "google", householdId: household.householdId };
+    }
     return {
-      kind: "coordinator",
+      kind: "review",
+      householdId: household.householdId,
+      expectedIntakeVersion: household.intakeVersion,
+      expectedMembershipOnboardingVersion: household.membershipOnboardingVersion,
+    };
+  }
+  if (!household.adultRosterReviewed) {
+    return {
+      kind: "adults",
       householdId: household.householdId,
       expectedVersion: household.intakeVersion,
     };
@@ -141,17 +170,6 @@ export function projectFamilyOnboardingStep(state: FamilyOnboardingPolicyState):
   if (!household.childRosterReviewed) {
     return {
       kind: "children",
-      householdId: household.householdId,
-      expectedVersion: household.intakeVersion,
-    };
-  }
-  if (
-    household.coordinatorDisposition === "proposed" &&
-    !household.coordinatorInvitationResolved &&
-    !household.coordinatorInviteDeferred
-  ) {
-    return {
-      kind: "coordinator_invite",
       householdId: household.householdId,
       expectedVersion: household.intakeVersion,
     };
@@ -199,7 +217,7 @@ export interface FamilyOnboarding {
       readonly selectedAt: Date;
     },
   ): Promise<{ readonly version: number }>;
-  setCoordinator(
+  saveAdultRoster(
     transaction: FamilyOnboardingTransaction,
     input: {
       readonly actorPersonId: string;
@@ -207,9 +225,12 @@ export interface FamilyOnboarding {
       readonly householdId: string;
       readonly expectedMembershipVersion: number;
       readonly expectedIntakeVersion: number;
-      readonly disposition: Exclude<CoordinatorDisposition, "unanswered">;
-      readonly proposedCoordinatorName?: string;
-      readonly answeredAt: Date;
+      readonly adults: readonly {
+        readonly id?: string | undefined;
+        readonly displayName: string;
+        readonly role: "steward" | "caregiver";
+      }[];
+      readonly reviewedAt: Date;
     },
   ): Promise<{ readonly version: number }>;
   markChildRosterReviewed(
@@ -223,15 +244,33 @@ export interface FamilyOnboarding {
       readonly reviewedAt: Date;
     },
   ): Promise<{ readonly version: number }>;
-  deferCoordinatorInvite(
+  prepareAdultIntentInvitation(
     transaction: FamilyOnboardingTransaction,
     input: {
       readonly actorPersonId: string;
       readonly personId: string;
       readonly householdId: string;
       readonly expectedMembershipVersion: number;
-      readonly expectedIntakeVersion: number;
-      readonly deferredAt: Date;
+      readonly adultIntentId: string;
+      readonly expectedIntentVersion: number;
+      readonly proposedDisplayName: string;
+      readonly role: "steward" | "caregiver";
+      readonly matchedPersonId: string;
+      readonly preparedAt: Date;
+    },
+  ): Promise<{ readonly intentVersion: number }>;
+  bindAdultIntentInvitation(
+    transaction: FamilyOnboardingTransaction,
+    input: {
+      readonly actorPersonId: string;
+      readonly personId: string;
+      readonly householdId: string;
+      readonly expectedMembershipVersion: number;
+      readonly adultIntentId: string;
+      readonly expectedIntentVersion: number;
+      readonly matchedPersonId: string;
+      readonly invitationId: string;
+      readonly boundAt: Date;
     },
   ): Promise<{ readonly version: number }>;
   reviewSharedContext(
@@ -313,11 +352,21 @@ interface MembershipRow {
 }
 
 interface IntakeRow {
-  readonly coordinator_disposition: string;
-  readonly proposed_coordinator_name_ciphertext: Buffer | null;
-  readonly coordinator_invite_deferred_at: Date | null;
+  readonly adult_roster_reviewed_by_person_id: string | null;
+  readonly adult_roster_reviewed_at: Date | null;
   readonly child_roster_reviewed_by_person_id: string | null;
   readonly child_roster_reviewed_at: Date | null;
+  readonly version: number | string;
+}
+
+interface AdultIntentRow {
+  readonly id: string;
+  readonly display_name_ciphertext: Buffer;
+  readonly role: string;
+  readonly matched_person_id: string | null;
+  readonly invitation_id: string | null;
+  readonly invitation_current_pending: boolean;
+  readonly joined: boolean;
   readonly version: number | string;
 }
 
@@ -333,12 +382,8 @@ interface ChildRow {
 interface MembershipOnboardingRow {
   readonly version: number | string;
   readonly shared_context_household_intake_version: number | string | null;
+  readonly completed_household_intake_version: number | string | null;
   readonly completed_at: Date | null;
-}
-
-interface InvitationRow {
-  readonly id: string;
-  readonly proposed_display_name_ciphertext: Buffer | null;
 }
 
 /** PostgreSQL adapter for the family-onboarding seam. */
@@ -516,7 +561,7 @@ export class PostgresFamilyOnboarding implements FamilyOnboarding {
     return { version: Number(rows[0].version) };
   }
 
-  public async setCoordinator(
+  public async saveAdultRoster(
     transaction: FamilyOnboardingTransaction,
     inputCandidate: {
       readonly actorPersonId: string;
@@ -524,9 +569,12 @@ export class PostgresFamilyOnboarding implements FamilyOnboarding {
       readonly householdId: string;
       readonly expectedMembershipVersion: number;
       readonly expectedIntakeVersion: number;
-      readonly disposition: Exclude<CoordinatorDisposition, "unanswered">;
-      readonly proposedCoordinatorName?: string;
-      readonly answeredAt: Date;
+      readonly adults: readonly {
+        readonly id?: string | undefined;
+        readonly displayName: string;
+        readonly role: "steward" | "caregiver";
+      }[];
+      readonly reviewedAt: Date;
     },
   ): Promise<{ readonly version: number }> {
     const input = z
@@ -534,23 +582,24 @@ export class PostgresFamilyOnboarding implements FamilyOnboarding {
         ...exactHouseholdInputSchema.shape,
         expectedMembershipVersion: z.number().int().positive(),
         expectedIntakeVersion: z.number().int().nonnegative(),
-        disposition: CoordinatorDispositionSchema.exclude(["unanswered"]),
-        proposedCoordinatorName: z.string().trim().min(1).max(80).optional(),
-        answeredAt: z.date(),
+        adults: z
+          .array(
+            z.strictObject({
+              id: z.string().uuid().optional(),
+              displayName: z.string().trim().min(1).max(80),
+              role: AdultIntentRoleSchema,
+            }),
+          )
+          .max(MAX_ADULT_INTENTS),
+        reviewedAt: z.date(),
       })
       .superRefine((value, context) => {
-        if (value.disposition === "proposed" && !value.proposedCoordinatorName) {
+        const ids = value.adults.flatMap((adult) => (adult.id ? [adult.id] : []));
+        if (new Set(ids).size !== ids.length) {
           context.addIssue({
             code: "custom",
-            message: "A proposed coordinator needs a name",
-            path: ["proposedCoordinatorName"],
-          });
-        }
-        if (value.disposition !== "proposed" && value.proposedCoordinatorName) {
-          context.addIssue({
-            code: "custom",
-            message: "Only a proposed coordinator can have a name",
-            path: ["proposedCoordinatorName"],
+            message: "Each adult can appear only once in the onboarding roster",
+            path: ["adults"],
           });
         }
       })
@@ -560,46 +609,96 @@ export class PostgresFamilyOnboarding implements FamilyOnboarding {
     const current = await lockIntake(transaction, input.householdId);
     const currentVersion = Number(current?.version ?? 0);
     requireVersion(currentVersion, input.expectedIntakeVersion, "family intake");
-    const encrypted = input.proposedCoordinatorName
-      ? this.secretBox.encrypt(
-          input.proposedCoordinatorName,
-          `household-onboarding-proposed-coordinator:${input.householdId}`,
-        )
-      : null;
+    const existing = await lockAdultIntents(transaction, input.householdId);
+    const existingById = new Map(existing.map((intent) => [intent.id, intent] as const));
+    for (const adult of input.adults) {
+      if (adult.id && !existingById.has(adult.id)) {
+        throw new ConflictError("The adult roster changed before it was saved");
+      }
+    }
+
+    const retainedIds: string[] = [];
+    for (const adult of input.adults) {
+      const id = adult.id ?? randomUUID();
+      retainedIds.push(id);
+      const prior = existingById.get(id);
+      if (prior?.invitation_id) {
+        const priorName = openText(
+          this.secretBox,
+          prior.display_name_ciphertext,
+          `household-onboarding-adult-intent-name:${id}`,
+          80,
+        );
+        if (priorName !== adult.displayName || prior.role !== adult.role) {
+          throw new ConflictError("An invited adult cannot be renamed or assigned a different role");
+        }
+      }
+      const encryptedName = this.secretBox.encrypt(
+        adult.displayName,
+        `household-onboarding-adult-intent-name:${id}`,
+      );
+      if (prior) {
+        await transaction`
+          update household_onboarding_adult_intents
+          set display_name_ciphertext = ${Buffer.from(JSON.stringify(encryptedName), "utf8")},
+            display_name_key_version = ${encryptedName.kid}, role = ${adult.role},
+            recorded_by_person_id = ${input.actorPersonId}, version = version + 1,
+            updated_at = ${input.reviewedAt}
+          where id = ${id} and household_id = ${input.householdId}
+        `;
+      } else {
+        await transaction`
+          insert into household_onboarding_adult_intents (
+            id, household_id, display_name_ciphertext, display_name_key_version,
+            role, recorded_by_person_id, version, created_at, updated_at
+          ) values (
+            ${id}, ${input.householdId},
+            ${Buffer.from(JSON.stringify(encryptedName), "utf8")}, ${encryptedName.kid},
+            ${adult.role}, ${input.actorPersonId}, 1, ${input.reviewedAt}, ${input.reviewedAt}
+          )
+        `;
+      }
+    }
+    const removedIds = existing.map((intent) => intent.id).filter((id) => !retainedIds.includes(id));
+    if (
+      removedIds.some((id) => {
+        const intent = existingById.get(id);
+        return intent?.matched_person_id !== null || intent.invitation_id !== null;
+      })
+    ) {
+      throw new ConflictError("An invited adult cannot be removed from the onboarding roster");
+    }
+    if (removedIds.length > 0) {
+      await transaction`
+        delete from household_onboarding_adult_intents
+        where household_id = ${input.householdId}
+          and id = any(${transaction.array(removedIds)}::uuid[])
+      `;
+    }
+
     const version = currentVersion + 1;
     if (!current) {
       await transaction`
         insert into household_onboarding_intakes (
-          household_id, coordinator_disposition,
-          proposed_coordinator_name_ciphertext, proposed_coordinator_name_key_version,
-          coordinator_answered_by_person_id, coordinator_answered_at,
+          household_id, adult_roster_reviewed_by_person_id, adult_roster_reviewed_at,
           version, created_at, updated_at
         ) values (
-          ${input.householdId}, ${input.disposition},
-          ${encrypted ? Buffer.from(JSON.stringify(encrypted), "utf8") : null},
-          ${encrypted?.kid ?? null}, ${input.actorPersonId}, ${input.answeredAt},
-          ${version}, ${input.answeredAt}, ${input.answeredAt}
+          ${input.householdId}, ${input.actorPersonId}, ${input.reviewedAt},
+          ${version}, ${input.reviewedAt}, ${input.reviewedAt}
         )
       `;
     } else {
       const updated = await transaction<{ readonly version: number | string }[]>`
         update household_onboarding_intakes
-        set coordinator_disposition = ${input.disposition},
-          proposed_coordinator_name_ciphertext = ${
-            encrypted ? Buffer.from(JSON.stringify(encrypted), "utf8") : null
-          },
-          proposed_coordinator_name_key_version = ${encrypted?.kid ?? null},
-          coordinator_answered_by_person_id = ${input.actorPersonId},
-          coordinator_answered_at = ${input.answeredAt},
-          coordinator_invite_deferred_by_person_id = null,
-          coordinator_invite_deferred_at = null,
-          version = version + 1, updated_at = ${input.answeredAt}
+        set adult_roster_reviewed_by_person_id = ${input.actorPersonId},
+          adult_roster_reviewed_at = ${input.reviewedAt}, version = version + 1,
+          updated_at = ${input.reviewedAt}
         where household_id = ${input.householdId} and version = ${input.expectedIntakeVersion}
         returning version
       `;
       if (!updated[0]) throw new ConflictError("Your family intake changed before it was saved");
     }
-    await touchPersonProgress(transaction, input.personId, input.answeredAt);
+    await touchPersonProgress(transaction, input.personId, input.reviewedAt);
     return { version };
   }
 
@@ -625,8 +724,8 @@ export class PostgresFamilyOnboarding implements FamilyOnboarding {
     requireSelf(input.actorPersonId, input.personId);
     await requireAdultMembership(transaction, input, true, input.expectedMembershipVersion);
     const current = await lockIntake(transaction, input.householdId);
-    if (!current || current.coordinator_disposition === "unanswered") {
-      throw new ConflictError("Answer who coordinates this family before reviewing the children");
+    if (!current?.adult_roster_reviewed_at) {
+      throw new ConflictError("Review the adults who help this family before reviewing the children");
     }
     requireVersion(Number(current.version), input.expectedIntakeVersion, "family intake");
     const householdRows = await transaction<{ readonly membership_version: number | string }[]>`
@@ -663,42 +762,261 @@ export class PostgresFamilyOnboarding implements FamilyOnboarding {
     return { version: Number(rows[0].version) };
   }
 
-  public async deferCoordinatorInvite(
+  public async prepareAdultIntentInvitation(
     transaction: FamilyOnboardingTransaction,
     inputCandidate: {
       readonly actorPersonId: string;
       readonly personId: string;
       readonly householdId: string;
       readonly expectedMembershipVersion: number;
-      readonly expectedIntakeVersion: number;
-      readonly deferredAt: Date;
+      readonly adultIntentId: string;
+      readonly expectedIntentVersion: number;
+      readonly proposedDisplayName: string;
+      readonly role: "steward" | "caregiver";
+      readonly matchedPersonId: string;
+      readonly preparedAt: Date;
+    },
+  ): Promise<{ readonly intentVersion: number }> {
+    const input = z
+      .strictObject({
+        ...exactHouseholdInputSchema.shape,
+        expectedMembershipVersion: z.number().int().positive(),
+        adultIntentId: z.string().uuid(),
+        expectedIntentVersion: z.number().int().positive(),
+        proposedDisplayName: z.string().trim().min(1).max(80),
+        role: AdultIntentRoleSchema,
+        matchedPersonId: z.string().uuid(),
+        preparedAt: z.date(),
+      })
+      .parse(inputCandidate);
+    requireSelf(input.actorPersonId, input.personId);
+    await requireAdultMembership(transaction, input, true, input.expectedMembershipVersion);
+    const rows = await transaction<
+      {
+        readonly display_name_ciphertext: Buffer;
+        readonly role: string;
+        readonly matched_person_id: string | null;
+        readonly invitation_id: string | null;
+        readonly version: number | string;
+      }[]
+    >`
+      select display_name_ciphertext, role, matched_person_id, invitation_id, version
+      from household_onboarding_adult_intents
+      where id = ${input.adultIntentId} and household_id = ${input.householdId}
+      for update
+    `;
+    const intent = rows[0];
+    if (!intent) throw new NotFoundError("That onboarding adult is no longer in the family roster");
+    if (Number(intent.version) !== input.expectedIntentVersion) {
+      throw new ConflictError("The adult roster changed before the invitation was prepared");
+    }
+    const displayName = openText(
+      this.secretBox,
+      intent.display_name_ciphertext,
+      `household-onboarding-adult-intent-name:${input.adultIntentId}`,
+      80,
+    );
+    if (displayName !== input.proposedDisplayName || intent.role !== input.role) {
+      throw new ConflictError("The adult’s name or family role changed before the invitation was created");
+    }
+    if (!intent.invitation_id || !intent.matched_person_id) {
+      return { intentVersion: Number(intent.version) };
+    }
+    const bindings = await transaction<
+      {
+        readonly status: string;
+        readonly current_pending: boolean;
+        readonly joined: boolean;
+      }[]
+    >`
+      select invitation.status,
+        invitation.status = 'pending'
+          and invitation.expires_at > ${input.preparedAt}
+          and invitation.household_membership_version = household.membership_version
+          and invitation.requested_role = ${intent.role}
+          and identity.person_id = ${intent.matched_person_id}
+          and identity.status in ('observed', 'verified')
+          and exists(
+            select 1
+            from conversations source_conversation
+            join participant_epochs source_epoch
+              on source_epoch.id = source_conversation.current_epoch_id
+              and source_epoch.id = invitation.source_participant_epoch_id
+              and source_epoch.ended_at is null
+              and source_epoch.participant_set_digest = invitation.source_participant_digest
+            join epoch_participants source_invitee
+              on source_invitee.participant_epoch_id = source_epoch.id
+              and source_invitee.person_identity_id = invitation.invitee_identity_id
+              and source_invitee.person_id = identity.person_id
+            where source_conversation.id = invitation.source_conversation_id
+              and source_conversation.kind = 'group'
+              and source_conversation.status = 'active'
+          )
+          and (
+            invitation.source_revision_id is null
+            or exists(
+              select 1
+              from source_revisions source_revision
+              join source_objects source_object on source_object.id = source_revision.source_object_id
+                and source_object.status = 'active'
+                and source_object.latest_revision_number = source_revision.revision_number
+              where source_revision.id = invitation.source_revision_id
+                and source_revision.participant_epoch_id = invitation.source_participant_epoch_id
+                and source_revision.revoked_at is null
+                and source_revision.retention_until > ${input.preparedAt}
+            )
+          ) as current_pending,
+        invitation.status = 'accepted'
+          and invitation.accepted_by_person_id = ${intent.matched_person_id}
+          and invitation.requested_role = ${intent.role}
+          and identity.person_id = ${intent.matched_person_id}
+          and exists(
+            select 1 from household_memberships joined_membership
+            where joined_membership.household_id = invitation.household_id
+              and joined_membership.person_id = ${intent.matched_person_id}
+              and joined_membership.role = ${intent.role}
+              and joined_membership.status = 'active'
+          ) as joined
+      from invitations invitation
+      join households household on household.id = invitation.household_id
+      join person_identities identity on identity.id = invitation.invitee_identity_id
+      where invitation.id = ${intent.invitation_id}
+        and invitation.household_id = ${input.householdId}
+      for update of invitation
+    `;
+    const binding = bindings[0];
+    if (!binding) {
+      throw new ConflictError("The linked family invitation is no longer available");
+    }
+    if (binding.joined) {
+      throw new ConflictError("That family adult has already joined and cannot be rematched");
+    }
+    if (binding.current_pending && intent.matched_person_id === input.matchedPersonId) {
+      return { intentVersion: Number(intent.version) };
+    }
+    if (binding.status === "pending") {
+      await transaction`
+        update invitations
+        set status = 'revoked', updated_at = ${input.preparedAt}
+        where id = ${intent.invitation_id} and status = 'pending'
+      `;
+    }
+    const reset = await transaction<{ readonly version: number | string }[]>`
+      update household_onboarding_adult_intents
+      set matched_person_id = null, invitation_id = null,
+        version = version + 1, updated_at = ${input.preparedAt}
+      where id = ${input.adultIntentId} and household_id = ${input.householdId}
+        and version = ${input.expectedIntentVersion}
+      returning version
+    `;
+    if (!reset[0]) {
+      throw new ConflictError("The adult roster changed before the invitation was prepared");
+    }
+    return { intentVersion: Number(reset[0].version) };
+  }
+
+  public async bindAdultIntentInvitation(
+    transaction: FamilyOnboardingTransaction,
+    inputCandidate: {
+      readonly actorPersonId: string;
+      readonly personId: string;
+      readonly householdId: string;
+      readonly expectedMembershipVersion: number;
+      readonly adultIntentId: string;
+      readonly expectedIntentVersion: number;
+      readonly matchedPersonId: string;
+      readonly invitationId: string;
+      readonly boundAt: Date;
     },
   ): Promise<{ readonly version: number }> {
     const input = z
       .strictObject({
         ...exactHouseholdInputSchema.shape,
         expectedMembershipVersion: z.number().int().positive(),
-        expectedIntakeVersion: z.number().int().positive(),
-        deferredAt: z.date(),
+        adultIntentId: z.string().uuid(),
+        expectedIntentVersion: z.number().int().positive(),
+        matchedPersonId: z.string().uuid(),
+        invitationId: z.string().uuid(),
+        boundAt: z.date(),
       })
       .parse(inputCandidate);
     requireSelf(input.actorPersonId, input.personId);
     await requireAdultMembership(transaction, input, true, input.expectedMembershipVersion);
+    const intentRows = await transaction<
+      {
+        readonly display_name_ciphertext: Buffer;
+        readonly role: string;
+        readonly matched_person_id: string | null;
+        readonly invitation_id: string | null;
+        readonly version: number | string;
+      }[]
+    >`
+      select display_name_ciphertext, role, matched_person_id, invitation_id, version
+      from household_onboarding_adult_intents
+      where id = ${input.adultIntentId} and household_id = ${input.householdId}
+      for update
+    `;
+    const intent = intentRows[0];
+    if (!intent || Number(intent.version) !== input.expectedIntentVersion) {
+      throw new ConflictError("The adult roster changed before the invitation was linked");
+    }
+    const invitationRows = await transaction<
+      {
+        readonly household_id: string;
+        readonly invitee_person_id: string;
+        readonly requested_role: string;
+        readonly proposed_display_name_ciphertext: Buffer | null;
+        readonly status: string;
+      }[]
+    >`
+      select invitation.household_id, identity.person_id as invitee_person_id,
+        invitation.requested_role, invitation.proposed_display_name_ciphertext,
+        invitation.status
+      from invitations invitation
+      join person_identities identity on identity.id = invitation.invitee_identity_id
+      where invitation.id = ${input.invitationId}
+      for update of invitation
+    `;
+    const invitation = invitationRows[0];
+    const intentName = openText(
+      this.secretBox,
+      intent.display_name_ciphertext,
+      `household-onboarding-adult-intent-name:${input.adultIntentId}`,
+      80,
+    );
+    const invitationName = invitation?.proposed_display_name_ciphertext
+      ? openText(
+          this.secretBox,
+          invitation.proposed_display_name_ciphertext,
+          `invitation-proposed-display-name:${input.invitationId}`,
+          80,
+        )
+      : null;
+    if (
+      !invitation ||
+      invitation.household_id !== input.householdId ||
+      invitation.invitee_person_id !== input.matchedPersonId ||
+      invitation.requested_role !== intent.role ||
+      invitationName !== intentName ||
+      !["pending", "accepted"].includes(invitation.status)
+    ) {
+      throw new ConflictError("The exact family invitation no longer matches this onboarding adult");
+    }
+    if (intent.matched_person_id && intent.matched_person_id !== input.matchedPersonId) {
+      throw new ConflictError("That onboarding adult is already matched to someone else");
+    }
+    if (intent.matched_person_id === input.matchedPersonId && intent.invitation_id === input.invitationId) {
+      return { version: Number(intent.version) };
+    }
     const rows = await transaction<{ readonly version: number | string }[]>`
-      update household_onboarding_intakes
-      set coordinator_invite_deferred_by_person_id = ${input.actorPersonId},
-        coordinator_invite_deferred_at = ${input.deferredAt},
-        version = version + 1, updated_at = ${input.deferredAt}
-      where household_id = ${input.householdId}
-        and version = ${input.expectedIntakeVersion}
-        and coordinator_disposition = 'proposed'
-        and child_roster_reviewed_at is not null
+      update household_onboarding_adult_intents
+      set matched_person_id = ${input.matchedPersonId}, invitation_id = ${input.invitationId},
+        version = version + 1, updated_at = ${input.boundAt}
+      where id = ${input.adultIntentId} and household_id = ${input.householdId}
+        and version = ${input.expectedIntentVersion}
       returning version
     `;
-    if (!rows[0]) {
-      throw new ConflictError("The coordinator invitation step changed before it was deferred");
-    }
-    await touchPersonProgress(transaction, input.personId, input.deferredAt);
+    if (!rows[0]) throw new ConflictError("The adult roster changed before the invitation was linked");
     return { version: Number(rows[0].version) };
   }
 
@@ -737,8 +1055,35 @@ export class PostgresFamilyOnboarding implements FamilyOnboarding {
     const current = await lockMembershipOnboarding(transaction, membership.membershipId);
     const currentVersion = Number(current?.version ?? 0);
     requireVersion(currentVersion, input.expectedMembershipOnboardingVersion, "family membership onboarding");
-    if (current?.completed_at) return { version: currentVersion };
     const version = currentVersion + 1;
+    if (current?.completed_at) {
+      if (membership.role === "steward") {
+        throw new ConflictError("A completed parent setup cannot be reopened as a supporting adult review");
+      }
+      if (
+        Number(current.shared_context_household_intake_version ?? 0) === input.expectedIntakeVersion &&
+        Number(current.completed_household_intake_version ?? -1) === input.expectedIntakeVersion
+      ) {
+        return { version: currentVersion };
+      }
+      const reopened = await transaction<{ readonly version: number | string }[]>`
+        update membership_onboarding
+        set shared_context_reviewed_by_person_id = ${input.actorPersonId},
+          shared_context_household_intake_version = ${input.expectedIntakeVersion},
+          shared_context_reviewed_at = ${input.reviewedAt},
+          completed_by_person_id = null, completed_membership_version = null,
+          completed_profile_review_version = null, completed_household_intake_version = null,
+          completed_google_decision = null, completed_at = null,
+          version = version + 1, updated_at = ${input.reviewedAt}
+        where membership_id = ${membership.membershipId}
+          and version = ${input.expectedMembershipOnboardingVersion}
+          and completed_at is not null
+        returning version
+      `;
+      if (!reopened[0]) throw new ConflictError("Your family review changed before it was saved");
+      await touchPersonProgress(transaction, input.personId, input.reviewedAt);
+      return { version: Number(reopened[0].version) };
+    }
     if (!current) {
       await transaction`
         insert into membership_onboarding (
@@ -786,13 +1131,14 @@ export class PostgresFamilyOnboarding implements FamilyOnboarding {
         ...exactHouseholdInputSchema.shape,
         expectedMembershipVersion: z.number().int().positive(),
         expectedProfileReviewVersion: z.number().int().positive(),
-        expectedIntakeVersion: z.number().int().positive(),
+        expectedIntakeVersion: z.number().int().nonnegative(),
         expectedMembershipOnboardingVersion: z.number().int().nonnegative(),
         completedAt: z.date(),
       })
       .parse(inputCandidate);
     requireSelf(input.actorPersonId, input.personId);
-    let projection = await this.project(transaction, input);
+    const projectionInput = { actorPersonId: input.actorPersonId, personId: input.personId };
+    let projection = await this.project(transaction, projectionInput);
     if (
       projection.profile.selectedHouseholdId === null &&
       projection.householdChoices.length === 1 &&
@@ -805,7 +1151,7 @@ export class PostgresFamilyOnboarding implements FamilyOnboarding {
         expectedPersonOnboardingVersion: projection.profile.onboardingVersion,
         selectedAt: input.completedAt,
       });
-      projection = await this.project(transaction, input);
+      projection = await this.project(transaction, projectionInput);
     }
     const household = projection.household;
     if (!household || projection.nextStep.kind !== "review") {
@@ -982,12 +1328,80 @@ export class PostgresFamilyOnboarding implements FamilyOnboarding {
     membership: MembershipRow,
   ): Promise<FamilyOnboardingHousehold> {
     const intakes = await transaction<IntakeRow[]>`
-      select coordinator_disposition, proposed_coordinator_name_ciphertext,
-        coordinator_invite_deferred_at, child_roster_reviewed_by_person_id,
-        child_roster_reviewed_at, version
+      select adult_roster_reviewed_by_person_id, adult_roster_reviewed_at,
+        child_roster_reviewed_by_person_id, child_roster_reviewed_at, version
       from household_onboarding_intakes where household_id = ${membership.household_id}
     `;
     const intake = intakes[0];
+    const adultRows = await transaction<AdultIntentRow[]>`
+      select intent.id, intent.display_name_ciphertext, intent.role,
+        intent.matched_person_id, intent.invitation_id,
+        coalesce(
+          invitation.status = 'pending'
+            and invitation.expires_at > now()
+            and invitation.household_membership_version = household.membership_version
+            and invitation.requested_role = intent.role
+            and invited_identity.person_id = intent.matched_person_id
+            and invited_identity.status in ('observed', 'verified')
+            and exists(
+              select 1
+              from conversations source_conversation
+              join participant_epochs source_epoch
+                on source_epoch.id = source_conversation.current_epoch_id
+                and source_epoch.id = invitation.source_participant_epoch_id
+                and source_epoch.ended_at is null
+                and source_epoch.participant_set_digest = invitation.source_participant_digest
+              join epoch_participants source_invitee
+                on source_invitee.participant_epoch_id = source_epoch.id
+                and source_invitee.person_identity_id = invitation.invitee_identity_id
+                and source_invitee.person_id = invited_identity.person_id
+              where source_conversation.id = invitation.source_conversation_id
+                and source_conversation.kind = 'group'
+                and source_conversation.status = 'active'
+            )
+            and (
+              invitation.source_revision_id is null
+              or exists(
+                select 1
+                from source_revisions source_revision
+                join source_objects source_object on source_object.id = source_revision.source_object_id
+                  and source_object.status = 'active'
+                  and source_object.latest_revision_number = source_revision.revision_number
+                where source_revision.id = invitation.source_revision_id
+                  and source_revision.participant_epoch_id = invitation.source_participant_epoch_id
+                  and source_revision.revoked_at is null
+                  and source_revision.retention_until > now()
+              )
+            ),
+          false
+        ) as invitation_current_pending,
+        coalesce(
+          invitation.status = 'accepted'
+            and invitation.accepted_by_person_id = intent.matched_person_id
+            and invitation.requested_role = intent.role
+            and invited_identity.person_id = intent.matched_person_id
+            and exists(
+              select 1 from household_memberships joined_membership
+              where joined_membership.household_id = intent.household_id
+                and joined_membership.person_id = intent.matched_person_id
+                and joined_membership.role = intent.role
+                and joined_membership.status = 'active'
+            ),
+          false
+        ) as joined,
+        intent.version
+      from household_onboarding_adult_intents intent
+      join households household on household.id = intent.household_id
+      left join invitations invitation on invitation.id = intent.invitation_id
+        and invitation.household_id = intent.household_id
+      left join person_identities invited_identity on invited_identity.id = invitation.invitee_identity_id
+      where intent.household_id = ${membership.household_id}
+      order by intent.created_at, intent.id
+      limit ${MAX_ADULT_INTENTS + 1}
+    `;
+    if (adultRows.length > MAX_ADULT_INTENTS) {
+      throw new ConflictError("This family has too many adults for onboarding");
+    }
     const childRows = await transaction<ChildRow[]>`
       select child.id as person_id, child.display_name_ciphertext,
         profile.aliases_ciphertext, profile.birth_year,
@@ -1005,25 +1419,24 @@ export class PostgresFamilyOnboarding implements FamilyOnboarding {
       throw new ConflictError("This family has too many child profiles for onboarding");
     }
     const onboardingRows = await transaction<MembershipOnboardingRow[]>`
-      select version, shared_context_household_intake_version, completed_at
+      select version, shared_context_household_intake_version,
+        completed_household_intake_version, completed_at
       from membership_onboarding where membership_id = ${membership.membership_id}
     `;
     const membershipOnboarding = onboardingRows[0];
     const intakeVersion = Number(intake?.version ?? 0);
-    const proposedCoordinatorName = intake?.proposed_coordinator_name_ciphertext
-      ? openText(
-          this.secretBox,
-          intake.proposed_coordinator_name_ciphertext,
-          `household-onboarding-proposed-coordinator:${membership.household_id}`,
-          80,
-        )
-      : null;
-    const coordinatorInvitationResolved = await this.coordinatorInvitationResolved(
-      transaction,
-      personId,
-      membership.household_id,
-      proposedCoordinatorName,
-    );
+    const role = parseAdultRole(membership.role);
+    const childRosterReviewed = intake?.child_roster_reviewed_at !== null && intake !== undefined;
+    const sharedContextReviewed =
+      intakeVersion > 0 &&
+      Number(membershipOnboarding?.shared_context_household_intake_version ?? 0) === intakeVersion;
+    const completionIsCurrent =
+      membershipOnboarding?.completed_at !== null &&
+      membershipOnboarding !== undefined &&
+      (role === "steward" ||
+        !childRosterReviewed ||
+        (sharedContextReviewed &&
+          Number(membershipOnboarding.completed_household_intake_version ?? -1) === intakeVersion));
     const googleRows = await transaction<{ readonly connected: boolean; readonly suppressed: boolean }[]>`
       select exists(
         select 1 from integrations integration
@@ -1041,62 +1454,20 @@ export class PostgresFamilyOnboarding implements FamilyOnboarding {
       householdId: membership.household_id,
       membershipId: membership.membership_id,
       membershipVersion: Number(membership.membership_version),
-      role: parseAdultRole(membership.role),
+      role,
       timezone: membership.timezone,
       intakeVersion,
-      coordinatorDisposition: CoordinatorDispositionSchema.parse(
-        intake?.coordinator_disposition ?? "unanswered",
-      ),
-      proposedCoordinatorName,
-      coordinatorInvitationResolved,
-      coordinatorInviteDeferred: intake?.coordinator_invite_deferred_at !== null && intake !== undefined,
-      childRosterReviewed: intake?.child_roster_reviewed_at !== null && intake !== undefined,
+      adultRosterReviewed: intake?.adult_roster_reviewed_at !== null && intake !== undefined,
+      adultRosterReviewedByPersonId: intake?.adult_roster_reviewed_by_person_id ?? null,
+      adults: adultRows.map((adult) => hydrateAdultIntent(this.secretBox, adult)),
+      childRosterReviewed,
       childRosterReviewedByPersonId: intake?.child_roster_reviewed_by_person_id ?? null,
       children: childRows.map((child) => hydrateChild(this.secretBox, child)),
-      sharedContextReviewed:
-        intakeVersion > 0 &&
-        Number(membershipOnboarding?.shared_context_household_intake_version ?? 0) === intakeVersion,
+      sharedContextReviewed,
       membershipOnboardingVersion: Number(membershipOnboarding?.version ?? 0),
       googleDecision,
-      completed: membershipOnboarding?.completed_at !== null && membershipOnboarding !== undefined,
+      completed: completionIsCurrent,
     };
-  }
-
-  private async coordinatorInvitationResolved(
-    transaction: FamilyOnboardingTransaction,
-    personId: string,
-    householdId: string,
-    proposedCoordinatorName: string | null,
-  ): Promise<boolean> {
-    const otherAdults = await transaction<{ readonly present: boolean }[]>`
-      select exists(
-        select 1 from household_memberships membership
-        where membership.household_id = ${householdId}
-          and membership.person_id <> ${personId}
-          and membership.role <> 'dependent' and membership.status = 'active'
-      ) as present
-    `;
-    if (otherAdults[0]?.present) return true;
-    if (!proposedCoordinatorName) return false;
-    const invitations = await transaction<InvitationRow[]>`
-      select id, proposed_display_name_ciphertext
-      from invitations
-      where household_id = ${householdId}
-        and requested_role in ('steward', 'caregiver')
-        and status in ('pending', 'accepted')
-      order by created_at desc
-      limit 8
-    `;
-    return invitations.some((invitation) => {
-      if (!invitation.proposed_display_name_ciphertext) return false;
-      const name = openText(
-        this.secretBox,
-        invitation.proposed_display_name_ciphertext,
-        `invitation-proposed-display-name:${invitation.id}`,
-        80,
-      );
-      return name?.localeCompare(proposedCoordinatorName, "en-US", { sensitivity: "base" }) === 0;
-    });
   }
 }
 
@@ -1188,18 +1559,23 @@ async function requireAdultMembership(
   requireGovern: boolean,
   expectedMembershipVersion?: number,
   allowSelectionChange = false,
-): Promise<{ readonly membershipId: string; readonly version: number }> {
+): Promise<{
+  readonly membershipId: string;
+  readonly version: number;
+  readonly role: FamilyOnboardingHouseholdChoice["role"];
+}> {
   const rows = await transaction<
     {
       readonly membership_id: string;
       readonly version: number | string;
+      readonly role: string;
       readonly can_read: boolean;
       readonly can_govern: boolean;
       readonly active_membership_count: number | string;
       readonly selected_household_id: string | null;
     }[]
   >`
-    select membership.id as membership_id, membership.version,
+    select membership.id as membership_id, membership.version, membership.role,
       exists(
         select 1 from membership_capabilities capability
         where capability.membership_id = membership.id
@@ -1246,7 +1622,7 @@ async function requireAdultMembership(
   if (expectedMembershipVersion !== undefined) {
     requireVersion(version, expectedMembershipVersion, "family membership");
   }
-  return { membershipId: membership.membership_id, version };
+  return { membershipId: membership.membership_id, version, role: parseAdultRole(membership.role) };
 }
 
 async function lockIntake(
@@ -1254,13 +1630,89 @@ async function lockIntake(
   householdId: string,
 ): Promise<IntakeRow | undefined> {
   const rows = await transaction<IntakeRow[]>`
-    select coordinator_disposition, proposed_coordinator_name_ciphertext,
-      coordinator_invite_deferred_at, child_roster_reviewed_by_person_id,
-      child_roster_reviewed_at, version
+    select adult_roster_reviewed_by_person_id, adult_roster_reviewed_at,
+      child_roster_reviewed_by_person_id, child_roster_reviewed_at, version
     from household_onboarding_intakes where household_id = ${householdId}
     for update
   `;
   return rows[0];
+}
+
+async function lockAdultIntents(
+  transaction: FamilyOnboardingTransaction,
+  householdId: string,
+): Promise<AdultIntentRow[]> {
+  const rows = await transaction<AdultIntentRow[]>`
+    select intent.id, intent.display_name_ciphertext, intent.role,
+      intent.matched_person_id, intent.invitation_id,
+      coalesce(
+        invitation.status = 'pending'
+          and invitation.expires_at > now()
+          and invitation.household_membership_version = household.membership_version
+          and invitation.requested_role = intent.role
+          and invited_identity.person_id = intent.matched_person_id
+          and invited_identity.status in ('observed', 'verified')
+          and exists(
+            select 1
+            from conversations source_conversation
+            join participant_epochs source_epoch
+              on source_epoch.id = source_conversation.current_epoch_id
+              and source_epoch.id = invitation.source_participant_epoch_id
+              and source_epoch.ended_at is null
+              and source_epoch.participant_set_digest = invitation.source_participant_digest
+            join epoch_participants source_invitee
+              on source_invitee.participant_epoch_id = source_epoch.id
+              and source_invitee.person_identity_id = invitation.invitee_identity_id
+              and source_invitee.person_id = invited_identity.person_id
+            where source_conversation.id = invitation.source_conversation_id
+              and source_conversation.kind = 'group'
+              and source_conversation.status = 'active'
+          )
+          and (
+            invitation.source_revision_id is null
+            or exists(
+              select 1
+              from source_revisions source_revision
+              join source_objects source_object on source_object.id = source_revision.source_object_id
+                and source_object.status = 'active'
+                and source_object.latest_revision_number = source_revision.revision_number
+              where source_revision.id = invitation.source_revision_id
+                and source_revision.participant_epoch_id = invitation.source_participant_epoch_id
+                and source_revision.revoked_at is null
+                and source_revision.retention_until > now()
+            )
+          ),
+        false
+      ) as invitation_current_pending,
+      coalesce(
+        invitation.status = 'accepted'
+          and invitation.accepted_by_person_id = intent.matched_person_id
+          and invitation.requested_role = intent.role
+          and invited_identity.person_id = intent.matched_person_id
+          and exists(
+            select 1 from household_memberships joined_membership
+            where joined_membership.household_id = intent.household_id
+              and joined_membership.person_id = intent.matched_person_id
+              and joined_membership.role = intent.role
+              and joined_membership.status = 'active'
+          ),
+        false
+      ) as joined,
+      intent.version
+    from household_onboarding_adult_intents intent
+    join households household on household.id = intent.household_id
+    left join invitations invitation on invitation.id = intent.invitation_id
+      and invitation.household_id = intent.household_id
+    left join person_identities invited_identity on invited_identity.id = invitation.invitee_identity_id
+    where intent.household_id = ${householdId}
+    order by intent.created_at, intent.id
+    limit ${MAX_ADULT_INTENTS + 1}
+    for update of intent
+  `;
+  if (rows.length > MAX_ADULT_INTENTS) {
+    throw new ConflictError("This family has too many adults for onboarding");
+  }
+  return rows;
 }
 
 async function lockMembershipOnboarding(
@@ -1268,7 +1720,8 @@ async function lockMembershipOnboarding(
   membershipId: string,
 ): Promise<MembershipOnboardingRow | undefined> {
   const rows = await transaction<MembershipOnboardingRow[]>`
-    select version, shared_context_household_intake_version, completed_at
+    select version, shared_context_household_intake_version,
+      completed_household_intake_version, completed_at
     from membership_onboarding where membership_id = ${membershipId}
     for update
   `;
@@ -1315,6 +1768,24 @@ function hydrateChild(secretBox: SecretBox, row: ChildRow): FamilyOnboardingChil
       24,
       120,
     ),
+  };
+}
+
+function hydrateAdultIntent(secretBox: SecretBox, row: AdultIntentRow): FamilyOnboardingAdultIntent {
+  return {
+    id: row.id,
+    version: Number(row.version),
+    displayName:
+      openText(
+        secretBox,
+        row.display_name_ciphertext,
+        `household-onboarding-adult-intent-name:${row.id}`,
+        80,
+      ) ?? "Family member",
+    role: AdultIntentRoleSchema.parse(row.role),
+    matchedPersonId: row.matched_person_id,
+    invitationId: row.invitation_id,
+    status: row.joined ? "joined" : row.invitation_current_pending ? "invited" : "not_invited",
   };
 }
 

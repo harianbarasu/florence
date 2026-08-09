@@ -302,6 +302,7 @@ export class HouseholdOnboarding {
   public async acceptInvitation(input: {
     readonly actorPersonId: string;
     readonly invitationId: string;
+    readonly expectedHouseholdMembershipVersion: number;
     readonly acceptedAt: Date;
   }): Promise<HouseholdMembership> {
     return inTransaction(this.database, async (transaction) => {
@@ -314,6 +315,7 @@ export class HouseholdOnboarding {
         join person_identities identity on identity.id = invitation.invitee_identity_id
           and identity.person_id = ${input.actorPersonId} and identity.status = 'verified'
         where invitation.id = ${input.invitationId}
+          and invitation.household_membership_version = ${input.expectedHouseholdMembershipVersion}
         for update of invitation
       `;
       const invitation = invitations[0];

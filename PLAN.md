@@ -32,14 +32,16 @@ hard product decisions.
 - **User steps:** Florence establishes private consent and identity, then sends one resumable
   mobile-web onboarding handoff. The parent confirms their prefilled profile, describes who else
   helps coordinate the family, creates or resolves the household, and enters the children, aliases,
-  schools, and activities Florence should recognize. The parent may then bind an equal co-parent
-  from one exact observed iMessage group. Personal Google is offered after the family context is
-  saved, with an explicit limited-mode choice. Every accepted step is durable and resumes on any
-  browser or a fresh private link.
+  schools, and activities Florence should recognize. The parent may name any number of other adults
+  with one plain relationship label—such as Kendall as a parent and Jenny as a babysitter—then bind
+  each invitation independently to one exact observed iMessage participant. Personal Google is
+  offered after the family context is saved, with an explicit limited-mode choice. Every accepted
+  step is durable and resumes on any browser or a fresh private link.
 - **Visible states:** one focused onboarding decision per screen; saved progress; proposed, pending,
-  or accepted co-parent; Google connected, syncing, or skipped; and a final family review. The normal
-  web cockpit and navigation remain hidden until this person completes onboarding. Detailed source
-  and account controls appear only after launch.
+  invited, or accepted adult relationships; Google connected, syncing, or skipped; and a final
+  family review. Adult invitations are independent and never block launch. The normal web cockpit
+  and navigation remain hidden until this person completes onboarding. Detailed source and account
+  controls appear only after launch.
 - **Partial and error behavior:** declining Google does not block Florence and does not create generic
   nagging. Florence offers it again only when it directly enables requested help. Mail and Calendar
   capabilities fail independently. A work account defaults to Calendar-only unless the person
@@ -192,6 +194,18 @@ hard product decisions.
 24. **Onboarding reminders are bounded.** Florence privately resumes the exact saved step the next
     day and once more roughly three days later. She then waits for renewed family-help intent, and
     any “not now” instruction suppresses proactive reminders immediately.
+25. **Adult intake is plural and lightweight.** A parent may name any number of other adults with one
+    relationship label, such as parent/co-parent or babysitter/caregiver. These typed intents grant
+    nothing. Each real membership is independently bound to one exact observed identity and privately
+    accepted; pending adult invitations never block the starter.
+26. **Caregiver duties are learned, then confirmed.** Onboarding does not ask parents to preconfigure
+    children, weekdays, activities, or chats for every caregiver. Florence may infer a narrow
+    recurring pattern from authorized conversation, but it remains a private candidate until she
+    asks the exact proposed holder and that person explicitly confirms the exact pattern. An unrelated
+    yes, silence, or a parent's statement on the caregiver's behalf never creates standing authority.
+    The first complete release proposes a routine only in an eligible exact family/caregiver group
+    that already includes the proposed holder; it never reaches across chats or assigns a parent-only
+    conversation to an absent caregiver.
 
 ## Implementation Plan
 
@@ -217,20 +231,21 @@ hard product decisions.
   meanings.
 - Route the first and every later setup handoff to `/onboarding`. Render no cockpit navigation before
   this person's completion, and return OAuth to the same canonical step.
-- Build one responsive flow for mobile and desktop: confirm self; co-parent intent; repeatable child
-  roster; each child's school and activities; exact-participant invitation or defer; Google connect
-  or limited mode; final review and launch.
+- Build one responsive flow for mobile and desktop: confirm self; repeatable lightweight adult roster
+  with parent/co-parent or babysitter/caregiver roles; repeatable child roster; each child's school
+  and activities; independent exact-participant invitations or defer; Google connect or limited
+  mode; final review and launch.
 - Reuse shared intake for every adult. The first steward who confirms the child roster satisfies that
   household step; invited adults never re-enter it and complete only their private branch.
 - Schedule two private, context-aware resume reminders at safe local times. Recheck incomplete state
   and suppression at execution; never remind a group or blame another adult.
 - Keep every mutation behind `FlorenceApplication.process()`, protect shared edits with expected
   versions, and fail closed on stale relationship or invitation authority.
-- **Done when:** Jackson can start on his phone, leave and resume on another device, add Kendall's
-  intent and the children once, connect or skip Google, and enter Today without waiting; Kendall can
-  later claim the relationship, see the existing family summary, make only her own Google decision,
-  and enter Today; neither sees the cockpit early, and bounded reminders stop after completion or
-  “not now.”
+- **Done when:** Jackson can start on his phone, leave and resume on another device, add Kendall as a
+  parent and Jenny as a babysitter plus the children once, connect or skip Google, and enter Today
+  without waiting for either invitation; Kendall and Jenny can independently claim only their exact
+  relationships and complete their shorter private branches; nobody sees the cockpit early, and
+  bounded reminders stop after completion or “not now.”
 
 ### Iteration 0 — Prove the group-native activation wedge
 
@@ -518,14 +533,17 @@ fields and not a repurposed settings page.
 1. Register the global person in iMessage and open one private web handoff at the exact next step.
 2. Confirm the person's prefilled preferred name, relationship, and local time zone without asking
    again for the already verified phone number.
-3. Create or join the relevant household and answer who else helps coordinate it. A typed co-parent
-   name records intent only; “just me” and “invite later” are valid explicit answers.
+3. Create or join the relevant household and add any number of other adults with only a name and a
+   plain relationship label: parent/co-parent or babysitter/caregiver. Typed entries record intent
+   only; “just me” and “invite later” are valid explicit answers. Do not ask for per-child, weekday,
+   activity, or chat permissions during initial intake.
 4. Add each child through a repeatable focused card, then explicitly confirm that the roster is
    complete. Capture only useful recognition fields: name, aliases, birth year or age band, school,
    and activities. Optional facts accept “not applicable,” “unknown,” or “add later.”
-5. After the roster is saved, bind any real co-parent or caregiver invitation to one exact current
-   observed iMessage participant. The invitee confirms privately. Pending acceptance never blocks
-   the starter, and the invitation is regenerated if shared family context changes before acceptance.
+5. After the roster is saved, bind each real parent or caregiver invitation independently to one
+   exact current observed iMessage participant. Every invitee confirms privately. Pending acceptance
+   never blocks the starter, and an invitation is regenerated if shared family context changes before
+   acceptance.
 6. Offer the person's primary personal Google account in terms of the family value it unlocks.
    Connecting Gmail and Calendar or explicitly choosing limited mode completes the step; source sync
    continues in the background. Work and additional accounts stay contextual post-onboarding.

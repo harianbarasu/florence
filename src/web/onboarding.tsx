@@ -74,21 +74,20 @@ export function OnboardingPage({ viewer, onCompleted }: { viewer: Viewer; onComp
     }
   }
 
-  async function inviteCoordinator(
+  async function connectAdult(
+    adult: NonNullable<OnboardingView["household"]>["adults"][number],
     invitee: OnboardingView["eligibleInvitees"][number],
-    proposedDisplayName: string,
-    role: "steward" | "caregiver",
   ) {
     if (!data?.household) return false;
-    const path = `/api/households/${data.household.id}/invitations`;
+    const path = `/api/onboarding/adults/${adult.id}/invite`;
     const body = {
+      householdId: data.household.id,
       conversationId: invitee.conversationId,
       expectedParticipantEpochId: invitee.participantEpochId,
       expectedParticipantDigest: invitee.participantDigest,
       inviteeIdentityId: invitee.identityId,
       inviteePersonId: invitee.personId,
-      proposedDisplayName,
-      role,
+      expectedIntentVersion: adult.version,
     };
     setBusy(path);
     setActionError(null);
@@ -96,22 +95,24 @@ export function OnboardingPage({ viewer, onCompleted }: { viewer: Viewer; onComp
     try {
       await postJson(path, viewer.csrfToken, body);
       await load(false);
-      setNotice(`Florence sent ${proposedDisplayName} a private invitation.`);
+      setNotice(`Florence sent ${adult.displayName} a private invitation.`);
       return true;
     } catch (reason) {
-      if (reason instanceof ApiError && reason.status === 401 && role === "steward") {
+      if (reason instanceof ApiError && reason.status === 401 && adult.role === "steward") {
         try {
           await postJson("/api/safety/request-step-up", viewer.csrfToken, {
             purpose: "household_invitation",
             context: {
               action: "invite",
               householdId: data.household.id,
+              onboardingAdultIntentId: adult.id,
+              onboardingAdultIntentVersion: String(adult.version),
               conversationId: invitee.conversationId,
               expectedParticipantEpochId: invitee.participantEpochId,
               expectedParticipantDigest: invitee.participantDigest,
               inviteeIdentityId: invitee.identityId,
               inviteePersonId: invitee.personId,
-              proposedDisplayName,
+              proposedDisplayName: adult.displayName,
               role: "steward",
             },
           });
@@ -177,17 +178,17 @@ export function OnboardingPage({ viewer, onCompleted }: { viewer: Viewer; onComp
         onContinue={(householdId) => save("/api/onboarding/select-household", { householdId })}
       />
     );
-  } else if (step === "coordinator" && household) {
+  } else if (step === "adults" && household) {
     content = (
-      <CoordinatorStep
-        coordinator={household.coordinator}
+      <AdultsStep
+        adults={household.adults}
         busy={busy !== null}
-        onContinue={(choice) =>
-          save("/api/onboarding/coordinator", {
+        onContinue={(adults) =>
+          save("/api/onboarding/adults", {
             householdId: household.id,
             expectedMembershipVersion: household.versions.membership,
             expectedIntakeVersion: household.versions.intake,
-            ...choice,
+            adults,
           })
         }
       />
@@ -214,23 +215,6 @@ export function OnboardingPage({ viewer, onCompleted }: { viewer: Viewer; onComp
                 expectedMembershipVersion: household.versions.membership,
                 expectedIntakeVersion: household.versions.intake,
               })
-        }
-      />
-    );
-  } else if (step === "coordinator_invite" && household) {
-    content = (
-      <CoordinatorInviteStep
-        household={household}
-        invitees={data.eligibleInvitees}
-        busy={busy !== null}
-        onRefresh={() => load(false).then((next) => next !== null)}
-        onInvite={inviteCoordinator}
-        onLater={() =>
-          save("/api/onboarding/coordinator-defer", {
-            householdId: household.id,
-            expectedMembershipVersion: household.versions.membership,
-            expectedIntakeVersion: household.versions.intake,
-          })
         }
       />
     );
@@ -280,6 +264,7 @@ export function OnboardingPage({ viewer, onCompleted }: { viewer: Viewer; onComp
       <OnboardingReviewStep
         view={data}
         busy={busy !== null}
+        onConnectAdult={connectAdult}
         onComplete={() =>
           save("/api/onboarding/complete", {
             householdId: household.id,
@@ -504,97 +489,136 @@ function HouseholdChoiceStep({
   );
 }
 
-function CoordinatorStep({
-  coordinator,
+function AdultsStep({
+  adults,
   busy,
   onContinue,
 }: {
-  coordinator: NonNullable<OnboardingView["household"]>["coordinator"];
+  adults: NonNullable<OnboardingView["household"]>["adults"];
   busy: boolean;
-  onContinue: (choice: {
-    disposition: "solo" | "deferred" | "proposed";
-    proposedName?: string;
-  }) => Promise<boolean>;
+  onContinue: (adults: AdultRosterInput[]) => Promise<boolean>;
 }) {
-  type Choice = "partner" | "caregiver" | "solo" | "later";
-  const existingChoice: Choice | null =
-    coordinator.disposition === "solo"
-      ? "solo"
-      : coordinator.disposition === "deferred"
-        ? "later"
-        : coordinator.disposition === "proposed" || coordinator.disposition === "pending"
-          ? "partner"
-          : null;
-  const [choice, setChoice] = useState<Choice | null>(existingChoice);
-  const [name, setName] = useState(coordinator.proposedName ?? "");
-  const needsName = choice === "partner" || choice === "caregiver";
+  const [drafts, setDrafts] = useState<AdultRosterDraft[]>(() =>
+    adults.map((adult) => ({
+      id: adult.id,
+      displayName: adult.displayName,
+      role: adult.role,
+      progress: adult.progress,
+      bound: adult.matchedPersonId !== null || adult.invitationId !== null,
+    })),
+  );
+  const complete = drafts.every((adult) => adult.displayName.trim().length > 0);
+  const update = (index: number, next: Partial<AdultRosterDraft>) => {
+    setDrafts((current) =>
+      current.map((adult, adultIndex) => (adultIndex === index ? { ...adult, ...next } : adult)),
+    );
+  };
+  const submit = () =>
+    onContinue(
+      drafts.map((adult) => ({
+        ...(adult.id ? { id: adult.id } : {}),
+        displayName: adult.displayName.trim(),
+        role: adult.role,
+      })),
+    );
   return (
     <form
       className="onboarding-form"
       onSubmit={(event) => {
         event.preventDefault();
-        if (choice === null) return;
-        if (needsName && !name.trim()) return;
-        if (choice === "solo") void onContinue({ disposition: "solo" });
-        else if (choice === "later") void onContinue({ disposition: "deferred" });
-        else void onContinue({ disposition: "proposed", proposedName: name.trim() });
+        if (complete) void submit();
       }}
     >
       <OnboardingHeading
         eyebrow="The adults"
-        title="Who else helps coordinate your family?"
-        copy="You’re only telling Florence who to expect. No one is contacted from a name alone."
+        title="Who helps care for your family?"
+        copy="Add the people Florence should know about. A name and relationship are enough—Florence will learn how you work together from conversation."
       />
-      <div className="onboarding-choice-list">
-        <ChoiceCard
-          name="coordinator"
-          value="partner"
-          checked={choice === "partner"}
-          title="A partner or co-parent"
-          copy="Another parent who helps make family decisions."
-          onChange={() => setChoice("partner")}
-        />
-        <ChoiceCard
-          name="coordinator"
-          value="caregiver"
-          checked={choice === "caregiver"}
-          title="Another caregiver"
-          copy="For example, a grandparent or regular caregiver."
-          onChange={() => setChoice("caregiver")}
-        />
-        <ChoiceCard
-          name="coordinator"
-          value="solo"
-          checked={choice === "solo"}
-          title="Just me"
-          copy="I’m the only person coordinating right now."
-          onChange={() => setChoice("solo")}
-        />
-        <ChoiceCard
-          name="coordinator"
-          value="later"
-          checked={choice === "later"}
-          title="I’ll add someone later"
-          copy="Finish setup now and invite them when you’re ready."
-          onChange={() => setChoice("later")}
-        />
-      </div>
-      {needsName ? (
-        <label className="onboarding-field onboarding-reveal-field">
-          <span>What should Florence call them?</span>
-          <input
-            autoComplete="off"
-            maxLength={80}
-            placeholder="Their first name"
-            value={name}
-            onChange={(event) => setName(event.target.value)}
+      <div className="onboarding-adult-list">
+        {drafts.map((adult, index) => (
+          <AdultRosterCard
+            key={adult.id ?? `new-${index}`}
+            adult={adult}
+            index={index}
+            onChange={(next) => update(index, next)}
+            onRemove={() => setDrafts((current) => current.filter((_, itemIndex) => itemIndex !== index))}
           />
-        </label>
+        ))}
+      </div>
+      <button
+        type="button"
+        className="onboarding-add-another"
+        disabled={busy}
+        onClick={() => setDrafts((current) => [...current, emptyAdultRosterDraft()])}
+      >
+        <span aria-hidden="true">＋</span> Add another person
+      </button>
+      {drafts.length ? (
+        <p className="onboarding-plain-note">
+          No one is contacted from a name alone. You can connect each person to their exact iMessage identity
+          later.
+        </p>
       ) : null}
-      <OnboardingPrimaryButton disabled={busy || choice === null || (needsName && !name.trim())} busy={busy}>
-        Continue
-      </OnboardingPrimaryButton>
+      {drafts.length ? (
+        <OnboardingPrimaryButton disabled={busy || !complete} busy={busy}>
+          Continue
+        </OnboardingPrimaryButton>
+      ) : (
+        <OnboardingPrimaryButton disabled={busy} busy={busy} onClick={() => void onContinue([])}>
+          Just me for now
+        </OnboardingPrimaryButton>
+      )}
     </form>
+  );
+}
+
+function AdultRosterCard({
+  adult,
+  index,
+  onChange,
+  onRemove,
+}: {
+  adult: AdultRosterDraft;
+  index: number;
+  onChange: (adult: Partial<AdultRosterDraft>) => void;
+  onRemove: () => void;
+}) {
+  const locked = adult.bound === true;
+  return (
+    <article className="onboarding-adult-card">
+      <div className="onboarding-adult-card-heading">
+        <strong>{adult.displayName.trim() || `Person ${index + 1}`}</strong>
+        {locked ? (
+          <span>{adultProgressLabel(adult.progress ?? "not_connected")}</span>
+        ) : (
+          <button type="button" onClick={onRemove} aria-label={`Remove person ${index + 1}`}>
+            Remove
+          </button>
+        )}
+      </div>
+      <label className="onboarding-field">
+        <span>Their name</span>
+        <input
+          autoComplete="off"
+          maxLength={80}
+          placeholder="First name"
+          value={adult.displayName}
+          disabled={locked}
+          onChange={(event) => onChange({ displayName: event.target.value })}
+        />
+      </label>
+      <label className="onboarding-field">
+        <span>Their relationship</span>
+        <select
+          value={adult.role}
+          disabled={locked}
+          onChange={(event) => onChange({ role: event.target.value as AdultRosterDraft["role"] })}
+        >
+          <option value="steward">Parent or co-parent</option>
+          <option value="caregiver">Babysitter or caregiver</option>
+        </select>
+      </label>
+    </article>
   );
 }
 
@@ -774,105 +798,6 @@ function ChildDetailsForm({
   );
 }
 
-function CoordinatorInviteStep({
-  household,
-  invitees,
-  busy,
-  onRefresh,
-  onInvite,
-  onLater,
-}: {
-  household: NonNullable<OnboardingView["household"]>;
-  invitees: OnboardingView["eligibleInvitees"];
-  busy: boolean;
-  onRefresh: () => Promise<boolean>;
-  onInvite: (
-    invitee: OnboardingView["eligibleInvitees"][number],
-    name: string,
-    role: "steward" | "caregiver",
-  ) => Promise<boolean>;
-  onLater: () => Promise<boolean>;
-}) {
-  const [selectedId, setSelectedId] = useState(invitees[0]?.identityId ?? "");
-  const [name, setName] = useState(household.coordinator.proposedName ?? "");
-  const [role, setRole] = useState<"steward" | "caregiver">("steward");
-  const selected = invitees.find((invitee) => invitee.identityId === selectedId) ?? null;
-  useEffect(() => {
-    if (!selectedId && invitees[0]) setSelectedId(invitees[0].identityId);
-  }, [invitees, selectedId]);
-  return (
-    <form
-      className="onboarding-form"
-      onSubmit={(event) => {
-        event.preventDefault();
-        if (selected && name.trim()) void onInvite(selected, name.trim(), role);
-      }}
-    >
-      <OnboardingHeading
-        eyebrow="Invite privately"
-        title={`Connect Florence with ${household.coordinator.proposedName ?? "your co-coordinator"}`}
-        copy="Add Florence to an iMessage group with them. Florence uses that exact group to identify the right person, then sends the invitation in a private message."
-      />
-      {invitees.length ? (
-        <>
-          <div className="onboarding-choice-list">
-            {invitees.map((invitee) => (
-              <label
-                className="onboarding-choice"
-                key={`${invitee.identityId}:${invitee.participantEpochId}`}
-              >
-                <input
-                  type="radio"
-                  name="invitee"
-                  checked={selectedId === invitee.identityId}
-                  onChange={() => setSelectedId(invitee.identityId)}
-                />
-                <span>
-                  <strong>{invitee.name}</strong>
-                  <small>
-                    {invitee.registered ? "Already uses Florence" : "Florence will ask them privately"}
-                  </small>
-                </span>
-              </label>
-            ))}
-          </div>
-          <label className="onboarding-field">
-            <span>Their name</span>
-            <input maxLength={80} value={name} onChange={(event) => setName(event.target.value)} />
-          </label>
-          <label className="onboarding-field">
-            <span>Their role</span>
-            <select value={role} onChange={(event) => setRole(event.target.value as typeof role)}>
-              <option value="steward">Partner or co-parent</option>
-              <option value="caregiver">Caregiver</option>
-            </select>
-          </label>
-          <OnboardingPrimaryButton disabled={busy || !selected || !name.trim()} busy={busy}>
-            Send private invitation
-          </OnboardingPrimaryButton>
-        </>
-      ) : (
-        <div className="onboarding-empty-invite">
-          <span aria-hidden="true">💬</span>
-          <strong>No shared group found yet</strong>
-          <p>After you add Florence to the group, come back and Florence will recognize the participants.</p>
-          <button
-            type="button"
-            className="onboarding-secondary-button"
-            disabled={busy}
-            onClick={() => void onRefresh()}
-          >
-            Check again
-          </button>
-        </div>
-      )}
-      <button type="button" className="onboarding-text-button" disabled={busy} onClick={() => void onLater()}>
-        Do this later
-      </button>
-    </form>
-  );
-}
-
 function SharedContextStep({
   household,
   busy,
@@ -999,19 +924,18 @@ function GoogleOnboardingStep({
 function OnboardingReviewStep({
   view,
   busy,
+  onConnectAdult,
   onComplete,
 }: {
   view: OnboardingView;
   busy: boolean;
+  onConnectAdult: (
+    adult: NonNullable<OnboardingView["household"]>["adults"][number],
+    invitee: OnboardingView["eligibleInvitees"][number],
+  ) => Promise<boolean>;
   onComplete: () => Promise<boolean>;
 }) {
   const household = view.household as NonNullable<OnboardingView["household"]>;
-  const coordinatorLabel =
-    household.coordinator.disposition === "solo"
-      ? "Just you for now"
-      : household.coordinator.disposition === "deferred"
-        ? "Add someone later"
-        : (household.coordinator.proposedName ?? "Invitation in progress");
   return (
     <div className="onboarding-form">
       <OnboardingHeading
@@ -1021,13 +945,16 @@ function OnboardingReviewStep({
       />
       <div className="onboarding-review-list">
         <ReviewLine label="You" value={`${view.person.name} · ${friendlyTimeZone(view.person.timeZone)}`} />
-        <ReviewLine label="Coordinating with" value={coordinatorLabel} />
-        <ReviewLine
-          label="Children"
-          value={
-            household.children.length ? household.children.map((child) => child.name).join(", ") : "Add later"
-          }
-        />
+        {view.branch !== "caregiver" || household.sharedIntakeComplete ? (
+          <ReviewLine
+            label="Children"
+            value={
+              household.children.length
+                ? household.children.map((child) => child.name).join(", ")
+                : "Add later"
+            }
+          />
+        ) : null}
         <ReviewLine
           label="Google"
           value={
@@ -1037,10 +964,109 @@ function OnboardingReviewStep({
           }
         />
       </div>
+      {view.branch === "caregiver" && !household.sharedIntakeComplete ? (
+        <p className="onboarding-plain-note">
+          A parent is still finishing the shared family details. You can finish your private setup now;
+          Florence won’t ask you to enter them.
+        </p>
+      ) : (
+        <section className="onboarding-review-adults">
+          <div>
+            <strong>Family adults</strong>
+            <span>Connecting them is optional and won’t hold up setup.</span>
+          </div>
+          {household.adults.length ? (
+            household.adults.map((adult) => (
+              <AdultConnectionRow
+                key={adult.id}
+                adult={adult}
+                invitees={view.eligibleInvitees.filter((invitee) => {
+                  return !household.adults.some(
+                    (other) => other.id !== adult.id && other.matchedPersonId === invitee.personId,
+                  );
+                })}
+                busy={busy}
+                onConnect={onConnectAdult}
+              />
+            ))
+          ) : (
+            <p className="onboarding-plain-note">Just you for now. You can add people later.</p>
+          )}
+        </section>
+      )}
       <OnboardingPrimaryButton disabled={busy} busy={busy} onClick={() => void onComplete()}>
         Start using Florence
       </OnboardingPrimaryButton>
     </div>
+  );
+}
+
+function AdultConnectionRow({
+  adult,
+  invitees,
+  busy,
+  onConnect,
+}: {
+  adult: NonNullable<OnboardingView["household"]>["adults"][number];
+  invitees: OnboardingView["eligibleInvitees"];
+  busy: boolean;
+  onConnect: (
+    adult: NonNullable<OnboardingView["household"]>["adults"][number],
+    invitee: OnboardingView["eligibleInvitees"][number],
+  ) => Promise<boolean>;
+}) {
+  const [selectedIdentityId, setSelectedIdentityId] = useState(invitees[0]?.identityId ?? "");
+  const selected = invitees.find((invitee) => invitee.identityId === selectedIdentityId) ?? null;
+  useEffect(() => {
+    if (!invitees.some((invitee) => invitee.identityId === selectedIdentityId)) {
+      setSelectedIdentityId(invitees[0]?.identityId ?? "");
+    }
+  }, [invitees, selectedIdentityId]);
+  const pending = adult.progress !== "not_connected";
+  return (
+    <article className="onboarding-review-adult">
+      <div className="onboarding-review-adult-heading">
+        <Avatar name={adult.displayName} />
+        <div>
+          <strong>{adult.displayName}</strong>
+          <span>
+            {adultRoleLabel(adult.role)} · {adultProgressLabel(adult.progress)}
+          </span>
+        </div>
+      </div>
+      {!pending && invitees.length ? (
+        <div className="onboarding-adult-connect">
+          <label className="onboarding-field">
+            <span>Match their iMessage identity</span>
+            <select
+              value={selectedIdentityId}
+              onChange={(event) => setSelectedIdentityId(event.target.value)}
+            >
+              {invitees.map((invitee) => (
+                <option
+                  value={invitee.identityId}
+                  key={`${invitee.identityId}:${invitee.participantEpochId}`}
+                >
+                  {invitee.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          <button
+            type="button"
+            className="onboarding-secondary-button"
+            disabled={busy || !selected}
+            onClick={() => {
+              if (selected) void onConnect(adult, selected);
+            }}
+          >
+            Connect privately
+          </button>
+        </div>
+      ) : !pending ? (
+        <p>Add Florence to an iMessage group with {adult.displayName} to connect them later.</p>
+      ) : null}
+    </article>
   );
 }
 
@@ -1057,32 +1083,6 @@ function OnboardingCompleteStep({ onContinue }: { onContinue: () => void }) {
       />
       <OnboardingPrimaryButton onClick={onContinue}>Open Florence</OnboardingPrimaryButton>
     </div>
-  );
-}
-
-function ChoiceCard({
-  name,
-  value,
-  checked,
-  title,
-  copy,
-  onChange,
-}: {
-  name: string;
-  value: string;
-  checked: boolean;
-  title: string;
-  copy: string;
-  onChange: () => void;
-}) {
-  return (
-    <label className="onboarding-choice">
-      <input type="radio" name={name} value={value} checked={checked} onChange={onChange} />
-      <span>
-        <strong>{title}</strong>
-        <small>{copy}</small>
-      </span>
-    </label>
   );
 }
 
@@ -1198,13 +1198,18 @@ function OnboardingProblem({
 
 function previousOnboardingStep(view: OnboardingView, step: OnboardingStep): OnboardingStep | null {
   if (step === "create_household" || step === "choose_household") return "confirm_profile";
-  if (step === "coordinator")
-    return view.householdChoices.length > 1 ? "choose_household" : "confirm_profile";
-  if (step === "children") return "coordinator";
+  if (step === "adults") return view.householdChoices.length > 1 ? "choose_household" : "confirm_profile";
+  if (step === "children") return "adults";
   if (step === "review_shared_context") return "confirm_profile";
   if (step === "google") {
-    if (view.branch === "invited_adult" || view.branch === "caregiver") return "review_shared_context";
-    return null;
+    if (
+      view.branch === "invited_adult" ||
+      (view.branch === "caregiver" && view.household?.sharedIntakeComplete)
+    ) {
+      return "review_shared_context";
+    }
+    if (view.branch === "caregiver") return "confirm_profile";
+    return "children";
   }
   if (step === "review") return "google";
   return null;
@@ -1258,6 +1263,33 @@ interface DependentDraft {
   birthYear: string;
   school: string;
   activities: string;
+}
+
+interface AdultRosterDraft {
+  id?: string;
+  displayName: string;
+  role: "steward" | "caregiver";
+  progress?: NonNullable<OnboardingView["household"]>["adults"][number]["progress"];
+  bound?: boolean;
+}
+
+type AdultRosterInput = AdultRosterDraft;
+
+function emptyAdultRosterDraft(): AdultRosterDraft {
+  return { displayName: "", role: "steward" };
+}
+
+function adultRoleLabel(role: AdultRosterDraft["role"]): string {
+  return role === "steward" ? "Parent or co-parent" : "Babysitter or caregiver";
+}
+
+function adultProgressLabel(
+  progress: NonNullable<OnboardingView["household"]>["adults"][number]["progress"],
+): string {
+  if (progress === "joined") return "Joined";
+  if (progress === "awaiting_steward_approval") return "Waiting for parent approval";
+  if (progress === "awaiting_acceptance") return "Invitation sent";
+  return "Not connected yet";
 }
 
 function emptyDependentDraft(): DependentDraft {

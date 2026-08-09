@@ -1,6 +1,6 @@
 import type { LinqChatSnapshot, LinqWebhookEnvelope } from "../adapters/linq/index.js";
 import type { PrivateBridgeProposalInput } from "../modules/bridges/index.js";
-import type { ResolvedTimePlan } from "../modules/coordination/index.js";
+import type { ConversationRoutineProposal, ResolvedTimePlan } from "../modules/coordination/index.js";
 import type { FamilyOnboardingStepKind } from "../modules/relationships/index.js";
 import type { IntegrationAccountKind, IntegrationCapability, JsonObject } from "../modules/sources/index.js";
 import type { TimerProcessPayload } from "../modules/work/index.js";
@@ -146,6 +146,18 @@ export type AppEnvelope =
       readonly proposal: FamilyIntroductionProposal;
     }
   | {
+      /** Persists only a pending conversational routine; it never creates a routine. */
+      readonly kind: "linq.routine_pattern_proposal";
+      readonly internalProviderEventId: string;
+      readonly proposal: ConversationRoutineProposal;
+    }
+  | {
+      /** Deterministically interprets the exact holder's exact receipt-bound reply. */
+      readonly kind: "linq.routine_pattern_confirmation";
+      readonly internalProviderEventId: string;
+      readonly candidateId: string;
+    }
+  | {
       /**
        * Commits a private-DM orchestration response, then considers the
        * person-scoped one-time Google activation offer in a later transaction.
@@ -279,21 +291,18 @@ export type AppEnvelope =
           }
         | { readonly kind: "select_onboarding_household"; readonly householdId: string }
         | {
-            readonly kind: "set_onboarding_coordinator";
+            readonly kind: "save_onboarding_adult_roster";
             readonly householdId: string;
             readonly expectedMembershipVersion: number;
             readonly expectedIntakeVersion: number;
-            readonly disposition: "just_me" | "invite_later" | "proposed";
-            readonly proposedName: string | null;
+            readonly adults: readonly {
+              readonly id?: string | undefined;
+              readonly displayName: string;
+              readonly role: "steward" | "caregiver";
+            }[];
           }
         | {
             readonly kind: "mark_onboarding_children_reviewed";
-            readonly householdId: string;
-            readonly expectedMembershipVersion: number;
-            readonly expectedIntakeVersion: number;
-          }
-        | {
-            readonly kind: "defer_onboarding_coordinator_invite";
             readonly householdId: string;
             readonly expectedMembershipVersion: number;
             readonly expectedIntakeVersion: number;
@@ -324,6 +333,8 @@ export type AppEnvelope =
             readonly inviteePersonId: string;
             readonly proposedDisplayName: string;
             readonly role: "steward" | "caregiver" | "participant";
+            readonly onboardingAdultIntentId?: string | null;
+            readonly onboardingAdultIntentVersion?: number | null;
           }
         | { readonly kind: "approve_household_invitation"; readonly invitationId: string }
         | { readonly kind: "accept_household_invitation"; readonly invitationId: string }

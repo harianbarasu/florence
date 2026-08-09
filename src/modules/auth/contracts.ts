@@ -59,24 +59,47 @@ export const CreateHandoffInputSchema = z
   });
 export type CreateHandoffInput = z.infer<typeof CreateHandoffInputSchema>;
 
-export const HouseholdInvitationStepUpContextSchema = z.discriminatedUnion("action", [
-  z.strictObject({
-    action: z.literal("invite"),
-    householdId: z.string().uuid(),
-    conversationId: z.string().uuid(),
-    expectedParticipantEpochId: z.string().uuid(),
-    expectedParticipantDigest: z.string().regex(/^[a-f0-9]{64}$/u),
-    inviteeIdentityId: z.string().uuid(),
-    inviteePersonId: z.string().uuid(),
-    proposedDisplayName: z.string().trim().min(1).max(80),
-    role: z.literal("steward"),
-  }),
-  z.strictObject({
-    action: z.enum(["approve", "accept"]),
-    householdId: z.string().uuid(),
-    invitationId: z.string().uuid(),
-  }),
-]);
+export const HouseholdInvitationStepUpContextSchema = z
+  .discriminatedUnion("action", [
+    z.strictObject({
+      action: z.literal("invite"),
+      householdId: z.string().uuid(),
+      conversationId: z.string().uuid(),
+      expectedParticipantEpochId: z.string().uuid(),
+      expectedParticipantDigest: z.string().regex(/^[a-f0-9]{64}$/u),
+      inviteeIdentityId: z.string().uuid(),
+      inviteePersonId: z.string().uuid(),
+      proposedDisplayName: z.string().trim().min(1).max(80),
+      role: z.literal("steward"),
+      onboardingAdultIntentId: z
+        .union([z.string().uuid(), z.literal("")])
+        .nullable()
+        .default("")
+        .transform((value) => value ?? ""),
+      onboardingAdultIntentVersion: z
+        .union([z.string().regex(/^[1-9][0-9]*$/u), z.literal("")])
+        .nullable()
+        .default("")
+        .transform((value) => value ?? ""),
+    }),
+    z.strictObject({
+      action: z.enum(["approve", "accept"]),
+      householdId: z.string().uuid(),
+      invitationId: z.string().uuid(),
+    }),
+  ])
+  .superRefine((value, context) => {
+    if (
+      value.action === "invite" &&
+      Boolean(value.onboardingAdultIntentId) !== Boolean(value.onboardingAdultIntentVersion)
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "An onboarding adult invitation requires one exact intent version",
+        path: ["onboardingAdultIntentVersion"],
+      });
+    }
+  });
 export type HouseholdInvitationStepUpContext = z.infer<typeof HouseholdInvitationStepUpContextSchema>;
 
 export interface CreatedHandoff {

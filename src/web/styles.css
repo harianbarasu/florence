@@ -495,7 +495,8 @@ p {
 .onboarding-add-another:focus-visible,
 .onboarding-text-button:focus-visible,
 .onboarding-back:focus-visible,
-.onboarding-child-summary button:focus-visible {
+.onboarding-child-summary button:focus-visible,
+.onboarding-adult-card-heading button:focus-visible {
   outline: 3px solid rgba(61, 74, 55, 0.28);
   outline-offset: 2px;
 }
@@ -588,10 +589,91 @@ p {
   font-weight: 450;
   line-height: 1.4;
 }
-.onboarding-reveal-field {
+.onboarding-adult-list,
+.onboarding-review-adults {
+  display: grid;
+  gap: 12px;
+}
+.onboarding-adult-card,
+.onboarding-review-adult {
   padding: 18px;
-  border-radius: 15px;
+  border: 1px solid #dfe3dd;
+  border-radius: 17px;
+  display: grid;
+  gap: 16px;
   background: #f7f8f5;
+}
+.onboarding-adult-card-heading,
+.onboarding-review-adult-heading {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 11px;
+}
+.onboarding-adult-card-heading {
+  justify-content: space-between;
+}
+.onboarding-adult-card-heading > strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14px;
+}
+.onboarding-adult-card-heading > span {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 650;
+}
+.onboarding-adult-card-heading button {
+  min-height: 36px;
+  padding: 0 4px;
+  border: 0;
+  color: var(--muted);
+  background: transparent;
+  font-size: 12px;
+  font-weight: 650;
+  cursor: pointer;
+}
+.onboarding-review-adults > div:first-child {
+  display: grid;
+  gap: 4px;
+}
+.onboarding-review-adults > div:first-child > strong {
+  font-size: 14px;
+}
+.onboarding-review-adults > div:first-child > span {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.onboarding-review-adult-heading > div:last-child {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+.onboarding-review-adult-heading strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14px;
+}
+.onboarding-review-adult-heading span,
+.onboarding-review-adult > p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+.onboarding-adult-connect {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 10px;
+}
+.onboarding-adult-connect .onboarding-secondary-button {
+  min-height: 52px;
+  white-space: nowrap;
 }
 .onboarding-explainer-list {
   display: grid;
@@ -682,27 +764,6 @@ p {
   border-style: dashed;
   color: var(--sage);
   background: transparent;
-}
-.onboarding-empty-invite {
-  padding: 24px;
-  border: 1px dashed #d4d9d2;
-  border-radius: 16px;
-  display: grid;
-  justify-items: center;
-  gap: 7px;
-  text-align: center;
-  background: #fafbf9;
-}
-.onboarding-empty-invite > span {
-  font-size: 25px;
-}
-.onboarding-empty-invite strong {
-  font-size: 15px;
-}
-.onboarding-empty-invite p {
-  max-width: 390px;
-  margin: 0 0 8px;
-  font-size: 12px;
 }
 .onboarding-privacy-promise,
 .onboarding-connected-account {
@@ -2223,6 +2284,17 @@ button:disabled {
   .onboarding-child-form {
     margin: 0 -8px;
     padding: 18px 15px;
+  }
+  .onboarding-adult-card,
+  .onboarding-review-adult {
+    margin: 0 -8px;
+    padding: 16px 15px;
+  }
+  .onboarding-adult-connect {
+    grid-template-columns: 1fr;
+  }
+  .onboarding-adult-connect .onboarding-secondary-button {
+    width: 100%;
   }
   .onboarding-inline-actions {
     align-items: stretch;

@@ -15,7 +15,11 @@ import {
   PostgresCoordination,
 } from "../modules/coordination/index.js";
 import { EffectOutbox } from "../modules/effects/index.js";
-import { JsonObjectSchema, PostgresSourceIntelligence } from "../modules/sources/index.js";
+import {
+  JsonObjectSchema,
+  PostgresSourceIntelligence,
+  sourceExternalObjectId,
+} from "../modules/sources/index.js";
 import type { SecretBox } from "../shared/crypto.js";
 import { NotFoundError, StaleAuthorityError, UnauthorizedError } from "../shared/errors.js";
 import type { CoverageProposal, ProcessReceipt } from "./contracts.js";
@@ -302,10 +306,19 @@ export class CoverageCoordinator {
     if (metadata.length !== evidenceIds.length) {
       throw new StaleAuthorityError("Coverage evidence is incomplete or no longer current");
     }
+    const expectedExternalObjectId = sourceExternalObjectId({
+      integrationId: null,
+      scope: {
+        kind: "conversation_epoch",
+        participantEpochId: source.record.routing.participantEpochId,
+      },
+      artifactKind: "conversation_message",
+      origin: { system: "linq", remoteObjectId: source.event.message.providerMessageId },
+    });
     const anchors = metadata.filter(
       (entry) =>
         entry.provider === "linq" &&
-        entry.external_object_id === source.event.message.providerMessageId &&
+        entry.external_object_id === expectedExternalObjectId &&
         entry.object_kind === "conversation_message",
     );
     if (anchors.length !== 1) {

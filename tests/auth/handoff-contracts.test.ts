@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   CreateHandoffInputSchema,
   GOOGLE_CONNECT_HANDOFF_TTL_SECONDS,
+  HouseholdInvitationStepUpContextSchema,
 } from "../../src/modules/auth/contracts.js";
 import { completedHandoffRedirect } from "../../src/server.js";
 
@@ -78,5 +79,35 @@ describe("handoff expiry contracts", () => {
     };
 
     expect(completedHandoffRedirect("household_invitation", session)).toBe("/confirm-action");
+  });
+
+  it("round-trips an optional onboarding adult through exact invitation assurance", () => {
+    const context = {
+      action: "invite",
+      householdId: "10000000-0000-4000-8000-000000000005",
+      conversationId: "10000000-0000-4000-8000-000000000006",
+      expectedParticipantEpochId: "10000000-0000-4000-8000-000000000007",
+      expectedParticipantDigest: "a".repeat(64),
+      inviteeIdentityId: "10000000-0000-4000-8000-000000000008",
+      inviteePersonId: "10000000-0000-4000-8000-000000000009",
+      proposedDisplayName: "Kendall",
+      role: "steward",
+    } as const;
+
+    const generic = HouseholdInvitationStepUpContextSchema.parse(context);
+    expect(generic.action).toBe("invite");
+    if (generic.action !== "invite") throw new Error("Expected invitation assurance");
+    expect(generic.onboardingAdultIntentId).toBe("");
+    expect(generic.onboardingAdultIntentVersion).toBe("");
+    expect(HouseholdInvitationStepUpContextSchema.parse(generic)).toEqual(generic);
+
+    const onboarding = HouseholdInvitationStepUpContextSchema.parse({
+      ...context,
+      onboardingAdultIntentId: "10000000-0000-4000-8000-000000000010",
+      onboardingAdultIntentVersion: "3",
+    });
+    expect(onboarding.action).toBe("invite");
+    if (onboarding.action !== "invite") throw new Error("Expected onboarding invitation assurance");
+    expect(HouseholdInvitationStepUpContextSchema.parse(onboarding)).toEqual(onboarding);
   });
 });

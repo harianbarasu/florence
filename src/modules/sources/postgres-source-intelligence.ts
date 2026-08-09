@@ -28,6 +28,7 @@ import {
   type SyncCursorState,
 } from "./contracts.js";
 import { gmailThreadFrontierLockKey, privateSourceIntegrationLockKey } from "./policy.js";
+import { sourceExternalObjectId } from "./source-identity.js";
 
 type Transaction = TransactionSql<Record<string, never>>;
 type Executor = Database | Transaction;
@@ -929,13 +930,12 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
       assertByteLimit(serialized, this.#maxSourceContentBytes, "Source content");
       const contentDigest = sha256(serialized);
       const parentSourceObjectId = await resolveAttachmentParentSourceObject(transaction, command, scope);
-      const objectIdentity = sourceObjectIdentity(
-        command.integrationId,
-        command.scope,
-        command.artifactKind,
-        command.origin,
-      );
-      const externalObjectId = `${command.artifactKind}:${objectIdentity}`;
+      const externalObjectId = sourceExternalObjectId({
+        integrationId: command.integrationId,
+        scope: command.scope,
+        artifactKind: command.artifactKind,
+        origin: command.origin,
+      });
       await transaction`select pg_advisory_xact_lock(hashtextextended(${`source:${command.origin.system}:${externalObjectId}`}, 0))`;
 
       const objects = await transaction<
@@ -1481,13 +1481,12 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
         command.integrationId,
         command.expectedIntegrationControlEpoch,
       );
-      const objectIdentity = sourceObjectIdentity(
-        command.integrationId,
-        command.scope,
-        command.artifactKind,
-        command.origin,
-      );
-      const externalObjectId = `${command.artifactKind}:${objectIdentity}`;
+      const externalObjectId = sourceExternalObjectId({
+        integrationId: command.integrationId,
+        scope: command.scope,
+        artifactKind: command.artifactKind,
+        origin: command.origin,
+      });
       let correlationDigest = command.correlationDigest ?? null;
       await acquireSourceWriteAuthorityLocks(transaction, {
         integrationId: command.integrationId,
@@ -3285,21 +3284,6 @@ async function promotePrivateCandidateMemory(
     set current_revision_id = ${revisionId}, updated_at = ${acceptedAt}
     where id = ${memoryRecordId} and current_revision_id is null
   `;
-}
-
-function sourceObjectIdentity(
-  integrationId: string | null,
-  scope: SourceScope,
-  artifactKind: string,
-  origin: { readonly system: string; readonly remoteObjectId: string },
-): string {
-  return canonicalDigest({
-    integrationId,
-    scope,
-    artifactKind,
-    system: origin.system,
-    remoteObjectId: origin.remoteObjectId,
-  });
 }
 
 async function resolveAttachmentParentSourceObject(

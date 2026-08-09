@@ -42,7 +42,7 @@ describeDatabase("starter family read model", () => {
     await database.end();
   });
 
-  it("keeps a just-created family visible before its coordinator intake exists", async () => {
+  it("keeps a just-created family visible before its adult roster exists", async () => {
     const now = new Date("2026-08-08T20:00:00.000Z");
     const createdPersonId = randomUUID();
     personId = createdPersonId;
@@ -95,7 +95,7 @@ describeDatabase("starter family read model", () => {
         personId: createdPersonId,
       });
       expect(projection.nextStep).toMatchObject({
-        kind: "coordinator",
+        kind: "adults",
         householdId: created.householdId,
       });
       return created.householdId;

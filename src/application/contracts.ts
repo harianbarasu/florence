@@ -160,6 +160,19 @@ export type AppEnvelope =
             readonly expectedPerson: { readonly id: string; readonly controlEpoch: number };
             readonly expectedConversation: ExpectedConversationAuthority;
             readonly expectedHousehold?: { readonly id: string; readonly controlEpoch: number };
+            readonly guidance?: {
+              readonly stateDigest: string;
+              readonly step:
+                | "create_household"
+                | "choose_household"
+                | "connect_google"
+                | "reconnect_google"
+                | "add_first_child"
+                | "add_first_routine"
+                | "wait_for_google"
+                | "ready";
+              readonly useRecommendedNextStep: boolean;
+            };
             readonly sourceAuthorities: readonly {
               readonly integrationId: string;
               readonly integrationControlEpoch: number;

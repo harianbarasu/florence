@@ -1026,9 +1026,12 @@ function handoffPage(token: string, purpose: string): string {
   return `<!doctype html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>${title}</title><link rel="stylesheet" href="/handoff.css"></head><body><main data-handoff-token="${escapeHtml(token)}" data-handoff-purpose="${escapeHtml(purpose)}"><div class="mark">F</div><h1>${title}</h1><p>${explanation}</p><form><button type="submit">${button}</button></form><div data-status aria-live="polite"></div><small>The link is not used until you tap the button. It expires shortly and cannot be reused.</small></main><script src="/handoff.js" defer></script></body></html>`;
 }
 
-function completedHandoffRedirect(purpose: HandoffPurpose, session: AuthenticatedSession): string {
+export function completedHandoffRedirect(purpose: HandoffPurpose, session: AuthenticatedSession): string {
   if (purpose === "invitation") return "/people";
   if (purpose === "private_review") return "/sources";
+  if (purpose === "web_sign_in") {
+    return session.assuranceContext.returnPath === "/sources" ? "/sources" : "/people";
+  }
   if (session.assuranceKind === "google_connect") {
     const profile = session.assuranceContext.profile;
     if (profile === "personal_family" || profile === "work") {

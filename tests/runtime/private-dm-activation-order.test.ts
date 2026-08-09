@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { FlorenceApplication, isNaturalPrivateGreeting } from "../../src/application/florence-application.js";
+import { PostgresPrivateOnboardingGuidance } from "../../src/application/private-onboarding-guidance.js";
 import type { Database } from "../../src/db/client.js";
+import { PostgresWebAuth } from "../../src/modules/auth/postgres-web-auth.js";
 import { WorkerAttemptError } from "../../src/modules/orchestration/bounded-worker-runtime.js";
 import type { WorkerResult, WorkerRuntime } from "../../src/modules/orchestration/contracts.js";
 import { GENERAL_ANSWER_SKILL, PRODUCT_SKILLS } from "../../src/modules/orchestration/skills.js";
@@ -71,6 +73,23 @@ describe("private DM activation ordering", () => {
     const personId = "10000000-0000-4000-8000-000000000012";
     const conversationId = "10000000-0000-4000-8000-000000000013";
     const sourceRevisionId = "10000000-0000-4000-8000-000000000014";
+    const householdId = "10000000-0000-4000-8000-000000000021";
+    const guidance = {
+      stateDigest: "e".repeat(64),
+      currentWork: "google_syncing" as const,
+      householdCount: 1,
+      household: {
+        id: householdId,
+        controlEpoch: 4,
+        dependentCount: 0,
+        activeRoutineCount: 0,
+      },
+      recommendedNextStep: {
+        kind: "add_first_child" as const,
+        action: "people_handoff" as const,
+        returnPath: "/people" as const,
+      },
+    };
     const run = vi
       .fn()
       .mockResolvedValueOnce(
@@ -90,15 +109,23 @@ describe("private DM activation ordering", () => {
         workerResult(GENERAL_ANSWER_SKILL, {
           answer: "Next, tell me about the family details and routines you want me to help with.",
           uncertainty: null,
+          useRecommendedNextStep: true,
         }),
       );
     const database = vi.fn(async () => [{ created_at: new Date() }]) as unknown as Database;
     Object.assign(database, {
-      begin: async (callback: (transaction: Database) => unknown) => callback(database),
+      begin: async (
+        modeOrCallback: string | ((transaction: Database) => unknown),
+        callback?: (transaction: Database) => unknown,
+      ) => (typeof modeOrCallback === "function" ? modeOrCallback : callback)?.(database),
     });
     const application = new FlorenceApplication(
       database,
-      { defaults: { rawSourceRetentionDays: 30 } } as never,
+      {
+        defaults: { rawSourceRetentionDays: 30 },
+        security: { tokenKey: "test-token-key" },
+        publicBaseUrl: "https://florence.test",
+      } as never,
       null as never,
     );
     const queue = vi.fn().mockResolvedValue({
@@ -125,8 +152,10 @@ describe("private DM activation ordering", () => {
             routing: {
               conversationId,
               senderPersonId: personId,
+              senderIdentityId: "10000000-0000-4000-8000-000000000022",
               participantEpochId: "10000000-0000-4000-8000-000000000016",
               appParticipantDigest: "a".repeat(64),
+              chatKind: "direct",
             },
           },
           snapshot: {
@@ -142,17 +171,27 @@ describe("private DM activation ordering", () => {
       queueAuthorizedConversationMessage: { value: queue },
       queueParentGoogleActivationOffer: { value: vi.fn().mockResolvedValue(null) },
     });
+    vi.spyOn(PostgresPrivateOnboardingGuidance.prototype, "projectPrivateGuidance").mockResolvedValue(
+      guidance,
+    );
+    vi.spyOn(PostgresWebAuth.prototype, "createHandoff").mockResolvedValue({
+      handoffId: "10000000-0000-4000-8000-000000000023",
+      token: "private-guidance-token",
+      expiresAt: new Date(Date.now() + 600_000),
+    });
     const workers: WorkerRuntime = {
       run: run as WorkerRuntime["run"],
       reconcile: vi.fn().mockResolvedValue(undefined),
     };
     const orchestrator = new FlorenceOrchestrator(
-      null as never,
+      database,
       { defaults: { rawSourceRetentionDays: 30 } } as never,
       null as never,
       workers,
       null,
       application,
+      null,
+      { projectPrivateGuidance: vi.fn().mockResolvedValue(guidance) },
     );
     const context = {
       row: { id: internalProviderEventId },
@@ -161,6 +200,8 @@ describe("private DM activation ordering", () => {
           chatKind: "direct",
           senderPersonId: personId,
           conversationId,
+          participantEpochId: "10000000-0000-4000-8000-000000000016",
+          appParticipantDigest: "a".repeat(64),
         },
       },
       text: "ok what should we keep doing",
@@ -174,7 +215,7 @@ describe("private DM activation ordering", () => {
         participantSetDigest: "a".repeat(64),
       },
       requestingPerson: { id: personId, controlEpoch: 1 },
-      household: null,
+      household: { id: householdId, controlEpoch: 4, timezone: "America/Los_Angeles" },
     };
     Object.defineProperties(orchestrator, {
       compileLinqContext: { value: vi.fn().mockResolvedValue(context) },
@@ -191,7 +232,16 @@ describe("private DM activation ordering", () => {
       duplicate: false,
     });
     expect(queue).toHaveBeenCalledOnce();
-    expect(queue.mock.calls[0]?.[5]).toBe("general_answer");
+    const queuedResponse = queue.mock.calls[0];
+    expect(queuedResponse?.[5]).toBe("general_answer");
+    expect(queuedResponse?.[3]).toContain("https://florence.test/handoff/private-guidance-token");
+    expect(queuedResponse?.[7]).toEqual(expect.any(Date));
+    const authorizationExpiresAt = queuedResponse?.[7] as Date;
+    expect(authorizationExpiresAt.getTime()).toBeLessThanOrEqual(Date.now() + 10 * 60_000);
+    expect(queuedResponse?.[8]).toContain(
+      `general-answer:${internalProviderEventId}:guidance:${guidance.stateDigest}:`,
+    );
+    expect(queuedResponse?.[10]).toEqual({ id: householdId, controlEpoch: 4 });
   });
 
   it("finishes a coverage no-op with a conversational reply", async () => {
@@ -274,34 +324,53 @@ describe("private DM activation ordering", () => {
     });
   });
 
-  it("fences household context supplied to a conversational answer", async () => {
+  it("turns Kendall's open-ended follow-up into one app-ranked next step", async () => {
     const personId = "10000000-0000-4000-8000-000000000021";
     const householdId = "10000000-0000-4000-8000-000000000022";
     const conversationId = "10000000-0000-4000-8000-000000000023";
     const run = vi.fn().mockResolvedValue(
       workerResult(GENERAL_ANSWER_SKILL, {
-        answer: "Keep the current school routine.",
+        answer: "Google is already reviewing your recent information. Next, let’s add your first child.",
         uncertainty: null,
+        useRecommendedNextStep: true,
       }),
     );
     const workers: WorkerRuntime = {
       run: run as WorkerRuntime["run"],
       reconcile: vi.fn().mockResolvedValue(undefined),
     };
+    const process = vi.fn().mockResolvedValue({
+      accepted: true,
+      duplicate: false,
+      disposition: "private_dm_response_queued",
+      ids: { responseOutboxId: "10000000-0000-4000-8000-000000000025" },
+    });
+    const compilePrivateQuestionContext = vi.fn();
+    const projectPrivateGuidance = vi.fn().mockResolvedValue({
+      stateDigest: "e".repeat(64),
+      currentWork: "google_syncing",
+      householdCount: 1,
+      household: {
+        id: householdId,
+        controlEpoch: 7,
+        dependentCount: 0,
+        activeRoutineCount: 0,
+      },
+      recommendedNextStep: {
+        kind: "add_first_child",
+        action: "people_handoff",
+        returnPath: "/people",
+      },
+    });
     const orchestrator = new FlorenceOrchestrator(
       null as never,
       { defaults: { rawSourceRetentionDays: 30 } } as never,
       null as never,
       workers,
       null,
-      {
-        process: vi.fn().mockResolvedValue({
-          accepted: true,
-          duplicate: false,
-          disposition: "private_dm_response_queued",
-          ids: { responseOutboxId: "10000000-0000-4000-8000-000000000025" },
-        }),
-      },
+      { process },
+      { compilePrivateQuestionContext },
+      { projectPrivateGuidance },
     );
     const context = {
       row: { id: "10000000-0000-4000-8000-000000000024" },
@@ -324,13 +393,6 @@ describe("private DM activation ordering", () => {
       requestingPerson: { id: personId, controlEpoch: 5 },
       household: { id: householdId, controlEpoch: 7, timezone: "America/Los_Angeles" },
     };
-    const householdContext = {
-      householdId,
-      representedChildren: [],
-      activeRoutines: [],
-      truncated: { representedChildren: false, activeRoutines: false },
-    };
-
     await expect(
       (
         orchestrator as unknown as {
@@ -341,7 +403,7 @@ describe("private DM activation ordering", () => {
             outboxEffectId: string;
           }>;
         }
-      ).answerGeneralQuestion(context, householdContext),
+      ).answerGeneralQuestion(context, null),
     ).resolves.toMatchObject({ outboxEffectId: "10000000-0000-4000-8000-000000000025" });
     expect(run.mock.calls[0]?.[0]).toMatchObject({
       authority: {
@@ -350,6 +412,27 @@ describe("private DM activation ordering", () => {
         conversation: { id: conversationId, authorityVersion: 3 },
       },
     });
+    expect(compilePrivateQuestionContext).not.toHaveBeenCalled();
+    expect(projectPrivateGuidance).toHaveBeenCalledWith({
+      personId,
+      expectedPersonControlEpoch: 5,
+    });
+    const answerJob = run.mock.calls[0]?.[0];
+    expect(answerJob?.authorizedContext).toContain('"currentWork":"google_syncing"');
+    expect(answerJob?.authorizedContext).toContain('"kind":"add_first_child"');
+    expect(answerJob?.goal).toContain("lead like a Chief of Staff");
+    expect(process).toHaveBeenCalledWith(
+      expect.objectContaining({
+        response: expect.objectContaining({
+          sourceAuthorities: [],
+          guidance: {
+            stateDigest: "e".repeat(64),
+            step: "add_first_child",
+            useRecommendedNextStep: true,
+          },
+        }),
+      }),
+    );
   });
 });
 

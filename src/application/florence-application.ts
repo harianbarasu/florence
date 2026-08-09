@@ -7,7 +7,11 @@ import type {
 } from "../adapters/linq/index.js";
 import type { FlorenceConfig } from "../config.js";
 import type { Database } from "../db/client.js";
-import { GOOGLE_CONNECT_HANDOFF_TTL_SECONDS, PostgresWebAuth } from "../modules/auth/index.js";
+import {
+  GOOGLE_CONNECT_HANDOFF_TTL_SECONDS,
+  MAX_STANDARD_HANDOFF_TTL_SECONDS,
+  PostgresWebAuth,
+} from "../modules/auth/index.js";
 import { openPrivateBridgePayload, PrivateSourceBridge } from "../modules/bridges/index.js";
 import {
   type ConversationAuthoritySnapshot,
@@ -38,9 +42,15 @@ import type {
 import { CoverageCoordinator } from "./coverage-coordinator.js";
 import { reconcileCoverageTimers } from "./coverage-timer-reconciliation.js";
 import { GoogleSyncCoordinator } from "./google-sync-coordinator.js";
+import {
+  PostgresPrivateOnboardingGuidance,
+  type PrivateOnboardingGuidance,
+} from "./private-onboarding-guidance.js";
 import { PrivateSourceReconciler } from "./private-source-reconciler.js";
 
 type Transaction = TransactionSql<Record<string, never>>;
+
+const PRIVATE_GUIDANCE_RESPONSE_TTL_MS = 10 * 60_000;
 const MAX_LIVE_GROUP_INVOCATION_AGE_MS = 10 * 60_000;
 const LINQ_FAILURE_RECONCILIATION_DELAY_MS = 60_000;
 
@@ -1310,8 +1320,10 @@ export class FlorenceApplication {
       }
       let text: string;
       let operation: string;
-      let idempotencyKey: string;
+      let idempotencyKey = `general-answer:${input.internalProviderEventId}`;
       let evidenceSourceRevisionIds: readonly string[] = [];
+      let responseHousehold: { readonly id: string; readonly controlEpoch: number } | null = null;
+      let guidanceHandledGoogleActivation = false;
       let authorizationExpiresAt = new Date(
         Date.now() + this.config.defaults.rawSourceRetentionDays * 86_400_000,
       );
@@ -1339,6 +1351,7 @@ export class FlorenceApplication {
           input.response.expectedPerson,
           input.response.expectedHousehold ?? null,
         );
+        responseHousehold = input.response.expectedHousehold ?? null;
         evidenceSourceRevisionIds =
           input.response.evidenceSourceRevisionIds.length > 0
             ? exactEvidenceSourceRevisionIds(input.response.evidenceSourceRevisionIds)
@@ -1348,6 +1361,48 @@ export class FlorenceApplication {
           source.personId,
           input.response.sourceAuthorities,
         );
+        if (input.response.guidance) {
+          const guidance = await new PostgresPrivateOnboardingGuidance(transaction).projectPrivateGuidance({
+            personId: source.personId,
+            expectedPersonControlEpoch: input.response.expectedPerson.controlEpoch,
+          });
+          if (
+            guidance.stateDigest !== input.response.guidance.stateDigest ||
+            guidance.recommendedNextStep.kind !== input.response.guidance.step
+          ) {
+            throw new StaleAuthorityError("Private guidance changed before response commit");
+          }
+          if (
+            (guidance.household === null) !== (responseHousehold === null) ||
+            (guidance.household !== null &&
+              (guidance.household.id !== responseHousehold?.id ||
+                guidance.household.controlEpoch !== responseHousehold.controlEpoch))
+          ) {
+            throw new StaleAuthorityError("Private guidance household changed before response commit");
+          }
+          const guidanceIssuedAt = new Date();
+          const guidanceBucket = Math.floor(guidanceIssuedAt.getTime() / PRIVATE_GUIDANCE_RESPONSE_TTL_MS);
+          idempotencyKey = `general-answer:${input.internalProviderEventId}:guidance:${input.response.guidance.stateDigest}:${guidanceBucket}`;
+          const guidanceAuthorizationExpiresAt = new Date(
+            guidanceIssuedAt.getTime() + PRIVATE_GUIDANCE_RESPONSE_TTL_MS,
+          );
+          if (guidanceAuthorizationExpiresAt < authorizationExpiresAt) {
+            authorizationExpiresAt = guidanceAuthorizationExpiresAt;
+          }
+          if (input.response.guidance.useRecommendedNextStep) {
+            const priorText = await recoverPriorConversationMessageText(
+              transaction,
+              this.secretBox,
+              idempotencyKey,
+            );
+            if (priorText) {
+              text = priorText;
+            } else if (guidance.recommendedNextStep.action !== "none") {
+              text = await this.appendPrivateGuidanceHandoff(transaction, source, text, guidance);
+            }
+            guidanceHandledGoogleActivation = guidance.recommendedNextStep.action === "google_handoff";
+          }
+        }
         const sourceIntelligence = new PostgresSourceIntelligence(transaction, this.secretBox, {
           rawRetentionDays: this.config.defaults.rawSourceRetentionDays,
           privateCandidateRetentionDays: 7,
@@ -1377,7 +1432,6 @@ export class FlorenceApplication {
           if (accessExpiresAt < authorizationExpiresAt) authorizationExpiresAt = accessExpiresAt;
         }
         operation = "general_answer";
-        idempotencyKey = `general-answer:${input.internalProviderEventId}`;
       }
 
       const queued = await this.queueAuthorizedConversationMessage(
@@ -1391,19 +1445,25 @@ export class FlorenceApplication {
         authorizationExpiresAt,
         idempotencyKey,
         evidenceSourceRevisionIds,
+        responseHousehold,
       );
       if (!queued) throw new StaleAuthorityError("Private DM response is no longer authorized");
-      return { ...queued, personId: source.personId };
+      return { ...queued, personId: source.personId, guidanceHandledGoogleActivation };
     });
 
     let googleActivationFailed = false;
-    const activationOffered = await this.database
-      .begin(async (transaction) => {
-        const source = await this.requireProcessedPrivateDmSource(transaction, input.internalProviderEventId);
-        if (source.personId !== response.personId) {
-          throw new StaleAuthorityError("Private DM sender changed before activation");
-        }
-        const committed = await transaction<{ readonly created_at: Date }[]>`
+    const activationOffered = response.guidanceHandledGoogleActivation
+      ? false
+      : await this.database
+          .begin(async (transaction) => {
+            const source = await this.requireProcessedPrivateDmSource(
+              transaction,
+              input.internalProviderEventId,
+            );
+            if (source.personId !== response.personId) {
+              throw new StaleAuthorityError("Private DM sender changed before activation");
+            }
+            const committed = await transaction<{ readonly created_at: Date }[]>`
         select created_at from outbox
         where id = ${response.outboxId}
           and person_id = ${source.personId}
@@ -1413,17 +1473,17 @@ export class FlorenceApplication {
           and status in ('pending', 'leased', 'retry', 'submitted', 'confirmed')
         for share
       `;
-        const committedResponse = committed[0];
-        if (!committedResponse) return false;
+            const committedResponse = committed[0];
+            if (!committedResponse) return false;
 
-        const offered = await this.queueParentGoogleActivationOffer(
-          transaction,
-          source.personId,
-          "existing_steward_dm",
-          source.record,
-        );
-        if (offered) {
-          await transaction`
+            const offered = await this.queueParentGoogleActivationOffer(
+              transaction,
+              source.personId,
+              "existing_steward_dm",
+              source.record,
+            );
+            if (offered) {
+              await transaction`
           update outbox
           set available_at = greatest(
             available_at,
@@ -1431,13 +1491,13 @@ export class FlorenceApplication {
           )
           where idempotency_key = ${`google-parent-activation:${source.personId}`}
         `;
-        }
-        return offered !== null;
-      })
-      .catch(() => {
-        googleActivationFailed = true;
-        return false;
-      });
+            }
+            return offered !== null;
+          })
+          .catch(() => {
+            googleActivationFailed = true;
+            return false;
+          });
 
     return {
       accepted: true,
@@ -1452,6 +1512,38 @@ export class FlorenceApplication {
         responseOutboxId: response.outboxId,
       },
     };
+  }
+
+  private async appendPrivateGuidanceHandoff(
+    transaction: Transaction,
+    source: ProcessedPrivateDmSource,
+    text: string,
+    guidance: PrivateOnboardingGuidance,
+  ): Promise<string> {
+    const identityId = source.record.routing.senderIdentityId;
+    const returnPath = guidance.recommendedNextStep.returnPath;
+    if (!identityId || !returnPath || source.record.routing.chatKind !== "direct") {
+      throw new StaleAuthorityError("Private guidance no longer has an exact action route");
+    }
+    const googleAction = guidance.recommendedNextStep.action === "google_handoff";
+    const handoff = await new PostgresWebAuth(
+      transaction,
+      this.secretBox,
+      this.config.security.tokenKey,
+    ).createHandoff({
+      personId: source.personId,
+      privateIdentityId: identityId,
+      privateConversationId: source.record.routing.conversationId,
+      purpose: googleAction ? "google_connect" : "web_sign_in",
+      context: {
+        onboarding: true,
+        returnPath,
+        ...(googleAction ? { activation: "parent_google", profile: "personal_family" } : {}),
+      },
+      expiresInSeconds: googleAction ? GOOGLE_CONNECT_HANDOFF_TTL_SECONDS : MAX_STANDARD_HANDOFF_TTL_SECONDS,
+    });
+    const link = `${this.config.publicBaseUrl}/handoff/${handoff.token}`;
+    return `${text}\n\n${privateGuidanceActionCopy(guidance.recommendedNextStep.kind)} ${link}\n\nIf the link expires, text me “settings” for a fresh one.`;
   }
 
   private async requireProcessedPrivateDmSource(
@@ -3665,6 +3757,7 @@ export class FlorenceApplication {
     authorizationExpiresAt = new Date(Date.now() + 5 * 60_000),
     idempotencyKey = `linq:${operation}:${record.routing.conversationId}:${record.event?.providerEventId ?? sha256Hex(`${record.messageOccurredAt ?? "no-message-time"}:${text}`)}`,
     evidenceSourceRevisionIds: readonly string[] = [],
+    responseHousehold: { readonly id: string; readonly controlEpoch: number } | null = null,
   ): Promise<{ readonly outboxId: string; readonly created: boolean }> {
     if (!snapshot.participantEpochId || !snapshot.participantSetDigest)
       throw new StaleAuthorityError("Conversation has no live epoch");
@@ -3694,6 +3787,18 @@ export class FlorenceApplication {
       from conversations conversation join households household on household.id = conversation.household_id
       where conversation.id = ${record.routing.conversationId}
     `;
+    const boundHousehold = household[0]
+      ? { id: household[0].id, controlEpoch: Number(household[0].control_epoch) }
+      : null;
+    if (
+      responseHousehold &&
+      boundHousehold &&
+      (responseHousehold.id !== boundHousehold.id ||
+        responseHousehold.controlEpoch !== boundHousehold.controlEpoch)
+    ) {
+      throw new StaleAuthorityError("Conversation and response household authority disagree");
+    }
+    const householdFence = responseHousehold ?? boundHousehold;
     return new EffectOutbox(transaction, this.secretBox).authorizeAndEnqueue({
       ...(record.routing.senderPersonId ? { actorPersonId: record.routing.senderPersonId } : {}),
       participantEpochId: snapshot.participantEpochId,
@@ -3726,9 +3831,7 @@ export class FlorenceApplication {
           }
         : {}),
       ...(record.routing.senderPersonId ? await personFence(transaction, record.routing.senderPersonId) : {}),
-      ...(household[0]
-        ? { household: { id: household[0].id, controlEpoch: Number(household[0].control_epoch) } }
-        : {}),
+      ...(householdFence ? { household: householdFence } : {}),
     });
   }
 
@@ -5212,6 +5315,50 @@ function messageText(event: LinqMessageReceivedEvent): string {
     .join("\n");
 }
 
+function privateGuidanceActionCopy(step: PrivateOnboardingGuidance["recommendedNextStep"]["kind"]): string {
+  switch (step) {
+    case "create_household":
+      return "Set up your private Florence family here:";
+    case "choose_household":
+      return "Choose the family you want to continue with here:";
+    case "connect_google":
+      return "Connect your personal Google account privately here:";
+    case "reconnect_google":
+      return "Review or reconnect your personal Google account privately here:";
+    case "add_first_child":
+      return "Add your first child and the family context Florence should know privately here:";
+    case "add_first_routine":
+      return "Add the first recurring family routine you want Florence to help cover here:";
+    case "wait_for_google":
+    case "ready":
+      throw new UnauthorizedError("This private guidance step has no handoff action");
+  }
+}
+
+async function recoverPriorConversationMessageText(
+  transaction: Transaction,
+  secretBox: SecretBox,
+  idempotencyKey: string,
+): Promise<string | null> {
+  const rows = await transaction<{ readonly payload_ciphertext: Buffer }[]>`
+    select payload_ciphertext from outbox where idempotency_key = ${idempotencyKey}
+  `;
+  const ciphertext = rows[0]?.payload_ciphertext;
+  if (!ciphertext) return null;
+  const payload = JSON.parse(
+    secretBox.decrypt(JSON.parse(ciphertext.toString("utf8")), "effect-payload").toString("utf8"),
+  ) as unknown;
+  if (
+    typeof payload !== "object" ||
+    payload === null ||
+    !("text" in payload) ||
+    typeof payload.text !== "string"
+  ) {
+    throw new UnauthorizedError("Prior conversational response payload is invalid");
+  }
+  return payload.text;
+}
+
 function isFreshLiveMessage(event: LinqMessageReceivedEvent): boolean {
   if (event.message.reconciledAt !== undefined) return false;
   const age = Date.parse(event.receivedAt) - Date.parse(event.message.sentAt);
@@ -5315,12 +5462,29 @@ async function assertExpectedResponseAuthority(
   if (!expectedHousehold) return;
   const households = await transaction<{ readonly id: string }[]>`
     select household.id
-    from conversations conversation
-    join households household on household.id = conversation.household_id
-    where conversation.id = ${record.routing.conversationId}
-      and household.id = ${expectedHousehold.id}
+    from households household
+    where household.id = ${expectedHousehold.id}
       and household.control_epoch = ${expectedHousehold.controlEpoch}
       and household.status in ('onboarding', 'active', 'paused')
+      and (
+        exists(
+          select 1 from conversations conversation
+          where conversation.id = ${record.routing.conversationId}
+            and conversation.household_id = household.id
+            and conversation.status = 'active'
+        )
+        or exists(
+          select 1
+          from conversations conversation
+          join household_memberships membership on membership.household_id = household.id
+            and membership.person_id = ${expectedPerson.id} and membership.status = 'active'
+          join membership_capabilities read_capability on read_capability.membership_id = membership.id
+            and read_capability.capability = 'household.read' and read_capability.status = 'active'
+          where conversation.id = ${record.routing.conversationId}
+            and conversation.kind = 'direct' and conversation.status = 'active'
+            and conversation.household_id is null
+        )
+      )
     for share of household
   `;
   if (!households[0]) throw new StaleAuthorityError("Response household authority changed");

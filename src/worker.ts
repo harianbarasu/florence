@@ -8,7 +8,7 @@ import {
   LinqClient,
   type LinqConfig,
 } from "./adapters/linq/index.js";
-import { FlorenceApplication } from "./application/index.js";
+import { FlorenceApplication, PostgresPrivateOnboardingGuidance } from "./application/index.js";
 import { loadConfig } from "./config.js";
 import { createDatabase } from "./db/client.js";
 import { PostgresWebAuth } from "./modules/auth/index.js";
@@ -191,6 +191,7 @@ async function main(): Promise<void> {
       linq,
       application,
       google,
+      new PostgresPrivateOnboardingGuidance(database),
     );
     const sources = new PostgresSourceIntelligence(database, secretBox, {
       rawRetentionDays: config.defaults.rawSourceRetentionDays,

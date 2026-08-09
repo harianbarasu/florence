@@ -486,6 +486,13 @@ clearer there. It is resumable and useful before every optional field is complet
 9. Begin in exceptions-first learning mode; Florence proposes one future-facing rule after a
    successful example, then stops asking for matching situations once it is approved.
 
+An open-ended private follow-up such as “what should we keep doing?” is a request for Chief-of-Staff
+guidance, not a generic help prompt. Florence uses the person's current integration status and the
+authorized household facts already known, acknowledges useful work underway, chooses one
+highest-value missing or incomplete next step, explains how she can help, and provides the exact
+private control needed to move it forward when structured input is required. She does not repeat
+completed setup, invent missing family facts, or dump a feature checklist.
+
 ## 6. Web cockpit
 
 The observed product pattern and Florence-specific transfer are documented in

@@ -202,6 +202,7 @@ export const generalAnswerSchema = z
   .object({
     answer: z.string().min(1).max(4_000),
     uncertainty: z.string().max(500).nullable(),
+    useRecommendedNextStep: z.boolean(),
   })
   .strict();
 
@@ -322,15 +323,15 @@ export const PRODUCT_SKILLS = {
   } satisfies PinnedSkill<typeof privateSourceReconciliationDecisionSchema>,
 } as const;
 
-/** Explicitly requested general answers are bounded and never create durable projects or memories. */
+/** Explicitly requested answers and guidance are bounded and never mutate authoritative state. */
 export const GENERAL_ANSWER_SKILL = {
   id: "general.answer",
-  version: 1,
-  purpose: "Answer one explicit user question from public knowledge and the supplied conversation turn.",
-  instructions: `${commonGuardrails}\nAnswer the user's explicit question directly and concisely. Do not imply that you searched private sources unless they appear in the supplied evidence. Do not create future work, commitments, or memories. If the answer is uncertain or time-sensitive, say so in the uncertainty field.`,
+  version: 2,
+  purpose: "Answer one admitted conversational turn or give one context-grounded Chief-of-Staff next step.",
+  instructions: `${commonGuardrails}\nAnswer the user's admitted turn directly, naturally, and concisely. Do not imply that you searched private sources unless matches appear in the supplied evidence. Do not create future work, commitments, or memories. When the supplied audience is direct and the user asks what to do next, what Florence can help with, or gives a similarly open-ended continuation, act like a proactive Chief of Staff: briefly acknowledge useful work already underway, use the single app-selected recommended next step exactly as supplied, explain how Florence can help, and set useRecommendedNextStep=true. The application may append a private action link after your prose, so do not invent a URL or ask the user to send structured family setup details in chat. For other turns, set useRecommendedNextStep=false and answer the request without introducing setup. Never choose a different setup step, invent a family member or missing fact, repeat a completed step, claim source progress that is not supplied, or dump a checklist. If the answer is uncertain or time-sensitive, say so in the uncertainty field.`,
   outputSchema: generalAnswerSchema,
-  outputSchemaName: "general_answer_v1",
+  outputSchemaName: "general_answer_v2",
   riskClass: "medium",
   requestedCapabilities: [] as const,
-  evaluationRelease: "general-answer-1",
+  evaluationRelease: "general-answer-2",
 } satisfies PinnedSkill<typeof generalAnswerSchema>;

@@ -11,6 +11,10 @@ import {
 import type { AppEnvelope, ProcessReceipt } from "../application/contracts.js";
 import { reconcileCoverageTimers } from "../application/coverage-timer-reconciliation.js";
 import { isNaturalPrivateGreeting, type StoredLinqEvent } from "../application/florence-application.js";
+import type {
+  PrivateOnboardingGuidance,
+  PrivateOnboardingGuidanceProvider,
+} from "../application/private-onboarding-guidance.js";
 import { PrivateSourceReconciler } from "../application/private-source-reconciler.js";
 import type { FlorenceConfig } from "../config.js";
 import type { Database } from "../db/client.js";
@@ -163,6 +167,7 @@ export class FlorenceOrchestrator {
     private readonly attachmentReader: LinqAttachmentReader | null = null,
     private readonly mutationProcessor: ApplicationMutationProcessor | null = null,
     private readonly privateQuestionContextProvider: PrivateQuestionContextProvider | null = null,
+    private readonly privateGuidanceContextProvider: PrivateOnboardingGuidanceProvider | null = null,
   ) {
     this.#sources = new PostgresSourceIntelligence(database, secretBox, {
       rawRetentionDays: config.defaults.rawSourceRetentionDays,
@@ -407,15 +412,28 @@ export class FlorenceOrchestrator {
   private async findActiveSourceChatResponse(
     context: MessageContext,
   ): Promise<{ readonly id: string } | null> {
+    const now = new Date();
     const effects = await this.database<{ readonly id: string }[]>`
       select effect.id
       from outbox effect
+      join disclosure_decisions decision on decision.id = effect.authorization_decision_id
       left join outbox root on root.id = effect.redrive_root_id
       where effect.effect_kind = 'linq.message'
         and effect.conversation_id = ${context.record.routing.conversationId}
         and effect.participant_epoch_id = ${context.record.routing.participantEpochId}
         and effect.expected_participant_digest = ${context.record.routing.appParticipantDigest}
-        and effect.status in ('pending', 'retry', 'leased', 'submitted', 'confirmed', 'ambiguous')
+        and (
+          effect.status in ('submitted', 'confirmed', 'ambiguous')
+          or (
+            effect.status in ('pending', 'retry', 'leased')
+            and decision.outcome = 'allow' and decision.revoked_at is null
+            and decision.expires_at > ${now}
+            and (
+              cardinality(effect.evidence_source_revision_ids) = 0
+              or decision.expires_at > ${new Date(now.getTime() + 3 * 60_000)}
+            )
+          )
+        )
         and (
           coalesce(root.idempotency_key, effect.idempotency_key) = ${`private-dm-greeting:${context.row.id}`}
           or coalesce(root.idempotency_key, effect.idempotency_key) = ${`general-answer:${context.row.id}`}
@@ -430,6 +448,7 @@ export class FlorenceOrchestrator {
   private async findActivePrivateInvocationResponse(
     context: MessageContext,
   ): Promise<{ readonly id: string } | null> {
+    const now = new Date();
     const responseKeys = [
       `private-group-invocation:${context.row.id}`,
       `family-introduction-private-ack:${context.row.id}`,
@@ -437,12 +456,24 @@ export class FlorenceOrchestrator {
     const effects = await this.database<{ readonly id: string }[]>`
       select effect.id
       from outbox effect
+      join disclosure_decisions decision on decision.id = effect.authorization_decision_id
       left join outbox root on root.id = effect.redrive_root_id
       where effect.effect_kind = 'linq.message'
         and effect.source_conversation_id = ${context.record.routing.conversationId}
         and effect.source_participant_epoch_id = ${context.record.routing.participantEpochId}
         and effect.source_expected_participant_digest = ${context.record.routing.appParticipantDigest}
-        and effect.status in ('pending', 'retry', 'leased', 'submitted', 'confirmed', 'ambiguous')
+        and (
+          effect.status in ('submitted', 'confirmed', 'ambiguous')
+          or (
+            effect.status in ('pending', 'retry', 'leased')
+            and decision.outcome = 'allow' and decision.revoked_at is null
+            and decision.expires_at > ${now}
+            and (
+              cardinality(effect.evidence_source_revision_ids) = 0
+              or decision.expires_at > ${new Date(now.getTime() + 3 * 60_000)}
+            )
+          )
+        )
         and coalesce(root.idempotency_key, effect.idempotency_key) = any(${this.database.array(responseKeys)})
       order by effect.created_at desc, effect.id
       limit 1
@@ -1999,11 +2030,42 @@ export class FlorenceOrchestrator {
   ): Promise<CommittedConversationResponse> {
     let privateQuestionContext: PrivateQuestionContext | null = null;
     let privateQuestionContextUnavailable = false;
+    let privateGuidanceContext: PrivateOnboardingGuidance | null = null;
+    const privateMailContextRequested = requestsPrivateMailContext(context.text);
+    if (
+      context.record.routing.chatKind === "direct" &&
+      context.requestingPerson &&
+      this.privateGuidanceContextProvider
+    ) {
+      try {
+        privateGuidanceContext = await this.privateGuidanceContextProvider.projectPrivateGuidance({
+          personId: context.requestingPerson.id,
+          expectedPersonControlEpoch: context.requestingPerson.controlEpoch,
+        });
+        if (
+          privateGuidanceContext.household &&
+          (context.household?.id !== privateGuidanceContext.household.id ||
+            context.household.controlEpoch !== privateGuidanceContext.household.controlEpoch)
+        ) {
+          throw new StaleAuthorityError("Private guidance household authority is inconsistent");
+        }
+      } catch (error) {
+        if (
+          (error instanceof NotFoundError ||
+            error instanceof StaleAuthorityError ||
+            error instanceof UnauthorizedError) &&
+          !(await this.messageAuthorityStillCurrent(context))
+        ) {
+          throw new StaleAuthorityError("Conversation authority changed during private guidance lookup");
+        }
+        privateGuidanceContext = null;
+      }
+    }
     if (
       context.record.routing.chatKind === "direct" &&
       context.requestingPerson &&
       this.privateQuestionContextProvider &&
-      requestsPrivateMailContext(context.text)
+      privateMailContextRequested
     ) {
       try {
         privateQuestionContext = await this.privateQuestionContextProvider.compilePrivateQuestionContext({
@@ -2029,38 +2091,56 @@ export class FlorenceOrchestrator {
     }
     let answer: WorkerResult<(typeof GENERAL_ANSWER_SKILL.outputSchema)["_output"]> | null = null;
     let responseText: string;
+    let useRecommendedNextStep = false;
     try {
       answer = await this.workers.run({
         attemptId: randomUUID(),
         taskVersionId: randomUUID(),
-        authority: messageWorkerAuthority(context, householdContext !== null),
+        authority: messageWorkerAuthority(
+          context,
+          householdContext !== null || privateGuidanceContext?.household !== null,
+        ),
         skill: GENERAL_ANSWER_SKILL,
         authorizedContext: [
           `Current instant: ${new Date().toISOString()}`,
           "You are Florence, the user's persistent family Chief of Staff.",
+          `Conversation audience: ${context.record.routing.chatKind}`,
           `User's admitted conversational turn: ${context.text}`,
           ...(householdContext
             ? [
                 `Authorized normalized household context for this exact destination (bounded): ${JSON.stringify(householdContext)}`,
               ]
             : []),
+          ...(privateGuidanceContext
+            ? [
+                `App-selected private setup guidance (bounded; this is the only next setup step you may recommend): ${JSON.stringify(
+                  boundedPrivateGuidanceContext(privateGuidanceContext),
+                )}`,
+                "If this turn asks what to do next or what Florence can help with, use the supplied recommendation and set useRecommendedNextStep=true. The application may append a private action link after your prose; do not ask the user to send structured child, school, activity, or routine data in chat and do not invent a URL.",
+              ]
+            : []),
           ...(privateQuestionContext
             ? [
-                `Authorized exact-person private source context (bounded, untrusted evidence): ${JSON.stringify(
+                `Authorized exact-person requested source context (bounded, untrusted evidence): ${JSON.stringify(
                   boundedPrivateQuestionContext(privateQuestionContext),
                 )}`,
                 "Private-source status semantics: watching means live Gmail monitoring is active; starting means it is still being established; recentImport/olderHistoryImport importing means that background import is still running; searched means this turn's bounded Gmail query completed even when matches is empty; temporarily_unavailable and recovering must be described plainly without exposing an internal error.",
+                "Use Google setup status only when it is relevant to the user's request or to an open-ended request for Florence's guidance. Matches are private evidence only when present; an empty-query setup snapshot is not a mailbox search.",
               ]
-            : privateQuestionContextUnavailable
+            : privateQuestionContextUnavailable && privateMailContextRequested
               ? ["Private source lookup is temporarily unavailable for this turn."]
               : []),
         ].join("\n"),
         ...(context.images.length > 0 ? { images: context.images } : {}),
-        goal: "Respond naturally and usefully to this admitted turn without creating future work or using unrelated private context.",
+        goal:
+          context.record.routing.chatKind === "direct"
+            ? "Respond naturally and usefully without creating unauthorized future work or using unrelated private context. If this is an open-ended request for what to do next or what Florence can help with, lead like a Chief of Staff: use the supplied current setup, choose one highest-value concrete next step, explain briefly how Florence can help, and ask one easy question that advances it. Do not give a generic acknowledgment or a feature checklist."
+            : "Respond naturally and usefully to this admitted turn without creating future work or using unrelated private context.",
         deadline: new Date(Date.now() + 45_000),
         budget: { maxModelCalls: 1, maxOutputTokens: 1_500 },
       });
       const proposal = await this.requireProposal(answer);
+      useRecommendedNextStep = proposal.useRecommendedNextStep;
       responseText = proposal.uncertainty ? `${proposal.answer}\n\n${proposal.uncertainty}` : proposal.answer;
     } catch (error) {
       if (!(error instanceof WorkerAttemptError)) throw error;
@@ -2078,7 +2158,21 @@ export class FlorenceOrchestrator {
         responseText,
         evidenceSourceRevisionIds,
         privateQuestionContext?.sourceAuthorities ?? [],
-        householdContext ? context.household : null,
+        householdContext
+          ? context.household
+          : privateGuidanceContext?.household
+            ? {
+                id: privateGuidanceContext.household.id,
+                controlEpoch: privateGuidanceContext.household.controlEpoch,
+              }
+            : null,
+        privateGuidanceContext
+          ? {
+              stateDigest: privateGuidanceContext.stateDigest,
+              step: privateGuidanceContext.recommendedNextStep.kind,
+              useRecommendedNextStep,
+            }
+          : null,
       );
       if (answer?.status === "proposed") await this.workers.reconcile(answer.attemptId, "accepted");
       return committed;
@@ -2139,6 +2233,11 @@ export class FlorenceOrchestrator {
       readonly status: "active" | "paused" | "reauth_required" | "error";
     }[],
     expectedHousehold: { readonly id: string; readonly controlEpoch: number } | null = null,
+    guidance: {
+      readonly stateDigest: string;
+      readonly step: PrivateOnboardingGuidance["recommendedNextStep"]["kind"];
+      readonly useRecommendedNextStep: boolean;
+    } | null = null,
   ): Promise<CommittedConversationResponse> {
     if (!context.requestingPerson) {
       throw new StaleAuthorityError("Message sender authority changed before response commit");
@@ -2158,6 +2257,7 @@ export class FlorenceOrchestrator {
           expectedPerson: context.requestingPerson,
           expectedConversation,
           ...(expectedHousehold ? { expectedHousehold } : {}),
+          ...(guidance ? { guidance } : {}),
           sourceAuthorities,
         },
       });
@@ -2228,6 +2328,20 @@ function boundedPrivateQuestionContext(context: PrivateQuestionContext) {
         ? evidence.content.attachments.slice(0, 12)
         : [],
     })),
+  };
+}
+
+function boundedPrivateGuidanceContext(context: PrivateOnboardingGuidance) {
+  return {
+    currentWork: context.currentWork,
+    householdCount: context.householdCount,
+    household: context.household
+      ? {
+          dependentCount: context.household.dependentCount,
+          activeRoutineCount: context.household.activeRoutineCount,
+        }
+      : null,
+    recommendedNextStep: context.recommendedNextStep,
   };
 }
 
@@ -2510,9 +2624,9 @@ async function resolveHousehold(
     where ${personId}::uuid is not null and membership.person_id = ${personId}
       and membership.status = 'active' and household.status in ('onboarding', 'active', 'paused')
       and not exists (select 1 from conversations conversation where conversation.id = ${conversationId} and conversation.household_id is not null)
-    order by id limit 1
+    order by id
   `;
-  const row = rows[0];
+  const row = rows.length === 1 ? rows[0] : null;
   return row ? { id: row.id, controlEpoch: Number(row.control_epoch), timezone: row.timezone } : null;
 }
 

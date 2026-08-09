@@ -160,7 +160,12 @@ export class PostgresWebAuth {
         row.purpose === "private_bridge_standing"
           ? row.purpose
           : "base";
-      const assuranceContext = assuranceKind === "base" ? {} : decryptContext(row, this.secretBox);
+      const assuranceContext =
+        assuranceKind === "base"
+          ? row.purpose === "web_sign_in"
+            ? webSignInAssuranceContext(decryptContext(row, this.secretBox))
+            : {}
+          : decryptContext(row, this.secretBox);
       const assuranceExpiresAt = assuranceKind === "base" ? null : new Date(now.getTime() + 15 * 60_000);
       await transaction`
         update auth_handoffs set consumed_at = ${now}
@@ -286,6 +291,11 @@ function decryptContext(row: HandoffRow, secretBox: SecretBox): Record<string, s
     string,
     string
   >;
+}
+
+function webSignInAssuranceContext(context: Readonly<Record<string, string>>): Record<string, string> {
+  const returnPath = context.returnPath;
+  return returnPath === "/people" || returnPath === "/sources" ? { returnPath } : {};
 }
 
 function inTransaction<Result>(

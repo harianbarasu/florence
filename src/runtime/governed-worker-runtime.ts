@@ -100,6 +100,11 @@ const DEPLOYED_BOOTSTRAP_BASELINE: Readonly<Record<string, BootstrapBaseline>> =
     evaluationRelease: "general-answer-1",
     evaluationSuiteDigest: sha256Hex("general-answer-1:initial-protected-suite"),
   },
+  "general.answer@2": {
+    definitionDigest: "dc077100a8d9988d2260a79b668e6c750b306db9789d656277382c12add57b55",
+    evaluationRelease: "general-answer-2",
+    evaluationSuiteDigest: sha256Hex("general-answer-2:chief-of-staff-guidance-suite"),
+  },
 };
 
 /** Persists the immutable skill/runtime/evaluation pins around an otherwise ephemeral worker. */

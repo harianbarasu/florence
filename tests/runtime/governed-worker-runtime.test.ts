@@ -11,7 +11,7 @@ describe("governed skill definition identity", () => {
   it("pins the complete declared definition and changes when executable meaning changes", () => {
     const baseline = governedSkillDefinitionDigest(GENERAL_ANSWER_SKILL);
 
-    expect(baseline).toBe("ddb2d444be24d37a239d1c811efce2769100789d9f9edc50b2160dc252570159");
+    expect(baseline).toBe("dc077100a8d9988d2260a79b668e6c750b306db9789d656277382c12add57b55");
     expect(
       governedSkillDefinitionDigest({
         ...GENERAL_ANSWER_SKILL,
@@ -44,10 +44,9 @@ describe("governed skill definition identity", () => {
           skill.id !== "relationship.introduction_classify" &&
           skill.id !== "coverage.need_interpret",
       ),
-      GENERAL_ANSWER_SKILL,
     ];
 
-    expect(migratedPins.size).toBe(migratedSkills.length + 2);
+    expect(migratedPins.size).toBe(migratedSkills.length + 3);
     for (const skill of migratedSkills) {
       expect(migratedPins.get(`${skill.id}@${skill.version}`)).toBe(governedSkillDefinitionDigest(skill));
     }
@@ -56,6 +55,9 @@ describe("governed skill definition identity", () => {
     );
     expect(migratedPins.get("coverage.need_interpret@3")).toBe(
       "11672c7a656c3ef49449816c12d54bb78b2c915b86761c71e9a0866fafe7eeb7",
+    );
+    expect(migratedPins.get("general.answer@1")).toBe(
+      "ddb2d444be24d37a239d1c811efce2769100789d9f9edc50b2160dc252570159",
     );
     expect(governedSkillDefinitionDigest(PRODUCT_SKILLS.needInterpret)).toBe(
       "e0dbb77250ac82997175fb60a3234a7c43e18e1e46a6153362e8ef25dbcf4260",

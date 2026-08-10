@@ -359,6 +359,49 @@ describeDatabase("Google provider-account identity binding", () => {
     authAttemptIds = [];
   });
 
+  it("reuses one browser binding across concurrent login attempts and never substitutes a session", async () => {
+    const now = new Date();
+    const auth = new PostgresWebAuth(database, secretBox, "test-token-key");
+    const first = await auth.beginGoogleAuthAttempt({ mode: "login", returnPath: "/home" }, now);
+    const concurrent = await auth.beginGoogleAuthAttempt(
+      { mode: "login", returnPath: "/home" },
+      new Date(now.getTime() + 1_000),
+      first.browserBinding,
+    );
+    authAttemptIds = [first.attemptId, concurrent.attemptId];
+    expect(concurrent.browserBinding).toBe(first.browserBinding);
+
+    const fakeLinkSession = {
+      sessionId: randomUUID(),
+      personId: randomUUID(),
+      controlEpoch: 1,
+    };
+    await expect(
+      auth.readGoogleAuthAttempt(
+        first.state,
+        { browserBinding: null, linkSession: fakeLinkSession },
+        new Date(now.getTime() + 2_000),
+      ),
+    ).rejects.toThrow("browser that started it");
+    await expect(
+      auth.readGoogleAuthAttempt(
+        first.state,
+        { browserBinding: randomBytes(32).toString("base64url"), linkSession: fakeLinkSession },
+        new Date(now.getTime() + 2_000),
+      ),
+    ).rejects.toThrow("browser that started it");
+    await expect(
+      auth.readGoogleAuthAttempt(
+        first.state,
+        { browserBinding: concurrent.browserBinding, linkSession: null },
+        new Date(now.getTime() + 2_000),
+      ),
+    ).resolves.toMatchObject({
+      mode: "login",
+      browserBindingDigest: sha256(first.browserBinding),
+    });
+  });
+
   it("revalidates first-link onboarding and exact subsequent-link assurance", async () => {
     const now = new Date();
     const personId = randomUUID();
@@ -428,6 +471,57 @@ describeDatabase("Google provider-account identity binding", () => {
       now,
     );
     authAttemptIds.push(firstAttempt.attemptId);
+    const exactLinkSession = { sessionId, personId, controlEpoch: 1 };
+    await expect(
+      auth.readGoogleAuthAttempt(
+        firstAttempt.state,
+        { browserBinding: null, linkSession: exactLinkSession },
+        new Date(now.getTime() + 1_000),
+      ),
+    ).resolves.toMatchObject({
+      mode: "link",
+      browserBindingDigest: sha256(firstAttempt.browserBinding),
+    });
+    await expect(
+      auth.readGoogleAuthAttempt(
+        firstAttempt.state,
+        {
+          browserBinding: randomBytes(32).toString("base64url"),
+          linkSession: exactLinkSession,
+        },
+        new Date(now.getTime() + 1_000),
+      ),
+    ).resolves.toMatchObject({ mode: "link" });
+    await expect(
+      auth.readGoogleAuthAttempt(
+        firstAttempt.state,
+        {
+          browserBinding: null,
+          linkSession: { ...exactLinkSession, sessionId: randomUUID() },
+        },
+        new Date(now.getTime() + 1_000),
+      ),
+    ).rejects.toThrow("browser that started it");
+    await expect(
+      auth.readGoogleAuthAttempt(
+        firstAttempt.state,
+        {
+          browserBinding: null,
+          linkSession: { ...exactLinkSession, personId: randomUUID() },
+        },
+        new Date(now.getTime() + 1_000),
+      ),
+    ).rejects.toThrow("browser that started it");
+    await expect(
+      auth.readGoogleAuthAttempt(
+        firstAttempt.state,
+        {
+          browserBinding: null,
+          linkSession: { ...exactLinkSession, controlEpoch: 2 },
+        },
+        new Date(now.getTime() + 1_000),
+      ),
+    ).rejects.toThrow("browser that started it");
     await database`
       update person_sessions
       set assurance_kind = 'base', assurance_context = ${database.json({})}, assurance_expires_at = null

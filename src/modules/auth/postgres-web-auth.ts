@@ -102,6 +102,13 @@ interface GoogleLinkSessionRow {
   readonly assurance_expires_at: Date | null;
 }
 
+type GoogleAuthLinkSessionProof = Pick<SessionPrincipal, "sessionId" | "personId" | "controlEpoch">;
+
+interface GoogleAuthAttemptProof {
+  readonly browserBinding: string | null;
+  readonly linkSession: GoogleAuthLinkSessionProof | null;
+}
+
 type Transaction = TransactionSql<Record<string, never>>;
 type Executor = Database | Transaction;
 
@@ -120,11 +127,14 @@ export class PostgresWebAuth {
   public async beginGoogleAuthAttempt(
     inputCandidate: BeginGoogleAuthAttemptInput,
     now = new Date(),
+    existingBrowserBinding: string | null = null,
   ): Promise<CreatedGoogleAuthAttempt> {
     const input = BeginGoogleAuthAttemptInputSchema.parse(inputCandidate);
     const attemptId = randomUUID();
     const state = randomOpaqueToken(32);
-    const browserBinding = randomOpaqueToken(32);
+    const browserBinding = isGoogleAuthBrowserBinding(existingBrowserBinding)
+      ? existingBrowserBinding
+      : randomOpaqueToken(32);
     const pkceVerifier = randomOpaqueToken(48);
     const pkceChallenge = createHash("sha256").update(pkceVerifier).digest("base64url");
     const nonce = randomOpaqueToken(32);
@@ -209,15 +219,16 @@ export class PostgresWebAuth {
    */
   public async readGoogleAuthAttempt(
     state: string,
-    browserBinding: string,
+    proof: GoogleAuthAttemptProof,
     now = new Date(),
   ): Promise<GoogleAuthAttemptAccess> {
     const row = await loadGoogleAuthAttempt(this.database, sha256Hex(state), false);
-    assertUsableGoogleAuthAttempt(row, browserBinding, now);
+    assertUsableGoogleAuthAttempt(row, proof, now);
     const secret = decryptGoogleAuthSecret(row, this.secretBox);
     const common = {
       attemptId: row.id,
       provider: "google" as const,
+      browserBindingDigest: row.browser_binding_digest,
       pkceVerifier: secret.pkceVerifier,
       nonce: secret.nonce,
       returnPath: row.return_path,
@@ -255,7 +266,7 @@ export class PostgresWebAuth {
     const input = CompleteGoogleLoginInputSchema.parse(inputCandidate);
     return inTransaction(this.database, async (transaction) => {
       const row = await loadGoogleAuthAttempt(transaction, sha256Hex(input.state), true);
-      assertUsableGoogleAuthAttempt(row, input.browserBinding, now);
+      assertUsableGoogleAuthAttempt(row, { browserBinding: input.browserBinding, linkSession: null }, now);
       if (row.mode !== "login") {
         throw new UnauthorizedError("A Google account link must be completed through Florence authority");
       }
@@ -596,7 +607,8 @@ async function loadGoogleAuthAttempt(
           session.idle_expires_at as session_idle_expires_at,
           session.absolute_expires_at as session_absolute_expires_at,
           session.authentication_identity_id as session_authentication_identity_id,
-          session.authentication_identity_authority_version,
+          session.authentication_identity_authority_version
+            as session_authentication_identity_authority_version,
           identity.authority_version as current_session_identity_authority_version,
           identity.person_id as session_identity_person_id,
           identity.status as session_identity_status
@@ -619,7 +631,8 @@ async function loadGoogleAuthAttempt(
           session.idle_expires_at as session_idle_expires_at,
           session.absolute_expires_at as session_absolute_expires_at,
           session.authentication_identity_id as session_authentication_identity_id,
-          session.authentication_identity_authority_version,
+          session.authentication_identity_authority_version
+            as session_authentication_identity_authority_version,
           identity.authority_version as current_session_identity_authority_version,
           identity.person_id as session_identity_person_id,
           identity.status as session_identity_status
@@ -634,8 +647,22 @@ async function loadGoogleAuthAttempt(
   return row;
 }
 
-function assertUsableGoogleAuthAttempt(row: GoogleAuthAttemptRow, browserBinding: string, now: Date): void {
-  if (!secureDigestEquals(row.browser_binding_digest, sha256Hex(browserBinding))) {
+function assertUsableGoogleAuthAttempt(
+  row: GoogleAuthAttemptRow,
+  proof: GoogleAuthAttemptProof,
+  now: Date,
+): void {
+  const browserBindingMatches =
+    proof.browserBinding !== null &&
+    isGoogleAuthBrowserBinding(proof.browserBinding) &&
+    secureDigestEquals(row.browser_binding_digest, sha256Hex(proof.browserBinding));
+  const linkSessionMatches =
+    row.mode === "link" &&
+    proof.linkSession !== null &&
+    proof.linkSession.sessionId === row.initiating_session_id &&
+    proof.linkSession.personId === row.person_id &&
+    proof.linkSession.controlEpoch === Number(row.person_control_epoch);
+  if (!browserBindingMatches && !linkSessionMatches) {
     throw new UnauthorizedError("Google sign-in must finish in the browser that started it");
   }
   if (row.consumed_at) throw new ConflictError("Google sign-in attempt was already used");
@@ -664,6 +691,10 @@ function assertUsableGoogleAuthAttempt(row: GoogleAuthAttemptRow, browserBinding
   ) {
     throw new UnauthorizedError("Google account link authority is no longer current");
   }
+}
+
+function isGoogleAuthBrowserBinding(value: string | null): value is string {
+  return value !== null && /^[A-Za-z0-9_-]{32,128}$/u.test(value);
 }
 
 function decryptGoogleAuthSecret(

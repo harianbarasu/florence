@@ -5023,11 +5023,7 @@ export class FlorenceApplication {
       );
       return "onboarding_reminders_suppressed";
     }
-    if (
-      record.routing.chatKind === "direct" &&
-      person &&
-      /^(?:continue|finish|resume) (?:my )?(?:setup|onboarding)$|^set up florence$/u.test(normalizedCommand)
-    ) {
+    if (record.routing.chatKind === "direct" && person && isOnboardingResumeRequest(text)) {
       const personId = record.routing.senderPersonId;
       if (!personId) return "ignored";
       const resumeKey =
@@ -7504,6 +7500,37 @@ function isExplicitFamilyInvitationDecline(value: string): boolean {
     .replace(/[.!]+$/gu, "")
     .replace(/\s+/gu, " ");
   return /^(?:no|not me|that (?:isn't|is not) me|decline)$/u.test(normalized);
+}
+
+/** Routes natural requests for a replacement onboarding URL before model orchestration. */
+export function isOnboardingResumeRequest(value: string): boolean {
+  const normalized = value
+    .normalize("NFKC")
+    .trim()
+    .toLocaleLowerCase("en-US")
+    .replace(/[’]/gu, "'")
+    .replace(/[.!?…]+$/gu, "")
+    .replace(/\s+/gu, " ");
+  if (/^(?:continue|finish|resume) (?:my )?(?:setup|onboarding)$|^set up florence$/u.test(normalized)) {
+    return true;
+  }
+  if (!/\b(?:link|url)\b/u.test(normalized)) return false;
+  if (/\b(?:google|gmail|calendar|review|privacy|settings?|sign[ -]?in|account)\b/u.test(normalized)) {
+    return false;
+  }
+  if (/\b(?:setup|onboarding)\b/u.test(normalized)) return true;
+  if (
+    /^(?:(?:a|an|the) )?(?:new|fresh|updated|replacement|another) (?:link|url)$|^(?:the |this |that |my )?(?:link|url)(?: is| has)? (?:expired|broken|not working)$|^(?:link|url) again$/u.test(
+      normalized,
+    )
+  ) {
+    return true;
+  }
+  return (
+    /\b(?:new|fresh|updated|replacement|another|again|expired|refresh|replace)\b/u.test(normalized) &&
+    (/\b(?:send|give|get|provide|need|want|generate|update|refresh|replace)\b/u.test(normalized) ||
+      /\b(?:can|could|may|might|would) (?:i|you)\b/u.test(normalized))
+  );
 }
 
 /** A strict social greeting, never a message that may contain family work. */

@@ -35,14 +35,23 @@ application service. Their filesystems are scratch space and PostgreSQL is canon
 
 ### Pilot reset state
 
-As verified on 2026-08-09, `api` and `florence-worker-v2` are intentionally scaled to zero while the reusable
-Google-login release is finalized. Both services reference the clean sibling PostgreSQL service created for the
-pilot reset; that database has no people or customer/runtime rows. The former full PostgreSQL service remains
-offline and unchanged as rollback, and its encrypted backup was independently restored and fingerprinted.
+As verified on 2026-08-10, `api` and `florence-worker-v2` are live on the reusable Google-login release and both
+reference the clean sibling PostgreSQL service created for the pilot reset. The former full PostgreSQL service
+remains offline and unchanged as rollback, and its encrypted backup was independently restored and fingerprinted.
 
 Deploy the same verified commit to both application services, let pre-deploy migrate the clean database, start
 the worker first, and start the API only after the worker lease is healthy. Do not delete the old PostgreSQL
 service until Jackson/Kendall acceptance succeeds and a separate retirement decision is recorded.
+
+`api` also terminates the production Linq webhook. Never stop it merely because Google Console configuration or
+Google-login acceptance is incomplete; that would remove iMessage ingress for everyone. Treat an unfinished
+Google callback as a degraded auth path while keeping the last verified API live, or finish that external
+configuration before exposing the login flow.
+
+After `railway down`, do not use a generic `railway redeploy` to restore an application service. Railway may
+select an older historical image rather than the intended release. Deploy the exact clean verified source with
+`railway up --service <service> --environment production`, or deploy the exact verified Git commit, then check
+the deployment metadata, `/readyz`, and the service-specific acceptance signal before declaring recovery.
 
 The operational HTTPS origin is currently `https://florence-production-b9af.up.railway.app`. Keep Google OAuth,
 Linq webhooks, and `FLORENCE_WEB_BASE_URL` on that origin until `harianbarasu.com` has working public DNS and all

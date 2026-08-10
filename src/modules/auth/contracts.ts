@@ -214,6 +214,7 @@ export interface CreatedGoogleAuthAttempt {
 interface GoogleAuthAttemptAccessBase {
   readonly attemptId: string;
   readonly provider: "google";
+  readonly browserBindingDigest: string;
   readonly pkceVerifier: string;
   readonly nonce: string;
   readonly returnPath: string;

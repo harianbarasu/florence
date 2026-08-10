@@ -288,6 +288,8 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
               returnPath,
             }
           : { mode: "login", returnPath },
+        new Date(),
+        request.cookies[googleAuthCookieName(config)] ?? null,
       );
       reply.setCookie(googleAuthCookieName(config), attempt.browserBinding, {
         path: "/",
@@ -321,21 +323,29 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
         .passthrough()
         .safeParse(request.query);
       const browserBinding = request.cookies[googleAuthCookieName(config)];
-      if (!parsed.success || !browserBinding) {
-        clearGoogleAuthCookie(reply, config);
+      if (!parsed.success) {
         return reply.redirect(await googleAuthFailurePath(request, config, auth, "expired"));
+      }
+
+      let initiatingPrincipal: SessionPrincipal | null = null;
+      try {
+        initiatingPrincipal = await requireSession(request, config, auth);
+      } catch {
+        // Anonymous login remains valid only through its exact browser-bound cookie.
       }
 
       let attempt: Awaited<ReturnType<PostgresWebAuth["readGoogleAuthAttempt"]>>;
       try {
-        attempt = await auth.readGoogleAuthAttempt(parsed.data.state, browserBinding);
+        attempt = await auth.readGoogleAuthAttempt(parsed.data.state, {
+          browserBinding: browserBinding ?? null,
+          linkSession: initiatingPrincipal,
+        });
       } catch (error) {
         if (
           error instanceof NotFoundError ||
           error instanceof ConflictError ||
           error instanceof UnauthorizedError
         ) {
-          clearGoogleAuthCookie(reply, config);
           return reply.redirect(await googleAuthFailurePath(request, config, auth, "expired"));
         }
         throw error;
@@ -344,11 +354,9 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
       const failurePath = (reason: GoogleAuthError) =>
         googleAuthResultPath(attempt.mode, attempt.returnPath, reason);
       if (parsed.data.error) {
-        clearGoogleAuthCookie(reply, config);
         return reply.redirect(failurePath(parsed.data.error === "access_denied" ? "cancelled" : "provider"));
       }
       if (!parsed.data.code) {
-        clearGoogleAuthCookie(reply, config);
         return reply.redirect(failurePath("provider"));
       }
 
@@ -356,7 +364,6 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
       try {
         identity = await googleOAuth.exchangeIdentity(parsed.data.code, attempt.pkceVerifier, attempt.nonce);
       } catch {
-        clearGoogleAuthCookie(reply, config);
         return reply.redirect(failurePath("provider"));
       }
 
@@ -365,7 +372,6 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
         try {
           principal = await requireSession(request, config, auth);
         } catch {
-          clearGoogleAuthCookie(reply, config);
           return reply.redirect(failurePath("expired"));
         }
         if (
@@ -373,29 +379,30 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
           principal.personId !== attempt.personId ||
           principal.controlEpoch !== attempt.personControlEpoch
         ) {
-          clearGoogleAuthCookie(reply, config);
           return reply.redirect(failurePath("expired"));
         }
         try {
           await application.process({
             kind: "auth.google_identity.bind",
             stateDigest: sha256Hex(parsed.data.state),
-            browserBindingDigest: sha256Hex(browserBinding),
+            browserBindingDigest: attempt.browserBindingDigest,
             externalSubjectDigest: sha256Hex(identity.subject),
             externalSubject: identity.subject,
             verifiedEmail: identity.email,
             boundAt: new Date().toISOString(),
           });
         } catch (error) {
-          clearGoogleAuthCookie(reply, config);
           if (error instanceof ConflictError) return reply.redirect(failurePath("account_conflict"));
           if (error instanceof UnauthorizedError || error instanceof StaleAuthorityError) {
             return reply.redirect(failurePath("expired"));
           }
           throw error;
         }
-        clearGoogleAuthCookie(reply, config);
         return reply.redirect(safeGoogleAuthReturnPath(attempt.returnPath));
+      }
+
+      if (!browserBinding) {
+        return reply.redirect(failurePath("expired"));
       }
 
       const completed = await auth.completeGoogleLogin({
@@ -403,7 +410,6 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
         browserBinding,
         externalSubjectDigest: sha256Hex(identity.subject),
       });
-      clearGoogleAuthCookie(reply, config);
       if (completed.kind === "not_linked") {
         return reply.redirect(googleAuthResultPath("login", completed.returnPath, "not_linked"));
       }
@@ -1857,10 +1863,6 @@ function setSessionCookie(reply: FastifyReply, config: FlorenceConfig, session: 
     sameSite: "lax",
     expires: session.absoluteExpiresAt,
   });
-}
-
-function clearGoogleAuthCookie(reply: FastifyReply, config: FlorenceConfig): void {
-  reply.clearCookie(googleAuthCookieName(config), { path: "/" });
 }
 
 type GoogleAuthError = "cancelled" | "not_linked" | "account_conflict" | "expired" | "provider";

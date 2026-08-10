@@ -2,13 +2,12 @@ import { z } from "zod";
 
 export const DEFAULT_HANDOFF_TTL_SECONDS = 10 * 60;
 export const MAX_STANDARD_HANDOFF_TTL_SECONDS = 15 * 60;
-export const GOOGLE_CONNECT_HANDOFF_TTL_SECONDS = 30 * 60;
 export const ONBOARDING_HANDOFF_TTL_SECONDS = 24 * 60 * 60;
+export const GOOGLE_AUTH_ATTEMPT_TTL_SECONDS = 10 * 60;
 
 export const HandoffPurposeSchema = z.enum([
   "web_sign_in",
   "onboarding",
-  "google_connect",
   "account_controls",
   "household_invitation",
   "private_bridge_standing",
@@ -32,28 +31,14 @@ export const CreateHandoffInputSchema = z
       .default(DEFAULT_HANDOFF_TTL_SECONDS),
   })
   .superRefine((input, context) => {
-    if (input.purpose === "google_connect" && input.expiresInSeconds > GOOGLE_CONNECT_HANDOFF_TTL_SECONDS) {
-      context.addIssue({
-        code: "too_big",
-        maximum: GOOGLE_CONNECT_HANDOFF_TTL_SECONDS,
-        origin: "number",
-        inclusive: true,
-        path: ["expiresInSeconds"],
-        message: "Google connection handoffs expire within 30 minutes",
-      });
-    }
-    if (
-      input.purpose !== "google_connect" &&
-      input.purpose !== "onboarding" &&
-      input.expiresInSeconds > MAX_STANDARD_HANDOFF_TTL_SECONDS
-    ) {
+    if (input.purpose !== "onboarding" && input.expiresInSeconds > MAX_STANDARD_HANDOFF_TTL_SECONDS) {
       context.addIssue({
         code: "too_big",
         maximum: MAX_STANDARD_HANDOFF_TTL_SECONDS,
         origin: "number",
         inclusive: true,
         path: ["expiresInSeconds"],
-        message: "Only onboarding and Google connection handoffs may remain valid for longer than 15 minutes",
+        message: "Only onboarding handoffs may remain valid for longer than 15 minutes",
       });
     }
   });
@@ -117,6 +102,7 @@ export interface HandoffPreview {
 export interface AuthenticatedSession {
   readonly sessionId: string;
   readonly personId: string;
+  readonly authenticationIdentityId: string;
   readonly sessionToken: string;
   readonly csrfToken: string;
   readonly idleExpiresAt: Date;
@@ -129,6 +115,7 @@ export interface AuthenticatedSession {
 export interface SessionPrincipal {
   readonly sessionId: string;
   readonly personId: string;
+  readonly authenticationIdentityId: string;
   readonly controlEpoch: number;
   readonly csrfToken: string;
   readonly createdAt: Date;
@@ -143,7 +130,125 @@ export interface SessionPrincipal {
 export type AssuranceKind =
   | "base"
   | "onboarding"
-  | "google_connect"
   | "account_controls"
   | "household_invitation"
   | "private_bridge_standing";
+
+export const GOOGLE_IDENTITY_LINK_ACTION = "link_google_identity";
+export const GOOGLE_IDENTITY_LINK_RETURN_PATH = "/link-account";
+export const GOOGLE_IDENTITY_REVOKE_ACTION = "revoke_login_identity";
+export const GOOGLE_IDENTITY_REVOKE_RETURN_PATH = "/safety";
+
+export const GoogleIdentityLinkAssuranceContextSchema = z.strictObject({
+  action: z.literal(GOOGLE_IDENTITY_LINK_ACTION),
+  returnPath: z.literal(GOOGLE_IDENTITY_LINK_RETURN_PATH),
+});
+
+export const GoogleIdentityRevokeAssuranceContextSchema = z.strictObject({
+  action: z.literal(GOOGLE_IDENTITY_REVOKE_ACTION),
+  identityId: z.string().uuid(),
+  returnPath: z.literal(GOOGLE_IDENTITY_REVOKE_RETURN_PATH),
+});
+
+export function hasFreshGoogleIdentityLinkAssurance(input: {
+  readonly hasVerifiedGoogleIdentity: boolean;
+  readonly assuranceKind: AssuranceKind;
+  readonly assuranceContext: unknown;
+  readonly assuranceExpiresAt: Date | null;
+  readonly asOf: Date;
+}): boolean {
+  if (
+    input.assuranceExpiresAt === null ||
+    Number.isNaN(input.assuranceExpiresAt.getTime()) ||
+    input.assuranceExpiresAt <= input.asOf
+  ) {
+    return false;
+  }
+  if (!input.hasVerifiedGoogleIdentity) return input.assuranceKind === "onboarding";
+  return (
+    input.assuranceKind === "account_controls" &&
+    GoogleIdentityLinkAssuranceContextSchema.safeParse(input.assuranceContext).success
+  );
+}
+
+export const GoogleAuthModeSchema = z.enum(["login", "link"]);
+export type GoogleAuthMode = z.infer<typeof GoogleAuthModeSchema>;
+
+const GoogleAuthReturnPathSchema = z
+  .string()
+  .min(1)
+  .max(1_000)
+  .refine(
+    (value) =>
+      value.startsWith("/") &&
+      !value.startsWith("//") &&
+      ![...value].some((character) => character.charCodeAt(0) < 32),
+    "Return path must be a local path without control characters",
+  );
+
+export const BeginGoogleAuthAttemptInputSchema = z.discriminatedUnion("mode", [
+  z.strictObject({
+    mode: z.literal("login"),
+    returnPath: GoogleAuthReturnPathSchema,
+  }),
+  z.strictObject({
+    mode: z.literal("link"),
+    personId: z.string().uuid(),
+    initiatingSessionId: z.string().uuid(),
+    personControlEpoch: z.number().int().positive(),
+    returnPath: GoogleAuthReturnPathSchema,
+  }),
+]);
+export type BeginGoogleAuthAttemptInput = z.infer<typeof BeginGoogleAuthAttemptInputSchema>;
+
+export interface CreatedGoogleAuthAttempt {
+  readonly attemptId: string;
+  readonly mode: GoogleAuthMode;
+  readonly state: string;
+  readonly browserBinding: string;
+  readonly pkceChallenge: string;
+  readonly nonce: string;
+  readonly expiresAt: Date;
+}
+
+interface GoogleAuthAttemptAccessBase {
+  readonly attemptId: string;
+  readonly provider: "google";
+  readonly pkceVerifier: string;
+  readonly nonce: string;
+  readonly returnPath: string;
+  readonly expiresAt: Date;
+}
+
+export type GoogleAuthAttemptAccess =
+  | (GoogleAuthAttemptAccessBase & {
+      readonly mode: "login";
+      readonly personId: null;
+      readonly initiatingSessionId: null;
+      readonly personControlEpoch: null;
+    })
+  | (GoogleAuthAttemptAccessBase & {
+      readonly mode: "link";
+      readonly personId: string;
+      readonly initiatingSessionId: string;
+      readonly personControlEpoch: number;
+    });
+
+export const CompleteGoogleLoginInputSchema = z.strictObject({
+  state: z.string().regex(/^[A-Za-z0-9_-]{32,128}$/u),
+  browserBinding: z.string().regex(/^[A-Za-z0-9_-]{32,128}$/u),
+  externalSubjectDigest: z.string().regex(/^[a-f0-9]{64}$/u),
+});
+export type CompleteGoogleLoginInput = z.infer<typeof CompleteGoogleLoginInputSchema>;
+
+export type GoogleLoginCompletion =
+  | {
+      readonly kind: "signed_in";
+      readonly identityId: string;
+      readonly returnPath: string;
+      readonly session: AuthenticatedSession;
+    }
+  | {
+      readonly kind: "not_linked";
+      readonly returnPath: string;
+    };

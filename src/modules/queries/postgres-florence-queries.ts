@@ -55,11 +55,7 @@ export class PostgresFlorenceQueries {
     });
   }
 
-  public async viewer(
-    personId: string,
-    csrfToken: string,
-    session: Viewer["session"] = { assuranceKind: "base", assuranceExpiresAt: null },
-  ): Promise<Viewer> {
+  public async viewer(personId: string, csrfToken: string, session: Viewer["session"]): Promise<Viewer> {
     const people = await this.database<PersonRow[]>`
       select person.id, person.timezone, person.display_name_ciphertext,
         exists(
@@ -92,11 +88,15 @@ export class PostgresFlorenceQueries {
       group by household.id, membership.role, membership.joined_at
       order by membership.joined_at
     `;
+    const [loginAccounts, verifiedPhone] = await Promise.all([
+      this.googleLoginAccounts(personId),
+      this.verifiedPhone(personId),
+    ]);
     return {
       person: {
         id: person.id,
         name: decryptPersonName(this.#secretBox, person.id, person.display_name_ciphertext) ?? "You",
-        phone: "Verified iMessage",
+        phone: verifiedPhone ?? "Verified iMessage",
         timezone: person.timezone ?? "America/Los_Angeles",
       },
       households: households.map((household, index) => ({
@@ -105,6 +105,7 @@ export class PostgresFlorenceQueries {
         role: household.role,
         memberCount: Number(household.member_count),
       })),
+      loginAccounts,
       onboardingCompleted: person.onboarding_completed,
       session,
       csrfToken,
@@ -1271,7 +1272,6 @@ export class PostgresFlorenceQueries {
         ) as active_capabilities
       from integrations integration
       where integration.person_id = ${personId} and integration.provider = 'google'
-        and integration.status <> 'revoked'
       order by integration.connected_at
     `;
     const integrationIds = integrations.map((integration) => integration.id);
@@ -1442,10 +1442,23 @@ export class PostgresFlorenceQueries {
           expectedControlEpoch: controlEpoch,
         })
         .catch(() => null);
-      const accountEmail =
-        profile?.kind === "integration_profile" ? profile.accountEmail : "Account email unavailable";
       const accountKind = integration.account_kind === "work" ? "work" : "personal_family";
+      const accountEmail =
+        profile?.kind === "integration_profile"
+          ? profile.accountEmail
+          : integration.status === "revoked"
+            ? accountKind === "work"
+              ? "Disconnected work Google"
+              : "Disconnected personal Google"
+            : "Account email unavailable";
       const activeCapabilities = new Set(integration.active_capabilities);
+      const lastAuthorizedCapabilities: Array<"mail" | "calendar"> =
+        profile?.kind === "integration_profile"
+          ? [...profile.integration.lastAuthorizedCapabilities]
+          : integration.active_capabilities.filter(
+              (capability): capability is "mail" | "calendar" =>
+                capability === "mail" || capability === "calendar",
+            );
       const allConnectionCursors = cursors.filter((cursor) => cursor.integration_id === integration.id);
       const connectionCursors = allConnectionCursors.filter(
         (cursor) => cursor.updated_at >= integration.connected_at,
@@ -1618,10 +1631,11 @@ export class PostgresFlorenceQueries {
         accountKind,
         accountKindLabel:
           accountKind === "work"
-            ? activeCapabilities.has("mail")
+            ? lastAuthorizedCapabilities.includes("mail")
               ? "Work Mail & Calendar"
               : "Work Calendar"
             : "Personal & family",
+        lastAuthorizedCapabilities,
         status: integration.status,
         statusLabel: childNeedsAttention ? "Needs attention" : integrationStatusLabel(integration.status),
         mail: activeCapabilities.has("mail")
@@ -1865,14 +1879,15 @@ export class PostgresFlorenceQueries {
       where target_person_id = ${personId}
       order by requested_at desc limit 1
     `;
-    const integrations = await this.database<
-      { id: string; provider: string; status: string; control_epoch: number | string }[]
-    >`
+    const [integrations, loginAccounts] = await Promise.all([
+      this.database<{ id: string; provider: string; status: string; control_epoch: number | string }[]>`
       select id, provider, status, control_epoch
       from integrations
       where person_id = ${personId} and status <> 'revoked'
       order by connected_at
-    `;
+      `,
+      this.googleLoginAccounts(personId),
+    ]);
     const connections: DataSafetyView["connections"] = [];
     for (const integration of integrations) {
       if (integration.provider !== "google") continue;
@@ -1899,11 +1914,52 @@ export class PostgresFlorenceQueries {
         lastSeenAt: session.last_seen_at.toISOString(),
         current: session.id === currentSessionId,
       })),
+      loginAccounts,
       connections,
       deletion: deletion[0]
         ? { status: deletion[0].status, requestedAt: deletion[0].requested_at.toISOString() }
         : null,
     };
+  }
+
+  private async googleLoginAccounts(personId: string): Promise<Viewer["loginAccounts"]> {
+    const rows = await this.database<
+      {
+        id: string;
+        display_label_ciphertext: Buffer | null;
+      }[]
+    >`
+      select id, display_label_ciphertext
+      from person_identities
+      where person_id = ${personId}
+        and kind = 'provider_account'
+        and issuer = 'google'
+        and status = 'verified'
+      order by verified_at, id
+    `;
+    return rows.map((identity) => ({
+      id: identity.id,
+      provider: "google" as const,
+      email:
+        decryptIdentityDisplayLabel(this.#secretBox, identity.id, identity.display_label_ciphertext) ??
+        "Google account",
+    }));
+  }
+
+  private async verifiedPhone(personId: string): Promise<string | null> {
+    const rows = await this.database<{ id: string; subject_ciphertext: Buffer | null }[]>`
+      select id, subject_ciphertext
+      from person_identities
+      where person_id = ${personId}
+        and kind = 'phone'
+        and status = 'verified'
+      order by verified_at, id
+      limit 1
+    `;
+    const identity = rows[0];
+    return identity
+      ? decryptIdentitySubject(this.#secretBox, identity.id, identity.subject_ciphertext)
+      : null;
   }
 }
 
@@ -1950,6 +2006,23 @@ function decryptIdentitySubject(
       .toString("utf8")
       .trim();
     return subject.length > 0 && subject.length <= 320 ? subject : null;
+  } catch {
+    return null;
+  }
+}
+
+function decryptIdentityDisplayLabel(
+  secretBox: SecretBox,
+  identityId: string,
+  ciphertext: Buffer | null,
+): string | null {
+  if (!ciphertext) return null;
+  try {
+    const label = secretBox
+      .decrypt(JSON.parse(ciphertext.toString("utf8")) as unknown, `identity-display-label:${identityId}`)
+      .toString("utf8")
+      .trim();
+    return label.length > 0 && label.length <= 320 ? label : null;
   } catch {
     return null;
   }
@@ -2182,6 +2255,10 @@ function integrationStatusLabel(status: string): string {
       return "Reconnect needed";
     case "error":
       return "Needs attention";
+    case "revocation_pending":
+      return "Disconnecting";
+    case "revoked":
+      return "Disconnected";
     default:
       return "Unavailable";
   }

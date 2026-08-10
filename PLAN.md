@@ -504,25 +504,36 @@ reauthorize against the provider's live participant list immediately before exec
 
 ### Passwordless identity
 
-The private Linq DM is the root recovery channel for the first release.
+The private Linq DM is the bootstrap and recovery channel for the first release. After that first
+identity proof, Google is the ordinary reusable browser login.
 
 1. A verified inbound private DM resolves or creates a provisional phone-bound person.
-2. Florence issues a random 256-bit, single-purpose handoff and stores only its digest, person,
+2. Florence issues one random 256-bit, single-purpose bootstrap handoff and stores only its digest, person,
    exact private binding, authority epoch, expiry, state, and encrypted context.
 3. The browser landing page is generic and non-consuming.
 4. An explicit POST atomically consumes the handoff and revalidates the live private identity.
-5. Florence creates a server-side person session in a Secure, HttpOnly, SameSite, `__Host-` cookie
-   and redirects to a token-free URL.
-6. Browser writes require CSRF protection plus Origin and Host validation.
-7. Sessions revalidate person and relationship authority for every operation and are revoked by
+5. Florence creates a server-side person session bound to that exact verified phone identity in a
+   Secure, HttpOnly, SameSite, `__Host-` cookie and redirects to a token-free URL.
+6. The person explicitly links one or more verified Google accounts as reusable login identities.
+   Google login uses identity-only OIDC scopes and does not grant Gmail or Calendar access.
+7. A later visit starts at a stable sign-in page. Florence authenticates by Google's immutable
+   provider subject, never by mutable email, and creates a session bound to that exact login identity.
+   An unknown Google account creates no person and never auto-merges by matching email; the person
+   must bootstrap through their verified private DM first.
+8. Browser writes require CSRF protection plus Origin and Host validation.
+9. Sessions revalidate the authenticating identity, person, and relationship authority for every operation and are revoked by
    STOP, identity changes, deletion fencing, or explicit logout.
-8. High-risk actions require a fresh challenge delivered to and confirmed from the same private DM.
+10. High-risk actions require a fresh challenge delivered to and confirmed from the same private DM.
 
 Default browser sessions expire after 30 days of inactivity and 90 days absolutely. Users can view
 and revoke active sessions.
 
-Google identity is an integration identity, not Florence login. Connecting several work and personal
-Google accounts never creates several Florence people.
+One Florence person may have multiple verified phone numbers, Google login identities, and other
+provider identities. Mutable email addresses are encrypted account labels and contact facts, not
+person-merging or login keys. Gmail, Calendar, and future source accounts remain separate
+person-owned integrations: disconnecting a source does not delete the login identity, linking a
+login does not grant source access, and connecting several accounts never creates several Florence
+people.
 
 ### Progressive hybrid onboarding
 
@@ -530,7 +541,9 @@ Onboarding begins in iMessage and moves to mobile web when structured or sensiti
 clearer there. It is a canonical, resumable journey—not a loose checklist inferred from optional
 fields and not a repurposed settings page.
 
-1. Register the global person in iMessage and open one private web handoff at the exact next step.
+1. Register the global person in iMessage, consume one private bootstrap handoff, link a reusable
+   Google login, and open the exact canonical onboarding step. Future visits use the stable sign-in
+   page rather than fresh text links.
 2. Confirm the person's prefilled preferred name, relationship, and local time zone without asking
    again for the already verified phone number.
 3. Create or join the relevant household and add any number of other adults with only a name and a
@@ -544,9 +557,10 @@ fields and not a repurposed settings page.
    exact current observed iMessage participant. Every invitee confirms privately. Pending acceptance
    never blocks the starter, and an invitation is regenerated if shared family context changes before
    acceptance.
-6. Offer the person's primary personal Google account in terms of the family value it unlocks.
-   Connecting Gmail and Calendar or explicitly choosing limited mode completes the step; source sync
-   continues in the background. Work and additional accounts stay contextual post-onboarding.
+6. Separately offer Gmail and Calendar access for the person's primary personal Google account in
+   terms of the family value it unlocks. This is an optional source grant, not login. Connecting it
+   or explicitly declining completes the step; source sync continues in the background. Work and
+   additional source accounts stay contextual post-onboarding.
 7. Review the current family summary and launch Florence. This records the exact reviewed setup,
    unlocks the cockpit for that person, and privately confirms what Florence will do next.
 8. An invited co-steward follows a shorter branch: confirm self, see the already-completed family
@@ -655,16 +669,21 @@ agent builder, skill administration page, or free-form relationship graph editor
 
 Require a new exact private-DM challenge for:
 
-- adding, removing, or merging a verified identity;
+- adding, removing, or merging a verified login identity after bootstrap;
 - accepting/leaving a household or widening a role/capability;
 - adding a co-equal steward;
 - activating trusted ambient behavior or widening epoch retention/proactivity;
 - creating a standing private-source bridge to a new audience;
-- connecting, replacing, or disconnecting an integration;
 - export, account deletion, household deletion, or destructive chat-history removal; and
 - any external write added in a later release.
 
 Narrowing, pausing, STOP, correcting, and forgetting take effect immediately.
+
+Connecting or reconnecting a private source is a CSRF-protected action from a current Florence
+session followed by the provider's own OAuth account selection and consent. It does not require a
+second iMessage link. The OAuth attempt is bound to the exact Florence session and, for a reconnect,
+the exact existing account and authority epoch. Disconnecting immediately narrows local access and
+starts durable provider-grant revocation.
 
 ## 7. Coverage loops
 
@@ -1369,7 +1388,8 @@ Before declaring the product usable, perform the full real flow:
 Canonical URLs:
 
 - app and public pages: `https://harianbarasu.com`
-- Google callback: `https://harianbarasu.com/oauth/google/callback`
+- Google identity-login callback: `https://harianbarasu.com/auth/google/callback`
+- Google private-source callback: `https://harianbarasu.com/oauth/google/callback`
 - Linq webhook: `https://harianbarasu.com/webhooks/linq`
 - Railway-generated domain remains a diagnostic fallback, not the customer URL.
 

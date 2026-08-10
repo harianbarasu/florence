@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { z } from "zod";
+import { GoogleOAuthAdapter } from "./adapters/google/oauth.js";
 import {
   LinqApiError,
   LinqAttachmentError,
@@ -11,11 +12,19 @@ import {
 import { FlorenceApplication, PostgresPrivateOnboardingGuidance } from "./application/index.js";
 import { loadConfig } from "./config.js";
 import { createDatabase } from "./db/client.js";
-import { PostgresWebAuth } from "./modules/auth/index.js";
+import {
+  GOOGLE_IDENTITY_LINK_ACTION,
+  GOOGLE_IDENTITY_LINK_RETURN_PATH,
+  PostgresWebAuth,
+} from "./modules/auth/index.js";
 import { PrivateSourceBridge } from "./modules/bridges/index.js";
 import { PostgresConversationAuthority } from "./modules/conversations/index.js";
 import { CoordinationError } from "./modules/coordination/index.js";
-import { EffectOutbox, LinqMessageEffectExecutor } from "./modules/effects/index.js";
+import {
+  EffectOutbox,
+  GoogleTokenRevocationEffectExecutor,
+  LinqMessageEffectExecutor,
+} from "./modules/effects/index.js";
 import { BoundedWorkerRuntime, WorkerAttemptError } from "./modules/orchestration/bounded-worker-runtime.js";
 import { LangChainModelGateway } from "./modules/orchestration/langchain-model-gateway.js";
 import { PostgresSourceIntelligence } from "./modules/sources/index.js";
@@ -56,7 +65,7 @@ const CONVERSATION_JOB_REDRIVE_MAX_GENERATIONS = 1_000;
 
 const StepUpPayloadSchema = z.strictObject({
   actorPersonId: z.string().uuid(),
-  purpose: z.enum(["account_controls", "google_connect", "household_invitation", "private_bridge_standing"]),
+  purpose: z.enum(["account_controls", "household_invitation", "private_bridge_standing"]),
   context: z.record(z.string(), z.string()).default({}),
 });
 const OrchestrateMessagePayloadSchema = z.strictObject({ internalProviderEventId: z.string().uuid() });
@@ -178,9 +187,14 @@ async function main(): Promise<void> {
     const linq = new LinqClient(linqConfig);
     const work = new DurableWork(database, secretBox);
     const outbox = new EffectOutbox(database, secretBox);
-    const effectExecutor = new LinqMessageEffectExecutor(linq, outbox);
+    const linqEffectExecutor = new LinqMessageEffectExecutor(linq, outbox);
     const timerRuntime = new TimerRuntime(database, secretBox, linq);
     const application = new FlorenceApplication(database, config, secretBox, timerRuntime);
+    const googleTokenRevocationExecutor = new GoogleTokenRevocationEffectExecutor(
+      new GoogleOAuthAdapter(config.google),
+      outbox,
+      application,
+    );
     const modelRuntime = new GovernedWorkerRuntime(
       database,
       secretBox,
@@ -204,6 +218,7 @@ async function main(): Promise<void> {
       rawRetentionDays: config.defaults.rawSourceRetentionDays,
       privateCandidateRetentionDays: 7,
     });
+    const webAuth = new PostgresWebAuth(database, secretBox, config.security.tokenKey);
     const privateSourceBridge = new PrivateSourceBridge(
       database,
       secretBox,
@@ -219,10 +234,22 @@ async function main(): Promise<void> {
         lastMaintenanceCheckBucket = maintenanceBucket;
       }
       const effects = await outbox.claim(workerId, 20);
-      for (const effect of effects) await effectExecutor.execute(effect);
+      for (const effect of effects) {
+        if (effect.effectKind === "google.oauth_token.revoke") {
+          await googleTokenRevocationExecutor.execute(effect);
+        } else {
+          await linqEffectExecutor.execute(effect);
+        }
+      }
 
       const submittedEffects = await outbox.claimSubmittedForReconciliation(workerId, 20);
-      for (const effect of submittedEffects) await effectExecutor.reconcile(effect);
+      for (const effect of submittedEffects) {
+        if (effect.effectKind === "google.oauth_token.revoke") {
+          await googleTokenRevocationExecutor.reconcile(effect);
+        } else {
+          await linqEffectExecutor.reconcile(effect);
+        }
+      }
 
       const jobs = await work.claim(workerId, 12);
       for (const job of jobs) {
@@ -507,13 +534,13 @@ async function main(): Promise<void> {
           context: {
             ...payload.context,
             returnPath:
-              payload.purpose === "google_connect"
-                ? "/sources"
-                : payload.purpose === "account_controls"
-                  ? "/safety"
-                  : payload.purpose === "private_bridge_standing"
-                    ? "/sources"
-                    : "/people",
+              payload.purpose === "account_controls"
+                ? payload.context.action === GOOGLE_IDENTITY_LINK_ACTION
+                  ? GOOGLE_IDENTITY_LINK_RETURN_PATH
+                  : "/safety"
+                : payload.purpose === "private_bridge_standing"
+                  ? "/sources"
+                  : "/people",
           },
           expiresInSeconds: 10 * 60,
         });
@@ -607,6 +634,7 @@ async function main(): Promise<void> {
       await seedGoogleRecovery(now);
       await observeCurrentGoogleSync();
       await sources.apply({ kind: "sweep_retention", asOf: now.toISOString(), limit: 500 });
+      await webAuth.sweepGoogleAuthAttempts(now, 500);
       await database`
       delete from provider_events where received_at < ${new Date(now.getTime() - config.defaults.rawSourceRetentionDays * 86_400_000)}
         and processing_status in ('processed', 'ignored', 'failed')

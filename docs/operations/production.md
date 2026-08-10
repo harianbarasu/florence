@@ -33,13 +33,16 @@ Set each service's Config-as-Code path explicitly in **Settings → Build**. Rai
 `/railway.json`; the worker will not use `/railway.worker.json` automatically. Do not attach a volume to either
 application service. Their filesystems are scratch space and PostgreSQL is canonical.
 
-### Current production state
+### Pilot reset state
 
-As verified on 2026-08-07, all three production services are live. `api` and `florence-worker-v2` deploy from
-the canonical `harianbarasu/florence` source, run with `NODE_ENV=production`, and share the same
-`FLORENCE_POSTGRES_SCHEMA=florence_v4` database and runtime contract. The worker uses
-`/railway.worker.json`; the API uses `/railway.json`. Do not create or replace PostgreSQL or reuse the legacy
-`florence` schema.
+As verified on 2026-08-09, `api` and `florence-worker-v2` are intentionally scaled to zero while the reusable
+Google-login release is finalized. Both services reference the clean sibling PostgreSQL service created for the
+pilot reset; that database has no people or customer/runtime rows. The former full PostgreSQL service remains
+offline and unchanged as rollback, and its encrypted backup was independently restored and fingerprinted.
+
+Deploy the same verified commit to both application services, let pre-deploy migrate the clean database, start
+the worker first, and start the API only after the worker lease is healthy. Do not delete the old PostgreSQL
+service until Jackson/Kendall acceptance succeeds and a separate retirement decision is recorded.
 
 The operational HTTPS origin is currently `https://florence-production-b9af.up.railway.app`. Keep Google OAuth,
 Linq webhooks, and `FLORENCE_WEB_BASE_URL` on that origin until `harianbarasu.com` has working public DNS and all
@@ -55,7 +58,8 @@ applied file.
 ## Exact environment contract
 
 Make the runtime variables shared by `api` and `florence-worker-v2`. Set
-`FLORENCE_DATABASE_URL=${{Postgres.DATABASE_URL}}` as a reference variable on both services. Do not define
+`FLORENCE_DATABASE_URL=${{<active-postgres-service>.DATABASE_URL}}` as a reference variable on both services;
+for the 2026-08-09 pilot reset this is the clean sibling database, not the retained rollback service. Do not define
 `PORT`; Railway injects it. The Docker image sets `NODE_ENV=production`.
 
 Required for every production process:
@@ -96,10 +100,15 @@ Optional variables and defaults:
 | `RAW_SOURCE_RETENTION_DAYS` | `30` (maximum 30) |
 | `WORKER_SCRATCH_RETENTION_DAYS` | `7` (maximum 7) |
 
-There is no separately configured Google redirect URI. Florence derives it as
-`<FLORENCE_WEB_BASE_URL>/oauth/google/callback`, which prevents the browser origin, cookie boundary, and OAuth
-callback from drifting apart. Register that exact URI in Google Cloud before deployment. If the canonical
-domain changes, update Google and `FLORENCE_WEB_BASE_URL` together.
+There are no separately configured Google redirect variables. Florence derives two exact callbacks
+from `FLORENCE_WEB_BASE_URL`:
+
+- `<FLORENCE_WEB_BASE_URL>/auth/google/callback` for identity-only browser login; and
+- `<FLORENCE_WEB_BASE_URL>/oauth/google/callback` for optional Gmail and Calendar source access.
+
+Register both exact URIs in Google Cloud before deployment. Keeping the flows separate prevents a
+normal sign-in from silently asking for private-source access. If the canonical domain changes,
+update both Google callbacks and `FLORENCE_WEB_BASE_URL` together.
 
 Generate independent secrets locally, then paste them directly into sealed Railway variables:
 
@@ -118,15 +127,21 @@ After the web service has its canonical domain:
 
 1. In Linq, set the webhook endpoint to `<origin>/webhooks/linq`, select payload version `2026-02-03`, and copy
    that endpoint's signing secret into `LINQ_WEBHOOK_SECRET`. The API key is not the webhook signing secret.
-2. In Google Cloud, register `<origin>/oauth/google/callback` on the OAuth web client and add the intended test
-   users while the consent screen remains in testing. Enable both the Gmail API and Google Calendar API for
-   the project. Florence offers two least-privilege connection profiles: personal/family requests read-only
-   Mail and Calendar, while work requests read-only Calendar only. Each connection forces Google's account
-   chooser so one person can attach multiple Google accounts deliberately.
+2. In Google Cloud, register both `<origin>/auth/google/callback` and
+   `<origin>/oauth/google/callback` on the OAuth web client and add the intended test users while
+   the consent screen remains in testing. The login flow requests only OpenID identity claims and
+   stores no Google access or refresh token. Enable both the Gmail API and Google Calendar API for
+   the separate source-connection flow. Florence offers two least-privilege connection profiles:
+   personal/family requests read-only Mail and Calendar, while work starts with read-only Calendar
+   and can explicitly include read-only Gmail. Each connection uses Google's account chooser so one person can attach multiple accounts
+   deliberately.
 3. Send only synthetic messages during the first connector smoke. Confirm webhook authentication failures do
    not create provider-event rows and that a duplicate delivery does not create duplicate work or output.
 
-For the first Google smoke, connect a personal test account from Sources. Confirm that the card reaches “Keeping
+For the first auth smoke, consume one private iMessage bootstrap link, explicitly link a Google
+login, sign out, and sign back in from the stable public sign-in page. Confirm an unlinked Google
+account cannot create or merge a Florence person. Then connect a personal test account from Sources.
+Confirm that the card reaches “Keeping
 up with new mail,” the primary calendar appears, and recent mail begins moving before older history completes.
 Then connect a different work account and confirm its card contains Calendar but no Mail status. Provider auth
 failures must change the connection to `reauth_required`; reconnecting the same account starts a new integration
@@ -173,42 +188,31 @@ general-purpose skill administration UI in the first release.
 
 ### Rebuild cutover recovery reference
 
-The first `florence_v4` cutover is complete. Preserve this sequence only for disaster recovery or a deliberate
-rebuild into a new schema; it keeps the current API and legacy schema untouched until a replacement worker is
-healthy:
+For disaster recovery or an intentional pilot reset, cut over to a sibling PostgreSQL service. Do not mass-delete,
+truncate with `CASCADE`, wipe, or rebuild in place on a nearly full volume. A sibling service avoids WAL pressure
+on the endangered volume and leaves an immediate rollback target.
 
-1. Take and verify a Railway PostgreSQL backup. Do not delete, rename, reset, or restore over the existing
-   database service or legacy `florence` schema.
-2. Temporarily disable GitHub autodeploy on `api`. Connect `florence-worker-v2` to the same repository and keep
-   its autodeploy disabled until the cutover finishes.
-3. Commit and push the exact release after `pnpm check` and the Docker build pass. This makes one auditable source
-   commit available without changing the live API.
-4. Update variables without triggering the old image: set `NODE_ENV=production` and
-   `FLORENCE_POSTGRES_SCHEMA=florence_v4`; use the same private Postgres reference, token key, complete data
-   keyring, Linq account/key/number/webhook secret, Google client, and active model route on both services. Use
-   Railway shared/reference variables rather than copying rendered secret values through a terminal.
-
-   Railway's sealed-variable UI is preferred for secrets. If an operator uses the CLI, send one secret through
-   standard input so it never appears in shell history, and suppress the automatic deployment while the full
-   contract is being assembled:
-
-   ```bash
-   railway variable set SECRET_VARIABLE --stdin --skip-deploys --service api --environment production
-   ```
-
-   Set the non-secret release guards explicitly on each service without starting a deployment:
-
-   ```bash
-   railway variable set NODE_ENV=production FLORENCE_POSTGRES_SCHEMA=florence_v4 --skip-deploys --service api --environment production
-   railway variable set NODE_ENV=production FLORENCE_POSTGRES_SCHEMA=florence_v4 --skip-deploys --service florence-worker-v2 --environment production
-   ```
-
-   Do not use `railway variable --json`, `--kv`, or any command that renders the resolved environment during
-   release preparation. Review variable names and reference links in Railway's UI, then apply all staged changes
-   together.
-5. Confirm the worker's Config-as-Code path is `/railway.worker.json`, then deploy that exact commit to
-   `florence-worker-v2`. Its pre-deploy creates or verifies only `florence_v4`. Wait for the worker lease to be
-   live and fresh:
+1. Stop `api` and `florence-worker-v2`. Take an encrypted PostgreSQL backup, restore it into an isolated database,
+   and verify a full metadata fingerprint before touching service references.
+2. Preserve exactly `schema_migrations`, `skills`, `skill_versions`, `evaluation_releases`, `evaluation_runs`, and
+   `skill_release_events`. Assert that every preserved `skill_release_events.actor_person_id` is null. Do not copy
+   customer/runtime tables or `worker_attempts`.
+3. Provision a sibling Railway PostgreSQL service. Using the immutable release that matches the backup, migrate
+   only through the backup's last applied migration (001–021 for the 2026-08-09 reset). In one transaction,
+   empty the fresh baseline rows in FK-safe order—`skill_release_events`, `evaluation_runs`, `worker_attempts`,
+   `skill_versions`, `skills`, `evaluation_releases`, then `schema_migrations`—and restore the six preserved
+   governance tables exactly, including the 001–021 migration digests and timestamps. `worker_attempts` is
+   deliberately emptied but never restored. Rerun that baseline migrator and require a no-op.
+4. Verify the baseline table set, exact governance fingerprints, and zero rows in every customer/runtime table.
+   Confirm PostgreSQL is healthy and not in recovery.
+5. While both application services remain stopped, point both `FLORENCE_DATABASE_URL` reference variables at the
+   sibling database with `--skip-deploys`. Never render resolved secrets in terminal output.
+6. Commit and push the release only after lint, typecheck, the full PostgreSQL-backed test suite, build, and the
+   pinned Docker build pass. Confirm the worker uses `/railway.worker.json` and the API uses `/railway.json`.
+7. Deploy and start `florence-worker-v2` first. Its pre-deploy must migrate the sibling database successfully.
+   For this release, pre-deploy applies only 022–023. Run the current migrator a second time and require a no-op;
+   recheck that the five governed-skill tables are unchanged, the preserved 001–021 migration rows still match
+   exactly, and 022–023 match the current committed digests. Then wait for the worker lease to be live and fresh:
 
    ```sql
    select release_id, now() - last_seen_at as heartbeat_age, stopped_at
@@ -217,13 +221,15 @@ healthy:
    ```
 
    `stopped_at` must be null and `heartbeat_age` must remain below 30 seconds.
-6. Confirm `api` uses `/railway.json`, then deploy the same commit. Railway must not switch traffic until the new
-   `/readyz` returns 200 against `florence_v4`. If pre-deploy or readiness fails, stop: the previous API remains
-   live and no legacy schema was modified.
-7. Run the automated smoke below, then one synthetic Linq delivery, one private onboarding, one consented-group
-   ingest, and one coverage loop through explicit acknowledgement. Inspect only stable error codes in logs.
-8. Re-enable autodeploy only after both services show the same commit/release, coherent shared variables, and a
-   fresh worker heartbeat. Keep the legacy schema and backup until a separate, explicit retirement decision.
+8. Deploy and start `api` from the same commit. Railway must not switch traffic until `/readyz` returns 200
+   against the sibling `florence_v4` schema.
+9. Run the automated smoke below, then the Jackson/Kendall onboarding acceptance. Keep the former PostgreSQL
+   service and encrypted backup intact until a separate, explicit retirement decision.
+
+Before the first new inbound event, rollback is simply: stop both application services, restore both database
+references to the retained service, and redeploy the matching prior image. After new state reaches the clean
+database, do not blindly repoint to the old service; restore or repair the new database so accepted state is not
+lost.
 
 Review Railway's staged changes before applying them. Confirm the web service shows the `/railway.json` file
 icon and the worker shows `/railway.worker.json` in deployment details. The production pre-deploy must finish

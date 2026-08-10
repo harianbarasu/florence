@@ -1,4 +1,4 @@
-import { type FormEvent, StrictMode, useCallback, useEffect, useMemo, useState } from "react";
+import { type FormEvent, type ReactNode, StrictMode, useCallback, useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { BrowserRouter, Navigate, NavLink, Outlet, Route, Routes, useLocation } from "react-router-dom";
 import {
@@ -20,6 +20,7 @@ function FlorenceApp() {
   const [viewer, setViewer] = useState<Viewer | null>(null);
   const [loading, setLoading] = useState(true);
   const [unauthorized, setUnauthorized] = useState(false);
+  const location = useLocation();
 
   useEffect(() => {
     getJson<Viewer>("/api/me")
@@ -31,10 +32,40 @@ function FlorenceApp() {
   }, []);
 
   if (loading) return <LoadingScreen />;
-  if (!viewer || unauthorized) return <PublicLanding />;
+  if (!viewer || unauthorized) {
+    const returnTo = safeAppReturnPath(`${location.pathname}${location.search}`);
+    return (
+      <Routes>
+        <Route path="/" element={<PublicLanding />} />
+        <Route path="/sign-in" element={<SignInPage />} />
+        <Route
+          path="*"
+          element={<Navigate to={signInPath(returnTo === "/" ? "/home" : returnTo)} replace />}
+        />
+      </Routes>
+    );
+  }
 
   const finishOnboarding = () =>
     setViewer((current) => (current ? { ...current, onboardingCompleted: true } : current));
+
+  if (viewer.loginAccounts.length === 0) {
+    return (
+      <Routes>
+        <Route path="/confirm-action" element={<PendingActionPage viewer={viewer} />} />
+        <Route path="/link-account" element={<LinkGoogleAccountPage viewer={viewer} />} />
+        <Route
+          path="/safety"
+          element={
+            <OnboardingSafetyPage>
+              <SafetyPage viewer={viewer} />
+            </OnboardingSafetyPage>
+          }
+        />
+        <Route path="*" element={<Navigate to="/link-account" replace />} />
+      </Routes>
+    );
+  }
 
   if (!viewer.onboardingCompleted) {
     return (
@@ -59,6 +90,11 @@ function FlorenceApp() {
 
   return (
     <Routes>
+      <Route
+        path="/sign-in"
+        element={<Navigate to={viewer.onboardingCompleted ? "/home" : "/onboarding"} replace />}
+      />
+      <Route path="/link-account" element={<LinkGoogleAccountPage viewer={viewer} />} />
       <Route path="/onboarding" element={<Navigate to="/home" replace />} />
       <Route path="/confirm-action" element={<PendingActionPage viewer={viewer} />} />
       <Route element={<AppShell viewer={viewer} />}>
@@ -72,6 +108,189 @@ function FlorenceApp() {
       <Route path="*" element={<Navigate to="/home" replace />} />
     </Routes>
   );
+}
+
+function SignInPage() {
+  const location = useLocation();
+  const query = new URLSearchParams(location.search);
+  const returnTo = safeAppReturnPath(query.get("returnTo"));
+  const error = googleLoginError(query.get("error"));
+  return (
+    <AuthFrame>
+      <div className="auth-heading">
+        <span>Welcome back</span>
+        <h1>Open Florence</h1>
+        <p>Sign in with a Google account you’ve already linked to Florence.</p>
+      </div>
+      {error ? (
+        <div className="auth-error" role="alert">
+          <strong>{error.title}</strong>
+          <span>{error.detail}</span>
+        </div>
+      ) : null}
+      <GoogleAuthButton mode="login" returnTo={returnTo === "/" ? "/home" : returnTo} />
+      <NewToFlorence />
+    </AuthFrame>
+  );
+}
+
+function LinkGoogleAccountPage({ viewer }: { viewer: Viewer }) {
+  const location = useLocation();
+  const error = googleLoginError(new URLSearchParams(location.search).get("error"));
+  const linkingFirstAccount = viewer.loginAccounts.length === 0;
+  return (
+    <AuthFrame privacyHref="/safety">
+      <div className="auth-heading">
+        <span>Your private Florence account</span>
+        <h1>{linkingFirstAccount ? "Save your sign-in" : "Add another sign-in"}</h1>
+        <p>
+          Link a Google account once, then return to Florence from this browser or any other device without
+          requesting another text link.
+        </p>
+      </div>
+      <div className="auth-privacy-note">
+        <strong>This does not connect Gmail or Calendar.</strong>
+        <span>Florence asks separately before reading either one.</span>
+      </div>
+      {error ? (
+        <div className="auth-error" role="alert">
+          <strong>{error.title}</strong>
+          <span>{error.detail}</span>
+        </div>
+      ) : null}
+      <GoogleAuthButton
+        mode="link"
+        returnTo={linkingFirstAccount ? "/onboarding" : "/safety"}
+        csrfToken={viewer.csrfToken}
+      />
+      <p className="auth-footnote">
+        You arrived through your verified private Florence conversation. Google confirms which reusable
+        sign-in belongs to that same person.
+      </p>
+    </AuthFrame>
+  );
+}
+
+function GoogleAuthButton({
+  mode,
+  returnTo,
+  csrfToken,
+}: {
+  mode: "login" | "link";
+  returnTo: string;
+  csrfToken?: string;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  async function begin() {
+    setBusy(true);
+    setError(null);
+    try {
+      const response = await fetch("/auth/google/start", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          ...(csrfToken ? { "X-CSRF-Token": csrfToken } : {}),
+        },
+        body: JSON.stringify({ mode, returnTo }),
+      });
+      const body = (await response.json().catch(() => null)) as {
+        authorizationUrl?: string;
+        error?: string;
+      } | null;
+      if (!response.ok || !body?.authorizationUrl) {
+        throw new Error(body?.error ?? "Google sign-in could not start.");
+      }
+      window.location.assign(body.authorizationUrl);
+    } catch {
+      setError("Google sign-in couldn’t start. Please try again.");
+      setBusy(false);
+    }
+  }
+  return (
+    <div className="google-auth-action">
+      <button type="button" className="google-auth-button" disabled={busy} onClick={() => void begin()}>
+        <span className="google-auth-mark" aria-hidden="true">
+          G
+        </span>
+        <span>{busy ? "Opening Google…" : "Continue with Google"}</span>
+      </button>
+      {error ? (
+        <p className="auth-inline-error" role="alert">
+          {error}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+function AuthFrame({ children, privacyHref = "/privacy" }: { children: ReactNode; privacyHref?: string }) {
+  return (
+    <div className="auth-shell">
+      <header className="auth-topbar">
+        <Brand />
+        <a href={privacyHref}>Privacy & account</a>
+      </header>
+      <main className="auth-main">
+        <section className="auth-card">{children}</section>
+      </main>
+    </div>
+  );
+}
+
+function NewToFlorence() {
+  const florencePhone = document.documentElement.dataset.florencePhone;
+  return (
+    <div className="auth-new-user">
+      <strong>New to Florence?</strong>
+      <span>Start by texting Florence so she can verify your private iMessage identity.</span>
+      {florencePhone ? <a href={`sms:${florencePhone}`}>Text Florence</a> : null}
+    </div>
+  );
+}
+
+function googleLoginError(value: string | null): { title: string; detail: string } | null {
+  if (value === "cancelled") {
+    return { title: "Google sign-in was cancelled.", detail: "Nothing changed. You can try again." };
+  }
+  if (value === "not_linked") {
+    return {
+      title: "That Google account isn’t linked to Florence yet.",
+      detail: "Choose another account, or open the private setup link Florence sent in iMessage once.",
+    };
+  }
+  if (value === "account_conflict") {
+    return {
+      title: "That Google account is already linked to another Florence person.",
+      detail: "Choose a different Google account, or sign out and open the Florence person it belongs to.",
+    };
+  }
+  if (value === "expired") {
+    return { title: "That sign-in attempt expired.", detail: "Your account is safe. Please start again." };
+  }
+  if (value === "provider") {
+    return { title: "Google couldn’t complete sign-in.", detail: "Please try again in a moment." };
+  }
+  return null;
+}
+
+function safeAppReturnPath(value: string | null | undefined): string {
+  if (!value) return "/home";
+  const path = value.split("?", 1)[0];
+  return path === "/home" ||
+    path === "/people" ||
+    path === "/chats" ||
+    path === "/sources" ||
+    path === "/safety" ||
+    path === "/onboarding"
+    ? path
+    : "/home";
+}
+
+function signInPath(returnTo: string): string {
+  return `/sign-in?returnTo=${encodeURIComponent(safeAppReturnPath(returnTo))}`;
 }
 
 interface PendingActionView {
@@ -192,11 +411,14 @@ function PublicLanding() {
           </div>
         </div>
         <div className="cta-card">
-          <strong>Start in iMessage</strong>
-          <span>Text Florence to register. Your private link will open this companion securely.</span>
-          <a className="primary-button" href={florencePhone ? `sms:${florencePhone}` : "/privacy"}>
-            {florencePhone ? "Text Florence" : "Florence is connecting"}
-          </a>
+          <strong>Open your Florence</strong>
+          <span>Return anytime with the Google account you linked during private setup.</span>
+          <GoogleAuthButton mode="login" returnTo="/home" />
+          {florencePhone ? (
+            <a className="landing-text-link" href={`sms:${florencePhone}`}>
+              New to Florence? Start in iMessage
+            </a>
+          ) : null}
         </div>
       </section>
       <section className="promise-grid">
@@ -1192,10 +1414,6 @@ function SourcesPage({ viewer }: { viewer: Viewer }) {
   const [shareDestinations, setShareDestinations] = useState<Record<string, string>>({});
   const [includeWorkMail, setIncludeWorkMail] = useState(false);
   const location = useLocation();
-  const googleStepUpReady =
-    viewer.session.assuranceKind === "google_connect" &&
-    viewer.session.assuranceExpiresAt !== null &&
-    new Date(viewer.session.assuranceExpiresAt) > new Date();
   useEffect(() => {
     if (!data?.privateReviews.some((review) => review.preparingShare)) return;
     const poll = window.setInterval(() => void reload(false), 3_000);
@@ -1228,6 +1446,27 @@ function SourcesPage({ viewer }: { viewer: Viewer }) {
   }, [googleSyncIncomplete, reload]);
   if (loading) return <PageSkeleton />;
   if (error || !data) return <ErrorCard message={error ?? "Could not load sources."} />;
+  async function connectGoogle(input: {
+    profile: "personal_family" | "work";
+    includeMail?: boolean;
+    integrationId?: string;
+  }) {
+    const busyKey = `google:${input.integrationId ?? input.profile}`;
+    setBusy(busyKey);
+    setActionError(null);
+    try {
+      const started = await postJson<{ authorizationUrl: string }>("/oauth/google/start", viewer.csrfToken, {
+        profile: input.profile,
+        ...(input.includeMail ? { mail: "include" } : {}),
+        from: "sources",
+        integrationId: input.integrationId ?? null,
+      });
+      window.location.assign(started.authorizationUrl);
+    } catch (reason) {
+      setActionError(reason instanceof Error ? reason.message : "Google connection could not start.");
+      setBusy(null);
+    }
+  }
   async function changeCalendar(
     connectionId: string,
     calendarId: string,
@@ -1340,27 +1579,6 @@ function SourcesPage({ viewer }: { viewer: Viewer }) {
       setBusy(null);
     }
   }
-  async function requestGoogleConnect(profile: "personal_family" | "work", includeMail = false) {
-    const busyKey = `google-connect:${profile}`;
-    setBusy(busyKey);
-    setActionError(null);
-    try {
-      await postJson("/api/safety/request-step-up", viewer.csrfToken, {
-        purpose: "google_connect",
-        context: {
-          profile,
-          ...(profile === "work" && includeMail ? { mail: "include" } : {}),
-        },
-      });
-      setActionMessage(
-        `Check your private iMessage from Florence to connect your ${profile === "work" ? "work" : "personal"} Google account.`,
-      );
-    } catch (reason) {
-      setActionError(reason instanceof Error ? reason.message : "Florence could not send the secure link.");
-    } finally {
-      setBusy(null);
-    }
-  }
   async function forgetMemory(memoryId: string) {
     if (!window.confirm("Forget this private memory? Florence will remove its stored copy.")) return;
     setBusy(`memory:${memoryId}`);
@@ -1403,6 +1621,9 @@ function SourcesPage({ viewer }: { viewer: Viewer }) {
       {location.search.includes("google=cancelled") ? (
         <div className="error-notice">Google was not connected. Nothing changed.</div>
       ) : null}
+      {location.search.includes("google=stale") ? (
+        <div className="error-notice">That Google connection changed before it finished. Try again.</div>
+      ) : null}
       {actionMessage ? (
         <div className="success-notice" role="status">
           {actionMessage}
@@ -1416,7 +1637,10 @@ function SourcesPage({ viewer }: { viewer: Viewer }) {
       <SectionHeading title="Connections" count={data.connections.length} />
       <div className="card-list">
         {data.connections.map((connection) => {
-          const requiresReconnect = connection.status === "reauth_required" || connection.status === "error";
+          const requiresReconnect =
+            connection.status === "reauth_required" ||
+            connection.status === "error" ||
+            connection.status === "revoked";
           const needsAttention =
             requiresReconnect ||
             connection.mail?.liveState === "needs_attention" ||
@@ -1424,8 +1648,9 @@ function SourcesPage({ viewer }: { viewer: Viewer }) {
             connection.calendar?.syncState === "needs_attention";
           const reconnectLabel =
             connection.accountKind === "work" ? "Reconnect work Google" : "Reconnect personal Google";
-          const reconnectIncludesWorkMail = connection.accountKind === "work" && connection.mail !== null;
-          const reconnectHref = `/oauth/google/start?profile=${connection.accountKind}${reconnectIncludesWorkMail ? "&mail=include" : ""}`;
+          const reconnectIncludesWorkMail =
+            connection.accountKind === "work" && connection.lastAuthorizedCapabilities.includes("mail");
+          const googleBusyKey = `google:${connection.id}`;
           return (
             <article className="source-card" key={connection.id}>
               <div className="source-heading">
@@ -1540,27 +1765,25 @@ function SourcesPage({ viewer }: { viewer: Viewer }) {
                 <div className="source-reconnect">
                   <p>
                     {connection.accountKind === "work"
-                      ? connection.mail
+                      ? reconnectIncludesWorkMail
                         ? "Reconnect this work Mail and Calendar profile. Its contents remain private to you."
                         : "Reconnect this calendar-only work profile. Work Gmail remains optional."
                       : "Reconnect this personal profile to restore its private Mail and Calendar access."}
                   </p>
-                  {googleStepUpReady ? (
-                    <a className="secondary-button" href={reconnectHref}>
-                      {reconnectLabel}
-                    </a>
-                  ) : (
-                    <button
-                      type="button"
-                      className="secondary-button"
-                      disabled={busy === `google-connect:${connection.accountKind}`}
-                      onClick={() =>
-                        void requestGoogleConnect(connection.accountKind, reconnectIncludesWorkMail)
-                      }
-                    >
-                      {reconnectLabel}
-                    </button>
-                  )}
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    disabled={busy === googleBusyKey}
+                    onClick={() =>
+                      void connectGoogle({
+                        profile: connection.accountKind,
+                        includeMail: reconnectIncludesWorkMail,
+                        integrationId: connection.id,
+                      })
+                    }
+                  >
+                    {reconnectLabel}
+                  </button>
                 </div>
               ) : null}
               {connection.status === "active" &&
@@ -1571,20 +1794,16 @@ function SourcesPage({ viewer }: { viewer: Viewer }) {
                     Want Florence to find family logistics in this account too? Work Gmail is optional and
                     stays private to you.
                   </p>
-                  {googleStepUpReady ? (
-                    <a className="secondary-button" href="/oauth/google/start?profile=work&mail=include">
-                      Add work Gmail
-                    </a>
-                  ) : (
-                    <button
-                      type="button"
-                      className="secondary-button"
-                      disabled={busy === "google-connect:work"}
-                      onClick={() => void requestGoogleConnect("work", true)}
-                    >
-                      Add work Gmail
-                    </button>
-                  )}
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    disabled={busy === googleBusyKey}
+                    onClick={() =>
+                      void connectGoogle({ profile: "work", includeMail: true, integrationId: connection.id })
+                    }
+                  >
+                    Add work Gmail
+                  </button>
                 </div>
               ) : null}
             </article>
@@ -1612,42 +1831,26 @@ function SourcesPage({ viewer }: { viewer: Viewer }) {
             </small>
           </span>
         </label>
-        {googleStepUpReady ? (
-          <div className="source-connect-actions">
-            <a className="primary-button" href="/oauth/google/start?profile=personal_family">
-              Connect personal Google
-              <small>Mail and Calendar</small>
-            </a>
-            <a
-              className="secondary-button"
-              href={`/oauth/google/start?profile=work${includeWorkMail ? "&mail=include" : ""}`}
-            >
-              Connect work Google
-              <small>{includeWorkMail ? "Mail and Calendar" : "Calendar only"}</small>
-            </a>
-          </div>
-        ) : (
-          <div className="source-connect-actions">
-            <button
-              type="button"
-              className="primary-button"
-              disabled={busy === "google-connect:personal_family"}
-              onClick={() => void requestGoogleConnect("personal_family")}
-            >
-              Connect personal Google
-              <small>Mail and Calendar</small>
-            </button>
-            <button
-              type="button"
-              className="secondary-button"
-              disabled={busy === "google-connect:work"}
-              onClick={() => void requestGoogleConnect("work", includeWorkMail)}
-            >
-              Connect work Google
-              <small>{includeWorkMail ? "Mail and Calendar" : "Calendar only"}</small>
-            </button>
-          </div>
-        )}
+        <div className="source-connect-actions">
+          <button
+            type="button"
+            className="primary-button"
+            disabled={busy === "google:personal_family"}
+            onClick={() => void connectGoogle({ profile: "personal_family" })}
+          >
+            Connect personal Google
+            <small>Mail and Calendar</small>
+          </button>
+          <button
+            type="button"
+            className="secondary-button"
+            disabled={busy === "google:work"}
+            onClick={() => void connectGoogle({ profile: "work", includeMail: includeWorkMail })}
+          >
+            Connect work Google
+            <small>{includeWorkMail ? "Mail and Calendar" : "Calendar only"}</small>
+          </button>
+        </div>
       </div>
       <RoutinesSection viewer={viewer} />
       <SectionHeading title="Private review" count={data.privateReviews.length} />
@@ -2257,10 +2460,19 @@ function SafetyPage({ viewer }: { viewer: Viewer }) {
   const [busy, setBusy] = useState<string | null>(null);
   const [actionMessage, setActionMessage] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
-  const accountControlsReady =
+  const [deletionReceipt, setDeletionReceipt] = useState<string | null>(null);
+  const freshAccountControlsAssurance =
     viewer.session.assuranceKind === "account_controls" &&
     viewer.session.assuranceExpiresAt !== null &&
     new Date(viewer.session.assuranceExpiresAt) > new Date();
+  const accountControlsReady =
+    freshAccountControlsAssurance && viewer.session.assuranceContext.action === undefined;
+  const exactIdentityLinkReady =
+    freshAccountControlsAssurance && viewer.session.assuranceContext.action === "link_google_identity";
+  const exactIdentityRevocationReady = (identityId: string) =>
+    freshAccountControlsAssurance &&
+    viewer.session.assuranceContext.action === "revoke_login_identity" &&
+    viewer.session.assuranceContext.identityId === identityId;
 
   async function runAction(key: string, path: string, body: unknown, success: string, after?: () => void) {
     setBusy(key);
@@ -2287,8 +2499,81 @@ function SafetyPage({ viewer }: { viewer: Viewer }) {
     );
   }
 
+  function linkAnotherGoogleAccount() {
+    if (exactIdentityLinkReady) {
+      window.location.assign("/link-account");
+      return;
+    }
+    void runAction(
+      "identity-link-step-up",
+      "/api/safety/request-step-up",
+      { purpose: "account_controls", context: { action: "link_google_identity" } },
+      "Check your private iMessage, open the exact sign-in confirmation, then continue there.",
+    );
+  }
+
+  function revokeGoogleIdentity(identityId: string) {
+    if (!exactIdentityRevocationReady(identityId)) {
+      void runAction(
+        `identity-step-up:${identityId}`,
+        "/api/safety/request-step-up",
+        {
+          purpose: "account_controls",
+          context: { action: "revoke_login_identity", identityId },
+        },
+        "Check your private iMessage, open the exact removal confirmation, then remove this sign-in here.",
+      );
+      return;
+    }
+    if (!window.confirm("Remove this Google account as a way to sign in to Florence?")) return;
+    void runAction(
+      `identity:${identityId}`,
+      `/api/safety/login-identities/${identityId}/revoke`,
+      {},
+      "That Google account can no longer sign in to Florence.",
+      identityId === viewer.session.authenticationIdentityId
+        ? () => window.location.assign("/sign-in")
+        : undefined,
+    );
+  }
+
+  async function deletePerson() {
+    setBusy("delete-person");
+    setActionMessage(null);
+    setActionError(null);
+    try {
+      const receipt = await postJson<{ ids: { deletionReceiptDigest?: string } }>(
+        "/api/safety/delete-person",
+        viewer.csrfToken,
+        {},
+      );
+      if (!receipt.ids.deletionReceiptDigest) throw new Error("Deletion receipt was not returned");
+      setDeletionReceipt(receipt.ids.deletionReceiptDigest);
+    } catch (reason) {
+      setActionError(reason instanceof Error ? reason.message : "Florence could not delete your account.");
+      setBusy(null);
+    }
+  }
+
   if (loading) return <PageSkeleton />;
   if (error || !data) return <ErrorCard message={error ?? "Could not load safety controls."} />;
+  if (deletionReceipt) {
+    return (
+      <div className="page-stack">
+        <Intro
+          title="Your Florence account was deleted"
+          copy="Your access, private identities, credentials, source content, and memories were erased or revoked. Keep this receipt digest for your records."
+        />
+        <article className="settings-card">
+          <span className="section-kicker">Deletion receipt</span>
+          <code className="receipt-digest">{deletionReceipt}</code>
+        </article>
+        <a className="secondary-button" href="/sign-in">
+          Return to sign in
+        </a>
+      </div>
+    );
+  }
   return (
     <div className="page-stack">
       <Intro
@@ -2328,6 +2613,52 @@ function SafetyPage({ viewer }: { viewer: Viewer }) {
           {...(accountControlsReady ? { href: "/api/safety/export" } : { onClick: requestAccountControls })}
         />
       </div>
+      <SectionHeading title="Sign-in accounts" count={data.loginAccounts.length} />
+      <p className="section-explainer">
+        These accounts can open Florence. Gmail and Calendar access is managed separately below.
+      </p>
+      <div className="item-list">
+        {data.loginAccounts.map((account) => (
+          <article className="knowledge-row" key={account.id}>
+            <div>
+              <h3>{account.email}</h3>
+              <p>Google · Sign-in only</p>
+            </div>
+            <div className="row-actions">
+              <span className="status-pill good">Linked</span>
+              <button
+                type="button"
+                className="quiet-button"
+                disabled={
+                  data.loginAccounts.length <= 1 ||
+                  busy === `identity:${account.id}` ||
+                  busy === `identity-step-up:${account.id}`
+                }
+                title={
+                  data.loginAccounts.length <= 1
+                    ? "Add another Google sign-in before removing this one."
+                    : undefined
+                }
+                onClick={() => revokeGoogleIdentity(account.id)}
+              >
+                {data.loginAccounts.length <= 1
+                  ? "Only sign-in"
+                  : exactIdentityRevocationReady(account.id)
+                    ? "Remove sign-in"
+                    : "Confirm removal"}
+              </button>
+            </div>
+          </article>
+        ))}
+      </div>
+      <button
+        type="button"
+        className="secondary-button"
+        disabled={busy === "identity-link-step-up"}
+        onClick={linkAnotherGoogleAccount}
+      >
+        {exactIdentityLinkReady ? "Add another Google sign-in" : "Confirm another sign-in privately"}
+      </button>
       <SectionHeading title="Active browser sessions" count={data.sessions.length} />
       <div className="item-list">
         {data.sessions.map((session) => (
@@ -2357,7 +2688,7 @@ function SafetyPage({ viewer }: { viewer: Viewer }) {
           </article>
         ))}
       </div>
-      <SectionHeading title="Private connections" count={data.connections.length} />
+      <SectionHeading title="Gmail & Calendar connections" count={data.connections.length} />
       <div className="item-list">
         {data.connections.map((connection) => (
           <article className="knowledge-row" key={connection.id}>
@@ -2365,27 +2696,25 @@ function SafetyPage({ viewer }: { viewer: Viewer }) {
               <h3>{connection.email}</h3>
               <p>Google · {connection.status.replaceAll("_", " ")}</p>
             </div>
-            {accountControlsReady ? (
-              <button
-                type="button"
-                className="quiet-button"
-                disabled={busy === `connection:${connection.id}`}
-                onClick={() =>
-                  void runAction(
-                    `connection:${connection.id}`,
-                    `/api/sources/${connection.id}/disconnect`,
-                    {},
-                    `${connection.email} was disconnected and its private source access was revoked.`,
-                  )
-                }
-              >
-                Disconnect
-              </button>
-            ) : null}
+            <button
+              type="button"
+              className="quiet-button"
+              disabled={busy === `connection:${connection.id}`}
+              onClick={() =>
+                void runAction(
+                  `connection:${connection.id}`,
+                  `/api/sources/${connection.id}/disconnect`,
+                  {},
+                  `${connection.email} was disconnected and its private source access was revoked.`,
+                )
+              }
+            >
+              Disconnect
+            </button>
           </article>
         ))}
       </div>
-      {!accountControlsReady && (data.sessions.length > 1 || data.connections.length > 0) ? (
+      {!accountControlsReady && (data.sessions.length > 1 || data.loginAccounts.length > 0) ? (
         <button
           type="button"
           className="secondary-button"
@@ -2409,13 +2738,7 @@ function SafetyPage({ viewer }: { viewer: Viewer }) {
           onClick={() => {
             if (!accountControlsReady) return requestAccountControls();
             if (!window.confirm("Permanently delete your Florence account and private data?")) return;
-            void runAction(
-              "delete-person",
-              "/api/safety/delete-person",
-              {},
-              "Your Florence account was deleted.",
-              () => window.location.assign("/"),
-            );
+            void deletePerson();
           }}
         >
           {accountControlsReady ? "Delete my account" : "Confirm privately first"}

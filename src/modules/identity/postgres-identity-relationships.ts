@@ -1,12 +1,15 @@
 import { randomUUID } from "node:crypto";
 import type { TransactionSql } from "postgres";
 import type { Database } from "../../db/client.js";
-import { secureDigestEquals } from "../../shared/crypto.js";
+import { type SecretBox, secureDigestEquals } from "../../shared/crypto.js";
 import { ConflictError, NotFoundError, StaleAuthorityError, UnauthorizedError } from "../../shared/errors.js";
+import { providerAccountOwnershipLockKey } from "../../shared/provider-account.js";
 import {
   AcceptInvitationInputSchema,
   type ApproveInvitationInput,
   ApproveInvitationInputSchema,
+  type BindProviderAccountIdentityInput,
+  BindProviderAccountIdentityInputSchema,
   type ClaimIdentityInput,
   ClaimIdentityInputSchema,
   type CreateHouseholdInput,
@@ -24,6 +27,9 @@ import {
   type MembershipCapability,
   type ObserveIdentityInput,
   ObserveIdentityInputSchema,
+  ProviderAccountIdentityBindingSchema,
+  type RefreshProviderAccountIdentityLabelInput,
+  RefreshProviderAccountIdentityLabelInputSchema,
   StewardCapabilities,
   type SuspendCaregiverInput,
   SuspendCaregiverInputSchema,
@@ -67,7 +73,10 @@ interface InvitationRow {
  * transaction; callers never assemble partial identity or membership writes.
  */
 export class PostgresIdentityRelationships implements IdentityRelationships {
-  public constructor(private readonly database: Executor) {}
+  public constructor(
+    private readonly database: Executor,
+    private readonly secretBox?: SecretBox,
+  ) {}
 
   public async observeIdentity(inputCandidate: ObserveIdentityInput): Promise<IdentityPrincipal> {
     const input = ObserveIdentityInputSchema.parse(inputCandidate);
@@ -228,6 +237,242 @@ export class PostgresIdentityRelationships implements IdentityRelationships {
         personStatus: "registered",
         identityStatus: "verified",
         identityAuthorityVersion: input.expectedIdentityAuthorityVersion + 1,
+      });
+    });
+  }
+
+  /**
+   * Binds an already-verified provider account directly to an existing person.
+   * This deliberately does not create a provisional person or travel through
+   * the private-handle claim flow: the caller must already hold current person
+   * authority, and one provider subject can belong to only one global person.
+   */
+  public async bindProviderAccountIdentity(inputCandidate: BindProviderAccountIdentityInput) {
+    const input = BindProviderAccountIdentityInputSchema.parse(inputCandidate);
+    const secretBox = requireSecretBox(this.secretBox);
+    return inTransaction(this.database, async (transaction) => {
+      const lockKey = providerAccountOwnershipLockKey(input.issuer, input.subjectDigest);
+      await transaction`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`;
+      const personRows = await transaction<
+        { readonly status: string; readonly control_epoch: number | string }[]
+      >`
+        select status, control_epoch from people where id = ${input.personId} for update
+      `;
+      const person = personRows[0];
+      if (!person) throw new NotFoundError("Person does not exist");
+      if (person.status !== "registered") {
+        throw new UnauthorizedError("Only a registered person may bind a provider account");
+      }
+      if (Number(person.control_epoch) !== input.expectedPersonControlEpoch) {
+        throw new StaleAuthorityError("Person authority changed before provider account binding");
+      }
+
+      const integrationOwners = await transaction<{ readonly person_id: string }[]>`
+        select person_id from integrations
+        where provider = ${input.issuer}
+          and external_subject_digest = ${input.subjectDigest}
+        for update
+      `;
+      if (integrationOwners.some((owner) => owner.person_id !== input.personId)) {
+        throw new ConflictError("Google account source already belongs to another Florence person");
+      }
+      const existingRows = await transaction<
+        (PrincipalRow & {
+          readonly subject_ciphertext: Buffer | null;
+          readonly display_label_ciphertext: Buffer | null;
+        })[]
+      >`
+        select identity.person_id, identity.id as identity_id,
+          person.status as person_status, identity.status as identity_status,
+          identity.authority_version as identity_authority_version,
+          identity.subject_ciphertext, identity.display_label_ciphertext
+        from person_identities identity
+        join people person on person.id = identity.person_id
+        where identity.issuer = ${input.issuer}
+          and identity.kind = 'provider_account'
+          and identity.subject_digest = ${input.subjectDigest}
+        for update of identity
+      `;
+      const existing = existingRows[0];
+      if (existing && existing.person_id !== input.personId) {
+        throw new ConflictError("Google account already belongs to another Florence person");
+      }
+
+      const boundAt = new Date(input.boundAt);
+      const normalizedEmail = input.verifiedEmail.toLocaleLowerCase("en-US");
+      if (!existing) {
+        const identityId = randomUUID();
+        const subject = sealIdentityValue(secretBox, identityId, "subject", input.subject);
+        const displayLabel = sealIdentityValue(secretBox, identityId, "display-label", normalizedEmail);
+        await transaction`
+          insert into person_identities (
+            id, person_id, kind, issuer, subject_digest, subject_ciphertext,
+            subject_key_version, display_label_ciphertext, display_label_key_version,
+            status, authority_version, observed_at, verified_at, created_at, updated_at
+          ) values (
+            ${identityId}, ${input.personId}, 'provider_account', ${input.issuer},
+            ${input.subjectDigest}, ${subject.ciphertext}, ${subject.keyVersion},
+            ${displayLabel.ciphertext}, ${displayLabel.keyVersion}, 'verified', 1,
+            ${boundAt}, ${boundAt}, ${boundAt}, ${boundAt}
+          )
+        `;
+        return ProviderAccountIdentityBindingSchema.parse({
+          identity: {
+            personId: input.personId,
+            identityId,
+            personStatus: "registered",
+            identityStatus: "verified",
+            identityAuthorityVersion: 1,
+          },
+          duplicate: false,
+        });
+      }
+
+      if (
+        existing.subject_ciphertext &&
+        openIdentityValue(secretBox, existing.identity_id, "subject", existing.subject_ciphertext) !==
+          input.subject
+      ) {
+        throw new ConflictError("Google subject does not match its existing identity record");
+      }
+      const currentEmail = existing.display_label_ciphertext
+        ? openIdentityValue(
+            secretBox,
+            existing.identity_id,
+            "display-label",
+            existing.display_label_ciphertext,
+          )
+        : null;
+      const subjectMissing = existing.subject_ciphertext === null;
+      const labelChanged = currentEmail !== normalizedEmail;
+      const relinking = existing.identity_status !== "verified";
+      if (subjectMissing || labelChanged || relinking) {
+        const subject = subjectMissing
+          ? sealIdentityValue(secretBox, existing.identity_id, "subject", input.subject)
+          : null;
+        const displayLabel = labelChanged
+          ? sealIdentityValue(secretBox, existing.identity_id, "display-label", normalizedEmail)
+          : null;
+        await transaction`
+          update person_identities
+          set subject_ciphertext = coalesce(${subject?.ciphertext ?? null}, subject_ciphertext),
+              subject_key_version = coalesce(${subject?.keyVersion ?? null}, subject_key_version),
+              display_label_ciphertext = coalesce(
+                ${displayLabel?.ciphertext ?? null}, display_label_ciphertext
+              ),
+              display_label_key_version = coalesce(
+                ${displayLabel?.keyVersion ?? null}, display_label_key_version
+              ),
+              status = 'verified',
+              verified_at = case when status = 'verified' then verified_at else ${boundAt} end,
+              revoked_at = null,
+              authority_version = authority_version + case when status = 'verified' then 0 else 1 end,
+              updated_at = ${boundAt}
+          where id = ${existing.identity_id} and person_id = ${input.personId}
+        `;
+      }
+      return ProviderAccountIdentityBindingSchema.parse({
+        identity: {
+          personId: input.personId,
+          identityId: existing.identity_id,
+          personStatus: "registered",
+          identityStatus: "verified",
+          identityAuthorityVersion: Number(existing.identity_authority_version) + (relinking ? 1 : 0),
+        },
+        duplicate: !subjectMissing && !labelChanged && !relinking,
+      });
+    });
+  }
+
+  /**
+   * Refreshes the mutable account label observed during a returning login.
+   * The immutable provider subject remains the sole login authority.
+   */
+  public async refreshProviderAccountIdentityLabel(inputCandidate: RefreshProviderAccountIdentityLabelInput) {
+    const input = RefreshProviderAccountIdentityLabelInputSchema.parse(inputCandidate);
+    const secretBox = requireSecretBox(this.secretBox);
+    return inTransaction(this.database, async (transaction) => {
+      const personRows = await transaction<
+        { readonly status: string; readonly control_epoch: number | string }[]
+      >`
+        select status, control_epoch from people where id = ${input.personId} for update
+      `;
+      const person = personRows[0];
+      if (!person) throw new NotFoundError("Person does not exist");
+      if (
+        person.status !== "registered" ||
+        Number(person.control_epoch) !== input.expectedPersonControlEpoch
+      ) {
+        throw new StaleAuthorityError("Person authority changed before provider label refresh");
+      }
+
+      const identityRows = await transaction<
+        (PrincipalRow & {
+          readonly issuer: string;
+          readonly kind: string;
+          readonly subject_digest: string;
+          readonly display_label_ciphertext: Buffer | null;
+        })[]
+      >`
+        select identity.person_id, identity.id as identity_id,
+          person.status as person_status, identity.status as identity_status,
+          identity.authority_version as identity_authority_version,
+          identity.issuer, identity.kind, identity.subject_digest,
+          identity.display_label_ciphertext
+        from person_identities identity
+        join people person on person.id = identity.person_id
+        where identity.id = ${input.identityId}
+        for update of identity
+      `;
+      const identity = identityRows[0];
+      if (!identity) throw new NotFoundError("Provider account identity does not exist");
+      if (
+        identity.person_id !== input.personId ||
+        identity.person_status !== "registered" ||
+        identity.identity_status !== "verified" ||
+        Number(identity.identity_authority_version) !== input.expectedIdentityAuthorityVersion ||
+        identity.issuer !== input.issuer ||
+        identity.kind !== "provider_account" ||
+        identity.subject_digest !== input.subjectDigest
+      ) {
+        throw new StaleAuthorityError("Provider account authority changed before label refresh");
+      }
+
+      const normalizedEmail = input.verifiedEmail.toLocaleLowerCase("en-US");
+      const currentLabel = identity.display_label_ciphertext
+        ? openIdentityValue(
+            secretBox,
+            identity.identity_id,
+            "display-label",
+            identity.display_label_ciphertext,
+          )
+        : null;
+      const changed = currentLabel !== normalizedEmail;
+      if (changed) {
+        const displayLabel = sealIdentityValue(
+          secretBox,
+          identity.identity_id,
+          "display-label",
+          normalizedEmail,
+        );
+        await transaction`
+          update person_identities
+          set display_label_ciphertext = ${displayLabel.ciphertext},
+              display_label_key_version = ${displayLabel.keyVersion},
+              observed_at = ${new Date(input.observedAt)},
+              updated_at = ${new Date(input.observedAt)}
+          where id = ${identity.identity_id}
+        `;
+      }
+      return ProviderAccountIdentityBindingSchema.parse({
+        identity: {
+          personId: input.personId,
+          identityId: identity.identity_id,
+          personStatus: "registered",
+          identityStatus: "verified",
+          identityAuthorityVersion: Number(identity.identity_authority_version),
+        },
+        duplicate: !changed,
       });
     });
   }
@@ -747,6 +992,39 @@ function inTransaction<Result>(
   return "begin" in executor
     ? (executor.begin(operation) as unknown as Promise<Result>)
     : operation(executor);
+}
+
+function requireSecretBox(secretBox: SecretBox | undefined): SecretBox {
+  if (!secretBox) throw new Error("Provider account binding requires encrypted identity storage");
+  return secretBox;
+}
+
+function identityValuePurpose(identityId: string, kind: "subject" | "display-label"): string {
+  return kind === "subject" ? `identity-subject:${identityId}` : `identity-display-label:${identityId}`;
+}
+
+function sealIdentityValue(
+  secretBox: SecretBox,
+  identityId: string,
+  kind: "subject" | "display-label",
+  value: string,
+): { readonly ciphertext: Buffer; readonly keyVersion: string } {
+  const sealed = secretBox.encrypt(value, identityValuePurpose(identityId, kind));
+  return {
+    ciphertext: Buffer.from(JSON.stringify(sealed), "utf8"),
+    keyVersion: sealed.kid,
+  };
+}
+
+function openIdentityValue(
+  secretBox: SecretBox,
+  identityId: string,
+  kind: "subject" | "display-label",
+  ciphertext: Buffer,
+): string {
+  return secretBox
+    .decrypt(JSON.parse(ciphertext.toString("utf8")) as unknown, identityValuePurpose(identityId, kind))
+    .toString("utf8");
 }
 
 async function requireRegisteredPerson(transaction: Transaction, personId: string): Promise<void> {

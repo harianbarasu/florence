@@ -849,23 +849,7 @@ export class GoogleSyncCoordinator {
     const idempotencyKey = milestoneKey(scope, phase);
     let text = await recoverPriorMessageText(transaction, this.secretBox, idempotencyKey);
     if (text === null) {
-      const handoff = await new PostgresWebAuth(
-        transaction,
-        this.secretBox,
-        this.config.security.tokenKey,
-      ).createHandoff({
-        personId: scope.personId,
-        privateIdentityId: route.identityId,
-        privateConversationId: route.conversationId,
-        purpose: "google_connect",
-        context: {
-          returnPath: "/sources",
-          integrationId: scope.integrationId,
-          reconnect: true,
-        },
-        expiresInSeconds: 10 * 60,
-      });
-      text = attentionRequiredMessage(scope, `${this.config.publicBaseUrl}/handoff/${handoff.token}`);
+      text = attentionRequiredMessage(scope, `${this.config.publicBaseUrl}/sources`);
     }
     return this.enqueueEffect(transaction, {
       scope,
@@ -1008,7 +992,7 @@ function attentionRequiredMessage(scope: IntegrationScope, link: string): string
     scope.accountKind === "work" && isCalendarOnly(scope)
       ? "work Google Calendar"
       : `${scope.accountKind === "work" ? "work" : "personal"} Google account`;
-  return `I lost access to your ${source}. Reconnect it privately here so I can resume reviewing ${sourceNames(scope)}: ${link}\n\nThis secure link expires in 10 minutes. If it expires, text me “connect Google” for a fresh one.`;
+  return `I lost access to your ${source}. Reconnect it privately in Florence so I can resume reviewing ${sourceNames(scope)}: ${link}`;
 }
 
 function sourceNames(scope: IntegrationScope): string {

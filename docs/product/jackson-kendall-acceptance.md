@@ -20,11 +20,15 @@ Florence answers plainly, explains that she can retain permitted family context,
 details, and asks for consent in natural language. Jackson may consent with an ordinary affirmative
 reply; no `START`, `NAME`, or other command is required. Florence learns what to call him, offers to
 create his family, and moves to a secure mobile-web handoff when structured controls are useful.
+That first private handoff proves Jackson's phone-bound Florence identity once. Jackson links a
+Google login during bootstrap; after that he can return through Florence's stable “Continue with
+Google” page without requesting another text link. This identity-only login does not grant Gmail or
+Calendar access.
 
 ### 2. Jackson connects Google while setup continues
 
-After the household is resolved, Florence offers Jackson a private, single-use handoff for personal
-Google. Sync begins immediately without waiting for Kendall. Florence confirms meaningful private
+After the household is resolved, Florence separately offers Jackson optional personal Gmail and
+Calendar access from the authenticated onboarding flow. Sync begins immediately without waiting for Kendall. Florence confirms meaningful private
 milestones while Jackson can continue adding children, schools, activities, routines, and a
 co-parent. Declining Google does not block Florence or create repeated generic reminders.
 

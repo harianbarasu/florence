@@ -16,6 +16,8 @@ export interface PrivateSourceEffectFrontier {
   readonly sourceGeneration: number;
 }
 
+export type EffectKind = "linq.message" | "google.oauth_token.revoke";
+
 export interface AuthorizedEffectInput extends AuthorityFence {
   readonly actionIntentId?: string;
   readonly actorPersonId?: string;
@@ -37,7 +39,7 @@ export interface AuthorizedEffectInput extends AuthorityFence {
   };
   readonly sourceFrontier?: PrivateSourceEffectFrontier;
   readonly evidenceSourceRevisionIds?: readonly string[];
-  readonly effectKind: "linq.message";
+  readonly effectKind: EffectKind;
   readonly idempotencyKey: string;
   readonly data: unknown;
   readonly policy: unknown;
@@ -49,7 +51,7 @@ export interface AuthorizedEffectInput extends AuthorityFence {
 
 export interface ClaimedEffect<Payload = unknown> {
   readonly outboxId: string;
-  readonly effectKind: "linq.message";
+  readonly effectKind: EffectKind;
   readonly idempotencyKey: string;
   readonly payload: Payload;
   readonly attemptCount: number;
@@ -65,7 +67,7 @@ export interface ClaimedSubmittedEffect<Payload = unknown> extends ClaimedEffect
 
 interface OutboxRow {
   id: string;
-  effect_kind: "linq.message";
+  effect_kind: EffectKind;
   idempotency_key: string;
   payload_ciphertext: Buffer;
   attempt_count: number;
@@ -82,7 +84,7 @@ type DeliverableEffectStatus = "pending" | "leased" | "retry" | "submitted" | "c
 interface ExistingEffectRow {
   readonly id: string;
   readonly status: DeliverableEffectStatus | "ambiguous" | "dead" | "cancelled";
-  readonly effect_kind: "linq.message";
+  readonly effect_kind: EffectKind;
   readonly action_intent_id: string | null;
   readonly household_id: string | null;
   readonly household_control_epoch: number | string | null;
@@ -155,6 +157,15 @@ interface EffectSourceLockTarget {
 export type GuardedSubmissionResult<Result> =
   | { readonly authorized: false }
   | { readonly authorized: true; readonly result: Result };
+
+export type GoogleTokenRevocationSubmissionResult<Result> =
+  | { readonly authorized: false }
+  | {
+      readonly authorized: true;
+      readonly integrationId: string;
+      readonly expectedIntegrationControlEpoch: number;
+      readonly result: Result;
+    };
 
 type Transaction = TransactionSql<Record<string, never>>;
 type Executor = Database | Transaction;
@@ -380,7 +391,11 @@ export class EffectOutbox {
         where effect.status in ('pending', 'retry', 'leased')
           and effect.available_at <= ${now}
           and (effect.status <> 'leased' or effect.lease_expires_at <= ${now})
-          and decision.outcome = 'allow' and decision.revoked_at is null and decision.expires_at > ${now}
+          and decision.outcome = 'allow' and decision.revoked_at is null
+          and (
+            effect.effect_kind = 'google.oauth_token.revoke'
+            or decision.expires_at > ${now}
+          )
           and (effect.routine_pattern_candidate_id is null or exists (
             select 1 from knowledge_candidates routine_candidate
             where routine_candidate.id = effect.routine_pattern_candidate_id
@@ -392,7 +407,7 @@ export class EffectOutbox {
             cardinality(effect.evidence_source_revision_ids) = 0
             or decision.expires_at > ${new Date(now.getTime() + 3 * 60_000)}
           )
-          and (effect.person_id is null or (
+          and (effect.effect_kind = 'google.oauth_token.revoke' or effect.person_id is null or (
             person.status = 'registered' and person.control_epoch = effect.person_control_epoch
           ))
           and (effect.person_onboarding_version is null or person_onboarding_fence_is_current(
@@ -400,8 +415,16 @@ export class EffectOutbox {
           ))
           and (effect.household_id is null or household.control_epoch = effect.household_control_epoch)
           and (effect.integration_id is null or (
-            integration.status <> 'revoked'
-            and integration.control_epoch = effect.integration_control_epoch
+            integration.control_epoch = effect.integration_control_epoch
+            and (
+              (effect.effect_kind = 'google.oauth_token.revoke'
+                and integration.provider = 'google'
+                and integration.status = 'revocation_pending'
+                and integration.credential_ciphertext is not null)
+              or
+              (effect.effect_kind <> 'google.oauth_token.revoke'
+                and integration.status <> 'revoked')
+            )
           ))
           and (effect.conversation_id is null or (
             conversation.status = 'active'
@@ -649,7 +672,10 @@ export class EffectOutbox {
           and candidate.private_source_case_key_digest is not distinct from
             ${target.private_source_case_key_digest}::text
           and decision.outcome = 'allow' and decision.revoked_at is null
-          and decision.expires_at > ${authorizedAt}
+          and (
+            candidate.effect_kind = 'google.oauth_token.revoke'
+            or decision.expires_at > ${authorizedAt}
+          )
           and (candidate.routine_pattern_candidate_id is null or exists (
             select 1 from knowledge_candidates routine_candidate
             where routine_candidate.id = candidate.routine_pattern_candidate_id
@@ -662,7 +688,7 @@ export class EffectOutbox {
             cardinality(candidate.evidence_source_revision_ids) = 0
             or decision.expires_at > ${new Date(authorizedAt.getTime() + 3 * 60_000)}
           )
-          and (candidate.person_id is null or (
+          and (candidate.effect_kind = 'google.oauth_token.revoke' or candidate.person_id is null or (
             person.status = 'registered' and person.control_epoch = candidate.person_control_epoch
           ))
           and (candidate.person_onboarding_version is null or person_onboarding_fence_is_current(
@@ -673,8 +699,16 @@ export class EffectOutbox {
             and household.control_epoch = candidate.household_control_epoch
           ))
           and (candidate.integration_id is null or (
-            integration.status <> 'revoked'
-            and integration.control_epoch = candidate.integration_control_epoch
+            integration.control_epoch = candidate.integration_control_epoch
+            and (
+              (candidate.effect_kind = 'google.oauth_token.revoke'
+                and integration.provider = 'google'
+                and integration.status = 'revocation_pending'
+                and integration.credential_ciphertext is not null)
+              or
+              (candidate.effect_kind <> 'google.oauth_token.revoke'
+                and integration.status <> 'revoked')
+            )
           ))
           and (candidate.conversation_id is null or (
             conversation.status = 'active'
@@ -745,6 +779,117 @@ export class EffectOutbox {
           and status = 'leased' and lease_token = ${effect.leaseToken}
       `;
       return { authorized: true, result };
+    });
+  }
+
+  /**
+   * Keeps Google credentials out of the durable effect payload and the claimed
+   * worker value. The encrypted integration credential is opened only after the
+   * exact disconnect intent, approval, effect lease, and pending epoch agree,
+   * then is handed directly to the provider adapter callback.
+   */
+  public async reauthorizeGoogleTokenRevocation<Result>(
+    effect: Pick<ClaimedEffect, "outboxId" | "leaseToken">,
+    revoke: (credentials: Readonly<Record<string, unknown>>) => Promise<Result>,
+    now = new Date(),
+  ): Promise<GoogleTokenRevocationSubmissionResult<Result>> {
+    return inTransaction(this.database, async (transaction) => {
+      const rows = await transaction<
+        {
+          readonly integration_id: string;
+          readonly integration_control_epoch: number | string;
+          readonly credential_ciphertext: Buffer;
+        }[]
+      >`
+        select integration.id as integration_id,
+          effect.integration_control_epoch, integration.credential_ciphertext
+        from outbox effect
+        join disclosure_decisions decision on decision.id = effect.authorization_decision_id
+        join action_intents intent on intent.id = effect.action_intent_id
+        join integrations integration on integration.id = effect.integration_id
+        where effect.id = ${effect.outboxId}
+          and effect.effect_kind = 'google.oauth_token.revoke'
+          and effect.status in ('leased', 'submitted') and effect.lease_token = ${effect.leaseToken}
+          and effect.person_id = integration.person_id
+          and effect.integration_control_epoch = integration.control_epoch
+          and integration.provider = 'google' and integration.status = 'revocation_pending'
+          and integration.credential_ciphertext is not null
+          and intent.action_kind = 'google_oauth_token_revocation' and intent.status = 'executing'
+          and intent.person_id = effect.person_id
+          and intent.action_digest = decision.action_digest
+          and intent.data_digest = decision.data_digest
+          and intent.policy_digest = decision.policy_digest
+          and intent.target_digest = decision.target_digest
+          and decision.outcome = 'allow' and decision.revoked_at is null
+          and exists (
+            select 1 from action_approvals approval
+            where approval.action_intent_id = intent.id
+              and approval.approved_by_person_id = effect.person_id
+              and approval.action_digest = intent.action_digest
+              and approval.data_digest = intent.data_digest
+              and approval.policy_digest = intent.policy_digest
+              and approval.target_digest = intent.target_digest
+              and approval.approved_at <= ${now} and approval.revoked_at is null
+          )
+        for update of effect, intent, integration
+      `;
+      const row = rows[0];
+      if (!row) {
+        await transaction`
+          update outbox set
+            status = case
+              when exists (
+                select 1 from integrations integration
+                where integration.id = outbox.integration_id
+                  and integration.provider = 'google'
+                  and integration.status = 'revocation_pending'
+                  and integration.control_epoch = outbox.integration_control_epoch
+                  and integration.credential_ciphertext is not null
+              ) then case when status = 'leased' then 'retry' else 'submitted' end
+              else 'cancelled'
+            end,
+            available_at = ${new Date(now.getTime() + 60_000)},
+            lease_owner = null, lease_token = null, lease_expires_at = null,
+            last_error_code = case
+              when exists (
+                select 1 from integrations integration
+                where integration.id = outbox.integration_id
+                  and integration.status = 'revocation_pending'
+                  and integration.control_epoch = outbox.integration_control_epoch
+                  and integration.credential_ciphertext is not null
+              ) then 'google_revocation_authority_retry'
+              else 'google_revocation_locally_finalized'
+            end,
+            updated_at = ${now}
+          where id = ${effect.outboxId} and lease_token = ${effect.leaseToken}
+            and status in ('leased', 'submitted')
+        `;
+        return { authorized: false };
+      }
+      const credentials = parseJsonObject(
+        JSON.parse(
+          this.secretBox
+            .decrypt(
+              JSON.parse(row.credential_ciphertext.toString("utf8")),
+              integrationCredentialPurpose(row.integration_id),
+            )
+            .toString("utf8"),
+        ) as unknown,
+      );
+      const result = await revoke(credentials);
+      await transaction`
+        update outbox
+        set status = 'submitted', available_at = ${new Date(now.getTime() + 60_000)},
+          updated_at = ${now}
+        where id = ${effect.outboxId} and lease_token = ${effect.leaseToken}
+          and status in ('leased', 'submitted')
+      `;
+      return {
+        authorized: true,
+        integrationId: row.integration_id,
+        expectedIntegrationControlEpoch: Number(row.integration_control_epoch),
+        result,
+      };
     });
   }
 
@@ -1106,7 +1251,7 @@ export class EffectOutbox {
       update outbox effect set status = 'cancelled', lease_owner = null, lease_token = null,
         lease_expires_at = null, last_error_code = 'authority_fence_changed', updated_at = ${now}
       where effect.status in ('pending', 'retry', 'leased') and (
-        not exists (
+        (effect.effect_kind <> 'google.oauth_token.revoke' and not exists (
           select 1 from disclosure_decisions decision
           where decision.id = effect.authorization_decision_id
             and decision.outcome = 'allow' and decision.revoked_at is null
@@ -1115,8 +1260,9 @@ export class EffectOutbox {
               cardinality(effect.evidence_source_revision_ids) = 0
               or decision.expires_at > ${new Date(now.getTime() + 3 * 60_000)}
             )
-        )
-        or (effect.person_id is not null and not exists (
+        ))
+        or (effect.effect_kind <> 'google.oauth_token.revoke'
+          and effect.person_id is not null and not exists (
           select 1 from people person where person.id = effect.person_id
             and person.status = 'registered' and person.control_epoch = effect.person_control_epoch
         ))
@@ -1130,8 +1276,16 @@ export class EffectOutbox {
         ))
         or (effect.integration_id is not null and not exists (
           select 1 from integrations integration where integration.id = effect.integration_id
-            and integration.status <> 'revoked'
             and integration.control_epoch = effect.integration_control_epoch
+            and (
+              (effect.effect_kind = 'google.oauth_token.revoke'
+                and integration.provider = 'google'
+                and integration.status = 'revocation_pending'
+                and integration.credential_ciphertext is not null)
+              or
+              (effect.effect_kind <> 'google.oauth_token.revoke'
+                and integration.status <> 'revoked')
+            )
         ))
         or (effect.conversation_id is not null and not exists (
           select 1
@@ -1407,9 +1561,9 @@ async function loadCurrentActionIntentDigests(
   const rows = await transaction<
     {
       readonly person_id: string;
-      readonly household_id: string;
-      readonly conversation_id: string;
-      readonly participant_epoch_id: string;
+      readonly household_id: string | null;
+      readonly conversation_id: string | null;
+      readonly participant_epoch_id: string | null;
       readonly action_digest: string;
       readonly data_digest: string;
       readonly policy_digest: string;
@@ -1428,9 +1582,9 @@ async function loadCurrentActionIntentDigests(
     !intent ||
     input.actorPersonId !== intent.person_id ||
     input.person?.id !== intent.person_id ||
-    input.household?.id !== intent.household_id ||
-    input.conversation?.id !== intent.conversation_id ||
-    input.participantEpochId !== intent.participant_epoch_id
+    (input.household?.id ?? null) !== intent.household_id ||
+    (input.conversation?.id ?? null) !== intent.conversation_id ||
+    (input.participantEpochId ?? null) !== intent.participant_epoch_id
   ) {
     throw new UnauthorizedError("Effect scope does not match its current approved action intent");
   }
@@ -1628,4 +1782,15 @@ function digest(value: unknown): string {
 
 function sha256Hex(value: string): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function parseJsonObject(value: unknown): Readonly<Record<string, unknown>> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("Google integration credential is not an object");
+  }
+  return value as Readonly<Record<string, unknown>>;
+}
+
+function integrationCredentialPurpose(integrationId: string): string {
+  return `florence:integration:${integrationId}:credentials`;
 }

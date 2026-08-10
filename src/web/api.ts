@@ -11,17 +11,23 @@ export interface Viewer {
     role: string;
     memberCount: number;
   }[];
+  loginAccounts: {
+    id: string;
+    provider: "google";
+    email: string;
+  }[];
   onboardingCompleted: boolean;
   csrfToken: string;
   session: {
     assuranceKind:
       | "base"
       | "onboarding"
-      | "google_connect"
       | "account_controls"
       | "household_invitation"
       | "private_bridge_standing";
     assuranceExpiresAt: string | null;
+    assuranceContext: Record<string, string>;
+    authenticationIdentityId: string;
   };
 }
 
@@ -205,6 +211,7 @@ export interface SourceView {
     email: string;
     accountKind: "personal_family" | "work";
     accountKindLabel: string;
+    lastAuthorizedCapabilities: ("mail" | "calendar")[];
     status: string;
     statusLabel: string;
     mail: {
@@ -318,6 +325,7 @@ export interface RoutineView {
 export interface DataSafetyView {
   paused: boolean;
   sessions: { id: string; createdAt: string; lastSeenAt: string; current: boolean }[];
+  loginAccounts: { id: string; provider: "google"; email: string }[];
   connections: { id: string; provider: "google"; email: string; status: string }[];
   deletion: { status: string; requestedAt: string | null } | null;
 }

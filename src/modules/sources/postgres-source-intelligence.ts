@@ -5,6 +5,7 @@ import type { Database } from "../../db/client.js";
 import { canonicalDigest, canonicalJson } from "../../shared/canonical-json.js";
 import type { EncryptedValue, SecretBox } from "../../shared/crypto.js";
 import { ConflictError, NotFoundError, StaleAuthorityError, UnauthorizedError } from "../../shared/errors.js";
+import { providerAccountOwnershipLockKey } from "../../shared/provider-account.js";
 import {
   type CalendarPrivacyMode,
   type ConversationSourceAccessMode,
@@ -13,6 +14,7 @@ import {
   type IntegrationCapability,
   IntegrationCapabilitySchema,
   type IntegrationStatus,
+  IntegrationStatusSchema,
   type IntegrationView,
   JsonObjectSchema,
   JsonValueSchema,
@@ -45,13 +47,53 @@ interface IntegrationRow {
   readonly id: string;
   readonly person_id: string;
   readonly provider: string;
+  readonly external_subject_digest: string;
   readonly account_kind: string;
   readonly status: string;
   readonly credential_ciphertext: Buffer | null;
   readonly credential_key_version: string | null;
+  readonly account_label_ciphertext: Buffer | null;
+  readonly account_label_key_version: string | null;
+  readonly last_authorized_capabilities: readonly string[];
   readonly control_epoch: number | string;
   readonly connected_at: Date;
   readonly updated_at: Date;
+}
+
+const OAuthAttemptSecretSchema = z.strictObject({
+  pkceVerifier: z.string().min(43).max(512),
+  nonce: z.string().min(32).max(512),
+});
+
+const IntegrationAccountEmailSchema = z.string().trim().email().max(320);
+
+interface OAuthAttemptRow {
+  readonly id: string;
+  readonly person_id: string;
+  readonly provider: string;
+  readonly initiating_session_id: string | null;
+  readonly secret_ciphertext: Buffer;
+  readonly nonce_digest: string;
+  readonly return_path: string;
+  readonly requested_capabilities: string[];
+  readonly account_kind: string;
+  readonly target_integration_id: string | null;
+  readonly target_integration_control_epoch: number | string | null;
+  readonly target_external_subject_digest: string | null;
+  readonly person_control_epoch: number | string;
+  readonly current_control_epoch: number | string;
+  readonly person_status: string;
+  readonly expires_at: Date;
+  readonly consumed_at: Date | null;
+  readonly session_person_id: string | null;
+  readonly session_person_control_epoch: number | string | null;
+  readonly session_revoked_at: Date | null;
+  readonly session_idle_expires_at: Date | null;
+  readonly session_absolute_expires_at: Date | null;
+  readonly session_authentication_identity_authority_version: number | string | null;
+  readonly authentication_identity_person_id: string | null;
+  readonly authentication_identity_status: string | null;
+  readonly current_authentication_identity_authority_version: number | string | null;
 }
 
 interface SourceRevisionRow {
@@ -121,8 +163,10 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
         return this.connectIntegration(command);
       case "set_integration_status":
         return this.setIntegrationStatus(command);
-      case "revoke_integration":
-        return this.revokeIntegration(command);
+      case "begin_integration_revocation":
+        return this.beginIntegrationRevocation(command);
+      case "complete_integration_revocation":
+        return this.completeIntegrationRevocation(command);
       case "begin_oauth_attempt":
         return this.beginOAuthAttempt(command);
       case "consume_oauth_attempt":
@@ -186,25 +230,70 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
     command: Extract<SourceCommand, { kind: "connect_integration" }>,
   ): Promise<SourceMutationResult> {
     return inTransaction(this.database, async (transaction) => {
+      const lockKey = providerAccountOwnershipLockKey(command.provider, command.externalSubjectDigest);
+      await transaction`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`;
       const person = await requireRegisteredPerson(transaction, command.personId, true);
       if (Number(person.control_epoch) !== command.expectedPersonControlEpoch) {
         throw new StaleAuthorityError("Person authority changed before integration connection");
       }
-      const lockKey = `integration:${command.provider}:${command.personId}:${command.externalSubjectDigest}`;
-      await transaction`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`;
+      const providerIdentityOwners = await transaction<{ readonly person_id: string }[]>`
+        select person_id from person_identities
+        where issuer = ${command.provider}
+          and kind = 'provider_account'
+          and subject_digest = ${command.externalSubjectDigest}
+        for update
+      `;
+      if (providerIdentityOwners.some((owner) => owner.person_id !== command.personId)) {
+        throw new ConflictError("Provider account identity belongs to another Florence person");
+      }
+      const integrationOwners = await transaction<{ readonly person_id: string }[]>`
+        select person_id from integrations
+        where provider = ${command.provider}
+          and external_subject_digest = ${command.externalSubjectDigest}
+        for update
+      `;
+      if (integrationOwners.some((owner) => owner.person_id !== command.personId)) {
+        throw new ConflictError("Provider account source belongs to another Florence person");
+      }
+
+      if (
+        command.reconnectTarget !== null &&
+        command.reconnectTarget.externalSubjectDigest !== command.externalSubjectDigest
+      ) {
+        throw new UnauthorizedError("Google reconnect returned a different provider account");
+      }
 
       const existingRows = await transaction<IntegrationRow[]>`
-        select id, person_id, provider, account_kind, status, credential_ciphertext,
-          credential_key_version, control_epoch, connected_at, updated_at
+        select id, person_id, provider, external_subject_digest, account_kind, status,
+          credential_ciphertext, credential_key_version,
+          account_label_ciphertext, account_label_key_version, last_authorized_capabilities,
+          control_epoch, connected_at, updated_at
         from integrations
-        where person_id = ${command.personId}
-          and provider = ${command.provider}
-          and external_subject_digest = ${command.externalSubjectDigest}
-          and status in ('active', 'paused', 'reauth_required', 'error')
+        where person_id = ${command.personId} and provider = ${command.provider}
+          and (
+            (${command.reconnectTarget?.integrationId ?? null}::uuid is not null
+              and id = ${command.reconnectTarget?.integrationId ?? null})
+            or
+            (${command.reconnectTarget?.integrationId ?? null}::uuid is null
+              and external_subject_digest = ${command.externalSubjectDigest})
+          )
         order by connected_at desc
         limit 1
         for update
       `;
+      if (command.reconnectTarget !== null) {
+        const target = existingRows[0];
+        if (
+          !target ||
+          !["active", "paused", "reauth_required", "revoked", "error"].includes(target.status) ||
+          Number(target.control_epoch) !== command.reconnectTarget.expectedControlEpoch ||
+          target.external_subject_digest !== command.reconnectTarget.externalSubjectDigest
+        ) {
+          throw new StaleAuthorityError("Google reconnect target is no longer current");
+        }
+      } else if (existingRows[0]) {
+        throw new ConflictError("A previously known provider account requires an exact targeted reconnect");
+      }
       const integrationId = existingRows[0]?.id ?? randomUUID();
       const priorCapabilities = existingRows[0]
         ? await loadActiveIntegrationCapabilities(
@@ -222,11 +311,24 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
             ),
           )
         : {};
+      const accountEmail = IntegrationAccountEmailSchema.parse(
+        command.credentials.accountEmail,
+      ).toLowerCase();
+      const suppliedCredentials = { ...command.credentials };
+      Reflect.deleteProperty(suppliedCredentials, "accountEmail");
+      const mergedCredentials = { ...priorCredentials, ...suppliedCredentials };
+      Reflect.deleteProperty(mergedCredentials, "idToken");
       const credentials = sealJson(
         this.secretBox,
-        JsonObjectSchema.parse({ ...priorCredentials, ...command.credentials }),
+        JsonObjectSchema.parse(mergedCredentials),
         integrationPurpose(integrationId),
         this.#maxSourceContentBytes,
+      );
+      const accountLabel = sealJson(
+        this.secretBox,
+        accountEmail,
+        integrationAccountLabelPurpose(integrationId),
+        1_024,
       );
       const connectedAt = new Date(command.connectedAt);
 
@@ -237,13 +339,18 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
               account_kind = ${command.accountKind},
               credential_ciphertext = ${credentials.ciphertext},
               credential_key_version = ${credentials.keyVersion},
+              account_label_ciphertext = ${accountLabel.ciphertext},
+              account_label_key_version = ${accountLabel.keyVersion},
+              last_authorized_capabilities = ${transaction.array([...command.activeCapabilities])}::text[],
               control_epoch = control_epoch + 1,
               connected_at = ${connectedAt},
               revoked_at = null,
               updated_at = ${connectedAt}
           where id = ${integrationId}
-          returning id, person_id, provider, account_kind, status, credential_ciphertext,
-            credential_key_version, control_epoch, connected_at, updated_at
+          returning id, person_id, provider, external_subject_digest, account_kind, status,
+            credential_ciphertext, credential_key_version,
+            account_label_ciphertext, account_label_key_version, last_authorized_capabilities,
+            control_epoch, connected_at, updated_at
         `;
         await replaceActiveIntegrationCapabilities(
           transaction,
@@ -321,15 +428,22 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
       const rows = await transaction<IntegrationRow[]>`
         insert into integrations (
           id, person_id, provider, external_subject_digest, account_kind, status,
-          credential_ciphertext, credential_key_version, control_epoch,
+          credential_ciphertext, credential_key_version,
+          account_label_ciphertext, account_label_key_version, last_authorized_capabilities,
+          control_epoch,
           connected_at, updated_at
         ) values (
           ${integrationId}, ${command.personId}, ${command.provider},
           ${command.externalSubjectDigest}, ${command.accountKind}, 'active',
-          ${credentials.ciphertext}, ${credentials.keyVersion}, 1, ${connectedAt}, ${connectedAt}
+          ${credentials.ciphertext}, ${credentials.keyVersion},
+          ${accountLabel.ciphertext}, ${accountLabel.keyVersion},
+          ${transaction.array([...command.activeCapabilities])}::text[],
+          1, ${connectedAt}, ${connectedAt}
         )
-        returning id, person_id, provider, account_kind, status, credential_ciphertext,
-          credential_key_version, control_epoch, connected_at, updated_at
+        returning id, person_id, provider, external_subject_digest, account_kind, status,
+          credential_ciphertext, credential_key_version,
+          account_label_ciphertext, account_label_key_version, last_authorized_capabilities,
+          control_epoch, connected_at, updated_at
       `;
       await replaceActiveIntegrationCapabilities(
         transaction,
@@ -354,8 +468,9 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
         command.personId,
       );
       assertControlEpoch(integration, command.expectedControlEpoch);
-      if (integration.status === "revoked")
-        throw new UnauthorizedError("A revoked integration cannot change status");
+      if (integrationIsRevokingOrRevoked(integration.status)) {
+        throw new UnauthorizedError("A disconnecting integration cannot change status");
+      }
       if (command.status === "active" && integration.credential_ciphertext === null) {
         throw new ConflictError("An integration without credentials cannot become active");
       }
@@ -364,8 +479,10 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
         set status = ${command.status}, control_epoch = control_epoch + 1,
             updated_at = ${new Date(command.changedAt)}
         where id = ${command.integrationId}
-        returning id, person_id, provider, account_kind, status, credential_ciphertext,
-          credential_key_version, control_epoch, connected_at, updated_at
+        returning id, person_id, provider, external_subject_digest, account_kind, status,
+          credential_ciphertext, credential_key_version,
+          account_label_ciphertext, account_label_key_version, last_authorized_capabilities,
+          control_epoch, connected_at, updated_at
       `;
       const updated = requireRow(rows[0], "Integration status update failed");
       const activeCapabilities = await loadActiveIntegrationCapabilities(
@@ -380,8 +497,8 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
     });
   }
 
-  private async revokeIntegration(
-    command: Extract<SourceCommand, { kind: "revoke_integration" }>,
+  private async beginIntegrationRevocation(
+    command: Extract<SourceCommand, { kind: "begin_integration_revocation" }>,
   ): Promise<SourceMutationResult> {
     return inTransaction(this.database, async (transaction) => {
       const integration = await loadIntegrationForUpdate(
@@ -390,16 +507,39 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
         command.personId,
       );
       assertControlEpoch(integration, command.expectedControlEpoch);
-      if (integration.status === "revoked") {
+      if (integration.status === "revocation_pending") {
         return {
-          kind: "integration_revoked",
+          kind: "integration_revocation_started",
           integrationId: integration.id,
           controlEpoch: Number(integration.control_epoch),
           invalidatedRevisionCount: 0,
           revokedCandidateCount: 0,
         };
       }
-      const revokedAt = new Date(command.revokedAt);
+      if (integration.status === "revoked") {
+        return {
+          kind: "integration_revocation_completed",
+          integrationId: integration.id,
+          controlEpoch: Number(integration.control_epoch),
+          duplicate: true,
+        };
+      }
+      const requestedAt = new Date(command.requestedAt);
+      const untargetedAttempts = await transaction<{ readonly id: string }[]>`
+        select id from oauth_attempts
+        where person_id = ${command.personId} and provider = ${integration.provider}
+          and target_integration_id is null and consumed_at is null
+        for update
+      `;
+      for (const attempt of untargetedAttempts) {
+        const retiredSecret = sealJson(this.secretBox, { consumed: true }, oauthPurpose(attempt.id), 256);
+        await transaction`
+          update oauth_attempts
+          set consumed_at = ${requestedAt}, secret_ciphertext = ${retiredSecret.ciphertext},
+            secret_key_version = ${retiredSecret.keyVersion}
+          where id = ${attempt.id} and consumed_at is null
+        `;
+      }
       const revisionRows = await transaction<{ readonly id: string }[]>`
         select revision.id
         from source_revisions revision
@@ -411,41 +551,89 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
       const invalidation = await invalidateRevisions(
         transaction,
         revisionRows.map((row) => row.id),
-        revokedAt,
+        requestedAt,
       );
       await transaction`
-        update source_objects set status = 'revoked', updated_at = ${revokedAt}
+        update source_objects set status = 'revoked', updated_at = ${requestedAt}
         where integration_id = ${command.integrationId}
       `;
       await transaction`
         update sync_cursors
         set cursor_ciphertext = null, cursor_key_version = null, state = 'exhausted',
-            checkpoint_at = ${revokedAt}, updated_at = ${revokedAt}
+            checkpoint_at = ${requestedAt}, updated_at = ${requestedAt}
         where integration_id = ${command.integrationId}
       `;
       await transaction`
         update integration_grants
-        set status = 'revoked', revoked_at = ${revokedAt}
+        set status = 'revoked', revoked_at = ${requestedAt}
         where integration_id = ${command.integrationId} and status = 'active'
       `;
       await transaction`
         update integration_capabilities
-        set status = 'revoked', revoked_at = ${revokedAt}, updated_at = ${revokedAt}
+        set status = 'revoked', revoked_at = ${requestedAt}, updated_at = ${requestedAt}
         where integration_id = ${command.integrationId} and status = 'active'
       `;
       const updated = await transaction<{ readonly control_epoch: number | string }[]>`
         update integrations
+        set status = ${integration.credential_ciphertext === null ? "revoked" : "revocation_pending"},
+            control_epoch = control_epoch + 1, revoked_at = ${requestedAt}, updated_at = ${requestedAt}
+        where id = ${command.integrationId}
+        returning control_epoch
+      `;
+      const controlEpoch = Number(requireRow(updated[0], "Integration revocation failed").control_epoch);
+      if (integration.credential_ciphertext === null) {
+        return {
+          kind: "integration_revocation_completed",
+          integrationId: command.integrationId,
+          controlEpoch,
+          duplicate: false,
+        };
+      }
+      return {
+        kind: "integration_revocation_started",
+        integrationId: command.integrationId,
+        controlEpoch,
+        invalidatedRevisionCount: invalidation.invalidatedRevisionCount,
+        revokedCandidateCount: invalidation.revokedCandidateCount,
+      };
+    });
+  }
+
+  private async completeIntegrationRevocation(
+    command: Extract<SourceCommand, { kind: "complete_integration_revocation" }>,
+  ): Promise<SourceMutationResult> {
+    return inTransaction(this.database, async (transaction) => {
+      const integration = await loadIntegrationForUpdate(
+        transaction,
+        command.integrationId,
+        command.personId,
+      );
+      if (integration.status === "revoked" && integration.credential_ciphertext === null) {
+        return {
+          kind: "integration_revocation_completed",
+          integrationId: integration.id,
+          controlEpoch: Number(integration.control_epoch),
+          duplicate: true,
+        };
+      }
+      assertControlEpoch(integration, command.expectedControlEpoch);
+      if (integration.status !== "revocation_pending" || integration.credential_ciphertext === null) {
+        throw new UnauthorizedError("Google integration is not awaiting provider revocation");
+      }
+      const completedAt = new Date(command.completedAt);
+      const rows = await transaction<{ readonly control_epoch: number | string }[]>`
+        update integrations
         set status = 'revoked', credential_ciphertext = null, credential_key_version = null,
-            control_epoch = control_epoch + 1, revoked_at = ${revokedAt}, updated_at = ${revokedAt}
+          control_epoch = control_epoch + 1, revoked_at = coalesce(revoked_at, ${completedAt}),
+          updated_at = ${completedAt}
         where id = ${command.integrationId}
         returning control_epoch
       `;
       return {
-        kind: "integration_revoked",
+        kind: "integration_revocation_completed",
         integrationId: command.integrationId,
-        controlEpoch: Number(requireRow(updated[0], "Integration revocation failed").control_epoch),
-        invalidatedRevisionCount: invalidation.invalidatedRevisionCount,
-        revokedCandidateCount: invalidation.revokedCandidateCount,
+        controlEpoch: Number(requireRow(rows[0], "Integration revocation completion failed").control_epoch),
+        duplicate: false,
       };
     });
   }
@@ -456,42 +644,79 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
     const createdAt = new Date(command.createdAt);
     const expiresAt = new Date(command.expiresAt);
     if (expiresAt <= createdAt) throw new ConflictError("OAuth attempt must expire after creation");
+    if (sha256(command.nonce) !== command.nonceDigest) {
+      throw new UnauthorizedError("OAuth nonce does not match its digest");
+    }
     return inTransaction(this.database, async (transaction) => {
       const person = await requireRegisteredPerson(transaction, command.personId, true);
       if (Number(person.control_epoch) !== command.expectedPersonControlEpoch) {
         throw new StaleAuthorityError("Person authority changed before OAuth began");
       }
       const sessions = await transaction<{ readonly id: string }[]>`
-        select id from person_sessions
-        where id = ${command.initiatingSessionId}
-          and person_id = ${command.personId}
-          and revoked_at is null
-          and idle_expires_at > ${createdAt}
-          and absolute_expires_at > ${createdAt}
+        select session.id from person_sessions session
+        join person_identities authentication_identity
+          on authentication_identity.id = session.authentication_identity_id
+        where session.id = ${command.initiatingSessionId}
+          and session.person_id = ${command.personId}
+          and session.person_control_epoch = ${command.expectedPersonControlEpoch}
+          and session.revoked_at is null
+          and session.idle_expires_at > ${createdAt}
+          and session.absolute_expires_at > ${createdAt}
+          and authentication_identity.person_id = ${command.personId}
+          and authentication_identity.status = 'verified'
+          and authentication_identity.authority_version =
+            session.authentication_identity_authority_version
       `;
       if (!sessions[0]) throw new UnauthorizedError("OAuth requires the initiating active session");
+      if (command.reconnectTarget !== null) {
+        const targets = await transaction<IntegrationRow[]>`
+          select id, person_id, provider, external_subject_digest, account_kind, status,
+            credential_ciphertext, credential_key_version,
+            account_label_ciphertext, account_label_key_version, last_authorized_capabilities,
+            control_epoch, connected_at, updated_at
+          from integrations
+          where id = ${command.reconnectTarget.integrationId}
+            and person_id = ${command.personId}
+            and provider = ${command.provider}
+            and status in ('active', 'paused', 'reauth_required', 'revoked', 'error')
+          for update
+        `;
+        const target = targets[0];
+        if (
+          !target ||
+          Number(target.control_epoch) !== command.reconnectTarget.expectedControlEpoch ||
+          target.external_subject_digest !== command.reconnectTarget.externalSubjectDigest
+        ) {
+          throw new StaleAuthorityError("Google reconnect target is no longer current");
+        }
+      }
       await transaction`select pg_advisory_xact_lock(hashtextextended(${`oauth:${command.stateDigest}`}, 0))`;
       const existing = await transaction<{ readonly id: string }[]>`
         select id from oauth_attempts where state_digest = ${command.stateDigest}
       `;
       if (existing[0]) throw new ConflictError("OAuth state has already been issued");
       const oauthAttemptId = randomUUID();
-      const verifier = sealBytes(
+      const attemptSecret = sealJson(
         this.secretBox,
-        Buffer.from(command.pkceVerifier, "utf8"),
+        { pkceVerifier: command.pkceVerifier, nonce: command.nonce },
         oauthPurpose(oauthAttemptId),
+        2_048,
       );
       await transaction`
         insert into oauth_attempts (
-          id, person_id, provider, state_digest, pkce_verifier_ciphertext,
-          key_version, return_path, requested_capabilities, account_kind, initiating_session_id,
-          person_control_epoch, expires_at, created_at
+          id, person_id, provider, state_digest, nonce_digest, secret_ciphertext,
+          secret_key_version, return_path, requested_capabilities, account_kind, initiating_session_id,
+          person_control_epoch, target_integration_id, target_integration_control_epoch,
+          target_external_subject_digest, expires_at, created_at
         ) values (
           ${oauthAttemptId}, ${command.personId}, ${command.provider}, ${command.stateDigest},
-          ${verifier.ciphertext}, ${verifier.keyVersion}, ${command.returnPath},
+          ${command.nonceDigest},
+          ${attemptSecret.ciphertext}, ${attemptSecret.keyVersion}, ${command.returnPath},
           ${transaction.array(command.requestedCapabilities)}, ${command.accountKind},
           ${command.initiatingSessionId},
-          ${command.expectedPersonControlEpoch}, ${expiresAt}, ${createdAt}
+          ${command.expectedPersonControlEpoch}, ${command.reconnectTarget?.integrationId ?? null},
+          ${command.reconnectTarget?.expectedControlEpoch ?? null},
+          ${command.reconnectTarget?.externalSubjectDigest ?? null}, ${expiresAt}, ${createdAt}
         )
       `;
       return {
@@ -506,32 +731,33 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
     command: Extract<SourceCommand, { kind: "consume_oauth_attempt" }>,
   ): Promise<SourceMutationResult> {
     return inTransaction(this.database, async (transaction) => {
-      const rows = await transaction<
-        {
-          readonly id: string;
-          readonly person_id: string;
-          readonly provider: string;
-          readonly initiating_session_id: string | null;
-          readonly pkce_verifier_ciphertext: Buffer;
-          readonly return_path: string;
-          readonly requested_capabilities: string[];
-          readonly account_kind: string;
-          readonly person_control_epoch: number | string;
-          readonly current_control_epoch: number | string;
-          readonly person_status: string;
-          readonly expires_at: Date;
-          readonly consumed_at: Date | null;
-        }[]
-      >`
+      const rows = await transaction<OAuthAttemptRow[]>`
         select attempt.id, attempt.person_id, attempt.provider,
-          attempt.initiating_session_id, attempt.pkce_verifier_ciphertext, attempt.return_path,
+          attempt.initiating_session_id, attempt.secret_ciphertext, attempt.nonce_digest,
+          attempt.return_path,
           attempt.requested_capabilities, attempt.account_kind,
+          attempt.target_integration_id, attempt.target_integration_control_epoch,
+          attempt.target_external_subject_digest,
           attempt.person_control_epoch, attempt.expires_at, attempt.consumed_at,
-          person.control_epoch as current_control_epoch, person.status as person_status
+          person.control_epoch as current_control_epoch, person.status as person_status,
+          session.person_id as session_person_id,
+          session.person_control_epoch as session_person_control_epoch,
+          session.revoked_at as session_revoked_at,
+          session.idle_expires_at as session_idle_expires_at,
+          session.absolute_expires_at as session_absolute_expires_at,
+          session.authentication_identity_authority_version
+            as session_authentication_identity_authority_version,
+          authentication_identity.person_id as authentication_identity_person_id,
+          authentication_identity.status as authentication_identity_status,
+          authentication_identity.authority_version
+            as current_authentication_identity_authority_version
         from oauth_attempts attempt
         join people person on person.id = attempt.person_id
+        join person_sessions session on session.id = attempt.initiating_session_id
+        join person_identities authentication_identity
+          on authentication_identity.id = session.authentication_identity_id
         where attempt.state_digest = ${command.stateDigest}
-        for update of attempt, person
+        for update of attempt, person, session, authentication_identity
       `;
       const attempt = rows[0];
       if (!attempt || attempt.provider !== command.provider) {
@@ -543,17 +769,13 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
       const consumedAt = new Date(command.consumedAt);
       if (attempt.consumed_at !== null) throw new ConflictError("OAuth attempt was already consumed");
       if (attempt.expires_at <= consumedAt) throw new UnauthorizedError("OAuth attempt has expired");
-      if (attempt.person_status !== "registered") throw new UnauthorizedError("OAuth owner is not active");
-      if (Number(attempt.person_control_epoch) !== Number(attempt.current_control_epoch)) {
-        throw new StaleAuthorityError("Person authority changed during OAuth");
-      }
-      const verifier = openBytes(
-        this.secretBox,
-        attempt.pkce_verifier_ciphertext,
-        oauthPurpose(attempt.id),
-      ).toString("utf8");
+      assertOAuthAttemptAuthority(attempt, consumedAt);
+      const retiredSecret = sealJson(this.secretBox, { consumed: true }, oauthPurpose(attempt.id), 256);
       await transaction`
-        update oauth_attempts set consumed_at = ${consumedAt} where id = ${attempt.id}
+        update oauth_attempts
+        set consumed_at = ${consumedAt}, secret_ciphertext = ${retiredSecret.ciphertext},
+          secret_key_version = ${retiredSecret.keyVersion}
+        where id = ${attempt.id}
       `;
       return {
         kind: "oauth_attempt_consumed",
@@ -561,11 +783,12 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
         personId: attempt.person_id,
         provider: attempt.provider,
         initiatingSessionId: attempt.initiating_session_id,
-        pkceVerifier: verifier,
+        nonceDigest: attempt.nonce_digest,
         returnPath: attempt.return_path,
         personControlEpoch: Number(attempt.person_control_epoch),
         requestedCapabilities: integrationCapabilities(attempt.requested_capabilities),
         accountKind: integrationAccountKind(attempt.account_kind),
+        reconnectTarget: oauthReconnectTarget(attempt),
       };
     });
   }
@@ -643,8 +866,8 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
         command.personId,
       );
       assertControlEpoch(integration, command.expectedIntegrationControlEpoch);
-      if (integration.status === "revoked") {
-        throw new UnauthorizedError("A revoked integration cannot change calendar privacy");
+      if (integrationIsRevokingOrRevoked(integration.status)) {
+        throw new UnauthorizedError("A disconnecting integration cannot change calendar privacy");
       }
       const lockKey = `calendar-privacy:${command.integrationId}:${command.calendarIdDigest}`;
       await transaction`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`;
@@ -1770,8 +1993,10 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
     query: Extract<SourceQuery, { kind: "integration_access" }>,
   ): Promise<SourceReadResult> {
     const rows = await this.database<IntegrationRow[]>`
-      select id, person_id, provider, account_kind, status, credential_ciphertext,
-        credential_key_version, control_epoch, connected_at, updated_at
+      select id, person_id, provider, external_subject_digest, account_kind, status,
+        credential_ciphertext, credential_key_version,
+        account_label_ciphertext, account_label_key_version, last_authorized_capabilities,
+        control_epoch, connected_at, updated_at
       from integrations
       where id = ${query.integrationId} and person_id = ${query.personId}
     `;
@@ -1803,24 +2028,26 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
     query: Extract<SourceQuery, { kind: "integration_profile" }>,
   ): Promise<SourceReadResult> {
     const rows = await this.database<IntegrationRow[]>`
-      select id, person_id, provider, account_kind, status, credential_ciphertext,
-        credential_key_version, control_epoch, connected_at, updated_at
+      select id, person_id, provider, external_subject_digest, account_kind, status,
+        credential_ciphertext, credential_key_version,
+        account_label_ciphertext, account_label_key_version, last_authorized_capabilities,
+        control_epoch, connected_at, updated_at
       from integrations
       where id = ${query.integrationId} and person_id = ${query.personId}
     `;
     const integration = rows[0];
     if (!integration) throw new NotFoundError("Integration does not exist");
     assertControlEpoch(integration, query.expectedControlEpoch);
-    if (integration.status === "revoked" || integration.credential_ciphertext === null) {
-      throw new UnauthorizedError("Integration profile is no longer available");
-    }
-    const credentials = JsonObjectSchema.parse(
-      openJson(this.secretBox, integration.credential_ciphertext, integrationPurpose(integration.id)),
-    );
-    const accountEmail = credentials.accountEmail;
-    if (typeof accountEmail !== "string" || accountEmail.length > 320 || !accountEmail.includes("@")) {
+    if (integration.account_label_ciphertext === null) {
       throw new ConflictError("Connected Google account email is unavailable");
     }
+    const accountEmail = IntegrationAccountEmailSchema.parse(
+      openJson(
+        this.secretBox,
+        integration.account_label_ciphertext,
+        integrationAccountLabelPurpose(integration.id),
+      ),
+    );
     const activeCapabilities = await loadActiveIntegrationCapabilities(
       this.database,
       integration.id,
@@ -1836,30 +2063,31 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
   private async readOAuthAttemptAccess(
     query: Extract<SourceQuery, { kind: "oauth_attempt_access" }>,
   ): Promise<SourceReadResult> {
-    const rows = await this.database<
-      {
-        readonly id: string;
-        readonly person_id: string;
-        readonly provider: string;
-        readonly initiating_session_id: string | null;
-        readonly pkce_verifier_ciphertext: Buffer;
-        readonly return_path: string;
-        readonly requested_capabilities: string[];
-        readonly account_kind: string;
-        readonly person_control_epoch: number | string;
-        readonly current_control_epoch: number | string;
-        readonly person_status: string;
-        readonly expires_at: Date;
-        readonly consumed_at: Date | null;
-      }[]
-    >`
+    const rows = await this.database<OAuthAttemptRow[]>`
       select attempt.id, attempt.person_id, attempt.provider,
-        attempt.initiating_session_id, attempt.pkce_verifier_ciphertext, attempt.return_path,
+        attempt.initiating_session_id, attempt.secret_ciphertext, attempt.nonce_digest,
+        attempt.return_path,
         attempt.requested_capabilities, attempt.account_kind,
+        attempt.target_integration_id, attempt.target_integration_control_epoch,
+        attempt.target_external_subject_digest,
         attempt.person_control_epoch, attempt.expires_at, attempt.consumed_at,
-        person.control_epoch as current_control_epoch, person.status as person_status
+        person.control_epoch as current_control_epoch, person.status as person_status,
+        session.person_id as session_person_id,
+        session.person_control_epoch as session_person_control_epoch,
+        session.revoked_at as session_revoked_at,
+        session.idle_expires_at as session_idle_expires_at,
+        session.absolute_expires_at as session_absolute_expires_at,
+        session.authentication_identity_authority_version
+          as session_authentication_identity_authority_version,
+        authentication_identity.person_id as authentication_identity_person_id,
+        authentication_identity.status as authentication_identity_status,
+        authentication_identity.authority_version
+          as current_authentication_identity_authority_version
       from oauth_attempts attempt
       join people person on person.id = attempt.person_id
+      join person_sessions session on session.id = attempt.initiating_session_id
+      join person_identities authentication_identity
+        on authentication_identity.id = session.authentication_identity_id
       where attempt.state_digest = ${query.stateDigest}
     `;
     const attempt = rows[0];
@@ -1872,40 +2100,43 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
     const asOf = new Date(query.asOf);
     if (attempt.consumed_at !== null) throw new UnauthorizedError("OAuth attempt was already consumed");
     if (attempt.expires_at <= asOf) throw new UnauthorizedError("OAuth attempt has expired");
-    if (attempt.person_status !== "registered") throw new UnauthorizedError("OAuth owner is not active");
-    if (Number(attempt.person_control_epoch) !== Number(attempt.current_control_epoch)) {
-      throw new StaleAuthorityError("Person authority changed during OAuth");
-    }
+    assertOAuthAttemptAuthority(attempt, asOf);
+    const attemptSecret = OAuthAttemptSecretSchema.parse(
+      openJson(this.secretBox, attempt.secret_ciphertext, oauthPurpose(attempt.id)),
+    );
     return {
       kind: "oauth_attempt_access",
       oauthAttemptId: attempt.id,
       personId: attempt.person_id,
       provider: attempt.provider,
       initiatingSessionId: attempt.initiating_session_id,
-      pkceVerifier: openBytes(
-        this.secretBox,
-        attempt.pkce_verifier_ciphertext,
-        oauthPurpose(attempt.id),
-      ).toString("utf8"),
+      pkceVerifier: attemptSecret.pkceVerifier,
+      nonce: attemptSecret.nonce,
+      nonceDigest: attempt.nonce_digest,
       returnPath: attempt.return_path,
       personControlEpoch: Number(attempt.person_control_epoch),
       requestedCapabilities: integrationCapabilities(attempt.requested_capabilities),
       accountKind: integrationAccountKind(attempt.account_kind),
+      reconnectTarget: oauthReconnectTarget(attempt),
       expiresAt: attempt.expires_at.toISOString(),
     };
   }
 
   private async readCursor(query: Extract<SourceQuery, { kind: "sync_cursor" }>): Promise<SourceReadResult> {
     const integrationRows = await this.database<IntegrationRow[]>`
-      select id, person_id, provider, account_kind, status, credential_ciphertext,
-        credential_key_version, control_epoch, connected_at, updated_at
+      select id, person_id, provider, external_subject_digest, account_kind, status,
+        credential_ciphertext, credential_key_version,
+        account_label_ciphertext, account_label_key_version, last_authorized_capabilities,
+        control_epoch, connected_at, updated_at
       from integrations
       where id = ${query.integrationId} and person_id = ${query.personId}
     `;
     const integration = integrationRows[0];
     if (!integration) throw new NotFoundError("Integration does not exist");
     assertControlEpoch(integration, query.expectedIntegrationControlEpoch);
-    if (integration.status === "revoked") throw new UnauthorizedError("Integration was revoked");
+    if (integrationIsRevokingOrRevoked(integration.status)) {
+      throw new UnauthorizedError("Integration was revoked");
+    }
     const rows = await this.database<
       {
         readonly cursor_ciphertext: Buffer | null;
@@ -1944,15 +2175,19 @@ export class PostgresSourceIntelligence implements SourceIntelligence {
     query: Extract<SourceQuery, { kind: "calendar_privacy" }>,
   ): Promise<SourceReadResult> {
     const integrationRows = await this.database<IntegrationRow[]>`
-      select id, person_id, provider, account_kind, status, credential_ciphertext,
-        credential_key_version, control_epoch, connected_at, updated_at
+      select id, person_id, provider, external_subject_digest, account_kind, status,
+        credential_ciphertext, credential_key_version,
+        account_label_ciphertext, account_label_key_version, last_authorized_capabilities,
+        control_epoch, connected_at, updated_at
       from integrations
       where id = ${query.integrationId} and person_id = ${query.personId}
     `;
     const integration = integrationRows[0];
     if (!integration) throw new NotFoundError("Integration does not exist");
     assertControlEpoch(integration, query.expectedIntegrationControlEpoch);
-    if (integration.status === "revoked") throw new UnauthorizedError("Integration was revoked");
+    if (integrationIsRevokingOrRevoked(integration.status)) {
+      throw new UnauthorizedError("Integration was revoked");
+    }
     const rows = await this.database<{ readonly mode: string; readonly version: number | string }[]>`
       select scope->>'mode' as mode, version
       from integration_grants
@@ -2432,8 +2667,10 @@ async function loadIntegrationForUpdate(
   personId: string,
 ): Promise<IntegrationRow> {
   const rows = await transaction<IntegrationRow[]>`
-    select id, person_id, provider, account_kind, status, credential_ciphertext,
-      credential_key_version, control_epoch, connected_at, updated_at
+    select id, person_id, provider, external_subject_digest, account_kind, status,
+      credential_ciphertext, credential_key_version,
+      account_label_ciphertext, account_label_key_version, last_authorized_capabilities,
+      control_epoch, connected_at, updated_at
     from integrations
     where id = ${integrationId} and person_id = ${personId}
     for update
@@ -3451,7 +3688,8 @@ function integrationView(
     provider: row.provider,
     accountKind: integrationAccountKind(row.account_kind),
     activeCapabilities: integrationCapabilities(activeCapabilities),
-    status: row.status as IntegrationStatus,
+    lastAuthorizedCapabilities: integrationCapabilities(row.last_authorized_capabilities),
+    status: integrationStatus(row.status),
     controlEpoch: Number(row.control_epoch),
     connectedAt: row.connected_at.toISOString(),
     updatedAt: row.updated_at.toISOString(),
@@ -3467,6 +3705,64 @@ function integrationCapabilities(capabilities: readonly string[]): IntegrationCa
 
 function integrationAccountKind(accountKind: string): IntegrationAccountKind {
   return IntegrationAccountKindSchema.parse(accountKind);
+}
+
+function integrationStatus(status: string): IntegrationStatus {
+  return IntegrationStatusSchema.parse(status);
+}
+
+function integrationIsRevokingOrRevoked(status: string): boolean {
+  return status === "revocation_pending" || status === "revoked";
+}
+
+function oauthReconnectTarget(attempt: OAuthAttemptRow): {
+  readonly integrationId: string;
+  readonly expectedControlEpoch: number;
+  readonly externalSubjectDigest: string;
+} | null {
+  const fields = [
+    attempt.target_integration_id,
+    attempt.target_integration_control_epoch,
+    attempt.target_external_subject_digest,
+  ];
+  if (fields.every((field) => field === null)) return null;
+  if (fields.some((field) => field === null)) {
+    throw new UnauthorizedError("OAuth reconnect target is incomplete");
+  }
+  return {
+    integrationId: attempt.target_integration_id as string,
+    expectedControlEpoch: Number(attempt.target_integration_control_epoch),
+    externalSubjectDigest: attempt.target_external_subject_digest as string,
+  };
+}
+
+function assertOAuthAttemptAuthority(attempt: OAuthAttemptRow, asOf: Date): void {
+  if (attempt.person_status !== "registered") {
+    throw new UnauthorizedError("OAuth owner is not active");
+  }
+  if (
+    Number(attempt.person_control_epoch) !== Number(attempt.current_control_epoch) ||
+    attempt.session_person_id !== attempt.person_id ||
+    attempt.session_person_control_epoch === null ||
+    Number(attempt.session_person_control_epoch) !== Number(attempt.person_control_epoch)
+  ) {
+    throw new StaleAuthorityError("Person authority changed during OAuth");
+  }
+  if (
+    attempt.session_revoked_at !== null ||
+    attempt.session_idle_expires_at === null ||
+    attempt.session_idle_expires_at <= asOf ||
+    attempt.session_absolute_expires_at === null ||
+    attempt.session_absolute_expires_at <= asOf ||
+    attempt.authentication_identity_person_id !== attempt.person_id ||
+    attempt.authentication_identity_status !== "verified" ||
+    attempt.session_authentication_identity_authority_version === null ||
+    attempt.current_authentication_identity_authority_version === null ||
+    Number(attempt.session_authentication_identity_authority_version) !==
+      Number(attempt.current_authentication_identity_authority_version)
+  ) {
+    throw new UnauthorizedError("OAuth initiating session is no longer active");
+  }
 }
 
 function sealJson(
@@ -3499,6 +3795,10 @@ function openBytes(secretBox: SecretBox, value: Buffer, purpose: string): Buffer
 
 function integrationPurpose(integrationId: string): string {
   return `florence:integration:${integrationId}:credentials`;
+}
+
+function integrationAccountLabelPurpose(integrationId: string): string {
+  return `florence:integration:${integrationId}:account-label`;
 }
 
 function oauthPurpose(oauthAttemptId: string): string {

@@ -5,7 +5,7 @@ import cookie from "@fastify/cookie";
 import helmet from "@fastify/helmet";
 import rateLimit from "@fastify/rate-limit";
 import fastifyStatic from "@fastify/static";
-import Fastify, { type FastifyRequest, LogController } from "fastify";
+import Fastify, { type FastifyReply, type FastifyRequest, LogController } from "fastify";
 import rawBody from "fastify-raw-body";
 import { z } from "zod";
 import type { GoogleCapability, GoogleConnectionProfile } from "./adapters/google/contracts.js";
@@ -16,6 +16,10 @@ import { type FlorenceConfig, loadConfig } from "./config.js";
 import { createDatabase, type Database, verifyDatabase } from "./db/client.js";
 import {
   type AuthenticatedSession,
+  GOOGLE_IDENTITY_LINK_ACTION,
+  GOOGLE_IDENTITY_LINK_RETURN_PATH,
+  GOOGLE_IDENTITY_REVOKE_ACTION,
+  GoogleIdentityLinkAssuranceContextSchema,
   type HandoffPurpose,
   type HouseholdInvitationStepUpContext,
   HouseholdInvitationStepUpContextSchema,
@@ -32,6 +36,12 @@ import type { OnboardingView, PeopleView } from "./web/api.js";
 
 const SESSION_COOKIE_PRODUCTION = "__Host-florence_session";
 const SESSION_COOKIE_DEVELOPMENT = "florence_session";
+const GOOGLE_AUTH_COOKIE_PRODUCTION = "__Host-florence_google_auth";
+const GOOGLE_AUTH_COOKIE_DEVELOPMENT = "florence_google_auth";
+const googleAuthStartBodySchema = z.strictObject({
+  mode: z.enum(["login", "link"]),
+  returnTo: z.string().trim().min(1).max(1_000),
+});
 const routineFields = {
   destinationConversationId: z.string().uuid(),
   title: z.string().trim().min(1).max(200),
@@ -83,11 +93,12 @@ const updateDependentBodySchema = z.strictObject({
   expectedRosterVersion: z.number().int().positive(),
   expectedIntakeVersion: z.number().int().nonnegative(),
 });
-const googleStartQuerySchema = z
+const googleSourceStartBodySchema = z
   .strictObject({
     profile: z.enum(["personal_family", "work"]).default("personal_family"),
     mail: z.literal("include").optional(),
     from: z.enum(["onboarding", "sources"]).default("sources"),
+    integrationId: z.string().uuid().nullable().default(null),
   })
   .refine((query) => query.profile === "work" || query.mail === undefined, {
     message: "The work Gmail option is only valid for a work Google profile",
@@ -251,17 +262,168 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
         .parse(request.body);
       const preview = await auth.previewHandoff(body.token);
       const session = await auth.consumeHandoff(body.token);
-      reply.setCookie(sessionCookieName(config), session.sessionToken, {
-        path: "/",
-        httpOnly: true,
-        secure: config.environment === "production",
-        sameSite: "lax",
-        expires: session.absoluteExpiresAt,
-      });
+      setSessionCookie(reply, config, session);
       reply.header("Cache-Control", "no-store");
       return {
         redirect: completedHandoffRedirect(preview.purpose, session),
       };
+    },
+  );
+
+  app.post(
+    "/auth/google/start",
+    { config: { rateLimit: { max: 20, timeWindow: "10 minutes" } } },
+    async (request, reply) => {
+      verifySameOrigin(request, config);
+      const body = googleAuthStartBodySchema.parse(request.body);
+      const returnPath = safeGoogleAuthReturnPath(body.returnTo);
+      const principal = body.mode === "link" ? await requireWriteSession(request, config, auth) : null;
+      const attempt = await auth.beginGoogleAuthAttempt(
+        principal
+          ? {
+              mode: "link",
+              personId: principal.personId,
+              initiatingSessionId: principal.sessionId,
+              personControlEpoch: principal.controlEpoch,
+              returnPath,
+            }
+          : { mode: "login", returnPath },
+      );
+      reply.setCookie(googleAuthCookieName(config), attempt.browserBinding, {
+        path: "/",
+        httpOnly: true,
+        secure: config.environment === "production",
+        sameSite: "lax",
+        expires: attempt.expiresAt,
+      });
+      reply.header("Cache-Control", "no-store");
+      return {
+        authorizationUrl: googleOAuth.identityAuthorizationUrl({
+          state: attempt.state,
+          challenge: attempt.pkceChallenge,
+          nonce: attempt.nonce,
+        }),
+      };
+    },
+  );
+
+  app.get(
+    "/auth/google/callback",
+    { config: { rateLimit: { max: 30, timeWindow: "10 minutes" } } },
+    async (request, reply) => {
+      reply.header("Cache-Control", "no-store");
+      const parsed = z
+        .object({
+          code: z.string().min(1).optional(),
+          state: z.string().regex(/^[A-Za-z0-9_-]{32,128}$/u),
+          error: z.string().trim().min(1).max(200).optional(),
+        })
+        .passthrough()
+        .safeParse(request.query);
+      const browserBinding = request.cookies[googleAuthCookieName(config)];
+      if (!parsed.success || !browserBinding) {
+        clearGoogleAuthCookie(reply, config);
+        return reply.redirect(await googleAuthFailurePath(request, config, auth, "expired"));
+      }
+
+      let attempt: Awaited<ReturnType<PostgresWebAuth["readGoogleAuthAttempt"]>>;
+      try {
+        attempt = await auth.readGoogleAuthAttempt(parsed.data.state, browserBinding);
+      } catch (error) {
+        if (
+          error instanceof NotFoundError ||
+          error instanceof ConflictError ||
+          error instanceof UnauthorizedError
+        ) {
+          clearGoogleAuthCookie(reply, config);
+          return reply.redirect(await googleAuthFailurePath(request, config, auth, "expired"));
+        }
+        throw error;
+      }
+
+      const failurePath = (reason: GoogleAuthError) =>
+        googleAuthResultPath(attempt.mode, attempt.returnPath, reason);
+      if (parsed.data.error) {
+        clearGoogleAuthCookie(reply, config);
+        return reply.redirect(failurePath(parsed.data.error === "access_denied" ? "cancelled" : "provider"));
+      }
+      if (!parsed.data.code) {
+        clearGoogleAuthCookie(reply, config);
+        return reply.redirect(failurePath("provider"));
+      }
+
+      let identity: Awaited<ReturnType<GoogleOAuthAdapter["exchangeIdentity"]>>;
+      try {
+        identity = await googleOAuth.exchangeIdentity(parsed.data.code, attempt.pkceVerifier, attempt.nonce);
+      } catch {
+        clearGoogleAuthCookie(reply, config);
+        return reply.redirect(failurePath("provider"));
+      }
+
+      if (attempt.mode === "link") {
+        let principal: SessionPrincipal;
+        try {
+          principal = await requireSession(request, config, auth);
+        } catch {
+          clearGoogleAuthCookie(reply, config);
+          return reply.redirect(failurePath("expired"));
+        }
+        if (
+          principal.sessionId !== attempt.initiatingSessionId ||
+          principal.personId !== attempt.personId ||
+          principal.controlEpoch !== attempt.personControlEpoch
+        ) {
+          clearGoogleAuthCookie(reply, config);
+          return reply.redirect(failurePath("expired"));
+        }
+        try {
+          await application.process({
+            kind: "auth.google_identity.bind",
+            stateDigest: sha256Hex(parsed.data.state),
+            browserBindingDigest: sha256Hex(browserBinding),
+            externalSubjectDigest: sha256Hex(identity.subject),
+            externalSubject: identity.subject,
+            verifiedEmail: identity.email,
+            boundAt: new Date().toISOString(),
+          });
+        } catch (error) {
+          clearGoogleAuthCookie(reply, config);
+          if (error instanceof ConflictError) return reply.redirect(failurePath("account_conflict"));
+          if (error instanceof UnauthorizedError || error instanceof StaleAuthorityError) {
+            return reply.redirect(failurePath("expired"));
+          }
+          throw error;
+        }
+        clearGoogleAuthCookie(reply, config);
+        return reply.redirect(safeGoogleAuthReturnPath(attempt.returnPath));
+      }
+
+      const completed = await auth.completeGoogleLogin({
+        state: parsed.data.state,
+        browserBinding,
+        externalSubjectDigest: sha256Hex(identity.subject),
+      });
+      clearGoogleAuthCookie(reply, config);
+      if (completed.kind === "not_linked") {
+        return reply.redirect(googleAuthResultPath("login", completed.returnPath, "not_linked"));
+      }
+      try {
+        await application.process({
+          kind: "auth.google_identity.login_observed",
+          sessionId: completed.session.sessionId,
+          personId: completed.session.personId,
+          identityId: completed.identityId,
+          externalSubjectDigest: sha256Hex(identity.subject),
+          verifiedEmail: identity.email,
+        });
+      } catch (error) {
+        if (error instanceof UnauthorizedError || error instanceof StaleAuthorityError) {
+          return reply.redirect(failurePath("expired"));
+        }
+        throw error;
+      }
+      setSessionCookie(reply, config, completed.session);
+      return reply.redirect(safeGoogleAuthReturnPath(completed.returnPath));
     },
   );
 
@@ -274,32 +436,101 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
     return { ok: true };
   });
 
-  app.get("/oauth/google/start", async (request, reply) => {
-    const query = googleStartQuerySchema.parse(request.query);
-    const principal = await requireGoogleStartSession(request, config, auth, query.from);
-    const requestedCapabilities = googleCapabilitiesForProfile(query.profile, query.mail === "include");
+  app.post("/oauth/google/start", async (request) => {
+    const body = googleSourceStartBodySchema.parse(request.body);
+    const principal = await requireWriteSession(request, config, auth);
+    const targetRows =
+      body.integrationId === null
+        ? []
+        : await database<
+            {
+              readonly id: string;
+              readonly external_subject_digest: string;
+              readonly account_kind: "personal_family" | "work";
+              readonly control_epoch: number | string;
+            }[]
+          >`
+          select integration.id, integration.external_subject_digest,
+            integration.account_kind, integration.control_epoch
+          from integrations integration
+          where integration.id = ${body.integrationId}
+            and integration.person_id = ${principal.personId}
+            and integration.provider = 'google'
+            and integration.status in ('active', 'paused', 'reauth_required', 'error', 'revoked')
+        `;
+    const target = targetRows[0] ?? null;
+    if (body.integrationId !== null && target === null) {
+      throw new NotFoundError("Google connection does not exist");
+    }
+    if (target !== null && target.account_kind !== body.profile) {
+      throw new ConflictError("Google reconnect profile does not match the selected connection");
+    }
+    const onboardingCompleted = await personHasCompletedOnboarding(database, principal.personId);
+    const onboardingStep = onboardingCompleted
+      ? null
+      : (
+          await database.begin("isolation level repeatable read read only", async (transaction) =>
+            familyOnboarding.project(transaction, {
+              actorPersonId: principal.personId,
+              personId: principal.personId,
+            }),
+          )
+        ).nextStep.kind;
+    const existingGoogleIntegrations =
+      onboardingCompleted || target !== null
+        ? false
+        : (
+            await database<{ readonly present: boolean }[]>`
+              select exists(
+                select 1 from integrations
+                where person_id = ${principal.personId} and provider = 'google'
+              ) as present
+            `
+          )[0]?.present === true;
+    assertGoogleSourceStartPolicy({
+      onboardingCompleted,
+      onboardingStep,
+      from: body.from,
+      profile: body.profile,
+      includeWorkMail: body.mail === "include",
+      reconnectAccountKind: target?.account_kind ?? null,
+      existingGoogleIntegrations,
+    });
+    const requestedCapabilities = googleCapabilitiesForProfile(body.profile, body.mail === "include");
     const pkce = googleOAuth.createPkce();
     const state = randomOpaqueToken(32);
+    const nonce = randomOpaqueToken(32);
     await application.process({
       kind: "google.oauth.begin",
       personId: principal.personId,
       initiatingSessionId: principal.sessionId,
       stateDigest: sha256Hex(state),
+      nonce,
+      nonceDigest: sha256Hex(nonce),
       pkceVerifier: pkce.verifier,
-      returnPath: query.from === "onboarding" ? "/onboarding" : "/sources",
+      returnPath: body.from === "onboarding" ? "/onboarding" : "/sources",
       requestedCapabilities,
-      accountKind: query.profile,
+      accountKind: body.profile,
+      reconnectTarget:
+        target === null
+          ? null
+          : {
+              integrationId: target.id,
+              expectedControlEpoch: Number(target.control_epoch),
+              externalSubjectDigest: target.external_subject_digest,
+            },
       expectedPersonControlEpoch: principal.controlEpoch,
       expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
       createdAt: new Date().toISOString(),
     });
-    return reply.redirect(
-      googleOAuth.authorizationUrl({
+    return {
+      authorizationUrl: googleOAuth.authorizationUrl({
         state,
         challenge: pkce.challenge,
+        nonce,
         requestedCapabilities,
       }),
-    );
+    };
   });
 
   app.get("/oauth/google/callback", async (request, reply) => {
@@ -336,24 +567,36 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
     const exchange = await googleOAuth.exchange(
       query.code,
       attempt.pkceVerifier,
+      attempt.nonce,
       attempt.requestedCapabilities,
     );
-    const completed = await application.process({
-      kind: "google.oauth.complete",
-      stateDigest: sha256Hex(query.state),
-      externalSubjectDigest: sha256Hex(exchange.subject),
-      credentials: JSON.parse(
-        JSON.stringify({
-          ...exchange.credentials,
-          accountEmail: exchange.email,
-          grantedScopes: [...exchange.grantedScopes],
-        }),
-      ),
-      grantedCapabilities: exchange.grantedCapabilities,
-      completedAt: new Date().toISOString(),
-    });
-    if (!completed.accepted) throw new Error("Google integration was not connected");
-    return reply.redirect(`${attempt.returnPath}?connected=1`);
+    try {
+      const completed = await application.process({
+        kind: "google.oauth.complete",
+        stateDigest: sha256Hex(query.state),
+        externalSubjectDigest: sha256Hex(exchange.subject),
+        credentials: JSON.parse(
+          JSON.stringify({
+            ...exchange.credentials,
+            accountEmail: exchange.email,
+            grantedScopes: [...exchange.grantedScopes],
+          }),
+        ),
+        grantedCapabilities: exchange.grantedCapabilities,
+        completedAt: new Date().toISOString(),
+      });
+      if (!completed.accepted) throw new Error("Google integration was not connected");
+      return reply.redirect(`${attempt.returnPath}?connected=1`);
+    } catch (error) {
+      if (
+        error instanceof ConflictError ||
+        error instanceof StaleAuthorityError ||
+        error instanceof UnauthorizedError
+      ) {
+        return reply.redirect(`${attempt.returnPath}?google=stale`);
+      }
+      throw error;
+    }
   });
 
   app.get("/api/me", async (request, reply) => {
@@ -362,6 +605,8 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
     return queries.viewer(principal.personId, principal.csrfToken, {
       assuranceKind: principal.assuranceKind,
       assuranceExpiresAt: principal.assuranceExpiresAt?.toISOString() ?? null,
+      assuranceContext: principal.assuranceContext,
+      authenticationIdentityId: principal.authenticationIdentityId,
     });
   });
   app.get("/api/onboarding", async (request, reply) => {
@@ -720,7 +965,7 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
     });
   });
   app.post("/api/routines", async (request) => {
-    const principal = await requireWriteSession(request, config, auth);
+    const principal = await requireCompletedWriteSession(request, config, auth, database);
     const body = createRoutineBodySchema.parse(request.body);
     return application.process({
       kind: "web.command",
@@ -729,7 +974,7 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
     });
   });
   app.post("/api/routines/:routineId/revisions", async (request) => {
-    const principal = await requireWriteSession(request, config, auth);
+    const principal = await requireCompletedWriteSession(request, config, auth, database);
     const routineId = z
       .string()
       .uuid()
@@ -742,7 +987,7 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
     });
   });
   app.post("/api/routines/:routineId/status", async (request) => {
-    const principal = await requireWriteSession(request, config, auth);
+    const principal = await requireCompletedWriteSession(request, config, auth, database);
     const routineId = z
       .string()
       .uuid()
@@ -760,7 +1005,7 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
     });
   });
   app.post("/api/sources/calendar-mode", async (request) => {
-    const principal = await requireWriteSession(request, config, auth);
+    const principal = await requireCompletedWriteSession(request, config, auth, database);
     const body = z
       .strictObject({
         connectionId: z.string().uuid(),
@@ -780,7 +1025,7 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
     });
   });
   app.post("/api/sources/private-reviews/:candidateId", async (request) => {
-    const principal = await requireWriteSession(request, config, auth);
+    const principal = await requireCompletedWriteSession(request, config, auth, database);
     const candidateId = z
       .string()
       .uuid()
@@ -797,7 +1042,7 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
     });
   });
   app.post("/api/sources/private-reviews/:candidateId/prepare-share", async (request) => {
-    const principal = await requireWriteSession(request, config, auth);
+    const principal = await requireCompletedWriteSession(request, config, auth, database);
     const candidateId = z
       .string()
       .uuid()
@@ -847,6 +1092,7 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
             exactStandingContext,
           )
         : await requireWriteSession(request, config, auth);
+    await requireCompletedOnboarding(database, principal.personId);
     return application.process({
       kind: "web.command",
       actorPersonId: principal.personId,
@@ -890,19 +1136,16 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
     const principal = await requireWriteSession(request, config, auth);
     const body = z
       .discriminatedUnion("purpose", [
-        z.strictObject({ purpose: z.literal("account_controls") }),
         z.strictObject({
-          purpose: z.literal("google_connect"),
+          purpose: z.literal("account_controls"),
           context: z
-            .strictObject({
-              profile: z.enum(["personal_family", "work"]),
-              mail: z.literal("include").optional(),
-              returnPath: z.literal("/onboarding").optional(),
-            })
-            .refine((context) => context.profile === "work" || context.mail === undefined, {
-              message: "The work Gmail option is only valid for a work Google profile",
-              path: ["mail"],
-            })
+            .discriminatedUnion("action", [
+              z.strictObject({ action: z.literal(GOOGLE_IDENTITY_LINK_ACTION) }),
+              z.strictObject({
+                action: z.literal(GOOGLE_IDENTITY_REVOKE_ACTION),
+                identityId: z.string().uuid(),
+              }),
+            ])
             .optional(),
         }),
         z.strictObject({
@@ -1006,7 +1249,7 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
     return reply.type("application/json; charset=utf-8").send(JSON.stringify(exported, null, 2));
   });
   app.post("/api/sources/:integrationId/disconnect", async (request) => {
-    const principal = await requireStepUpWriteSession(request, config, auth, "account_controls");
+    const principal = await requireWriteSession(request, config, auth);
     const integrationId = z
       .string()
       .uuid()
@@ -1029,6 +1272,33 @@ export async function createServer(input?: { config?: FlorenceConfig; database?:
       command: { kind: "revoke_session", sessionId },
     });
     if (sessionId === principal.sessionId) reply.clearCookie(sessionCookieName(config), { path: "/" });
+    return receipt;
+  });
+  app.post("/api/safety/login-identities/:identityId/revoke", async (request, reply) => {
+    const identityId = z
+      .string()
+      .uuid()
+      .parse((request.params as { identityId?: unknown }).identityId);
+    const exactContext = { action: GOOGLE_IDENTITY_REVOKE_ACTION, identityId } as const;
+    const principal = await requireExactStepUpWriteSession(
+      request,
+      config,
+      auth,
+      "account_controls",
+      exactContext,
+    );
+    const receipt = await application.process({
+      kind: "web.command",
+      actorPersonId: principal.personId,
+      command: {
+        kind: "revoke_login_identity",
+        identityId,
+        assuranceSessionId: principal.sessionId,
+      },
+    });
+    if (principal.authenticationIdentityId === identityId) {
+      reply.clearCookie(sessionCookieName(config), { path: "/" });
+    }
     return receipt;
   });
   app.post("/api/safety/delete-person", async (request, reply) => {
@@ -1443,6 +1713,12 @@ function familyRoleLabel(role: PeopleView["invitations"][number]["role"]): strin
 }
 
 async function requireCompletedOnboarding(database: Database, personId: string): Promise<void> {
+  if (!(await personHasCompletedOnboarding(database, personId))) {
+    throw new ConflictError("Finish your private Florence setup before opening this section");
+  }
+}
+
+async function personHasCompletedOnboarding(database: Database, personId: string): Promise<boolean> {
   const rows = await database<{ readonly completed: boolean }[]>`
     select exists(
       select 1 from person_onboarding selection
@@ -1458,9 +1734,7 @@ async function requireCompletedOnboarding(database: Database, personId: string):
         and family_membership_onboarding_is_current(membership.id)
     ) as completed
   `;
-  if (!rows[0]?.completed) {
-    throw new ConflictError("Finish your private Florence setup before opening this section");
-  }
+  return rows[0]?.completed === true;
 }
 
 async function requireSession(
@@ -1469,7 +1743,7 @@ async function requireSession(
   auth: PostgresWebAuth,
 ): Promise<SessionPrincipal> {
   const token = request.cookies[sessionCookieName(config)];
-  if (!token) throw new UnauthorizedError("Open a fresh private Florence link to sign in");
+  if (!token) throw new UnauthorizedError("Sign in with your linked Google account to open Florence");
   return auth.authenticate(token);
 }
 
@@ -1484,34 +1758,30 @@ async function requireWriteSession(
   return principal;
 }
 
+async function requireCompletedWriteSession(
+  request: FastifyRequest,
+  config: FlorenceConfig,
+  auth: PostgresWebAuth,
+  database: Database,
+): Promise<SessionPrincipal> {
+  const principal = await requireWriteSession(request, config, auth);
+  await requireCompletedOnboarding(database, principal.personId);
+  return principal;
+}
+
 async function requireStepUpSession(
   request: FastifyRequest,
   config: FlorenceConfig,
   auth: PostgresWebAuth,
-  purpose: "google_connect" | "account_controls",
+  purpose: "account_controls",
 ): Promise<SessionPrincipal> {
   const principal = await requireSession(request, config, auth);
   if (
     principal.assuranceKind !== purpose ||
     principal.assuranceExpiresAt === null ||
-    principal.assuranceExpiresAt <= new Date()
+    principal.assuranceExpiresAt <= new Date() ||
+    (purpose === "account_controls" && principal.assuranceContext.action !== undefined)
   ) {
-    throw new UnauthorizedError("Request a fresh private Florence confirmation first");
-  }
-  return principal;
-}
-
-async function requireGoogleStartSession(
-  request: FastifyRequest,
-  config: FlorenceConfig,
-  auth: PostgresWebAuth,
-  from: "onboarding" | "sources",
-): Promise<SessionPrincipal> {
-  const principal = await requireSession(request, config, auth);
-  const allowed =
-    principal.assuranceKind === "google_connect" ||
-    (from === "onboarding" && principal.assuranceKind === "onboarding");
-  if (!allowed || principal.assuranceExpiresAt === null || principal.assuranceExpiresAt <= new Date()) {
     throw new UnauthorizedError("Request a fresh private Florence confirmation first");
   }
   return principal;
@@ -1521,7 +1791,7 @@ async function requireStepUpWriteSession(
   request: FastifyRequest,
   config: FlorenceConfig,
   auth: PostgresWebAuth,
-  purpose: "google_connect" | "account_controls",
+  purpose: "account_controls",
 ): Promise<SessionPrincipal> {
   verifySameOrigin(request, config);
   const principal = await requireStepUpSession(request, config, auth, purpose);
@@ -1533,7 +1803,7 @@ async function requireExactStepUpWriteSession(
   request: FastifyRequest,
   config: FlorenceConfig,
   auth: PostgresWebAuth,
-  purpose: "household_invitation" | "private_bridge_standing",
+  purpose: "account_controls" | "household_invitation" | "private_bridge_standing",
   context: Readonly<Record<string, string>>,
 ): Promise<SessionPrincipal> {
   verifySameOrigin(request, config);
@@ -1545,7 +1815,7 @@ async function requireExactStepUpWriteSession(
 
 function verifyExactStepUp(
   principal: SessionPrincipal,
-  purpose: "household_invitation" | "private_bridge_standing",
+  purpose: "account_controls" | "household_invitation" | "private_bridge_standing",
   context: Readonly<Record<string, string>>,
 ): void {
   const serverContextKeys = new Set(["returnPath"]);
@@ -1573,6 +1843,66 @@ function verifySameOrigin(request: FastifyRequest, config: FlorenceConfig): void
 
 function sessionCookieName(config: FlorenceConfig): string {
   return config.environment === "production" ? SESSION_COOKIE_PRODUCTION : SESSION_COOKIE_DEVELOPMENT;
+}
+
+function googleAuthCookieName(config: FlorenceConfig): string {
+  return config.environment === "production" ? GOOGLE_AUTH_COOKIE_PRODUCTION : GOOGLE_AUTH_COOKIE_DEVELOPMENT;
+}
+
+function setSessionCookie(reply: FastifyReply, config: FlorenceConfig, session: AuthenticatedSession): void {
+  reply.setCookie(sessionCookieName(config), session.sessionToken, {
+    path: "/",
+    httpOnly: true,
+    secure: config.environment === "production",
+    sameSite: "lax",
+    expires: session.absoluteExpiresAt,
+  });
+}
+
+function clearGoogleAuthCookie(reply: FastifyReply, config: FlorenceConfig): void {
+  reply.clearCookie(googleAuthCookieName(config), { path: "/" });
+}
+
+type GoogleAuthError = "cancelled" | "not_linked" | "account_conflict" | "expired" | "provider";
+
+export function safeGoogleAuthReturnPath(value: string | null | undefined): string {
+  if (!value) return "/home";
+  const pathname = value.split(/[?#]/u, 1)[0];
+  return pathname === "/home" ||
+    pathname === "/people" ||
+    pathname === "/chats" ||
+    pathname === "/sources" ||
+    pathname === "/safety" ||
+    pathname === "/onboarding"
+    ? pathname
+    : "/home";
+}
+
+export function googleAuthResultPath(
+  mode: "login" | "link",
+  returnPath: string,
+  error: GoogleAuthError,
+): string {
+  if (mode === "link") return `/link-account?error=${error}`;
+  return `/sign-in?error=${error}&returnTo=${encodeURIComponent(safeGoogleAuthReturnPath(returnPath))}`;
+}
+
+async function googleAuthFailurePath(
+  request: FastifyRequest,
+  config: FlorenceConfig,
+  auth: PostgresWebAuth,
+  error: GoogleAuthError,
+): Promise<string> {
+  const sessionToken = request.cookies[sessionCookieName(config)];
+  if (sessionToken) {
+    try {
+      await auth.authenticate(sessionToken);
+      return googleAuthResultPath("link", "/onboarding", error);
+    } catch {
+      // A stale Florence session is equivalent to being signed out here.
+    }
+  }
+  return googleAuthResultPath("login", "/home", error);
 }
 
 function headersForVerification(headers: FastifyRequest["headers"]): Headers {
@@ -1613,21 +1943,16 @@ async function readTextOrFallback(target: string, fallback: string): Promise<str
 }
 
 function handoffPage(token: string, purpose: string): string {
-  const googleConnect = purpose === "google_connect";
   const onboarding = purpose === "onboarding";
   const title = onboarding
     ? "Set up Florence"
-    : googleConnect
-      ? "Connect Google"
-      : purpose === "account_controls"
-        ? "Confirm private controls"
-        : "Open Florence";
+    : purpose === "account_controls"
+      ? "Confirm private controls"
+      : "Open Florence";
   const explanation = onboarding
     ? "Continue your private family setup. Florence will resume exactly where you left off."
-    : googleConnect
-      ? "Continue to Google to choose the account Florence should privately connect to you."
-      : "This link came through your exact private Florence conversation. Continue to open your secure account.";
-  const button = onboarding ? "Continue setup" : googleConnect ? "Continue to Google" : "Continue securely";
+    : "This link came through your exact private Florence conversation. Continue to open your secure account.";
+  const button = onboarding ? "Continue setup" : "Continue securely";
   const expiry = onboarding ? "It remains available for one day" : "It expires shortly";
   return `<!doctype html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>${title}</title><link rel="stylesheet" href="/handoff.css"></head><body><main data-handoff-token="${escapeHtml(token)}" data-handoff-purpose="${escapeHtml(purpose)}"><div class="mark">F</div><h1>${title}</h1><p>${explanation}</p><form><button type="submit">${button}</button></form><div data-status aria-live="polite"></div><small>The link is not used until you tap the button. ${expiry} and cannot be reused.</small></main><script src="/handoff.js" defer></script></body></html>`;
 }
@@ -1640,16 +1965,11 @@ export function completedHandoffRedirect(purpose: HandoffPurpose, session: Authe
   if (purpose === "web_sign_in") {
     return session.assuranceContext.returnPath === "/sources" ? "/sources" : "/people";
   }
-  if (session.assuranceKind === "google_connect") {
-    const profile = session.assuranceContext.profile;
-    if (profile === "personal_family" || profile === "work") {
-      const mail = profile === "work" && session.assuranceContext.mail === "include" ? "&mail=include" : "";
-      const from = session.assuranceContext.returnPath === "/onboarding" ? "&from=onboarding" : "";
-      return `/oauth/google/start?profile=${profile}${mail}${from}`;
-    }
-    return "/sources?step_up=google_connect";
+  if (session.assuranceKind === "account_controls") {
+    return GoogleIdentityLinkAssuranceContextSchema.safeParse(session.assuranceContext).success
+      ? GOOGLE_IDENTITY_LINK_RETURN_PATH
+      : "/safety?step_up=account_controls";
   }
-  if (session.assuranceKind === "account_controls") return "/safety?step_up=account_controls";
   if (session.assuranceKind === "private_bridge_standing") {
     return "/sources?step_up=private_bridge_standing";
   }
@@ -1657,7 +1977,7 @@ export function completedHandoffRedirect(purpose: HandoffPurpose, session: Authe
 }
 
 function unavailableHandoffPage(florencePhone: string): string {
-  return `<!doctype html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>Get a fresh Florence link</title><link rel="stylesheet" href="/handoff.css"></head><body><main><div class="mark">F</div><h1>This private link is no longer available</h1><p>Florence links are single-use. Nothing is wrong with your account.</p><p>Text <strong>continue setup</strong> to resume onboarding, <strong>connect Google</strong> for Gmail and Calendar, or <strong>settings</strong> for private controls.</p><a href="sms:${escapeHtml(florencePhone)}">Text Florence</a></main></body></html>`;
+  return `<!doctype html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>Open Florence</title><link rel="stylesheet" href="/handoff.css"></head><body><main><div class="mark">F</div><h1>This private link is no longer available</h1><p>Nothing is wrong with your account. If you linked Google during setup, you can sign in normally—Florence links are reserved for sensitive confirmations and account recovery.</p><a href="/sign-in">Continue with Google</a><p><small>Still setting up or need help?</small></p><a href="sms:${escapeHtml(florencePhone)}">Text Florence</a></main></body></html>`;
 }
 
 function policyPage(title: string, paragraphs: readonly string[]): string {
@@ -1681,4 +2001,26 @@ function googleCapabilitiesForProfile(
   includeWorkMail = false,
 ): readonly GoogleCapability[] {
   return profile === "work" && !includeWorkMail ? ["calendar"] : ["mail", "calendar"];
+}
+
+export function assertGoogleSourceStartPolicy(input: {
+  readonly onboardingCompleted: boolean;
+  readonly onboardingStep: FamilyOnboardingProjection["nextStep"]["kind"] | null;
+  readonly from: "onboarding" | "sources";
+  readonly profile: GoogleConnectionProfile;
+  readonly includeWorkMail: boolean;
+  readonly reconnectAccountKind: GoogleConnectionProfile | null;
+  readonly existingGoogleIntegrations: boolean;
+}): void {
+  if (input.onboardingCompleted) return;
+  if (
+    input.from !== "onboarding" ||
+    input.onboardingStep !== "google" ||
+    input.profile !== "personal_family" ||
+    input.includeWorkMail ||
+    (input.reconnectAccountKind !== null && input.reconnectAccountKind !== "personal_family") ||
+    (input.reconnectAccountKind === null && input.existingGoogleIntegrations)
+  ) {
+    throw new ConflictError("Finish family onboarding before adding work or additional Google sources");
+  }
 }

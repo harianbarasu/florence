@@ -7,7 +7,6 @@ export interface GoogleCredentials {
   expiryDate?: number;
   scope?: string;
   tokenType?: string;
-  idToken?: string;
 }
 
 export interface GoogleTokenExchange {
@@ -16,6 +15,11 @@ export interface GoogleTokenExchange {
   email: string;
   grantedScopes: readonly string[];
   grantedCapabilities: readonly GoogleCapability[];
+}
+
+export interface GoogleTokenRevocationReceipt {
+  readonly outcome: "revoked" | "already_invalid" | "no_token";
+  readonly httpStatus: number;
 }
 
 export interface GmailAttachmentReference {

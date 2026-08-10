@@ -46,6 +46,9 @@ export function OnboardingPage({ viewer, onCompleted }: { viewer: Viewer; onComp
     } else if (query.get("google") === "cancelled") {
       setNotice("Google was not connected. You can try again or choose not now.");
       window.history.replaceState({}, "", "/onboarding");
+    } else if (query.get("google") === "stale") {
+      setNotice("Your setup changed before Google finished. Nothing extra was connected.");
+      window.history.replaceState({}, "", "/onboarding");
     }
   }, [location.search]);
 
@@ -70,6 +73,24 @@ export function OnboardingPage({ viewer, onCompleted }: { viewer: Viewer; onComp
       }
       return false;
     } finally {
+      setBusy(null);
+    }
+  }
+
+  async function connectPersonalGoogle() {
+    setBusy("/oauth/google/start");
+    setActionError(null);
+    setNotice(null);
+    try {
+      const started = await postJson<{ authorizationUrl: string }>("/oauth/google/start", viewer.csrfToken, {
+        profile: "personal_family",
+        from: "onboarding",
+        integrationId: null,
+      });
+      window.location.assign(started.authorizationUrl);
+    } catch (reason) {
+      if (reason instanceof ApiError && reason.status === 401) setSessionExpired(true);
+      else setActionError("Google connection couldn’t start. Nothing changed—please try again.");
       setBusy(null);
     }
   }
@@ -238,7 +259,6 @@ export function OnboardingPage({ viewer, onCompleted }: { viewer: Viewer; onComp
   } else if (step === "google") {
     content = (
       <GoogleOnboardingStep
-        viewer={viewer}
         google={data.google}
         busy={busy !== null}
         editing={isEditingEarlierStep}
@@ -246,17 +266,8 @@ export function OnboardingPage({ viewer, onCompleted }: { viewer: Viewer; onComp
           if (isEditingEarlierStep) setPreviewStep(null);
           else void load(false);
         }}
-        onRequestLink={() =>
-          save(
-            "/api/safety/request-step-up",
-            {
-              purpose: "google_connect",
-              context: { profile: "personal_family", returnPath: "/onboarding" },
-            },
-            "Florence sent a private, secure continuation link in iMessage.",
-          )
-        }
         onSkip={() => save("/api/onboarding/google-skip", {})}
+        onConnect={connectPersonalGoogle}
       />
     );
   } else if (step === "review" && household) {
@@ -838,26 +849,20 @@ function SharedContextStep({
 }
 
 function GoogleOnboardingStep({
-  viewer,
   google,
   busy,
   editing,
   onContinue,
-  onRequestLink,
   onSkip,
+  onConnect,
 }: {
-  viewer: Viewer;
   google: OnboardingView["google"];
   busy: boolean;
   editing: boolean;
   onContinue: () => void;
-  onRequestLink: () => Promise<boolean>;
   onSkip: () => Promise<boolean>;
+  onConnect: () => Promise<void>;
 }) {
-  const expiresAt = viewer.session.assuranceExpiresAt;
-  const assuranceReady =
-    (viewer.session.assuranceKind === "onboarding" || viewer.session.assuranceKind === "google_connect") &&
-    (expiresAt === null || new Date(expiresAt) > new Date());
   if (google.decision === "connected") {
     return (
       <div className="onboarding-form">
@@ -902,18 +907,14 @@ function GoogleOnboardingStep({
           Other family members never see your email. Florence only shares family meaning after your approval.
         </span>
       </div>
-      {assuranceReady ? (
-        <a
-          className="onboarding-primary-button"
-          href="/oauth/google/start?profile=personal_family&from=onboarding"
-        >
-          Connect personal Google
-        </a>
-      ) : (
-        <OnboardingPrimaryButton disabled={busy} busy={busy} onClick={() => void onRequestLink()}>
-          Connect personal Google
-        </OnboardingPrimaryButton>
-      )}
+      <button
+        type="button"
+        className="onboarding-primary-button"
+        disabled={busy}
+        onClick={() => void onConnect()}
+      >
+        Connect personal Google
+      </button>
       <button type="button" className="onboarding-text-button" disabled={busy} onClick={() => void onSkip()}>
         Not now
       </button>
@@ -1145,14 +1146,34 @@ function OnboardingLoading() {
 function OnboardingExpired() {
   const florencePhone = document.documentElement.dataset.florencePhone;
   return (
-    <OnboardingProblem
-      title="This private session has ended"
-      copy="Your saved setup is still here. Text Florence for a fresh private link and continue where you left off."
-      {...(florencePhone
-        ? { href: `sms:${florencePhone}&body=${encodeURIComponent("Send me a fresh setup link")}` }
-        : {})}
-      action="Text Florence"
-    />
+    <div className="onboarding-shell">
+      <header className="onboarding-topbar">
+        <Brand />
+        <a href="/privacy">Privacy</a>
+      </header>
+      <main className="onboarding-main">
+        <section className="onboarding-card-main">
+          <div className="onboarding-form onboarding-problem">
+            <OnboardingHeading
+              eyebrow="Setup paused"
+              title="Your session has ended"
+              copy="Everything you saved is still here. Sign in with your linked Google account and Florence will resume at the right step."
+            />
+            <a className="onboarding-primary-button" href="/sign-in?returnTo=%2Fonboarding">
+              Sign in with Google
+            </a>
+            {florencePhone ? (
+              <a
+                className="onboarding-secondary-button"
+                href={`sms:${florencePhone}&body=${encodeURIComponent("Help me reopen Florence")}`}
+              >
+                Recover through iMessage
+              </a>
+            ) : null}
+          </div>
+        </section>
+      </main>
+    </div>
   );
 }
 

@@ -61,7 +61,14 @@ export const SourceOriginSchema = z.strictObject({
 });
 export type SourceOrigin = z.infer<typeof SourceOriginSchema>;
 
-export const IntegrationStatusSchema = z.enum(["active", "paused", "reauth_required", "revoked", "error"]);
+export const IntegrationStatusSchema = z.enum([
+  "active",
+  "paused",
+  "reauth_required",
+  "revocation_pending",
+  "revoked",
+  "error",
+]);
 export type IntegrationStatus = z.infer<typeof IntegrationStatusSchema>;
 
 export const IntegrationCapabilitySchema = z.enum(["mail", "calendar"]);
@@ -69,6 +76,12 @@ export type IntegrationCapability = z.infer<typeof IntegrationCapabilitySchema>;
 
 export const IntegrationAccountKindSchema = z.enum(["personal_family", "work"]);
 export type IntegrationAccountKind = z.infer<typeof IntegrationAccountKindSchema>;
+
+const IntegrationReconnectTargetSchema = z.strictObject({
+  integrationId: EntityIdSchema,
+  expectedControlEpoch: z.number().int().positive(),
+  externalSubjectDigest: DigestSchema,
+});
 
 const IntegrationCapabilitiesSchema = z
   .array(IntegrationCapabilitySchema)
@@ -93,6 +106,7 @@ const ConnectIntegrationCommandSchema = z.strictObject({
   activeCapabilities: IntegrationCapabilitiesSchema,
   credentials: JsonObjectSchema,
   expectedPersonControlEpoch: z.number().int().positive(),
+  reconnectTarget: IntegrationReconnectTargetSchema.nullable(),
   connectedAt: InstantSchema,
 });
 
@@ -105,12 +119,20 @@ const SetIntegrationStatusCommandSchema = z.strictObject({
   changedAt: InstantSchema,
 });
 
-const RevokeIntegrationCommandSchema = z.strictObject({
-  kind: z.literal("revoke_integration"),
+const BeginIntegrationRevocationCommandSchema = z.strictObject({
+  kind: z.literal("begin_integration_revocation"),
   integrationId: EntityIdSchema,
   personId: EntityIdSchema,
   expectedControlEpoch: z.number().int().positive(),
-  revokedAt: InstantSchema,
+  requestedAt: InstantSchema,
+});
+
+const CompleteIntegrationRevocationCommandSchema = z.strictObject({
+  kind: z.literal("complete_integration_revocation"),
+  integrationId: EntityIdSchema,
+  personId: EntityIdSchema,
+  expectedControlEpoch: z.number().int().positive(),
+  completedAt: InstantSchema,
 });
 
 const BeginOAuthAttemptCommandSchema = z.strictObject({
@@ -119,6 +141,8 @@ const BeginOAuthAttemptCommandSchema = z.strictObject({
   provider: DurableKindSchema,
   initiatingSessionId: EntityIdSchema,
   stateDigest: DigestSchema,
+  nonce: z.string().min(32).max(512),
+  nonceDigest: DigestSchema,
   pkceVerifier: z.string().min(43).max(512),
   returnPath: z
     .string()
@@ -133,6 +157,7 @@ const BeginOAuthAttemptCommandSchema = z.strictObject({
     ),
   requestedCapabilities: IntegrationCapabilitiesSchema,
   accountKind: IntegrationAccountKindSchema,
+  reconnectTarget: IntegrationReconnectTargetSchema.nullable(),
   expectedPersonControlEpoch: z.number().int().positive(),
   expiresAt: InstantSchema,
   createdAt: InstantSchema,
@@ -384,7 +409,8 @@ const SweepRetentionCommandSchema = z.strictObject({
 export const SourceCommandSchema = z.discriminatedUnion("kind", [
   ConnectIntegrationCommandSchema,
   SetIntegrationStatusCommandSchema,
-  RevokeIntegrationCommandSchema,
+  BeginIntegrationRevocationCommandSchema,
+  CompleteIntegrationRevocationCommandSchema,
   BeginOAuthAttemptCommandSchema,
   ConsumeOAuthAttemptCommandSchema,
   CheckpointCursorCommandSchema,
@@ -540,6 +566,7 @@ export interface IntegrationView {
   readonly provider: string;
   readonly accountKind: IntegrationAccountKind;
   readonly activeCapabilities: readonly IntegrationCapability[];
+  readonly lastAuthorizedCapabilities: readonly IntegrationCapability[];
   readonly status: IntegrationStatus;
   readonly controlEpoch: number;
   readonly connectedAt: string;
@@ -550,11 +577,17 @@ export type SourceMutationResult =
   | ({ readonly kind: "integration_connected" } & IntegrationView)
   | ({ readonly kind: "integration_status_changed" } & IntegrationView)
   | {
-      readonly kind: "integration_revoked";
+      readonly kind: "integration_revocation_started";
       readonly integrationId: string;
       readonly controlEpoch: number;
       readonly invalidatedRevisionCount: number;
       readonly revokedCandidateCount: number;
+    }
+  | {
+      readonly kind: "integration_revocation_completed";
+      readonly integrationId: string;
+      readonly controlEpoch: number;
+      readonly duplicate: boolean;
     }
   | {
       readonly kind: "oauth_attempt_started";
@@ -567,11 +600,12 @@ export type SourceMutationResult =
       readonly personId: string;
       readonly provider: string;
       readonly initiatingSessionId: string;
-      readonly pkceVerifier: string;
+      readonly nonceDigest: string;
       readonly returnPath: string;
       readonly personControlEpoch: number;
       readonly requestedCapabilities: readonly IntegrationCapability[];
       readonly accountKind: IntegrationAccountKind;
+      readonly reconnectTarget: z.infer<typeof IntegrationReconnectTargetSchema> | null;
     }
   | {
       readonly kind: "cursor_checkpointed";
@@ -688,10 +722,13 @@ export type SourceReadResult =
       readonly provider: string;
       readonly initiatingSessionId: string;
       readonly pkceVerifier: string;
+      readonly nonce: string;
+      readonly nonceDigest: string;
       readonly returnPath: string;
       readonly personControlEpoch: number;
       readonly requestedCapabilities: readonly IntegrationCapability[];
       readonly accountKind: IntegrationAccountKind;
+      readonly reconnectTarget: z.infer<typeof IntegrationReconnectTargetSchema> | null;
       readonly expiresAt: string;
     }
   | {

@@ -4,13 +4,12 @@
   const button = document.querySelector("button");
   const status = document.querySelector("[data-status]");
   const token = root?.getAttribute("data-handoff-token");
-  const purpose = root?.getAttribute("data-handoff-purpose");
   history.replaceState({}, "", "/sign-in");
   if (!form || !button || !status || !token) return;
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
     button.disabled = true;
-    status.textContent = purpose === "google_connect" ? "Opening Google…" : "Opening Florence…";
+    status.textContent = "Opening Florence…";
     try {
       const response = await fetch("/auth/consume", {
         method: "POST",

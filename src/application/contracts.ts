@@ -233,13 +233,42 @@ export type AppEnvelope =
       readonly personId: string;
       readonly initiatingSessionId: string;
       readonly stateDigest: string;
+      readonly nonce: string;
+      readonly nonceDigest: string;
       readonly pkceVerifier: string;
       readonly returnPath: string;
       readonly requestedCapabilities: readonly IntegrationCapability[];
       readonly accountKind: IntegrationAccountKind;
+      readonly reconnectTarget: {
+        readonly integrationId: string;
+        readonly expectedControlEpoch: number;
+        readonly externalSubjectDigest: string;
+      } | null;
       readonly expectedPersonControlEpoch: number;
       readonly expiresAt: string;
       readonly createdAt: string;
+    }
+  | {
+      /**
+       * Binds one verified Google subject through the exact still-current link
+       * attempt that was initiated by an already-authenticated Florence person.
+       */
+      readonly kind: "auth.google_identity.bind";
+      readonly stateDigest: string;
+      readonly browserBindingDigest: string;
+      readonly externalSubjectDigest: string;
+      readonly externalSubject: string;
+      readonly verifiedEmail: string;
+      readonly boundAt: string;
+    }
+  | {
+      /** Refreshes only the mutable verified-email label for an exact returning login. */
+      readonly kind: "auth.google_identity.login_observed";
+      readonly sessionId: string;
+      readonly personId: string;
+      readonly identityId: string;
+      readonly externalSubjectDigest: string;
+      readonly verifiedEmail: string;
     }
   | {
       readonly kind: "google.oauth.complete";
@@ -248,6 +277,20 @@ export type AppEnvelope =
       readonly credentials: JsonObject;
       readonly grantedCapabilities: readonly IntegrationCapability[];
       readonly completedAt: string;
+    }
+  | {
+      /** Reconciles one provider-confirmed disconnect and retires its last token. */
+      readonly kind: "google.oauth.revoke_receipt";
+      readonly outboxId: string;
+      readonly leaseToken: string;
+      readonly idempotencyKey: string;
+      readonly integrationId: string;
+      readonly expectedIntegrationControlEpoch: number;
+      readonly receipt: {
+        readonly outcome: "revoked" | "already_invalid" | "no_token";
+        readonly httpStatus: number;
+      };
+      readonly occurredAt: string;
     }
   | ({ readonly kind: "google.sync.observe" } & GoogleSyncObservationFields)
   | {
@@ -400,15 +443,16 @@ export type AppEnvelope =
         | { readonly kind: "revoke_bridge_rule"; readonly ruleId: string }
         | { readonly kind: "disconnect_integration"; readonly integrationId: string }
         | { readonly kind: "revoke_session"; readonly sessionId: string }
+        | {
+            readonly kind: "revoke_login_identity";
+            readonly identityId: string;
+            readonly assuranceSessionId: string;
+          }
         | { readonly kind: "delete_person" }
         | { readonly kind: "pause_person"; readonly paused: boolean }
         | {
             readonly kind: "request_step_up";
-            readonly purpose:
-              | "account_controls"
-              | "google_connect"
-              | "household_invitation"
-              | "private_bridge_standing";
+            readonly purpose: "account_controls" | "household_invitation" | "private_bridge_standing";
             readonly context?: Readonly<Record<string, string>>;
           };
     };

@@ -14,7 +14,7 @@ export const PersonStatusSchema = z.enum([
 ]);
 export type PersonStatus = z.infer<typeof PersonStatusSchema>;
 
-export const IdentityKindSchema = z.enum(["phone", "email", "provider_handle"]);
+export const IdentityKindSchema = z.enum(["phone", "email", "provider_handle", "provider_account"]);
 export type IdentityKind = z.infer<typeof IdentityKindSchema>;
 
 export const IdentityStatusSchema = z.enum(["observed", "pending_claim", "verified", "revoked"]);
@@ -72,6 +72,37 @@ export const ClaimIdentityInputSchema = z
     path: ["confirmedByIdentityId"],
   });
 export type ClaimIdentityInput = z.infer<typeof ClaimIdentityInputSchema>;
+
+export const BindProviderAccountIdentityInputSchema = z.strictObject({
+  personId: EntityIdSchema,
+  expectedPersonControlEpoch: z.number().int().positive(),
+  issuer: z.literal("google"),
+  subjectDigest: DigestSchema,
+  subject: z.string().trim().min(1).max(255),
+  verifiedEmail: z.string().trim().email().max(320),
+  boundAt: InstantSchema,
+});
+export type BindProviderAccountIdentityInput = z.infer<typeof BindProviderAccountIdentityInputSchema>;
+
+export const RefreshProviderAccountIdentityLabelInputSchema = z.strictObject({
+  personId: EntityIdSchema,
+  expectedPersonControlEpoch: z.number().int().positive(),
+  identityId: EntityIdSchema,
+  expectedIdentityAuthorityVersion: z.number().int().positive(),
+  issuer: z.literal("google"),
+  subjectDigest: DigestSchema,
+  verifiedEmail: z.string().trim().email().max(320),
+  observedAt: InstantSchema,
+});
+export type RefreshProviderAccountIdentityLabelInput = z.infer<
+  typeof RefreshProviderAccountIdentityLabelInputSchema
+>;
+
+export const ProviderAccountIdentityBindingSchema = z.strictObject({
+  identity: IdentityPrincipalSchema,
+  duplicate: z.boolean(),
+});
+export type ProviderAccountIdentityBinding = z.infer<typeof ProviderAccountIdentityBindingSchema>;
 
 export const HouseholdMembershipSchema = z.strictObject({
   membershipId: EntityIdSchema,
@@ -166,6 +197,9 @@ export type SuspendCaregiverInput = z.infer<typeof SuspendCaregiverInputSchema>;
 export interface IdentityRelationships {
   observeIdentity(input: ObserveIdentityInput): Promise<IdentityPrincipal>;
   claimIdentity(input: ClaimIdentityInput): Promise<IdentityPrincipal>;
+  bindProviderAccountIdentity(
+    input: BindProviderAccountIdentityInput,
+  ): Promise<ProviderAccountIdentityBinding>;
   createHousehold(input: CreateHouseholdInput): Promise<CreateHouseholdResult>;
   inviteMember(input: InviteHouseholdMemberInput): Promise<HouseholdInvitation>;
   approveInvitation(input: ApproveInvitationInput): Promise<HouseholdInvitation>;

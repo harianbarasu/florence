@@ -133,6 +133,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
       clientId: parsed.GOOGLE_CLIENT_ID,
       clientSecret: parsed.GOOGLE_CLIENT_SECRET,
       redirectUri: new URL("/oauth/google/callback", publicBaseUrl).toString(),
+      identityRedirectUri: new URL("/auth/google/callback", publicBaseUrl).toString(),
     },
     model: {
       provider: parsed.MODEL_PROVIDER,

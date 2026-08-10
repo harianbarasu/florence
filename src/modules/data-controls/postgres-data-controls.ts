@@ -106,10 +106,19 @@ export class PostgresDataControls {
         delete from oauth_attempts where person_id = ${input.actorPersonId}
       `;
       await transaction`
+        delete from web_auth_attempts where person_id = ${input.actorPersonId}
+      `;
+      await transaction`
+        delete from auth_handoffs where person_id = ${input.actorPersonId}
+      `;
+      await transaction`
         update integrations set status = 'revoked', credential_ciphertext = null,
-          credential_key_version = null, control_epoch = control_epoch + 1,
+          credential_key_version = null, account_label_ciphertext = null,
+          account_label_key_version = null, control_epoch = control_epoch + 1,
           revoked_at = coalesce(revoked_at, ${input.deletedAt}), updated_at = ${input.deletedAt}
-        where person_id = ${input.actorPersonId} and status <> 'revoked'
+        where person_id = ${input.actorPersonId}
+          and (status <> 'revoked' or credential_ciphertext is not null
+            or account_label_ciphertext is not null)
       `;
       await transaction`
         update integration_grants grant_row set status = 'revoked', revoked_at = ${input.deletedAt}
@@ -244,9 +253,13 @@ export class PostgresDataControls {
         )
       `;
       await transaction`
-        update person_identities set status = 'revoked', revoked_at = ${input.deletedAt},
-          authority_version = authority_version + 1, updated_at = ${input.deletedAt}
-        where person_id = ${input.actorPersonId} and status <> 'revoked'
+        update person_identities set status = 'revoked',
+          revoked_at = coalesce(revoked_at, ${input.deletedAt}),
+          subject_ciphertext = null, subject_key_version = null,
+          display_label_ciphertext = null, display_label_key_version = null,
+          authority_version = authority_version + case when status = 'revoked' then 0 else 1 end,
+          updated_at = ${input.deletedAt}
+        where person_id = ${input.actorPersonId}
       `;
       await transaction`
         update people set status = 'deleted', consented_at = null, timezone = null,

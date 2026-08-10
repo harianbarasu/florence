@@ -8,7 +8,11 @@ import type {
 import type { FlorenceConfig } from "../config.js";
 import type { Database } from "../db/client.js";
 import {
-  GOOGLE_CONNECT_HANDOFF_TTL_SECONDS,
+  type AssuranceKind,
+  GOOGLE_IDENTITY_REVOKE_ACTION,
+  GoogleIdentityRevokeAssuranceContextSchema,
+  googleAuthAttemptSecretPurpose,
+  hasFreshGoogleIdentityLinkAssurance,
   ONBOARDING_HANDOFF_TTL_SECONDS,
   PostgresWebAuth,
 } from "../modules/auth/index.js";
@@ -54,6 +58,7 @@ import { DurableWork } from "../modules/work/index.js";
 import { canonicalDigest, canonicalJson } from "../shared/canonical-json.js";
 import type { SecretBox } from "../shared/crypto.js";
 import { ConflictError, NotFoundError, StaleAuthorityError, UnauthorizedError } from "../shared/errors.js";
+import { providerAccountOwnershipLockKey } from "../shared/provider-account.js";
 import type {
   AppEnvelope,
   ApplicationTimerProcessor,
@@ -76,6 +81,7 @@ type Transaction = TransactionSql<Record<string, never>>;
 const PRIVATE_GUIDANCE_RESPONSE_TTL_MS = 10 * 60_000;
 const MAX_LIVE_GROUP_INVOCATION_AGE_MS = 10 * 60_000;
 const LINQ_FAILURE_RECONCILIATION_DELAY_MS = 60_000;
+const DURABLE_GOOGLE_REVOCATION_EXPIRES_AT = "9999-12-31T23:59:59.999Z";
 
 interface ReconciledConversation {
   readonly conversationId: string;
@@ -264,10 +270,16 @@ export class FlorenceApplication {
           ids: { redriven: String(redriven) },
         };
       }
+      case "auth.google_identity.bind":
+        return this.bindGoogleIdentity(input);
+      case "auth.google_identity.login_observed":
+        return this.observeGoogleIdentityLogin(input);
       case "google.oauth.begin":
         return this.beginGoogleOAuth(input);
       case "google.oauth.complete":
         return this.completeGoogleOAuth(input);
+      case "google.oauth.revoke_receipt":
+        return this.reconcileGoogleTokenRevocation(input);
       case "google.sync.observe":
         return this.observeGoogleSync(input);
       case "private_source.notify_candidate":
@@ -319,31 +331,361 @@ export class FlorenceApplication {
   private async beginGoogleOAuth(
     input: Extract<AppEnvelope, { kind: "google.oauth.begin" }>,
   ): Promise<ProcessReceipt> {
-    const result = await new PostgresSourceIntelligence(this.database, this.secretBox, {
-      rawRetentionDays: this.config.defaults.rawSourceRetentionDays,
-    }).apply({
-      kind: "begin_oauth_attempt",
-      personId: input.personId,
-      provider: "google",
-      initiatingSessionId: input.initiatingSessionId,
-      stateDigest: input.stateDigest,
-      pkceVerifier: input.pkceVerifier,
-      returnPath: input.returnPath,
-      requestedCapabilities: [...input.requestedCapabilities],
-      accountKind: input.accountKind,
-      expectedPersonControlEpoch: input.expectedPersonControlEpoch,
-      expiresAt: input.expiresAt,
-      createdAt: input.createdAt,
+    return this.database.begin(async (transaction) => {
+      if (input.returnPath === "/onboarding") {
+        await transaction`select pg_advisory_xact_lock(hashtextextended(${`onboarding-google:${input.personId}`}, 0))`;
+        const projection = await new PostgresFamilyOnboarding(this.secretBox).project(transaction, {
+          actorPersonId: input.personId,
+          personId: input.personId,
+        });
+        const onboardingCapabilities = new Set(input.requestedCapabilities);
+        if (
+          projection.nextStep.kind !== "google" ||
+          input.accountKind !== "personal_family" ||
+          onboardingCapabilities.size !== 2 ||
+          !onboardingCapabilities.has("mail") ||
+          !onboardingCapabilities.has("calendar")
+        ) {
+          throw new ConflictError("Google is not the current family onboarding step");
+        }
+        // Exactly one personal-source ceremony may be live during onboarding.
+        // Starting a fresh one invalidates older browser tabs before persisting
+        // the new attempt, so parallel starts cannot create extra accounts.
+        await transaction`
+          delete from oauth_attempts
+          where person_id = ${input.personId} and provider = 'google'
+            and return_path = '/onboarding' and consumed_at is null
+        `;
+      }
+      const result = await new PostgresSourceIntelligence(transaction, this.secretBox, {
+        rawRetentionDays: this.config.defaults.rawSourceRetentionDays,
+      }).apply({
+        kind: "begin_oauth_attempt",
+        personId: input.personId,
+        provider: "google",
+        initiatingSessionId: input.initiatingSessionId,
+        stateDigest: input.stateDigest,
+        nonce: input.nonce,
+        nonceDigest: input.nonceDigest,
+        pkceVerifier: input.pkceVerifier,
+        returnPath: input.returnPath,
+        requestedCapabilities: [...input.requestedCapabilities],
+        accountKind: input.accountKind,
+        reconnectTarget: input.reconnectTarget,
+        expectedPersonControlEpoch: input.expectedPersonControlEpoch,
+        expiresAt: input.expiresAt,
+        createdAt: input.createdAt,
+      });
+      if (result.kind !== "oauth_attempt_started") {
+        throw new Error("Google OAuth attempt did not start");
+      }
+      return {
+        accepted: true,
+        duplicate: false,
+        disposition: "google_oauth_started",
+        ids: { oauthAttemptId: result.oauthAttemptId },
+      };
     });
-    if (result.kind !== "oauth_attempt_started") {
-      throw new Error("Google OAuth attempt did not start");
+  }
+
+  private async bindGoogleIdentity(
+    input: Extract<AppEnvelope, { kind: "auth.google_identity.bind" }>,
+  ): Promise<ProcessReceipt> {
+    if (
+      !/^[a-f0-9]{64}$/u.test(input.stateDigest) ||
+      !/^[a-f0-9]{64}$/u.test(input.browserBindingDigest) ||
+      !/^[a-f0-9]{64}$/u.test(input.externalSubjectDigest) ||
+      sha256Hex(input.externalSubject) !== input.externalSubjectDigest
+    ) {
+      throw new UnauthorizedError("Google identity binding proof is invalid");
     }
-    return {
-      accepted: true,
-      duplicate: false,
-      disposition: "google_oauth_started",
-      ids: { oauthAttemptId: result.oauthAttemptId },
-    };
+    const boundAt = new Date(input.boundAt);
+    if (Number.isNaN(boundAt.getTime())) {
+      throw new UnauthorizedError("Google identity binding time is invalid");
+    }
+    return this.database.begin(async (transaction) => {
+      await transaction`select pg_advisory_xact_lock(hashtextextended(${providerAccountOwnershipLockKey(
+        "google",
+        input.externalSubjectDigest,
+      )}, 0))`;
+      const attempts = await transaction<
+        {
+          readonly id: string;
+          readonly mode: string;
+          readonly person_id: string | null;
+          readonly person_control_epoch: number | string | null;
+          readonly initiating_session_id: string | null;
+          readonly expires_at: Date;
+          readonly consumed_at: Date | null;
+          readonly session_person_id: string | null;
+          readonly session_person_control_epoch: number | string | null;
+          readonly session_authentication_identity_id: string | null;
+          readonly session_authentication_identity_authority_version: number | string | null;
+          readonly session_assurance_kind: AssuranceKind;
+          readonly session_assurance_context: unknown;
+          readonly session_assurance_expires_at: Date | null;
+          readonly session_revoked_at: Date | null;
+          readonly session_idle_expires_at: Date | null;
+          readonly session_absolute_expires_at: Date | null;
+          readonly person_status: string | null;
+          readonly current_person_control_epoch: number | string | null;
+          readonly authentication_identity_person_id: string | null;
+          readonly authentication_identity_status: string | null;
+          readonly current_authentication_identity_authority_version: number | string | null;
+        }[]
+      >`
+        select attempt.id, attempt.mode, attempt.person_id, attempt.person_control_epoch,
+          attempt.initiating_session_id, attempt.expires_at, attempt.consumed_at,
+          session.person_id as session_person_id,
+          session.person_control_epoch as session_person_control_epoch,
+          session.authentication_identity_id as session_authentication_identity_id,
+          session.authentication_identity_authority_version as session_authentication_identity_authority_version,
+          session.assurance_kind as session_assurance_kind,
+          session.assurance_context as session_assurance_context,
+          session.assurance_expires_at as session_assurance_expires_at,
+          session.revoked_at as session_revoked_at,
+          session.idle_expires_at as session_idle_expires_at,
+          session.absolute_expires_at as session_absolute_expires_at,
+          person.status as person_status,
+          person.control_epoch as current_person_control_epoch,
+          authentication_identity.person_id as authentication_identity_person_id,
+          authentication_identity.status as authentication_identity_status,
+          authentication_identity.authority_version as current_authentication_identity_authority_version
+        from web_auth_attempts attempt
+        join person_sessions session on session.id = attempt.initiating_session_id
+        join people person on person.id = attempt.person_id
+        join person_identities authentication_identity
+          on authentication_identity.id = session.authentication_identity_id
+        where attempt.provider = 'google'
+          and attempt.state_digest = ${input.stateDigest}
+          and attempt.browser_binding_digest = ${input.browserBindingDigest}
+        for update of attempt, session, person, authentication_identity
+      `;
+      const attempt = attempts[0];
+      if (!attempt) throw new UnauthorizedError("Google identity link is no longer current");
+      const evaluated = await transaction<{ readonly at: Date }[]>`
+        select clock_timestamp() as at
+      `;
+      const evaluatedAt = evaluated[0]?.at;
+      if (!evaluatedAt) throw new UnauthorizedError("Google identity link is no longer current");
+      if (
+        attempt.mode !== "link" ||
+        attempt.consumed_at !== null ||
+        attempt.expires_at <= evaluatedAt ||
+        attempt.person_id === null ||
+        attempt.person_control_epoch === null ||
+        attempt.initiating_session_id === null ||
+        attempt.session_person_id !== attempt.person_id ||
+        attempt.session_person_control_epoch === null ||
+        Number(attempt.session_person_control_epoch) !== Number(attempt.person_control_epoch) ||
+        attempt.session_authentication_identity_id === null ||
+        attempt.session_authentication_identity_authority_version === null ||
+        attempt.authentication_identity_person_id !== attempt.person_id ||
+        attempt.authentication_identity_status !== "verified" ||
+        attempt.current_authentication_identity_authority_version === null ||
+        Number(attempt.current_authentication_identity_authority_version) !==
+          Number(attempt.session_authentication_identity_authority_version) ||
+        attempt.session_revoked_at !== null ||
+        attempt.session_idle_expires_at === null ||
+        attempt.session_idle_expires_at <= evaluatedAt ||
+        attempt.session_absolute_expires_at === null ||
+        attempt.session_absolute_expires_at <= evaluatedAt ||
+        attempt.person_status !== "registered" ||
+        attempt.current_person_control_epoch === null ||
+        Number(attempt.current_person_control_epoch) !== Number(attempt.person_control_epoch)
+      ) {
+        throw new UnauthorizedError("Google identity link is no longer current");
+      }
+
+      const existingGoogleIdentities = await transaction<{ readonly present: boolean }[]>`
+        select exists(
+          select 1 from person_identities
+          where person_id = ${attempt.person_id}
+            and issuer = 'google'
+            and kind = 'provider_account'
+            and status = 'verified'
+        ) as present
+      `;
+      if (
+        !hasFreshGoogleIdentityLinkAssurance({
+          hasVerifiedGoogleIdentity: existingGoogleIdentities[0]?.present === true,
+          assuranceKind: attempt.session_assurance_kind,
+          assuranceContext: attempt.session_assurance_context,
+          assuranceExpiresAt: attempt.session_assurance_expires_at,
+          asOf: evaluatedAt,
+        })
+      ) {
+        throw new UnauthorizedError("Google identity link assurance is no longer current");
+      }
+
+      const binding = await new PostgresIdentityRelationships(
+        transaction,
+        this.secretBox,
+      ).bindProviderAccountIdentity({
+        personId: attempt.person_id,
+        expectedPersonControlEpoch: Number(attempt.person_control_epoch),
+        issuer: "google",
+        subjectDigest: input.externalSubjectDigest,
+        subject: input.externalSubject,
+        verifiedEmail: input.verifiedEmail,
+        boundAt: evaluatedAt.toISOString(),
+      });
+      const retiredSecret = this.secretBox.encrypt(
+        JSON.stringify({ consumed: true }),
+        googleAuthAttemptSecretPurpose(attempt.id),
+      );
+      const consumed = await transaction<{ readonly id: string }[]>`
+        update web_auth_attempts
+        set consumed_at = ${evaluatedAt},
+          secret_ciphertext = ${Buffer.from(JSON.stringify(retiredSecret), "utf8")},
+          secret_key_version = ${retiredSecret.kid}
+        where id = ${attempt.id} and consumed_at is null
+        returning id
+      `;
+      if (!consumed[0]) throw new ConflictError("Google identity link was already consumed");
+      await transaction`
+        update person_sessions
+        set assurance_kind = 'base', assurance_context = ${transaction.json({})},
+          assurance_expires_at = null
+        where id = ${attempt.initiating_session_id} and person_id = ${attempt.person_id}
+      `;
+      await appendAudit(transaction, {
+        conversationId: null,
+        householdId: null,
+        personId: attempt.person_id,
+        eventType: binding.duplicate ? "google_identity_link_confirmed" : "google_identity_bound",
+        targetType: "person_identity",
+        targetId: binding.identity.identityId,
+        reasons: ["exact_google_link_attempt", "verified_provider_subject"],
+        manifest: {
+          authAttemptId: attempt.id,
+          identityAuthorityVersion: binding.identity.identityAuthorityVersion,
+        },
+      });
+      return {
+        accepted: true,
+        duplicate: binding.duplicate,
+        disposition: binding.duplicate ? "google_identity_already_bound" : "google_identity_bound",
+        ids: {
+          authAttemptId: attempt.id,
+          identityId: binding.identity.identityId,
+          personId: attempt.person_id,
+        },
+      };
+    });
+  }
+
+  private async observeGoogleIdentityLogin(
+    input: Extract<AppEnvelope, { kind: "auth.google_identity.login_observed" }>,
+  ): Promise<ProcessReceipt> {
+    if (!/^[a-f0-9]{64}$/u.test(input.externalSubjectDigest)) {
+      throw new UnauthorizedError("Google login identity proof is invalid");
+    }
+    return this.database.begin(async (transaction) => {
+      const rows = await transaction<
+        {
+          readonly session_person_id: string;
+          readonly session_person_control_epoch: number | string;
+          readonly authentication_identity_id: string;
+          readonly authentication_identity_authority_version: number | string;
+          readonly idle_expires_at: Date;
+          readonly absolute_expires_at: Date;
+          readonly revoked_at: Date | null;
+          readonly person_status: string;
+          readonly current_person_control_epoch: number | string;
+          readonly identity_person_id: string;
+          readonly identity_status: string;
+          readonly identity_kind: string;
+          readonly identity_issuer: string;
+          readonly identity_subject_digest: string;
+          readonly current_identity_authority_version: number | string;
+        }[]
+      >`
+        select session.person_id as session_person_id,
+          session.person_control_epoch as session_person_control_epoch,
+          session.authentication_identity_id,
+          session.authentication_identity_authority_version,
+          session.idle_expires_at, session.absolute_expires_at, session.revoked_at,
+          person.status as person_status,
+          person.control_epoch as current_person_control_epoch,
+          identity.person_id as identity_person_id,
+          identity.status as identity_status,
+          identity.kind as identity_kind,
+          identity.issuer as identity_issuer,
+          identity.subject_digest as identity_subject_digest,
+          identity.authority_version as current_identity_authority_version
+        from person_sessions session
+        join people person on person.id = session.person_id
+        join person_identities identity on identity.id = session.authentication_identity_id
+        where session.id = ${input.sessionId}
+        for update of session, person, identity
+      `;
+      const row = rows[0];
+      const evaluated = await transaction<{ readonly at: Date }[]>`
+        select clock_timestamp() as at
+      `;
+      const evaluatedAt = evaluated[0]?.at;
+      if (
+        !row ||
+        !evaluatedAt ||
+        row.session_person_id !== input.personId ||
+        row.authentication_identity_id !== input.identityId ||
+        row.identity_person_id !== input.personId ||
+        row.person_status !== "registered" ||
+        row.identity_status !== "verified" ||
+        row.identity_kind !== "provider_account" ||
+        row.identity_issuer !== "google" ||
+        row.identity_subject_digest !== input.externalSubjectDigest ||
+        Number(row.session_person_control_epoch) !== Number(row.current_person_control_epoch) ||
+        Number(row.authentication_identity_authority_version) !==
+          Number(row.current_identity_authority_version) ||
+        row.revoked_at !== null ||
+        row.idle_expires_at <= evaluatedAt ||
+        row.absolute_expires_at <= evaluatedAt
+      ) {
+        throw new UnauthorizedError("Google login identity is no longer current");
+      }
+
+      const refreshed = await new PostgresIdentityRelationships(
+        transaction,
+        this.secretBox,
+      ).refreshProviderAccountIdentityLabel({
+        personId: input.personId,
+        expectedPersonControlEpoch: Number(row.current_person_control_epoch),
+        identityId: input.identityId,
+        expectedIdentityAuthorityVersion: Number(row.current_identity_authority_version),
+        issuer: "google",
+        subjectDigest: input.externalSubjectDigest,
+        verifiedEmail: input.verifiedEmail,
+        observedAt: evaluatedAt.toISOString(),
+      });
+      if (!refreshed.duplicate) {
+        await appendAudit(transaction, {
+          conversationId: null,
+          householdId: null,
+          personId: input.personId,
+          eventType: "google_identity_label_refreshed",
+          targetType: "person_identity",
+          targetId: input.identityId,
+          reasons: ["verified_returning_google_login"],
+          manifest: {
+            identityAuthorityVersion: refreshed.identity.identityAuthorityVersion,
+          },
+        });
+      }
+      return {
+        accepted: true,
+        duplicate: refreshed.duplicate,
+        disposition: refreshed.duplicate
+          ? "google_identity_login_confirmed"
+          : "google_identity_label_refreshed",
+        ids: {
+          sessionId: input.sessionId,
+          identityId: input.identityId,
+          personId: input.personId,
+        },
+      };
+    });
   }
 
   private async completeGoogleOAuth(
@@ -353,6 +695,25 @@ export class FlorenceApplication {
       const sources = new PostgresSourceIntelligence(transaction, this.secretBox, {
         rawRetentionDays: this.config.defaults.rawSourceRetentionDays,
       });
+      const attempt = await sources.read({
+        kind: "oauth_attempt_access",
+        provider: "google",
+        stateDigest: input.stateDigest,
+        asOf: input.completedAt,
+      });
+      if (attempt.kind !== "oauth_attempt_access") {
+        throw new UnauthorizedError("Google OAuth attempt is no longer current");
+      }
+      if (attempt.returnPath === "/onboarding") {
+        await transaction`select pg_advisory_xact_lock(hashtextextended(${`onboarding-google:${attempt.personId}`}, 0))`;
+        const projection = await new PostgresFamilyOnboarding(this.secretBox).project(transaction, {
+          actorPersonId: attempt.personId,
+          personId: attempt.personId,
+        });
+        if (projection.nextStep.kind !== "google" || attempt.accountKind !== "personal_family") {
+          throw new ConflictError("Google is no longer the current family onboarding step");
+        }
+      }
       const consumed = await sources.apply({
         kind: "consume_oauth_attempt",
         provider: "google",
@@ -370,6 +731,12 @@ export class FlorenceApplication {
       if (activeCapabilities.length === 0) {
         throw new UnauthorizedError("Google granted no requested account capability");
       }
+      if (
+        consumed.reconnectTarget !== null &&
+        consumed.reconnectTarget.externalSubjectDigest !== input.externalSubjectDigest
+      ) {
+        throw new UnauthorizedError("Google reconnect returned a different provider account");
+      }
 
       const connected = await sources.apply({
         kind: "connect_integration",
@@ -380,6 +747,7 @@ export class FlorenceApplication {
         activeCapabilities: [...activeCapabilities],
         credentials: input.credentials,
         expectedPersonControlEpoch: consumed.personControlEpoch,
+        reconnectTarget: consumed.reconnectTarget,
         connectedAt: input.completedAt,
       });
       if (connected.kind !== "integration_connected") {
@@ -422,6 +790,128 @@ export class FlorenceApplication {
           ...(milestone.outboxIds[0] ? { milestoneOutboxId: milestone.outboxIds[0] } : {}),
           returnPath: consumed.returnPath,
         },
+      };
+    });
+  }
+
+  private async reconcileGoogleTokenRevocation(
+    input: Extract<AppEnvelope, { kind: "google.oauth.revoke_receipt" }>,
+  ): Promise<ProcessReceipt> {
+    if (
+      (input.receipt.outcome === "revoked" &&
+        (input.receipt.httpStatus < 200 || input.receipt.httpStatus >= 300)) ||
+      (input.receipt.outcome === "already_invalid" && input.receipt.httpStatus !== 400) ||
+      (input.receipt.outcome === "no_token" && input.receipt.httpStatus !== 0)
+    ) {
+      throw new UnauthorizedError("Google revocation receipt is not internally consistent");
+    }
+    const occurredAt = new Date(input.occurredAt);
+    if (!Number.isFinite(occurredAt.getTime())) {
+      throw new UnauthorizedError("Google revocation receipt time is invalid");
+    }
+    return this.database.begin(async (transaction) => {
+      const effects = await transaction<
+        {
+          readonly status: string;
+          readonly effect_kind: string;
+          readonly idempotency_key: string;
+          readonly integration_id: string | null;
+          readonly integration_control_epoch: number | string | null;
+          readonly person_id: string | null;
+          readonly action_intent_id: string | null;
+          readonly lease_token: string | null;
+        }[]
+      >`
+        select status, effect_kind, idempotency_key, integration_id,
+          integration_control_epoch, person_id, action_intent_id, lease_token
+        from outbox where id = ${input.outboxId}
+        for update
+      `;
+      const effect = effects[0];
+      if (
+        effect?.effect_kind !== "google.oauth_token.revoke" ||
+        effect.idempotency_key !== input.idempotencyKey ||
+        effect.integration_id !== input.integrationId ||
+        Number(effect.integration_control_epoch) !== input.expectedIntegrationControlEpoch ||
+        effect.person_id === null ||
+        effect.action_intent_id === null
+      ) {
+        throw new UnauthorizedError("Google revocation receipt does not match its exact effect");
+      }
+      if (effect.status === "confirmed") {
+        return {
+          accepted: true,
+          duplicate: true,
+          disposition: "google_token_revocation_reconciled",
+          ids: { integrationId: input.integrationId, outboxId: input.outboxId },
+        };
+      }
+      if (
+        (effect.status !== "leased" && effect.status !== "submitted") ||
+        effect.lease_token !== input.leaseToken
+      ) {
+        throw new StaleAuthorityError("Google revocation receipt lease is no longer current");
+      }
+
+      const sourceResult = await new PostgresSourceIntelligence(transaction, this.secretBox, {
+        rawRetentionDays: this.config.defaults.rawSourceRetentionDays,
+      }).apply({
+        kind: "complete_integration_revocation",
+        integrationId: input.integrationId,
+        personId: effect.person_id,
+        expectedControlEpoch: input.expectedIntegrationControlEpoch,
+        completedAt: occurredAt.toISOString(),
+      });
+      if (sourceResult.kind !== "integration_revocation_completed") {
+        throw new Error("Google integration token was not retired");
+      }
+      const receipt = {
+        kind: "google_oauth_token_revocation",
+        integrationId: input.integrationId,
+        outcome: input.receipt.outcome,
+        httpStatus: input.receipt.httpStatus,
+      };
+      const recorded = await new EffectOutbox(transaction, this.secretBox).recordReceipt({
+        effect: {
+          outboxId: input.outboxId,
+          leaseToken: input.leaseToken,
+          idempotencyKey: input.idempotencyKey,
+        },
+        status: "confirmed",
+        receipt,
+        now: occurredAt,
+      });
+      if (!recorded) throw new StaleAuthorityError("Google revocation receipt was already reconciled");
+      await transaction`
+        update action_intents set status = 'succeeded', updated_at = ${occurredAt}
+        where id = ${effect.action_intent_id}
+          and action_kind = 'google_oauth_token_revocation' and status = 'executing'
+      `;
+      await appendAudit(transaction, {
+        conversationId: null,
+        householdId: null,
+        personId: effect.person_id,
+        eventType:
+          input.receipt.outcome === "no_token"
+            ? "google_source_revocation_locally_finalized"
+            : "google_source_revocation_confirmed",
+        targetType: "integration",
+        targetId: input.integrationId,
+        reasons:
+          input.receipt.outcome === "no_token"
+            ? ["no_provider_token_retained", "credential_retired"]
+            : ["provider_revocation_receipt", "credential_retired"],
+        manifest: {
+          outboxId: input.outboxId,
+          outcome: input.receipt.outcome,
+          retiredControlEpoch: sourceResult.controlEpoch,
+        },
+      });
+      return {
+        accepted: true,
+        duplicate: sourceResult.duplicate,
+        disposition: "google_token_revocation_reconciled",
+        ids: { integrationId: input.integrationId, outboxId: input.outboxId },
       };
     });
   }
@@ -4576,46 +5066,6 @@ export class FlorenceApplication {
     }
     if (
       record.routing.chatKind === "direct" &&
-      person &&
-      /^(?:not now|no thanks|skip google|don['’]t connect google|do not connect google)$/u.test(
-        normalizedCommand,
-      )
-    ) {
-      const personId = record.routing.senderPersonId;
-      if (!personId) return "ignored";
-      const recentOffers = await transaction<{ readonly present: boolean }[]>`
-        select exists(
-          select 1 from auth_handoffs handoff
-          where handoff.person_id = ${personId} and handoff.purpose = 'google_connect'
-            and handoff.created_at > now() - interval '24 hours'
-        ) and not exists(
-          select 1 from integrations integration
-          where integration.person_id = ${personId} and integration.provider = 'google'
-            and integration.account_kind = 'personal_family'
-            and integration.status <> 'revoked'
-        ) as present
-      `;
-      if (recentOffers[0]?.present) {
-        await transaction`
-          update people set google_activation_suppressed_at = now(), updated_at = now()
-          where id = ${personId} and status = 'registered'
-        `;
-        const snapshot = await new PostgresConversationAuthority(transaction).snapshot(
-          record.routing.conversationId,
-        );
-        await this.queueAuthorizedConversationMessage(
-          transaction,
-          record,
-          snapshot,
-          "No problem—I won’t keep asking. If you change your mind, just say “connect Google.”",
-          "direct_response",
-          "google_activation_suppressed",
-        );
-        return "google_activation_suppressed";
-      }
-    }
-    if (
-      record.routing.chatKind === "direct" &&
       /^(sign in|settings|open florence|connect google|review|open review|send me (?:a|the) review link)$/u.test(
         normalizedCommand,
       )
@@ -4628,6 +5078,18 @@ export class FlorenceApplication {
           update people set google_activation_suppressed_at = null, updated_at = now()
           where id = ${personId} and status = 'registered'
         `;
+        const snapshot = await new PostgresConversationAuthority(transaction).snapshot(
+          record.routing.conversationId,
+        );
+        await this.queueAuthorizedConversationMessage(
+          transaction,
+          record,
+          snapshot,
+          `Connect or manage your Google accounts in Florence: ${this.config.publicBaseUrl}/sources`,
+          "direct_response",
+          "google_sources_link",
+        );
+        return "google_sources_link_shared";
       }
       const handoff = await new PostgresWebAuth(
         transaction,
@@ -4637,23 +5099,9 @@ export class FlorenceApplication {
         personId,
         privateIdentityId: identityId,
         privateConversationId: record.routing.conversationId,
-        purpose:
-          normalizedCommand === "connect google"
-            ? "google_connect"
-            : /review/u.test(normalizedCommand)
-              ? "private_review"
-              : "web_sign_in",
-        context: {
-          ...(normalizedCommand === "connect google"
-            ? { activation: "parent_google", profile: "personal_family" }
-            : {}),
-          returnPath:
-            normalizedCommand === "connect google" || /review/u.test(normalizedCommand)
-              ? "/sources"
-              : "/home",
-        },
-        expiresInSeconds:
-          normalizedCommand === "connect google" ? GOOGLE_CONNECT_HANDOFF_TTL_SECONDS : 10 * 60,
+        purpose: /review/u.test(normalizedCommand) ? "private_review" : "web_sign_in",
+        context: { returnPath: /review/u.test(normalizedCommand) ? "/sources" : "/home" },
+        expiresInSeconds: 10 * 60,
       });
       const snapshot = await new PostgresConversationAuthority(transaction).snapshot(
         record.routing.conversationId,
@@ -4662,9 +5110,7 @@ export class FlorenceApplication {
         transaction,
         record,
         snapshot,
-        normalizedCommand === "connect google"
-          ? `Here’s a fresh link to connect your personal Gmail and Calendar: ${this.config.publicBaseUrl}/handoff/${handoff.token}\n\nIt’s valid for 30 minutes.`
-          : `Here’s your private, single-use Florence link: ${this.config.publicBaseUrl}/handoff/${handoff.token}`,
+        `Here’s your private, single-use Florence link: ${this.config.publicBaseUrl}/handoff/${handoff.token}`,
         "direct_response",
         "private_handoff",
       );
@@ -6231,28 +6677,200 @@ export class FlorenceApplication {
           };
         }
         case "disconnect_integration": {
-          const integrations = await transaction<{ control_epoch: number | string }[]>`
-            select control_epoch from integrations
+          const integrations = await transaction<
+            { readonly control_epoch: number | string; readonly provider: string; readonly status: string }[]
+          >`
+            select control_epoch, provider, status from integrations
             where id = ${command.integrationId} and person_id = ${actorPersonId}
-              and status <> 'revoked' for update
+            for update
           `;
           const integration = integrations[0];
-          if (!integration) throw new Error("Google connection does not belong to this person");
+          if (integration?.provider !== "google") {
+            throw new Error("Google connection does not belong to this person");
+          }
+          if (integration.status === "revoked") {
+            return {
+              accepted: true,
+              duplicate: true,
+              disposition: "integration_disconnected",
+              ids: { integrationId: command.integrationId },
+            };
+          }
+          if (integration.status === "revocation_pending") {
+            const pending = await transaction<
+              { readonly id: string; readonly action_intent_id: string | null; readonly status: string }[]
+            >`
+              select id, action_intent_id, status from outbox
+              where effect_kind = 'google.oauth_token.revoke'
+                and integration_id = ${command.integrationId}
+                and integration_control_epoch = ${Number(integration.control_epoch)}
+              order by created_at desc limit 1
+            `;
+            if (pending[0]) {
+              const recovered = await transaction<{ readonly id: string }[]>`
+                update outbox set status = 'retry', available_at = now(),
+                  lease_owner = null, lease_token = null, lease_expires_at = null,
+                  last_error_code = 'owner_reconfirmed_google_revocation', updated_at = now()
+                where id = ${pending[0].id} and status in ('dead', 'ambiguous', 'cancelled')
+                returning id
+              `;
+              if (recovered[0]) {
+                await appendAudit(transaction, {
+                  conversationId: null,
+                  householdId: null,
+                  personId: actorPersonId,
+                  eventType: "google_source_revocation_recovered",
+                  targetType: "integration",
+                  targetId: command.integrationId,
+                  reasons: ["owner_reconfirmed_disconnect", "provider_revocation_still_required"],
+                  manifest: { outboxId: pending[0].id, priorEffectStatus: pending[0].status },
+                });
+              }
+              return {
+                accepted: true,
+                duplicate: !recovered[0],
+                disposition: "integration_disconnected",
+                ids: {
+                  integrationId: command.integrationId,
+                  outboxId: pending[0].id,
+                  ...(pending[0].action_intent_id ? { actionIntentId: pending[0].action_intent_id } : {}),
+                },
+              };
+            }
+          }
+          const requestedAt = new Date();
           const result = await new PostgresSourceIntelligence(transaction, this.secretBox, {
             rawRetentionDays: this.config.defaults.rawSourceRetentionDays,
           }).apply({
-            kind: "revoke_integration",
+            kind: "begin_integration_revocation",
             integrationId: command.integrationId,
             personId: actorPersonId,
             expectedControlEpoch: Number(integration.control_epoch),
-            revokedAt: new Date().toISOString(),
+            requestedAt: requestedAt.toISOString(),
           });
-          if (result.kind !== "integration_revoked") throw new Error("Google connection was not revoked");
+          if (result.kind === "integration_revocation_completed") {
+            await appendAudit(transaction, {
+              conversationId: null,
+              householdId: null,
+              personId: actorPersonId,
+              eventType: "google_source_disconnected",
+              targetType: "integration",
+              targetId: command.integrationId,
+              reasons: ["owner_requested_disconnect", "no_provider_token_retained"],
+              manifest: { controlEpoch: result.controlEpoch },
+            });
+            return {
+              accepted: true,
+              duplicate: result.duplicate,
+              disposition: "integration_disconnected",
+              ids: { integrationId: result.integrationId },
+            };
+          }
+          if (result.kind !== "integration_revocation_started") {
+            throw new Error("Google integration revocation did not start");
+          }
+
+          const effectKind = "google.oauth_token.revoke" as const;
+          const idempotencyKey = `google:token-revoke:${result.integrationId}:e${result.controlEpoch}`;
+          const payload = {
+            integrationId: result.integrationId,
+            expectedIntegrationControlEpoch: result.controlEpoch,
+          };
+          const data = {
+            integrationId: result.integrationId,
+            expectedIntegrationControlEpoch: result.controlEpoch,
+          };
+          const policy = {
+            exactOwnerDisconnect: true,
+            localSourceAuthorityRevoked: true,
+          };
+          const target = { provider: "google", mutation: "oauth_token_revocation" };
+          const payloadDigest = canonicalDigest(payload);
+          const digests = {
+            actionDigest: canonicalDigest({ effectKind, idempotencyKey }),
+            dataDigest: canonicalDigest({ data, payloadDigest }),
+            policyDigest: canonicalDigest(policy),
+            targetDigest: canonicalDigest(target),
+          };
+          const actionIntentId = randomUUID();
+          // Once the source has been fenced locally, revoking its remaining
+          // provider grant is a monotonic cleanup obligation. It stays
+          // authorized until reconciled instead of expiring during an outage.
+          const actionExpiresAt = new Date(DURABLE_GOOGLE_REVOCATION_EXPIRES_AT);
+          const actionPayload = {
+            schemaVersion: 1,
+            effectKind,
+            idempotencyKey,
+            data,
+            policy,
+            target,
+            payload,
+          };
+          const encryptedAction = this.secretBox.encrypt(
+            canonicalJson(actionPayload),
+            `florence:action-intent:${actionIntentId}:payload`,
+          );
+          await transaction`
+            insert into action_intents (
+              id, person_id, action_kind, action_digest, data_digest, policy_digest,
+              target_digest, payload_ciphertext, payload_key_version, status,
+              person_control_epoch, expires_at, created_at, updated_at
+            ) values (
+              ${actionIntentId}, ${actorPersonId}, 'google_oauth_token_revocation',
+              ${digests.actionDigest}, ${digests.dataDigest}, ${digests.policyDigest},
+              ${digests.targetDigest},
+              ${Buffer.from(JSON.stringify(encryptedAction), "utf8")}, ${encryptedAction.kid},
+              'executing', ${Number(people[0].control_epoch)}, ${actionExpiresAt},
+              ${requestedAt}, ${requestedAt}
+            )
+          `;
+          await transaction`
+            insert into action_approvals (
+              id, action_intent_id, approved_by_person_id, action_digest, data_digest,
+              policy_digest, target_digest, approved_at, expires_at
+            ) values (
+              ${randomUUID()}, ${actionIntentId}, ${actorPersonId}, ${digests.actionDigest},
+              ${digests.dataDigest}, ${digests.policyDigest}, ${digests.targetDigest},
+              ${requestedAt}, ${actionExpiresAt}
+            )
+          `;
+          const queued = await new EffectOutbox(transaction, this.secretBox).authorizeAndEnqueue({
+            actionIntentId,
+            actorPersonId,
+            person: { id: actorPersonId, controlEpoch: Number(people[0].control_epoch) },
+            integration: { id: result.integrationId, controlEpoch: result.controlEpoch },
+            effectKind,
+            idempotencyKey,
+            data,
+            policy,
+            target,
+            payload,
+            reasonCodes: ["owner_requested_disconnect", "provider_token_revocation_required"],
+            authorizationExpiresAt: actionExpiresAt,
+          });
+          await appendAudit(transaction, {
+            conversationId: null,
+            householdId: null,
+            personId: actorPersonId,
+            eventType: "google_source_revocation_requested",
+            targetType: "integration",
+            targetId: result.integrationId,
+            reasons: ["owner_requested_disconnect", "local_source_authority_revoked"],
+            manifest: {
+              actionIntentId,
+              outboxId: queued.outboxId,
+              controlEpoch: result.controlEpoch,
+            },
+          });
           return {
             accepted: true,
             duplicate: false,
             disposition: "integration_disconnected",
-            ids: { integrationId: result.integrationId },
+            ids: {
+              integrationId: result.integrationId,
+              actionIntentId,
+              outboxId: queued.outboxId,
+            },
           };
         }
         case "revoke_session": {
@@ -6268,6 +6886,87 @@ export class FlorenceApplication {
             ids: { sessionId: command.sessionId },
           };
         }
+        case "revoke_login_identity": {
+          const sessions = await transaction<
+            {
+              readonly assurance_kind: string;
+              readonly assurance_context: unknown;
+              readonly assurance_expires_at: Date | null;
+              readonly revoked_at: Date | null;
+            }[]
+          >`
+            select assurance_kind, assurance_context, assurance_expires_at, revoked_at
+            from person_sessions
+            where id = ${command.assuranceSessionId} and person_id = ${actorPersonId}
+            for update
+          `;
+          const assurance = sessions[0];
+          const exactContext = GoogleIdentityRevokeAssuranceContextSchema.safeParse(
+            assurance?.assurance_context,
+          );
+          if (
+            !assurance ||
+            assurance.revoked_at !== null ||
+            assurance.assurance_kind !== "account_controls" ||
+            assurance.assurance_expires_at === null ||
+            assurance.assurance_expires_at <= new Date() ||
+            !exactContext.success ||
+            exactContext.data.action !== GOOGLE_IDENTITY_REVOKE_ACTION ||
+            exactContext.data.identityId !== command.identityId
+          ) {
+            throw new UnauthorizedError(
+              "Request a fresh private Florence confirmation for this exact sign-in first",
+            );
+          }
+          const identities = await transaction<
+            { readonly id: string; readonly status: string; readonly authority_version: number | string }[]
+          >`
+            select id, status, authority_version
+            from person_identities
+            where person_id = ${actorPersonId}
+              and issuer = 'google' and kind = 'provider_account'
+            order by id
+            for update
+          `;
+          const identity = identities.find((candidate) => candidate.id === command.identityId);
+          if (!identity) throw new NotFoundError("Google sign-in identity does not exist");
+          if (identity.status === "verified") {
+            const verifiedIdentityCount = identities.filter(
+              (candidate) => candidate.status === "verified",
+            ).length;
+            if (verifiedIdentityCount <= 1) {
+              throw new ConflictError("Add another Google sign-in before removing your only sign-in");
+            }
+            await transaction`
+              update person_identities
+              set status = 'revoked', revoked_at = now(), authority_version = authority_version + 1,
+                subject_ciphertext = null, subject_key_version = null,
+                display_label_ciphertext = null, display_label_key_version = null,
+                updated_at = now()
+              where id = ${command.identityId} and person_id = ${actorPersonId}
+            `;
+            await appendAudit(transaction, {
+              conversationId: null,
+              householdId: null,
+              personId: actorPersonId,
+              eventType: "google_identity_revoked",
+              targetType: "person_identity",
+              targetId: command.identityId,
+              reasons: ["exact_private_account_control", "person_requested_login_revocation"],
+              manifest: { priorAuthorityVersion: Number(identity.authority_version) },
+            });
+          }
+          await transaction`
+            update person_sessions set revoked_at = coalesce(revoked_at, now())
+            where authentication_identity_id = ${command.identityId} and person_id = ${actorPersonId}
+          `;
+          return {
+            accepted: true,
+            duplicate: identity.status !== "verified",
+            disposition: "login_identity_revoked",
+            ids: { identityId: command.identityId },
+          };
+        }
         case "delete_person": {
           const result = await new PostgresDataControls(transaction, this.secretBox).deletePerson({
             actorPersonId,
@@ -6277,7 +6976,10 @@ export class FlorenceApplication {
             accepted: true,
             duplicate: result.duplicate,
             disposition: "person_deleted",
-            ids: { deletionRequestId: result.deletionRequestId },
+            ids: {
+              deletionRequestId: result.deletionRequestId,
+              deletionReceiptDigest: result.receiptDigest,
+            },
           };
         }
         case "pause_person": {

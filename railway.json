@@ -5,8 +5,8 @@
     "dockerfilePath": "Dockerfile"
   },
   "deploy": {
-    "preDeployCommand": "node dist/ops/predeploy-production.js",
-    "startCommand": "node dist/server.js",
+    "preDeployCommand": "node packages/database/dist/predeploy.js",
+    "startCommand": "node apps/api/dist/server.js",
     "numReplicas": 1,
     "healthcheckPath": "/readyz",
     "healthcheckTimeout": 120,

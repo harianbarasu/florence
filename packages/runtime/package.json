@@ -1,0 +1,26 @@
+{
+  "name": "@florence/runtime",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./dist/index.js"
+    },
+    "./openai": {
+      "types": "./src/openai.ts",
+      "import": "./dist/openai.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run --config ../../vitest.config.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@florence/contracts": "workspace:*",
+    "openai": "6.49.0",
+    "zod": "4.4.3"
+  }
+}

@@ -5,8 +5,8 @@
     "dockerfilePath": "Dockerfile"
   },
   "deploy": {
-    "preDeployCommand": "node dist/ops/predeploy-production.js",
-    "startCommand": "node dist/worker.js",
+    "preDeployCommand": "node packages/database/dist/predeploy.js",
+    "startCommand": "node apps/worker/dist/server.js",
     "numReplicas": 1,
     "sleepApplication": false,
     "restartPolicyType": "ON_FAILURE",

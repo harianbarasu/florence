@@ -1,0 +1,27 @@
+{
+  "name": "@florence/api",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx watch src/server.ts",
+    "start": "node dist/server.js",
+    "test": "vitest run --config ../../vitest.config.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@fastify/cors": "11.3.0",
+    "@fastify/helmet": "13.1.0",
+    "@fastify/rate-limit": "11.2.0",
+    "@fastify/static": "10.1.2",
+    "@florence/artifacts": "workspace:*",
+    "@florence/contracts": "workspace:*",
+    "@florence/control-plane": "workspace:*",
+    "@florence/database": "workspace:*",
+    "@florence/google": "workspace:*",
+    "@florence/linq": "workspace:*",
+    "@florence/runtime": "workspace:*",
+    "fastify": "5.11.2"
+  }
+}

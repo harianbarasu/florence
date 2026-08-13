@@ -1,24 +1,41 @@
 # Florence
 
-Florence is an iMessage-first family Chief of Staff. It watches authorized family sources, opens
-coverage loops, and coordinates explicit ownership in the group chats families already use.
+Florence is an iMessage-first family Chief of Staff. It learns the family context adults explicitly
+authorize, notices concrete open outcomes, asks for ownership, follows up neutrally, and closes the loop
+in the conversations the family already uses.
 
-The canonical product and engineering contract is [`PLAN.md`](PLAN.md). The research transfer is in
-[`docs/research/florence-architecture-transfer-from-session-019fcdde-2026-08-05.md`](docs/research/florence-architecture-transfer-from-session-019fcdde-2026-08-05.md).
+The mobile web app is Florence's setup and authority surface: family members, children, schools and
+grades, Linq enrollment, Google connections, privacy, and exceptions. It is not a second chat or a
+generic task dashboard.
+
+## Repository shape
+
+- `apps/api`: authenticated dashboard API, Linq webhook ingress, Google OAuth, and the built web app.
+- `apps/worker`: bounded model deliberation, timers, Gmail observation, Linq delivery, and Calendar writes.
+- `apps/web`: mobile onboarding and family settings.
+- `packages/control-plane`: the single authoritative `HouseholdChiefOfStaff.accept()` seam.
+- `packages/database`: PostgreSQL event spine, effects, timers, encrypted artifacts, and migrations.
+- `packages/{runtime,linq,google,artifacts}`: narrow provider boundaries.
+
+PostgreSQL is canonical. Model calls are ephemeral, provider retries are idempotent, private Gmail/image
+meaning stays private until an exact promotion, and Calendar writes require an exact private approval plus
+a provider reread proof.
 
 ## Local development
 
+Requires Node 24 and pnpm 10.10.
+
 ```bash
 corepack enable
-pnpm install
+pnpm install --frozen-lockfile
 cp .env.example .env
 docker compose up -d postgres
 pnpm db:migrate
-pnpm dev:server
+pnpm dev
 ```
 
-Fill the required connector, model, and encryption values in the ignored `.env` before migrating. Run
-`pnpm dev:web` and `pnpm dev:worker` in separate terminals.
+The API serves at `http://localhost:3000`; Vite runs the web app at `http://localhost:5173` in development.
+Secrets belong only in ignored local configuration or Railway variables.
 
 ## Verification
 
@@ -27,12 +44,9 @@ pnpm lint
 pnpm typecheck
 pnpm test
 pnpm build
+docker build --tag florence:local .
 ```
 
-Secrets belong only in `.env` or Railway variables. Never commit them.
-
-## Production
-
-The exact two-service Railway topology, environment contract, connector setup, deployment checks, and recovery
-procedure are in [`docs/operations/production.md`](docs/operations/production.md). Do not deploy while any
-release gate in that runbook is open.
+PostgreSQL integration tests are opt-in through `FLORENCE_TEST_DATABASE_URL` and must target a disposable
+database/schema. Production deployment and data cutover remain separate, explicit operations; see
+[`docs/operations/production.md`](docs/operations/production.md).

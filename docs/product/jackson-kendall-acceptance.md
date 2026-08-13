@@ -1,109 +1,104 @@
-# Jackson and Kendall acceptance contract
+# Jackson and Kendall pilot acceptance
 
-Florence is not ready for a two-parent pilot until these flows work from real phones without an
-operator, database intervention, magic keywords, or advance explanation. We exercise them in short
-iterations rather than waiting for every source integration before learning from the group
-coordination experience.
+Florence is ready for the private two-parent pilot only when this journey works from two real phones
+and two independent browser sessions without database intervention, magic conversational wording, or
+operator repair.
 
-## Iteration A — Direct group coverage
+## 1. Jackson sets up the family
 
-This is the first production exercise because the deployed product already supports the complete
-coverage state machine without waiting on Gmail backfill.
+Jackson signs into his own pilot browser session, creates the family, and enters:
 
-### 1. Jackson meets Florence naturally
-
-Jackson sends any ordinary first message to the Florence number, for example:
-
-> Hey, what can you help our family with?
-
-Florence answers plainly, explains that she can retain permitted family context, links privacy
-details, and asks for consent in natural language. Jackson may consent with an ordinary affirmative
-reply; no `START`, `NAME`, or other command is required. Florence learns what to call him, offers to
-create his family, and moves to a secure mobile-web handoff when structured controls are useful.
-
-### 2. Jackson connects Google while setup continues
-
-After the household is resolved, Florence offers Jackson a private, single-use handoff for personal
-Google. Sync begins immediately without waiting for Kendall. Florence confirms meaningful private
-milestones while Jackson can continue adding children, schools, activities, routines, and a
-co-parent. Declining Google does not block Florence or create repeated generic reminders.
-
-### 3. Kendall joins without rediscovering the product
-
-Jackson adds Florence and Kendall to an iMessage group. Florence remains completely silent in that
-group while it is observe-only. New post-addition messages belong only to that exact chat epoch; they
-do not give Florence write authority or make Kendall a Florence user.
-
-Jackson invites Kendall as a co-steward from his private controls. Kendall receives one private
-message that names Jackson as the inviter, explains Florence without jargon, supports immediate
-`STOP`, and asks for natural consent. Florence does not ask Kendall to repeat family facts Jackson
-already supplied. Kendall reviews those facts, corrects conflicts, and adds missing information or
-non-conflicting aliases.
-
-Kendall accepts as an equal parent. Each parent separately approves proactive coverage for the exact
-current family group. Florence tells each person privately when it is ready; she does not post an
-administrative announcement in the group. A later participant change revokes the write rule and
-returns the new exact epoch to observe-only.
-
-### 4. Florence knows enough family context
-
-At minimum the household can represent:
-
-- each child's preferred name and known aliases;
-- birth year or age when supplied;
+- Jackson and Kendall as adults;
+- each child's preferred name and aliases;
+- birth year;
 - school;
-- activities; and
-- recurring pickup/drop-off facts needed for coverage.
+- grade, academic year, and effective date; and
+- relevant activities.
 
-Different names such as Jonathan, John, and Johnny are treated as possible aliases, not immediate
-conflicts. Real contradictions are flagged once to the parent stewards.
+The page is resumable and editable after onboarding. Child facts remain structured family context,
+not chat transcript. Jackson cannot mark Kendall verified from the browser.
 
-### 5. The first coverage loop closes naturally
+## 2. Each adult connects privately
 
-For the first exercise, include the time explicitly:
+Jackson issues Kendall's private Linq enrollment code from the dashboard. Kendall sends the entire
+code to Florence in a one-to-one iMessage. Pass conditions:
 
-> **Jackson:** I can't pick Avery up Wednesday at 3:00.
->
-> **Florence:** Avery's Wednesday pickup at 3:00 is uncovered. Kendall, can you take it?
->
-> **Kendall:** Yeah, I'll get her.
->
-> **Florence:** Covered — Kendall has Avery's Wednesday 3:00 pickup.
+- the code expires, is one-use, and a retry returns the same result;
+- only a keyed digest is durable;
+- the raw code never appears in household events, model input, or group context;
+- the live chat contains exactly Kendall's identity;
+- Kendall becomes the planned adult, not a browser-selected identity; and
+- Florence queues one private confirmation.
+
+Jackson and Kendall then use separate browser credentials. Neither session can read or mutate the
+other person's unrelated household authority.
+
+## 3. The exact family group becomes interactive
+
+Jackson creates a group with Kendall and Florence. The first ordinary message is accepted only when
+the live Linq participant set is exactly the two verified adults for exactly one household.
+
+Adding a third person, removing a parent, using an old provider handle, or receiving an ambiguous
+provider observation must reject the message and produce no group output. Exact duplicate webhooks
+must not duplicate cognition, events, or effects.
+
+## 4. One family episode closes naturally
+
+Use a real but synthetic obligation, for example:
+
+> Jackson: The field trip form is due Friday.
+
+Florence should either ask one necessary clarification or create one source-linked open episode.
+Kendall can say naturally that she will handle it. Florence records Kendall as owner only because the
+message came from Kendall. At the useful follow-up time Florence sends a neutral reminder. Kendall
+then says it is handled, the episode closes, and no stale reminder remains.
 
 Pass conditions:
 
-- Florence derives the obligation only from permitted context and current evidence.
-- The named proposed holder is the only person who can accept for themselves.
-- Natural acknowledgments work; silence, delivery, read state, and historical habits do not.
-- A reply to Florence targets the exact loop. If more than one loop matches, Florence asks which one.
-- If a consequential fact is missing, Florence asks once and advances the existing provisional loop.
-- A private decline reveals only that coverage remains open unless the person approves more detail.
-- Reminders occur before the useful boundary, remain neutral, and stop immediately after coverage.
+- no task/project/run object is exposed to the family;
+- silence, delivery, read state, or model inference never assigns an owner;
+- replay causes no second model call or effect;
+- reassignment/update cites a current authorized message and advances the episode version;
+- timer authority is rechecked when it fires; and
+- reminders are factual and blame-free.
 
-After authorized household context is wired into interpretation, repeat without the time:
+## 5. Jackson connects Google privately
 
-> **Jackson:** I can't pick Avery up Wednesday.
+Jackson starts Google OAuth from his own session. Florence binds the connection to Jackson regardless
+of browser-supplied data. Tokens remain encrypted outside household events and never enter model
+context or logs.
 
-Florence must recover the time only from the current authorized routine/family projection. If more
-than one current routine matches, she asks one narrow question instead of guessing.
+A synthetic school email is observed. Florence privately stages only normalized current meaning for
+Jackson. Before explicit promotion:
 
-## Iteration B — Google-derived coverage
+- Kendall and the group cannot see the candidate;
+- no raw email body or attachment enters family context; and
+- Gmail IDs alone are durable at ingestion.
 
-1. Florence privately confirms connection and reports only meaningful milestones: recent sources
-   being reviewed, current information reconciled, older history continuing, or an actionable error.
-2. A synthetic school email and a later update or cancellation arrive in the same thread, with a
-   matching Calendar revision when appropriate.
-3. Florence keeps candidate findings silent until the newest thread, relevant attachment, and current
-   Calendar state are reconciled.
-4. If the obligation remains current and uncovered, Florence privately offers Jackson the minimum
-   operational risk. Raw private email never enters the family group.
-5. Jackson approves the exact item from iMessage. Florence opens the minimum-meaning loop in the
-   exact interactive household group; Kendall accepts naturally; Florence closes it.
-6. Repeat with a later cancellation. Florence suppresses an obsolete prompt or updates the same
-   already-open loop; it never creates a duplicate.
+Jackson explicitly approves sharing the exact minimum meaning. Only that stored candidate version and
+digest enters family context.
+
+## 6. Jackson approves one Calendar event
+
+The same private candidate contains a visible Calendar draft. Jackson explicitly approves that exact
+draft in his private conversation. Florence inserts one deterministic event into Jackson's primary
+calendar, rereads it, and records a receipt only if summary, times, time zone, status, and approval
+markers match.
+
+Timeout and conflict retries must find the same provider event. A mismatched reread fails closed and
+does not claim success.
 
 ## Production gate
 
-Each iteration passes only after its complete flow runs through the production Linq number, Railway
-web and worker services, PostgreSQL, the configured model, and two independent browser sessions.
-Synthetic checks support that evidence but cannot replace it.
+Automated tests support but do not replace the live rehearsal. The release passes only when the full
+journey runs through:
+
+- the production Linq number;
+- Railway API and worker on the same commit;
+- PostgreSQL migration `007` and a fresh worker heartbeat;
+- the configured OpenAI model;
+- one Google pilot account; and
+- two independent adult browser sessions.
+
+Use synthetic family data for the first production rehearsal. A passing local Docker build does not
+authorize deployment or production data mutation.

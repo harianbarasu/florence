@@ -1,11 +1,11 @@
 node_modules/
 dist/
 coverage/
-.env
-.env.*
-!.env.example
 .DS_Store
+.env
+.env.local
 *.log
-.railway/
-.tmp/
-tmp/
+.vite/
+playwright-report/
+test-results/
+data/

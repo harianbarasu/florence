@@ -63,6 +63,18 @@ const DEFAULT_PREFERENCES: PreferencesInput = {
 };
 const LOOP_IDLE_MS = 250;
 const RETRY_MS = 15_000;
+const WORK_CUE_MS = 6_000;
+const ARTIFACT_PURGE_INTERVAL_MS = 60 * 60_000;
+
+type TurnBoundaries = FlorenceReasonerInput["boundaries"];
+type ActiveInbound = {
+  sourceId: string;
+  latestSourceId: string;
+  channelId: string;
+  providerConversationId: string;
+  controller: AbortController;
+  knownSourceIds: Set<string>;
+};
 
 export class Florence {
   readonly #store: PostgresFlorenceStore;
@@ -74,6 +86,9 @@ export class Florence {
   readonly #messagesUrl: string | null;
   readonly #now: () => Date;
   #activeRun: Promise<boolean> | null = null;
+  #activeInbound: ActiveInbound | null = null;
+  #pendingInboundAccepts = new Set<Promise<unknown>>();
+  #nextArtifactPurgeAt = 0;
   #timer: ReturnType<typeof setTimeout> | null = null;
   #started = false;
 
@@ -233,7 +248,33 @@ export class Florence {
   }
 
   async acceptInbound(input: AcceptInboundInput): Promise<AcceptInboundResult | null> {
-    const result = await this.#store.acceptInbound(input);
+    const active = this.#activeInbound;
+    const sameActiveConversation = active?.providerConversationId === input.providerConversationId;
+    const incomingSourceId = deterministicUuid(`linq-v3\0signal\0${input.providerEventId}`);
+    const acceptance = this.#store.acceptInbound({
+      ...input,
+      ...(sameActiveConversation ? { supersedesSourceId: active.latestSourceId } : {}),
+      ...(explicitlyProhibitsRetention(input.text) ? { discardSupersededFacts: true } : {}),
+    });
+    this.#pendingInboundAccepts.add(acceptance);
+    void acceptance.then(
+      () => this.#pendingInboundAccepts.delete(acceptance),
+      () => this.#pendingInboundAccepts.delete(acceptance),
+    );
+    if (active && sameActiveConversation && !active.knownSourceIds.has(incomingSourceId)) {
+      active.knownSourceIds.add(incomingSourceId);
+      active.controller.abort();
+    }
+    const result = await acceptance;
+    if (
+      result &&
+      result.sourceId !== active?.sourceId &&
+      result.channelId === active?.channelId &&
+      (result.disposition === "accepted" || result.disposition === "stopped")
+    ) {
+      active.latestSourceId = result.sourceId;
+      active.controller.abort();
+    }
     if (result?.disposition === "accepted") this.#wake();
     return result;
   }
@@ -273,23 +314,45 @@ export class Florence {
 
   async #runCycle(): Promise<boolean> {
     let worked = false;
+    await this.#purgeExpiredArtifacts();
     const inbound = await this.#store.readNextInbound(this.#now().toISOString());
     if (inbound) {
       await this.#handleInbound(inbound);
       worked = true;
     }
+    await this.#settleInboundAccepts();
     if (await this.#store.promoteDueFollowUp({ now: this.#now().toISOString() })) worked = true;
+    await this.#settleInboundAccepts();
     const outbound = await this.#store.readNextOutbound(this.#now().toISOString());
+    await this.#settleInboundAccepts();
     if (outbound) {
       await this.#deliverOutbound(outbound.sourceId);
       worked = true;
     }
+    await this.#settleInboundAccepts();
     const calendar = await this.#store.readNextCalendarAction(this.#now().toISOString());
     if (calendar) {
       await this.#executeCalendar(calendar);
       worked = true;
     }
     return worked;
+  }
+
+  async #settleInboundAccepts(): Promise<void> {
+    while (this.#pendingInboundAccepts.size > 0) {
+      await Promise.allSettled([...this.#pendingInboundAccepts]);
+    }
+  }
+
+  async #purgeExpiredArtifacts(): Promise<void> {
+    const now = this.#now();
+    if (!this.#imageVault || now.getTime() < this.#nextArtifactPurgeAt) return;
+    this.#nextArtifactPurgeAt = now.getTime() + ARTIFACT_PURGE_INTERVAL_MS;
+    try {
+      await this.#imageVault.purgeExpired(now);
+    } catch {
+      // Attachment reads still enforce expiry. Cleanup retries on the next bounded sweep.
+    }
   }
 
   async #handleInbound(turn: InboundTurn): Promise<void> {
@@ -307,27 +370,88 @@ export class Florence {
       return;
     }
 
+    const controller = new AbortController();
+    const active: ActiveInbound = {
+      sourceId: turn.message.sourceId,
+      latestSourceId: turn.message.sourceId,
+      channelId: turn.authority.channelId,
+      providerConversationId: turn.authority.providerConversationId,
+      controller,
+      knownSourceIds: new Set([
+        ...turn.supersededMessages.map((message) => message.sourceId),
+        turn.message.sourceId,
+      ]),
+    };
+    this.#activeInbound = active;
     const expectedAuthority = {
       audience: turn.authority.audience,
       participantIdentityDigests: turn.authority.expectedParticipantIdentityDigests,
     };
-    const typing =
-      turn.authority.audience === "private" &&
-      (await this.#setTyping({
-        providerConversationId: turn.authority.providerConversationId,
-        expectedAuthority,
-        active: true,
-      }));
+    const attachmentJob =
+      turn.message.images.length > 0 ||
+      (turn.currentDocuments?.length ?? 0) > 0 ||
+      turn.supersededMessages.some((message) => message.images.length > 0);
+    let typing = false;
+    let workTimer: ReturnType<typeof setTimeout> | null = null;
+    let workCue: Promise<void> | null = null;
+    let immediateReactionStaged = false;
     try {
+      if (attachmentJob) {
+        workTimer = setTimeout(() => {
+          if (controller.signal.aborted) return;
+          workCue = this.#tryTurnCue(turn.message.sourceId, "work").then(() => undefined);
+        }, WORK_CUE_MS);
+        immediateReactionStaged = await this.#tryTurnCue(turn.message.sourceId, "reaction");
+      }
+      controller.signal.throwIfAborted();
+      typing =
+        turn.authority.audience === "private" &&
+        (await this.#setTyping({
+          providerConversationId: turn.authority.providerConversationId,
+          expectedAuthority,
+          active: true,
+        }));
       const context = await this.#reasonerContext(turn);
-      const decision = await this.#reasoner.decide(context.input, context.reads);
-      await this.#store.commitTurn(decisionCommit(turn, decision, this.#now()));
+      controller.signal.throwIfAborted();
+      const decision = await this.#reasoner.decide(context.input, context.reads, controller.signal);
+      if (workTimer) clearTimeout(workTimer);
+      workTimer = null;
+      if (workCue) await workCue;
+      controller.signal.throwIfAborted();
+      const guarded = enforceBoundaries(decision, context.input.boundaries, turn);
+      await this.#store.commitTurn(
+        decisionCommit(turn, guarded, this.#now(), { omitReaction: immediateReactionStaged }),
+      );
     } catch (error) {
+      if (controller.signal.aborted) return;
       if (error instanceof FlorenceReasonerError && !error.retryable) {
-        await this.#store.commitTurn({
-          sourceId: turn.message.sourceId,
-          handledAt: this.#now().toISOString(),
-        });
+        if (workTimer) clearTimeout(workTimer);
+        workTimer = null;
+        if (workCue) await workCue;
+        await this.#store.commitTurn(
+          attachmentJob
+            ? decisionCommit(
+                turn,
+                {
+                  conversation: {
+                    replyToCurrentMessage: true,
+                    reaction: null,
+                    bubbles: [
+                      {
+                        text: "I couldn’t finish reading that reliably, so I didn’t retain, schedule, or send anything.",
+                        delayMs: 0,
+                      },
+                    ],
+                  },
+                  facts: [],
+                  followUp: null,
+                  calendar: null,
+                },
+                this.#now(),
+                { omitReaction: immediateReactionStaged },
+              )
+            : { sourceId: turn.message.sourceId, handledAt: this.#now().toISOString() },
+        );
         return;
       }
       await this.#store.retryInbound({
@@ -336,6 +460,8 @@ export class Florence {
         error: errorText(error),
       });
     } finally {
+      if (workTimer) clearTimeout(workTimer);
+      if (workCue) await workCue;
       if (typing) {
         await this.#setTyping({
           providerConversationId: turn.authority.providerConversationId,
@@ -343,6 +469,7 @@ export class Florence {
           active: false,
         });
       }
+      if (this.#activeInbound === active) this.#activeInbound = null;
     }
   }
 
@@ -354,7 +481,11 @@ export class Florence {
     const visibleSources = memorySources(turn.facts);
     const sourceIndex = new Map(visibleSources.map((source) => [source.sourceId, source]));
     const visibility = turn.authority.audience === "group" ? "shared" : "adult_private";
-    const currentDocuments = turn.currentDocuments ?? [];
+    const currentDocuments = (turn.currentDocuments ?? []).slice(-3);
+    const jobMessages = [...turn.supersededMessages, turn.message];
+    const currentImages = jobMessages
+      .flatMap((message) => message.images.map((image) => ({ ...image, sourceId: message.sourceId })))
+      .slice(-10);
     const repliedMessage = turn.replyTarget;
     const indexMessage = (message: InboundTurn["message"] | InboundTurn["recentMessages"][number]) => {
       const text = turnText(message);
@@ -372,6 +503,7 @@ export class Florence {
     indexMessage(turn.message);
     if (repliedMessage) indexMessage(repliedMessage);
     for (const message of turn.recentMessages) indexMessage(message);
+    for (const message of turn.supersededMessages) indexMessage(message);
     for (const document of currentDocuments) {
       sourceIndex.set(document.id, {
         sourceId: document.id,
@@ -417,7 +549,7 @@ export class Florence {
         moveKind: turn.message.moveKind,
         text: turnText(turn.message),
         occurredAt: turn.message.occurredAt,
-        images: turn.message.images.map(reasonerImage),
+        images: currentImages.map(reasonerImage),
         pdfs: currentDocuments.map((document) => ({
           documentId: document.id,
           filename: document.filename,
@@ -436,13 +568,16 @@ export class Florence {
             }
           : null,
       },
-      recentMessages: turn.recentMessages.slice(-24).map((message) => ({
-        sourceId: message.sourceId,
-        senderName:
-          message.speaker === "florence" ? "Florence" : (members.get(message.speaker) ?? "Family member"),
-        text: turnText(message),
-        occurredAt: message.occurredAt,
-      })),
+      recentMessages: [...turn.recentMessages, ...turn.supersededMessages]
+        .sort((left, right) => left.occurredAt.localeCompare(right.occurredAt))
+        .slice(-24)
+        .map((message) => ({
+          sourceId: message.sourceId,
+          senderName:
+            message.speaker === "florence" ? "Florence" : (members.get(message.speaker) ?? "Family member"),
+          text: turnText(message),
+          occurredAt: message.occurredAt,
+        })),
       visibleSources,
       pendingFollowUps: turn.pendingFollowUps.map((followUp) => ({
         followUpId: followUp.id,
@@ -461,6 +596,7 @@ export class Florence {
           ? [{ connectionId: connection.connectionId, emailLabel: connection.emailLabel }]
           : [],
       ),
+      boundaries: turnBoundaries(turn),
     };
 
     const reads: FlorenceReadTools = {
@@ -495,13 +631,16 @@ export class Florence {
       },
       readSource: async ({ sourceId }) => sourceIndex.get(sourceId) ?? null,
       readCurrentImage: async ({ assetId, mimeType }) => {
-        if (!turn.message.images.some((image) => image.assetId === assetId && image.mimeType === mimeType)) {
+        const image = currentImages.find(
+          (candidate) => candidate.assetId === assetId && candidate.mimeType === mimeType,
+        );
+        if (!image) {
           throw new Error("The image is not attached to the current message");
         }
         if (!this.#imageVault) throw new Error("Florence image reading is not configured");
         return this.#imageVault.read({
           householdId: turn.household.id,
-          signalId: turn.message.sourceId,
+          signalId: image.sourceId,
           image: { assetId, mimeType },
         });
       },
@@ -518,7 +657,7 @@ export class Florence {
         return this.#imageVault.openPdf({
           documentId: document.id,
           householdId: turn.household.id,
-          signalId: turn.message.sourceId,
+          signalId: document.parentSourceId,
           filename: document.filename,
           mimeType: document.mimeType,
           contentDigest: document.contentDigest,
@@ -562,7 +701,7 @@ export class Florence {
     return { input, reads };
   }
 
-  async #deliverOutbound(sourceId: string): Promise<void> {
+  async #deliverOutbound(sourceId: string, retryTransient = true): Promise<void> {
     const outbound = await this.#store.beginOutbound({ sourceId, now: this.#now().toISOString() });
     if (!outbound) return;
     try {
@@ -611,9 +750,26 @@ export class Florence {
     } catch (error) {
       await this.#store.retryOutbound({
         sourceId,
-        retryAt: error instanceof LinqError && error.retryable ? later(this.#now(), 5_000) : null,
+        retryAt:
+          retryTransient && error instanceof LinqError && error.retryable ? later(this.#now(), 5_000) : null,
         error: errorText(error),
       });
+    }
+  }
+
+  async #tryTurnCue(sourceId: string, cue: "reaction" | "work"): Promise<boolean> {
+    try {
+      const cueSourceId = await this.#store.stageTurnCue({
+        sourceId,
+        cue,
+        occurredAt: this.#now().toISOString(),
+      });
+      if (!cueSourceId) return false;
+      await this.#deliverOutbound(cueSourceId, false);
+      return true;
+    } catch {
+      // A progress cue is optional. The substantive answer remains the product outcome.
+      return false;
     }
   }
 
@@ -836,7 +992,158 @@ function memorySources(facts: readonly FactRecord[]): FlorenceSource[] {
   );
 }
 
-function decisionCommit(turn: InboundTurn, decision: FlorenceDecision, now: Date): CommitTurnInput {
+function turnBoundaries(turn: InboundTurn): TurnBoundaries {
+  const boundaries: TurnBoundaries = {
+    retain: true,
+    schedule: true,
+    consequentialAction: true,
+  };
+  for (const message of [...turn.supersededMessages, turn.message]) {
+    applyBoundaryText(boundaries, message.text);
+  }
+  return boundaries;
+}
+
+function applyBoundaryText(boundaries: TurnBoundaries, text: string | null): void {
+  if (!text) return;
+  const request = text
+    .toLocaleLowerCase()
+    .replaceAll("’", "'")
+    .replaceAll("–", "-")
+    .replace(/\s+/g, " ")
+    .trim();
+  const positiveClauses = [
+    ...request.matchAll(/\b(?:go ahead and|you (?:can|may)(?: now)?|please(?: now)?)\s+[^.!?\n]{0,120}/g),
+  ].map(([clause]) => clause);
+  const negativeClauses = [...request.matchAll(/\b(?:do not|don't|dont|never)\s+[^.!?\n]{0,120}/g)].map(
+    ([clause]) => clause,
+  );
+
+  for (const clause of positiveClauses) {
+    const action = clause.replace(/^.*?\b(?:go ahead and|you (?:can|may)(?: now)?|please(?: now)?)\s+/, "");
+    if (/^(?:save|retain|remember|store)\b/.test(action)) boundaries.retain = true;
+    if (/^(?:schedule|set (?:a )?reminder|remind)\b/.test(action)) boundaries.schedule = true;
+    if (/^(?:add|put|schedule)\b[^.!?\n]{0,50}\b(?:to|on) (?:my|the) calendar\b/.test(action)) {
+      boundaries.schedule = true;
+      boundaries.consequentialAction = true;
+    }
+    if (/^(?:send|contact|submit|book|buy|purchase)\b/.test(action)) {
+      boundaries.consequentialAction = true;
+    }
+  }
+
+  for (const clause of negativeClauses) {
+    if (/\b(?:save|retain|remember|store)\b/.test(clause)) {
+      boundaries.retain = false;
+      boundaries.schedule = false;
+      boundaries.consequentialAction = false;
+    }
+    if (
+      /\b(?:schedule|set (?:a )?reminder|remind|book)\b/.test(clause) ||
+      /\b(?:add|put)\b[^.!?\n]{0,30}\bcalendar\b/.test(clause)
+    ) {
+      boundaries.schedule = false;
+      boundaries.consequentialAction = false;
+    }
+    if (/\b(?:send|contact|submit|book|buy|purchase|act)\b/.test(clause)) {
+      boundaries.consequentialAction = false;
+    }
+  }
+  if (/\bdraft only\b/.test(request)) boundaries.consequentialAction = false;
+}
+
+function explicitlyProhibitsRetention(text: string | null): boolean {
+  const request = normalizedParentText(text);
+  return /\b(?:don't|do not|never)\s+(?!forget\s+to\b)(?:(?:please|ever|again)\s+)*(?:save|retain|remember|store)\b/.test(
+    request,
+  );
+}
+
+function enforceBoundaries(
+  decision: FlorenceDecision,
+  boundaries: TurnBoundaries,
+  turn: InboundTurn,
+): FlorenceDecision {
+  const retain = boundaries.retain;
+  const schedule = retain && boundaries.schedule;
+  const consequentialAction = schedule && boundaries.consequentialAction;
+  let calendar = consequentialAction ? decision.calendar : null;
+  if (
+    calendar?.mode === "direct" &&
+    (turnHasAttachments(turn) || !explicitCalendarWriteInstruction(turn.message))
+  ) {
+    calendar = { ...calendar, mode: "offer" };
+  }
+  if (calendar?.mode === "approve" && !explicitCalendarOfferApproval(turn, calendar.proposalId)) {
+    calendar = null;
+  }
+  const confirmation = !retain
+    ? "I didn’t retain anything in the Vault, send anything externally, schedule a follow-up, or add anything to your calendar."
+    : !schedule
+      ? "I didn’t schedule a follow-up or add anything to your calendar."
+      : !consequentialAction
+        ? "I didn’t send, submit, book, purchase, or add anything to your calendar."
+        : null;
+  const bubbles = decision.conversation.bubbles.map((bubble) => ({ ...bubble }));
+  if (confirmation) {
+    const last = bubbles.at(-1);
+    if (last) last.text = `${last.text}\n\n${confirmation}`;
+    else bubbles.push({ text: confirmation, delayMs: 0 });
+  }
+  return {
+    conversation: { ...decision.conversation, bubbles },
+    facts: retain ? decision.facts : [],
+    followUp: schedule ? decision.followUp : null,
+    calendar,
+  };
+}
+
+function turnHasAttachments(turn: InboundTurn): boolean {
+  return (
+    (turn.currentDocuments?.length ?? 0) > 0 ||
+    turn.message.images.length > 0 ||
+    turn.supersededMessages.some((message) => message.images.length > 0)
+  );
+}
+
+function explicitCalendarWriteInstruction(message: InboundTurn["message"]): boolean {
+  return (
+    message.moveKind !== "reaction" &&
+    /^(?:(?:please|kindly)\s+|(?:(?:can|could|would|will)\s+you(?:\s+please)?\s+)|(?:go ahead and\s+))?(?:add|put|schedule)\b.{1,240}\b(?:to|on|in)\s+(?:my|the)\s+calendar\b/.test(
+      normalizedParentText(message.text),
+    )
+  );
+}
+
+function explicitCalendarOfferApproval(turn: InboundTurn, proposalId: string): boolean {
+  if (
+    turn.message.moveKind === "reaction" ||
+    turn.pendingCalendarOffers.length !== 1 ||
+    turn.pendingCalendarOffers[0]?.id !== proposalId
+  ) {
+    return false;
+  }
+  return /^(?:yes,?\s+(?:please\s+)?add it|go ahead\s+and\s+add it|please\s+add it|add it(?:,?\s+please)?)\.?$/.test(
+    normalizedParentText(turn.message.text),
+  );
+}
+
+function normalizedParentText(text: string | null): string {
+  return (text ?? "")
+    .toLocaleLowerCase()
+    .replaceAll("’", "'")
+    .replaceAll("–", "-")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/^(?:hey\s+)?florence[,!:;\s]+/, "");
+}
+
+function decisionCommit(
+  turn: InboundTurn,
+  decision: FlorenceDecision,
+  now: Date,
+  options: { omitReaction?: boolean } = {},
+): CommitTurnInput {
   if (
     turn.message.moveKind === "reaction" &&
     (decision.facts.length > 0 || decision.followUp !== null || decision.calendar !== null)
@@ -852,10 +1159,11 @@ function decisionCommit(turn: InboundTurn, decision: FlorenceDecision, now: Date
     throw new FlorenceReasonerError("invalid_output", "An inbound reaction has no Florence target");
   }
   const turnId = deterministicUuid(`turn\0${turn.message.sourceId}`);
-  const bubbles =
-    decision.calendar?.mode === "offer"
+  const bubbles = decision.calendar
+    ? decision.calendar.mode === "offer"
       ? [{ text: calendarOfferText(decision.calendar.event), delayMs: 0 }]
-      : decision.conversation.bubbles;
+      : []
+    : decision.conversation.bubbles;
   const facts: FactDraft[] = [];
   const deleteFactIds: string[] = [];
   for (const [index, change] of decision.facts.entries()) {
@@ -906,7 +1214,7 @@ function decisionCommit(turn: InboundTurn, decision: FlorenceDecision, now: Date
         ]
       : [];
   const outbound: NonNullable<CommitTurnInput["outbound"]>[number][] = [];
-  if (decision.conversation.reaction) {
+  if (decision.conversation.reaction && !options.omitReaction) {
     outbound.push({
       sourceId: deterministicUuid(`outbound\0${turnId}\0reaction`),
       idempotencyKey: `turn:${turn.message.sourceId}:reaction`,

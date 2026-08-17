@@ -101,6 +101,7 @@ export type FactRecord = {
 
 export type CurrentMessageDocument = {
   id: string;
+  parentSourceId: string;
   filename: string;
   mimeType: "application/pdf";
   contentDigest: string;
@@ -198,6 +199,8 @@ export type AcceptInboundInput = {
   text: string | null;
   images?: readonly ImageReference[];
   documents?: readonly InboundDocumentInput[];
+  supersedesSourceId?: string | null;
+  discardSupersededFacts?: boolean;
   occurredAt: string;
 };
 
@@ -257,6 +260,7 @@ export type PendingFollowUp = {
 
 export type InboundTurn = {
   message: ConversationTurn & { speaker: string };
+  supersededMessages: readonly (ConversationTurn & { speaker: string })[];
   replyTarget: ConversationTurn | null;
   authority: LinqAuthority;
   household: { id: string; name: string; timeZone: string; members: readonly FamilyMemberRecord[] };
@@ -340,6 +344,8 @@ export type CommitTurnInput = {
   calendarActions?: readonly CalendarActionDraft[];
   handledAt: string;
 };
+
+export type CommitTurnResult = "committed" | "superseded";
 
 export type OutboundMessage = {
   sourceId: string;
@@ -886,6 +892,53 @@ export class PostgresFlorenceStore {
     return this.#sql.begin((sql) => insertInboundReaction(sql, channel, authority.senderAdultId, input));
   }
 
+  async stageTurnCue(input: {
+    sourceId: string;
+    cue: "reaction" | "work";
+    occurredAt: string;
+  }): Promise<string | null> {
+    assertUuid(input.sourceId, "Inbound source ID");
+    const occurredAt = instant(input.occurredAt);
+    return this.#sql.begin(async (sql) => {
+      const [turn] = await sql<
+        {
+          source_id: string;
+          household_id: string;
+          channel_id: string;
+          visibility: Visibility;
+          owner_adult_id: string | null;
+          metadata: JsonValue;
+        }[]
+      >`
+        select m.source_id,s.household_id,m.channel_id,s.visibility,s.owner_adult_id,s.metadata
+        from messages m join sources s on s.id=m.source_id join linq_channels c on c.id=m.channel_id
+        where m.source_id=${input.sourceId} and m.direction='inbound' and m.status='received'
+          and c.revoked_at is null and c.stopped_at is null
+        for update of m
+      `;
+      if (!turn) return null;
+      const rootSourceId = await supersessionRoot(sql, turn.channel_id, turn.source_id, turn.metadata);
+      const cueTurnId = deterministicUuid(`cue-turn\0${rootSourceId}`);
+      const sourceId = deterministicUuid(`cue\0${rootSourceId}\0${input.cue}`);
+      await insertOutbound(sql, {
+        sourceId,
+        idempotencyKey: `cue:${rootSourceId}:${input.cue}`,
+        moveKind: input.cue === "reaction" ? "reaction" : "message",
+        ...(input.cue === "reaction"
+          ? { reaction: "emphasize", replyToSourceId: rootSourceId, turnPart: -1 as const }
+          : { text: "I’m looking through this now.", turnPart: 0 as const }),
+        turnId: cueTurnId,
+        notBefore: occurredAt.toISOString(),
+        householdId: turn.household_id,
+        channelId: turn.channel_id,
+        visibility: turn.visibility,
+        ownerAdultId: turn.owner_adult_id,
+        occurredAt,
+      });
+      return sourceId;
+    });
+  }
+
   async recordGmailEvidence(input: {
     householdId: string;
     ownerAdultId: string;
@@ -980,9 +1033,49 @@ export class PostgresFlorenceStore {
     const members = await this.#sql<PersonRow[]>`
       select * from people where household_id=${row.household_id} order by adult_slot nulls last,created_at,id
     `;
+    const supersededRows = await this.#sql<
+      {
+        source_id: string;
+        sender_adult_id: string;
+        move_kind: "message" | "reply" | "reaction";
+        text: string | null;
+        reaction: string | null;
+        images: JsonValue;
+        reply_to_source_id: string | null;
+        occurred_at: Date;
+        depth: number;
+      }[]
+    >`
+      with recursive superseded as (
+        select prior_message.source_id,prior_message.sender_adult_id,prior_message.move_kind,
+          prior_message.text,prior_message.reaction,prior_message.images,prior_message.reply_to_source_id,
+          prior_source.occurred_at,prior_source.metadata,1 as depth,
+          array[current_source.id,prior_source.id] as path
+        from sources current_source
+        join sources prior_source
+          on prior_source.id::text=current_source.metadata->>'supersedesSourceId'
+        join messages prior_message on prior_message.source_id=prior_source.id
+        where current_source.id=${row.source_id} and prior_message.channel_id=${row.channel_id}
+          and prior_message.direction='inbound'
+        union all
+        select prior_message.source_id,prior_message.sender_adult_id,prior_message.move_kind,
+          prior_message.text,prior_message.reaction,prior_message.images,prior_message.reply_to_source_id,
+          prior_source.occurred_at,prior_source.metadata,superseded.depth+1,
+          superseded.path||prior_source.id
+        from superseded
+        join sources prior_source on prior_source.id::text=superseded.metadata->>'supersedesSourceId'
+        join messages prior_message on prior_message.source_id=prior_source.id
+        where prior_message.channel_id=${row.channel_id} and prior_message.direction='inbound'
+          and not prior_source.id=any(superseded.path) and superseded.depth<100
+      )
+      select source_id,sender_adult_id,move_kind,text,reaction,images,reply_to_source_id,occurred_at,depth
+      from superseded order by depth desc
+    `;
+    const activeSourceIds = [...supersededRows.map((message) => message.source_id), row.source_id];
     const currentDocumentRows = await this.#sql<
       {
         id: string;
+        parent_source_id: string;
         filename: string;
         mime_type: string;
         content_digest: string;
@@ -990,14 +1083,14 @@ export class PostgresFlorenceStore {
         discard_after: Date;
       }[]
     >`
-      select s.id,d.filename,d.mime_type,d.content_digest,d.content_envelope,d.discard_after
+      select s.id,s.parent_source_id,d.filename,d.mime_type,d.content_digest,d.content_envelope,d.discard_after
       from sources s join sources parent on parent.id=s.parent_source_id
       join documents d on d.source_id=s.id
-      where s.household_id=${row.household_id} and s.parent_source_id=${row.source_id}
+      where s.household_id=${row.household_id} and s.parent_source_id in ${this.#sql(activeSourceIds)}
         and s.visibility=parent.visibility and s.owner_adult_id is not distinct from parent.owner_adult_id
         and s.kind='document' and d.mime_type='application/pdf' and d.retained=false
         and d.content_envelope is not null and d.discard_after>${current}
-      order by s.id
+      order by parent.occurred_at,s.id
     `;
     const privateViewer = channel.audience === "private" ? row.sender_adult_id : null;
     const recentRows = await this.#sql<
@@ -1016,7 +1109,7 @@ export class PostgresFlorenceStore {
       select m.source_id,m.sender_adult_id,m.direction,m.move_kind,m.text,m.reaction,m.images,
              m.reply_to_source_id,s.occurred_at
       from messages m join sources s on s.id=m.source_id
-      where m.channel_id=${row.channel_id} and m.source_id<>${row.source_id}
+      where m.channel_id=${row.channel_id} and m.source_id not in ${this.#sql(activeSourceIds)}
         and m.status in ('handled','sent')
       order by s.occurred_at desc,m.turn_part desc,m.source_id desc limit 100
     `;
@@ -1078,6 +1171,16 @@ export class PostgresFlorenceStore {
         replyToSourceId: row.reply_to_source_id,
         occurredAt: row.occurred_at.toISOString(),
       },
+      supersededMessages: supersededRows.map((message) => ({
+        sourceId: message.source_id,
+        speaker: message.sender_adult_id,
+        moveKind: message.move_kind,
+        text: message.text,
+        reaction: message.reaction,
+        images: imageReferences(message.images),
+        replyToSourceId: message.reply_to_source_id,
+        occurredAt: message.occurred_at.toISOString(),
+      })),
       replyTarget: replyTargetRow
         ? {
             sourceId: replyTargetRow.source_id,
@@ -1103,6 +1206,7 @@ export class PostgresFlorenceStore {
       facts: await this.#readFacts(row.household_id, privateViewer, channel.audience === "group"),
       currentDocuments: currentDocumentRows.map((document) => ({
         id: document.id,
+        parentSourceId: document.parent_source_id,
         filename: document.filename,
         mimeType: pdfMimeType(document.mime_type),
         contentDigest: document.content_digest,
@@ -1137,9 +1241,9 @@ export class PostgresFlorenceStore {
     };
   }
 
-  async commitTurn(input: CommitTurnInput): Promise<void> {
+  async commitTurn(input: CommitTurnInput): Promise<CommitTurnResult> {
     const handledAt = instant(input.handledAt);
-    await this.#sql.begin(async (sql) => {
+    return this.#sql.begin(async (sql) => {
       const [turn] = await sql<
         {
           source_id: string;
@@ -1148,14 +1252,45 @@ export class PostgresFlorenceStore {
           sender_adult_id: string;
           audience: Audience;
           visibility: Visibility;
+          move_kind: "message" | "reply" | "reaction";
+          status: "received" | "handled";
+          metadata: JsonValue;
+          created_at: Date;
+          revoked_at: Date | null;
+          stopped_at: Date | null;
         }[]
       >`
-        select m.source_id,s.household_id,m.channel_id,m.sender_adult_id,c.audience,s.visibility
+        select m.source_id,s.household_id,m.channel_id,m.sender_adult_id,c.audience,s.visibility,
+          m.move_kind,m.status,s.metadata,s.created_at,c.revoked_at,c.stopped_at
         from messages m join sources s on s.id=m.source_id join linq_channels c on c.id=m.channel_id
-        where m.source_id=${input.sourceId} and m.direction='inbound' and m.status='received'
-          and c.revoked_at is null and c.stopped_at is null for update of m
+        where m.source_id=${input.sourceId} and m.direction='inbound' for update of m,s
       `;
       if (!turn) throw new FlorenceStoreConflict("The inbound message is no longer awaiting a turn");
+      if (supersededBySourceId(turn.metadata)) return "superseded";
+      if (turn.status !== "received" || turn.revoked_at || turn.stopped_at) {
+        throw new FlorenceStoreConflict("The inbound message is no longer awaiting a turn");
+      }
+      const [newer] = await sql<{ source_id: string }[]>`
+        select newer.source_id from messages newer
+        join sources newer_source on newer_source.id=newer.source_id
+        where newer.channel_id=${turn.channel_id} and newer.direction='inbound'
+          and newer.move_kind in ('message','reply') and newer.source_id<>${turn.source_id}
+          and (newer_source.created_at,newer_source.id) > (${turn.created_at},${turn.source_id}::uuid)
+        order by newer_source.created_at,newer_source.id limit 1
+        for share of newer,newer_source
+      `;
+      if (newer) {
+        if (turn.move_kind === "reaction") {
+          await sql`
+            update messages set status='handled',handled_at=${handledAt},retry_at=null,
+              last_error='Superseded by a newer message in this conversation'
+            where source_id=${turn.source_id} and direction='inbound' and status='received'
+          `;
+          return "superseded";
+        }
+        await markInboundSuperseded(sql, [turn.source_id], turn.source_id, newer.source_id, handledAt);
+        return "superseded";
+      }
       if (
         turn.audience !== "private" &&
         ((input.calendarOffers?.length ?? 0) > 0 ||
@@ -1264,6 +1399,7 @@ export class PostgresFlorenceStore {
           ...outbound,
           householdId: turn.household_id,
           channelId: turn.channel_id,
+          parentSourceId: turn.source_id,
           visibility: turn.visibility,
           ownerAdultId: turn.visibility === "private" ? turn.sender_adult_id : null,
           occurredAt: handledAt,
@@ -1345,6 +1481,7 @@ export class PostgresFlorenceStore {
         where source_id=${turn.source_id} and status='received' returning source_id
       `;
       if (handled.length !== 1) throw new FlorenceStoreConflict("The inbound turn changed before commit");
+      return "committed";
     });
   }
 
@@ -1364,10 +1501,16 @@ export class PostgresFlorenceStore {
       where direction='outbound' and move_kind='reaction' and status='sending' and sending_at<=${stale}
     `;
     await this.#sql`
+      update messages set status='failed',sending_at=null,retry_at=null,
+        last_error='A stale work cue was suppressed after interruption'
+      where direction='outbound' and move_kind in ('message','reply') and status='sending'
+        and sending_at<=${stale} and idempotency_key like 'cue:%'
+    `;
+    await this.#sql`
       update messages set status='pending',sending_at=null,retry_at=${current},
         last_error='Recovering an idempotent Linq send after interruption'
       where direction='outbound' and move_kind in ('message','reply')
-        and status='sending' and sending_at<=${stale}
+        and status='sending' and sending_at<=${stale} and idempotency_key not like 'cue:%'
     `;
     await this.#sql`
       update messages m set status='failed',last_error='Messages authority is no longer active'
@@ -1627,15 +1770,24 @@ export class PostgresFlorenceStore {
           approval_digest: string;
           payload_digest: string;
           payload: JsonValue;
+          approval_metadata: JsonValue;
         }[]
       >`
         select a.id,a.action_id,a.household_id,a.connection_id,a.owner_adult_id,a.approval_source_id,
-               a.approval_digest,a.payload_digest,a.payload
-        from calendar_actions a
+               a.approval_digest,a.payload_digest,a.payload,approval.metadata as approval_metadata
+        from calendar_actions a join sources approval on approval.id=a.approval_source_id
         where a.status='pending' and a.retry_at<=${claimedAt}
         order by a.retry_at,a.created_at,a.id for update of a skip locked limit 1
       `;
       if (!row?.approval_source_id) return null;
+      if (supersededBySourceId(row.approval_metadata)) {
+        await sql`
+          update calendar_actions set status='failed',retry_at=${claimedAt},
+            last_error='Superseded before provider execution by a newer message in this conversation'
+          where id=${row.id} and status='pending'
+        `;
+        return null;
+      }
       await sql`
         update calendar_actions set retry_at=${new Date(claimedAt.getTime() + CALENDAR_CLAIM_MS)}
         where id=${row.id} and status='pending'
@@ -2061,6 +2213,7 @@ export class PostgresFlorenceStore {
 type OutboundInsert = OutboundDraft & {
   householdId: string;
   channelId: string;
+  parentSourceId?: string;
   visibility: Visibility;
   ownerAdultId: string | null;
   occurredAt: Date;
@@ -2187,6 +2340,183 @@ async function assertSourcesVisible(
   }
 }
 
+type SupersessionTail = {
+  chainSourceIds: string[];
+  tailSourceId: string;
+};
+
+async function resolveSupersessionTail(
+  sql: postgres.TransactionSql,
+  channelId: string,
+  requestedSourceId: string,
+  incomingSourceId: string,
+): Promise<SupersessionTail> {
+  const chainSourceIds: string[] = [];
+  const seen = new Set<string>();
+  let sourceId = requestedSourceId;
+  for (let depth = 0; depth < 100; depth += 1) {
+    if (sourceId === incomingSourceId || seen.has(sourceId)) {
+      throw new FlorenceStoreConflict("An inbound supersession chain contains a cycle");
+    }
+    seen.add(sourceId);
+    const [message] = await sql<{ source_id: string; metadata: JsonValue }[]>`
+      select m.source_id,s.metadata from messages m join sources s on s.id=m.source_id
+      where m.source_id=${sourceId} and m.channel_id=${channelId} and m.direction='inbound'
+      for update of m,s
+    `;
+    if (!message) {
+      throw new FlorenceStoreUnauthorized("A message can only supersede an inbound turn in its conversation");
+    }
+    chainSourceIds.push(message.source_id);
+    const nextSourceId = supersededBySourceId(message.metadata);
+    if (!nextSourceId) return { chainSourceIds, tailSourceId: message.source_id };
+    sourceId = nextSourceId;
+  }
+  throw new FlorenceStoreConflict("An inbound supersession chain is too long");
+}
+
+async function supersessionRoot(
+  sql: postgres.TransactionSql,
+  channelId: string,
+  currentSourceId: string,
+  currentMetadata: JsonValue,
+): Promise<string> {
+  const seen = new Set([currentSourceId]);
+  let rootSourceId = currentSourceId;
+  let metadata = currentMetadata;
+  for (let depth = 0; depth < 100; depth += 1) {
+    const priorSourceId = supersedesSourceId(metadata);
+    if (!priorSourceId) return rootSourceId;
+    if (seen.has(priorSourceId)) {
+      throw new FlorenceStoreConflict("An inbound supersession chain contains a cycle");
+    }
+    seen.add(priorSourceId);
+    const [prior] = await sql<{ source_id: string; metadata: JsonValue }[]>`
+      select m.source_id,s.metadata from messages m join sources s on s.id=m.source_id
+      where m.source_id=${priorSourceId} and m.channel_id=${channelId} and m.direction='inbound'
+      for share of m,s
+    `;
+    if (!prior) throw new FlorenceStoreConflict("An inbound supersession chain is incomplete");
+    rootSourceId = prior.source_id;
+    metadata = prior.metadata;
+  }
+  throw new FlorenceStoreConflict("An inbound supersession chain is too long");
+}
+
+async function markInboundSuperseded(
+  sql: postgres.TransactionSql,
+  chainSourceIds: readonly string[],
+  tailSourceId: string,
+  newerSourceId: string,
+  handledAt: Date,
+): Promise<void> {
+  const chain = unique(chainSourceIds);
+  if (chain.length === 0 || chain.at(-1) !== tailSourceId) {
+    throw new FlorenceStoreConflict("An inbound supersession chain is invalid");
+  }
+  const [newer] = await sql<{ metadata: JsonValue; visibility: Visibility; owner_adult_id: string | null }[]>`
+    select metadata,visibility,owner_adult_id from sources where id=${newerSourceId} for update
+  `;
+  if (!newer) throw new FlorenceStoreConflict("The superseding inbound message does not exist");
+  const discardSupersededFacts = jsonRecord(newer.metadata).discardSupersededFacts;
+  if (discardSupersededFacts !== undefined && typeof discardSupersededFacts !== "boolean") {
+    throw new FlorenceStoreConflict("Stored inbound retention boundaries are invalid");
+  }
+  const existingPrior = supersedesSourceId(newer.metadata);
+  if (existingPrior && existingPrior !== tailSourceId) {
+    throw new FlorenceStoreConflict("The superseding inbound message belongs to another turn chain");
+  }
+  await sql`
+    update sources set metadata=metadata||${sql.json({ supersededBySourceId: newerSourceId })}
+    where id=${tailSourceId}
+  `;
+  if (!existingPrior) {
+    await sql`
+      update sources set metadata=metadata||${sql.json({ supersedesSourceId: tailSourceId })}
+      where id=${newerSourceId}
+    `;
+  }
+  await sql`
+    update messages set status='handled',handled_at=${handledAt},retry_at=null,
+      last_error='Superseded by a newer message in this conversation'
+    where source_id in ${sql(chain)} and direction='inbound' and status='received'
+  `;
+  const finalTurnIds = chain.map((sourceId) => deterministicUuid(`turn\0${sourceId}`));
+  const calendarIds = chain.map((sourceId) => deterministicUuid(`calendar\0${sourceId}`));
+  await sql`
+    update messages set status='failed',retry_at=null,
+      last_error='Superseded before delivery by a newer message in this conversation'
+    where direction='outbound' and status='pending' and turn_id in ${sql(finalTurnIds)}
+  `;
+  if (discardSupersededFacts === true) {
+    await sql`
+      delete from facts fact
+      where ((${newer.visibility}='household' and fact.visibility='household')
+          or (${newer.visibility}='private' and fact.visibility='private'
+            and fact.owner_adult_id=${newer.owner_adult_id}))
+        and exists (
+        select 1 from fact_sources fs join sources source on source.id=fs.source_id
+        where fs.fact_id=fact.id
+          and (source.id in ${sql(chain)} or source.parent_source_id in ${sql(chain)})
+      ) and not exists (
+        select 1 from fact_sources fs join sources source on source.id=fs.source_id
+        where fs.fact_id=fact.id
+          and source.id not in ${sql(chain)}
+          and (source.parent_source_id is null or source.parent_source_id not in ${sql(chain)})
+      )
+    `;
+  }
+  await sql`
+    update messages reminder set status='failed',retry_at=null,
+      last_error='Superseded before delivery by a newer message in this conversation'
+    from follow_ups f
+    where f.sent_message_source_id=reminder.source_id and f.status='queued'
+      and reminder.status='pending' and exists (
+        select 1 from follow_up_sources fs join sources source on source.id=fs.source_id
+        where fs.follow_up_id=f.id
+          and (source.id in ${sql(chain)} or source.parent_source_id in ${sql(chain)})
+      )
+  `;
+  await sql`
+    update follow_ups f set status='cancelled',cancelled_at=${handledAt}
+    where f.status in ('scheduled','queued') and exists (
+      select 1 from follow_up_sources fs join sources source on source.id=fs.source_id
+      where fs.follow_up_id=f.id
+        and (source.id in ${sql(chain)} or source.parent_source_id in ${sql(chain)})
+    )
+  `;
+  await sql`
+    delete from calendar_actions action where action.status='offered'
+      and (action.id in ${sql(calendarIds)} or action.basis_source_id in (
+          select source.id from sources source
+          where source.id in ${sql(chain)} or source.parent_source_id in ${sql(chain)}
+        ))
+  `;
+  await sql`
+    update calendar_actions set status='failed',retry_at=${handledAt},
+      last_error='Superseded before provider execution by a newer message in this conversation'
+    where status='pending' and retry_at<=${handledAt} and approval_source_id in ${sql(chain)}
+  `;
+}
+
+function supersedesSourceId(metadata: JsonValue): string | null {
+  return supersessionMetadataId(metadata, "supersedesSourceId");
+}
+
+function supersededBySourceId(metadata: JsonValue): string | null {
+  return supersessionMetadataId(metadata, "supersededBySourceId");
+}
+
+function supersessionMetadataId(metadata: JsonValue, key: string): string | null {
+  const value = jsonRecord(metadata)[key];
+  if (value === undefined) return null;
+  if (typeof value !== "string") {
+    throw new FlorenceStoreConflict("Stored inbound supersession metadata is invalid");
+  }
+  assertUuid(value, "Stored inbound supersession source ID");
+  return value;
+}
+
 async function insertInbound(
   sql: postgres.TransactionSql,
   channel: ChannelRow,
@@ -2208,6 +2538,10 @@ async function insertInbound(
   const occurredAt = instant(input.occurredAt);
   const documents = validateInboundDocuments(input.documents ?? [], occurredAt);
   const sourceId = deterministicUuid(`linq-v3\0signal\0${input.providerEventId}`);
+  let requestedSupersedesSourceId = input.supersedesSourceId ?? null;
+  if (requestedSupersedesSourceId) {
+    assertUuid(requestedSupersedesSourceId, "Superseded inbound source ID");
+  }
   const [existing] = await sql<
     {
       source_id: string;
@@ -2254,6 +2588,37 @@ async function insertInbound(
       channelId: channel.id,
     };
   }
+  if (!requestedSupersedesSourceId) {
+    const [pendingTurn] = await sql<{ source_id: string }[]>`
+      select inbound.source_id
+      from messages pending
+      join sources pending_source on pending_source.id=pending.source_id
+      join messages inbound on inbound.source_id=pending_source.parent_source_id
+      join sources inbound_source on inbound_source.id=inbound.source_id
+      where pending.channel_id=${channel.id} and pending.direction='outbound' and pending.status='pending'
+        and inbound.direction='inbound' and inbound.move_kind in ('message','reply')
+      order by inbound_source.created_at desc,inbound.source_id desc limit 1
+      for update of inbound,inbound_source
+    `;
+    requestedSupersedesSourceId = pendingTurn?.source_id ?? null;
+  }
+  if (!requestedSupersedesSourceId) {
+    const [pendingCalendarTurn] = await sql<{ source_id: string }[]>`
+      select inbound.source_id
+      from calendar_actions action
+      join messages inbound on inbound.source_id=action.approval_source_id
+      join sources inbound_source on inbound_source.id=inbound.source_id
+      where action.status='pending' and action.retry_at=inbound.handled_at
+        and inbound.channel_id=${channel.id} and inbound.direction='inbound'
+        and inbound.move_kind in ('message','reply')
+      order by inbound_source.created_at desc,inbound.source_id desc limit 1
+      for update of action,inbound,inbound_source
+    `;
+    requestedSupersedesSourceId = pendingCalendarTurn?.source_id ?? null;
+  }
+  if (requestedSupersedesSourceId === sourceId) {
+    throw new FlorenceStoreConflict("An inbound message cannot supersede itself");
+  }
   const stop = isClearMessagesOptOut(input.text);
   if (channel.stopped_at && !stop) {
     return {
@@ -2266,6 +2631,9 @@ async function insertInbound(
   if (input.text === null && images.length === 0 && documents.length === 0) {
     throw new FlorenceStoreConflict("An inbound message needs text, an image, or a document");
   }
+  const supersession = requestedSupersedesSourceId
+    ? await resolveSupersessionTail(sql, channel.id, requestedSupersedesSourceId, sourceId)
+    : null;
   const visibility: Visibility = channel.audience === "group" ? "household" : "private";
   const ownerAdultId = visibility === "private" ? senderAdultId : null;
   const [reply] = input.replyToProviderMessageId
@@ -2278,7 +2646,11 @@ async function insertInbound(
     insert into sources (id,household_id,kind,visibility,owner_adult_id,external_key,label,metadata,occurred_at)
     values (${sourceId},${channel.household_id},'linq_message',${visibility},${ownerAdultId},
       ${`inbound:${input.providerEventId}`},${bounded(input.text ?? "Family attachment", 500)},
-      ${sql.json({ providerMessageId: input.providerMessageId })},${occurredAt})
+      ${sql.json({
+        providerMessageId: input.providerMessageId,
+        ...(supersession ? { supersedesSourceId: supersession.tailSourceId } : {}),
+        ...(input.discardSupersededFacts ? { discardSupersededFacts: true } : {}),
+      })},${occurredAt})
   `;
   await sql`
     insert into messages (
@@ -2305,6 +2677,15 @@ async function insertInbound(
       ) values (${document.documentId},${senderAdultId},${document.filename},${document.mimeType},
         ${document.contentDigest},false,${Buffer.from(document.contentEnvelope)},${discardAfter})
     `;
+  }
+  if (supersession) {
+    await markInboundSuperseded(
+      sql,
+      supersession.chainSourceIds,
+      supersession.tailSourceId,
+      sourceId,
+      occurredAt,
+    );
   }
   if (stop) await sql`update linq_channels set stopped_at=${occurredAt} where id=${channel.id}`;
   return {
@@ -2486,10 +2867,12 @@ async function insertOutbound(sql: postgres.TransactionSql, input: OutboundInser
     return;
   }
   await sql`
-    insert into sources (id,household_id,kind,visibility,owner_adult_id,external_key,label,metadata,occurred_at)
+    insert into sources (
+      id,household_id,kind,visibility,owner_adult_id,external_key,parent_source_id,label,metadata,occurred_at
+    )
     values (${input.sourceId},${input.householdId},'linq_message',${input.visibility},${input.ownerAdultId},
-      ${`outbound:${input.idempotencyKey}`},${bounded(input.text ?? input.reaction ?? "Florence response", 500)},'{}'::jsonb,
-      ${input.occurredAt})
+      ${`outbound:${input.idempotencyKey}`},${input.parentSourceId ?? null},
+      ${bounded(input.text ?? input.reaction ?? "Florence response", 500)},'{}'::jsonb,${input.occurredAt})
   `;
   await sql`
     insert into messages (

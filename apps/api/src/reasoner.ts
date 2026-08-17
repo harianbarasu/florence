@@ -1,5 +1,12 @@
 import { MAX_IMAGE_BYTES, MAX_PDF_BYTES } from "@florence/artifacts";
-import { APIConnectionError, APIError, InternalServerError, OpenAI, RateLimitError } from "openai";
+import {
+  APIConnectionError,
+  APIError,
+  APIUserAbortError,
+  InternalServerError,
+  OpenAI,
+  RateLimitError,
+} from "openai";
 import { zodTextFormat } from "openai/helpers/zod";
 import type {
   FunctionTool,
@@ -98,6 +105,13 @@ export const florenceReasonerInputSchema = z
       .strict(),
     audience: z.enum(["private", "group"]),
     currentAdultId: opaqueId,
+    boundaries: z
+      .object({
+        retain: z.boolean(),
+        schedule: z.boolean(),
+        consequentialAction: z.boolean(),
+      })
+      .strict(),
     currentMessage: z
       .object({
         sourceId: opaqueId,
@@ -327,7 +341,13 @@ const INSTRUCTIONS = `You are Florence, a warm, capable family assistant inside 
 
 Act like an excellent participant in the family thread, not a workflow engine. Use short, natural language. A useful turn may be silence, a reaction, one bubble, or at most three paced bubbles. Do not narrate internal work. Reply inline only when it materially disambiguates what you are answering.
 
+The application's boundaries are authoritative. A false retain boundary means do not remember or correct facts. A false schedule boundary means do not create a follow-up, Calendar offer, or Calendar action. A false consequentialAction boundary means do not offer, approve, or directly perform a Calendar action. Never treat a later correction, silence, reaction, or ordinary acknowledgement as permission to relax a false boundary. When a boundary is false, say plainly what was not retained, scheduled, or sent; do not imply that a draft or external action happened.
+
 Use currentMessage.replyTo as the exact message the parent replied to when it is present. Use current-message images and PDFs directly when attached. An attached PDF's documentId is its source ID. Use read tools naturally when the answer depends on family memory or the current adult's Google context. Gmail and Calendar are private to their owning adult and are never available in a group turn. Never expose an adult_private source in the group. Calendar window results are ephemeral scheduling context: never cite them as sources or turn their contents into memory. Every fact change, follow-up, and Calendar decision must cite source IDs you actually received.
+
+For a parent document or photo, use judgment before extraction. Lead with the one or two deadlines, conflicts, or decisions that deserve attention; do not dump every date or detail. Distinguish action-needed items, useful dates, stable logistics that may matter later, and one-offs that should remain temporary. In a private turn with an active Google connection, read the current adult's Calendar around every useful date before describing availability or a conflict. Mention only meaningful conflicts or uncertainty, never an unrelated event dump. Ask at most one blocking question across the whole turn.
+
+When the parent corrects an assumption or fact during the task, incorporate the correction, rerank what matters, preserve still-valid context, and answer once from the corrected premise. Do not restart the conversation or repeat an obsolete result. If a useful next step is a message or email, provide the exact draft and state clearly that it was not sent.
 
 A currentMessage with moveKind reaction is affect or acknowledgement only. Never interpret a reaction as an approval, confirmation, completion, cancellation, instruction, factual correction, memory request, scheduling request, or Calendar authority. For a reaction turn, facts must be empty and followUp and calendar must be null; use natural silence or a conversational response.
 
@@ -407,7 +427,7 @@ const CALENDAR_TOOL: FunctionTool = {
   type: "function",
   name: "read_calendar_window",
   description:
-    "Privately read a bounded window from the current adult's primary Google Calendar before proposing or directly creating an event.",
+    "Privately read a bounded window from the current adult's primary Google Calendar to check useful dates and conflicts, and before proposing or directly creating an event.",
   strict: true,
   parameters: {
     type: "object",
@@ -436,8 +456,18 @@ export class FlorenceReasoner {
     this.#client = client ?? new OpenAI({ apiKey: options.apiKey, timeout, maxRetries: 0 });
   }
 
-  async decide(untrustedInput: FlorenceReasonerInput, reads: FlorenceReadTools): Promise<FlorenceDecision> {
-    const input = florenceReasonerInputSchema.parse(untrustedInput);
+  async decide(
+    untrustedInput: FlorenceReasonerInput,
+    reads: FlorenceReadTools,
+    signal?: AbortSignal,
+  ): Promise<FlorenceDecision> {
+    throwIfAborted(signal);
+    let input: FlorenceReasonerInput;
+    try {
+      input = florenceReasonerInputSchema.parse(untrustedInput);
+    } catch (error) {
+      throw normalizeError(error);
+    }
     if (
       input.audience === "group" &&
       (input.visibleSources.some((source) => source.visibility !== "shared") ||
@@ -446,6 +476,7 @@ export class FlorenceReasoner {
     ) {
       throw unsafeRead("Private adult context cannot enter a group turn");
     }
+    throwIfAborted(signal);
     const knownSources = new Set([
       input.currentMessage.sourceId,
       ...(input.currentMessage.replyTo ? [input.currentMessage.replyTo.sourceId] : []),
@@ -472,7 +503,9 @@ export class FlorenceReasoner {
     }
     const currentImages = await Promise.all(
       input.currentMessage.images.map(async (image) => {
+        throwIfAborted(signal);
         const read = await reads.readCurrentImage(image);
+        throwIfAborted(signal);
         if (
           read.mimeType !== image.mimeType ||
           read.bytes.byteLength < 1 ||
@@ -489,8 +522,10 @@ export class FlorenceReasoner {
     );
     const currentPdfs = await Promise.all(
       (input.currentMessage.pdfs ?? []).map(async (document) => {
+        throwIfAborted(signal);
         if (!reads.readCurrentPdf) throw unsafeRead("Current-message PDF reading is unavailable");
         const read = await reads.readCurrentPdf(document);
+        throwIfAborted(signal);
         if (
           read.mimeType !== document.mimeType ||
           read.bytes.byteLength < 1 ||
@@ -514,28 +549,35 @@ export class FlorenceReasoner {
 
     try {
       for (let turn = 0; turn < 5; turn += 1) {
-        const response = await this.#client.responses.parse({
-          model: this.#model,
-          store: false,
-          include: ["reasoning.encrypted_content"],
-          instructions: INSTRUCTIONS,
-          input: modelInput,
-          tools,
-          parallel_tool_calls: false,
-          max_tool_calls: 4,
-          max_output_tokens: this.#maxOutputTokens,
-          text: { format: zodTextFormat(florenceDecisionSchema, "florence_decision") },
-        });
+        throwIfAborted(signal);
+        const response = await this.#client.responses.parse(
+          {
+            model: this.#model,
+            store: false,
+            include: ["reasoning.encrypted_content"],
+            instructions: INSTRUCTIONS,
+            input: modelInput,
+            tools,
+            parallel_tool_calls: false,
+            max_tool_calls: 4,
+            max_output_tokens: this.#maxOutputTokens,
+            text: { format: zodTextFormat(florenceDecisionSchema, "florence_decision") },
+          },
+          { signal },
+        );
+        throwIfAborted(signal);
         const calls = response.output.filter((item) => item.type === "function_call");
         if (input.currentMessage.moveKind === "reaction" && calls.length > 0) {
           throw unsafeRead("Reaction turns cannot call read tools");
         }
         if (calls.length === 0) {
           if (response.output_parsed === null) throw invalidOutput("OpenAI returned no Florence decision");
+          throwIfAborted(signal);
           return validateDecision(response.output_parsed, input, knownSources, knownFacts, calendarReads);
         }
         modelInput.push(...continuationItems(response.output));
         for (const call of calls) {
+          throwIfAborted(signal);
           modelInput.push({
             type: "function_call_output",
             call_id: call.call_id,
@@ -547,12 +589,16 @@ export class FlorenceReasoner {
               knownSources,
               knownFacts,
               calendarReads,
+              signal,
             ),
           });
+          throwIfAborted(signal);
         }
       }
       throw invalidOutput("OpenAI exceeded Florence's read-tool turn limit");
     } catch (error) {
+      if (error instanceof APIUserAbortError || isAbortError(error)) throw error;
+      throwIfAborted(signal);
       throw normalizeError(error);
     }
   }
@@ -577,7 +623,9 @@ async function runReadTool(
   knownSources: Set<string>,
   knownFacts: Set<string>,
   calendarReads: CalendarReadCoverage[],
+  signal?: AbortSignal,
 ): Promise<string> {
+  throwIfAborted(signal);
   if (name === "read_calendar_window") {
     if (input.audience !== "private") throw unsafeRead("Calendar cannot be read from a group turn");
     const args = calendarArguments.parse(JSON.parse(rawArguments));
@@ -590,6 +638,7 @@ async function runReadTool(
       throw unsafeRead("Calendar read window is invalid");
     }
     const read = calendarWindowReadSchema.parse(await reads.readCalendarWindow(args));
+    throwIfAborted(signal);
     if (read.status === "complete") {
       calendarReads.push({ connectionId: args.connectionId, timeMin, timeMax });
     }
@@ -610,16 +659,19 @@ async function runReadTool(
       throw unsafeRead("Gmail connection is not owned by the current adult");
     }
     sources = await reads.searchGmail(args);
+    throwIfAborted(signal);
     if (sources.some((source) => source.visibility !== "adult_private" || source.kind !== "gmail")) {
       throw unsafeRead("Gmail returned incorrectly scoped evidence");
     }
   } else if (name === "search_family_memory") {
     const args = memoryArguments.parse(JSON.parse(rawArguments));
     sources = await reads.searchFamilyMemory(args);
+    throwIfAborted(signal);
   } else if (name === "read_source") {
     const args = sourceArguments.parse(JSON.parse(rawArguments));
     if (!knownSources.has(args.sourceId)) throw unsafeRead("OpenAI requested an unreferenced source");
     const source = await reads.readSource(args);
+    throwIfAborted(signal);
     sources = source ? [source] : [];
   } else {
     throw unsafeRead("OpenAI requested an unknown read tool");
@@ -756,6 +808,14 @@ function invalidOutput(message: string, cause?: unknown): FlorenceReasonerError 
 
 function unsafeRead(message: string): FlorenceReasonerError {
   return new FlorenceReasonerError("unsafe_read", message);
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  signal?.throwIfAborted();
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
 }
 
 function positiveInteger(value: number, label: string): number {

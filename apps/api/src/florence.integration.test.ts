@@ -46,23 +46,38 @@ const EVENT = {
   timeZone: "America/Los_Angeles",
   location: "Muir Elementary",
 };
+const TRIP_WINDOW = {
+  timeMin: "2026-08-21T22:30:00.000Z",
+  timeMax: "2026-08-21T23:30:00.000Z",
+};
+const PICKUP_CONFLICT = {
+  title: "Both parents unavailable",
+  startsAt: "2026-08-21T22:30:00.000Z",
+  endsAt: "2026-08-21T23:30:00.000Z",
+  allDay: false,
+};
 
 type Reason = FlorenceReasoner["decide"];
 
 const release = TEST_DATABASE_URL ? describe : describe.skip;
 
 release("Florence release journeys", () => {
-  test("runs the real two-adult household journey from onboarding through correction and Calendar proof", async () => {
+  test("runs the real two-adult household journey from an interruptible document turn through Calendar proof", async () => {
     let pdfWasRead = false;
     let reactionWasUnderstood = false;
     let calendarWasRead = false;
-    const harness = await freshHarness(async (input, reads) => {
+    let obsoleteResultWasSuppressed = false;
+    const harness = await freshHarness(async (input, reads, signal) => {
       const sourceId = input.currentMessage.sourceId;
       if (input.currentMessage.moveKind === "reaction") {
+        if (input.currentMessage.replyTo?.text === "I’m looking through this now.") {
+          expect(input.audience).toBe("private");
+          return decision();
+        }
         reactionWasUnderstood = true;
         expect(input.currentMessage.replyTo).toMatchObject({
           senderName: "Florence",
-          text: "Got it — 2:45 dismissal.",
+          text: "Family thread is connected.",
         });
         if (input.currentMessage.text === "Reacted like") {
           return decision({
@@ -85,19 +100,104 @@ release("Florence release journeys", () => {
           calendar: calendarDraft("direct", sourceId),
         });
       }
-      if (input.currentMessage.text.includes("School packet")) {
+      if (input.currentMessage.text.includes("Review this school packet")) {
         const pdf = input.currentMessage.pdfs?.[0];
         if (!pdf || !reads.readCurrentPdf) throw new Error("The attached PDF was not readable");
         const opened = await reads.readCurrentPdf(pdf);
-        pdfWasRead = new TextDecoder().decode(opened.bytes).includes("dismissal 2:45");
-        expect((await reads.readSource({ sourceId }))?.visibility).toBe("shared");
+        pdfWasRead = new TextDecoder().decode(opened.bytes).includes("bus returns at 3:45");
+        expect((await reads.readSource({ sourceId }))?.visibility).toBe("adult_private");
+        await waitForAbort(signal);
+        return decision({
+          bubbles: [{ text: "This obsolete answer must never be sent.", delayMs: 0 }],
+        });
+      }
+      if (
+        input.currentMessage.text.includes("Alex is unavailable too") ||
+        input.currentMessage.text.includes("Sam can cover")
+      ) {
+        expect(input.boundaries).toEqual({
+          retain: false,
+          schedule: false,
+          consequentialAction: false,
+        });
+        expect(input.recentMessages).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ text: expect.stringContaining("Review this school packet") }),
+          ]),
+        );
+        const pdf = input.currentMessage.pdfs?.[0];
+        if (!pdf || !reads.readCurrentPdf) throw new Error("The superseded PDF was not carried forward");
+        const opened = await reads.readCurrentPdf(pdf);
+        pdfWasRead = pdfWasRead && new TextDecoder().decode(opened.bytes).includes("Ms. Chen");
+        const calendar = await reads.readCalendarWindow({
+          connectionId: GOOGLE_CONNECTION,
+          ...TRIP_WINDOW,
+          limit: 50,
+        });
+        expect(calendar).toEqual({ status: "complete", events: [PICKUP_CONFLICT] });
+        calendarWasRead = true;
+        obsoleteResultWasSuppressed = true;
+        if (input.currentMessage.text.includes("Sam can cover")) {
+          return decision({
+            bubbles: [
+              {
+                text: "Updated: Sam can cover the 3:45 pickup, so the pickup conflict is cleared.",
+                delayMs: 0,
+              },
+              {
+                text: "Tuesday’s permission-slip deadline still needs attention. Ms. Chen is a stable school contact; Friday’s trip and return are one-offs. I saved neither.",
+                delayMs: 250,
+              },
+              {
+                text: "Updated draft to Ms. Chen: “Sam can cover Maya’s 3:45 pickup. Please let me know if the bus returns late.”",
+                delayMs: 400,
+              },
+            ],
+            facts: [remember("Ms. Chen is Maya’s teacher", sourceId)],
+            followUp: {
+              operation: "schedule",
+              followUpId: null,
+              at: new Date(Date.parse(input.currentMessage.occurredAt) + 60_000).toISOString(),
+              text: "This prohibited reminder must never be sent.",
+              sourceIds: [sourceId],
+            },
+            calendar: calendarDraft("direct", sourceId),
+          });
+        }
         return decision({
           reaction: "love",
           reply: true,
           bubbles: [
-            { text: "Got it — 2:45 dismissal.", delayMs: 0 },
-            { text: "I’ll remind both of you before pickup.", delayMs: 500 },
+            {
+              text: "The real issue is the unsupervised pickup gap after the bus returns at 3:45 — both of you are unavailable.",
+              delayMs: 0,
+            },
+            {
+              text: "Tuesday’s permission-slip deadline is actionable. Ms. Chen is a stable school contact; Friday’s trip and 3:45 return are one-offs. I saved neither.",
+              delayMs: 250,
+            },
+            {
+              text: "Draft to Ms. Chen: “Both of us are unavailable at 3:45. Can Maya stay with the bus group until 4:15?”\n\nShould I change the draft to name an alternate pickup adult?",
+              delayMs: 400,
+            },
           ],
+          facts: [remember("Ms. Chen is Maya’s teacher", sourceId)],
+          followUp: {
+            operation: "schedule",
+            followUpId: null,
+            at: new Date(Date.parse(input.currentMessage.occurredAt) + 60_000).toISOString(),
+            text: "This prohibited reminder must never be sent.",
+            sourceIds: [sourceId],
+          },
+          calendar: calendarDraft("direct", sourceId),
+        });
+      }
+      if (input.currentMessage.text === "Hi Florence") {
+        return decision({ bubbles: [{ text: "Family thread is connected.", delayMs: 0 }] });
+      }
+      if (input.currentMessage.text.includes("remind both of us about pickup")) {
+        return decision({
+          bubbles: [{ text: "I’ll remind both of you.", delayMs: 0 }],
           facts: [remember("School dismissal is at 2:45", sourceId)],
           followUp: {
             operation: "schedule",
@@ -108,6 +208,24 @@ release("Florence release journeys", () => {
           },
         });
       }
+      if (input.currentMessage.text === "Remember that the school gate code is 2468.") {
+        return decision({
+          bubbles: [
+            { text: "I noted the gate code.", delayMs: 0 },
+            { text: "I’ll keep it with the school logistics.", delayMs: 10_000 },
+          ],
+          facts: [
+            remember("The school gate code is 2468", sourceId),
+            {
+              ...remember("The school office closes at 4", sourceId),
+              sourceIds: [sourceId, inboundSourceId("event-independent-school-hours")],
+            },
+          ],
+        });
+      }
+      if (input.currentMessage.text === "The school office closes at 4.") {
+        return decision({ facts: [remember("The school office closes at 4", sourceId)] });
+      }
       if (input.currentMessage.text.startsWith("Could you add")) {
         const calendar = await reads.readCalendarWindow({
           connectionId: GOOGLE_CONNECTION,
@@ -115,7 +233,7 @@ release("Florence release journeys", () => {
           timeMax: EVENT.endsAt,
           limit: 50,
         });
-        calendarWasRead = calendar.status === "complete";
+        calendarWasRead = calendarWasRead && calendar.status === "complete";
         expect(calendar.events).toEqual([]);
         return decision({
           calendar: {
@@ -141,49 +259,172 @@ release("Florence release journeys", () => {
     await harness.onboard();
     await harness.activateGoogle();
 
-    const signalId = inboundSourceId("event-group-packet");
+    const signalId = inboundSourceId("event-private-school-packet");
     const sealed = harness.vault.sealPdf({
       documentId: "55555555-5555-4555-8555-555555555555",
       householdId: (await harness.store.listHouseholdIdsForAdult(ADULT_ONE))[0] ?? "missing",
       signalId,
       filename: "school-packet.pdf",
       declaredMimeType: "application/pdf",
-      bytes: new TextEncoder().encode("%PDF-1.7\nSchool dismissal 2:45\n%%EOF\n"),
+      bytes: new TextEncoder().encode(
+        "%PDF-1.7\nMuir field trip with Ms. Chen. Permission slip due Tuesday. Friday trip. The bus returns at 3:45.\n%%EOF\n",
+      ),
       discardAfter: new Date(harness.now + 120_000).toISOString(),
     });
-    const groupMessage = harness.inbound("group", "group-packet", "School packet: dismissal is at 2:45.", {
-      documents: [
-        {
-          ...sealed,
-          externalKey: "linq-document-school-packet",
-          retained: false,
-        },
-      ],
+    const documentMessage = harness.inbound(
+      "private",
+      "private-school-packet",
+      "Review this school packet and draft the exact note to Ms. Chen. Don’t send it. Also don’t retain it or schedule anything.",
+      { documents: [{ ...sealed, externalKey: "linq-document-school-packet" }] },
+    );
+    expect((await harness.florence.acceptInbound(documentMessage))?.disposition).toBe("accepted");
+    await eventually(() =>
+      harness.linq.reactions.some(
+        (reaction) =>
+          reaction.targetProviderMessageId === "message-private-school-packet" &&
+          reaction.reaction === "emphasize",
+      ),
+    );
+    await eventually(
+      () => harness.linq.messages.some((message) => message.text === "I’m looking through this now."),
+      8_000,
+    );
+    const workCueIndex = harness.linq.messages.findIndex(
+      (message) => message.text === "I’m looking through this now.",
+    );
+    expect(workCueIndex).toBeGreaterThanOrEqual(0);
+    expect(
+      await harness.receiveReaction("document-work-like", `sent-${workCueIndex + 1}`, "like", "private"),
+    ).toEqual({
+      disposition: "accepted",
+      sourceId: inboundSourceId("event-document-work-like"),
     });
-    expect((await harness.florence.bootstrapMessagesGroup(groupMessage))?.disposition).toBe("accepted");
+    await harness.acceptPrivate(
+      "private-school-correction",
+      "Correction: Alex is unavailable too. Please keep going.",
+    );
     await harness.drain();
-    expect((await harness.florence.acceptInbound(groupMessage))?.disposition).toBe("duplicate");
+    expect((await harness.florence.acceptInbound(documentMessage))?.disposition).toBe("duplicate");
+    expect(harness.linq.messages.map((message) => message.text)).not.toContain(
+      "Tuesday’s permission-slip deadline is actionable. Ms. Chen is a stable school contact; Friday’s trip and 3:45 return are one-offs. I saved neither.",
+    );
+    await harness.acceptPrivate(
+      "private-school-late-correction",
+      "One more correction: Sam can cover the 3:45 pickup. Please keep going.",
+    );
+    await harness.drain();
+    harness.now += 1_000;
+    await harness.drain();
 
-    expect(await harness.receiveReaction("family-love", "sent-1", "love")).toEqual({
+    expect(pdfWasRead).toBe(true);
+    expect(calendarWasRead).toBe(true);
+    expect(obsoleteResultWasSuppressed).toBe(true);
+    expect(harness.googleReads).toBe(2);
+    expect(harness.googleEffects).toBe(0);
+    const documentWorkspace = await harness.florence.workspaceForAdult(ADULT_ONE);
+    expect(documentWorkspace.vault?.facts).not.toEqual(
+      expect.arrayContaining([expect.objectContaining({ statement: "Ms. Chen is Maya’s teacher" })]),
+    );
+    const documentReplies = harness.linq.messages.map((message) => message.text);
+    expect(documentReplies).toEqual(
+      expect.arrayContaining([
+        "I’m looking through this now.",
+        expect.stringContaining("unsupervised pickup gap"),
+        expect.stringMatching(/stable school contact.*one-offs/),
+        expect.stringMatching(/draft to Ms\. Chen/i),
+      ]),
+    );
+    expect(documentReplies).not.toContain(
+      "Tuesday’s permission-slip deadline is actionable. Ms. Chen is a stable school contact; Friday’s trip and 3:45 return are one-offs. I saved neither.",
+    );
+    expect(documentReplies.join("\n")).toContain(
+      "I didn’t retain anything in the Vault, send anything externally, schedule a follow-up, or add anything to your calendar.",
+    );
+    expect(documentReplies.join("\n")).toContain("Tuesday’s permission-slip deadline still needs attention.");
+    expect(documentReplies).not.toContain("This obsolete answer must never be sent.");
+    harness.now += 60_000;
+    await harness.drain();
+    expect(harness.linq.messages.map((message) => message.text)).not.toContain(
+      "This prohibited reminder must never be sent.",
+    );
+
+    const groupStart = harness.inbound("group", "group-start", "Hi Florence");
+    expect((await harness.florence.bootstrapMessagesGroup(groupStart))?.disposition).toBe("accepted");
+    await harness.drain();
+    expect((await harness.florence.acceptInbound(groupStart))?.disposition).toBe("duplicate");
+    const groupReplyIndex = harness.linq.messages.findIndex(
+      (message) => message.text === "Family thread is connected.",
+    );
+    expect(groupReplyIndex).toBeGreaterThanOrEqual(0);
+    const groupReplyProviderId = `sent-${groupReplyIndex + 1}`;
+
+    expect(
+      (
+        await harness.florence.acceptInbound(
+          harness.inbound("group", "independent-school-hours", "The school office closes at 4."),
+        )
+      )?.disposition,
+    ).toBe("accepted");
+    await harness.drain();
+    const temporaryFact = harness.inbound(
+      "group",
+      "temporary-school-code",
+      "Remember that the school gate code is 2468.",
+    );
+    expect((await harness.florence.acceptInbound(temporaryFact))?.disposition).toBe("accepted");
+    await harness.drain();
+    expect(
+      (await harness.florence.workspaceForAdult(ADULT_ONE)).vault?.facts.some((fact) =>
+        fact.statement.includes("gate code"),
+      ),
+    ).toBe(true);
+    expect(
+      (
+        await harness.florence.acceptInbound(
+          harness.inbound("group", "forget-temporary-school-code", "Actually, don’t retain that."),
+        )
+      )?.disposition,
+    ).toBe("accepted");
+    await harness.drain();
+    expect(
+      (await harness.florence.workspaceForAdult(ADULT_ONE)).vault?.facts.some((fact) =>
+        fact.statement.includes("gate code"),
+      ),
+    ).toBe(false);
+    expect(
+      (await harness.florence.workspaceForAdult(ADULT_ONE)).vault?.facts.some((fact) =>
+        fact.statement.includes("office closes at 4"),
+      ),
+    ).toBe(true);
+    expect(harness.linq.messages.map((message) => message.text)).not.toContain(
+      "I’ll keep it with the school logistics.",
+    );
+
+    expect(await harness.receiveReaction("family-love", groupReplyProviderId, "love")).toEqual({
       disposition: "accepted",
       sourceId: inboundSourceId("event-family-love"),
     });
     await harness.drain();
-    expect(await harness.receiveReaction("family-love", "sent-1", "love")).toEqual({
+    expect(await harness.receiveReaction("family-love", groupReplyProviderId, "love")).toEqual({
       disposition: "duplicate",
       sourceId: inboundSourceId("event-family-love"),
     });
-    expect(await harness.receiveReaction("not-florence", "message-group-packet", "love")).toEqual({
+    expect(await harness.receiveReaction("not-florence", "message-group-start", "love")).toEqual({
       disposition: "rejected",
       reason: "authority_not_found",
     });
-    expect(await harness.receiveReaction("family-like", "sent-1", "like")).toEqual({
+    expect(await harness.receiveReaction("family-like", groupReplyProviderId, "like")).toEqual({
       disposition: "accepted",
       sourceId: inboundSourceId("event-family-like"),
     });
     await harness.drain();
 
-    harness.now += 500;
+    const pickupMessage = harness.inbound(
+      "group",
+      "group-pickup",
+      "Pickup is at 2:45; please remind both of us about pickup.",
+    );
+    expect((await harness.florence.acceptInbound(pickupMessage))?.disposition).toBe("accepted");
     await harness.drain();
     harness.now += 60_000;
     await harness.drain();
@@ -195,7 +436,7 @@ release("Florence release journeys", () => {
       expect.arrayContaining([expect.objectContaining({ statement: "School dismissal is at 3:00" })]),
     );
 
-    await harness.acceptPrivate("calendar-offer", "Could you add the school assembly?");
+    await harness.acceptPrivate("calendar-offer", "Could you add the school assembly to my calendar?");
     await harness.drain();
     await harness.acceptPrivate("calendar-approval", "Yes, add it");
     await harness.drain();
@@ -205,32 +446,29 @@ release("Florence release journeys", () => {
     expect(pdfWasRead).toBe(true);
     expect(reactionWasUnderstood).toBe(true);
     expect(calendarWasRead).toBe(true);
-    expect(harness.googleReads).toBe(1);
+    expect(obsoleteResultWasSuppressed).toBe(true);
+    expect(harness.googleReads).toBe(3);
     expect(workspace.vault?.facts).not.toEqual(
       expect.arrayContaining([expect.objectContaining({ statement: "A tapback changed family memory" })]),
     );
     expect(harness.googleEffects).toBe(1);
     expect(harness.linq.reactions).toHaveLength(2);
     expect(harness.linq.reactions[1]).toMatchObject({
-      targetProviderMessageId: "sent-1",
+      targetProviderMessageId: groupReplyProviderId,
       reaction: "laugh",
     });
     expect(harness.linq.messages.map((message) => message.text)).toEqual(
       expect.arrayContaining([
-        "Got it — 2:45 dismissal.",
-        "I’ll remind both of you before pickup.",
+        "I’ll remind both of you.",
         "That made me smile.",
         "Pickup reminder: dismissal is at 2:45.",
         "Added “School assembly” to your calendar.",
       ]),
     );
-    expect(harness.linq.messages.find((message) => message.text.startsWith("Got it"))?.replyTo).toEqual({
-      providerMessageId: "message-group-packet",
-    });
     expect(harness.linq.messages.find((message) => message.text === "That made me smile.")?.replyTo).toEqual({
-      providerMessageId: "sent-1",
+      providerMessageId: groupReplyProviderId,
     });
-  });
+  }, 20_000);
 
   test("keeps private memory and corrections private, shares only group corrections, understands replies, and rejects mismatched group authority", async () => {
     let understoodReply = false;
@@ -395,6 +633,7 @@ release("Florence release journeys", () => {
           }),
         ).toMatchObject({ status: "complete", events: [] });
         return decision({
+          bubbles: [{ text: "Done — I added it.", delayMs: 0 }],
           calendar: {
             ...calendarDraft("direct", input.currentMessage.sourceId),
           },
@@ -409,10 +648,40 @@ release("Florence release journeys", () => {
     );
     await harness.onboard();
     await harness.activateGoogle();
+    const attachmentSourceId = inboundSourceId("event-calendar-attachment-request");
+    const attachedEvent = harness.vault.sealPdf({
+      documentId: "77777777-7777-4777-8777-777777777777",
+      householdId: (await harness.store.listHouseholdIdsForAdult(ADULT_ONE))[0] ?? "missing",
+      signalId: attachmentSourceId,
+      filename: "assembly.pdf",
+      declaredMimeType: "application/pdf",
+      bytes: new TextEncoder().encode("%PDF-1.7\nSchool assembly details\n%%EOF\n"),
+      discardAfter: new Date(harness.now + 120_000).toISOString(),
+    });
+    expect(
+      (
+        await harness.florence.acceptInbound(
+          harness.inbound(
+            "private",
+            "calendar-attachment-request",
+            "Add the school assembly in this PDF to my calendar.",
+            { documents: [{ ...attachedEvent, externalKey: "linq-calendar-attachment" }] },
+          ),
+        )
+      )?.disposition,
+    ).toBe("accepted");
+    await harness.drain();
+    expect(harness.googleAttempts).toBe(0);
+    await harness.acceptPrivate("calendar-unrequested", "Review the school assembly details.");
+    await harness.drain();
+    expect(harness.googleAttempts).toBe(0);
+    expect(
+      harness.linq.messages.some((message) => message.text.startsWith("I can add this to your calendar:")),
+    ).toBe(true);
     const inbound = harness.inbound(
       "private",
       "calendar-direct",
-      "Add the school assembly exactly as written",
+      "Add the school assembly to my calendar exactly as written",
     );
     expect((await harness.florence.acceptInbound(inbound))?.disposition).toBe("accepted");
     await harness.drain();
@@ -423,17 +692,18 @@ release("Florence release journeys", () => {
     await harness.drain();
     expect(harness.googleAttempts).toBe(2);
     expect(harness.googleEffects).toBe(1);
+    expect(harness.linq.messages.map((message) => message.text)).not.toContain("Done — I added it.");
     expect(
       harness.linq.messages.filter((message) => message.text === "Added “School assembly” to your calendar."),
     ).toHaveLength(1);
 
     await harness.acceptPrivate(
       "calendar-definitive-failure",
-      "Add the school assembly exactly as written again",
+      "Add the school assembly to my calendar exactly as written again",
     );
     await harness.drain();
     expect(harness.googleAttempts).toBe(3);
-    expect(harness.googleReads).toBe(2);
+    expect(harness.googleReads).toBe(4);
     const failures = harness.linq.messages.filter((message) =>
       message.text.startsWith("I couldn’t confirm that “School assembly”"),
     );
@@ -447,6 +717,29 @@ release("Florence release journeys", () => {
         message.text.startsWith("I couldn’t confirm that “School assembly”"),
       ),
     ).toHaveLength(1);
+
+    const cancelledInbound = await harness.store.acceptInbound(
+      harness.inbound("private", "calendar-cancel-before-claim", "Add the school assembly to my calendar."),
+    );
+    const cancelledAction = storedCalendarAction(cancelledInbound?.sourceId ?? "missing");
+    const cancellationInput = harness.inbound(
+      "private",
+      "calendar-never-mind",
+      "Actually, don’t add that yet.",
+    );
+    harness.now += 30_000;
+    await harness.store.commitTurn({
+      sourceId: cancelledInbound?.sourceId ?? "missing",
+      calendarActions: [cancelledAction],
+      handledAt: harness.iso(),
+    });
+    const cancellation = await harness.store.acceptInbound(cancellationInput);
+    expect(cancellation?.disposition).toBe("accepted");
+    expect(await harness.store.readNextCalendarAction(harness.iso())).toBeNull();
+    await harness.store.commitTurn({
+      sourceId: cancellation?.sourceId ?? "missing",
+      handledAt: harness.iso(),
+    });
 
     const claimInbound = await harness.store.acceptInbound(
       harness.inbound("private", "calendar-claim", "Add one more assembly"),
@@ -591,6 +884,7 @@ class Harness {
     key: string,
     targetProviderMessageId: string,
     reaction: "love" | "like" | "dislike" | "laugh" | "emphasize" | "question",
+    audience: "private" | "group" = "group",
   ) {
     const providerEventId = `event-${key}`;
     const timestamp = Math.floor(this.now / 1_000).toString();
@@ -604,7 +898,7 @@ class Harness {
         trace_id: `trace-${key}`,
         partner_id: LINQ_PARTNER,
         data: {
-          chat_id: GROUP,
+          chat_id: audience === "group" ? GROUP : PRIVATE_ONE,
           message_id: targetProviderMessageId,
           part_index: 0,
           reaction_type: reaction,
@@ -713,11 +1007,16 @@ async function freshHarness(
       householdId: string;
       ownerAdultId: string;
       connectionId: string;
+      timeMin: string;
+      timeMax: string;
     }) => {
       harness.googleReads += 1;
       const credential = await store.readActiveGoogleCredential(input);
       return credential
-        ? { status: "complete" as const, events: [] }
+        ? {
+            status: "complete" as const,
+            events: input.timeMin === TRIP_WINDOW.timeMin ? [PICKUP_CONFLICT] : [],
+          }
         : { status: "unavailable" as const, events: [] };
     },
     executeCalendar: async () => {
@@ -768,6 +1067,22 @@ function decision(
     followUp: input.followUp ?? null,
     calendar: input.calendar ?? null,
   };
+}
+
+async function waitForAbort(signal?: AbortSignal): Promise<never> {
+  if (!signal) throw new Error("The reasoner was not given an abort signal");
+  if (signal.aborted) throw signal.reason;
+  return new Promise((_, reject) => {
+    signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+  });
+}
+
+async function eventually(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error(`Condition was not met within ${timeoutMs}ms`);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
 }
 
 function committedCalendar(occurredAt: string) {

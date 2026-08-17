@@ -19,7 +19,7 @@
     "smoke:production": "node apps/api/dist/smoke-production.js",
     "start": "node apps/api/dist/server.js",
     "test": "pnpm -r --if-present test",
-    "typecheck": "pnpm -r --if-present typecheck"
+    "typecheck": "pnpm -r --filter './packages/**' build && pnpm -r --if-present typecheck"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.7",

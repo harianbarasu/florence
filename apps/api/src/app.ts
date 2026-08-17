@@ -5,12 +5,13 @@ import helmet from "@fastify/helmet";
 import fastifyStatic from "@fastify/static";
 import { decodeImageVaultKey, EncryptedImageVault, ImageVaultError } from "@florence/artifacts";
 import {
+  completeFamilyOnboardingInputSchema,
   disconnectGoogleConnectionInputSchema,
   familyMemberInputSchema,
   idSchema,
   patchFactInputSchema,
   preferencesInputSchema,
-  putHouseholdInputSchema,
+  setupSessionInputSchema,
 } from "@florence/contracts";
 import { FlorenceStoreConflict, FlorenceStoreUnauthorized, PostgresFlorenceStore } from "@florence/database";
 import { GoogleConnection, GoogleConnectionError } from "@florence/google";
@@ -25,9 +26,8 @@ import { createFlorenceReasonerFromEnv } from "./reasoner.js";
 export type AdultCaller = { adultId: string };
 
 export interface CallerResolver {
-  readonly participatingAdultIds: readonly string[];
   resolve(request: FastifyRequest): Promise<AdultCaller | null>;
-  issueSession?(credential: string): Promise<{ caller: AdultCaller; token: string } | null>;
+  issueSession(adultId: string): { caller: AdultCaller; token: string };
 }
 
 export type AppDependencies = {
@@ -44,17 +44,10 @@ export type AppOptions = {
 };
 
 const defaultFrontendRoot = fileURLToPath(new URL("../../web/dist", import.meta.url));
-const pilotSessionCookie = "florence_pilot_session";
-const pilotSessionLifetimeSeconds = 7 * 24 * 60 * 60;
+const sessionCookieName = "florence_session";
+const sessionLifetimeSeconds = 7 * 24 * 60 * 60;
 const memberParamsSchema = z.object({ memberId: idSchema }).strict();
-const adultParamsSchema = z.object({ adultId: idSchema }).strict();
 const factParamsSchema = z.object({ factId: idSchema }).strict();
-
-type PilotCredential = {
-  token: string;
-  adultId: string;
-  sessionSubject: string;
-};
 
 export function createDefaultDependencies(env: NodeJS.ProcessEnv = process.env): AppDependencies {
   const databaseUrl = requiredEnv(env, "FLORENCE_DATABASE_URL");
@@ -67,6 +60,7 @@ export function createDefaultDependencies(env: NodeJS.ProcessEnv = process.env):
     encryptionKey: decodeImageVaultKey(requiredEnv(env, "FLORENCE_IMAGE_VAULT_KEY")),
   });
   const google = createDefaultGoogleConnection(env, store);
+  const setupOrigin = google ? new URL(requiredEnv(env, "GOOGLE_OAUTH_REDIRECT_URI")).origin : null;
   const florence = new Florence({
     store,
     linq,
@@ -75,6 +69,7 @@ export function createDefaultDependencies(env: NodeJS.ProcessEnv = process.env):
     enrollmentCodes,
     imageVault,
     messagesUrl: env.FLORENCE_MESSAGES_URL ?? null,
+    setupOrigin,
   });
   const linqIngress = createLinqIngress({
     signingSecret: requiredEnv(env, "LINQ_WEBHOOK_SECRET"),
@@ -82,13 +77,12 @@ export function createDefaultDependencies(env: NodeJS.ProcessEnv = process.env):
     linq,
     imageVault,
     florence,
-    enrollmentCodes,
   });
   florence.start();
   return {
     florence,
     linqIngress,
-    callerResolver: createPilotCallerResolver(env),
+    callerResolver: createSessionCallerResolver(env),
     ready: () => store.ready(),
     close: async () => {
       florence.stop();
@@ -97,45 +91,20 @@ export function createDefaultDependencies(env: NodeJS.ProcessEnv = process.env):
   };
 }
 
-export function createPilotCallerResolver(env: NodeJS.ProcessEnv = process.env): CallerResolver {
-  const encodedCredentials = env.FLORENCE_PILOT_CREDENTIALS;
-  const encodedSessionSecret = env.FLORENCE_SESSION_SECRET;
-  if (Boolean(encodedCredentials) !== Boolean(encodedSessionSecret)) {
-    throw new Error("FLORENCE_PILOT_CREDENTIALS and FLORENCE_SESSION_SECRET must be configured together");
-  }
-  if (!encodedCredentials || !encodedSessionSecret) {
-    return {
-      participatingAdultIds: [],
-      async resolve() {
-        return null;
-      },
-    };
-  }
+export function createSessionCallerResolver(env: NodeJS.ProcessEnv = process.env): CallerResolver {
+  const encodedSessionSecret = requiredEnv(env, "FLORENCE_SESSION_SECRET");
   if (Buffer.byteLength(encodedSessionSecret) < 32) {
     throw new Error("FLORENCE_SESSION_SECRET must contain at least 32 bytes");
   }
   const sessionSecret = Buffer.from(encodedSessionSecret);
-  const credentials = parsePilotCredentials(encodedCredentials).map((credential) => ({
-    ...credential,
-    sessionSubject: sessionSubject(credential.adultId, sessionSecret),
-  }));
   return {
-    participatingAdultIds: credentials.map((credential) => credential.adultId),
     async resolve(request) {
-      const accessToken = bearerToken(request);
-      const credential = accessToken
-        ? findPilotCredential(credentials, accessToken)
-        : verifySession(cookieValue(request, pilotSessionCookie), credentials, sessionSecret);
-      return credential ? { adultId: credential.adultId } : null;
+      const adultId = verifySession(cookieValue(request, sessionCookieName), sessionSecret);
+      return adultId ? { adultId } : null;
     },
-    async issueSession(accessToken) {
-      const credential = findPilotCredential(credentials, accessToken);
-      return credential
-        ? {
-            caller: { adultId: credential.adultId },
-            token: issueSessionToken(credential.sessionSubject, sessionSecret),
-          }
-        : null;
+    issueSession(adultId) {
+      if (!idSchema.safeParse(adultId).success) throw new Error("Session adult ID must be a UUID");
+      return { caller: { adultId }, token: issueSessionToken(adultId, sessionSecret) };
     },
   };
 }
@@ -180,10 +149,15 @@ export async function buildApp(
   });
 
   app.post("/api/v1/session", async (request, reply) => {
-    const credential = bearerToken(request);
-    if (!credential) return reply.status(400).send({ error: "pilot_access_code_required" });
-    const session = await dependencies.callerResolver.issueSession?.(credential);
-    if (!session) return reply.status(401).send({ error: "unauthorized" });
+    reply.header("Cache-Control", "no-store");
+    const body = setupSessionInputSchema.safeParse(request.body);
+    if (!body.success) return invalidRequest(reply);
+    const enrollment = await dependencies.florence.redeemSetupLink(body.data).catch((error: unknown) => {
+      if (error instanceof FlorenceStoreConflict) return null;
+      throw error;
+    });
+    if (!enrollment) return reply.status(401).send({ error: "invalid_or_expired_setup_link" });
+    const session = dependencies.callerResolver.issueSession(enrollment.adultId);
     reply.header("Set-Cookie", sessionCookie(session.token, process.env.NODE_ENV === "production"));
     return { adultId: session.caller.adultId };
   });
@@ -201,9 +175,11 @@ export async function buildApp(
   app.put("/api/v1/vault/household", async (request, reply) => {
     const caller = await requireAdult(request, reply, dependencies.callerResolver);
     if (!caller) return;
-    const input = putHouseholdInputSchema.safeParse(request.body);
+    const input = completeFamilyOnboardingInputSchema.safeParse(request.body);
     if (!input.success) return invalidRequest(reply);
-    return { workspace: await dependencies.florence.putHousehold(caller.adultId, input.data) };
+    return {
+      workspace: await dependencies.florence.completeFamilyOnboarding(caller.adultId, input.data),
+    };
   });
 
   app.put("/api/v1/vault/members/:memberId", async (request, reply) => {
@@ -212,33 +188,9 @@ export async function buildApp(
     const params = memberParamsSchema.safeParse(request.params);
     const body = familyMemberInputSchema.safeParse(request.body);
     if (!params.success || !body.success) return invalidRequest(reply);
-    let memberId = params.data.memberId;
-    if (body.data.kind === "adult") {
-      const workspace = await dependencies.florence.workspaceForAdult(caller.adultId);
-      const adults = workspace.vault?.members.filter((member) => member.kind === "adult") ?? [];
-      const existing = adults.find((member) => member.id === memberId);
-      if (!existing) {
-        const available = dependencies.callerResolver.participatingAdultIds.filter(
-          (adultId) => !adults.some((adult) => adult.id === adultId),
-        );
-        if (available.length !== 1) {
-          return reply.status(409).send({ error: "participating_adult_identity_unavailable" });
-        }
-        memberId = available[0] as string;
-      }
-    }
     return {
-      workspace: await dependencies.florence.putMember(caller.adultId, memberId, body.data),
+      workspace: await dependencies.florence.putMember(caller.adultId, params.data.memberId, body.data),
     };
-  });
-
-  app.post("/api/v1/vault/adults/:adultId/messages-invite", async (request, reply) => {
-    const caller = await requireAdult(request, reply, dependencies.callerResolver);
-    if (!caller) return;
-    const params = adultParamsSchema.safeParse(request.params);
-    if (!params.success) return invalidRequest(reply);
-    reply.header("Cache-Control", "no-store");
-    return dependencies.florence.issueMessagesInvite(caller.adultId, params.data.adultId);
   });
 
   app.patch("/api/v1/vault/facts/:factId", async (request, reply) => {
@@ -303,14 +255,12 @@ export async function buildApp(
         return reply.redirect("/?google=authorization_cancelled");
       }
       try {
-        const connection = await dependencies.florence.finishGoogle({
+        await dependencies.florence.finishGoogle({
+          adultId: caller.adultId,
           state: request.query.state,
           code: request.query.code,
           sessionBindingDigest,
         });
-        if (connection.ownerAdultId !== caller.adultId) {
-          throw new GoogleConnectionError("Google connection owner changed", "invalid_state");
-        }
         return reply.redirect("/?google=connected");
       } catch (error) {
         if (error instanceof GoogleConnectionError) {
@@ -405,10 +355,6 @@ function requiredEnv(env: NodeJS.ProcessEnv, name: string): string {
   return value;
 }
 
-function bearerToken(request: FastifyRequest): string | null {
-  return /^Bearer (.+)$/i.exec(request.headers.authorization ?? "")?.[1] ?? null;
-}
-
 function cookieValue(request: FastifyRequest, name: string): string | null {
   for (const part of (request.headers.cookie ?? "").split(";")) {
     const separator = part.indexOf("=");
@@ -423,93 +369,48 @@ function cookieValue(request: FastifyRequest, name: string): string | null {
 }
 
 function googleSessionBinding(request: FastifyRequest): string | null {
-  const session = cookieValue(request, pilotSessionCookie);
+  const session = cookieValue(request, sessionCookieName);
   return session ? createHash("sha256").update(`florence-google-session-v1\0${session}`).digest("hex") : null;
 }
 
-function parsePilotCredentials(encoded: string): Omit<PilotCredential, "sessionSubject">[] {
-  let decoded: unknown;
-  try {
-    decoded = JSON.parse(encoded);
-  } catch {
-    throw new Error("FLORENCE_PILOT_CREDENTIALS must be valid JSON");
-  }
-  if (!Array.isArray(decoded) || decoded.length !== 2) {
-    throw new Error("FLORENCE_PILOT_CREDENTIALS must contain exactly two adult credentials");
-  }
-  const credentials = decoded.map((value) => {
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
-      throw new Error("Each pilot credential must be an object");
-    }
-    const record = value as Record<string, unknown>;
-    if (
-      Object.keys(record).some((key) => !["token", "adultId"].includes(key)) ||
-      typeof record.token !== "string" ||
-      typeof record.adultId !== "string"
-    ) {
-      throw new Error("Each pilot credential must contain only token and adultId");
-    }
-    if (Buffer.byteLength(record.token) < 32 || !/^[\x21-\x7e]+$/.test(record.token)) {
-      throw new Error("Each pilot token must be a printable secret containing at least 32 bytes");
-    }
-    if (!idSchema.safeParse(record.adultId).success) {
-      throw new Error("Each pilot adultId must be a UUID");
-    }
-    return { token: record.token, adultId: record.adultId };
-  });
-  if (new Set(credentials.map(({ token }) => token)).size !== 2) {
-    throw new Error("Pilot tokens must be distinct");
-  }
-  if (new Set(credentials.map(({ adultId }) => adultId)).size !== 2) {
-    throw new Error("Pilot adultIds must be distinct");
-  }
-  return credentials;
+function issueSessionToken(adultId: string, secret: Buffer): string {
+  const expiresAt = Math.floor(Date.now() / 1_000) + sessionLifetimeSeconds;
+  const unsigned = `v2.${adultId}.${expiresAt}`;
+  const signature = createHmac("sha256", secret)
+    .update(`florence-browser-session-v2\0${unsigned}`)
+    .digest("base64url");
+  return `${unsigned}.${signature}`;
 }
 
-function findPilotCredential(credentials: readonly PilotCredential[], token: string): PilotCredential | null {
-  return credentials.find((credential) => safeTokenEqual(token, credential.token)) ?? null;
-}
-
-function sessionSubject(adultId: string, secret: Buffer): string {
-  return createHmac("sha256", secret).update(`florence-pilot-adult\0${adultId}`).digest("base64url");
-}
-
-function issueSessionToken(subject: string, secret: Buffer): string {
-  const expiresAt = Math.floor(Date.now() / 1_000) + pilotSessionLifetimeSeconds;
-  const unsigned = `v1.${subject}.${expiresAt}`;
-  return `${unsigned}.${createHmac("sha256", secret).update(unsigned).digest("base64url")}`;
-}
-
-function verifySession(
-  token: string | null,
-  credentials: readonly PilotCredential[],
-  secret: Buffer,
-): PilotCredential | null {
+function verifySession(token: string | null, secret: Buffer): string | null {
   if (!token) return null;
-  const [version, subject, encodedExpiry, signature, extra] = token.split(".");
-  if (version !== "v1" || !subject || !encodedExpiry || !signature || extra) return null;
-  const unsigned = `${version}.${subject}.${encodedExpiry}`;
-  const expected = createHmac("sha256", secret).update(unsigned).digest("base64url");
+  const [version, adultId, encodedExpiry, signature, extra] = token.split(".");
+  if (version !== "v2" || !adultId || !encodedExpiry || !signature || extra) return null;
+  if (!idSchema.safeParse(adultId).success) return null;
+  const unsigned = `${version}.${adultId}.${encodedExpiry}`;
+  const expected = createHmac("sha256", secret)
+    .update(`florence-browser-session-v2\0${unsigned}`)
+    .digest("base64url");
   if (!safeTokenEqual(signature, expected) || !/^\d+$/.test(encodedExpiry)) return null;
   const expiresAt = Number(encodedExpiry);
   if (!Number.isSafeInteger(expiresAt) || expiresAt <= Math.floor(Date.now() / 1_000)) return null;
-  return credentials.find((credential) => safeTokenEqual(subject, credential.sessionSubject)) ?? null;
+  return adultId;
 }
 
 function sessionCookie(sessionToken: string, secure: boolean): string {
   return [
-    `${pilotSessionCookie}=${encodeURIComponent(sessionToken)}`,
+    `${sessionCookieName}=${encodeURIComponent(sessionToken)}`,
     "HttpOnly",
     "SameSite=Lax",
     "Path=/",
-    `Max-Age=${pilotSessionLifetimeSeconds}`,
+    `Max-Age=${sessionLifetimeSeconds}`,
     ...(secure ? ["Secure"] : []),
   ].join("; ");
 }
 
 function expiredSessionCookie(secure: boolean): string {
   return [
-    `${pilotSessionCookie}=`,
+    `${sessionCookieName}=`,
     "HttpOnly",
     "SameSite=Lax",
     "Path=/",

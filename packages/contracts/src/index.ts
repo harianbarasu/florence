@@ -151,7 +151,7 @@ export type GoogleConnectionSummary = z.infer<typeof googleConnectionSummarySche
 
 export const setupChecklistSchema = z
   .object({
-    householdCreated: z.boolean(),
+    onboardingComplete: z.boolean(),
     secondAdultAdded: z.boolean(),
     bothAdultsMessagesConnected: z.boolean(),
     familyGroupConnected: z.boolean(),
@@ -168,7 +168,6 @@ export const preferencesViewSchema = preferencesInputSchema;
 
 export const householdVaultSchema = z
   .object({
-    name: nonempty(160),
     timeZone: nonempty(100),
     members: z.array(familyMemberProfileSchema).max(100),
     contacts: z.array(vaultContactSchema).max(100),
@@ -198,14 +197,54 @@ export const workspaceViewSchema = z
   .strict();
 export type WorkspaceView = z.infer<typeof workspaceViewSchema>;
 
-export const putHouseholdInputSchema = z
+const familyOnboardingAdultSchema = z
   .object({
-    name: nonempty(160),
-    timeZone: nonempty(100),
-    foundingAdultDisplayName: nonempty(160),
+    id: idSchema,
+    displayName: nonempty(160),
   })
   .strict();
-export type PutHouseholdInput = z.infer<typeof putHouseholdInputSchema>;
+
+const familyOnboardingChildSchema = familyOnboardingAdultSchema
+  .extend({
+    school: nonempty(300).optional(),
+    activities: z.array(nonempty(300)).max(50).optional(),
+  })
+  .strict();
+
+export const completeFamilyOnboardingInputSchema = z
+  .object({
+    partner: familyOnboardingAdultSchema.optional(),
+    children: z.array(familyOnboardingChildSchema).min(1).max(20),
+  })
+  .strict()
+  .superRefine((input, context) => {
+    const ids = [...(input.partner ? [input.partner.id] : []), ...input.children.map((child) => child.id)];
+    if (new Set(ids).size !== ids.length) {
+      context.addIssue({
+        code: "custom",
+        path: ["children"],
+        message: "Every family member must have a distinct ID.",
+      });
+    }
+  });
+export type CompleteFamilyOnboardingInput = z.infer<typeof completeFamilyOnboardingInputSchema>;
+
+export const setupSessionInputSchema = z
+  .object({
+    setupToken: nonempty(2_000),
+    profile: z
+      .object({
+        displayName: nonempty(160),
+        timeZone: nonempty(100),
+        guardianAttested: z.literal(true),
+      })
+      .strict(),
+  })
+  .strict();
+export type SetupSessionInput = z.infer<typeof setupSessionInputSchema>;
+
+export const sessionResponseSchema = z.object({ adultId: idSchema }).strict();
+export type SessionResponse = z.infer<typeof sessionResponseSchema>;
 
 export const patchFactInputSchema = z.object({ statement: nonempty(4_000) }).strict();
 export type PatchFactInput = z.infer<typeof patchFactInputSchema>;
@@ -214,21 +253,5 @@ export const disconnectGoogleConnectionInputSchema = z.object({ connectionId: id
 export type DisconnectGoogleConnectionInput = z.infer<typeof disconnectGoogleConnectionInputSchema>;
 
 export const workspaceResponseSchema = z.object({ workspace: workspaceViewSchema }).strict();
-
-export const messagesInviteSchema = z
-  .object({
-    code: nonempty(1_000),
-    expiresAt: timestampSchema,
-  })
-  .strict();
-export type MessagesInvite = z.infer<typeof messagesInviteSchema>;
-
-export const messagesInviteResponseSchema = z
-  .object({
-    invite: messagesInviteSchema,
-    workspace: workspaceViewSchema,
-  })
-  .strict();
-export type MessagesInviteResponse = z.infer<typeof messagesInviteResponseSchema>;
 
 export const googleStartResponseSchema = z.object({ authorizationUrl: z.url() }).strict();

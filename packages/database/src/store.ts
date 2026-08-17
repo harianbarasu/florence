@@ -132,11 +132,31 @@ export type HouseholdRecord = {
   googleConnections: readonly GoogleConnectionView[];
 };
 
-export type CreateHouseholdInput = {
+export type CompleteFounderOnboardingInput = {
+  setupTokenDigest: string;
+  setupExpiresAt: string;
   householdId: string;
-  name: string;
   timeZone: string;
-  founder: { adultId: string; displayName: string; profile?: JsonObject };
+  adultId: string;
+  displayName: string;
+  identitySubjectDigest: string;
+  consentVersion: string;
+  consentedAt: string;
+  guardianAttestedAt: string;
+  providerConversationId: string;
+  occurredAt: string;
+};
+
+export type CompleteFamilyOnboardingInput = {
+  householdId: string;
+  founderAdultId: string;
+  partner?: { id: string; displayName: string };
+  children: readonly {
+    id: string;
+    displayName: string;
+    school?: string;
+    activities?: readonly string[];
+  }[];
   occurredAt: string;
 };
 
@@ -513,6 +533,13 @@ export class PostgresFlorenceStore {
     return rows.map((row) => row.household_id);
   }
 
+  async hasPilotHousehold(): Promise<boolean> {
+    const [row] = await this.#sql<{ exists: boolean }[]>`
+      select exists(select 1 from households limit 1) as exists
+    `;
+    return row?.exists === true;
+  }
+
   async readHousehold(input: {
     householdId: string;
     viewerAdultId?: string;
@@ -560,45 +587,271 @@ export class PostgresFlorenceStore {
     };
   }
 
-  async createHousehold(input: CreateHouseholdInput): Promise<HouseholdRecord> {
+  async completeFounderOnboarding(
+    input: CompleteFounderOnboardingInput,
+  ): Promise<MessagesEnrollmentResult | null> {
+    assertDigest(input.setupTokenDigest, "Founder setup token");
+    assertDigest(input.identitySubjectDigest, "Messages identity");
+    const setupExpiresAt = instant(input.setupExpiresAt);
+    const consentedAt = instant(input.consentedAt);
+    const guardianAttestedAt = instant(input.guardianAttestedAt);
     const occurredAt = instant(input.occurredAt);
-    await this.#sql.begin(async (sql) => {
-      const [existing] = await sql<{ id: string }[]>`select id from households limit 1 for update`;
-      if (existing) {
-        if (existing.id !== input.householdId)
-          throw new FlorenceStoreConflict("The pilot household already exists");
-        const [founder] = await sql<{ id: string }[]>`
-          select id from people where household_id=${input.householdId}
-            and id=${input.founder.adultId} and kind='adult' and status='verified'
+    if (setupExpiresAt <= occurredAt) return null;
+    const timeZone = required(input.timeZone, "Household time zone");
+    const displayName = required(input.displayName, "Founder display name");
+    const consentVersion = required(input.consentVersion, "Messages consent version");
+    const providerConversationId = required(input.providerConversationId, "Linq conversation ID");
+
+    return this.#sql.begin(async (sql) => {
+      await sql`select pg_advisory_xact_lock(hashtext('florence-founder-onboarding'))`;
+      const [replay] = await sql<
+        {
+          id: string;
+          household_id: string;
+          kind: "adult" | "child";
+          role: "steward" | "caregiver" | "dependent";
+          adult_slot: 1 | 2 | null;
+          display_name: string;
+          status: "planned" | "verified" | "represented";
+          identity_subject_digest: string | null;
+          consent_version: string | null;
+          consented_at: Date | null;
+          guardian_attested_at: Date | null;
+          invitation_expires_at: Date | null;
+          invitation_consumed_at: Date | null;
+          household_name: string;
+          time_zone: string;
+        }[]
+      >`
+        select p.id,p.household_id,p.kind,p.role,p.adult_slot,p.display_name,p.status,
+               p.identity_subject_digest,p.consent_version,p.consented_at,p.guardian_attested_at,
+               p.invitation_expires_at,p.invitation_consumed_at,
+               h.name as household_name,h.time_zone
+        from people p join households h on h.id=p.household_id
+        where p.invitation_digest=${input.setupTokenDigest}
+        for update of p
+      `;
+      if (replay) {
+        const [channel] = await sql<ChannelRow[]>`
+          select * from linq_channels where household_id=${replay.household_id}
+            and adult_one_id=${replay.id} and audience='private' and revoked_at is null
+          limit 1
         `;
-        if (!founder) throw new FlorenceStoreUnauthorized();
-        await sql`
-          update households set name=${required(input.name, "Household name")},
-            time_zone=${required(input.timeZone, "Household time zone")},updated_at=${occurredAt}
-          where id=${input.householdId}
-        `;
-        await sql`
-          update people set display_name=${required(input.founder.displayName, "Founder display name")},
-            updated_at=${occurredAt}
-          where id=${input.founder.adultId}
-        `;
-        return;
+        const recoveryAgeMs = replay.invitation_consumed_at
+          ? occurredAt.getTime() - replay.invitation_consumed_at.getTime()
+          : Number.POSITIVE_INFINITY;
+        if (
+          replay.id !== input.adultId ||
+          replay.household_id !== input.householdId ||
+          replay.kind !== "adult" ||
+          replay.role !== "steward" ||
+          replay.adult_slot !== 1 ||
+          replay.status !== "verified" ||
+          replay.display_name !== displayName ||
+          replay.household_name !== "Family" ||
+          replay.time_zone !== timeZone ||
+          replay.identity_subject_digest !== input.identitySubjectDigest ||
+          replay.consent_version !== consentVersion ||
+          replay.consented_at === null ||
+          replay.guardian_attested_at === null ||
+          replay.invitation_expires_at?.getTime() !== setupExpiresAt.getTime() ||
+          replay.invitation_consumed_at === null ||
+          recoveryAgeMs < 0 ||
+          recoveryAgeMs > 60_000 ||
+          channel?.provider_conversation_id !== providerConversationId ||
+          channel.identity_one_digest !== input.identitySubjectDigest
+        ) {
+          return null;
+        }
+        return {
+          disposition: "duplicate" as const,
+          householdId: replay.household_id,
+          adultId: replay.id,
+          channel: channelRecord(channel),
+        };
       }
+
+      const [household] = await sql<{ id: string }[]>`select id from households limit 1 for update`;
+      if (household) throw new FlorenceStoreConflict("The pilot household already exists");
+      const [identityOwner] = await sql<{ id: string }[]>`
+        select id from people where identity_subject_digest=${input.identitySubjectDigest} limit 1
+      `;
+      if (identityOwner) return null;
+      const [conversation] = await sql<{ id: string }[]>`
+        select id from linq_channels where provider_conversation_id=${providerConversationId}
+          and revoked_at is null limit 1
+      `;
+      if (conversation) return null;
+
       await sql`
         insert into households (id,name,time_zone,created_at,updated_at)
-        values (${input.householdId},${required(input.name, "Household name")},
-          ${required(input.timeZone, "Household time zone")},${occurredAt},${occurredAt})
+        values (${input.householdId},'Family',${timeZone},${occurredAt},${occurredAt})
       `;
       await sql`
-        insert into people (id,household_id,kind,role,adult_slot,display_name,status,profile,created_at,updated_at)
-        values (${input.founder.adultId},${input.householdId},'adult','steward',1,
-          ${required(input.founder.displayName, "Founder display name")},'verified',
-          ${sql.json(input.founder.profile ?? {})},${occurredAt},${occurredAt})
+        insert into people (
+          id,household_id,kind,role,adult_slot,display_name,status,identity_subject_digest,
+          consent_version,consented_at,guardian_attested_at,invitation_digest,
+          invitation_expires_at,invitation_consumed_at,created_at,updated_at
+        ) values (${input.adultId},${input.householdId},'adult','steward',1,${displayName},'verified',
+          ${input.identitySubjectDigest},${consentVersion},${consentedAt},${guardianAttestedAt},
+          ${input.setupTokenDigest},${setupExpiresAt},${occurredAt},${occurredAt},${occurredAt})
+      `;
+      const authorityDigest = digestStrings([input.adultId, input.identitySubjectDigest]);
+      const [channel] = await sql<ChannelRow[]>`
+        insert into linq_channels (
+          id,household_id,audience,provider_conversation_id,adult_one_id,identity_one_digest,
+          authority_digest,bound_at
+        ) values (${deterministicUuid(`linq-private\0${providerConversationId}`)},${input.householdId},
+          'private',${providerConversationId},${input.adultId},${input.identitySubjectDigest},
+          ${authorityDigest},${occurredAt})
+        returning *
+      `;
+      if (!channel) throw new Error("The founder's private Messages channel was not bound");
+      return {
+        disposition: "accepted" as const,
+        householdId: input.householdId,
+        adultId: input.adultId,
+        channel: channelRecord(channel),
+      };
+    });
+  }
+
+  async completeFamilyOnboarding(input: CompleteFamilyOnboardingInput): Promise<void> {
+    assertUuid(input.householdId, "Household ID");
+    assertUuid(input.founderAdultId, "Founder adult ID");
+    const occurredAt = instant(input.occurredAt);
+    const partner = input.partner
+      ? {
+          id: input.partner.id,
+          displayName: required(input.partner.displayName, "Partner display name"),
+        }
+      : null;
+    if (partner) assertUuid(partner.id, "Partner ID");
+    if (input.children.length < 1 || input.children.length > 20) {
+      throw new FlorenceStoreConflict("Family onboarding needs between one and twenty children");
+    }
+    const children = input.children.map((child, childIndex) => {
+      assertUuid(child.id, `Child ${childIndex + 1} ID`);
+      if (child.activities && child.activities.length > 50) {
+        throw new FlorenceStoreConflict("A child cannot have more than fifty activities");
+      }
+      return {
+        id: child.id,
+        displayName: required(child.displayName, `Child ${childIndex + 1} display name`),
+        ...(child.school ? { school: required(child.school, `Child ${childIndex + 1} school`) } : {}),
+        ...(child.activities
+          ? {
+              activities: child.activities.map((activity, activityIndex) =>
+                required(activity, `Child ${childIndex + 1} activity ${activityIndex + 1}`),
+              ),
+            }
+          : {}),
+      };
+    });
+    const memberIds = [...(partner ? [partner.id] : []), ...children.map((child) => child.id)];
+    if (memberIds.includes(input.founderAdultId) || new Set(memberIds).size !== memberIds.length) {
+      throw new FlorenceStoreConflict("Family onboarding member IDs must be distinct");
+    }
+
+    await this.#sql.begin(async (sql) => {
+      const [founder] = await sql<PersonRow[]>`
+        select * from people where household_id=${input.householdId} and id=${input.founderAdultId}
+          and kind='adult' and role='steward' and adult_slot=1 and status='verified'
+          and guardian_attested_at is not null
+        for update
+      `;
+      if (!founder) {
+        throw new FlorenceStoreUnauthorized(
+          "A verified, guardian-attested founder must complete family onboarding",
+        );
+      }
+      const [google] = await sql<{ id: string }[]>`
+        select id from google_connections where household_id=${input.householdId}
+          and owner_adult_id=${input.founderAdultId} and status='active'
+        order by created_at,id limit 1 for share
+      `;
+      if (!google) {
+        throw new FlorenceStoreUnauthorized("Family onboarding requires the founder's active Google account");
+      }
+
+      if (partner) {
+        const [adultTwo] = await sql<PersonRow[]>`
+          select * from people where household_id=${input.householdId} and adult_slot=2 for update
+        `;
+        if (adultTwo && adultTwo.id !== partner.id) {
+          throw new FlorenceStoreConflict("The household already has a different second adult");
+        }
+        const [existingPartner] = await sql<
+          PersonRow[]
+        >`select * from people where id=${partner.id} for update`;
+        if (existingPartner) {
+          if (
+            existingPartner.household_id !== input.householdId ||
+            existingPartner.kind !== "adult" ||
+            existingPartner.adult_slot !== 2 ||
+            existingPartner.status !== "planned" ||
+            existingPartner.identity_subject_digest !== null
+          ) {
+            throw new FlorenceStoreConflict("Family onboarding can only update a planned second adult");
+          }
+          await sql`
+            update people set display_name=${partner.displayName},role='steward',
+              profile=${sql.json({ relationship: "Parent" })},updated_at=${occurredAt}
+            where id=${partner.id}
+          `;
+        } else {
+          await sql`
+            insert into people (
+              id,household_id,kind,role,adult_slot,display_name,status,profile,created_at,updated_at
+            ) values (${partner.id},${input.householdId},'adult','steward',2,${partner.displayName},
+              'planned',${sql.json({ relationship: "Parent" })},${occurredAt},${occurredAt})
+          `;
+        }
+      }
+
+      for (const child of children) {
+        const [existing] = await sql<PersonRow[]>`select * from people where id=${child.id} for update`;
+        const profile = {
+          relationship: "Child",
+          ...(child.school ? { school: child.school } : {}),
+          ...(child.activities ? { activities: child.activities } : {}),
+        };
+        if (existing) {
+          if (
+            existing.household_id !== input.householdId ||
+            existing.kind !== "child" ||
+            existing.status !== "represented" ||
+            existing.adult_slot !== null ||
+            existing.identity_subject_digest !== null
+          ) {
+            throw new FlorenceStoreConflict("Family onboarding can only update represented children");
+          }
+          await sql`
+            update people set display_name=${child.displayName},role='dependent',
+              profile=${sql.json(profile)},updated_at=${occurredAt}
+            where id=${child.id}
+          `;
+        } else {
+          await sql`
+            insert into people (
+              id,household_id,kind,role,adult_slot,display_name,status,profile,created_at,updated_at
+            ) values (${child.id},${input.householdId},'child','dependent',null,${child.displayName},
+              'represented',${sql.json(profile)},${occurredAt},${occurredAt})
+          `;
+        }
+      }
+
+      await sql`
+        update people set
+          profile=case
+            when nullif(profile->>'onboardingCompletedAt','') is null
+              then profile || ${sql.json({ onboardingCompletedAt: occurredAt.toISOString() })}
+            else profile
+          end,
+          updated_at=${occurredAt}
+        where household_id=${input.householdId} and id=${input.founderAdultId}
       `;
     });
-    return requiredHousehold(
-      await this.readHousehold({ householdId: input.householdId, viewerAdultId: input.founder.adultId }),
-    );
   }
 
   async upsertMember(input: UpsertMemberInput): Promise<FamilyMemberRecord> {
@@ -2037,6 +2290,106 @@ export class PostgresFlorenceStore {
     `;
     if (!row) throw new FlorenceStoreConflict("Google OAuth state is no longer current");
     return googleConnectionView(row);
+  }
+
+  async stageFounderWelcome(input: {
+    householdId: string;
+    adultId: string;
+    channelId: string;
+    providerConversationId: string;
+    texts: readonly string[];
+    occurredAt: string;
+  }): Promise<readonly string[]> {
+    if (input.texts.length < 1 || input.texts.length > 3) {
+      throw new FlorenceStoreConflict("The founder welcome needs one to three message bubbles");
+    }
+    const texts = input.texts.map((text, index) => required(text, `Founder welcome bubble ${index + 1}`));
+    const providerConversationId = required(input.providerConversationId, "Linq conversation ID");
+    const occurredAt = instant(input.occurredAt);
+    const turnId = deterministicUuid(`founder-welcome-turn\0${input.householdId}\0${input.adultId}`);
+    const sourceIds = texts.map((_, index) =>
+      deterministicUuid(`founder-welcome\0${input.householdId}\0${input.adultId}\0${index}`),
+    );
+
+    return this.#sql.begin(async (sql) => {
+      const [channel] = await sql<ChannelRow[]>`
+        select c.* from linq_channels c
+        join people p on p.household_id=c.household_id and p.id=c.adult_one_id
+        where c.id=${input.channelId} and c.household_id=${input.householdId}
+          and c.audience='private' and c.adult_one_id=${input.adultId}
+          and c.provider_conversation_id=${providerConversationId}
+          and c.revoked_at is null and c.stopped_at is null
+          and p.kind='adult' and p.status='verified' and p.guardian_attested_at is not null
+          and nullif(p.profile->>'onboardingCompletedAt','') is not null
+        for update of c
+      `;
+      if (!channel) {
+        throw new FlorenceStoreUnauthorized(
+          "The founder welcome requires completed onboarding in the verified adult's private thread",
+        );
+      }
+      const [google] = await sql<{ id: string }[]>`
+        select id from google_connections where household_id=${input.householdId}
+          and owner_adult_id=${input.adultId} and status='active'
+        order by created_at,id limit 1 for share
+      `;
+      if (!google) {
+        throw new FlorenceStoreUnauthorized(
+          "The founder welcome requires the adult's active Google connection",
+        );
+      }
+
+      const existing = await sql<
+        {
+          source_id: string;
+          channel_id: string;
+          move_kind: "message" | "reply" | "reaction";
+          text: string | null;
+          reply_to_source_id: string | null;
+          turn_part: -1 | 0 | 1 | 2;
+          idempotency_key: string | null;
+        }[]
+      >`
+        select source_id,channel_id,move_kind,text,reply_to_source_id,turn_part,idempotency_key
+        from messages where turn_id=${turnId} order by turn_part for update
+      `;
+      if (existing.length > 0) {
+        if (
+          existing.length > 3 ||
+          existing.some(
+            (message, index) =>
+              message.source_id !==
+                deterministicUuid(`founder-welcome\0${input.householdId}\0${input.adultId}\0${index}`) ||
+              message.channel_id !== channel.id ||
+              message.move_kind !== "message" ||
+              message.reply_to_source_id !== null ||
+              message.turn_part !== index ||
+              message.idempotency_key !== `founder-welcome:${input.householdId}:${input.adultId}:${index}`,
+          )
+        ) {
+          throw new FlorenceStoreConflict("The founder welcome was already staged with different content");
+        }
+        return existing.map((message) => message.source_id);
+      }
+
+      for (const [index, text] of texts.entries()) {
+        await insertOutbound(sql, {
+          sourceId: sourceIds[index] as string,
+          idempotencyKey: `founder-welcome:${input.householdId}:${input.adultId}:${index}`,
+          moveKind: "message",
+          text,
+          turnId,
+          turnPart: index as 0 | 1 | 2,
+          notBefore: new Date(occurredAt.getTime() + index * 700).toISOString(),
+          householdId: input.householdId,
+          channelId: channel.id,
+          visibility: "private",
+          ownerAdultId: input.adultId,
+          occurredAt,
+        });
+      }
+      return sourceIds;
+    });
   }
 
   async markPendingFailure(input: {

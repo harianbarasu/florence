@@ -1,21 +1,21 @@
 import type {
+  CompleteFamilyOnboardingInput,
   FamilyMemberInput,
   PatchFactInput,
   PreferencesInput,
-  PutHouseholdInput,
+  SetupSessionInput,
 } from "@florence/contracts";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  completeFamilyOnboarding,
   createSession,
   deleteSession,
   deleteVaultFact,
   disconnectGoogleConnection,
   getSession,
   getWorkspace,
-  issueMessagesInvite,
   patchVaultFact,
   putFamilyMember,
-  putHousehold,
   putPreferences,
   startGoogleConnection,
 } from "./api";
@@ -25,14 +25,14 @@ export const queryKeys = {
   workspace: ["workspace"] as const,
 };
 
-export function useSession() {
-  return useQuery({ queryKey: queryKeys.session, queryFn: getSession, retry: false });
+export function useSession(enabled = true) {
+  return useQuery({ queryKey: queryKeys.session, queryFn: getSession, retry: false, enabled });
 }
 
 export function useCreateSession() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: createSession,
+    mutationFn: (input: SetupSessionInput) => createSession(input),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: queryKeys.session });
       await queryClient.invalidateQueries({ queryKey: queryKeys.workspace });
@@ -48,15 +48,13 @@ export function useDeleteSession() {
   });
 }
 
-export function useWorkspace() {
-  return useQuery({ queryKey: queryKeys.workspace, queryFn: getWorkspace });
+export function useWorkspace(enabled = true) {
+  return useQuery({ queryKey: queryKeys.workspace, queryFn: getWorkspace, enabled });
 }
 
-export function usePutHousehold() {
-  const queryClient = useQueryClient();
+export function useCompleteFamilyOnboarding() {
   return useMutation({
-    mutationFn: (input: PutHouseholdInput) => putHousehold(input),
-    onSuccess: (workspace) => queryClient.setQueryData(queryKeys.workspace, workspace),
+    mutationFn: (input: CompleteFamilyOnboardingInput) => completeFamilyOnboarding(input),
   });
 }
 
@@ -66,14 +64,6 @@ export function usePutMember() {
     mutationFn: ({ memberId, input }: { memberId: string; input: FamilyMemberInput }) =>
       putFamilyMember(memberId, input),
     onSuccess: (workspace) => queryClient.setQueryData(queryKeys.workspace, workspace),
-  });
-}
-
-export function useMessagesInvite() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: (adultId: string) => issueMessagesInvite(adultId),
-    onSuccess: ({ workspace }) => queryClient.setQueryData(queryKeys.workspace, workspace),
   });
 }
 

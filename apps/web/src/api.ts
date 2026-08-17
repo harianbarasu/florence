@@ -1,12 +1,13 @@
 import {
+  type CompleteFamilyOnboardingInput,
   type DisconnectGoogleConnectionInput,
   type FamilyMemberInput,
   googleStartResponseSchema,
-  type MessagesInviteResponse,
-  messagesInviteResponseSchema,
   type PatchFactInput,
   type PreferencesInput,
-  type PutHouseholdInput,
+  type SessionResponse,
+  type SetupSessionInput,
+  sessionResponseSchema,
   type WorkspaceView,
   workspaceResponseSchema,
 } from "@florence/contracts";
@@ -45,17 +46,17 @@ async function requestWorkspace(path: string, init?: RequestInit): Promise<Works
   return workspaceResponseSchema.parse(await requestJson(path, init)).workspace;
 }
 
-export async function getSession(): Promise<{ adultId: string }> {
-  const payload = await requestJson("/api/v1/session");
-  return { adultId: String(property(payload, "adultId")) };
+export async function getSession(): Promise<SessionResponse> {
+  return sessionResponseSchema.parse(await requestJson("/api/v1/session"));
 }
 
-export async function createSession(accessCode: string): Promise<{ adultId: string }> {
-  const payload = await requestJson("/api/v1/session", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${accessCode}` },
-  });
-  return { adultId: String(property(payload, "adultId")) };
+export async function createSession(input: SetupSessionInput): Promise<SessionResponse> {
+  return sessionResponseSchema.parse(
+    await requestJson("/api/v1/session", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  );
 }
 
 export async function deleteSession(): Promise<void> {
@@ -66,7 +67,7 @@ export function getWorkspace(): Promise<WorkspaceView> {
   return requestWorkspace("/api/v1/workspace");
 }
 
-export function putHousehold(input: PutHouseholdInput): Promise<WorkspaceView> {
+export function completeFamilyOnboarding(input: CompleteFamilyOnboardingInput): Promise<WorkspaceView> {
   return requestWorkspace("/api/v1/vault/household", {
     method: "PUT",
     body: JSON.stringify(input),
@@ -78,14 +79,6 @@ export function putFamilyMember(memberId: string, input: FamilyMemberInput): Pro
     method: "PUT",
     body: JSON.stringify(input),
   });
-}
-
-export async function issueMessagesInvite(adultId: string): Promise<MessagesInviteResponse> {
-  return messagesInviteResponseSchema.parse(
-    await requestJson(`/api/v1/vault/adults/${encodeURIComponent(adultId)}/messages-invite`, {
-      method: "POST",
-    }),
-  );
 }
 
 export function patchVaultFact(factId: string, input: PatchFactInput): Promise<WorkspaceView> {
@@ -118,13 +111,6 @@ export function disconnectGoogleConnection(connectionId: string): Promise<Worksp
     method: "DELETE",
     body: JSON.stringify(input),
   });
-}
-
-function property(payload: unknown, key: string): unknown {
-  if (typeof payload !== "object" || payload === null || !(key in payload)) {
-    throw new Error(`Florence returned an invalid ${key} response`);
-  }
-  return payload[key as keyof typeof payload];
 }
 
 function readError(payload: unknown): string | null {

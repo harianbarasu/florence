@@ -1,13 +1,14 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import type { EncryptedImageVault } from "@florence/artifacts";
 import {
+  type CompleteFamilyOnboardingInput,
+  completeFamilyOnboardingInputSchema,
   type FamilyMemberInput,
   familyMemberInputSchema,
   familyMemberProfileSchema,
   type PreferencesInput,
-  type PutHouseholdInput,
   preferencesInputSchema,
-  putHouseholdInputSchema,
+  type SetupSessionInput,
   type VaultSource,
   type WorkspaceView,
   workspaceViewSchema,
@@ -22,6 +23,7 @@ import type {
   CalendarOfferApproval,
   CalendarOfferDraft,
   CommitTurnInput,
+  CompleteFounderOnboardingInput,
   FactDraft,
   FactRecord,
   FamilyMemberRecord,
@@ -32,13 +34,13 @@ import type {
   LinqAuthority,
   MessagesEnrollmentResult,
   PostgresFlorenceStore,
-  RedeemMessagesEnrollmentInput,
   SourceRecord,
 } from "@florence/database";
 import {
   type BeginGoogleConnectionResult,
   GoogleCalendarTransientError,
   type GoogleConnection,
+  GoogleConnectionError,
   type GoogleConnectionView,
 } from "@florence/google";
 import {
@@ -84,6 +86,7 @@ export class Florence {
   readonly #enrollmentCodes: EnrollmentCodes;
   readonly #imageVault: EncryptedImageVault | null;
   readonly #messagesUrl: string | null;
+  readonly #setupOrigin: string | null;
   readonly #now: () => Date;
   #activeRun: Promise<boolean> | null = null;
   #activeInbound: ActiveInbound | null = null;
@@ -100,6 +103,7 @@ export class Florence {
     enrollmentCodes: EnrollmentCodes;
     imageVault: EncryptedImageVault | null;
     messagesUrl: string | null;
+    setupOrigin?: string | null;
     now?: () => Date;
   }) {
     this.#store = input.store;
@@ -109,28 +113,40 @@ export class Florence {
     this.#enrollmentCodes = input.enrollmentCodes;
     this.#imageVault = input.imageVault;
     this.#messagesUrl = nullableText(input.messagesUrl);
+    this.#setupOrigin = input.setupOrigin ? normalizedOrigin(input.setupOrigin) : null;
     this.#now = input.now ?? (() => new Date());
   }
 
   async workspaceForAdult(adultId: string): Promise<WorkspaceView> {
     const household = await this.#householdForAdultOrNull(adultId);
+    const founder = household?.members.find(
+      (member) => member.id === adultId && member.kind === "adult" && member.adultSlot === 1,
+    );
+    const google = household?.googleConnections.find(
+      (connection) => connection.ownerAdultId === adultId && connection.status === "active",
+    );
+    if (founder && google && profileString(founder.profile, "onboardingCompletedAt")) {
+      await this.#stageFounderWelcome(google);
+    }
     return workspaceViewSchema.parse(workspace(adultId, household, this.#messagesUrl));
   }
 
-  async putHousehold(adultId: string, untrustedInput: PutHouseholdInput): Promise<WorkspaceView> {
-    const input = putHouseholdInputSchema.parse(untrustedInput);
-    const householdIds = await this.#store.listHouseholdIdsForAdult(adultId);
-    const householdId = householdIds[0] ?? deterministicUuid(`household\0${adultId}`);
-    if (householdIds.length > 1) throw new Error("The two-adult pilot cannot span multiple households");
-    await this.#store.createHousehold({
-      householdId,
-      name: input.name,
-      timeZone: input.timeZone,
-      founder: {
-        adultId,
-        displayName: input.foundingAdultDisplayName,
-        profile: { relationship: "Parent" },
-      },
+  async completeFamilyOnboarding(
+    adultId: string,
+    untrustedInput: CompleteFamilyOnboardingInput,
+  ): Promise<WorkspaceView> {
+    const input = completeFamilyOnboardingInputSchema.parse(untrustedInput);
+    const household = await this.#householdForAdult(adultId);
+    await this.#store.completeFamilyOnboarding({
+      householdId: household.id,
+      founderAdultId: adultId,
+      ...(input.partner ? { partner: input.partner } : {}),
+      children: input.children.map((child) => ({
+        id: child.id,
+        displayName: child.displayName,
+        ...(child.school ? { school: child.school } : {}),
+        ...(child.activities ? { activities: child.activities } : {}),
+      })),
       occurredAt: this.#now().toISOString(),
     });
     return this.workspaceForAdult(adultId);
@@ -156,30 +172,6 @@ export class Florence {
       occurredAt: this.#now().toISOString(),
     });
     return this.workspaceForAdult(adultId);
-  }
-
-  async issueMessagesInvite(
-    adultId: string,
-    invitedAdultId: string,
-  ): Promise<{ invite: { code: string; expiresAt: string }; workspace: WorkspaceView }> {
-    const household = await this.#householdForAdult(adultId);
-    const commandId = randomUUID();
-    const invite = this.#enrollmentCodes.issue({
-      commandId,
-      householdId: household.id,
-      adultId: invitedAdultId,
-    });
-    const issuedAt = this.#now();
-    const expiresAt = new Date(issuedAt.getTime() + 30 * 60_000).toISOString();
-    await this.#store.issueMessagesEnrollment({
-      householdId: household.id,
-      actorAdultId: adultId,
-      adultId: invitedAdultId,
-      challengeDigest: invite.challengeDigest,
-      issuedAt: issuedAt.toISOString(),
-      expiresAt,
-    });
-    return { invite: { code: invite.code, expiresAt }, workspace: await this.workspaceForAdult(adultId) };
   }
 
   async correctFact(adultId: string, factId: string, statement: string): Promise<WorkspaceView> {
@@ -212,12 +204,29 @@ export class Florence {
     });
   }
 
-  finishGoogle(input: {
+  async finishGoogle(input: {
+    adultId: string;
     state: string;
     code: string;
     sessionBindingDigest: string;
   }): Promise<GoogleConnectionView> {
-    return this.#requiredGoogle().finish({ ...input, now: this.#now().toISOString() });
+    const connection = await this.#requiredGoogle().finish({
+      state: input.state,
+      code: input.code,
+      sessionBindingDigest: input.sessionBindingDigest,
+      now: this.#now().toISOString(),
+    });
+    if (connection.ownerAdultId !== input.adultId) {
+      throw new GoogleConnectionError("Google connection owner changed", "invalid_state");
+    }
+    const household = await this.#householdForAdult(input.adultId);
+    const founder = household.members.find(
+      (member) => member.id === input.adultId && member.kind === "adult" && member.adultSlot === 1,
+    );
+    if (founder && profileString(founder.profile, "onboardingCompletedAt")) {
+      await this.#stageFounderWelcome(connection);
+    }
+    return connection;
   }
 
   async disconnectGoogle(adultId: string, connectionId: string): Promise<WorkspaceView> {
@@ -237,8 +246,95 @@ export class Florence {
     return this.#store.resolveLinqAuthority(input);
   }
 
-  redeemMessagesEnrollment(input: RedeemMessagesEnrollmentInput): Promise<MessagesEnrollmentResult | null> {
-    return this.#store.redeemMessagesEnrollment(input);
+  async startMessagesOnboarding(input: {
+    providerEventId: string;
+    providerConversationId: string;
+    identitySubjectDigest: string;
+    occurredAt: string;
+  }): Promise<boolean> {
+    if (await this.#store.hasPilotHousehold()) return false;
+    if (!this.#setupOrigin || !this.#google) {
+      throw new Error("Google Workspace onboarding is not configured");
+    }
+    const setup = this.#enrollmentCodes.issueFounderSetup({
+      providerEventId: input.providerEventId,
+      providerConversationId: input.providerConversationId,
+      identitySubjectDigest: input.identitySubjectDigest,
+      occurredAt: input.occurredAt,
+    });
+    const setupUrl = `${this.#setupOrigin}/#setup=${encodeURIComponent(setup.token)}`;
+    const expectedAuthority = {
+      audience: "private" as const,
+      participantIdentityDigests: [input.identitySubjectDigest],
+    };
+    const bubbles = [
+      "Hey! Glad you’re here.",
+      "I’m Florence. I help parents keep school, schedules, and the loose ends between two adults from becoming another job.",
+      `Start with a quick private setup. You’ll connect your own Google account there: ${setupUrl}`,
+    ];
+    await this.#setTyping({
+      providerConversationId: input.providerConversationId,
+      expectedAuthority,
+      active: true,
+    });
+    try {
+      for (const [index, text] of bubbles.entries()) {
+        if (index > 0) await pause(650);
+        const result = await this.#linq.sendMessage({
+          idempotencyKey: `founder-setup:${deterministicUuid(`${input.providerEventId}\0${index}`)}`,
+          providerConversationId: input.providerConversationId,
+          expectedAuthority,
+          text,
+        });
+        if (result.status === "unknown") {
+          throw new LinqError("provider_retryable", result.detail, true);
+        }
+        if (result.status === "failed") {
+          throw new LinqError("provider_rejected", result.detail, false);
+        }
+      }
+    } finally {
+      await this.#setTyping({
+        providerConversationId: input.providerConversationId,
+        expectedAuthority,
+        active: false,
+      });
+    }
+    return true;
+  }
+
+  async redeemSetupLink(input: SetupSessionInput): Promise<MessagesEnrollmentResult | null> {
+    if (!this.#google || !this.#setupOrigin) return null;
+    if (input.profile.guardianAttested !== true) return null;
+    const setup = this.#enrollmentCodes.verifyFounderSetup(input.setupToken, this.#now());
+    if (!setup || !isIanaTimeZone(input.profile.timeZone)) return null;
+    const observed = await this.#linq.observeChat(setup.providerConversationId);
+    if (
+      observed.audience !== "private" ||
+      observed.participantIdentityDigests.length !== 1 ||
+      observed.participantIdentityDigests[0] !== setup.identitySubjectDigest
+    ) {
+      return null;
+    }
+    const completedAt = this.#now();
+    if (!this.#enrollmentCodes.verifyFounderSetup(input.setupToken, completedAt)) return null;
+    const occurredAt = completedAt.toISOString();
+    const completion: CompleteFounderOnboardingInput = {
+      setupTokenDigest: this.#enrollmentCodes.digestFounderSetup(input.setupToken),
+      setupExpiresAt: setup.expiresAt,
+      householdId: setup.householdId,
+      timeZone: input.profile.timeZone,
+      adultId: setup.adultId,
+      displayName: input.profile.displayName,
+      identitySubjectDigest: setup.identitySubjectDigest,
+      consentVersion: "linq-private-setup-v1",
+      consentedAt: occurredAt,
+      guardianAttestedAt: occurredAt,
+      providerConversationId: setup.providerConversationId,
+      occurredAt,
+    };
+    const result = await this.#store.completeFounderOnboarding(completion);
+    return result;
   }
 
   async bootstrapMessagesGroup(input: BootstrapMessagesGroupInput): Promise<AcceptInboundResult | null> {
@@ -359,6 +455,41 @@ export class Florence {
     const observed = await this.#linq.observeChat(turn.authority.providerConversationId);
     if (!sameAuthority(observed, turn.authority)) {
       await this.#store.commitTurn({ sourceId: turn.message.sourceId, handledAt: this.#now().toISOString() });
+      return;
+    }
+    const sender = turn.household.members.find(
+      (member) => member.id === turn.authority.senderAdultId && member.kind === "adult",
+    );
+    const googleActive =
+      turn.authority.audience !== "private" ||
+      (await this.#hasActiveGoogle(turn.authority.householdId, turn.authority.senderAdultId));
+    const onboardingComplete = Boolean(
+      sender && (sender.adultSlot === 2 || profileString(sender.profile, "onboardingCompletedAt")),
+    );
+    if (turn.authority.audience === "private" && (!googleActive || !onboardingComplete)) {
+      await this.#store.commitTurn(
+        decisionCommit(
+          turn,
+          {
+            conversation: {
+              replyToCurrentMessage: true,
+              reaction: null,
+              bubbles: [
+                {
+                  text: googleActive
+                    ? "Finish the family setup on the web first. Nothing else is retained, scheduled, or changed yet."
+                    : "Finish connecting Google from the setup page first. Nothing else is connected or changed yet.",
+                  delayMs: 0,
+                },
+              ],
+            },
+            facts: [],
+            followUp: null,
+            calendar: null,
+          },
+          this.#now(),
+        ),
+      );
       return;
     }
     if (!this.#reasoner) {
@@ -812,6 +943,47 @@ export class Florence {
     }
   }
 
+  async #stageFounderWelcome(connection: GoogleConnectionView): Promise<void> {
+    const household = await this.#householdForAdult(connection.ownerAdultId);
+    const founder = household.members.find(
+      (member) =>
+        member.id === connection.ownerAdultId &&
+        member.kind === "adult" &&
+        member.adultSlot === 1 &&
+        profileString(member.profile, "onboardingCompletedAt"),
+    );
+    const channels = household.channels.filter(
+      (channel) =>
+        channel.audience === "private" &&
+        channel.adultIds.length === 1 &&
+        channel.adultIds[0] === connection.ownerAdultId,
+    );
+    if (!founder || channels.length !== 1) {
+      throw new Error("The Google owner does not have one exact active private Messages channel");
+    }
+    const channel = channels[0];
+    if (!channel) throw new Error("The founder's private Messages channel is missing");
+    if (channel.revokedAt || channel.stoppedAt) return;
+    await this.#store.stageFounderWelcome({
+      householdId: household.id,
+      adultId: connection.ownerAdultId,
+      channelId: channel.id,
+      providerConversationId: channel.providerConversationId,
+      texts: [
+        `You’re in, ${founder.displayName} 🎉`,
+        "Your Google account stays private to you. I’ll only bring family-relevant things into shared context with your direction.",
+        "What’s one thing you’d rather not deal with yourself? I’ll take a first pass.",
+      ],
+      occurredAt: this.#now().toISOString(),
+    });
+  }
+
+  async #hasActiveGoogle(householdId: string, adultId: string): Promise<boolean> {
+    if (!this.#google) return false;
+    const connections = await this.#google.status({ householdId, ownerAdultId: adultId });
+    return connections.some((connection) => connection.status === "active");
+  }
+
   async #householdForAdult(adultId: string): Promise<HouseholdRecord> {
     const household = await this.#householdForAdultOrNull(adultId);
     if (!household) throw new Error("The adult does not belong to a Florence household");
@@ -861,6 +1033,7 @@ function workspace(
   messagesUrl: string | null,
 ): WorkspaceView {
   const viewer = household?.members.find((member) => member.id === adultId) ?? null;
+  const founder = household?.members.find((member) => member.kind === "adult" && member.adultSlot === 1);
   const adults = household?.members.filter((member) => member.kind === "adult") ?? [];
   const activeChannels =
     household?.channels.filter((channel) => !channel.revokedAt && !channel.stoppedAt) ?? [];
@@ -899,7 +1072,7 @@ function workspace(
             : [],
         ) ?? [],
       setup: {
-        householdCreated: household !== null,
+        onboardingComplete: Boolean(founder && profileString(founder.profile, "onboardingCompletedAt")),
         secondAdultAdded: adults.length === 2,
         bothAdultsMessagesConnected:
           adults.length === 2 && adults.every((adult) => adult.messagesIdentity === "connected"),
@@ -908,7 +1081,6 @@ function workspace(
     },
     vault: household
       ? {
-          name: household.name,
           timeZone: household.timeZone,
           members: household.members.map(memberView),
           contacts,
@@ -1404,6 +1576,31 @@ function sameAuthority(
       (digest, index) => digest === expected.expectedParticipantIdentityDigests[index],
     )
   );
+}
+
+function normalizedOrigin(value: string): string {
+  const url = new URL(value);
+  if (
+    (url.protocol !== "http:" && url.protocol !== "https:") ||
+    url.username ||
+    url.password ||
+    url.origin === "null"
+  ) {
+    throw new Error("Florence setup origin must be an HTTP(S) origin without credentials");
+  }
+  return url.origin;
+}
+
+function isIanaTimeZone(value: string): boolean {
+  try {
+    return new Intl.DateTimeFormat("en-US", { timeZone: value }).resolvedOptions().timeZone === value;
+  } catch {
+    return false;
+  }
+}
+
+function pause(delayMs: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, delayMs));
 }
 
 function reaction(value: string | null): LinqReaction {

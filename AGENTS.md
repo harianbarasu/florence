@@ -21,8 +21,11 @@ If that sentence is not visible and testable by the pilot family, reject the cha
 ## Pilot invariants
 
 - The pilot is one household, exactly two independently verified participating adults, represented children, two private iMessage relationships, and one exact family iMessage group.
+- No household, adult, channel, or founding identity is operator-created or preconfigured for onboarding. While the pilot database is empty, any signed, live, one-participant private iMessage greeting may receive a stateless short-lived setup link. The first valid form redemption atomically creates the founder and household; competing links then fail neutrally, and subsequent unknown senders stay silent.
+- Private one-to-one threads are the trust anchors. The family group is the shared coordination layer, not permission to disclose either adult's private context.
+- Keep mobile onboarding focused and one-task-per-screen: first name and caregiver attestation, the adult's own Google connection, then an optional partner and each child's name, school, and activities. Infer the browser time zone without making it a chore. Never ask the parent to name an internal tenancy record. Learn deeper ownership, recurring logistics, communication style, and sharing preferences conversationally while doing useful work.
 - Private messages, Gmail, and personal memory remain private by default. Sharing requires a current direction, approval, or an explicit narrow standing rule.
-- Unknown senders and changed or ambiguous group membership are silent and retain no family meaning.
+- Outside the empty-database greeting seam, unknown senders and changed or ambiguous group membership are silent and retain no family meaning.
 - Every outbound message rechecks the live Linq audience and participant set.
 - Direct natural-language instructions may authorize the described action. An inferred consequential action is shown exactly and approved once before execution.
 - Calendar or email success is reported only after provider reconciliation proves the intended result. Uncertainty is stated honestly.
@@ -54,4 +57,4 @@ pnpm check
 
 The release gate is the real two-phone, two-browser, Google, Linq, and Railway rehearsal. A green internal framework is not completion.
 
-Phase 1 is a mandatory stop after the real parent-document Messages benchmark. Do not continue into passwordless onboarding or the complete pilot until the user reviews that conversation and approves the next phase.
+Phase 1 includes the founding adult's Messages-first mobile onboarding and is a mandatory stop after the real parent-document conversation. Do not continue into the second adult's onboarding or the complete pilot until the user reviews that conversation and approves the next phase.

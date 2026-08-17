@@ -19,6 +19,7 @@ import {
   linqIdentitySubjectDigest,
 } from "@florence/linq";
 import { describe, expect, onTestFinished, test } from "vitest";
+import { buildApp, createSessionCallerResolver } from "./app.js";
 import { EnrollmentCodes } from "./enrollment.js";
 import { Florence } from "./florence.js";
 import { createLinqIngress } from "./linq-ingress.js";
@@ -26,16 +27,33 @@ import { type FlorenceDecision, type FlorenceReasoner, FlorenceReasonerError } f
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const NOW = Date.parse("2026-08-16T18:00:00.000Z");
-const ADULT_ONE = "11111111-1111-4111-8111-111111111111";
-const ADULT_TWO = "22222222-2222-4222-8222-222222222222";
-const GOOGLE_CONNECTION = "44444444-4444-4444-8444-444444444444";
+const ENROLLMENT_SECRET = "release-journey-secret-is-at-least-thirty-two-bytes";
+const SESSION_SECRET = "release-journey-browser-session-secret-is-at-least-thirty-two-bytes";
 const ADULT_ONE_HANDLE = "messages-adult-one";
 const ADULT_TWO_HANDLE = "messages-adult-two";
+const COMPETING_FOUNDER_HANDLE = "messages-competing-founder";
 const ADULT_ONE_IDENTITY = linqIdentitySubjectDigest(ADULT_ONE_HANDLE);
 const ADULT_TWO_IDENTITY = linqIdentitySubjectDigest(ADULT_TWO_HANDLE);
+const COMPETING_FOUNDER_IDENTITY = linqIdentitySubjectDigest(COMPETING_FOUNDER_HANDLE);
+const PRIVATE_ONE = "linq-private-one";
+const PRIVATE_COMPETING_FOUNDER = "linq-private-competing-founder";
+const FOUNDER_IDS = new EnrollmentCodes(ENROLLMENT_SECRET).issueFounderSetup({
+  providerEventId: "event-founder-id-fixture",
+  providerConversationId: PRIVATE_ONE,
+  identitySubjectDigest: ADULT_ONE_IDENTITY,
+  occurredAt: new Date(NOW).toISOString(),
+});
+const ADULT_ONE = FOUNDER_IDS.adultId;
+const COMPETING_FOUNDER = new EnrollmentCodes(ENROLLMENT_SECRET).issueFounderSetup({
+  providerEventId: "event-competing-founder-id-fixture",
+  providerConversationId: PRIVATE_COMPETING_FOUNDER,
+  identitySubjectDigest: COMPETING_FOUNDER_IDENTITY,
+  occurredAt: new Date(NOW).toISOString(),
+}).adultId;
+const ADULT_TWO = "22222222-2222-4222-8222-222222222222";
+const GOOGLE_CONNECTION = "44444444-4444-4444-8444-444444444444";
 const PARTICIPANTS = [ADULT_ONE_IDENTITY, ADULT_TWO_IDENTITY].sort();
 const GROUP = "linq-group-family";
-const PRIVATE_ONE = "linq-private-one";
 const LINQ_PARTNER = "partner-florence";
 const LINQ_SIGNING_KEY = Buffer.from("florence-release-webhook-key-32b", "utf8");
 const LINQ_SIGNING_SECRET = `whsec_${LINQ_SIGNING_KEY.toString("base64")}`;
@@ -56,6 +74,15 @@ const PICKUP_CONFLICT = {
   endsAt: "2026-08-21T23:30:00.000Z",
   allDay: false,
 };
+const SCHOOL_EMAIL = {
+  messageId: "gmail-school-packet",
+  threadId: "gmail-school-thread",
+  historyId: "gmail-history-1",
+  from: "Muir Elementary <office@muir.example>",
+  subject: "Field trip permission slip",
+  sentAt: "2026-08-15T17:00:00.000Z",
+  text: "Permission slip due Tuesday. Friday's bus returns at 3:45.",
+};
 
 type Reason = FlorenceReasoner["decide"];
 
@@ -66,6 +93,7 @@ release("Florence release journeys", () => {
     let pdfWasRead = false;
     let reactionWasUnderstood = false;
     let calendarWasRead = false;
+    let gmailWasRead = false;
     let obsoleteResultWasSuppressed = false;
     const harness = await freshHarness(async (input, reads, signal) => {
       const sourceId = input.currentMessage.sourceId;
@@ -136,6 +164,22 @@ release("Florence release journeys", () => {
         });
         expect(calendar).toEqual({ status: "complete", events: [PICKUP_CONFLICT] });
         calendarWasRead = true;
+        if (input.currentMessage.text.includes("Sam can cover")) {
+          const gmail = await reads.searchGmail({
+            connectionId: GOOGLE_CONNECTION,
+            query: 'newer_than:30d ("Muir" OR "field trip")',
+            limit: 5,
+          });
+          expect(gmail).toEqual([
+            expect.objectContaining({
+              kind: "gmail",
+              visibility: "adult_private",
+              label: SCHOOL_EMAIL.subject,
+              text: SCHOOL_EMAIL.text,
+            }),
+          ]);
+          gmailWasRead = true;
+        }
         obsoleteResultWasSuppressed = true;
         if (input.currentMessage.text.includes("Sam can cover")) {
           return decision({
@@ -256,8 +300,29 @@ release("Florence release journeys", () => {
       }
       return decision();
     });
-    await harness.onboard();
+    await harness.onboard({ exerciseMessagesFirst: true });
     await harness.activateGoogle();
+
+    expect(harness.linq.messages.map((message) => message.text)).not.toEqual(
+      expect.arrayContaining([expect.stringMatching(/^You’re in, Hari 🎉$/)]),
+    );
+    await harness.acceptPrivate("private-before-family-setup", "Can you check tomorrow for me?");
+    await harness.drain();
+    expect(harness.linq.messages.map((message) => message.text)).toContain(
+      "Finish the family setup on the web first. Nothing else is retained, scheduled, or changed yet.",
+    );
+    await harness.completeFamilyOnboarding();
+
+    expect(harness.linq.messages.map((message) => message.text)).toEqual(
+      expect.arrayContaining([
+        "Hey! Glad you’re here.",
+        expect.stringContaining("I help parents"),
+        expect.stringContaining("Start with a quick private setup"),
+        expect.stringMatching(/^You’re in, Hari 🎉$/),
+        expect.stringContaining("Google account stays private to you"),
+        "What’s one thing you’d rather not deal with yourself? I’ll take a first pass.",
+      ]),
+    );
 
     const signalId = inboundSourceId("event-private-school-packet");
     const sealed = harness.vault.sealPdf({
@@ -318,9 +383,21 @@ release("Florence release journeys", () => {
 
     expect(pdfWasRead).toBe(true);
     expect(calendarWasRead).toBe(true);
+    expect(gmailWasRead).toBe(true);
     expect(obsoleteResultWasSuppressed).toBe(true);
     expect(harness.googleReads).toBe(2);
+    expect(harness.gmailReads).toBe(1);
     expect(harness.googleEffects).toBe(0);
+    const storedEmail = await harness.store.recordGmailEvidence({
+      householdId: (await harness.store.listHouseholdIdsForAdult(ADULT_ONE))[0] ?? "missing",
+      ownerAdultId: ADULT_ONE,
+      connectionId: GOOGLE_CONNECTION,
+      ...SCHOOL_EMAIL,
+      text: "A raw body must not be retained here.",
+    });
+    expect(storedEmail.visibility).toBe("private");
+    expect(storedEmail.ownerAdultId).toBe(ADULT_ONE);
+    expect(JSON.stringify(storedEmail.metadata)).not.toContain("A raw body must not be retained here.");
     const documentWorkspace = await harness.florence.workspaceForAdult(ADULT_ONE);
     expect(documentWorkspace.vault?.facts).not.toEqual(
       expect.arrayContaining([expect.objectContaining({ statement: "Ms. Chen is Maya’s teacher" })]),
@@ -535,6 +612,8 @@ release("Florence release journeys", () => {
       return decision();
     });
     await harness.onboard();
+    await harness.activateGoogle();
+    await harness.completeFamilyOnboarding();
     const privateMessage = await harness.acceptPrivate("private-note", "Private doctor note");
     await harness.drain();
     await harness.acceptPrivate("private-reply", "What note was I replying to?", {
@@ -619,6 +698,11 @@ release("Florence release journeys", () => {
         handledAt: harness.iso(),
       }),
     ).rejects.toBeInstanceOf(FlorenceStoreUnauthorized);
+
+    expect(await harness.acceptPrivate("private-stop", "STOP")).toMatchObject({
+      disposition: "stopped",
+    });
+    expect((await harness.florence.workspaceForAdult(ADULT_ONE)).viewer.displayName).toBe("Hari");
   });
 
   test("reconciles an ambiguous Calendar write and reports one definitive failure privately", async () => {
@@ -648,6 +732,7 @@ release("Florence release journeys", () => {
     );
     await harness.onboard();
     await harness.activateGoogle();
+    await harness.completeFamilyOnboarding();
     const attachmentSourceId = inboundSourceId("event-calendar-attachment-request");
     const attachedEvent = harness.vault.sealPdf({
       documentId: "77777777-7777-4777-8777-777777777777",
@@ -772,61 +857,162 @@ class Harness {
   googleAttempts = 0;
   googleEffects = 0;
   googleReads = 0;
+  gmailReads = 0;
 
   constructor(
     readonly store: PostgresFlorenceStore,
     readonly florence: Florence,
     readonly linq: FakeLinq,
     readonly vault: EncryptedImageVault,
+    readonly enrollmentCodes: EnrollmentCodes,
   ) {}
 
   iso(): string {
     return new Date(this.now).toISOString();
   }
 
-  async onboard(): Promise<void> {
-    await this.florence.putHousehold(ADULT_ONE, {
-      name: "Barasu Family",
-      timeZone: "America/Los_Angeles",
-      foundingAdultDisplayName: "Hari",
+  async onboard(input: { exerciseMessagesFirst?: boolean } = {}): Promise<void> {
+    this.linq.authorities.set(PRIVATE_ONE, {
+      audience: "private",
+      participantIdentityDigests: [ADULT_ONE_IDENTITY],
     });
-    await this.florence.putMember(ADULT_ONE, ADULT_TWO, {
-      kind: "adult",
-      role: "steward",
-      displayName: "Alex",
-      relationship: "Parent",
-    });
-    await this.florence.putMember(ADULT_ONE, "33333333-3333-4333-8333-333333333333", {
-      kind: "child",
-      role: "dependent",
-      displayName: "Maya",
-      relationship: "Child",
-      school: "Muir Elementary",
-    });
-    const codes = new EnrollmentCodes("release-journey-secret-is-at-least-thirty-two-bytes");
-    for (const [adultId, identity, conversation] of [
-      [ADULT_ONE, ADULT_ONE_IDENTITY, PRIVATE_ONE],
-      [ADULT_TWO, ADULT_TWO_IDENTITY, "linq-private-two"],
-    ] as const) {
-      const invite = await this.florence.issueMessagesInvite(ADULT_ONE, adultId);
-      await this.florence.redeemMessagesEnrollment({
-        challengeDigest: codes.digestCandidate(invite.invite.code) ?? "missing",
-        identitySubjectDigest: identity,
-        consentVersion: "pilot-v1",
-        consentedAt: this.iso(),
-        providerConversationId: conversation,
+    expect(await this.store.listHouseholdIdsForAdult(ADULT_ONE)).toEqual([]);
+    let setupToken: string;
+    let competingSetupToken: string | null = null;
+    if (input.exerciseMessagesFirst) {
+      expect(await this.receiveFounderGreeting("founder-hi", "Hi")).toEqual({
+        disposition: "acknowledged",
+        reason: "onboarding_offered",
+      });
+      expect(
+        await this.receiveFounderGreeting("competing-founder-hi", "Hello", {
+          providerConversationId: PRIVATE_COMPETING_FOUNDER,
+          providerHandleId: COMPETING_FOUNDER_HANDLE,
+        }),
+      ).toEqual({ disposition: "acknowledged", reason: "onboarding_offered" });
+      expect(await this.store.hasPilotHousehold()).toBe(false);
+      expect(await this.store.listHouseholdIdsForAdult(ADULT_ONE)).toEqual([]);
+      expect(await this.store.listHouseholdIdsForAdult(COMPETING_FOUNDER)).toEqual([]);
+      setupToken = this.setupTokenFor(PRIVATE_ONE);
+      competingSetupToken = this.setupTokenFor(PRIVATE_COMPETING_FOUNDER);
+    } else {
+      setupToken = this.enrollmentCodes.issueFounderSetup({
+        providerEventId: "event-founder-direct-setup",
+        providerConversationId: PRIVATE_ONE,
+        identitySubjectDigest: ADULT_ONE_IDENTITY,
         occurredAt: this.iso(),
-      });
-      this.linq.authorities.set(conversation, {
-        audience: "private",
-        participantIdentityDigests: [identity],
-      });
+      }).token;
     }
+
+    const app = await buildApp(
+      {
+        florence: this.florence,
+        callerResolver: createSessionCallerResolver({ FLORENCE_SESSION_SECRET: SESSION_SECRET }),
+        ready: () => this.store.ready(),
+      },
+      { serveFrontend: false },
+    );
+    const setupBody = {
+      setupToken,
+      profile: {
+        displayName: "Hari",
+        timeZone: "America/Los_Angeles",
+        guardianAttested: true as const,
+      },
+    };
+    const setup = await app.inject({ method: "POST", url: "/api/v1/session", payload: setupBody });
+    expect(setup.statusCode).toBe(200);
+    expect(setup.json()).toEqual({ adultId: ADULT_ONE });
+    expect(setup.headers["set-cookie"]).toContain("HttpOnly");
+    const replay = await app.inject({ method: "POST", url: "/api/v1/session", payload: setupBody });
+    expect(replay.statusCode).toBe(200);
+    expect(replay.headers["set-cookie"]).toContain("HttpOnly");
+    this.now += 60_001;
+    const lateReplay = await app.inject({ method: "POST", url: "/api/v1/session", payload: setupBody });
+    expect(lateReplay.statusCode).toBe(401);
+    if (competingSetupToken) {
+      const losingSetup = await app.inject({
+        method: "POST",
+        url: "/api/v1/session",
+        payload: {
+          ...setupBody,
+          setupToken: competingSetupToken,
+          profile: { ...setupBody.profile, displayName: "Other parent" },
+        },
+      });
+      expect(losingSetup.statusCode).toBe(401);
+      expect(losingSetup.json()).toEqual({ error: "invalid_or_expired_setup_link" });
+      expect(await this.store.hasPilotHousehold()).toBe(true);
+      expect(await this.store.listHouseholdIdsForAdult(COMPETING_FOUNDER)).toEqual([]);
+      const sentBeforeLateGreeting = this.linq.messages.length;
+      expect(
+        await this.receiveFounderGreeting("competing-founder-after-setup", "Hi", {
+          providerConversationId: PRIVATE_COMPETING_FOUNDER,
+          providerHandleId: COMPETING_FOUNDER_HANDLE,
+        }),
+      ).toEqual({ disposition: "rejected", reason: "authority_not_found" });
+      expect(this.linq.messages).toHaveLength(sentBeforeLateGreeting);
+    }
+    await app.close();
+  }
+
+  async completeFamilyOnboarding(): Promise<void> {
+    const workspace = await this.florence.completeFamilyOnboarding(ADULT_ONE, {
+      partner: { id: ADULT_TWO, displayName: "Alex" },
+      children: [
+        {
+          id: "33333333-3333-4333-8333-333333333333",
+          displayName: "Maya",
+          school: "Muir Elementary",
+          activities: ["Soccer"],
+        },
+      ],
+    });
+    expect(workspace.workspace.setup.onboardingComplete).toBe(true);
+    expect(workspace.vault?.members).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: ADULT_TWO, displayName: "Alex", messagesIdentity: "not_invited" }),
+        expect.objectContaining({
+          id: "33333333-3333-4333-8333-333333333333",
+          displayName: "Maya",
+          school: "Muir Elementary",
+          activities: ["Soccer"],
+        }),
+      ]),
+    );
+    this.now += 1_400;
+    await this.drain();
+
+    const householdId = (await this.store.listHouseholdIdsForAdult(ADULT_ONE))[0] ?? "missing";
+    const partnerChallenge = digest("release-partner-enrollment");
+    await this.store.issueMessagesEnrollment({
+      householdId,
+      actorAdultId: ADULT_ONE,
+      adultId: ADULT_TWO,
+      challengeDigest: partnerChallenge,
+      issuedAt: this.iso(),
+      expiresAt: new Date(this.now + 60_000).toISOString(),
+    });
+    expect(
+      await this.store.redeemMessagesEnrollment({
+        challengeDigest: partnerChallenge,
+        identitySubjectDigest: ADULT_TWO_IDENTITY,
+        consentVersion: "release-fixture-v1",
+        consentedAt: this.iso(),
+        providerConversationId: "linq-private-two",
+        occurredAt: this.iso(),
+      }),
+    ).toMatchObject({ disposition: "accepted", adultId: ADULT_TWO });
+    this.linq.authorities.set("linq-private-two", {
+      audience: "private",
+      participantIdentityDigests: [ADULT_TWO_IDENTITY],
+    });
     this.linq.authorities.set(GROUP, { audience: "group", participantIdentityDigests: PARTICIPANTS });
   }
 
   async activateGoogle(): Promise<void> {
-    const stateDigest = digest("google-state");
+    const state = "google-state";
+    const stateDigest = digest(state);
     const sessionBindingDigest = digest("google-session");
     await this.store.createPending({
       connectionId: GOOGLE_CONNECTION,
@@ -837,21 +1023,14 @@ class Harness {
       stateExpiresAt: new Date(this.now + 60_000).toISOString(),
       now: this.iso(),
     });
-    await this.store.consumePendingState({ stateDigest, sessionBindingDigest, now: this.iso() });
-    await this.store.activate({
-      connectionId: GOOGLE_CONNECTION,
-      stateDigest,
-      googleSubjectDigest: digest("google-subject"),
-      emailLabel: "hari@example.com",
-      grantedScopes: [
-        "openid",
-        "email",
-        "https://www.googleapis.com/auth/gmail.readonly",
-        "https://www.googleapis.com/auth/calendar.events.owned",
-      ],
-      refreshTokenEnvelope: "encrypted-refresh-token",
-      now: this.iso(),
+    await this.florence.finishGoogle({
+      adultId: ADULT_ONE,
+      state,
+      code: "google-authorization-code",
+      sessionBindingDigest,
     });
+    this.now += 1_400;
+    await this.drain();
   }
 
   inbound<Audience extends "private" | "group">(
@@ -878,6 +1057,86 @@ class Harness {
     const result = await this.florence.acceptInbound(this.inbound("private", key, text, extra));
     if (!result) throw new Error("Private inbound was rejected");
     return result;
+  }
+
+  setupTokenFor(providerConversationId: string): string {
+    const setupMessage = this.linq.messages.findLast(
+      (message) =>
+        message.providerConversationId === providerConversationId && message.text.includes("#setup="),
+    );
+    const encodedToken = /#setup=([^\s]+)$/.exec(setupMessage?.text ?? "")?.[1];
+    if (!encodedToken) throw new Error("Florence did not send the founder setup link");
+    return decodeURIComponent(encodedToken);
+  }
+
+  async receiveFounderGreeting(
+    key: string,
+    text: string,
+    input: { providerConversationId?: string; providerHandleId?: string } = {},
+  ) {
+    const providerConversationId = input.providerConversationId ?? PRIVATE_ONE;
+    const providerHandleId = input.providerHandleId ?? ADULT_ONE_HANDLE;
+    const identitySubjectDigest = linqIdentitySubjectDigest(providerHandleId);
+    this.linq.authorities.set(providerConversationId, {
+      audience: "private",
+      participantIdentityDigests: [identitySubjectDigest],
+    });
+    const providerEventId = `event-${key}`;
+    const timestamp = Math.floor(this.now / 1_000).toString();
+    const rawBody = new TextEncoder().encode(
+      JSON.stringify({
+        api_version: "v3",
+        webhook_version: "2026-02-03",
+        event_type: "message.received",
+        event_id: providerEventId,
+        created_at: this.iso(),
+        trace_id: `trace-${key}`,
+        partner_id: LINQ_PARTNER,
+        data: {
+          id: `message-${key}`,
+          direction: "inbound",
+          chat: {
+            id: providerConversationId,
+            is_group: false,
+            owner_handle: {
+              id: "messages-florence-owner",
+              handle: "+15555550000",
+              is_me: true,
+            },
+          },
+          sender_handle: {
+            id: providerHandleId,
+            handle: "+15555550101",
+            is_me: false,
+          },
+          service: "iMessage",
+          parts: [{ type: "text", value: text }],
+          reply_to: null,
+          sent_at: this.iso(),
+          reconciled_at: null,
+        },
+      }),
+    );
+    const signature = createHmac("sha256", LINQ_SIGNING_KEY)
+      .update(`${providerEventId}.${timestamp}.`, "utf8")
+      .update(rawBody)
+      .digest("base64");
+    return createLinqIngress({
+      signingSecret: LINQ_SIGNING_SECRET,
+      expectedPartnerId: LINQ_PARTNER,
+      linq: this.linq as unknown as LinqClient,
+      imageVault: this.vault,
+      florence: this.florence,
+      now: () => new Date(this.now),
+    }).receive({
+      rawBody,
+      headers: {
+        "webhook-id": providerEventId,
+        "webhook-timestamp": timestamp,
+        "webhook-signature": `v1,${signature}`,
+      },
+      version: "2026-02-03",
+    });
   }
 
   async receiveReaction(
@@ -924,7 +1183,6 @@ class Harness {
       linq: this.linq as unknown as LinqClient,
       imageVault: this.vault,
       florence: this.florence,
-      enrollmentCodes: new EnrollmentCodes("release-journey-secret-is-at-least-thirty-two-bytes"),
       now: () => new Date(this.now),
     });
     return ingress.receive({
@@ -952,6 +1210,10 @@ class FakeLinq {
     const authority = this.authorities.get(providerConversationId);
     if (!authority) throw new Error(`Unknown fake Linq conversation ${providerConversationId}`);
     return authority;
+  }
+
+  async setTyping(): Promise<boolean> {
+    return true;
   }
 
   async sendMessage(input: LinqSendMessage) {
@@ -1000,9 +1262,32 @@ async function freshHarness(
     encryptionKey: new Uint8Array(32).fill(7),
   });
   const reasoner = { decide: reason } as unknown as FlorenceReasoner;
+  const enrollmentCodes = new EnrollmentCodes(ENROLLMENT_SECRET);
   let harness: Harness;
   const google = {
     status: (input: { householdId: string; ownerAdultId: string }) => store.listActive(input),
+    finish: async (input: { state: string; sessionBindingDigest: string; now: string }) => {
+      const stateDigest = digest(input.state);
+      await store.consumePendingState({
+        stateDigest,
+        sessionBindingDigest: input.sessionBindingDigest,
+        now: input.now,
+      });
+      return store.activate({
+        connectionId: GOOGLE_CONNECTION,
+        stateDigest,
+        googleSubjectDigest: digest("google-subject"),
+        emailLabel: "hari@example.com",
+        grantedScopes: [
+          "openid",
+          "email",
+          "https://www.googleapis.com/auth/gmail.readonly",
+          "https://www.googleapis.com/auth/calendar.events.owned",
+        ],
+        refreshTokenEnvelope: "encrypted-refresh-token",
+        now: input.now,
+      });
+    },
     readCalendarWindow: async (input: {
       householdId: string;
       ownerAdultId: string;
@@ -1019,6 +1304,19 @@ async function freshHarness(
           }
         : { status: "unavailable" as const, events: [] };
     },
+    searchGmail: async (input: {
+      householdId: string;
+      ownerAdultId: string;
+      connectionId: string;
+      query: string;
+      limit: number;
+    }) => {
+      harness.gmailReads += 1;
+      expect(input.query).toBe('newer_than:30d ("Muir" OR "field trip")');
+      expect(input.limit).toBe(5);
+      const credential = await store.readActiveGoogleCredential(input);
+      return credential ? [SCHOOL_EMAIL] : [];
+    },
     executeCalendar: async () => {
       harness.googleAttempts += 1;
       if (executeCalendar) return executeCalendar();
@@ -1031,12 +1329,13 @@ async function freshHarness(
     linq: linq as unknown as LinqClient,
     google,
     reasoner,
-    enrollmentCodes: new EnrollmentCodes("release-journey-secret-is-at-least-thirty-two-bytes"),
+    enrollmentCodes,
     imageVault: vault,
     messagesUrl: "https://florence.test/messages",
+    setupOrigin: "https://florence.test",
     now: () => new Date(harness.now),
   });
-  harness = new Harness(store, florence, linq, vault);
+  harness = new Harness(store, florence, linq, vault, enrollmentCodes);
   onTestFinished(async () => {
     florence.stop();
     await store.close();

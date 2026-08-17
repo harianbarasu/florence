@@ -1,5 +1,5 @@
 import react from "@vitejs/plugin-react";
-import { defineConfig } from "vitest/config";
+import { defineConfig } from "vite";
 
 export default defineConfig({
   plugins: [react()],
@@ -8,10 +8,5 @@ export default defineConfig({
     proxy: {
       "/api": "http://127.0.0.1:8787",
     },
-  },
-  test: {
-    environment: "jsdom",
-    exclude: ["**/node_modules/**", "**/dist/**"],
-    setupFiles: ["./src/test/setup.ts"],
   },
 });

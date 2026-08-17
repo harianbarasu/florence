@@ -18,19 +18,69 @@ export type LinqMediaReference = {
 /** Provider evidence only. The application must resolve chat and sender authority. */
 export type LinqInboundMessageProposal = {
   kind: "inbound_message";
+  provider: "linq-v3";
   providerEventId: string;
+  providerPartnerId: string;
   providerConversationId: string;
   providerMessageId: string;
+  webhookCreatedAt: string;
   occurredAt: string;
-  isGroup: boolean;
+  reconciledAt: string | null;
+  traceId: string;
+  isGroup: boolean | null;
   service: "iMessage" | "RCS" | "SMS";
-  sender: { providerHandleId: string };
+  sender: { providerHandleId: string; address: string };
+  ownerLine: { providerHandleId: string; address: string } | null;
   text: string | null;
   media: readonly LinqMediaReference[];
-  replyTo: { providerMessageId: string } | null;
+  replyTo: { providerMessageId: string; partIndex: number | null } | null;
 };
 
-export type LinqWebhookProposal = LinqInboundMessageProposal | { kind: "ignored" };
+export type LinqMessageStatusProposal = {
+  kind: "message_status";
+  provider: "linq-v3";
+  providerEventId: string;
+  providerPartnerId: string;
+  providerConversationId: string;
+  providerMessageId: string;
+  idempotencyKey: string | null;
+  status: "sent" | "delivered" | "read" | "failed";
+  occurredAt: string;
+  traceId: string;
+  failure: { code: number; reason: string | null } | null;
+};
+
+export type LinqReactionProposal = {
+  kind: "reaction";
+  provider: "linq-v3";
+  providerEventId: string;
+  providerPartnerId: string;
+  providerConversationId: string;
+  targetProviderMessageId: string;
+  operation: "added" | "removed";
+  reaction: LinqReaction | "custom" | "sticker";
+  customEmoji: string | null;
+  partIndex: number;
+  isFromMe: boolean;
+  sender: { providerHandleId: string; address: string } | null;
+  service: "iMessage" | "RCS" | "SMS";
+  occurredAt: string;
+  traceId: string;
+};
+
+export type LinqIgnoredProposal = {
+  kind: "ignored";
+  provider: "linq-v3";
+  providerEventId: string;
+  eventType: string;
+  occurredAt: string;
+};
+
+export type LinqWebhookProposal =
+  | LinqInboundMessageProposal
+  | LinqMessageStatusProposal
+  | LinqReactionProposal
+  | LinqIgnoredProposal;
 
 export type UnwrapLinqWebhookInput = {
   signingSecret: string;
@@ -86,35 +136,90 @@ export function unwrapLinqWebhook(input: UnwrapLinqWebhookInput): LinqWebhookPro
   literal(envelope.api_version, "v3", "api_version");
   literal(envelope.webhook_version, LINQ_WEBHOOK_VERSION, "webhook_version");
   const eventType = string(envelope.event_type, "event_type");
-  timestamp(envelope.created_at, "created_at");
-  string(envelope.trace_id, "trace_id");
+  const createdAt = timestamp(envelope.created_at, "created_at");
+  const traceId = string(envelope.trace_id, "trace_id");
   const partnerId = string(envelope.partner_id, "partner_id");
   if (input.expectedPartnerId !== undefined && partnerId !== input.expectedPartnerId) {
     fail("invalid_payload", "Linq webhook partner does not match this endpoint");
   }
 
   if (eventType === "message.received") {
-    return inboundProposal(envelope, eventId);
+    return inboundProposal(envelope, { eventId, createdAt, traceId, partnerId });
   }
-  return { kind: "ignored" };
+  if (
+    eventType === "message.sent" ||
+    eventType === "message.delivered" ||
+    eventType === "message.read" ||
+    eventType === "message.failed"
+  ) {
+    return statusProposal(envelope, {
+      eventId,
+      eventType,
+      createdAt,
+      traceId,
+      partnerId,
+    });
+  }
+  if (eventType === "reaction.added" || eventType === "reaction.removed") {
+    return reactionProposal(envelope, {
+      eventId,
+      eventType,
+      createdAt,
+      traceId,
+      partnerId,
+    });
+  }
+  return { kind: "ignored", provider: "linq-v3", providerEventId: eventId, eventType, occurredAt: createdAt };
 }
 
-type DeliverableMessage = {
-  idempotencyKey: string;
-  providerConversationId: string;
-  payload: { text: string };
-  expectedAudience?: "private" | "group";
-  expectedParticipantIdentityDigests?: readonly string[];
-};
-
-export type LinqObservedChat = {
+export type LinqConversationAuthority = {
   audience: "private" | "group";
   participantIdentityDigests: readonly string[];
 };
 
-export type LinqExecutionResult =
-  | { status: "committed"; providerReceiptId: string; detail: null; occurredAt: string }
-  | { status: "failed"; providerReceiptId: null; detail: string; occurredAt: string };
+export type LinqMessageReplyTarget = {
+  providerMessageId: string;
+  partIndex?: number;
+};
+
+export type LinqSendMessage = {
+  idempotencyKey: string;
+  providerConversationId: string;
+  expectedAuthority: LinqConversationAuthority;
+  text: string;
+  replyTo?: LinqMessageReplyTarget | null;
+};
+
+export type LinqReaction = "love" | "like" | "dislike" | "laugh" | "emphasize" | "question";
+
+export type LinqSendReaction = {
+  /** Persist this key before calling. Linq's reaction endpoint has no idempotency parameter. */
+  idempotencyKey: string;
+  providerConversationId: string;
+  expectedAuthority: LinqConversationAuthority;
+  targetProviderMessageId: string;
+  partIndex?: number;
+  reaction: LinqReaction;
+};
+
+export type LinqObservedChat = LinqConversationAuthority;
+
+export type LinqDeliveryResult =
+  | {
+      status: "committed";
+      providerState: "accepted" | "reaction_added";
+      idempotencyKey: string;
+      providerReceiptId: string;
+      detail: null;
+      occurredAt: string;
+    }
+  | {
+      status: "failed" | "unknown";
+      idempotencyKey: string;
+      providerReceiptId: null;
+      detail: string;
+      occurredAt: string;
+    };
 
 export type LinqClientOptions = {
   apiKey: string;
@@ -124,6 +229,8 @@ export type LinqClientOptions = {
 };
 
 export type FetchedLinqMedia = LinqMediaReference & { bytes: Uint8Array };
+
+type ObservedReactionTarget = { hasOwnReaction: boolean };
 
 /** SHA-256 of the UTF-8 bytes `linq-v3\0${providerHandleId}`. */
 export function linqIdentitySubjectDigest(providerHandleId: string): string {
@@ -170,25 +277,49 @@ export class LinqClient {
     }
   }
 
-  /** Structurally satisfies Florence worker's EffectExecutor interface. */
-  async execute(effect: DeliverableMessage): Promise<LinqExecutionResult> {
-    const conversationId = bounded(effect.providerConversationId, "Provider conversation ID", 500);
-    const idempotencyKey = bounded(effect.idempotencyKey, "Message idempotency key", 255);
-    const text = bounded(effect.payload.text, "Message text", 10_000);
-    const expected = expectedChatAuthority(effect);
-    if (!expected) {
-      return this.failed("Florence did not supply valid current chat authority.");
-    }
-    let observed: LinqObservedChat;
+  /** Best-effort presence only. Group typing is deliberately unsupported by Florence. */
+  async setTyping(input: {
+    providerConversationId: string;
+    expectedAuthority: LinqConversationAuthority;
+    active: boolean;
+  }): Promise<boolean> {
+    const conversationId = bounded(input.providerConversationId, "Provider conversation ID", 500);
+    const expected = expectedChatAuthority(input.expectedAuthority);
+    if (expected?.audience !== "private") return false;
     try {
-      observed = await this.observeChat(conversationId);
-    } catch (error) {
-      if (error instanceof LinqError && error.retryable) throw error;
-      return this.failed("Linq could not verify the current chat authority.");
+      const observed = await this.observeChat(conversationId);
+      if (!sameChatAuthority(expected, observed)) return false;
+      const response = await this.#fetch(
+        this.endpoint(`chats/${encodeURIComponent(conversationId)}/typing`),
+        {
+          method: input.active ? "POST" : "DELETE",
+          headers: this.headers(),
+          redirect: "error",
+        },
+      );
+      return response.ok;
+    } catch {
+      return false;
     }
-    if (!sameChatAuthority(expected, observed)) {
-      return this.failed("Linq chat participants no longer match Florence's delivery authority.");
-    }
+  }
+
+  async sendMessage(input: LinqSendMessage): Promise<LinqDeliveryResult> {
+    const conversationId = bounded(input.providerConversationId, "Provider conversation ID", 500);
+    const idempotencyKey = bounded(input.idempotencyKey, "Message idempotency key", 255);
+    const text = bounded(input.text, "Message text", 10_000);
+    const authorityFailure = await this.authorityFailure(
+      conversationId,
+      expectedChatAuthority(input.expectedAuthority),
+      idempotencyKey,
+    );
+    if (authorityFailure) return authorityFailure;
+
+    const replyTo = input.replyTo
+      ? {
+          message_id: bounded(input.replyTo.providerMessageId, "Reply target message ID", 500),
+          part_index: nonnegativeInteger(input.replyTo.partIndex ?? 0, "Reply target part index"),
+        }
+      : undefined;
     let response: Response;
     try {
       response = await this.#fetch(this.endpoint(`chats/${encodeURIComponent(conversationId)}/messages`), {
@@ -199,6 +330,8 @@ export class LinqClient {
           message: {
             parts: [{ type: "text", value: text }],
             idempotency_key: idempotencyKey,
+            preferred_service: "iMessage",
+            ...(replyTo ? { reply_to: replyTo } : {}),
           },
         }),
       });
@@ -211,6 +344,7 @@ export class LinqClient {
       }
       return {
         status: "failed",
+        idempotencyKey,
         providerReceiptId: null,
         detail: `Linq rejected message delivery (HTTP ${response.status}).`,
         occurredAt: this.#now().toISOString(),
@@ -222,11 +356,165 @@ export class LinqClient {
       const message = object(payload.message, "send response message");
       const receiptId = string(message.id, "send response message id");
       const occurredAt = timestamp(message.created_at, "send response created_at");
-      return { status: "committed", providerReceiptId: receiptId, detail: null, occurredAt };
+      return {
+        status: "committed",
+        providerState: "accepted",
+        idempotencyKey,
+        providerReceiptId: receiptId,
+        detail: null,
+        occurredAt,
+      };
     } catch (error) {
       if (error instanceof LinqError && error.retryable) throw error;
       throw retryable("Linq accepted the send but returned an invalid receipt", error);
     }
+  }
+
+  async sendReaction(input: LinqSendReaction): Promise<LinqDeliveryResult> {
+    const conversationId = bounded(input.providerConversationId, "Provider conversation ID", 500);
+    const idempotencyKey = bounded(input.idempotencyKey, "Reaction idempotency key", 255);
+    const targetMessageId = bounded(input.targetProviderMessageId, "Reaction target message ID", 500);
+    const authorityFailure = await this.authorityFailure(
+      conversationId,
+      expectedChatAuthority(input.expectedAuthority),
+      idempotencyKey,
+    );
+    if (authorityFailure) return authorityFailure;
+
+    const partIndex =
+      input.partIndex === undefined ? 0 : nonnegativeInteger(input.partIndex, "Reaction target part index");
+    const desiredReaction = reactionType(input.reaction);
+    let before: ObservedReactionTarget;
+    try {
+      before = await this.readReactionTarget(conversationId, targetMessageId, partIndex, desiredReaction);
+    } catch (error) {
+      if (error instanceof LinqError && error.retryable) throw error;
+      return this.failed(idempotencyKey, "The reaction target is not a message in the authorized chat.");
+    }
+    if (before.hasOwnReaction) {
+      return {
+        status: "committed",
+        providerState: "reaction_added",
+        idempotencyKey,
+        providerReceiptId: reactionStateReceipt(targetMessageId, partIndex, desiredReaction),
+        detail: null,
+        occurredAt: this.#now().toISOString(),
+      };
+    }
+
+    let response: Response;
+    try {
+      response = await this.#fetch(
+        this.endpoint(`messages/${encodeURIComponent(targetMessageId)}/reactions`),
+        {
+          method: "POST",
+          headers: this.headers(),
+          redirect: "error",
+          body: JSON.stringify({
+            operation: "add",
+            type: desiredReaction,
+            part_index: partIndex,
+          }),
+        },
+      );
+    } catch {
+      return this.reconcileReaction(
+        conversationId,
+        targetMessageId,
+        partIndex,
+        desiredReaction,
+        idempotencyKey,
+        null,
+        "Linq reaction delivery could not be confirmed.",
+      );
+    }
+    if (retryableStatus(response.status)) {
+      return this.reconcileReaction(
+        conversationId,
+        targetMessageId,
+        partIndex,
+        desiredReaction,
+        idempotencyKey,
+        null,
+        `Linq reaction delivery could not be confirmed (HTTP ${response.status}).`,
+      );
+    }
+    if (!response.ok) {
+      return this.failed(idempotencyKey, `Linq rejected reaction delivery (HTTP ${response.status}).`);
+    }
+    let traceId: string | null = null;
+    try {
+      const payload = object(await response.json(), "reaction response");
+      literal(payload.status, "accepted", "reaction response status");
+      traceId = string(payload.trace_id, "reaction response trace_id");
+    } catch {
+      // A malformed acknowledgement can still be reconciled from current message state.
+    }
+    return this.reconcileReaction(
+      conversationId,
+      targetMessageId,
+      partIndex,
+      desiredReaction,
+      idempotencyKey,
+      traceId,
+      "Linq accepted the reaction, but the tapback is not yet confirmed.",
+    );
+  }
+
+  private async reconcileReaction(
+    conversationId: string,
+    targetMessageId: string,
+    partIndex: number,
+    reaction: LinqReaction,
+    idempotencyKey: string,
+    traceId: string | null,
+    unknownDetail: string,
+  ): Promise<LinqDeliveryResult> {
+    try {
+      const observed = await this.readReactionTarget(conversationId, targetMessageId, partIndex, reaction);
+      if (observed.hasOwnReaction) {
+        return {
+          status: "committed",
+          providerState: "reaction_added",
+          idempotencyKey,
+          providerReceiptId: traceId ?? reactionStateReceipt(targetMessageId, partIndex, reaction),
+          detail: null,
+          occurredAt: this.#now().toISOString(),
+        };
+      }
+    } catch {
+      // The mutation may have happened. Never retry an unconfirmed reaction.
+    }
+    return this.unknown(idempotencyKey, unknownDetail);
+  }
+
+  private async readReactionTarget(
+    conversationId: string,
+    targetMessageId: string,
+    partIndex: number,
+    reaction: LinqReaction,
+  ): Promise<ObservedReactionTarget> {
+    const response = await this.request(
+      this.endpoint(`messages/${encodeURIComponent(targetMessageId)}`),
+      { method: "GET", headers: this.headers(), redirect: "error" },
+      "verifying a reaction target",
+    );
+    const message = object(await response.json(), "reaction target message");
+    literal(message.id, targetMessageId, "reaction target message id");
+    literal(message.chat_id, conversationId, "reaction target chat id");
+    const parts = array(message.parts, "reaction target parts");
+    const part = parts[partIndex];
+    if (part === undefined) fail("invalid_payload", "Linq reaction target part does not exist");
+    const reactionsValue = object(part, "reaction target part").reactions;
+    const reactions =
+      reactionsValue === null || reactionsValue === undefined
+        ? []
+        : array(reactionsValue, "reaction target part reactions");
+    const hasOwnReaction = reactions.some((value) => {
+      const candidate = object(value, "reaction target reaction");
+      return candidate.is_me === true && candidate.type === reaction;
+    });
+    return { hasOwnReaction };
   }
 
   async fetchMedia(reference: LinqMediaReference): Promise<FetchedLinqMedia> {
@@ -245,7 +533,6 @@ export class LinqClient {
       throw retryable("Linq returned invalid attachment metadata", error);
     }
     literal(metadata.id, attachmentId, "attachment id");
-    literal(metadata.status, "complete", "attachment status");
     const filename = string(metadata.filename, "attachment filename");
     const mimeType = string(metadata.content_type, "attachment content type");
     const sizeBytes = positiveInteger(metadata.size_bytes, "Attachment metadata size");
@@ -278,9 +565,40 @@ export class LinqClient {
     return new URL(`${LINQ_API_BASE_URL}/${path}`);
   }
 
-  private failed(detail: string): LinqExecutionResult {
+  private async authorityFailure(
+    conversationId: string,
+    expected: LinqConversationAuthority | null,
+    idempotencyKey: string,
+  ): Promise<LinqDeliveryResult | null> {
+    if (!expected) {
+      return this.failed(idempotencyKey, "Florence did not supply valid current chat authority.");
+    }
+    let observed: LinqObservedChat;
+    try {
+      observed = await this.observeChat(conversationId);
+    } catch (error) {
+      if (error instanceof LinqError && error.retryable) throw error;
+      return this.failed(idempotencyKey, "Linq could not verify the current chat authority.");
+    }
+    return sameChatAuthority(expected, observed)
+      ? null
+      : this.failed(idempotencyKey, "Linq chat participants no longer match Florence's delivery authority.");
+  }
+
+  private failed(idempotencyKey: string, detail: string): LinqDeliveryResult {
     return {
       status: "failed",
+      idempotencyKey,
+      providerReceiptId: null,
+      detail,
+      occurredAt: this.#now().toISOString(),
+    };
+  }
+
+  private unknown(idempotencyKey: string, detail: string): LinqDeliveryResult {
+    return {
+      status: "unknown",
+      idempotencyKey,
       providerReceiptId: null,
       detail,
       occurredAt: this.#now().toISOString(),
@@ -336,9 +654,7 @@ function observeChatAuthority(chat: Record<string, unknown>): LinqObservedChat {
     if ((status === "active") === hasLeftAt) {
       fail("invalid_payload", "Linq chat handle status and left_at are inconsistent");
     }
-    if (status !== "active") {
-      fail("invalid_payload", "Linq chat contains a former participant and cannot regain Florence authority");
-    }
+    if (status !== "active") continue;
     if (service !== "iMessage") {
       fail("invalid_payload", "Linq chat active handles must use iMessage");
     }
@@ -368,9 +684,9 @@ function participantStatus(value: unknown): "active" | "left" | "removed" {
   fail("invalid_payload", "Linq chat handle status must be active, left, or removed");
 }
 
-function expectedChatAuthority(effect: DeliverableMessage): LinqObservedChat | null {
-  const audience = effect.expectedAudience;
-  const digests = effect.expectedParticipantIdentityDigests;
+function expectedChatAuthority(authority: LinqConversationAuthority): LinqObservedChat | null {
+  const audience = authority.audience;
+  const digests = authority.participantIdentityDigests;
   if ((audience !== "private" && audience !== "group") || !Array.isArray(digests)) return null;
   const requiredParticipants = audience === "private" ? 1 : 2;
   if (digests.length !== requiredParticipants) return null;
@@ -380,6 +696,41 @@ function expectedChatAuthority(effect: DeliverableMessage): LinqObservedChat | n
     unique.add(digest);
   }
   return { audience, participantIdentityDigests: [...unique].sort() };
+}
+
+function reactionType(value: LinqReaction): LinqReaction {
+  if (
+    value === "love" ||
+    value === "like" ||
+    value === "dislike" ||
+    value === "laugh" ||
+    value === "emphasize" ||
+    value === "question"
+  ) {
+    return value;
+  }
+  fail("configuration", "Linq reaction type is invalid");
+}
+
+function webhookReactionType(value: unknown): LinqReaction | "custom" | "sticker" {
+  if (value === "custom" || value === "sticker") return value;
+  if (
+    value === "love" ||
+    value === "like" ||
+    value === "dislike" ||
+    value === "laugh" ||
+    value === "emphasize" ||
+    value === "question"
+  ) {
+    return value;
+  }
+  fail("invalid_payload", "Linq webhook reaction type is invalid");
+}
+
+function reactionStateReceipt(targetMessageId: string, partIndex: number, reaction: LinqReaction): string {
+  return `reaction-state:${createHash("sha256")
+    .update(`${targetMessageId}\0${partIndex}\0${reaction}`, "utf8")
+    .digest("hex")}`;
 }
 
 function sameChatAuthority(expected: LinqObservedChat, observed: LinqObservedChat): boolean {
@@ -392,12 +743,18 @@ function sameChatAuthority(expected: LinqObservedChat, observed: LinqObservedCha
   );
 }
 
-function inboundProposal(envelope: Record<string, unknown>, eventId: string): LinqInboundMessageProposal {
+function inboundProposal(
+  envelope: Record<string, unknown>,
+  common: { eventId: string; createdAt: string; traceId: string; partnerId: string },
+): LinqInboundMessageProposal {
   const data = object(envelope.data, "message.received data");
   literal(data.direction, "inbound", "message direction");
   const chat = object(data.chat, "message chat");
   const sender = handle(data.sender_handle, "sender_handle", false);
-  handle(chat.owner_handle, "owner_handle", true);
+  const owner =
+    chat.owner_handle === null || chat.owner_handle === undefined
+      ? null
+      : handle(chat.owner_handle, "owner_handle", true);
   const service = serviceType(data.service);
   const parts = array(data.parts, "message parts");
   const textParts: string[] = [];
@@ -406,6 +763,7 @@ function inboundProposal(envelope: Record<string, unknown>, eventId: string): Li
     const part = object(rawPart, "message part");
     const type = string(part.type, "message part type");
     if (type === "text") textParts.push(string(part.value, "text part value"));
+    if (type === "link") textParts.push(httpsLink(part.value));
     if (type === "media") {
       media.push({
         providerAttachmentId: string(part.id, "media part id"),
@@ -417,18 +775,144 @@ function inboundProposal(envelope: Record<string, unknown>, eventId: string): Li
   }
   const reply =
     data.reply_to === null || data.reply_to === undefined ? null : object(data.reply_to, "reply_to");
+  const partIndex = reply?.part_index;
   return {
     kind: "inbound_message",
-    providerEventId: eventId,
+    provider: "linq-v3",
+    providerEventId: common.eventId,
+    providerPartnerId: common.partnerId,
     providerConversationId: string(chat.id, "chat id"),
     providerMessageId: string(data.id, "message id"),
+    webhookCreatedAt: common.createdAt,
     occurredAt: timestamp(data.sent_at, "message sent_at"),
-    isGroup: boolean(chat.is_group, "chat is_group"),
+    reconciledAt:
+      data.reconciled_at === null || data.reconciled_at === undefined
+        ? null
+        : timestamp(data.reconciled_at, "message reconciled_at"),
+    traceId: common.traceId,
+    isGroup: nullableBoolean(chat.is_group, "chat is_group"),
     service,
-    sender: { providerHandleId: sender.id },
+    sender: { providerHandleId: sender.id, address: sender.address },
+    ownerLine: owner ? { providerHandleId: owner.id, address: owner.address } : null,
     text: textParts.length > 0 ? textParts.join("\n") : null,
     media,
-    replyTo: reply ? { providerMessageId: string(reply.message_id, "reply_to message_id") } : null,
+    replyTo: reply
+      ? {
+          providerMessageId: string(reply.message_id, "reply_to message_id"),
+          partIndex:
+            partIndex === null || partIndex === undefined
+              ? null
+              : nonnegativeInteger(partIndex, "Reply part index"),
+        }
+      : null,
+  };
+}
+
+function statusProposal(
+  envelope: Record<string, unknown>,
+  common: {
+    eventId: string;
+    eventType: "message.sent" | "message.delivered" | "message.read" | "message.failed";
+    createdAt: string;
+    traceId: string;
+    partnerId: string;
+  },
+): LinqMessageStatusProposal | LinqIgnoredProposal {
+  const data = object(envelope.data, `${common.eventType} data`);
+  const status = common.eventType.slice("message.".length) as LinqMessageStatusProposal["status"];
+  const chatValue = data.chat;
+  const chatIdValue =
+    chatValue === null || chatValue === undefined
+      ? data.chat_id
+      : object(chatValue, "message status chat").id;
+  const messageIdValue = data.message_id ?? data.id;
+  if (!presentString(chatIdValue) || !presentString(messageIdValue)) {
+    return {
+      kind: "ignored",
+      provider: "linq-v3",
+      providerEventId: common.eventId,
+      eventType: common.eventType,
+      occurredAt: common.createdAt,
+    };
+  }
+  const chatId = string(chatIdValue, "message status chat id");
+  const messageId = string(messageIdValue, "message status message id");
+  const occurredField = status === "failed" ? data.failed_at : data[`${status}_at`];
+  const failure =
+    status === "failed"
+      ? {
+          code: nonnegativeInteger(data.code, "failure code"),
+          reason: optionalString(data.reason, "failure reason"),
+        }
+      : null;
+  return {
+    kind: "message_status",
+    provider: "linq-v3",
+    providerEventId: common.eventId,
+    providerPartnerId: common.partnerId,
+    providerConversationId: chatId,
+    providerMessageId: messageId,
+    idempotencyKey:
+      data.idempotency_key === null || data.idempotency_key === undefined
+        ? null
+        : string(data.idempotency_key, "message status idempotency_key"),
+    status,
+    occurredAt:
+      occurredField === null || occurredField === undefined
+        ? common.createdAt
+        : timestamp(occurredField, `message ${status}_at`),
+    traceId: common.traceId,
+    failure,
+  };
+}
+
+function reactionProposal(
+  envelope: Record<string, unknown>,
+  common: {
+    eventId: string;
+    eventType: "reaction.added" | "reaction.removed";
+    createdAt: string;
+    traceId: string;
+    partnerId: string;
+  },
+): LinqReactionProposal | LinqIgnoredProposal {
+  const data = object(envelope.data, `${common.eventType} data`);
+  if (!presentString(data.chat_id) || !presentString(data.message_id)) {
+    return {
+      kind: "ignored",
+      provider: "linq-v3",
+      providerEventId: common.eventId,
+      eventType: common.eventType,
+      occurredAt: common.createdAt,
+    };
+  }
+  const isFromMe = boolean(data.is_from_me, "reaction is_from_me");
+  const sender =
+    data.from_handle === null || data.from_handle === undefined
+      ? null
+      : handle(data.from_handle, "reaction from_handle", isFromMe);
+  return {
+    kind: "reaction",
+    provider: "linq-v3",
+    providerEventId: common.eventId,
+    providerPartnerId: common.partnerId,
+    providerConversationId: string(data.chat_id, "reaction chat_id"),
+    targetProviderMessageId: string(data.message_id, "reaction message_id"),
+    operation: common.eventType === "reaction.added" ? "added" : "removed",
+    reaction: webhookReactionType(data.reaction_type),
+    customEmoji: optionalString(data.custom_emoji, "reaction custom_emoji"),
+    partIndex:
+      data.part_index === null || data.part_index === undefined
+        ? 0
+        : nonnegativeInteger(data.part_index, "reaction part_index"),
+    isFromMe,
+    sender: sender ? { providerHandleId: sender.id, address: sender.address } : null,
+    service: serviceType(data.service),
+    occurredAt:
+      data.reacted_at === null || data.reacted_at === undefined
+        ? common.createdAt
+        : timestamp(data.reacted_at, "reaction reacted_at"),
+    traceId: common.traceId,
   };
 }
 
@@ -543,11 +1027,10 @@ function decodeBase64(value: string, name: string): Buffer {
   return Buffer.from(value, "base64");
 }
 
-function handle(value: unknown, name: string, expectedIsMe: boolean): { id: string } {
+function handle(value: unknown, name: string, expectedIsMe: boolean): { id: string; address: string } {
   const parsed = object(value, name);
   if (parsed.is_me !== expectedIsMe) fail("invalid_payload", `${name} has an invalid owner marker`);
-  string(parsed.handle, `${name} address`);
-  return { id: string(parsed.id, `${name} id`) };
+  return { id: string(parsed.id, `${name} id`), address: string(parsed.handle, `${name} address`) };
 }
 
 function serviceType(value: unknown): "iMessage" | "RCS" | "SMS" {
@@ -574,6 +1057,14 @@ function string(value: unknown, name: string): string {
   return value;
 }
 
+function optionalString(value: unknown, name: string): string | null {
+  return value === null || value === undefined ? null : string(value, name);
+}
+
+function presentString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 10_000;
+}
+
 function bounded(value: unknown, name: string, maximum: number): string {
   const parsed = nonempty(value, name);
   if (parsed.length > maximum) fail("configuration", `${name} exceeds ${maximum} characters`);
@@ -592,6 +1083,27 @@ function boolean(value: unknown, name: string): boolean {
   return value;
 }
 
+function nullableBoolean(value: unknown, name: string): boolean | null {
+  return value === null || value === undefined ? null : boolean(value, name);
+}
+
+function httpsLink(value: unknown): string {
+  const text = string(value, "link part value");
+  if (text.length > 2_048) fail("invalid_payload", "Linq link part exceeds 2048 characters");
+  let url: URL;
+  try {
+    url = new URL(text);
+  } catch (error) {
+    throw new LinqError("invalid_payload", "Linq link part is not a valid URL", false, {
+      cause: error,
+    });
+  }
+  if (url.protocol !== "https:" || url.username || url.password) {
+    fail("invalid_payload", "Linq link part must use HTTPS");
+  }
+  return text;
+}
+
 function timestamp(value: unknown, name: string): string {
   const parsed = string(value, name);
   if (Number.isNaN(Date.parse(parsed))) fail("invalid_payload", `Linq ${name} must be a timestamp`);
@@ -605,6 +1117,13 @@ function literal(value: unknown, expected: string, name: string): void {
 function positiveInteger(value: unknown, name: string): number {
   if (!Number.isSafeInteger(value) || (value as number) <= 0)
     fail("invalid_payload", `${name} must be positive`);
+  return value as number;
+}
+
+function nonnegativeInteger(value: unknown, name: string): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    fail("invalid_payload", `${name} must be non-negative`);
+  }
   return value as number;
 }
 

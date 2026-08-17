@@ -30,33 +30,22 @@ export type PendingGoogleConnection = {
   sessionBindingDigest: string;
 };
 
+export type StoredGoogleConnection = GoogleConnectionView & {
+  stateDigest: string;
+  stateExpiresAt: string;
+  stateConsumedAt: string | null;
+  googleSubjectDigest: string | null;
+  refreshTokenEnvelope: string | null;
+};
+
 export type ActiveGoogleCredential = {
   connectionId: string;
   householdId: string;
   ownerAdultId: string;
   refreshTokenEnvelope: string;
-  gmailCursor: string | null;
 };
 
-export type ClaimedGmailSync = ActiveGoogleCredential & { leaseOwner: string };
-
-export type GmailMessageChange = {
-  messageId: string;
-  threadId: string;
-  historyId: string;
-};
-
-export type GmailSyncBatch = {
-  connectionId: string;
-  householdId: string;
-  ownerAdultId: string;
-  leaseOwner: string;
-  cursor: string | null;
-  changes: readonly GmailMessageChange[];
-  nextCursor: string;
-};
-
-export type GoogleCalendarDraft = {
+export type CalendarEventDraft = {
   title: string;
   startsAt: string;
   endsAt: string;
@@ -64,27 +53,33 @@ export type GoogleCalendarDraft = {
   location: string | null;
 };
 
-/** Structurally matches the worker's narrow, approved Calendar effect. */
-export type GoogleCalendarEffect = {
-  id: string;
+export type ApprovedCalendarAction = {
+  actionId: string;
   householdId: string;
-  idempotencyKey: string;
-  kind: "google.calendar.create";
   connectionId: string;
   ownerAdultId: string;
-  actionId: string;
+  approvalMessageId: string;
   approvalDigest: string;
-  candidateId: string;
-  candidateVersion: 1;
-  candidateDigest: string;
-  payload: GoogleCalendarDraft;
+  proposalDigest: string;
+  event: CalendarEventDraft;
 };
 
 export type GoogleCalendarExecutionResult =
   | { status: "committed"; providerReceiptId: string; detail: string; occurredAt: string }
   | { status: "failed"; providerReceiptId: null; detail: string; occurredAt: string };
 
-/** Matches HouseholdChiefOfStaff's private, just-in-time source-reader seam. */
+export type GoogleCalendarWindowEvent = {
+  title: string | null;
+  startsAt: string;
+  endsAt: string;
+  allDay: boolean;
+};
+
+export type GoogleCalendarWindowRead = {
+  status: "complete" | "truncated" | "unavailable";
+  events: readonly GoogleCalendarWindowEvent[];
+};
+
 export type GmailEvidence = {
   messageId: string;
   threadId: string;
@@ -95,7 +90,7 @@ export type GmailEvidence = {
   text: string;
 };
 
-/** Infrastructure seam. Credential plaintext must never cross this interface. */
+/** Credential plaintext must never cross this interface. */
 export interface GoogleConnectionStore {
   createPending(input: {
     connectionId: string;
@@ -138,18 +133,6 @@ export interface GoogleConnectionStore {
     householdId: string;
     ownerAdultId: string;
   }): Promise<ActiveGoogleCredential | null>;
-  claimNextGmailSync(input: {
-    owner: string;
-    now: string;
-    leaseUntil: string;
-  }): Promise<ClaimedGmailSync | null>;
-  releaseGmailSync(input: {
-    connectionId: string;
-    owner: string;
-    nextAt: string;
-    cursor?: string;
-    error?: string | null;
-  }): Promise<void>;
 }
 
 export type BeginGoogleConnectionResult = {
@@ -175,6 +158,13 @@ export class GoogleConnectionError extends Error {
   ) {
     super(message);
     this.name = "GoogleConnectionError";
+  }
+}
+
+export class GoogleCalendarTransientError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "GoogleCalendarTransientError";
   }
 }
 
@@ -371,93 +361,113 @@ export class GoogleConnection {
     const credential = await this.#store.readActiveGoogleCredential(input);
     if (!credential) throw new GoogleConnectionError("Active Google connection was not found", "not_found");
     const accessToken = await this.#accessToken(credential);
-    const response = await this.#fetch(
-      `https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(input.messageId)}?format=full`,
-      { headers: { authorization: `Bearer ${accessToken}` } },
-    );
-    if (!response.ok) throw providerError("Gmail message could not be read");
-    const message = await safeJson(response);
-    const messageId = stringField(message, "id");
-    const threadId = stringField(message, "threadId");
-    const historyId = stringField(message, "historyId");
-    if (messageId !== input.messageId || threadId !== input.threadId || historyId !== input.historyId) {
-      throw providerError("Gmail returned evidence for a different message");
-    }
-    const payload = recordField(message, "payload");
-    const headers = headerMap(payload.headers);
-    const from = bounded(required(headers.get("from") ?? "", "Gmail From header"), 500);
-    const subject = nullableBounded(headers.get("subject"), 1_000);
-    const timestamp = Number(stringField(message, "internalDate"));
-    if (!Number.isFinite(timestamp)) throw providerError("Gmail returned an invalid message date");
-    const body = collectPlainText(payload).trim() || stringField(message, "snippet").trim();
-    if (!body) throw providerError("Gmail message has no readable text");
-    return {
-      messageId,
-      threadId,
-      historyId,
-      from,
-      subject,
-      sentAt: new Date(timestamp).toISOString(),
-      text: bounded(body, 50_000),
-    };
+    return this.#readGmailMessage(accessToken, input);
   }
 
-  async claimNextGmailSync(input: {
-    owner: string;
-    now: string;
-    leaseUntil: string;
+  async searchGmail(input: {
+    householdId: string;
+    ownerAdultId: string;
+    connectionId: string;
+    query: string;
     limit?: number;
-  }): Promise<GmailSyncBatch | null> {
-    const now = instant(input.now);
-    const leaseUntil = instant(input.leaseUntil);
-    if (leaseUntil <= now) throw new Error("Gmail sync lease must end after now");
-    const limit = input.limit ?? 50;
-    if (!Number.isInteger(limit) || limit < 1 || limit > 50) {
-      throw new Error("Gmail sync limit must be between 1 and 50");
+  }): Promise<readonly GmailEvidence[]> {
+    const queryText = required(input.query, "Gmail search query").trim();
+    if (queryText.length > 500) throw new Error("Gmail search query exceeds 500 characters");
+    const limit = input.limit ?? 10;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 20) {
+      throw new Error("Gmail search limit must be between 1 and 20");
     }
-    const claim = await this.#store.claimNextGmailSync({
-      owner: required(input.owner, "Gmail sync owner"),
-      now: now.toISOString(),
-      leaseUntil: leaseUntil.toISOString(),
+    const credential = await this.#store.readActiveGoogleCredential({
+      householdId: input.householdId,
+      ownerAdultId: input.ownerAdultId,
+      connectionId: input.connectionId,
     });
-    if (!claim) return null;
+    if (!credential) throw new GoogleConnectionError("Active Google connection was not found", "not_found");
+    const accessToken = await this.#accessToken(credential);
+    const query = new URLSearchParams({ maxResults: String(limit), q: queryText });
+    const list = await this.#gmailJson(`messages?${query}`, accessToken);
+    const identities = await Promise.all(
+      recordArray(list.messages)
+        .slice(0, limit)
+        .map((message) => this.#messageIdentity(accessToken, message)),
+    );
+    return Promise.all(identities.map((identity) => this.#readGmailMessage(accessToken, identity)));
+  }
+
+  async readCalendarWindow(input: {
+    householdId: string;
+    ownerAdultId: string;
+    connectionId: string;
+    timeMin: string;
+    timeMax: string;
+    limit?: number;
+  }): Promise<GoogleCalendarWindowRead> {
+    const timeMin = explicitInstant(input.timeMin);
+    const timeMax = explicitInstant(input.timeMax);
+    if (timeMax <= timeMin) throw new Error("Calendar read end must follow start");
+    if (timeMax.getTime() - timeMin.getTime() > 31 * 24 * 60 * 60_000) {
+      throw new Error("Calendar read window cannot exceed 31 days");
+    }
+    const limit = input.limit ?? 50;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 50) {
+      throw new Error("Calendar read limit must be between 1 and 50");
+    }
+    const credential = await this.#store.readActiveGoogleCredential({
+      householdId: input.householdId,
+      ownerAdultId: input.ownerAdultId,
+      connectionId: input.connectionId,
+    });
+    if (!credential) return { status: "unavailable", events: [] };
+
     try {
-      const accessToken = await this.#accessToken(claim);
-      const result = claim.gmailCursor
-        ? await this.#incrementalChanges(accessToken, claim.gmailCursor, limit)
-        : await this.#initialChanges(accessToken, limit);
+      const accessToken = await this.#calendarAccessToken(credential);
+      const query = new URLSearchParams({
+        fields:
+          "nextPageToken,timeZone,items(status,summary,start,end,transparency,attendees(self,responseStatus))",
+        maxResults: String(limit),
+        orderBy: "startTime",
+        showDeleted: "false",
+        singleEvents: "true",
+        timeMax: timeMax.toISOString(),
+        timeMin: timeMin.toISOString(),
+      });
+      let response: Response;
+      try {
+        response = await this.#fetch(
+          `https://www.googleapis.com/calendar/v3/calendars/primary/events?${query}`,
+          {
+            headers: { authorization: `Bearer ${accessToken}` },
+            signal: AbortSignal.timeout(15_000),
+          },
+        );
+      } catch (error) {
+        throw transientCalendarError("Google Calendar read failed", error);
+      }
+      if (transientHttpStatus(response.status)) {
+        throw transientCalendarError(`Google Calendar read returned HTTP ${response.status}`);
+      }
+      if (!response.ok) return { status: "unavailable", events: [] };
+      const body = await safeJson(response);
+      const calendarTimeZone = stringField(body, "timeZone");
+      const nextPageToken = body.nextPageToken;
+      if (nextPageToken !== undefined && (typeof nextPageToken !== "string" || !nextPageToken)) {
+        return { status: "unavailable", events: [] };
+      }
+      const events = recordArray(body.items).flatMap((event) => {
+        const busy = calendarWindowEvent(event, calendarTimeZone, timeMin, timeMax);
+        return busy ? [busy] : [];
+      });
       return {
-        connectionId: claim.connectionId,
-        householdId: claim.householdId,
-        ownerAdultId: claim.ownerAdultId,
-        leaseOwner: claim.leaseOwner,
-        cursor: claim.gmailCursor,
-        changes: result.changes,
-        nextCursor: result.nextCursor,
+        status: nextPageToken ? "truncated" : "complete",
+        events,
       };
     } catch (error) {
-      await this.#store.releaseGmailSync({
-        connectionId: claim.connectionId,
-        owner: claim.leaseOwner,
-        nextAt: new Date(now.getTime() + 5 * 60_000).toISOString(),
-        error: error instanceof GoogleConnectionError ? error.code : "gmail_poll_failed",
-      });
-      throw error;
+      if (error instanceof GoogleCalendarTransientError) throw error;
+      return { status: "unavailable", events: [] };
     }
   }
 
-  releaseGmailSync(input: {
-    connectionId: string;
-    owner: string;
-    nextAt: string;
-    cursor?: string;
-    error?: string | null;
-  }): Promise<void> {
-    instant(input.nextAt);
-    return this.#store.releaseGmailSync(input);
-  }
-
-  async executeCalendar(effect: GoogleCalendarEffect): Promise<GoogleCalendarExecutionResult> {
+  async executeCalendar(action: ApprovedCalendarAction): Promise<GoogleCalendarExecutionResult> {
     const failed = (detail: string): GoogleCalendarExecutionResult => ({
       status: "failed",
       providerReceiptId: null,
@@ -465,15 +475,15 @@ export class GoogleConnection {
       occurredAt: new Date().toISOString(),
     });
     try {
-      validateCalendarEffect(effect);
+      validateCalendarAction(action);
     } catch {
-      return failed("The approved Calendar effect is invalid");
+      return failed("The approved Calendar action is invalid");
     }
 
     const credential = await this.#store.readActiveGoogleCredential({
-      connectionId: effect.connectionId,
-      householdId: effect.householdId,
-      ownerAdultId: effect.ownerAdultId,
+      connectionId: action.connectionId,
+      householdId: action.householdId,
+      ownerAdultId: action.ownerAdultId,
     });
     if (!credential) return failed("The approved Google connection is no longer active");
 
@@ -485,18 +495,19 @@ export class GoogleConnection {
       throw error;
     }
 
-    const eventId = calendarEventId(effect.actionId);
+    const eventId = googleCalendarEventId(action.actionId);
     const eventBody = {
       id: eventId,
-      summary: effect.payload.title,
-      start: { dateTime: effect.payload.startsAt, timeZone: effect.payload.timeZone },
-      end: { dateTime: effect.payload.endsAt, timeZone: effect.payload.timeZone },
-      ...(effect.payload.location === null ? {} : { location: effect.payload.location }),
+      summary: action.event.title,
+      start: { dateTime: action.event.startsAt, timeZone: action.event.timeZone },
+      end: { dateTime: action.event.endsAt, timeZone: action.event.timeZone },
+      ...(action.event.location === null ? {} : { location: action.event.location }),
       extendedProperties: {
         private: {
-          florenceActionId: effect.actionId,
-          florenceApprovalDigest: effect.approvalDigest,
-          florenceCandidateDigest: effect.candidateDigest,
+          florenceActionId: action.actionId,
+          florenceApprovalMessageId: action.approvalMessageId,
+          florenceApprovalDigest: action.approvalDigest,
+          florenceProposalDigest: action.proposalDigest,
         },
       },
     };
@@ -557,7 +568,7 @@ export class GoogleConnection {
     } catch {
       return failed("Google Calendar returned an invalid proof event");
     }
-    const proof = calendarEventProof(event, eventId, effect);
+    const proof = calendarEventProof(event, eventId, action);
     if (!proof) return failed("Google Calendar did not preserve the exact approved event");
     const detail = JSON.stringify({
       provider: "google-calendar",
@@ -589,11 +600,54 @@ export class GoogleConnection {
         grant_type: "refresh_token",
         refresh_token: refreshToken,
       }),
+      signal: AbortSignal.timeout(15_000),
     });
     if (!response.ok) throw providerError("Google access-token refresh failed");
     const token = await safeJson(response);
     if (token.token_type !== "Bearer") throw providerError("Google returned an unsupported token type");
     return stringField(token, "access_token");
+  }
+
+  async #readGmailMessage(
+    accessToken: string,
+    expected: { messageId: string; threadId: string; historyId: string },
+  ): Promise<GmailEvidence> {
+    const response = await this.#fetch(
+      `https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(expected.messageId)}?format=full`,
+      {
+        headers: { authorization: `Bearer ${accessToken}` },
+        signal: AbortSignal.timeout(15_000),
+      },
+    );
+    if (!response.ok) throw providerError("Gmail message could not be read");
+    const message = await safeJson(response);
+    const messageId = stringField(message, "id");
+    const threadId = stringField(message, "threadId");
+    const historyId = stringField(message, "historyId");
+    if (
+      messageId !== expected.messageId ||
+      threadId !== expected.threadId ||
+      historyId !== expected.historyId
+    ) {
+      throw providerError("Gmail returned evidence for a different message");
+    }
+    const payload = recordField(message, "payload");
+    const headers = headerMap(payload.headers);
+    const from = bounded(required(headers.get("from") ?? "", "Gmail From header"), 500);
+    const subject = nullableBounded(headers.get("subject"), 1_000);
+    const timestamp = Number(stringField(message, "internalDate"));
+    if (!Number.isFinite(timestamp)) throw providerError("Gmail returned an invalid message date");
+    const body = collectPlainText(payload).trim() || stringField(message, "snippet").trim();
+    if (!body) throw providerError("Gmail message has no readable text");
+    return {
+      messageId,
+      threadId,
+      historyId,
+      from,
+      subject,
+      sentAt: new Date(timestamp).toISOString(),
+      text: bounded(body, 50_000),
+    };
   }
 
   async #calendarAccessToken(credential: ActiveGoogleCredential): Promise<string> {
@@ -647,57 +701,19 @@ export class GoogleConnection {
     }
   }
 
-  async #initialChanges(accessToken: string, limit: number) {
-    const profile = await this.#gmailJson("profile", accessToken);
-    const nextCursor = stringField(profile, "historyId");
-    const query = new URLSearchParams({ maxResults: String(limit), q: "newer_than:90d" });
-    const list = await this.#gmailJson(`messages?${query}`, accessToken);
-    const messages = recordArray(list.messages).slice(0, limit);
-    return {
-      changes: await Promise.all(messages.map((message) => this.#messageIdentity(accessToken, message))),
-      nextCursor,
-    };
-  }
-
-  async #incrementalChanges(accessToken: string, cursor: string, limit: number) {
-    const query = new URLSearchParams({
-      historyTypes: "messageAdded",
-      maxResults: String(limit),
-      startHistoryId: cursor,
-    });
-    const result = await this.#gmailJson(`history?${query}`, accessToken);
-    const messages: Record<string, unknown>[] = [];
-    let fullyConsumedCursor = cursor;
-    let truncated = false;
-    for (const history of recordArray(result.history)) {
-      const historyId = stringField(history, "id");
-      const added = recordArray(history.messagesAdded).map((entry) => recordField(entry, "message"));
-      if (added.length > limit) throw providerError("One Gmail history record exceeds the safe batch limit");
-      if (messages.length + added.length > limit) {
-        truncated = true;
-        break;
-      }
-      messages.push(...added);
-      fullyConsumedCursor = historyId;
-    }
-    return {
-      changes: await Promise.all(messages.map((message) => this.#messageIdentity(accessToken, message))),
-      nextCursor:
-        truncated || typeof result.nextPageToken === "string"
-          ? fullyConsumedCursor
-          : stringField(result, "historyId"),
-    };
-  }
-
   async #gmailJson(path: string, accessToken: string): Promise<Record<string, unknown>> {
     const response = await this.#fetch(`https://gmail.googleapis.com/gmail/v1/users/me/${path}`, {
       headers: { authorization: `Bearer ${accessToken}` },
+      signal: AbortSignal.timeout(15_000),
     });
-    if (!response.ok) throw providerError("Gmail synchronization failed");
+    if (!response.ok) throw providerError("Gmail read failed");
     return safeJson(response);
   }
 
-  async #messageIdentity(accessToken: string, listed: Record<string, unknown>): Promise<GmailMessageChange> {
+  async #messageIdentity(
+    accessToken: string,
+    listed: Record<string, unknown>,
+  ): Promise<{ messageId: string; threadId: string; historyId: string }> {
     const messageId = stringField(listed, "id");
     const threadId = stringField(listed, "threadId");
     const message = await this.#gmailJson(
@@ -705,7 +721,7 @@ export class GoogleConnection {
       accessToken,
     );
     if (stringField(message, "id") !== messageId || stringField(message, "threadId") !== threadId) {
-      throw providerError("Gmail message identity changed during synchronization");
+      throw providerError("Gmail message identity changed during search");
     }
     return { messageId, threadId, historyId: stringField(message, "historyId") };
   }
@@ -718,46 +734,88 @@ class DefinitiveCalendarError extends Error {
   }
 }
 
-function transientCalendarError(message: string, cause?: unknown): Error {
-  return cause === undefined ? new Error(message) : new Error(message, { cause });
+function transientCalendarError(message: string, cause?: unknown): GoogleCalendarTransientError {
+  return new GoogleCalendarTransientError(message, cause === undefined ? undefined : { cause });
 }
 
 function transientHttpStatus(status: number): boolean {
-  return status === 408 || status === 425 || status === 429 || status >= 500;
+  return status === 403 || status === 408 || status === 425 || status === 429 || status >= 500;
 }
 
-function calendarEventId(actionId: string): string {
-  return digest(`florence-google-calendar-event-v1\0${actionId}`);
+export function googleCalendarEventId(actionId: string): string {
+  return digest(`florence-google-calendar-event-v1\0${required(actionId, "Calendar action ID")}`);
 }
 
-function validateCalendarEffect(effect: GoogleCalendarEffect): void {
-  if (effect.kind !== "google.calendar.create" || effect.candidateVersion !== 1) {
-    throw new Error("Invalid Google Calendar effect kind or version");
-  }
+function validateCalendarAction(action: ApprovedCalendarAction): void {
   for (const [value, label] of [
-    [effect.id, "effect ID"],
-    [effect.householdId, "household ID"],
-    [effect.connectionId, "connection ID"],
-    [effect.ownerAdultId, "owner adult ID"],
-    [effect.actionId, "action ID"],
-    [effect.candidateId, "candidate ID"],
-    [effect.payload.title, "Calendar title"],
-    [effect.payload.timeZone, "Calendar time zone"],
+    [action.householdId, "household ID"],
+    [action.connectionId, "connection ID"],
+    [action.ownerAdultId, "owner adult ID"],
+    [action.actionId, "action ID"],
+    [action.approvalMessageId, "approval message ID"],
+    [action.event.title, "Calendar title"],
+    [action.event.timeZone, "Calendar time zone"],
   ] as const) {
     required(value, label);
   }
-  assertDigest(effect.approvalDigest, "Calendar approval");
-  assertDigest(effect.candidateDigest, "Calendar candidate");
-  const startsAt = instant(effect.payload.startsAt);
-  const endsAt = instant(effect.payload.endsAt);
+  assertDigest(action.approvalDigest, "Calendar approval");
+  assertDigest(action.proposalDigest, "Calendar proposal");
+  const startsAt = explicitInstant(action.event.startsAt);
+  const endsAt = explicitInstant(action.event.endsAt);
   if (endsAt <= startsAt) throw new Error("Calendar end must follow start");
-  if (effect.payload.location !== null) required(effect.payload.location, "Calendar location");
+  if (action.event.location !== null) required(action.event.location, "Calendar location");
+}
+
+function calendarWindowEvent(
+  event: Record<string, unknown>,
+  calendarTimeZone: string,
+  timeMin: Date,
+  timeMax: Date,
+): GoogleCalendarWindowEvent | null {
+  if (event.status === "cancelled" || event.transparency === "transparent") return null;
+  if (
+    recordArray(event.attendees).some(
+      (attendee) => attendee.self === true && attendee.responseStatus === "declined",
+    )
+  ) {
+    return null;
+  }
+  const start = recordField(event, "start");
+  const end = recordField(event, "end");
+  const startDateTime = optionalStringField(start, "dateTime");
+  const endDateTime = optionalStringField(end, "dateTime");
+  const startDate = optionalStringField(start, "date");
+  const endDate = optionalStringField(end, "date");
+  const allDay = startDateTime === null && endDateTime === null;
+  if (allDay !== (startDate !== null && endDate !== null)) {
+    throw providerError("Google returned an invalid Calendar event interval");
+  }
+  if (!allDay && (!startDateTime || !endDateTime || startDate || endDate)) {
+    throw providerError("Google returned an invalid Calendar event interval");
+  }
+  const startInstant = allDay
+    ? zonedDateStart(required(startDate ?? "", "Calendar all-day start"), calendarTimeZone)
+    : explicitInstant(startDateTime ?? "");
+  const endInstant = allDay
+    ? zonedDateStart(required(endDate ?? "", "Calendar all-day end"), calendarTimeZone)
+    : explicitInstant(endDateTime ?? "");
+  if (endInstant <= startInstant) {
+    throw providerError("Google returned an invalid Calendar event interval");
+  }
+  if (endInstant <= timeMin || startInstant >= timeMax) return null;
+  const summary = optionalStringField(event, "summary");
+  return {
+    title: summary === null ? null : bounded(summary, 500),
+    startsAt: startInstant.toISOString(),
+    endsAt: endInstant.toISOString(),
+    allDay,
+  };
 }
 
 function calendarEventProof(
   event: Record<string, unknown>,
   expectedId: string,
-  effect: GoogleCalendarEffect,
+  action: ApprovedCalendarAction,
 ): { etag: string; digest: string } | null {
   try {
     const start = recordField(event, "start");
@@ -771,15 +829,16 @@ function calendarEventProof(
     if (
       stringField(event, "id") !== expectedId ||
       event.status !== "confirmed" ||
-      event.summary !== effect.payload.title ||
-      !sameInstant(startsAt, effect.payload.startsAt) ||
-      !sameInstant(endsAt, effect.payload.endsAt) ||
-      start.timeZone !== effect.payload.timeZone ||
-      end.timeZone !== effect.payload.timeZone ||
-      location !== effect.payload.location ||
-      privateProperties.florenceActionId !== effect.actionId ||
-      privateProperties.florenceApprovalDigest !== effect.approvalDigest ||
-      privateProperties.florenceCandidateDigest !== effect.candidateDigest
+      event.summary !== action.event.title ||
+      !sameInstant(startsAt, action.event.startsAt) ||
+      !sameInstant(endsAt, action.event.endsAt) ||
+      start.timeZone !== action.event.timeZone ||
+      end.timeZone !== action.event.timeZone ||
+      location !== action.event.location ||
+      privateProperties.florenceActionId !== action.actionId ||
+      privateProperties.florenceApprovalMessageId !== action.approvalMessageId ||
+      privateProperties.florenceApprovalDigest !== action.approvalDigest ||
+      privateProperties.florenceProposalDigest !== action.proposalDigest
     ) {
       return null;
     }
@@ -788,16 +847,15 @@ function calendarEventProof(
       eventId: expectedId,
       etag,
       status: "confirmed",
-      title: effect.payload.title,
+      title: action.event.title,
       startsAt: new Date(startsAt).toISOString(),
       endsAt: new Date(endsAt).toISOString(),
-      timeZone: effect.payload.timeZone,
-      location: effect.payload.location,
-      actionId: effect.actionId,
-      approvalDigest: effect.approvalDigest,
-      candidateId: effect.candidateId,
-      candidateVersion: effect.candidateVersion,
-      candidateDigest: effect.candidateDigest,
+      timeZone: action.event.timeZone,
+      location: action.event.location,
+      actionId: action.actionId,
+      approvalMessageId: action.approvalMessageId,
+      approvalDigest: action.approvalDigest,
+      proposalDigest: action.proposalDigest,
     });
     return { etag, digest: digest(canonicalProof) };
   } catch {
@@ -806,9 +864,11 @@ function calendarEventProof(
 }
 
 function sameInstant(left: string, right: string): boolean {
-  const leftTime = new Date(left).getTime();
-  const rightTime = new Date(right).getTime();
-  return Number.isFinite(leftTime) && leftTime === rightTime;
+  try {
+    return explicitInstant(left).getTime() === explicitInstant(right).getTime();
+  } catch {
+    return false;
+  }
 }
 
 function exactScopes(value: string): readonly GoogleScope[] {
@@ -862,6 +922,57 @@ function instant(value: string): Date {
   return parsed;
 }
 
+function explicitInstant(value: string): Date {
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/.test(value)) {
+    throw new Error("Calendar timestamp must include Z or a UTC offset");
+  }
+  return instant(value);
+}
+
+function zonedDateStart(value: string, timeZone: string): Date {
+  if (
+    !/^\d{4}-\d{2}-\d{2}$/.test(value) ||
+    new Date(`${value}T00:00:00.000Z`).toISOString().slice(0, 10) !== value
+  ) {
+    throw new Error("Google returned an invalid Calendar all-day date");
+  }
+  const [year, month, day] = value.split("-").map(Number) as [number, number, number];
+  const wanted = Date.UTC(year, month - 1, day);
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    calendar: "iso8601",
+    numberingSystem: "latn",
+    timeZone: required(timeZone, "Calendar time zone"),
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  });
+  let candidate = wanted;
+  for (let pass = 0; pass < 4; pass += 1) {
+    const parts = Object.fromEntries(
+      formatter
+        .formatToParts(new Date(candidate))
+        .filter((part) => part.type !== "literal")
+        .map((part) => [part.type, Number(part.value)]),
+    );
+    const observed = Date.UTC(
+      parts.year ?? 0,
+      (parts.month ?? 0) - 1,
+      parts.day ?? 0,
+      parts.hour ?? 0,
+      parts.minute ?? 0,
+      parts.second ?? 0,
+    );
+    const correction = wanted - observed;
+    if (correction === 0) return new Date(candidate);
+    candidate += correction;
+  }
+  throw new Error("Google Calendar all-day boundary is not representable in its time zone");
+}
+
 function required(value: string, label: string): string {
   if (!value.trim()) throw new Error(`${label} is required`);
   return value;
@@ -885,6 +996,13 @@ async function safeJson(response: Response): Promise<Record<string, unknown>> {
 function stringField(value: Record<string, unknown>, field: string): string {
   const result = value[field];
   if (typeof result !== "string" || !result) throw providerError("Google returned an incomplete response");
+  return result;
+}
+
+function optionalStringField(value: Record<string, unknown>, field: string): string | null {
+  const result = value[field];
+  if (result === undefined) return null;
+  if (typeof result !== "string" || !result) throw providerError("Google returned an invalid response");
   return result;
 }
 

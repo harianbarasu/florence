@@ -4,13 +4,9 @@ try {
   const baseUrl = productionBaseUrl(commandArgument(process.argv.slice(2)));
   const completed: string[] = [];
 
-  const health = await getJson(baseUrl, "/healthz");
-  assert(health.ok === true && health.service === "florence-web", "liveness payload is invalid");
-  completed.push("liveness");
-
-  const readiness = await getJson(baseUrl, "/readyz");
-  assert(readiness.ok === true && readiness.database === true, "readiness payload is invalid");
-  completed.push("readiness");
+  const health = await getJson(baseUrl, "/api/health");
+  assert(health.status === "ok" && health.service === "florence-api", "health payload is invalid");
+  completed.push("health");
 
   const landing = await get(baseUrl, "/");
   const landingHtml = await landing.text();

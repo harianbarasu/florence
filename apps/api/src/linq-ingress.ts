@@ -1,68 +1,46 @@
 import { createHash } from "node:crypto";
-import type { HouseholdSignal, ImageReference } from "@florence/contracts";
-import { householdSignalSchema } from "@florence/contracts";
-import type { HouseholdChiefOfStaff } from "@florence/control-plane";
+import type { EncryptedImageVault } from "@florence/artifacts";
+import type { ImageReference } from "@florence/contracts";
+import { type InboundDocumentInput, isClearMessagesOptOut } from "@florence/database";
 import {
+  type LinqClient,
   LinqError,
   type LinqInboundMessageProposal,
   type LinqMediaReference,
-  type LinqObservedChat,
+  type LinqReactionProposal,
   type LinqWebhookHeaders,
   linqIdentitySubjectDigest,
   unwrapLinqWebhook,
 } from "@florence/linq";
 import type { EnrollmentCodes } from "./enrollment.js";
+import type { Florence } from "./florence.js";
 
 const webhookVersion = "2026-02-03";
-const supportedImageTypes = new Set<ImageReference["mimeType"]>([
-  "image/jpeg",
-  "image/png",
-  "image/webp",
-  "image/heic",
-]);
+const supportedImageTypes = new Set<ImageReference["mimeType"]>(["image/jpeg", "image/png", "image/webp"]);
+const PDF_MIME_TYPE = "application/pdf";
+const PDF_DISCARD_MS = 24 * 60 * 60_000;
 
-export type LinqIngressAuthority = {
-  householdId: string;
-  conversationId: string;
-  audience: "private" | "group";
-  authorityVersion: number;
-  participantSetDigest: string;
-  expectedParticipantIdentityDigests: readonly string[];
-  senderAdultId: string;
-  replyToSignalId: string | null;
-};
-
-export interface LinqIngressAuthorityResolver {
-  resolveLinqIngressAuthority(input: {
-    providerConversationId: string;
-    providerHandleId: string;
-    replyToProviderMessageId: string | null;
-    occurredAt: string;
-  }): Promise<LinqIngressAuthority | null>;
-}
-
-export interface LinqProviderReader {
-  observeChat(providerConversationId: string): Promise<LinqObservedChat>;
-  fetchMedia(reference: LinqMediaReference): Promise<{ bytes: Uint8Array; mimeType: string }>;
-}
-
-type LinqImageVault = {
-  store(input: {
-    assetId: string;
-    householdId: string;
-    signalId: string;
-    declaredMimeType: ImageReference["mimeType"];
-    bytes: Uint8Array;
-  }): Promise<{ image: ImageReference }>;
-};
-
-type SignalAcceptor = Pick<HouseholdChiefOfStaff, "accept">;
+type FlorenceIngress = Pick<
+  Florence,
+  | "resolveLinqAuthority"
+  | "redeemMessagesEnrollment"
+  | "bootstrapMessagesGroup"
+  | "acceptInbound"
+  | "acceptInboundReaction"
+  | "recordLinqObservation"
+>;
 
 export type LinqIngressResult =
-  | { disposition: "accepted" | "duplicate"; signalId: string }
+  | { disposition: "accepted" | "duplicate"; sourceId: string }
   | {
       disposition: "acknowledged";
-      reason: "event_not_supported" | "message_has_no_supported_content";
+      reason:
+        | "event_not_supported"
+        | "message_has_no_supported_content"
+        | "channel_stopped"
+        | "opted_out"
+        | "provider_observation"
+        | "reconciled_history";
     }
   | {
       disposition: "rejected";
@@ -83,7 +61,7 @@ export class LinqIngressError extends Error {
     readonly retryable: boolean,
     options?: ErrorOptions,
   ) {
-    super("Linq ingress could not process the webhook", options);
+    super("Florence could not accept the Linq webhook", options);
     this.name = "LinqIngressError";
   }
 }
@@ -91,11 +69,10 @@ export class LinqIngressError extends Error {
 export function createLinqIngress(options: {
   signingSecret: string;
   expectedPartnerId: string;
-  authorityResolver: LinqIngressAuthorityResolver;
-  providerReader: LinqProviderReader;
-  imageVault: LinqImageVault;
-  chiefOfStaff: SignalAcceptor;
-  enrollmentCodes?: EnrollmentCodes;
+  linq: LinqClient;
+  imageVault: EncryptedImageVault;
+  florence: FlorenceIngress;
+  enrollmentCodes: EnrollmentCodes;
   now?: () => Date;
 }): LinqIngress {
   return {
@@ -111,13 +88,33 @@ export function createLinqIngress(options: {
           rawBody: input.rawBody,
           ...(options.now ? { now: options.now() } : {}),
         });
-        if (proposal.kind === "ignored") {
+        if (proposal.kind === "reaction" && proposal.service !== "iMessage") {
+          return { disposition: "rejected", reason: "unsupported_service" };
+        }
+        if (proposal.kind === "reaction") {
+          if (proposal.isFromMe) {
+            await options.florence.recordLinqObservation(proposal);
+            return { disposition: "acknowledged", reason: "provider_observation" };
+          }
+          if (proposal.operation === "removed") {
+            return { disposition: "acknowledged", reason: "provider_observation" };
+          }
+          return acceptReaction(proposal, options);
+        }
+        if (proposal.kind === "message_status") {
+          await options.florence.recordLinqObservation(proposal);
+          return { disposition: "acknowledged", reason: "provider_observation" };
+        }
+        if (proposal.kind !== "inbound_message") {
           return { disposition: "acknowledged", reason: "event_not_supported" };
+        }
+        if (proposal.reconciledAt !== null) {
+          return { disposition: "acknowledged", reason: "reconciled_history" };
         }
         if (proposal.service !== "iMessage") {
           return { disposition: "rejected", reason: "unsupported_service" };
         }
-        return await acceptInbound(proposal, options);
+        return acceptMessage(proposal, options);
       } catch (error) {
         if (error instanceof LinqIngressError) throw error;
         if (error instanceof LinqError) {
@@ -126,7 +123,7 @@ export function createLinqIngress(options: {
         if (isRetryableError(error)) {
           throw new LinqIngressError("provider_retryable", true, { cause: error });
         }
-        if (isPermanentImageError(error)) {
+        if (isPermanentArtifactError(error)) {
           throw new LinqIngressError("unsafe_media", false, { cause: error });
         }
         throw error;
@@ -135,174 +132,241 @@ export function createLinqIngress(options: {
   };
 }
 
-async function acceptInbound(
+async function acceptReaction(
+  proposal: LinqReactionProposal,
+  options: { linq: LinqClient; florence: FlorenceIngress },
+): Promise<LinqIngressResult> {
+  if (!proposal.sender || proposal.partIndex !== 0) {
+    return { disposition: "rejected", reason: "authority_evidence_mismatch" };
+  }
+  const observed = await options.linq.observeChat(proposal.providerConversationId);
+  const senderIdentitySubjectDigest = linqIdentitySubjectDigest(proposal.sender.providerHandleId);
+  const authority = await options.florence.resolveLinqAuthority({
+    providerConversationId: proposal.providerConversationId,
+    audience: observed.audience,
+    participantIdentityDigests: observed.participantIdentityDigests,
+    senderIdentitySubjectDigest,
+    replyToProviderMessageId: proposal.targetProviderMessageId,
+    occurredAt: proposal.occurredAt,
+  });
+  if (!authority) return { disposition: "rejected", reason: "authority_not_found" };
+  if (authority.stopped) return { disposition: "acknowledged", reason: "channel_stopped" };
+  const receipt = await options.florence.acceptInboundReaction({
+    providerConversationId: proposal.providerConversationId,
+    audience: observed.audience,
+    participantIdentityDigests: observed.participantIdentityDigests,
+    senderIdentitySubjectDigest,
+    providerEventId: proposal.providerEventId,
+    targetProviderMessageId: proposal.targetProviderMessageId,
+    reaction: inboundReaction(proposal),
+    partIndex: proposal.partIndex,
+    occurredAt: proposal.occurredAt,
+  });
+  if (!receipt) return { disposition: "rejected", reason: "authority_not_found" };
+  if (receipt.disposition === "stopped") {
+    return { disposition: "acknowledged", reason: "channel_stopped" };
+  }
+  return { disposition: receipt.disposition, sourceId: receipt.sourceId };
+}
+
+async function acceptMessage(
   proposal: LinqInboundMessageProposal,
   options: {
-    authorityResolver: LinqIngressAuthorityResolver;
-    providerReader: LinqProviderReader;
-    imageVault: LinqImageVault;
-    chiefOfStaff: SignalAcceptor;
-    enrollmentCodes?: EnrollmentCodes;
+    linq: LinqClient;
+    imageVault: EncryptedImageVault;
+    florence: FlorenceIngress;
+    enrollmentCodes: EnrollmentCodes;
   },
 ): Promise<LinqIngressResult> {
-  const authority = await options.authorityResolver.resolveLinqIngressAuthority({
+  const observed = await options.linq.observeChat(proposal.providerConversationId);
+  if (proposal.isGroup !== null && observed.audience !== (proposal.isGroup ? "group" : "private")) {
+    return { disposition: "rejected", reason: "authority_evidence_mismatch" };
+  }
+  const audience = observed.audience;
+  const senderIdentitySubjectDigest = linqIdentitySubjectDigest(proposal.sender.providerHandleId);
+  const authority = await options.florence.resolveLinqAuthority({
     providerConversationId: proposal.providerConversationId,
-    providerHandleId: proposal.sender.providerHandleId,
+    audience,
+    participantIdentityDigests: observed.participantIdentityDigests,
+    senderIdentitySubjectDigest,
     replyToProviderMessageId: proposal.replyTo?.providerMessageId ?? null,
     occurredAt: proposal.occurredAt,
   });
-  if (!authority) return establishAuthority(proposal, options);
-
-  const providerAudience = proposal.isGroup ? "group" : "private";
-  if (providerAudience !== authority.audience) {
-    return { disposition: "rejected", reason: "authority_evidence_mismatch" };
-  }
-  const observed = await options.providerReader.observeChat(proposal.providerConversationId);
-  if (
-    observed.audience !== authority.audience ||
-    !sameSortedDigests(authority.expectedParticipantIdentityDigests, observed.participantIdentityDigests)
-  ) {
-    return { disposition: "rejected", reason: "authority_evidence_mismatch" };
+  if (!authority) {
+    return establishAuthority(proposal, observed, options);
   }
 
-  const signalId = deterministicUuid(`linq-v3\0signal\0${proposal.providerEventId}`);
-  const supportedMedia = proposal.media.flatMap((media) =>
-    isSupportedImageType(media.mimeType) ? [{ ...media, mimeType: media.mimeType }] : [],
-  );
-  if (supportedMedia.length > 10) throw new LinqIngressError("invalid_payload", false);
-  if (proposal.text === null && supportedMedia.length === 0) {
-    return { disposition: "acknowledged", reason: "message_has_no_supported_content" };
+  const sourceId = inboundSourceId(proposal.providerEventId);
+  if (authority.stopped) {
+    return { disposition: "acknowledged", reason: "channel_stopped" };
   }
-  const images: ImageReference[] = [];
-  for (const media of supportedMedia) {
-    const assetId = deterministicUuid(
-      `linq-v3\0asset\0${proposal.providerEventId}\0${media.providerAttachmentId}`,
-    );
-    const fetched = await options.providerReader.fetchMedia(media);
-    if (fetched.mimeType !== media.mimeType) {
-      throw new LinqIngressError("unsafe_media", false);
-    }
-    const stored = await options.imageVault.store({
-      assetId,
-      householdId: authority.householdId,
-      signalId,
-      declaredMimeType: media.mimeType,
-      bytes: fetched.bytes,
-    });
-    images.push(stored.image);
-  }
-
-  const candidate = {
-    type: "conversation.message",
-    signalId,
-    householdId: authority.householdId,
-    idempotencyKey: `linq-v3:${signalId}`,
-    occurredAt: proposal.occurredAt,
-    conversationId: authority.conversationId,
-    audience: authority.audience,
-    authorityVersion: authority.authorityVersion,
-    participantSetDigest: authority.participantSetDigest,
-    senderAdultId: authority.senderAdultId,
-    text: proposal.text,
-    images,
-    replyToSignalId: authority.replyToSignalId,
-    source: {
-      system: "linq-v3",
+  if (isClearMessagesOptOut(proposal.text)) {
+    const receipt = await options.florence.acceptInbound({
+      providerConversationId: proposal.providerConversationId,
+      audience,
+      participantIdentityDigests: observed.participantIdentityDigests,
+      senderIdentitySubjectDigest,
       providerEventId: proposal.providerEventId,
       providerMessageId: proposal.providerMessageId,
-    },
-  };
-  const parsed = householdSignalSchema.safeParse(candidate);
-  if (!parsed.success) throw new LinqIngressError("invalid_payload", false, { cause: parsed.error });
-  const signal: HouseholdSignal = parsed.data;
-  const receipt = await options.chiefOfStaff.accept(signal);
-  return { disposition: receipt.disposition, signalId };
+      replyToProviderMessageId: proposal.replyTo?.providerMessageId ?? null,
+      text: proposal.text,
+      images: [],
+      documents: [],
+      occurredAt: proposal.occurredAt,
+    });
+    if (!receipt) return { disposition: "rejected", reason: "authority_not_found" };
+    return receipt.disposition === "duplicate"
+      ? { disposition: "duplicate", sourceId: receipt.sourceId }
+      : { disposition: "acknowledged", reason: "opted_out" };
+  }
+  const media = await storeMedia(proposal, authority.householdId, sourceId, options);
+  if (proposal.text === null && media.images.length === 0 && media.documents.length === 0) {
+    return { disposition: "acknowledged", reason: "message_has_no_supported_content" };
+  }
+  const receipt = await options.florence.acceptInbound({
+    providerConversationId: proposal.providerConversationId,
+    audience,
+    participantIdentityDigests: observed.participantIdentityDigests,
+    senderIdentitySubjectDigest,
+    providerEventId: proposal.providerEventId,
+    providerMessageId: proposal.providerMessageId,
+    replyToProviderMessageId: proposal.replyTo?.providerMessageId ?? null,
+    text: proposal.text,
+    images: media.images,
+    documents: media.documents,
+    occurredAt: proposal.occurredAt,
+  });
+  if (!receipt || receipt.disposition === "stopped") {
+    return { disposition: "rejected", reason: "authority_not_found" };
+  }
+  return { disposition: receipt.disposition, sourceId: receipt.sourceId };
 }
 
 async function establishAuthority(
   proposal: LinqInboundMessageProposal,
+  observed: { audience: "private" | "group"; participantIdentityDigests: readonly string[] },
   options: {
-    providerReader: LinqProviderReader;
-    chiefOfStaff: SignalAcceptor;
-    enrollmentCodes?: EnrollmentCodes;
+    florence: FlorenceIngress;
+    enrollmentCodes: EnrollmentCodes;
   },
 ): Promise<LinqIngressResult> {
-  if (!proposal.isGroup) return redeemEnrollment(proposal, options);
-  if (proposal.media.length > 0 || proposal.text === null) {
-    return { disposition: "rejected", reason: "authority_not_found" };
-  }
-  const observed = await options.providerReader.observeChat(proposal.providerConversationId);
+  const { participantIdentityDigests } = observed;
   const senderIdentitySubjectDigest = linqIdentitySubjectDigest(proposal.sender.providerHandleId);
-  if (
-    observed.audience !== "group" ||
-    observed.participantIdentityDigests.length !== 2 ||
-    !observed.participantIdentityDigests.includes(senderIdentitySubjectDigest)
-  ) {
-    return { disposition: "rejected", reason: "authority_evidence_mismatch" };
-  }
-  const bindingSignalId = deterministicUuid(`linq-v3\0group-binding\0${proposal.providerConversationId}`);
-  const messageSignalId = deterministicUuid(`linq-v3\0signal\0${proposal.providerEventId}`);
-  const receipt = await options.chiefOfStaff.accept({
-    command: "linq.group.bootstrap",
-    input: {
-      bindingSignalId,
-      bindingIdempotencyKey: `linq-v3:group-binding:${bindingSignalId}`,
-      messageSignalId,
-      messageIdempotencyKey: `linq-v3:${messageSignalId}`,
-      occurredAt: proposal.occurredAt,
-      providerConversationId: proposal.providerConversationId,
-      participantIdentityDigests: observed.participantIdentityDigests,
-      senderIdentitySubjectDigest,
-      text: proposal.text,
-      providerEventId: proposal.providerEventId,
-      providerMessageId: proposal.providerMessageId,
-    },
-  });
-  return receipt
-    ? { disposition: receipt.disposition, signalId: receipt.signalId }
-    : { disposition: "rejected", reason: "authority_not_found" };
-}
-
-async function redeemEnrollment(
-  proposal: LinqInboundMessageProposal,
-  options: {
-    providerReader: LinqProviderReader;
-    chiefOfStaff: SignalAcceptor;
-    enrollmentCodes?: EnrollmentCodes;
-  },
-): Promise<LinqIngressResult> {
-  if (proposal.isGroup || proposal.media.length > 0) {
-    return { disposition: "rejected", reason: "authority_not_found" };
-  }
-  const challengeDigest = options.enrollmentCodes?.digestCandidate(proposal.text) ?? null;
-  if (!challengeDigest) return { disposition: "rejected", reason: "authority_not_found" };
-
-  const identitySubjectDigest = linqIdentitySubjectDigest(proposal.sender.providerHandleId);
-  const observed = await options.providerReader.observeChat(proposal.providerConversationId);
-  if (
-    observed.audience !== "private" ||
-    observed.participantIdentityDigests.length !== 1 ||
-    observed.participantIdentityDigests[0] !== identitySubjectDigest
-  ) {
-    return { disposition: "rejected", reason: "authority_evidence_mismatch" };
-  }
-  const signalId = deterministicUuid(`linq-v3\0enrollment\0${proposal.providerEventId}`);
-  const receipt = await options.chiefOfStaff.accept({
-    command: "linq.enrollment.redeem",
-    input: {
-      signalId,
-      idempotencyKey: `linq-v3:enrollment:${signalId}`,
-      occurredAt: proposal.occurredAt,
+  if (observed.audience === "private") {
+    if (proposal.media.length > 0) {
+      return { disposition: "rejected", reason: "authority_not_found" };
+    }
+    const challengeDigest = options.enrollmentCodes.digestCandidate(proposal.text);
+    if (!challengeDigest || participantIdentityDigests.length !== 1) {
+      return { disposition: "rejected", reason: "authority_not_found" };
+    }
+    if (participantIdentityDigests[0] !== senderIdentitySubjectDigest) {
+      return { disposition: "rejected", reason: "authority_evidence_mismatch" };
+    }
+    const receipt = await options.florence.redeemMessagesEnrollment({
       challengeDigest,
-      identitySubjectDigest,
+      identitySubjectDigest: senderIdentitySubjectDigest,
       consentVersion: "linq-private-code-v1",
       consentedAt: proposal.occurredAt,
       providerConversationId: proposal.providerConversationId,
-    },
+      occurredAt: proposal.occurredAt,
+    });
+    return receipt
+      ? { disposition: receipt.disposition, sourceId: inboundSourceId(proposal.providerEventId) }
+      : { disposition: "rejected", reason: "authority_not_found" };
+  }
+
+  if (proposal.media.length > 0 || proposal.text === null || participantIdentityDigests.length !== 2) {
+    return { disposition: "rejected", reason: "authority_not_found" };
+  }
+  if (!participantIdentityDigests.includes(senderIdentitySubjectDigest)) {
+    return { disposition: "rejected", reason: "authority_evidence_mismatch" };
+  }
+  const receipt = await options.florence.bootstrapMessagesGroup({
+    providerConversationId: proposal.providerConversationId,
+    audience: "group",
+    participantIdentityDigests,
+    senderIdentitySubjectDigest,
+    providerEventId: proposal.providerEventId,
+    providerMessageId: proposal.providerMessageId,
+    replyToProviderMessageId: proposal.replyTo?.providerMessageId ?? null,
+    text: proposal.text,
+    occurredAt: proposal.occurredAt,
   });
-  return receipt
-    ? { disposition: receipt.disposition, signalId: receipt.signalId }
+  return receipt && receipt.disposition !== "stopped"
+    ? { disposition: receipt.disposition, sourceId: receipt.sourceId }
     : { disposition: "rejected", reason: "authority_not_found" };
+}
+
+async function storeMedia(
+  proposal: LinqInboundMessageProposal,
+  householdId: string,
+  sourceId: string,
+  options: { linq: LinqClient; imageVault: EncryptedImageVault },
+): Promise<{ images: ImageReference[]; documents: InboundDocumentInput[] }> {
+  const imageMedia = proposal.media.filter(
+    (item): item is LinqMediaReference & { mimeType: ImageReference["mimeType"] } =>
+      supportedImageTypes.has(item.mimeType as ImageReference["mimeType"]),
+  );
+  const pdfMedia = proposal.media.filter(
+    (item): item is LinqMediaReference & { mimeType: typeof PDF_MIME_TYPE } =>
+      item.mimeType === PDF_MIME_TYPE,
+  );
+  if (imageMedia.length > 10 || pdfMedia.length > 3) {
+    throw new LinqIngressError("invalid_payload", false);
+  }
+  const images: ImageReference[] = [];
+  for (const item of imageMedia) {
+    const fetched = await options.linq.fetchMedia(item);
+    if (fetched.mimeType !== item.mimeType) throw new LinqIngressError("unsafe_media", false);
+    const stored = await options.imageVault.store({
+      assetId: deterministicUuid(`linq-v3\0asset\0${proposal.providerEventId}\0${item.providerAttachmentId}`),
+      householdId,
+      signalId: sourceId,
+      declaredMimeType: item.mimeType,
+      bytes: fetched.bytes,
+    });
+    images.push(stored.image);
+  }
+  const documents: InboundDocumentInput[] = [];
+  const discardAfter = new Date(Date.parse(proposal.occurredAt) + PDF_DISCARD_MS).toISOString();
+  for (const item of pdfMedia) {
+    const fetched = await options.linq.fetchMedia(item);
+    if (fetched.mimeType !== PDF_MIME_TYPE) throw new LinqIngressError("unsafe_media", false);
+    const sealed = options.imageVault.sealPdf({
+      documentId: deterministicUuid(
+        `linq-v3\0document\0${proposal.providerEventId}\0${item.providerAttachmentId}`,
+      ),
+      householdId,
+      signalId: sourceId,
+      filename: item.filename,
+      declaredMimeType: item.mimeType,
+      bytes: fetched.bytes,
+      discardAfter,
+    });
+    documents.push({
+      documentId: sealed.documentId,
+      externalKey: `linq-v3:${proposal.providerEventId}:${item.providerAttachmentId}`,
+      filename: sealed.filename,
+      mimeType: sealed.mimeType,
+      contentDigest: sealed.contentDigest,
+      contentEnvelope: sealed.contentEnvelope,
+      retained: false,
+      discardAfter: sealed.discardAfter,
+    });
+  }
+  return { images, documents };
+}
+
+function inboundSourceId(providerEventId: string): string {
+  return deterministicUuid(`linq-v3\0signal\0${providerEventId}`);
+}
+
+function inboundReaction(proposal: LinqReactionProposal): string {
+  if (proposal.reaction !== "custom") return proposal.reaction;
+  if (!proposal.customEmoji) return "custom";
+  if (proposal.customEmoji.length > 100) throw new LinqIngressError("invalid_payload", false);
+  return `custom:${proposal.customEmoji}`;
 }
 
 function deterministicUuid(identity: string): string {
@@ -313,28 +377,20 @@ function deterministicUuid(identity: string): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-function isSupportedImageType(value: string): value is ImageReference["mimeType"] {
-  return supportedImageTypes.has(value as ImageReference["mimeType"]);
-}
-
-function isPermanentImageError(error: unknown): error is { retryable: false } {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "retryable" in error &&
-    (error as { retryable?: unknown }).retryable === false
+function isPermanentArtifactError(error: unknown): error is { retryable: false } {
+  return Boolean(
+    error &&
+      typeof error === "object" &&
+      "retryable" in error &&
+      (error as { retryable?: unknown }).retryable === false,
   );
 }
 
 function isRetryableError(error: unknown): error is { retryable: true } {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "retryable" in error &&
-    (error as { retryable?: unknown }).retryable === true
+  return Boolean(
+    error &&
+      typeof error === "object" &&
+      "retryable" in error &&
+      (error as { retryable?: unknown }).retryable === true,
   );
-}
-
-function sameSortedDigests(expected: readonly string[], observed: readonly string[]): boolean {
-  return expected.length === observed.length && expected.every((digest, index) => digest === observed[index]);
 }

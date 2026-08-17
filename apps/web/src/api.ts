@@ -1,12 +1,15 @@
 import {
-  type AcceptanceReceipt,
-  acceptanceReceiptSchema,
-  type FamilyMemberProfile,
-  type HouseholdProfile,
-  householdProfileSchema,
+  type DisconnectGoogleConnectionInput,
+  type FamilyMemberInput,
+  googleStartResponseSchema,
+  type MessagesInviteResponse,
+  messagesInviteResponseSchema,
+  type PatchFactInput,
+  type PreferencesInput,
+  type PutHouseholdInput,
+  type WorkspaceView,
+  workspaceResponseSchema,
 } from "@florence/contracts";
-
-const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "";
 
 export class FlorenceRequestError extends Error {
   constructor(
@@ -18,38 +21,8 @@ export class FlorenceRequestError extends Error {
   }
 }
 
-export type CreateHouseholdInput = {
-  commandId: string;
-  occurredAt: string;
-  name: string;
-  timeZone: string;
-  foundingAdultDisplayName: string;
-  secondAdultDisplayName: string;
-  secondAdultRole: "steward" | "caregiver";
-  secondAdultRelationship: string;
-};
-
-export type UpsertMemberInput = Omit<FamilyMemberProfile, "id" | "status"> & {
-  commandId: string;
-  occurredAt: string;
-};
-
-export type IssueLinqEnrollmentInput = { commandId: string; occurredAt: string };
-
-export type GoogleConnectionView = {
-  connectionId: string;
-  householdId: string;
-  ownerAdultId: string;
-  status: "active";
-  emailLabel: string;
-  grantedScopes: readonly string[];
-  lastError: string | null;
-  createdAt: string;
-  updatedAt: string;
-};
-
 async function requestJson(path: string, init?: RequestInit): Promise<unknown> {
-  const response = await fetch(`${API_BASE}${path}`, {
+  const response = await fetch(path, {
     credentials: "include",
     ...init,
     headers: {
@@ -66,6 +39,10 @@ async function requestJson(path: string, init?: RequestInit): Promise<unknown> {
     );
   }
   return payload;
+}
+
+async function requestWorkspace(path: string, init?: RequestInit): Promise<WorkspaceView> {
+  return workspaceResponseSchema.parse(await requestJson(path, init)).workspace;
 }
 
 export async function getSession(): Promise<{ adultId: string }> {
@@ -85,109 +62,68 @@ export async function deleteSession(): Promise<void> {
   await requestJson("/api/v1/session", { method: "DELETE" });
 }
 
-export async function listHouseholds(): Promise<HouseholdProfile[]> {
-  const payload = await requestJson("/api/v1/households");
-  return householdProfileSchema.array().parse(property(payload, "households"));
+export function getWorkspace(): Promise<WorkspaceView> {
+  return requestWorkspace("/api/v1/workspace");
 }
 
-export async function getHousehold(householdId: string): Promise<HouseholdProfile> {
-  const payload = await requestJson(`/api/v1/households/${householdId}`);
-  return householdProfileSchema.parse(property(payload, "household"));
-}
-
-export async function createHousehold(
-  input: CreateHouseholdInput,
-): Promise<{ householdId: string; receipt: AcceptanceReceipt }> {
-  const payload = await requestJson("/api/v1/households", {
-    method: "POST",
-    body: JSON.stringify(input),
-  });
-  return {
-    householdId: String(property(payload, "householdId")),
-    receipt: acceptanceReceiptSchema.parse(property(payload, "receipt")),
-  };
-}
-
-export async function upsertFamilyMember(
-  householdId: string,
-  memberId: string,
-  input: UpsertMemberInput,
-): Promise<AcceptanceReceipt> {
-  const payload = await requestJson(`/api/v1/households/${householdId}/members/${memberId}`, {
+export function putHousehold(input: PutHouseholdInput): Promise<WorkspaceView> {
+  return requestWorkspace("/api/v1/vault/household", {
     method: "PUT",
     body: JSON.stringify(input),
   });
-  return acceptanceReceiptSchema.parse(property(payload, "receipt"));
 }
 
-export async function issueLinqEnrollment(
-  householdId: string,
-  adultId: string,
-  input: IssueLinqEnrollmentInput,
-): Promise<{ code: string; expiresAt: string }> {
-  const payload = await requestJson(`/api/v1/households/${householdId}/members/${adultId}/linq-enrollment`, {
-    method: "POST",
+export function putFamilyMember(memberId: string, input: FamilyMemberInput): Promise<WorkspaceView> {
+  return requestWorkspace(`/api/v1/vault/members/${encodeURIComponent(memberId)}`, {
+    method: "PUT",
     body: JSON.stringify(input),
   });
-  return {
-    code: String(property(payload, "code")),
-    expiresAt: String(property(payload, "expiresAt")),
-  };
 }
 
-export async function listGoogleConnections(householdId: string): Promise<GoogleConnectionView[]> {
-  const payload = await requestJson(`/api/v1/households/${householdId}/google-connections`);
-  const connections = property(payload, "connections");
-  if (!Array.isArray(connections)) throw new Error("Florence returned invalid Google connections");
-  return connections.map(parseGoogleConnection);
+export async function issueMessagesInvite(adultId: string): Promise<MessagesInviteResponse> {
+  return messagesInviteResponseSchema.parse(
+    await requestJson(`/api/v1/vault/adults/${encodeURIComponent(adultId)}/messages-invite`, {
+      method: "POST",
+    }),
+  );
 }
 
-export async function startGoogleConnection(householdId: string): Promise<{ authorizationUrl: string }> {
-  const payload = await requestJson(`/api/v1/households/${householdId}/google-connections`, {
-    method: "POST",
+export function patchVaultFact(factId: string, input: PatchFactInput): Promise<WorkspaceView> {
+  return requestWorkspace(`/api/v1/vault/facts/${encodeURIComponent(factId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(input),
   });
-  const authorizationUrl = property(payload, "authorizationUrl");
-  if (typeof authorizationUrl !== "string" || !URL.canParse(authorizationUrl)) {
-    throw new Error("Florence returned an invalid Google authorization link");
-  }
-  return { authorizationUrl };
 }
 
-export async function disconnectGoogleConnection(householdId: string, connectionId: string): Promise<void> {
-  await requestJson(`/api/v1/households/${householdId}/google-connections/${connectionId}`, {
+export function deleteVaultFact(factId: string): Promise<WorkspaceView> {
+  return requestWorkspace(`/api/v1/vault/facts/${encodeURIComponent(factId)}`, { method: "DELETE" });
+}
+
+export function deleteVaultDocument(documentId: string): Promise<WorkspaceView> {
+  return requestWorkspace(`/api/v1/vault/documents/${encodeURIComponent(documentId)}`, {
     method: "DELETE",
   });
 }
 
-function parseGoogleConnection(value: unknown): GoogleConnectionView {
-  if (!value || typeof value !== "object") throw new Error("Florence returned an invalid Google connection");
-  const row = value as Record<string, unknown>;
-  const grantedScopes = row.grantedScopes;
-  if (
-    typeof row.connectionId !== "string" ||
-    typeof row.householdId !== "string" ||
-    typeof row.ownerAdultId !== "string" ||
-    row.status !== "active" ||
-    typeof row.emailLabel !== "string" ||
-    !Array.isArray(grantedScopes) ||
-    grantedScopes.some((scope) => typeof scope !== "string") ||
-    (row.lastError !== null && typeof row.lastError !== "string") ||
-    typeof row.createdAt !== "string" ||
-    typeof row.updatedAt !== "string"
-  ) {
-    throw new Error("Florence returned an invalid Google connection");
-  }
-  return {
-    connectionId: row.connectionId,
-    householdId: row.householdId,
-    ownerAdultId: row.ownerAdultId,
-    status: row.status,
-    emailLabel: row.emailLabel,
-    grantedScopes: grantedScopes as string[],
-    lastError: row.lastError as string | null,
-    createdAt: row.createdAt,
-    updatedAt: row.updatedAt,
-  };
+export function putPreferences(input: PreferencesInput): Promise<WorkspaceView> {
+  return requestWorkspace("/api/v1/preferences", {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+export async function startGoogleConnection(): Promise<{ authorizationUrl: string }> {
+  return googleStartResponseSchema.parse(
+    await requestJson("/api/v1/workspace/google-connections", { method: "POST" }),
+  );
+}
+
+export function disconnectGoogleConnection(connectionId: string): Promise<WorkspaceView> {
+  const input: DisconnectGoogleConnectionInput = { connectionId };
+  return requestWorkspace("/api/v1/workspace/google-connections", {
+    method: "DELETE",
+    body: JSON.stringify(input),
+  });
 }
 
 function property(payload: unknown, key: string): unknown {

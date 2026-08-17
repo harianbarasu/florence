@@ -1,20 +1,18 @@
-import type { FamilyMemberProfile } from "@florence/contracts";
+import type { FamilyMemberInput, FamilyMemberProfile } from "@florence/contracts";
 import { Check, Plus, X } from "lucide-react";
 import { type FormEvent, useRef, useState } from "react";
-import type { UpsertMemberInput } from "../api";
 
 type MemberEditorProps = {
   member?: FamilyMemberProfile;
   isSaving: boolean;
   onCancel: () => void;
-  onSave: (memberId: string, input: UpsertMemberInput) => Promise<unknown>;
+  onSave: (memberId: string, input: FamilyMemberInput) => Promise<unknown>;
 };
 
 export function MemberEditor({ member, isSaving, onCancel, onSave }: MemberEditorProps) {
-  const kind = member?.kind ?? "child";
+  const [kind, setKind] = useState<"adult" | "child">(member?.kind ?? "child");
   const [error, setError] = useState<string | null>(null);
   const memberId = useRef(member?.id ?? crypto.randomUUID());
-  const command = useRef({ commandId: crypto.randomUUID(), occurredAt: new Date().toISOString() });
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -32,8 +30,7 @@ export function MemberEditor({ member, isSaving, onCancel, onSave }: MemberEdito
     }
 
     const birthYearText = optional(data, "birthYear");
-    const input: UpsertMemberInput = {
-      ...command.current,
+    const input: FamilyMemberInput = {
       kind,
       role: kind === "child" ? "dependent" : (data.get("role") as "steward" | "caregiver"),
       displayName: required(data, "displayName"),
@@ -69,6 +66,18 @@ export function MemberEditor({ member, isSaving, onCancel, onSave }: MemberEdito
           <X size={19} />
         </button>
       </div>
+
+      {!member && (
+        <fieldset className="segmented-control">
+          <legend>Person type</legend>
+          <button className={kind === "child" ? "active" : ""} type="button" onClick={() => setKind("child")}>
+            Child
+          </button>
+          <button className={kind === "adult" ? "active" : ""} type="button" onClick={() => setKind("adult")}>
+            Adult
+          </button>
+        </fieldset>
+      )}
 
       <div className="form-grid">
         <Field label="Name" name="displayName" defaultValue={member?.displayName} required />

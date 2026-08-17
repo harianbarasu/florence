@@ -8,7 +8,7 @@
     "preDeployCommand": "node packages/database/dist/predeploy.js",
     "startCommand": "node apps/api/dist/server.js",
     "numReplicas": 1,
-    "healthcheckPath": "/readyz",
+    "healthcheckPath": "/api/health",
     "healthcheckTimeout": 120,
     "sleepApplication": false,
     "restartPolicyType": "ON_FAILURE",

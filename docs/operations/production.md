@@ -1,174 +1,116 @@
 # Florence production runbook
 
-Florence runs as two Railway services from one immutable Docker image:
-
-| Role | Config | Start command | Public |
-| --- | --- | --- | --- |
-| API/web | `/railway.json` | `node apps/api/dist/server.js` | Yes, one HTTPS origin |
-| Worker | `/railway.worker.json` | `node apps/worker/dist/server.js` | No |
-
-Both use the same PostgreSQL service, commit, migration set, and shared variables. Neither application
-service has durable local storage. PostgreSQL is canonical, including encrypted image artifacts.
+Florence runs as one Railway API/web service from `railway.json`, plus one fresh PostgreSQL service. The API process owns the direct conversation loop; there is no worker service, singleton lease, generic queue, or legacy migration chain.
 
 ## Stop conditions
 
 Do not deploy when any of these is true:
 
-- `pnpm check` or the Docker build is red;
-- API and worker do not reference the same commit;
-- the exact PostgreSQL service reference is uncertain;
-- no verified backup exists;
-- migration `007_household_signal_core.sql` has not been tested from `001` on a disposable database;
-- production data in the former tables is still needed but has no explicit migration into the new
-  household event spine;
+- `pnpm check`, the three live-PostgreSQL scenarios, or the Docker build is red;
+- the exact PostgreSQL service or restorable backup is uncertain;
+- the database is not an explicitly approved fresh pilot database;
 - Linq or Google callback registrations point at another origin;
-- either adult lacks a separate pilot credential/session;
-- the worker singleton heartbeat is absent or stale;
-- a live connector rehearsal would require real family data instead of synthetic data.
+- either adult lacks a separate pilot credential and browser session;
+- the API has no persistent directory for encrypted image retry data;
+- a connector rehearsal would require real family data before synthetic proof passes.
 
-This branch does not automatically translate the former Florence data model. Migrations `001–006`
-remain immutable for ledger safety. Migration `007` adds the new product spine alongside it. Before
-cutover, explicitly decide whether existing production rows are disposable pilot data or require a
-separate, reviewed data migration. Never infer that decision from schema compatibility.
+The clean baseline intentionally does not translate the former Florence schema. Never point it at an old database and hope table names are compatible.
 
-## Railway topology
+## Topology
 
-Project: `Florence`.
+- Config-as-code: `/railway.json`.
+- Start: `node apps/api/dist/server.js`.
+- Predeploy: `node packages/database/dist/predeploy.js`.
+- Health: `GET /api/health`.
+- One replica for the pilot.
+- One attached persistent directory for `FLORENCE_IMAGE_VAULT_DIRECTORY`.
+- PostgreSQL is durable product truth. The image vault holds encrypted short-lived attachment bytes only.
 
-- API Config-as-Code path: `/railway.json`.
-- Worker Config-as-Code path: `/railway.worker.json`.
-- API health path: `/readyz`.
-- API binds `0.0.0.0:$PORT`; Railway owns `PORT`.
-- Worker stays at exactly one replica and owns PostgreSQL advisory lock `4607346623`.
-- API overlap is 5 seconds; worker overlap is zero.
-- Both predeploy with `node packages/database/dist/predeploy.js`.
-
-Two PostgreSQL service records currently exist in Railway. Network evidence previously showed the
-applications using the service named `Postgres-8tFu`. Confirm reference links and backups in the
-Railway UI. Do not delete, replace, or rewire either database record during an application release.
+Delete or permanently scale down the former worker service before enabling autodeploy. It has no artifact or start command in this product.
 
 ## Environment contract
 
-Required on API and worker:
+Required:
 
 | Variable | Contract |
 | --- | --- |
 | `NODE_ENV` | `production` |
-| `FLORENCE_DATABASE_URL` | Private Railway PostgreSQL reference |
-| `FLORENCE_POSTGRES_SCHEMA` | Exactly `florence_v4` |
-| `FLORENCE_WEB_BASE_URL` | Clean canonical HTTPS origin |
-| `FLORENCE_IMAGE_VAULT_KEY` | Canonical base64 32-byte key; same on both roles |
-| `LINQ_API_KEY` | Linq partner API key |
-
-Required on API:
-
-| Variable | Contract |
-| --- | --- |
-| `FLORENCE_PILOT_CREDENTIALS` | JSON array of exactly two separate adult credentials |
+| `FLORENCE_DATABASE_URL` | Private URL for the approved fresh PostgreSQL service |
+| `FLORENCE_PILOT_CREDENTIALS` | JSON array of exactly two distinct `{token,adultId}` entries; tokens are at least 32 printable bytes |
 | `FLORENCE_SESSION_SECRET` | At least 32 random bytes |
 | `FLORENCE_ENROLLMENT_SECRET` | At least 32 random bytes |
-| `LINQ_WEBHOOK_SECRET` | Linq Standard Webhooks signing secret |
-| `LINQ_PARTNER_ID` | Exact expected partner ID |
-
-Required on worker:
-
-| Variable | Contract |
-| --- | --- |
+| `FLORENCE_IMAGE_VAULT_DIRECTORY` | Absolute path on the attached persistent volume |
+| `FLORENCE_IMAGE_VAULT_KEY` | Canonical base64 encoding of exactly 32 random bytes |
+| `LINQ_API_KEY` | Linq partner API key |
+| `LINQ_WEBHOOK_SECRET` | Current Standard Webhooks signing secret |
+| `LINQ_PARTNER_ID` | Exact expected Linq partner UUID |
 | `OPENAI_API_KEY` | Model credential |
-| `OPENAI_MODEL` | Pinned configured model |
+| `FLORENCE_OPENAI_MODEL` | Pinned supported model ID |
 
-Google is optional, but these four variables are all-or-none on both roles:
+Google is optional as a bundle but required for the full pilot journey:
 
-- `GOOGLE_CLIENT_ID`
-- `GOOGLE_CLIENT_SECRET`
-- `GOOGLE_CREDENTIAL_KEY` — canonical base64 32-byte key
-- `FLORENCE_WEB_BASE_URL` — callback is derived as `/oauth/google/callback`
+- `GOOGLE_OAUTH_CLIENT_ID`
+- `GOOGLE_OAUTH_CLIENT_SECRET`
+- `GOOGLE_OAUTH_REDIRECT_URI` — exact `<origin>/api/v1/google/callback`
+- `GOOGLE_CREDENTIAL_KEY` — canonical base64 encoding of exactly 32 random bytes
 
 Optional bounded settings:
 
-- `LOG_LEVEL=info`
+- `FLORENCE_MESSAGES_URL`
+- `FLORENCE_FORWARDING_EMAIL` only after a real inbound path exists
 - `FLORENCE_IMAGE_RETENTION_DAYS=30` (1–365)
 - `FLORENCE_MODEL_TIMEOUT_MS=30000`
 - `FLORENCE_MODEL_MAX_OUTPUT_TOKENS=4000`
+- `LOG_LEVEL=info`
 
-Never print resolved Railway variables or put them in shell arguments, source control, fixtures, or
-model context. Use Railway sealed variables/reference variables.
+Railway owns `PORT`. Never print resolved variables or place them in shell arguments, fixtures, logs, or model context.
 
-## Connector registration
+## Provider registration
 
 Register exactly:
 
-- Linq webhook: `<origin>/webhooks/linq`, payload version `2026-02-03`.
-- Google OAuth redirect: `<origin>/oauth/google/callback`.
+- Linq webhook: `<origin>/api/v1/webhooks/linq?version=2026-02-03`.
+- Google OAuth redirect: `<origin>/api/v1/google/callback`.
 
-The Linq API credential is not the webhook signing secret. The API verifies the raw signature before
-business parsing, then re-reads live chat participants before accepting content. Test signature
-failure, duplicate delivery, participant drift, and one image before enabling real family traffic.
+The Linq API key and webhook signing secret are different credentials. Florence verifies the raw webhook signature, pins the payload version, re-reads the live chat, and requires iMessage plus the exact current participant set before retaining content.
 
-Google uses `openid email gmail.readonly calendar.events.owned`. Gmail read access is restricted and
-may require Google verification/security review for public launch. An External consent screen in
-Testing may expire refresh tokens after seven days; that is acceptable only for a deliberate pilot
-reconnect cadence.
+Google currently uses `openid email gmail.readonly calendar.events.owned`. Gmail remains private to its owning adult. Calendar writes require a current exact instruction or approval and provider reread proof.
 
 ## Build gates
 
-From a clean checkout on Node 24.19:
+From a clean checkout on Node 24:
 
 ```bash
 corepack enable
 pnpm install --frozen-lockfile
 pnpm check
+TEST_DATABASE_URL=postgres://... pnpm --filter @florence/api test
 docker build --tag florence:release .
 docker run --rm --entrypoint node florence:release --version
 ```
 
-On a disposable PostgreSQL database, set `FLORENCE_DATABASE_URL` and
-`FLORENCE_POSTGRES_SCHEMA=florence_v4`, then run `pnpm db:migrate` twice. Both must pass; the ledger
-must contain seven entries ending in `007_household_signal_core.sql`.
+On a disposable empty database, run `pnpm db:migrate` twice. Both runs must pass, and `florence_schema_migrations` must contain the exact digest for `001_florence`.
 
-## Cutover sequence
+## Clean pilot cutover
 
-1. Disable GitHub autodeploy for API and worker.
-2. Verify the exact database reference and take a restorable backup.
-3. Resolve the old-data decision explicitly; do not continue with an unanswered migration need.
-4. Configure the shared variables and connector callbacks without triggering a deployment.
-5. Deploy the worker from the exact release commit using `/railway.worker.json`.
-6. Confirm its singleton lease remains current for at least 30 seconds:
+1. Disable Railway autodeploy.
+2. Record the exact old API deployment, database, and volume IDs; take and verify a restorable backup.
+3. Stop the old API and worker and confirm no running instance can write.
+4. Create or explicitly empty the approved pilot PostgreSQL database. Do not mix the new baseline with the old schema.
+5. Configure the variables and callbacks without starting a deployment.
+6. Attach the persistent image-vault directory to the API service.
+7. Delete or leave permanently stopped the obsolete worker service.
+8. Deploy the exact release commit through `/railway.json`.
+9. Wait for `/api/health`, then run `pnpm smoke:production -- https://<canonical-host>`.
+10. Rehearse two browser sessions, two private enrollments, the exact two-adult group, a signed PDF message, a natural response/reaction/reply, sourced memory, a useful follow-up, one approved Calendar write, provider proof, correction, and Vault deletion.
+11. Enable autodeploy only after the full synthetic journey and the two-phone experience pass.
 
-   ```sql
-   select worker_id, release_id, now() - last_seen_at as heartbeat_age, stopped_at
-   from florence_v4.worker_leases
-   where lease_name = 'florence-worker-singleton';
-   ```
+## Recovery
 
-   `stopped_at` must be null and `heartbeat_age` under 30 seconds.
-7. Deploy API from the same commit using `/railway.json`.
-8. Wait for `/readyz` to return 200, then run:
+- Keep the pre-reset database backup until the pilot has completed the full journey and the user explicitly authorizes disposal.
+- Roll back code only when it understands the current baseline; otherwise stop the API and restore the matching database backup.
+- Treat an uncertain Calendar write as pending reconciliation, never as success.
+- Rotate one connector credential at a time and repeat that connector's synthetic rehearsal.
+- Keep request bodies, cookies, authorization headers, provider payloads, raw family content, and exception objects out of logs.
 
-   ```bash
-   pnpm smoke:production -- https://<canonical-host>
-   ```
-
-9. Using only synthetic pilot data, rehearse two browser sessions, two private Linq enrollments, the
-   exact two-adult group bootstrap, one episode through ownership/reminder/completion, one Gmail
-   private candidate/promotion, and one Calendar approval/reread receipt.
-10. Re-enable autodeploy only after both roles show the same commit and the worker heartbeat remains
-    fresh.
-
-No step in this runbook authorizes deleting old tables, dropping a schema, changing domains, or
-restoring a backup over production.
-
-## Health, rollback, and incident response
-
-- `/healthz` proves only that the API process answers HTTP.
-- `/readyz` proves PostgreSQL is reachable and migration `007` is present.
-- Continuously monitor the worker lease, oldest pending signal/effect, and dead signals.
-- Keep request bodies, cookies, authorization headers, provider payloads, and exceptions out of logs.
-- Roll back application code only when the prior image understands the current schema. Otherwise
-  stop both roles and coordinate a matching database restore.
-- Never edit an applied migration. Add the next numbered migration after taking a backup.
-- Rotate one connector credential at a time, deploy both roles, and repeat that connector's synthetic
-  smoke before rotating another.
-
-Production deployment remains an explicit operator action. Passing local gates does not grant
-permission to deploy or mutate production data.
+Production mutation remains an explicit operator action. Passing local gates does not authorize a deploy or database reset.

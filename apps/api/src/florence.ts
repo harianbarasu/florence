@@ -60,9 +60,6 @@ import {
 
 const DEFAULT_PREFERENCES: PreferencesInput = {
   appearance: "system",
-  privateMemoryDefault: "private",
-  proactivity: "important_only",
-  responseStyle: "concise",
 };
 const LOOP_IDLE_MS = 250;
 const RETRY_MS = 15_000;
@@ -75,7 +72,6 @@ export class Florence {
   readonly #enrollmentCodes: EnrollmentCodes;
   readonly #imageVault: EncryptedImageVault | null;
   readonly #messagesUrl: string | null;
-  readonly #forwardingEmail: string | null;
   readonly #now: () => Date;
   #activeRun: Promise<boolean> | null = null;
   #timer: ReturnType<typeof setTimeout> | null = null;
@@ -89,7 +85,6 @@ export class Florence {
     enrollmentCodes: EnrollmentCodes;
     imageVault: EncryptedImageVault | null;
     messagesUrl: string | null;
-    forwardingEmail: string | null;
     now?: () => Date;
   }) {
     this.#store = input.store;
@@ -99,13 +94,12 @@ export class Florence {
     this.#enrollmentCodes = input.enrollmentCodes;
     this.#imageVault = input.imageVault;
     this.#messagesUrl = nullableText(input.messagesUrl);
-    this.#forwardingEmail = nullableText(input.forwardingEmail);
     this.#now = input.now ?? (() => new Date());
   }
 
   async workspaceForAdult(adultId: string): Promise<WorkspaceView> {
     const household = await this.#householdForAdultOrNull(adultId);
-    return workspaceViewSchema.parse(workspace(adultId, household, this.#messagesUrl, this.#forwardingEmail));
+    return workspaceViewSchema.parse(workspace(adultId, household, this.#messagesUrl));
   }
 
   async putHousehold(adultId: string, untrustedInput: PutHouseholdInput): Promise<WorkspaceView> {
@@ -182,12 +176,6 @@ export class Florence {
   async deleteFact(adultId: string, factId: string): Promise<WorkspaceView> {
     const household = await this.#householdForAdult(adultId);
     await this.#store.deleteFact({ householdId: household.id, adultId, factId });
-    return this.workspaceForAdult(adultId);
-  }
-
-  async deleteDocument(adultId: string, documentId: string): Promise<WorkspaceView> {
-    const household = await this.#householdForAdult(adultId);
-    await this.#store.deleteDocument({ householdId: household.id, adultId, documentId });
     return this.workspaceForAdult(adultId);
   }
 
@@ -715,7 +703,6 @@ function workspace(
   adultId: string,
   household: HouseholdRecord | null,
   messagesUrl: string | null,
-  forwardingEmail: string | null,
 ): WorkspaceView {
   const viewer = household?.members.find((member) => member.id === adultId) ?? null;
   const adults = household?.members.filter((member) => member.kind === "adult") ?? [];
@@ -742,7 +729,6 @@ function workspace(
     viewer: { adultId, displayName: viewer?.displayName ?? null },
     workspace: {
       messagesUrl,
-      forwardingEmail,
       googleConnections:
         household?.googleConnections.flatMap((connection) =>
           connection.status === "active" && connection.emailLabel
@@ -785,20 +771,6 @@ function workspace(
               },
             ];
           }),
-          documents: household.documents.map((document) => ({
-            id: document.id,
-            fileName: document.filename,
-            mimeType: document.mimeType,
-            visibility: document.visibility,
-            source: {
-              id: document.id,
-              kind: "document" as const,
-              label: document.filename,
-              occurredAt: document.occurredAt,
-            },
-            retainedAt: document.occurredAt,
-            deletable: true,
-          })),
         }
       : null,
     preferences: preferences(viewer?.preferences),

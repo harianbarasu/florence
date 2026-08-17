@@ -3,12 +3,7 @@ import { basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import helmet from "@fastify/helmet";
 import fastifyStatic from "@fastify/static";
-import {
-  DEFAULT_IMAGE_RETENTION_MS,
-  decodeImageVaultKey,
-  EncryptedImageVault,
-  ImageVaultError,
-} from "@florence/artifacts";
+import { decodeImageVaultKey, EncryptedImageVault, ImageVaultError } from "@florence/artifacts";
 import {
   disconnectGoogleConnectionInputSchema,
   familyMemberInputSchema,
@@ -54,7 +49,6 @@ const pilotSessionLifetimeSeconds = 7 * 24 * 60 * 60;
 const memberParamsSchema = z.object({ memberId: idSchema }).strict();
 const adultParamsSchema = z.object({ adultId: idSchema }).strict();
 const factParamsSchema = z.object({ factId: idSchema }).strict();
-const documentParamsSchema = z.object({ documentId: idSchema }).strict();
 
 type PilotCredential = {
   token: string;
@@ -71,7 +65,6 @@ export function createDefaultDependencies(env: NodeJS.ProcessEnv = process.env):
   const imageVault = new EncryptedImageVault({
     rootDirectory: requiredEnv(env, "FLORENCE_IMAGE_VAULT_DIRECTORY"),
     encryptionKey: decodeImageVaultKey(requiredEnv(env, "FLORENCE_IMAGE_VAULT_KEY")),
-    retentionMs: imageRetentionMilliseconds(env.FLORENCE_IMAGE_RETENTION_DAYS),
   });
   const google = createDefaultGoogleConnection(env, store);
   const florence = new Florence({
@@ -82,7 +75,6 @@ export function createDefaultDependencies(env: NodeJS.ProcessEnv = process.env):
     enrollmentCodes,
     imageVault,
     messagesUrl: env.FLORENCE_MESSAGES_URL ?? null,
-    forwardingEmail: env.FLORENCE_FORWARDING_EMAIL ?? null,
   });
   const linqIngress = createLinqIngress({
     signingSecret: requiredEnv(env, "LINQ_WEBHOOK_SECRET"),
@@ -270,16 +262,6 @@ export async function buildApp(
     const params = factParamsSchema.safeParse(request.params);
     if (!params.success) return invalidRequest(reply);
     return { workspace: await dependencies.florence.deleteFact(caller.adultId, params.data.factId) };
-  });
-
-  app.delete("/api/v1/vault/documents/:documentId", async (request, reply) => {
-    const caller = await requireAdult(request, reply, dependencies.callerResolver);
-    if (!caller) return;
-    const params = documentParamsSchema.safeParse(request.params);
-    if (!params.success) return invalidRequest(reply);
-    return {
-      workspace: await dependencies.florence.deleteDocument(caller.adultId, params.data.documentId),
-    };
   });
 
   app.put("/api/v1/preferences", async (request, reply) => {
@@ -540,15 +522,6 @@ function safeTokenEqual(left: string, right: string): boolean {
   const leftBytes = Buffer.from(left);
   const rightBytes = Buffer.from(right);
   return leftBytes.length === rightBytes.length && timingSafeEqual(leftBytes, rightBytes);
-}
-
-function imageRetentionMilliseconds(value: string | undefined): number {
-  if (value === undefined) return DEFAULT_IMAGE_RETENTION_MS;
-  const days = Number(value);
-  if (!Number.isSafeInteger(days) || days < 1 || days > 365) {
-    throw new Error("FLORENCE_IMAGE_RETENTION_DAYS must be an integer from 1 through 365");
-  }
-  return days * 24 * 60 * 60 * 1_000;
 }
 
 async function registerFrontend(app: FastifyInstance, frontendRoot?: string): Promise<void> {

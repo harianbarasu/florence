@@ -5,8 +5,7 @@ import type { ImageReference } from "@florence/contracts";
 
 export const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 export const MAX_PDF_BYTES = 20 * 1024 * 1024;
-export const DEFAULT_IMAGE_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
-const maximumRetentionMs = 365 * 24 * 60 * 60 * 1_000;
+const imageRetentionMs = 24 * 60 * 60 * 1_000;
 const envelopeOverheadLimit = 16 * 1024;
 const imageEnvelopeMagic = Buffer.from("FIV1");
 const pdfEnvelopeMagic = Buffer.from("FPD1");
@@ -36,7 +35,6 @@ export type HeicNormalizer = (bytes: Uint8Array) => Promise<Uint8Array>;
 export type EncryptedImageVaultOptions = {
   rootDirectory: string;
   encryptionKey: Uint8Array;
-  retentionMs?: number;
   normalizeHeic?: HeicNormalizer;
 };
 
@@ -108,7 +106,6 @@ export function decodeImageVaultKey(value: string): Uint8Array {
 export class EncryptedImageVault {
   readonly #rootDirectory: string;
   readonly #key: Buffer;
-  readonly #retentionMs: number;
   readonly #normalizeHeic: HeicNormalizer | undefined;
 
   constructor(options: EncryptedImageVaultOptions) {
@@ -118,13 +115,8 @@ export class EncryptedImageVault {
     if (options.encryptionKey.byteLength !== 32) {
       throw new ImageVaultError("invalid_configuration", "Image vault key must contain 32 bytes");
     }
-    const retentionMs = options.retentionMs ?? DEFAULT_IMAGE_RETENTION_MS;
-    if (!Number.isSafeInteger(retentionMs) || retentionMs < 1 || retentionMs > maximumRetentionMs) {
-      throw new ImageVaultError("invalid_configuration", "Image retention must be between 1 ms and 365 days");
-    }
     this.#rootDirectory = options.rootDirectory;
     this.#key = Buffer.from(options.encryptionKey);
-    this.#retentionMs = retentionMs;
     this.#normalizeHeic = options.normalizeHeic;
   }
 
@@ -177,7 +169,7 @@ export class EncryptedImageVault {
       throw new ImageVaultError("image_too_large", "Normalized image exceeds Florence's 20 MB limit");
     }
 
-    const expiresAt = new Date(Date.now() + this.#retentionMs);
+    const expiresAt = new Date(Date.now() + imageRetentionMs);
     const metadata: ImageMetadata = {
       version: 1,
       assetId,
@@ -321,7 +313,7 @@ export class EncryptedImageVault {
           expired = Date.parse(metadata.expiresAt) <= now.getTime();
         } catch {
           const file = await stat(assetPath);
-          expired = file.mtimeMs + this.#retentionMs <= now.getTime();
+          expired = file.mtimeMs + imageRetentionMs <= now.getTime();
         }
         if (expired) {
           await unlink(assetPath);

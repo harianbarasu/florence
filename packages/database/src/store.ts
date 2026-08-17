@@ -99,18 +99,6 @@ export type FactRecord = {
   updatedAt: string;
 };
 
-export type DocumentRecord = {
-  id: string;
-  filename: string;
-  mimeType: string;
-  contentDigest: string;
-  retained: boolean;
-  extractedText: string | null;
-  visibility: Visibility;
-  ownerAdultId: string | null;
-  occurredAt: string;
-};
-
 export type CurrentMessageDocument = {
   id: string;
   filename: string;
@@ -137,13 +125,10 @@ export type HouseholdRecord = {
   id: string;
   name: string;
   timeZone: string;
-  preferences: JsonObject;
   members: readonly FamilyMemberRecord[];
   channels: readonly LinqChannelRecord[];
   facts: readonly FactRecord[];
-  documents: readonly DocumentRecord[];
   googleConnections: readonly GoogleConnectionView[];
-  onboardingComplete: boolean;
 };
 
 export type CreateHouseholdInput = {
@@ -199,7 +184,6 @@ export type InboundDocumentInput = {
   mimeType: string;
   contentDigest: string;
   contentEnvelope: Uint8Array;
-  retained?: boolean;
   discardAfter?: string;
 };
 
@@ -277,7 +261,6 @@ export type InboundTurn = {
   authority: LinqAuthority;
   household: { id: string; name: string; timeZone: string; members: readonly FamilyMemberRecord[] };
   facts: readonly FactRecord[];
-  documents: readonly DocumentRecord[];
   currentDocuments?: readonly CurrentMessageDocument[];
   recentMessages: readonly ConversationTurn[];
   pendingFollowUps: readonly PendingFollowUp[];
@@ -535,9 +518,9 @@ export class PostgresFlorenceStore {
       `;
       if (!viewer) return null;
     }
-    const [household] = await this.#sql<
-      { id: string; name: string; time_zone: string; preferences: JsonObject }[]
-    >`select id,name,time_zone,preferences from households where id=${input.householdId}`;
+    const [household] = await this.#sql<{ id: string; name: string; time_zone: string }[]>`
+      select id,name,time_zone from households where id=${input.householdId}
+    `;
     if (!household) return null;
 
     const members = await this.#sql<PersonRow[]>`
@@ -552,7 +535,6 @@ export class PostgresFlorenceStore {
       order by bound_at,id
     `;
     const facts = await this.#readFacts(input.householdId, input.viewerAdultId ?? null);
-    const documents = await this.#readDocuments(input.householdId, input.viewerAdultId ?? null);
     const googleRows = input.viewerAdultId
       ? await this.#sql<GoogleConnectionRow[]>`
           select * from google_connections where household_id=${input.householdId}
@@ -565,18 +547,10 @@ export class PostgresFlorenceStore {
       id: household.id,
       name: household.name,
       timeZone: household.time_zone,
-      preferences: household.preferences,
       members: memberRecords,
       channels: channelRecords,
       facts,
-      documents,
       googleConnections: googleRows.map(googleConnectionView),
-      onboardingComplete:
-        memberRecords.filter((member) => member.kind === "adult" && member.status === "verified").length ===
-          2 &&
-        channelRecords.filter((channel) => channel.revokedAt === null && channel.audience === "private")
-          .length === 2 &&
-        channelRecords.some((channel) => channel.revokedAt === null && channel.audience === "group"),
     };
   }
 
@@ -707,42 +681,6 @@ export class PostgresFlorenceStore {
         and (visibility='household' or owner_adult_id=${input.adultId}) returning id
     `;
     if (deleted.length === 0) throw new FlorenceStoreUnauthorized("That fact is not visible to this adult");
-    return requiredHousehold(
-      await this.readHousehold({ householdId: input.householdId, viewerAdultId: input.adultId }),
-    );
-  }
-
-  async deleteDocument(input: {
-    householdId: string;
-    adultId: string;
-    documentId: string;
-  }): Promise<HouseholdRecord> {
-    await this.#requireVerifiedAdult(input.householdId, input.adultId);
-    await this.#sql.begin(async (sql) => {
-      const [source] = await sql<{ id: string }[]>`
-        select s.id from sources s join documents d on d.source_id=s.id
-        where s.id=${input.documentId} and s.household_id=${input.householdId}
-          and (s.visibility='household' or s.owner_adult_id=${input.adultId}) for update
-      `;
-      if (!source) throw new FlorenceStoreUnauthorized("That document is not visible to this adult");
-      await sql`
-        delete from facts f where exists (
-          select 1 from fact_sources own where own.fact_id=f.id and own.source_id=${source.id}
-        ) and not exists (
-          select 1 from fact_sources other where other.fact_id=f.id and other.source_id<>${source.id}
-        )
-      `;
-      await sql`
-        update follow_ups set status='cancelled',cancelled_at=now()
-        where status='scheduled' and exists (
-          select 1 from follow_up_sources fs where fs.follow_up_id=follow_ups.id and fs.source_id=${source.id}
-        )
-      `;
-      await sql`
-        delete from calendar_actions where basis_source_id=${source.id} and status='offered'
-      `;
-      await sql`delete from sources where id=${source.id}`;
-    });
     return requiredHousehold(
       await this.readHousehold({ householdId: input.householdId, viewerAdultId: input.adultId }),
     );
@@ -1163,7 +1101,6 @@ export class PostgresFlorenceStore {
         members: members.map(personRecord),
       },
       facts: await this.#readFacts(row.household_id, privateViewer, channel.audience === "group"),
-      documents: await this.#readDocuments(row.household_id, privateViewer, channel.audience === "group"),
       currentDocuments: currentDocumentRows.map((document) => ({
         id: document.id,
         filename: document.filename,
@@ -2071,45 +2008,6 @@ export class PostgresFlorenceStore {
     }));
   }
 
-  async #readDocuments(
-    householdId: string,
-    viewerAdultId: string | null,
-    householdOnly = false,
-  ): Promise<readonly DocumentRecord[]> {
-    const rows = await this.#sql<
-      {
-        source_id: string;
-        filename: string;
-        mime_type: string;
-        content_digest: string;
-        retained: boolean;
-        extracted_text: string | null;
-        visibility: Visibility;
-        owner_adult_id: string | null;
-        occurred_at: Date;
-      }[]
-    >`
-      select d.source_id,d.filename,d.mime_type,d.content_digest,d.retained,d.extracted_text,
-             s.visibility,s.owner_adult_id,s.occurred_at
-      from documents d join sources s on s.id=d.source_id
-      where s.household_id=${householdId}
-        and (${householdOnly} or s.visibility='household' or s.owner_adult_id=${viewerAdultId})
-        and (not ${householdOnly} or s.visibility='household')
-      order by s.occurred_at desc,d.source_id
-    `;
-    return rows.map((row) => ({
-      id: row.source_id,
-      filename: row.filename,
-      mimeType: row.mime_type,
-      contentDigest: row.content_digest,
-      retained: row.retained,
-      extractedText: row.extracted_text,
-      visibility: row.visibility,
-      ownerAdultId: row.owner_adult_id,
-      occurredAt: row.occurred_at.toISOString(),
-    }));
-  }
-
   async #readOutbound(sourceId: string): Promise<OutboundMessage | null> {
     const [row] = await this.#sql<
       {
@@ -2393,10 +2291,7 @@ async function insertInbound(
       ${stop ? occurredAt : null})
   `;
   for (const document of documents) {
-    const retained = document.retained ?? false;
-    const discardAfter = retained
-      ? null
-      : instant(document.discardAfter ?? new Date(occurredAt.getTime() + 24 * 60 * 60_000).toISOString());
+    const discardAfter = instant(document.discardAfter);
     await sql`
       insert into sources (
         id,household_id,kind,visibility,owner_adult_id,external_key,parent_source_id,label,metadata,occurred_at
@@ -2408,7 +2303,7 @@ async function insertInbound(
       insert into documents (
         source_id,saved_by_adult_id,filename,mime_type,content_digest,retained,content_envelope,discard_after
       ) values (${document.documentId},${senderAdultId},${document.filename},${document.mimeType},
-        ${document.contentDigest},${retained},${Buffer.from(document.contentEnvelope)},${discardAfter})
+        ${document.contentDigest},false,${Buffer.from(document.contentEnvelope)},${discardAfter})
     `;
   }
   if (stop) await sql`update linq_channels set stopped_at=${occurredAt} where id=${channel.id}`;
@@ -2633,8 +2528,7 @@ function validateImageReferences(values: readonly ImageReference[]): ImageRefere
   return result;
 }
 
-type ValidatedInboundDocument = Omit<InboundDocumentInput, "retained" | "discardAfter"> & {
-  retained: false;
+type ValidatedInboundDocument = Omit<InboundDocumentInput, "discardAfter"> & {
   discardAfter: string;
 };
 
@@ -2671,9 +2565,6 @@ function validateInboundDocuments(
     ) {
       throw new FlorenceStoreConflict("A PDF envelope exceeds its storage limit");
     }
-    if (document.retained === true) {
-      throw new FlorenceStoreConflict("An inbound PDF is incidental and cannot be retained automatically");
-    }
     const discardAfter = instant(
       document.discardAfter ?? new Date(occurredAt.getTime() + 24 * 60 * 60_000).toISOString(),
     );
@@ -2687,7 +2578,6 @@ function validateInboundDocuments(
       mimeType: "application/pdf" as const,
       contentDigest: document.contentDigest,
       contentEnvelope: document.contentEnvelope,
-      retained: false as const,
       discardAfter: discardAfter.toISOString(),
     };
   });
@@ -2717,7 +2607,7 @@ function sameInboundDocuments(
         document.filename === candidate.filename &&
         document.mime_type === candidate.mimeType &&
         document.content_digest === candidate.contentDigest &&
-        document.retained === candidate.retained &&
+        document.retained === false &&
         document.discard_after?.toISOString() === candidate.discardAfter
       );
     })
@@ -3013,12 +2903,6 @@ function deterministicUuid(value: string): string {
   const digest = createHash("sha256").update(value).digest("hex");
   const variant = ((Number.parseInt(digest[16] ?? "0", 16) & 3) | 8).toString(16);
   return `${digest.slice(0, 8)}-${digest.slice(8, 12)}-5${digest.slice(13, 16)}-${variant}${digest.slice(17, 20)}-${digest.slice(20, 32)}`;
-}
-
-export function linqIdentitySubjectDigest(providerHandleId: string): string {
-  return createHash("sha256")
-    .update(`linq-v3\0${required(providerHandleId, "Linq handle ID")}`)
-    .digest("hex");
 }
 
 function sameStrings(left: readonly string[], right: readonly string[]): boolean {

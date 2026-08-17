@@ -99,12 +99,6 @@ export function deleteVaultFact(factId: string): Promise<WorkspaceView> {
   return requestWorkspace(`/api/v1/vault/facts/${encodeURIComponent(factId)}`, { method: "DELETE" });
 }
 
-export function deleteVaultDocument(documentId: string): Promise<WorkspaceView> {
-  return requestWorkspace(`/api/v1/vault/documents/${encodeURIComponent(documentId)}`, {
-    method: "DELETE",
-  });
-}
-
 export function putPreferences(input: PreferencesInput): Promise<WorkspaceView> {
   return requestWorkspace("/api/v1/preferences", {
     method: "PUT",

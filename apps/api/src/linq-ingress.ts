@@ -351,7 +351,6 @@ async function storeMedia(
       mimeType: sealed.mimeType,
       contentDigest: sealed.contentDigest,
       contentEnvelope: sealed.contentEnvelope,
-      retained: false,
       discardAfter: sealed.discardAfter,
     });
   }

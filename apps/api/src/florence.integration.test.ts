@@ -190,9 +190,6 @@ release("Florence release journeys", () => {
     const beforeCorrection = await harness.florence.workspaceForAdult(ADULT_TWO);
     const dismissal = beforeCorrection.vault?.facts.find((fact) => fact.statement.includes("dismissal"));
     expect(dismissal?.visibility).toBe("household");
-    expect(beforeCorrection.vault?.documents.map((document) => document.fileName)).toContain(
-      "school-packet.pdf",
-    );
     await harness.florence.correctFact(ADULT_TWO, dismissal?.id ?? "missing", "School dismissal is at 3:00");
     expect((await harness.florence.workspaceForAdult(ADULT_ONE)).vault?.facts).toEqual(
       expect.arrayContaining([expect.objectContaining({ statement: "School dismissal is at 3:00" })]),
@@ -738,7 +735,6 @@ async function freshHarness(
     enrollmentCodes: new EnrollmentCodes("release-journey-secret-is-at-least-thirty-two-bytes"),
     imageVault: vault,
     messagesUrl: "https://florence.test/messages",
-    forwardingEmail: "family@florence.test",
     now: () => new Date(harness.now),
   });
   harness = new Harness(store, florence, linq, vault);

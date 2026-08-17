@@ -2,7 +2,6 @@ CREATE TABLE households (
   id uuid PRIMARY KEY, singleton boolean NOT NULL DEFAULT true UNIQUE CHECK (singleton),
   name text NOT NULL CHECK (length(trim(name)) > 0),
   time_zone text NOT NULL CHECK (length(trim(time_zone)) > 0),
-  preferences jsonb NOT NULL DEFAULT '{}'::jsonb,
   created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now()
 );
 
@@ -109,7 +108,7 @@ CREATE TABLE documents (
   source_id uuid PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
   saved_by_adult_id uuid NOT NULL REFERENCES people(id), filename text NOT NULL, mime_type text NOT NULL,
   content_digest text NOT NULL CHECK (content_digest ~ '^[0-9a-f]{64}$'), retained boolean NOT NULL DEFAULT false,
-  content_envelope bytea, extracted_text text, processed_at timestamptz, discard_after timestamptz,
+  content_envelope bytea, discard_after timestamptz,
   CHECK (NOT retained OR (content_envelope IS NOT NULL AND discard_after IS NULL))
 );
 

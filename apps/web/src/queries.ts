@@ -8,7 +8,6 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   createSession,
   deleteSession,
-  deleteVaultDocument,
   deleteVaultFact,
   disconnectGoogleConnection,
   getSession,
@@ -91,14 +90,6 @@ export function useDeleteFact() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (factId: string) => deleteVaultFact(factId),
-    onSuccess: (workspace) => queryClient.setQueryData(queryKeys.workspace, workspace),
-  });
-}
-
-export function useDeleteDocument() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: (documentId: string) => deleteVaultDocument(documentId),
     onSuccess: (workspace) => queryClient.setQueryData(queryKeys.workspace, workspace),
   });
 }

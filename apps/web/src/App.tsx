@@ -4,18 +4,16 @@ import type {
   MessagesInvite,
   PreferencesInput,
   VaultContact,
-  VaultDocument,
   VaultFact,
   WorkspaceView,
 } from "@florence/contracts";
 import { Link, Outlet, useNavigate } from "@tanstack/react-router";
-import { Check, ExternalLink, FileText, MessageCircle, Plus, Trash2 } from "lucide-react";
+import { Check, ExternalLink, MessageCircle, Plus, Trash2 } from "lucide-react";
 import { type FormEvent, useEffect, useState } from "react";
 import { FlorenceRequestError } from "./api";
 import { MemberEditor } from "./components/MemberEditor";
 import {
   useCreateSession,
-  useDeleteDocument,
   useDeleteFact,
   useDeleteSession,
   useDisconnectGoogleConnection,
@@ -129,7 +127,6 @@ export function VaultPage() {
   const putMember = usePutMember();
   const patchFact = usePatchFact();
   const deleteFact = useDeleteFact();
-  const deleteDocument = useDeleteDocument();
   const [editing, setEditing] = useState<FamilyMemberProfile | "new" | null>(null);
   useWorkspaceAppearance(query.data?.preferences.appearance);
 
@@ -188,14 +185,6 @@ export function VaultPage() {
           isSaving={patchFact.isPending || deleteFact.isPending}
           onCorrect={(factId, statement) => patchFact.mutateAsync({ factId, input: { statement } })}
           onDelete={(factId) => deleteFact.mutateAsync(factId)}
-        />
-      </VaultSection>
-
-      <VaultSection label="Documents">
-        <DocumentList
-          documents={vault.documents}
-          isDeleting={deleteDocument.isPending}
-          onDelete={(documentId) => deleteDocument.mutateAsync(documentId)}
         />
       </VaultSection>
 
@@ -637,53 +626,6 @@ function FactRow({
   );
 }
 
-function DocumentList({
-  documents,
-  isDeleting,
-  onDelete,
-}: {
-  documents: VaultDocument[];
-  isDeleting: boolean;
-  onDelete: (documentId: string) => Promise<unknown>;
-}) {
-  if (!documents.length) {
-    return (
-      <EmptyVaultRow
-        icon={<FileText size={18} />}
-        title="No retained documents"
-        detail="Send a school schedule or PDF to Florence in Messages. Temporary attachments are discarded unless you save them."
-      />
-    );
-  }
-  return (
-    <div className="vault-data-list">
-      {documents.map((document) => (
-        <div className="vault-data-row" key={document.id}>
-          <FileText className="vault-data-icon" size={18} />
-          <div className="vault-data-copy">
-            <strong>{document.fileName}</strong>
-            <p>{sourceSummary(document.visibility, document.source.label)}</p>
-          </div>
-          {document.deletable && (
-            <button
-              className="text-button danger"
-              type="button"
-              disabled={isDeleting}
-              onClick={() => {
-                if (window.confirm(`Delete ${document.fileName} from the Vault?`)) {
-                  void onDelete(document.id);
-                }
-              }}
-            >
-              <Trash2 size={13} /> Delete
-            </button>
-          )}
-        </div>
-      ))}
-    </div>
-  );
-}
-
 function ContactList({ contacts }: { contacts: VaultContact[] }) {
   if (!contacts.length) {
     return (
@@ -801,10 +743,9 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
   return <h2 className="section-label">{children}</h2>;
 }
 
-function EmptyVaultRow({ icon, title, detail }: { icon?: React.ReactNode; title: string; detail: string }) {
+function EmptyVaultRow({ title, detail }: { title: string; detail: string }) {
   return (
     <div className="empty-row">
-      {icon && <span>{icon}</span>}
       <div>
         <strong>{title}</strong>
         <p>{detail}</p>

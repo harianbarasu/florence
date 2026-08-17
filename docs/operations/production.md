@@ -57,8 +57,6 @@ Google is optional as a bundle but required for the full pilot journey:
 Optional bounded settings:
 
 - `FLORENCE_MESSAGES_URL`
-- `FLORENCE_FORWARDING_EMAIL` only after a real inbound path exists
-- `FLORENCE_IMAGE_RETENTION_DAYS=30` (1–365)
 - `FLORENCE_MODEL_TIMEOUT_MS=30000`
 - `FLORENCE_MODEL_MAX_OUTPUT_TOKENS=4000`
 - `LOG_LEVEL=info`

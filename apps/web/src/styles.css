@@ -637,10 +637,6 @@ button.contact-button {
   border-radius: 6px;
 }
 
-.empty-row > span {
-  color: var(--tertiary);
-}
-
 .vault-data-list {
   overflow: hidden;
   border: 1px solid var(--border);
@@ -678,10 +674,6 @@ button.contact-button {
   display: block;
   margin-top: 3px;
   color: var(--secondary);
-}
-
-.vault-data-icon {
-  color: var(--tertiary);
 }
 
 .row-actions {

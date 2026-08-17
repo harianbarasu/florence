@@ -56,10 +56,8 @@ export const familyMemberInputSchema = z
 export type FamilyMemberInput = z.infer<typeof familyMemberInputSchema>;
 
 export const familyMemberStatusSchema = z.enum(["verified", "planned", "represented"]);
-export type FamilyMemberStatus = z.infer<typeof familyMemberStatusSchema>;
 
 export const messagesIdentityStatusSchema = z.enum(["not_invited", "invited", "connected"]);
-export type MessagesIdentityStatus = z.infer<typeof messagesIdentityStatusSchema>;
 
 export const familyMemberProfileSchema = z
   .object({
@@ -122,19 +120,6 @@ export const vaultFactSchema = z
   .strict();
 export type VaultFact = z.infer<typeof vaultFactSchema>;
 
-export const vaultDocumentSchema = z
-  .object({
-    id: idSchema,
-    fileName: nonempty(500),
-    mimeType: nonempty(200),
-    visibility: vaultVisibilitySchema,
-    source: vaultSourceSchema,
-    retainedAt: timestampSchema,
-    deletable: z.boolean(),
-  })
-  .strict();
-export type VaultDocument = z.infer<typeof vaultDocumentSchema>;
-
 export const vaultContactInputSchema = z
   .object({
     kind: z.enum(["address", "phone"]),
@@ -143,7 +128,6 @@ export const vaultContactInputSchema = z
     visibility: vaultVisibilitySchema,
   })
   .strict();
-export type VaultContactInput = z.infer<typeof vaultContactInputSchema>;
 
 export const vaultContactSchema = vaultContactInputSchema
   .extend({
@@ -173,19 +157,14 @@ export const setupChecklistSchema = z
     familyGroupConnected: z.boolean(),
   })
   .strict();
-export type SetupChecklist = z.infer<typeof setupChecklistSchema>;
 
 export const preferencesInputSchema = z
   .object({
     appearance: z.enum(["light", "dark", "system"]),
-    privateMemoryDefault: z.enum(["private", "ask_to_share"]),
-    proactivity: z.enum(["important_only", "off"]),
-    responseStyle: z.enum(["concise", "balanced"]),
   })
   .strict();
 export type PreferencesInput = z.infer<typeof preferencesInputSchema>;
 export const preferencesViewSchema = preferencesInputSchema;
-export type PreferencesView = PreferencesInput;
 
 export const householdVaultSchema = z
   .object({
@@ -194,7 +173,6 @@ export const householdVaultSchema = z
     members: z.array(familyMemberProfileSchema).max(100),
     contacts: z.array(vaultContactSchema).max(100),
     facts: z.array(vaultFactSchema).max(500),
-    documents: z.array(vaultDocumentSchema).max(100),
   })
   .strict();
 export type HouseholdVault = z.infer<typeof householdVaultSchema>;
@@ -210,7 +188,6 @@ export const workspaceViewSchema = z
     workspace: z
       .object({
         messagesUrl: nonempty(2_000).nullable(),
-        forwardingEmail: z.email().nullable(),
         googleConnections: z.array(googleConnectionSummarySchema).max(10),
         setup: setupChecklistSchema,
       })
@@ -237,7 +214,6 @@ export const disconnectGoogleConnectionInputSchema = z.object({ connectionId: id
 export type DisconnectGoogleConnectionInput = z.infer<typeof disconnectGoogleConnectionInputSchema>;
 
 export const workspaceResponseSchema = z.object({ workspace: workspaceViewSchema }).strict();
-export type WorkspaceResponse = z.infer<typeof workspaceResponseSchema>;
 
 export const messagesInviteSchema = z
   .object({
@@ -256,4 +232,3 @@ export const messagesInviteResponseSchema = z
 export type MessagesInviteResponse = z.infer<typeof messagesInviteResponseSchema>;
 
 export const googleStartResponseSchema = z.object({ authorizationUrl: z.url() }).strict();
-export type GoogleStartResponse = z.infer<typeof googleStartResponseSchema>;

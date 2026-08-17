@@ -1,10 +1,8 @@
 import { buildApp, createDefaultDependencies } from "./app.js";
 
-const host = "0.0.0.0";
-const port = Number(process.env.PORT ?? 8787);
-if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) {
-  throw new Error("PORT must be an integer from 1 through 65535");
-}
+const isProduction = process.env.NODE_ENV === "production";
+const host = process.env.API_HOST ?? (isProduction ? "0.0.0.0" : "127.0.0.1");
+const port = Number(process.env.PORT ?? process.env.API_PORT ?? 8787);
 const app = await buildApp(createDefaultDependencies());
 
 let shuttingDown = false;
@@ -14,8 +12,8 @@ async function shutdown(signal: NodeJS.Signals): Promise<void> {
   console.log(`Received ${signal}; closing Florence API`);
   try {
     await app.close();
-  } catch {
-    console.error("[shutdown_failed] Florence API could not close cleanly");
+  } catch (error) {
+    console.error("Failed to close Florence API cleanly", error);
     process.exitCode = 1;
   }
 }
@@ -26,12 +24,7 @@ process.once("SIGINT", () => void shutdown("SIGINT"));
 try {
   await app.listen({ host, port });
   console.log(`Florence API listening on http://${host}:${port}`);
-} catch {
-  app.log.error({ code: "startup_failed" }, "Florence API failed to start");
-  try {
-    await app.close();
-  } catch {
-    app.log.error({ code: "startup_cleanup_failed" }, "Florence API startup cleanup failed");
-  }
+} catch (error) {
+  app.log.error(error);
   process.exitCode = 1;
 }

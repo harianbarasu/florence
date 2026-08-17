@@ -10,17 +10,16 @@
   },
   "scripts": {
     "build": "pnpm -r --if-present build",
-    "check": "pnpm lint && pnpm typecheck && pnpm build && pnpm test",
+    "check": "pnpm lint && pnpm typecheck && pnpm test && pnpm build",
     "db:migrate": "pnpm --filter @florence/database db:migrate",
-    "dev": "pnpm -r --filter './packages/**' build && pnpm --parallel --filter @florence/api --filter @florence/web --filter @florence/worker dev",
+    "dev": "pnpm -r --filter './packages/**' build && pnpm --parallel --filter @florence/api --filter @florence/web dev",
     "format": "biome format --write .",
     "lint": "biome check .",
     "predeploy:production": "node packages/database/dist/predeploy.js",
     "smoke:production": "node apps/api/dist/smoke-production.js",
     "start": "node apps/api/dist/server.js",
-    "start:worker": "node apps/worker/dist/server.js",
     "test": "pnpm -r --if-present test",
-    "typecheck": "pnpm -r --if-present typecheck"
+    "typecheck": "pnpm -r --filter './packages/**' build && pnpm -r --if-present typecheck"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.7",

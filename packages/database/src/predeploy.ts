@@ -5,16 +5,13 @@ let phase: "configuration" | "migration" = "configuration";
 try {
   if (process.env.NODE_ENV !== "production") throw new Error("node_environment_not_production");
   const connectionString = required("FLORENCE_DATABASE_URL");
-  const schema = required("FLORENCE_POSTGRES_SCHEMA");
-  if (schema !== "florence_v4") throw new Error("database_schema_not_florence_v4");
   phase = "migration";
-  await migrateDatabase({ connectionString, schema, ssl: true });
+  await migrateDatabase(connectionString);
   process.stdout.write(
     `${JSON.stringify({
       ok: true,
       event: "production_predeploy_complete",
       service: safeServiceName(process.env.RAILWAY_SERVICE_NAME),
-      schema,
     })}\n`,
   );
 } catch (error) {

@@ -5,21 +5,16 @@
   "type": "module",
   "exports": {
     ".": {
-      "types": "./src/index.ts",
+      "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     }
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "db:migrate": "tsx src/migrate.ts",
-    "test": "vitest run --config ../../vitest.config.ts src",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@florence/contracts": "workspace:*",
-    "@florence/control-plane": "workspace:*",
-    "@florence/google": "workspace:*",
-    "@florence/linq": "workspace:*",
     "postgres": "3.4.9"
   }
 }

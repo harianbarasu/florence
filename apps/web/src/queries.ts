@@ -1,24 +1,28 @@
+import type {
+  FamilyMemberInput,
+  PatchFactInput,
+  PreferencesInput,
+  PutHouseholdInput,
+} from "@florence/contracts";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  type CreateHouseholdInput,
-  createHousehold,
   createSession,
   deleteSession,
+  deleteVaultFact,
   disconnectGoogleConnection,
-  getHousehold,
   getSession,
-  listGoogleConnections,
-  listHouseholds,
+  getWorkspace,
+  issueMessagesInvite,
+  patchVaultFact,
+  putFamilyMember,
+  putHousehold,
+  putPreferences,
   startGoogleConnection,
-  type UpsertMemberInput,
-  upsertFamilyMember,
 } from "./api";
 
 export const queryKeys = {
   session: ["session"] as const,
-  households: ["households"] as const,
-  household: (householdId: string) => ["households", householdId] as const,
-  googleConnections: (householdId: string) => ["households", householdId, "google-connections"] as const,
+  workspace: ["workspace"] as const,
 };
 
 export function useSession() {
@@ -29,7 +33,10 @@ export function useCreateSession() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: createSession,
-    onSuccess: async () => queryClient.invalidateQueries({ queryKey: queryKeys.session }),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: queryKeys.session });
+      await queryClient.invalidateQueries({ queryKey: queryKeys.workspace });
+    },
   });
 }
 
@@ -41,111 +48,68 @@ export function useDeleteSession() {
   });
 }
 
-export function useHouseholds() {
-  return useQuery({ queryKey: queryKeys.households, queryFn: listHouseholds });
+export function useWorkspace() {
+  return useQuery({ queryKey: queryKeys.workspace, queryFn: getWorkspace });
 }
 
-export function useHousehold(householdId: string | null) {
-  return useQuery({
-    queryKey: queryKeys.household(householdId ?? "none"),
-    queryFn: () => getHousehold(householdId as string),
-    enabled: householdId !== null,
-  });
-}
-
-export function useGoogleConnections(householdId: string | null) {
-  return useQuery({
-    queryKey: queryKeys.googleConnections(householdId ?? "none"),
-    queryFn: () => listGoogleConnections(householdId as string),
-    enabled: householdId !== null,
-  });
-}
-
-export function useStartGoogleConnection(householdId: string) {
-  return useMutation({ mutationFn: () => startGoogleConnection(householdId) });
-}
-
-export function useDisconnectGoogleConnection(householdId: string) {
+export function usePutHousehold() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (connectionId: string) => disconnectGoogleConnection(householdId, connectionId),
-    onSuccess: async () =>
-      queryClient.invalidateQueries({ queryKey: queryKeys.googleConnections(householdId) }),
+    mutationFn: (input: PutHouseholdInput) => putHousehold(input),
+    onSuccess: (workspace) => queryClient.setQueryData(queryKeys.workspace, workspace),
   });
 }
 
-export function useCreateHousehold() {
+export function usePutMember() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async (input: CreateHouseholdInput) => {
-      const result = await createHousehold(input);
-      const households = await waitForAppliedState(listHouseholds, (profiles) =>
-        profiles.some((profile) => profile.householdId === result.householdId),
-      );
-      queryClient.setQueryData(queryKeys.households, households);
-      return result;
-    },
+    mutationFn: ({ memberId, input }: { memberId: string; input: FamilyMemberInput }) =>
+      putFamilyMember(memberId, input),
+    onSuccess: (workspace) => queryClient.setQueryData(queryKeys.workspace, workspace),
   });
 }
 
-export function useUpsertMember(householdId: string) {
+export function useMessagesInvite() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async ({ memberId, input }: { memberId: string; input: UpsertMemberInput }) => {
-      const receipt = await upsertFamilyMember(householdId, memberId, input);
-      const household = await waitForAppliedState(
-        () => getHousehold(householdId),
-        (profile) =>
-          memberMatches(
-            profile.members.find((member) => member.id === memberId),
-            input,
-          ),
-      );
-      queryClient.setQueryData(queryKeys.household(householdId), household);
-      return receipt;
-    },
+    mutationFn: (adultId: string) => issueMessagesInvite(adultId),
+    onSuccess: ({ workspace }) => queryClient.setQueryData(queryKeys.workspace, workspace),
   });
 }
 
-async function waitForAppliedState<T>(load: () => Promise<T>, isApplied: (value: T) => boolean): Promise<T> {
-  const deadline = Date.now() + 10_000;
-  let lastError: unknown;
-  while (Date.now() < deadline) {
-    try {
-      const value = await load();
-      if (isApplied(value)) return value;
-    } catch (error) {
-      lastError = error;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 200));
-  }
-  throw new Error("Florence saved this change, but the household worker has not applied it yet.", {
-    cause: lastError,
+export function usePatchFact() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ factId, input }: { factId: string; input: PatchFactInput }) =>
+      patchVaultFact(factId, input),
+    onSuccess: (workspace) => queryClient.setQueryData(queryKeys.workspace, workspace),
   });
 }
 
-function memberMatches(
-  member: Awaited<ReturnType<typeof getHousehold>>["members"][number] | undefined,
-  input: UpsertMemberInput,
-): boolean {
-  if (!member) return false;
-  return (
-    member.kind === input.kind &&
-    member.role === input.role &&
-    member.displayName === input.displayName &&
-    member.relationship === input.relationship &&
-    sameStrings(member.aliases, input.aliases) &&
-    member.birthYear === input.birthYear &&
-    member.school === input.school &&
-    member.currentGrade === input.currentGrade &&
-    member.academicYear === input.academicYear &&
-    member.gradeEffectiveFrom === input.gradeEffectiveFrom &&
-    sameStrings(member.activities, input.activities)
-  );
+export function useDeleteFact() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (factId: string) => deleteVaultFact(factId),
+    onSuccess: (workspace) => queryClient.setQueryData(queryKeys.workspace, workspace),
+  });
 }
 
-function sameStrings(left: readonly string[] | undefined, right: readonly string[] | undefined): boolean {
-  const first = left ?? [];
-  const second = right ?? [];
-  return first.length === second.length && first.every((value, index) => value === second[index]);
+export function usePutPreferences() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (input: PreferencesInput) => putPreferences(input),
+    onSuccess: (workspace) => queryClient.setQueryData(queryKeys.workspace, workspace),
+  });
+}
+
+export function useStartGoogleConnection() {
+  return useMutation({ mutationFn: startGoogleConnection });
+}
+
+export function useDisconnectGoogleConnection() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (connectionId: string) => disconnectGoogleConnection(connectionId),
+    onSuccess: (workspace) => queryClient.setQueryData(queryKeys.workspace, workspace),
+  });
 }

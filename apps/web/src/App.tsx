@@ -1,25 +1,24 @@
 import type {
+  CompleteFamilyOnboardingInput,
   FamilyMemberProfile,
-  HouseholdVault,
-  MessagesInvite,
   PreferencesInput,
+  SetupSessionInput,
   VaultContact,
   VaultFact,
   WorkspaceView,
 } from "@florence/contracts";
-import { Link, Outlet, useNavigate } from "@tanstack/react-router";
+import { Link, Outlet } from "@tanstack/react-router";
 import { Check, ExternalLink, MessageCircle, Plus, Trash2 } from "lucide-react";
 import { type FormEvent, useEffect, useState } from "react";
 import { FlorenceRequestError } from "./api";
 import { MemberEditor } from "./components/MemberEditor";
 import {
+  useCompleteFamilyOnboarding,
   useCreateSession,
   useDeleteFact,
   useDeleteSession,
   useDisconnectGoogleConnection,
-  useMessagesInvite,
   usePatchFact,
-  usePutHousehold,
   usePutMember,
   usePutPreferences,
   useSession,
@@ -27,13 +26,28 @@ import {
   useWorkspace,
 } from "./queries";
 
+const onboardingEntry = consumeOnboardingEntry();
+
 export function AppShell() {
-  const session = useSession();
+  const session = useSession(onboardingEntry.setupToken === null);
+  const workspace = useWorkspace(onboardingEntry.setupToken === null && session.isSuccess);
+  if (onboardingEntry.setupToken) return <SetupPage setupToken={onboardingEntry.setupToken} />;
   if (session.isLoading) return <PageLoader />;
   if (session.error instanceof FlorenceRequestError && session.error.status === 401) {
-    return <AccessPage />;
+    return <StartInMessagesPage />;
   }
   if (session.isError) return <LoadError error={session.error} />;
+  if (workspace.isLoading) return <PageLoader />;
+  if (workspace.isError) return <LoadError error={workspace.error} />;
+  if (!workspace.data) return <PageLoader />;
+  const googleConnected = workspace.data.workspace.googleConnections.length > 0;
+  if (!googleConnected) return <GoogleSetupGate status={onboardingEntry.googleStatus} />;
+  if (!workspace.data.workspace.setup.onboardingComplete) {
+    return <FamilySetupPage view={workspace.data} />;
+  }
+  if (onboardingEntry.setupComplete) {
+    return <GoogleSetupSuccess view={workspace.data} />;
+  }
 
   return (
     <div className="shell">
@@ -48,41 +62,521 @@ export function AppShell() {
   );
 }
 
-function AccessPage() {
+function SetupPage({ setupToken }: { setupToken: string }) {
   const createSession = useCreateSession();
+  const startGoogle = useStartGoogleConnection();
+  const [step, setStep] = useState<"profile" | "google">("profile");
+  const [token, setToken] = useState<string | null>(setupToken);
   const [error, setError] = useState<string | null>(null);
 
-  async function submit(event: FormEvent<HTMLFormElement>) {
+  async function submitProfile(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setError(null);
+    if (!token) return;
+    const data = new FormData(event.currentTarget);
+    const timeZone = detectedTimeZone();
+    if (!isTimeZone(timeZone)) {
+      setError("Use an IANA time zone such as America/Los_Angeles.");
+      return;
+    }
+    const profile: SetupSessionInput["profile"] = {
+      displayName: required(data, "displayName"),
+      timeZone,
+      guardianAttested: true,
+    };
     try {
-      await createSession.mutateAsync(required(new FormData(event.currentTarget), "accessCode"));
+      await createSession.mutateAsync({ setupToken: token, profile });
+      setToken(null);
+      setStep("google");
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Florence could not verify this access code.");
+      setError(setupError(cause));
+    }
+  }
+
+  async function connectGoogle() {
+    setError(null);
+    try {
+      const result = await startGoogle.mutateAsync();
+      window.location.assign(result.authorizationUrl);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Florence could not open Google.");
+    }
+  }
+
+  if (step === "google") {
+    return (
+      <SetupFrame>
+        <GoogleSetupStep
+          error={error}
+          isPending={startGoogle.isPending}
+          onConnect={() => void connectGoogle()}
+        />
+      </SetupFrame>
+    );
+  }
+
+  return (
+    <SetupFrame>
+      <form className="setup-form" onSubmit={(event) => void submitProfile(event)}>
+        <SetupHeading
+          title="What should Florence call you?"
+          detail="This stays tied to the private Messages conversation you just started."
+        />
+        <label className="field">
+          <span>First name</span>
+          <input name="displayName" autoComplete="given-name" placeholder="Your first name" required />
+        </label>
+        <label className="setup-attestation">
+          <input name="guardianAttested" type="checkbox" required />
+          <span>I’m a parent, guardian, or authorized caregiver for any children I add to Florence.</span>
+        </label>
+        {error && (
+          <p className="form-error" role="alert">
+            {error}
+          </p>
+        )}
+        <button className="button primary wide" type="submit" disabled={createSession.isPending}>
+          {createSession.isPending ? "Saving…" : "Continue"}
+        </button>
+      </form>
+    </SetupFrame>
+  );
+}
+
+function StartInMessagesPage() {
+  return (
+    <SetupFrame>
+      <SetupHeading
+        title="Start in Messages"
+        detail="Text Florence “Hi,” then open the private setup link she sends back in that conversation."
+      />
+      <p className="setup-footnote">There’s no password or access code to keep track of.</p>
+    </SetupFrame>
+  );
+}
+
+function GoogleSetupGate({ status }: { status: string | null }) {
+  const startGoogle = useStartGoogleConnection();
+  const [error, setError] = useState<string | null>(null);
+
+  async function connectGoogle() {
+    setError(null);
+    try {
+      const result = await startGoogle.mutateAsync();
+      window.location.assign(result.authorizationUrl);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Florence could not open Google.");
     }
   }
 
   return (
-    <main className="access-page">
-      <div className="access-brand">
-        <Brand />
-        <p>Private family pilot</p>
+    <SetupFrame>
+      <GoogleSetupStep
+        error={error ?? (status ? googleSetupError(status) : null)}
+        isPending={startGoogle.isPending}
+        onConnect={() => void connectGoogle()}
+      />
+    </SetupFrame>
+  );
+}
+
+function GoogleSetupSuccess({ view }: { view: WorkspaceView }) {
+  const displayName = firstName(view.viewer.displayName ?? "there");
+  return (
+    <SetupFrame>
+      <div className="setup-success-mark" aria-hidden="true">
+        <Check size={18} />
       </div>
-      <form className="access-card" onSubmit={(event) => void submit(event)}>
-        <div>
-          <h1>Welcome to Florence</h1>
-          <p>Use the private access code issued to you. Each participating adult has their own identity.</p>
+      <SetupHeading
+        title={`You’re all set, ${displayName}.`}
+        detail="Florence is ready in the Messages thread you just started."
+      />
+      {view.workspace.messagesUrl ? (
+        <a className="button primary wide" href={view.workspace.messagesUrl}>
+          Back to Messages
+        </a>
+      ) : (
+        <p className="setup-footnote">You can close this page and return to Messages.</p>
+      )}
+    </SetupFrame>
+  );
+}
+
+type ChildDraft = {
+  id: string;
+  displayName: string;
+  school: string;
+  activities: string;
+};
+
+type FamilySetupScreen =
+  | { kind: "partner"; returnToReview?: boolean }
+  | { kind: "child-name"; childId: string; returnToReview?: boolean }
+  | { kind: "child-school"; childId: string; returnToReview?: boolean }
+  | { kind: "child-activities"; childId: string; returnToReview?: boolean }
+  | { kind: "more-children" }
+  | { kind: "review" };
+
+function FamilySetupPage({ view }: { view: WorkspaceView }) {
+  const complete = useCompleteFamilyOnboarding();
+  const [partnerId] = useState(() => crypto.randomUUID());
+  const [partnerName, setPartnerName] = useState("");
+  const [children, setChildren] = useState<ChildDraft[]>(() => [newChildDraft()]);
+  const [screen, setScreen] = useState<FamilySetupScreen>({ kind: "partner" });
+  const [error, setError] = useState<string | null>(null);
+
+  function updateChild(id: string, patch: Partial<ChildDraft>) {
+    setChildren((current) => current.map((child) => (child.id === id ? { ...child, ...patch } : child)));
+  }
+
+  function showScreen(next: FamilySetupScreen) {
+    setError(null);
+    setScreen(next);
+  }
+
+  function continueFromPartner(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setPartnerName((current) => current.trim());
+    if (screen.kind !== "partner") return;
+    showScreen(
+      screen.returnToReview
+        ? { kind: "review" }
+        : { kind: "child-name", childId: children[0]?.id ?? newChildDraft().id },
+    );
+  }
+
+  function continueFromChildName(event: FormEvent<HTMLFormElement>, child: ChildDraft) {
+    event.preventDefault();
+    if (!child.displayName.trim()) {
+      setError("Add your child’s first name.");
+      return;
+    }
+    updateChild(child.id, { displayName: child.displayName.trim() });
+    showScreen({
+      kind: "child-school",
+      childId: child.id,
+      ...(screen.kind === "child-name" && screen.returnToReview ? { returnToReview: true } : {}),
+    });
+  }
+
+  function continueFromChildSchool(event: FormEvent<HTMLFormElement>, child: ChildDraft) {
+    event.preventDefault();
+    updateChild(child.id, { school: child.school.trim() });
+    showScreen({
+      kind: "child-activities",
+      childId: child.id,
+      ...(screen.kind === "child-school" && screen.returnToReview ? { returnToReview: true } : {}),
+    });
+  }
+
+  function continueFromChildActivities(event: FormEvent<HTMLFormElement>, child: ChildDraft) {
+    event.preventDefault();
+    updateChild(child.id, { activities: child.activities.trim() });
+    showScreen(
+      screen.kind === "child-activities" && screen.returnToReview
+        ? { kind: "review" }
+        : { kind: "more-children" },
+    );
+  }
+
+  function addChild() {
+    const child = newChildDraft();
+    setChildren((current) => [...current, child]);
+    showScreen({ kind: "child-name", childId: child.id });
+  }
+
+  function discardChild(id: string) {
+    setChildren((current) => current.filter((child) => child.id !== id));
+    showScreen({ kind: "more-children" });
+  }
+
+  async function submit() {
+    setError(null);
+    const input: CompleteFamilyOnboardingInput = {
+      ...(partnerName.trim() ? { partner: { id: partnerId, displayName: partnerName.trim() } } : {}),
+      children: children.map((child) => {
+        const activities = listValues(child.activities);
+        return {
+          id: child.id,
+          displayName: child.displayName.trim(),
+          ...(child.school.trim() ? { school: child.school.trim() } : {}),
+          ...(activities.length ? { activities } : {}),
+        };
+      }),
+    };
+    if (input.children.some((child) => !child.displayName)) {
+      setError("Add each child’s first name.");
+      return;
+    }
+    try {
+      await complete.mutateAsync(input);
+      window.location.replace("/?setup=complete");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Florence could not save your family setup.");
+    }
+  }
+
+  const activeChild = "childId" in screen ? children.find((child) => child.id === screen.childId) : undefined;
+
+  if (screen.kind === "partner") {
+    return (
+      <SetupFrame>
+        <form className="setup-form" onSubmit={continueFromPartner}>
+          <SetupHeading
+            title={`Who helps run family life with you, ${firstName(view.viewer.displayName ?? "there")}?`}
+            detail="Add a partner or co-parent if you have one. They’ll connect their own Messages and Google privately later."
+          />
+          <label className="field">
+            <span>First name (optional)</span>
+            <input
+              value={partnerName}
+              onChange={(event) => setPartnerName(event.target.value)}
+              autoComplete="off"
+              placeholder="Partner’s first name"
+            />
+          </label>
+          <button className="button primary wide" type="submit">
+            {partnerName.trim() ? "Continue" : "Skip for now"}
+          </button>
+        </form>
+      </SetupFrame>
+    );
+  }
+
+  if (screen.kind === "child-name" && activeChild) {
+    return (
+      <SetupFrame>
+        <form className="setup-form" onSubmit={(event) => continueFromChildName(event, activeChild)}>
+          <SetupHeading
+            title="Who should Florence know about?"
+            detail="Add one child at a time. Florence uses this to recognize the family details that reach your inbox."
+          />
+          <label className="field">
+            <span>Child’s first name</span>
+            <input
+              value={activeChild.displayName}
+              onChange={(event) => updateChild(activeChild.id, { displayName: event.target.value })}
+              autoComplete="off"
+              placeholder="First name"
+              required
+            />
+          </label>
+          {error && <SetupError>{error}</SetupError>}
+          <button className="button primary wide" type="submit">
+            Continue
+          </button>
+          {children.length > 1 && !screen.returnToReview && (
+            <button
+              className="setup-secondary-action"
+              type="button"
+              onClick={() => discardChild(activeChild.id)}
+            >
+              Never mind
+            </button>
+          )}
+        </form>
+      </SetupFrame>
+    );
+  }
+
+  if (screen.kind === "child-school" && activeChild) {
+    return (
+      <SetupFrame>
+        <form className="setup-form" onSubmit={(event) => continueFromChildSchool(event, activeChild)}>
+          <SetupHeading
+            title={`Where does ${firstName(activeChild.displayName)} go during the day?`}
+            detail="A school, daycare, or preschool helps Florence recognize schedules and messages."
+          />
+          <label className="field">
+            <span>School or daycare (optional)</span>
+            <input
+              value={activeChild.school}
+              onChange={(event) => updateChild(activeChild.id, { school: event.target.value })}
+              autoComplete="off"
+              placeholder="School or daycare"
+            />
+          </label>
+          <button className="button primary wide" type="submit">
+            {activeChild.school.trim() ? "Continue" : "Skip for now"}
+          </button>
+        </form>
+      </SetupFrame>
+    );
+  }
+
+  if (screen.kind === "child-activities" && activeChild) {
+    return (
+      <SetupFrame>
+        <form className="setup-form" onSubmit={(event) => continueFromChildActivities(event, activeChild)}>
+          <SetupHeading
+            title={`What is ${firstName(activeChild.displayName)} into?`}
+            detail="Add any recurring activities that tend to create practices, pickups, or calendar events."
+          />
+          <label className="field">
+            <span>Activities (optional)</span>
+            <input
+              value={activeChild.activities}
+              onChange={(event) => updateChild(activeChild.id, { activities: event.target.value })}
+              autoComplete="off"
+              placeholder="Soccer, piano, robotics"
+            />
+          </label>
+          <button className="button primary wide" type="submit">
+            {activeChild.activities.trim() ? "Continue" : "Skip for now"}
+          </button>
+        </form>
+      </SetupFrame>
+    );
+  }
+
+  if (screen.kind === "more-children") {
+    const names = children.map((child) => firstName(child.displayName)).join(", ");
+    return (
+      <SetupFrame>
+        <div className="setup-form">
+          <SetupHeading
+            title="Anyone else?"
+            detail={`${names} ${children.length === 1 ? "is" : "are"} in. You can add another child or keep going.`}
+          />
+          <button
+            className="button primary wide"
+            type="button"
+            onClick={() => showScreen({ kind: "review" })}
+          >
+            Review family
+          </button>
+          {children.length < 20 && (
+            <button className="setup-secondary-action" type="button" onClick={addChild}>
+              Add another child
+            </button>
+          )}
         </div>
-        <label className="field">
-          <span>Access code</span>
-          <input name="accessCode" type="password" autoComplete="current-password" required />
-        </label>
-        {error && <p className="form-error">{error}</p>}
-        <button className="button primary wide" type="submit" disabled={createSession.isPending}>
-          {createSession.isPending ? "Opening…" : "Continue"}
-        </button>
-      </form>
+      </SetupFrame>
+    );
+  }
+
+  if (screen.kind === "review") {
+    return (
+      <SetupFrame>
+        <div className="setup-form">
+          <SetupHeading
+            title="Does this look right?"
+            detail="Florence will use these names to make sense of the family logistics you share."
+          />
+          <div className="setup-review-list">
+            <button
+              className="setup-review-row"
+              type="button"
+              onClick={() => showScreen({ kind: "partner", returnToReview: true })}
+            >
+              <span>Partner or co-parent</span>
+              <strong>{partnerName || "Not added"}</strong>
+            </button>
+            {children.map((child) => (
+              <button
+                className="setup-review-row"
+                type="button"
+                key={child.id}
+                onClick={() => showScreen({ kind: "child-name", childId: child.id, returnToReview: true })}
+              >
+                <span>{child.displayName}</span>
+                <strong>
+                  {[child.school, child.activities].filter(Boolean).join(" · ") || "No details added"}
+                </strong>
+              </button>
+            ))}
+          </div>
+          {error && <SetupError>{error}</SetupError>}
+          <button
+            className="button primary wide"
+            type="button"
+            onClick={() => void submit()}
+            disabled={complete.isPending}
+          >
+            {complete.isPending ? "Saving your family…" : "Finish setup"}
+          </button>
+          <button
+            className="setup-secondary-action"
+            type="button"
+            onClick={() => showScreen({ kind: "more-children" })}
+          >
+            Add another child
+          </button>
+        </div>
+      </SetupFrame>
+    );
+  }
+
+  return <PageLoader />;
+}
+
+function GoogleSetupStep({
+  error,
+  isPending,
+  onConnect,
+}: {
+  error: string | null;
+  isPending: boolean;
+  onConnect: () => void;
+}) {
+  return (
+    <div className="setup-form">
+      <SetupHeading
+        title="Connect your Google account"
+        detail="Connect the account you use for family logistics. Florence can read Gmail and Calendar when you ask, so she can spot real conflicts instead of guessing."
+      />
+      <div className="setup-google-card">
+        <span className="google-mark" aria-hidden="true">
+          G
+        </span>
+        <div>
+          <strong>Google Workspace</strong>
+          <p>Gmail and Calendar</p>
+        </div>
+      </div>
+      <p className="setup-trust">
+        Your Google account stays private to you. Florence cannot send email, and she won’t change your
+        calendar without a direct instruction or exact approval. Your partner connects separately.
+      </p>
+      {error && (
+        <p className="form-error" role="alert">
+          {error}
+        </p>
+      )}
+      <button className="button primary wide" type="button" onClick={onConnect} disabled={isPending}>
+        {isPending ? "Opening Google…" : "Connect Google Workspace"}
+      </button>
+    </div>
+  );
+}
+
+function SetupFrame({ children }: { children: React.ReactNode }) {
+  return (
+    <main className="setup-page">
+      <section className="setup-flow">
+        <div className="setup-brand" aria-hidden="true">
+          F
+        </div>
+        <div className="setup-content">{children}</div>
+      </section>
     </main>
+  );
+}
+
+function SetupHeading({ title, detail }: { title: string; detail: string }) {
+  return (
+    <header className="setup-heading-copy">
+      <h1>{title}</h1>
+      <p>{detail}</p>
+    </header>
+  );
+}
+
+function SetupError({ children }: { children: React.ReactNode }) {
+  return (
+    <p className="form-error" role="alert">
+      {children}
+    </p>
   );
 }
 
@@ -95,9 +589,7 @@ export function WorkspacePage() {
   if (!view) return <PageLoader />;
 
   return (
-    <Page title="Workspace" intro="Your next step and the places you can reach Florence.">
-      <SetupChecklist view={view} />
-
+    <Page title="Workspace" intro="The places you can reach Florence and the sources connected to you.">
       <section className="section">
         <SectionLabel>Contact Florence</SectionLabel>
         <div className="contact-grid">
@@ -135,7 +627,13 @@ export function VaultPage() {
   const view = query.data;
   if (!view) return <PageLoader />;
   const vault = view.vault;
-  if (!vault) return <HouseholdOnboarding />;
+  if (!vault) {
+    return (
+      <LoadError
+        error={new Error("Your household setup is incomplete. Return to the private link Florence sent.")}
+      />
+    );
+  }
   const adults = vault.members.filter((member) => member.kind === "adult");
   const children = vault.members.filter((member) => member.kind === "child");
 
@@ -165,8 +663,6 @@ export function VaultPage() {
       >
         <PeopleList members={adults} onEdit={setEditing} />
       </VaultSection>
-
-      <LinqEnrollment vault={vault} />
 
       <VaultSection
         label="Children"
@@ -261,148 +757,6 @@ function PreferencesEditor({ initial }: { initial: PreferencesInput }) {
   );
 }
 
-function HouseholdOnboarding() {
-  const put = usePutHousehold();
-  const navigate = useNavigate();
-  const [error, setError] = useState<string | null>(null);
-
-  async function submit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    setError(null);
-    const data = new FormData(event.currentTarget);
-    try {
-      await put.mutateAsync({
-        name: required(data, "householdName"),
-        foundingAdultDisplayName: required(data, "displayName"),
-        timeZone: required(data, "timeZone"),
-      });
-      await navigate({ to: "/vault" });
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Florence could not create the household.");
-    }
-  }
-
-  return (
-    <Page title="Vault" intro="Start with the family Florence will support.">
-      <form className="onboarding-form" onSubmit={(event) => void submit(event)}>
-        <div className="onboarding-step">
-          <span>1</span>
-          <div>
-            <strong>Create your household</strong>
-            <p>The second adult will verify and consent independently.</p>
-          </div>
-        </div>
-        <label className="field">
-          <span>Household name</span>
-          <input name="householdName" placeholder="The Barasu family" required />
-        </label>
-        <label className="field">
-          <span>Your name</span>
-          <input name="displayName" autoComplete="name" required />
-        </label>
-        <label className="field">
-          <span>Time zone</span>
-          <select name="timeZone" defaultValue={Intl.DateTimeFormat().resolvedOptions().timeZone} required>
-            {timeZones().map((zone) => (
-              <option value={zone} key={zone}>
-                {zone.replaceAll("_", " ")}
-              </option>
-            ))}
-          </select>
-        </label>
-        {error && <p className="form-error">{error}</p>}
-        <button className="button primary" type="submit" disabled={put.isPending}>
-          {put.isPending ? "Creating…" : "Create household"}
-        </button>
-      </form>
-    </Page>
-  );
-}
-
-function SetupChecklist({ view }: { view: WorkspaceView }) {
-  const setup = view.workspace.setup;
-  const adults = view.vault?.members.filter((member) => member.kind === "adult") ?? [];
-  const googleConnectionCount = view.workspace.googleConnections.length;
-  const adultNames = adults.map((adult) => adult.displayName).join(", ");
-  const items = [
-    {
-      complete: setup.householdCreated,
-      label: "Create your household",
-      detail: "Add the family Florence will support.",
-      action: (
-        <Link className="button pill" to="/vault">
-          Create household
-        </Link>
-      ),
-    },
-    {
-      complete: setup.secondAdultAdded,
-      label: "Add the second participating adult",
-      detail: "Florence's pilot is one household with exactly two participating adults.",
-      action: (
-        <Link className="button pill" to="/vault">
-          Open Vault
-        </Link>
-      ),
-    },
-    {
-      complete: setup.bothAdultsMessagesConnected,
-      label: "Connect both adults privately in Messages",
-      detail:
-        "Generate a one-use code for each adult in the Vault. That adult sends their code to Florence privately.",
-      action: (
-        <a className="button pill" href="/vault#messages-identities">
-          Open Messages setup
-        </a>
-      ),
-    },
-    {
-      complete: googleConnectionCount > 0,
-      label: "Connect your Google Workspace",
-      detail: "Connect Gmail and Calendar from this signed-in Florence account.",
-      action: (
-        <a className="button pill" href="/#google-connections">
-          Connect Google
-        </a>
-      ),
-    },
-    {
-      complete: setup.familyGroupConnected,
-      label: "Create the exact family group in Messages",
-      detail: `In Messages, tap compose and add Florence${adultNames ? `, ${adultNames}` : ""} as the only three participants. Send “Hi Florence” so Florence can verify the group.`,
-      action: view.workspace.messagesUrl ? (
-        <a className="button pill" href={view.workspace.messagesUrl}>
-          Open Messages
-        </a>
-      ) : null,
-    },
-  ];
-  const nextIndex = items.findIndex((item) => !item.complete);
-  if (nextIndex === -1) return null;
-  const completedCount = items.filter((item) => item.complete).length;
-  const next = items[nextIndex];
-  if (!next) return null;
-
-  return (
-    <section className="section setup-section">
-      <div className="setup-heading">
-        <SectionLabel>Next setup step</SectionLabel>
-        <span>
-          {completedCount} of {items.length} complete
-        </span>
-      </div>
-      <div className="setup-next">
-        <span>{nextIndex + 1}</span>
-        <div>
-          <strong>{next.label}</strong>
-          <p>{next.detail}</p>
-        </div>
-        {next.action}
-      </div>
-    </section>
-  );
-}
-
 function GoogleConnector({ view }: { view: WorkspaceView }) {
   const start = useStartGoogleConnection();
   const disconnect = useDisconnectGoogleConnection();
@@ -452,66 +806,6 @@ function GoogleConnector({ view }: { view: WorkspaceView }) {
         ))}
       </div>
     </article>
-  );
-}
-
-function LinqEnrollment({ vault }: { vault: HouseholdVault }) {
-  const adults = vault.members.filter((member) => member.kind === "adult");
-  return (
-    <VaultSection id="messages-identities" label="Messages identities">
-      <div className="identity-list">
-        {adults.map((adult) => (
-          <AdultIdentity key={adult.id} adult={adult} />
-        ))}
-      </div>
-    </VaultSection>
-  );
-}
-
-function AdultIdentity({ adult }: { adult: FamilyMemberProfile }) {
-  const issue = useMessagesInvite();
-  const [invite, setInvite] = useState<MessagesInvite | null>(null);
-  const connected = adult.messagesIdentity === "connected";
-
-  async function showInvite() {
-    const result = await issue.mutateAsync(adult.id);
-    setInvite(result.invite);
-  }
-
-  return (
-    <div className="identity-row">
-      <span className="initials">{initials(adult.displayName)}</span>
-      <div>
-        <strong>{adult.displayName}</strong>
-        {connected ? (
-          <p>Connected privately in Messages</p>
-        ) : invite ? (
-          <>
-            <p>Send this entire code privately to Florence. It expires {formatTime(invite.expiresAt)}.</p>
-            <code>{invite.code}</code>
-          </>
-        ) : adult.messagesIdentity === "invited" ? (
-          <p>An invitation is ready. Show the current code to continue.</p>
-        ) : (
-          <p>Not connected to Messages</p>
-        )}
-        {issue.error && <p className="form-error">{issue.error.message}</p>}
-      </div>
-      {connected ? (
-        <span className="connected-status">
-          <Check size={13} /> Connected
-        </span>
-      ) : !invite ? (
-        <button
-          className="button pill"
-          type="button"
-          onClick={() => void showInvite()}
-          disabled={issue.isPending}
-        >
-          {issue.isPending ? "Opening…" : adult.messagesIdentity === "invited" ? "Show code" : "Invite"}
-        </button>
-      ) : null}
-    </div>
   );
 }
 
@@ -882,25 +1176,74 @@ function required(data: FormData, key: string) {
   return value.trim();
 }
 
+function newChildDraft(): ChildDraft {
+  return { id: crypto.randomUUID(), displayName: "", school: "", activities: "" };
+}
+
+function listValues(value: string): string[] {
+  return value
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function consumeOnboardingEntry(): {
+  setupToken: string | null;
+  googleStatus: string | null;
+  setupComplete: boolean;
+} {
+  const url = new URL(window.location.href);
+  const fragment = new URLSearchParams(url.hash.startsWith("#") ? url.hash.slice(1) : url.hash);
+  const hasSetupFragment = fragment.has("setup");
+  const setupToken = fragment.get("setup")?.trim() || null;
+  const googleStatus = url.searchParams.get("google")?.trim() || null;
+  const setupComplete = url.searchParams.get("setup") === "complete";
+  if (hasSetupFragment) url.hash = "";
+  if (url.searchParams.has("google")) url.searchParams.delete("google");
+  if (url.searchParams.has("setup")) url.searchParams.delete("setup");
+  if (hasSetupFragment || googleStatus !== null || setupComplete) {
+    window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
+  }
+  return { setupToken, googleStatus, setupComplete };
+}
+
+function setupError(cause: unknown): string {
+  if (cause instanceof FlorenceRequestError && (cause.status === 401 || cause.status === 410)) {
+    return "This setup link is no longer valid. If setup has not started, text Florence “new link” in the same thread. If you already submitted your name, continue in the same browser.";
+  }
+  if (cause instanceof FlorenceRequestError && cause.status === 409) {
+    return "Florence is already set up. Return to the Messages conversation you started.";
+  }
+  return cause instanceof Error ? cause.message : "Florence could not finish this setup.";
+}
+
+function googleSetupError(status: string): string {
+  if (status === "authorization_cancelled" || status === "provider_rejected") {
+    return "Google wasn’t connected. Nothing changed—try again when you’re ready.";
+  }
+  if (status === "connected") {
+    return "Florence couldn’t confirm the Google connection. Nothing changed—please try again.";
+  }
+  return "Florence couldn’t connect Google. Nothing changed—please try again.";
+}
+
+function detectedTimeZone(): string {
+  return Intl.DateTimeFormat().resolvedOptions().timeZone || "America/Los_Angeles";
+}
+
+function isTimeZone(value: string): boolean {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: value }).format();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function firstName(value: string): string {
+  return value.trim().split(/\s+/, 1)[0] ?? value;
+}
+
 function capitalize(value: string) {
   return value[0]?.toUpperCase() + value.slice(1);
-}
-
-function formatTime(value: string) {
-  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(
-    new Date(value),
-  );
-}
-
-function timeZones() {
-  return [
-    ...new Set([
-      Intl.DateTimeFormat().resolvedOptions().timeZone,
-      "America/Los_Angeles",
-      "America/Denver",
-      "America/Chicago",
-      "America/New_York",
-      "UTC",
-    ]),
-  ];
 }

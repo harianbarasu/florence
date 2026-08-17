@@ -12,7 +12,6 @@ import {
   linqIdentitySubjectDigest,
   unwrapLinqWebhook,
 } from "@florence/linq";
-import type { EnrollmentCodes } from "./enrollment.js";
 import type { Florence } from "./florence.js";
 
 const webhookVersion = "2026-02-03";
@@ -23,7 +22,7 @@ const PDF_DISCARD_MS = 24 * 60 * 60_000;
 type FlorenceIngress = Pick<
   Florence,
   | "resolveLinqAuthority"
-  | "redeemMessagesEnrollment"
+  | "startMessagesOnboarding"
   | "bootstrapMessagesGroup"
   | "acceptInbound"
   | "acceptInboundReaction"
@@ -38,6 +37,7 @@ export type LinqIngressResult =
         | "event_not_supported"
         | "message_has_no_supported_content"
         | "channel_stopped"
+        | "onboarding_offered"
         | "opted_out"
         | "provider_observation"
         | "reconciled_history";
@@ -72,7 +72,6 @@ export function createLinqIngress(options: {
   linq: LinqClient;
   imageVault: EncryptedImageVault;
   florence: FlorenceIngress;
-  enrollmentCodes: EnrollmentCodes;
   now?: () => Date;
 }): LinqIngress {
   return {
@@ -175,7 +174,6 @@ async function acceptMessage(
     linq: LinqClient;
     imageVault: EncryptedImageVault;
     florence: FlorenceIngress;
-    enrollmentCodes: EnrollmentCodes;
   },
 ): Promise<LinqIngressResult> {
   const observed = await options.linq.observeChat(proposal.providerConversationId);
@@ -247,32 +245,28 @@ async function establishAuthority(
   observed: { audience: "private" | "group"; participantIdentityDigests: readonly string[] },
   options: {
     florence: FlorenceIngress;
-    enrollmentCodes: EnrollmentCodes;
   },
 ): Promise<LinqIngressResult> {
   const { participantIdentityDigests } = observed;
   const senderIdentitySubjectDigest = linqIdentitySubjectDigest(proposal.sender.providerHandleId);
   if (observed.audience === "private") {
-    if (proposal.media.length > 0) {
-      return { disposition: "rejected", reason: "authority_not_found" };
-    }
-    const challengeDigest = options.enrollmentCodes.digestCandidate(proposal.text);
-    if (!challengeDigest || participantIdentityDigests.length !== 1) {
+    if (proposal.media.length > 0 || participantIdentityDigests.length !== 1) {
       return { disposition: "rejected", reason: "authority_not_found" };
     }
     if (participantIdentityDigests[0] !== senderIdentitySubjectDigest) {
       return { disposition: "rejected", reason: "authority_evidence_mismatch" };
     }
-    const receipt = await options.florence.redeemMessagesEnrollment({
-      challengeDigest,
-      identitySubjectDigest: senderIdentitySubjectDigest,
-      consentVersion: "linq-private-code-v1",
-      consentedAt: proposal.occurredAt,
+    if (!isFounderOnboardingRequest(proposal.text)) {
+      return { disposition: "rejected", reason: "authority_not_found" };
+    }
+    const offered = await options.florence.startMessagesOnboarding({
+      providerEventId: proposal.providerEventId,
       providerConversationId: proposal.providerConversationId,
+      identitySubjectDigest: senderIdentitySubjectDigest,
       occurredAt: proposal.occurredAt,
     });
-    return receipt
-      ? { disposition: receipt.disposition, sourceId: inboundSourceId(proposal.providerEventId) }
+    return offered
+      ? { disposition: "acknowledged", reason: "onboarding_offered" }
       : { disposition: "rejected", reason: "authority_not_found" };
   }
 
@@ -296,6 +290,20 @@ async function establishAuthority(
   return receipt && receipt.disposition !== "stopped"
     ? { disposition: receipt.disposition, sourceId: receipt.sourceId }
     : { disposition: "rejected", reason: "authority_not_found" };
+}
+
+function isFounderOnboardingRequest(text: string | null): boolean {
+  if (!text || Buffer.byteLength(text, "utf8") > 80) return false;
+  const request = text
+    .normalize("NFKC")
+    .toLocaleLowerCase("en-US")
+    .replace(/[.!?,\s👋🙂😊]+$/gu, "")
+    .trim();
+  return (
+    /^(?:hi|hello|hey|hiya)(?: florence)?$/.test(request) ||
+    /^(?:start|setup|set me up)$/.test(request) ||
+    /^(?:new|another|resend|send me a new|send another) (?:setup )?link$/.test(request)
+  );
 }
 
 async function storeMedia(

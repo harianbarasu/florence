@@ -1,8 +1,18 @@
-import { createHmac } from "node:crypto";
+import { createHmac, timingSafeEqual } from "node:crypto";
 
-export type EnrollmentIssue = {
-  code: string;
-  challengeDigest: string;
+const FOUNDER_SETUP_LIFETIME_MS = 15 * 60_000;
+const MAX_PROVIDER_ID_BYTES = 500;
+
+export type FounderSetupClaims = {
+  providerConversationId: string;
+  identitySubjectDigest: string;
+  expiresAt: string;
+  householdId: string;
+  adultId: string;
+};
+
+export type FounderSetupIssue = FounderSetupClaims & {
+  token: string;
 };
 
 export class EnrollmentCodes {
@@ -15,30 +25,150 @@ export class EnrollmentCodes {
     this.#secret = secret;
   }
 
-  issue(input: { commandId: string; householdId: string; adultId: string }): EnrollmentIssue {
-    const material = `${input.commandId}\0${input.householdId}\0${input.adultId}`;
-    const token = createHmac("sha256", this.#secret)
-      .update(`florence-enrollment-code-v1\0${material}`)
-      .digest("base64url");
-    const code = `FLORENCE-${token}`;
-    return { code, challengeDigest: this.digest(code) };
+  issueFounderSetup(input: {
+    providerEventId: string;
+    providerConversationId: string;
+    identitySubjectDigest: string;
+    occurredAt: string;
+  }): FounderSetupIssue {
+    const providerEventId = boundedProviderId(input.providerEventId, "Provider event ID");
+    const providerConversationId = boundedProviderId(
+      input.providerConversationId,
+      "Provider conversation ID",
+    );
+    const identitySubjectDigest = digest(input.identitySubjectDigest, "Messages identity");
+    const occurredAt = instant(input.occurredAt, "Founder setup issue time");
+    const expiresAtSeconds = Math.floor((occurredAt.getTime() + FOUNDER_SETUP_LIFETIME_MS) / 1_000);
+    const expiresAt = new Date(expiresAtSeconds * 1_000);
+    const householdId = this.#deterministicUuid(`founder-household\0${identitySubjectDigest}`);
+    const adultId = this.#deterministicUuid(`founder-adult\0${identitySubjectDigest}`);
+    const requestNonce = this.#macText(
+      `florence-founder-setup-nonce-v1\0${providerEventId}\0${providerConversationId}`,
+      "base64url",
+    );
+    const payload = Buffer.from(
+      JSON.stringify([
+        1,
+        providerConversationId,
+        identitySubjectDigest,
+        requestNonce,
+        expiresAtSeconds,
+        householdId,
+        adultId,
+      ]),
+      "utf8",
+    ).toString("base64url");
+    const signature = this.#macText(`florence-founder-setup-signature-v1\0${payload}`, "base64url");
+    const token = `fs1.${payload}.${signature}`;
+    return {
+      token,
+      providerConversationId,
+      identitySubjectDigest,
+      expiresAt: expiresAt.toISOString(),
+      householdId,
+      adultId,
+    };
   }
 
-  digestCandidate(message: string | null): string | null {
-    const code = message?.trim();
-    if (!code?.startsWith("FLORENCE-") || code.length !== 52) return null;
-    for (const character of code.slice("FLORENCE-".length)) {
-      const digit = character >= "0" && character <= "9";
-      const upper = character >= "A" && character <= "Z";
-      const lower = character >= "a" && character <= "z";
-      if (!digit && !upper && !lower && character !== "_" && character !== "-") return null;
+  verifyFounderSetup(token: string, now = new Date()): FounderSetupClaims | null {
+    if (!Number.isFinite(now.getTime())) return null;
+    if (Buffer.byteLength(token, "utf8") > 4_000) return null;
+    const [version, payload, signature, extra] = token.split(".");
+    if (version !== "fs1" || !payload || !signature || extra) return null;
+    const expected = this.#macText(`florence-founder-setup-signature-v1\0${payload}`, "base64url");
+    if (!safeEqual(signature, expected)) return null;
+    let untrusted: unknown;
+    try {
+      untrusted = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    } catch {
+      return null;
     }
-    return this.digest(code);
+    if (!Array.isArray(untrusted) || untrusted.length !== 7) return null;
+    const [payloadVersion, conversation, identity, nonce, expiresAtSeconds, householdId, adultId] = untrusted;
+    if (
+      payloadVersion !== 1 ||
+      typeof conversation !== "string" ||
+      typeof identity !== "string" ||
+      typeof nonce !== "string" ||
+      typeof expiresAtSeconds !== "number" ||
+      typeof householdId !== "string" ||
+      typeof adultId !== "string"
+    ) {
+      return null;
+    }
+    if (
+      !isBoundedProviderId(conversation) ||
+      !isDigest(identity) ||
+      !/^[A-Za-z0-9_-]{43}$/.test(nonce) ||
+      !isUuid(householdId) ||
+      !isUuid(adultId) ||
+      !Number.isSafeInteger(expiresAtSeconds)
+    ) {
+      return null;
+    }
+    const expiresAt = new Date(expiresAtSeconds * 1_000);
+    if (expiresAt.getTime() <= now.getTime()) return null;
+    return {
+      providerConversationId: conversation,
+      identitySubjectDigest: identity,
+      expiresAt: expiresAt.toISOString(),
+      householdId,
+      adultId,
+    };
   }
 
-  private digest(code: string): string {
-    return createHmac("sha256", this.#secret)
-      .update(`florence-enrollment-challenge-v1\0${code}`)
-      .digest("hex");
+  digestFounderSetup(token: string): string {
+    return this.#macText(`florence-founder-setup-digest-v1\0${token}`, "hex");
   }
+
+  #deterministicUuid(material: string): string {
+    const bytes = this.#macBytes(`florence-founder-setup-id-v1\0${material}`).subarray(0, 16);
+    bytes[6] = ((bytes[6] ?? 0) & 0x0f) | 0x50;
+    bytes[8] = ((bytes[8] ?? 0) & 0x3f) | 0x80;
+    const hex = bytes.toString("hex");
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  }
+
+  #macText(material: string, encoding: "base64url" | "hex"): string {
+    return createHmac("sha256", this.#secret).update(material).digest(encoding);
+  }
+
+  #macBytes(material: string): Buffer {
+    return createHmac("sha256", this.#secret).update(material).digest();
+  }
+}
+
+function boundedProviderId(value: string, label: string): string {
+  if (!isBoundedProviderId(value)) throw new Error(`${label} must be a nonempty bounded string`);
+  return value;
+}
+
+function isBoundedProviderId(value: string): boolean {
+  const bytes = Buffer.byteLength(value, "utf8");
+  return value.trim() === value && bytes > 0 && bytes <= MAX_PROVIDER_ID_BYTES;
+}
+
+function digest(value: string, label: string): string {
+  if (!isDigest(value)) throw new Error(`${label} must be a lowercase SHA-256 digest`);
+  return value;
+}
+
+function isDigest(value: string): boolean {
+  return /^[0-9a-f]{64}$/.test(value);
+}
+
+function instant(value: string, label: string): Date {
+  const parsed = new Date(value);
+  if (!Number.isFinite(parsed.getTime())) throw new Error(`${label} must be a timestamp`);
+  return parsed;
+}
+
+function isUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
+}
+
+function safeEqual(left: string, right: string): boolean {
+  const leftBytes = Buffer.from(left);
+  const rightBytes = Buffer.from(right);
+  return leftBytes.length === rightBytes.length && timingSafeEqual(leftBytes, rightBytes);
 }

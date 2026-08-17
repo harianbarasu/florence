@@ -12,20 +12,24 @@ Delivery is split into two explicit gates:
    tree, then delete only the clearly unnecessary code, documents,
    dependencies, speculative controls, and temporary artifacts named by this
    contract.
-2. **Phase 1 — canonical parent-document checkpoint.** Use the existing pilot
-   bootstrap and Railway environment with a fresh Florence schema. Through real
-   Linq, OpenAI, PostgreSQL, and an authorized Google Calendar read, prove one
-   real two-adult Messages conversation around a synthetic school PDF or iPhone
-   photo. Florence must react immediately, use an honest work bubble only when
-   needed, lead with judgment, identify the relevant conflict, separate durable
-   facts from one-offs, ask at most one useful question, honor a no-retention and
-   no-action instruction, absorb a correction without emitting the stale
-   answer, and produce an exact unsent draft. No external write occurs.
+2. **Phase 1 — founding-adult onboarding and canonical parent-document
+   checkpoint.** Start from an empty Florence schema. The pilot adult texts
+   Florence in a private iMessage thread, completes the minimal
+   mobile setup, connects their own Google account, and returns to that same
+   thread. Then, through real Linq, OpenAI, PostgreSQL, and an authorized Google
+   Calendar read, prove the real parent-document conversation around a
+   synthetic school PDF or iPhone photo. Florence must react immediately, use
+   an honest work bubble only when needed, lead with judgment, identify the
+   relevant conflict, separate durable facts from one-offs, ask at most one
+   useful question, honor a no-retention and no-action instruction, absorb a
+   correction without emitting the stale answer, and produce an exact unsent
+   draft. No external write occurs.
 3. Stop after that conversation. Review the actual experience with the user and
    revise this contract if necessary.
-4. **Phase 2 — complete pilot.** The first fast follow is passwordless
-   Messages-based onboarding for both adults. Then finish the Instinct-style
-   web experience, connected-source reads, public research, finite proactive
+4. **Phase 2 — second adult and complete pilot.** The first fast follow is the
+   second adult's independent Messages, mobile-web, and Google onboarding.
+   Then establish the exact family group and finish the Instinct-style web
+   experience, connected-source reads, public research, finite proactive
    rechecks, source-aware memory, the one authorized Calendar write, and the
    real-household rehearsal.
 
@@ -182,32 +186,76 @@ These outcomes may be revised or cancelled through natural conversation. They ar
 
 Onboarding is a core trust experience, not an admin afterthought.
 
-The polished onboarding flow is the first fast follow after Phase 1. It has no
-password: an adult texts Florence and receives a short-lived, single-use web
-setup link.
+There is no password, access code, operator-authored household, placeholder
+adult, or preconfigured founding identity. On an empty pilot database, a parent
+texts Florence in a private iMessage thread. Florence verifies the signed Linq
+event and the live one-person iMessage audience, then replies naturally with a
+stateless, short-lived, single-use mobile setup link containing only the
+observed conversation and opaque identity claims. If two people greet Florence
+before either finishes setup, both may receive links, but the first valid form
+redemption atomically creates the one pilot founder and household. Every losing
+link fails neutrally. Once that household exists, unknown senders stay silent.
 
-1. The founding adult creates the household, provides the household name and
-   time zone, and establishes their private Messages relationship.
-2. They add both adult names and each child's name plus age or grade and school
-   when applicable. Addresses, phone numbers, teachers, caregivers, activities,
-   schedules, safety facts, and documents are useful but optional at first.
-3. They invite the second adult privately. The second adult receives an
-   independent browser session and establishes their own private Messages
-   relationship.
-4. Florence verifies the exact two-adult family iMessage group and introduces
-   itself there in plain language.
-5. Each adult independently connects their Google account.
-6. Cross-adult Calendar comparison is a separate consent after connection. It
-   is off by default, independently revocable, and reveals only the minimum
-   free/busy conflict unless the event details are already household-shared.
+No household, adult, channel, source, or message record exists before the
+adult submits the first setup screen. That submission atomically creates the
+real adult, private relationship, and a neutral internal tenancy root required
+to own private Google data. The parent is never asked to name or understand
+that internal record. The mobile flow is one calm task per screen, in this
+order:
+
+1. the adult's first name and parent, guardian, or authorized-caregiver
+   attestation; the browser time zone is submitted without turning it into a
+   questionnaire;
+2. that adult's private Google connection;
+3. an optional partner or co-parent name, with clear copy that this does not
+   connect or consent for them;
+4. each child's name, followed separately by school and activities; and
+5. one review and completion action before returning to Messages.
+
+Google is required to complete pilot onboarding. Cancellation or provider
+failure leaves a resumable setup screen; it never produces a false success.
+The setup link is held in the URL fragment, removed before any network request,
+and expires quickly. One normal redemption consumes it. To recover a committed
+setup whose cookie response was lost, the exact same token, profile, and live
+private thread may repeat for at most sixty seconds; later replay fails. For
+this private pilot it is a bearer credential until redemption; expiry, hashing,
+the narrow recovery window, and rejection after that window protect against
+database leakage and replay, not theft before redemption. The
+empty-database singleton is the pilot admission boundary; a same-thread
+confirmation link is the first security fast follow before the number is
+distributed beyond the intended pilot adults.
+
+After Google is connected, Florence finishes the short family setup described
+above, then returns to the exact private thread and asks for one real thing the
+adult would rather not handle themselves. The mobile experience has no wizard
+chrome, progress counter, dense all-family form, or household-name question.
+Deeper ownership, recurring logistics, communication style, and sharing
+preferences are learned conversationally, one useful question at a time,
+while Florence helps with actual work.
+
+The private one-to-one relationships are the trust anchors. Florence acts as
+connective tissue between the adults while remaining explicit about what
+crosses between them. The exact three-participant family thread is the shared
+coordination layer, not permission to disclose either adult's private Messages,
+Gmail, Calendar details, or memory.
+
+The second adult is the immediate Phase 2 fast follow. The founding adult may
+forward a non-authenticating invitation, but the second adult must prove a
+distinct private Messages identity, receive their own setup link in that
+thread, create their own browser session, attest independently, and connect
+their own Google account. Only then does Florence establish the exact family
+group. Cross-adult Calendar comparison is a separate consent after connection;
+it is off by default, independently revocable, and reveals only minimum
+free/busy conflict unless details are already household-shared.
 
 An enrolled adult attests that they are a parent, guardian, or authorized
 caregiver before providing child information. Children have no independent
 account or Florence conversation in the pilot.
 
-The founding adult cannot consent to the other adult's private memory or Google access.
-The existing operator bootstrap is allowed only for the Phase 1 benchmark; it
-is not an acceptable final onboarding path.
+The founding adult cannot consent to the other adult's private memory or Google
+access. Child names, schools, caregivers, schedules, safety facts, and retained
+documents belong in later conversation or the Vault; they are not prerequisites
+for meeting Florence.
 
 ## The web workspace
 
@@ -266,7 +314,12 @@ Passwords, account-recovery infrastructure, payments, and account-wide export
 or deletion workflows are not launch requirements. Item-level inspection,
 correction, and deletion remain first-class in the Vault.
 
-Onboarding is the incomplete state of Workspace and Vault, not a third destination.
+Before authentication, onboarding is a sparse mobile flow with no application
+navigation. It follows Instinct's observed one-task-per-screen rhythm: a
+full-height white canvas, a centered narrow column, one heading, one short
+explanation, one input or decision, and one primary pill action. After
+authentication, incomplete Google or family setup continues in that same
+focused shell, not in Workspace and not as a third destination.
 
 ## Web visual system
 
@@ -303,6 +356,16 @@ The initial connected suite is Google Workspace only:
 - Sheets.
 
 Florence may search and read these sources dynamically when useful. Google remains the source of truth; Florence does not build a shadow inbox or document system.
+
+Connecting Google before the family-detail screens makes the verified private
+connection ready before the parent's first real job. In Phase 1, the first
+private request performs the bounded live Gmail and Calendar reads it actually
+needs; Florence does not run a hidden scan whose results are discarded or
+pretend that an ongoing sync exists. The immediate post-review fast follow is
+one useful, source-linked, private bootstrap read that can survive restart and
+surface a concrete family-relevant result. It must reuse the Google, source,
+and Florence seams, retain no raw mailbox, and must not become a generic sync
+engine, inbox mirror, or background-job framework.
 
 The only launch provider write is creating or updating the exact Calendar event
 an adult directly instructed or explicitly approved. Florence may draft emails,
@@ -403,24 +466,36 @@ Phase 1 is not complete until the user can inspect the actual real-provider
 Messages conversation and confirm that Florence meets or exceeds the observed
 Instinct parent-document benchmark:
 
-1. The existing pilot bootstrap establishes the two real adult relationships.
-2. One adult sends a synthetic school PDF or iPhone photo with an explicit
+1. The production-shaped schema contains no household or adult. The intended
+   founding adult texts Florence in a private iMessage thread; their identity
+   is observed from that signed live conversation, not configured beforehand.
+2. Florence responds in a few natural bubbles with the secure mobile setup
+   link. Submitting the first screen creates the adult, neutral internal tenancy
+   root, and exact private relationship atomically; nothing is pre-created by
+   an operator, and no household-name question is shown.
+3. The adult connects their private Google account in the same mobile flow.
+   Florence reports connection only after provider proof, then asks one screen
+   at a time for an optional partner and each child's name, school, and
+   activities. Only after that review is complete does Florence return to the
+   same thread, explain the private/shared boundary briefly, and ask for one
+   real thing to take off the adult's plate.
+4. The adult sends a synthetic school PDF or iPhone photo with an explicit
    instruction not to retain or schedule anything.
-3. Florence reacts immediately. It sends a short work bubble only if processing
+5. Florence reacts immediately. It sends a short work bubble only if processing
    will take noticeably longer than an ordinary response—roughly five to eight
    seconds.
-4. Florence leads with the one or two items that deserve attention, extracts the
+6. Florence leads with the one or two items that deserve attention, extracts the
    useful dates, and compares them with that adult's authorized Calendar
    context without writing to it.
-5. Florence distinguishes stable logistics from one-offs, asks at most one
+7. Florence distinguishes stable logistics from one-offs, asks at most one
    blocking question, and explicitly confirms that it sent, saved, and scheduled
    nothing.
-6. A correction arrives while the work is active. The obsolete final answer is
+8. A correction arrives while the work is active. The obsolete final answer is
    suppressed; the correction is incorporated into one reranked response while
    the already-sent reaction or honest work bubble remains.
-7. Florence produces an exact useful draft and clearly states that it was not
+9. Florence produces an exact useful draft and clearly states that it was not
    sent.
-8. The user and Florence stop, inspect the conversation together, and decide
+10. The user and Florence stop, inspect the conversation together, and decide
    whether the plan is still right before Phase 2 begins.
 
 ## First complete journey
@@ -516,11 +591,11 @@ The burden of proof is on adding a test, not deleting one.
 
 ## Release gate
 
-Phase 1 ends in a mandatory user review and cannot silently roll into broader
-implementation. Florence is ready for the complete pilot only when Jackson and
-Kendall can complete the passwordless onboarding and full journey without
-database repair, operator-authored records, hidden commands, or explanation of
-internal concepts.
+Phase 1 ends in a mandatory user review and cannot silently roll into partner
+onboarding or broader implementation. Florence is ready for the complete pilot
+only when both adults can complete their independent Messages/mobile-web/Google
+onboarding and the full journey without database repair, operator-authored
+records, hidden commands, or explanation of internal concepts.
 
 Two gates are absolute: zero disclosure from one adult's private context into household context without authority, and zero unauthorized consequential action. Any failure blocks release.
 

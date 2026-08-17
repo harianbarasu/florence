@@ -10,7 +10,9 @@ Do not deploy when any of these is true:
 - the exact PostgreSQL service or restorable backup is uncertain;
 - the database is not an explicitly approved fresh pilot database;
 - Linq or Google callback registrations point at another origin;
-- either adult lacks a separate pilot credential and browser session;
+- the pilot database already contains a household before the intended founder
+  starts onboarding, or the Florence number has been distributed beyond the
+  intended pilot adults;
 - the API has no persistent directory for encrypted image retry data;
 - a connector rehearsal would require real family data before synthetic proof passes.
 
@@ -36,27 +38,23 @@ Required:
 | --- | --- |
 | `NODE_ENV` | `production` |
 | `FLORENCE_DATABASE_URL` | Private URL for the approved fresh PostgreSQL service |
-| `FLORENCE_PILOT_CREDENTIALS` | JSON array of exactly two distinct `{token,adultId}` entries; tokens are at least 32 printable bytes |
 | `FLORENCE_SESSION_SECRET` | At least 32 random bytes |
 | `FLORENCE_ENROLLMENT_SECRET` | At least 32 random bytes |
 | `FLORENCE_IMAGE_VAULT_DIRECTORY` | Absolute path on the attached persistent volume |
 | `FLORENCE_IMAGE_VAULT_KEY` | Canonical base64 encoding of exactly 32 random bytes |
+| `FLORENCE_MESSAGES_URL` | Canonical link that returns the adult to Florence's iMessage thread |
 | `LINQ_API_KEY` | Linq partner API key |
 | `LINQ_WEBHOOK_SECRET` | Current Standard Webhooks signing secret |
 | `LINQ_PARTNER_ID` | Exact expected Linq partner UUID |
 | `OPENAI_API_KEY` | Model credential |
 | `FLORENCE_OPENAI_MODEL` | Pinned supported model ID |
-
-Google is optional as a bundle but required for the full pilot journey:
-
-- `GOOGLE_OAUTH_CLIENT_ID`
-- `GOOGLE_OAUTH_CLIENT_SECRET`
-- `GOOGLE_OAUTH_REDIRECT_URI` — exact `<origin>/api/v1/google/callback`
-- `GOOGLE_CREDENTIAL_KEY` — canonical base64 encoding of exactly 32 random bytes
+| `GOOGLE_OAUTH_CLIENT_ID` | Google OAuth web client ID |
+| `GOOGLE_OAUTH_CLIENT_SECRET` | Google OAuth web client secret |
+| `GOOGLE_OAUTH_REDIRECT_URI` | Exact `<origin>/api/v1/google/callback`; its origin is also used for setup links |
+| `GOOGLE_CREDENTIAL_KEY` | Canonical base64 encoding of exactly 32 random bytes |
 
 Optional bounded settings:
 
-- `FLORENCE_MESSAGES_URL`
 - `FLORENCE_MODEL_TIMEOUT_MS=30000`
 - `FLORENCE_MODEL_MAX_OUTPUT_TOKENS=4000`
 - `LOG_LEVEL=info`
@@ -94,13 +92,24 @@ On a disposable empty database, run `pnpm db:migrate` twice. Both runs must pass
 1. Disable Railway autodeploy.
 2. Record the exact old API deployment, database, and volume IDs; take and verify a restorable backup.
 3. Stop the old API and worker and confirm no running instance can write.
-4. Create or explicitly empty the approved pilot PostgreSQL database. Do not mix the new baseline with the old schema.
+4. Create or explicitly empty the approved pilot PostgreSQL database. Verify it
+   contains no household or adult. Do not mix the new baseline with the old
+   schema.
 5. Configure the variables and callbacks without starting a deployment.
 6. Attach the persistent image-vault directory to the API service.
 7. Delete or leave permanently stopped the obsolete worker service.
 8. Deploy the exact release commit through `/railway.json`.
 9. Wait for `/api/health`, then run `pnpm smoke:production -- https://<canonical-host>`.
-10. Rehearse two browser sessions, two private enrollments, the exact two-adult group, a signed PDF message, a natural response/reaction/reply, sourced memory, a useful follow-up, one approved Calendar write, provider proof, correction, and Vault deletion.
+10. Before sharing the number more broadly, have the intended founding adult
+    text Florence, complete the fragment-link mobile setup first, connect
+    Google, add the optional partner and child/school/activity basics one screen
+    at a time, and return to the exact private thread. No identity is configured
+    ahead of that message, no household name is requested, and the first valid
+    setup redemption wins. Then
+    rehearse the signed PDF conversation through the Phase 1 stop. After that
+    experience is approved, rehearse the second adult's independent onboarding,
+    exact family group, sourced memory, useful follow-up, one approved Calendar
+    write, provider proof, correction, and Vault deletion.
 11. Enable autodeploy only after the full synthetic journey and the two-phone experience pass.
 
 ## Recovery

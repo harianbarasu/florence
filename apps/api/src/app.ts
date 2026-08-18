@@ -245,7 +245,7 @@ export async function buildApp(
   });
 
   app.get<{ Querystring: { state?: string; code?: string; error?: string } }>(
-    "/api/v1/google/callback",
+    "/oauth/google/callback",
     async (request, reply) => {
       const caller = await requireAdult(request, reply, dependencies.callerResolver);
       if (!caller) return;

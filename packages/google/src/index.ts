@@ -1,5 +1,11 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from "node:crypto";
 
+// Keep these aligned with @florence/artifacts. This package has no workspace dependencies.
+const MAX_GMAIL_IMAGE_BYTES = 20 * 1024 * 1024;
+const MAX_GMAIL_PDF_BYTES = 20 * 1024 * 1024;
+const MAX_GMAIL_ATTACHMENTS_PER_MESSAGE = 20;
+const CALENDAR_CURSOR_OVERLAP_MS = 5 * 60_000;
+
 export const GOOGLE_SCOPES = [
   "openid",
   "email",
@@ -73,15 +79,35 @@ export type GoogleCalendarExecutionResult =
   | { status: "failed"; providerReceiptId: null; detail: string; occurredAt: string };
 
 export type GoogleCalendarWindowEvent = {
+  providerEventId: string;
+  providerRevision: string;
+  providerUpdatedAt: string;
   title: string | null;
   startsAt: string;
   endsAt: string;
   allDay: boolean;
 };
 
+/**
+ * Rolling Calendar polling cursor. The five-minute overlap intentionally favors duplicate reads
+ * over gaps caused by provider/local clock skew. De-duplicate with providerEventId + providerRevision.
+ * Google sync tokens inherit an initial time filter and cannot later change timeMin/timeMax, so a
+ * token created from the fixed briefing window cannot follow a rolling 21-day window. The outer
+ * read status still reports when the initial window itself was truncated.
+ */
+export type GoogleCalendarBoundedCursor = {
+  kind: "calendar_updated_min_v1";
+  calendarId: string;
+  updatedMin: string;
+  windowTimeMin: string;
+  windowTimeMax: string;
+  overlapMs: typeof CALENDAR_CURSOR_OVERLAP_MS;
+};
+
 export type GoogleCalendarWindowRead = {
   status: "complete" | "truncated" | "unavailable";
   events: readonly GoogleCalendarWindowEvent[];
+  cursor: GoogleCalendarBoundedCursor | null;
 };
 
 export type GoogleFamilyCalendarProvisioningResult = {
@@ -100,6 +126,26 @@ export type GoogleFamilyCalendarProvisioningResult = {
   occurredAt: string;
 };
 
+export type GoogleSupportedGmailAttachmentMimeType =
+  | "application/pdf"
+  | "image/jpeg"
+  | "image/png"
+  | "image/webp";
+
+export type GmailAttachmentReference = {
+  messageId: string;
+  threadId: string;
+  historyId: string;
+  partId: string;
+  attachmentId: string;
+  storage: "external" | "inline";
+  filename: string;
+  mimeType: GoogleSupportedGmailAttachmentMimeType;
+  sizeBytes: number;
+};
+
+export type GmailAttachmentRead = GmailAttachmentReference & { bytes: Uint8Array };
+
 export type GmailEvidence = {
   messageId: string;
   threadId: string;
@@ -108,6 +154,21 @@ export type GmailEvidence = {
   subject: string | null;
   sentAt: string;
   text: string;
+  textStatus: "complete" | "truncated" | "unavailable";
+  attachments: readonly GmailAttachmentReference[];
+  attachmentsStatus: "complete" | "truncated";
+};
+
+export type GmailSearchResult = {
+  status: "complete" | "truncated";
+  messages: readonly GmailEvidence[];
+};
+
+/** Capture before the baseline Gmail reads, then persist only after that review commits. */
+export type GoogleGmailCursor = {
+  kind: "gmail_history_v1";
+  historyId: string;
+  capturedAt: string;
 };
 
 type FamilyCalendarListEntry = {
@@ -417,15 +478,71 @@ export class GoogleConnection {
     return this.#readGmailMessage(accessToken, input);
   }
 
+  async captureGmailCursor(input: {
+    householdId: string;
+    ownerAdultId: string;
+    connectionId: string;
+  }): Promise<GoogleGmailCursor> {
+    const credential = await this.#store.readActiveGoogleCredential(input);
+    if (!credential) throw new GoogleConnectionError("Active Google connection was not found", "not_found");
+    const accessToken = await this.#accessToken(credential);
+    const profile = await this.#gmailJson("profile", accessToken);
+    const historyId = gmailHistoryId(profile.historyId);
+    stringField(profile, "emailAddress");
+    nonNegativeIntegerField(profile, "messagesTotal");
+    nonNegativeIntegerField(profile, "threadsTotal");
+    return { kind: "gmail_history_v1", historyId, capturedAt: new Date().toISOString() };
+  }
+
+  async readGmailAttachment(input: {
+    householdId: string;
+    ownerAdultId: string;
+    connectionId: string;
+    attachment: GmailAttachmentReference;
+  }): Promise<GmailAttachmentRead> {
+    const expected = validateGmailAttachmentReference(input.attachment);
+    const credential = await this.#store.readActiveGoogleCredential({
+      householdId: input.householdId,
+      ownerAdultId: input.ownerAdultId,
+      connectionId: input.connectionId,
+    });
+    if (!credential) throw new GoogleConnectionError("Active Google connection was not found", "not_found");
+    const accessToken = await this.#accessToken(credential);
+    const message = await this.#readGmailMessage(accessToken, expected);
+    if (!message.attachments.some((attachment) => sameGmailAttachment(attachment, expected))) {
+      throw providerError("Gmail attachment identity changed before it could be read");
+    }
+    const body =
+      expected.storage === "external"
+        ? await this.#gmailJson(
+            `messages/${encodeURIComponent(expected.messageId)}/attachments/${encodeURIComponent(expected.attachmentId)}`,
+            accessToken,
+          )
+        : await this.#readInlineGmailAttachmentBody(accessToken, expected);
+    const sizeBytes = nonNegativeIntegerField(body, "size");
+    if (sizeBytes !== expected.sizeBytes) {
+      throw providerError("Gmail attachment size changed before it could be read");
+    }
+    const encoded = stringField(body, "data");
+    const bytes = strictBase64UrlDecode(encoded, gmailAttachmentLimit(expected.mimeType));
+    if (bytes.byteLength !== expected.sizeBytes || !gmailBytesMatchMimeType(bytes, expected.mimeType)) {
+      throw providerError("Gmail attachment content did not match its declared type and size");
+    }
+    return { ...expected, bytes };
+  }
+
   async searchGmail(input: {
     householdId: string;
     ownerAdultId: string;
     connectionId: string;
     query: string;
+    after?: string;
+    before?: string;
     limit?: number;
-  }): Promise<readonly GmailEvidence[]> {
+  }): Promise<GmailSearchResult> {
     const queryText = required(input.query, "Gmail search query").trim();
     if (queryText.length > 500) throw new Error("Gmail search query exceeds 500 characters");
+    const bounds = gmailSearchBounds(input.after, input.before);
     const limit = input.limit ?? 10;
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 20) {
       throw new Error("Gmail search limit must be between 1 and 20");
@@ -437,14 +554,23 @@ export class GoogleConnection {
     });
     if (!credential) throw new GoogleConnectionError("Active Google connection was not found", "not_found");
     const accessToken = await this.#accessToken(credential);
-    const query = new URLSearchParams({ maxResults: String(limit), q: queryText });
+    const boundedQuery = bounds
+      ? `(${queryText}) after:${Math.floor(bounds.after.getTime() / 1_000)} before:${Math.ceil(bounds.before.getTime() / 1_000)}`
+      : queryText;
+    const query = new URLSearchParams({ maxResults: String(limit), q: boundedQuery });
     const list = await this.#gmailJson(`messages?${query}`, accessToken);
+    const nextPageToken = optionalStringField(list, "nextPageToken");
     const identities = await Promise.all(
       recordArray(list.messages)
         .slice(0, limit)
         .map((message) => this.#messageIdentity(accessToken, message)),
     );
-    return Promise.all(identities.map((identity) => this.#readGmailMessage(accessToken, identity)));
+    return {
+      status: nextPageToken === null ? "complete" : "truncated",
+      messages: await Promise.all(
+        identities.map((identity) => this.#readGmailMessage(accessToken, identity)),
+      ),
+    };
   }
 
   async provisionFamilyCalendar(input: {
@@ -608,6 +734,26 @@ export class GoogleConnection {
     }
   }
 
+  async readInitialCalendarReview(input: {
+    householdId: string;
+    ownerAdultId: string;
+    connectionId: string;
+    calendarId?: string;
+    currentTime: string;
+    limit?: number;
+  }): Promise<GoogleCalendarWindowRead> {
+    const timeMin = explicitInstant(input.currentTime);
+    return this.readCalendarWindow({
+      householdId: input.householdId,
+      ownerAdultId: input.ownerAdultId,
+      connectionId: input.connectionId,
+      ...(input.calendarId === undefined ? {} : { calendarId: input.calendarId }),
+      timeMin: timeMin.toISOString(),
+      timeMax: new Date(timeMin.getTime() + 21 * 24 * 60 * 60_000).toISOString(),
+      ...(input.limit === undefined ? {} : { limit: input.limit }),
+    });
+  }
+
   async readCalendarWindow(input: {
     householdId: string;
     ownerAdultId: string;
@@ -633,13 +779,14 @@ export class GoogleConnection {
       ownerAdultId: input.ownerAdultId,
       connectionId: input.connectionId,
     });
-    if (!credential) return { status: "unavailable", events: [] };
+    if (!credential) return { status: "unavailable", events: [], cursor: null };
 
     try {
       const accessToken = await this.#calendarAccessToken(credential);
+      const cursorCapturedAt = new Date();
       const query = new URLSearchParams({
         fields:
-          "nextPageToken,timeZone,items(status,summary,start,end,transparency,attendees(self,responseStatus))",
+          "nextPageToken,timeZone,items(id,etag,updated,status,summary,start,end,transparency,attendees(self,responseStatus))",
         maxResults: String(limit),
         orderBy: "startTime",
         showDeleted: "false",
@@ -662,12 +809,12 @@ export class GoogleConnection {
       if (transientHttpStatus(response.status)) {
         throw transientCalendarError(`Google Calendar read returned HTTP ${response.status}`);
       }
-      if (!response.ok) return { status: "unavailable", events: [] };
+      if (!response.ok) return { status: "unavailable", events: [], cursor: null };
       const body = await safeJson(response);
       const calendarTimeZone = stringField(body, "timeZone");
       const nextPageToken = body.nextPageToken;
       if (nextPageToken !== undefined && (typeof nextPageToken !== "string" || !nextPageToken)) {
-        return { status: "unavailable", events: [] };
+        return { status: "unavailable", events: [], cursor: null };
       }
       const events = recordArray(body.items).flatMap((event) => {
         const busy = calendarWindowEvent(event, calendarTimeZone, timeMin, timeMax);
@@ -676,10 +823,18 @@ export class GoogleConnection {
       return {
         status: nextPageToken ? "truncated" : "complete",
         events,
+        cursor: {
+          kind: "calendar_updated_min_v1",
+          calendarId,
+          updatedMin: new Date(cursorCapturedAt.getTime() - CALENDAR_CURSOR_OVERLAP_MS).toISOString(),
+          windowTimeMin: timeMin.toISOString(),
+          windowTimeMax: timeMax.toISOString(),
+          overlapMs: CALENDAR_CURSOR_OVERLAP_MS,
+        },
       };
     } catch (error) {
       if (error instanceof GoogleCalendarTransientError) throw error;
-      return { status: "unavailable", events: [] };
+      return { status: "unavailable", events: [], cursor: null };
     }
   }
 
@@ -1216,8 +1371,21 @@ export class GoogleConnection {
     const subject = nullableBounded(headers.get("subject"), 1_000);
     const timestamp = Number(stringField(message, "internalDate"));
     if (!Number.isFinite(timestamp)) throw providerError("Gmail returned an invalid message date");
-    const body = collectPlainText(payload).trim() || stringField(message, "snippet").trim();
-    if (!body) throw providerError("Gmail message has no readable text");
+    const supportedAttachments = collectGmailAttachmentReferences(payload, {
+      messageId,
+      threadId,
+      historyId,
+    });
+    if (typeof message.snippet !== "string") throw providerError("Gmail returned an invalid snippet");
+    const plainText = collectPlainText(payload).trim();
+    const snippet = message.snippet.trim();
+    const readableBody = plainText || snippet;
+    if (!readableBody && supportedAttachments.attachments.length === 0) {
+      throw providerError("Gmail message has no readable text or supported attachment");
+    }
+    const text =
+      readableBody ||
+      `Attachment-only message: ${supportedAttachments.attachments.map((attachment) => attachment.filename).join(", ")}`;
     return {
       messageId,
       threadId,
@@ -1225,8 +1393,48 @@ export class GoogleConnection {
       from,
       subject,
       sentAt: new Date(timestamp).toISOString(),
-      text: bounded(body, 50_000),
+      text: bounded(text, 50_000),
+      textStatus: plainText
+        ? plainText.length > 50_000
+          ? "truncated"
+          : "complete"
+        : snippet
+          ? "truncated"
+          : "unavailable",
+      attachments: supportedAttachments.attachments,
+      attachmentsStatus: supportedAttachments.status,
     };
+  }
+
+  async #readInlineGmailAttachmentBody(
+    accessToken: string,
+    expected: GmailAttachmentReference,
+  ): Promise<Record<string, unknown>> {
+    const message = await this.#gmailJson(
+      `messages/${encodeURIComponent(expected.messageId)}?format=full`,
+      accessToken,
+    );
+    if (
+      stringField(message, "id") !== expected.messageId ||
+      stringField(message, "threadId") !== expected.threadId ||
+      stringField(message, "historyId") !== expected.historyId
+    ) {
+      throw providerError("Gmail inline attachment message identity changed");
+    }
+    const part = findGmailPart(recordField(message, "payload"), expected.partId);
+    if (
+      !part ||
+      typeof part.filename !== "string" ||
+      part.filename.trim() !== expected.filename ||
+      supportedGmailAttachmentMimeType(String(part.mimeType ?? "")) !== expected.mimeType
+    ) {
+      throw providerError("Gmail inline attachment part identity changed");
+    }
+    const body = recordField(part, "body");
+    if (body.attachmentId !== undefined) {
+      throw providerError("Gmail inline attachment storage identity changed");
+    }
+    return body;
   }
 
   async #calendarAccessToken(credential: ActiveGoogleCredential): Promise<string> {
@@ -1492,6 +1700,9 @@ function calendarWindowEvent(
   if (endInstant <= timeMin || startInstant >= timeMax) return null;
   const summary = optionalStringField(event, "summary");
   return {
+    providerEventId: bounded(stringField(event, "id"), 1_024),
+    providerRevision: bounded(stringField(event, "etag"), 500),
+    providerUpdatedAt: explicitInstant(stringField(event, "updated")).toISOString(),
     title: summary === null ? null : bounded(summary, 500),
     startsAt: startInstant.toISOString(),
     endsAt: endInstant.toISOString(),
@@ -1690,6 +1901,12 @@ function required(value: string, label: string): string {
   return value;
 }
 
+function boundedRequired(value: string, label: string, maximum: number): string {
+  const result = required(value, label).trim();
+  if (result.length > maximum) throw new Error(`${label} exceeds ${maximum} characters`);
+  return result;
+}
+
 function assertDigest(value: string, label: string): void {
   if (!/^[0-9a-f]{64}$/.test(value)) throw new Error(`${label} must be a SHA-256 digest`);
 }
@@ -1743,6 +1960,211 @@ function headerMap(value: unknown): Map<string, string> {
     headers.set(stringField(header, "name").toLowerCase(), stringField(header, "value"));
   }
   return headers;
+}
+
+function gmailSearchBounds(
+  afterValue: string | undefined,
+  beforeValue: string | undefined,
+): { after: Date; before: Date } | null {
+  if (afterValue === undefined && beforeValue === undefined) return null;
+  if (afterValue === undefined || beforeValue === undefined) {
+    throw new Error("Gmail search bounds must include both after and before");
+  }
+  const after = explicitInstant(afterValue);
+  const before = explicitInstant(beforeValue);
+  if (before <= after) throw new Error("Gmail search before must follow after");
+  if (before.getTime() - after.getTime() > 90 * 24 * 60 * 60_000) {
+    throw new Error("Gmail search window cannot exceed 90 days");
+  }
+  return { after, before };
+}
+
+function gmailHistoryId(value: unknown): string {
+  if (typeof value !== "string" || !/^[1-9][0-9]{0,29}$/.test(value)) {
+    throw providerError("Gmail returned an invalid history cursor");
+  }
+  return value;
+}
+
+function nonNegativeIntegerField(value: Record<string, unknown>, field: string): number {
+  const result = value[field];
+  if (!Number.isSafeInteger(result) || (result as number) < 0) {
+    throw providerError("Google returned an invalid numeric field");
+  }
+  return result as number;
+}
+
+function collectGmailAttachmentReferences(
+  payload: Record<string, unknown>,
+  message: { messageId: string; threadId: string; historyId: string },
+): { attachments: readonly GmailAttachmentReference[]; status: "complete" | "truncated" } {
+  const found: GmailAttachmentReference[] = [];
+  const visit = (part: Record<string, unknown>): void => {
+    const rawMimeType = part.mimeType;
+    const mimeType = typeof rawMimeType === "string" ? supportedGmailAttachmentMimeType(rawMimeType) : null;
+    const rawFilename = part.filename;
+    const filename = typeof rawFilename === "string" ? rawFilename.trim() : "";
+    if (mimeType && filename) {
+      const body = recordField(part, "body");
+      const sizeBytes = nonNegativeIntegerField(body, "size");
+      const externalAttachmentId = optionalStringField(body, "attachmentId");
+      const inlineData = body.data;
+      const partId = stringField(part, "partId");
+      if (
+        sizeBytes > 0 &&
+        sizeBytes <= gmailAttachmentLimit(mimeType) &&
+        (externalAttachmentId || (typeof inlineData === "string" && inlineData))
+      ) {
+        found.push(
+          validateGmailAttachmentReference({
+            ...message,
+            partId,
+            attachmentId: externalAttachmentId ?? `inline:${partId}`,
+            storage: externalAttachmentId ? "external" : "inline",
+            filename,
+            mimeType,
+            sizeBytes,
+          }),
+        );
+      }
+    }
+    for (const child of recordArray(part.parts)) visit(child);
+  };
+  visit(payload);
+  return {
+    attachments: found.slice(0, MAX_GMAIL_ATTACHMENTS_PER_MESSAGE),
+    status: found.length > MAX_GMAIL_ATTACHMENTS_PER_MESSAGE ? "truncated" : "complete",
+  };
+}
+
+function findGmailPart(
+  part: Record<string, unknown>,
+  expectedPartId: string,
+): Record<string, unknown> | null {
+  if (part.partId === expectedPartId) return part;
+  for (const child of recordArray(part.parts)) {
+    const found = findGmailPart(child, expectedPartId);
+    if (found) return found;
+  }
+  return null;
+}
+
+function supportedGmailAttachmentMimeType(value: string): GoogleSupportedGmailAttachmentMimeType | null {
+  const normalized = value.trim().toLowerCase();
+  return normalized === "application/pdf" ||
+    normalized === "image/jpeg" ||
+    normalized === "image/png" ||
+    normalized === "image/webp"
+    ? normalized
+    : null;
+}
+
+function validateGmailAttachmentReference(value: GmailAttachmentReference): GmailAttachmentReference {
+  const mimeType = supportedGmailAttachmentMimeType(value.mimeType);
+  if (!mimeType) throw new Error("Unsupported Gmail attachment type");
+  const filename = value.filename.trim();
+  if (
+    filename.length < 1 ||
+    filename.length > 500 ||
+    [...filename].some((character) => {
+      const code = character.charCodeAt(0);
+      return code < 32 || code === 127;
+    })
+  ) {
+    throw providerError("Gmail returned an invalid attachment filename");
+  }
+  const result = {
+    messageId: boundedRequired(value.messageId, "Gmail message ID", 500),
+    threadId: boundedRequired(value.threadId, "Gmail thread ID", 500),
+    historyId: gmailHistoryId(value.historyId),
+    partId: boundedRequired(value.partId, "Gmail attachment part ID", 500),
+    attachmentId: boundedRequired(value.attachmentId, "Gmail attachment ID", 500),
+    storage: value.storage,
+    filename,
+    mimeType,
+    sizeBytes: value.sizeBytes,
+  };
+  if (result.storage !== "external" && result.storage !== "inline") {
+    throw providerError("Gmail returned an invalid attachment storage type");
+  }
+  if (result.storage === "inline" && result.attachmentId !== `inline:${result.partId}`) {
+    throw providerError("Gmail returned an invalid inline attachment identity");
+  }
+  if (
+    !Number.isSafeInteger(result.sizeBytes) ||
+    result.sizeBytes < 1 ||
+    result.sizeBytes > gmailAttachmentLimit(result.mimeType)
+  ) {
+    throw providerError("Gmail attachment exceeds Florence's artifact limit");
+  }
+  return result;
+}
+
+function sameGmailAttachment(left: GmailAttachmentReference, right: GmailAttachmentReference): boolean {
+  return (
+    left.messageId === right.messageId &&
+    left.threadId === right.threadId &&
+    left.historyId === right.historyId &&
+    left.partId === right.partId &&
+    left.attachmentId === right.attachmentId &&
+    left.storage === right.storage &&
+    left.filename === right.filename &&
+    left.mimeType === right.mimeType &&
+    left.sizeBytes === right.sizeBytes
+  );
+}
+
+function gmailAttachmentLimit(mimeType: GoogleSupportedGmailAttachmentMimeType): number {
+  return mimeType === "application/pdf" ? MAX_GMAIL_PDF_BYTES : MAX_GMAIL_IMAGE_BYTES;
+}
+
+function strictBase64UrlDecode(value: string, maximumBytes: number): Uint8Array {
+  const unpadded = value.replace(/=+$/, "");
+  const paddingLength = value.length - unpadded.length;
+  if (
+    !unpadded ||
+    !/^[A-Za-z0-9_-]+$/.test(unpadded) ||
+    paddingLength > 2 ||
+    unpadded.length % 4 === 1 ||
+    unpadded.length > Math.ceil((maximumBytes * 4) / 3) + 4
+  ) {
+    throw providerError("Gmail returned invalid attachment encoding");
+  }
+  const requiredPadding = (4 - (unpadded.length % 4)) % 4;
+  if (paddingLength !== 0 && paddingLength !== requiredPadding) {
+    throw providerError("Gmail returned non-canonical attachment encoding");
+  }
+  const bytes = Buffer.from(unpadded, "base64url");
+  if (bytes.toString("base64url") !== unpadded || bytes.byteLength > maximumBytes) {
+    throw providerError("Gmail returned invalid attachment encoding");
+  }
+  return bytes;
+}
+
+function gmailBytesMatchMimeType(
+  bytes: Uint8Array,
+  mimeType: GoogleSupportedGmailAttachmentMimeType,
+): boolean {
+  const value = Buffer.from(bytes);
+  if (mimeType === "application/pdf") {
+    if (value.length < 12 || value.toString("ascii", 0, 5) !== "%PDF-") return false;
+    if (!/^(?:1\.[0-9]|2\.0)$/.test(value.toString("ascii", 5, 8))) return false;
+    return value.subarray(Math.max(0, value.length - 2_048)).includes(Buffer.from("%%EOF"));
+  }
+  if (mimeType === "image/jpeg") {
+    return value.length >= 3 && value[0] === 0xff && value[1] === 0xd8 && value[2] === 0xff;
+  }
+  if (mimeType === "image/png") {
+    return (
+      value.length >= 8 &&
+      value.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+    );
+  }
+  return (
+    value.length >= 12 &&
+    value.toString("ascii", 0, 4) === "RIFF" &&
+    value.toString("ascii", 8, 12) === "WEBP"
+  );
 }
 
 function collectPlainText(part: Record<string, unknown>): string {

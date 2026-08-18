@@ -11,6 +11,7 @@ import {
   PostgresFlorenceStore,
 } from "@florence/database";
 import {
+  type GmailAttachmentReference,
   GOOGLE_SCOPES,
   type GoogleCalendarExecutionResult,
   GoogleConnection,
@@ -98,6 +99,23 @@ const SCHOOL_EMAIL = {
   subject: "Field trip permission slip",
   sentAt: "2026-08-15T17:00:00.000Z",
   text: "Permission slip due Tuesday. Friday's bus returns at 3:45.",
+  textStatus: "complete" as const,
+  attachmentsStatus: "complete" as const,
+  attachments: [],
+};
+const SCHOOL_PDF_BYTES = new TextEncoder().encode(
+  "%PDF-1.7\nMuir permission slip due Tuesday. Soccer clinic is Saturday.\n%%EOF\n",
+);
+const SCHOOL_PDF_ATTACHMENT: GmailAttachmentReference = {
+  messageId: "gmail-initial-school-packet",
+  threadId: "gmail-initial-school-thread",
+  historyId: "gmail-history-initial-founder",
+  partId: "2",
+  attachmentId: "gmail-school-pdf",
+  storage: "external",
+  filename: "school-packet.pdf",
+  mimeType: "application/pdf",
+  sizeBytes: SCHOOL_PDF_BYTES.byteLength,
 };
 const NATURAL_SETUP_OPT_OUT = "I don’t want Florence to message me here anymore.";
 const PARTNER_INVITATION_APPROVAL =
@@ -110,6 +128,10 @@ type InterpretPartnerInvitationApproval = FlorenceReasoner["interpretPartnerInvi
 type SetupConversationInput = Parameters<SetupConversation>[0];
 type CalendarApprovalInput = Parameters<InterpretCalendarApproval>[0];
 type PartnerInvitationApprovalInput = Parameters<InterpretPartnerInvitationApproval>[0];
+type PrivateGoogleReview = FlorenceReasoner["reviewPrivateGoogle"];
+type HouseholdBriefing = FlorenceReasoner["synthesizeHouseholdBriefing"];
+type PrivateGoogleReviewInput = Parameters<PrivateGoogleReview>[0];
+type HouseholdBriefingInput = Parameters<HouseholdBriefing>[0];
 type FamilyCalendarProvisioningInput = Parameters<GoogleConnection["provisionFamilyCalendar"]>[0];
 type CalendarReadInput = Parameters<GoogleConnection["readCalendarWindow"]>[0];
 type CalendarExecutionInput = Parameters<GoogleConnection["executeCalendar"]>[0] & {
@@ -474,8 +496,8 @@ release("Florence release journeys", () => {
     expect(calendarWasRead).toBe(true);
     expect(gmailWasRead).toBe(true);
     expect(obsoleteResultWasSuppressed).toBe(true);
-    expect(harness.googleReads).toBe(2);
-    expect(harness.gmailReads).toBe(1);
+    expect(harness.googleReads).toBe(4);
+    expect(harness.gmailReads).toBe(5);
     expect(harness.googleEffects).toBe(0);
     const storedEmail = await harness.store.recordGmailEvidence({
       householdId: (await harness.store.listHouseholdIdsForAdult(ADULT_ONE))[0] ?? "missing",
@@ -662,7 +684,7 @@ release("Florence release journeys", () => {
     expect(reactionWasUnderstood).toBe(true);
     expect(calendarWasRead).toBe(true);
     expect(obsoleteResultWasSuppressed).toBe(true);
-    expect(harness.googleReads).toBe(4);
+    expect(harness.googleReads).toBe(6);
     expect(workspace.vault?.facts).not.toEqual(
       expect.arrayContaining([expect.objectContaining({ statement: "A tapback changed family memory" })]),
     );
@@ -981,7 +1003,7 @@ release("Florence release journeys", () => {
     );
     await harness.drain();
     expect(harness.googleAttempts).toBe(3);
-    expect(harness.googleReads).toBe(3);
+    expect(harness.googleReads).toBe(5);
     const failures = harness.linq.messages.filter((message) =>
       message.text.startsWith("I couldn’t confirm that “School assembly”"),
     );
@@ -1117,6 +1139,7 @@ class Harness {
   googleEffects = 0;
   googleReads = 0;
   gmailReads = 0;
+  gmailAttachmentReads = 0;
   partnerAdultId: string | null = null;
   childId: string | null = null;
 
@@ -1129,6 +1152,8 @@ class Harness {
     readonly setupTurns: SetupConversationInput[],
     readonly calendarApprovalTurns: CalendarApprovalInput[],
     readonly partnerInvitationApprovalTurns: PartnerInvitationApprovalInput[],
+    readonly privateGoogleReviewTurns: PrivateGoogleReviewInput[],
+    readonly householdBriefingTurns: HouseholdBriefingInput[],
     readonly familyCalendarProvisioningCalls: FamilyCalendarProvisioningInput[],
     readonly calendarReadCalls: CalendarReadInput[],
     readonly calendarExecutions: CalendarExecutionInput[],
@@ -1324,6 +1349,29 @@ class Harness {
         "Want me to text Alex at ••••0202 so they can set up their side?",
       ]),
     );
+    expect(this.privateGoogleReviewTurns).toHaveLength(1);
+    expect(this.privateGoogleReviewTurns[0]).toMatchObject({
+      adult: { adultId: ADULT_ONE, firstName: "Hari" },
+      googleConnection: { connectionId: GOOGLE_CONNECTION, status: "active", kind: "personal" },
+      familyProfile: {
+        familyLabel: "Anbarasu Family",
+        adultFirstNames: ["Hari", "Alex"],
+        children: [{ firstName: "Maya", school: "Muir Elementary", activities: ["Soccer"] }],
+        postalCode: "94110",
+      },
+    });
+    expect(this.householdBriefingTurns).toHaveLength(0);
+    expect(this.gmailReads).toBe(2);
+    expect(this.googleReads).toBe(1);
+    expect(this.gmailAttachmentReads).toBe(1);
+    expect(this.linq.messages).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          providerConversationId: PRIVATE_ONE,
+          text: expect.stringContaining("Hari, I took a first pass through your side"),
+        }),
+      ]),
+    );
     await this.acceptPrivate("partner-invitation-approval", PARTNER_INVITATION_APPROVAL);
     await this.drain();
     expect(this.partnerInvitationApprovalTurns).toEqual([
@@ -1372,6 +1420,34 @@ class Harness {
     });
     this.now += 1_400;
     await this.drain();
+    expect(this.privateGoogleReviewTurns).toHaveLength(2);
+    expect(
+      this.privateGoogleReviewTurns.map((turn) => ({
+        adultId: turn.adult.adultId,
+        connectionId: turn.googleConnection.connectionId,
+      })),
+    ).toEqual([
+      { adultId: ADULT_ONE, connectionId: GOOGLE_CONNECTION },
+      { adultId: partner.id, connectionId: PARTNER_GOOGLE_CONNECTION },
+    ]);
+    expect(this.gmailReads).toBe(4);
+    expect(this.googleReads).toBe(2);
+    expect(this.gmailAttachmentReads).toBe(1);
+    expect(this.householdBriefingTurns).toHaveLength(1);
+    expect(this.householdBriefingTurns[0]?.candidates).toHaveLength(2);
+    const householdBriefingInput = JSON.stringify(this.householdBriefingTurns[0]);
+    expect(householdBriefingInput).not.toMatch(
+      /hari-private|alex-private|private body|private appointment|private errand|gmail-initial|calendar-source/i,
+    );
+    const combinedBriefing = this.linq.messages.find(
+      (message) =>
+        message.providerConversationId === GROUP &&
+        message.text.includes("Here’s the household picture I found"),
+    );
+    expect(combinedBriefing?.text).toContain("permission-slip deadline Tuesday");
+    expect(combinedBriefing?.text).toContain("handoff owner for Saturday soccer");
+    expect(combinedBriefing?.text).toContain("Did I get that right?");
+    expect(combinedBriefing?.text).not.toMatch(/private|@example\.com|gmail-|calendar-/i);
     expect(this.linq.createdChats).toHaveLength(2);
     expect(this.linq.createdChats[1]).toMatchObject({
       input: {
@@ -1401,6 +1477,9 @@ class Harness {
     ]);
     const founderWorkspace = await this.florence.workspaceForAdult(ADULT_ONE);
     const partnerWorkspace = await this.florence.workspaceForAdult(partner.id);
+    await this.drain();
+    expect(this.privateGoogleReviewTurns).toHaveLength(2);
+    expect(this.householdBriefingTurns).toHaveLength(1);
     expect(founderWorkspace.workspace.setup).toEqual({
       ownOnboardingComplete: true,
       secondAdultAdded: true,
@@ -1787,6 +1866,8 @@ async function freshHarness(
   const setupTurns: SetupConversationInput[] = [];
   const calendarApprovalTurns: CalendarApprovalInput[] = [];
   const partnerInvitationApprovalTurns: PartnerInvitationApprovalInput[] = [];
+  const privateGoogleReviewTurns: PrivateGoogleReviewInput[] = [];
+  const householdBriefingTurns: HouseholdBriefingInput[] = [];
   const familyCalendarProvisioningCalls: FamilyCalendarProvisioningInput[] = [];
   const calendarReadCalls: CalendarReadInput[] = [];
   const calendarExecutions: CalendarExecutionInput[] = [];
@@ -1822,11 +1903,88 @@ async function freshHarness(
       }
     );
   };
+  const reviewPrivateGoogle: PrivateGoogleReview = async (input, reads) => {
+    privateGoogleReviewTurns.push(input);
+    const current = Date.parse(input.currentTime);
+    const recent = await reads.searchGmail({
+      connectionId: input.googleConnection.connectionId,
+      query: "(school OR activity OR form) -category:promotions -category:social",
+      after: new Date(current - 14 * 24 * 60 * 60_000).toISOString(),
+      before: input.currentTime,
+      limit: 10,
+    });
+    const prior = await reads.searchGmail({
+      connectionId: input.googleConnection.connectionId,
+      query: "(school OR activity OR family) -category:promotions -category:social",
+      after: new Date(current - 90 * 24 * 60 * 60_000).toISOString(),
+      before: new Date(current - 14 * 24 * 60 * 60_000).toISOString(),
+      limit: 10,
+    });
+    const calendar = await reads.readPersonalCalendarWindow({
+      connectionId: input.googleConnection.connectionId,
+      timeMin: input.currentTime,
+      timeMax: new Date(current + 21 * 24 * 60 * 60_000).toISOString(),
+      limit: 50,
+    });
+    const firstSource = recent[0] ?? prior[0] ?? calendar.events[0];
+    if (!firstSource) throw new Error("The initial review fake received no private evidence");
+    const attachment = recent[0]?.attachments[0];
+    if (attachment) {
+      const opened = await reads.readGmailAttachment({
+        connectionId: input.googleConnection.connectionId,
+        sourceId: recent[0]?.sourceId ?? "missing",
+        attachment,
+      });
+      expect(opened.bytes).toEqual(SCHOOL_PDF_BYTES);
+    }
+    const owner = input.adult.firstName;
+    return {
+      bubbles: [
+        {
+          text: `${owner}, I took a first pass through your side. I found one school item worth keeping on the household radar.`,
+          delayMs: 0,
+        },
+      ],
+      findings: [
+        {
+          privateSummary: `${owner}'s private source detail stays in this thread.`,
+          sourceIds: [firstSource.sourceId],
+          candidate: {
+            category: "deadline",
+            summary:
+              owner === "Hari"
+                ? "Maya’s school packet has a permission-slip deadline Tuesday."
+                : "The family calendar needs a handoff owner for Saturday soccer.",
+            urgency: "soon",
+            dueAt: owner === "Hari" ? "2026-08-18T18:00:00.000Z" : null,
+            needsAnswer: true,
+          },
+        },
+      ],
+    };
+  };
+  const synthesizeHouseholdBriefing: HouseholdBriefing = async (input) => {
+    householdBriefingTurns.push(input);
+    return {
+      selectedCandidateIds: input.candidates.slice(0, 3).map((candidate) => candidate.candidateId),
+      bubbles: [
+        {
+          text: `Here’s the household picture I found:\n${input.candidates
+            .slice(0, 3)
+            .map((candidate) => `– ${candidate.summary}`)
+            .join("\n")}\n\nDid I get that right? What else can I take off your plate?`,
+          delayMs: 0,
+        },
+      ],
+    };
+  };
   const reasoner = {
     decide: reason,
     converseDuringSetup,
     interpretCalendarApproval,
     interpretPartnerInvitationApproval,
+    reviewPrivateGoogle,
+    synthesizeHouseholdBriefing,
   } as unknown as FlorenceReasoner;
   const enrollmentCodes = new EnrollmentCodes(ENROLLMENT_SECRET);
   let harness: Harness;
@@ -1894,22 +2052,141 @@ async function freshHarness(
       return credential
         ? {
             status: "complete" as const,
-            events: input.timeMin === TRIP_WINDOW.timeMin ? [PICKUP_CONFLICT] : [],
+            events:
+              input.timeMin === TRIP_WINDOW.timeMin
+                ? [
+                    {
+                      providerEventId: "calendar-pickup-conflict",
+                      providerRevision: "pickup-revision-1",
+                      providerUpdatedAt: harness.iso(),
+                      ...PICKUP_CONFLICT,
+                    },
+                  ]
+                : [],
+            cursor: {
+              kind: "calendar_updated_min_v1" as const,
+              calendarId: input.calendarId ?? "primary",
+              updatedMin: harness.iso(),
+              windowTimeMin: input.timeMin,
+              windowTimeMax: input.timeMax,
+              overlapMs: 300_000 as const,
+            },
           }
-        : { status: "unavailable" as const, events: [] };
+        : { status: "unavailable" as const, events: [], cursor: null };
+    },
+    readInitialCalendarReview: async (input: {
+      householdId: string;
+      ownerAdultId: string;
+      connectionId: string;
+      currentTime: string;
+      limit: number;
+    }) => {
+      harness.googleReads += 1;
+      expect(input.limit).toBe(50);
+      const credential = await store.readActiveGoogleCredential(input);
+      if (!credential) return { status: "unavailable" as const, events: [], cursor: null };
+      const startsAt = new Date(Date.parse(input.currentTime) + 2 * 24 * 60 * 60_000).toISOString();
+      const endsAt = new Date(Date.parse(startsAt) + 60 * 60_000).toISOString();
+      return {
+        status: "complete" as const,
+        events: [
+          {
+            providerEventId: `private-event-${input.ownerAdultId}`,
+            providerRevision: `private-revision-${input.ownerAdultId}`,
+            providerUpdatedAt: harness.iso(),
+            title: input.ownerAdultId === ADULT_ONE ? "Hari private appointment" : "Alex private errand",
+            startsAt,
+            endsAt,
+            allDay: false,
+          },
+        ],
+        cursor: {
+          kind: "calendar_updated_min_v1" as const,
+          calendarId: "primary",
+          updatedMin: harness.iso(),
+          windowTimeMin: input.currentTime,
+          windowTimeMax: new Date(Date.parse(input.currentTime) + 21 * 24 * 60 * 60_000).toISOString(),
+          overlapMs: 300_000 as const,
+        },
+      };
+    },
+    captureGmailCursor: async (input: {
+      householdId: string;
+      ownerAdultId: string;
+      connectionId: string;
+    }) => {
+      const credential = await store.readActiveGoogleCredential(input);
+      if (!credential) throw new Error("The fake Gmail cursor owner is unavailable");
+      return {
+        kind: "gmail_history_v1" as const,
+        historyId: input.ownerAdultId === ADULT_ONE ? "9001" : "9002",
+        capturedAt: harness.iso(),
+      };
     },
     searchGmail: async (input: {
       householdId: string;
       ownerAdultId: string;
       connectionId: string;
       query: string;
-      limit: number;
+      after?: string;
+      before?: string;
+      limit?: number;
     }) => {
       harness.gmailReads += 1;
-      expect(input.query).toBe('newer_than:30d ("Muir" OR "field trip")');
-      expect(input.limit).toBe(5);
       const credential = await store.readActiveGoogleCredential(input);
-      return credential ? [SCHOOL_EMAIL] : [];
+      if (!credential) return { status: "complete" as const, messages: [] };
+      if (!input.after || !input.before) {
+        expect(input.query).toBe('newer_than:30d ("Muir" OR "field trip")');
+        expect(input.limit).toBe(5);
+        return { status: "complete" as const, messages: [SCHOOL_EMAIL] };
+      }
+      const span = Date.parse(input.before) - Date.parse(input.after);
+      expect([14, 76].map((days) => days * 24 * 60 * 60_000)).toContain(span);
+      const recent = span <= 15 * 24 * 60 * 60_000;
+      const founderRecent = input.ownerAdultId === ADULT_ONE && recent;
+      const messageId = founderRecent
+        ? SCHOOL_PDF_ATTACHMENT.messageId
+        : `gmail-${input.ownerAdultId}-${recent ? "recent" : "prior"}`;
+      const threadId = founderRecent
+        ? SCHOOL_PDF_ATTACHMENT.threadId
+        : `thread-${input.ownerAdultId}-${recent ? "recent" : "prior"}`;
+      const historyId = founderRecent
+        ? SCHOOL_PDF_ATTACHMENT.historyId
+        : `history-${input.ownerAdultId}-${recent ? "recent" : "prior"}`;
+      return {
+        status: "complete" as const,
+        messages: [
+          {
+            messageId,
+            threadId,
+            historyId,
+            from: input.ownerAdultId === ADULT_ONE ? "hari-private@example.com" : "alex-private@example.com",
+            subject: input.ownerAdultId === ADULT_ONE ? "Hari private school detail" : "Alex private detail",
+            sentAt: new Date((Date.parse(input.after) + Date.parse(input.before)) / 2).toISOString(),
+            text:
+              input.ownerAdultId === ADULT_ONE
+                ? "Hari private body: the permission slip is due Tuesday."
+                : "Alex private body: Saturday has a personal conflict.",
+            textStatus: "complete" as const,
+            attachments: founderRecent ? [SCHOOL_PDF_ATTACHMENT] : [],
+            attachmentsStatus: "complete" as const,
+          },
+        ],
+      };
+    },
+    readGmailAttachment: async (input: {
+      householdId: string;
+      ownerAdultId: string;
+      connectionId: string;
+      attachment: GmailAttachmentReference;
+    }) => {
+      const credential = await store.readActiveGoogleCredential(input);
+      if (!credential || input.ownerAdultId !== ADULT_ONE) {
+        throw new Error("The fake Gmail attachment owner is unavailable");
+      }
+      expect(input.attachment).toEqual(SCHOOL_PDF_ATTACHMENT);
+      harness.gmailAttachmentReads += 1;
+      return { ...SCHOOL_PDF_ATTACHMENT, bytes: SCHOOL_PDF_BYTES };
     },
     executeCalendar: async (input: CalendarExecutionInput) => {
       calendarExecutions.push(input);
@@ -1940,6 +2217,8 @@ async function freshHarness(
     setupTurns,
     calendarApprovalTurns,
     partnerInvitationApprovalTurns,
+    privateGoogleReviewTurns,
+    householdBriefingTurns,
     familyCalendarProvisioningCalls,
     calendarReadCalls,
     calendarExecutions,

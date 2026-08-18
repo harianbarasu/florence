@@ -8,7 +8,8 @@ export const baselineFile = fileURLToPath(new URL("../sql/001_florence.sql", imp
 export const householdActivationFile = fileURLToPath(
   new URL("../sql/002_household_activation.sql", import.meta.url),
 );
-export const migrationFiles = [baselineFile, householdActivationFile] as const;
+export const proactiveWorkFile = fileURLToPath(new URL("../sql/003_proactive_work.sql", import.meta.url));
+export const migrationFiles = [baselineFile, householdActivationFile, proactiveWorkFile] as const;
 
 export async function migrateDatabase(connectionString: string, sqlFile?: string): Promise<void> {
   const client = postgres(connectionString, { max: 1 });

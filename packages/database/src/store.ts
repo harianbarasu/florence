@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import postgres from "postgres";
 
 export type JsonValue = postgres.JSONValue;
@@ -14,6 +14,8 @@ const MAX_CURRENT_PDFS = 3;
 const MAX_PDF_ENVELOPE_BYTES = 20 * 1024 * 1024 + 16 * 1024;
 const CALENDAR_CLAIM_MS = 2 * 60_000;
 const PARTNER_INVITATION_CLAIM_MS = 2 * 60_000;
+const INITIAL_INTELLIGENCE_CLAIM_MS = 10 * 60_000;
+const GOOGLE_SYNC_INTERVAL_MS = 2 * 60_000;
 export type GoogleScope =
   | "openid"
   | "email"
@@ -72,7 +74,7 @@ export type LinqChannelRecord = {
 
 export type SourceRecord = {
   id: string;
-  kind: "linq_message" | "gmail" | "google_file" | "document" | "web" | "setup";
+  kind: "linq_message" | "gmail" | "google_file" | "document" | "web" | "setup" | "calendar";
   visibility: Visibility;
   ownerAdultId: string | null;
   label: string;
@@ -142,6 +144,82 @@ export type HouseholdRecord = {
   channels: readonly LinqChannelRecord[];
   facts: readonly FactRecord[];
   googleConnections: readonly GoogleConnectionView[];
+  initialIntelligence: {
+    privateReviewCompletedAdultIds: readonly string[];
+    householdBriefingCompleted: boolean;
+  };
+};
+
+export type SharedFamilyProfile = {
+  householdId: string;
+  familyLabel: string;
+  timeZone: string;
+  postalCode: string | null;
+  adults: readonly { adultId: string; firstName: string; displayName: string }[];
+  children: readonly {
+    childId: string;
+    firstName: string;
+    displayName: string;
+    school: string | null;
+    activities: readonly string[];
+  }[];
+};
+
+export type SharedBriefingCandidate = {
+  candidateId: string;
+  category: "deadline" | "conflict" | "handoff" | "family_date" | "loose_end";
+  summary: string;
+  urgency: "now" | "soon" | "watch";
+  dueAt: string | null;
+  needsAnswer: boolean;
+};
+
+export type PrivateReviewFinding = {
+  sourceIds: readonly string[];
+  householdCandidate: Omit<SharedBriefingCandidate, "candidateId"> | null;
+};
+
+export type InitialIntelligenceWork =
+  | {
+      kind: "initial_private_review";
+      workId: string;
+      leaseToken: string;
+      household: SharedFamilyProfile;
+      adultId: string;
+      adultFirstName: string;
+      connectionId: string;
+      channelId: string;
+      providerConversationId: string;
+    }
+  | {
+      kind: "initial_household_briefing";
+      workId: string;
+      leaseToken: string;
+      household: SharedFamilyProfile;
+      channelId: string;
+      providerConversationId: string;
+      candidates: readonly SharedBriefingCandidate[];
+    };
+
+export type InitialBriefingBubble = { text: string; delayMs: number };
+
+export type CompletePrivateInitialReviewInput = {
+  workId: string;
+  leaseToken: string;
+  gmailCursor: string;
+  calendarCursor: string;
+  bubbles: readonly InitialBriefingBubble[];
+  findings: readonly PrivateReviewFinding[];
+  coverage: JsonObject;
+  occurredAt: string;
+};
+
+export type CompleteHouseholdInitialBriefingInput = {
+  workId: string;
+  leaseToken: string;
+  selectedCandidateIds: readonly string[];
+  bubbles: readonly InitialBriefingBubble[];
+  occurredAt: string;
 };
 
 export type CompleteFounderOnboardingInput = {
@@ -571,6 +649,31 @@ type GoogleConnectionRow = {
   updated_at: Date;
 };
 
+type ProactiveWorkRow = {
+  id: string;
+  household_id: string;
+  kind:
+    | "initial_private_review"
+    | "initial_household_briefing"
+    | "gmail_sync"
+    | "calendar_sync"
+    | "finite_monitor"
+    | "interest_discovery";
+  visibility: Visibility;
+  owner_adult_id: string | null;
+  connection_id: string | null;
+  calendar_id: string | null;
+  dedupe_key: string;
+  briefing_candidates: JsonValue;
+  coverage: JsonValue;
+  status: "waiting_initial" | "active" | "paused" | "completed";
+  next_check_at: Date | null;
+  lease_token: string | null;
+  lease_until: Date | null;
+  failure_count: number;
+  last_error: string | null;
+};
+
 type LinqObservationRow = {
   source_id: string;
   status: "pending" | "sending" | "sent" | "failed";
@@ -685,6 +788,15 @@ export class PostgresFlorenceStore {
         ${input.viewerAdultId ? this.#sql`and owner_adult_id=${input.viewerAdultId}` : this.#sql``}
       order by created_at,id
     `;
+    const initialIntelligenceRows = await this.#sql<
+      { kind: "initial_private_review" | "initial_household_briefing"; owner_adult_id: string | null }[]
+    >`
+      select kind,owner_adult_id from proactive_work
+      where household_id=${input.householdId}
+        and kind in ('initial_private_review','initial_household_briefing')
+        and status='completed'
+      order by owner_adult_id nulls last,id
+    `;
     const memberRecords = members.map(personRecord);
     const channelRecords = channels.map(channelRecord);
     return {
@@ -700,7 +812,471 @@ export class PostgresFlorenceStore {
       channels: channelRecords,
       facts,
       googleConnections: googleRows.map(googleConnectionView),
+      initialIntelligence: {
+        privateReviewCompletedAdultIds: initialIntelligenceRows.flatMap((row) =>
+          row.kind === "initial_private_review" && row.owner_adult_id ? [row.owner_adult_id] : [],
+        ),
+        householdBriefingCompleted: initialIntelligenceRows.some(
+          (row) => row.kind === "initial_household_briefing",
+        ),
+      },
     };
+  }
+
+  async ensureInitialIntelligence(input: { householdId: string; now: string }): Promise<void> {
+    assertUuid(input.householdId, "Household ID");
+    const now = instant(input.now);
+    await this.#sql.begin(async (sql) => {
+      const [household] = await sql<
+        {
+          id: string;
+          family_calendar_id: string | null;
+          family_calendar_owner_connection_id: string | null;
+          family_calendar_created_at: Date | null;
+        }[]
+      >`
+        select id,family_calendar_id,family_calendar_owner_connection_id,family_calendar_created_at
+        from households where id=${input.householdId} for update
+      `;
+      if (!household) return;
+      const eligible = await sql<
+        {
+          adult_id: string;
+          connection_id: string;
+        }[]
+      >`
+        select p.id as adult_id,g.id as connection_id
+        from people p
+        join google_connections g on g.household_id=p.household_id
+          and g.owner_adult_id=p.id and g.status='active'
+        join linq_channels c on c.household_id=p.household_id and c.audience='private'
+          and c.adult_one_id=p.id and c.adult_two_id is null
+          and c.revoked_at is null and c.stopped_at is null
+        where p.household_id=${input.householdId} and p.kind='adult' and p.status='verified'
+          and p.guardian_attested_at is not null
+          and nullif(p.profile->>'onboardingCompletedAt','') is not null
+          and nullif(p.preferences->>'proactiveUseAcceptedAt','') is not null
+        order by p.adult_slot,p.id
+      `;
+      for (const adult of eligible) {
+        const reviewId = deterministicUuid(`initial-private-review\0${adult.adult_id}`);
+        await sql`
+          insert into proactive_work (
+            id,household_id,kind,visibility,owner_adult_id,connection_id,dedupe_key,
+            status,next_check_at,created_at,updated_at
+          ) values (${reviewId},${input.householdId},'initial_private_review','private',
+            ${adult.adult_id},${adult.connection_id},${adult.adult_id},'active',${now},${now},${now})
+          on conflict (household_id,kind,dedupe_key) do update
+            set connection_id=excluded.connection_id,updated_at=excluded.updated_at
+            where proactive_work.status<>'completed'
+        `;
+        await sql`
+          insert into proactive_work (
+            id,household_id,kind,visibility,owner_adult_id,connection_id,dedupe_key,
+            status,created_at,updated_at
+          ) values (${deterministicUuid(`gmail-sync\0${adult.connection_id}`)},${input.householdId},
+            'gmail_sync','private',${adult.adult_id},${adult.connection_id},${adult.connection_id},
+            'waiting_initial',${now},${now})
+          on conflict (household_id,kind,dedupe_key) do nothing
+        `;
+        await sql`
+          insert into proactive_work (
+            id,household_id,kind,visibility,owner_adult_id,connection_id,calendar_id,dedupe_key,
+            status,created_at,updated_at
+          ) values (${deterministicUuid(`calendar-sync\0${adult.connection_id}\0primary`)},
+            ${input.householdId},'calendar_sync','private',${adult.adult_id},${adult.connection_id},
+            'primary',${`${adult.connection_id}:primary`},'waiting_initial',${now},${now})
+          on conflict (household_id,kind,dedupe_key) do nothing
+        `;
+      }
+      const [group] = await sql<{ id: string }[]>`
+        select id from linq_channels where household_id=${input.householdId} and audience='group'
+          and adult_two_id is not null and revoked_at is null and stopped_at is null
+        order by bound_at,id limit 1 for share
+      `;
+      if (group && household.family_calendar_id && household.family_calendar_created_at) {
+        await sql`
+          insert into proactive_work (
+            id,household_id,kind,visibility,dedupe_key,status,created_at,updated_at
+          ) values (${deterministicUuid(`initial-household-briefing\0${input.householdId}`)},
+            ${input.householdId},'initial_household_briefing','household',${input.householdId},
+            'waiting_initial',${now},${now})
+          on conflict (household_id,kind,dedupe_key) do nothing
+        `;
+        if (household.family_calendar_owner_connection_id) {
+          await sql`
+            insert into proactive_work (
+              id,household_id,kind,visibility,connection_id,calendar_id,dedupe_key,
+              status,created_at,updated_at
+            ) values (${deterministicUuid(
+              `calendar-sync\0${household.family_calendar_owner_connection_id}\0${household.family_calendar_id}`,
+            )},${input.householdId},'calendar_sync','household',
+              ${household.family_calendar_owner_connection_id},${household.family_calendar_id},
+              ${`family:${household.family_calendar_id}`},'waiting_initial',${now},${now})
+            on conflict (household_id,kind,dedupe_key) do nothing
+          `;
+        }
+      }
+    });
+  }
+
+  async readNextInitialIntelligence(nowInput: string): Promise<InitialIntelligenceWork | null> {
+    const now = instant(nowInput);
+    return this.#sql.begin(async (sql) => {
+      await sql`
+        update proactive_work set lease_token=null,lease_until=null,updated_at=${now}
+        where kind in ('initial_private_review','initial_household_briefing')
+          and status='active' and lease_until<=${now}
+      `;
+      const [privateWork] = await sql<
+        (ProactiveWorkRow & {
+          adult_first_name: string | null;
+          adult_display_name: string;
+          channel_id: string;
+          provider_conversation_id: string;
+        })[]
+      >`
+        select w.*,p.profile->>'firstName' as adult_first_name,p.display_name as adult_display_name,
+          c.id as channel_id,c.provider_conversation_id
+        from proactive_work w
+        join people p on p.household_id=w.household_id and p.id=w.owner_adult_id
+        join google_connections g on g.id=w.connection_id and g.household_id=w.household_id
+          and g.owner_adult_id=w.owner_adult_id
+        join linq_channels c on c.household_id=w.household_id and c.audience='private'
+          and c.adult_one_id=w.owner_adult_id and c.adult_two_id is null
+        where w.kind='initial_private_review' and w.status='active'
+          and w.next_check_at<=${now} and w.lease_token is null
+          and p.kind='adult' and p.status='verified' and p.guardian_attested_at is not null
+          and nullif(p.profile->>'onboardingCompletedAt','') is not null
+          and nullif(p.preferences->>'proactiveUseAcceptedAt','') is not null
+          and g.status='active' and c.revoked_at is null and c.stopped_at is null
+        order by w.next_check_at,w.id for update of w skip locked limit 1
+      `;
+      if (privateWork?.owner_adult_id && privateWork.connection_id) {
+        const leaseToken = randomUUID();
+        await sql`
+          update proactive_work set lease_token=${leaseToken},
+            lease_until=${new Date(now.getTime() + INITIAL_INTELLIGENCE_CLAIM_MS)},updated_at=${now}
+          where id=${privateWork.id}
+        `;
+        return {
+          kind: "initial_private_review" as const,
+          workId: privateWork.id,
+          leaseToken,
+          household: await sharedFamilyProfile(sql, privateWork.household_id),
+          adultId: privateWork.owner_adult_id,
+          adultFirstName: privateWork.adult_first_name ?? privateWork.adult_display_name,
+          connectionId: privateWork.connection_id,
+          channelId: privateWork.channel_id,
+          providerConversationId: privateWork.provider_conversation_id,
+        };
+      }
+
+      const [householdWork] = await sql<ProactiveWorkRow[]>`
+        select w.* from proactive_work w
+        join households h on h.id=w.household_id
+        join linq_channels group_channel on group_channel.household_id=w.household_id
+          and group_channel.audience='group' and group_channel.adult_two_id is not null
+          and group_channel.revoked_at is null and group_channel.stopped_at is null
+        where w.kind='initial_household_briefing'
+          and (
+            w.status='waiting_initial'
+            or (w.status='active' and w.next_check_at<=${now} and w.lease_token is null)
+          )
+          and h.family_calendar_id is not null and h.family_calendar_created_at is not null
+          and (select count(distinct private_work.owner_adult_id) from proactive_work private_work
+            where private_work.household_id=w.household_id
+              and private_work.kind='initial_private_review' and private_work.status='completed'
+              and private_work.owner_adult_id in (
+                group_channel.adult_one_id,group_channel.adult_two_id
+              ))=2
+          and not exists (
+            select 1 from proactive_work private_work
+            where private_work.household_id=w.household_id
+              and private_work.kind='initial_private_review' and private_work.status='completed'
+              and private_work.owner_adult_id in (
+                group_channel.adult_one_id,group_channel.adult_two_id
+              )
+              and (
+                (select count(*) from messages private_message
+                  where private_message.idempotency_key like
+                    'initial-private-review:' || private_work.id::text || ':%') not between 1 and 3
+                or exists (
+                  select 1 from messages private_message
+                  where private_message.idempotency_key like
+                    'initial-private-review:' || private_work.id::text || ':%'
+                    and private_message.status<>'sent'
+                )
+              )
+          )
+        order by w.created_at,w.id for update of w skip locked limit 1
+      `;
+      if (!householdWork) return null;
+      const [group] = await sql<ChannelRow[]>`
+        select * from linq_channels where household_id=${householdWork.household_id}
+          and audience='group' and adult_two_id is not null and revoked_at is null and stopped_at is null
+        order by bound_at,id limit 1 for share
+      `;
+      if (!group?.adult_two_id) return null;
+      const completedReviews = await sql<ProactiveWorkRow[]>`
+        select * from proactive_work where household_id=${householdWork.household_id}
+          and kind='initial_private_review' and status='completed'
+          and owner_adult_id in (${group.adult_one_id},${group.adult_two_id}) order by owner_adult_id,id
+        for share
+      `;
+      if (completedReviews.length !== 2) return null;
+      for (const review of completedReviews) {
+        const messages = await sql<{ status: string }[]>`
+          select status from messages
+          where idempotency_key like ${`initial-private-review:${review.id}:%`}
+          order by turn_part
+        `;
+        if (
+          messages.length < 1 ||
+          messages.length > 3 ||
+          messages.some((message) => message.status !== "sent")
+        ) {
+          return null;
+        }
+      }
+      const candidates = completedReviews.flatMap((review) =>
+        storedBriefingCandidates(review.briefing_candidates),
+      );
+      const leaseToken = randomUUID();
+      await sql`
+        update proactive_work set status='active',next_check_at=${now},lease_token=${leaseToken},
+          lease_until=${new Date(now.getTime() + INITIAL_INTELLIGENCE_CLAIM_MS)},updated_at=${now}
+        where id=${householdWork.id}
+      `;
+      return {
+        kind: "initial_household_briefing" as const,
+        workId: householdWork.id,
+        leaseToken,
+        household: await sharedFamilyProfile(sql, householdWork.household_id),
+        channelId: group.id,
+        providerConversationId: group.provider_conversation_id,
+        candidates: candidates.map(({ sourceIds: _sourceIds, ...candidate }) => candidate),
+      };
+    });
+  }
+
+  async completePrivateInitialReview(input: CompletePrivateInitialReviewInput): Promise<void> {
+    assertUuid(input.workId, "Initial private review work ID");
+    assertUuid(input.leaseToken, "Initial private review lease");
+    const gmailCursor = required(input.gmailCursor, "Gmail review cursor");
+    const calendarCursor = required(input.calendarCursor, "Calendar review cursor");
+    const bubbles = initialBriefingBubbles(input.bubbles, "private Google review");
+    const occurredAt = instant(input.occurredAt);
+    await this.#sql.begin(async (sql) => {
+      const [work] = await sql<ProactiveWorkRow[]>`
+        select * from proactive_work where id=${input.workId} and kind='initial_private_review'
+          and status='active' and lease_token=${input.leaseToken} and lease_until>=${occurredAt}
+        for update
+      `;
+      if (!work?.owner_adult_id || !work.connection_id) {
+        throw new FlorenceStoreConflict("The private Google review lease is no longer current");
+      }
+      const [channel] = await sql<ChannelRow[]>`
+        select * from linq_channels where household_id=${work.household_id} and audience='private'
+          and adult_one_id=${work.owner_adult_id} and adult_two_id is null
+          and revoked_at is null and stopped_at is null
+        order by bound_at,id limit 1 for share
+      `;
+      const [connection] = await sql<{ id: string }[]>`
+        select id from google_connections where id=${work.connection_id}
+          and household_id=${work.household_id} and owner_adult_id=${work.owner_adult_id}
+          and status='active' for share
+      `;
+      if (!channel || !connection) {
+        throw new FlorenceStoreUnauthorized("The private Google review authority is no longer active");
+      }
+      const allSourceIds = [...new Set(input.findings.flatMap((finding) => [...finding.sourceIds]))];
+      if (allSourceIds.length > 0) {
+        const sources = await sql<{ id: string }[]>`
+          select id from sources where household_id=${work.household_id}
+            and visibility='private' and owner_adult_id=${work.owner_adult_id}
+            and id in ${sql(allSourceIds)} for share
+        `;
+        if (sources.length !== allSourceIds.length) {
+          throw new FlorenceStoreUnauthorized("A private review finding cited unavailable evidence");
+        }
+      }
+      const candidates = input.findings.flatMap((finding, findingIndex) => {
+        if (!finding.householdCandidate) return [];
+        return [
+          privateReviewCandidate(
+            deterministicUuid(`briefing-candidate\0${work.id}\0${findingIndex}`),
+            finding.householdCandidate,
+            finding.sourceIds,
+          ),
+        ];
+      });
+      const turnId = deterministicUuid(`initial-private-review-turn\0${work.id}`);
+      const existing = await sql<{ source_id: string }[]>`
+        select source_id from messages where turn_id=${turnId} order by turn_part for update
+      `;
+      if (existing.length === 0) {
+        for (const [index, bubble] of bubbles.entries()) {
+          await insertOutbound(sql, {
+            sourceId: deterministicUuid(`initial-private-review-message\0${work.id}\0${index}`),
+            idempotencyKey: `initial-private-review:${work.id}:${index}`,
+            moveKind: "message",
+            text: bubble.text,
+            turnId,
+            turnPart: index as 0 | 1 | 2,
+            notBefore: new Date(occurredAt.getTime() + bubble.delayMs).toISOString(),
+            householdId: work.household_id,
+            channelId: channel.id,
+            visibility: "private",
+            ownerAdultId: work.owner_adult_id,
+            occurredAt,
+          });
+        }
+      } else if (existing.length < 1 || existing.length > 3) {
+        throw new FlorenceStoreConflict("The private Google review output is incomplete");
+      }
+      for (const sourceId of allSourceIds) {
+        await sql`
+          insert into proactive_work_sources (work_id,source_id) values (${work.id},${sourceId})
+          on conflict do nothing
+        `;
+      }
+      await sql`
+        update proactive_work set status='completed',next_check_at=null,lease_token=null,lease_until=null,
+          briefing_candidates=${sql.json(candidates)},coverage=${sql.json(input.coverage)},
+          last_checked_at=${occurredAt},last_changed_at=${occurredAt},
+          last_notified_at=${occurredAt},last_error=null,updated_at=${occurredAt}
+        where id=${work.id}
+      `;
+      const staggerAt = new Date(
+        occurredAt.getTime() + GOOGLE_SYNC_INTERVAL_MS + deterministicStaggerMs(work.id),
+      );
+      await sql`
+        update proactive_work set status='active',provider_cursor=${gmailCursor},next_check_at=${staggerAt},
+          updated_at=${occurredAt},last_error=null
+        where household_id=${work.household_id} and kind='gmail_sync'
+          and owner_adult_id=${work.owner_adult_id} and connection_id=${work.connection_id}
+          and status='waiting_initial'
+      `;
+      await sql`
+        update proactive_work set status='active',provider_cursor=${calendarCursor},
+          next_check_at=${new Date(staggerAt.getTime() + 15_000)},updated_at=${occurredAt},last_error=null
+        where household_id=${work.household_id} and kind='calendar_sync'
+          and visibility='private' and owner_adult_id=${work.owner_adult_id}
+          and connection_id=${work.connection_id} and calendar_id='primary'
+          and status='waiting_initial'
+      `;
+    });
+  }
+
+  async completeHouseholdInitialBriefing(input: CompleteHouseholdInitialBriefingInput): Promise<void> {
+    assertUuid(input.workId, "Initial household briefing work ID");
+    assertUuid(input.leaseToken, "Initial household briefing lease");
+    if (
+      input.selectedCandidateIds.length > 3 ||
+      new Set(input.selectedCandidateIds).size !== input.selectedCandidateIds.length
+    ) {
+      throw new FlorenceStoreConflict("A household briefing may select at most three distinct findings");
+    }
+    for (const candidateId of input.selectedCandidateIds) assertUuid(candidateId, "Briefing candidate ID");
+    const bubbles = initialBriefingBubbles(input.bubbles, "household briefing");
+    const occurredAt = instant(input.occurredAt);
+    await this.#sql.begin(async (sql) => {
+      const [work] = await sql<ProactiveWorkRow[]>`
+        select * from proactive_work where id=${input.workId} and kind='initial_household_briefing'
+          and status='active' and lease_token=${input.leaseToken} and lease_until>=${occurredAt}
+        for update
+      `;
+      if (!work) throw new FlorenceStoreConflict("The household briefing lease is no longer current");
+      const [channel] = await sql<ChannelRow[]>`
+        select c.* from linq_channels c join households h on h.id=c.household_id
+        where c.household_id=${work.household_id} and c.audience='group'
+          and c.adult_two_id is not null and c.revoked_at is null and c.stopped_at is null
+          and h.family_calendar_id is not null and h.family_calendar_created_at is not null
+        order by c.bound_at,c.id limit 1 for share of c,h
+      `;
+      if (!channel?.adult_two_id) {
+        throw new FlorenceStoreUnauthorized("The family group is no longer active");
+      }
+      const reviews = await sql<ProactiveWorkRow[]>`
+        select * from proactive_work where household_id=${work.household_id}
+          and kind='initial_private_review' and status='completed'
+          and owner_adult_id in (${channel.adult_one_id},${channel.adult_two_id})
+        order by owner_adult_id,id for share
+      `;
+      if (reviews.length !== 2) {
+        throw new FlorenceStoreConflict("Both private Google reviews must finish first");
+      }
+      for (const review of reviews) {
+        const messages = await sql<{ status: string }[]>`
+          select status from messages
+          where idempotency_key like ${`initial-private-review:${review.id}:%`}
+          order by turn_part for share
+        `;
+        if (
+          messages.length < 1 ||
+          messages.length > 3 ||
+          messages.some((message) => message.status !== "sent")
+        ) {
+          throw new FlorenceStoreConflict("Both private Google briefings must be delivered first");
+        }
+      }
+      const candidateIds = new Set(
+        reviews.flatMap((review) =>
+          storedBriefingCandidates(review.briefing_candidates).map((item) => item.candidateId),
+        ),
+      );
+      if (input.selectedCandidateIds.some((candidateId) => !candidateIds.has(candidateId))) {
+        throw new FlorenceStoreUnauthorized("The household briefing selected an unavailable finding");
+      }
+      const turnId = deterministicUuid(`initial-household-briefing-turn\0${work.id}`);
+      const existing = await sql<{ source_id: string }[]>`
+        select source_id from messages where turn_id=${turnId} order by turn_part for update
+      `;
+      if (existing.length === 0) {
+        for (const [index, bubble] of bubbles.entries()) {
+          await insertOutbound(sql, {
+            sourceId: deterministicUuid(`initial-household-briefing-message\0${work.id}\0${index}`),
+            idempotencyKey: `initial-household-briefing:${work.id}:${index}`,
+            moveKind: "message",
+            text: bubble.text,
+            turnId,
+            turnPart: index as 0 | 1 | 2,
+            notBefore: new Date(occurredAt.getTime() + bubble.delayMs).toISOString(),
+            householdId: work.household_id,
+            channelId: channel.id,
+            visibility: "household",
+            ownerAdultId: null,
+            occurredAt,
+          });
+        }
+      } else if (existing.length < 1 || existing.length > 3) {
+        throw new FlorenceStoreConflict("The household briefing output is incomplete");
+      }
+      await sql`
+        update proactive_work set status='completed',next_check_at=null,lease_token=null,lease_until=null,
+          coverage=${sql.json({ selectedCandidateIds: [...input.selectedCandidateIds] })},
+          last_checked_at=${occurredAt},last_changed_at=${occurredAt},last_notified_at=${occurredAt},
+          last_error=null,updated_at=${occurredAt}
+        where id=${work.id}
+      `;
+    });
+  }
+
+  async retryInitialIntelligence(input: {
+    workId: string;
+    leaseToken: string;
+    retryAt: string;
+    error: string;
+  }): Promise<void> {
+    const retryAt = instant(input.retryAt);
+    const [row] = await this.#sql<{ id: string }[]>`
+      update proactive_work set status='active',next_check_at=${retryAt},lease_token=null,lease_until=null,
+        failure_count=failure_count+1,last_error=${bounded(input.error, 2_000)},updated_at=${retryAt}
+      where id=${input.workId} and kind in ('initial_private_review','initial_household_briefing')
+        and status='active' and lease_token=${input.leaseToken} returning id
+    `;
+    if (!row) throw new FlorenceStoreConflict("The initial intelligence lease is no longer retryable");
   }
 
   async completeFounderOnboarding(
@@ -1871,6 +2447,70 @@ export class PostgresFlorenceStore {
         returning id,kind,visibility,owner_adult_id,label,metadata,occurred_at
       `;
       if (!source) throw new Error("The Gmail evidence was not saved");
+      return sourceRecord(source);
+    });
+  }
+
+  async recordCalendarEvidence(input: {
+    householdId: string;
+    ownerAdultId: string;
+    connectionId: string;
+    calendarId: string;
+    providerEventId: string;
+    providerRevision: string;
+    providerUpdatedAt: string;
+    title: string | null;
+    startsAt: string;
+    endsAt: string;
+    allDay: boolean;
+  }): Promise<SourceRecord> {
+    const connectionId = required(input.connectionId, "Google connection ID");
+    const calendarId = required(input.calendarId, "Google Calendar ID");
+    const providerEventId = required(input.providerEventId, "Google Calendar event ID");
+    const providerRevision = required(input.providerRevision, "Google Calendar event revision");
+    const providerUpdatedAt = instant(input.providerUpdatedAt);
+    const startsAt = instant(input.startsAt);
+    const endsAt = instant(input.endsAt);
+    if (endsAt <= startsAt) throw new FlorenceStoreConflict("Calendar evidence has an invalid interval");
+    const externalKey = `${connectionId}:${calendarId}:${providerEventId}:${providerRevision}`;
+    const sourceId = deterministicUuid(`calendar-source\0${input.householdId}\0${externalKey}`);
+    return this.#sql.begin(async (sql) => {
+      const [connection] = await sql<{ id: string }[]>`
+        select id from google_connections where id=${connectionId}
+          and household_id=${input.householdId} and owner_adult_id=${input.ownerAdultId}
+          and status='active'
+      `;
+      if (!connection) {
+        throw new FlorenceStoreUnauthorized("That Calendar connection is not owned by this adult");
+      }
+      const [existing] = await sql<SourceRow[]>`
+        select id,kind,visibility,owner_adult_id,label,metadata,occurred_at from sources
+        where household_id=${input.householdId} and kind='calendar' and external_key=${externalKey}
+      `;
+      if (existing) {
+        if (existing.id !== sourceId || existing.owner_adult_id !== input.ownerAdultId) {
+          throw new FlorenceStoreConflict("A Calendar event reference conflicts with stored evidence");
+        }
+        return sourceRecord(existing);
+      }
+      const [source] = await sql<SourceRow[]>`
+        insert into sources (
+          id,household_id,kind,visibility,owner_adult_id,external_key,label,metadata,occurred_at
+        ) values (${sourceId},${input.householdId},'calendar','private',${input.ownerAdultId},
+          ${externalKey},${bounded(input.title ?? "Private calendar event", 500)},
+          ${sql.json({
+            connectionId,
+            calendarId,
+            providerEventId,
+            providerRevision,
+            providerUpdatedAt: providerUpdatedAt.toISOString(),
+            startsAt: startsAt.toISOString(),
+            endsAt: endsAt.toISOString(),
+            allDay: input.allDay,
+          })},${startsAt})
+        returning id,kind,visibility,owner_adult_id,label,metadata,occurred_at
+      `;
+      if (!source) throw new Error("The Calendar evidence was not saved");
       return sourceRecord(source);
     });
   }
@@ -4028,6 +4668,184 @@ function googleConnectionView(row: GoogleConnectionRow): GoogleConnectionView {
     createdAt: row.created_at.toISOString(),
     updatedAt: row.updated_at.toISOString(),
   };
+}
+
+async function sharedFamilyProfile(
+  sql: postgres.TransactionSql,
+  householdId: string,
+): Promise<SharedFamilyProfile> {
+  const [household] = await sql<{ id: string; name: string; time_zone: string }[]>`
+    select id,name,time_zone from households where id=${householdId} for share
+  `;
+  if (!household) throw new FlorenceStoreConflict("The initial intelligence household is missing");
+  const people = await sql<
+    {
+      id: string;
+      kind: "adult" | "child";
+      adult_slot: 1 | 2 | null;
+      display_name: string;
+      profile: JsonValue;
+    }[]
+  >`
+    select id,kind,adult_slot,display_name,profile from people where household_id=${householdId}
+    order by adult_slot nulls last,created_at,id
+  `;
+  const founderProfile = jsonRecord(
+    people.find((person) => person.kind === "adult" && person.adult_slot === 1)?.profile,
+  );
+  const postalCode = founderProfile.postalCode;
+  return {
+    householdId: household.id,
+    familyLabel: household.name,
+    timeZone: household.time_zone,
+    postalCode: typeof postalCode === "string" && postalCode.trim() ? postalCode : null,
+    adults: people.flatMap((person) => {
+      if (person.kind !== "adult") return [];
+      const firstName = jsonRecord(person.profile).firstName;
+      return [
+        {
+          adultId: person.id,
+          firstName:
+            typeof firstName === "string" && firstName.trim()
+              ? firstName.trim()
+              : person.display_name.split(/\s+/u)[0] || person.display_name,
+          displayName: person.display_name,
+        },
+      ];
+    }),
+    children: people.flatMap((person) => {
+      if (person.kind !== "child") return [];
+      const profile = jsonRecord(person.profile);
+      const firstName = profile.firstName;
+      const school = profile.school;
+      const activities = profile.activities;
+      return [
+        {
+          childId: person.id,
+          firstName:
+            typeof firstName === "string" && firstName.trim()
+              ? firstName.trim()
+              : person.display_name.split(/\s+/u)[0] || person.display_name,
+          displayName: person.display_name,
+          school: typeof school === "string" && school.trim() ? school.trim() : null,
+          activities: Array.isArray(activities)
+            ? activities.filter(
+                (value): value is string => typeof value === "string" && value.trim().length > 0,
+              )
+            : [],
+        },
+      ];
+    }),
+  };
+}
+
+type StoredBriefingCandidate = SharedBriefingCandidate & { sourceIds: readonly string[] };
+
+function privateReviewCandidate(
+  candidateId: string,
+  candidate: Omit<SharedBriefingCandidate, "candidateId">,
+  sourceIds: readonly string[],
+): StoredBriefingCandidate {
+  assertUuid(candidateId, "Briefing candidate ID");
+  const category = candidate.category;
+  if (!["deadline", "conflict", "handoff", "family_date", "loose_end"].includes(category)) {
+    throw new FlorenceStoreConflict("A briefing candidate category is invalid");
+  }
+  const urgency = candidate.urgency;
+  if (!["now", "soon", "watch"].includes(urgency)) {
+    throw new FlorenceStoreConflict("A briefing candidate urgency is invalid");
+  }
+  const summary = required(candidate.summary, "Household-safe briefing summary");
+  if (summary.length > 2_000) throw new FlorenceStoreConflict("A briefing summary is too long");
+  const cited = unique(sourceIds);
+  if (cited.length < 1 || cited.length > 20) {
+    throw new FlorenceStoreConflict("A briefing candidate needs one to twenty private sources");
+  }
+  for (const sourceId of cited) assertUuid(sourceId, "Briefing source ID");
+  return {
+    candidateId,
+    category,
+    summary,
+    urgency,
+    dueAt: candidate.dueAt === null ? null : instant(candidate.dueAt).toISOString(),
+    needsAnswer: candidate.needsAnswer,
+    sourceIds: cited,
+  };
+}
+
+function storedBriefingCandidates(value: JsonValue): StoredBriefingCandidate[] {
+  if (!Array.isArray(value)) throw new FlorenceStoreConflict("Stored briefing candidates are invalid");
+  return value.map((item) => {
+    const record = jsonRecord(item);
+    const sourceIds = record.sourceIds;
+    if (!Array.isArray(sourceIds) || sourceIds.some((sourceId) => typeof sourceId !== "string")) {
+      throw new FlorenceStoreConflict("Stored briefing candidate sources are invalid");
+    }
+    const dueAt = record.dueAt;
+    const needsAnswer = record.needsAnswer;
+    if (dueAt !== null && typeof dueAt !== "string") {
+      throw new FlorenceStoreConflict("Stored briefing due date is invalid");
+    }
+    if (typeof needsAnswer !== "boolean") {
+      throw new FlorenceStoreConflict("Stored briefing answer state is invalid");
+    }
+    return privateReviewCandidate(
+      requiredStringField(record, "candidateId", "Stored briefing candidate ID"),
+      {
+        category: briefingCategory(record.category),
+        summary: requiredStringField(record, "summary", "Stored briefing summary"),
+        urgency: briefingUrgency(record.urgency),
+        dueAt,
+        needsAnswer,
+      },
+      sourceIds as string[],
+    );
+  });
+}
+
+function briefingCategory(value: JsonValue | undefined): SharedBriefingCandidate["category"] {
+  if (
+    value === "deadline" ||
+    value === "conflict" ||
+    value === "handoff" ||
+    value === "family_date" ||
+    value === "loose_end"
+  ) {
+    return value;
+  }
+  throw new FlorenceStoreConflict("Stored briefing category is invalid");
+}
+
+function briefingUrgency(value: JsonValue | undefined): SharedBriefingCandidate["urgency"] {
+  if (value === "now" || value === "soon" || value === "watch") return value;
+  throw new FlorenceStoreConflict("Stored briefing urgency is invalid");
+}
+
+function requiredStringField(record: Record<string, JsonValue>, key: string, name: string): string {
+  const value = record[key];
+  if (typeof value !== "string") throw new FlorenceStoreConflict(`${name} is invalid`);
+  return required(value, name);
+}
+
+function initialBriefingBubbles(
+  input: readonly InitialBriefingBubble[],
+  name: string,
+): InitialBriefingBubble[] {
+  if (input.length < 1 || input.length > 3) {
+    throw new FlorenceStoreConflict(`The ${name} needs one to three bubbles`);
+  }
+  return input.map((bubble, index) => {
+    const text = required(bubble.text, `${name} bubble ${index + 1}`);
+    if (text.length > 2_000) throw new FlorenceStoreConflict(`The ${name} bubble is too long`);
+    if (!Number.isSafeInteger(bubble.delayMs) || bubble.delayMs < 0 || bubble.delayMs > 5_000) {
+      throw new FlorenceStoreConflict(`The ${name} bubble delay is invalid`);
+    }
+    return { text, delayMs: bubble.delayMs };
+  });
+}
+
+function deterministicStaggerMs(value: string): number {
+  return Number.parseInt(createHash("sha256").update(value).digest("hex").slice(0, 8), 16) % 30_000;
 }
 
 async function requireSteward(

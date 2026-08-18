@@ -31,6 +31,7 @@ import type {
   FollowUpDraft,
   HouseholdRecord,
   InboundTurn,
+  InitialIntelligenceWork,
   JsonObject,
   LinqAuthority,
   MessagesEnrollmentResult,
@@ -39,6 +40,7 @@ import type {
 } from "@florence/database";
 import {
   type BeginGoogleConnectionResult,
+  type GmailAttachmentReference,
   GoogleCalendarTransientError,
   type GoogleConnection,
   GoogleConnectionError,
@@ -56,6 +58,8 @@ import {
 import type { EnrollmentCodes } from "./enrollment.js";
 import {
   type FlorenceDecision,
+  type FlorenceNarrowFamilyProfile,
+  type FlorencePrivateGmailSource,
   type FlorenceReadTools,
   type FlorenceReasoner,
   FlorenceReasonerError,
@@ -133,7 +137,13 @@ export class Florence {
     if (founder && google && profileString(founder.profile, "onboardingCompletedAt")) {
       await this.#stageFounderHandoff(google);
     }
-    if (household) await this.#ensureHouseholdActivation(household.id);
+    if (household) {
+      await this.#ensureHouseholdActivation(household.id);
+      await this.#store.ensureInitialIntelligence({
+        householdId: household.id,
+        now: this.#now().toISOString(),
+      });
+    }
     const current = household ? await this.#householdForAdult(adultId) : null;
     return workspaceViewSchema.parse(workspace(adultId, current, this.#messagesUrl));
   }
@@ -242,6 +252,11 @@ export class Florence {
       await this.#stageFounderHandoff(connection);
     }
     await this.#ensureHouseholdActivation(household.id);
+    await this.#store.ensureInitialIntelligence({
+      householdId: household.id,
+      now: this.#now().toISOString(),
+    });
+    this.#wake();
     return connection;
   }
 
@@ -499,6 +514,11 @@ export class Florence {
     const calendar = await this.#store.readNextCalendarAction(this.#now().toISOString());
     if (calendar) {
       await this.#executeCalendar(calendar);
+      worked = true;
+    }
+    const initialIntelligence = await this.#store.readNextInitialIntelligence(this.#now().toISOString());
+    if (initialIntelligence) {
+      await this.#executeInitialIntelligence(initialIntelligence);
       worked = true;
     }
     return worked;
@@ -879,7 +899,7 @@ export class Florence {
             name: member.displayName,
             kind: member.kind,
             role: member.role,
-            profile: member.profile,
+            profile: familyProfileForReasoning(member),
           })),
         ),
       },
@@ -962,7 +982,7 @@ export class Florence {
           return { status: "unavailable", events: [] };
         }
         try {
-          return await this.#google.readCalendarWindow({
+          const read = await this.#google.readCalendarWindow({
             householdId: turn.authority.householdId,
             ownerAdultId:
               turn.authority.audience === "group"
@@ -976,6 +996,15 @@ export class Florence {
             timeMax,
             limit,
           });
+          return {
+            status: read.status,
+            events: read.events.map((event) => ({
+              title: event.title,
+              startsAt: event.startsAt,
+              endsAt: event.endsAt,
+              allDay: event.allDay,
+            })),
+          };
         } catch (error) {
           if (error instanceof GoogleCalendarTransientError) {
             throw new FlorenceReasonerError("transient", "Google Calendar is temporarily unavailable", {
@@ -1032,7 +1061,7 @@ export class Florence {
           limit,
         });
         return Promise.all(
-          evidence.map(async (message) => {
+          evidence.messages.map(async (message) => {
             const source = await this.#store.recordGmailEvidence({
               householdId: turn.authority.householdId,
               ownerAdultId: turn.authority.senderAdultId,
@@ -1162,6 +1191,216 @@ export class Florence {
     } catch (error) {
       await this.#store.retryCalendarAction({
         id: action.id,
+        retryAt: later(this.#now(), RETRY_MS),
+        error: errorText(error),
+      });
+    }
+  }
+
+  async #executeInitialIntelligence(work: InitialIntelligenceWork): Promise<void> {
+    if (!this.#google || !this.#reasoner) {
+      await this.#store.retryInitialIntelligence({
+        workId: work.workId,
+        leaseToken: work.leaseToken,
+        retryAt: later(this.#now(), RETRY_MS),
+        error: "Florence's proactive Google review is not configured",
+      });
+      return;
+    }
+    try {
+      if (work.kind === "initial_household_briefing") {
+        const decision = await this.#reasoner.synthesizeHouseholdBriefing({
+          familyProfile: initialFamilyProfile(work.household),
+          candidates: work.candidates.map((candidate) => ({ ...candidate })),
+        });
+        await this.#store.completeHouseholdInitialBriefing({
+          workId: work.workId,
+          leaseToken: work.leaseToken,
+          selectedCandidateIds: decision.selectedCandidateIds,
+          bubbles: decision.bubbles,
+          occurredAt: this.#now().toISOString(),
+        });
+        return;
+      }
+
+      const currentTime = this.#now().toISOString();
+      const gmailCursor = await this.#google.captureGmailCursor({
+        householdId: work.household.householdId,
+        ownerAdultId: work.adultId,
+        connectionId: work.connectionId,
+      });
+      const gmailCoverage: {
+        after: string;
+        before: string;
+        status: "complete" | "truncated";
+        messages: number;
+      }[] = [];
+      const attachmentIndex = new Map<string, GmailAttachmentReference>();
+      let calendarCoverage: {
+        status: "complete" | "truncated";
+        events: number;
+        timeMin: string;
+        timeMax: string;
+      } | null = null;
+      let calendarCursor: string | null = null;
+      const decision = await this.#reasoner.reviewPrivateGoogle(
+        {
+          familyProfile: initialFamilyProfile(work.household),
+          adult: { adultId: work.adultId, firstName: work.adultFirstName },
+          googleConnection: {
+            connectionId: work.connectionId,
+            status: "active",
+            kind: "personal",
+          },
+          currentTime,
+        },
+        {
+          searchGmail: async ({ connectionId, query, after, before, limit }) => {
+            if (connectionId !== work.connectionId) {
+              throw new Error("The private review requested another adult's Gmail connection");
+            }
+            const result = await this.#google?.searchGmail({
+              householdId: work.household.householdId,
+              ownerAdultId: work.adultId,
+              connectionId,
+              query,
+              after,
+              before,
+              limit,
+            });
+            if (!result) throw new Error("Google is not configured");
+            gmailCoverage.push({ after, before, status: result.status, messages: result.messages.length });
+            return Promise.all(
+              result.messages.map(async (message): Promise<FlorencePrivateGmailSource> => {
+                const source = await this.#store.recordGmailEvidence({
+                  householdId: work.household.householdId,
+                  ownerAdultId: work.adultId,
+                  connectionId,
+                  messageId: message.messageId,
+                  threadId: message.threadId,
+                  historyId: message.historyId,
+                  from: message.from,
+                  subject: message.subject,
+                  sentAt: message.sentAt,
+                  text: message.text,
+                });
+                for (const attachment of message.attachments) {
+                  attachmentIndex.set(`${source.id}\0${attachment.attachmentId}`, attachment);
+                }
+                return {
+                  sourceId: source.id,
+                  kind: "gmail",
+                  visibility: "adult_private",
+                  sentAt: message.sentAt,
+                  sender: message.from,
+                  subject: message.subject,
+                  text: message.text,
+                  attachments: message.attachments.map((attachment) => ({
+                    attachmentId: attachment.attachmentId,
+                    filename: attachment.filename,
+                    mimeType: attachment.mimeType,
+                    sizeBytes: attachment.sizeBytes,
+                  })),
+                };
+              }),
+            );
+          },
+          readPersonalCalendarWindow: async ({ connectionId, timeMin, timeMax, limit }) => {
+            if (connectionId !== work.connectionId) {
+              throw new Error("The private review requested another adult's Calendar connection");
+            }
+            const expectedTimeMin = currentTime;
+            const expectedTimeMax = new Date(Date.parse(currentTime) + 21 * 24 * 60 * 60_000).toISOString();
+            if (timeMin !== expectedTimeMin || timeMax !== expectedTimeMax) {
+              throw new Error("The private review requested a different Calendar window");
+            }
+            const read = await this.#google?.readInitialCalendarReview({
+              householdId: work.household.householdId,
+              ownerAdultId: work.adultId,
+              connectionId,
+              currentTime,
+              limit,
+            });
+            if (!read || read.status === "unavailable" || !read.cursor) {
+              throw new Error("The private Calendar review is temporarily unavailable");
+            }
+            calendarCursor = JSON.stringify(read.cursor);
+            calendarCoverage = {
+              status: read.status,
+              events: read.events.length,
+              timeMin,
+              timeMax,
+            };
+            return {
+              status: read.status,
+              events: await Promise.all(
+                read.events.map(async (event) => {
+                  const source = await this.#store.recordCalendarEvidence({
+                    householdId: work.household.householdId,
+                    ownerAdultId: work.adultId,
+                    connectionId,
+                    calendarId: "primary",
+                    ...event,
+                  });
+                  return {
+                    sourceId: source.id,
+                    kind: "calendar" as const,
+                    visibility: "adult_private" as const,
+                    title: event.title,
+                    startsAt: event.startsAt,
+                    endsAt: event.endsAt,
+                    allDay: event.allDay,
+                  };
+                }),
+              ),
+            };
+          },
+          readGmailAttachment: async ({ connectionId, sourceId, attachment }) => {
+            if (connectionId !== work.connectionId) {
+              throw new Error("The private review requested another adult's Gmail attachment");
+            }
+            const reference = attachmentIndex.get(`${sourceId}\0${attachment.attachmentId}`);
+            if (!reference) throw new Error("The Gmail attachment was not returned by this review");
+            const read = await this.#google?.readGmailAttachment({
+              householdId: work.household.householdId,
+              ownerAdultId: work.adultId,
+              connectionId,
+              attachment: reference,
+            });
+            if (!read) throw new Error("Google is not configured");
+            return {
+              sourceId,
+              attachmentId: read.attachmentId,
+              filename: read.filename,
+              mimeType: read.mimeType,
+              bytes: read.bytes,
+            };
+          },
+        },
+      );
+      if (!calendarCursor || !calendarCoverage) {
+        throw new Error("The private Google review did not establish Calendar coverage");
+      }
+      await this.#store.completePrivateInitialReview({
+        workId: work.workId,
+        leaseToken: work.leaseToken,
+        gmailCursor: JSON.stringify(gmailCursor),
+        calendarCursor,
+        bubbles: decision.bubbles,
+        findings: decision.findings.map((finding) => ({
+          sourceIds: finding.sourceIds,
+          householdCandidate: finding.candidate,
+        })),
+        coverage: {
+          gmail: gmailCoverage,
+          calendar: calendarCoverage,
+        },
+        occurredAt: this.#now().toISOString(),
+      });
+    } catch (error) {
+      await this.#store.retryInitialIntelligence({
+        workId: work.workId,
+        leaseToken: work.leaseToken,
         retryAt: later(this.#now(), RETRY_MS),
         error: errorText(error),
       });
@@ -1555,6 +1794,20 @@ function workspace(
         }
       : null,
     preferences: preferences(viewer?.preferences),
+  };
+}
+
+function initialFamilyProfile(household: InitialIntelligenceWork["household"]): FlorenceNarrowFamilyProfile {
+  return {
+    familyLabel: household.familyLabel,
+    timeZone: household.timeZone,
+    adultFirstNames: household.adults.map((adult) => adult.firstName),
+    children: household.children.map((child) => ({
+      firstName: child.firstName,
+      school: child.school,
+      activities: [...child.activities],
+    })),
+    postalCode: household.postalCode,
   };
 }
 
@@ -2003,6 +2256,31 @@ function reaction(value: string | null): LinqReaction {
 function defaultRelationship(member: FamilyMemberRecord): string {
   if (member.kind === "child") return "Child";
   return member.role === "steward" ? "Parent" : "Caregiver";
+}
+
+function familyProfileForReasoning(member: FamilyMemberRecord): JsonObject {
+  const firstName = profileString(member.profile, "firstName");
+  const lastName = profileString(member.profile, "lastName");
+  const relationship = profileString(member.profile, "relationship") ?? defaultRelationship(member);
+  if (member.kind === "adult") {
+    return {
+      relationship,
+      ...(firstName ? { firstName } : {}),
+      ...(lastName ? { lastName } : {}),
+      ...(member.adultSlot === 1 && profileString(member.profile, "postalCode")
+        ? { postalCode: profileString(member.profile, "postalCode") as string }
+        : {}),
+    };
+  }
+  const school = profileString(member.profile, "school");
+  const activities = profileStrings(member.profile, "activities");
+  return {
+    relationship,
+    ...(firstName ? { firstName } : {}),
+    ...(lastName ? { lastName } : {}),
+    ...(school ? { school } : {}),
+    ...(activities ? { activities } : {}),
+  };
 }
 
 function profileString(profile: JsonObject, key: string): string | null {

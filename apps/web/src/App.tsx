@@ -1194,8 +1194,10 @@ function consumeOnboardingEntry(): {
 } {
   const url = new URL(window.location.href);
   const fragment = new URLSearchParams(url.hash.startsWith("#") ? url.hash.slice(1) : url.hash);
-  const hasSetupFragment = fragment.has("setup");
-  const setupToken = fragment.get("setup")?.trim() || null;
+  const hasSetupFragment = fragment.has("s") || fragment.has("setup");
+  const compactSetupToken = fragment.get("s")?.trim() || null;
+  const legacySetupToken = fragment.get("setup")?.trim() || null;
+  const setupToken = compactSetupToken && legacySetupToken ? null : (compactSetupToken ?? legacySetupToken);
   const googleStatus = url.searchParams.get("google")?.trim() || null;
   const setupComplete = url.searchParams.get("setup") === "complete";
   if (hasSetupFragment) url.hash = "";

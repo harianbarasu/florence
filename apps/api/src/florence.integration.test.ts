@@ -38,14 +38,12 @@ const COMPETING_FOUNDER_IDENTITY = linqIdentitySubjectDigest(COMPETING_FOUNDER_H
 const PRIVATE_ONE = "linq-private-one";
 const PRIVATE_COMPETING_FOUNDER = "linq-private-competing-founder";
 const FOUNDER_IDS = new EnrollmentCodes(ENROLLMENT_SECRET).issueFounderSetup({
-  providerEventId: "event-founder-id-fixture",
   providerConversationId: PRIVATE_ONE,
   identitySubjectDigest: ADULT_ONE_IDENTITY,
   occurredAt: new Date(NOW).toISOString(),
 });
 const ADULT_ONE = FOUNDER_IDS.adultId;
 const COMPETING_FOUNDER = new EnrollmentCodes(ENROLLMENT_SECRET).issueFounderSetup({
-  providerEventId: "event-competing-founder-id-fixture",
   providerConversationId: PRIVATE_COMPETING_FOUNDER,
   identitySubjectDigest: COMPETING_FOUNDER_IDENTITY,
   occurredAt: new Date(NOW).toISOString(),
@@ -893,11 +891,16 @@ class Harness {
       expect(await this.store.hasPilotHousehold()).toBe(false);
       expect(await this.store.listHouseholdIdsForAdult(ADULT_ONE)).toEqual([]);
       expect(await this.store.listHouseholdIdsForAdult(COMPETING_FOUNDER)).toEqual([]);
+      const setupBubble = this.linq.messages.findLast(
+        (message) => message.providerConversationId === PRIVATE_ONE && message.text.includes("#s="),
+      );
+      const setupLink = /https:\/\/\S+$/.exec(setupBubble?.text ?? "")?.[0] ?? "";
+      expect(setupLink.length).toBeLessThanOrEqual(190);
+      expect(setupBubble?.text).toBe(setupLink);
       setupToken = this.setupTokenFor(PRIVATE_ONE);
       competingSetupToken = this.setupTokenFor(PRIVATE_COMPETING_FOUNDER);
     } else {
       setupToken = this.enrollmentCodes.issueFounderSetup({
-        providerEventId: "event-founder-direct-setup",
         providerConversationId: PRIVATE_ONE,
         identitySubjectDigest: ADULT_ONE_IDENTITY,
         occurredAt: this.iso(),
@@ -1062,11 +1065,14 @@ class Harness {
   setupTokenFor(providerConversationId: string): string {
     const setupMessage = this.linq.messages.findLast(
       (message) =>
-        message.providerConversationId === providerConversationId && message.text.includes("#setup="),
+        message.providerConversationId === providerConversationId &&
+        (message.text.includes("#s=") || message.text.includes("#setup=")),
     );
-    const encodedToken = /#setup=([^\s]+)$/.exec(setupMessage?.text ?? "")?.[1];
-    if (!encodedToken) throw new Error("Florence did not send the founder setup link");
-    return decodeURIComponent(encodedToken);
+    if (!setupMessage) throw new Error("Florence did not send the founder setup link");
+    const fragment = new URL(setupMessage.text).hash.slice(1);
+    const token = new URLSearchParams(fragment).get("s") ?? new URLSearchParams(fragment).get("setup");
+    if (!token) throw new Error("Florence did not send the founder setup token");
+    return token;
   }
 
   async receiveFounderGreeting(

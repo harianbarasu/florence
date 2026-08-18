@@ -2,6 +2,9 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 
 const FOUNDER_SETUP_LIFETIME_MS = 15 * 60_000;
 const MAX_PROVIDER_ID_BYTES = 500;
+const COMPACT_SIGNATURE_BYTES = 24;
+const COMPACT_HEADER_BYTES = 6;
+const IDENTITY_DIGEST_BYTES = 32;
 
 export type FounderSetupClaims = {
   providerConversationId: string;
@@ -26,12 +29,10 @@ export class EnrollmentCodes {
   }
 
   issueFounderSetup(input: {
-    providerEventId: string;
     providerConversationId: string;
     identitySubjectDigest: string;
     occurredAt: string;
   }): FounderSetupIssue {
-    const providerEventId = boundedProviderId(input.providerEventId, "Provider event ID");
     const providerConversationId = boundedProviderId(
       input.providerConversationId,
       "Provider conversation ID",
@@ -42,24 +43,19 @@ export class EnrollmentCodes {
     const expiresAt = new Date(expiresAtSeconds * 1_000);
     const householdId = this.#deterministicUuid(`founder-household\0${identitySubjectDigest}`);
     const adultId = this.#deterministicUuid(`founder-adult\0${identitySubjectDigest}`);
-    const requestNonce = this.#macText(
-      `florence-founder-setup-nonce-v1\0${providerEventId}\0${providerConversationId}`,
-      "base64url",
-    );
-    const payload = Buffer.from(
-      JSON.stringify([
-        1,
-        providerConversationId,
-        identitySubjectDigest,
-        requestNonce,
-        expiresAtSeconds,
-        householdId,
-        adultId,
-      ]),
-      "utf8",
-    ).toString("base64url");
-    const signature = this.#macText(`florence-founder-setup-signature-v1\0${payload}`, "base64url");
-    const token = `fs1.${payload}.${signature}`;
+    if (expiresAtSeconds < 0 || expiresAtSeconds > 0xffff_ffff) {
+      throw new Error("Founder setup expiry is outside the compact token range");
+    }
+    const conversation = Buffer.from(providerConversationId, "utf8");
+    const identity = Buffer.from(identitySubjectDigest, "hex");
+    const payloadBytes = Buffer.alloc(COMPACT_HEADER_BYTES + conversation.length + identity.length);
+    payloadBytes.writeUInt32BE(expiresAtSeconds, 0);
+    payloadBytes.writeUInt16BE(conversation.length, 4);
+    conversation.copy(payloadBytes, COMPACT_HEADER_BYTES);
+    identity.copy(payloadBytes, COMPACT_HEADER_BYTES + conversation.length);
+    const payload = payloadBytes.toString("base64url");
+    const signature = this.#compactSignature(payloadBytes).toString("base64url");
+    const token = `fs2.${payload}.${signature}`;
     return {
       token,
       providerConversationId,
@@ -74,7 +70,51 @@ export class EnrollmentCodes {
     if (!Number.isFinite(now.getTime())) return null;
     if (Buffer.byteLength(token, "utf8") > 4_000) return null;
     const [version, payload, signature, extra] = token.split(".");
-    if (version !== "fs1" || !payload || !signature || extra) return null;
+    if (!payload || !signature || extra) return null;
+    if (version === "fs2") return this.#verifyCompactFounderSetup(payload, signature, now);
+    if (version !== "fs1") return null;
+    return this.#verifyLegacyFounderSetup(payload, signature, now);
+  }
+
+  #verifyCompactFounderSetup(payload: string, signature: string, now: Date): FounderSetupClaims | null {
+    let bytes: Buffer;
+    let signatureBytes: Buffer;
+    try {
+      bytes = Buffer.from(payload, "base64url");
+      signatureBytes = Buffer.from(signature, "base64url");
+    } catch {
+      return null;
+    }
+    if (
+      bytes.toString("base64url") !== payload ||
+      signatureBytes.toString("base64url") !== signature ||
+      signatureBytes.length !== COMPACT_SIGNATURE_BYTES ||
+      bytes.length < COMPACT_HEADER_BYTES + 1 + 32 ||
+      !timingSafeEqual(signatureBytes, this.#compactSignature(bytes))
+    ) {
+      return null;
+    }
+    const expiresAtSeconds = bytes.readUInt32BE(0);
+    const conversationLength = bytes.readUInt16BE(4);
+    if (bytes.length !== COMPACT_HEADER_BYTES + conversationLength + IDENTITY_DIGEST_BYTES) return null;
+    const conversationBytes = bytes.subarray(COMPACT_HEADER_BYTES, COMPACT_HEADER_BYTES + conversationLength);
+    const conversation = conversationBytes.toString("utf8");
+    if (!Buffer.from(conversation, "utf8").equals(conversationBytes) || !isBoundedProviderId(conversation)) {
+      return null;
+    }
+    const identity = bytes.subarray(COMPACT_HEADER_BYTES + conversationLength).toString("hex");
+    const expiresAt = new Date(expiresAtSeconds * 1_000);
+    if (expiresAt.getTime() <= now.getTime()) return null;
+    return {
+      providerConversationId: conversation,
+      identitySubjectDigest: identity,
+      expiresAt: expiresAt.toISOString(),
+      householdId: this.#deterministicUuid(`founder-household\0${identity}`),
+      adultId: this.#deterministicUuid(`founder-adult\0${identity}`),
+    };
+  }
+
+  #verifyLegacyFounderSetup(payload: string, signature: string, now: Date): FounderSetupClaims | null {
     const expected = this.#macText(`florence-founder-setup-signature-v1\0${payload}`, "base64url");
     if (!safeEqual(signature, expected)) return null;
     let untrusted: unknown;
@@ -135,6 +175,14 @@ export class EnrollmentCodes {
 
   #macBytes(material: string): Buffer {
     return createHmac("sha256", this.#secret).update(material).digest();
+  }
+
+  #compactSignature(payload: Buffer): Buffer {
+    return createHmac("sha256", this.#secret)
+      .update("florence-founder-setup-signature-v2\0")
+      .update(payload)
+      .digest()
+      .subarray(0, COMPACT_SIGNATURE_BYTES);
   }
 }
 

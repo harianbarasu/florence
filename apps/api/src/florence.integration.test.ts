@@ -62,6 +62,9 @@ const EVENT = {
   timeZone: "America/Los_Angeles",
   location: "Muir Elementary",
 };
+const COMPOUND_CALENDAR_APPROVAL = "Yep, add it — and remind me that morning.";
+const CALENDAR_MORNING_REMINDER_AT = "2026-08-18T15:00:00.000Z";
+const CALENDAR_MORNING_REMINDER = "School assembly is this morning at 10:00.";
 const TRIP_WINDOW = {
   timeMin: "2026-08-21T22:30:00.000Z",
   timeMax: "2026-08-21T23:30:00.000Z",
@@ -81,8 +84,13 @@ const SCHOOL_EMAIL = {
   sentAt: "2026-08-15T17:00:00.000Z",
   text: "Permission slip due Tuesday. Friday's bus returns at 3:45.",
 };
+const NATURAL_SETUP_OPT_OUT = "I don’t want Florence to message me here anymore.";
 
 type Reason = FlorenceReasoner["decide"];
+type SetupConversation = FlorenceReasoner["converseDuringSetup"];
+type InterpretCalendarApproval = FlorenceReasoner["interpretCalendarApproval"];
+type SetupConversationInput = Parameters<SetupConversation>[0];
+type CalendarApprovalInput = Parameters<InterpretCalendarApproval>[0];
 
 const release = TEST_DATABASE_URL ? describe : describe.skip;
 
@@ -93,105 +101,133 @@ release("Florence release journeys", () => {
     let calendarWasRead = false;
     let gmailWasRead = false;
     let obsoleteResultWasSuppressed = false;
-    const harness = await freshHarness(async (input, reads, signal) => {
-      const sourceId = input.currentMessage.sourceId;
-      if (input.currentMessage.moveKind === "reaction") {
-        if (input.currentMessage.replyTo?.text === "I’m looking through this now.") {
-          expect(input.audience).toBe("private");
-          return decision();
-        }
-        reactionWasUnderstood = true;
-        expect(input.currentMessage.replyTo).toMatchObject({
-          senderName: "Florence",
-          text: "Family thread is connected.",
-        });
-        if (input.currentMessage.text === "Reacted like") {
+    const harness = await freshHarness(
+      async (input, reads, signal) => {
+        const sourceId = input.currentMessage.sourceId;
+        if (input.currentMessage.moveKind === "reaction") {
+          if (input.currentMessage.replyTo?.text === "I’m looking through this now.") {
+            expect(input.audience).toBe("private");
+            return decision({ policy: noMutationPolicy() });
+          }
+          reactionWasUnderstood = true;
+          expect(input.currentMessage.replyTo).toMatchObject({
+            senderName: "Florence",
+            text: "Family thread is connected.",
+          });
+          if (input.currentMessage.text === "Reacted like") {
+            return decision({
+              policy: noMutationPolicy(),
+              reaction: "laugh",
+              reply: true,
+              bubbles: [{ text: "That made me smile.", delayMs: 0 }],
+            });
+          }
+          expect(input.currentMessage.text).toBe("Reacted love");
           return decision({
-            reaction: "laugh",
-            reply: true,
-            bubbles: [{ text: "That made me smile.", delayMs: 0 }],
+            policy: noMutationPolicy(),
+            bubbles: [{ text: "A reaction should only be conversational.", delayMs: 0 }],
+            facts: [remember("A tapback changed family memory", sourceId)],
+            followUp: {
+              operation: "cancel",
+              followUpId: input.pendingFollowUps[0]?.followUpId ?? "missing",
+              at: null,
+              text: null,
+              sourceIds: [sourceId],
+            },
+            calendar: calendarDraft("direct", sourceId),
           });
         }
-        expect(input.currentMessage.text).toBe("Reacted love");
-        return decision({
-          bubbles: [{ text: "A reaction should only be conversational.", delayMs: 0 }],
-          facts: [remember("A tapback changed family memory", sourceId)],
-          followUp: {
-            operation: "cancel",
-            followUpId: input.pendingFollowUps[0]?.followUpId ?? "missing",
-            at: null,
-            text: null,
-            sourceIds: [sourceId],
-          },
-          calendar: calendarDraft("direct", sourceId),
-        });
-      }
-      if (input.currentMessage.text.includes("Review this school packet")) {
-        const pdf = input.currentMessage.pdfs?.[0];
-        if (!pdf || !reads.readCurrentPdf) throw new Error("The attached PDF was not readable");
-        const opened = await reads.readCurrentPdf(pdf);
-        pdfWasRead = new TextDecoder().decode(opened.bytes).includes("bus returns at 3:45");
-        expect((await reads.readSource({ sourceId }))?.visibility).toBe("adult_private");
-        await waitForAbort(signal);
-        return decision({
-          bubbles: [{ text: "This obsolete answer must never be sent.", delayMs: 0 }],
-        });
-      }
-      if (
-        input.currentMessage.text.includes("Alex is unavailable too") ||
-        input.currentMessage.text.includes("Sam can cover")
-      ) {
-        expect(input.boundaries).toEqual({
-          retain: false,
-          schedule: false,
-          consequentialAction: false,
-        });
-        expect(input.recentMessages).toEqual(
-          expect.arrayContaining([
-            expect.objectContaining({ text: expect.stringContaining("Review this school packet") }),
-          ]),
-        );
-        const pdf = input.currentMessage.pdfs?.[0];
-        if (!pdf || !reads.readCurrentPdf) throw new Error("The superseded PDF was not carried forward");
-        const opened = await reads.readCurrentPdf(pdf);
-        pdfWasRead = pdfWasRead && new TextDecoder().decode(opened.bytes).includes("Ms. Chen");
-        const calendar = await reads.readCalendarWindow({
-          connectionId: GOOGLE_CONNECTION,
-          ...TRIP_WINDOW,
-          limit: 50,
-        });
-        expect(calendar).toEqual({ status: "complete", events: [PICKUP_CONFLICT] });
-        calendarWasRead = true;
-        if (input.currentMessage.text.includes("Sam can cover")) {
-          const gmail = await reads.searchGmail({
+        if (input.currentMessage.text.includes("Review this school packet")) {
+          const pdf = input.currentMessage.pdfs?.[0];
+          if (!pdf || !reads.readCurrentPdf) throw new Error("The attached PDF was not readable");
+          const opened = await reads.readCurrentPdf(pdf);
+          pdfWasRead = new TextDecoder().decode(opened.bytes).includes("bus returns at 3:45");
+          expect((await reads.readSource({ sourceId }))?.visibility).toBe("adult_private");
+          await waitForAbort(signal);
+          return decision({
+            bubbles: [{ text: "This obsolete answer must never be sent.", delayMs: 0 }],
+          });
+        }
+        if (
+          input.currentMessage.text.includes("Alex is unavailable too") ||
+          input.currentMessage.text.includes("Sam can cover")
+        ) {
+          expect(input.recentMessages).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({ text: expect.stringContaining("Review this school packet") }),
+            ]),
+          );
+          const pdf = input.currentMessage.pdfs?.[0];
+          if (!pdf || !reads.readCurrentPdf) throw new Error("The superseded PDF was not carried forward");
+          const opened = await reads.readCurrentPdf(pdf);
+          pdfWasRead = pdfWasRead && new TextDecoder().decode(opened.bytes).includes("Ms. Chen");
+          const calendar = await reads.readCalendarWindow({
             connectionId: GOOGLE_CONNECTION,
-            query: 'newer_than:30d ("Muir" OR "field trip")',
-            limit: 5,
+            ...TRIP_WINDOW,
+            limit: 50,
           });
-          expect(gmail).toEqual([
-            expect.objectContaining({
-              kind: "gmail",
-              visibility: "adult_private",
-              label: SCHOOL_EMAIL.subject,
-              text: SCHOOL_EMAIL.text,
-            }),
-          ]);
-          gmailWasRead = true;
-        }
-        obsoleteResultWasSuppressed = true;
-        if (input.currentMessage.text.includes("Sam can cover")) {
+          expect(calendar).toEqual({ status: "complete", events: [PICKUP_CONFLICT] });
+          calendarWasRead = true;
+          if (input.currentMessage.text.includes("Sam can cover")) {
+            const gmail = await reads.searchGmail({
+              connectionId: GOOGLE_CONNECTION,
+              query: 'newer_than:30d ("Muir" OR "field trip")',
+              limit: 5,
+            });
+            expect(gmail).toEqual([
+              expect.objectContaining({
+                kind: "gmail",
+                visibility: "adult_private",
+                label: SCHOOL_EMAIL.subject,
+                text: SCHOOL_EMAIL.text,
+              }),
+            ]);
+            gmailWasRead = true;
+          }
+          obsoleteResultWasSuppressed = true;
+          if (input.currentMessage.text.includes("Sam can cover")) {
+            return decision({
+              policy: noMutationPolicy(),
+              bubbles: [
+                {
+                  text: "Updated: Sam can cover the 3:45 pickup, so the pickup conflict is cleared.",
+                  delayMs: 0,
+                },
+                {
+                  text: "Tuesday’s permission-slip deadline still needs attention. Ms. Chen is a stable school contact; Friday’s trip and return are one-offs. I saved neither.",
+                  delayMs: 250,
+                },
+                {
+                  text: "Updated draft to Ms. Chen: “Sam can cover Maya’s 3:45 pickup. Please let me know if the bus returns late.”",
+                  delayMs: 400,
+                },
+              ],
+              facts: [remember("Ms. Chen is Maya’s teacher", sourceId)],
+              followUp: {
+                operation: "schedule",
+                followUpId: null,
+                at: new Date(Date.parse(input.currentMessage.occurredAt) + 60_000).toISOString(),
+                text: "This prohibited reminder must never be sent.",
+                sourceIds: [sourceId],
+              },
+              calendar: calendarDraft("direct", sourceId),
+            });
+          }
           return decision({
+            policy: noMutationPolicy(),
+            reaction: "love",
+            reply: true,
             bubbles: [
               {
-                text: "Updated: Sam can cover the 3:45 pickup, so the pickup conflict is cleared.",
+                text: "The real issue is the unsupervised pickup gap after the bus returns at 3:45 — both of you are unavailable.",
                 delayMs: 0,
               },
               {
-                text: "Tuesday’s permission-slip deadline still needs attention. Ms. Chen is a stable school contact; Friday’s trip and return are one-offs. I saved neither.",
+                text: "Tuesday’s permission-slip deadline is actionable. Ms. Chen is a stable school contact; Friday’s trip and 3:45 return are one-offs. I saved neither.",
                 delayMs: 250,
               },
               {
-                text: "Updated draft to Ms. Chen: “Sam can cover Maya’s 3:45 pickup. Please let me know if the bus returns late.”",
+                text: "Draft to Ms. Chen: “Both of us are unavailable at 3:45. Can Maya stay with the bus group until 4:15?”\n\nShould I change the draft to name an alternate pickup adult?",
                 delayMs: 400,
               },
             ],
@@ -206,116 +242,113 @@ release("Florence release journeys", () => {
             calendar: calendarDraft("direct", sourceId),
           });
         }
-        return decision({
-          reaction: "love",
-          reply: true,
-          bubbles: [
-            {
-              text: "The real issue is the unsupervised pickup gap after the bus returns at 3:45 — both of you are unavailable.",
-              delayMs: 0,
+        if (input.currentMessage.text === "Hi Florence") {
+          return decision({ bubbles: [{ text: "Family thread is connected.", delayMs: 0 }] });
+        }
+        if (input.currentMessage.text.includes("remind both of us about pickup")) {
+          return decision({
+            bubbles: [{ text: "I’ll remind both of you.", delayMs: 0 }],
+            facts: [remember("School dismissal is at 2:45", sourceId)],
+            followUp: {
+              operation: "schedule",
+              followUpId: null,
+              at: new Date(Date.parse(input.currentMessage.occurredAt) + 60_000).toISOString(),
+              text: "Pickup reminder: dismissal is at 2:45.",
+              sourceIds: [sourceId],
             },
-            {
-              text: "Tuesday’s permission-slip deadline is actionable. Ms. Chen is a stable school contact; Friday’s trip and 3:45 return are one-offs. I saved neither.",
-              delayMs: 250,
+          });
+        }
+        if (input.currentMessage.text === "Remember that the school gate code is 2468.") {
+          return decision({
+            bubbles: [
+              { text: "I noted the gate code.", delayMs: 0 },
+              { text: "I’ll keep it with the school logistics.", delayMs: 10_000 },
+            ],
+            facts: [
+              remember("The school gate code is 2468", sourceId),
+              {
+                ...remember("The school office closes at 4", sourceId),
+                sourceIds: [sourceId, inboundSourceId("event-independent-school-hours")],
+              },
+            ],
+          });
+        }
+        if (input.currentMessage.text === "The school office closes at 4.") {
+          return decision({ facts: [remember("The school office closes at 4", sourceId)] });
+        }
+        if (input.currentMessage.text === "Actually, don’t retain that.") {
+          const gateCode = input.visibleSources.find(
+            (source) =>
+              source.kind === "memory" && source.visibility === "shared" && source.text.includes("gate code"),
+          );
+          return decision({
+            policy: noMutationPolicy(),
+            facts: [
+              {
+                operation: "forget",
+                factId: gateCode?.recordId ?? "missing",
+                statement: null,
+                sourceIds: [sourceId],
+              },
+            ],
+          });
+        }
+        if (input.currentMessage.text.startsWith("Could you add")) {
+          const calendar = await reads.readCalendarWindow({
+            connectionId: GOOGLE_CONNECTION,
+            timeMin: EVENT.startsAt,
+            timeMax: EVENT.endsAt,
+            limit: 50,
+          });
+          calendarWasRead = calendarWasRead && calendar.status === "complete";
+          expect(calendar.events).toEqual([]);
+          return decision({
+            calendar: {
+              ...calendarDraft("offer", sourceId),
             },
-            {
-              text: "Draft to Ms. Chen: “Both of us are unavailable at 3:45. Can Maya stay with the bus group until 4:15?”\n\nShould I change the draft to name an alternate pickup adult?",
-              delayMs: 400,
+          });
+        }
+        if (input.currentMessage.text === COMPOUND_CALENDAR_APPROVAL) {
+          expect(input.pendingCalendarOffers).toEqual([expect.objectContaining({ event: EVENT })]);
+          return decision({
+            bubbles: [{ text: "I’ll remind you that morning.", delayMs: 0 }],
+            followUp: {
+              operation: "schedule",
+              followUpId: null,
+              at: CALENDAR_MORNING_REMINDER_AT,
+              text: CALENDAR_MORNING_REMINDER,
+              sourceIds: [sourceId],
             },
-          ],
-          facts: [remember("Ms. Chen is Maya’s teacher", sourceId)],
-          followUp: {
-            operation: "schedule",
-            followUpId: null,
-            at: new Date(Date.parse(input.currentMessage.occurredAt) + 60_000).toISOString(),
-            text: "This prohibited reminder must never be sent.",
-            sourceIds: [sourceId],
-          },
-          calendar: calendarDraft("direct", sourceId),
-        });
-      }
-      if (input.currentMessage.text === "Hi Florence") {
-        return decision({ bubbles: [{ text: "Family thread is connected.", delayMs: 0 }] });
-      }
-      if (input.currentMessage.text.includes("remind both of us about pickup")) {
-        return decision({
-          bubbles: [{ text: "I’ll remind both of you.", delayMs: 0 }],
-          facts: [remember("School dismissal is at 2:45", sourceId)],
-          followUp: {
-            operation: "schedule",
-            followUpId: null,
-            at: new Date(Date.parse(input.currentMessage.occurredAt) + 60_000).toISOString(),
-            text: "Pickup reminder: dismissal is at 2:45.",
-            sourceIds: [sourceId],
-          },
-        });
-      }
-      if (input.currentMessage.text === "Remember that the school gate code is 2468.") {
-        return decision({
-          bubbles: [
-            { text: "I noted the gate code.", delayMs: 0 },
-            { text: "I’ll keep it with the school logistics.", delayMs: 10_000 },
-          ],
-          facts: [
-            remember("The school gate code is 2468", sourceId),
-            {
-              ...remember("The school office closes at 4", sourceId),
-              sourceIds: [sourceId, inboundSourceId("event-independent-school-hours")],
-            },
-          ],
-        });
-      }
-      if (input.currentMessage.text === "The school office closes at 4.") {
-        return decision({ facts: [remember("The school office closes at 4", sourceId)] });
-      }
-      if (input.currentMessage.text.startsWith("Could you add")) {
-        const calendar = await reads.readCalendarWindow({
-          connectionId: GOOGLE_CONNECTION,
-          timeMin: EVENT.startsAt,
-          timeMax: EVENT.endsAt,
-          limit: 50,
-        });
-        calendarWasRead = calendarWasRead && calendar.status === "complete";
-        expect(calendar.events).toEqual([]);
-        return decision({
-          calendar: {
-            ...calendarDraft("offer", sourceId),
-          },
-        });
-      }
-      if (input.currentMessage.text === "Yes, add it") {
-        const offer = input.pendingCalendarOffers[0];
-        expect(offer?.event).toEqual(EVENT);
-        return decision({
-          calendar: {
-            mode: "approve",
-            proposalId: offer?.proposalId ?? "missing",
-            connectionId: null,
-            event: null,
-            sourceIds: [sourceId],
-          },
-        });
-      }
-      return decision();
-    });
+          });
+        }
+        return decision();
+      },
+      {
+        interpretCalendarApproval: async (input) => ({
+          approve: input.currentMessage.text === COMPOUND_CALENDAR_APPROVAL,
+        }),
+      },
+    );
     await harness.onboard({ exerciseMessagesFirst: true });
     await harness.activateGoogle();
 
     expect(harness.linq.messages.map((message) => message.text)).not.toEqual(
       expect.arrayContaining([expect.stringMatching(/^You’re in, Hari 🎉$/)]),
     );
+    const setupTurnsBeforeFamilyPrompt = harness.setupTurns.length;
     await harness.acceptPrivate("private-before-family-setup", "Can you check tomorrow for me?");
     await harness.drain();
-    expect(harness.linq.messages.map((message) => message.text)).toContain(
-      "Finish the family setup on the web first. Nothing else is retained, scheduled, or changed yet.",
-    );
+    expect(harness.setupTurns).toHaveLength(setupTurnsBeforeFamilyPrompt + 1);
+    expect(harness.setupTurns.at(-1)).toMatchObject({
+      stage: "family_profile",
+      currentMessage: { text: "Can you check tomorrow for me?" },
+      nextStep: "finish_family_profile",
+    });
+    expect(harness.linq.messages.map((message) => message.text)).toContain("https://florence.test/");
     await harness.completeFamilyOnboarding();
 
     expect(harness.linq.messages.map((message) => message.text)).toEqual(
       expect.arrayContaining([
-        "Hey! Glad you’re here.",
-        expect.stringContaining("I help parents"),
-        expect.stringContaining("Start with a quick private setup"),
         expect.stringMatching(/^You’re in, Hari 🎉$/),
         expect.stringContaining("Google account stays private to you"),
         "What’s one thing you’d rather not deal with yourself? I’ll take a first pass.",
@@ -413,7 +446,7 @@ release("Florence release journeys", () => {
       "Tuesday’s permission-slip deadline is actionable. Ms. Chen is a stable school contact; Friday’s trip and 3:45 return are one-offs. I saved neither.",
     );
     expect(documentReplies.join("\n")).toContain(
-      "I didn’t retain anything in the Vault, send anything externally, schedule a follow-up, or add anything to your calendar.",
+      "I didn’t retain anything in the Vault or schedule anything.",
     );
     expect(documentReplies.join("\n")).toContain("Tuesday’s permission-slip deadline still needs attention.");
     expect(documentReplies).not.toContain("This obsolete answer must never be sent.");
@@ -513,8 +546,18 @@ release("Florence release journeys", () => {
 
     await harness.acceptPrivate("calendar-offer", "Could you add the school assembly to my calendar?");
     await harness.drain();
-    await harness.acceptPrivate("calendar-approval", "Yes, add it");
+    expect(harness.googleEffects).toBe(0);
+    await harness.acceptPrivate("calendar-approval", COMPOUND_CALENDAR_APPROVAL);
     await harness.drain();
+    expect(harness.calendarApprovalTurns).toEqual([
+      {
+        currentMessage: {
+          text: COMPOUND_CALENDAR_APPROVAL,
+          occurredAt: expect.any(String),
+        },
+        event: EVENT,
+      },
+    ]);
 
     const workspace = await harness.florence.workspaceForAdult(ADULT_ONE);
     expect(Object.values(workspace.workspace.setup)).not.toContain(false);
@@ -537,18 +580,29 @@ release("Florence release journeys", () => {
         "I’ll remind both of you.",
         "That made me smile.",
         "Pickup reminder: dismissal is at 2:45.",
+        "I’ll remind you that morning.",
         "Added “School assembly” to your calendar.",
       ]),
     );
     expect(harness.linq.messages.find((message) => message.text === "That made me smile.")?.replyTo).toEqual({
       providerMessageId: groupReplyProviderId,
     });
+    harness.now = Date.parse(CALENDAR_MORNING_REMINDER_AT);
+    await harness.drain();
+    expect(harness.linq.messages.map((message) => message.text)).toContain(CALENDAR_MORNING_REMINDER);
   }, 20_000);
 
   test("keeps private memory and corrections private, shares only group corrections, understands replies, and rejects mismatched group authority", async () => {
     let understoodReply = false;
+    let understoodNaturalOptOut = false;
     const harness = await freshHarness(async (input) => {
       const sourceId = input.currentMessage.sourceId;
+      if (input.currentMessage.text === "Please stop messaging me in this conversation.") {
+        understoodNaturalOptOut = true;
+        return decision({
+          policy: { retain: false, schedule: false, stopMessaging: true },
+        });
+      }
       if (input.currentMessage.text === "Private doctor note") {
         throw new FlorenceReasonerError("transient", "Keep this reply target retrying");
       }
@@ -697,8 +751,18 @@ release("Florence release journeys", () => {
       }),
     ).rejects.toBeInstanceOf(FlorenceStoreUnauthorized);
 
-    expect(await harness.acceptPrivate("private-stop", "STOP")).toMatchObject({
-      disposition: "stopped",
+    const sentBeforeStop = harness.linq.messages.length;
+    expect(
+      await harness.acceptPrivate("private-stop", "Please stop messaging me in this conversation."),
+    ).toMatchObject({
+      disposition: "accepted",
+    });
+    await harness.drain();
+    expect(understoodNaturalOptOut).toBe(true);
+    expect(harness.linq.messages).toHaveLength(sentBeforeStop);
+    expect(await harness.receiveMessagesText("private-after-stop", "Are you still there?")).toEqual({
+      disposition: "acknowledged",
+      reason: "channel_stopped",
     });
     expect((await harness.florence.workspaceForAdult(ADULT_ONE)).viewer.displayName).toBe("Hari");
   });
@@ -706,6 +770,9 @@ release("Florence release journeys", () => {
   test("reconciles an ambiguous Calendar write and reports one definitive failure privately", async () => {
     const harness = await freshHarness(
       async (input, reads) => {
+        if (input.currentMessage.text === "Review the school assembly details.") {
+          return decision();
+        }
         expect(
           await reads.readCalendarWindow({
             connectionId: GOOGLE_CONNECTION,
@@ -717,15 +784,20 @@ release("Florence release journeys", () => {
         return decision({
           bubbles: [{ text: "Done — I added it.", delayMs: 0 }],
           calendar: {
-            ...calendarDraft("direct", input.currentMessage.sourceId),
+            ...calendarDraft(
+              input.currentMessage.pdfs?.length ? "offer" : "direct",
+              input.currentMessage.sourceId,
+            ),
           },
         });
       },
-      async () => {
-        if (harness.googleEffects === 0) harness.googleEffects += 1;
-        if (harness.googleAttempts === 1) throw new Error("connection dropped after Google committed");
-        if (harness.googleAttempts === 2) return committedCalendar(harness.iso());
-        return failedCalendar(harness.iso());
+      {
+        executeCalendar: async () => {
+          if (harness.googleEffects === 0) harness.googleEffects += 1;
+          if (harness.googleAttempts === 1) throw new Error("connection dropped after Google committed");
+          if (harness.googleAttempts === 2) return committedCalendar(harness.iso());
+          return failedCalendar(harness.iso());
+        },
       },
     );
     await harness.onboard();
@@ -758,6 +830,15 @@ release("Florence release journeys", () => {
     await harness.acceptPrivate("calendar-unrequested", "Review the school assembly details.");
     await harness.drain();
     expect(harness.googleAttempts).toBe(0);
+    expect(harness.calendarApprovalTurns).toEqual([
+      {
+        currentMessage: {
+          text: "Review the school assembly details.",
+          occurredAt: expect.any(String),
+        },
+        event: EVENT,
+      },
+    ]);
     expect(
       harness.linq.messages.some((message) => message.text.startsWith("I can add this to your calendar:")),
     ).toBe(true);
@@ -786,7 +867,7 @@ release("Florence release journeys", () => {
     );
     await harness.drain();
     expect(harness.googleAttempts).toBe(3);
-    expect(harness.googleReads).toBe(4);
+    expect(harness.googleReads).toBe(3);
     const failures = harness.linq.messages.filter((message) =>
       message.text.startsWith("I couldn’t confirm that “School assembly”"),
     );
@@ -863,6 +944,8 @@ class Harness {
     readonly linq: FakeLinq,
     readonly vault: EncryptedImageVault,
     readonly enrollmentCodes: EnrollmentCodes,
+    readonly setupTurns: SetupConversationInput[],
+    readonly calendarApprovalTurns: CalendarApprovalInput[],
   ) {}
 
   iso(): string {
@@ -878,12 +961,59 @@ class Harness {
     let setupToken: string;
     let competingSetupToken: string | null = null;
     if (input.exerciseMessagesFirst) {
-      expect(await this.receiveFounderGreeting("founder-hi", "New link please!")).toEqual({
+      const beforeIgnoredMessages = this.linq.messages.length;
+      expect(await this.receiveMessagesText("founder-whitespace", "   ")).toEqual({
+        disposition: "rejected",
+        reason: "authority_not_found",
+      });
+      expect(await this.receiveMessagesText("founder-stop", "STOP")).toEqual({
+        disposition: "acknowledged",
+        reason: "opted_out",
+      });
+      expect(await this.receiveMessagesText("founder-natural-stop", NATURAL_SETUP_OPT_OUT)).toEqual({
         disposition: "acknowledged",
         reason: "onboarding_offered",
       });
+      expect(this.setupTurns.at(-1)).toMatchObject({
+        stage: "unclaimed",
+        currentMessage: { text: NATURAL_SETUP_OPT_OUT },
+      });
+      expect(this.linq.messages).toHaveLength(beforeIgnoredMessages);
+      expect(await this.store.hasPilotHousehold()).toBe(false);
+
+      const arbitraryFirstText = randomUUID();
+      expect(await this.receiveMessagesText("founder-first-message", arbitraryFirstText)).toEqual({
+        disposition: "acknowledged",
+        reason: "onboarding_offered",
+      });
+      expect(this.setupTurns).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            stage: "unclaimed",
+            currentMessage: expect.objectContaining({ text: arbitraryFirstText }),
+            nextStep: "signed_link_will_follow",
+          }),
+        ]),
+      );
+      const firstSetupLinkCount = this.linq.messages.filter(
+        (message) => message.providerConversationId === PRIVATE_ONE && message.text.includes("#s="),
+      ).length;
+      const setupTurnsBeforeSecondMessage = this.setupTurns.length;
+      this.now += 1_000;
       expect(
-        await this.receiveFounderGreeting("competing-founder-hi", "Hello", {
+        await this.receiveMessagesText(
+          "founder-second-message",
+          `The thing I need help with changed ${randomUUID()}`,
+        ),
+      ).toEqual({ disposition: "acknowledged", reason: "onboarding_offered" });
+      expect(this.setupTurns).toHaveLength(setupTurnsBeforeSecondMessage + 1);
+      expect(
+        this.linq.messages.filter(
+          (message) => message.providerConversationId === PRIVATE_ONE && message.text.includes("#s="),
+        ),
+      ).toHaveLength(firstSetupLinkCount + 1);
+      expect(
+        await this.receiveMessagesText("competing-founder-hi", randomUUID(), {
           providerConversationId: PRIVATE_COMPETING_FOUNDER,
           providerHandleId: COMPETING_FOUNDER_HANDLE,
         }),
@@ -949,7 +1079,7 @@ class Harness {
       expect(await this.store.listHouseholdIdsForAdult(COMPETING_FOUNDER)).toEqual([]);
       const sentBeforeLateGreeting = this.linq.messages.length;
       expect(
-        await this.receiveFounderGreeting("competing-founder-after-setup", "Hi", {
+        await this.receiveMessagesText("competing-founder-after-setup", "Hi", {
           providerConversationId: PRIVATE_COMPETING_FOUNDER,
           providerHandleId: COMPETING_FOUNDER_HANDLE,
         }),
@@ -1075,7 +1205,7 @@ class Harness {
     return token;
   }
 
-  async receiveFounderGreeting(
+  async receiveMessagesText(
     key: string,
     text: string,
     input: { providerConversationId?: string; providerHandleId?: string } = {},
@@ -1249,7 +1379,10 @@ class FakeLinq {
 
 async function freshHarness(
   reason: Reason,
-  executeCalendar?: () => Promise<GoogleCalendarExecutionResult>,
+  options: {
+    executeCalendar?: () => Promise<GoogleCalendarExecutionResult>;
+    interpretCalendarApproval?: InterpretCalendarApproval;
+  } = {},
 ): Promise<Harness> {
   if (!TEST_DATABASE_URL) throw new Error("TEST_DATABASE_URL is required");
   const directory = await mkdtemp(join(tmpdir(), "florence-release-"));
@@ -1267,7 +1400,37 @@ async function freshHarness(
     rootDirectory: join(directory, "vault"),
     encryptionKey: new Uint8Array(32).fill(7),
   });
-  const reasoner = { decide: reason } as unknown as FlorenceReasoner;
+  const setupTurns: SetupConversationInput[] = [];
+  const calendarApprovalTurns: CalendarApprovalInput[] = [];
+  const converseDuringSetup: SetupConversation = async (input) => {
+    setupTurns.push(input);
+    if (input.currentMessage.text === NATURAL_SETUP_OPT_OUT) {
+      return { stopMessaging: true, bubbles: [] };
+    }
+    return {
+      stopMessaging: false,
+      bubbles: [
+        {
+          text:
+            input.stage === "unclaimed"
+              ? "I can help with that. Let’s finish your private setup, then we can keep going here."
+              : input.stage === "connect_google"
+                ? "Connect your Google account on the private setup page, then we’ll keep going here."
+                : "Add your partner and the useful family basics on the setup page, then we’ll keep going here.",
+          delayMs: 0,
+        },
+      ],
+    };
+  };
+  const interpretCalendarApproval: InterpretCalendarApproval = async (input) => {
+    calendarApprovalTurns.push(input);
+    return options.interpretCalendarApproval?.(input) ?? { approve: false };
+  };
+  const reasoner = {
+    decide: reason,
+    converseDuringSetup,
+    interpretCalendarApproval,
+  } as unknown as FlorenceReasoner;
   const enrollmentCodes = new EnrollmentCodes(ENROLLMENT_SECRET);
   let harness: Harness;
   const google = {
@@ -1325,7 +1488,7 @@ async function freshHarness(
     },
     executeCalendar: async () => {
       harness.googleAttempts += 1;
-      if (executeCalendar) return executeCalendar();
+      if (options.executeCalendar) return options.executeCalendar();
       harness.googleEffects += 1;
       return committedCalendar(harness.iso());
     },
@@ -1341,7 +1504,7 @@ async function freshHarness(
     setupOrigin: "https://florence.test",
     now: () => new Date(harness.now),
   });
-  harness = new Harness(store, florence, linq, vault, enrollmentCodes);
+  harness = new Harness(store, florence, linq, vault, enrollmentCodes, setupTurns, calendarApprovalTurns);
   onTestFinished(async () => {
     florence.stop();
     await store.close();
@@ -1354,6 +1517,7 @@ async function freshHarness(
 
 function decision(
   input: {
+    policy?: FlorenceDecision["policy"];
     reaction?: FlorenceDecision["conversation"]["reaction"];
     reply?: boolean;
     bubbles?: FlorenceDecision["conversation"]["bubbles"];
@@ -1363,6 +1527,7 @@ function decision(
   } = {},
 ): FlorenceDecision {
   return {
+    policy: input.policy ?? { retain: true, schedule: true, stopMessaging: false },
     conversation: {
       replyToCurrentMessage: input.reply ?? false,
       reaction: input.reaction ?? null,
@@ -1372,6 +1537,10 @@ function decision(
     followUp: input.followUp ?? null,
     calendar: input.calendar ?? null,
   };
+}
+
+function noMutationPolicy(): FlorenceDecision["policy"] {
+  return { retain: false, schedule: false, stopMessaging: false };
 }
 
 async function waitForAbort(signal?: AbortSignal): Promise<never> {

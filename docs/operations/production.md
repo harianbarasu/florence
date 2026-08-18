@@ -50,7 +50,7 @@ Required:
 | `FLORENCE_OPENAI_MODEL` | Pinned supported model ID |
 | `GOOGLE_OAUTH_CLIENT_ID` | Google OAuth web client ID |
 | `GOOGLE_OAUTH_CLIENT_SECRET` | Google OAuth web client secret |
-| `GOOGLE_OAUTH_REDIRECT_URI` | Exact `<origin>/api/v1/google/callback`; its origin is also used for setup links |
+| `GOOGLE_OAUTH_REDIRECT_URI` | Exact `<origin>/oauth/google/callback`; its origin is also used for setup links |
 | `GOOGLE_CREDENTIAL_KEY` | Canonical base64 encoding of exactly 32 random bytes |
 
 Optional bounded settings:
@@ -66,7 +66,7 @@ Railway owns `PORT`. Never print resolved variables or place them in shell argum
 Register exactly:
 
 - Linq webhook: `<origin>/api/v1/webhooks/linq?version=2026-02-03`.
-- Google OAuth redirect: `<origin>/api/v1/google/callback`.
+- Google OAuth redirect: `<origin>/oauth/google/callback`.
 
 The Linq API key and webhook signing secret are different credentials. Florence verifies the raw webhook signature, pins the payload version, re-reads the live chat, and requires iMessage plus the exact current participant set before retaining content.
 

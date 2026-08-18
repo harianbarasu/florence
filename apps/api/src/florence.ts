@@ -18,6 +18,7 @@ import type {
   AcceptInboundReactionInput,
   AcceptInboundResult,
   ApprovedCalendarAction,
+  ApprovedPartnerInvitation,
   BootstrapMessagesGroupInput,
   CalendarActionDraft,
   CalendarOfferApproval,
@@ -42,6 +43,8 @@ import {
   type GoogleConnection,
   GoogleConnectionError,
   type GoogleConnectionView,
+  GoogleFamilyCalendarProvisioningError,
+  GoogleFamilyCalendarTransientError,
 } from "@florence/google";
 import {
   type LinqClient,
@@ -85,6 +88,7 @@ export class Florence {
   readonly #enrollmentCodes: EnrollmentCodes;
   readonly #imageVault: EncryptedImageVault | null;
   readonly #messagesUrl: string | null;
+  readonly #linqSenderPhoneNumber: string | null;
   readonly #setupOrigin: string | null;
   readonly #now: () => Date;
   #activeRun: Promise<boolean> | null = null;
@@ -102,6 +106,7 @@ export class Florence {
     enrollmentCodes: EnrollmentCodes;
     imageVault: EncryptedImageVault | null;
     messagesUrl: string | null;
+    linqSenderPhoneNumber?: string | null;
     setupOrigin?: string | null;
     now?: () => Date;
   }) {
@@ -112,6 +117,7 @@ export class Florence {
     this.#enrollmentCodes = input.enrollmentCodes;
     this.#imageVault = input.imageVault;
     this.#messagesUrl = nullableText(input.messagesUrl);
+    this.#linqSenderPhoneNumber = nullableText(input.linqSenderPhoneNumber ?? null);
     this.#setupOrigin = input.setupOrigin ? normalizedOrigin(input.setupOrigin) : null;
     this.#now = input.now ?? (() => new Date());
   }
@@ -125,9 +131,11 @@ export class Florence {
       (connection) => connection.ownerAdultId === adultId && connection.status === "active",
     );
     if (founder && google && profileString(founder.profile, "onboardingCompletedAt")) {
-      await this.#stageFounderWelcome(google);
+      await this.#stageFounderHandoff(google);
     }
-    return workspaceViewSchema.parse(workspace(adultId, household, this.#messagesUrl));
+    if (household) await this.#ensureHouseholdActivation(household.id);
+    const current = household ? await this.#householdForAdult(adultId) : null;
+    return workspaceViewSchema.parse(workspace(adultId, current, this.#messagesUrl));
   }
 
   async completeFamilyOnboarding(
@@ -139,10 +147,13 @@ export class Florence {
     await this.#store.completeFamilyOnboarding({
       householdId: household.id,
       founderAdultId: adultId,
-      ...(input.partner ? { partner: input.partner } : {}),
+      familyLabel: input.familyLabel,
+      postalCode: input.postalCode,
+      mode: input.mode,
+      partner: input.partner,
       children: input.children.map((child) => ({
-        id: child.id,
-        displayName: child.displayName,
+        firstName: child.firstName,
+        ...(child.lastName ? { lastName: child.lastName } : {}),
         ...(child.school ? { school: child.school } : {}),
         ...(child.activities ? { activities: child.activities } : {}),
       })),
@@ -219,12 +230,18 @@ export class Florence {
       throw new GoogleConnectionError("Google connection owner changed", "invalid_state");
     }
     const household = await this.#householdForAdult(input.adultId);
-    const founder = household.members.find(
-      (member) => member.id === input.adultId && member.kind === "adult" && member.adultSlot === 1,
-    );
-    if (founder && profileString(founder.profile, "onboardingCompletedAt")) {
-      await this.#stageFounderWelcome(connection);
+    const adult = household.members.find((member) => member.id === input.adultId && member.kind === "adult");
+    if (adult?.adultSlot === 2) {
+      await this.#store.completePartnerOnboarding({
+        householdId: household.id,
+        adultId: adult.id,
+        occurredAt: this.#now().toISOString(),
+      });
     }
+    if (adult?.adultSlot === 1 && profileString(adult.profile, "onboardingCompletedAt")) {
+      await this.#stageFounderHandoff(connection);
+    }
+    await this.#ensureHouseholdActivation(household.id);
     return connection;
   }
 
@@ -325,31 +342,60 @@ export class Florence {
   async redeemSetupLink(input: SetupSessionInput): Promise<MessagesEnrollmentResult | null> {
     if (!this.#google || !this.#setupOrigin) return null;
     if (input.profile.guardianAttested !== true) return null;
-    const setup = this.#enrollmentCodes.verifyFounderSetup(input.setupToken, this.#now());
-    if (!setup || !isIanaTimeZone(input.profile.timeZone)) return null;
+    const checkedAt = this.#now();
+    if (!isIanaTimeZone(input.profile.timeZone)) return null;
+    const founderSetup = this.#enrollmentCodes.verifyFounderSetup(input.setupToken, checkedAt);
+    const partnerSetup = founderSetup
+      ? null
+      : this.#enrollmentCodes.verifyPartnerSetup(input.setupToken, checkedAt);
+    const setup = founderSetup ?? partnerSetup;
+    if (!setup) return null;
     const observed = await this.#linq.observeChat(setup.providerConversationId);
     if (
       observed.audience !== "private" ||
       observed.participantIdentityDigests.length !== 1 ||
-      observed.participantIdentityDigests[0] !== setup.identitySubjectDigest
+      observed.participantIdentityDigests[0] !== setup.identitySubjectDigest ||
+      observed.participants.length !== 1 ||
+      observed.participants[0]?.identitySubjectDigest !== setup.identitySubjectDigest
     ) {
       return null;
     }
     const completedAt = this.#now();
-    if (!this.#enrollmentCodes.verifyFounderSetup(input.setupToken, completedAt)) return null;
     const occurredAt = completedAt.toISOString();
+    if (partnerSetup) {
+      if (!this.#enrollmentCodes.verifyPartnerSetup(input.setupToken, completedAt)) return null;
+      return this.#store.redeemMessagesEnrollment({
+        challengeDigest: this.#enrollmentCodes.digestPartnerSetup(input.setupToken),
+        identitySubjectDigest: partnerSetup.identitySubjectDigest,
+        messagesAddress: observed.participants[0].phoneNumber,
+        firstName: input.profile.firstName,
+        lastName: input.profile.lastName,
+        consentVersion: "linq-private-setup-v1",
+        consentedAt: occurredAt,
+        guardianAttestedAt: occurredAt,
+        proactiveUseAcceptedAt: occurredAt,
+        providerConversationId: partnerSetup.providerConversationId,
+        occurredAt,
+      });
+    }
+    if (!founderSetup || !this.#enrollmentCodes.verifyFounderSetup(input.setupToken, completedAt)) {
+      return null;
+    }
     const completion: CompleteFounderOnboardingInput = {
       setupTokenDigest: this.#enrollmentCodes.digestFounderSetup(input.setupToken),
-      setupExpiresAt: setup.expiresAt,
-      householdId: setup.householdId,
+      setupExpiresAt: founderSetup.expiresAt,
+      householdId: founderSetup.householdId,
       timeZone: input.profile.timeZone,
-      adultId: setup.adultId,
-      displayName: input.profile.displayName,
-      identitySubjectDigest: setup.identitySubjectDigest,
+      adultId: founderSetup.adultId,
+      firstName: input.profile.firstName,
+      lastName: input.profile.lastName,
+      messagesAddress: observed.participants[0].phoneNumber,
+      identitySubjectDigest: founderSetup.identitySubjectDigest,
       consentVersion: "linq-private-setup-v1",
       consentedAt: occurredAt,
       guardianAttestedAt: occurredAt,
-      providerConversationId: setup.providerConversationId,
+      proactiveUseAcceptedAt: occurredAt,
+      providerConversationId: founderSetup.providerConversationId,
       occurredAt,
     };
     const result = await this.#store.completeFounderOnboarding(completion);
@@ -444,6 +490,12 @@ export class Florence {
       worked = true;
     }
     await this.#settleInboundAccepts();
+    const partnerInvitation = await this.#store.readNextPartnerInvitation(this.#now().toISOString());
+    if (partnerInvitation) {
+      await this.#executePartnerInvitation(partnerInvitation);
+      worked = true;
+    }
+    await this.#settleInboundAccepts();
     const calendar = await this.#store.readNextCalendarAction(this.#now().toISOString());
     if (calendar) {
       await this.#executeCalendar(calendar);
@@ -481,9 +533,7 @@ export class Florence {
     const googleActive =
       turn.authority.audience !== "private" ||
       (await this.#hasActiveGoogle(turn.authority.householdId, turn.authority.senderAdultId));
-    const onboardingComplete = Boolean(
-      sender && (sender.adultSlot === 2 || profileString(sender.profile, "onboardingCompletedAt")),
-    );
+    const onboardingComplete = Boolean(sender && profileString(sender.profile, "onboardingCompletedAt"));
     if (turn.authority.audience === "private" && (!googleActive || !onboardingComplete)) {
       if (turn.message.moveKind === "reaction") {
         await this.#store.commitTurn({
@@ -555,11 +605,35 @@ export class Florence {
     }
 
     let approvedCalendarOffer: InboundTurn["pendingCalendarOffers"][number] | null = null;
+    let approvedPartnerInvitation: InboundTurn["pendingPartnerInvitation"] = null;
     if (
       turn.authority.audience === "private" &&
       turn.message.moveKind !== "reaction" &&
-      turn.pendingCalendarOffers.length === 1
+      turn.pendingPartnerInvitation
     ) {
+      try {
+        const interpretation = await this.#reasoner.interpretPartnerInvitationApproval({
+          currentMessage: { text: turnText(turn.message) },
+          partner: {
+            adultId: turn.pendingPartnerInvitation.adultId,
+            firstName: turn.pendingPartnerInvitation.firstName,
+            maskedPhoneNumber: turn.pendingPartnerInvitation.maskedPhoneNumber,
+          },
+        });
+        if (interpretation.sendInvitation) approvedPartnerInvitation = turn.pendingPartnerInvitation;
+      } catch (error) {
+        if (error instanceof FlorenceReasonerError && error.retryable) {
+          await this.#store.retryInbound({
+            sourceId: turn.message.sourceId,
+            retryAt: later(this.#now(), RETRY_MS),
+            error: errorText(error),
+          });
+          return;
+        }
+        if (!(error instanceof FlorenceReasonerError)) throw error;
+      }
+    }
+    if (turn.message.moveKind !== "reaction" && turn.pendingCalendarOffers.length === 1) {
       const offer = turn.pendingCalendarOffers[0];
       if (!offer) throw new Error("The sole Calendar offer disappeared");
       try {
@@ -631,11 +705,13 @@ export class Florence {
       controller.signal.throwIfAborted();
       const guarded = enforcePolicy(decision, turn.message.moveKind !== "reaction");
       const approval = guarded.policy.schedule ? approvedCalendarOffer : null;
+      const partnerApproval = guarded.policy.stopMessaging ? null : approvedPartnerInvitation;
       const committedDecision = approval ? { ...guarded, calendar: null } : guarded;
       await this.#store.commitTurn(
         decisionCommit(turn, committedDecision, this.#now(), {
           omitReaction: immediateReactionStaged,
           approveCalendarOffer: approval,
+          approvePartnerInvitation: partnerApproval,
         }),
       );
     } catch (error) {
@@ -644,7 +720,13 @@ export class Florence {
         if (workTimer) clearTimeout(workTimer);
         workTimer = null;
         if (workCue) await workCue;
-        if (approvedCalendarOffer) {
+        if (approvedCalendarOffer || approvedPartnerInvitation) {
+          const actionText =
+            approvedCalendarOffer && approvedPartnerInvitation
+              ? `I’ll add the calendar item and text ${approvedPartnerInvitation.firstName} now. I couldn’t finish the rest reliably.`
+              : approvedCalendarOffer
+                ? "I’ll handle the calendar item you approved. I couldn’t finish the rest reliably."
+                : `I’ll text ${approvedPartnerInvitation?.firstName ?? "your partner"} now. I couldn’t finish the rest reliably.`;
           await this.#store.commitTurn(
             decisionCommit(
               turn,
@@ -655,7 +737,7 @@ export class Florence {
                   reaction: null,
                   bubbles: [
                     {
-                      text: "I’ll handle the calendar item you approved. I couldn’t finish the rest reliably.",
+                      text: actionText,
                       delayMs: 0,
                     },
                   ],
@@ -668,6 +750,7 @@ export class Florence {
               {
                 omitReaction: immediateReactionStaged,
                 approveCalendarOffer: approvedCalendarOffer,
+                approvePartnerInvitation: approvedPartnerInvitation,
               },
             ),
           );
@@ -762,13 +845,26 @@ export class Florence {
       });
     }
 
-    const googleConnections =
-      turn.authority.audience === "private" && this.#google
+    const familyCalendarOwner = turn.household.members.find(
+      (member) => member.kind === "adult" && member.adultSlot === 1,
+    );
+    const googleConnections = !this.#google
+      ? []
+      : turn.authority.audience === "private"
         ? await this.#google.status({
             householdId: turn.authority.householdId,
             ownerAdultId: turn.authority.senderAdultId,
           })
-        : [];
+        : turn.household.familyCalendarOwnerConnectionId && familyCalendarOwner
+          ? (
+              await this.#google.status({
+                householdId: turn.authority.householdId,
+                ownerAdultId: familyCalendarOwner.id,
+              })
+            ).filter(
+              (connection) => connection.connectionId === turn.household.familyCalendarOwnerConnectionId,
+            )
+          : [];
     const input: FlorenceReasonerInput = {
       household: {
         householdId: turn.household.id,
@@ -839,7 +935,17 @@ export class Florence {
       })),
       googleConnections: googleConnections.flatMap((connection) =>
         connection.status === "active" && connection.emailLabel
-          ? [{ connectionId: connection.connectionId, emailLabel: connection.emailLabel }]
+          ? [
+              {
+                connectionId: connection.connectionId,
+                emailLabel:
+                  turn.authority.audience === "group"
+                    ? (turn.household.familyCalendarLabel ?? turn.household.name)
+                    : connection.emailLabel,
+                calendarId: turn.authority.audience === "group" ? turn.household.familyCalendarId : null,
+                kind: turn.authority.audience === "group" ? ("family" as const) : ("personal" as const),
+              },
+            ]
           : [],
       ),
     };
@@ -849,7 +955,6 @@ export class Florence {
       readCalendarWindow: async ({ connectionId, timeMin, timeMax, limit }) => {
         if (
           !this.#google ||
-          turn.authority.audience !== "private" ||
           !googleConnections.some(
             (connection) => connection.connectionId === connectionId && connection.status === "active",
           )
@@ -859,8 +964,14 @@ export class Florence {
         try {
           return await this.#google.readCalendarWindow({
             householdId: turn.authority.householdId,
-            ownerAdultId: turn.authority.senderAdultId,
+            ownerAdultId:
+              turn.authority.audience === "group"
+                ? requiredText(familyCalendarOwner?.id ?? null, "Family Calendar owner")
+                : turn.authority.senderAdultId,
             connectionId,
+            ...(turn.authority.audience === "group" && turn.household.familyCalendarId
+              ? { calendarId: turn.household.familyCalendarId }
+              : {}),
             timeMin,
             timeMax,
             limit,
@@ -1033,7 +1144,7 @@ export class Florence {
         await this.#store.failCalendarAction({
           id: action.id,
           error: result.detail,
-          failureText: `I couldn’t confirm that “${action.event.title}” was added correctly. Please check Google Calendar before trying again.`,
+          failureText: `I couldn’t confirm that “${action.event.title}” was added correctly. Please check ${action.audience === "household" ? "the family calendar" : "Google Calendar"} before trying again.`,
           failedAt: result.occurredAt,
         });
         return;
@@ -1045,7 +1156,7 @@ export class Florence {
         providerEtag: proof.etag,
         proofDigest: proof.digest,
         proof,
-        confirmationText: `Added “${action.event.title}” to your calendar.`,
+        confirmationText: `Added “${action.event.title}” to ${action.audience === "household" ? "the family calendar" : "your calendar"}.`,
         committedAt: result.occurredAt,
       });
     } catch (error) {
@@ -1057,7 +1168,194 @@ export class Florence {
     }
   }
 
-  async #stageFounderWelcome(connection: GoogleConnectionView): Promise<void> {
+  async #executePartnerInvitation(invitation: ApprovedPartnerInvitation): Promise<void> {
+    if (!this.#setupOrigin || !this.#linqSenderPhoneNumber) {
+      await this.#store.retryPartnerInvitation({
+        adultId: invitation.partnerAdultId,
+        retryAt: later(this.#now(), RETRY_MS),
+        error: "Partner Messages setup is not configured",
+      });
+      return;
+    }
+    try {
+      const household = await this.#store.readHousehold({ householdId: invitation.householdId });
+      const founder = household?.members.find(
+        (member) => member.id === invitation.founderAdultId && member.kind === "adult",
+      );
+      if (!founder) throw new Error("The partner invitation founder is no longer in the household");
+      const founderFirstName = profileString(founder.profile, "firstName") ?? founder.displayName;
+      const created = await this.#linq.createChat({
+        idempotencyKey: `partner-invite-chat:${invitation.householdId}:${invitation.partnerAdultId}`,
+        senderPhoneNumber: this.#linqSenderPhoneNumber,
+        participantPhoneNumbers: [invitation.partnerPhoneNumber],
+        initialText: `Hi ${invitation.partnerFirstName} — I’m Florence. ${founderFirstName} asked me to help the two of you stay ahead of school, schedules, and family loose ends. I’ll send your private setup link next.`,
+      });
+      const participant = created.authority.participants[0];
+      if (
+        created.authority.audience !== "private" ||
+        created.authority.participants.length !== 1 ||
+        !participant ||
+        participant.phoneNumber !== invitation.partnerPhoneNumber
+      ) {
+        throw new Error("Linq created a different private partner conversation");
+      }
+      const setup = this.#enrollmentCodes.issuePartnerSetup({
+        providerConversationId: created.providerConversationId,
+        identitySubjectDigest: participant.identitySubjectDigest,
+        householdId: invitation.householdId,
+        adultId: invitation.partnerAdultId,
+        occurredAt: invitation.approvedAt,
+      });
+      const result = await this.#linq.sendMessage({
+        idempotencyKey: `partner-invite-link:${invitation.householdId}:${invitation.partnerAdultId}`,
+        providerConversationId: created.providerConversationId,
+        expectedAuthority: created.authority,
+        text: `Set up your side here:\n${this.#setupOrigin}/#s=${encodeURIComponent(setup.token)}`,
+      });
+      if (result.status !== "committed" || !result.providerReceiptId) {
+        throw new LinqError(
+          result.status === "unknown" ? "provider_retryable" : "provider_rejected",
+          result.detail ?? "Linq did not confirm the partner setup link",
+          result.status === "unknown",
+        );
+      }
+      await this.#store.issueMessagesEnrollment({
+        householdId: invitation.householdId,
+        actorAdultId: invitation.founderAdultId,
+        adultId: invitation.partnerAdultId,
+        challengeDigest: this.#enrollmentCodes.digestPartnerSetup(setup.token),
+        providerConversationId: created.providerConversationId,
+        identitySubjectDigest: participant.identitySubjectDigest,
+        messagesAddress: participant.phoneNumber,
+        providerMessageId: result.providerReceiptId,
+        expiresAt: setup.expiresAt,
+        issuedAt: invitation.approvedAt,
+      });
+    } catch (error) {
+      await this.#store.retryPartnerInvitation({
+        adultId: invitation.partnerAdultId,
+        retryAt: later(this.#now(), RETRY_MS),
+        error: errorText(error),
+      });
+    }
+  }
+
+  async #ensureHouseholdActivation(householdId: string): Promise<void> {
+    if (!this.#google || !this.#linqSenderPhoneNumber) return;
+    let household = await this.#store.readHousehold({ householdId });
+    if (!household) return;
+    const adults = household.members
+      .filter((member) => member.kind === "adult")
+      .sort((left, right) => (left.adultSlot ?? 0) - (right.adultSlot ?? 0));
+    const founder = adults.find((adult) => adult.adultSlot === 1);
+    const partner = adults.find((adult) => adult.adultSlot === 2);
+    if (
+      !founder ||
+      !partner ||
+      founder.status !== "verified" ||
+      partner.status !== "verified" ||
+      founder.messagesIdentity !== "connected" ||
+      partner.messagesIdentity !== "connected" ||
+      !founder.messagesAddress ||
+      !partner.messagesAddress ||
+      !profileString(founder.profile, "onboardingCompletedAt") ||
+      !profileString(partner.profile, "onboardingCompletedAt")
+    ) {
+      return;
+    }
+    const founderGoogle = household.googleConnections.find(
+      (connection) => connection.ownerAdultId === founder.id && connection.status === "active",
+    );
+    const partnerGoogle = household.googleConnections.find(
+      (connection) => connection.ownerAdultId === partner.id && connection.status === "active",
+    );
+    if (!founderGoogle || !partnerGoogle) return;
+
+    let group = household.channels.find(
+      (channel) => channel.audience === "group" && !channel.revokedAt && !channel.stoppedAt,
+    );
+    if (!group) {
+      const founderFirstName = profileString(founder.profile, "firstName") ?? founder.displayName;
+      const partnerFirstName = profileString(partner.profile, "firstName") ?? partner.displayName;
+      const created = await this.#linq.createChat({
+        idempotencyKey: `family-group:${household.id}`,
+        senderPhoneNumber: this.#linqSenderPhoneNumber,
+        participantPhoneNumbers: [founder.messagesAddress, partner.messagesAddress],
+        initialText: `Hi ${founderFirstName} and ${partnerFirstName} — I’m Florence. This is our family thread. I’ll keep the household picture here, take first passes, and follow up privately when something is only for one of you.`,
+      });
+      if (created.authority.audience !== "group") {
+        throw new Error("Linq created a different family group");
+      }
+      group = await this.#store.bindCreatedMessagesGroup({
+        householdId: household.id,
+        providerConversationId: created.providerConversationId,
+        participantIdentityDigests: created.authority.participantIdentityDigests,
+        occurredAt: created.initialMessage.occurredAt,
+      });
+      household = (await this.#store.readHousehold({ householdId })) ?? household;
+    }
+
+    if (!household.familyCalendarCreatedAt) {
+      try {
+        const result = await this.#google.provisionFamilyCalendar({
+          householdId: household.id,
+          founderAdultId: founder.id,
+          founderConnectionId: founderGoogle.connectionId,
+          partnerAdultId: partner.id,
+          partnerConnectionId: partnerGoogle.connectionId,
+          summary: household.name,
+          timeZone: household.timeZone,
+          ...(household.familyCalendarId ? { calendarId: household.familyCalendarId } : {}),
+        });
+        await this.#store.rememberFamilyCalendarId({
+          householdId: household.id,
+          calendarId: result.calendarId,
+          occurredAt: result.occurredAt,
+        });
+        household = await this.#store.completeFamilyCalendarProvisioning({
+          householdId: household.id,
+          calendarId: result.calendarId,
+          founderConnectionId: result.founderConnectionId,
+          partnerConnectionId: result.partnerConnectionId,
+          label: result.summary,
+          occurredAt: result.occurredAt,
+        });
+      } catch (error) {
+        if (
+          (error instanceof GoogleFamilyCalendarTransientError ||
+            error instanceof GoogleFamilyCalendarProvisioningError) &&
+          error.calendarId
+        ) {
+          await this.#store.rememberFamilyCalendarId({
+            householdId: household.id,
+            calendarId: error.calendarId,
+            occurredAt: this.#now().toISOString(),
+          });
+        }
+        throw error;
+      }
+    }
+
+    const calendarLabel = household.familyCalendarLabel ?? household.name;
+    const result = await this.#linq.sendMessage({
+      idempotencyKey: `family-calendar-ready:${household.id}`,
+      providerConversationId: group.providerConversationId,
+      expectedAuthority: {
+        audience: "group",
+        participantIdentityDigests: group.participantIdentityDigests,
+      },
+      text: `I made the ${calendarLabel} calendar too. Either of you can ask me to add or change family plans here.`,
+    });
+    if (result.status !== "committed") {
+      throw new LinqError(
+        result.status === "unknown" ? "provider_retryable" : "provider_rejected",
+        result.detail ?? "Linq did not confirm the Family Calendar message",
+        result.status === "unknown",
+      );
+    }
+  }
+
+  async #stageFounderHandoff(connection: GoogleConnectionView): Promise<void> {
     const household = await this.#householdForAdult(connection.ownerAdultId);
     const founder = household.members.find(
       (member) =>
@@ -1078,16 +1376,27 @@ export class Florence {
     const channel = channels[0];
     if (!channel) throw new Error("The founder's private Messages channel is missing");
     if (channel.revokedAt || channel.stoppedAt) return;
-    await this.#store.stageFounderWelcome({
+    const partner = household.members.find(
+      (member) => member.kind === "adult" && member.adultSlot === 2 && member.status === "planned",
+    );
+    const partnerPhone = partner ? profileString(partner.profile, "phoneNumber") : null;
+    const householdMode = profileString(founder.profile, "householdMode");
+    if (!householdMode || (householdMode === "two_adult" && (!partner || !partnerPhone))) return;
+    const founderFirstName = profileString(founder.profile, "firstName") ?? founder.displayName;
+    const texts =
+      partner && partnerPhone
+        ? [
+            `Your side is ready, ${founderFirstName}.`,
+            "I’ll use your Gmail and calendar to catch school dates, conflicts, and loose ends without sharing your private stuff.",
+            `Want me to text ${profileString(partner.profile, "firstName") ?? partner.displayName} at ${maskPhoneNumber(partnerPhone)} so they can set up their side?`,
+          ]
+        : [`Your side is ready, ${founderFirstName}.`];
+    await this.#store.stageFounderHandoff({
       householdId: household.id,
       adultId: connection.ownerAdultId,
       channelId: channel.id,
       providerConversationId: channel.providerConversationId,
-      texts: [
-        `You’re in, ${founder.displayName} 🎉`,
-        "Your Google account stays private to you. I’ll only bring family-relevant things into shared context with your direction.",
-        "What’s one thing you’d rather not deal with yourself? I’ll take a first pass.",
-      ],
+      texts,
       occurredAt: this.#now().toISOString(),
     });
   }
@@ -1107,7 +1416,20 @@ export class Florence {
   async #householdForAdultOrNull(adultId: string): Promise<HouseholdRecord | null> {
     const ids = await this.#store.listHouseholdIdsForAdult(adultId);
     if (ids.length > 1) throw new Error("The two-adult pilot cannot span multiple households");
-    return ids[0] ? await this.#store.readHousehold({ householdId: ids[0], viewerAdultId: adultId }) : null;
+    if (!ids[0]) return null;
+    const scoped = await this.#store.readHousehold({ householdId: ids[0], viewerAdultId: adultId });
+    if (!scoped) return null;
+    const system = await this.#store.readHousehold({ householdId: ids[0] });
+    if (!system) return null;
+    return {
+      ...scoped,
+      familyCalendarId: system.familyCalendarId,
+      familyCalendarOwnerConnectionId: system.familyCalendarOwnerConnectionId,
+      familyCalendarPartnerConnectionId: system.familyCalendarPartnerConnectionId,
+      familyCalendarLabel: system.familyCalendarLabel,
+      familyCalendarCreatedAt: system.familyCalendarCreatedAt,
+      googleConnections: system.googleConnections,
+    };
   }
 
   #requiredGoogle(): GoogleConnection {
@@ -1147,8 +1469,13 @@ function workspace(
   messagesUrl: string | null,
 ): WorkspaceView {
   const viewer = household?.members.find((member) => member.id === adultId) ?? null;
-  const founder = household?.members.find((member) => member.kind === "adult" && member.adultSlot === 1);
   const adults = household?.members.filter((member) => member.kind === "adult") ?? [];
+  const partner = adults.find((adult) => adult.adultSlot === 2) ?? null;
+  const activeGoogleAdultIds = new Set(
+    household?.googleConnections
+      .filter((connection) => connection.status === "active")
+      .map((connection) => connection.ownerAdultId) ?? [],
+  );
   const activeChannels =
     household?.channels.filter((channel) => !channel.revokedAt && !channel.stoppedAt) ?? [];
   const contacts =
@@ -1174,7 +1501,7 @@ function workspace(
       messagesUrl,
       googleConnections:
         household?.googleConnections.flatMap((connection) =>
-          connection.status === "active" && connection.emailLabel
+          connection.ownerAdultId === adultId && connection.status === "active" && connection.emailLabel
             ? [
                 {
                   connectionId: connection.connectionId,
@@ -1186,11 +1513,23 @@ function workspace(
             : [],
         ) ?? [],
       setup: {
-        onboardingComplete: Boolean(founder && profileString(founder.profile, "onboardingCompletedAt")),
+        ownOnboardingComplete: Boolean(viewer && profileString(viewer.profile, "onboardingCompletedAt")),
         secondAdultAdded: adults.length === 2,
+        partnerInvitation: !partner
+          ? "not_ready"
+          : partner.messagesIdentity === "connected"
+            ? "connected"
+            : partner.messagesIdentity === "invited"
+              ? "invited"
+              : partner.messagesInvitationApproved
+                ? "approved"
+                : "ready",
         bothAdultsMessagesConnected:
           adults.length === 2 && adults.every((adult) => adult.messagesIdentity === "connected"),
+        bothAdultsGoogleConnected:
+          adults.length === 2 && adults.every((adult) => activeGoogleAdultIds.has(adult.id)),
         familyGroupConnected: activeChannels.some((channel) => channel.audience === "group"),
+        familyCalendarConnected: Boolean(household?.familyCalendarCreatedAt),
       },
     },
     vault: household
@@ -1322,6 +1661,7 @@ function decisionCommit(
   options: {
     omitReaction?: boolean;
     approveCalendarOffer?: InboundTurn["pendingCalendarOffers"][number] | null;
+    approvePartnerInvitation?: InboundTurn["pendingPartnerInvitation"];
   } = {},
 ): CommitTurnInput {
   if (decision.policy.stopMessaging) {
@@ -1348,7 +1688,15 @@ function decisionCommit(
   const turnId = deterministicUuid(`turn\0${turn.message.sourceId}`);
   const bubbles = decision.calendar
     ? decision.calendar.mode === "offer"
-      ? [{ text: calendarOfferText(decision.calendar.event), delayMs: 0 }]
+      ? [
+          {
+            text: calendarOfferText(
+              decision.calendar.event,
+              turn.authority.audience === "group" ? "the family calendar" : "your calendar",
+            ),
+            delayMs: 0,
+          },
+        ]
       : []
     : decision.conversation.bubbles;
   const facts: FactDraft[] = [];
@@ -1439,19 +1787,22 @@ function decisionCommit(
     cancelFollowUpIds: decision.followUp?.operation === "cancel" ? [decision.followUp.followUpId] : [],
     outbound,
     approveCalendarOffers: approval,
+    ...(options.approvePartnerInvitation
+      ? { partnerInvitationApproval: { adultId: options.approvePartnerInvitation.adultId } }
+      : {}),
     ...calendar,
     handledAt: now.toISOString(),
   };
 }
 
-function calendarOfferText(event: CalendarActionDraft["event"]): string {
+function calendarOfferText(event: CalendarActionDraft["event"], calendarLabel: string): string {
   const format = new Intl.DateTimeFormat("en-US", {
     dateStyle: "medium",
     timeStyle: "short",
     timeZone: event.timeZone,
   });
   const location = event.location ? `\n${event.location}` : "";
-  return `I can add this to your calendar:\n\n${event.title}\n${format.format(new Date(event.startsAt))} – ${format.format(new Date(event.endsAt))}\n${event.timeZone}${location}\n\nWant me to add it?`;
+  return `I can add this to ${calendarLabel}:\n\n${event.title}\n${format.format(new Date(event.startsAt))} – ${format.format(new Date(event.endsAt))}\n${event.timeZone}${location}\n\nWant me to add it?`;
 }
 
 function calendarCommit(
@@ -1462,9 +1813,20 @@ function calendarCommit(
   if (!decision.calendar.sourceIds.includes(turn.message.sourceId)) {
     throw new Error("A Calendar decision must cite the current adult message");
   }
+  const householdCalendar = turn.authority.audience === "group";
+  const credentialOwnerAdultId = householdCalendar
+    ? turn.household.members.find((member) => member.kind === "adult" && member.adultSlot === 1)?.id
+    : turn.authority.senderAdultId;
+  const calendarId = householdCalendar ? turn.household.familyCalendarId : "primary";
+  if (!credentialOwnerAdultId || !calendarId) {
+    throw new Error("The Calendar target is not configured for this conversation");
+  }
+  const calendarAudience = householdCalendar ? ("household" as const) : ("private" as const);
   const proposalDigest = sha256(
     JSON.stringify({
       connectionId: decision.calendar.connectionId,
+      calendarId,
+      audience: calendarAudience,
       event: decision.calendar.event,
       sourceIds: decision.calendar.sourceIds,
     }),
@@ -1476,7 +1838,9 @@ function calendarCommit(
       id,
       actionId,
       connectionId: decision.calendar.connectionId,
-      ownerAdultId: turn.authority.senderAdultId,
+      ownerAdultId: credentialOwnerAdultId,
+      calendarId,
+      audience: calendarAudience,
       basisSourceId: turn.message.sourceId,
       proposalDigest,
       event: decision.calendar.event,
@@ -1487,7 +1851,9 @@ function calendarCommit(
     id,
     actionId,
     connectionId: decision.calendar.connectionId,
-    ownerAdultId: turn.authority.senderAdultId,
+    ownerAdultId: credentialOwnerAdultId,
+    calendarId,
+    audience: calendarAudience,
     basisSourceId: turn.message.sourceId,
     approvalMessageId: turn.message.sourceId,
     approvalDigest: sha256(
@@ -1657,6 +2023,11 @@ function profileNumber(profile: JsonObject, key: string): number | null {
 function nullableText(value: string | null): string | null {
   const trimmed = value?.trim();
   return trimmed ? trimmed : null;
+}
+
+function maskPhoneNumber(value: string): string {
+  const digits = value.replaceAll(/\D/g, "");
+  return digits.length >= 4 ? `••••${digits.slice(-4)}` : "their saved number";
 }
 
 function requiredText(value: string | null, label: string): string {

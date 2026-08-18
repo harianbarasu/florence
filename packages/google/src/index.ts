@@ -5,6 +5,9 @@ export const GOOGLE_SCOPES = [
   "email",
   "https://www.googleapis.com/auth/gmail.readonly",
   "https://www.googleapis.com/auth/calendar.events.owned",
+  "https://www.googleapis.com/auth/calendar.app.created",
+  "https://www.googleapis.com/auth/calendar.acls",
+  "https://www.googleapis.com/auth/calendar.calendarlist",
 ] as const;
 
 export type GoogleScope = (typeof GOOGLE_SCOPES)[number];
@@ -58,6 +61,7 @@ export type ApprovedCalendarAction = {
   householdId: string;
   connectionId: string;
   ownerAdultId: string;
+  calendarId?: string;
   approvalMessageId: string;
   approvalDigest: string;
   proposalDigest: string;
@@ -80,6 +84,22 @@ export type GoogleCalendarWindowRead = {
   events: readonly GoogleCalendarWindowEvent[];
 };
 
+export type GoogleFamilyCalendarProvisioningResult = {
+  status: "committed";
+  calendarId: string;
+  summary: string;
+  timeZone: string;
+  founderConnectionId: string;
+  founderAccessRole: "owner";
+  partnerConnectionId: string;
+  partnerEmailLabel: string;
+  partnerAccessRole: "owner";
+  partnerCalendarListSelected: true;
+  providerReceiptId: string;
+  detail: string;
+  occurredAt: string;
+};
+
 export type GmailEvidence = {
   messageId: string;
   threadId: string;
@@ -88,6 +108,16 @@ export type GmailEvidence = {
   subject: string | null;
   sentAt: string;
   text: string;
+};
+
+type FamilyCalendarListEntry = {
+  id: string;
+  etag: string;
+  summary: string;
+  timeZone: string;
+  accessRole: string;
+  selected: boolean;
+  primary: boolean;
 };
 
 /** Credential plaintext must never cross this interface. */
@@ -165,6 +195,29 @@ export class GoogleCalendarTransientError extends Error {
   constructor(message: string, options?: ErrorOptions) {
     super(message, options);
     this.name = "GoogleCalendarTransientError";
+  }
+}
+
+/** The calendar exists; retry provisioning with this exact ID rather than creating another one. */
+export class GoogleFamilyCalendarTransientError extends GoogleCalendarTransientError {
+  constructor(
+    message: string,
+    readonly calendarId: string,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+    this.name = "GoogleFamilyCalendarTransientError";
+  }
+}
+
+export class GoogleFamilyCalendarProvisioningError extends Error {
+  constructor(
+    message: string,
+    readonly code: "provider_rejected" | "indeterminate_create",
+    readonly calendarId: string | null = null,
+  ) {
+    super(message);
+    this.name = "GoogleFamilyCalendarProvisioningError";
   }
 }
 
@@ -394,14 +447,177 @@ export class GoogleConnection {
     return Promise.all(identities.map((identity) => this.#readGmailMessage(accessToken, identity)));
   }
 
+  async provisionFamilyCalendar(input: {
+    householdId: string;
+    founderAdultId: string;
+    founderConnectionId: string;
+    partnerAdultId: string;
+    partnerConnectionId: string;
+    summary: string;
+    timeZone: string;
+    /** Supply the returned ID when resuming after a transient post-creation failure. */
+    calendarId?: string;
+  }): Promise<GoogleFamilyCalendarProvisioningResult> {
+    const householdId = required(input.householdId, "household ID");
+    const founderAdultId = required(input.founderAdultId, "founder adult ID");
+    const founderConnectionId = required(input.founderConnectionId, "founder Google connection ID");
+    const partnerAdultId = required(input.partnerAdultId, "partner adult ID");
+    const partnerConnectionId = required(input.partnerConnectionId, "partner Google connection ID");
+    if (founderAdultId === partnerAdultId) {
+      throw new Error("Family Calendar adults must be different");
+    }
+    if (founderConnectionId === partnerConnectionId) {
+      throw new Error("Family Calendar Google connections must be different");
+    }
+    const summary = required(input.summary, "Family Calendar title").trim();
+    if (summary.length > 500) throw new Error("Family Calendar title exceeds 500 characters");
+    const timeZone = calendarTimeZone(input.timeZone);
+    const resumedCalendarId =
+      input.calendarId === undefined ? null : secondaryCalendarTarget(input.calendarId);
+
+    const [founderCredential, partnerCredential, founderConnections, partnerConnections] = await Promise.all([
+      this.#store.readActiveGoogleCredential({
+        connectionId: founderConnectionId,
+        householdId,
+        ownerAdultId: founderAdultId,
+      }),
+      this.#store.readActiveGoogleCredential({
+        connectionId: partnerConnectionId,
+        householdId,
+        ownerAdultId: partnerAdultId,
+      }),
+      this.#store.listActive({ householdId, ownerAdultId: founderAdultId }),
+      this.#store.listActive({ householdId, ownerAdultId: partnerAdultId }),
+    ]);
+    const founderConnection = exactActiveConnection(
+      founderConnections,
+      householdId,
+      founderAdultId,
+      founderConnectionId,
+    );
+    const partnerConnection = exactActiveConnection(
+      partnerConnections,
+      householdId,
+      partnerAdultId,
+      partnerConnectionId,
+    );
+    if (!founderCredential || !founderConnection) {
+      throw new GoogleConnectionError("The founder Google connection is no longer active", "not_found");
+    }
+    if (!partnerCredential || !partnerConnection) {
+      throw new GoogleConnectionError("The partner Google connection is no longer active", "not_found");
+    }
+    const founderEmail = required(founderConnection.emailLabel ?? "", "founder Google email");
+    const partnerEmail = required(partnerConnection.emailLabel ?? "", "partner Google email");
+
+    let founderAccessToken: string;
+    let partnerAccessToken: string;
+    try {
+      [founderAccessToken, partnerAccessToken] = await Promise.all([
+        this.#calendarAccessToken(founderCredential),
+        this.#calendarAccessToken(partnerCredential),
+      ]);
+    } catch (error) {
+      if (error instanceof DefinitiveCalendarError) {
+        throw new GoogleFamilyCalendarProvisioningError(
+          error.message,
+          "provider_rejected",
+          resumedCalendarId,
+        );
+      }
+      if (resumedCalendarId && error instanceof GoogleCalendarTransientError) {
+        throw new GoogleFamilyCalendarTransientError(error.message, resumedCalendarId, {
+          cause: error,
+        });
+      }
+      throw error;
+    }
+
+    const calendarId =
+      resumedCalendarId ??
+      (await this.#createFamilyCalendar(founderAccessToken, {
+        summary,
+        timeZone,
+      }));
+    try {
+      const calendar = await this.#readFamilyCalendar(founderAccessToken, calendarId, summary, timeZone);
+      const founderAcl = await this.#readOwnerAcl(founderAccessToken, calendarId, founderEmail);
+      if (!founderAcl) {
+        throw new GoogleFamilyCalendarProvisioningError(
+          "Google did not verify the founder as a Family Calendar owner",
+          "provider_rejected",
+        );
+      }
+      const partnerAcl = await this.#ensureOwnerAcl(founderAccessToken, calendarId, partnerEmail);
+      const partnerList = await this.#ensurePartnerCalendarList(
+        partnerAccessToken,
+        calendarId,
+        summary,
+        timeZone,
+      );
+      const canonical = {
+        provider: "google-calendar",
+        calendarId,
+        calendarEtag: calendar.etag,
+        summary,
+        timeZone,
+        founderConnectionId,
+        founderAclId: founderAcl.id,
+        founderAclEtag: founderAcl.etag,
+        partnerConnectionId,
+        partnerAclId: partnerAcl.id,
+        partnerAclEtag: partnerAcl.etag,
+        partnerCalendarListEtag: partnerList.etag,
+        partnerAccessRole: "owner",
+        partnerCalendarListSelected: true,
+      } as const;
+      const canonicalProof = JSON.stringify(canonical);
+      const detail = JSON.stringify({
+        ...canonical,
+        digest: digest(canonicalProof),
+      });
+      if (detail.length > 2_000) {
+        throw new GoogleFamilyCalendarProvisioningError(
+          "Google Family Calendar proof exceeded the safe receipt limit",
+          "provider_rejected",
+        );
+      }
+      return {
+        status: "committed",
+        calendarId,
+        summary,
+        timeZone,
+        founderConnectionId,
+        founderAccessRole: "owner",
+        partnerConnectionId,
+        partnerEmailLabel: partnerEmail,
+        partnerAccessRole: "owner",
+        partnerCalendarListSelected: true,
+        providerReceiptId: calendarId,
+        detail,
+        occurredAt: new Date().toISOString(),
+      };
+    } catch (error) {
+      if (error instanceof GoogleCalendarTransientError) {
+        throw new GoogleFamilyCalendarTransientError(error.message, calendarId, { cause: error });
+      }
+      if (error instanceof GoogleFamilyCalendarProvisioningError && error.calendarId === null) {
+        throw new GoogleFamilyCalendarProvisioningError(error.message, error.code, calendarId);
+      }
+      throw error;
+    }
+  }
+
   async readCalendarWindow(input: {
     householdId: string;
     ownerAdultId: string;
     connectionId: string;
+    calendarId?: string;
     timeMin: string;
     timeMax: string;
     limit?: number;
   }): Promise<GoogleCalendarWindowRead> {
+    const calendarId = calendarTarget(input.calendarId);
     const timeMin = explicitInstant(input.timeMin);
     const timeMax = explicitInstant(input.timeMax);
     if (timeMax <= timeMin) throw new Error("Calendar read end must follow start");
@@ -434,7 +650,7 @@ export class GoogleConnection {
       let response: Response;
       try {
         response = await this.#fetch(
-          `https://www.googleapis.com/calendar/v3/calendars/primary/events?${query}`,
+          `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events?${query}`,
           {
             headers: { authorization: `Bearer ${accessToken}` },
             signal: AbortSignal.timeout(15_000),
@@ -511,7 +727,9 @@ export class GoogleConnection {
         },
       },
     };
-    const collectionUrl = "https://www.googleapis.com/calendar/v3/calendars/primary/events?sendUpdates=none";
+    const calendarId = calendarTarget(action.calendarId);
+    const calendarUrl = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}`;
+    const collectionUrl = `${calendarUrl}/events?sendUpdates=none`;
     let insertDisposition: "accepted" | "ambiguous" | "rejected" = "ambiguous";
     let rejectedStatus: number | null = null;
     try {
@@ -538,13 +756,10 @@ export class GoogleConnection {
 
     let reread: Response;
     try {
-      reread = await this.#fetch(
-        `https://www.googleapis.com/calendar/v3/calendars/primary/events/${encodeURIComponent(eventId)}`,
-        {
-          headers: { authorization: `Bearer ${accessToken}` },
-          signal: AbortSignal.timeout(15_000),
-        },
-      );
+      reread = await this.#fetch(`${calendarUrl}/events/${encodeURIComponent(eventId)}`, {
+        headers: { authorization: `Bearer ${accessToken}` },
+        signal: AbortSignal.timeout(15_000),
+      });
     } catch (error) {
       throw transientCalendarError("Google Calendar proof read failed", error);
     }
@@ -568,10 +783,11 @@ export class GoogleConnection {
     } catch {
       return failed("Google Calendar returned an invalid proof event");
     }
-    const proof = calendarEventProof(event, eventId, action);
+    const proof = calendarEventProof(event, eventId, calendarId, action);
     if (!proof) return failed("Google Calendar did not preserve the exact approved event");
     const detail = JSON.stringify({
       provider: "google-calendar",
+      calendarId,
       eventId,
       etag: proof.etag,
       digest: proof.digest,
@@ -583,6 +799,369 @@ export class GoogleConnection {
       detail,
       occurredAt: new Date().toISOString(),
     };
+  }
+
+  async #createFamilyCalendar(
+    accessToken: string,
+    input: { summary: string; timeZone: string },
+  ): Promise<string> {
+    let response: Response;
+    try {
+      response = await this.#fetch("https://www.googleapis.com/calendar/v3/calendars", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${accessToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(input),
+        signal: AbortSignal.timeout(15_000),
+      });
+    } catch {
+      throw new GoogleFamilyCalendarProvisioningError(
+        "Google did not confirm whether the Family Calendar was created",
+        "indeterminate_create",
+      );
+    }
+    if (response.status === 408 || response.status >= 500) {
+      throw new GoogleFamilyCalendarProvisioningError(
+        `Google did not confirm whether the Family Calendar was created (HTTP ${response.status})`,
+        "indeterminate_create",
+      );
+    }
+    if (transientHttpStatus(response.status)) {
+      throw transientCalendarError(
+        `Google Family Calendar creation was temporarily rejected with HTTP ${response.status}`,
+      );
+    }
+    if (!response.ok) {
+      throw new GoogleFamilyCalendarProvisioningError(
+        `Google rejected Family Calendar creation with HTTP ${response.status}`,
+        "provider_rejected",
+      );
+    }
+    try {
+      return secondaryCalendarTarget(stringField(await safeJson(response), "id"));
+    } catch {
+      // A successful create with an unreadable response may have committed, but its ID is unrecoverable here.
+      throw new GoogleFamilyCalendarProvisioningError(
+        "Google created an unidentifiable Family Calendar",
+        "indeterminate_create",
+      );
+    }
+  }
+
+  async #readFamilyCalendar(
+    accessToken: string,
+    calendarId: string,
+    summary: string,
+    timeZone: string,
+  ): Promise<{ etag: string }> {
+    let response: Response;
+    try {
+      response = await this.#fetch(
+        `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}`,
+        {
+          headers: { authorization: `Bearer ${accessToken}` },
+          signal: AbortSignal.timeout(15_000),
+        },
+      );
+    } catch (error) {
+      throw transientCalendarError("Google Family Calendar proof read failed", error);
+    }
+    if (transientHttpStatus(response.status)) {
+      throw transientCalendarError(`Google Family Calendar proof read returned HTTP ${response.status}`);
+    }
+    if (!response.ok) {
+      throw new GoogleFamilyCalendarProvisioningError(
+        `Google rejected the Family Calendar proof read with HTTP ${response.status}`,
+        "provider_rejected",
+      );
+    }
+    let calendar: Record<string, unknown>;
+    try {
+      calendar = await safeJson(response);
+    } catch {
+      throw new GoogleFamilyCalendarProvisioningError(
+        "Google returned an invalid Family Calendar",
+        "provider_rejected",
+      );
+    }
+    try {
+      if (
+        stringField(calendar, "id") !== calendarId ||
+        stringField(calendar, "summary") !== summary ||
+        stringField(calendar, "timeZone") !== timeZone
+      ) {
+        throw invalidFamilyCalendarProvider("Google did not preserve the exact Family Calendar");
+      }
+      return { etag: stringField(calendar, "etag") };
+    } catch (error) {
+      if (error instanceof GoogleFamilyCalendarProvisioningError) throw error;
+      throw invalidFamilyCalendarProvider("Google returned an incomplete Family Calendar");
+    }
+  }
+
+  async #readOwnerAcl(
+    accessToken: string,
+    calendarId: string,
+    email: string,
+  ): Promise<{ id: string; etag: string } | null> {
+    for (const rule of await this.#readCalendarAcls(accessToken, calendarId)) {
+      const match = calendarAclForEmail(rule, email);
+      if (match?.role === "owner") return { id: match.id, etag: match.etag };
+    }
+    return null;
+  }
+
+  async #readCalendarAcls(
+    accessToken: string,
+    calendarId: string,
+  ): Promise<readonly Record<string, unknown>[]> {
+    const rules: Record<string, unknown>[] = [];
+    let pageToken: string | null = null;
+    for (let page = 0; page < 25; page += 1) {
+      const query = new URLSearchParams({
+        fields: "nextPageToken,items(deleted,etag,id,role,scope(type,value))",
+        maxResults: "250",
+        showDeleted: "false",
+      });
+      if (pageToken) query.set("pageToken", pageToken);
+      let response: Response;
+      try {
+        response = await this.#fetch(
+          `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/acl?${query}`,
+          {
+            headers: { authorization: `Bearer ${accessToken}` },
+            signal: AbortSignal.timeout(15_000),
+          },
+        );
+      } catch (error) {
+        throw transientCalendarError("Google Family Calendar owner proof read failed", error);
+      }
+      if (transientHttpStatus(response.status)) {
+        throw transientCalendarError(
+          `Google Family Calendar owner proof read returned HTTP ${response.status}`,
+        );
+      }
+      if (!response.ok) {
+        throw new GoogleFamilyCalendarProvisioningError(
+          `Google rejected the Family Calendar owner proof read with HTTP ${response.status}`,
+          "provider_rejected",
+        );
+      }
+      let body: Record<string, unknown>;
+      try {
+        body = await safeJson(response);
+        rules.push(...recordArray(body.items));
+      } catch {
+        throw new GoogleFamilyCalendarProvisioningError(
+          "Google returned an invalid Family Calendar owner list",
+          "provider_rejected",
+        );
+      }
+      const nextPageToken = body.nextPageToken;
+      if (nextPageToken === undefined) return rules;
+      if (typeof nextPageToken !== "string" || !nextPageToken) {
+        throw new GoogleFamilyCalendarProvisioningError(
+          "Google returned an invalid Family Calendar owner page",
+          "provider_rejected",
+        );
+      }
+      pageToken = nextPageToken;
+    }
+    throw new GoogleFamilyCalendarProvisioningError(
+      "Google Family Calendar has too many owner rules to verify safely",
+      "provider_rejected",
+    );
+  }
+
+  async #ensureOwnerAcl(
+    accessToken: string,
+    calendarId: string,
+    email: string,
+  ): Promise<{ id: string; etag: string }> {
+    const existingRules = await this.#readCalendarAcls(accessToken, calendarId);
+    const existing = existingRules
+      .map((rule) => calendarAclForEmail(rule, email))
+      .find((rule) => rule !== null);
+    if (existing?.role === "owner") return { id: existing.id, etag: existing.etag };
+
+    const collectionUrl = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/acl`;
+    const requestUrl = existing
+      ? `${collectionUrl}/${encodeURIComponent(existing.id)}?sendNotifications=true`
+      : `${collectionUrl}?sendNotifications=true`;
+    const requestBody = existing
+      ? { role: "owner" }
+      : { role: "owner", scope: { type: "user", value: email } };
+    let disposition: "accepted" | "retryable" | "rejected" = "retryable";
+    let rejectedStatus: number | null = null;
+    let acceptedResponseValid = true;
+    try {
+      const response = await this.#fetch(requestUrl, {
+        method: existing ? "PATCH" : "POST",
+        headers: {
+          authorization: `Bearer ${accessToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(requestBody),
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (response.ok) {
+        disposition = "accepted";
+        try {
+          const proof = calendarAclForEmail(await safeJson(response), email);
+          acceptedResponseValid = proof?.role === "owner";
+        } catch {
+          acceptedResponseValid = false;
+        }
+      } else if (response.status === 409 || transientHttpStatus(response.status)) {
+        disposition = "retryable";
+      } else {
+        disposition = "rejected";
+        rejectedStatus = response.status;
+      }
+    } catch {
+      // A timed-out ACL write may have committed; the owner-list proof below resolves it.
+    }
+
+    const proof = await this.#readOwnerAcl(accessToken, calendarId, email);
+    if (proof) return proof;
+    if (disposition === "rejected") {
+      throw new GoogleFamilyCalendarProvisioningError(
+        `Google rejected partner Family Calendar ownership with HTTP ${rejectedStatus}`,
+        "provider_rejected",
+      );
+    }
+    if (!acceptedResponseValid) {
+      throw new GoogleFamilyCalendarProvisioningError(
+        "Google returned an invalid partner Family Calendar owner rule",
+        "provider_rejected",
+      );
+    }
+    throw transientCalendarError(
+      disposition === "accepted"
+        ? "The partner Family Calendar owner rule is not visible yet"
+        : "Google has not confirmed the partner Family Calendar owner rule",
+    );
+  }
+
+  async #ensurePartnerCalendarList(
+    accessToken: string,
+    calendarId: string,
+    summary: string,
+    timeZone: string,
+  ): Promise<{ etag: string }> {
+    const existing = await this.#readCalendarListEntry(accessToken, calendarId);
+    const existingProof = familyCalendarListProof(existing, calendarId, summary, timeZone);
+    if (existingProof) return existingProof;
+    if (existing && existing.accessRole !== "owner") {
+      throw transientCalendarError("The partner Family Calendar owner access is not visible yet");
+    }
+
+    const collectionUrl = "https://www.googleapis.com/calendar/v3/users/me/calendarList";
+    const requestUrl = existing ? `${collectionUrl}/${encodeURIComponent(calendarId)}` : collectionUrl;
+    let disposition: "accepted" | "retryable" | "rejected" = "retryable";
+    let rejectedStatus: number | null = null;
+    let acceptedResponseValid = true;
+    try {
+      const response = await this.#fetch(requestUrl, {
+        method: existing ? "PATCH" : "POST",
+        headers: {
+          authorization: `Bearer ${accessToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(existing ? { selected: true } : { id: calendarId, selected: true }),
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (response.ok) {
+        disposition = "accepted";
+        try {
+          acceptedResponseValid = Boolean(
+            familyCalendarListProof(
+              calendarListEntry(await safeJson(response), calendarId),
+              calendarId,
+              summary,
+              timeZone,
+            ),
+          );
+        } catch {
+          acceptedResponseValid = false;
+        }
+      } else if (response.status === 409 || transientHttpStatus(response.status)) {
+        disposition = "retryable";
+      } else {
+        disposition = "rejected";
+        rejectedStatus = response.status;
+      }
+    } catch {
+      // A timed-out CalendarList write may have committed; the proof read below resolves it.
+    }
+
+    const proof = familyCalendarListProof(
+      await this.#readCalendarListEntry(accessToken, calendarId),
+      calendarId,
+      summary,
+      timeZone,
+    );
+    if (proof) return proof;
+    if (disposition === "rejected") {
+      throw new GoogleFamilyCalendarProvisioningError(
+        `Google rejected the partner Family Calendar list entry with HTTP ${rejectedStatus}`,
+        "provider_rejected",
+      );
+    }
+    if (!acceptedResponseValid) {
+      throw new GoogleFamilyCalendarProvisioningError(
+        "Google returned an invalid partner Family Calendar list entry",
+        "provider_rejected",
+      );
+    }
+    throw transientCalendarError(
+      disposition === "accepted"
+        ? "The partner Family Calendar list entry is not visible yet"
+        : "Google has not confirmed the partner Family Calendar list entry",
+    );
+  }
+
+  async #readCalendarListEntry(
+    accessToken: string,
+    calendarId: string,
+  ): Promise<FamilyCalendarListEntry | null> {
+    const query = new URLSearchParams({
+      fields: "accessRole,etag,id,primary,selected,summary,timeZone",
+    });
+    let response: Response;
+    try {
+      response = await this.#fetch(
+        `https://www.googleapis.com/calendar/v3/users/me/calendarList/${encodeURIComponent(calendarId)}?${query}`,
+        {
+          headers: { authorization: `Bearer ${accessToken}` },
+          signal: AbortSignal.timeout(15_000),
+        },
+      );
+    } catch (error) {
+      throw transientCalendarError("Google partner Calendar list proof read failed", error);
+    }
+    if (response.status === 404) return null;
+    if (transientHttpStatus(response.status)) {
+      throw transientCalendarError(
+        `Google partner Calendar list proof read returned HTTP ${response.status}`,
+      );
+    }
+    if (!response.ok) {
+      throw new GoogleFamilyCalendarProvisioningError(
+        `Google rejected the partner Calendar list proof read with HTTP ${response.status}`,
+        "provider_rejected",
+      );
+    }
+    try {
+      return calendarListEntry(await safeJson(response), calendarId);
+    } catch {
+      throw new GoogleFamilyCalendarProvisioningError(
+        "Google returned an invalid partner Family Calendar list entry",
+        "provider_rejected",
+      );
+    }
   }
 
   async #accessToken(credential: ActiveGoogleCredential): Promise<string> {
@@ -742,6 +1321,113 @@ function transientHttpStatus(status: number): boolean {
   return status === 403 || status === 408 || status === 425 || status === 429 || status >= 500;
 }
 
+function exactActiveConnection(
+  connections: readonly GoogleConnectionView[],
+  householdId: string,
+  ownerAdultId: string,
+  connectionId: string,
+): GoogleConnectionView | null {
+  return (
+    connections.find(
+      (connection) =>
+        connection.connectionId === connectionId &&
+        connection.householdId === householdId &&
+        connection.ownerAdultId === ownerAdultId &&
+        connection.status === "active",
+    ) ?? null
+  );
+}
+
+function calendarAclForEmail(
+  rule: Record<string, unknown>,
+  email: string,
+): { id: string; etag: string; role: string } | null {
+  if (rule.deleted === true) return null;
+  if (rule.deleted !== undefined && typeof rule.deleted !== "boolean") {
+    throw invalidFamilyCalendarProvider("Google returned an invalid Family Calendar owner rule");
+  }
+  const scope = rule.scope;
+  if (!scope || typeof scope !== "object" || Array.isArray(scope)) {
+    throw invalidFamilyCalendarProvider("Google returned an invalid Family Calendar owner scope");
+  }
+  const scopeRecord = scope as Record<string, unknown>;
+  if (typeof scopeRecord.type !== "string" || !scopeRecord.type) {
+    throw invalidFamilyCalendarProvider("Google returned an invalid Family Calendar owner scope");
+  }
+  if (scopeRecord.type !== "user") return null;
+  if (typeof scopeRecord.value !== "string" || !scopeRecord.value) {
+    throw invalidFamilyCalendarProvider("Google returned an incomplete Family Calendar user scope");
+  }
+  if (scopeRecord.value.trim().toLowerCase() !== email.trim().toLowerCase()) return null;
+  if (
+    typeof rule.id !== "string" ||
+    !rule.id ||
+    typeof rule.etag !== "string" ||
+    !rule.etag ||
+    typeof rule.role !== "string" ||
+    !rule.role
+  ) {
+    throw invalidFamilyCalendarProvider("Google returned an incomplete Family Calendar owner rule");
+  }
+  return { id: rule.id, etag: rule.etag, role: rule.role };
+}
+
+function calendarListEntry(
+  value: Record<string, unknown>,
+  expectedCalendarId: string,
+): FamilyCalendarListEntry {
+  if (value.id !== expectedCalendarId) {
+    throw invalidFamilyCalendarProvider("Google returned a different partner Calendar list entry");
+  }
+  if (
+    typeof value.etag !== "string" ||
+    !value.etag ||
+    typeof value.summary !== "string" ||
+    !value.summary ||
+    typeof value.timeZone !== "string" ||
+    !value.timeZone ||
+    typeof value.accessRole !== "string" ||
+    !value.accessRole ||
+    (value.selected !== undefined && typeof value.selected !== "boolean") ||
+    (value.primary !== undefined && typeof value.primary !== "boolean")
+  ) {
+    throw invalidFamilyCalendarProvider("Google returned an incomplete partner Calendar list entry");
+  }
+  return {
+    id: expectedCalendarId,
+    etag: value.etag,
+    summary: value.summary,
+    timeZone: value.timeZone,
+    accessRole: value.accessRole,
+    selected: value.selected === true,
+    primary: value.primary === true,
+  };
+}
+
+function familyCalendarListProof(
+  entry: FamilyCalendarListEntry | null,
+  calendarId: string,
+  summary: string,
+  timeZone: string,
+): { etag: string } | null {
+  if (
+    !entry ||
+    entry.id !== calendarId ||
+    entry.summary !== summary ||
+    entry.timeZone !== timeZone ||
+    entry.accessRole !== "owner" ||
+    !entry.selected ||
+    entry.primary
+  ) {
+    return null;
+  }
+  return { etag: entry.etag };
+}
+
+function invalidFamilyCalendarProvider(message: string): GoogleFamilyCalendarProvisioningError {
+  return new GoogleFamilyCalendarProvisioningError(message, "provider_rejected");
+}
+
 export function googleCalendarEventId(actionId: string): string {
   return digest(`florence-google-calendar-event-v1\0${required(actionId, "Calendar action ID")}`);
 }
@@ -758,6 +1444,7 @@ function validateCalendarAction(action: ApprovedCalendarAction): void {
   ] as const) {
     required(value, label);
   }
+  calendarTarget(action.calendarId);
   assertDigest(action.approvalDigest, "Calendar approval");
   assertDigest(action.proposalDigest, "Calendar proposal");
   const startsAt = explicitInstant(action.event.startsAt);
@@ -815,6 +1502,7 @@ function calendarWindowEvent(
 function calendarEventProof(
   event: Record<string, unknown>,
   expectedId: string,
+  calendarId: string,
   action: ApprovedCalendarAction,
 ): { etag: string; digest: string } | null {
   try {
@@ -844,6 +1532,7 @@ function calendarEventProof(
     }
     const canonicalProof = JSON.stringify({
       provider: "google-calendar",
+      calendarId,
       eventId: expectedId,
       etag,
       status: "confirmed",
@@ -928,6 +1617,28 @@ function explicitInstant(value: string): Date {
     throw new Error("Calendar timestamp must include Z or a UTC offset");
   }
   return instant(value);
+}
+
+function calendarTarget(value: string | undefined): string {
+  const calendarId = required(value ?? "primary", "Google Calendar ID").trim();
+  if (calendarId.length > 1_024) throw new Error("Google Calendar ID exceeds 1024 characters");
+  return calendarId;
+}
+
+function secondaryCalendarTarget(value: string): string {
+  const calendarId = calendarTarget(value);
+  if (calendarId === "primary") throw new Error("Family Calendar must be a secondary calendar");
+  return calendarId;
+}
+
+function calendarTimeZone(value: string): string {
+  const timeZone = required(value, "Family Calendar time zone").trim();
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone }).format(0);
+  } catch {
+    throw new Error("Family Calendar time zone is invalid");
+  }
+  return timeZone;
 }
 
 function zonedDateStart(value: string, timeZone: string): Date {

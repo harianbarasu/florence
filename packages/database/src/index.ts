@@ -1,2 +1,2 @@
-export { baselineFile, migrateDatabase } from "./migrate.js";
+export { baselineFile, householdActivationFile, migrateDatabase, migrationFiles } from "./migrate.js";
 export * from "./store.js";

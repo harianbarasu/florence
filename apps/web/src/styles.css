@@ -831,6 +831,7 @@ button.contact-button {
   display: grid;
   width: 48px;
   height: 48px;
+  justify-self: center;
   place-items: center;
   border-radius: 50%;
   background: #f3f4f6;
@@ -841,6 +842,7 @@ button.contact-button {
   color: rgb(16 17 19 / 60%);
   font-size: 14px;
   line-height: 1.5;
+  text-align: center;
 }
 
 .field {

@@ -4,20 +4,24 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EncryptedImageVault } from "@florence/artifacts";
 import {
-  baselineFile,
   FlorenceStoreConflict,
   FlorenceStoreUnauthorized,
   migrateDatabase,
+  migrationFiles,
   PostgresFlorenceStore,
 } from "@florence/database";
 import {
+  GOOGLE_SCOPES,
   type GoogleCalendarExecutionResult,
   GoogleConnection,
   type GoogleConnectionStore,
+  type GoogleFamilyCalendarProvisioningResult,
 } from "@florence/google";
 import {
   type LinqClient,
   type LinqConversationAuthority,
+  type LinqCreateChat,
+  type LinqCreatedChat,
   type LinqSendMessage,
   type LinqSendReaction,
   linqIdentitySubjectDigest,
@@ -40,7 +44,12 @@ const ADULT_ONE_IDENTITY = linqIdentitySubjectDigest(ADULT_ONE_HANDLE);
 const ADULT_TWO_IDENTITY = linqIdentitySubjectDigest(ADULT_TWO_HANDLE);
 const COMPETING_FOUNDER_IDENTITY = linqIdentitySubjectDigest(COMPETING_FOUNDER_HANDLE);
 const PRIVATE_ONE = "linq-private-one";
+const PRIVATE_TWO = "linq-private-two";
 const PRIVATE_COMPETING_FOUNDER = "linq-private-competing-founder";
+const FLORENCE_PHONE = "+15555550000";
+const ADULT_ONE_PHONE = "+15555550101";
+const ADULT_TWO_PHONE = "+15555550202";
+const COMPETING_FOUNDER_PHONE = "+15555550303";
 const FOUNDER_IDS = new EnrollmentCodes(ENROLLMENT_SECRET).issueFounderSetup({
   providerConversationId: PRIVATE_ONE,
   identitySubjectDigest: ADULT_ONE_IDENTITY,
@@ -52,9 +61,9 @@ const COMPETING_FOUNDER = new EnrollmentCodes(ENROLLMENT_SECRET).issueFounderSet
   identitySubjectDigest: COMPETING_FOUNDER_IDENTITY,
   occurredAt: new Date(NOW).toISOString(),
 }).adultId;
-const ADULT_TWO = "22222222-2222-4222-8222-222222222222";
 const GOOGLE_CONNECTION = "44444444-4444-4444-8444-444444444444";
-const PARTICIPANTS = [ADULT_ONE_IDENTITY, ADULT_TWO_IDENTITY].sort();
+const PARTNER_GOOGLE_CONNECTION = "44444444-4444-4444-8444-444444444445";
+const FAMILY_CALENDAR = "anbarasu-family@group.calendar.google.com";
 const GROUP = "linq-group-family";
 const LINQ_PARTNER = "partner-florence";
 const LINQ_SIGNING_KEY = Buffer.from("florence-release-webhook-key-32b", "utf8");
@@ -67,6 +76,8 @@ const EVENT = {
   location: "Muir Elementary",
 };
 const COMPOUND_CALENDAR_APPROVAL = "Yep, add it — and remind me that morning.";
+const FAMILY_CALENDAR_REQUEST =
+  "Alex here—add the school assembly to our family calendar exactly as written.";
 const CALENDAR_MORNING_REMINDER_AT = "2026-08-18T15:00:00.000Z";
 const CALENDAR_MORNING_REMINDER = "School assembly is this morning at 10:00.";
 const TRIP_WINDOW = {
@@ -89,12 +100,21 @@ const SCHOOL_EMAIL = {
   text: "Permission slip due Tuesday. Friday's bus returns at 3:45.",
 };
 const NATURAL_SETUP_OPT_OUT = "I don’t want Florence to message me here anymore.";
+const PARTNER_INVITATION_APPROVAL =
+  "Yes—please text Alex. And once we’re both in, tell us which school date needs attention first.";
 
 type Reason = FlorenceReasoner["decide"];
 type SetupConversation = FlorenceReasoner["converseDuringSetup"];
 type InterpretCalendarApproval = FlorenceReasoner["interpretCalendarApproval"];
+type InterpretPartnerInvitationApproval = FlorenceReasoner["interpretPartnerInvitationApproval"];
 type SetupConversationInput = Parameters<SetupConversation>[0];
 type CalendarApprovalInput = Parameters<InterpretCalendarApproval>[0];
+type PartnerInvitationApprovalInput = Parameters<InterpretPartnerInvitationApproval>[0];
+type FamilyCalendarProvisioningInput = Parameters<GoogleConnection["provisionFamilyCalendar"]>[0];
+type CalendarReadInput = Parameters<GoogleConnection["readCalendarWindow"]>[0];
+type CalendarExecutionInput = Parameters<GoogleConnection["executeCalendar"]>[0] & {
+  audience: "private" | "household";
+};
 
 const release = TEST_DATABASE_URL ? describe : describe.skip;
 
@@ -139,7 +159,10 @@ release("Florence release journeys", () => {
               text: null,
               sourceIds: [sourceId],
             },
-            calendar: calendarDraft("direct", sourceId),
+            calendar: calendarDraft("direct", sourceId, {
+              calendarId: FAMILY_CALENDAR,
+              audience: "household",
+            }),
           });
         }
         if (input.currentMessage.text.includes("Review this school packet")) {
@@ -313,6 +336,32 @@ release("Florence release journeys", () => {
             },
           });
         }
+        if (input.currentMessage.text === FAMILY_CALENDAR_REQUEST) {
+          expect(input.audience).toBe("group");
+          expect(input.currentAdultId).toBe(harness.adultTwoId);
+          expect(input.googleConnections).toEqual([
+            {
+              connectionId: GOOGLE_CONNECTION,
+              emailLabel: "Anbarasu Family",
+              calendarId: FAMILY_CALENDAR,
+              kind: "family",
+            },
+          ]);
+          const calendar = await reads.readCalendarWindow({
+            connectionId: GOOGLE_CONNECTION,
+            timeMin: EVENT.startsAt,
+            timeMax: EVENT.endsAt,
+            limit: 50,
+          });
+          expect(calendar).toEqual({ status: "complete", events: [] });
+          calendarWasRead = true;
+          return decision({
+            calendar: calendarDraft("direct", sourceId, {
+              calendarId: FAMILY_CALENDAR,
+              audience: "household",
+            }),
+          });
+        }
         if (input.currentMessage.text === COMPOUND_CALENDAR_APPROVAL) {
           expect(input.pendingCalendarOffers).toEqual([expect.objectContaining({ event: EVENT })]);
           return decision({
@@ -354,9 +403,13 @@ release("Florence release journeys", () => {
 
     expect(harness.linq.messages.map((message) => message.text)).toEqual(
       expect.arrayContaining([
-        expect.stringMatching(/^You’re in, Hari 🎉$/),
-        expect.stringContaining("Google account stays private to you"),
-        "What’s one thing you’d rather not deal with yourself? I’ll take a first pass.",
+        "Your side is ready, Hari.",
+        "I’ll use your Gmail and calendar to catch school dates, conflicts, and loose ends without sharing your private stuff.",
+        "Want me to text Alex at ••••0202 so they can set up their side?",
+        expect.stringMatching(/^Hi Alex — I’m Florence\./),
+        expect.stringMatching(/^Set up your side here:\nhttps:\/\/florence\.test\/#s=ps1\./),
+        expect.stringMatching(/^Hi Hari and Alex — I’m Florence\. This is our family thread\./),
+        "I made the Anbarasu Family calendar too. Either of you can ask me to add or change family plans here.",
       ]),
     );
 
@@ -462,7 +515,7 @@ release("Florence release journeys", () => {
     );
 
     const groupStart = harness.inbound("group", "group-start", "Hi Florence");
-    expect((await harness.florence.bootstrapMessagesGroup(groupStart))?.disposition).toBe("accepted");
+    expect((await harness.florence.acceptInbound(groupStart))?.disposition).toBe("accepted");
     await harness.drain();
     expect((await harness.florence.acceptInbound(groupStart))?.disposition).toBe("duplicate");
     const groupReplyIndex = harness.linq.messages.findIndex(
@@ -541,10 +594,14 @@ release("Florence release journeys", () => {
     await harness.drain();
     harness.now += 60_000;
     await harness.drain();
-    const beforeCorrection = await harness.florence.workspaceForAdult(ADULT_TWO);
+    const beforeCorrection = await harness.florence.workspaceForAdult(harness.adultTwoId);
     const dismissal = beforeCorrection.vault?.facts.find((fact) => fact.statement.includes("dismissal"));
     expect(dismissal?.visibility).toBe("household");
-    await harness.florence.correctFact(ADULT_TWO, dismissal?.id ?? "missing", "School dismissal is at 3:00");
+    await harness.florence.correctFact(
+      harness.adultTwoId,
+      dismissal?.id ?? "missing",
+      "School dismissal is at 3:00",
+    );
     expect((await harness.florence.workspaceForAdult(ADULT_ONE)).vault?.facts).toEqual(
       expect.arrayContaining([expect.objectContaining({ statement: "School dismissal is at 3:00" })]),
     );
@@ -563,6 +620,41 @@ release("Florence release journeys", () => {
         event: EVENT,
       },
     ]);
+    expect(harness.googleEffects).toBe(1);
+    const familyCalendarRequest = harness.inbound(
+      "group",
+      "family-calendar-direct",
+      FAMILY_CALENDAR_REQUEST,
+      {
+        senderIdentitySubjectDigest: ADULT_TWO_IDENTITY,
+      },
+    );
+    expect((await harness.florence.acceptInbound(familyCalendarRequest))?.disposition).toBe("accepted");
+    await harness.drain();
+    expect(harness.calendarReadCalls).toEqual(
+      expect.arrayContaining([
+        {
+          householdId: FOUNDER_IDS.householdId,
+          ownerAdultId: ADULT_ONE,
+          connectionId: GOOGLE_CONNECTION,
+          calendarId: FAMILY_CALENDAR,
+          timeMin: EVENT.startsAt,
+          timeMax: EVENT.endsAt,
+          limit: 50,
+        },
+      ]),
+    );
+    expect(harness.calendarExecutions.filter((action) => action.audience === "household")).toEqual([
+      expect.objectContaining({
+        householdId: FOUNDER_IDS.householdId,
+        connectionId: GOOGLE_CONNECTION,
+        ownerAdultId: ADULT_ONE,
+        calendarId: FAMILY_CALENDAR,
+        audience: "household",
+        approvalMessageId: inboundSourceId("event-family-calendar-direct"),
+        event: EVENT,
+      }),
+    ]);
 
     const workspace = await harness.florence.workspaceForAdult(ADULT_ONE);
     expect(Object.values(workspace.workspace.setup)).not.toContain(false);
@@ -570,11 +662,11 @@ release("Florence release journeys", () => {
     expect(reactionWasUnderstood).toBe(true);
     expect(calendarWasRead).toBe(true);
     expect(obsoleteResultWasSuppressed).toBe(true);
-    expect(harness.googleReads).toBe(3);
+    expect(harness.googleReads).toBe(4);
     expect(workspace.vault?.facts).not.toEqual(
       expect.arrayContaining([expect.objectContaining({ statement: "A tapback changed family memory" })]),
     );
-    expect(harness.googleEffects).toBe(1);
+    expect(harness.googleEffects).toBe(2);
     expect(harness.linq.reactions).toHaveLength(2);
     expect(harness.linq.reactions[1]).toMatchObject({
       targetProviderMessageId: groupReplyProviderId,
@@ -587,8 +679,16 @@ release("Florence release journeys", () => {
         "Pickup reminder: dismissal is at 2:45.",
         "I’ll remind you that morning.",
         "Added “School assembly” to your calendar.",
+        "Added “School assembly” to the family calendar.",
       ]),
     );
+    expect(
+      harness.linq.messages.filter(
+        (message) =>
+          message.providerConversationId === GROUP &&
+          message.text === "Added “School assembly” to the family calendar.",
+      ),
+    ).toHaveLength(1);
     expect(harness.linq.messages.find((message) => message.text === "That made me smile.")?.replyTo).toEqual({
       providerMessageId: groupReplyProviderId,
     });
@@ -600,7 +700,11 @@ release("Florence release journeys", () => {
   test("keeps private memory and corrections private, shares only group corrections, understands replies, and rejects mismatched group authority", async () => {
     let understoodReply = false;
     let understoodNaturalOptOut = false;
+    const reasonedTexts: string[] = [];
+    let observedReplyTarget: unknown = null;
+    let replyTargetWasInRecentMessages: boolean | null = null;
     const harness = await freshHarness(async (input) => {
+      reasonedTexts.push(input.currentMessage.text);
       const sourceId = input.currentMessage.sourceId;
       if (input.currentMessage.text === "Please stop messaging me in this conversation.") {
         understoodNaturalOptOut = true;
@@ -612,14 +716,10 @@ release("Florence release journeys", () => {
         throw new FlorenceReasonerError("transient", "Keep this reply target retrying");
       }
       if (input.currentMessage.text === "What note was I replying to?") {
-        expect(input.currentMessage.replyTo).toMatchObject({
-          sourceId: inboundSourceId("event-private-note"),
-          senderName: "Hari",
-          text: "Private doctor note",
-        });
-        expect(
-          input.recentMessages.some((message) => message.sourceId === input.currentMessage.replyTo?.sourceId),
-        ).toBe(false);
+        observedReplyTarget = input.currentMessage.replyTo;
+        replyTargetWasInRecentMessages = input.recentMessages.some(
+          (message) => message.sourceId === input.currentMessage.replyTo?.sourceId,
+        );
         understoodReply = true;
         return decision();
       }
@@ -677,19 +777,24 @@ release("Florence release journeys", () => {
       replyToProviderMessageId: "message-private-note",
     });
     await harness.drain();
-    await harness.florence.bootstrapMessagesGroup(
-      harness.inbound("group", "group-start", "Pickup is at 2:45"),
-    );
+    await harness.florence.acceptInbound(harness.inbound("group", "group-start", "Pickup is at 2:45"));
     await harness.drain();
 
+    expect(reasonedTexts).toContain("What note was I replying to?");
+    expect(observedReplyTarget).toMatchObject({
+      sourceId: inboundSourceId("event-private-note"),
+      senderName: "Hari Anbarasu",
+      text: "Private doctor note",
+    });
+    expect(replyTargetWasInRecentMessages).toBe(false);
     expect(understoodReply).toBe(true);
-    expect((await harness.florence.workspaceForAdult(ADULT_TWO)).vault?.facts).not.toEqual(
+    expect((await harness.florence.workspaceForAdult(harness.adultTwoId)).vault?.facts).not.toEqual(
       expect.arrayContaining([expect.objectContaining({ statement: "Private doctor note" })]),
     );
 
     await harness.acceptPrivate("private-forget", "Forget pickup privately");
     await harness.drain();
-    expect((await harness.florence.workspaceForAdult(ADULT_TWO)).vault?.facts).toEqual(
+    expect((await harness.florence.workspaceForAdult(harness.adultTwoId)).vault?.facts).toEqual(
       expect.arrayContaining([expect.objectContaining({ statement: "Pickup is at 2:45" })]),
     );
 
@@ -701,10 +806,10 @@ release("Florence release journeys", () => {
         expect.objectContaining({ statement: "Pickup is at 3:00", visibility: "private" }),
       ]),
     );
-    expect((await harness.florence.workspaceForAdult(ADULT_TWO)).vault?.facts).toEqual(
+    expect((await harness.florence.workspaceForAdult(harness.adultTwoId)).vault?.facts).toEqual(
       expect.arrayContaining([expect.objectContaining({ statement: "Pickup is at 2:45" })]),
     );
-    expect((await harness.florence.workspaceForAdult(ADULT_TWO)).vault?.facts).not.toEqual(
+    expect((await harness.florence.workspaceForAdult(harness.adultTwoId)).vault?.facts).not.toEqual(
       expect.arrayContaining([expect.objectContaining({ statement: "Pickup is at 3:00" })]),
     );
 
@@ -712,7 +817,7 @@ release("Florence release journeys", () => {
       harness.inbound("group", "shared-correction", "Pickup is now 3:00 for everyone"),
     );
     await harness.drain();
-    expect((await harness.florence.workspaceForAdult(ADULT_TWO)).vault?.facts).toEqual(
+    expect((await harness.florence.workspaceForAdult(harness.adultTwoId)).vault?.facts).toEqual(
       expect.arrayContaining([expect.objectContaining({ statement: "Pickup is at 3:00" })]),
     );
 
@@ -769,15 +874,21 @@ release("Florence release journeys", () => {
       disposition: "acknowledged",
       reason: "channel_stopped",
     });
-    expect((await harness.florence.workspaceForAdult(ADULT_ONE)).viewer.displayName).toBe("Hari");
+    expect((await harness.florence.workspaceForAdult(ADULT_ONE)).viewer.displayName).toBe("Hari Anbarasu");
   });
 
   test("reconciles an ambiguous Calendar write and reports one definitive failure privately", async () => {
     const harness = await freshHarness(
       async (input, reads) => {
-        if (input.currentMessage.text === "Review the school assembly details.") {
+        if (
+          input.currentMessage.text === "Review the school assembly details." ||
+          input.currentMessage.text === PARTNER_INVITATION_APPROVAL
+        ) {
           return decision();
         }
+        const hasAttachedEvent =
+          input.currentMessage.text === "Add the school assembly in this PDF to my calendar.";
+        if (hasAttachedEvent) expect(input.currentMessage.pdfs).toHaveLength(1);
         expect(
           await reads.readCalendarWindow({
             connectionId: GOOGLE_CONNECTION,
@@ -789,10 +900,7 @@ release("Florence release journeys", () => {
         return decision({
           bubbles: [{ text: "Done — I added it.", delayMs: 0 }],
           calendar: {
-            ...calendarDraft(
-              input.currentMessage.pdfs?.length ? "offer" : "direct",
-              input.currentMessage.sourceId,
-            ),
+            ...calendarDraft(hasAttachedEvent ? "offer" : "direct", input.currentMessage.sourceId),
           },
         });
       },
@@ -808,6 +916,7 @@ release("Florence release journeys", () => {
     await harness.onboard();
     await harness.activateGoogle();
     await harness.completeFamilyOnboarding();
+    expect(harness.googleAttempts).toBe(0);
     const attachmentSourceId = inboundSourceId("event-calendar-attachment-request");
     const attachedEvent = harness.vault.sealPdf({
       documentId: "77777777-7777-4777-8777-777777777777",
@@ -980,6 +1089,9 @@ async function expectCanonicalGoogleScopeAcceptance(): Promise<void> {
               "https://www.googleapis.com/auth/userinfo.email",
               "https://www.googleapis.com/auth/userinfo.profile",
               "https://www.googleapis.com/auth/gmail.readonly",
+              "https://www.googleapis.com/auth/calendar.app.created",
+              "https://www.googleapis.com/auth/calendar.acls",
+              "https://www.googleapis.com/auth/calendar.calendarlist",
               "https://www.googleapis.com/auth/calendar.events.owned",
             ].join(" "),
             token_type: "Bearer",
@@ -995,12 +1107,7 @@ async function expectCanonicalGoogleScopeAcceptance(): Promise<void> {
     }),
   ).resolves.toMatchObject({
     status: "active",
-    grantedScopes: [
-      "openid",
-      "email",
-      "https://www.googleapis.com/auth/gmail.readonly",
-      "https://www.googleapis.com/auth/calendar.events.owned",
-    ],
+    grantedScopes: GOOGLE_SCOPES,
   });
 }
 
@@ -1010,6 +1117,8 @@ class Harness {
   googleEffects = 0;
   googleReads = 0;
   gmailReads = 0;
+  partnerAdultId: string | null = null;
+  childId: string | null = null;
 
   constructor(
     readonly store: PostgresFlorenceStore,
@@ -1019,6 +1128,10 @@ class Harness {
     readonly enrollmentCodes: EnrollmentCodes,
     readonly setupTurns: SetupConversationInput[],
     readonly calendarApprovalTurns: CalendarApprovalInput[],
+    readonly partnerInvitationApprovalTurns: PartnerInvitationApprovalInput[],
+    readonly familyCalendarProvisioningCalls: FamilyCalendarProvisioningInput[],
+    readonly calendarReadCalls: CalendarReadInput[],
+    readonly calendarExecutions: CalendarExecutionInput[],
   ) {}
 
   iso(): string {
@@ -1121,9 +1234,11 @@ class Harness {
     const setupBody = {
       setupToken,
       profile: {
-        displayName: "Hari",
+        firstName: "Hari",
+        lastName: "Anbarasu",
         timeZone: "America/Los_Angeles",
         guardianAttested: true as const,
+        proactiveUseAccepted: true as const,
       },
     };
     const setup = await app.inject({ method: "POST", url: "/api/v1/session", payload: setupBody });
@@ -1143,7 +1258,7 @@ class Harness {
         payload: {
           ...setupBody,
           setupToken: competingSetupToken,
-          profile: { ...setupBody.profile, displayName: "Other parent" },
+          profile: { ...setupBody.profile, firstName: "Other", lastName: "Parent" },
         },
       });
       expect(losingSetup.statusCode).toBe(401);
@@ -1164,23 +1279,37 @@ class Harness {
 
   async completeFamilyOnboarding(): Promise<void> {
     const workspace = await this.florence.completeFamilyOnboarding(ADULT_ONE, {
-      partner: { id: ADULT_TWO, displayName: "Alex" },
+      mode: "two_adult",
+      familyLabel: "Anbarasu Family",
+      postalCode: "94110",
+      partner: { firstName: "Alex", lastName: "Anbarasu", phoneNumber: "+15555550202" },
       children: [
         {
-          id: "33333333-3333-4333-8333-333333333333",
-          displayName: "Maya",
+          firstName: "Maya",
+          lastName: "Anbarasu",
           school: "Muir Elementary",
           activities: ["Soccer"],
         },
       ],
     });
-    expect(workspace.workspace.setup.onboardingComplete).toBe(true);
+    expect(workspace.workspace.setup.ownOnboardingComplete).toBe(true);
+    const partner = workspace.vault?.members.find(
+      (member) => member.kind === "adult" && member.relationship === "Partner",
+    );
+    const child = workspace.vault?.members.find((member) => member.kind === "child");
+    if (!partner || !child) throw new Error("Server did not create the planned family members");
+    this.partnerAdultId = partner.id;
+    this.childId = child.id;
     expect(workspace.vault?.members).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ id: ADULT_TWO, displayName: "Alex", messagesIdentity: "not_invited" }),
         expect.objectContaining({
-          id: "33333333-3333-4333-8333-333333333333",
-          displayName: "Maya",
+          id: partner.id,
+          displayName: "Alex Anbarasu",
+          messagesIdentity: "not_invited",
+        }),
+        expect.objectContaining({
+          id: child.id,
+          displayName: "Maya Anbarasu",
           school: "Muir Elementary",
           activities: ["Soccer"],
         }),
@@ -1188,55 +1317,154 @@ class Harness {
     );
     this.now += 1_400;
     await this.drain();
-
-    const householdId = (await this.store.listHouseholdIdsForAdult(ADULT_ONE))[0] ?? "missing";
-    const partnerChallenge = digest("release-partner-enrollment");
-    await this.store.issueMessagesEnrollment({
-      householdId,
-      actorAdultId: ADULT_ONE,
-      adultId: ADULT_TWO,
-      challengeDigest: partnerChallenge,
-      issuedAt: this.iso(),
-      expiresAt: new Date(this.now + 60_000).toISOString(),
+    expect(this.linq.messages.map((message) => message.text)).toEqual(
+      expect.arrayContaining([
+        "Your side is ready, Hari.",
+        "I’ll use your Gmail and calendar to catch school dates, conflicts, and loose ends without sharing your private stuff.",
+        "Want me to text Alex at ••••0202 so they can set up their side?",
+      ]),
+    );
+    await this.acceptPrivate("partner-invitation-approval", PARTNER_INVITATION_APPROVAL);
+    await this.drain();
+    expect(this.partnerInvitationApprovalTurns).toEqual([
+      {
+        currentMessage: { text: PARTNER_INVITATION_APPROVAL },
+        partner: {
+          adultId: partner.id,
+          firstName: "Alex",
+          maskedPhoneNumber: "••• ••• 0202",
+        },
+      },
+    ]);
+    expect(this.linq.createdChats[0]).toMatchObject({
+      input: {
+        senderPhoneNumber: FLORENCE_PHONE,
+        participantPhoneNumbers: [ADULT_TWO_PHONE],
+        initialText: expect.stringMatching(/^Hi Alex — I’m Florence\./),
+      },
+      result: {
+        providerConversationId: PRIVATE_TWO,
+        authority: {
+          audience: "private",
+          ownerPhoneNumber: FLORENCE_PHONE,
+          participants: [{ identitySubjectDigest: ADULT_TWO_IDENTITY, phoneNumber: ADULT_TWO_PHONE }],
+        },
+      },
     });
+    const partnerSetupToken = this.setupTokenFor(PRIVATE_TWO);
     expect(
-      await this.store.redeemMessagesEnrollment({
-        challengeDigest: partnerChallenge,
-        identitySubjectDigest: ADULT_TWO_IDENTITY,
-        consentVersion: "release-fixture-v1",
-        consentedAt: this.iso(),
-        providerConversationId: "linq-private-two",
-        occurredAt: this.iso(),
+      await this.florence.redeemSetupLink({
+        setupToken: partnerSetupToken,
+        profile: {
+          firstName: "Alex",
+          lastName: "Anbarasu",
+          timeZone: "America/Los_Angeles",
+          guardianAttested: true,
+          proactiveUseAccepted: true,
+        },
       }),
-    ).toMatchObject({ disposition: "accepted", adultId: ADULT_TWO });
-    this.linq.authorities.set("linq-private-two", {
-      audience: "private",
-      participantIdentityDigests: [ADULT_TWO_IDENTITY],
+    ).toMatchObject({ disposition: "accepted", adultId: partner.id });
+    await this.activateGoogleConnection({
+      adultId: partner.id,
+      connectionId: PARTNER_GOOGLE_CONNECTION,
+      state: "partner-google-state",
+      sessionBinding: "partner-google-session",
     });
-    this.linq.authorities.set(GROUP, { audience: "group", participantIdentityDigests: PARTICIPANTS });
+    this.now += 1_400;
+    await this.drain();
+    expect(this.linq.createdChats).toHaveLength(2);
+    expect(this.linq.createdChats[1]).toMatchObject({
+      input: {
+        senderPhoneNumber: FLORENCE_PHONE,
+        participantPhoneNumbers: expect.arrayContaining([ADULT_ONE_PHONE, ADULT_TWO_PHONE]),
+        initialText: expect.stringMatching(/^Hi Hari and Alex — I’m Florence\./),
+      },
+      result: {
+        providerConversationId: GROUP,
+        authority: {
+          audience: "group",
+          ownerPhoneNumber: FLORENCE_PHONE,
+          participantIdentityDigests: this.participants,
+        },
+      },
+    });
+    expect(this.familyCalendarProvisioningCalls).toEqual([
+      {
+        householdId: (await this.store.listHouseholdIdsForAdult(ADULT_ONE))[0],
+        founderAdultId: ADULT_ONE,
+        founderConnectionId: GOOGLE_CONNECTION,
+        partnerAdultId: partner.id,
+        partnerConnectionId: PARTNER_GOOGLE_CONNECTION,
+        summary: "Anbarasu Family",
+        timeZone: "America/Los_Angeles",
+      },
+    ]);
+    const founderWorkspace = await this.florence.workspaceForAdult(ADULT_ONE);
+    const partnerWorkspace = await this.florence.workspaceForAdult(partner.id);
+    expect(founderWorkspace.workspace.setup).toEqual({
+      ownOnboardingComplete: true,
+      secondAdultAdded: true,
+      partnerInvitation: "connected",
+      bothAdultsMessagesConnected: true,
+      bothAdultsGoogleConnected: true,
+      familyGroupConnected: true,
+      familyCalendarConnected: true,
+    });
+    expect(partnerWorkspace.workspace.setup).toEqual(founderWorkspace.workspace.setup);
+    expect(founderWorkspace.workspace.googleConnections).toEqual([
+      expect.objectContaining({ connectionId: GOOGLE_CONNECTION, emailLabel: "hari@example.com" }),
+    ]);
+    expect(partnerWorkspace.workspace.googleConnections).toEqual([
+      expect.objectContaining({
+        connectionId: PARTNER_GOOGLE_CONNECTION,
+        emailLabel: "alex@example.com",
+      }),
+    ]);
+  }
+
+  get adultTwoId(): string {
+    if (!this.partnerAdultId) throw new Error("Partner has not been created");
+    return this.partnerAdultId;
+  }
+
+  get participants(): string[] {
+    return [ADULT_ONE_IDENTITY, ADULT_TWO_IDENTITY].sort();
   }
 
   async activateGoogle(): Promise<void> {
-    const state = "google-state";
-    const stateDigest = digest(state);
-    const sessionBindingDigest = digest("google-session");
-    await this.store.createPending({
+    await this.activateGoogleConnection({
+      adultId: ADULT_ONE,
       connectionId: GOOGLE_CONNECTION,
-      householdId: (await this.store.listHouseholdIdsForAdult(ADULT_ONE))[0] ?? "missing",
-      ownerAdultId: ADULT_ONE,
+      state: "google-state",
+      sessionBinding: "google-session",
+    });
+    this.now += 1_400;
+    await this.drain();
+  }
+
+  async activateGoogleConnection(input: {
+    adultId: string;
+    connectionId: string;
+    state: string;
+    sessionBinding: string;
+  }): Promise<void> {
+    const stateDigest = digest(input.state);
+    const sessionBindingDigest = digest(input.sessionBinding);
+    await this.store.createPending({
+      connectionId: input.connectionId,
+      householdId: (await this.store.listHouseholdIdsForAdult(input.adultId))[0] ?? "missing",
+      ownerAdultId: input.adultId,
       stateDigest,
       sessionBindingDigest,
       stateExpiresAt: new Date(this.now + 60_000).toISOString(),
       now: this.iso(),
     });
     await this.florence.finishGoogle({
-      adultId: ADULT_ONE,
-      state,
+      adultId: input.adultId,
+      state: input.state,
       code: "google-authorization-code",
       sessionBindingDigest,
     });
-    this.now += 1_400;
-    await this.drain();
   }
 
   inbound<Audience extends "private" | "group">(
@@ -1249,7 +1477,7 @@ class Harness {
     return {
       providerConversationId: isGroup ? GROUP : PRIVATE_ONE,
       audience,
-      participantIdentityDigests: isGroup ? PARTICIPANTS : [ADULT_ONE_IDENTITY],
+      participantIdentityDigests: isGroup ? this.participants : [ADULT_ONE_IDENTITY],
       senderIdentitySubjectDigest: ADULT_ONE_IDENTITY,
       providerEventId: `event-${key}`,
       providerMessageId: `message-${key}`,
@@ -1272,7 +1500,9 @@ class Harness {
         (message.text.includes("#s=") || message.text.includes("#setup=")),
     );
     if (!setupMessage) throw new Error("Florence did not send the founder setup link");
-    const fragment = new URL(setupMessage.text).hash.slice(1);
+    const setupUrl = /https:\/\/\S+/.exec(setupMessage.text)?.[0];
+    if (!setupUrl) throw new Error("Florence did not send a setup URL");
+    const fragment = new URL(setupUrl).hash.slice(1);
     const token = new URLSearchParams(fragment).get("s") ?? new URLSearchParams(fragment).get("setup");
     if (!token) throw new Error("Florence did not send the founder setup token");
     return token;
@@ -1406,19 +1636,92 @@ class Harness {
   }
 
   async drain(): Promise<void> {
-    for (let index = 0; index < 20 && (await this.florence.runOnce()); index += 1);
+    let consecutiveIdleCycles = 0;
+    for (let index = 0; index < 40 && consecutiveIdleCycles < 2; index += 1) {
+      const worked = await this.florence.runOnce();
+      consecutiveIdleCycles = worked ? 0 : consecutiveIdleCycles + 1;
+      if (!worked) await new Promise((resolve) => setTimeout(resolve, 0));
+    }
   }
 }
 
 class FakeLinq {
   readonly authorities = new Map<string, LinqConversationAuthority>();
+  readonly createdChats: { input: LinqCreateChat; result: LinqCreatedChat }[] = [];
   readonly messages: LinqSendMessage[] = [];
   readonly reactions: LinqSendReaction[] = [];
+  readonly #createdByIdempotencyKey = new Map<string, { input: LinqCreateChat; result: LinqCreatedChat }>();
+  readonly #sentByIdempotencyKey = new Map<
+    string,
+    { input: LinqSendMessage; result: Awaited<ReturnType<LinqClient["sendMessage"]>> }
+  >();
+
+  async createChat(input: LinqCreateChat): Promise<LinqCreatedChat> {
+    const prior = this.#createdByIdempotencyKey.get(input.idempotencyKey);
+    if (prior) {
+      expect(input).toEqual(prior.input);
+      return prior.result;
+    }
+    expect(input.senderPhoneNumber).toBe(FLORENCE_PHONE);
+    expect(input.initialText.trim()).not.toBe("");
+    expect(input.initialText).not.toMatch(/https?:\/\//i);
+    const privateInvitation = input.participantPhoneNumbers.length === 1;
+    expect([...input.participantPhoneNumbers].sort()).toEqual(
+      privateInvitation ? [ADULT_TWO_PHONE] : [ADULT_ONE_PHONE, ADULT_TWO_PHONE].sort(),
+    );
+    const participantIdentityDigests = privateInvitation
+      ? [ADULT_TWO_IDENTITY]
+      : [ADULT_ONE_IDENTITY, ADULT_TWO_IDENTITY].sort();
+    const participants = privateInvitation
+      ? [{ identitySubjectDigest: ADULT_TWO_IDENTITY, phoneNumber: ADULT_TWO_PHONE }]
+      : [
+          { identitySubjectDigest: ADULT_ONE_IDENTITY, phoneNumber: ADULT_ONE_PHONE },
+          { identitySubjectDigest: ADULT_TWO_IDENTITY, phoneNumber: ADULT_TWO_PHONE },
+        ].sort((left, right) => left.identitySubjectDigest.localeCompare(right.identitySubjectDigest));
+    const authority = {
+      audience: privateInvitation ? ("private" as const) : ("group" as const),
+      participantIdentityDigests,
+      ownerPhoneNumber: FLORENCE_PHONE,
+      participants,
+    };
+    const providerConversationId = privateInvitation ? PRIVATE_TWO : GROUP;
+    const result: LinqCreatedChat = {
+      providerConversationId,
+      authority,
+      initialMessage: {
+        idempotencyKey: input.idempotencyKey,
+        providerMessageId: `created-chat-message-${this.createdChats.length + 1}`,
+        occurredAt: new Date(NOW).toISOString(),
+      },
+    };
+    this.authorities.set(providerConversationId, authority);
+    this.createdChats.push({ input, result });
+    this.#createdByIdempotencyKey.set(input.idempotencyKey, { input, result });
+    this.messages.push({
+      idempotencyKey: input.idempotencyKey,
+      providerConversationId,
+      expectedAuthority: authority,
+      text: input.initialText,
+    });
+    return result;
+  }
 
   async observeChat(providerConversationId: string) {
     const authority = this.authorities.get(providerConversationId);
     if (!authority) throw new Error(`Unknown fake Linq conversation ${providerConversationId}`);
-    return authority;
+    return {
+      ...authority,
+      ownerPhoneNumber: FLORENCE_PHONE,
+      participants: authority.participantIdentityDigests.map((identitySubjectDigest) => ({
+        identitySubjectDigest,
+        phoneNumber:
+          identitySubjectDigest === ADULT_ONE_IDENTITY
+            ? ADULT_ONE_PHONE
+            : identitySubjectDigest === ADULT_TWO_IDENTITY
+              ? ADULT_TWO_PHONE
+              : COMPETING_FOUNDER_PHONE,
+      })),
+    };
   }
 
   async setTyping(): Promise<boolean> {
@@ -1426,22 +1729,31 @@ class FakeLinq {
   }
 
   async sendMessage(input: LinqSendMessage) {
-    expect(await this.observeChat(input.providerConversationId)).toEqual(input.expectedAuthority);
+    const prior = this.#sentByIdempotencyKey.get(input.idempotencyKey);
+    if (prior) {
+      expect(input).toEqual(prior.input);
+      return prior.result;
+    }
+    expect(await this.observeChat(input.providerConversationId)).toMatchObject(input.expectedAuthority);
     this.messages.push(input);
-    return {
+    const result = {
       status: "committed" as const,
+      providerState: "accepted" as const,
       idempotencyKey: input.idempotencyKey,
       providerReceiptId: `sent-${this.messages.length}`,
       detail: null,
       occurredAt: new Date(NOW).toISOString(),
     };
+    this.#sentByIdempotencyKey.set(input.idempotencyKey, { input, result });
+    return result;
   }
 
   async sendReaction(input: LinqSendReaction) {
-    expect(await this.observeChat(input.providerConversationId)).toEqual(input.expectedAuthority);
+    expect(await this.observeChat(input.providerConversationId)).toMatchObject(input.expectedAuthority);
     this.reactions.push(input);
     return {
       status: "committed" as const,
+      providerState: "reaction_added" as const,
       idempotencyKey: input.idempotencyKey,
       providerReceiptId: `reaction-${this.reactions.length}`,
       detail: null,
@@ -1455,16 +1767,15 @@ async function freshHarness(
   options: {
     executeCalendar?: () => Promise<GoogleCalendarExecutionResult>;
     interpretCalendarApproval?: InterpretCalendarApproval;
+    interpretPartnerInvitationApproval?: InterpretPartnerInvitationApproval;
   } = {},
 ): Promise<Harness> {
   if (!TEST_DATABASE_URL) throw new Error("TEST_DATABASE_URL is required");
   const directory = await mkdtemp(join(tmpdir(), "florence-release-"));
   const schema = `florence_${randomUUID().replaceAll("-", "")}`;
   const setupFile = join(directory, "setup.sql");
-  await writeFile(
-    setupFile,
-    `CREATE SCHEMA "${schema}"; SET search_path TO "${schema}";\n${await readFile(baselineFile, "utf8")}`,
-  );
+  const migrationSql = (await Promise.all(migrationFiles.map((file) => readFile(file, "utf8")))).join("\n");
+  await writeFile(setupFile, `CREATE SCHEMA "${schema}"; SET search_path TO "${schema}";\n${migrationSql}`);
   const databaseUrl = withSchema(TEST_DATABASE_URL, schema);
   await migrateDatabase(databaseUrl, setupFile);
   const store = new PostgresFlorenceStore(databaseUrl);
@@ -1475,6 +1786,10 @@ async function freshHarness(
   });
   const setupTurns: SetupConversationInput[] = [];
   const calendarApprovalTurns: CalendarApprovalInput[] = [];
+  const partnerInvitationApprovalTurns: PartnerInvitationApprovalInput[] = [];
+  const familyCalendarProvisioningCalls: FamilyCalendarProvisioningInput[] = [];
+  const calendarReadCalls: CalendarReadInput[] = [];
+  const calendarExecutions: CalendarExecutionInput[] = [];
   const converseDuringSetup: SetupConversation = async (input) => {
     setupTurns.push(input);
     if (input.currentMessage.text === NATURAL_SETUP_OPT_OUT) {
@@ -1499,10 +1814,19 @@ async function freshHarness(
     calendarApprovalTurns.push(input);
     return options.interpretCalendarApproval?.(input) ?? { approve: false };
   };
+  const interpretPartnerInvitationApproval: InterpretPartnerInvitationApproval = async (input) => {
+    partnerInvitationApprovalTurns.push(input);
+    return (
+      options.interpretPartnerInvitationApproval?.(input) ?? {
+        sendInvitation: input.currentMessage.text === PARTNER_INVITATION_APPROVAL,
+      }
+    );
+  };
   const reasoner = {
     decide: reason,
     converseDuringSetup,
     interpretCalendarApproval,
+    interpretPartnerInvitationApproval,
   } as unknown as FlorenceReasoner;
   const enrollmentCodes = new EnrollmentCodes(ENROLLMENT_SECRET);
   let harness: Harness;
@@ -1510,33 +1834,61 @@ async function freshHarness(
     status: (input: { householdId: string; ownerAdultId: string }) => store.listActive(input),
     finish: async (input: { state: string; sessionBindingDigest: string; now: string }) => {
       const stateDigest = digest(input.state);
-      await store.consumePendingState({
+      const pending = await store.consumePendingState({
         stateDigest,
         sessionBindingDigest: input.sessionBindingDigest,
         now: input.now,
       });
+      if (!pending) throw new Error("The fake Google state was not pending");
+      const isFounder = pending.ownerAdultId === ADULT_ONE;
       return store.activate({
-        connectionId: GOOGLE_CONNECTION,
+        connectionId: pending.connectionId,
         stateDigest,
-        googleSubjectDigest: digest("google-subject"),
-        emailLabel: "hari@example.com",
-        grantedScopes: [
-          "openid",
-          "email",
-          "https://www.googleapis.com/auth/gmail.readonly",
-          "https://www.googleapis.com/auth/calendar.events.owned",
-        ],
-        refreshTokenEnvelope: "encrypted-refresh-token",
+        googleSubjectDigest: digest(isFounder ? "google-subject-founder" : "google-subject-partner"),
+        emailLabel: isFounder ? "hari@example.com" : "alex@example.com",
+        grantedScopes: GOOGLE_SCOPES,
+        refreshTokenEnvelope: isFounder
+          ? "encrypted-founder-refresh-token"
+          : "encrypted-partner-refresh-token",
         now: input.now,
       });
     },
-    readCalendarWindow: async (input: {
+    provisionFamilyCalendar: async (input: {
       householdId: string;
-      ownerAdultId: string;
-      connectionId: string;
-      timeMin: string;
-      timeMax: string;
-    }) => {
+      founderAdultId: string;
+      founderConnectionId: string;
+      partnerAdultId: string;
+      partnerConnectionId: string;
+      summary: string;
+      timeZone: string;
+      calendarId?: string;
+    }): Promise<GoogleFamilyCalendarProvisioningResult> => {
+      familyCalendarProvisioningCalls.push(input);
+      expect(input.founderAdultId).toBe(ADULT_ONE);
+      expect(input.founderConnectionId).toBe(GOOGLE_CONNECTION);
+      expect(input.partnerAdultId).toBe(harness.adultTwoId);
+      expect(input.partnerConnectionId).toBe(PARTNER_GOOGLE_CONNECTION);
+      expect(input.summary).toBe("Anbarasu Family");
+      expect(input.timeZone).toBe("America/Los_Angeles");
+      expect(input.calendarId).toBeUndefined();
+      return {
+        status: "committed",
+        calendarId: FAMILY_CALENDAR,
+        summary: input.summary,
+        timeZone: input.timeZone,
+        founderConnectionId: input.founderConnectionId,
+        founderAccessRole: "owner",
+        partnerConnectionId: input.partnerConnectionId,
+        partnerEmailLabel: "alex@example.com",
+        partnerAccessRole: "owner",
+        partnerCalendarListSelected: true,
+        providerReceiptId: FAMILY_CALENDAR,
+        detail: JSON.stringify({ calendarId: FAMILY_CALENDAR, partnerAccessRole: "owner" }),
+        occurredAt: harness.iso(),
+      };
+    },
+    readCalendarWindow: async (input: CalendarReadInput) => {
+      calendarReadCalls.push(input);
       harness.googleReads += 1;
       const credential = await store.readActiveGoogleCredential(input);
       return credential
@@ -1559,11 +1911,12 @@ async function freshHarness(
       const credential = await store.readActiveGoogleCredential(input);
       return credential ? [SCHOOL_EMAIL] : [];
     },
-    executeCalendar: async () => {
+    executeCalendar: async (input: CalendarExecutionInput) => {
+      calendarExecutions.push(input);
       harness.googleAttempts += 1;
       if (options.executeCalendar) return options.executeCalendar();
       harness.googleEffects += 1;
-      return committedCalendar(harness.iso());
+      return committedCalendar(harness.iso(), `google-event-${input.actionId}`);
     },
   } as unknown as GoogleConnection;
   const florence = new Florence({
@@ -1575,9 +1928,22 @@ async function freshHarness(
     imageVault: vault,
     messagesUrl: "https://florence.test/messages",
     setupOrigin: "https://florence.test",
+    linqSenderPhoneNumber: FLORENCE_PHONE,
     now: () => new Date(harness.now),
   });
-  harness = new Harness(store, florence, linq, vault, enrollmentCodes, setupTurns, calendarApprovalTurns);
+  harness = new Harness(
+    store,
+    florence,
+    linq,
+    vault,
+    enrollmentCodes,
+    setupTurns,
+    calendarApprovalTurns,
+    partnerInvitationApprovalTurns,
+    familyCalendarProvisioningCalls,
+    calendarReadCalls,
+    calendarExecutions,
+  );
   onTestFinished(async () => {
     florence.stop();
     await store.close();
@@ -1632,13 +1998,13 @@ async function eventually(predicate: () => boolean, timeoutMs = 2_000): Promise<
   }
 }
 
-function committedCalendar(occurredAt: string) {
+function committedCalendar(occurredAt: string, providerReceiptId = "google-event-school-assembly") {
   return {
     status: "committed" as const,
-    providerReceiptId: "google-event-school-assembly",
+    providerReceiptId,
     detail: JSON.stringify({
       provider: "google-calendar",
-      eventId: "google-event-school-assembly",
+      eventId: providerReceiptId,
       etag: '"assembly-etag"',
       digest: digest("google-calendar-proof"),
     }),
@@ -1659,8 +2025,23 @@ function remember(statement: string, sourceId: string): FlorenceDecision["facts"
   return { operation: "remember", factId: null, statement, sourceIds: [sourceId] };
 }
 
-function calendarDraft(mode: "offer" | "direct", sourceId: string) {
-  return { mode, proposalId: null, connectionId: GOOGLE_CONNECTION, event: EVENT, sourceIds: [sourceId] };
+function calendarDraft(
+  mode: "offer" | "direct",
+  sourceId: string,
+  target: { calendarId: string; audience: "private" | "household" } = {
+    calendarId: "primary",
+    audience: "private",
+  },
+) {
+  return {
+    mode,
+    proposalId: null,
+    connectionId: GOOGLE_CONNECTION,
+    calendarId: target.calendarId,
+    audience: target.audience,
+    event: EVENT,
+    sourceIds: [sourceId],
+  };
 }
 
 function storedCalendarAction(sourceId: string) {
@@ -1668,6 +2049,8 @@ function storedCalendarAction(sourceId: string) {
     id: randomUUID(),
     actionId: randomUUID(),
     connectionId: GOOGLE_CONNECTION,
+    calendarId: "primary",
+    audience: "private" as const,
     ownerAdultId: ADULT_ONE,
     basisSourceId: sourceId,
     approvalMessageId: sourceId,

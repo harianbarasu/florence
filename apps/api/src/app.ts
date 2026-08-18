@@ -69,6 +69,7 @@ export function createDefaultDependencies(env: NodeJS.ProcessEnv = process.env):
     enrollmentCodes,
     imageVault,
     messagesUrl: env.FLORENCE_MESSAGES_URL ?? null,
+    linqSenderPhoneNumber: requiredEnv(env, "LINQ_FROM_PHONE"),
     setupOrigin,
   });
   const linqIngress = createLinqIngress({

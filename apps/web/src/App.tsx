@@ -42,10 +42,10 @@ export function AppShell() {
   if (!workspace.data) return <PageLoader />;
   const googleConnected = workspace.data.workspace.googleConnections.length > 0;
   if (!googleConnected) return <GoogleSetupGate status={onboardingEntry.googleStatus} />;
-  if (!workspace.data.workspace.setup.onboardingComplete) {
+  if (!workspace.data.workspace.setup.ownOnboardingComplete) {
     return <FamilySetupPage view={workspace.data} />;
   }
-  if (onboardingEntry.setupComplete) {
+  if (onboardingEntry.setupComplete || onboardingEntry.googleStatus === "connected") {
     return <GoogleSetupSuccess view={workspace.data} />;
   }
 
@@ -65,24 +65,34 @@ export function AppShell() {
 function SetupPage({ setupToken }: { setupToken: string }) {
   const createSession = useCreateSession();
   const startGoogle = useStartGoogleConnection();
-  const [step, setStep] = useState<"profile" | "google">("profile");
+  const [step, setStep] = useState<"profile" | "permission" | "google">("profile");
+  const [firstNameValue, setFirstNameValue] = useState("");
+  const [lastNameValue, setLastNameValue] = useState("");
   const [token, setToken] = useState<string | null>(setupToken);
   const [error, setError] = useState<string | null>(null);
+
+  function continueFromName(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setFirstNameValue((value) => value.trim());
+    setLastNameValue((value) => value.trim());
+    setStep("permission");
+  }
 
   async function submitProfile(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setError(null);
     if (!token) return;
-    const data = new FormData(event.currentTarget);
     const timeZone = detectedTimeZone();
     if (!isTimeZone(timeZone)) {
       setError("Use an IANA time zone such as America/Los_Angeles.");
       return;
     }
     const profile: SetupSessionInput["profile"] = {
-      displayName: required(data, "displayName"),
+      firstName: firstNameValue,
+      lastName: lastNameValue,
       timeZone,
       guardianAttested: true,
+      proactiveUseAccepted: true,
     };
     try {
       await createSession.mutateAsync({ setupToken: token, profile });
@@ -115,28 +125,65 @@ function SetupPage({ setupToken }: { setupToken: string }) {
     );
   }
 
+  if (step === "permission") {
+    return (
+      <SetupFrame>
+        <form className="setup-form" onSubmit={(event) => void submitProfile(event)}>
+          <SetupHeading
+            title="Can Florence get ahead of things for you?"
+            detail="She’ll look for school dates, schedule changes, and loose ends, then text when something needs attention."
+          />
+          <label className="setup-attestation">
+            <input name="proactiveUseAccepted" type="checkbox" required />
+            <span>Yes, Florence can keep an eye on the family details I connect.</span>
+          </label>
+          <label className="setup-attestation">
+            <input name="guardianAttested" type="checkbox" required />
+            <span>I’m a parent, guardian, or caregiver for the children I add.</span>
+          </label>
+          {error && <SetupError>{error}</SetupError>}
+          <button className="button primary wide" type="submit" disabled={createSession.isPending}>
+            {createSession.isPending ? "Saving…" : "Continue"}
+          </button>
+        </form>
+      </SetupFrame>
+    );
+  }
+
   return (
     <SetupFrame>
-      <form className="setup-form" onSubmit={(event) => void submitProfile(event)}>
+      <form className="setup-form" onSubmit={continueFromName}>
         <SetupHeading
-          title="What should Florence call you?"
-          detail="This stays tied to the private Messages conversation you just started."
+          title="What’s your name?"
+          detail="Florence will use it when she texts you and your family."
         />
         <label className="field">
           <span>First name</span>
-          <input name="displayName" autoComplete="given-name" placeholder="Your first name" required />
+          <input
+            value={firstNameValue}
+            onChange={(event) => setFirstNameValue(event.target.value)}
+            autoComplete="given-name"
+            placeholder="First name"
+            required
+          />
         </label>
-        <label className="setup-attestation">
-          <input name="guardianAttested" type="checkbox" required />
-          <span>I’m a parent, guardian, or authorized caregiver for any children I add to Florence.</span>
+        <label className="field">
+          <span>Last name</span>
+          <input
+            value={lastNameValue}
+            onChange={(event) => setLastNameValue(event.target.value)}
+            autoComplete="family-name"
+            placeholder="Last name"
+            required
+          />
         </label>
         {error && (
           <p className="form-error" role="alert">
             {error}
           </p>
         )}
-        <button className="button primary wide" type="submit" disabled={createSession.isPending}>
-          {createSession.isPending ? "Saving…" : "Continue"}
+        <button className="button primary wide" type="submit">
+          Continue
         </button>
       </form>
     </SetupFrame>
@@ -181,15 +228,14 @@ function GoogleSetupGate({ status }: { status: string | null }) {
 }
 
 function GoogleSetupSuccess({ view }: { view: WorkspaceView }) {
-  const displayName = firstName(view.viewer.displayName ?? "there");
   return (
     <SetupFrame>
       <div className="setup-success-mark" aria-hidden="true">
         <Check size={18} />
       </div>
       <SetupHeading
-        title={`You’re all set, ${displayName}.`}
-        detail="Florence is ready in the Messages thread you just started."
+        title="Your side is ready"
+        detail="Florence just texted you. Head back to Messages to keep going."
       />
       {view.workspace.messagesUrl ? (
         <a className="button primary wide" href={view.workspace.messagesUrl}>
@@ -198,29 +244,41 @@ function GoogleSetupSuccess({ view }: { view: WorkspaceView }) {
       ) : (
         <p className="setup-footnote">You can close this page and return to Messages.</p>
       )}
+      <a className="setup-secondary-action" href="/workspace">
+        Open Florence settings
+      </a>
     </SetupFrame>
   );
 }
 
 type ChildDraft = {
   id: string;
-  displayName: string;
+  firstName: string;
+  lastName: string;
   school: string;
   activities: string;
 };
 
 type FamilySetupScreen =
-  | { kind: "partner"; returnToReview?: boolean }
+  | { kind: "partner" }
+  | { kind: "partner-phone" }
   | { kind: "child-name"; childId: string; returnToReview?: boolean }
   | { kind: "child-school"; childId: string; returnToReview?: boolean }
   | { kind: "child-activities"; childId: string; returnToReview?: boolean }
   | { kind: "more-children" }
+  | { kind: "postal-code" }
+  | { kind: "family-label" }
   | { kind: "review" };
 
 function FamilySetupPage({ view }: { view: WorkspaceView }) {
   const complete = useCompleteFamilyOnboarding();
-  const [partnerId] = useState(() => crypto.randomUUID());
-  const [partnerName, setPartnerName] = useState("");
+  const [mode, setMode] = useState<"two_adult" | "solo">("two_adult");
+  const [partnerFirstName, setPartnerFirstName] = useState("");
+  const [partnerLastName, setPartnerLastName] = useState("");
+  const [partnerPhone, setPartnerPhone] = useState("");
+  const [postalCode, setPostalCode] = useState("");
+  const viewerLastName = view.viewer.displayName?.trim().split(/\s+/).at(-1) ?? "Family";
+  const [familyLabel, setFamilyLabel] = useState(`${viewerLastName} Family`);
   const [children, setChildren] = useState<ChildDraft[]>(() => [newChildDraft()]);
   const [screen, setScreen] = useState<FamilySetupScreen>({ kind: "partner" });
   const [error, setError] = useState<string | null>(null);
@@ -236,22 +294,20 @@ function FamilySetupPage({ view }: { view: WorkspaceView }) {
 
   function continueFromPartner(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    setPartnerName((current) => current.trim());
-    if (screen.kind !== "partner") return;
-    showScreen(
-      screen.returnToReview
-        ? { kind: "review" }
-        : { kind: "child-name", childId: children[0]?.id ?? newChildDraft().id },
-    );
+    setPartnerFirstName((current) => current.trim());
+    setPartnerLastName((current) => current.trim());
+    const suggestedSurnames = [viewerLastName, partnerLastName.trim()].filter(Boolean);
+    setFamilyLabel(`${[...new Set(suggestedSurnames)].join("–")} Family`);
+    showScreen({ kind: "partner-phone" });
   }
 
   function continueFromChildName(event: FormEvent<HTMLFormElement>, child: ChildDraft) {
     event.preventDefault();
-    if (!child.displayName.trim()) {
+    if (!child.firstName.trim()) {
       setError("Add your child’s first name.");
       return;
     }
-    updateChild(child.id, { displayName: child.displayName.trim() });
+    updateChild(child.id, { firstName: child.firstName.trim(), lastName: child.lastName.trim() });
     showScreen({
       kind: "child-school",
       childId: child.id,
@@ -292,19 +348,32 @@ function FamilySetupPage({ view }: { view: WorkspaceView }) {
 
   async function submit() {
     setError(null);
-    const input: CompleteFamilyOnboardingInput = {
-      ...(partnerName.trim() ? { partner: { id: partnerId, displayName: partnerName.trim() } } : {}),
+    const family = {
+      familyLabel: familyLabel.trim(),
+      postalCode: postalCode.trim(),
       children: children.map((child) => {
         const activities = listValues(child.activities);
         return {
-          id: child.id,
-          displayName: child.displayName.trim(),
+          firstName: child.firstName.trim(),
+          ...(child.lastName.trim() ? { lastName: child.lastName.trim() } : {}),
           ...(child.school.trim() ? { school: child.school.trim() } : {}),
           ...(activities.length ? { activities } : {}),
         };
       }),
     };
-    if (input.children.some((child) => !child.displayName)) {
+    const input: CompleteFamilyOnboardingInput =
+      mode === "two_adult"
+        ? {
+            ...family,
+            mode: "two_adult",
+            partner: {
+              firstName: partnerFirstName.trim(),
+              lastName: partnerLastName.trim(),
+              phoneNumber: partnerPhone.trim(),
+            },
+          }
+        : { ...family, mode: "solo", partner: null };
+    if (input.children.some((child) => !child.firstName)) {
       setError("Add each child’s first name.");
       return;
     }
@@ -323,20 +392,77 @@ function FamilySetupPage({ view }: { view: WorkspaceView }) {
       <SetupFrame>
         <form className="setup-form" onSubmit={continueFromPartner}>
           <SetupHeading
-            title={`Who helps run family life with you, ${firstName(view.viewer.displayName ?? "there")}?`}
-            detail="Add a partner or co-parent if you have one. They’ll connect their own Messages and Google privately later."
+            title={`Who runs family life with you, ${firstName(view.viewer.displayName ?? "there")}?`}
+            detail="Florence will ask before texting them. They’ll set up their own account."
           />
           <label className="field">
-            <span>First name (optional)</span>
+            <span>First name</span>
             <input
-              value={partnerName}
-              onChange={(event) => setPartnerName(event.target.value)}
-              autoComplete="off"
-              placeholder="Partner’s first name"
+              value={partnerFirstName}
+              onChange={(event) => setPartnerFirstName(event.target.value)}
+              autoComplete="given-name"
+              placeholder="First name"
+              required
+            />
+          </label>
+          <label className="field">
+            <span>Last name</span>
+            <input
+              value={partnerLastName}
+              onChange={(event) => setPartnerLastName(event.target.value)}
+              autoComplete="family-name"
+              placeholder="Last name"
+              required
             />
           </label>
           <button className="button primary wide" type="submit">
-            {partnerName.trim() ? "Continue" : "Skip for now"}
+            Continue
+          </button>
+          <button
+            className="setup-secondary-action"
+            type="button"
+            onClick={() => {
+              setMode("solo");
+              showScreen({ kind: "child-name", childId: children[0]?.id ?? "" });
+            }}
+          >
+            It’s just me
+          </button>
+        </form>
+      </SetupFrame>
+    );
+  }
+
+  if (screen.kind === "partner-phone") {
+    return (
+      <SetupFrame>
+        <form
+          className="setup-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            setMode("two_adult");
+            showScreen({ kind: "child-name", childId: children[0]?.id ?? "" });
+          }}
+        >
+          <SetupHeading
+            title={`What’s ${partnerFirstName}’s number?`}
+            detail="Florence won’t text them until she asks you in Messages."
+          />
+          <label className="field">
+            <span>Mobile number</span>
+            <input
+              value={partnerPhone}
+              onChange={(event) => setPartnerPhone(normalizePhone(event.target.value))}
+              autoComplete="tel"
+              inputMode="tel"
+              placeholder="+1 415 555 0123"
+              pattern="\+[1-9][0-9]{7,14}"
+              required
+            />
+          </label>
+          <p className="setup-footnote">Include the country code, like +1.</p>
+          <button className="button primary wide" type="submit">
+            Continue
           </button>
         </form>
       </SetupFrame>
@@ -354,11 +480,20 @@ function FamilySetupPage({ view }: { view: WorkspaceView }) {
           <label className="field">
             <span>Child’s first name</span>
             <input
-              value={activeChild.displayName}
-              onChange={(event) => updateChild(activeChild.id, { displayName: event.target.value })}
-              autoComplete="off"
+              value={activeChild.firstName}
+              onChange={(event) => updateChild(activeChild.id, { firstName: event.target.value })}
+              autoComplete="given-name"
               placeholder="First name"
               required
+            />
+          </label>
+          <label className="field">
+            <span>Last name (optional)</span>
+            <input
+              value={activeChild.lastName}
+              onChange={(event) => updateChild(activeChild.id, { lastName: event.target.value })}
+              autoComplete="family-name"
+              placeholder="Last name"
             />
           </label>
           {error && <SetupError>{error}</SetupError>}
@@ -384,7 +519,7 @@ function FamilySetupPage({ view }: { view: WorkspaceView }) {
       <SetupFrame>
         <form className="setup-form" onSubmit={(event) => continueFromChildSchool(event, activeChild)}>
           <SetupHeading
-            title={`Where does ${firstName(activeChild.displayName)} go during the day?`}
+            title={`Where does ${firstName(activeChild.firstName)} go during the day?`}
             detail="A school, daycare, or preschool helps Florence recognize schedules and messages."
           />
           <label className="field">
@@ -409,7 +544,7 @@ function FamilySetupPage({ view }: { view: WorkspaceView }) {
       <SetupFrame>
         <form className="setup-form" onSubmit={(event) => continueFromChildActivities(event, activeChild)}>
           <SetupHeading
-            title={`What is ${firstName(activeChild.displayName)} into?`}
+            title={`What is ${firstName(activeChild.firstName)} into?`}
             detail="Add any recurring activities that tend to create practices, pickups, or calendar events."
           />
           <label className="field">
@@ -430,7 +565,7 @@ function FamilySetupPage({ view }: { view: WorkspaceView }) {
   }
 
   if (screen.kind === "more-children") {
-    const names = children.map((child) => firstName(child.displayName)).join(", ");
+    const names = children.map((child) => firstName(child.firstName)).join(", ");
     return (
       <SetupFrame>
         <div className="setup-form">
@@ -441,7 +576,7 @@ function FamilySetupPage({ view }: { view: WorkspaceView }) {
           <button
             className="button primary wide"
             type="button"
-            onClick={() => showScreen({ kind: "review" })}
+            onClick={() => showScreen({ kind: "postal-code" })}
           >
             Review family
           </button>
@@ -451,6 +586,71 @@ function FamilySetupPage({ view }: { view: WorkspaceView }) {
             </button>
           )}
         </div>
+      </SetupFrame>
+    );
+  }
+
+  if (screen.kind === "postal-code") {
+    return (
+      <SetupFrame>
+        <form
+          className="setup-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            showScreen({ kind: "family-label" });
+          }}
+        >
+          <SetupHeading
+            title="What’s your ZIP code?"
+            detail="This helps Florence find nearby school and family activities."
+          />
+          <label className="field">
+            <span>ZIP code</span>
+            <input
+              value={postalCode}
+              onChange={(event) => setPostalCode(event.target.value)}
+              inputMode="numeric"
+              autoComplete="postal-code"
+              placeholder="94110"
+              pattern="[0-9]{5}(-[0-9]{4})?"
+              required
+            />
+          </label>
+          <button className="button primary wide" type="submit">
+            Continue
+          </button>
+        </form>
+      </SetupFrame>
+    );
+  }
+
+  if (screen.kind === "family-label") {
+    return (
+      <SetupFrame>
+        <form
+          className="setup-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            showScreen({ kind: "review" });
+          }}
+        >
+          <SetupHeading
+            title="What should Florence call your family?"
+            detail="We suggested a name. Change it if another one feels more like you."
+          />
+          <label className="field">
+            <span>Family name</span>
+            <input
+              value={familyLabel}
+              onChange={(event) => setFamilyLabel(event.target.value)}
+              placeholder="Anbarasu Family"
+              required
+            />
+          </label>
+          <button className="button primary wide" type="submit">
+            Continue
+          </button>
+        </form>
       </SetupFrame>
     );
   }
@@ -467,10 +667,14 @@ function FamilySetupPage({ view }: { view: WorkspaceView }) {
             <button
               className="setup-review-row"
               type="button"
-              onClick={() => showScreen({ kind: "partner", returnToReview: true })}
+              onClick={() => showScreen({ kind: "partner" })}
             >
               <span>Partner or co-parent</span>
-              <strong>{partnerName || "Not added"}</strong>
+              <strong>
+                {mode === "two_adult"
+                  ? `${partnerFirstName} ${partnerLastName} · ${partnerPhone}`
+                  : "It’s just me"}
+              </strong>
             </button>
             {children.map((child) => (
               <button
@@ -479,12 +683,20 @@ function FamilySetupPage({ view }: { view: WorkspaceView }) {
                 key={child.id}
                 onClick={() => showScreen({ kind: "child-name", childId: child.id, returnToReview: true })}
               >
-                <span>{child.displayName}</span>
+                <span>{`${child.firstName} ${child.lastName}`.trim()}</span>
                 <strong>
                   {[child.school, child.activities].filter(Boolean).join(" · ") || "No details added"}
                 </strong>
               </button>
             ))}
+            <button
+              className="setup-review-row"
+              type="button"
+              onClick={() => showScreen({ kind: "postal-code" })}
+            >
+              <span>{familyLabel}</span>
+              <strong>{postalCode}</strong>
+            </button>
           </div>
           {error && <SetupError>{error}</SetupError>}
           <button
@@ -523,7 +735,7 @@ function GoogleSetupStep({
     <div className="setup-form">
       <SetupHeading
         title="Connect your Google account"
-        detail="Connect the account you use for family logistics. Florence can read Gmail and Calendar when you ask, so she can spot real conflicts instead of guessing."
+        detail="Use the account where school emails and family plans usually land. Florence will start sorting through them while you finish setup."
       />
       <div className="setup-google-card">
         <span className="google-mark" aria-hidden="true">
@@ -535,8 +747,8 @@ function GoogleSetupStep({
         </div>
       </div>
       <p className="setup-trust">
-        Your Google account stays private to you. Florence cannot send email, and she won’t change your
-        calendar without a direct instruction or exact approval. Your partner connects separately.
+        Florence won’t share your private email. She’ll bring the useful family details to you, and ask before
+        changing anything.
       </p>
       {error && (
         <p className="form-error" role="alert">
@@ -1170,14 +1382,8 @@ function initials(name: string) {
     .toUpperCase();
 }
 
-function required(data: FormData, key: string) {
-  const value = data.get(key);
-  if (typeof value !== "string" || !value.trim()) throw new Error(`${key} is required`);
-  return value.trim();
-}
-
 function newChildDraft(): ChildDraft {
-  return { id: crypto.randomUUID(), displayName: "", school: "", activities: "" };
+  return { id: crypto.randomUUID(), firstName: "", lastName: "", school: "", activities: "" };
 }
 
 function listValues(value: string): string[] {
@@ -1185,6 +1391,11 @@ function listValues(value: string): string[] {
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function normalizePhone(value: string): string {
+  const digits = value.replace(/\D/g, "");
+  return digits ? `+${digits.slice(0, 15)}` : "";
 }
 
 function consumeOnboardingEntry(): {

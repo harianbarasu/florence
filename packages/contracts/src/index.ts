@@ -151,10 +151,13 @@ export type GoogleConnectionSummary = z.infer<typeof googleConnectionSummarySche
 
 export const setupChecklistSchema = z
   .object({
-    onboardingComplete: z.boolean(),
+    ownOnboardingComplete: z.boolean(),
     secondAdultAdded: z.boolean(),
+    partnerInvitation: z.enum(["not_ready", "ready", "approved", "invited", "connected"]),
     bothAdultsMessagesConnected: z.boolean(),
+    bothAdultsGoogleConnected: z.boolean(),
     familyGroupConnected: z.boolean(),
+    familyCalendarConnected: z.boolean(),
   })
   .strict();
 
@@ -197,36 +200,52 @@ export const workspaceViewSchema = z
   .strict();
 export type WorkspaceView = z.infer<typeof workspaceViewSchema>;
 
-const familyOnboardingAdultSchema = z
+const personNameSchema = z
   .object({
-    id: idSchema,
-    displayName: nonempty(160),
+    firstName: nonempty(160),
+    lastName: nonempty(160),
   })
   .strict();
 
-const familyOnboardingChildSchema = familyOnboardingAdultSchema
+const familyOnboardingPartnerSchema = personNameSchema
+  .extend({
+    phoneNumber: z.string().regex(/^\+[1-9]\d{7,14}$/),
+  })
+  .strict();
+
+const familyOnboardingChildSchema = z
+  .object({
+    firstName: nonempty(160),
+    lastName: nonempty(160).optional(),
+  })
   .extend({
     school: nonempty(300).optional(),
     activities: z.array(nonempty(300)).max(50).optional(),
   })
   .strict();
 
-export const completeFamilyOnboardingInputSchema = z
-  .object({
-    partner: familyOnboardingAdultSchema.optional(),
-    children: z.array(familyOnboardingChildSchema).min(1).max(20),
-  })
-  .strict()
-  .superRefine((input, context) => {
-    const ids = [...(input.partner ? [input.partner.id] : []), ...input.children.map((child) => child.id)];
-    if (new Set(ids).size !== ids.length) {
-      context.addIssue({
-        code: "custom",
-        path: ["children"],
-        message: "Every family member must have a distinct ID.",
-      });
-    }
-  });
+const familyOnboardingBase = {
+  familyLabel: nonempty(160),
+  postalCode: z.string().regex(/^\d{5}(?:-\d{4})?$/),
+  children: z.array(familyOnboardingChildSchema).min(1).max(20),
+};
+
+export const completeFamilyOnboardingInputSchema = z.discriminatedUnion("mode", [
+  z
+    .object({
+      ...familyOnboardingBase,
+      mode: z.literal("two_adult"),
+      partner: familyOnboardingPartnerSchema,
+    })
+    .strict(),
+  z
+    .object({
+      ...familyOnboardingBase,
+      mode: z.literal("solo"),
+      partner: z.null(),
+    })
+    .strict(),
+]);
 export type CompleteFamilyOnboardingInput = z.infer<typeof completeFamilyOnboardingInputSchema>;
 
 export const setupSessionInputSchema = z
@@ -234,9 +253,11 @@ export const setupSessionInputSchema = z
     setupToken: nonempty(2_000),
     profile: z
       .object({
-        displayName: nonempty(160),
+        firstName: nonempty(160),
+        lastName: nonempty(160),
         timeZone: nonempty(100),
         guardianAttested: z.literal(true),
+        proactiveUseAccepted: z.literal(true),
       })
       .strict(),
   })

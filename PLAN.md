@@ -2,645 +2,489 @@
 
 ## Status
 
-This is the product contract for the Florence pilot. It replaces the previous architecture-led plan.
+This is the controlling product contract for the Florence household pilot. It
+replaces the founder-only checkpoint and the old Phase 1/Phase 2 split.
 
-Florence will be judged by what Jackson and Kendall feel in iMessage and on the web—not by the amount of infrastructure, abstraction, schema, or test coverage behind it.
-
-Delivery is split into two explicit gates:
-
-1. Verify and preserve a recoverable Git checkpoint of the reduced Florence
-   tree, then delete only the clearly unnecessary code, documents,
-   dependencies, speculative controls, and temporary artifacts named by this
-   contract.
-2. **Phase 1 — founding-adult onboarding and canonical parent-document
-   checkpoint.** Start from an empty Florence schema. The pilot adult texts
-   Florence in a private iMessage thread, completes the minimal
-   mobile setup, connects their own Google account, and returns to that same
-   thread. Then, through real Linq, OpenAI, PostgreSQL, and an authorized Google
-   Calendar read, prove the real parent-document conversation around a
-   synthetic school PDF or iPhone photo. Florence must react immediately, use
-   an honest work bubble only when needed, lead with judgment, identify the
-   relevant conflict, separate durable facts from one-offs, ask at most one
-   useful question, honor a no-retention and no-action instruction, absorb a
-   correction without emitting the stale answer, and produce an exact unsent
-   draft. No external write occurs.
-3. Stop after that conversation. Review the actual experience with the user and
-   revise this contract if necessary.
-4. **Phase 2 — second adult and complete pilot.** The first fast follow is the
-   second adult's independent Messages, mobile-web, and Google onboarding.
-   Then establish the exact family group and finish the Instinct-style web
-   experience, connected-source reads, public research, finite proactive
-   rechecks, source-aware memory, the one authorized Calendar write, and the
-   real-household rehearsal.
+Florence is judged by the lived two-parent iMessage and mobile-web experience,
+not by infrastructure, abstraction, schema breadth, or test count. The next
+production reset happens only after the complete household loop is ready for a
+real rehearsal with two phones and two Google accounts.
 
 Before an unstated product decision or scope change, tell the user the decision
-and recommendation. Report concrete progress at meaningful checkpoints rather
-than silently extending the work.
+and recommendation. Report progress at meaningful checkpoints rather than
+silently extending the work.
 
 ## The product in one sentence
 
-Florence is a warm, capable family chief of staff who lives primarily in iMessage, understands the family's real context, notices what matters, helps without ceremony, and reliably follows through.
+Florence is Instinct for a household: a warm, proactive family chief of staff
+whose primary home is the two-parent iMessage group, who notices what matters
+and takes mental load away without making either parent manage a workflow.
 
-Instinct and Poke are the interaction benchmark. Ollie is the closest active family-product benchmark. Milo's failure is the warning: reliability infrastructure must never consume the conversational usefulness and delight of the product.
+The emotional benchmark is relief for the parent carrying the invisible load.
+The interaction benchmark is Instinct: conversational from the first message,
+opinionated when judgment helps, capable of research and follow-through, and
+quiet when nothing useful should be said.
 
 ## Pilot boundary
 
 The pilot supports exactly:
 
 - one household;
-- two independently verified participating adults;
+- two independently verified, equal-authority participating adults;
 - represented children, not child accounts;
-- one verified family iMessage group;
 - one private iMessage relationship with each adult;
-- one Google Workspace connection owned independently by each adult;
-- a responsive web workspace for setup, family knowledge, connections, and preferences.
+- one exact three-participant family iMessage group;
+- one private Google connection owned independently by each adult;
+- one new Florence-created shared family calendar;
+- one responsive mobile-web setup and authenticated Workspace, Vault, and
+  Preferences experience.
 
-Florence is a broad family generalist inside that boundary. She should help with virtually any reasonable parent request—research, travel, shopping, school questions, health logistics, household decisions, and everyday curiosity. Persistent understanding and unsolicited proactivity remain family-centered. She is not merely an obligation closer, calendar bot, or task manager.
+An off-the-beaten-path “Set up Florence just for me” path is allowed. The solo
+adult's private thread becomes the primary channel and Florence still creates
+the surname-based family calendar. Adding a partner later shares that calendar
+and transitions the household into the standard family group without a reset.
+
+Florence is a broad family generalist inside this boundary. She can research,
+compare, recommend, monitor, draft, interpret family documents, remember, and
+coordinate the enrolled parents. The pilot's external writes are deliberately
+narrow: partner invitation, exact family-group creation, and approved family
+Calendar changes.
 
 ## What Florence should feel like
 
-Florence is:
-
-- warm, observant, concise, confident, and lightly funny;
-- opinionated when judgment is useful;
-- emotionally aware without pretending to be a person or therapist;
-- proactive when something genuinely matters;
-- comfortable saying nothing when nothing useful should be said;
-- able to recover the thread after interruptions, corrections, and topic changes;
-- gradually adaptive to the household's conversational style without becoming an imitation of either adult;
-- transparent when she is unsure, blocked, or has not completed an action.
-
-Florence is not:
-
-- a corporate assistant;
-- a workflow UI speaking through text messages;
-- relentlessly cheerful, verbose, or emoji-heavy;
-- fake-intimate;
-- a notification firehose;
-- a dashboard that happens to send messages.
-
-## The native iMessage experience
-
-iMessage is the primary product surface. Florence must use it like a native participant, including:
-
-- direct and group conversation;
-- inline replies to the relevant message;
-- reactions, including reaction-only acknowledgements;
-- a small number of naturally paced bubbles when that reads better than a block
-  of text; most answers need one to three, while a document triage may earn a
-  fourth when every bubble has a distinct job;
-- typing presence where supported;
-- ordinary text, PDFs, Gmail items, and iPhone photos including HEIC, JPEG, and
-  PNG as launch input;
-- useful images and files as output;
-- natural corrections and resumed topics;
-- selective proactive messages;
-- useful silence.
-
-The default response is short. Detail is available when asked or when omission would make the answer unsafe or misleading.
-
-Florence may research, read connected sources, remember, reason, respond, react, draft, and follow up automatically. Consequential external writes remain app-authorized and verifiably completed.
-
-Silence, delivery, and a reaction are never by themselves approval, assignment of responsibility, or proof of completion.
-
-### The canonical Florence turn
-
-For a substantive request, Florence should behave like a capable chief of staff rather than a search box:
-
-1. If useful work will take noticeable time, acknowledge it immediately with a native reaction and at most one short, honest work bubble.
-2. Do the reading, research, comparison, and narrowing without making the parent manage tabs or a workflow.
-3. Return with the recommendation first, then the small amount of evidence that changes the decision.
-4. Use remembered family constraints to rank the answer; do not leak those constraints into public search queries.
-5. Prefer a small set of concrete options over a broad catalogue of possibilities.
-6. Ask no more than one genuinely blocking question at a time. Continue everything that does not depend on that answer.
-7. Say plainly what Florence will take off the family's plate and what exact decision or approval still belongs to a parent.
-8. When fresh external research materially changes the recommendation, include
-   only the direct, clickable sources needed to verify the important claim; do
-   not turn the answer into a link dump.
-
-Typing presence is enough for ordinary quick work. Florence should not emit canned status chatter, promise work it cannot durably resume, or say it is monitoring something unless a real re-check has been scheduled.
-
-### The parent-document turn
-
-A school PDF, screenshot, forwarded email, schedule, or form is not a request for
-a generic summary. Florence should:
-
-1. React immediately. If the answer will be ready quickly, the reaction is the
-   entire progress update.
-2. Lead with the one or two things that actually require parental attention.
-3. Separate deadlines and actions from calendar context and background noise.
-4. Extract every useful date, then compare it with known schedules and call out
-   the real collision or missing handoff.
-5. Say which durable rules, contacts, or logistics it would normally remember,
-   while keeping one-off details temporary and honoring an explicit request not
-   to retain anything.
-6. Ask the single smallest question that only a parent can answer.
-7. If the parent prohibited action, close the loop explicitly: nothing was sent,
-   saved, scheduled, or added to a calendar.
-
-When a parent corrects context, Florence re-ranks the result and continues the
-same job instead of restarting it. The correction supersedes only what it
-actually contradicts; still-relevant remembered context remains available and
-is identified as remembered context rather than document content. A requested
-draft is useful work. Sending it is a separate consequential action.
-
-## Proactivity
-
-Florence should notice family-relevant facts, schedule pressure, conflicts, missing preparation, and unresolved decisions.
-
-The rule is selective usefulness:
-
-- interrupt only when the family has a real decision to make now or a useful window they would be annoyed to miss; otherwise stay quiet;
-- send one concise interruption when the expected value is high;
-- explain what matters and why now;
-- use meaningful thresholds for noisy changes such as prices, advisories, or schedule movement rather than reporting every fluctuation;
-- avoid repeating information the family already handled;
-- back off when ignored;
-- do not turn every observation into a task;
-- do not require a workflow to be created before helping;
-- start discretionary projects such as travel, shopping, or meal research only when asked or under an explicit recurring request;
-- begin a future re-check only after a parent directly requests it or accepts a
-  specific proposed re-check; every re-check has a clear subject and time and
-  ends unless explicitly renewed;
-- when a re-check becomes due, read current context again and choose whether to update, reschedule, or say nothing; never send stale reminder copy blindly;
-- anchor follow-ups to useful action windows, departures, handoffs, and transitions—not merely nominal deadlines;
-- cancel or revise stale follow-ups when the underlying schedule changes;
-- describe the unresolved situation neutrally rather than blaming an adult;
-- state honestly when a useful window was missed.
-
-The optional morning brief contains only useful schedule context, preparation, conflicts, pickup or handoff information, and genuinely unresolved commitments. Exceptional alerts are separate and immediate.
-
-## Ordinary family outcomes
-
-Florence works with five ordinary outcomes rather than feature-specific workflow engines:
-
-- an event;
-- a reminder;
-- a conflict or decision;
-- a retained fact;
-- no action.
-
-These outcomes may be revised or cancelled through natural conversation. They are not separate state-machine products.
-
-## Trusted onboarding
-
-Onboarding is a core trust experience, not an admin afterthought.
-
-There is no password, access code, operator-authored household, placeholder
-adult, or preconfigured founding identity. On an empty pilot database, a parent
-texts Florence in a private iMessage thread. Florence verifies the signed Linq
-event, the live one-person iMessage audience, and the exact sender-participant
-match. Those provider facts—not the parent's wording—are the complete evidence
-that it is safe to answer. Any message with text or an attachment, other than
-the canonical carrier opt-out, may receive a natural response and a stateless, short-lived,
-single-use mobile setup link containing only the observed conversation and
-opaque identity claims. The parent never needs to say “hi,” “setup,” “link,” or
-another prescribed command. If two people message Florence before either
-finishes setup, both may receive links, but the first valid form
-redemption atomically creates the one pilot founder and household. Every losing
-link fails neutrally. Once that household exists, unknown senders stay silent.
-
-Before redemption, Florence may process only the current verified private
-message ephemerally through a setup-specific conversation with no read tools,
-household context, memory, Google, durable message record, or action output.
-The setup link itself is appended by deterministic application code. A later
-message in the same unclaimed thread receives a current link without special
-wording. After redemption, Florence remains conversational while Google or
-family setup is incomplete; it can explain and restore the next handoff, but it
-cannot read unavailable sources, retain facts, schedule work, or propose an
-external effect.
-
-No household, adult, channel, source, or message record exists before the
-adult submits the first setup screen. That submission atomically creates the
-real adult, private relationship, and a neutral internal tenancy root required
-to own private Google data. The parent is never asked to name or understand
-that internal record. The mobile flow is one calm task per screen, in this
-order:
-
-1. the adult's first name and parent, guardian, or authorized-caregiver
-   attestation; the browser time zone is submitted without turning it into a
-   questionnaire;
-2. that adult's private Google connection;
-3. an optional partner or co-parent name, with clear copy that this does not
-   connect or consent for them;
-4. each child's name, followed separately by school and activities; and
-5. one review and completion action before returning to Messages.
-
-Google is required to complete pilot onboarding. Cancellation or provider
-failure leaves a resumable setup screen; it never produces a false success.
-The compact signed setup link is sent alone so Messages can render a clean link
-preview. Its token is held in the URL fragment, removed before any network
-request, and expires quickly. One normal redemption consumes it. To recover a committed
-setup whose cookie response was lost, the exact same token, profile, and live
-private thread may repeat for at most sixty seconds; later replay fails. For
-this private pilot it is a bearer credential until redemption; expiry, hashing,
-the narrow recovery window, and rejection after that window protect against
-database leakage and replay, not theft before redemption. The
-empty-database singleton is the pilot admission boundary; a same-thread
-confirmation link is the first security fast follow before the number is
-distributed beyond the intended pilot adults.
-
-After Google is connected, Florence finishes the short family setup described
-above, then returns to the exact private thread and asks for one real thing the
-adult would rather not handle themselves. The mobile experience has no wizard
-chrome, progress counter, dense all-family form, or household-name question.
-Deeper ownership, recurring logistics, communication style, and sharing
-preferences are learned conversationally, one useful question at a time,
-while Florence helps with actual work.
-
-The private one-to-one relationships are the trust anchors. Florence acts as
-connective tissue between the adults while remaining explicit about what
-crosses between them. The exact three-participant family thread is the shared
-coordination layer, not permission to disclose either adult's private Messages,
-Gmail, Calendar details, or memory.
-
-The second adult is the immediate Phase 2 fast follow. The founding adult may
-forward a non-authenticating invitation, but the second adult must prove a
-distinct private Messages identity, receive their own setup link in that
-thread, create their own browser session, attest independently, and connect
-their own Google account. Only then does Florence establish the exact family
-group. Cross-adult Calendar comparison is a separate consent after connection;
-it is off by default, independently revocable, and reveals only minimum
-free/busy conflict unless details are already household-shared.
-
-An enrolled adult attests that they are a parent, guardian, or authorized
-caregiver before providing child information. Children have no independent
-account or Florence conversation in the pilot.
-
-The founding adult cannot consent to the other adult's private memory or Google
-access. Child names, schools, caregivers, schedules, safety facts, and retained
-documents belong in later conversation or the Vault; they are not prerequisites
-for meeting Florence.
-
-## The web workspace
-
-The current page composition and navigation will be replaced while preserving
-the visual primitives that already match Instinct. This is a shell recomposition,
-not a new web architecture or a ground-up component rewrite.
-
-The interaction and visual benchmark is Instinct's authenticated workspace:
-quiet, sparse, fast, and obvious. Florence should reproduce its measured layout,
-proportions, typography, spacing, density, modal behavior, and interaction
-patterns as closely as practical while using Florence-specific copy and data.
-Use properly licensed GT America and equivalent icons; do not copy Instinct's
-source code or proprietary branded assets.
-
-The web information architecture has two primary destinations. Preferences are
-available from the adult's account menu, as in Instinct, rather than occupying
-primary navigation.
-
-### Workspace
-
-- Connect Google Workspace.
-- Open Florence in Messages.
-- Show whether both adults have completed private Google setup without exposing
-  either adult's account label to the other.
-- See only connection state and the next useful setup action.
-
-There is no activity feed, task dashboard, metric panel, system-health view, or infrastructure vocabulary.
-
-### Vault
-
-The Vault contains editable household knowledge:
-
-- participating adults;
-- children and aliases;
-- birth dates or birth years;
-- schools, grades, teachers, and academic periods;
-- activities, caregivers, and recurring schedules;
-- home addresses and important phone numbers;
-- doctors, emergency contacts, and other important contacts;
-- preferences and family facts;
-- safety-critical information such as allergies;
-- deliberately retained documents and their extracted facts;
-- visibility, source, correction, and deletion controls.
-
-It does not store passwords, payment cards, full medical records, dossiers, or child accounts.
-
-### Preferences
-
-- display name;
-- read-only verified Messages, phone, and sign-in identity;
-- the adult's Google connection and revocable cross-calendar consent;
-- appearance: Light, Dark, or System;
-- sign out.
-
-Passwords, account-recovery infrastructure, payments, and account-wide export
-or deletion workflows are not launch requirements. Item-level inspection,
-correction, and deletion remain first-class in the Vault.
-
-Before authentication, onboarding is a sparse mobile flow with no application
-navigation. It follows Instinct's observed one-task-per-screen rhythm: a
-full-height white canvas, a centered narrow column, one heading, one short
-explanation, one input or decision, and one primary pill action. After
-authentication, incomplete Google or family setup continues in that same
-focused shell, not in Workspace and not as a third destination.
-
-## Web visual system
-
-Use properly licensed GT America Regular and Medium with system fallbacks. Florence's restrained serif `F` monogram and wordmark remain the only distinctive brand gesture.
-
-The authenticated Instinct observations in [the benchmark specification](docs/product-benchmarks.md#authenticated-instinct-ui-observations--root-owned-section) are the canonical visual reference. Match its measured component rhythm, not merely its general mood. Validate Workspace, Vault, Preferences, menus, and modals side-by-side against the signed-in Instinct product and pause for the user's visual approval before expanding the web surface:
-
-- white page and cards;
-- primary text `#101113`;
-- borders `#e5e7eb`;
-- muted surfaces `#f3f4f6`;
-- secondary text at roughly 60% opacity and tertiary text at roughly 35%;
-- a quiet blue keyboard-focus ring;
-- 200px desktop sidebar and 48px top bar;
-- centered content approximately 700px wide, 636px inner content, and 32px page padding;
-- 16px horizontal padding on mobile and no persistent sidebar;
-- 13px/500 page titles, 14px/500 section headings, and 12px/500 uppercase Vault labels with `0.14em` tracking;
-- connector cards with 1px borders, 12px radii, and 12px-by-16px padding;
-- 32px Connect pills and 44px contact-action pills;
-- empty Vault rows with 1px dashed borders, 6px radii, and 12px-by-16px padding;
-- Light, Dark, and System treatments that preserve the same quiet contrast hierarchy;
-- no gradients, charts, decorative widgets, or ornamental motion.
-
-The product should feel finished through proportion, typography, copy, and responsiveness—not through visual volume.
-
-## Sources and connected tools
-
-The initial connected suite is Google Workspace only:
-
-- Gmail;
-- Calendar;
-- Drive;
-- Docs;
-- Sheets.
-
-Florence may search and read these sources dynamically when useful. Google remains the source of truth; Florence does not build a shadow inbox or document system.
-
-Connecting Google before the family-detail screens makes the verified private
-connection ready before the parent's first real job. In Phase 1, the first
-private request performs the bounded live Gmail and Calendar reads it actually
-needs; Florence does not run a hidden scan whose results are discarded or
-pretend that an ongoing sync exists. The immediate post-review fast follow is
-one useful, source-linked, private bootstrap read that can survive restart and
-surface a concrete family-relevant result. It must reuse the Google, source,
-and Florence seams, retain no raw mailbox, and must not become a generic sync
-engine, inbox mirror, or background-job framework.
-
-The only launch provider write is creating or updating the exact Calendar event
-an adult directly instructed or explicitly approved. Florence may draft emails,
-messages, and forms in conversation, but it cannot send or submit them in the
-pilot.
-
-PDF parsing is a first-class launch capability. School schedules, forms, flyers,
-screenshots, email attachments, and photographed documents are common parent
-inputs. Florence must extract useful structure, retain provenance, and
-distinguish an intentionally saved Vault document from a temporary attachment.
-Incidental raw attachments are encrypted only for bounded processing and retry,
-for no more than 24 hours, then discarded. A raw document enters the Vault only
-after an adult explicitly saves it. Voice notes and arbitrary Office-file input
-are deferred until demonstrated demand.
-
-PDF generation and editing are deferred until demonstrated demand.
-
-## Memory and privacy
-
-Memory has three scopes:
-
-- temporary working context;
-- private memory owned by one adult;
-- household-shared memory.
-
-Private Gmail, private messages, and personal inferences stay private by default. Florence may share only the minimum family-relevant meaning after the owning adult directs or approves it.
-
-An adult may establish a narrow standing rule such as sharing messages from a specific school, revoke it immediately, or override it for a sensitive item. A standing rule never widens itself.
-
-Only an enrolled adult may provide child information, and they attest that they have parent or guardian authority to do so. Florence retains only information needed for a visible family use, never interacts with a child as an account holder, and keeps every child source inspectable and deletable.
-
-Household messages, memories, child data, Gmail, and documents are never used for advertising or to train Florence's or a provider's general models.
-
-Every retained fact must remain explainable in plain language:
-
-- what Florence believes;
-- whether it was stated by a parent, extracted from a source, or inferred;
-- where it came from;
-- who can see it;
-- how to correct it;
-- how to forget or delete it.
-
-Florence proactively retains useful parent-stated facts and clearly extracted
-stable logistics without asking about every item. Inferences may also be
-remembered when useful, but the Vault marks them **Inferred — review** and
-Florence never presents them as parent-confirmed truth. Every retained item has
-a source and visibility. An explicit “don't retain this” overrides automatic
-memory: no Vault fact or document is created, no follow-up is scheduled, and no
-action is taken. The ordinary Messages turn remains as conversation and
-idempotency history.
-
-Corrected facts show who corrected them and when. The original source may remain
-as superseded history but is never displayed as support for the corrected
-value. Before deleting a retained document, the Vault shows its dependent facts
-and follow-ups. Deletion removes facts supported only by that document while
-preserving independently confirmed or corrected facts with their surviving
-provenance.
-
-When advice depends on assumptions, Florence must distinguish remembered facts from its own inference or taste and say what important context it does not know. It should never present an inference about one adult as knowledge supplied by the other.
-
-Participant or authority drift fails closed. Privacy boundaries are product behavior, not optional infrastructure.
-
-The same controls work conversationally. In a private message an adult can ask what Florence knows, why something was shared, who can see it, to forget it, to revoke a standing rule, to disconnect Google, or to export or delete their data.
-
-Unknown senders and changed group membership are rejected until re-verified. A
-canonical carrier `STOP` is honored immediately without model processing.
-Natural requests to stop all Florence messaging are interpreted by the normal
-conversation model and atomically suppress further messaging on that channel;
-they are not maintained as a phrase dictionary.
-
-## Autonomy and approval
-
-A clear direct instruction from the verified adult is approval for the described
-Calendar action and may execute in the same turn. The conversation model owns
-that natural-language judgment; there is no action-verb or approval phrase
-allowlist. When the request is ambiguous or Florence infers a useful action, it
-shows one exact immutable offer with the title, interval, time zone, and location.
-A later private adult message may naturally approve that sole stored offer.
-Approval interpretation receives only the current adult's text and the app-owned
-exact offer. A reaction, silence, delivery, group message, multiple pending
-offers, or an unrelated acknowledgement is not approval.
-
-The human rule is simple: research, reading, organizing, drafting, narrowing, comparing, and monitoring are Florence's job. Anything that costs money, contacts someone as the family, submits or books something, shares private information, commits a person, or makes an irreversible external change comes back once with the exact action first.
-
-An explicit negative instruction such as “don't book anything” or “do not contact them” remains binding for the entire active task and every later re-check or follow-up derived from it. Only a later direct instruction that clearly changes that boundary can authorize the action.
+Florence is warm, observant, concise, confident, lightly funny, and proactive
+when something genuinely matters. She behaves like a partner and near-member of
+the household without pretending to be human. She is comfortable saying
+nothing, recovers naturally after corrections or interruptions, and is honest
+when blocked or when an action is not yet complete.
+
+Florence is not a corporate assistant, a workflow UI speaking through text, a
+dashboard that sends notifications, a source of blank “What can I help with?”
+prompts, or a notification firehose.
+
+Every screen and message must pass: **Would Instinct do this?** Florence-specific
+copy is plain, warm, and written for a busy parent. It presents one clear next
+step and never exposes implementation terms such as “shared context,”
+“authority,” “workflow,” or “provider state.”
+
+## The household channel model
+
+The family group is the primary product channel. Private one-to-one threads are
+the trust anchors and the place for personal details, private context, setup,
+and the affected adult's detailed explanation.
+
+In the family group Florence:
+
+- responds when addressed, replied to, or given a task;
+- may react or stay silent during ordinary parent conversation;
+- steps in proactively for a useful conflict, handoff, deadline, unresolved
+  decision, or unusually relevant opportunity;
+- sends household updates, reminders, decisions, follow-ups, Calendar changes,
+  and source-backed recommendations by default;
+- treats both adults as equal authorities over household facts, reminders,
+  handoffs, and family-calendar items;
+- preserves current state and asks one focused question when the adults give
+  conflicting instructions.
+
+A clear private request to tell the other parent or update the household
+authorizes the minimum necessary group update. Discovered private information
+does not cross into the group unless covered by that adult's standing direction
+or current instruction. A private Calendar conflict appears in the group only
+as minimum household meaning, such as “Kendall has a conflict then”; the
+affected adult receives the private detail separately.
+
+If the exact family-group participant set changes, Florence stops using that
+thread, privately notifies both adults, and creates a replacement exact group.
+
+## Trusted Messages-first onboarding
+
+There is no password, access code, operator-created household, placeholder
+adult, or preconfigured founding identity. On an empty pilot database, any
+signed, live, one-participant private iMessage containing text or an attachment
+may receive a natural setup conversation and a short-lived setup link, except
+for a canonical carrier opt-out. Message wording is never identity or authority
+evidence. The first valid setup redemption atomically creates the founder and
+household; competing links fail neutrally. Unknown senders remain silent after
+that.
+
+Before enrollment, Florence converses only through a setup-specific
+no-tools/no-effects interface. It has no household, memory, Google, or action
+access. Setup remains conversational; no phrase dictionary or magic command is
+allowed.
+
+The mobile flow is one calm task per screen:
+
+1. founding adult first and last name, browser-derived time zone, and caregiver
+   attestation;
+2. that adult's private Google connection and one plain-language proactive-use
+   permission;
+3. partner first and last name plus mobile number;
+4. each child's first name, optional last name, school, and activities;
+5. home ZIP for coarse local discovery, with no street address requirement;
+6. an editable family label derived as “Anbarasu Family” for one surname or
+   “Anbarasu–Smith Family” for two surnames;
+7. review and completion.
+
+The Google permission says plainly that Florence will look for family-related
+things in Gmail and Calendar, remember useful details, add clear school and
+family dates to the family calendar, and speak up when something needs
+attention. Personal details stay private unless that adult directs sharing.
+Each adult agrees independently and can revoke the behavior later.
+
+The completion page says the founder's side is ready, says Florence just texted
+them, and offers **Back to Messages** plus **Open Florence settings**. It does
+not invite the partner from a web form.
+
+In the founder's private thread Florence asks:
+
+> Your side is ready. Want me to text Kendall at •••• 1234 so we can set up the
+> family group?
+
+Any clear affirmative response authorizes the invitation; “not yet” waits. The
+founder may ask later in ordinary language. The first partner message contains
+no household or child details. The partner independently proves their private
+Messages identity, receives their own setup link, creates their own web session,
+attests, connects Google, and accepts the proactive-use permission. The founder
+cannot consent or connect Google for them.
+
+If the number is wrong or the recipient refuses or opts out, invalidate the
+invitation and tell the founder only that setup did not complete. Send one light
+partner reminder after about a day and one founder update if setup remains
+incomplete; then stop nudging.
+
+## Household activation
+
+The founder does not wait idly for the partner. After founder setup, Florence
+runs a private first pass using only that adult's Google context and presents it
+as “a first pass on your side.”
+
+When both adults complete independent setup, Florence automatically:
+
+1. creates the exact three-person iMessage group;
+2. creates a new shared family calendar using the founding adult's Google
+   credential;
+3. grants the second adult owner-level Calendar access and adds it to their
+   Google Calendar list;
+4. stores both adults' equal Florence authority over the shared calendar;
+5. introduces herself in two short group bubbles; and
+6. starts the combined household briefing without asking the family to invent a
+   task.
+
+The opening should be close to:
+
+> Hey Hari and Kendall—I made this chat for the three of us.
+
+> I made the Anbarasu Family calendar too. I’m doing a first pass on school
+> dates, schedule clashes, and loose ends now.
+
+Florence returns with at most three findings that deserve attention now. It asks
+“Did I get that right? If I missed something, tell me here.” If a real decision
+is blocked, it asks that one concrete question instead. It does not end with a
+generic delegation prompt.
+
+The household briefing combines separately processed, permissioned context
+from both adults. Raw private contexts never enter one shared model call. Only
+minimum typed household conclusions cross into the group; owner-private details
+and provenance remain available to that adult.
+
+If nothing needs attention in the one-time review, Florence says it checked both
+calendars and recent family email, nothing needs attention now, and it will keep
+watching. Later empty checks remain silent. If one account is unavailable,
+Florence does not claim an all-clear; it privately tells that adult and retries.
+
+## Proactive intelligence
+
+Florence removes mental load by looking before asking. One durable due-work seam
+owns three behaviors:
+
+1. continuous household triage of connected Gmail and Calendar changes;
+2. finite monitoring of one unresolved decision, deadline, risk, or handoff;
+3. ongoing discovery rooted in a durable family interest.
+
+### Initial and continuous Google review
+
+The first pass searches the previous 90 days for family-relevant material,
+including children, schools, activities, appointments, travel, forms,
+deadlines, and household logistics, while prioritizing the most recent two
+weeks. Promotions, social mail, and irrelevant personal correspondence are not
+summarized. Florence examines roughly the next three weeks of each adult's
+Calendar.
+
+Relevant Gmail PDF and image attachments are inspected automatically. Gmail
+bodies and raw attachment bytes are not retained as a shadow mailbox.
+
+Incremental Gmail and Calendar reads run roughly every two minutes, staggered by
+connection, targeting about five-minute freshness. Google push is deferred
+until scale or seconds-level responsiveness makes the additional service
+worthwhile. Reading cadence is not messaging cadence.
+
+Florence waits roughly five to ten minutes for related changes to settle into
+one conclusion. Truly urgent same-day changes may interrupt immediately.
+Distinct useful findings may produce more than one update per day; there is no
+arbitrary twice-daily or one-message ceiling. Default quiet hours are 8 PM–7 AM
+in the household time zone, except when waiting would materially harm the
+family.
+
+### Finite monitors
+
+Florence creates a finite monitor automatically when a family source reveals an
+unresolved matter worth following. A monitor has a clear objective, current
+conclusion, next check, and real end condition. It rereads current sources when
+due and speaks only for a material change, correction, decision window, or
+failure requiring intervention. It never sends stale reminder copy blindly.
+
+### Interest discovery
+
+One clear stable statement such as “Lexi likes soccer” may become a durable
+interest; a casual mention does not. Interest discovery begins immediately
+after household activation and searches public sources using only generic
+interest terms plus coarse ZIP/city context—never a child's name, address,
+private Calendar title, or other private detail.
+
+Florence sends only unusually relevant, timely opportunities that fit age,
+location, and household schedule. The rough ceiling is two unsolicited
+suggestions per week per household. Ignored suggestions are down-ranked; after
+three ignored suggestions, pause that discovery and show it as paused in the
+Vault. A suggestion never becomes a Calendar commitment until a parent says to
+add it.
+
+Research leads with Florence's judgment, then the family consequence, then one
+to three direct source links. Corrections to prior research are proactive and
+explicit. Monitoring remains quiet between meaningful changes.
+
+## The family calendar
+
+Florence always creates a new secondary Google calendar after both adults
+connect and the exact group exists. It never adopts an existing calendar. The
+calendar and group use the same editable surname-derived family label.
+
+The founding adult is the underlying Google data owner. The second adult gets
+owner-level ACL access and the calendar is inserted into their Calendar list.
+Both adults have equal day-to-day authority inside Florence and Google, while
+Florence retains the provider ownership fact needed for deletion and recovery.
+
+Each adult accepts the same standing rule during onboarding: Florence may add
+clear school, activity, appointment, and family-travel dates to the family
+calendar. Clear means the source supplies an unambiguous event and both parents'
+current standing rules remain active. Ambiguous items become a suggestion or
+one focused group question. Either adult can add, correct, rename, or remove a
+shared event. Every change is announced in the family group only after provider
+reconciliation proves it.
+
+Personal primary calendars remain private and read-only to their owner.
+Conflict comparison reveals only minimum busy meaning in the group and sends
+private title/detail to the affected adult. Disconnecting one account should
+not unnecessarily stop household use through the other parent's shared-calendar
+access. Privately request reconnection and tell the group only when reliable
+family-calendar operation is actually impaired.
+
+## Native iMessage and source inputs
+
+iMessage is the primary surface. Florence uses inline replies, native
+reactions, typing presence where supported, naturally paced bubbles, rich link
+previews, and useful silence.
+
+Launch input includes:
+
+- ordinary and forwarded text;
+- public links;
+- screenshots and JPEG, PNG, WebP, and HEIC photos;
+- PDFs;
+- Gmail message bodies and relevant Gmail PDF/image attachments;
+- voice notes.
+
+Parents may forward messages, screenshots, photos, PDFs, or voice notes from
+other chats into a private or family Florence thread. Florence does not join or
+monitor outside parent, school, WhatsApp, or Signal groups in this goal.
+
+Forwarded material is evidence, not authority. A clearly official school PDF
+may supply an unambiguous date under the standing family-calendar rule. Casual
+group-chat claims produce a suggestion or focused question, never an automatic
+external action.
+
+Raw media is encrypted only for bounded processing and retry and is discarded
+within 24 hours unless a parent explicitly asks to retain it. Useful facts,
+dates, conclusions, and provenance may remain. The Vault is not an automatic
+archive of every attachment.
+
+## Memory, Vault, Workspace, and Preferences
+
+Memory has temporary, adult-private, and household-shared scopes. Parent-stated
+facts, clearly extracted stable logistics, and useful inferences remain
+distinguishable. Every retained item explains what Florence believes, how it
+learned it, who can see it, and how to correct or delete it.
+
+Florence automatically retains obvious stable family facts and creates useful
+monitors under the one-time proactive permission. Sensitive personal details
+remain private unless their owner directs sharing. An explicit no-retention
+instruction overrides automatic memory.
+
+New evidence may replace an obviously superseded fact or date while preserving
+source history and telling the family what changed. Ambiguity or a consequential
+change preserves current state and asks one focused question.
+
+The Vault shows and allows correction or deletion of:
+
+- adults, children, surnames, ZIP, schools, activities, caregivers, and useful
+  household facts;
+- source, visibility, correction, and deletion history;
+- active finite monitors and interest discoveries;
+- what Florence is watching, why, its latest conclusion, and when it last
+  checked;
+- plain controls to pause, stop watching, or correct an item.
+
+The Workspace shows the one current household action plus partner, exact-group,
+Google, family-calendar, and initial-briefing state. It is not an activity feed,
+task dashboard, metric panel, or systems console.
+
+Preferences include the adult's private Google connection, proactive-use and
+private-conflict-sharing permissions, appearance, account, and sign-out.
+
+The visual benchmark is Instinct's sparse authenticated and mobile setup
+experience: a calm narrow column, measured typography and spacing, one primary
+action, no wizard chrome, no dense all-family form, and no decorative dashboard
+widgets. Preferences live in the account menu. Use licensed typefaces or honest
+system fallbacks; never claim a font that is not bundled.
+
+## Autonomy and actions
+
+Research, reading, organizing, drafting, narrowing, comparing, remembering,
+monitoring, and discovery are Florence's job. She does not ask permission to do
+harmless useful work already covered by setup consent.
 
 Florence may automatically:
 
 - read and research;
-- organize context;
-- retain an allowed fact;
-- create drafts;
-- schedule internal reminders;
-- follow up in the family's own conversations.
+- organize context and retain allowed facts;
+- create drafts and internal monitors;
+- coordinate the enrolled parents in their private and family threads;
+- create the family group and shared family calendar;
+- perform clear family-calendar changes under both adults' standing rule.
 
-Florence asks once, naturally, before an inferred consequential action. The only
-consequential launch action is the exact instructed or approved Calendar write. Provider success is
-reported only after the provider confirms the intended result; uncertainty is
-stated honestly.
+Anything that costs money, contacts an outside person as the family, submits or
+books something, shares private information, commits a person, or makes another
+irreversible external change comes back once with the exact action first.
+Calendar or invitation success is reported only after provider proof.
 
-Silence, message delivery, group membership, and prior approval of a different action never authorize a new action or establish completion.
+Sending external email, contacting schools, purchases, bookings, and form
+submission are not in this goal. Florence may produce exact ready-to-send
+drafts. Drive, Docs, Sheets, Slides, arbitrary Office files, PDF authoring, and
+PDF editing are the immediate breadth follow-up after the household loop is
+proven.
 
-The model owns ordinary-language meaning and may use app-owned read tools for
-web research, Google, memory, and documents. Deterministic application code
-owns identity, visibility, source ownership, the immutable offered object,
-the exact direct-action payload, execution, deduplication, and provider proof. English vocabulary is never an
-identity, privacy, or effect-authorization primitive.
+## Implementation order
 
-## Phase 1 checkpoint
+Build one vertical household product, deepening existing modules and replacing
+obsolete paths in place:
 
-Phase 1 is not complete until the user can inspect the actual real-provider
-Messages conversation and confirm that Florence meets or exceeds the observed
-Instinct parent-document benchmark:
+1. **Partner handoff:** collect surname/phone, move invitation approval into
+   Messages, and complete the second adult's independent private setup.
+2. **Household activation:** automatically create and bind the exact family
+   group and Florence-created family calendar with equal adult authority.
+3. **Initial intelligence:** run founder-private and combined household
+   briefings from bounded Google reads and attachments.
+4. **Durable proactivity:** replace static follow-up text promotion with one
+   due-work seam for reminders, monitors, and discovery; add frequent
+   incremental Google reads.
+5. **Native inputs:** complete HEIC, voice-note, and Gmail attachment handling.
+6. **Web and Vault:** finish the Instinct-quality setup, Workspace, Vault,
+   Preferences, monitoring controls, and settings handoff.
+7. **Production rehearsal:** verify internally, reset once, deploy the
+   integrated loop, and run the real two-parent household journey.
 
-1. The production-shaped schema contains no household or adult. The intended
-   founding adult texts Florence in a private iMessage thread; their identity
-   is observed from that signed live conversation, not configured beforehand.
-2. Florence responds in a few natural bubbles with the secure mobile setup
-   link. Submitting the first screen creates the adult, neutral internal tenancy
-   root, and exact private relationship atomically; nothing is pre-created by
-   an operator, and no household-name question is shown.
-3. The adult connects their private Google account in the same mobile flow.
-   Florence reports connection only after provider proof, then asks one screen
-   at a time for an optional partner and each child's name, school, and
-   activities. Only after that review is complete does Florence return to the
-   same thread, explain the private/shared boundary briefly, and ask for one
-   real thing to take off the adult's plate.
-4. The adult sends a synthetic school PDF or iPhone photo with an explicit
-   instruction not to retain or schedule anything.
-5. Florence reacts immediately. It sends a short work bubble only if processing
-   will take noticeably longer than an ordinary response—roughly five to eight
-   seconds.
-6. Florence leads with the one or two items that deserve attention, extracts the
-   useful dates, and compares them with that adult's authorized Calendar
-   context without writing to it.
-7. Florence distinguishes stable logistics from one-offs, asks at most one
-   blocking question, and explicitly confirms that it sent, saved, and scheduled
-   nothing.
-8. A correction arrives while the work is active. The obsolete final answer is
-   suppressed; the correction is incorporated into one reranked response while
-   the already-sent reaction or honest work bubble remains.
-9. Florence produces an exact useful draft and clearly states that it was not
-   sent.
-10. The user and Florence stop, inspect the conversation together, and decide
-   whether the plan is still right before Phase 2 begins.
-
-## First complete journey
-
-The reduced product is not considered alive until this real journey works:
-
-1. Jackson and Kendall complete trusted onboarding independently.
-2. Florence establishes both private relationships and the exact family group.
-3. A parent sends or forwards a school PDF, photo, message, or Gmail item.
-4. Florence understands it and responds naturally using replies, reactions, or paced bubbles.
-5. Florence extracts the useful family facts with source and visibility.
-6. Florence notices a real schedule conflict or decision.
-7. A parent naturally approves the exact Calendar action.
-8. Florence performs it exactly once and reports the verified result.
-9. Florence follows up at a useful time.
-10. A parent corrects something naturally; Florence updates the right memory and stops the obsolete follow-up.
-11. The Vault shows the retained source, facts, visibility, correction, and deletion controls.
-
-This is demonstrated with the real phones, real Google accounts, real provider paths, and production-shaped deployment.
-
-## Deletion mandate
-
-Before additional feature work, remove everything that does not directly support this contract.
-
-Delete or replace:
-
-- legacy schemas and migration history that will not serve the reset product;
-- generic workflow, task, job, run, grant, catalog, and feature-state machinery;
-- provider-portability and connector-framework abstractions without two current concrete uses;
-- duplicate DTO, repository, command, event, and projection layers;
-- compatibility paths and fallbacks for the abandoned product;
-- task dashboards, activity dashboards, and internal-status UI;
-- speculative evaluation, self-learning, tracing, and policy systems;
-- broad unit, schema, component, fixture, and combinatorial test matrices;
-- historical research and implementation diaries from the active product surface;
-- generated build output and dead dependencies.
-
-Keep only what protects or enables a visible product behavior: receiving the right family's messages, saving allowed facts, scheduling a useful follow-up, understanding documents, using Google, and executing each approved provider write once without lying about the result.
-
-The deletion happens from a recoverable Git checkpoint. Preserve the working vertical household journey at each checkpoint. Do not build a replacement architecture merely because the old one was deleted. After the reduced core is green, reset the pilot database and rehearse from a clean household.
+Do not deploy a partial founder-only product again.
 
 ## Structural anti-bloat laws
 
-These rules are stronger than arbitrary line-count quotas:
-
-1. Every change begins with: **The family can now ___ in iMessage or on the web.** If that sentence is not concrete, reject the change.
+1. Every change begins: **The family can now ___ in iMessage or on the web.**
 2. Deepen an existing product module before adding another module.
-3. Do not add an abstraction until two current, concrete callers need the same behavior.
-4. Keep one durable source of household truth. Do not create feature-specific workflow engines.
-5. Replace an old path in the same change. No compatibility layers, dual writes, or permanent fallbacks.
-6. A new table, module, interface, queue, process, dependency, route, or persistent status must explain why the existing core cannot own the behavior.
-7. Architecture changes must reduce the number of concepts a future engineer must understand.
-8. “Future-proofing,” “clean architecture,” and “correctness” are not sufficient justifications by themselves.
-9. A boundary exists only when it protects a family, a secret, an irreversible action, or a genuinely independent provider.
-10. Completion means a visible real-world demonstration, not an internal framework becoming extensible.
+3. Do not add an abstraction until two current concrete callers need it.
+4. Keep one durable source of household truth; no feature workflow engines.
+5. Replace obsolete paths in the same change. No compatibility layers, dual
+   writes, or permanent fallbacks.
+6. A new table, module, interface, queue, process, dependency, route, persistent
+   status, or test must explain why the existing core cannot own the behavior.
+7. Architecture changes must reduce the concepts a future engineer must learn.
+8. Boundaries exist only to protect a family, secret, identity, or irreversible
+   external action.
+9. Completion is a real-world demonstration, not an extensible framework.
 
-## The minimum test doctrine
+A real additive migration is allowed for family-calendar binding, incremental
+source cursors, and durable monitor/discovery state because the existing schema
+cannot truthfully recover those behaviors. Do not hide provider operational
+state in profile JSON or facts. Do not add a worker, generic queue, sync service,
+connector registry, or workflow engine; the existing Florence loop owns due
+work.
 
-Tests exist only where failure would be expensive and other verification cannot prove the behavior.
+## Minimum test doctrine
 
-The default suite is:
+Keep exactly the minimum scenario suite:
 
-- one real whole-household journey covering onboarding, private/group context, a document, natural conversation, an approved external action, follow-up, correction, and duplicate provider delivery;
-- a thin privacy/authority boundary test where a provider could disclose one adult's information to the other or to the wrong group;
-- a thin idempotency/reconciliation test where duplicate provider delivery or a retry could duplicate an irreversible external action or falsely report success.
+1. one real whole-household journey covering founder and partner onboarding,
+   private threads, automatic group and calendar creation, the combined
+   briefing, a document, memory, a family-calendar change, monitoring,
+   discovery, correction, and duplicate provider delivery;
+2. one privacy/authority boundary narrative covering cross-adult private
+   context, group membership, invitation, and minimum conflict disclosure;
+3. one irreversible-action reconciliation narrative covering duplicate, retry,
+   ambiguity, and provider proof.
 
-A regression extends the closest existing journey. It does not create a new
-test file or fixture world unless the failure crosses a genuinely different
-dangerous boundary. A fourth automated test requires both that proof and the
-user's explicit approval; this is a default discipline rather than an arbitrary
-permanent cap.
+A regression extends the closest existing narrative. A fourth automated test
+requires a genuinely different expensive boundary and explicit user approval.
+Typecheck, build, direct inspection, provider-shaped probes, and the real
+rehearsal carry the rest. Fake reasoners prove orchestration and deterministic
+boundaries, not conversational quality.
 
-Do not add tests for schemas, DTOs, helpers, implementation details, static copy, ordinary UI rendering, exhaustive permutations, or behavior already guaranteed by types and the whole-product journey. Prefer typecheck, build, a deployment startup/migration/authenticated-webhook verification, one real provider-shaped rehearsal, and direct inspection.
+## Explicit non-goals for this goal
 
-When message wording must be irrelevant, the closest journey uses a
-runtime-generated opaque non-empty message and inspects the resulting behavior;
-it does not grow a matrix of accepted phrases. Fake reasoners prove orchestration
-and deterministic safety, not language generalization or conversational quality.
-Those remain real-provider transcript gates.
-
-The burden of proof is on adding a test, not deleting one.
-
-## Explicit non-goals for the pilot
-
-- child accounts;
 - more than one household or more than two participating adults;
+- child accounts;
+- Florence joining or passively watching outside parent groups;
+- non-iMessage messaging networks;
+- Drive, Docs, Sheets, Slides, and arbitrary Office-file browsing;
+- sending external email or messages as a parent;
+- contacting schools or institutions;
+- purchasing, booking, or submitting forms;
 - native mobile apps;
-- messaging networks other than iMessage through Linq;
-- Microsoft or non-Google productivity suites;
-- payment, password, or card storage;
 - generic task/project management;
-- meal-planning as a launch gate;
-- a connector registry or plugin platform;
-- a generalized workflow engine;
-- a model-provider portability framework;
-- mailbox or Drive mirroring;
-- PDF authoring;
-- analytics, evaluation, or self-learning infrastructure not required for the live household rehearsal.
+- mailbox, Drive, or document mirroring;
+- a connector registry, workflow engine, separate worker, or model-provider
+  portability framework;
+- analytics or self-learning infrastructure not required for the rehearsal.
 
-## Release gate
+## Completion and release gate
 
-Phase 1 ends in a mandatory user review and cannot silently roll into partner
-onboarding or broader implementation. Florence is ready for the complete pilot
-only when both adults can complete their independent Messages/mobile-web/Google
-onboarding and the full journey without database repair, operator-authored
-records, hidden commands, or explanation of internal concepts.
+The next production reset occurs only after the integrated loop is internally
+green. Completion requires a real rehearsal with the user and partner, real
+phones, real Google accounts, Linq, OpenAI, PostgreSQL, and the production-shaped
+deployment:
 
-Two gates are absolute: zero disclosure from one adult's private context into household context without authority, and zero unauthorized consequential action. Any failure blocks release.
+1. founder texts Florence and completes mobile setup;
+2. Florence privately asks to invite the named partner;
+3. partner independently completes Messages, web, and Google setup;
+4. Florence creates the exact group and shared family calendar;
+5. Florence produces a useful combined briefing without being handed a task;
+6. a parent sends or forwards a real family message, image, PDF, or voice note;
+7. Florence identifies a real conflict, deadline, handoff, or decision and
+   stores inspectable household knowledge;
+8. Florence performs one clear or approved family-calendar change exactly once
+   and reports verified completion;
+9. one automatic monitor produces a meaningful update or useful silence;
+10. one durable interest produces a sourced, genuinely relevant opportunity;
+11. a parent corrects something naturally and the group, calendar, monitor, and
+    Vault converge on the corrected truth.
+
+Two gates are absolute: no unauthorized disclosure from one adult's private
+context into the household, and no unauthorized consequential action.
 
 The final questions are experiential:
 
 - Did Florence feel perceptive and easy to talk to?
-- Did she help without turning family life into a workflow?
+- Did she remove mental load without turning family life into a workflow?
+- Did the group feel like Florence's natural home?
 - Did each adult trust what stayed private and what became shared?
-- Did the web feel as calm and obvious as Instinct?
-- Did Florence complete the real action exactly once and tell the truth about it?
+- Did mobile web feel as calm and obvious as Instinct?
+- Did Florence complete real actions exactly once and tell the truth?
 - Would the family miss her if she disappeared tomorrow?
 
 If those answers are not yes, more infrastructure is not the default remedy.

@@ -46,6 +46,7 @@ Required:
 | `LINQ_API_KEY` | Linq partner API key |
 | `LINQ_WEBHOOK_SECRET` | Current Standard Webhooks signing secret |
 | `LINQ_PARTNER_ID` | Exact expected Linq partner UUID |
+| `LINQ_FROM_PHONE` | Florence's exact E.164 iMessage sender number |
 | `OPENAI_API_KEY` | Model credential |
 | `FLORENCE_OPENAI_MODEL` | Pinned supported model ID |
 | `GOOGLE_OAUTH_CLIENT_ID` | Google OAuth web client ID |

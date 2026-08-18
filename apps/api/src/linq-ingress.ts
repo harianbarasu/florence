@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { EncryptedImageVault } from "@florence/artifacts";
 import type { ImageReference } from "@florence/contracts";
-import { type InboundDocumentInput, isClearMessagesOptOut } from "@florence/database";
+import { type InboundDocumentInput, isCarrierMessagesOptOut } from "@florence/database";
 import {
   type LinqClient,
   LinqError,
@@ -22,7 +22,7 @@ const PDF_DISCARD_MS = 24 * 60 * 60_000;
 type FlorenceIngress = Pick<
   Florence,
   | "resolveLinqAuthority"
-  | "startMessagesOnboarding"
+  | "respondBeforeEnrollment"
   | "bootstrapMessagesGroup"
   | "acceptInbound"
   | "acceptInboundReaction"
@@ -191,14 +191,14 @@ async function acceptMessage(
     occurredAt: proposal.occurredAt,
   });
   if (!authority) {
-    return establishAuthority(proposal, observed, options);
+    return handleUnboundMessage(proposal, observed, options);
   }
 
   const sourceId = inboundSourceId(proposal.providerEventId);
   if (authority.stopped) {
     return { disposition: "acknowledged", reason: "channel_stopped" };
   }
-  if (isClearMessagesOptOut(proposal.text)) {
+  if (isCarrierMessagesOptOut(proposal.text)) {
     const receipt = await options.florence.acceptInbound({
       providerConversationId: proposal.providerConversationId,
       audience,
@@ -240,7 +240,7 @@ async function acceptMessage(
   return { disposition: receipt.disposition, sourceId: receipt.sourceId };
 }
 
-async function establishAuthority(
+async function handleUnboundMessage(
   proposal: LinqInboundMessageProposal,
   observed: { audience: "private" | "group"; participantIdentityDigests: readonly string[] },
   options: {
@@ -250,19 +250,23 @@ async function establishAuthority(
   const { participantIdentityDigests } = observed;
   const senderIdentitySubjectDigest = linqIdentitySubjectDigest(proposal.sender.providerHandleId);
   if (observed.audience === "private") {
-    if (proposal.media.length > 0 || participantIdentityDigests.length !== 1) {
+    if (participantIdentityDigests.length !== 1) {
       return { disposition: "rejected", reason: "authority_not_found" };
     }
     if (participantIdentityDigests[0] !== senderIdentitySubjectDigest) {
       return { disposition: "rejected", reason: "authority_evidence_mismatch" };
     }
-    if (!isFounderOnboardingRequest(proposal.text)) {
+    if (isCarrierMessagesOptOut(proposal.text)) {
+      return { disposition: "acknowledged", reason: "opted_out" };
+    }
+    if (!proposal.text?.trim() && proposal.media.length === 0) {
       return { disposition: "rejected", reason: "authority_not_found" };
     }
-    const offered = await options.florence.startMessagesOnboarding({
+    const offered = await options.florence.respondBeforeEnrollment({
       providerEventId: proposal.providerEventId,
       providerConversationId: proposal.providerConversationId,
       identitySubjectDigest: senderIdentitySubjectDigest,
+      text: proposal.text?.trim() || "Shared an attachment.",
       occurredAt: proposal.occurredAt,
     });
     return offered
@@ -290,20 +294,6 @@ async function establishAuthority(
   return receipt && receipt.disposition !== "stopped"
     ? { disposition: receipt.disposition, sourceId: receipt.sourceId }
     : { disposition: "rejected", reason: "authority_not_found" };
-}
-
-function isFounderOnboardingRequest(text: string | null): boolean {
-  if (!text || Buffer.byteLength(text, "utf8") > 80) return false;
-  const request = text
-    .normalize("NFKC")
-    .toLocaleLowerCase("en-US")
-    .replace(/[.!?,\s👋🙂😊]+$/gu, "")
-    .trim();
-  return (
-    /^(?:hi|hello|hey|hiya)(?: florence)?$/.test(request) ||
-    /^(?:start|setup|set me up)$/.test(request) ||
-    /^(?:new|another|resend|send me a new|send another) (?:setup )?link$/.test(request)
-  );
 }
 
 async function storeMedia(

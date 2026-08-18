@@ -189,12 +189,26 @@ Onboarding is a core trust experience, not an admin afterthought.
 There is no password, access code, operator-authored household, placeholder
 adult, or preconfigured founding identity. On an empty pilot database, a parent
 texts Florence in a private iMessage thread. Florence verifies the signed Linq
-event and the live one-person iMessage audience, then replies naturally with a
-stateless, short-lived, single-use mobile setup link containing only the
-observed conversation and opaque identity claims. If two people greet Florence
-before either finishes setup, both may receive links, but the first valid form
+event, the live one-person iMessage audience, and the exact sender-participant
+match. Those provider facts—not the parent's wording—are the complete evidence
+that it is safe to answer. Any message with text or an attachment, other than
+the canonical carrier opt-out, may receive a natural response and a stateless, short-lived,
+single-use mobile setup link containing only the observed conversation and
+opaque identity claims. The parent never needs to say “hi,” “setup,” “link,” or
+another prescribed command. If two people message Florence before either
+finishes setup, both may receive links, but the first valid form
 redemption atomically creates the one pilot founder and household. Every losing
 link fails neutrally. Once that household exists, unknown senders stay silent.
+
+Before redemption, Florence may process only the current verified private
+message ephemerally through a setup-specific conversation with no read tools,
+household context, memory, Google, durable message record, or action output.
+The setup link itself is appended by deterministic application code. A later
+message in the same unclaimed thread receives a current link without special
+wording. After redemption, Florence remains conversational while Google or
+family setup is incomplete; it can explain and restore the next handoff, but it
+cannot read unavailable sources, retain facts, schedule work, or propose an
+external effect.
 
 No household, adult, channel, source, or message record exists before the
 adult submits the first setup screen. That submission atomically creates the
@@ -431,13 +445,23 @@ Participant or authority drift fails closed. Privacy boundaries are product beha
 
 The same controls work conversationally. In a private message an adult can ask what Florence knows, why something was shared, who can see it, to forget it, to revoke a standing rule, to disconnect Google, or to export or delete their data.
 
-Unknown senders and changed group membership are rejected until re-verified. STOP or an equivalent clear opt-out immediately suppresses further Florence messaging on that channel.
+Unknown senders and changed group membership are rejected until re-verified. A
+canonical carrier `STOP` is honored immediately without model processing.
+Natural requests to stop all Florence messaging are interpreted by the normal
+conversation model and atomically suppress further messaging on that channel;
+they are not maintained as a phrase dictionary.
 
 ## Autonomy and approval
 
-A direct natural-language instruction with an action verb is approval for the
-described exact action. A reaction, “looks good,” silence, or delivery is not
-approval.
+A clear direct instruction from the verified adult is approval for the described
+Calendar action and may execute in the same turn. The conversation model owns
+that natural-language judgment; there is no action-verb or approval phrase
+allowlist. When the request is ambiguous or Florence infers a useful action, it
+shows one exact immutable offer with the title, interval, time zone, and location.
+A later private adult message may naturally approve that sole stored offer.
+Approval interpretation receives only the current adult's text and the app-owned
+exact offer. A reaction, silence, delivery, group message, multiple pending
+offers, or an unrelated acknowledgement is not approval.
 
 The human rule is simple: research, reading, organizing, drafting, narrowing, comparing, and monitoring are Florence's job. Anything that costs money, contacts someone as the family, submits or books something, shares private information, commits a person, or makes an irreversible external change comes back once with the exact action first.
 
@@ -453,13 +477,17 @@ Florence may automatically:
 - follow up in the family's own conversations.
 
 Florence asks once, naturally, before an inferred consequential action. The only
-consequential launch action is the exact Calendar write. Provider success is
+consequential launch action is the exact instructed or approved Calendar write. Provider success is
 reported only after the provider confirms the intended result; uncertainty is
 stated honestly.
 
 Silence, message delivery, group membership, and prior approval of a different action never authorize a new action or establish completion.
 
-The model may use app-owned read tools for web research, Google, memory, and documents. It proposes consequential writes; deterministic application code authorizes, executes, deduplicates, and verifies them.
+The model owns ordinary-language meaning and may use app-owned read tools for
+web research, Google, memory, and documents. Deterministic application code
+owns identity, visibility, source ownership, the immutable offered object,
+the exact direct-action payload, execution, deduplication, and provider proof. English vocabulary is never an
+identity, privacy, or effect-authorization primitive.
 
 ## Phase 1 checkpoint
 
@@ -570,6 +598,12 @@ user's explicit approval; this is a default discipline rather than an arbitrary
 permanent cap.
 
 Do not add tests for schemas, DTOs, helpers, implementation details, static copy, ordinary UI rendering, exhaustive permutations, or behavior already guaranteed by types and the whole-product journey. Prefer typecheck, build, a deployment startup/migration/authenticated-webhook verification, one real provider-shaped rehearsal, and direct inspection.
+
+When message wording must be irrelevant, the closest journey uses a
+runtime-generated opaque non-empty message and inspects the resulting behavior;
+it does not grow a matrix of accepted phrases. Fake reasoners prove orchestration
+and deterministic safety, not language generalization or conversational quality.
+Those remain real-provider transcript gates.
 
 The burden of proof is on adding a test, not deleting one.
 

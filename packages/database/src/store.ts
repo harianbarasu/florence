@@ -220,7 +220,6 @@ export type AcceptInboundInput = {
   images?: readonly ImageReference[];
   documents?: readonly InboundDocumentInput[];
   supersedesSourceId?: string | null;
-  discardSupersededFacts?: boolean;
   occurredAt: string;
 };
 
@@ -362,6 +361,7 @@ export type CommitTurnInput = {
   calendarOffers?: readonly CalendarOfferDraft[];
   approveCalendarOffers?: readonly CalendarOfferApproval[];
   calendarActions?: readonly CalendarActionDraft[];
+  stopChannel?: boolean;
   handledAt: string;
 };
 
@@ -1544,6 +1544,28 @@ export class PostgresFlorenceStore {
         await markInboundSuperseded(sql, [turn.source_id], turn.source_id, newer.source_id, handledAt);
         return "superseded";
       }
+      if (input.stopChannel) {
+        if (
+          (input.facts?.length ?? 0) > 0 ||
+          (input.deleteFactIds?.length ?? 0) > 0 ||
+          (input.followUps?.length ?? 0) > 0 ||
+          (input.cancelFollowUpIds?.length ?? 0) > 0 ||
+          (input.outbound?.length ?? 0) > 0 ||
+          (input.calendarOffers?.length ?? 0) > 0 ||
+          (input.approveCalendarOffers?.length ?? 0) > 0 ||
+          (input.calendarActions?.length ?? 0) > 0
+        ) {
+          throw new FlorenceStoreConflict("Stopping Messages cannot commit any other turn mutations");
+        }
+        await stopMessagesChannel(sql, turn.channel_id, handledAt);
+        const handled = await sql`
+          update messages set status='handled',handled_at=${handledAt},retry_at=null,last_error=null
+          where source_id=${turn.source_id} and direction='inbound' and status='received'
+          returning source_id
+        `;
+        if (handled.length !== 1) throw new FlorenceStoreConflict("The inbound turn changed before commit");
+        return "committed";
+      }
       if (
         turn.audience !== "private" &&
         ((input.calendarOffers?.length ?? 0) > 0 ||
@@ -1676,6 +1698,10 @@ export class PostgresFlorenceStore {
         if (!connection)
           throw new FlorenceStoreUnauthorized("That Google connection is not owned by this adult");
         await sql`
+          delete from calendar_actions where household_id=${turn.household_id}
+            and owner_adult_id=${offer.ownerAdultId} and status='offered'
+        `;
+        await sql`
           insert into calendar_actions (
             id,household_id,owner_adult_id,connection_id,basis_source_id,operation,action_id,
             payload,payload_digest,status,retry_at,created_at
@@ -1688,10 +1714,25 @@ export class PostgresFlorenceStore {
       for (const approval of input.approveCalendarOffers ?? []) {
         assertDigest(approval.approvalDigest, "Calendar approval");
         const approved = await sql`
-          update calendar_actions set status='pending',approval_source_id=${turn.source_id},
+          update calendar_actions action set status='pending',approval_source_id=${turn.source_id},
             approval_digest=${approval.approvalDigest},retry_at=${handledAt},last_error=null
-          where id=${approval.offerId} and household_id=${turn.household_id}
-            and owner_adult_id=${turn.sender_adult_id} and status='offered' returning id
+          where action.id=${approval.offerId} and action.household_id=${turn.household_id}
+            and action.owner_adult_id=${turn.sender_adult_id} and action.status='offered'
+            and exists (
+              select 1 from messages basis join sources basis_source on basis_source.id=basis.source_id
+              where basis.source_id=action.basis_source_id and basis.channel_id=${turn.channel_id}
+                and basis.direction='inbound' and basis.sender_adult_id=${turn.sender_adult_id}
+                and (basis_source.created_at,basis_source.id)
+                  < (${turn.created_at},${turn.source_id}::uuid)
+            )
+            and exists (
+              select 1 from messages offer_message
+              join sources offer_source on offer_source.id=offer_message.source_id
+              where offer_source.parent_source_id=action.basis_source_id
+                and offer_message.channel_id=${turn.channel_id} and offer_message.direction='outbound'
+                and offer_message.move_kind in ('message','reply') and offer_message.status='sent'
+            )
+          returning action.id
         `;
         if (approved.length !== 1) {
           throw new FlorenceStoreConflict("The Calendar offer is no longer awaiting this adult's approval");
@@ -1719,6 +1760,10 @@ export class PostgresFlorenceStore {
         `;
         if (!connection)
           throw new FlorenceStoreUnauthorized("The approving adult does not own that Google connection");
+        await sql`
+          delete from calendar_actions where household_id=${turn.household_id}
+            and owner_adult_id=${action.ownerAdultId} and status='offered'
+        `;
         await sql`
           insert into calendar_actions (
             id,household_id,owner_adult_id,connection_id,basis_source_id,approval_source_id,
@@ -2767,14 +2812,10 @@ async function markInboundSuperseded(
   if (chain.length === 0 || chain.at(-1) !== tailSourceId) {
     throw new FlorenceStoreConflict("An inbound supersession chain is invalid");
   }
-  const [newer] = await sql<{ metadata: JsonValue; visibility: Visibility; owner_adult_id: string | null }[]>`
-    select metadata,visibility,owner_adult_id from sources where id=${newerSourceId} for update
+  const [newer] = await sql<{ metadata: JsonValue }[]>`
+    select metadata from sources where id=${newerSourceId} for update
   `;
   if (!newer) throw new FlorenceStoreConflict("The superseding inbound message does not exist");
-  const discardSupersededFacts = jsonRecord(newer.metadata).discardSupersededFacts;
-  if (discardSupersededFacts !== undefined && typeof discardSupersededFacts !== "boolean") {
-    throw new FlorenceStoreConflict("Stored inbound retention boundaries are invalid");
-  }
   const existingPrior = supersedesSourceId(newer.metadata);
   if (existingPrior && existingPrior !== tailSourceId) {
     throw new FlorenceStoreConflict("The superseding inbound message belongs to another turn chain");
@@ -2801,24 +2842,6 @@ async function markInboundSuperseded(
       last_error='Superseded before delivery by a newer message in this conversation'
     where direction='outbound' and status='pending' and turn_id in ${sql(finalTurnIds)}
   `;
-  if (discardSupersededFacts === true) {
-    await sql`
-      delete from facts fact
-      where ((${newer.visibility}='household' and fact.visibility='household')
-          or (${newer.visibility}='private' and fact.visibility='private'
-            and fact.owner_adult_id=${newer.owner_adult_id}))
-        and exists (
-        select 1 from fact_sources fs join sources source on source.id=fs.source_id
-        where fs.fact_id=fact.id
-          and (source.id in ${sql(chain)} or source.parent_source_id in ${sql(chain)})
-      ) and not exists (
-        select 1 from fact_sources fs join sources source on source.id=fs.source_id
-        where fs.fact_id=fact.id
-          and source.id not in ${sql(chain)}
-          and (source.parent_source_id is null or source.parent_source_id not in ${sql(chain)})
-      )
-    `;
-  }
   await sql`
     update messages reminder set status='failed',retry_at=null,
       last_error='Superseded before delivery by a newer message in this conversation'
@@ -2868,6 +2891,29 @@ function supersessionMetadataId(metadata: JsonValue, key: string): string | null
   }
   assertUuid(value, "Stored inbound supersession source ID");
   return value;
+}
+
+async function stopMessagesChannel(
+  sql: postgres.TransactionSql,
+  channelId: string,
+  stoppedAt: Date,
+): Promise<void> {
+  const stopped = await sql`
+    update linq_channels set stopped_at=coalesce(stopped_at,${stoppedAt})
+    where id=${channelId} and revoked_at is null returning id
+  `;
+  if (stopped.length !== 1) {
+    throw new FlorenceStoreConflict("The Messages channel is no longer active");
+  }
+  await sql`
+    update messages set status='failed',sending_at=null,retry_at=null,
+      last_error='Messages were stopped by this adult'
+    where channel_id=${channelId} and direction='outbound' and status='pending'
+  `;
+  await sql`
+    update follow_ups set status='cancelled',cancelled_at=${stoppedAt}
+    where channel_id=${channelId} and status in ('scheduled','queued')
+  `;
 }
 
 async function insertInbound(
@@ -2972,7 +3018,7 @@ async function insertInbound(
   if (requestedSupersedesSourceId === sourceId) {
     throw new FlorenceStoreConflict("An inbound message cannot supersede itself");
   }
-  const stop = isClearMessagesOptOut(input.text);
+  const stop = isCarrierMessagesOptOut(input.text);
   if (channel.stopped_at && !stop) {
     return {
       disposition: "stopped",
@@ -3002,7 +3048,6 @@ async function insertInbound(
       ${sql.json({
         providerMessageId: input.providerMessageId,
         ...(supersession ? { supersedesSourceId: supersession.tailSourceId } : {}),
-        ...(input.discardSupersededFacts ? { discardSupersededFacts: true } : {}),
       })},${occurredAt})
   `;
   await sql`
@@ -3040,7 +3085,7 @@ async function insertInbound(
       occurredAt,
     );
   }
-  if (stop) await sql`update linq_channels set stopped_at=${occurredAt} where id=${channel.id}`;
+  if (stop) await stopMessagesChannel(sql, channel.id, occurredAt);
   return {
     disposition: stop ? "stopped" : "accepted",
     sourceId,
@@ -3172,34 +3217,8 @@ async function insertInboundReaction(
   };
 }
 
-export function isClearMessagesOptOut(text: string | null | undefined): boolean {
-  if (!text?.trim()) return false;
-  const request = text
-    .trim()
-    .toLowerCase()
-    .replaceAll("’", "'")
-    .replace(/[.!?]+$/g, "")
-    .replace(/[,;:]+/g, " ")
-    .replace(/\s+/g, " ")
-    .replace(/^florence\s+/, "")
-    .replace(/^(?:please\s+|(?:can|could|would|will)\s+you(?:\s+please)?\s+)/, "")
-    .replace(/\s+please$/, "")
-    .trim();
-
-  return [
-    /^stop$/,
-    /^unsubscribe(?: me)?$/,
-    /^opt (?:me )?out$/,
-    /^stop (?:all )?(?:messages|texts)$/,
-    /^stop (?:messaging|texting|contacting) me(?: (?:now|anymore|again))?$/,
-    /^stop sending me (?:any )?(?:more )?(?:messages|texts)(?: (?:now|anymore))?$/,
-    /^(?:do not|don'?t) (?:message|text|contact) me(?: (?:anymore|again))?$/,
-    /^(?:do not|don'?t) send me (?:any )?(?:more )?(?:messages|texts)$/,
-    /^never (?:message|text|contact) me again$/,
-    /^no more (?:messages|texts)$/,
-    /^i (?:want|need) to (?:unsubscribe|opt out)$/,
-    /^i(?:'d| would) like to (?:unsubscribe|opt out)$/,
-  ].some((pattern) => pattern.test(request));
+export function isCarrierMessagesOptOut(text: string | null | undefined): boolean {
+  return /^(?:STOP|UNSUBSCRIBE|QUIT|END|CANCEL)$/i.test(text?.trim() ?? "");
 }
 
 async function insertOutbound(sql: postgres.TransactionSql, input: OutboundInsert): Promise<void> {

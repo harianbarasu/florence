@@ -298,7 +298,8 @@ function isFounderOnboardingRequest(text: string | null): boolean {
     .normalize("NFKC")
     .toLocaleLowerCase("en-US")
     .replace(/[.!?,\s👋🙂😊]+$/gu, "")
-    .trim();
+    .trim()
+    .replace(/^please\s+|\s+please$/g, "");
   return (
     /^(?:hi|hello|hey|hiya)(?: florence)?$/.test(request) ||
     /^(?:start|setup|set me up)$/.test(request) ||

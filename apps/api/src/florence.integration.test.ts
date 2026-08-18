@@ -878,7 +878,7 @@ class Harness {
     let setupToken: string;
     let competingSetupToken: string | null = null;
     if (input.exerciseMessagesFirst) {
-      expect(await this.receiveFounderGreeting("founder-hi", "Hi")).toEqual({
+      expect(await this.receiveFounderGreeting("founder-hi", "New link please!")).toEqual({
         disposition: "acknowledged",
         reason: "onboarding_offered",
       });

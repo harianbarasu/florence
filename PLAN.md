@@ -214,8 +214,9 @@ order:
 
 Google is required to complete pilot onboarding. Cancellation or provider
 failure leaves a resumable setup screen; it never produces a false success.
-The setup link is held in the URL fragment, removed before any network request,
-and expires quickly. One normal redemption consumes it. To recover a committed
+The compact signed setup link is sent alone so Messages can render a clean link
+preview. Its token is held in the URL fragment, removed before any network
+request, and expires quickly. One normal redemption consumes it. To recover a committed
 setup whose cookie response was lost, the exact same token, profile, and live
 private thread may repeat for at most sixty seconds; later replay fails. For
 this private pilot it is a bearer credential until redemption; expiry, hashing,

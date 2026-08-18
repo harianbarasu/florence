@@ -257,20 +257,19 @@ export class Florence {
       throw new Error("Google Workspace onboarding is not configured");
     }
     const setup = this.#enrollmentCodes.issueFounderSetup({
-      providerEventId: input.providerEventId,
       providerConversationId: input.providerConversationId,
       identitySubjectDigest: input.identitySubjectDigest,
       occurredAt: input.occurredAt,
     });
-    const setupUrl = `${this.#setupOrigin}/#setup=${encodeURIComponent(setup.token)}`;
+    const setupUrl = `${this.#setupOrigin}/#s=${encodeURIComponent(setup.token)}`;
     const expectedAuthority = {
       audience: "private" as const,
       participantIdentityDigests: [input.identitySubjectDigest],
     };
     const bubbles = [
       "Hey! Glad you’re here.",
-      "I’m Florence. I help parents keep school, schedules, and the loose ends between two adults from becoming another job.",
-      `Start with a quick private setup. You’ll connect your own Google account there: ${setupUrl}`,
+      "I’m Florence. I help parents keep school, schedules, and the loose ends between two adults from becoming another job. Start with a quick private setup—you’ll connect your own Google account there.",
+      setupUrl,
     ];
     await this.#setTyping({
       providerConversationId: input.providerConversationId,

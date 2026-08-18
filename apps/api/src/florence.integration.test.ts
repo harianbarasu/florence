@@ -10,7 +10,11 @@ import {
   migrateDatabase,
   PostgresFlorenceStore,
 } from "@florence/database";
-import type { GoogleCalendarExecutionResult, GoogleConnection } from "@florence/google";
+import {
+  type GoogleCalendarExecutionResult,
+  GoogleConnection,
+  type GoogleConnectionStore,
+} from "@florence/google";
 import {
   type LinqClient,
   type LinqConversationAuthority,
@@ -96,6 +100,7 @@ const release = TEST_DATABASE_URL ? describe : describe.skip;
 
 release("Florence release journeys", () => {
   test("runs the real two-adult household journey from an interruptible document turn through Calendar proof", async () => {
+    await expectCanonicalGoogleScopeAcceptance();
     let pdfWasRead = false;
     let reactionWasUnderstood = false;
     let calendarWasRead = false;
@@ -930,6 +935,74 @@ release("Florence release journeys", () => {
     expect((await harness.store.readNextCalendarAction(harness.iso()))?.id).toBe(claimAction.id);
   });
 });
+
+async function expectCanonicalGoogleScopeAcceptance(): Promise<void> {
+  const pending = {
+    connectionId: GOOGLE_CONNECTION,
+    householdId: FOUNDER_IDS.householdId,
+    ownerAdultId: ADULT_ONE,
+    status: "pending" as const,
+    emailLabel: null,
+    grantedScopes: [],
+    lastError: null,
+    createdAt: new Date(NOW).toISOString(),
+    updatedAt: new Date(NOW).toISOString(),
+  };
+  const store = {
+    consumePendingState: async () => ({
+      connectionId: pending.connectionId,
+      householdId: pending.householdId,
+      ownerAdultId: pending.ownerAdultId,
+      stateDigest: digest("google-state"),
+      sessionBindingDigest: digest("browser-session"),
+    }),
+    activate: async (input: Parameters<GoogleConnectionStore["activate"]>[0]) => ({
+      ...pending,
+      status: "active" as const,
+      emailLabel: input.emailLabel,
+      grantedScopes: input.grantedScopes,
+    }),
+    markPendingFailure: async () => undefined,
+  } as unknown as GoogleConnectionStore;
+  const google = new GoogleConnection({
+    store,
+    clientId: "google-client",
+    clientSecret: "google-secret",
+    redirectUri: "https://florence.test/oauth/google/callback",
+    encryptionKey: new Uint8Array(32),
+    fetch: async (request) =>
+      String(request).endsWith("/token")
+        ? Response.json({
+            access_token: "access-token",
+            refresh_token: "refresh-token",
+            scope: [
+              "openid",
+              "https://www.googleapis.com/auth/userinfo.email",
+              "https://www.googleapis.com/auth/userinfo.profile",
+              "https://www.googleapis.com/auth/gmail.readonly",
+              "https://www.googleapis.com/auth/calendar.events.owned",
+            ].join(" "),
+            token_type: "Bearer",
+          })
+        : Response.json({ sub: "google-subject", email: "parent@example.com", email_verified: true }),
+  });
+  await expect(
+    google.finish({
+      state: "google-state",
+      code: "authorization-code",
+      sessionBindingDigest: digest("browser-session"),
+      now: new Date(NOW).toISOString(),
+    }),
+  ).resolves.toMatchObject({
+    status: "active",
+    grantedScopes: [
+      "openid",
+      "email",
+      "https://www.googleapis.com/auth/gmail.readonly",
+      "https://www.googleapis.com/auth/calendar.events.owned",
+    ],
+  });
+}
 
 class Harness {
   now = NOW;

@@ -872,13 +872,14 @@ function sameInstant(left: string, right: string): boolean {
 }
 
 function exactScopes(value: string): readonly GoogleScope[] {
-  const actual = [...new Set(value.split(/\s+/).filter(Boolean))].sort();
-  const expected = [...GOOGLE_SCOPES].sort();
-  if (actual.length !== expected.length || actual.some((scope, index) => scope !== expected[index])) {
-    throw new GoogleConnectionError(
-      "Google did not grant exactly the requested permissions",
-      "invalid_grant",
-    );
+  const actual = new Set(
+    value
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((scope) => (scope === "https://www.googleapis.com/auth/userinfo.email" ? "email" : scope)),
+  );
+  if (GOOGLE_SCOPES.some((scope) => !actual.has(scope))) {
+    throw new GoogleConnectionError("Google did not grant all required permissions", "invalid_grant");
   }
   return [...GOOGLE_SCOPES];
 }

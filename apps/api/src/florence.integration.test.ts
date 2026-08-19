@@ -26,12 +26,13 @@ import {
   type LinqSendReaction,
   linqIdentitySubjectDigest,
 } from "@florence/linq";
+import type { OpenAI } from "openai";
 import { describe, expect, onTestFinished, test } from "vitest";
 import { buildApp, createSessionCallerResolver } from "./app.js";
 import { EnrollmentCodes } from "./enrollment.js";
 import { Florence } from "./florence.js";
 import { createLinqIngress } from "./linq-ingress.js";
-import type { FlorenceDecision, FlorenceReasoner } from "./reasoner.js";
+import { type FlorenceDecision, FlorenceReasoner } from "./reasoner.js";
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const NOW = Date.parse("2026-08-16T18:00:00.000Z");
@@ -76,8 +77,6 @@ const INTEREST_RECOMMENDATION =
 const INTEREST_URL = "https://example.com/bay-city-family-soccer";
 const GROUP_REPAIR_NOTICE =
   "The people in our family thread changed, so I stopped using it. I’ll make a fresh thread with just the two of you.";
-const INITIAL_REVIEW_OUTAGE_NOTICE =
-  "I couldn’t finish checking your Gmail and calendar just now, so I’m not calling it all clear. I’ll keep trying.";
 const PRIVATE_SCHOOL_FACT_SLOT = "child:maya:school";
 const INITIAL_PRIVATE_SCHOOL_FACT = "Maya attends Muir Elementary.";
 const UPDATED_PRIVATE_SCHOOL_FACT = "Maya attends Muir Academy.";
@@ -208,6 +207,7 @@ const release = TEST_DATABASE_URL ? describe : describe.skip;
 
 release("Florence parent journeys", () => {
   test("keeps private setup useful and recovers one two-parent family loop without duplicate work", async () => {
+    await assertFunctionCallContinuationIsWireSafe();
     const harness = await createHarness();
     harness.state.founderProductRecenterReview = true;
     await harness.setupFounder();
@@ -286,6 +286,17 @@ release("Florence parent journeys", () => {
     );
     expect(harness.linq.createdChats).toHaveLength(0);
     expect(harness.state.calendarExecutions).toHaveLength(0);
+    expect(
+      harness.linq.messages.filter(
+        (message) =>
+          message.providerConversationId === PRIVATE_FOUNDER && message.text === "Your side is ready, Hari.",
+      ),
+    ).toHaveLength(1);
+    expect(
+      harness.linq.messages.some((message) =>
+        message.text.includes("I’ll use your Gmail and calendar to catch school dates"),
+      ),
+    ).toBe(false);
     expect(
       harness.linq.messages.filter(
         (message) =>
@@ -587,15 +598,13 @@ release("Florence parent journeys", () => {
     ).toHaveLength(0);
 
     expect(harness.state.briefings).toHaveLength(0);
-    expect(
-      harness.linq.messages.filter((message) => message.text === INITIAL_REVIEW_OUTAGE_NOTICE),
-    ).toHaveLength(1);
+    expect(harness.state.initialGoogleFailuresRemaining).toBe(1);
+    const messagesAfterFirstSilentReviewFailure = harness.linq.messages.length;
     harness.state.now += 16_000;
     await harness.drain();
     expect(harness.state.briefings).toHaveLength(0);
-    expect(
-      harness.linq.messages.filter((message) => message.text === INITIAL_REVIEW_OUTAGE_NOTICE),
-    ).toHaveLength(1);
+    expect(harness.state.initialGoogleFailuresRemaining).toBe(0);
+    expect(harness.linq.messages).toHaveLength(messagesAfterFirstSilentReviewFailure);
     harness.state.now += 16_000;
     await harness.drain();
 
@@ -962,9 +971,6 @@ release("Florence parent journeys", () => {
           message.providerConversationId === FAMILY_GROUP && /Google|reconnect/i.test(message.text),
       ),
     ).toHaveLength(0);
-    expect(
-      harness.linq.messages.filter((message) => message.text === INITIAL_REVIEW_OUTAGE_NOTICE),
-    ).toHaveLength(1);
     expect(
       (await harness.florence.workspaceForAdult(harness.founderAdultId)).workspace.googleConnections,
     ).toHaveLength(0);
@@ -2656,7 +2662,7 @@ function familyProfileInput(): Parameters<Florence["completeFamilyOnboarding"]>[
   return {
     mode: "two_adult",
     postalCode: "94110",
-    partner: { firstName: "Alex", lastName: "Anbarasu", phoneNumber: PARTNER_PHONE },
+    partner: { firstName: "Alex", lastName: "Anbarasu", phoneNumber: PARTNER_PHONE.slice(2) },
     children: [
       {
         firstName: "Maya",
@@ -2666,6 +2672,73 @@ function familyProfileInput(): Parameters<Florence["completeFamilyOnboarding"]>[
       },
     ],
   };
+}
+
+async function assertFunctionCallContinuationIsWireSafe(): Promise<void> {
+  const functionCall = {
+    type: "function_call" as const,
+    id: "fc_1",
+    call_id: "call_1",
+    name: "search_private_gmail",
+    arguments: '{"query":"school","range":"recent_14_days","limit":10}',
+    status: "completed" as const,
+    parsed_arguments: { query: "school", range: "recent_14_days", limit: 10 },
+  };
+  let parseCalls = 0;
+  let continuedInput: unknown = null;
+  const fakeClient = {
+    responses: {
+      parse: async (params: { input?: unknown }) => {
+        parseCalls += 1;
+        if (parseCalls === 1) return { output: [functionCall], output_parsed: null };
+        continuedInput = params.input;
+        throw new Error("Stop after capturing the continued OpenAI input");
+      },
+    },
+  };
+  const reasoner = new FlorenceReasoner(
+    { apiKey: "fake-openai-key", model: "fake-openai-model" },
+    fakeClient as unknown as OpenAI,
+  );
+  await expect(
+    reasoner.reviewPrivateGoogle(
+      {
+        familyProfile: {
+          familyLabel: "Anbarasu Family",
+          timeZone: "America/Los_Angeles",
+          adultFirstNames: ["Hari"],
+          children: [],
+          postalCode: "94110",
+        },
+        adult: { adultId: "adult-1", firstName: "Hari" },
+        googleConnection: { connectionId: "google-1", status: "active", kind: "personal" },
+        currentTime: new Date(NOW).toISOString(),
+        currentPrivateFacts: [],
+      },
+      {
+        searchGmail: async () => [],
+        readPersonalCalendarWindow: async () => ({ status: "complete", events: [] }),
+        readGmailAttachment: async () => {
+          throw new Error("The continuation regression does not request an attachment");
+        },
+      },
+    ),
+  ).rejects.toMatchObject({ code: "rejected" });
+  expect(parseCalls).toBe(2);
+  if (!Array.isArray(continuedInput)) throw new Error("OpenAI continuation input was not captured");
+  const replayed = (continuedInput as unknown[]).find(
+    (item): item is Record<string, unknown> =>
+      typeof item === "object" && item !== null && "id" in item && item.id === functionCall.id,
+  );
+  expect(replayed).toEqual({
+    type: functionCall.type,
+    id: functionCall.id,
+    call_id: functionCall.call_id,
+    name: functionCall.name,
+    arguments: functionCall.arguments,
+    status: functionCall.status,
+  });
+  expect(Object.hasOwn(replayed ?? {}, "parsed_arguments")).toBe(false);
 }
 
 function withSchema(connectionString: string, schema: string): string {

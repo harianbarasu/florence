@@ -121,7 +121,8 @@ The mobile flow is one calm task per screen:
    attestation;
 2. that adult's private Google connection and one plain-language proactive-use
    permission;
-3. partner first and last name plus mobile number;
+3. partner first and last name plus a 10-digit US mobile number, entered without
+   a country code and normalized to `+1` at the API boundary;
 4. each child's first name, optional last name, school, and activities;
 5. home ZIP for coarse local discovery, with no street address requirement;
 6. a surname-derived family label shown as “Anbarasu Family” for one surname or

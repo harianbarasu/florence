@@ -1634,7 +1634,6 @@ export class Florence {
       await this.#store.retryInitialIntelligence({
         workId: work.workId,
         retryAt: later(this.#now(), RETRY_MS),
-        failedAt: this.#now().toISOString(),
         error: "Florence's proactive Google review is not configured",
       });
       return;
@@ -1823,7 +1822,6 @@ export class Florence {
       await this.#store.retryInitialIntelligence({
         workId: work.workId,
         retryAt: later(this.#now(), RETRY_MS),
-        failedAt: this.#now().toISOString(),
         error: errorText(error),
       });
     }
@@ -2620,7 +2618,6 @@ export class Florence {
       partner && partnerPhone
         ? [
             `Your side is ready, ${founderFirstName}.`,
-            "I’ll use your Gmail and calendar to catch school dates, conflicts, and loose ends without sharing your private stuff.",
             `Want me to text ${profileString(partner.profile, "firstName") ?? partner.displayName} at ${maskPhoneNumber(partnerPhone)} so they can set up their side?`,
           ]
         : [`Your side is ready, ${founderFirstName}.`];

@@ -15,8 +15,6 @@ const GOOGLE_POLL_INTERVAL_MS = 2 * 60_000;
 const INTEREST_CHECK_INTERVAL_MS = 7 * 24 * 60 * 60_000;
 const PROACTIVE_CONSENT_PAUSE_REASON = "Paused because proactive Google use is disabled";
 const HOUSEHOLD_SAFE_MONITOR_WHY = "Florence is watching this family coordination item.";
-const INITIAL_PRIVATE_REVIEW_OUTAGE_NOTICE =
-  "I couldn’t finish checking your Gmail and calendar just now, so I’m not calling it all clear. I’ll keep trying.";
 export type GoogleScope =
   | "openid"
   | "email"
@@ -1647,59 +1645,19 @@ export class PostgresFlorenceStore {
     });
   }
 
-  async retryInitialIntelligence(input: {
-    workId: string;
-    retryAt: string;
-    failedAt: string;
-    error: string;
-  }): Promise<void> {
+  async retryInitialIntelligence(input: { workId: string; retryAt: string; error: string }): Promise<void> {
     assertUuid(input.workId, "Initial intelligence work ID");
     const retryAt = instant(input.retryAt);
-    const failedAt = instant(input.failedAt);
-    if (retryAt < failedAt) {
-      throw new FlorenceStoreConflict("An initial intelligence retry cannot precede its failure");
+    const updated = await this.#sql`
+      update proactive_work set next_check_at=${retryAt},last_error=${bounded(input.error, 2_000)}
+      where id=${input.workId}
+        and kind in ('initial_private_review','initial_household_briefing')
+        and status='active'
+      returning id
+    `;
+    if (updated.length !== 1) {
+      throw new FlorenceStoreConflict("The initial intelligence work is no longer retryable");
     }
-    await this.#sql.begin(async (sql) => {
-      const [work] = await sql<ProactiveWorkRow[]>`
-        select * from proactive_work where id=${input.workId}
-          and kind in ('initial_private_review','initial_household_briefing')
-          and status='active' for update
-      `;
-      if (!work) throw new FlorenceStoreConflict("The initial intelligence work is no longer retryable");
-      if (work.kind === "initial_private_review") {
-        if (!work.owner_adult_id) {
-          throw new FlorenceStoreConflict("The private Google review is missing its adult");
-        }
-        const [channel] = await sql<ChannelRow[]>`
-          select * from linq_channels where household_id=${work.household_id} and audience='private'
-            and adult_one_id=${work.owner_adult_id} and adult_two_id is null
-            and revoked_at is null and stopped_at is null
-          order by bound_at,id limit 1 for share
-        `;
-        if (!channel) {
-          throw new FlorenceStoreUnauthorized("The private Google review thread is no longer active");
-        }
-        await insertOutbound(sql, {
-          sourceId: deterministicUuid(`initial-private-review-outage-message\0${work.id}`),
-          idempotencyKey: `initial-private-review-outage:${work.id}`,
-          moveKind: "message",
-          text: INITIAL_PRIVATE_REVIEW_OUTAGE_NOTICE,
-          turnId: deterministicUuid(`initial-private-review-outage-turn\0${work.id}`),
-          turnPart: 0,
-          notBefore: failedAt.toISOString(),
-          householdId: work.household_id,
-          channelId: channel.id,
-          visibility: "private",
-          ownerAdultId: work.owner_adult_id,
-          occurredAt: failedAt,
-        });
-      }
-      await sql`
-        update proactive_work set status='active',next_check_at=${retryAt},
-          last_error=${bounded(input.error, 2_000)}
-        where id=${work.id}
-      `;
-    });
   }
 
   async readNextDueProactiveWork(nowInput: string): Promise<DueProactiveWork | null> {
@@ -4440,8 +4398,9 @@ export class PostgresFlorenceStore {
         select source_id,channel_id,status,move_kind,turn_part,idempotency_key
         from messages where turn_id=${handoffTurnId} order by turn_part
       `;
+      // The active pilot household may already have the previously shipped three-bubble handoff.
       const handoffSent =
-        handoffRows.length === 3 &&
+        (handoffRows.length === 2 || handoffRows.length === 3) &&
         handoffRows.every(
           (message, index) =>
             message.source_id ===
@@ -4479,7 +4438,7 @@ export class PostgresFlorenceStore {
           limit 1
         `;
         if (partner) {
-          const approvalPromptSourceId = handoffRows[2]?.source_id;
+          const approvalPromptSourceId = handoffRows.at(-1)?.source_id;
           if (!approvalPromptSourceId) {
             throw new FlorenceStoreConflict("The founder handoff approval prompt is unavailable");
           }
@@ -4801,7 +4760,7 @@ export class PostgresFlorenceStore {
           from messages where turn_id=${handoffTurnId} order by turn_part for share
         `;
         if (
-          handoffRows.length !== 3 ||
+          (handoffRows.length !== 2 && handoffRows.length !== 3) ||
           handoffRows.some(
             (message, index) =>
               message.source_id !==
@@ -5812,20 +5771,35 @@ export class PostgresFlorenceStore {
         from messages where turn_id=${turnId} order by turn_part for update
       `;
       if (existing.length > 0) {
-        if (
-          existing.length > 3 ||
-          existing.some(
+        const exactCurrentHandoff =
+          existing.length === texts.length &&
+          existing.every(
             (message, index) =>
-              message.source_id !==
-                deterministicUuid(`founder-handoff\0${input.householdId}\0${input.adultId}\0${index}`) ||
-              message.channel_id !== channel.id ||
-              message.move_kind !== "message" ||
-              message.text !== texts[index] ||
-              message.reply_to_source_id !== null ||
-              message.turn_part !== index ||
-              message.idempotency_key !== `founder-handoff:${input.householdId}:${input.adultId}:${index}`,
-          )
-        ) {
+              message.source_id ===
+                deterministicUuid(`founder-handoff\0${input.householdId}\0${input.adultId}\0${index}`) &&
+              message.channel_id === channel.id &&
+              message.move_kind === "message" &&
+              message.text === texts[index] &&
+              message.reply_to_source_id === null &&
+              message.turn_part === index &&
+              message.idempotency_key === `founder-handoff:${input.householdId}:${input.adultId}:${index}`,
+          );
+        const deployedThreeBubbleHandoff =
+          texts.length === 2 &&
+          existing.length === 3 &&
+          existing.every(
+            (message, index) =>
+              message.source_id ===
+                deterministicUuid(`founder-handoff\0${input.householdId}\0${input.adultId}\0${index}`) &&
+              message.channel_id === channel.id &&
+              message.move_kind === "message" &&
+              message.reply_to_source_id === null &&
+              message.turn_part === index &&
+              message.idempotency_key === `founder-handoff:${input.householdId}:${input.adultId}:${index}`,
+          ) &&
+          existing[0]?.text === texts[0] &&
+          existing[2]?.text === texts[1];
+        if (!exactCurrentHandoff && !deployedThreeBubbleHandoff) {
           throw new FlorenceStoreConflict("The founder handoff was already staged with different content");
         }
         return existing.map((message) => message.source_id);

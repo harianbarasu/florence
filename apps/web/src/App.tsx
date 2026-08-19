@@ -415,7 +415,7 @@ function FamilySetupPage({ view }: { view: WorkspaceView }) {
       partner: {
         firstName: partnerFirstName.trim(),
         lastName: partnerLastName.trim(),
-        phoneNumber: partnerPhone.trim(),
+        phoneNumber: partnerPhone,
       },
     };
     if (input.children.some((child) => !child.firstName)) {
@@ -483,18 +483,19 @@ function FamilySetupPage({ view }: { view: WorkspaceView }) {
             detail="Florence won’t text them until she asks you in Messages."
           />
           <label className="field">
-            <span>Mobile number</span>
+            <span>US mobile number</span>
             <input
-              value={partnerPhone}
-              onChange={(event) => setPartnerPhone(normalizePhone(event.target.value))}
+              value={formatUsPhoneNumber(partnerPhone)}
+              onChange={(event) => setPartnerPhone(usPhoneDigits(event.target.value))}
               autoComplete="tel"
-              inputMode="tel"
-              placeholder="+1 415 555 0123"
-              pattern="\+[1-9][0-9]{7,14}"
+              inputMode="numeric"
+              placeholder="415 555 0123"
+              pattern="[0-9]{3} [0-9]{3} [0-9]{4}"
+              maxLength={12}
               required
             />
           </label>
-          <p className="setup-footnote">Include the country code, like +1.</p>
+          <p className="setup-footnote">No country code needed.</p>
           <button className="button primary wide" type="submit">
             Continue
           </button>
@@ -673,7 +674,7 @@ function FamilySetupPage({ view }: { view: WorkspaceView }) {
               onClick={() => showScreen({ kind: "partner" })}
             >
               <span>Partner or co-parent</span>
-              <strong>{`${partnerFirstName} ${partnerLastName} · ${partnerPhone}`}</strong>
+              <strong>{`${partnerFirstName} ${partnerLastName} · ${formatUsPhoneNumber(partnerPhone)}`}</strong>
             </button>
             {children.map((child) => (
               <button
@@ -2134,9 +2135,15 @@ function listValues(value: string): string[] {
     .filter(Boolean);
 }
 
-function normalizePhone(value: string): string {
-  const digits = value.replace(/\D/g, "");
-  return digits ? `+${digits.slice(0, 15)}` : "";
+function usPhoneDigits(value: string): string {
+  return value.replace(/\D/g, "").slice(0, 10);
+}
+
+function formatUsPhoneNumber(value: string): string {
+  const digits = usPhoneDigits(value);
+  if (digits.length <= 3) return digits;
+  if (digits.length <= 6) return `${digits.slice(0, 3)} ${digits.slice(3)}`;
+  return `${digits.slice(0, 3)} ${digits.slice(3, 6)} ${digits.slice(6)}`;
 }
 
 function consumeOnboardingEntry(): {

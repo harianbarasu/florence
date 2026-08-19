@@ -5,6 +5,15 @@ export const timestampSchema = z.iso.datetime();
 
 const nonempty = (maximum: number) => z.string().trim().min(1).max(maximum);
 const postalCodeSchema = z.string().regex(/^\d{5}(?:-\d{4})?$/);
+const familyOnboardingUsPhoneNumberSchema = z
+  .string()
+  .trim()
+  .refine(
+    (value) =>
+      /^\+1\d{10}$/.test(value) || (/^[\d\s().-]+$/.test(value) && value.replace(/\D/g, "").length === 10),
+    "Enter a 10-digit US mobile number.",
+  )
+  .transform((value) => (value.startsWith("+1") ? value : `+1${value.replace(/\D/g, "")}`));
 
 const familyMemberFields = {
   kind: z.enum(["adult", "child"]),
@@ -285,7 +294,7 @@ const personNameSchema = z
 
 const familyOnboardingPartnerSchema = personNameSchema
   .extend({
-    phoneNumber: z.string().regex(/^\+[1-9]\d{7,14}$/),
+    phoneNumber: familyOnboardingUsPhoneNumberSchema,
   })
   .strict();
 

@@ -3346,18 +3346,18 @@ function currentAuthoredText(input: FlorenceReasonerInput): string | null {
 }
 
 function continuationItems(output: readonly ResponseOutputItem[]): ResponseInputItem[] {
-  return output.filter(
-    (
-      item,
-    ): item is Extract<
-      ResponseOutputItem,
-      { type: "message" | "function_call" | "reasoning" | "web_search_call" }
-    > =>
-      item.type === "message" ||
-      item.type === "function_call" ||
-      item.type === "reasoning" ||
-      item.type === "web_search_call",
-  );
+  const items: ResponseInputItem[] = [];
+  for (const item of output) {
+    if (item.type === "function_call") {
+      const { parsed_arguments: _parsedArguments, ...call } = item as typeof item & {
+        parsed_arguments?: unknown;
+      };
+      items.push(call);
+    } else if (item.type === "message" || item.type === "reasoning" || item.type === "web_search_call") {
+      items.push(item);
+    }
+  }
+  return items;
 }
 
 function normalizeError(error: unknown): FlorenceReasonerError {

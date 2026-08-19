@@ -1,8 +1,2 @@
-export {
-  baselineFile,
-  householdActivationFile,
-  migrateDatabase,
-  migrationFiles,
-  proactiveWorkFile,
-} from "./migrate.js";
+export { baselineFile, migrateDatabase, migrationFiles } from "./migrate.js";
 export * from "./store.js";

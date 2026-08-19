@@ -1,9 +1,12 @@
 import {
   type CompleteFamilyOnboardingInput,
   type DisconnectGoogleConnectionInput,
-  type FamilyMemberInput,
+  type FamilyCalendarMonthView,
+  type FamilyMemberMutationInput,
+  familyCalendarMonthViewSchema,
   googleStartResponseSchema,
   type PatchFactInput,
+  type PatchWatchInput,
   type PreferencesInput,
   type SessionResponse,
   type SetupSessionInput,
@@ -67,6 +70,12 @@ export function getWorkspace(): Promise<WorkspaceView> {
   return requestWorkspace("/api/v1/workspace");
 }
 
+export async function getFamilyCalendarMonth(month: string): Promise<FamilyCalendarMonthView> {
+  return familyCalendarMonthViewSchema.parse(
+    await requestJson(`/api/v1/calendar?month=${encodeURIComponent(month)}`),
+  );
+}
+
 export function completeFamilyOnboarding(input: CompleteFamilyOnboardingInput): Promise<WorkspaceView> {
   return requestWorkspace("/api/v1/vault/household", {
     method: "PUT",
@@ -74,7 +83,7 @@ export function completeFamilyOnboarding(input: CompleteFamilyOnboardingInput): 
   });
 }
 
-export function putFamilyMember(memberId: string, input: FamilyMemberInput): Promise<WorkspaceView> {
+export function putFamilyMember(memberId: string, input: FamilyMemberMutationInput): Promise<WorkspaceView> {
   return requestWorkspace(`/api/v1/vault/members/${encodeURIComponent(memberId)}`, {
     method: "PUT",
     body: JSON.stringify(input),
@@ -89,7 +98,22 @@ export function patchVaultFact(factId: string, input: PatchFactInput): Promise<W
 }
 
 export function deleteVaultFact(factId: string): Promise<WorkspaceView> {
-  return requestWorkspace(`/api/v1/vault/facts/${encodeURIComponent(factId)}`, { method: "DELETE" });
+  return requestWorkspace(`/api/v1/vault/facts/${encodeURIComponent(factId)}`, {
+    method: "DELETE",
+  });
+}
+
+export function patchVaultWatch(workId: string, input: PatchWatchInput): Promise<WorkspaceView> {
+  return requestWorkspace(`/api/v1/vault/watches/${encodeURIComponent(workId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(input),
+  });
+}
+
+export function deleteVaultWatch(workId: string): Promise<WorkspaceView> {
+  return requestWorkspace(`/api/v1/vault/watches/${encodeURIComponent(workId)}`, {
+    method: "DELETE",
+  });
 }
 
 export function putPreferences(input: PreferencesInput): Promise<WorkspaceView> {

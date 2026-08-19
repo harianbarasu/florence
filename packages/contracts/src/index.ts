@@ -4,56 +4,52 @@ export const idSchema = z.uuid();
 export const timestampSchema = z.iso.datetime();
 
 const nonempty = (maximum: number) => z.string().trim().min(1).max(maximum);
+const postalCodeSchema = z.string().regex(/^\d{5}(?:-\d{4})?$/);
 
 const familyMemberFields = {
   kind: z.enum(["adult", "child"]),
-  role: z.enum(["steward", "caregiver", "dependent"]),
+  firstName: nonempty(160),
+  lastName: nonempty(160).nullable(),
   displayName: nonempty(160),
   relationship: nonempty(160),
-  aliases: z.array(nonempty(160)).max(20).optional(),
-  birthYear: z.number().int().min(1800).max(3000).optional(),
   school: nonempty(300).optional(),
-  currentGrade: nonempty(100).optional(),
-  academicYear: nonempty(100).optional(),
-  gradeEffectiveFrom: z.iso.date().optional(),
   activities: z.array(nonempty(300)).max(50).optional(),
 };
 
-function requireCompleteGrade(
-  member: {
-    currentGrade?: string | undefined;
-    academicYear?: string | undefined;
-    gradeEffectiveFrom?: string | undefined;
-  },
-  context: z.core.$RefinementCtx,
-): void {
-  const fields = [member.currentGrade, member.academicYear, member.gradeEffectiveFrom];
-  if (fields.some(Boolean) && !fields.every(Boolean)) {
-    context.addIssue({
-      code: "custom",
-      path: ["currentGrade"],
-      message: "Grade, academic year, and effective date must be provided together.",
-    });
-  }
-}
-
 export const familyMemberInputSchema = z
-  .object(familyMemberFields)
+  .object({
+    kind: z.literal("child"),
+    firstName: nonempty(160),
+    lastName: nonempty(160).nullable().optional(),
+    school: nonempty(300).optional(),
+    activities: z.array(nonempty(300)).max(50).optional(),
+  })
+  .strict();
+export type FamilyMemberInput = z.infer<typeof familyMemberInputSchema>;
+
+const familyMemberPatchFields = {
+  firstName: nonempty(160).optional(),
+  lastName: nonempty(160).nullable().optional(),
+  school: nonempty(300).nullable().optional(),
+  activities: z.array(nonempty(300)).max(50).optional(),
+  postalCode: postalCodeSchema.optional(),
+};
+
+export const patchFamilyMemberInputSchema = z
+  .object(familyMemberPatchFields)
   .strict()
   .superRefine((member, context) => {
-    requireCompleteGrade(member, context);
-    if (member.kind === "child" && member.role !== "dependent") {
-      context.addIssue({ code: "custom", path: ["role"], message: "A child must be a dependent." });
-    }
-    if (member.kind === "adult" && member.role === "dependent") {
-      context.addIssue({
-        code: "custom",
-        path: ["role"],
-        message: "An adult must be a steward or caregiver.",
-      });
+    if (Object.values(member).every((value) => value === undefined)) {
+      context.addIssue({ code: "custom", message: "Change at least one family member detail." });
     }
   });
-export type FamilyMemberInput = z.infer<typeof familyMemberInputSchema>;
+export type PatchFamilyMemberInput = z.infer<typeof patchFamilyMemberInputSchema>;
+
+export const familyMemberMutationInputSchema = z.union([
+  familyMemberInputSchema,
+  patchFamilyMemberInputSchema,
+]);
+export type FamilyMemberMutationInput = z.infer<typeof familyMemberMutationInputSchema>;
 
 export const familyMemberStatusSchema = z.enum(["verified", "planned", "represented"]);
 
@@ -63,24 +59,24 @@ export const familyMemberProfileSchema = z
   .object({
     id: idSchema,
     ...familyMemberFields,
+    postalCode: postalCodeSchema.nullable().optional(),
     status: familyMemberStatusSchema,
     messagesIdentity: messagesIdentityStatusSchema.nullable(),
   })
   .strict()
   .superRefine((member, context) => {
-    requireCompleteGrade(member, context);
-    if (member.kind === "child" && (member.role !== "dependent" || member.messagesIdentity !== null)) {
+    if (member.kind === "adult" && member.lastName === null) {
+      context.addIssue({
+        code: "custom",
+        path: ["lastName"],
+        message: "An adult needs a last name.",
+      });
+    }
+    if (member.kind === "child" && member.messagesIdentity !== null) {
       context.addIssue({
         code: "custom",
         path: ["kind"],
         message: "A child is represented by the household and never has a Messages identity.",
-      });
-    }
-    if (member.kind === "adult" && member.role === "dependent") {
-      context.addIssue({
-        code: "custom",
-        path: ["role"],
-        message: "An adult must be a steward or caregiver.",
       });
     }
   });
@@ -120,24 +116,32 @@ export const vaultFactSchema = z
   .strict();
 export type VaultFact = z.infer<typeof vaultFactSchema>;
 
-export const vaultContactInputSchema = z
-  .object({
-    kind: z.enum(["address", "phone"]),
-    label: nonempty(160),
-    value: nonempty(1_000),
-    visibility: vaultVisibilitySchema,
-  })
-  .strict();
+const vaultWatchFields = {
+  workId: idSchema,
+  objective: nonempty(2_000),
+  currentConclusion: nonempty(4_000).nullable(),
+  visibility: vaultVisibilitySchema,
+  status: z.enum(["active", "paused"]),
+  source: vaultSourceSchema.nullable(),
+};
 
-export const vaultContactSchema = vaultContactInputSchema
-  .extend({
-    id: idSchema,
-    source: vaultSourceSchema,
-    editable: z.boolean(),
-    deletable: z.boolean(),
-  })
-  .strict();
-export type VaultContact = z.infer<typeof vaultContactSchema>;
+const watchInterestTermSchema = nonempty(100);
+
+export const vaultWatchSchema = z.discriminatedUnion("kind", [
+  z
+    .object({
+      ...vaultWatchFields,
+      kind: z.literal("monitor"),
+    })
+    .strict(),
+  z
+    .object({
+      ...vaultWatchFields,
+      kind: z.literal("interest"),
+    })
+    .strict(),
+]);
+export type VaultWatch = z.infer<typeof vaultWatchSchema>;
 
 export const googleConnectionSummarySchema = z
   .object({
@@ -163,7 +167,9 @@ export const setupChecklistSchema = z
 
 export const preferencesInputSchema = z
   .object({
-    appearance: z.enum(["light", "dark", "system"]),
+    proactiveGoogleEnabled: z.boolean(),
+    automaticFamilyCalendarEnabled: z.boolean(),
+    privateConflictBusySharingEnabled: z.boolean(),
   })
   .strict();
 export type PreferencesInput = z.infer<typeof preferencesInputSchema>;
@@ -172,9 +178,10 @@ export const preferencesViewSchema = preferencesInputSchema;
 export const householdVaultSchema = z
   .object({
     timeZone: nonempty(100),
+    postalCode: postalCodeSchema.nullable(),
     members: z.array(familyMemberProfileSchema).max(100),
-    contacts: z.array(vaultContactSchema).max(100),
     facts: z.array(vaultFactSchema).max(500),
+    watches: z.array(vaultWatchSchema).max(100),
   })
   .strict();
 export type HouseholdVault = z.infer<typeof householdVaultSchema>;
@@ -185,6 +192,7 @@ export const workspaceViewSchema = z
       .object({
         adultId: idSchema,
         displayName: nonempty(160).nullable(),
+        lastName: nonempty(160).nullable(),
       })
       .strict(),
     workspace: z
@@ -199,6 +207,73 @@ export const workspaceViewSchema = z
   })
   .strict();
 export type WorkspaceView = z.infer<typeof workspaceViewSchema>;
+
+export const calendarMonthSchema = z.string().regex(/^[1-9]\d{3}-(?:0[1-9]|1[0-2])$/);
+
+export const familyCalendarMonthQuerySchema = z
+  .object({
+    month: calendarMonthSchema,
+  })
+  .strict();
+
+const familyCalendarEventFields = {
+  status: z.enum(["confirmed", "tentative"]),
+  title: nonempty(500).nullable(),
+  location: nonempty(500).nullable(),
+};
+
+export const familyCalendarEventSchema = z.discriminatedUnion("intervalKind", [
+  z
+    .object({
+      ...familyCalendarEventFields,
+      intervalKind: z.literal("timed"),
+      startsAt: timestampSchema,
+      endsAt: timestampSchema,
+      timeZone: nonempty(100),
+    })
+    .strict(),
+  z
+    .object({
+      ...familyCalendarEventFields,
+      intervalKind: z.literal("all_day"),
+      startDate: z.iso.date(),
+      endDate: z.iso.date(),
+    })
+    .strict(),
+]);
+export type FamilyCalendarEvent = z.infer<typeof familyCalendarEventSchema>;
+
+const familyCalendarMonthFields = {
+  month: calendarMonthSchema,
+  timeZone: nonempty(100),
+};
+
+export const familyCalendarMonthViewSchema = z.discriminatedUnion("status", [
+  z
+    .object({
+      ...familyCalendarMonthFields,
+      status: z.literal("ready"),
+      calendarName: nonempty(160),
+      truncated: z.boolean(),
+      events: z.array(familyCalendarEventSchema).max(100),
+    })
+    .strict(),
+  z
+    .object({
+      ...familyCalendarMonthFields,
+      status: z.literal("not_ready"),
+      calendarName: nonempty(160).nullable(),
+    })
+    .strict(),
+  z
+    .object({
+      ...familyCalendarMonthFields,
+      status: z.literal("temporarily_unavailable"),
+      calendarName: nonempty(160),
+    })
+    .strict(),
+]);
+export type FamilyCalendarMonthView = z.infer<typeof familyCalendarMonthViewSchema>;
 
 const personNameSchema = z
   .object({
@@ -225,8 +300,7 @@ const familyOnboardingChildSchema = z
   .strict();
 
 const familyOnboardingBase = {
-  familyLabel: nonempty(160),
-  postalCode: z.string().regex(/^\d{5}(?:-\d{4})?$/),
+  postalCode: postalCodeSchema,
   children: z.array(familyOnboardingChildSchema).min(1).max(20),
 };
 
@@ -258,6 +332,7 @@ export const setupSessionInputSchema = z
         timeZone: nonempty(100),
         guardianAttested: z.literal(true),
         proactiveUseAccepted: z.literal(true),
+        privateConflictBusySharingEnabled: z.boolean().default(false),
       })
       .strict(),
   })
@@ -267,8 +342,55 @@ export type SetupSessionInput = z.infer<typeof setupSessionInputSchema>;
 export const sessionResponseSchema = z.object({ adultId: idSchema }).strict();
 export type SessionResponse = z.infer<typeof sessionResponseSchema>;
 
-export const patchFactInputSchema = z.object({ statement: nonempty(4_000) }).strict();
+export const patchFactInputSchema = z
+  .object({
+    statement: nonempty(4_000),
+  })
+  .strict();
 export type PatchFactInput = z.infer<typeof patchFactInputSchema>;
+
+export const patchWatchInputSchema = z
+  .discriminatedUnion("kind", [
+    z
+      .object({
+        kind: z.literal("monitor"),
+        objective: nonempty(2_000).optional(),
+        endCondition: nonempty(2_000).optional(),
+        status: z.enum(["active", "paused"]).optional(),
+      })
+      .strict(),
+    z
+      .object({
+        kind: z.literal("interest"),
+        objective: nonempty(2_000).optional(),
+        genericTerms: z.array(watchInterestTermSchema).min(1).max(8).optional(),
+        status: z.enum(["active", "paused"]).optional(),
+      })
+      .strict(),
+  ])
+  .superRefine((input, context) => {
+    const hasCorrection =
+      input.objective !== undefined ||
+      input.status !== undefined ||
+      (input.kind === "monitor" ? input.endCondition !== undefined : input.genericTerms !== undefined);
+    if (!hasCorrection) {
+      context.addIssue({
+        code: "custom",
+        message: "Change what Florence watches or whether it is paused.",
+      });
+    }
+    if (input.kind === "interest" && input.genericTerms) {
+      const terms = input.genericTerms.map((term) => term.toLocaleLowerCase("en-US"));
+      if (new Set(terms).size !== terms.length) {
+        context.addIssue({
+          code: "custom",
+          path: ["genericTerms"],
+          message: "Use each interest once.",
+        });
+      }
+    }
+  });
+export type PatchWatchInput = z.infer<typeof patchWatchInputSchema>;
 
 export const disconnectGoogleConnectionInputSchema = z.object({ connectionId: idSchema }).strict();
 export type DisconnectGoogleConnectionInput = z.infer<typeof disconnectGoogleConnectionInputSchema>;

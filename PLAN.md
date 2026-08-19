@@ -27,9 +27,10 @@ quiet when nothing useful should be said.
 
 ## Pilot boundary
 
-The pilot supports exactly:
+The pilot is designed and operated for roughly the first 100 independent
+households; this is a scale boundary, not an in-product admission gate. Each
+household supports exactly:
 
-- one household;
 - two independently verified, equal-authority participating adults;
 - represented children, not child accounts;
 - one private iMessage relationship with each adult;
@@ -40,9 +41,10 @@ The pilot supports exactly:
   Preferences experience.
 
 An off-the-beaten-path “Set up Florence just for me” path is allowed. The solo
-adult's private thread becomes the primary channel and Florence still creates
-the surname-based family calendar. Adding a partner later shares that calendar
-and transitions the household into the standard family group without a reset.
+adult's private thread becomes the primary channel, but Florence does not
+create a family group or shared family calendar yet. Adding a partner later
+transitions the household into the standard two-adult activation without a
+reset.
 
 Florence is a broad family generalist inside this boundary. She can research,
 compare, recommend, monitor, draft, interpret family documents, remember, and
@@ -99,13 +101,14 @@ thread, privately notifies both adults, and creates a replacement exact group.
 ## Trusted Messages-first onboarding
 
 There is no password, access code, operator-created household, placeholder
-adult, or preconfigured founding identity. On an empty pilot database, any
-signed, live, one-participant private iMessage containing text or an attachment
-may receive a natural setup conversation and a short-lived setup link, except
-for a canonical carrier opt-out. Message wording is never identity or authority
-evidence. The first valid setup redemption atomically creates the founder and
-household; competing links fail neutrally. Unknown senders remain silent after
-that.
+adult, or preconfigured founding identity. Any signed, live, one-participant
+private iMessage containing text or an attachment may receive a natural setup
+conversation and a short-lived setup link, except for a canonical carrier
+opt-out. Message wording is never identity or authority evidence. The first
+valid setup redemption for that Messages identity atomically creates its
+founder and household; duplicate or conflicting links for the same identity
+fail neutrally. An unknown parent may begin a different household until the
+rough pilot capacity is reached.
 
 Before enrollment, Florence converses only through a setup-specific
 no-tools/no-effects interface. It has no household, memory, Google, or action
@@ -121,7 +124,7 @@ The mobile flow is one calm task per screen:
 3. partner first and last name plus mobile number;
 4. each child's first name, optional last name, school, and activities;
 5. home ZIP for coarse local discovery, with no street address requirement;
-6. an editable family label derived as “Anbarasu Family” for one surname or
+6. a surname-derived family label shown as “Anbarasu Family” for one surname or
    “Anbarasu–Smith Family” for two surnames;
 7. review and completion.
 
@@ -148,9 +151,9 @@ attests, connects Google, and accepts the proactive-use permission. The founder
 cannot consent or connect Google for them.
 
 If the number is wrong or the recipient refuses or opts out, invalidate the
-invitation and tell the founder only that setup did not complete. Send one light
-partner reminder after about a day and one founder update if setup remains
-incomplete; then stop nudging.
+invitation and tell the founder only that setup did not complete. Florence asks
+once and does not run an automated reminder workflow; the founder can ask again
+in ordinary language.
 
 ## Household activation
 
@@ -213,17 +216,17 @@ Calendar.
 Relevant Gmail PDF and image attachments are inspected automatically. Gmail
 bodies and raw attachment bytes are not retained as a shadow mailbox.
 
-Incremental Gmail and Calendar reads run roughly every two minutes, staggered by
-connection, targeting about five-minute freshness. Google push is deferred
+Incremental Gmail and Calendar reads run roughly every two minutes from the
+same Florence process, targeting about five-minute freshness. Google push is deferred
 until scale or seconds-level responsiveness makes the additional service
 worthwhile. Reading cadence is not messaging cadence.
 
-Florence waits roughly five to ten minutes for related changes to settle into
-one conclusion. Truly urgent same-day changes may interrupt immediately.
-Distinct useful findings may produce more than one update per day; there is no
-arbitrary twice-daily or one-message ceiling. Default quiet hours are 8 PM–7 AM
-in the household time zone, except when waiting would materially harm the
-family.
+Each poll reasons once over the useful changes it found and produces the
+smallest meaningful conclusion. Distinct useful findings may produce more than
+one update per day; there is no arbitrary twice-daily or one-message ceiling.
+Default quiet hours are 8 PM–7 AM in the household time zone, except when
+waiting would materially harm the family. The pilot does not persist a separate
+settlement workflow merely to combine nearby provider events.
 
 ### Finite monitors
 
@@ -243,10 +246,10 @@ private Calendar title, or other private detail.
 
 Florence sends only unusually relevant, timely opportunities that fit age,
 location, and household schedule. The rough ceiling is two unsolicited
-suggestions per week per household. Ignored suggestions are down-ranked; after
-three ignored suggestions, pause that discovery and show it as paused in the
-Vault. A suggestion never becomes a Calendar commitment until a parent says to
-add it.
+suggestions per week per household. A parent can narrow, pause, or stop a
+discovery in ordinary language or in the Vault. The pilot does not maintain a
+hidden ignore counter. A suggestion never becomes a Calendar commitment until
+a parent says to add it.
 
 Research leads with Florence's judgment, then the family consequence, then one
 to three direct source links. Corrections to prior research are proactive and
@@ -256,7 +259,7 @@ explicit. Monitoring remains quiet between meaningful changes.
 
 Florence always creates a new secondary Google calendar after both adults
 connect and the exact group exists. It never adopts an existing calendar. The
-calendar and group use the same editable surname-derived family label.
+calendar and group use the same surname-derived family label.
 
 The founding adult is the underlying Google data owner. The second adult gets
 owner-level ACL access and the calendar is inserted into their Calendar list.
@@ -297,10 +300,23 @@ Parents may forward messages, screenshots, photos, PDFs, or voice notes from
 other chats into a private or family Florence thread. Florence does not join or
 monitor outside parent, school, WhatsApp, or Signal groups in this goal.
 
-Forwarded material is evidence, not authority. A clearly official school PDF
+Provider-identifiable source material is evidence, not parent authority. That
+includes attachments, voice transcripts, inline-reply quotations, rich-link
+pages, Gmail, Calendar, and other tool results. A clearly official school PDF
 may supply an unambiguous date under the standing family-calendar rule. Casual
 group-chat claims produce a suggestion or focused question, never an automatic
 external action.
+
+Linq does not expose a trustworthy marker for ordinary text that a parent
+forwarded, pasted, or typed themselves. Florence therefore evaluates the
+ordinary text portion of a signed Message from the verified parent as that
+parent's current utterance. She uses semantic judgment and asks once when a
+consequential meaning is genuinely ambiguous; she does not add forwarded-text
+regexes, phrase lists, or magic approval wording. An inline Calendar or partner
+invitation approval is eligible for the isolated approval pass only when it
+replies to Florence's exact sent approval prompt. An ordinary unthreaded
+natural-language approval remains frictionless. Canonical carrier opt-out stays
+an ingress rule.
 
 Raw media is encrypted only for bounded processing and retry and is discarded
 within 24 hours unless a parent explicitly asks to retain it. Useful facts,
@@ -319,18 +335,17 @@ monitors under the one-time proactive permission. Sensitive personal details
 remain private unless their owner directs sharing. An explicit no-retention
 instruction overrides automatic memory.
 
-New evidence may replace an obviously superseded fact or date while preserving
-source history and telling the family what changed. Ambiguity or a consequential
-change preserves current state and asks one focused question.
+New evidence may replace an obviously superseded fact or date while retaining
+the current supporting source and telling the family what changed. Ambiguity or
+a consequential change preserves current state and asks one focused question.
 
 The Vault shows and allows correction or deletion of:
 
 - adults, children, surnames, ZIP, schools, activities, caregivers, and useful
   household facts;
-- source, visibility, correction, and deletion history;
+- the current supporting source and who can see each fact;
 - active finite monitors and interest discoveries;
-- what Florence is watching, why, its latest conclusion, and when it last
-  checked;
+- what Florence is watching and its latest useful conclusion;
 - plain controls to pause, stop watching, or correct an item.
 
 The Workspace shows the one current household action plus partner, exact-group,
@@ -338,7 +353,7 @@ Google, family-calendar, and initial-briefing state. It is not an activity feed,
 task dashboard, metric panel, or systems console.
 
 Preferences include the adult's private Google connection, proactive-use and
-private-conflict-sharing permissions, appearance, account, and sign-out.
+private-conflict-sharing permissions, account, and sign-out.
 
 The visual benchmark is Instinct's sparse authenticated and mobile setup
 experience: a calm narrow column, measured typography and spacing, one primary
@@ -364,7 +379,7 @@ Florence may automatically:
 Anything that costs money, contacts an outside person as the family, submits or
 books something, shares private information, commits a person, or makes another
 irreversible external change comes back once with the exact action first.
-Calendar or invitation success is reported only after provider proof.
+Calendar or invitation success is reported only after the provider confirms it.
 
 Sending external email, contacting schools, purchases, bookings, and form
 submission are not in this goal. Florence may produce exact ready-to-send
@@ -383,9 +398,9 @@ obsolete paths in place:
    group and Florence-created family calendar with equal adult authority.
 3. **Initial intelligence:** run founder-private and combined household
    briefings from bounded Google reads and attachments.
-4. **Durable proactivity:** replace static follow-up text promotion with one
-   due-work seam for reminders, monitors, and discovery; add frequent
-   incremental Google reads.
+4. **Durable proactivity:** replace static follow-up text promotion with direct
+   Google polling, finite monitors, and interest discovery in the same Florence
+   process.
 5. **Native inputs:** complete HEIC, voice-note, and Gmail attachment handling.
 6. **Web and Vault:** finish the Instinct-quality setup, Workspace, Vault,
    Preferences, monitoring controls, and settings handoff.
@@ -408,26 +423,29 @@ Do not deploy a partial founder-only product again.
 8. Boundaries exist only to protect a family, secret, identity, or irreversible
    external action.
 9. Completion is a real-world demonstration, not an extensible framework.
+10. For the first roughly 100 households, prefer one process, ordinary database
+    transactions, uniqueness constraints, and repairable failures over leases,
+    distributed locks, proof ledgers, workflow state, or scale-first queues.
 
-A real additive migration is allowed for family-calendar binding, incremental
-source cursors, and durable monitor/discovery state because the existing schema
-cannot truthfully recover those behaviors. Do not hide provider operational
-state in profile JSON or facts. Do not add a worker, generic queue, sync service,
-connector registry, or workflow engine; the existing Florence loop owns due
-work.
+The fresh pilot schema may include family-calendar binding, incremental source
+cursors, and durable monitor/discovery state because those are user-visible
+product behaviors. Do not hide provider operational state in profile JSON or
+facts. Do not add a worker, generic queue, sync service, connector registry, or
+workflow engine; the existing Florence loop owns due work.
 
 ## Minimum test doctrine
 
 Keep exactly the minimum scenario suite:
 
-1. one real whole-household journey covering founder and partner onboarding,
-   private threads, automatic group and calendar creation, the combined
-   briefing, a document, memory, a family-calendar change, monitoring,
-   discovery, correction, and duplicate provider delivery;
-2. one privacy/authority boundary narrative covering cross-adult private
-   context, group membership, invitation, and minimum conflict disclosure;
-3. one irreversible-action reconciliation narrative covering duplicate, retry,
-   ambiguity, and provider proof.
+1. one complete two-parent setup journey: founder setup and Google, one partner
+   invitation question, partner setup and Google, then automatic exact family
+   group and shared family calendar creation without visible duplicates;
+2. one proactive-family journey: separate private reviews, a safe combined
+   briefing, a forwarded family input, current source-linked memory, a finite
+   monitor, one automatic family date, and the read-only Calendar page;
+3. one equal-authority and privacy journey: private context stays private,
+   either adult can correct household state and change the family calendar, and
+   one changed-participant group is retired and replaced.
 
 A regression extends the closest existing narrative. A fourth automated test
 requires a genuinely different expensive boundary and explicit user approval.
@@ -437,7 +455,8 @@ boundaries, not conversational quality.
 
 ## Explicit non-goals for this goal
 
-- more than one household or more than two participating adults;
+- more than roughly 100 households or more than two participating adults per
+  household;
 - child accounts;
 - Florence joining or passively watching outside parent groups;
 - non-iMessage messaging networks;

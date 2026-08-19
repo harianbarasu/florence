@@ -82,9 +82,8 @@ export class EnrollmentCodes {
     if (Buffer.byteLength(token, "utf8") > 4_000) return null;
     const [version, payload, signature, extra] = token.split(".");
     if (!payload || !signature || extra) return null;
-    if (version === "fs2") return this.#verifyCompactFounderSetup(payload, signature, now);
-    if (version !== "fs1") return null;
-    return this.#verifyLegacyFounderSetup(payload, signature, now);
+    if (version !== "fs2") return null;
+    return this.#verifyCompactFounderSetup(payload, signature, now);
   }
 
   #verifyCompactFounderSetup(payload: string, signature: string, now: Date): FounderSetupClaims | null {
@@ -122,49 +121,6 @@ export class EnrollmentCodes {
       expiresAt: expiresAt.toISOString(),
       householdId: this.#deterministicUuid(`founder-household\0${identity}`),
       adultId: this.#deterministicUuid(`founder-adult\0${identity}`),
-    };
-  }
-
-  #verifyLegacyFounderSetup(payload: string, signature: string, now: Date): FounderSetupClaims | null {
-    const expected = this.#macText(`florence-founder-setup-signature-v1\0${payload}`, "base64url");
-    if (!safeEqual(signature, expected)) return null;
-    let untrusted: unknown;
-    try {
-      untrusted = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
-    } catch {
-      return null;
-    }
-    if (!Array.isArray(untrusted) || untrusted.length !== 7) return null;
-    const [payloadVersion, conversation, identity, nonce, expiresAtSeconds, householdId, adultId] = untrusted;
-    if (
-      payloadVersion !== 1 ||
-      typeof conversation !== "string" ||
-      typeof identity !== "string" ||
-      typeof nonce !== "string" ||
-      typeof expiresAtSeconds !== "number" ||
-      typeof householdId !== "string" ||
-      typeof adultId !== "string"
-    ) {
-      return null;
-    }
-    if (
-      !isBoundedProviderId(conversation) ||
-      !isDigest(identity) ||
-      !/^[A-Za-z0-9_-]{43}$/.test(nonce) ||
-      !isUuid(householdId) ||
-      !isUuid(adultId) ||
-      !Number.isSafeInteger(expiresAtSeconds)
-    ) {
-      return null;
-    }
-    const expiresAt = new Date(expiresAtSeconds * 1_000);
-    if (expiresAt.getTime() <= now.getTime()) return null;
-    return {
-      providerConversationId: conversation,
-      identitySubjectDigest: identity,
-      expiresAt: expiresAt.toISOString(),
-      householdId,
-      adultId,
     };
   }
 
@@ -334,10 +290,4 @@ function uuidBytes(value: string): Buffer {
 function uuidFromBytes(value: Buffer): string {
   const hex = value.toString("hex");
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
-}
-
-function safeEqual(left: string, right: string): boolean {
-  const leftBytes = Buffer.from(left);
-  const rightBytes = Buffer.from(right);
-  return leftBytes.length === rightBytes.length && timingSafeEqual(leftBytes, rightBytes);
 }

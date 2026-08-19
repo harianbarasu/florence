@@ -4,6 +4,7 @@ const LINQ_API_BASE_URL = "https://api.linqapp.com/api/partner/v3";
 const LINQ_WEBHOOK_VERSION = "2026-02-03";
 const MAX_WEBHOOK_BYTES = 1024 * 1024;
 const DEFAULT_MAX_MEDIA_BYTES = 20 * 1024 * 1024;
+const MAX_OBSERVED_CHAT_HANDLES = 32;
 
 type HeaderValue = string | readonly string[] | undefined;
 export type LinqWebhookHeaders = Headers | Readonly<Record<string, HeaderValue>>;
@@ -219,6 +220,7 @@ export type LinqSendReaction = {
   reaction: LinqReaction;
 };
 
+/** Raw, bounded provider membership. Unlike expected authority, drift may contain any participant count. */
 export type LinqObservedChat = LinqConversationAuthority & {
   ownerPhoneNumber: string;
   participants: readonly {
@@ -230,7 +232,7 @@ export type LinqObservedChat = LinqConversationAuthority & {
 export type LinqDeliveryResult =
   | {
       status: "committed";
-      providerState: "accepted" | "reaction_added";
+      providerState: "accepted" | "sent" | "delivered" | "read" | "reaction_added";
       idempotencyKey: string;
       providerReceiptId: string;
       detail: null;
@@ -340,7 +342,7 @@ export class LinqClient {
       if (message.service !== null && message.service !== undefined) {
         literal(message.service, "iMessage", "create chat response message service");
       }
-      acceptedMessageStatus(message.delivery_status, "create chat response message delivery_status");
+      outboundMessageState(message.delivery_status, "create chat response message delivery_status");
       return {
         providerConversationId,
         authority,
@@ -451,9 +453,13 @@ export class LinqClient {
       const message = object(payload.message, "send response message");
       const receiptId = string(message.id, "send response message id");
       const occurredAt = timestamp(message.created_at, "send response created_at");
+      const providerState = outboundMessageState(
+        message.delivery_status,
+        "send response message delivery_status",
+      );
       return {
         status: "committed",
-        providerState: "accepted",
+        providerState,
         idempotencyKey,
         providerReceiptId: receiptId,
         detail: null,
@@ -806,6 +812,9 @@ function observeChatAuthority(chat: Record<string, unknown>): LinqObservedChat {
     fail("invalid_payload", "Linq chat must use iMessage");
   }
   const handles = array(chat.handles, "chat handles");
+  if (handles.length > MAX_OBSERVED_CHAT_HANDLES) {
+    fail("invalid_payload", "Linq chat contains too many handles to reconcile safely");
+  }
   const seenHandleIds = new Set<string>();
   const seenActivePhoneNumbers = new Set<string>();
   const activeParticipants: LinqObservedChat["participants"][number][] = [];
@@ -849,13 +858,6 @@ function observeChatAuthority(chat: Record<string, unknown>): LinqObservedChat {
 
   if (activeSelfCount !== 1) {
     fail("invalid_payload", "Linq chat must have exactly one active owner handle");
-  }
-  const requiredParticipants = audience === "private" ? 1 : 2;
-  if (activeParticipants.length !== requiredParticipants) {
-    fail(
-      "invalid_payload",
-      `Linq ${audience} chat must have exactly ${requiredParticipants} active non-owner participant${requiredParticipants === 1 ? "" : "s"}`,
-    );
   }
   if (ownerPhoneNumber === null) {
     fail("invalid_payload", "Linq chat has no active owner phone number");
@@ -911,16 +913,10 @@ function containsUrl(value: string): boolean {
   );
 }
 
-function acceptedMessageStatus(value: unknown, name: string): void {
-  if (
-    value !== "pending" &&
-    value !== "queued" &&
-    value !== "sent" &&
-    value !== "delivered" &&
-    value !== "read"
-  ) {
-    fail("invalid_payload", `Linq ${name} must describe an accepted outbound message`);
-  }
+function outboundMessageState(value: unknown, name: string): "accepted" | "sent" | "delivered" | "read" {
+  if (value === "pending" || value === "queued") return "accepted";
+  if (value === "sent" || value === "delivered" || value === "read") return value;
+  fail("invalid_payload", `Linq ${name} must describe an accepted outbound message`);
 }
 
 function expectedChatAuthority(authority: LinqConversationAuthority): LinqConversationAuthority | null {

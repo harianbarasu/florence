@@ -2,11 +2,18 @@ import { createHash } from "node:crypto";
 import type { EncryptedImageVault } from "@florence/artifacts";
 import {
   type CompleteFamilyOnboardingInput,
+  calendarMonthSchema,
   completeFamilyOnboardingInputSchema,
+  type FamilyCalendarMonthView,
   type FamilyMemberInput,
-  familyMemberInputSchema,
+  type FamilyMemberMutationInput,
+  familyCalendarMonthViewSchema,
+  familyMemberMutationInputSchema,
   familyMemberProfileSchema,
+  type PatchFamilyMemberInput,
+  type PatchWatchInput,
   type PreferencesInput,
+  patchWatchInputSchema,
   preferencesInputSchema,
   type SetupSessionInput,
   type VaultSource,
@@ -14,39 +21,53 @@ import {
   workspaceViewSchema,
 } from "@florence/contracts";
 import type {
+  AcceptInboundEnvelopeInput,
   AcceptInboundInput,
   AcceptInboundReactionInput,
   AcceptInboundResult,
   ApprovedCalendarAction,
   ApprovedPartnerInvitation,
-  BootstrapMessagesGroupInput,
   CalendarActionDraft,
+  CalendarEvidenceDraft,
   CalendarOfferApproval,
   CalendarOfferDraft,
   CommitTurnInput,
   CompleteFounderOnboardingInput,
+  DueProactiveWork,
   FactDraft,
   FactRecord,
+  FamilyGroupCreationWork,
   FamilyMemberRecord,
-  FollowUpDraft,
+  FiniteMonitorDraft,
+  FiniteMonitorUpdate,
+  GoogleEvidenceDraft,
   HouseholdRecord,
+  InboundPreparationContext,
   InboundTurn,
   InitialIntelligenceWork,
   JsonObject,
   LinqAuthority,
   MessagesEnrollmentResult,
   PostgresFlorenceStore,
+  PreparedInboundContent,
+  ProactiveDelivery,
   SourceRecord,
 } from "@florence/database";
+import { draftCalendarEvidence, draftGmailEvidence } from "@florence/database";
 import {
   type BeginGoogleConnectionResult,
   type GmailAttachmentReference,
+  type GmailEvidence,
+  type GoogleCalendarBoundedCursor,
+  type GoogleCalendarChange,
   GoogleCalendarTransientError,
+  type GoogleCalendarWindowEvent,
   type GoogleConnection,
   GoogleConnectionError,
   type GoogleConnectionView,
   GoogleFamilyCalendarProvisioningError,
   GoogleFamilyCalendarTransientError,
+  type GoogleGmailCursor,
 } from "@florence/google";
 import {
   type LinqClient,
@@ -57,27 +78,35 @@ import {
 } from "@florence/linq";
 import type { EnrollmentCodes } from "./enrollment.js";
 import {
+  type FlorenceBoundedPrivateGoogleEvidence,
   type FlorenceDecision,
   type FlorenceNarrowFamilyProfile,
+  type FlorencePrivateCalendarEvent,
   type FlorencePrivateGmailSource,
   type FlorenceReadTools,
   type FlorenceReasoner,
   FlorenceReasonerError,
   type FlorenceReasonerInput,
   type FlorenceSource,
+  type FlorenceVoiceNoteInput,
 } from "./reasoner.js";
 
 const DEFAULT_PREFERENCES: PreferencesInput = {
-  appearance: "system",
+  proactiveGoogleEnabled: true,
+  automaticFamilyCalendarEnabled: true,
+  privateConflictBusySharingEnabled: false,
 };
 const LOOP_IDLE_MS = 250;
 const RETRY_MS = 15_000;
 const WORK_CUE_MS = 6_000;
 const ARTIFACT_PURGE_INTERVAL_MS = 60 * 60_000;
+const QUIET_START_HOUR = 20;
+const QUIET_END_HOUR = 7;
 
 type ActiveInbound = {
   sourceId: string;
   latestSourceId: string;
+  latestOccurredAt: string;
   channelId: string;
   providerConversationId: string;
   controller: AbortController;
@@ -148,6 +177,110 @@ export class Florence {
     return workspaceViewSchema.parse(workspace(adultId, current, this.#messagesUrl));
   }
 
+  async familyCalendarMonthForAdult(
+    adultId: string,
+    untrustedMonth: string,
+  ): Promise<FamilyCalendarMonthView> {
+    const month = calendarMonthSchema.parse(untrustedMonth);
+    const household = await this.#householdForAdult(adultId);
+    const timeZone = household.timeZone;
+    const calendarName = household.familyCalendarLabel ?? household.name;
+    if (
+      !household.familyCalendarId ||
+      household.familyCalendarId === "primary" ||
+      !household.familyCalendarOwnerConnectionId ||
+      !household.familyCalendarPartnerConnectionId ||
+      !household.familyCalendarCreatedAt
+    ) {
+      return familyCalendarMonthViewSchema.parse({
+        status: "not_ready",
+        month,
+        timeZone,
+        calendarName,
+      });
+    }
+    const google = this.#google;
+    if (!google) {
+      return familyCalendarMonthViewSchema.parse({
+        status: "temporarily_unavailable",
+        month,
+        timeZone,
+        calendarName,
+      });
+    }
+    const credential = await this.#store.readActiveFamilyCalendarCredential({ householdId: household.id });
+    if (!credential || credential.calendarId !== household.familyCalendarId) {
+      return familyCalendarMonthViewSchema.parse({
+        status: "temporarily_unavailable",
+        month,
+        timeZone,
+        calendarName,
+      });
+    }
+
+    try {
+      const reads = await Promise.all(
+        familyCalendarMonthWindows(month, timeZone).map(({ timeMin, timeMax }) =>
+          google.readCalendarWindow({
+            householdId: household.id,
+            ownerAdultId: credential.ownerAdultId,
+            connectionId: credential.connectionId,
+            calendarId: credential.calendarId,
+            timeMin,
+            timeMax,
+            limit: 50,
+            eventSelection: "all",
+          }),
+        ),
+      );
+      if (reads.some((read) => read.status === "unavailable")) {
+        return familyCalendarMonthViewSchema.parse({
+          status: "temporarily_unavailable",
+          month,
+          timeZone,
+          calendarName,
+        });
+      }
+      const events = deduplicateFamilyCalendarEvents(reads.flatMap((read) => read.events));
+      events.sort((left, right) => compareFamilyCalendarEvents(left, right, timeZone));
+      return familyCalendarMonthViewSchema.parse({
+        status: "ready",
+        month,
+        timeZone,
+        calendarName,
+        truncated: reads.some((read) => read.status === "truncated"),
+        events: events.map((event) =>
+          event.intervalKind === "all_day"
+            ? {
+                intervalKind: event.intervalKind,
+                status: event.status,
+                title: event.title,
+                location: event.location,
+                startDate: event.startDate,
+                endDate: event.endDate,
+              }
+            : {
+                intervalKind: event.intervalKind,
+                status: event.status,
+                title: event.title,
+                location: event.location,
+                startsAt: event.startsAt,
+                endsAt: event.endsAt,
+                timeZone: event.timeZone,
+              },
+        ),
+      });
+    } catch (error) {
+      if (!(error instanceof GoogleCalendarTransientError) && !credentialInvalidGrant(error)) throw error;
+      return familyCalendarMonthViewSchema.parse({
+        status: "temporarily_unavailable",
+        month,
+        timeZone,
+        calendarName,
+      });
+    }
+  }
+
   async completeFamilyOnboarding(
     adultId: string,
     untrustedInput: CompleteFamilyOnboardingInput,
@@ -157,7 +290,6 @@ export class Florence {
     await this.#store.completeFamilyOnboarding({
       householdId: household.id,
       founderAdultId: adultId,
-      familyLabel: input.familyLabel,
       postalCode: input.postalCode,
       mode: input.mode,
       partner: input.partner,
@@ -175,22 +307,31 @@ export class Florence {
   async putMember(
     adultId: string,
     memberId: string,
-    untrustedInput: FamilyMemberInput,
+    untrustedInput: FamilyMemberMutationInput,
   ): Promise<WorkspaceView> {
-    const input = familyMemberInputSchema.parse(untrustedInput);
+    const input = familyMemberMutationInputSchema.parse(untrustedInput);
     const household = await this.#householdForAdult(adultId);
+    const familyNameMayHaveChanged =
+      !("kind" in input) &&
+      input.lastName !== undefined &&
+      household.members.some((member) => member.id === memberId && member.kind === "adult");
     await this.#store.upsertMember({
       householdId: household.id,
       actorAdultId: adultId,
       memberId,
-      member: {
-        kind: input.kind,
-        role: input.role,
-        displayName: input.displayName,
-        profile: memberProfile(input),
-      },
+      member:
+        "kind" in input
+          ? {
+              operation: "create",
+              kind: input.kind,
+              firstName: input.firstName,
+              lastName: input.lastName ?? null,
+              profile: memberProfile(input),
+            }
+          : memberPatch(input),
       occurredAt: this.#now().toISOString(),
     });
+    if (familyNameMayHaveChanged) await this.#ensureHouseholdActivation(household.id);
     return this.workspaceForAdult(adultId);
   }
 
@@ -203,6 +344,38 @@ export class Florence {
   async deleteFact(adultId: string, factId: string): Promise<WorkspaceView> {
     const household = await this.#householdForAdult(adultId);
     await this.#store.deleteFact({ householdId: household.id, adultId, factId });
+    return this.workspaceForAdult(adultId);
+  }
+
+  async patchWatch(adultId: string, workId: string, untrustedInput: PatchWatchInput): Promise<WorkspaceView> {
+    const input = patchWatchInputSchema.parse(untrustedInput);
+    const household = await this.#householdForAdult(adultId);
+    await this.#store.patchProactiveWork({
+      householdId: household.id,
+      actorAdultId: adultId,
+      workId,
+      kind: input.kind,
+      ...(input.objective !== undefined ? { objective: input.objective } : {}),
+      ...(input.kind === "monitor" && input.endCondition !== undefined
+        ? { endCondition: input.endCondition }
+        : {}),
+      ...(input.kind === "interest" && input.genericTerms !== undefined
+        ? { genericTerms: input.genericTerms }
+        : {}),
+      ...(input.status !== undefined ? { status: input.status } : {}),
+      now: this.#now().toISOString(),
+    });
+    this.#wake();
+    return this.workspaceForAdult(adultId);
+  }
+
+  async stopWatch(adultId: string, workId: string): Promise<WorkspaceView> {
+    const household = await this.#householdForAdult(adultId);
+    await this.#store.stopProactiveWork({
+      householdId: household.id,
+      actorAdultId: adultId,
+      workId,
+    });
     return this.workspaceForAdult(adultId);
   }
 
@@ -268,6 +441,7 @@ export class Florence {
       ownerAdultId: adultId,
       now: this.#now().toISOString(),
     });
+    this.#wake();
     return this.workspaceForAdult(adultId);
   }
 
@@ -277,52 +451,117 @@ export class Florence {
     return this.#store.resolveLinqAuthority(input);
   }
 
+  transcribeVoiceNote(input: FlorenceVoiceNoteInput): Promise<string> {
+    if (!this.#reasoner) {
+      throw new FlorenceReasonerError("configuration", "Florence voice-note transcription is not configured");
+    }
+    return this.#reasoner.transcribeVoiceNote(input);
+  }
+
   async respondBeforeEnrollment(input: {
     providerEventId: string;
     providerConversationId: string;
     identitySubjectDigest: string;
     text: string;
     occurredAt: string;
+    carrierOptOut: boolean;
   }): Promise<boolean> {
-    if (await this.#store.hasPilotHousehold()) return false;
-    if (!this.#setupOrigin || !this.#google) {
-      throw new Error("Google Workspace onboarding is not configured");
-    }
-    const setup = this.#enrollmentCodes.issueFounderSetup({
-      providerConversationId: input.providerConversationId,
-      identitySubjectDigest: input.identitySubjectDigest,
-      occurredAt: input.occurredAt,
-    });
-    const setupUrl = `${this.#setupOrigin}/#s=${encodeURIComponent(setup.token)}`;
     const expectedAuthority = {
       audience: "private" as const,
       participantIdentityDigests: [input.identitySubjectDigest],
     };
-    const fallback = {
-      stopMessaging: false,
-      bubbles: [
-        {
-          text: "Hey—I’m Florence. I help parents keep school, schedules, and family loose ends from becoming another job. Here’s your private setup link.",
-          delayMs: 0,
-        },
-      ],
-    };
-    let conversation = fallback;
-    if (this.#reasoner) {
+    const invitation = await this.#store.readUnboundPartnerInvitation({
+      providerConversationId: input.providerConversationId,
+      identitySubjectDigest: input.identitySubjectDigest,
+    });
+    let bubbles: readonly { text: string; delayMs: number }[];
+    let idempotencyPrefix: "founder-setup" | "partner-setup-reply";
+
+    if (invitation) {
+      if (invitation.state === "declined") return true;
+      if (input.carrierOptOut) {
+        await this.#store.declinePartnerInvitation({
+          adultId: invitation.adultId,
+          providerConversationId: input.providerConversationId,
+          identitySubjectDigest: input.identitySubjectDigest,
+          occurredAt: input.occurredAt,
+        });
+        return true;
+      }
+      if (!this.#reasoner) {
+        throw new LinqError(
+          "provider_retryable",
+          "Florence setup interpretation is temporarily unavailable",
+          true,
+        );
+      }
+      let conversation: Awaited<ReturnType<FlorenceReasoner["converseDuringSetup"]>>;
       try {
         conversation = await this.#reasoner.converseDuringSetup({
-          stage: "unclaimed",
+          stage: "partner_invited",
           parentName: null,
           currentMessage: { text: input.text, occurredAt: input.occurredAt },
           recentMessages: [],
-          nextStep: "signed_link_will_follow",
+          nextStep: "use_existing_partner_setup_link",
         });
-      } catch {
-        conversation = fallback;
+      } catch (error) {
+        throw new LinqError(
+          "provider_retryable",
+          `Florence could not interpret the invited partner reply: ${errorText(error)}`,
+          true,
+        );
       }
+      if (conversation.stopMessaging || conversation.declineInvitation) {
+        await this.#store.declinePartnerInvitation({
+          adultId: invitation.adultId,
+          providerConversationId: input.providerConversationId,
+          identitySubjectDigest: input.identitySubjectDigest,
+          occurredAt: input.occurredAt,
+        });
+        return true;
+      }
+      bubbles = conversation.bubbles;
+      idempotencyPrefix = "partner-setup-reply";
+    } else {
+      if (input.carrierOptOut) return true;
+      if (!this.#setupOrigin || !this.#google) {
+        throw new Error("Google Workspace onboarding is not configured");
+      }
+      const setup = this.#enrollmentCodes.issueFounderSetup({
+        providerConversationId: input.providerConversationId,
+        identitySubjectDigest: input.identitySubjectDigest,
+        occurredAt: input.occurredAt,
+      });
+      const setupUrl = `${this.#setupOrigin}/#s=${encodeURIComponent(setup.token)}`;
+      const fallback = {
+        stopMessaging: false,
+        declineInvitation: false,
+        bubbles: [
+          {
+            text: "Hey—I’m Florence. I help parents keep school, schedules, and family loose ends from becoming another job. Here’s your private setup link.",
+            delayMs: 0,
+          },
+        ],
+      };
+      let conversation = fallback;
+      if (this.#reasoner) {
+        try {
+          conversation = await this.#reasoner.converseDuringSetup({
+            stage: "unclaimed",
+            parentName: null,
+            currentMessage: { text: input.text, occurredAt: input.occurredAt },
+            recentMessages: [],
+            nextStep: "signed_link_will_follow",
+          });
+        } catch {
+          conversation = fallback;
+        }
+      }
+      if (conversation.stopMessaging || conversation.declineInvitation) return true;
+      bubbles = [...conversation.bubbles, { text: setupUrl, delayMs: 0 }];
+      idempotencyPrefix = "founder-setup";
     }
-    if (conversation.stopMessaging) return true;
-    const bubbles = [...conversation.bubbles, { text: setupUrl, delayMs: 0 }];
+
     await this.#setTyping({
       providerConversationId: input.providerConversationId,
       expectedAuthority,
@@ -332,7 +571,7 @@ export class Florence {
       for (const [index, bubble] of bubbles.entries()) {
         if (index > 0) await pause(Math.max(650, bubble.delayMs));
         const result = await this.#linq.sendMessage({
-          idempotencyKey: `founder-setup:${deterministicUuid(`${input.providerEventId}\0${index}`)}`,
+          idempotencyKey: `${idempotencyPrefix}:${deterministicUuid(`${input.providerEventId}\0${index}`)}`,
           providerConversationId: input.providerConversationId,
           expectedAuthority,
           text: bubble.text,
@@ -389,6 +628,7 @@ export class Florence {
         consentedAt: occurredAt,
         guardianAttestedAt: occurredAt,
         proactiveUseAcceptedAt: occurredAt,
+        privateConflictBusySharingEnabled: input.profile.privateConflictBusySharingEnabled,
         providerConversationId: partnerSetup.providerConversationId,
         occurredAt,
       });
@@ -410,6 +650,7 @@ export class Florence {
       consentedAt: occurredAt,
       guardianAttestedAt: occurredAt,
       proactiveUseAcceptedAt: occurredAt,
+      privateConflictBusySharingEnabled: input.profile.privateConflictBusySharingEnabled,
       providerConversationId: founderSetup.providerConversationId,
       occurredAt,
     };
@@ -417,9 +658,14 @@ export class Florence {
     return result;
   }
 
-  async bootstrapMessagesGroup(input: BootstrapMessagesGroupInput): Promise<AcceptInboundResult | null> {
-    const result = await this.#store.bootstrapMessagesGroup(input);
-    if (result?.disposition === "accepted") this.#wake();
+  async reconcileObservedFamilyGroup(input: {
+    providerConversationId: string;
+    audience: "private" | "group";
+    participantIdentityDigests: readonly string[];
+    occurredAt: string;
+  }) {
+    const result = await this.#store.reconcileObservedFamilyGroup(input);
+    if (result === "mismatch") this.#wake();
     return result;
   }
 
@@ -427,9 +673,14 @@ export class Florence {
     const active = this.#activeInbound;
     const sameActiveConversation = active?.providerConversationId === input.providerConversationId;
     const incomingSourceId = deterministicUuid(`linq-v3\0signal\0${input.providerEventId}`);
+    const supersedesActive = Boolean(
+      active &&
+        sameActiveConversation &&
+        isLaterInbound(input.occurredAt, incomingSourceId, active.latestOccurredAt, active.latestSourceId),
+    );
     const acceptance = this.#store.acceptInbound({
       ...input,
-      ...(sameActiveConversation ? { supersedesSourceId: active.latestSourceId } : {}),
+      ...(active && supersedesActive ? { supersedesSourceId: active.latestSourceId } : {}),
     });
     this.#pendingInboundAccepts.add(acceptance);
     void acceptance.then(
@@ -438,17 +689,90 @@ export class Florence {
     );
     if (active && sameActiveConversation && !active.knownSourceIds.has(incomingSourceId)) {
       active.knownSourceIds.add(incomingSourceId);
-      active.controller.abort();
+      if (supersedesActive) active.controller.abort();
     }
     const result = await acceptance;
+    const currentActive = this.#activeInbound;
     if (
       result &&
-      result.sourceId !== active?.sourceId &&
-      result.channelId === active?.channelId &&
-      (result.disposition === "accepted" || result.disposition === "stopped")
+      currentActive &&
+      result.sourceId !== currentActive.sourceId &&
+      result.channelId === currentActive.channelId &&
+      currentActive.providerConversationId === input.providerConversationId &&
+      (result.disposition === "accepted" || result.disposition === "stopped") &&
+      isLaterInbound(
+        input.occurredAt,
+        result.sourceId,
+        currentActive.latestOccurredAt,
+        currentActive.latestSourceId,
+      )
     ) {
-      active.latestSourceId = result.sourceId;
-      active.controller.abort();
+      currentActive.latestSourceId = result.sourceId;
+      currentActive.latestOccurredAt = input.occurredAt;
+      currentActive.controller.abort();
+    }
+    if (result?.disposition === "accepted") this.#wake();
+    return result;
+  }
+
+  async acceptInboundWithPreparation(
+    input: AcceptInboundEnvelopeInput,
+    prepare: (context: InboundPreparationContext) => Promise<PreparedInboundContent>,
+  ): Promise<AcceptInboundResult | null> {
+    const active = this.#activeInbound;
+    const sameActiveConversation = active?.providerConversationId === input.providerConversationId;
+    const incomingSourceId = deterministicUuid(`linq-v3\0signal\0${input.providerEventId}`);
+    const supersedesActive = Boolean(
+      active &&
+        sameActiveConversation &&
+        isLaterInbound(input.occurredAt, incomingSourceId, active.latestOccurredAt, active.latestSourceId),
+    );
+    const acceptance = this.#store.acceptInboundWithPreparation(input, prepare, {
+      resolveSupersedesSourceId: () => {
+        const currentActive = this.#activeInbound;
+        if (
+          !currentActive ||
+          currentActive.providerConversationId !== input.providerConversationId ||
+          !isLaterInbound(
+            input.occurredAt,
+            incomingSourceId,
+            currentActive.latestOccurredAt,
+            currentActive.latestSourceId,
+          )
+        ) {
+          return null;
+        }
+        return currentActive.latestSourceId;
+      },
+    });
+    this.#pendingInboundAccepts.add(acceptance);
+    void acceptance.then(
+      () => this.#pendingInboundAccepts.delete(acceptance),
+      () => this.#pendingInboundAccepts.delete(acceptance),
+    );
+    if (active && sameActiveConversation && !active.knownSourceIds.has(incomingSourceId)) {
+      active.knownSourceIds.add(incomingSourceId);
+      if (supersedesActive) active.controller.abort();
+    }
+    const result = await acceptance;
+    const currentActive = this.#activeInbound;
+    if (
+      result &&
+      currentActive &&
+      result.sourceId !== currentActive.sourceId &&
+      result.channelId === currentActive.channelId &&
+      currentActive.providerConversationId === input.providerConversationId &&
+      (result.disposition === "accepted" || result.disposition === "stopped") &&
+      isLaterInbound(
+        input.occurredAt,
+        result.sourceId,
+        currentActive.latestOccurredAt,
+        currentActive.latestSourceId,
+      )
+    ) {
+      currentActive.latestSourceId = result.sourceId;
+      currentActive.latestOccurredAt = input.occurredAt;
+      currentActive.controller.abort();
     }
     if (result?.disposition === "accepted") this.#wake();
     return result;
@@ -489,6 +813,7 @@ export class Florence {
 
   async #runCycle(): Promise<boolean> {
     let worked = false;
+    await this.#settleInboundAccepts();
     await this.#purgeExpiredArtifacts();
     const inbound = await this.#store.readNextInbound(this.#now().toISOString());
     if (inbound) {
@@ -496,12 +821,18 @@ export class Florence {
       worked = true;
     }
     await this.#settleInboundAccepts();
-    if (await this.#store.promoteDueFollowUp({ now: this.#now().toISOString() })) worked = true;
-    await this.#settleInboundAccepts();
     const outbound = await this.#store.readNextOutbound(this.#now().toISOString());
     await this.#settleInboundAccepts();
     if (outbound) {
       await this.#deliverOutbound(outbound.sourceId);
+      worked = true;
+    }
+    await this.#settleInboundAccepts();
+    const familyGroup = this.#linqSenderPhoneNumber
+      ? await this.#store.readNextFamilyGroupCreation(this.#now().toISOString())
+      : null;
+    if (familyGroup) {
+      await this.#createFamilyGroup(familyGroup);
       worked = true;
     }
     await this.#settleInboundAccepts();
@@ -519,6 +850,11 @@ export class Florence {
     const initialIntelligence = await this.#store.readNextInitialIntelligence(this.#now().toISOString());
     if (initialIntelligence) {
       await this.#executeInitialIntelligence(initialIntelligence);
+      worked = true;
+    }
+    const proactiveWork = await this.#store.readNextDueProactiveWork(this.#now().toISOString());
+    if (proactiveWork) {
+      await this.#executeProactiveWork(proactiveWork);
       worked = true;
     }
     return worked;
@@ -609,6 +945,7 @@ export class Florence {
             facts: [],
             followUp: null,
             calendar: null,
+            householdUpdate: null,
           },
           this.#now(),
         ),
@@ -626,14 +963,20 @@ export class Florence {
 
     let approvedCalendarOffer: InboundTurn["pendingCalendarOffers"][number] | null = null;
     let approvedPartnerInvitation: InboundTurn["pendingPartnerInvitation"] = null;
+    const typedApprovalText = turn.message.authoredText?.trim() || null;
     if (
       turn.authority.audience === "private" &&
       turn.message.moveKind !== "reaction" &&
-      turn.pendingPartnerInvitation
+      typedApprovalText !== null &&
+      turn.pendingPartnerInvitation &&
+      approvalReplyTargetsPrompt(
+        turn.message.replyToSourceId,
+        turn.pendingPartnerInvitation.approvalPromptSourceId,
+      )
     ) {
       try {
         const interpretation = await this.#reasoner.interpretPartnerInvitationApproval({
-          currentMessage: { text: turnText(turn.message) },
+          currentMessage: { text: typedApprovalText },
           partner: {
             adultId: turn.pendingPartnerInvitation.adultId,
             firstName: turn.pendingPartnerInvitation.firstName,
@@ -653,12 +996,21 @@ export class Florence {
         if (!(error instanceof FlorenceReasonerError)) throw error;
       }
     }
-    if (turn.message.moveKind !== "reaction" && turn.pendingCalendarOffers.length === 1) {
+    if (
+      turn.authority.audience === "group" &&
+      turn.message.moveKind !== "reaction" &&
+      typedApprovalText !== null &&
+      turn.pendingCalendarOffers.length === 1 &&
+      approvalReplyTargetsPrompt(
+        turn.message.replyToSourceId,
+        turn.pendingCalendarOffers[0]?.approvalPromptSourceId ?? null,
+      )
+    ) {
       const offer = turn.pendingCalendarOffers[0];
       if (!offer) throw new Error("The sole Calendar offer disappeared");
       try {
         const interpretation = await this.#reasoner.interpretCalendarApproval({
-          currentMessage: { text: turnText(turn.message), occurredAt: turn.message.occurredAt },
+          currentMessage: { text: typedApprovalText, occurredAt: turn.message.occurredAt },
           event: offer.event,
         });
         if (interpretation.approve) approvedCalendarOffer = offer;
@@ -676,9 +1028,17 @@ export class Florence {
     }
 
     const controller = new AbortController();
+    const latestInbound = turn.supersededMessages.reduce(
+      (latest, message) =>
+        isLaterInbound(message.occurredAt, message.sourceId, latest.occurredAt, latest.sourceId)
+          ? message
+          : latest,
+      turn.message,
+    );
     const active: ActiveInbound = {
       sourceId: turn.message.sourceId,
-      latestSourceId: turn.message.sourceId,
+      latestSourceId: latestInbound.sourceId,
+      latestOccurredAt: latestInbound.occurredAt,
       channelId: turn.authority.channelId,
       providerConversationId: turn.authority.providerConversationId,
       controller,
@@ -732,6 +1092,7 @@ export class Florence {
           omitReaction: immediateReactionStaged,
           approveCalendarOffer: approval,
           approvePartnerInvitation: partnerApproval,
+          googleEvidence: context.googleEvidence(),
         }),
       );
     } catch (error) {
@@ -765,6 +1126,7 @@ export class Florence {
                 facts: [],
                 followUp: null,
                 calendar: null,
+                householdUpdate: null,
               },
               this.#now(),
               {
@@ -794,6 +1156,7 @@ export class Florence {
                     facts: [],
                     followUp: null,
                     calendar: null,
+                    householdUpdate: null,
                   },
                   this.#now(),
                   { omitReaction: immediateReactionStaged },
@@ -825,10 +1188,12 @@ export class Florence {
   async #reasonerContext(turn: InboundTurn): Promise<{
     input: FlorenceReasonerInput;
     reads: FlorenceReadTools;
+    googleEvidence: () => readonly GoogleEvidenceDraft[];
   }> {
     const members = new Map(turn.household.members.map((member) => [member.id, member.displayName]));
     const visibleSources = memorySources(turn.facts);
     const sourceIndex = new Map(visibleSources.map((source) => [source.sourceId, source]));
+    const googleEvidence = new Map<string, GoogleEvidenceDraft>();
     const visibility = turn.authority.audience === "group" ? "shared" : "adult_private";
     const currentDocuments = (turn.currentDocuments ?? []).slice(-3);
     const jobMessages = [...turn.supersededMessages, turn.message];
@@ -865,8 +1230,14 @@ export class Florence {
       });
     }
 
+    const familyCalendarCredential =
+      turn.authority.audience === "group"
+        ? await this.#store.readActiveFamilyCalendarCredential({
+            householdId: turn.authority.householdId,
+          })
+        : null;
     const familyCalendarOwner = turn.household.members.find(
-      (member) => member.kind === "adult" && member.adultSlot === 1,
+      (member) => member.id === familyCalendarCredential?.ownerAdultId,
     );
     const googleConnections = !this.#google
       ? []
@@ -875,15 +1246,13 @@ export class Florence {
             householdId: turn.authority.householdId,
             ownerAdultId: turn.authority.senderAdultId,
           })
-        : turn.household.familyCalendarOwnerConnectionId && familyCalendarOwner
+        : familyCalendarCredential && familyCalendarOwner
           ? (
               await this.#google.status({
                 householdId: turn.authority.householdId,
                 ownerAdultId: familyCalendarOwner.id,
               })
-            ).filter(
-              (connection) => connection.connectionId === turn.household.familyCalendarOwnerConnectionId,
-            )
+            ).filter((connection) => connection.connectionId === familyCalendarCredential.connectionId)
           : [];
     const input: FlorenceReasonerInput = {
       household: {
@@ -910,6 +1279,8 @@ export class Florence {
         senderName: members.get(turn.message.speaker) ?? "Family member",
         moveKind: turn.message.moveKind,
         text: turnText(turn.message),
+        authoredText: turn.message.authoredText,
+        voiceTranscriptPresent: turn.message.voiceTranscriptPresent,
         occurredAt: turn.message.occurredAt,
         images: currentImages.map(reasonerImage),
         pdfs: currentDocuments.map((document) => ({
@@ -943,15 +1314,24 @@ export class Florence {
       visibleSources,
       pendingFollowUps: turn.pendingFollowUps.map((followUp) => ({
         followUpId: followUp.id,
-        at: followUp.dueAt,
-        text: followUp.text,
+        objective: followUp.objective,
+        currentConclusion: followUp.currentConclusion,
+        endCondition: followUp.endCondition,
+        nextCheck: followUp.nextCheck,
+        why: followUp.why,
         sourceIds: [...followUp.sourceIds],
+      })),
+      visibleInterests: turn.visibleInterests.map((interest) => ({
+        interestWorkId: interest.interestWorkId,
+        status: interest.status,
+        genericTerms: [...interest.genericTerms],
+        objective: interest.objective,
+        why: interest.why,
       })),
       pendingCalendarOffers: turn.pendingCalendarOffers.map((offer) => ({
         proposalId: offer.id,
-        connectionId: offer.connectionId,
         event: offer.event,
-        sourceIds: [offer.basisSourceId],
+        sourceIds: [offer.approvalPromptSourceId],
       })),
       googleConnections: googleConnections.flatMap((connection) =>
         connection.status === "active" && connection.emailLabel
@@ -998,12 +1378,28 @@ export class Florence {
           });
           return {
             status: read.status,
-            events: read.events.map((event) => ({
-              title: event.title,
-              startsAt: event.startsAt,
-              endsAt: event.endsAt,
-              allDay: event.allDay,
-            })),
+            events: read.events.map((event) =>
+              event.intervalKind === "all_day"
+                ? {
+                    intervalKind: event.intervalKind,
+                    title: event.title,
+                    startDate: event.startDate,
+                    endDate: event.endDate,
+                    providerEventId: event.providerEventId,
+                    providerRevision: event.providerRevision,
+                    location: event.location,
+                  }
+                : {
+                    intervalKind: event.intervalKind,
+                    title: event.title,
+                    startsAt: event.startsAt,
+                    endsAt: event.endsAt,
+                    providerEventId: event.providerEventId,
+                    providerRevision: event.providerRevision,
+                    timeZone: event.timeZone,
+                    location: event.location,
+                  },
+            ),
           };
         } catch (error) {
           if (error instanceof GoogleCalendarTransientError) {
@@ -1060,36 +1456,43 @@ export class Florence {
           query,
           limit,
         });
-        return Promise.all(
-          evidence.messages.map(async (message) => {
-            const source = await this.#store.recordGmailEvidence({
-              householdId: turn.authority.householdId,
-              ownerAdultId: turn.authority.senderAdultId,
-              connectionId,
-              ...message,
-            });
-            const result: FlorenceSource = {
-              sourceId: source.id,
-              recordId: null,
-              kind: "gmail",
-              visibility: "adult_private",
-              label: message.subject ?? message.from,
-              occurredAt: message.sentAt,
-              text: message.text,
-            };
-            sourceIndex.set(result.sourceId, result);
-            return result;
-          }),
-        );
+        return evidence.messages.map((message) => {
+          const source = draftGmailEvidence({
+            householdId: turn.authority.householdId,
+            ownerAdultId: turn.authority.senderAdultId,
+            connectionId,
+            ...message,
+          });
+          googleEvidence.set(source.id, source);
+          const result: FlorenceSource = {
+            sourceId: source.id,
+            recordId: null,
+            kind: "gmail",
+            visibility: "adult_private",
+            label: message.subject ?? message.from,
+            occurredAt: message.sentAt,
+            text: message.text,
+          };
+          sourceIndex.set(result.sourceId, result);
+          return result;
+        });
       },
     };
-    return { input, reads };
+    return { input, reads, googleEvidence: () => [...googleEvidence.values()] };
   }
 
   async #deliverOutbound(sourceId: string, retryTransient = true): Promise<void> {
     const outbound = await this.#store.beginOutbound({ sourceId, now: this.#now().toISOString() });
     if (!outbound) return;
     try {
+      const observed = await this.#linq.observeChat(outbound.providerConversationId);
+      const groupObservation = await this.reconcileObservedFamilyGroup({
+        providerConversationId: outbound.providerConversationId,
+        audience: observed.audience,
+        participantIdentityDigests: observed.participantIdentityDigests,
+        occurredAt: this.#now().toISOString(),
+      });
+      if (groupObservation === "mismatch" || groupObservation === "retired") return;
       const result =
         outbound.moveKind === "reaction"
           ? await this.#linq.sendReaction({
@@ -1161,36 +1564,44 @@ export class Florence {
   async #executeCalendar(action: ApprovedCalendarAction): Promise<void> {
     if (!this.#google) {
       await this.#store.retryCalendarAction({
-        id: action.id,
+        id: action.actionId,
         retryAt: later(this.#now(), RETRY_MS),
         error: "Google Calendar is not configured",
       });
       return;
     }
+    const title = action.mutation.event?.title ?? action.mutation.target?.observedEvent.title ?? "that event";
     try {
       const result = await this.#google.executeCalendar(action);
+      if (result.status === "credential_rejected") {
+        await this.#google.disconnect({
+          connectionId: action.connectionId,
+          householdId: action.householdId,
+          ownerAdultId: action.ownerAdultId,
+          now: result.occurredAt,
+        });
+        return;
+      }
       if (result.status === "failed") {
         await this.#store.failCalendarAction({
-          id: action.id,
+          id: action.actionId,
           error: result.detail,
-          failureText: `I couldn’t confirm that “${action.event.title}” was added correctly. Please check ${action.audience === "household" ? "the family calendar" : "Google Calendar"} before trying again.`,
+          failureText: `I couldn’t confirm the ${calendarOperationNoun(action.mutation.operation)} for “${title}.” Please check the family calendar before trying again.`,
           failedAt: result.occurredAt,
         });
         return;
       }
-      const proof = calendarProof(result.detail, result.providerReceiptId);
       await this.#store.completeCalendarAction({
-        id: action.id,
-        providerEventId: result.providerReceiptId,
-        providerEtag: proof.etag,
-        proofDigest: proof.digest,
-        proof,
-        confirmationText: `Added “${action.event.title}” to ${action.audience === "household" ? "the family calendar" : "your calendar"}.`,
+        id: action.actionId,
+        providerEventId: result.providerEventId,
+        providerRevision: result.providerRevision,
+        confirmationText: `${calendarConfirmationVerb(action.mutation.operation)} “${title}” ${action.mutation.operation === "delete" ? "from" : "on"} the family calendar.`,
         committedAt: result.occurredAt,
       });
     } catch (error) {
+      if (credentialInvalidGrant(error)) return;
       await this.#store.retryCalendarAction({
-        id: action.id,
+        id: action.actionId,
         retryAt: later(this.#now(), RETRY_MS),
         error: errorText(error),
       });
@@ -1201,22 +1612,33 @@ export class Florence {
     if (!this.#google || !this.#reasoner) {
       await this.#store.retryInitialIntelligence({
         workId: work.workId,
-        leaseToken: work.leaseToken,
         retryAt: later(this.#now(), RETRY_MS),
+        failedAt: this.#now().toISOString(),
         error: "Florence's proactive Google review is not configured",
       });
       return;
     }
     try {
       if (work.kind === "initial_household_briefing") {
+        const familyCalendar = await this.#google.readInitialCalendarReview({
+          householdId: work.household.householdId,
+          ownerAdultId: work.familyCalendarOwnerAdultId,
+          connectionId: work.familyCalendarOwnerConnectionId,
+          calendarId: work.familyCalendarId,
+          currentTime: this.#now().toISOString(),
+          limit: 50,
+        });
+        if (familyCalendar.status === "unavailable" || !familyCalendar.cursor) {
+          throw new Error("The Family Calendar baseline is temporarily unavailable");
+        }
         const decision = await this.#reasoner.synthesizeHouseholdBriefing({
           familyProfile: initialFamilyProfile(work.household),
           candidates: work.candidates.map((candidate) => ({ ...candidate })),
         });
         await this.#store.completeHouseholdInitialBriefing({
           workId: work.workId,
-          leaseToken: work.leaseToken,
           selectedCandidateIds: decision.selectedCandidateIds,
+          familyCalendarCursor: JSON.stringify(familyCalendar.cursor),
           bubbles: decision.bubbles,
           occurredAt: this.#now().toISOString(),
         });
@@ -1229,19 +1651,8 @@ export class Florence {
         ownerAdultId: work.adultId,
         connectionId: work.connectionId,
       });
-      const gmailCoverage: {
-        after: string;
-        before: string;
-        status: "complete" | "truncated";
-        messages: number;
-      }[] = [];
       const attachmentIndex = new Map<string, GmailAttachmentReference>();
-      let calendarCoverage: {
-        status: "complete" | "truncated";
-        events: number;
-        timeMin: string;
-        timeMax: string;
-      } | null = null;
+      const googleEvidence = new Map<string, GoogleEvidenceDraft>();
       let calendarCursor: string | null = null;
       const decision = await this.#reasoner.reviewPrivateGoogle(
         {
@@ -1253,6 +1664,7 @@ export class Florence {
             kind: "personal",
           },
           currentTime,
+          currentPrivateFacts: [...work.currentPrivateFacts],
         },
         {
           searchGmail: async ({ connectionId, query, after, before, limit }) => {
@@ -1269,41 +1681,38 @@ export class Florence {
               limit,
             });
             if (!result) throw new Error("Google is not configured");
-            gmailCoverage.push({ after, before, status: result.status, messages: result.messages.length });
-            return Promise.all(
-              result.messages.map(async (message): Promise<FlorencePrivateGmailSource> => {
-                const source = await this.#store.recordGmailEvidence({
-                  householdId: work.household.householdId,
-                  ownerAdultId: work.adultId,
-                  connectionId,
-                  messageId: message.messageId,
-                  threadId: message.threadId,
-                  historyId: message.historyId,
-                  from: message.from,
-                  subject: message.subject,
-                  sentAt: message.sentAt,
-                  text: message.text,
-                });
-                for (const attachment of message.attachments) {
-                  attachmentIndex.set(`${source.id}\0${attachment.attachmentId}`, attachment);
-                }
-                return {
-                  sourceId: source.id,
-                  kind: "gmail",
-                  visibility: "adult_private",
-                  sentAt: message.sentAt,
-                  sender: message.from,
-                  subject: message.subject,
-                  text: message.text,
-                  attachments: message.attachments.map((attachment) => ({
-                    attachmentId: attachment.attachmentId,
-                    filename: attachment.filename,
-                    mimeType: attachment.mimeType,
-                    sizeBytes: attachment.sizeBytes,
-                  })),
-                };
-              }),
-            );
+            return result.messages.map((message): FlorencePrivateGmailSource => {
+              const source = draftGmailEvidence({
+                householdId: work.household.householdId,
+                ownerAdultId: work.adultId,
+                connectionId,
+                messageId: message.messageId,
+                threadId: message.threadId,
+                historyId: message.historyId,
+                from: message.from,
+                subject: message.subject,
+                sentAt: message.sentAt,
+              });
+              googleEvidence.set(source.id, source);
+              for (const attachment of message.attachments) {
+                attachmentIndex.set(`${source.id}\0${attachment.attachmentId}`, attachment);
+              }
+              return {
+                sourceId: source.id,
+                kind: "gmail",
+                visibility: "adult_private",
+                sentAt: message.sentAt,
+                sender: message.from,
+                subject: message.subject,
+                text: message.text,
+                attachments: message.attachments.map((attachment) => ({
+                  attachmentId: attachment.attachmentId,
+                  filename: attachment.filename,
+                  mimeType: attachment.mimeType,
+                  sizeBytes: attachment.sizeBytes,
+                })),
+              };
+            });
           },
           readPersonalCalendarWindow: async ({ connectionId, timeMin, timeMax, limit }) => {
             if (connectionId !== work.connectionId) {
@@ -1325,34 +1734,26 @@ export class Florence {
               throw new Error("The private Calendar review is temporarily unavailable");
             }
             calendarCursor = JSON.stringify(read.cursor);
-            calendarCoverage = {
-              status: read.status,
-              events: read.events.length,
-              timeMin,
-              timeMax,
-            };
             return {
               status: read.status,
-              events: await Promise.all(
-                read.events.map(async (event) => {
-                  const source = await this.#store.recordCalendarEvidence({
-                    householdId: work.household.householdId,
-                    ownerAdultId: work.adultId,
-                    connectionId,
-                    calendarId: "primary",
-                    ...event,
-                  });
-                  return {
-                    sourceId: source.id,
-                    kind: "calendar" as const,
-                    visibility: "adult_private" as const,
-                    title: event.title,
-                    startsAt: event.startsAt,
-                    endsAt: event.endsAt,
-                    allDay: event.allDay,
-                  };
-                }),
-              ),
+              events: read.events.map((event) => {
+                const interval = calendarEvidenceInterval(event, work.household.timeZone);
+                const source = draftCalendarEvidence({
+                  householdId: work.household.householdId,
+                  ownerAdultId: work.adultId,
+                  connectionId,
+                  calendarId: "primary",
+                  providerEventId: event.providerEventId,
+                  providerRevision: event.providerRevision,
+                  providerUpdatedAt: event.providerUpdatedAt,
+                  status: event.status,
+                  busy: event.busy,
+                  title: event.title,
+                  ...interval,
+                });
+                googleEvidence.set(source.id, source);
+                return privateCalendarEvidence(source, event, "adult_private");
+              }),
             };
           },
           readGmailAttachment: async ({ connectionId, sourceId, attachment }) => {
@@ -1378,29 +1779,530 @@ export class Florence {
           },
         },
       );
-      if (!calendarCursor || !calendarCoverage) {
+      if (!calendarCursor) {
         throw new Error("The private Google review did not establish Calendar coverage");
       }
       await this.#store.completePrivateInitialReview({
         workId: work.workId,
-        leaseToken: work.leaseToken,
         gmailCursor: JSON.stringify(gmailCursor),
         calendarCursor,
         bubbles: decision.bubbles,
         findings: decision.findings.map((finding) => ({
           sourceIds: finding.sourceIds,
           householdCandidate: finding.candidate,
+          monitor: finding.monitor ?? null,
+          familyCalendar: finding.familyCalendar ?? null,
         })),
-        coverage: {
-          gmail: gmailCoverage,
-          calendar: calendarCoverage,
-        },
+        facts: decision.facts,
+        googleEvidence: [...googleEvidence.values()],
         occurredAt: this.#now().toISOString(),
       });
     } catch (error) {
+      if (credentialInvalidGrant(error)) return;
       await this.#store.retryInitialIntelligence({
         workId: work.workId,
-        leaseToken: work.leaseToken,
+        retryAt: later(this.#now(), RETRY_MS),
+        failedAt: this.#now().toISOString(),
+        error: errorText(error),
+      });
+    }
+  }
+
+  async #executeProactiveWork(work: DueProactiveWork): Promise<void> {
+    if (!this.#google || !this.#reasoner) {
+      await this.#store.retryProactiveWork({
+        workId: work.workId,
+        retryAt: later(this.#now(), RETRY_MS),
+        error: "Florence's proactive review is not configured",
+      });
+      return;
+    }
+    const google = this.#google;
+    const currentTime = this.#now().toISOString();
+    const calendarTimeMax = new Date(Date.parse(currentTime) + 21 * 24 * 60 * 60_000).toISOString();
+    const gmailAfter = new Date(Date.parse(currentTime) - 90 * 24 * 60 * 60_000).toISOString();
+    try {
+      if (work.kind === "interest_monitor") {
+        const household = await this.#store.readHousehold({
+          householdId: work.household.householdId,
+        });
+        if (!household) throw new Error("The interest household is unavailable");
+        const personalConnections = household.googleConnections.filter(
+          (connection) =>
+            connection.status === "active" &&
+            household.members.some(
+              (member) =>
+                member.id === connection.ownerAdultId &&
+                proactiveGoogleAccessEnabled(member) &&
+                member.preferences.privateConflictBusySharingEnabled === true,
+            ),
+        );
+        const [familyCalendar, ...personalCalendars] = await Promise.all([
+          google.readInitialCalendarReview({
+            householdId: work.household.householdId,
+            ownerAdultId: work.ownerAdultId,
+            connectionId: work.connectionId,
+            calendarId: work.calendarId,
+            currentTime,
+            limit: 50,
+          }),
+          ...personalConnections.map((connection) =>
+            google.readInitialCalendarReview({
+              householdId: work.household.householdId,
+              ownerAdultId: connection.ownerAdultId,
+              connectionId: connection.connectionId,
+              currentTime,
+              limit: 50,
+            }),
+          ),
+        ]);
+        const busyIntervals = [...personalCalendars, familyCalendar]
+          .flatMap((calendar) =>
+            !calendar || calendar.status === "unavailable"
+              ? []
+              : calendar.events
+                  .map((event) => calendarWindowBounds(event, work.household.timeZone))
+                  .filter((event) => event.endsAt > currentTime),
+          )
+          .filter(
+            (interval, index, intervals) =>
+              intervals.findIndex(
+                (candidate) =>
+                  candidate.startsAt === interval.startsAt && candidate.endsAt === interval.endsAt,
+              ) === index,
+          )
+          .slice(0, 50);
+        const result = await this.#reasoner.researchInterest({
+          currentTime,
+          timeZone: work.household.timeZone,
+          genericInterestTerms: [...work.genericInterestTerms],
+          ageBracket: "all_ages",
+          location: {
+            city: null,
+            postalCode: work.coarseLocation,
+            countryCode: "US",
+          },
+          busyIntervals,
+        });
+        const completedAt = this.#now();
+        await this.#store.completeInterestMonitor({
+          workId: work.workId,
+          ...result,
+          deliverNotBefore: proactiveDeliveryAt(completedAt, work.household.timeZone, false).toISOString(),
+          occurredAt: completedAt.toISOString(),
+        });
+        return;
+      }
+
+      if (work.kind === "finite_monitor") {
+        const googleEvidence = new Map<string, GoogleEvidenceDraft>();
+        const split = new Date(Date.parse(currentTime) - 14 * 24 * 60 * 60_000).toISOString();
+        const [recent, earlier] =
+          work.visibility === "private"
+            ? await Promise.all([
+                this.#google.searchGmail({
+                  householdId: work.household.householdId,
+                  ownerAdultId: work.adultId,
+                  connectionId: work.connectionId,
+                  query: "-category:promotions -category:social",
+                  after: split,
+                  before: currentTime,
+                  limit: 20,
+                }),
+                this.#google.searchGmail({
+                  householdId: work.household.householdId,
+                  ownerAdultId: work.adultId,
+                  connectionId: work.connectionId,
+                  query: "-category:promotions -category:social",
+                  after: gmailAfter,
+                  before: split,
+                  limit: 20,
+                }),
+              ])
+            : [null, null];
+        const calendar = await this.#google.readInitialCalendarReview({
+          householdId: work.household.householdId,
+          ownerAdultId: work.adultId,
+          connectionId: work.connectionId,
+          calendarId: work.calendarId,
+          currentTime,
+          limit: 50,
+        });
+        const seenMessages = new Set<string>();
+        const gmailMessages = [...(recent?.messages ?? []), ...(earlier?.messages ?? [])].filter(
+          (message) => {
+            if (seenMessages.has(message.messageId)) return false;
+            seenMessages.add(message.messageId);
+            return true;
+          },
+        );
+        const gmailSources = gmailMessages.map((message): FlorencePrivateGmailSource => {
+          const source = draftGmailEvidence({
+            householdId: work.household.householdId,
+            ownerAdultId: work.adultId,
+            connectionId: work.connectionId,
+            messageId: message.messageId,
+            threadId: message.threadId,
+            historyId: message.historyId,
+            from: message.from,
+            subject: message.subject,
+            sentAt: message.sentAt,
+          });
+          googleEvidence.set(source.id, source);
+          return {
+            sourceId: source.id,
+            kind: "gmail",
+            visibility: "adult_private",
+            sentAt: message.sentAt,
+            sender: message.from,
+            subject: message.subject,
+            text: message.text,
+            attachments: message.attachments.map((attachment) => ({
+              attachmentId: attachment.attachmentId,
+              filename: attachment.filename,
+              mimeType: attachment.mimeType,
+              sizeBytes: attachment.sizeBytes,
+            })),
+          };
+        });
+        const calendarSources =
+          calendar.status === "unavailable"
+            ? []
+            : calendar.events.map((event) => {
+                const interval = calendarEvidenceInterval(event, work.household.timeZone);
+                const source = draftCalendarEvidence({
+                  householdId: work.household.householdId,
+                  ownerAdultId: work.adultId,
+                  connectionId: work.connectionId,
+                  calendarId: work.calendarId,
+                  visibility: work.visibility,
+                  providerEventId: event.providerEventId,
+                  providerRevision: event.providerRevision,
+                  providerUpdatedAt: event.providerUpdatedAt,
+                  status: event.status,
+                  busy: event.busy,
+                  title: event.title,
+                  ...interval,
+                });
+                googleEvidence.set(source.id, source);
+                return privateCalendarEvidence(
+                  source,
+                  event,
+                  work.visibility === "household" ? "shared" : "adult_private",
+                );
+              });
+        const currentEvidence: FlorenceBoundedPrivateGoogleEvidence = {
+          gmail: {
+            status:
+              recent?.status === "truncated" || earlier?.status === "truncated" ? "truncated" : "complete",
+            after: gmailAfter,
+            before: currentTime,
+            sources: gmailSources,
+          },
+          calendar: {
+            status: calendar.status,
+            timeMin: currentTime,
+            timeMax: calendarTimeMax,
+            events: calendarSources,
+          },
+        };
+        const result = await this.#reasoner.reviewFiniteMonitor({
+          familyProfile: initialFamilyProfile(work.household),
+          adult: { adultId: work.adultId, firstName: work.adultFirstName },
+          googleConnection: {
+            connectionId: work.connectionId,
+            status: "active",
+            kind: work.visibility === "private" ? "personal" : "family",
+          },
+          scope: work.visibility,
+          currentTime,
+          evidence: currentEvidence,
+          monitor: work.monitor,
+        });
+        const completedAt = this.#now();
+        await this.#store.completeFiniteMonitor({
+          workId: work.workId,
+          outcome: result.outcome,
+          privateDetail: work.visibility === "private" ? result.privateDetail : null,
+          householdConclusion: result.householdConclusion?.summary ?? null,
+          householdCategory: result.householdConclusion?.category ?? null,
+          sourceIds: result.sourceIds,
+          currentConclusion:
+            work.visibility === "household" && result.householdConclusion
+              ? result.householdConclusion.summary
+              : result.currentConclusion,
+          nextCheck: result.nextCheck,
+          why:
+            work.visibility === "household"
+              ? "Florence is watching this family coordination item."
+              : result.why,
+          googleEvidence: [...googleEvidence.values()],
+          deliverNotBefore: proactiveDeliveryAt(
+            completedAt,
+            work.household.timeZone,
+            result.urgency === "now",
+          ).toISOString(),
+          occurredAt: completedAt.toISOString(),
+        });
+        return;
+      }
+
+      const gmailMessages: GmailEvidence[] = [];
+      let nextGmailCursor: GoogleGmailCursor | null = null;
+      let gmailStatus: "complete" | "truncated" | "unavailable" = "unavailable";
+      if (work.kind === "personal_google_poll") {
+        const cursor = googleGmailCursor(work.gmailCursor);
+        const changes = await this.#google.readGmailChanges({
+          householdId: work.household.householdId,
+          ownerAdultId: work.adultId,
+          connectionId: work.connectionId,
+          cursor,
+        });
+        if (changes.resyncRequired) {
+          nextGmailCursor = await this.#google.captureGmailCursor({
+            householdId: work.household.householdId,
+            ownerAdultId: work.adultId,
+            connectionId: work.connectionId,
+          });
+          const resyncBefore = nextGmailCursor.capturedAt;
+          const split = new Date(Date.parse(resyncBefore) - 14 * 24 * 60 * 60_000).toISOString();
+          const [recent, earlier] = await Promise.all([
+            this.#google.searchGmail({
+              householdId: work.household.householdId,
+              ownerAdultId: work.adultId,
+              connectionId: work.connectionId,
+              query: "-category:promotions -category:social",
+              after: split,
+              before: resyncBefore,
+              limit: 20,
+            }),
+            this.#google.searchGmail({
+              householdId: work.household.householdId,
+              ownerAdultId: work.adultId,
+              connectionId: work.connectionId,
+              query: "-category:promotions -category:social",
+              after: gmailAfter,
+              before: split,
+              limit: 20,
+            }),
+          ]);
+          if (recent.status === "truncated" || earlier.status === "truncated") {
+            throw new Error("The bounded Gmail resync could not cover every matching message");
+          }
+          const seen = new Set<string>();
+          for (const message of [...recent.messages, ...earlier.messages]) {
+            if (!seen.has(message.messageId)) gmailMessages.push(message);
+            seen.add(message.messageId);
+          }
+          gmailStatus = "complete";
+        } else {
+          nextGmailCursor = changes.cursor;
+          gmailStatus = "complete";
+          gmailMessages.push(
+            ...changes.messages.filter(
+              (message) => message.sentAt >= gmailAfter && message.sentAt <= currentTime,
+            ),
+          );
+        }
+      }
+
+      const calendarCursor = googleCalendarCursor(work.calendarCursor);
+      const calendarChanges = await this.#google.readCalendarChanges({
+        householdId: work.household.householdId,
+        ownerAdultId: work.adultId,
+        connectionId: work.connectionId,
+        calendarId: work.calendarId,
+        cursor: calendarCursor,
+        currentTime,
+      });
+      let nextCalendarCursor = calendarCursor;
+      let calendarStatus: "complete" | "truncated" | "unavailable" = "complete";
+      let calendarEvents: readonly (GoogleCalendarWindowEvent | GoogleCalendarChange)[] = [];
+      if (calendarChanges.resyncRequired) {
+        const baseline = await this.#google.readInitialCalendarReview({
+          householdId: work.household.householdId,
+          ownerAdultId: work.adultId,
+          connectionId: work.connectionId,
+          calendarId: work.calendarId,
+          currentTime,
+          limit: 50,
+        });
+        if (baseline.status === "unavailable" || !baseline.cursor) {
+          calendarStatus = "unavailable";
+        } else if (baseline.status === "truncated") {
+          throw new Error("The bounded Calendar resync could not cover the rolling window");
+        } else {
+          nextCalendarCursor = baseline.cursor;
+          calendarStatus = baseline.status;
+          calendarEvents = baseline.events;
+        }
+      } else if (calendarChanges.status === "unavailable") {
+        calendarStatus = "unavailable";
+      } else {
+        nextCalendarCursor = calendarChanges.cursor;
+        calendarEvents = calendarChanges.events;
+      }
+
+      const attachmentIndex = new Map<string, GmailAttachmentReference>();
+      const googleEvidence = new Map<string, GoogleEvidenceDraft>();
+      const gmailSources = gmailMessages.slice(0, 50).map((message): FlorencePrivateGmailSource => {
+        const source = draftGmailEvidence({
+          householdId: work.household.householdId,
+          ownerAdultId: work.adultId,
+          connectionId: work.connectionId,
+          messageId: message.messageId,
+          threadId: message.threadId,
+          historyId: message.historyId,
+          from: message.from,
+          subject: message.subject,
+          sentAt: message.sentAt,
+        });
+        googleEvidence.set(source.id, source);
+        for (const attachment of message.attachments) {
+          attachmentIndex.set(`${source.id}\0${attachment.attachmentId}`, attachment);
+        }
+        return {
+          sourceId: source.id,
+          kind: "gmail",
+          visibility: "adult_private",
+          sentAt: message.sentAt,
+          sender: message.from,
+          subject: message.subject,
+          text: message.text,
+          attachments: message.attachments.map((attachment) => ({
+            attachmentId: attachment.attachmentId,
+            filename: attachment.filename,
+            mimeType: attachment.mimeType,
+            sizeBytes: attachment.sizeBytes,
+          })),
+        };
+      });
+      const calendarSources = calendarEvents.slice(0, 50).map((event) => {
+        const interval = calendarEvidenceInterval(event, work.household.timeZone);
+        const source = draftCalendarEvidence({
+          householdId: work.household.householdId,
+          ownerAdultId: work.adultId,
+          connectionId: work.connectionId,
+          calendarId: work.calendarId,
+          visibility: work.visibility,
+          providerEventId: event.providerEventId,
+          providerRevision: event.providerRevision,
+          providerUpdatedAt: event.providerUpdatedAt,
+          status: event.status,
+          busy: event.busy,
+          title: event.title,
+          ...interval,
+        });
+        googleEvidence.set(source.id, source);
+        return privateCalendarEvidence(
+          source,
+          event,
+          work.visibility === "household" ? "shared" : "adult_private",
+        );
+      });
+      const evidence: FlorenceBoundedPrivateGoogleEvidence = {
+        gmail: { status: gmailStatus, after: gmailAfter, before: currentTime, sources: gmailSources },
+        calendar: {
+          status: calendarStatus,
+          timeMin: currentTime,
+          timeMax: calendarTimeMax,
+          events: calendarSources,
+        },
+      };
+      if (gmailSources.length === 0 && calendarSources.length === 0) {
+        const completedAt = this.#now().toISOString();
+        if (work.kind === "personal_google_poll" && !nextGmailCursor) {
+          throw new Error("The personal Google poll did not advance its Gmail cursor");
+        }
+        await this.#store.completeGooglePoll({
+          workId: work.workId,
+          gmailCursor: nextGmailCursor ? JSON.stringify(nextGmailCursor) : null,
+          calendarCursor: JSON.stringify(nextCalendarCursor),
+          googleEvidence: [],
+          deliverNotBefore: completedAt,
+          deliveries: [],
+          facts: [],
+          occurredAt: completedAt,
+        });
+        return;
+      }
+      const decision = await this.#reasoner.assessGoogleChanges(
+        {
+          familyProfile: initialFamilyProfile(work.household),
+          adult: { adultId: work.adultId, firstName: work.adultFirstName },
+          googleConnection: {
+            connectionId: work.connectionId,
+            status: "active",
+            kind: work.visibility === "private" ? "personal" : "family",
+          },
+          currentTime,
+          evidence,
+          activeMonitors: [...work.activeMonitors],
+          currentPrivateFacts: work.kind === "personal_google_poll" ? [...work.currentPrivateFacts] : [],
+        },
+        {
+          readGmailAttachment: async ({ connectionId, sourceId, attachment }) => {
+            if (connectionId !== work.connectionId) {
+              throw new Error("The Google change review requested another adult's Gmail attachment");
+            }
+            const reference = attachmentIndex.get(`${sourceId}\0${attachment.attachmentId}`);
+            if (!reference) throw new Error("The Gmail attachment was not in this change set");
+            const read = await this.#google?.readGmailAttachment({
+              householdId: work.household.householdId,
+              ownerAdultId: work.adultId,
+              connectionId,
+              attachment: reference,
+            });
+            if (!read) throw new Error("Google is not configured");
+            return {
+              sourceId,
+              attachmentId: read.attachmentId,
+              filename: read.filename,
+              mimeType: read.mimeType,
+              bytes: read.bytes,
+            };
+          },
+        },
+      );
+      const materialFindings = decision.findings.filter((finding) => finding.materialChange);
+      const deliveries = materialFindings
+        .filter(
+          (finding) =>
+            work.visibility === "private" ||
+            finding.householdConclusion !== null ||
+            finding.monitor !== null ||
+            (finding.familyCalendar ?? null) !== null,
+        )
+        .map(
+          (finding): ProactiveDelivery => ({
+            privateDetail: work.visibility === "private" ? finding.privateDetail : null,
+            householdConclusion: finding.householdConclusion?.summary ?? null,
+            householdCategory: finding.householdConclusion?.category ?? null,
+            sourceIds: finding.sourceIds,
+            urgency: finding.urgency,
+            monitor: finding.monitor,
+            familyCalendar: finding.familyCalendar ?? null,
+          }),
+        );
+      const decidedAt = this.#now();
+      const urgent = deliveries.some((finding) => finding.urgency === "now");
+      if (work.kind === "personal_google_poll" && !nextGmailCursor) {
+        throw new Error("The personal Google poll did not advance its Gmail cursor");
+      }
+      await this.#store.completeGooglePoll({
+        workId: work.workId,
+        gmailCursor: nextGmailCursor ? JSON.stringify(nextGmailCursor) : null,
+        calendarCursor: JSON.stringify(nextCalendarCursor),
+        googleEvidence: [...googleEvidence.values()],
+        deliverNotBefore: proactiveDeliveryAt(decidedAt, work.household.timeZone, urgent).toISOString(),
+        deliveries,
+        facts: decision.facts,
+        occurredAt: decidedAt.toISOString(),
+      });
+    } catch (error) {
+      if (credentialInvalidGrant(error)) return;
+      await this.#store.retryProactiveWork({
+        workId: work.workId,
         retryAt: later(this.#now(), RETRY_MS),
         error: errorText(error),
       });
@@ -1424,7 +2326,7 @@ export class Florence {
       if (!founder) throw new Error("The partner invitation founder is no longer in the household");
       const founderFirstName = profileString(founder.profile, "firstName") ?? founder.displayName;
       const created = await this.#linq.createChat({
-        idempotencyKey: `partner-invite-chat:${invitation.householdId}:${invitation.partnerAdultId}`,
+        idempotencyKey: `partner-invite-chat:${invitation.householdId}:${invitation.partnerAdultId}:${invitation.approvalSourceId}`,
         senderPhoneNumber: this.#linqSenderPhoneNumber,
         participantPhoneNumbers: [invitation.partnerPhoneNumber],
         initialText: `Hi ${invitation.partnerFirstName} — I’m Florence. ${founderFirstName} asked me to help the two of you stay ahead of school, schedules, and family loose ends. I’ll send your private setup link next.`,
@@ -1446,16 +2348,22 @@ export class Florence {
         occurredAt: invitation.approvedAt,
       });
       const result = await this.#linq.sendMessage({
-        idempotencyKey: `partner-invite-link:${invitation.householdId}:${invitation.partnerAdultId}`,
+        idempotencyKey: `partner-invite-link:${invitation.householdId}:${invitation.partnerAdultId}:${invitation.approvalSourceId}`,
         providerConversationId: created.providerConversationId,
         expectedAuthority: created.authority,
         text: `Set up your side here:\n${this.#setupOrigin}/#s=${encodeURIComponent(setup.token)}`,
       });
-      if (result.status !== "committed" || !result.providerReceiptId) {
+      const dispatchConfirmed =
+        result.status === "committed" &&
+        (result.providerState === "sent" ||
+          result.providerState === "delivered" ||
+          result.providerState === "read");
+      if (!dispatchConfirmed || !result.providerReceiptId) {
+        const retryable = result.status === "unknown" || result.status === "committed";
         throw new LinqError(
-          result.status === "unknown" ? "provider_retryable" : "provider_rejected",
-          result.detail ?? "Linq did not confirm the partner setup link",
-          result.status === "unknown",
+          retryable ? "provider_retryable" : "provider_rejected",
+          result.detail ?? "Linq has not confirmed sending the partner setup link",
+          retryable,
         );
       }
       await this.#store.issueMessagesEnrollment({
@@ -1477,6 +2385,33 @@ export class Florence {
         error: errorText(error),
       });
     }
+  }
+
+  async #createFamilyGroup(work: FamilyGroupCreationWork): Promise<void> {
+    if (!this.#linqSenderPhoneNumber) return;
+    const created = await this.#linq.createChat({
+      idempotencyKey: work.createChatIdempotencyKey,
+      senderPhoneNumber: this.#linqSenderPhoneNumber,
+      participantPhoneNumbers: [...work.participantPhoneNumbers],
+      initialText: `Hi ${work.adultFirstNames[0]} and ${work.adultFirstNames[1]} — I’m Florence. This is our family thread. I’ll keep the household picture here, take first passes, and follow up privately when something is only for one of you.`,
+    });
+    if (
+      created.authority.audience !== "group" ||
+      !sameStrings(created.authority.participantIdentityDigests, work.participantIdentityDigests)
+    ) {
+      throw new Error("Linq created a different family group");
+    }
+    await this.#store.bindCreatedMessagesGroup({
+      householdId: work.householdId,
+      providerConversationId: created.providerConversationId,
+      participantIdentityDigests: created.authority.participantIdentityDigests,
+      occurredAt: created.initialMessage.occurredAt,
+    });
+    await this.#ensureHouseholdActivation(work.householdId);
+    await this.#store.ensureInitialIntelligence({
+      householdId: work.householdId,
+      now: this.#now().toISOString(),
+    });
   }
 
   async #ensureHouseholdActivation(householdId: string): Promise<void> {
@@ -1502,39 +2437,20 @@ export class Florence {
     ) {
       return;
     }
-    const founderGoogle = household.googleConnections.find(
-      (connection) => connection.ownerAdultId === founder.id && connection.status === "active",
-    );
-    const partnerGoogle = household.googleConnections.find(
-      (connection) => connection.ownerAdultId === partner.id && connection.status === "active",
-    );
-    if (!founderGoogle || !partnerGoogle) return;
-
-    let group = household.channels.find(
+    const group = household.channels.find(
       (channel) => channel.audience === "group" && !channel.revokedAt && !channel.stoppedAt,
     );
-    if (!group) {
-      const founderFirstName = profileString(founder.profile, "firstName") ?? founder.displayName;
-      const partnerFirstName = profileString(partner.profile, "firstName") ?? partner.displayName;
-      const created = await this.#linq.createChat({
-        idempotencyKey: `family-group:${household.id}`,
-        senderPhoneNumber: this.#linqSenderPhoneNumber,
-        participantPhoneNumbers: [founder.messagesAddress, partner.messagesAddress],
-        initialText: `Hi ${founderFirstName} and ${partnerFirstName} — I’m Florence. This is our family thread. I’ll keep the household picture here, take first passes, and follow up privately when something is only for one of you.`,
-      });
-      if (created.authority.audience !== "group") {
-        throw new Error("Linq created a different family group");
-      }
-      group = await this.#store.bindCreatedMessagesGroup({
-        householdId: household.id,
-        providerConversationId: created.providerConversationId,
-        participantIdentityDigests: created.authority.participantIdentityDigests,
-        occurredAt: created.initialMessage.occurredAt,
-      });
-      household = (await this.#store.readHousehold({ householdId })) ?? household;
-    }
+    if (!group) return;
 
+    const calendarWasAlreadyCreated = Boolean(household.familyCalendarCreatedAt);
     if (!household.familyCalendarCreatedAt) {
+      const founderGoogle = household.googleConnections.find(
+        (connection) => connection.ownerAdultId === founder.id && connection.status === "active",
+      );
+      const partnerGoogle = household.googleConnections.find(
+        (connection) => connection.ownerAdultId === partner.id && connection.status === "active",
+      );
+      if (!founderGoogle || !partnerGoogle) return;
       try {
         const result = await this.#google.provisionFamilyCalendar({
           householdId: household.id,
@@ -1560,6 +2476,7 @@ export class Florence {
           occurredAt: result.occurredAt,
         });
       } catch (error) {
+        if (credentialInvalidGrant(error)) return;
         if (
           (error instanceof GoogleFamilyCalendarTransientError ||
             error instanceof GoogleFamilyCalendarProvisioningError) &&
@@ -1575,9 +2492,44 @@ export class Florence {
       }
     }
 
+    if (
+      household.familyCalendarCreatedAt &&
+      household.familyCalendarId &&
+      household.familyCalendarLabel !== household.name
+    ) {
+      const credential = await this.#store.readActiveFamilyCalendarCredential({
+        householdId: household.id,
+      });
+      if (!credential || credential.calendarId !== household.familyCalendarId) return;
+      try {
+        const renamed = await this.#google.renameFamilyCalendar({
+          householdId: household.id,
+          ownerAdultId: credential.ownerAdultId,
+          connectionId: credential.connectionId,
+          calendarId: credential.calendarId,
+          summary: household.name,
+        });
+        household = await this.#store.confirmFamilyCalendarLabel({
+          householdId: household.id,
+          calendarId: credential.calendarId,
+          label: renamed.summary,
+          occurredAt: renamed.occurredAt,
+        });
+      } catch (error) {
+        if (credentialInvalidGrant(error)) return;
+        throw error;
+      }
+    }
+
+    if (
+      calendarWasAlreadyCreated &&
+      household.channels.filter((channel) => channel.audience === "group").length > 1
+    ) {
+      return;
+    }
     const calendarLabel = household.familyCalendarLabel ?? household.name;
     const result = await this.#linq.sendMessage({
-      idempotencyKey: `family-calendar-ready:${household.id}`,
+      idempotencyKey: `family-calendar-ready:${household.id}:${group.id}`,
       providerConversationId: group.providerConversationId,
       expectedAuthority: {
         audience: "group",
@@ -1709,6 +2661,7 @@ function workspace(
 ): WorkspaceView {
   const viewer = household?.members.find((member) => member.id === adultId) ?? null;
   const adults = household?.members.filter((member) => member.kind === "adult") ?? [];
+  const founder = adults.find((adult) => adult.adultSlot === 1) ?? null;
   const partner = adults.find((adult) => adult.adultSlot === 2) ?? null;
   const activeGoogleAdultIds = new Set(
     household?.googleConnections
@@ -1717,25 +2670,12 @@ function workspace(
   );
   const activeChannels =
     household?.channels.filter((channel) => !channel.revokedAt && !channel.stoppedAt) ?? [];
-  const contacts =
-    household?.facts.flatMap((fact) => {
-      const source = fact.sources[0];
-      if ((fact.kind !== "address" && fact.kind !== "phone") || !source) return [];
-      return [
-        {
-          id: fact.id,
-          kind: fact.kind,
-          label: fact.label,
-          value: factStatement(fact),
-          visibility: fact.visibility,
-          source: vaultSource(source),
-          editable: true,
-          deletable: true,
-        },
-      ];
-    }) ?? [];
   return {
-    viewer: { adultId, displayName: viewer?.displayName ?? null },
+    viewer: {
+      adultId,
+      displayName: viewer?.displayName ?? null,
+      lastName: viewer ? profileString(viewer.profile, "lastName") : null,
+    },
     workspace: {
       messagesUrl,
       googleConnections:
@@ -1774,8 +2714,8 @@ function workspace(
     vault: household
       ? {
           timeZone: household.timeZone,
+          postalCode: founder ? profileString(founder.profile, "postalCode") : null,
           members: household.members.map(memberView),
-          contacts,
           facts: household.facts.flatMap((fact) => {
             const source = fact.sources[0];
             if (!source || fact.kind === "address" || fact.kind === "phone") return [];
@@ -1790,6 +2730,17 @@ function workspace(
                 deletable: true,
               },
             ];
+          }),
+          watches: household.watches.map((watch) => {
+            return {
+              workId: watch.id,
+              kind: watch.kind,
+              objective: watch.objective,
+              currentConclusion: watch.currentConclusion,
+              visibility: watch.visibility,
+              status: watch.status,
+              source: watch.source ? vaultSource(watch.source) : null,
+            };
           }),
         }
       : null,
@@ -1812,28 +2763,17 @@ function initialFamilyProfile(household: InitialIntelligenceWork["household"]): 
 }
 
 function memberView(member: FamilyMemberRecord) {
+  const firstName = profileString(member.profile, "firstName");
+  const lastName = profileString(member.profile, "lastName");
   const candidate = {
     id: member.id,
     kind: member.kind,
-    role: member.role,
+    firstName: firstName ?? member.displayName,
+    lastName: member.kind === "adult" ? lastName : (lastName ?? null),
     displayName: member.displayName,
     relationship: profileString(member.profile, "relationship") ?? defaultRelationship(member),
-    ...(profileStrings(member.profile, "aliases")
-      ? { aliases: profileStrings(member.profile, "aliases") }
-      : {}),
-    ...(profileNumber(member.profile, "birthYear")
-      ? { birthYear: profileNumber(member.profile, "birthYear") }
-      : {}),
+    ...(member.adultSlot === 1 ? { postalCode: profileString(member.profile, "postalCode") } : {}),
     ...(profileString(member.profile, "school") ? { school: profileString(member.profile, "school") } : {}),
-    ...(profileString(member.profile, "currentGrade")
-      ? { currentGrade: profileString(member.profile, "currentGrade") }
-      : {}),
-    ...(profileString(member.profile, "academicYear")
-      ? { academicYear: profileString(member.profile, "academicYear") }
-      : {}),
-    ...(profileString(member.profile, "gradeEffectiveFrom")
-      ? { gradeEffectiveFrom: profileString(member.profile, "gradeEffectiveFrom") }
-      : {}),
     ...(profileStrings(member.profile, "activities")
       ? { activities: profileStrings(member.profile, "activities") }
       : {}),
@@ -1845,14 +2785,25 @@ function memberView(member: FamilyMemberRecord) {
 
 function memberProfile(member: FamilyMemberInput): JsonObject {
   return {
-    relationship: member.relationship,
-    ...(member.aliases ? { aliases: member.aliases } : {}),
-    ...(member.birthYear ? { birthYear: member.birthYear } : {}),
+    firstName: member.firstName,
+    ...(member.lastName ? { lastName: member.lastName } : {}),
+    relationship: "Child",
     ...(member.school ? { school: member.school } : {}),
-    ...(member.currentGrade ? { currentGrade: member.currentGrade } : {}),
-    ...(member.academicYear ? { academicYear: member.academicYear } : {}),
-    ...(member.gradeEffectiveFrom ? { gradeEffectiveFrom: member.gradeEffectiveFrom } : {}),
     ...(member.activities ? { activities: member.activities } : {}),
+  };
+}
+
+function memberPatch(member: PatchFamilyMemberInput) {
+  const profile: JsonObject = {
+    ...(member.school !== undefined ? { school: member.school } : {}),
+    ...(member.activities !== undefined ? { activities: member.activities } : {}),
+    ...(member.postalCode !== undefined ? { postalCode: member.postalCode } : {}),
+  };
+  return {
+    operation: "patch" as const,
+    ...(member.firstName !== undefined ? { firstName: member.firstName } : {}),
+    ...(member.lastName !== undefined ? { lastName: member.lastName } : {}),
+    ...(Object.keys(profile).length > 0 ? { profile } : {}),
   };
 }
 
@@ -1873,16 +2824,24 @@ function memorySources(facts: readonly FactRecord[]): FlorenceSource[] {
 function enforcePolicy(decision: FlorenceDecision, announceRestrictions: boolean): FlorenceDecision {
   if (decision.policy.stopMessaging) {
     return {
-      ...decision,
+      policy: decision.policy,
       conversation: { replyToCurrentMessage: false, reaction: null, bubbles: [] },
       facts: [],
       followUp: null,
+      interest: null,
       calendar: null,
+      householdUpdate: null,
     };
   }
   const retain = decision.policy.retain;
   const schedule = decision.policy.schedule;
   const calendar = schedule ? decision.calendar : null;
+  const interest =
+    decision.interest?.operation === "stop"
+      ? decision.interest
+      : retain && schedule
+        ? (decision.interest ?? null)
+        : null;
   const confirmation = !announceRestrictions
     ? null
     : !retain && !schedule
@@ -1903,8 +2862,28 @@ function enforcePolicy(decision: FlorenceDecision, announceRestrictions: boolean
     conversation: { ...decision.conversation, bubbles },
     facts: retain ? decision.facts : decision.facts.filter((fact) => fact.operation === "forget"),
     followUp: schedule ? decision.followUp : null,
+    interest,
     calendar,
+    householdUpdate: decision.householdUpdate,
+    ...(decision.researchUrls ? { researchUrls: [...decision.researchUrls] } : {}),
   };
+}
+
+function appendResearchSourceBubble(
+  bubbles: readonly { text: string; delayMs: number }[],
+  researchUrls: readonly string[],
+): { text: string; delayMs: number }[] {
+  const main = bubbles.map((bubble) => ({ ...bubble }));
+  if (researchUrls.length === 0) return main;
+  const sourceBubble = {
+    text: researchUrls.length === 1 ? (researchUrls[0] ?? "") : `Sources:\n${researchUrls.join("\n")}`,
+    delayMs: 0,
+  };
+  if (main.length < 3) return [...main, sourceBubble];
+  const first = main[0] as { text: string; delayMs: number };
+  const second = main[1] as { text: string; delayMs: number };
+  const third = main[2] as { text: string; delayMs: number };
+  return [first, { text: `${second.text}\n\n${third.text}`, delayMs: second.delayMs }, sourceBubble];
 }
 
 function decisionCommit(
@@ -1915,6 +2894,7 @@ function decisionCommit(
     omitReaction?: boolean;
     approveCalendarOffer?: InboundTurn["pendingCalendarOffers"][number] | null;
     approvePartnerInvitation?: InboundTurn["pendingPartnerInvitation"];
+    googleEvidence?: readonly GoogleEvidenceDraft[];
   } = {},
 ): CommitTurnInput {
   if (decision.policy.stopMessaging) {
@@ -1926,11 +2906,16 @@ function decisionCommit(
   }
   if (
     turn.message.moveKind === "reaction" &&
-    (decision.facts.length > 0 || decision.followUp !== null || decision.calendar !== null)
+    (decision.facts.length > 0 ||
+      decision.followUp !== null ||
+      decision.interest != null ||
+      decision.calendar !== null ||
+      decision.householdUpdate !== null ||
+      (decision.researchUrls?.length ?? 0) > 0)
   ) {
     throw new FlorenceReasonerError(
       "invalid_output",
-      "A reaction can express affect but cannot authorize durable or consequential changes",
+      "A reaction can express affect but cannot authorize durable, consequential, or research output",
     );
   }
   const responseTargetSourceId =
@@ -1939,19 +2924,21 @@ function decisionCommit(
     throw new FlorenceReasonerError("invalid_output", "An inbound reaction has no Florence target");
   }
   const turnId = deterministicUuid(`turn\0${turn.message.sourceId}`);
-  const bubbles = decision.calendar
-    ? decision.calendar.mode === "offer"
-      ? [
-          {
-            text: calendarOfferText(
-              decision.calendar.event,
-              turn.authority.audience === "group" ? "the family calendar" : "your calendar",
-            ),
-            delayMs: 0,
-          },
-        ]
-      : []
-    : decision.conversation.bubbles;
+  const baseBubbles = decision.householdUpdate
+    ? []
+    : decision.calendar
+      ? decision.calendar.mode === "offer"
+        ? [
+            {
+              text: calendarOfferText(decision.calendar.mutation.event, "the family calendar"),
+              delayMs: 0,
+            },
+          ]
+        : []
+      : decision.conversation.bubbles;
+  const bubbles = decision.householdUpdate
+    ? []
+    : appendResearchSourceBubble(baseBubbles, decision.researchUrls ?? []);
   const facts: FactDraft[] = [];
   const deleteFactIds: string[] = [];
   for (const [index, change] of decision.facts.entries()) {
@@ -1986,17 +2973,38 @@ function decisionCommit(
       value: { statement },
       visibility,
       ownerAdultId,
-      sourceIds: change.sourceIds,
+      sourceIds:
+        change.operation === "correct"
+          ? [...new Set([...change.sourceIds, turn.message.sourceId])]
+          : change.sourceIds,
     });
   }
-  const followUps: FollowUpDraft[] =
+  const finiteMonitors: FiniteMonitorDraft[] =
     decision.followUp?.operation === "schedule"
       ? [
           {
             id: deterministicUuid(`follow-up\0${turn.message.sourceId}`),
-            dedupeKey: `follow-up:${turn.message.sourceId}`,
-            text: decision.followUp.text,
-            dueAt: decision.followUp.at,
+            objective: decision.followUp.objective,
+            currentConclusion: decision.followUp.currentConclusion,
+            endCondition: decision.followUp.endCondition,
+            nextCheck: decision.followUp.nextCheck,
+            why: decision.followUp.why,
+            visibility: turn.authority.audience === "group" ? "household" : "private",
+            ownerAdultId: turn.authority.audience === "group" ? null : turn.authority.senderAdultId,
+            sourceIds: decision.followUp.sourceIds,
+          },
+        ]
+      : [];
+  const finiteMonitorUpdates: FiniteMonitorUpdate[] =
+    decision.followUp?.operation === "update"
+      ? [
+          {
+            id: decision.followUp.followUpId,
+            objective: decision.followUp.objective,
+            currentConclusion: decision.followUp.currentConclusion,
+            endCondition: decision.followUp.endCondition,
+            nextCheck: decision.followUp.nextCheck,
+            why: decision.followUp.why,
             sourceIds: decision.followUp.sourceIds,
           },
         ]
@@ -2031,30 +3039,59 @@ function decisionCommit(
     });
   });
   const calendar = calendarCommit(turn, decision);
-  const approval = options.approveCalendarOffer ? [calendarApproval(turn, options.approveCalendarOffer)] : [];
+  const approval = options.approveCalendarOffer ? [calendarApproval(options.approveCalendarOffer)] : [];
+  const householdUpdate = decision.householdUpdate;
+  if (householdUpdate) {
+    if (
+      turn.authority.audience !== "private" ||
+      turn.message.moveKind === "reaction" ||
+      !turn.message.authoredText?.trim() ||
+      householdUpdate.sourceIds.length !== 1 ||
+      householdUpdate.sourceIds[0] !== turn.message.sourceId
+    ) {
+      throw new FlorenceReasonerError(
+        "invalid_output",
+        "A household update requires only the current adult's typed private Message",
+      );
+    }
+  }
   return {
     sourceId: turn.message.sourceId,
+    googleEvidence: options.googleEvidence ?? [],
     facts,
     deleteFactIds,
-    followUps,
-    cancelFollowUpIds: decision.followUp?.operation === "cancel" ? [decision.followUp.followUpId] : [],
+    finiteMonitors,
+    finiteMonitorUpdates,
+    cancelMonitorIds: decision.followUp?.operation === "cancel" ? [decision.followUp.followUpId] : [],
+    interestMutation: decision.interest ?? null,
     outbound,
     approveCalendarOffers: approval,
     ...(options.approvePartnerInvitation
       ? { partnerInvitationApproval: { adultId: options.approvePartnerInvitation.adultId } }
+      : {}),
+    ...(householdUpdate
+      ? {
+          householdUpdate: {
+            basisSourceId: turn.message.sourceId,
+            text: householdUpdate.text,
+          },
+        }
       : {}),
     ...calendar,
     handledAt: now.toISOString(),
   };
 }
 
-function calendarOfferText(event: CalendarActionDraft["event"], calendarLabel: string): string {
+function calendarOfferText(event: CalendarOfferDraft["mutation"]["event"], calendarLabel: string): string {
+  const location = event.location ? `\n${event.location}` : "";
+  if (event.intervalKind === "all_day") {
+    return `I can add this to ${calendarLabel}:\n\n${event.title}\n${formatAllDayCalendarInterval(event.startDate, event.endDate)}${location}\n\nWant me to add it?`;
+  }
   const format = new Intl.DateTimeFormat("en-US", {
     dateStyle: "medium",
     timeStyle: "short",
     timeZone: event.timeZone,
   });
-  const location = event.location ? `\n${event.location}` : "";
   return `I can add this to ${calendarLabel}:\n\n${event.title}\n${format.format(new Date(event.startsAt))} – ${format.format(new Date(event.endsAt))}\n${event.timeZone}${location}\n\nWant me to add it?`;
 }
 
@@ -2063,83 +3100,57 @@ function calendarCommit(
   decision: FlorenceDecision,
 ): Pick<CommitTurnInput, "calendarOffers" | "calendarActions"> {
   if (!decision.calendar) return {};
+  if (turn.authority.audience !== "group") {
+    throw new FlorenceReasonerError(
+      "invalid_output",
+      "Calendar writes can originate only in the exact family group",
+    );
+  }
   if (!decision.calendar.sourceIds.includes(turn.message.sourceId)) {
-    throw new Error("A Calendar decision must cite the current adult message");
+    throw new FlorenceReasonerError(
+      "invalid_output",
+      "A Calendar decision must cite the current adult message",
+    );
   }
-  const householdCalendar = turn.authority.audience === "group";
-  const credentialOwnerAdultId = householdCalendar
-    ? turn.household.members.find((member) => member.kind === "adult" && member.adultSlot === 1)?.id
-    : turn.authority.senderAdultId;
-  const calendarId = householdCalendar ? turn.household.familyCalendarId : "primary";
-  if (!credentialOwnerAdultId || !calendarId) {
-    throw new Error("The Calendar target is not configured for this conversation");
+  if (!turn.message.authoredText?.trim()) {
+    throw new FlorenceReasonerError(
+      "invalid_output",
+      "A Calendar decision requires the current parent's authored instruction",
+    );
   }
-  const calendarAudience = householdCalendar ? ("household" as const) : ("private" as const);
-  const proposalDigest = sha256(
-    JSON.stringify({
-      connectionId: decision.calendar.connectionId,
-      calendarId,
-      audience: calendarAudience,
-      event: decision.calendar.event,
-      sourceIds: decision.calendar.sourceIds,
-    }),
-  );
+  if (!turn.household.familyCalendarId) {
+    throw new FlorenceReasonerError(
+      "invalid_output",
+      "The Calendar target is not configured for this conversation",
+    );
+  }
   const id = deterministicUuid(`calendar\0${turn.message.sourceId}`);
-  const actionId = deterministicUuid(`calendar-action\0${turn.message.sourceId}`);
   if (decision.calendar.mode === "offer") {
     const offer: CalendarOfferDraft = {
       id,
-      actionId,
-      connectionId: decision.calendar.connectionId,
-      ownerAdultId: credentialOwnerAdultId,
-      calendarId,
-      audience: calendarAudience,
       basisSourceId: turn.message.sourceId,
-      proposalDigest,
-      event: decision.calendar.event,
+      mutation: decision.calendar.mutation,
     };
     return { calendarOffers: [offer] };
   }
   const action: CalendarActionDraft = {
     id,
-    actionId,
-    connectionId: decision.calendar.connectionId,
-    ownerAdultId: credentialOwnerAdultId,
-    calendarId,
-    audience: calendarAudience,
     basisSourceId: turn.message.sourceId,
-    approvalMessageId: turn.message.sourceId,
-    approvalDigest: sha256(
-      JSON.stringify({
-        approvalMessageId: turn.message.sourceId,
-        proposalDigest,
-        text: turn.message.text,
-      }),
-    ),
-    proposalDigest,
-    event: decision.calendar.event,
+    mutation: decision.calendar.mutation,
   };
   return { calendarActions: [action] };
 }
 
-function calendarApproval(
-  turn: InboundTurn,
-  offer: InboundTurn["pendingCalendarOffers"][number],
-): CalendarOfferApproval {
-  return {
-    offerId: offer.id,
-    approvalDigest: sha256(
-      JSON.stringify({
-        approvalMessageId: turn.message.sourceId,
-        proposalDigest: offer.proposalDigest,
-        text: turn.message.text,
-      }),
-    ),
-  };
+function calendarApproval(offer: InboundTurn["pendingCalendarOffers"][number]): CalendarOfferApproval {
+  return { offerId: offer.id };
 }
 
 function preferences(value: JsonObject | undefined): PreferencesInput {
-  const parsed = preferencesInputSchema.safeParse({ ...DEFAULT_PREFERENCES, ...(value ?? {}) });
+  const parsed = preferencesInputSchema.safeParse({
+    proactiveGoogleEnabled: value?.proactiveGoogleEnabled !== false,
+    automaticFamilyCalendarEnabled: value?.automaticFamilyCalendarEnabled !== false,
+    privateConflictBusySharingEnabled: value?.privateConflictBusySharingEnabled === true,
+  });
   return parsed.success ? parsed.data : DEFAULT_PREFERENCES;
 }
 
@@ -2152,14 +3163,56 @@ function vaultSource(source: SourceRecord): VaultSource {
         : source.kind === "web"
           ? "web"
           : "document";
-  return { id: source.id, kind, label: source.label, occurredAt: source.occurredAt };
+  return { id: source.id, kind, label: source.label.slice(0, 300), occurredAt: source.occurredAt };
 }
 
 function factStatement(fact: FactRecord): string {
-  const value: unknown = fact.value;
+  return factValueStatement(fact.value);
+}
+
+function factValueStatement(value: unknown): string {
   if (typeof value === "string") return value;
   if (isRecord(value) && typeof value.statement === "string") return value.statement;
   return JSON.stringify(value);
+}
+
+function googleGmailCursor(value: string): GoogleGmailCursor {
+  const parsed: unknown = JSON.parse(value);
+  if (
+    !isRecord(parsed) ||
+    parsed.kind !== "gmail_history_v1" ||
+    typeof parsed.historyId !== "string" ||
+    !parsed.historyId.trim() ||
+    typeof parsed.capturedAt !== "string" ||
+    !Number.isFinite(Date.parse(parsed.capturedAt))
+  ) {
+    throw new Error("The stored Gmail monitoring cursor is invalid");
+  }
+  return {
+    kind: "gmail_history_v1",
+    historyId: parsed.historyId,
+    capturedAt: parsed.capturedAt,
+  };
+}
+
+function googleCalendarCursor(value: string): GoogleCalendarBoundedCursor {
+  const parsed: unknown = JSON.parse(value);
+  if (
+    !isRecord(parsed) ||
+    parsed.kind !== "calendar_updated_min_v1" ||
+    typeof parsed.calendarId !== "string" ||
+    !parsed.calendarId.trim() ||
+    typeof parsed.updatedMin !== "string" ||
+    typeof parsed.windowTimeMin !== "string" ||
+    typeof parsed.windowTimeMax !== "string" ||
+    parsed.overlapMs !== 5 * 60_000 ||
+    !Number.isFinite(Date.parse(parsed.updatedMin)) ||
+    !Number.isFinite(Date.parse(parsed.windowTimeMin)) ||
+    !Number.isFinite(Date.parse(parsed.windowTimeMax))
+  ) {
+    throw new Error("The stored Calendar monitoring cursor is invalid");
+  }
+  return parsed as GoogleCalendarBoundedCursor;
 }
 
 function reasonerImage(image: InboundTurn["message"]["images"][number]): {
@@ -2178,6 +3231,13 @@ function turnText(turn: InboundTurn["message"] | InboundTurn["recentMessages"][n
   return "Shared a family attachment.";
 }
 
+function approvalReplyTargetsPrompt(
+  replyToSourceId: string | null,
+  approvalPromptSourceId: string | null,
+): boolean {
+  return replyToSourceId === null || replyToSourceId === approvalPromptSourceId;
+}
+
 function searchSources(sources: readonly FlorenceSource[], query: string): FlorenceSource[] {
   const words = query.toLocaleLowerCase().split(/\s+/).filter(Boolean);
   return sources.filter((source) => {
@@ -2186,19 +3246,225 @@ function searchSources(sources: readonly FlorenceSource[], query: string): Flore
   });
 }
 
-function calendarProof(detail: string, eventId: string): JsonObject & { etag: string; digest: string } {
-  const parsed: unknown = JSON.parse(detail);
-  if (
-    !isRecord(parsed) ||
-    parsed.provider !== "google-calendar" ||
-    parsed.eventId !== eventId ||
-    typeof parsed.etag !== "string" ||
-    typeof parsed.digest !== "string" ||
-    !/^[0-9a-f]{64}$/.test(parsed.digest)
-  ) {
-    throw new Error("Google Calendar returned an invalid proof receipt");
+function calendarConfirmationVerb(operation: "create" | "update" | "delete"): string {
+  return operation === "create" ? "Added" : operation === "update" ? "Updated" : "Removed";
+}
+
+function calendarOperationNoun(operation: "create" | "update" | "delete"): string {
+  return operation === "create" ? "addition" : operation === "update" ? "update" : "removal";
+}
+
+function calendarEvidenceInterval(
+  event: GoogleCalendarWindowEvent | GoogleCalendarChange,
+  householdTimeZone: string,
+): Pick<CalendarEvidenceDraft, "startsAt" | "endsAt" | "allDay"> {
+  if ("intervalKind" in event) {
+    const bounds = calendarWindowBounds(event, householdTimeZone);
+    return {
+      startsAt: bounds.startsAt,
+      endsAt: bounds.endsAt,
+      allDay: event.intervalKind === "all_day",
+    };
   }
-  return parsed as JsonObject & { etag: string; digest: string };
+  return { startsAt: event.startsAt, endsAt: event.endsAt, allDay: event.allDay };
+}
+
+function privateCalendarEvidence(
+  source: CalendarEvidenceDraft,
+  event: GoogleCalendarWindowEvent | GoogleCalendarChange,
+  visibility: FlorencePrivateCalendarEvent["visibility"],
+): FlorencePrivateCalendarEvent {
+  if ("intervalKind" in event) {
+    return event.intervalKind === "all_day"
+      ? {
+          sourceId: source.id,
+          kind: "calendar",
+          visibility,
+          status: source.status,
+          busy: source.busy,
+          title: source.title,
+          startsAt: source.startsAt,
+          endsAt: source.endsAt,
+          allDay: source.allDay,
+          intervalKind: event.intervalKind,
+          timeZone: null,
+          startDate: event.startDate,
+          endDate: event.endDate,
+        }
+      : {
+          sourceId: source.id,
+          kind: "calendar",
+          visibility,
+          status: source.status,
+          busy: source.busy,
+          title: source.title,
+          startsAt: source.startsAt,
+          endsAt: source.endsAt,
+          allDay: source.allDay,
+          intervalKind: event.intervalKind,
+          timeZone: event.timeZone,
+          startDate: null,
+          endDate: null,
+        };
+  }
+  if (event.allDay === null) {
+    return {
+      sourceId: source.id,
+      kind: "calendar",
+      visibility,
+      status: source.status,
+      busy: source.busy,
+      title: source.title,
+      startsAt: source.startsAt,
+      endsAt: source.endsAt,
+      allDay: source.allDay,
+      intervalKind: null,
+      timeZone: null,
+      startDate: null,
+      endDate: null,
+    };
+  }
+  if (event.allDay) {
+    if (!event.startDate || !event.endDate) {
+      throw new Error("Google returned all-day Calendar evidence without exact dates");
+    }
+    return {
+      sourceId: source.id,
+      kind: "calendar",
+      visibility,
+      status: source.status,
+      busy: source.busy,
+      title: source.title,
+      startsAt: source.startsAt,
+      endsAt: source.endsAt,
+      allDay: source.allDay,
+      intervalKind: "all_day",
+      timeZone: null,
+      startDate: event.startDate,
+      endDate: event.endDate,
+    };
+  }
+  if (!event.timeZone) throw new Error("Google returned timed Calendar evidence without a time zone");
+  return {
+    sourceId: source.id,
+    kind: "calendar",
+    visibility,
+    status: source.status,
+    busy: source.busy,
+    title: source.title,
+    startsAt: source.startsAt,
+    endsAt: source.endsAt,
+    allDay: source.allDay,
+    intervalKind: "timed",
+    timeZone: event.timeZone,
+    startDate: null,
+    endDate: null,
+  };
+}
+
+function calendarWindowBounds(
+  event: GoogleCalendarWindowEvent,
+  householdTimeZone: string,
+): { startsAt: string; endsAt: string } {
+  if (event.intervalKind === "timed") {
+    return { startsAt: event.startsAt, endsAt: event.endsAt };
+  }
+  return {
+    startsAt: zonedCalendarDateStart(event.startDate, householdTimeZone).toISOString(),
+    endsAt: zonedCalendarDateStart(event.endDate, householdTimeZone).toISOString(),
+  };
+}
+
+function familyCalendarMonthWindows(
+  month: string,
+  timeZone: string,
+): readonly { timeMin: string; timeMax: string }[] {
+  const [yearText, monthText] = month.split("-");
+  const year = Number(yearText);
+  const monthNumber = Number(monthText);
+  if (!Number.isInteger(year) || !Number.isInteger(monthNumber)) {
+    throw new Error("Family Calendar month is invalid");
+  }
+  const nextYear = monthNumber === 12 ? year + 1 : year;
+  const nextMonth = monthNumber === 12 ? 1 : monthNumber + 1;
+  const start = zonedInstant(
+    { year, month: monthNumber, day: 1, hour: 0, minute: 0, second: 0 },
+    timeZone,
+  ).toISOString();
+  const middle = zonedInstant(
+    { year, month: monthNumber, day: 16, hour: 0, minute: 0, second: 0 },
+    timeZone,
+  ).toISOString();
+  const end = zonedInstant(
+    { year: nextYear, month: nextMonth, day: 1, hour: 0, minute: 0, second: 0 },
+    timeZone,
+  ).toISOString();
+  return [
+    { timeMin: start, timeMax: middle },
+    { timeMin: middle, timeMax: end },
+  ];
+}
+
+function deduplicateFamilyCalendarEvents(
+  events: readonly GoogleCalendarWindowEvent[],
+): GoogleCalendarWindowEvent[] {
+  const byProviderEventId = new Map<string, GoogleCalendarWindowEvent>();
+  for (const event of events) {
+    const current = byProviderEventId.get(event.providerEventId);
+    if (
+      !current ||
+      event.providerUpdatedAt > current.providerUpdatedAt ||
+      (event.providerUpdatedAt === current.providerUpdatedAt &&
+        event.providerRevision > current.providerRevision)
+    ) {
+      byProviderEventId.set(event.providerEventId, event);
+    }
+  }
+  return [...byProviderEventId.values()];
+}
+
+function compareFamilyCalendarEvents(
+  left: GoogleCalendarWindowEvent,
+  right: GoogleCalendarWindowEvent,
+  householdTimeZone: string,
+): number {
+  const leftBounds = calendarWindowBounds(left, householdTimeZone);
+  const rightBounds = calendarWindowBounds(right, householdTimeZone);
+  const startDifference = Date.parse(leftBounds.startsAt) - Date.parse(rightBounds.startsAt);
+  if (startDifference !== 0) return startDifference;
+  if (left.intervalKind !== right.intervalKind) return left.intervalKind === "all_day" ? -1 : 1;
+  const endDifference = Date.parse(leftBounds.endsAt) - Date.parse(rightBounds.endsAt);
+  if (endDifference !== 0) return endDifference;
+  return (left.title ?? "").localeCompare(right.title ?? "", "en-US");
+}
+
+function zonedCalendarDateStart(value: string, timeZone: string): Date {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  if (!match || !Number.isFinite(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== value) {
+    throw new Error("Google returned an invalid all-day Calendar date");
+  }
+  return zonedInstant(
+    {
+      year: Number(match[1]),
+      month: Number(match[2]),
+      day: Number(match[3]),
+      hour: 0,
+      minute: 0,
+      second: 0,
+    },
+    timeZone,
+  );
+}
+
+function formatAllDayCalendarInterval(startDate: string, exclusiveEndDate: string): string {
+  const start = new Date(`${startDate}T00:00:00.000Z`);
+  const inclusiveEnd = new Date(`${exclusiveEndDate}T00:00:00.000Z`);
+  inclusiveEnd.setUTCDate(inclusiveEnd.getUTCDate() - 1);
+  const format = new Intl.DateTimeFormat("en-US", { dateStyle: "medium", timeZone: "UTC" });
+  return start.getTime() === inclusiveEnd.getTime()
+    ? format.format(start)
+    : `${format.format(start)} – ${format.format(inclusiveEnd)}`;
 }
 
 function sameAuthority(
@@ -2235,6 +3501,102 @@ function isIanaTimeZone(value: string): boolean {
   }
 }
 
+function proactiveDeliveryAt(now: Date, timeZone: string, urgent: boolean): Date {
+  if (urgent) return now;
+  const local = zonedParts(now, timeZone);
+  if (local.hour >= QUIET_END_HOUR && local.hour < QUIET_START_HOUR) return now;
+  const targetDate = new Date(
+    Date.UTC(local.year, local.month - 1, local.day + (local.hour >= QUIET_START_HOUR ? 1 : 0)),
+  );
+  return zonedInstant(
+    {
+      year: targetDate.getUTCFullYear(),
+      month: targetDate.getUTCMonth() + 1,
+      day: targetDate.getUTCDate(),
+      hour: QUIET_END_HOUR,
+      minute: 0,
+      second: 0,
+    },
+    timeZone,
+  );
+}
+
+function zonedInstant(
+  target: {
+    year: number;
+    month: number;
+    day: number;
+    hour: number;
+    minute: number;
+    second: number;
+  },
+  timeZone: string,
+): Date {
+  const targetAsUtc = Date.UTC(
+    target.year,
+    target.month - 1,
+    target.day,
+    target.hour,
+    target.minute,
+    target.second,
+  );
+  let guess = targetAsUtc;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const represented = zonedParts(new Date(guess), timeZone);
+    const representedAsUtc = Date.UTC(
+      represented.year,
+      represented.month - 1,
+      represented.day,
+      represented.hour,
+      represented.minute,
+      represented.second,
+    );
+    const correction = targetAsUtc - representedAsUtc;
+    guess += correction;
+    if (correction === 0) break;
+  }
+  return new Date(guess);
+}
+
+function zonedParts(
+  date: Date,
+  timeZone: string,
+): {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  second: number;
+} {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    calendar: "gregory",
+    numberingSystem: "latn",
+    hourCycle: "h23",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).formatToParts(date);
+  const value = (type: Intl.DateTimeFormatPartTypes): number => {
+    const part = parts.find((candidate) => candidate.type === type)?.value;
+    const parsed = Number(part);
+    if (!Number.isInteger(parsed)) throw new Error(`Could not resolve ${type} in ${timeZone}`);
+    return parsed;
+  };
+  return {
+    year: value("year"),
+    month: value("month"),
+    day: value("day"),
+    hour: value("hour"),
+    minute: value("minute"),
+    second: value("second"),
+  };
+}
+
 function pause(delayMs: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, delayMs));
 }
@@ -2255,6 +3617,7 @@ function reaction(value: string | null): LinqReaction {
 
 function defaultRelationship(member: FamilyMemberRecord): string {
   if (member.kind === "child") return "Child";
+  if (member.adultSlot === 2) return "Partner";
   return member.role === "steward" ? "Parent" : "Caregiver";
 }
 
@@ -2293,9 +3656,14 @@ function profileStrings(profile: JsonObject, key: string): string[] | null {
   return Array.isArray(value) && value.every((item) => typeof item === "string") ? value : null;
 }
 
-function profileNumber(profile: JsonObject, key: string): number | null {
-  const value = profile[key];
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
+function proactiveGoogleAccessEnabled(member: FamilyMemberRecord): boolean {
+  const acceptedAt = member.preferences.proactiveUseAcceptedAt;
+  return (
+    typeof acceptedAt === "string" &&
+    acceptedAt.trim().length > 0 &&
+    Number.isFinite(Date.parse(acceptedAt)) &&
+    member.preferences.proactiveGoogleEnabled !== false
+  );
 }
 
 function nullableText(value: string | null): string | null {
@@ -2321,6 +3689,26 @@ function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
+function sameStrings(left: readonly string[], right: readonly string[]): boolean {
+  const expected = [...left].sort();
+  const actual = [...right].sort();
+  return expected.length === actual.length && expected.every((value, index) => value === actual[index]);
+}
+
+function isLaterInbound(
+  incomingOccurredAt: string,
+  incomingSourceId: string,
+  activeOccurredAt: string,
+  activeSourceId: string,
+): boolean {
+  const incomingTime = Date.parse(incomingOccurredAt);
+  const activeTime = Date.parse(activeOccurredAt);
+  if (!Number.isFinite(incomingTime) || !Number.isFinite(activeTime)) {
+    throw new Error("Inbound chronological comparison requires valid timestamps");
+  }
+  return incomingTime > activeTime || (incomingTime === activeTime && incomingSourceId > activeSourceId);
+}
+
 function deterministicUuid(value: string): string {
   const digest = sha256(value);
   const variant = ((Number.parseInt(digest[16] ?? "0", 16) & 3) | 8).toString(16);
@@ -2333,4 +3721,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : "Unknown Florence loop failure";
+}
+
+function credentialInvalidGrant(error: unknown): boolean {
+  return error instanceof GoogleConnectionError && error.code === "credential_invalid_grant";
 }

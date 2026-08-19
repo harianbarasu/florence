@@ -17,7 +17,6 @@ import {
   Check,
   ChevronLeft,
   ChevronRight,
-  ExternalLink,
   MapPin,
   MessageCircle,
   Pause,
@@ -799,27 +798,110 @@ export function WorkspacePage() {
   const view = query.data;
   if (!view) return <PageLoader />;
 
-  return (
-    <Page title="Workspace" intro="The places you can reach Florence and the sources connected to you.">
-      <section className="section">
-        <SectionLabel>Contact Florence</SectionLabel>
-        <div className="contact-grid">
-          <ContactAction
-            icon={<MessageCircle size={20} />}
-            title="Messages"
-            detail={
-              view.workspace.messagesUrl
-                ? "Open your conversation with Florence"
-                : "Available after Messages is configured"
-            }
-            href={view.workspace.messagesUrl ?? undefined}
-          />
-        </div>
-      </section>
+  const { setup } = view.workspace;
+  const partnerState =
+    setup.partnerInvitation === "connected"
+      ? "Private Messages connected"
+      : setup.partnerInvitation === "invited"
+        ? "Private invitation sent"
+        : setup.partnerInvitation === "approved"
+          ? "Invitation approved"
+          : setup.partnerInvitation === "ready"
+            ? "Ready to invite"
+            : "Not added yet";
+  const googleState = setup.bothAdultsGoogleConnected
+    ? "Both parents connected"
+    : view.workspace.googleConnections.length
+      ? "Your account is connected"
+      : "Not connected";
 
-      <section className="section" id="google-connections">
-        <SectionLabel>Connections</SectionLabel>
-        <GoogleConnector view={view} />
+  let currentTitle = "Bring your partner into Florence";
+  let currentDetail =
+    "Continue in your private Messages conversation. Florence will ask before sending a private invitation.";
+  if (setup.partnerInvitation === "ready") {
+    currentTitle = "Invite your partner in Messages";
+    currentDetail =
+      "Florence is waiting for your okay in your private conversation. Your partner will complete their own setup.";
+  } else if (setup.partnerInvitation === "approved") {
+    currentTitle = "Florence has your okay";
+    currentDetail =
+      "She’ll confirm in your private conversation once your partner’s invitation is delivered.";
+  } else if (setup.partnerInvitation === "invited") {
+    currentTitle = "Your partner has the next step";
+    currentDetail =
+      "They’ll finish in their own private Messages conversation and connect their own Google account.";
+  } else if (!setup.bothAdultsMessagesConnected) {
+    currentTitle = "Connect both parents in Messages";
+    currentDetail =
+      "Each parent needs a separate private conversation before Florence creates the family group.";
+  } else if (!setup.bothAdultsGoogleConnected) {
+    currentTitle = "One Google connection to go";
+    currentDetail =
+      "Your partner completes this privately. Florence keeps each parent’s Gmail, Calendar, and personal details separate.";
+  } else if (!setup.familyGroupConnected) {
+    currentTitle = "Next, Florence creates your family group";
+    currentDetail =
+      "The exact three-person Messages group will be the main place for family plans, follow-ups, and decisions.";
+  } else if (!setup.familyCalendarConnected) {
+    currentTitle = "Next, Florence creates your family calendar";
+    currentDetail = "Both parents will have equal Florence authority over the new shared family calendar.";
+  } else if (setup.initialBriefing === "preparing") {
+    currentTitle = "Florence is preparing your first family briefing";
+    currentDetail =
+      "She’s reviewing each parent’s side privately and will put only the useful shared picture in your family group.";
+  } else if (setup.initialBriefing === "not_ready") {
+    currentTitle = "Florence is starting your first family briefing";
+    currentDetail =
+      "Your household is connected. Florence will review each parent’s side before she writes in the family group.";
+  } else {
+    currentTitle = "Florence is ready in your family group";
+    currentDetail =
+      "Both parents, the exact family group, and the shared calendar are ready. Your first family briefing was sent in Messages.";
+  }
+
+  return (
+    <Page title="Workspace" intro="Family life happens in Messages. This is a quiet check on what’s ready.">
+      <section className="workspace-card" aria-labelledby="workspace-current-title">
+        <div className="workspace-current">
+          <div className="workspace-current-copy">
+            <span className="workspace-eyebrow">Current</span>
+            <h2 id="workspace-current-title">{currentTitle}</h2>
+            <p>{currentDetail}</p>
+          </div>
+          {view.workspace.messagesUrl && (
+            <a className="button primary workspace-message-action" href={view.workspace.messagesUrl}>
+              Open Messages
+            </a>
+          )}
+        </div>
+        <dl className="workspace-state-list" aria-label="Household readiness">
+          <div className="workspace-state-row">
+            <dt>Partner</dt>
+            <dd>{partnerState}</dd>
+          </div>
+          <div className="workspace-state-row">
+            <dt>Google</dt>
+            <dd>{googleState}</dd>
+          </div>
+          <div className="workspace-state-row">
+            <dt>Family group</dt>
+            <dd>{setup.familyGroupConnected ? "Exact group ready" : "Not created yet"}</dd>
+          </div>
+          <div className="workspace-state-row">
+            <dt>Family calendar</dt>
+            <dd>{setup.familyCalendarConnected ? "Shared calendar ready" : "Not created yet"}</dd>
+          </div>
+          <div className="workspace-state-row">
+            <dt>First family briefing</dt>
+            <dd>
+              {setup.initialBriefing === "sent"
+                ? "Sent in Messages"
+                : setup.initialBriefing === "preparing"
+                  ? "Preparing"
+                  : "Waiting for household setup"}
+            </dd>
+          </div>
+        </dl>
       </section>
     </Page>
   );
@@ -1702,37 +1784,6 @@ function PeopleList({
   );
 }
 
-function ContactAction({
-  icon,
-  title,
-  detail,
-  href,
-}: {
-  icon: React.ReactNode;
-  title: string;
-  detail: string;
-  href?: string | undefined;
-}) {
-  const action = href ? (
-    <a className="contact-button" href={href}>
-      Open <ExternalLink size={14} />
-    </a>
-  ) : (
-    <span className="unavailable">Not configured</span>
-  );
-
-  return (
-    <article className="contact-card">
-      <span className="contact-icon">{icon}</span>
-      <div>
-        <strong>{title}</strong>
-        <p>{detail}</p>
-      </div>
-      {action}
-    </article>
-  );
-}
-
 function Page({ title, intro, children }: { title: string; intro: string; children: React.ReactNode }) {
   return (
     <div className="page">
@@ -2110,7 +2161,7 @@ function consumeOnboardingEntry(): {
 
 function setupError(cause: unknown): string {
   if (cause instanceof FlorenceRequestError && (cause.status === 401 || cause.status === 410)) {
-    return "This setup link is no longer valid. If setup has not started, text Florence “new link” in the same thread. If you already submitted your name, continue in the same browser.";
+    return "This setup link is no longer valid. If someone invited you, ask them to have Florence send a fresh invitation. Otherwise, return to the Messages conversation where you started and ask Florence for a new link.";
   }
   if (cause instanceof FlorenceRequestError && cause.status === 409) {
     return "Florence is already set up. Return to the Messages conversation you started.";

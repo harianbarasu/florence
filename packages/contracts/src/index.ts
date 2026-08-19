@@ -162,6 +162,7 @@ export const setupChecklistSchema = z
     bothAdultsGoogleConnected: z.boolean(),
     familyGroupConnected: z.boolean(),
     familyCalendarConnected: z.boolean(),
+    initialBriefing: z.enum(["not_ready", "preparing", "sent"]),
   })
   .strict();
 

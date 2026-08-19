@@ -238,9 +238,11 @@ failure requiring intervention. It never sends stale reminder copy blindly.
 
 ### Interest discovery
 
-One clear stable statement such as “Lexi likes soccer” may become a durable
-interest; a casual mention does not. Interest discovery begins immediately
-after household activation and searches public sources using only generic
+One clear conversational direction such as “Keep an eye out for soccer
+opportunities for Lexi” may become a durable interest; a casual mention does
+not. Activities entered during setup are family context, not automatic
+subscriptions. Interest discovery begins from that clear parent direction and
+searches public sources using only generic
 interest terms plus coarse ZIP/city context—never a child's name, address,
 private Calendar title, or other private detail.
 

@@ -157,24 +157,7 @@ export class Florence {
 
   async workspaceForAdult(adultId: string): Promise<WorkspaceView> {
     const household = await this.#householdForAdultOrNull(adultId);
-    const founder = household?.members.find(
-      (member) => member.id === adultId && member.kind === "adult" && member.adultSlot === 1,
-    );
-    const google = household?.googleConnections.find(
-      (connection) => connection.ownerAdultId === adultId && connection.status === "active",
-    );
-    if (founder && google && profileString(founder.profile, "onboardingCompletedAt")) {
-      await this.#stageFounderHandoff(google);
-    }
-    if (household) {
-      await this.#ensureHouseholdActivation(household.id);
-      await this.#store.ensureInitialIntelligence({
-        householdId: household.id,
-        now: this.#now().toISOString(),
-      });
-    }
-    const current = household ? await this.#householdForAdult(adultId) : null;
-    return workspaceViewSchema.parse(workspace(adultId, current, this.#messagesUrl));
+    return workspaceViewSchema.parse(workspace(adultId, household, this.#messagesUrl));
   }
 
   async familyCalendarMonthForAdult(
@@ -301,6 +284,16 @@ export class Florence {
       })),
       occurredAt: this.#now().toISOString(),
     });
+    const current = await this.#householdForAdult(adultId);
+    const google = current.googleConnections.find(
+      (connection) => connection.ownerAdultId === adultId && connection.status === "active",
+    );
+    if (google) await this.#stageFounderHandoff(google);
+    await this.#store.ensureInitialIntelligence({
+      householdId: current.id,
+      now: this.#now().toISOString(),
+    });
+    this.#wake();
     return this.workspaceForAdult(adultId);
   }
 
@@ -470,12 +463,14 @@ export class Florence {
       audience: "private" as const,
       participantIdentityDigests: [input.identitySubjectDigest],
     };
+    const checkedAt = this.#now().toISOString();
     const invitation = await this.#store.readUnboundPartnerInvitation({
       providerConversationId: input.providerConversationId,
       identitySubjectDigest: input.identitySubjectDigest,
+      now: checkedAt,
     });
     let bubbles: readonly { text: string; delayMs: number }[];
-    let idempotencyPrefix: "founder-setup" | "partner-setup-reply";
+    let idempotencyPrefix: "founder-setup" | "partner-setup-expired" | "partner-setup-reply";
 
     if (invitation) {
       if (invitation.state === "declined") return true;
@@ -488,40 +483,51 @@ export class Florence {
         });
         return true;
       }
-      if (!this.#reasoner) {
-        throw new LinqError(
-          "provider_retryable",
-          "Florence setup interpretation is temporarily unavailable",
-          true,
-        );
+      if (invitation.state === "expired") {
+        await this.#store.expirePartnerInvitations({ now: checkedAt });
+        bubbles = [
+          {
+            text: "That Florence setup link has expired. Ask your partner to send a fresh invitation.",
+            delayMs: 0,
+          },
+        ];
+        idempotencyPrefix = "partner-setup-expired";
+      } else {
+        if (!this.#reasoner) {
+          throw new LinqError(
+            "provider_retryable",
+            "Florence setup interpretation is temporarily unavailable",
+            true,
+          );
+        }
+        let conversation: Awaited<ReturnType<FlorenceReasoner["converseDuringSetup"]>>;
+        try {
+          conversation = await this.#reasoner.converseDuringSetup({
+            stage: "partner_invited",
+            parentName: null,
+            currentMessage: { text: input.text, occurredAt: input.occurredAt },
+            recentMessages: [],
+            nextStep: "use_existing_partner_setup_link",
+          });
+        } catch (error) {
+          throw new LinqError(
+            "provider_retryable",
+            `Florence could not interpret the invited partner reply: ${errorText(error)}`,
+            true,
+          );
+        }
+        if (conversation.stopMessaging || conversation.declineInvitation) {
+          await this.#store.declinePartnerInvitation({
+            adultId: invitation.adultId,
+            providerConversationId: input.providerConversationId,
+            identitySubjectDigest: input.identitySubjectDigest,
+            occurredAt: input.occurredAt,
+          });
+          return true;
+        }
+        bubbles = conversation.bubbles;
+        idempotencyPrefix = "partner-setup-reply";
       }
-      let conversation: Awaited<ReturnType<FlorenceReasoner["converseDuringSetup"]>>;
-      try {
-        conversation = await this.#reasoner.converseDuringSetup({
-          stage: "partner_invited",
-          parentName: null,
-          currentMessage: { text: input.text, occurredAt: input.occurredAt },
-          recentMessages: [],
-          nextStep: "use_existing_partner_setup_link",
-        });
-      } catch (error) {
-        throw new LinqError(
-          "provider_retryable",
-          `Florence could not interpret the invited partner reply: ${errorText(error)}`,
-          true,
-        );
-      }
-      if (conversation.stopMessaging || conversation.declineInvitation) {
-        await this.#store.declinePartnerInvitation({
-          adultId: invitation.adultId,
-          providerConversationId: input.providerConversationId,
-          identitySubjectDigest: input.identitySubjectDigest,
-          occurredAt: input.occurredAt,
-        });
-        return true;
-      }
-      bubbles = conversation.bubbles;
-      idempotencyPrefix = "partner-setup-reply";
     } else {
       if (input.carrierOptOut) return true;
       if (!this.#setupOrigin || !this.#google) {
@@ -815,6 +821,9 @@ export class Florence {
     let worked = false;
     await this.#settleInboundAccepts();
     await this.#purgeExpiredArtifacts();
+    if ((await this.#store.expirePartnerInvitations({ now: this.#now().toISOString() })) > 0) {
+      worked = true;
+    }
     const inbound = await this.#store.readNextInbound(this.#now().toISOString());
     if (inbound) {
       await this.#handleInbound(inbound);
@@ -833,6 +842,18 @@ export class Florence {
       : null;
     if (familyGroup) {
       await this.#createFamilyGroup(familyGroup);
+      worked = true;
+    }
+    const incompleteActivation =
+      this.#google && this.#linqSenderPhoneNumber
+        ? await this.#store.readNextIncompleteHouseholdActivation()
+        : null;
+    if (incompleteActivation) {
+      await this.#ensureHouseholdActivation(incompleteActivation);
+      await this.#store.ensureInitialIntelligence({
+        householdId: incompleteActivation,
+        now: this.#now().toISOString(),
+      });
       worked = true;
     }
     await this.#settleInboundAccepts();
@@ -2311,13 +2332,20 @@ export class Florence {
 
   async #executePartnerInvitation(invitation: ApprovedPartnerInvitation): Promise<void> {
     if (!this.#setupOrigin || !this.#linqSenderPhoneNumber) {
-      await this.#store.retryPartnerInvitation({
+      await this.#store.failPartnerInvitationPermanently({
         adultId: invitation.partnerAdultId,
-        retryAt: later(this.#now(), RETRY_MS),
-        error: "Partner Messages setup is not configured",
+        occurredAt: this.#now().toISOString(),
       });
       return;
     }
+    let terminalDelivery:
+      | {
+          providerConversationId: string;
+          identitySubjectDigest: string;
+          providerMessageId: string;
+          issuedAt: string;
+        }
+      | undefined;
     try {
       const household = await this.#store.readHousehold({ householdId: invitation.householdId });
       const founder = household?.members.find(
@@ -2338,8 +2366,18 @@ export class Florence {
         !participant ||
         participant.phoneNumber !== invitation.partnerPhoneNumber
       ) {
-        throw new Error("Linq created a different private partner conversation");
+        throw new LinqError(
+          "provider_rejected",
+          "Linq created a different private partner conversation",
+          false,
+        );
       }
+      terminalDelivery = {
+        providerConversationId: created.providerConversationId,
+        identitySubjectDigest: participant.identitySubjectDigest,
+        providerMessageId: created.initialMessage.providerMessageId,
+        issuedAt: created.initialMessage.occurredAt,
+      };
       const setup = this.#enrollmentCodes.issuePartnerSetup({
         providerConversationId: created.providerConversationId,
         identitySubjectDigest: participant.identitySubjectDigest,
@@ -2379,10 +2417,19 @@ export class Florence {
         issuedAt: invitation.approvedAt,
       });
     } catch (error) {
-      await this.#store.retryPartnerInvitation({
+      if (!(error instanceof LinqError)) throw error;
+      if (error.retryable) {
+        await this.#store.retryPartnerInvitation({
+          adultId: invitation.partnerAdultId,
+          retryAt: later(this.#now(), RETRY_MS),
+          error: errorText(error),
+        });
+        return;
+      }
+      await this.#store.failPartnerInvitationPermanently({
         adultId: invitation.partnerAdultId,
-        retryAt: later(this.#now(), RETRY_MS),
-        error: errorText(error),
+        occurredAt: this.#now().toISOString(),
+        ...(terminalDelivery ? { delivery: terminalDelivery } : {}),
       });
     }
   }
@@ -2406,11 +2453,6 @@ export class Florence {
       providerConversationId: created.providerConversationId,
       participantIdentityDigests: created.authority.participantIdentityDigests,
       occurredAt: created.initialMessage.occurredAt,
-    });
-    await this.#ensureHouseholdActivation(work.householdId);
-    await this.#store.ensureInitialIntelligence({
-      householdId: work.householdId,
-      now: this.#now().toISOString(),
     });
   }
 
@@ -2709,6 +2751,7 @@ function workspace(
           adults.length === 2 && adults.every((adult) => activeGoogleAdultIds.has(adult.id)),
         familyGroupConnected: activeChannels.some((channel) => channel.audience === "group"),
         familyCalendarConnected: Boolean(household?.familyCalendarCreatedAt),
+        initialBriefing: household?.initialBriefingState ?? "not_ready",
       },
     },
     vault: household

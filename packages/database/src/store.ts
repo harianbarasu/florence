@@ -4398,9 +4398,8 @@ export class PostgresFlorenceStore {
         select source_id,channel_id,status,move_kind,turn_part,idempotency_key
         from messages where turn_id=${handoffTurnId} order by turn_part
       `;
-      // The active pilot household may already have the previously shipped three-bubble handoff.
       const handoffSent =
-        (handoffRows.length === 2 || handoffRows.length === 3) &&
+        handoffRows.length === 2 &&
         handoffRows.every(
           (message, index) =>
             message.source_id ===
@@ -4760,7 +4759,7 @@ export class PostgresFlorenceStore {
           from messages where turn_id=${handoffTurnId} order by turn_part for share
         `;
         if (
-          (handoffRows.length !== 2 && handoffRows.length !== 3) ||
+          handoffRows.length !== 2 ||
           handoffRows.some(
             (message, index) =>
               message.source_id !==
@@ -5771,35 +5770,20 @@ export class PostgresFlorenceStore {
         from messages where turn_id=${turnId} order by turn_part for update
       `;
       if (existing.length > 0) {
-        const exactCurrentHandoff =
-          existing.length === texts.length &&
-          existing.every(
+        if (
+          existing.length > 3 ||
+          existing.some(
             (message, index) =>
-              message.source_id ===
-                deterministicUuid(`founder-handoff\0${input.householdId}\0${input.adultId}\0${index}`) &&
-              message.channel_id === channel.id &&
-              message.move_kind === "message" &&
-              message.text === texts[index] &&
-              message.reply_to_source_id === null &&
-              message.turn_part === index &&
-              message.idempotency_key === `founder-handoff:${input.householdId}:${input.adultId}:${index}`,
-          );
-        const deployedThreeBubbleHandoff =
-          texts.length === 2 &&
-          existing.length === 3 &&
-          existing.every(
-            (message, index) =>
-              message.source_id ===
-                deterministicUuid(`founder-handoff\0${input.householdId}\0${input.adultId}\0${index}`) &&
-              message.channel_id === channel.id &&
-              message.move_kind === "message" &&
-              message.reply_to_source_id === null &&
-              message.turn_part === index &&
-              message.idempotency_key === `founder-handoff:${input.householdId}:${input.adultId}:${index}`,
-          ) &&
-          existing[0]?.text === texts[0] &&
-          existing[2]?.text === texts[1];
-        if (!exactCurrentHandoff && !deployedThreeBubbleHandoff) {
+              message.source_id !==
+                deterministicUuid(`founder-handoff\0${input.householdId}\0${input.adultId}\0${index}`) ||
+              message.channel_id !== channel.id ||
+              message.move_kind !== "message" ||
+              message.text !== texts[index] ||
+              message.reply_to_source_id !== null ||
+              message.turn_part !== index ||
+              message.idempotency_key !== `founder-handoff:${input.householdId}:${input.adultId}:${index}`,
+          )
+        ) {
           throw new FlorenceStoreConflict("The founder handoff was already staged with different content");
         }
         return existing.map((message) => message.source_id);

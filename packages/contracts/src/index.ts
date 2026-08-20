@@ -349,7 +349,18 @@ export const setupSessionInputSchema = z
   .strict();
 export type SetupSessionInput = z.infer<typeof setupSessionInputSchema>;
 
-export const sessionResponseSchema = z.object({ adultId: idSchema }).strict();
+export const webAccessPathSchema = z.enum(["/", "/calendar", "/vault", "/preferences"]);
+export type WebAccessPath = z.infer<typeof webAccessPathSchema>;
+
+export const accessSessionInputSchema = z.object({ accessToken: nonempty(2_000) }).strict();
+export type AccessSessionInput = z.infer<typeof accessSessionInputSchema>;
+
+export const sessionInputSchema = z.union([setupSessionInputSchema, accessSessionInputSchema]);
+export type SessionInput = z.infer<typeof sessionInputSchema>;
+
+export const sessionResponseSchema = z
+  .object({ adultId: idSchema, accessPath: webAccessPathSchema.optional() })
+  .strict();
 export type SessionResponse = z.infer<typeof sessionResponseSchema>;
 
 export const patchFactInputSchema = z

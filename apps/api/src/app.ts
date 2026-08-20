@@ -18,7 +18,7 @@ import {
   patchFactInputSchema,
   patchWatchInputSchema,
   preferencesInputSchema,
-  setupSessionInputSchema,
+  sessionInputSchema,
 } from "@florence/contracts";
 import { FlorenceStoreConflict, FlorenceStoreUnauthorized, PostgresFlorenceStore } from "@florence/database";
 import { GoogleConnection, GoogleConnectionError } from "@florence/google";
@@ -161,8 +161,15 @@ export async function buildApp(
 
   app.post("/api/v1/session", async (request, reply) => {
     reply.header("Cache-Control", "no-store");
-    const body = setupSessionInputSchema.safeParse(request.body);
+    const body = sessionInputSchema.safeParse(request.body);
     if (!body.success) return invalidRequest(reply);
+    if ("accessToken" in body.data) {
+      const access = await dependencies.florence.redeemAccessLink(body.data.accessToken);
+      if (!access) return reply.status(401).send({ error: "invalid_or_expired_access_link" });
+      const session = dependencies.callerResolver.issueSession(access.adultId);
+      reply.header("Set-Cookie", sessionCookie(session.token, process.env.NODE_ENV === "production"));
+      return { adultId: session.caller.adultId, accessPath: access.accessPath };
+    }
     const enrollment = await dependencies.florence.redeemSetupLink(body.data).catch((error: unknown) => {
       if (error instanceof FlorenceStoreConflict) return null;
       throw error;

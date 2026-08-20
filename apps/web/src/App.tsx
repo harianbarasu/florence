@@ -26,7 +26,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { type FormEvent, useEffect, useState } from "react";
-import { FlorenceRequestError } from "./api";
+import { createSession, FlorenceRequestError } from "./api";
 import { MemberEditor } from "./components/MemberEditor";
 import {
   queryKeys,
@@ -47,6 +47,7 @@ import {
 } from "./queries";
 
 const onboardingEntry = consumeOnboardingEntry();
+let accessSessionRequest: ReturnType<typeof createSession> | null = null;
 const CALENDAR_WEEKDAYS = [
   { short: "S", long: "Sunday" },
   { short: "M", long: "Monday" },
@@ -64,9 +65,11 @@ type CalendarMonthCell = {
 };
 
 export function AppShell() {
-  const session = useSession(onboardingEntry.setupToken === null);
-  const workspace = useWorkspace(onboardingEntry.setupToken === null && session.isSuccess);
+  const directEntry = onboardingEntry.setupToken !== null || onboardingEntry.accessToken !== null;
+  const session = useSession(!directEntry);
+  const workspace = useWorkspace(!directEntry && session.isSuccess);
   if (onboardingEntry.setupToken) return <SetupPage setupToken={onboardingEntry.setupToken} />;
+  if (onboardingEntry.accessToken) return <AccessPage accessToken={onboardingEntry.accessToken} />;
   if (session.isLoading) return <PageLoader />;
   if (session.error instanceof FlorenceRequestError && session.error.status === 401) {
     return <StartInMessagesPage />;
@@ -95,6 +98,37 @@ export function AppShell() {
       </div>
     </div>
   );
+}
+
+function AccessPage({ accessToken }: { accessToken: string }) {
+  const [error, setError] = useState<Error | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    accessSessionRequest ??= createSession({ accessToken });
+    void accessSessionRequest.then(
+      (session) => {
+        if (active) window.location.replace(session.accessPath ?? "/");
+      },
+      (cause: unknown) => {
+        if (!active) return;
+        setError(
+          new Error(
+            cause instanceof FlorenceRequestError && cause.status === 401
+              ? "This private link is no longer valid. Ask Florence for a fresh link in your private Messages conversation."
+              : cause instanceof Error
+                ? cause.message
+                : "Florence could not open this private link.",
+          ),
+        );
+      },
+    );
+    return () => {
+      active = false;
+    };
+  }, [accessToken]);
+
+  return error ? <LoadError error={error} /> : <PageLoader />;
 }
 
 function SetupPage({ setupToken }: { setupToken: string }) {
@@ -247,10 +281,12 @@ function StartInMessagesPage() {
   return (
     <SetupFrame>
       <SetupHeading
-        title="Start in Messages"
-        detail="Text Florence “Hi,” then open the private setup link she sends back in that conversation."
+        title="Open Florence from Messages"
+        detail="In your private conversation, ask Florence for a fresh web link, then open the link she sends there."
       />
-      <p className="setup-footnote">There’s no password or access code to keep track of.</p>
+      <p className="setup-footnote">
+        Florence will confirm it’s really your conversation before you sign in.
+      </p>
     </SetupFrame>
   );
 }
@@ -297,7 +333,7 @@ function GoogleSetupSuccess({ view }: { view: WorkspaceView }) {
       ) : (
         <p className="setup-footnote">You can close this page and return to Messages.</p>
       )}
-      <a className="setup-secondary-action" href="/workspace">
+      <a className="setup-secondary-action" href="/preferences">
         Open Florence settings
       </a>
     </SetupFrame>
@@ -2148,22 +2184,25 @@ function formatUsPhoneNumber(value: string): string {
 
 function consumeOnboardingEntry(): {
   setupToken: string | null;
+  accessToken: string | null;
   googleStatus: string | null;
   setupComplete: boolean;
 } {
   const url = new URL(window.location.href);
   const fragment = new URLSearchParams(url.hash.startsWith("#") ? url.hash.slice(1) : url.hash);
   const hasSetupFragment = fragment.has("s");
+  const hasAccessFragment = fragment.has("a");
   const setupToken = fragment.get("s")?.trim() || null;
+  const accessToken = setupToken === null ? fragment.get("a")?.trim() || null : null;
   const googleStatus = url.searchParams.get("google")?.trim() || null;
   const setupComplete = url.searchParams.get("setup") === "complete";
-  if (hasSetupFragment) url.hash = "";
+  if (hasSetupFragment || hasAccessFragment) url.hash = "";
   if (url.searchParams.has("google")) url.searchParams.delete("google");
   if (url.searchParams.has("setup")) url.searchParams.delete("setup");
-  if (hasSetupFragment || googleStatus !== null || setupComplete) {
+  if (hasSetupFragment || hasAccessFragment || googleStatus !== null || setupComplete) {
     window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
   }
-  return { setupToken, googleStatus, setupComplete };
+  return { setupToken, accessToken, googleStatus, setupComplete };
 }
 
 function setupError(cause: unknown): string {

@@ -4,7 +4,7 @@ import type {
   PatchFactInput,
   PatchWatchInput,
   PreferencesInput,
-  SetupSessionInput,
+  SessionInput,
 } from "@florence/contracts";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -37,7 +37,7 @@ export function useSession(enabled = true) {
 export function useCreateSession() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (input: SetupSessionInput) => createSession(input),
+    mutationFn: (input: SessionInput) => createSession(input),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: queryKeys.session });
       await queryClient.invalidateQueries({ queryKey: queryKeys.workspace });

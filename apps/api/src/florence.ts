@@ -76,7 +76,7 @@ import {
   type LinqReaction,
   type LinqReactionProposal,
 } from "@florence/linq";
-import type { EnrollmentCodes } from "./enrollment.js";
+import type { EnrollmentCodes, WebAccessPath } from "./enrollment.js";
 import {
   type FlorenceBoundedPrivateGoogleEvidence,
   type FlorenceDecision,
@@ -664,6 +664,54 @@ export class Florence {
     return result;
   }
 
+  async redeemAccessLink(
+    accessToken: string,
+  ): Promise<{ adultId: string; accessPath: WebAccessPath } | null> {
+    const checkedAt = this.#now();
+    const access = this.#enrollmentCodes.verifyWebAccess(accessToken, checkedAt);
+    if (!access) return null;
+    const observed = await this.#linq.observeChat(access.providerConversationId);
+    if (
+      observed.audience !== "private" ||
+      observed.participantIdentityDigests.length !== 1 ||
+      observed.participantIdentityDigests[0] !== access.identitySubjectDigest ||
+      observed.participants.length !== 1 ||
+      observed.participants[0]?.identitySubjectDigest !== access.identitySubjectDigest
+    ) {
+      return null;
+    }
+    const authority = await this.#store.resolveLinqAuthority({
+      providerConversationId: access.providerConversationId,
+      audience: "private",
+      participantIdentityDigests: [access.identitySubjectDigest],
+      senderIdentitySubjectDigest: access.identitySubjectDigest,
+      occurredAt: checkedAt.toISOString(),
+    });
+    if (
+      !authority ||
+      authority.stopped ||
+      authority.householdId !== access.householdId ||
+      authority.senderAdultId !== access.adultId ||
+      authority.adultIds.length !== 1 ||
+      authority.adultIds[0] !== access.adultId ||
+      authority.expectedParticipantIdentityDigests.length !== 1 ||
+      authority.expectedParticipantIdentityDigests[0] !== access.identitySubjectDigest
+    ) {
+      return null;
+    }
+    const household = await this.#householdForAdultOrNull(access.adultId);
+    const adult = household?.members.find((member) => member.id === access.adultId);
+    if (
+      household?.id !== access.householdId ||
+      adult?.kind !== "adult" ||
+      adult.status !== "verified" ||
+      !this.#enrollmentCodes.verifyWebAccess(accessToken, this.#now())
+    ) {
+      return null;
+    }
+    return { adultId: access.adultId, accessPath: access.accessPath };
+  }
+
   async reconcileObservedFamilyGroup(input: {
     providerConversationId: string;
     audience: "private" | "group";
@@ -952,7 +1000,8 @@ export class Florence {
         });
         return;
       }
-      if (this.#setupOrigin) bubbles.push({ text: `${this.#setupOrigin}/`, delayMs: 0 });
+      const accessUrl = this.#issueWebAccessUrl(turn, "/");
+      if (accessUrl) bubbles.push({ text: accessUrl, delayMs: 0 });
       await this.#store.commitTurn(
         decisionCommit(
           turn,
@@ -1104,7 +1153,10 @@ export class Florence {
       workTimer = null;
       if (workCue) await workCue;
       controller.signal.throwIfAborted();
-      const guarded = enforcePolicy(decision, turn.message.moveKind !== "reaction");
+      const guarded = this.#appendRequestedWebAccess(
+        turn,
+        enforcePolicy(decision, turn.message.moveKind !== "reaction"),
+      );
       const approval = guarded.policy.schedule ? approvedCalendarOffer : null;
       const partnerApproval = guarded.policy.stopMessaging ? null : approvedPartnerInvitation;
       const committedDecision = approval ? { ...guarded, calendar: null } : guarded;
@@ -1300,7 +1352,7 @@ export class Florence {
         senderName: members.get(turn.message.speaker) ?? "Family member",
         moveKind: turn.message.moveKind,
         text: turnText(turn.message),
-        authoredText: turn.message.authoredText,
+        authoredText: turn.message.authoredText ? redactWebAccessToken(turn.message.authoredText) : null,
         voiceTranscriptPresent: turn.message.voiceTranscriptPresent,
         occurredAt: turn.message.occurredAt,
         images: currentImages.map(reasonerImage),
@@ -2662,6 +2714,53 @@ export class Florence {
     };
   }
 
+  #appendRequestedWebAccess(turn: InboundTurn, decision: FlorenceDecision): FlorenceDecision {
+    const accessPath = decision.webAccessPath ?? null;
+    const authorized =
+      accessPath !== null &&
+      turn.authority.audience === "private" &&
+      turn.message.moveKind !== "reaction" &&
+      Boolean(turn.message.authoredText?.trim());
+    const accessUrl = authorized && accessPath ? this.#issueWebAccessUrl(turn, accessPath) : null;
+    if (!accessUrl) return { ...decision, webAccessPath: null };
+    const bubbles = decision.conversation.bubbles.map((bubble) => ({ ...bubble }));
+    if (bubbles.length < 3) bubbles.push({ text: accessUrl, delayMs: 0 });
+    else {
+      const last = bubbles.at(-1);
+      if (last) last.text = `${last.text}\n\n${accessUrl}`;
+    }
+    return {
+      ...decision,
+      conversation: { ...decision.conversation, bubbles },
+      webAccessPath: null,
+    };
+  }
+
+  #issueWebAccessUrl(turn: InboundTurn, accessPath: WebAccessPath): string | null {
+    if (!this.#setupOrigin || turn.authority.audience !== "private" || turn.authority.stopped) return null;
+    const identitySubjectDigest = turn.authority.expectedParticipantIdentityDigests[0];
+    const adult = turn.household.members.find((member) => member.id === turn.authority.senderAdultId);
+    if (
+      !identitySubjectDigest ||
+      turn.authority.expectedParticipantIdentityDigests.length !== 1 ||
+      turn.authority.adultIds.length !== 1 ||
+      turn.authority.adultIds[0] !== turn.authority.senderAdultId ||
+      adult?.kind !== "adult" ||
+      adult.status !== "verified"
+    ) {
+      return null;
+    }
+    const access = this.#enrollmentCodes.issueWebAccess({
+      providerConversationId: turn.authority.providerConversationId,
+      identitySubjectDigest,
+      householdId: turn.authority.householdId,
+      adultId: turn.authority.senderAdultId,
+      accessPath,
+      occurredAt: this.#now().toISOString(),
+    });
+    return `${this.#setupOrigin}${accessPath}#a=${encodeURIComponent(access.token)}`;
+  }
+
   #requiredGoogle(): GoogleConnection {
     if (!this.#google) throw new Error("Google Workspace is not configured");
     return this.#google;
@@ -2871,6 +2970,7 @@ function enforcePolicy(decision: FlorenceDecision, announceRestrictions: boolean
       interest: null,
       calendar: null,
       householdUpdate: null,
+      webAccessPath: null,
     };
   }
   const retain = decision.policy.retain;
@@ -2905,6 +3005,7 @@ function enforcePolicy(decision: FlorenceDecision, announceRestrictions: boolean
     interest,
     calendar,
     householdUpdate: decision.householdUpdate,
+    webAccessPath: decision.webAccessPath ?? null,
     ...(decision.researchUrls ? { researchUrls: [...decision.researchUrls] } : {}),
   };
 }
@@ -3266,9 +3367,13 @@ function reasonerImage(image: InboundTurn["message"]["images"][number]): {
 }
 
 function turnText(turn: InboundTurn["message"] | InboundTurn["recentMessages"][number]): string {
-  if (turn.text?.trim()) return turn.text;
+  if (turn.text?.trim()) return redactWebAccessToken(turn.text);
   if (turn.reaction) return `Reacted ${turn.reaction}`;
   return "Shared a family attachment.";
+}
+
+function redactWebAccessToken(value: string): string {
+  return value.replace(/wa1\.[A-Za-z0-9_-]+/gu, "[secure web link]");
 }
 
 function approvalReplyTargetsPrompt(

@@ -82,6 +82,8 @@ const INITIAL_PRIVATE_SCHOOL_FACT = "Maya attends Muir Elementary.";
 const UPDATED_PRIVATE_SCHOOL_FACT = "Maya attends Muir Academy.";
 const ORDINARY_UNUSED_GMAIL_QUERY = "ordinary-unused-family-email";
 const ORDINARY_UNUSED_GMAIL_QUESTION = "Is there anything useful in that family email?";
+const WEB_CALENDAR_ACCESS_REQUEST = "Can you send me a fresh link to my Florence calendar?";
+const WEB_ACCESS_FOLLOW_UP = "Thanks — is that private to me?";
 const OVERLAP_GMAIL_SUBJECT = "School bus route reminder";
 const OVERLAP_GMAIL_FACT_SLOT = "child:maya:school_bus";
 
@@ -208,9 +210,43 @@ const release = TEST_DATABASE_URL ? describe : describe.skip;
 release("Florence parent journeys", () => {
   test("keeps private setup useful and recovers one two-parent family loop without duplicate work", async () => {
     await assertFunctionCallContinuationIsWireSafe();
-    const harness = await createHarness();
+    let accessFollowUpHistory: readonly string[] = [];
+    let accessFollowUpAuthoredText: string | null = null;
+    const harness = await createHarness(async (input) => {
+      if (input.currentMessage.text === WEB_CALENDAR_ACCESS_REQUEST) {
+        return decision({
+          bubbles: [{ text: "Here’s a fresh private link.", delayMs: 0 }],
+          webAccessPath: "/calendar",
+        });
+      }
+      if (input.currentMessage.text.startsWith(WEB_ACCESS_FOLLOW_UP)) {
+        accessFollowUpHistory = input.recentMessages.map((message) => message.text);
+        accessFollowUpAuthoredText = input.currentMessage.authoredText;
+      }
+      return decision();
+    });
     harness.state.founderProductRecenterReview = true;
     await harness.setupFounder();
+    await harness.accept("private", "resume-incomplete-setup", "How do I finish connecting Google?");
+    await harness.drain();
+    const setupAccessUrl = harness.accessLinkFor(PRIVATE_FOUNDER);
+    expect(setupAccessUrl.pathname).toBe("/");
+    expect(setupAccessUrl.hash).toMatch(/^#a=wa1\./);
+    expect(
+      harness.linq.messages.some(
+        (message) =>
+          message.providerConversationId === PRIVATE_FOUNDER && message.text === "https://florence.test/",
+      ),
+    ).toBe(false);
+    const setupAccessApp = await harness.webApp(false);
+    const setupAccessResponse = await setupAccessApp.inject({
+      method: "POST",
+      url: "/api/v1/session",
+      payload: { accessToken: new URLSearchParams(setupAccessUrl.hash.slice(1)).get("a") },
+    });
+    await setupAccessApp.close();
+    expect(setupAccessResponse.statusCode).toBe(200);
+    expect(setupAccessResponse.json()).toEqual({ adultId: harness.founderAdultId, accessPath: "/" });
     const compoundSurnamePreview = await harness.florence.putMember(
       harness.founderAdultId,
       harness.founderAdultId,
@@ -493,6 +529,69 @@ release("Florence parent journeys", () => {
       initialBriefing: "sent",
     });
     expect(partner.workspace.setup).toEqual(founder.workspace.setup);
+
+    const privateAccessLinksBeforeRequest = harness.accessLinksFor(PRIVATE_FOUNDER).length;
+    await harness.accept("private", "calendar-web-access", WEB_CALENDAR_ACCESS_REQUEST);
+    await harness.drain();
+    const calendarAccessUrl = harness.accessLinkFor(PRIVATE_FOUNDER);
+    expect(calendarAccessUrl.pathname).toBe("/calendar");
+    expect(harness.accessLinksFor(PRIVATE_FOUNDER)).toHaveLength(privateAccessLinksBeforeRequest + 1);
+
+    const groupAccessLinksBeforeRequest = harness.accessLinksFor(FAMILY_GROUP).length;
+    await harness.accept("group", "group-calendar-web-access", WEB_CALENDAR_ACCESS_REQUEST);
+    await harness.drain();
+    expect(harness.accessLinksFor(FAMILY_GROUP)).toHaveLength(groupAccessLinksBeforeRequest);
+
+    const privateAccessLinksBeforeVoiceEvidence = harness.accessLinksFor(PRIVATE_FOUNDER).length;
+    const voiceOnlyAccess = await harness.florence.acceptInbound({
+      ...harness.inbound("private", "voice-only-calendar-web-access", WEB_CALENDAR_ACCESS_REQUEST),
+      authoredText: null,
+      voiceTranscriptPresent: true,
+    });
+    expect(voiceOnlyAccess).not.toBeNull();
+    await harness.drain();
+    expect(harness.accessLinksFor(PRIVATE_FOUNDER)).toHaveLength(privateAccessLinksBeforeVoiceEvidence);
+
+    await harness.accept(
+      "private",
+      "calendar-web-access-follow-up",
+      `${WEB_ACCESS_FOLLOW_UP} ${calendarAccessUrl.toString()}`,
+    );
+    await harness.drain();
+    expect(accessFollowUpHistory.some((text) => text.includes("wa1."))).toBe(false);
+    expect(accessFollowUpHistory.some((text) => text.includes("[secure web link]"))).toBe(true);
+    expect(accessFollowUpAuthoredText).not.toContain("wa1.");
+    expect(accessFollowUpAuthoredText).toContain("[secure web link]");
+
+    const calendarAccessToken = new URLSearchParams(calendarAccessUrl.hash.slice(1)).get("a");
+    if (!calendarAccessToken) throw new Error("The calendar access token was not sent");
+    const originalFounderAuthority = harness.linq.authorities.get(PRIVATE_FOUNDER);
+    if (!originalFounderAuthority) throw new Error("The founder private authority is unavailable");
+    harness.linq.authorities.set(PRIVATE_FOUNDER, {
+      audience: "group",
+      participantIdentityDigests: [FOUNDER_IDENTITY],
+    });
+    const rejectedAccessApp = await harness.webApp(false);
+    const rejectedAccessResponse = await rejectedAccessApp.inject({
+      method: "POST",
+      url: "/api/v1/session",
+      payload: { accessToken: calendarAccessToken },
+    });
+    await rejectedAccessApp.close();
+    expect(rejectedAccessResponse.statusCode).toBe(401);
+    harness.linq.authorities.set(PRIVATE_FOUNDER, originalFounderAuthority);
+    const calendarAccessApp = await harness.webApp(false);
+    const calendarAccessResponse = await calendarAccessApp.inject({
+      method: "POST",
+      url: "/api/v1/session",
+      payload: { accessToken: calendarAccessToken },
+    });
+    await calendarAccessApp.close();
+    expect(calendarAccessResponse.statusCode).toBe(200);
+    expect(calendarAccessResponse.json()).toEqual({
+      adultId: harness.founderAdultId,
+      accessPath: "/calendar",
+    });
 
     const visibleCounts = {
       chats: harness.linq.createdChats.length,
@@ -1636,6 +1735,22 @@ class Harness {
     return token;
   }
 
+  accessLinksFor(providerConversationId: string): URL[] {
+    return this.linq.messages.flatMap((candidate) => {
+      if (candidate.providerConversationId !== providerConversationId || !candidate.text.includes("#a=")) {
+        return [];
+      }
+      const link = /https:\/\/\S+/.exec(candidate.text)?.[0];
+      return link ? [new URL(link)] : [];
+    });
+  }
+
+  accessLinkFor(providerConversationId: string): URL {
+    const link = this.accessLinksFor(providerConversationId).at(-1);
+    if (!link) throw new Error("A private Florence access link was not sent");
+    return link;
+  }
+
   async webApp(requireSession = true) {
     if (requireSession && !this.sessionCookieValue) throw new Error("Founder session has not been created");
     return buildApp(
@@ -2582,6 +2697,7 @@ function decision(
     interest?: FlorenceDecision["interest"];
     calendar?: FlorenceDecision["calendar"];
     householdUpdate?: FlorenceDecision["householdUpdate"];
+    webAccessPath?: FlorenceDecision["webAccessPath"];
   } = {},
 ): FlorenceDecision {
   return {
@@ -2596,6 +2712,7 @@ function decision(
     interest: input.interest ?? null,
     calendar: input.calendar ?? null,
     householdUpdate: input.householdUpdate ?? null,
+    webAccessPath: input.webAccessPath ?? null,
   };
 }
 

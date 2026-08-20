@@ -8,8 +8,8 @@ import {
   type PatchFactInput,
   type PatchWatchInput,
   type PreferencesInput,
+  type SessionInput,
   type SessionResponse,
-  type SetupSessionInput,
   sessionResponseSchema,
   type WorkspaceView,
   workspaceResponseSchema,
@@ -53,7 +53,7 @@ export async function getSession(): Promise<SessionResponse> {
   return sessionResponseSchema.parse(await requestJson("/api/v1/session"));
 }
 
-export async function createSession(input: SetupSessionInput): Promise<SessionResponse> {
+export async function createSession(input: SessionInput): Promise<SessionResponse> {
   return sessionResponseSchema.parse(
     await requestJson("/api/v1/session", {
       method: "POST",

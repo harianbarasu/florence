@@ -289,9 +289,16 @@ export async function buildApp(
     if (!caller) return;
     const body = disconnectGoogleConnectionInputSchema.safeParse(request.body);
     if (!body.success) return invalidRequest(reply);
-    return {
-      workspace: await dependencies.florence.disconnectGoogle(caller.adultId, body.data.connectionId),
-    };
+    reply.header("Cache-Control", "private, no-store");
+    return dependencies.florence.disconnectGoogle(caller.adultId, body.data.connectionId);
+  });
+
+  app.delete("/api/v1/workspace/google-derived-data", async (request, reply) => {
+    const caller = await requireAdult(request, reply, dependencies.callerResolver);
+    if (!caller) return;
+    if (request.body !== undefined) return invalidRequest(reply);
+    reply.header("Cache-Control", "private, no-store");
+    return dependencies.florence.deleteGoogleDerivedData(caller.adultId);
   });
 
   app.get<{ Querystring: { state?: string; code?: string; error?: string } }>(

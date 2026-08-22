@@ -4,6 +4,8 @@ import {
   type CompleteFamilyOnboardingInput,
   calendarMonthSchema,
   completeFamilyOnboardingInputSchema,
+  type DeleteGoogleDerivedDataResponse,
+  type DisconnectGoogleConnectionResponse,
   type FamilyCalendarMonthView,
   type FamilyMemberInput,
   type FamilyMemberMutationInput,
@@ -426,16 +428,74 @@ export class Florence {
     return connection;
   }
 
-  async disconnectGoogle(adultId: string, connectionId: string): Promise<WorkspaceView> {
+  async disconnectGoogle(adultId: string, connectionId: string): Promise<DisconnectGoogleConnectionResponse> {
     const household = await this.#householdForAdult(adultId);
-    await this.#requiredGoogle().disconnect({
+    const result = await this.#requiredGoogle().disconnect({
       connectionId,
       householdId: household.id,
       ownerAdultId: adultId,
+      notifyReconnect: false,
       now: this.#now().toISOString(),
     });
     this.#wake();
-    return this.workspaceForAdult(adultId);
+    return {
+      workspace: await this.workspaceForAdult(adultId),
+      localAccess: "disconnected",
+      providerRevocation: result.providerRevocation,
+    };
+  }
+
+  async deleteGoogleDerivedData(adultId: string): Promise<DeleteGoogleDerivedDataResponse> {
+    const household = await this.#householdForAdult(adultId);
+    const google = this.#google;
+    const revocations: ("confirmed" | "unconfirmed" | "not-needed")[] = [];
+    let disconnectedConnections = 0;
+    if (google) {
+      const activeConnections = await google.status({
+        householdId: household.id,
+        ownerAdultId: adultId,
+      });
+      for (const connection of activeConnections) {
+        try {
+          const disconnected = await google.disconnect({
+            connectionId: connection.connectionId,
+            householdId: household.id,
+            ownerAdultId: adultId,
+            notifyReconnect: false,
+            now: this.#now().toISOString(),
+          });
+          disconnectedConnections += 1;
+          revocations.push(disconnected.providerRevocation);
+        } catch (error) {
+          if (!(error instanceof GoogleConnectionError) || error.code !== "not_found") throw error;
+        }
+      }
+    }
+    const purged = await this.#store.deleteGoogleDerivedData({
+      householdId: household.id,
+      adultId,
+      now: this.#now().toISOString(),
+    });
+    disconnectedConnections += purged.additionalActiveConnectionsDisconnected;
+    if (purged.additionalActiveConnectionsDisconnected > 0) revocations.push("unconfirmed");
+    const providerRevocation = revocations.includes("unconfirmed")
+      ? "unconfirmed"
+      : revocations.includes("confirmed")
+        ? "confirmed"
+        : "not-needed";
+    this.#wake();
+    return {
+      workspace: await this.workspaceForAdult(adultId),
+      providerRevocation,
+      deletion: {
+        disconnectedConnections,
+        googleSources: purged.googleSources,
+        facts: purged.facts,
+        watches: purged.watches,
+        calendarActions: purged.calendarActions,
+        unsentMessages: purged.unsentMessages,
+      },
+    };
   }
 
   resolveLinqAuthority(
@@ -1166,6 +1226,7 @@ export class Florence {
           approveCalendarOffer: approval,
           approvePartnerInvitation: partnerApproval,
           googleEvidence: context.googleEvidence(),
+          googleConnectionIdsUsed: context.googleConnectionIdsUsed(),
         }),
       );
     } catch (error) {
@@ -1262,11 +1323,13 @@ export class Florence {
     input: FlorenceReasonerInput;
     reads: FlorenceReadTools;
     googleEvidence: () => readonly GoogleEvidenceDraft[];
+    googleConnectionIdsUsed: () => readonly string[];
   }> {
     const members = new Map(turn.household.members.map((member) => [member.id, member.displayName]));
     const visibleSources = memorySources(turn.facts);
     const sourceIndex = new Map(visibleSources.map((source) => [source.sourceId, source]));
     const googleEvidence = new Map<string, GoogleEvidenceDraft>();
+    const googleConnectionIdsUsed = new Set<string>();
     const visibility = turn.authority.audience === "group" ? "shared" : "adult_private";
     const currentDocuments = (turn.currentDocuments ?? []).slice(-3);
     const jobMessages = [...turn.supersededMessages, turn.message];
@@ -1327,6 +1390,17 @@ export class Florence {
               })
             ).filter((connection) => connection.connectionId === familyCalendarCredential.connectionId)
           : [];
+    const googleBackedContextVisible =
+      turn.facts.some((fact) =>
+        fact.sources.some(
+          (source) => source.kind === "gmail" || source.kind === "calendar" || source.kind === "google_file",
+        ),
+      ) || turn.pendingFollowUps.some((followUp) => followUp.googleBacked);
+    if (googleBackedContextVisible) {
+      for (const connection of googleConnections) {
+        if (connection.status === "active") googleConnectionIdsUsed.add(connection.connectionId);
+      }
+    }
     const input: FlorenceReasonerInput = {
       household: {
         householdId: turn.household.id,
@@ -1449,6 +1523,7 @@ export class Florence {
             timeMax,
             limit,
           });
+          if (read.status !== "unavailable") googleConnectionIdsUsed.add(connectionId);
           return {
             status: read.status,
             events: read.events.map((event) =>
@@ -1529,6 +1604,7 @@ export class Florence {
           query,
           limit,
         });
+        googleConnectionIdsUsed.add(connectionId);
         return evidence.messages.map((message) => {
           const source = draftGmailEvidence({
             householdId: turn.authority.householdId,
@@ -1551,7 +1627,12 @@ export class Florence {
         });
       },
     };
-    return { input, reads, googleEvidence: () => [...googleEvidence.values()] };
+    return {
+      input,
+      reads,
+      googleEvidence: () => [...googleEvidence.values()],
+      googleConnectionIdsUsed: () => [...googleConnectionIdsUsed],
+    };
   }
 
   async #deliverOutbound(sourceId: string, retryTransient = true): Promise<void> {
@@ -3036,6 +3117,7 @@ function decisionCommit(
     approveCalendarOffer?: InboundTurn["pendingCalendarOffers"][number] | null;
     approvePartnerInvitation?: InboundTurn["pendingPartnerInvitation"];
     googleEvidence?: readonly GoogleEvidenceDraft[];
+    googleConnectionIdsUsed?: readonly string[];
   } = {},
 ): CommitTurnInput {
   if (decision.policy.stopMessaging) {
@@ -3199,6 +3281,7 @@ function decisionCommit(
   return {
     sourceId: turn.message.sourceId,
     googleEvidence: options.googleEvidence ?? [],
+    googleConnectionIdsUsed: options.googleConnectionIdsUsed ?? [],
     facts,
     deleteFactIds,
     finiteMonitors,

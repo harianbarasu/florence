@@ -494,7 +494,10 @@ deployment:
 9. one automatic monitor produces a meaningful update or useful silence;
 10. one durable interest produces a sourced, genuinely relevant opportunity;
 11. a parent corrects something naturally and the group, calendar, monitor, and
-    Vault converge on the corrected truth.
+    Vault converge on the corrected truth;
+12. a parent disconnects Google before a queued Google-derived update is sent,
+    sees the retained-data boundary, deletes their Google-derived data, and can
+    reconnect without changing the shared family calendar.
 
 Two gates are absolute: no unauthorized disclosure from one adult's private
 context into the household, and no unauthorized consequential action.

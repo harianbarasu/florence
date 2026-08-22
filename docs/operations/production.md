@@ -115,8 +115,10 @@ On a disposable empty database, run `pnpm db:migrate` twice. Both runs must pass
     Google connection, automatic exact family group and shared Calendar, the
     combined briefing, a real forwarded message/image/PDF/voice note, sourced
     memory, one finite monitor, one relevant interest recommendation, one
-    family-Calendar create/update/delete, correction, Vault deletion, and the
-    read-only web Calendar.
+    family-Calendar create/update/delete, correction, Vault deletion, the
+    read-only web Calendar, and a Google disconnect/delete/reconnect that
+    suppresses queued Google-derived output while preserving sent Messages and
+    provider-created family Calendar events.
 11. Enable autodeploy only after the full synthetic journey and the two-phone experience pass.
 
 ## Recovery

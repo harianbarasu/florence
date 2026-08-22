@@ -2,6 +2,7 @@ import type {
   CompleteFamilyOnboardingInput,
   FamilyCalendarEvent,
   FamilyMemberProfile,
+  GoogleProviderRevocation,
   PatchFactInput,
   PatchWatchInput,
   PreferencesInput,
@@ -33,6 +34,7 @@ import {
   useCompleteFamilyOnboarding,
   useCreateSession,
   useDeleteFact,
+  useDeleteGoogleDerivedData,
   useDeleteSession,
   useDeleteWatch,
   useDisconnectGoogleConnection,
@@ -79,7 +81,9 @@ export function AppShell() {
   if (workspace.isError) return <LoadError error={workspace.error} />;
   if (!workspace.data) return <PageLoader />;
   const googleConnected = workspace.data.workspace.googleConnections.length > 0;
-  if (!googleConnected) return <GoogleSetupGate status={onboardingEntry.googleStatus} />;
+  if (!googleConnected && !workspace.data.workspace.setup.ownOnboardingComplete) {
+    return <GoogleSetupGate status={onboardingEntry.googleStatus} />;
+  }
   if (!workspace.data.workspace.setup.ownOnboardingComplete) {
     return <FamilySetupPage view={workspace.data} />;
   }
@@ -312,6 +316,7 @@ function GoogleSetupGate({ status }: { status: string | null }) {
         isPending={startGoogle.isPending}
         onConnect={() => void connectGoogle()}
       />
+      <GoogleDataDeletionControl />
     </SetupFrame>
   );
 }
@@ -1524,12 +1529,39 @@ function PermissionSetting({
 function GoogleConnector({ view }: { view: WorkspaceView }) {
   const start = useStartGoogleConnection();
   const disconnect = useDisconnectGoogleConnection();
+  const deleteGoogleData = useDeleteGoogleDerivedData();
   const accounts = view.workspace.googleConnections;
-  const error = start.error ?? disconnect.error;
+  const [confirmation, setConfirmation] = useState<
+    { kind: "disconnect"; connectionId: string; emailLabel: string } | { kind: "delete" } | null
+  >(null);
+  const [resultNotice, setResultNotice] = useState<string | null>(null);
+  const error = start.error ?? disconnect.error ?? deleteGoogleData.error;
+  const isPending = disconnect.isPending || deleteGoogleData.isPending;
 
   async function connect() {
-    const result = await start.mutateAsync();
-    window.location.assign(result.authorizationUrl);
+    try {
+      const result = await start.mutateAsync();
+      window.location.assign(result.authorizationUrl);
+    } catch {
+      return;
+    }
+  }
+
+  async function confirmAction() {
+    if (!confirmation) return;
+    try {
+      if (confirmation.kind === "disconnect") {
+        const result = await disconnect.mutateAsync(confirmation.connectionId);
+        setConfirmation(null);
+        setResultNotice(googleActionResult("disconnect", result.providerRevocation));
+        return;
+      }
+      const result = await deleteGoogleData.mutateAsync();
+      setConfirmation(null);
+      setResultNotice(googleActionResult("delete", result.providerRevocation));
+    } catch {
+      return;
+    }
   }
 
   return (
@@ -1562,14 +1594,189 @@ function GoogleConnector({ view }: { view: WorkspaceView }) {
             className="text-button danger"
             type="button"
             key={account.connectionId}
-            onClick={() => void disconnect.mutateAsync(account.connectionId)}
-            disabled={disconnect.isPending}
+            onClick={() => {
+              setResultNotice(null);
+              setConfirmation({
+                kind: "disconnect",
+                connectionId: account.connectionId,
+                emailLabel: account.emailLabel,
+              });
+            }}
+            disabled={isPending}
           >
             Disconnect
           </button>
         ))}
+        <button
+          className="text-button danger google-delete-trigger"
+          type="button"
+          onClick={() => {
+            setResultNotice(null);
+            setConfirmation({ kind: "delete" });
+          }}
+          disabled={isPending}
+        >
+          Delete Google-derived data
+        </button>
       </div>
+      {confirmation && (
+        <GoogleActionConfirmation
+          kind={confirmation.kind}
+          emailLabel={confirmation.kind === "disconnect" ? confirmation.emailLabel : undefined}
+          isPending={isPending}
+          onCancel={() => setConfirmation(null)}
+          onConfirm={() => void confirmAction()}
+        />
+      )}
+      {resultNotice && (
+        <p className="google-action-success connector-result" role="status">
+          {resultNotice}
+        </p>
+      )}
     </article>
+  );
+}
+
+function GoogleDataDeletionControl() {
+  const deleteGoogleData = useDeleteGoogleDerivedData();
+  const [isConfirming, setIsConfirming] = useState(false);
+  const [resultNotice, setResultNotice] = useState<string | null>(null);
+
+  async function confirmDelete() {
+    try {
+      const result = await deleteGoogleData.mutateAsync();
+      setIsConfirming(false);
+      setResultNotice(googleActionResult("delete", result.providerRevocation));
+    } catch {
+      return;
+    }
+  }
+
+  return (
+    <div className="google-data-control google-data-control-setup">
+      {resultNotice ? (
+        <p className="google-action-success" role="status">
+          {resultNotice}
+        </p>
+      ) : isConfirming ? (
+        <GoogleActionConfirmation
+          kind="delete"
+          isPending={deleteGoogleData.isPending}
+          onCancel={() => setIsConfirming(false)}
+          onConfirm={() => void confirmDelete()}
+        />
+      ) : (
+        <button
+          className="setup-secondary-action google-delete-trigger"
+          type="button"
+          onClick={() => {
+            setResultNotice(null);
+            setIsConfirming(true);
+          }}
+        >
+          Delete Google-derived data
+        </button>
+      )}
+      {deleteGoogleData.error && (
+        <p className="form-error" role="alert">
+          {deleteGoogleData.error.message}
+        </p>
+      )}
+    </div>
+  );
+}
+
+function googleActionResult(
+  kind: "disconnect" | "delete",
+  providerRevocation: GoogleProviderRevocation,
+): string {
+  const result =
+    kind === "delete" ? "Florence’s retained Google-derived data was deleted." : "Google disconnected.";
+  const localAccess =
+    kind === "delete" ? " Any local Google access was removed" : " Florence’s local access was removed";
+  const providerResult =
+    providerRevocation === "confirmed"
+      ? `${localAccess}, and Google confirmed the separate revoke.`
+      : providerRevocation === "unconfirmed"
+        ? `${localAccess}, though Google did not confirm the separate revoke.`
+        : `${localAccess}; there was no Google token left to revoke.`;
+  const unchanged = kind === "delete" ? " Messages already sent and shared-calendar events remain." : "";
+  return `${result}${providerResult}${unchanged}`;
+}
+
+function GoogleActionConfirmation({
+  kind,
+  emailLabel,
+  isPending,
+  onCancel,
+  onConfirm,
+}: {
+  kind: "disconnect" | "delete";
+  emailLabel?: string | undefined;
+  isPending: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const isDelete = kind === "delete";
+  const titleId = `google-${kind}-title`;
+  const detailId = `google-${kind}-detail`;
+
+  return (
+    <section
+      className={`google-action-confirmation${isDelete ? " is-destructive" : ""}`}
+      role="alertdialog"
+      aria-modal="false"
+      aria-labelledby={titleId}
+      aria-describedby={detailId}
+    >
+      <div className="google-action-copy">
+        <strong id={titleId}>
+          {isDelete
+            ? "Delete Google-derived data?"
+            : emailLabel
+              ? `Disconnect ${emailLabel}?`
+              : "Disconnect Google?"}
+        </strong>
+        {isDelete ? (
+          <p id={detailId}>
+            This disconnects Google and permanently deletes Florence’s retained facts, watches, and source
+            details from Gmail and Calendar, plus queued updates and actions based on that Google data.
+            Messages already sent and events already added to the shared calendar remain.
+          </p>
+        ) : (
+          <div id={detailId}>
+            <p>
+              Florence will immediately stop reading new Gmail and Calendar information and cancel queued
+              updates based on Google.
+            </p>
+            <p>
+              Previously retained facts and source details remain, along with Messages already sent and
+              changes already made to the shared calendar. Florence’s local access is removed even if Google
+              does not confirm its separate revocation request.
+            </p>
+          </div>
+        )}
+      </div>
+      <div className="google-confirmation-actions">
+        <button className="button" type="button" onClick={onCancel} disabled={isPending}>
+          Cancel
+        </button>
+        <button
+          className={`button${isDelete ? " danger" : " primary"}`}
+          type="button"
+          onClick={onConfirm}
+          disabled={isPending}
+        >
+          {isPending
+            ? isDelete
+              ? "Deleting…"
+              : "Disconnecting…"
+            : isDelete
+              ? "Delete permanently"
+              : "Disconnect Google"}
+        </button>
+      </div>
+    </section>
   );
 }
 

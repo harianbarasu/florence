@@ -596,6 +596,7 @@ export type PendingFollowUp = {
   nextCheck: string;
   why: string;
   sourceIds: readonly string[];
+  googleBacked: boolean;
 };
 
 export type VisibleHouseholdInterest = {
@@ -774,6 +775,7 @@ export type CalendarOffer = {
 export type CommitTurnInput = {
   sourceId: string;
   googleEvidence?: readonly GoogleEvidenceDraft[];
+  googleConnectionIdsUsed?: readonly string[];
   facts?: readonly FactDraft[];
   deleteFactIds?: readonly string[];
   finiteMonitors?: readonly FiniteMonitorDraft[];
@@ -859,6 +861,15 @@ export type ActiveGoogleCredential = {
   householdId: string;
   ownerAdultId: string;
   refreshTokenEnvelope: string;
+};
+
+export type GoogleDataPurgeResult = {
+  additionalActiveConnectionsDisconnected: number;
+  googleSources: number;
+  facts: number;
+  watches: number;
+  calendarActions: number;
+  unsentMessages: number;
 };
 
 type PersonRow = {
@@ -4340,11 +4351,14 @@ export class PostgresFlorenceStore {
         next_check_at: Date;
         why: string;
         source_ids: string[];
+        google_backed: boolean;
       }[]
     >`
       select w.id,w.objective,w.current_conclusion,w.end_condition,w.next_check_at,w.why,
-        array_agg(pws.source_id order by pws.source_id) as source_ids
+        array_agg(pws.source_id order by pws.source_id) as source_ids,
+        bool_or(source.kind in ('gmail','calendar','google_file')) as google_backed
       from proactive_work w join proactive_work_sources pws on pws.work_id=w.id
+      join sources source on source.id=pws.source_id
       where w.household_id=${row.household_id} and w.kind='finite_monitor' and w.status='active'
         and (
           (${channel.audience === "private"} and w.visibility='private'
@@ -4532,6 +4546,7 @@ export class PostgresFlorenceStore {
         nextCheck: followUp.next_check_at.toISOString(),
         why: followUp.why,
         sourceIds: followUp.source_ids,
+        googleBacked: followUp.google_backed,
       })),
       visibleInterests: interestRows.map((interest) => ({
         interestWorkId: interest.id,
@@ -4707,6 +4722,39 @@ export class PostgresFlorenceStore {
         revoked_at: turn.revoked_at,
         stopped_at: turn.stopped_at,
       };
+      const googleConnectionIdsUsed = unique(input.googleConnectionIdsUsed ?? []).sort();
+      if (googleConnectionIdsUsed.length > 10) {
+        throw new FlorenceStoreConflict("A conversation turn used too many Google connections");
+      }
+      for (const connectionId of googleConnectionIdsUsed) {
+        assertUuid(connectionId, "Used Google connection ID");
+      }
+      if (googleConnectionIdsUsed.length > 0) {
+        const authorizedConnections = await sql<{ id: string }[]>`
+          select connection.id from google_connections connection
+          join people owner on owner.household_id=connection.household_id
+            and owner.id=connection.owner_adult_id and owner.kind='adult' and owner.status='verified'
+          join households household on household.id=connection.household_id
+          where connection.household_id=${turn.household_id} and connection.status='active'
+            and connection.id in ${sql(googleConnectionIdsUsed)}
+            and (
+              (${turn.audience}='private' and connection.owner_adult_id=${turn.sender_adult_id})
+              or (${turn.audience}='group'
+                and connection.id in (
+                  household.family_calendar_owner_connection_id,
+                  household.family_calendar_partner_connection_id
+                )
+                and household.family_calendar_id is not null
+                and household.family_calendar_created_at is not null)
+            )
+          order by connection.id for share of connection,owner,household
+        `;
+        if (authorizedConnections.length !== googleConnectionIdsUsed.length) {
+          throw new FlorenceStoreUnauthorized(
+            "A conversational Google read no longer belongs to this active audience",
+          );
+        }
+      }
       if (
         turn.audience === "group" &&
         calendarMutations &&
@@ -4977,6 +5025,9 @@ export class PostgresFlorenceStore {
           parentSourceId: turn.source_id,
           visibility: turn.visibility,
           ownerAdultId: turn.visibility === "private" ? turn.sender_adult_id : null,
+          ...(googleConnectionIdsUsed.length > 0
+            ? { metadata: { googleConnectionIds: [...googleConnectionIdsUsed] } }
+            : {}),
           occurredAt: handledAt,
         });
       }
@@ -5667,6 +5718,8 @@ export class PostgresFlorenceStore {
           adult_slot: 1 | 2 | null;
           founder_connection_id: string | null;
           partner_connection_id: string | null;
+          founder_connection_status: GoogleConnectionStatus | null;
+          partner_connection_status: GoogleConnectionStatus | null;
           founder_subject_digest: string | null;
           partner_subject_digest: string | null;
         }[]
@@ -5674,6 +5727,8 @@ export class PostgresFlorenceStore {
         select person.adult_slot,
           household.family_calendar_owner_connection_id as founder_connection_id,
           household.family_calendar_partner_connection_id as partner_connection_id,
+          founder.status as founder_connection_status,
+          partner.status as partner_connection_status,
           founder.google_subject_digest as founder_subject_digest,
           partner.google_subject_digest as partner_subject_digest
         from people person join households household on household.id=person.household_id
@@ -5688,7 +5743,9 @@ export class PostgresFlorenceStore {
       if (
         binding?.adult_slot === 1 &&
         binding.founder_connection_id !== null &&
-        binding.founder_subject_digest === input.googleSubjectDigest
+        binding.founder_connection_status === "disconnected" &&
+        (binding.founder_subject_digest === null ||
+          binding.founder_subject_digest === input.googleSubjectDigest)
       ) {
         await sql`
           update households set family_calendar_owner_connection_id=${row.id},updated_at=${now}
@@ -5697,7 +5754,9 @@ export class PostgresFlorenceStore {
       } else if (
         binding?.adult_slot === 2 &&
         binding.partner_connection_id !== null &&
-        binding.partner_subject_digest === input.googleSubjectDigest
+        binding.partner_connection_status === "disconnected" &&
+        (binding.partner_subject_digest === null ||
+          binding.partner_subject_digest === input.googleSubjectDigest)
       ) {
         await sql`
           update households set family_calendar_partner_connection_id=${row.id},updated_at=${now}
@@ -5836,6 +5895,7 @@ export class PostgresFlorenceStore {
     connectionId: string;
     householdId: string;
     ownerAdultId: string;
+    notifyReconnect?: boolean;
     now: string;
   }): Promise<{ view: GoogleConnectionView; refreshTokenEnvelope: string | null } | null> {
     const now = instant(input.now);
@@ -5850,12 +5910,39 @@ export class PostgresFlorenceStore {
           and status<>'disconnected' for update
       `;
       if (!current) return null;
+      const queuedGoogleMessages = await googleDerivedUnsentMessageSourceIds(sql, {
+        householdId: input.householdId,
+        adultId: input.ownerAdultId,
+        connectionId: input.connectionId,
+        statuses: ["pending"],
+      });
+      if (queuedGoogleMessages.length > 0) {
+        await sql`
+          update messages set status='failed',sending_at=null,retry_at=null,
+            last_error='Google was disconnected before this message was delivered'
+          where source_id in ${sql(queuedGoogleMessages)} and direction='outbound' and status='pending'
+        `;
+        await sql`
+          update sources set metadata=jsonb_set(
+            metadata,'{googleConnectionIds}',${sql.json([input.connectionId])},true
+          )
+          where id in ${sql(queuedGoogleMessages)}
+        `;
+      }
+      await sql`
+        delete from calendar_actions action using sources basis
+        where action.household_id=${input.householdId}
+          and action.basis_source_id=basis.id
+          and action.status in ('offered','pending','failed')
+          and basis.kind in ('gmail','calendar','google_file')
+          and basis.metadata->>'connectionId'=${input.connectionId}
+      `;
       const [row] = await sql<GoogleConnectionRow[]>`
         update google_connections set status='disconnected',refresh_token_envelope=null,
           updated_at=${now} where id=${input.connectionId} returning *
       `;
       if (!row) throw new Error("The Google connection was not disconnected");
-      if (current.status === "active") {
+      if (current.status === "active" && (input.notifyReconnect ?? true)) {
         const [privateChannel] = await sql<ChannelRow[]>`
           select * from linq_channels where household_id=${input.householdId}
             and audience='private' and adult_one_id=${input.ownerAdultId} and adult_two_id is null
@@ -5913,6 +6000,153 @@ export class PostgresFlorenceStore {
         }
       }
       return { view: googleConnectionView(row), refreshTokenEnvelope: current.refresh_token_envelope };
+    });
+  }
+
+  async deleteGoogleDerivedData(input: {
+    householdId: string;
+    adultId: string;
+    now: string;
+  }): Promise<GoogleDataPurgeResult> {
+    const now = instant(input.now);
+    return this.#sql.begin(async (sql) => {
+      const [adult] = await sql<{ id: string }[]>`
+        select id from people where household_id=${input.householdId} and id=${input.adultId}
+          and kind='adult' and status='verified' for update
+      `;
+      if (!adult) throw new FlorenceStoreUnauthorized();
+
+      const connections = await sql<GoogleConnectionRow[]>`
+        select * from google_connections where household_id=${input.householdId}
+          and owner_adult_id=${input.adultId} order by created_at,id for update
+      `;
+      const additionalActiveConnectionsDisconnected = connections.filter(
+        (connection) => connection.status === "active",
+      ).length;
+
+      const googleSources = await sql<{ id: string }[]>`
+        select evidence.id from sources evidence
+        where evidence.household_id=${input.householdId}
+          and evidence.kind in ('gmail','calendar','google_file')
+          and (
+            exists (
+              select 1 from google_connections connection
+              where connection.household_id=${input.householdId}
+                and connection.owner_adult_id=${input.adultId}
+                and evidence.metadata->>'connectionId'=connection.id::text
+            )
+            or (
+              evidence.visibility='private' and evidence.owner_adult_id=${input.adultId}
+              and evidence.metadata->>'connectionId' is null
+            )
+          )
+        order by evidence.id for update of evidence
+      `;
+      const googleSourceIds = googleSources.map((source) => source.id);
+
+      const unsentMessageSourceIds = await googleDerivedUnsentMessageSourceIds(sql, {
+        householdId: input.householdId,
+        adultId: input.adultId,
+        connectionId: null,
+        statuses: ["pending", "failed"],
+      });
+
+      const factRows =
+        googleSourceIds.length === 0
+          ? []
+          : await sql<{ id: string }[]>`
+              delete from facts fact where fact.household_id=${input.householdId}
+                and exists (
+                  select 1 from fact_sources link
+                  where link.fact_id=fact.id and link.source_id in ${sql(googleSourceIds)}
+                )
+              returning fact.id
+            `;
+
+      const workRows =
+        googleSourceIds.length === 0
+          ? await sql<{ id: string; kind: ProactiveWorkRow["kind"] }[]>`
+              select work.id,work.kind from proactive_work work
+              where work.household_id=${input.householdId}
+                and work.owner_adult_id=${input.adultId}
+                and work.kind in ('initial_private_review','personal_google_poll')
+              order by work.id for update of work
+            `
+          : await sql<{ id: string; kind: ProactiveWorkRow["kind"] }[]>`
+              select work.id,work.kind from proactive_work work
+              where work.household_id=${input.householdId}
+                and (
+                  (work.owner_adult_id=${input.adultId}
+                    and work.kind in ('initial_private_review','personal_google_poll'))
+                  or (
+                    work.kind in ('finite_monitor','interest_monitor')
+                    and exists (
+                      select 1 from proactive_work_sources link
+                      where link.work_id=work.id and link.source_id in ${sql(googleSourceIds)}
+                    )
+                  )
+                )
+              order by work.id for update of work
+            `;
+      if (workRows.length > 0) {
+        await sql`delete from proactive_work where id in ${sql(workRows.map((work) => work.id))}`;
+      }
+
+      const calendarActionRows = await sql<{ id: string }[]>`
+        delete from calendar_actions action where action.household_id=${input.householdId}
+          and (
+            ${
+              googleSourceIds.length === 0
+                ? sql`false`
+                : sql`action.basis_source_id in ${sql(googleSourceIds)}`
+            }
+            or ${
+              unsentMessageSourceIds.length === 0
+                ? sql`false`
+                : sql`action.approval_prompt_source_id in ${sql(unsentMessageSourceIds)}`
+            }
+          )
+        returning action.id
+      `;
+
+      let deletedUnsentMessages = 0;
+      if (unsentMessageSourceIds.length > 0) {
+        const rows = await sql<{ id: string }[]>`
+          delete from sources where household_id=${input.householdId}
+            and id in ${sql(unsentMessageSourceIds)} returning id
+        `;
+        deletedUnsentMessages = rows.length;
+      }
+
+      let deletedGoogleSources = 0;
+      if (googleSourceIds.length > 0) {
+        const rows = await sql<{ id: string }[]>`
+          delete from sources where household_id=${input.householdId}
+            and id in ${sql(googleSourceIds)} returning id
+        `;
+        deletedGoogleSources = rows.length;
+      }
+
+      for (const connection of connections) {
+        await sql`
+          update google_connections set status='disconnected',
+            state_digest=${sha256(`deleted-google-state\0${connection.id}`)},
+            session_binding_digest=null,state_consumed_at=null,google_subject_digest=null,
+            email_label=null,granted_scopes='{}'::text[],refresh_token_envelope=null,last_error=null,
+            updated_at=${now}
+          where id=${connection.id}
+        `;
+      }
+
+      return {
+        additionalActiveConnectionsDisconnected,
+        googleSources: deletedGoogleSources,
+        facts: factRows.length,
+        watches: workRows.filter((work) => work.kind === "finite_monitor" || work.kind === "interest_monitor")
+          .length,
+        calendarActions: calendarActionRows.length,
+        unsentMessages: deletedUnsentMessages,
+      };
     });
   }
 
@@ -8983,6 +9217,88 @@ async function reconcilePrivateConflictSharingState(
       and jsonb_typeof(s.metadata->'privateConflictOwnerAdultIds')='array'
       and (s.metadata->'privateConflictOwnerAdultIds') ? ${adultId}
   `;
+}
+
+async function googleDerivedUnsentMessageSourceIds(
+  sql: postgres.TransactionSql,
+  input: {
+    householdId: string;
+    adultId: string;
+    connectionId: string | null;
+    statuses: readonly ("pending" | "failed")[];
+  },
+): Promise<string[]> {
+  if (input.statuses.length === 0) return [];
+  const connectionId = input.connectionId ?? "";
+  const rows = await sql<{ source_id: string }[]>`
+    with scoped_connections as (
+      select connection.id from google_connections connection
+      where connection.household_id=${input.householdId}
+        and connection.owner_adult_id=${input.adultId}
+        and (${connectionId}='' or connection.id::text=${connectionId})
+    ), google_sources as (
+      select evidence.id from sources evidence
+      where evidence.household_id=${input.householdId}
+        and evidence.kind in ('gmail','calendar','google_file')
+        and (
+          exists (
+            select 1 from scoped_connections connection
+            where evidence.metadata->>'connectionId'=connection.id::text
+          )
+          or (
+            evidence.visibility='private' and evidence.owner_adult_id=${input.adultId}
+            and evidence.metadata->>'connectionId' is null
+          )
+        )
+    ), google_work as (
+      select work.id,work.kind from proactive_work work
+      where work.household_id=${input.householdId}
+        and (
+          (work.owner_adult_id=${input.adultId}
+            and work.kind in ('initial_private_review','personal_google_poll'))
+          or exists (
+            select 1 from proactive_work_sources link
+            join google_sources evidence on evidence.id=link.source_id
+            where link.work_id=work.id
+          )
+        )
+    )
+    select message.source_id from messages message
+    where message.direction='outbound' and message.status in ${sql([...input.statuses])}
+      and (message.status<>'failed' or message.receipt_detail->'acceptance' is null)
+      and (
+        exists (
+          select 1 from google_work work
+          where message.idempotency_key like ('proactive:' || work.id::text || ':%')
+            or (work.kind='initial_private_review'
+              and message.idempotency_key like ('initial-private-review:' || work.id::text || ':%'))
+        )
+        or (
+          message.idempotency_key like 'initial-household-briefing:%'
+          and exists (select 1 from scoped_connections)
+        )
+        or exists (
+          select 1 from scoped_connections connection
+          where message.idempotency_key=('google-reconnect:' || connection.id::text)
+        )
+        or exists (
+          select 1 from sources outbound_source
+          join scoped_connections connection
+            on jsonb_typeof(outbound_source.metadata->'googleConnectionIds')='array'
+            and (outbound_source.metadata->'googleConnectionIds') ? connection.id::text
+          where outbound_source.id=message.source_id
+        )
+        or exists (
+          select 1 from calendar_actions action
+          join google_sources evidence on evidence.id=action.basis_source_id
+          where action.approval_prompt_source_id=message.source_id
+            or (action.status='failed'
+              and message.idempotency_key=('calendar-failure:' || action.id::text))
+        )
+      )
+    order by message.source_id for update of message
+  `;
+  return unique(rows.map((row) => row.source_id));
 }
 
 function jsonRecord(value: JsonValue | null | undefined): Record<string, JsonValue> {

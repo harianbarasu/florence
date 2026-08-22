@@ -872,6 +872,98 @@ a {
   gap: 5px;
 }
 
+.google-delete-trigger {
+  white-space: nowrap;
+}
+
+.google-action-confirmation {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 18px;
+  align-items: end;
+  padding: 16px;
+  border: 1px solid var(--strong-border);
+  border-radius: 10px;
+  background: var(--muted);
+}
+
+.google-action-confirmation.is-destructive {
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
+}
+
+.google-action-copy {
+  display: grid;
+  gap: 7px;
+}
+
+.google-action-copy strong {
+  font-weight: 600;
+}
+
+.google-action-copy p {
+  margin: 0;
+  color: var(--secondary);
+  line-height: 1.5;
+}
+
+.google-action-copy div {
+  display: grid;
+  gap: 7px;
+}
+
+.google-confirmation-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.button.danger {
+  border-color: var(--danger);
+  background: var(--danger);
+  color: var(--bg);
+}
+
+.google-data-control-setup {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.google-data-control-setup .google-action-confirmation {
+  grid-template-columns: 1fr;
+  border-color: #e5e7eb;
+  background: #f3f4f6;
+  color: #101113;
+}
+
+.google-data-control-setup .google-action-copy p {
+  color: rgb(16 17 19 / 60%);
+}
+
+.google-data-control-setup .button:not(.danger) {
+  border-color: #d4d6da;
+  background: #ffffff;
+  color: #101113;
+}
+
+.google-data-control-setup .button.danger {
+  color: #ffffff;
+}
+
+.google-action-success {
+  color: var(--secondary);
+  line-height: 1.5;
+  text-align: center;
+}
+
+.connector-result {
+  grid-column: 1 / -1;
+  margin: 0;
+  padding-top: 4px;
+  text-align: left;
+}
+
 .button {
   display: inline-flex;
   align-items: center;
@@ -1624,6 +1716,18 @@ a {
     grid-column: 2;
     align-items: flex-start;
     justify-self: start;
+  }
+
+  .google-action-confirmation {
+    grid-template-columns: 1fr;
+  }
+
+  .google-confirmation-actions {
+    justify-content: stretch;
+  }
+
+  .google-confirmation-actions .button {
+    flex: 1;
   }
 
   .form-grid,

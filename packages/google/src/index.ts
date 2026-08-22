@@ -313,6 +313,7 @@ export interface GoogleConnectionStore {
     connectionId: string;
     householdId: string;
     ownerAdultId: string;
+    notifyReconnect?: boolean;
     now: string;
   }): Promise<{ view: GoogleConnectionView; refreshTokenEnvelope: string | null } | null>;
   readActiveGoogleCredential(input: {
@@ -540,6 +541,7 @@ export class GoogleConnection {
     connectionId: string;
     householdId: string;
     ownerAdultId: string;
+    notifyReconnect?: boolean;
     now: string;
   }): Promise<DisconnectGoogleConnectionResult> {
     const disconnected = await this.#store.disconnect({ ...input, now: instant(input.now).toISOString() });

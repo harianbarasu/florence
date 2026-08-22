@@ -418,4 +418,37 @@ export type DisconnectGoogleConnectionInput = z.infer<typeof disconnectGoogleCon
 
 export const workspaceResponseSchema = z.object({ workspace: workspaceViewSchema }).strict();
 
+export const googleProviderRevocationSchema = z.enum(["confirmed", "unconfirmed", "not-needed"]);
+export type GoogleProviderRevocation = z.infer<typeof googleProviderRevocationSchema>;
+
+export const disconnectGoogleConnectionResponseSchema = z
+  .object({
+    workspace: workspaceViewSchema,
+    localAccess: z.literal("disconnected"),
+    providerRevocation: googleProviderRevocationSchema,
+  })
+  .strict();
+export type DisconnectGoogleConnectionResponse = z.infer<typeof disconnectGoogleConnectionResponseSchema>;
+
+export const googleDataDeletionSummarySchema = z
+  .object({
+    disconnectedConnections: z.number().int().nonnegative(),
+    googleSources: z.number().int().nonnegative(),
+    facts: z.number().int().nonnegative(),
+    watches: z.number().int().nonnegative(),
+    calendarActions: z.number().int().nonnegative(),
+    unsentMessages: z.number().int().nonnegative(),
+  })
+  .strict();
+export type GoogleDataDeletionSummary = z.infer<typeof googleDataDeletionSummarySchema>;
+
+export const deleteGoogleDerivedDataResponseSchema = z
+  .object({
+    workspace: workspaceViewSchema,
+    providerRevocation: googleProviderRevocationSchema,
+    deletion: googleDataDeletionSummarySchema,
+  })
+  .strict();
+export type DeleteGoogleDerivedDataResponse = z.infer<typeof deleteGoogleDerivedDataResponseSchema>;
+
 export const googleStartResponseSchema = z.object({ authorizationUrl: z.url() }).strict();

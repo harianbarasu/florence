@@ -53,6 +53,8 @@ const REPLACEMENT_GROUP = "linq-family-group-replacement";
 const FAMILY_CALENDAR = "anbarasu-family@group.calendar.google.com";
 const FOUNDER_GOOGLE = "44444444-4444-4444-8444-444444444444";
 const PARTNER_GOOGLE = "44444444-4444-4444-8444-444444444445";
+const RECONNECTED_FOUNDER_GOOGLE = "44444444-4444-4444-8444-444444444446";
+const POST_DELETION_FOUNDER_GOOGLE = "44444444-4444-4444-8444-444444444447";
 const LINQ_PARTNER = "partner-florence";
 const LINQ_SIGNING_KEY = Buffer.from("florence-release-webhook-key-32b", "utf8");
 const LINQ_SIGNING_SECRET = `whsec_${LINQ_SIGNING_KEY.toString("base64")}`;
@@ -82,10 +84,21 @@ const INITIAL_PRIVATE_SCHOOL_FACT = "Maya attends Muir Elementary.";
 const UPDATED_PRIVATE_SCHOOL_FACT = "Maya attends Muir Academy.";
 const ORDINARY_UNUSED_GMAIL_QUERY = "ordinary-unused-family-email";
 const ORDINARY_UNUSED_GMAIL_QUESTION = "Is there anything useful in that family email?";
+const GOOGLE_CITED_REPLY_QUERY = "latest-school-office-update";
+const GOOGLE_CITED_REPLY_QUESTION = "What did the latest school office email say?";
+const GOOGLE_CITED_REPLY = "The school office says Maya’s emergency card still needs a signature.";
+const GOOGLE_MEMORY_REPLY_QUESTION = "What school did you already have saved for Maya?";
+const GOOGLE_MEMORY_REPLY = "I have Maya at Muir Academy.";
 const WEB_CALENDAR_ACCESS_REQUEST = "Can you send me a fresh link to my Florence calendar?";
 const WEB_ACCESS_FOLLOW_UP = "Thanks — is that private to me?";
 const OVERLAP_GMAIL_SUBJECT = "School bus route reminder";
 const OVERLAP_GMAIL_FACT_SLOT = "child:maya:school_bus";
+const PARTNER_PRIVATE_GOOGLE_FACT_SLOT = "child:maya:partner_school_handoff";
+const PARTNER_PRIVATE_GOOGLE_FACT = "Alex’s recurring school pickup handoff is Friday.";
+const GOOGLE_DELETION_GMAIL_SUBJECT = "Maya emergency-card reminder";
+const GOOGLE_DELETION_FACT_SLOT = "child:maya:school_office_hours";
+const GOOGLE_DELETION_FACT = "Muir Elementary’s school office closes at 4:00 p.m.";
+const GOOGLE_DELETION_PRIVATE_ALERT = "Muir says Maya’s emergency card still needs a signature.";
 
 const AUTOMATIC_FAMILY_DATE = {
   intervalKind: "all_day" as const,
@@ -99,6 +112,13 @@ const PRE_ACTIVATION_FAMILY_DATE = {
   title: "Maya’s field-trip volunteer briefing",
   startDate: "2026-08-22",
   endDate: "2026-08-23",
+  location: "Muir Elementary",
+};
+const GOOGLE_DELETION_FAMILY_DATE = {
+  intervalKind: "all_day" as const,
+  title: "Maya’s emergency-card deadline",
+  startDate: "2026-08-24",
+  endDate: "2026-08-25",
   location: "Muir Elementary",
 };
 const PICKUP_EVENT = {
@@ -203,6 +223,12 @@ type HarnessState = {
   familyCalendarProvisioningFailuresRemaining: number;
   invalidGrantAdultId: string | null;
   invalidGrantTriggered: boolean;
+  googleDeletionEvidencePending: boolean;
+  googleDeletionEvidenceDelivered: boolean;
+  googleDeletionSourceId: string | null;
+  googleChangeReads: { ownerAdultId: string; kind: "gmail" | "calendar" }[];
+  interactiveGoogleReads: number;
+  providerRevocations: ("confirmed" | "unconfirmed" | "not-needed")[];
 };
 
 const release = TEST_DATABASE_URL ? describe : describe.skip;
@@ -611,6 +637,8 @@ release("Florence parent journeys", () => {
   test("gets ahead from both parents’ context, native inputs, a monitor, and the read-only calendar", async () => {
     let nativeInputWasRead = false;
     let ordinaryUnusedSourceId: string | null = null;
+    let conversationalGoogleSourceId: string | null = null;
+    let retainedGoogleMemorySourceId: string | null = null;
     const nativeObservation: {
       audience: string | null;
       text: string | null;
@@ -627,6 +655,30 @@ release("Florence parent journeys", () => {
       pdfBytes: null,
     };
     const harness = await createHarness(async (input, reads) => {
+      if (input.currentMessage.text === GOOGLE_MEMORY_REPLY_QUESTION) {
+        const retained = input.visibleSources.find(
+          (source) => source.kind === "memory" && source.text === UPDATED_PRIVATE_SCHOOL_FACT,
+        );
+        if (!retained?.recordId) {
+          throw new Error("The retained Gmail-derived school fact was not visible to the parent turn");
+        }
+        retainedGoogleMemorySourceId = retained.sourceId;
+        return decision({ bubbles: [{ text: GOOGLE_MEMORY_REPLY, delayMs: 5_000 }] });
+      }
+      if (input.currentMessage.text === GOOGLE_CITED_REPLY_QUESTION) {
+        const connection = input.googleConnections.find((candidate) => candidate.kind === "personal");
+        if (!connection) throw new Error("The private Gmail connection is missing");
+        const [source] = await reads.searchGmail({
+          connectionId: connection.connectionId,
+          query: GOOGLE_CITED_REPLY_QUERY,
+          limit: 10,
+        });
+        if (!source?.text.includes("emergency card")) {
+          throw new Error("The conversational Gmail read returned no usable evidence");
+        }
+        conversationalGoogleSourceId = source.sourceId;
+        return decision({ bubbles: [{ text: GOOGLE_CITED_REPLY, delayMs: 5_000 }] });
+      }
       if (input.currentMessage.text === ORDINARY_UNUSED_GMAIL_QUESTION) {
         const connection = input.googleConnections.find((candidate) => candidate.kind === "personal");
         if (!connection) throw new Error("The private Gmail connection is missing");
@@ -1053,33 +1105,321 @@ release("Florence parent journeys", () => {
       ]),
     );
 
-    harness.state.invalidGrantAdultId = harness.founderAdultId;
-    harness.state.now += 2 * 60_000;
-    await harness.drain();
-    expect(harness.state.invalidGrantTriggered).toBe(true);
     const reconnectText =
       "Your Google connection stopped working. Reconnect it in Florence settings so I can keep helping with family plans.";
+    const familyCalendarReconnectText =
+      "The family calendar is paused because neither Google account is connected. Either of you can reconnect in Florence settings.";
+    harness.state.googleDeletionEvidencePending = true;
+    harness.state.now += 2 * 60_000;
+    await harness.accept("private", "google-cited-conversational-reply", GOOGLE_CITED_REPLY_QUESTION);
+    expect(await harness.florence.runOnce()).toBe(true);
+    if (!conversationalGoogleSourceId) {
+      throw new Error("The ordinary conversational turn did not read Gmail evidence");
+    }
+    await harness.assertDatabase(
+      "The ordinary Gmail-grounded reply was not waiting with its Google dependency",
+      `exists (
+        select 1 from messages message join sources response on response.id=message.source_id
+        where message.direction='outbound' and message.status='pending'
+          and message.text=${sqlLiteral(GOOGLE_CITED_REPLY)}
+          and response.parent_source_id=${sqlLiteral(inboundSourceId("event-google-cited-conversational-reply"))}::uuid
+          and response.metadata->'googleConnectionIds'
+            @> ${sqlLiteral(JSON.stringify([FOUNDER_GOOGLE]))}::jsonb
+      )`,
+    );
+    for (let index = 0; index < 20 && !harness.state.googleDeletionSourceId; index += 1) {
+      expect(await harness.florence.runOnce()).toBe(true);
+    }
+    if (!harness.state.googleDeletionSourceId) {
+      throw new Error("The Google-derived deletion exercise was not staged");
+    }
+    await harness.assertDatabase(
+      "The Google-derived alert, watch, fact, and Calendar suggestion were not staged together",
+      `exists (
+        select 1 from sources
+        where id=${sqlLiteral(harness.state.googleDeletionSourceId)}::uuid
+          and kind='gmail' and visibility='private'
+          and owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+      ) and exists (
+        select 1 from facts fact join fact_sources link on link.fact_id=fact.id
+          join sources source on source.id=link.source_id
+        where fact.owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+          and fact.slot=${sqlLiteral(PRIVATE_SCHOOL_FACT_SLOT)}
+          and fact.corrected_at is not null and source.kind='gmail'
+      ) and exists (
+        select 1 from fact_sources link join facts fact on fact.id=link.fact_id
+        where link.source_id=${sqlLiteral(harness.state.googleDeletionSourceId)}::uuid
+          and fact.slot=${sqlLiteral(GOOGLE_DELETION_FACT_SLOT)}
+      ) and exists (
+        select 1 from proactive_work_sources link join proactive_work work on work.id=link.work_id
+        where link.source_id=${sqlLiteral(harness.state.googleDeletionSourceId)}::uuid
+          and work.kind='finite_monitor' and work.status='active'
+      ) and exists (
+        select 1 from calendar_actions
+        where basis_source_id=${sqlLiteral(harness.state.googleDeletionSourceId)}::uuid
+          and status='offered'
+          and payload->'event'->>'title'=${sqlLiteral(GOOGLE_DELETION_FAMILY_DATE.title)}
+      ) and exists (
+        select 1 from messages where direction='outbound' and status='pending'
+          and text=${sqlLiteral(GOOGLE_DELETION_PRIVATE_ALERT)}
+      ) and exists (
+        select 1 from messages where direction='outbound' and status='pending'
+          and idempotency_key like 'calendar-review-prompt:%'
+          and text like ${sqlLiteral(`%${GOOGLE_DELETION_FAMILY_DATE.title}%`)}
+      )`,
+    );
+    const interactiveGoogleReadsBeforeMemory = harness.state.interactiveGoogleReads;
+    harness.linq.googleDeletionDeliveryFailuresRemaining = 1;
+    await harness.accept("private", "google-memory-conversational-reply", GOOGLE_MEMORY_REPLY_QUESTION);
+    expect(await harness.florence.runOnce()).toBe(true);
+    if (!retainedGoogleMemorySourceId) {
+      throw new Error("The ordinary conversational turn did not use retained Gmail-derived memory");
+    }
+    expect(harness.state.interactiveGoogleReads).toBe(interactiveGoogleReadsBeforeMemory);
+    await harness.assertDatabase(
+      "The retained-memory reply was not waiting with its inherited Google dependency",
+      `exists (
+        select 1 from messages message join sources response on response.id=message.source_id
+        where message.direction='outbound' and message.status='pending'
+          and message.text=${sqlLiteral(GOOGLE_MEMORY_REPLY)}
+          and response.parent_source_id=${sqlLiteral(inboundSourceId("event-google-memory-conversational-reply"))}::uuid
+          and response.metadata->'googleConnectionIds'
+            @> ${sqlLiteral(JSON.stringify([FOUNDER_GOOGLE]))}::jsonb
+      )`,
+    );
+    const founderGoogleReadsBeforeDisconnect = harness.state.googleChangeReads.filter(
+      (read) => read.ownerAdultId === harness.founderAdultId,
+    ).length;
+    harness.state.providerRevocations.push("unconfirmed");
+    const disconnectApp = await harness.webApp();
+    const disconnectResponse = await disconnectApp.inject({
+      method: "DELETE",
+      url: "/api/v1/workspace/google-connections",
+      headers: { cookie: harness.sessionCookie },
+      payload: { connectionId: FOUNDER_GOOGLE },
+    });
+    await disconnectApp.close();
+    expect(disconnectResponse.statusCode).toBe(200);
+    expect(disconnectResponse.json()).toMatchObject({
+      localAccess: "disconnected",
+      providerRevocation: "unconfirmed",
+      workspace: {
+        workspace: { googleConnections: [] },
+        vault: {
+          facts: expect.arrayContaining([
+            expect.objectContaining({ statement: GOOGLE_DELETION_FACT, visibility: "private" }),
+          ]),
+          watches: expect.arrayContaining([
+            expect.objectContaining({
+              kind: "monitor",
+              objective: "Watch for confirmation that Maya’s emergency card is signed.",
+            }),
+          ]),
+        },
+      },
+    });
+    await harness.assertDatabase(
+      "Ordinary disconnect deleted retained Google-derived data",
+      `exists (
+        select 1 from sources
+        where id=${sqlLiteral(harness.state.googleDeletionSourceId)}::uuid and kind='gmail'
+      ) and exists (
+        select 1 from fact_sources where source_id=${sqlLiteral(harness.state.googleDeletionSourceId)}::uuid
+      ) and exists (
+        select 1 from proactive_work_sources link join proactive_work work on work.id=link.work_id
+        where link.source_id=${sqlLiteral(harness.state.googleDeletionSourceId)}::uuid
+          and work.kind='finite_monitor'
+      )`,
+    );
+    await harness.assertDatabase(
+      "Ordinary disconnect did not remove only noncommitted Google Calendar work",
+      `not exists (
+        select 1 from calendar_actions
+        where basis_source_id=${sqlLiteral(harness.state.googleDeletionSourceId)}::uuid
+          and status in ('offered','pending','failed')
+      ) and exists (
+        select 1 from calendar_actions
+        where status='committed'
+          and payload->'event'->>'title'=${sqlLiteral(AUTOMATIC_FAMILY_DATE.title)}
+      )`,
+    );
+    await harness.assertDatabase(
+      "Ordinary disconnect left a Google-dependent outbound deliverable",
+      `exists (
+        select 1 from messages
+        where direction='outbound' and status='failed'
+          and text=${sqlLiteral(GOOGLE_MEMORY_REPLY)}
+      ) and not exists (
+        select 1 from messages where direction='outbound' and status in ('pending','sending','sent')
+          and (
+            text=${sqlLiteral(GOOGLE_DELETION_PRIVATE_ALERT)}
+            or text=${sqlLiteral(GOOGLE_CITED_REPLY)}
+            or text=${sqlLiteral(GOOGLE_MEMORY_REPLY)}
+            or (
+              idempotency_key like 'calendar-review-prompt:%'
+              and text like ${sqlLiteral(`%${GOOGLE_DELETION_FAMILY_DATE.title}%`)}
+            )
+          )
+      )`,
+    );
+    harness.state.now += 2 * 60_000;
+    await harness.drain();
+    expect(
+      harness.state.googleChangeReads.filter((read) => read.ownerAdultId === harness.founderAdultId),
+    ).toHaveLength(founderGoogleReadsBeforeDisconnect);
+    expect(
+      harness.linq.messages.some(
+        (message) =>
+          message.text === GOOGLE_DELETION_PRIVATE_ALERT ||
+          message.text === GOOGLE_CITED_REPLY ||
+          message.text === GOOGLE_MEMORY_REPLY ||
+          message.text.includes(GOOGLE_DELETION_FAMILY_DATE.title),
+      ),
+    ).toBe(false);
     expect(
       harness.linq.messages.filter(
         (message) => message.providerConversationId === PRIVATE_FOUNDER && message.text === reconnectText,
       ),
-    ).toHaveLength(1);
+    ).toHaveLength(0);
     expect(
       harness.linq.messages.filter(
         (message) =>
-          message.providerConversationId === FAMILY_GROUP && /Google|reconnect/i.test(message.text),
+          message.providerConversationId === FAMILY_GROUP && message.text === familyCalendarReconnectText,
       ),
     ).toHaveLength(0);
     expect(
-      (await harness.florence.workspaceForAdult(harness.founderAdultId)).workspace.googleConnections,
-    ).toHaveLength(0);
-    harness.state.now += 2 * 60_000;
-    await harness.drain();
+      [...harness.state.calendarEvents.values()].some((event) => event.title === AUTOMATIC_FAMILY_DATE.title),
+    ).toBe(true);
+
+    await harness.activateGoogle(
+      harness.founderAdultId,
+      RECONNECTED_FOUNDER_GOOGLE,
+      "founder-google-reconnected-state",
+    );
+    harness.state.providerRevocations.push("confirmed");
+    const deleteApp = await harness.webApp();
+    const deleteResponse = await deleteApp.inject({
+      method: "DELETE",
+      url: "/api/v1/workspace/google-derived-data",
+      headers: { cookie: harness.sessionCookie },
+    });
+    expect(deleteResponse.statusCode).toBe(200);
+    const deleted = deleteResponse.json();
+    expect(deleted).toMatchObject({
+      providerRevocation: "confirmed",
+      workspace: { workspace: { googleConnections: [] } },
+    });
+    expect(deleted.deletion.disconnectedConnections).toBe(1);
+    expect(deleted.deletion.googleSources).toBeGreaterThan(0);
+    expect(deleted.deletion.facts).toBeGreaterThan(0);
+    expect(deleted.deletion.watches).toBeGreaterThan(0);
+    expect(deleted.deletion.calendarActions).toBe(0);
+    expect(deleted.deletion.unsentMessages).toBeGreaterThan(0);
     expect(
-      harness.linq.messages.filter(
-        (message) => message.providerConversationId === PRIVATE_FOUNDER && message.text === reconnectText,
+      deleted.workspace.vault.facts.some(
+        (fact: { statement: string }) => fact.statement === GOOGLE_DELETION_FACT,
       ),
-    ).toHaveLength(1);
+    ).toBe(false);
+    expect(
+      deleted.workspace.vault.watches.some(
+        (watch: { objective: string }) =>
+          watch.objective === "Watch for confirmation that Maya’s emergency card is signed.",
+      ),
+    ).toBe(false);
+    await harness.assertDatabase(
+      "Deleting one adult's Google-derived data crossed its boundary or left linked data behind",
+      `not exists (
+        select 1 from sources
+        where owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+          and kind in ('gmail','calendar')
+      ) and not exists (
+        select 1 from facts
+        where owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+          and slot in (${sqlLiteral(PRIVATE_SCHOOL_FACT_SLOT)},${sqlLiteral(GOOGLE_DELETION_FACT_SLOT)})
+      ) and not exists (
+        select 1 from proactive_work
+        where owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+          and kind in ('initial_private_review','personal_google_poll','finite_monitor')
+      ) and not exists (
+        select 1 from calendar_actions
+        where payload->'event'->>'title'=${sqlLiteral(GOOGLE_DELETION_FAMILY_DATE.title)}
+      ) and not exists (
+        select 1 from messages
+        where text=${sqlLiteral(GOOGLE_DELETION_PRIVATE_ALERT)}
+          or text=${sqlLiteral(GOOGLE_CITED_REPLY)}
+          or text=${sqlLiteral(GOOGLE_MEMORY_REPLY)}
+          or (
+            idempotency_key like 'calendar-review-prompt:%'
+            and text like ${sqlLiteral(`%${GOOGLE_DELETION_FAMILY_DATE.title}%`)}
+          )
+      ) and exists (
+        select 1 from sources
+        where owner_adult_id=${sqlLiteral(harness.partnerAdultId)}::uuid and kind='gmail'
+      ) and exists (
+        select 1 from facts
+        where owner_adult_id=${sqlLiteral(harness.partnerAdultId)}::uuid
+          and slot=${sqlLiteral(PARTNER_PRIVATE_GOOGLE_FACT_SLOT)}
+      ) and exists (
+        select 1 from messages
+        where direction='outbound' and status='sent'
+          and text like 'Here’s what I found:%'
+      ) and exists (
+        select 1 from messages
+        where direction='outbound' and status='sent'
+          and text='Hari, I checked your side and found one family item worth tracking.'
+      ) and exists (
+        select 1 from messages
+        where direction='outbound' and status='sent'
+          and text=${sqlLiteral(automaticConfirmation)}
+      )`,
+    );
+    await harness.assertDatabase(
+      "Deleting Google-derived data left recoverable provider identity or credential state",
+      `exists (
+        select 1 from google_connections
+        where owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+      ) and not exists (
+        select 1 from google_connections
+        where owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+          and (
+            status<>'disconnected'
+            or refresh_token_envelope is not null
+            or email_label is not null
+            or google_subject_digest is not null
+            or session_binding_digest is not null
+            or state_consumed_at is not null
+            or last_error is not null
+            or cardinality(granted_scopes)<>0
+          )
+      )`,
+    );
+    expect((await harness.florence.workspaceForAdult(harness.partnerAdultId)).vault?.facts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ statement: PARTNER_PRIVATE_GOOGLE_FACT, visibility: "private" }),
+      ]),
+    );
+    expect(
+      [...harness.state.calendarEvents.values()].some((event) => event.title === AUTOMATIC_FAMILY_DATE.title),
+    ).toBe(true);
+
+    const duplicateDeleteResponse = await deleteApp.inject({
+      method: "DELETE",
+      url: "/api/v1/workspace/google-derived-data",
+      headers: { cookie: harness.sessionCookie },
+    });
+    await deleteApp.close();
+    expect(duplicateDeleteResponse.statusCode).toBe(200);
+    expect(duplicateDeleteResponse.json()).toMatchObject({
+      providerRevocation: "not-needed",
+      deletion: {
+        disconnectedConnections: 0,
+        googleSources: 0,
+        facts: 0,
+        watches: 0,
+        calendarActions: 0,
+        unsentMessages: 0,
+      },
+    });
 
     const app = await harness.webApp();
     const response = await app.inject({
@@ -1097,8 +1437,6 @@ release("Florence parent journeys", () => {
       events: [expect.objectContaining({ title: AUTOMATIC_FAMILY_DATE.title })],
     });
 
-    const familyCalendarReconnectText =
-      "The family calendar is paused because neither Google account is connected. Either of you can reconnect in Florence settings.";
     harness.state.invalidGrantAdultId = harness.partnerAdultId;
     harness.state.invalidGrantTriggered = false;
     harness.state.now += 2 * 60_000;
@@ -1136,6 +1474,24 @@ release("Florence parent journeys", () => {
       month: "2026-08",
       calendarName: "Anbarasu Family",
     });
+
+    await harness.activateGoogle(
+      harness.founderAdultId,
+      POST_DELETION_FOUNDER_GOOGLE,
+      "founder-google-after-deletion-state",
+    );
+    await harness.assertDatabase(
+      "A verified founder reconnect did not safely rebind the existing Family Calendar",
+      `exists (
+        select 1 from households household
+          join google_connections connection
+            on connection.id=household.family_calendar_owner_connection_id
+        where household.family_calendar_id=${sqlLiteral(FAMILY_CALENDAR)}
+          and household.family_calendar_owner_connection_id=${sqlLiteral(POST_DELETION_FOUNDER_GOOGLE)}::uuid
+          and connection.owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+          and connection.status='active'
+      )`,
+    );
   }, 20_000);
 
   test("keeps private context isolated while both parents can manage shared memory, Calendar, and group repair", async () => {
@@ -1797,6 +2153,7 @@ class FakeLinq {
   partnerSetupLinkAttempts = 0;
   partnerChatFailuresRemaining = 0;
   familyCalendarReadyFailuresRemaining = 0;
+  googleDeletionDeliveryFailuresRemaining = 0;
   readonly #created = new Map<string, LinqCreatedChat>();
   readonly #sent = new Map<string, Awaited<ReturnType<LinqClient["sendMessage"]>>>();
 
@@ -1924,6 +2281,13 @@ class FakeLinq {
         occurredAt: new Date(this.state.now).toISOString(),
       };
     }
+    if (
+      this.googleDeletionDeliveryFailuresRemaining > 0 &&
+      (input.text === GOOGLE_DELETION_PRIVATE_ALERT || input.text.includes(GOOGLE_DELETION_FAMILY_DATE.title))
+    ) {
+      this.googleDeletionDeliveryFailuresRemaining -= 1;
+      throw new LinqError("provider_retryable", "The staged Google alert is still pending", true);
+    }
     this.messages.push(input);
     this.state.timeline.push(`message:${input.text}`);
     const result: Awaited<ReturnType<LinqClient["sendMessage"]>> = {
@@ -1994,6 +2358,12 @@ async function createHarness(reason: Reason = async () => decision()): Promise<H
     familyCalendarProvisioningFailuresRemaining: 0,
     invalidGrantAdultId: null,
     invalidGrantTriggered: false,
+    googleDeletionEvidencePending: false,
+    googleDeletionEvidenceDelivered: false,
+    googleDeletionSourceId: null,
+    googleChangeReads: [],
+    interactiveGoogleReads: 0,
+    providerRevocations: [],
   };
   const linq = new FakeLinq(state);
   const vault = new EncryptedImageVault({
@@ -2150,15 +2520,13 @@ function createReasoner(reason: Reason, state: HarnessState): FlorenceReasoner {
                 },
           },
         ],
-        facts: founder
-          ? [
-              {
-                slot: PRIVATE_SCHOOL_FACT_SLOT,
-                statement: INITIAL_PRIVATE_SCHOOL_FACT,
-                sourceIds: [source.sourceId],
-              },
-            ]
-          : [],
+        facts: [
+          {
+            slot: founder ? PRIVATE_SCHOOL_FACT_SLOT : PARTNER_PRIVATE_GOOGLE_FACT_SLOT,
+            statement: founder ? INITIAL_PRIVATE_SCHOOL_FACT : PARTNER_PRIVATE_GOOGLE_FACT,
+            sourceIds: [source.sourceId],
+          },
+        ],
       };
     },
     synthesizeHouseholdBriefing: async (
@@ -2185,29 +2553,65 @@ function createReasoner(reason: Reason, state: HarnessState): FlorenceReasoner {
       const overlap = input.evidence.gmail.sources.find(
         (candidate) => candidate.subject === OVERLAP_GMAIL_SUBJECT,
       );
+      const deletionSource = input.evidence.gmail.sources.find(
+        (candidate) => candidate.subject === GOOGLE_DELETION_GMAIL_SUBJECT,
+      );
+      if (deletionSource) state.googleDeletionSourceId = deletionSource.sourceId;
       if (overlap) {
         state.overlapGmailAssessments += 1;
         state.overlapGmailSourceId = overlap.sourceId;
       }
       return {
-        findings: [],
-        facts: source
+        findings: deletionSource
           ? [
               {
-                slot: PRIVATE_SCHOOL_FACT_SLOT,
-                statement: UPDATED_PRIVATE_SCHOOL_FACT,
-                sourceIds: [source.sourceId],
+                privateDetail: GOOGLE_DELETION_PRIVATE_ALERT,
+                householdConclusion: null,
+                sourceIds: [deletionSource.sourceId],
+                urgency: "soon" as const,
+                materialChange: true,
+                monitor: {
+                  operation: "create" as const,
+                  monitorId: null,
+                  objective: "Watch for confirmation that Maya’s emergency card is signed.",
+                  currentConclusion: "The emergency card still needs a signature.",
+                  endCondition: "A parent or the school confirms the emergency card is signed.",
+                  nextCheck: new Date(Date.parse(input.currentTime) + 60 * 60_000).toISOString(),
+                  why: "The school reminder has a live deadline.",
+                },
+                familyCalendar: {
+                  disposition: "suggest" as const,
+                  sourceIds: [deletionSource.sourceId],
+                  event: GOOGLE_DELETION_FAMILY_DATE,
+                },
               },
             ]
-          : overlap && state.overlapGmailAssessments === 2
+          : [],
+        facts: deletionSource
+          ? [
+              {
+                slot: GOOGLE_DELETION_FACT_SLOT,
+                statement: GOOGLE_DELETION_FACT,
+                sourceIds: [deletionSource.sourceId],
+              },
+            ]
+          : source
             ? [
                 {
-                  slot: OVERLAP_GMAIL_FACT_SLOT,
-                  statement: "Maya’s school bus route reminder is current.",
-                  sourceIds: [overlap.sourceId],
+                  slot: PRIVATE_SCHOOL_FACT_SLOT,
+                  statement: UPDATED_PRIVATE_SCHOOL_FACT,
+                  sourceIds: [source.sourceId],
                 },
               ]
-            : [],
+            : overlap && state.overlapGmailAssessments === 2
+              ? [
+                  {
+                    slot: OVERLAP_GMAIL_FACT_SLOT,
+                    statement: "Maya’s school bus route reminder is current.",
+                    sourceIds: [overlap.sourceId],
+                  },
+                ]
+              : [],
       };
     },
     reviewFiniteMonitor: async (input: Parameters<FlorenceReasoner["reviewFiniteMonitor"]>[0]) => {
@@ -2369,7 +2773,10 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
     }) => {
       const disconnected = await store.disconnect(input);
       if (!disconnected) throw new Error("Fake Google connection was not found");
-      return { connection: disconnected.view, providerRevocation: "not-needed" as const };
+      return {
+        connection: disconnected.view,
+        providerRevocation: state.providerRevocations.shift() ?? ("not-needed" as const),
+      };
     },
     finish: async (input: { state: string; sessionBindingDigest: string; now: string }) => {
       const stateDigest = digest(input.state);
@@ -2459,39 +2866,51 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
       limit?: number;
     }) => {
       await activeCredential(input);
+      state.interactiveGoogleReads += 1;
       const founder = input.ownerAdultId === founderSetup().adultId;
       const recent =
         input.after && input.before
           ? Date.parse(input.before) - Date.parse(input.after) <= 15 * 24 * 60 * 60_000
           : true;
       const ordinaryUnused = input.query === ORDINARY_UNUSED_GMAIL_QUERY;
-      const messageId = ordinaryUnused
-        ? "gmail-ordinary-unused"
-        : founder && recent
-          ? SCHOOL_ATTACHMENT.messageId
-          : `gmail-${input.ownerAdultId}-${recent}`;
+      const citedReply = input.query === GOOGLE_CITED_REPLY_QUERY;
+      const messageId = citedReply
+        ? "gmail-school-office-conversation"
+        : ordinaryUnused
+          ? "gmail-ordinary-unused"
+          : founder && recent
+            ? SCHOOL_ATTACHMENT.messageId
+            : `gmail-${input.ownerAdultId}-${recent}`;
       return {
         status: "complete" as const,
         messages: [
           {
             messageId,
             threadId: `thread-${messageId}`,
-            historyId: founder ? "101" : "201",
-            from: founder ? "hari-private@example.com" : "alex-private@example.com",
-            subject: ordinaryUnused
-              ? "Ordinary family newsletter"
+            historyId: citedReply ? "106" : founder ? "101" : "201",
+            from: citedReply
+              ? "office@muir.example"
               : founder
-                ? "Private school form"
-                : "Private family schedule",
+                ? "hari-private@example.com"
+                : "alex-private@example.com",
+            subject: citedReply
+              ? "Emergency card status"
+              : ordinaryUnused
+                ? "Ordinary family newsletter"
+                : founder
+                  ? "Private school form"
+                  : "Private family schedule",
             sentAt: input.before ?? new Date(state.now).toISOString(),
-            text: ordinaryUnused
-              ? "This newsletter has no family action Florence should keep."
-              : founder
-                ? "Hari private email: Maya attends Muir Elementary and her form needs a signature."
-                : "Alex private email: a personal appointment moved.",
+            text: citedReply
+              ? "Maya’s emergency card still needs a signature."
+              : ordinaryUnused
+                ? "This newsletter has no family action Florence should keep."
+                : founder
+                  ? "Hari private email: Maya attends Muir Elementary and her form needs a signature."
+                  : "Alex private email: a personal appointment moved.",
             textStatus: "complete" as const,
             attachmentsStatus: "complete" as const,
-            attachments: !ordinaryUnused && founder && recent ? [SCHOOL_ATTACHMENT] : [],
+            attachments: !citedReply && !ordinaryUnused && founder && recent ? [SCHOOL_ATTACHMENT] : [],
           },
         ],
       };
@@ -2524,13 +2943,21 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
       cursor: { kind: "gmail_history_v1"; historyId: string; capturedAt: string };
     }) => {
       await activeCredential(input);
+      state.googleChangeReads.push({ ownerAdultId: input.ownerAdultId, kind: "gmail" });
       const hasPrivateFactUpdate =
         input.ownerAdultId === founderSetup().adultId &&
         state.privateFactUpdatePending &&
         !state.privateFactUpdateDelivered;
       if (hasPrivateFactUpdate) state.privateFactUpdateDelivered = true;
+      const hasGoogleDeletionEvidence =
+        !hasPrivateFactUpdate &&
+        input.ownerAdultId === founderSetup().adultId &&
+        state.googleDeletionEvidencePending &&
+        !state.googleDeletionEvidenceDelivered;
+      if (hasGoogleDeletionEvidence) state.googleDeletionEvidenceDelivered = true;
       const hasOverlap =
         !hasPrivateFactUpdate &&
+        !hasGoogleDeletionEvidence &&
         input.ownerAdultId === founderSetup().adultId &&
         state.overlapGmailReadsRemaining > 0;
       const overlapHistoryId = state.overlapGmailReadsRemaining === 2 ? "103" : "104";
@@ -2553,31 +2980,48 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
                 attachments: [],
               },
             ]
-          : hasOverlap
+          : hasGoogleDeletionEvidence
             ? [
                 {
-                  messageId: "gmail-school-bus-overlap",
-                  threadId: "gmail-school-bus-overlap-thread",
-                  historyId: overlapHistoryId,
-                  from: "transport@muir.example",
-                  subject: OVERLAP_GMAIL_SUBJECT,
+                  messageId: "gmail-maya-emergency-card-reminder",
+                  threadId: "gmail-maya-emergency-card-thread",
+                  historyId: "105",
+                  from: "office@muir.example",
+                  subject: GOOGLE_DELETION_GMAIL_SUBJECT,
                   sentAt: new Date(state.now).toISOString(),
-                  text: "Maya’s school bus route reminder is current.",
+                  text: `${GOOGLE_DELETION_FACT} Maya’s emergency card still needs a signature.`,
                   textStatus: "complete" as const,
                   attachmentsStatus: "complete" as const,
                   attachments: [],
                 },
               ]
-            : [],
+            : hasOverlap
+              ? [
+                  {
+                    messageId: "gmail-school-bus-overlap",
+                    threadId: "gmail-school-bus-overlap-thread",
+                    historyId: overlapHistoryId,
+                    from: "transport@muir.example",
+                    subject: OVERLAP_GMAIL_SUBJECT,
+                    sentAt: new Date(state.now).toISOString(),
+                    text: "Maya’s school bus route reminder is current.",
+                    textStatus: "complete" as const,
+                    attachmentsStatus: "complete" as const,
+                    attachments: [],
+                  },
+                ]
+              : [],
         cursor: hasPrivateFactUpdate
           ? { ...input.cursor, historyId: "102", capturedAt: new Date(state.now).toISOString() }
-          : hasOverlap
-            ? {
-                ...input.cursor,
-                historyId: overlapHistoryId,
-                capturedAt: new Date(state.now).toISOString(),
-              }
-            : input.cursor,
+          : hasGoogleDeletionEvidence
+            ? { ...input.cursor, historyId: "105", capturedAt: new Date(state.now).toISOString() }
+            : hasOverlap
+              ? {
+                  ...input.cursor,
+                  historyId: overlapHistoryId,
+                  capturedAt: new Date(state.now).toISOString(),
+                }
+              : input.cursor,
       };
     },
     readCalendarChanges: async (input: {
@@ -2596,6 +3040,7 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
       currentTime: string;
     }) => {
       await activeCredential(input);
+      state.googleChangeReads.push({ ownerAdultId: input.ownerAdultId, kind: "calendar" });
       return {
         status: "complete" as const,
         resyncRequired: false as const,
@@ -2610,6 +3055,7 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
     },
     readCalendarWindow: async (input: CalendarReadInput) => {
       await activeCredential(input);
+      state.interactiveGoogleReads += 1;
       state.calendarReads.push(input);
       return {
         status: "complete" as const,

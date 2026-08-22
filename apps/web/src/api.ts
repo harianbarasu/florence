@@ -1,6 +1,10 @@
 import {
   type CompleteFamilyOnboardingInput,
+  type DeleteGoogleDerivedDataResponse,
   type DisconnectGoogleConnectionInput,
+  type DisconnectGoogleConnectionResponse,
+  deleteGoogleDerivedDataResponseSchema,
+  disconnectGoogleConnectionResponseSchema,
   type FamilyCalendarMonthView,
   type FamilyMemberMutationInput,
   familyCalendarMonthViewSchema,
@@ -129,12 +133,22 @@ export async function startGoogleConnection(): Promise<{ authorizationUrl: strin
   );
 }
 
-export function disconnectGoogleConnection(connectionId: string): Promise<WorkspaceView> {
+export async function disconnectGoogleConnection(
+  connectionId: string,
+): Promise<DisconnectGoogleConnectionResponse> {
   const input: DisconnectGoogleConnectionInput = { connectionId };
-  return requestWorkspace("/api/v1/workspace/google-connections", {
-    method: "DELETE",
-    body: JSON.stringify(input),
-  });
+  return disconnectGoogleConnectionResponseSchema.parse(
+    await requestJson("/api/v1/workspace/google-connections", {
+      method: "DELETE",
+      body: JSON.stringify(input),
+    }),
+  );
+}
+
+export async function deleteGoogleDerivedData(): Promise<DeleteGoogleDerivedDataResponse> {
+  return deleteGoogleDerivedDataResponseSchema.parse(
+    await requestJson("/api/v1/workspace/google-derived-data", { method: "DELETE" }),
+  );
 }
 
 function readError(payload: unknown): string | null {

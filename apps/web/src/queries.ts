@@ -10,6 +10,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   completeFamilyOnboarding,
   createSession,
+  deleteGoogleDerivedData,
   deleteSession,
   deleteVaultFact,
   deleteVaultWatch,
@@ -130,6 +131,14 @@ export function useDisconnectGoogleConnection() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (connectionId: string) => disconnectGoogleConnection(connectionId),
-    onSuccess: (workspace) => queryClient.setQueryData(queryKeys.workspace, workspace),
+    onSuccess: (result) => queryClient.setQueryData(queryKeys.workspace, result.workspace),
+  });
+}
+
+export function useDeleteGoogleDerivedData() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: deleteGoogleDerivedData,
+    onSuccess: (result) => queryClient.setQueryData(queryKeys.workspace, result.workspace),
   });
 }

@@ -3,1013 +3,1824 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EncryptedImageVault } from "@florence/artifacts";
+import { migrateDatabase, migrationFiles, PostgresFlorenceStore } from "@florence/database";
 import {
-  baselineFile,
-  FlorenceStoreConflict,
-  FlorenceStoreUnauthorized,
-  migrateDatabase,
-  PostgresFlorenceStore,
-} from "@florence/database";
-import {
+  type GmailAttachmentReference,
+  GOOGLE_SCOPES,
   type GoogleCalendarExecutionResult,
-  GoogleConnection,
-  type GoogleConnectionStore,
+  GoogleCalendarTransientError,
+  type GoogleConnection,
+  GoogleConnectionError,
+  type GoogleFamilyCalendarProvisioningResult,
+  type GoogleFamilyCalendarRenameResult,
+  GoogleFamilyCalendarTransientError,
 } from "@florence/google";
 import {
   type LinqClient,
   type LinqConversationAuthority,
+  type LinqCreateChat,
+  type LinqCreatedChat,
+  LinqError,
+  type LinqMediaReference,
   type LinqSendMessage,
   type LinqSendReaction,
   linqIdentitySubjectDigest,
 } from "@florence/linq";
+import type { OpenAI } from "openai";
 import { describe, expect, onTestFinished, test } from "vitest";
 import { buildApp, createSessionCallerResolver } from "./app.js";
 import { EnrollmentCodes } from "./enrollment.js";
 import { Florence } from "./florence.js";
 import { createLinqIngress } from "./linq-ingress.js";
-import { type FlorenceDecision, type FlorenceReasoner, FlorenceReasonerError } from "./reasoner.js";
+import { type FlorenceDecision, FlorenceReasoner } from "./reasoner.js";
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const NOW = Date.parse("2026-08-16T18:00:00.000Z");
 const ENROLLMENT_SECRET = "release-journey-secret-is-at-least-thirty-two-bytes";
 const SESSION_SECRET = "release-journey-browser-session-secret-is-at-least-thirty-two-bytes";
-const ADULT_ONE_HANDLE = "messages-adult-one";
-const ADULT_TWO_HANDLE = "messages-adult-two";
-const COMPETING_FOUNDER_HANDLE = "messages-competing-founder";
-const ADULT_ONE_IDENTITY = linqIdentitySubjectDigest(ADULT_ONE_HANDLE);
-const ADULT_TWO_IDENTITY = linqIdentitySubjectDigest(ADULT_TWO_HANDLE);
-const COMPETING_FOUNDER_IDENTITY = linqIdentitySubjectDigest(COMPETING_FOUNDER_HANDLE);
-const PRIVATE_ONE = "linq-private-one";
-const PRIVATE_COMPETING_FOUNDER = "linq-private-competing-founder";
-const FOUNDER_IDS = new EnrollmentCodes(ENROLLMENT_SECRET).issueFounderSetup({
-  providerConversationId: PRIVATE_ONE,
-  identitySubjectDigest: ADULT_ONE_IDENTITY,
-  occurredAt: new Date(NOW).toISOString(),
-});
-const ADULT_ONE = FOUNDER_IDS.adultId;
-const COMPETING_FOUNDER = new EnrollmentCodes(ENROLLMENT_SECRET).issueFounderSetup({
-  providerConversationId: PRIVATE_COMPETING_FOUNDER,
-  identitySubjectDigest: COMPETING_FOUNDER_IDENTITY,
-  occurredAt: new Date(NOW).toISOString(),
-}).adultId;
-const ADULT_TWO = "22222222-2222-4222-8222-222222222222";
-const GOOGLE_CONNECTION = "44444444-4444-4444-8444-444444444444";
-const PARTICIPANTS = [ADULT_ONE_IDENTITY, ADULT_TWO_IDENTITY].sort();
-const GROUP = "linq-group-family";
+const FLORENCE_PHONE = "+15555550000";
+const FOUNDER_PHONE = "+15555550101";
+const PARTNER_PHONE = "+15555550202";
+const OUTSIDER_PHONE = "+15555550999";
+const FOUNDER_HANDLE = "messages-founder";
+const PARTNER_HANDLE = "messages-partner";
+const FOUNDER_IDENTITY = linqIdentitySubjectDigest(FOUNDER_HANDLE);
+const PARTNER_IDENTITY = linqIdentitySubjectDigest(PARTNER_HANDLE);
+const PRIVATE_FOUNDER = "linq-private-founder";
+const PRIVATE_PARTNER = "linq-private-partner";
+const FAMILY_GROUP = "linq-family-group";
+const REPLACEMENT_GROUP = "linq-family-group-replacement";
+const FAMILY_CALENDAR = "anbarasu-family@group.calendar.google.com";
+const FOUNDER_GOOGLE = "44444444-4444-4444-8444-444444444444";
+const PARTNER_GOOGLE = "44444444-4444-4444-8444-444444444445";
+const RECONNECTED_FOUNDER_GOOGLE = "44444444-4444-4444-8444-444444444446";
+const POST_DELETION_FOUNDER_GOOGLE = "44444444-4444-4444-8444-444444444447";
 const LINQ_PARTNER = "partner-florence";
 const LINQ_SIGNING_KEY = Buffer.from("florence-release-webhook-key-32b", "utf8");
 const LINQ_SIGNING_SECRET = `whsec_${LINQ_SIGNING_KEY.toString("base64")}`;
-const EVENT = {
-  title: "School assembly",
-  startsAt: "2026-08-18T17:00:00.000Z",
-  endsAt: "2026-08-18T18:00:00.000Z",
+const INVITE_APPROVAL = "Yes, please text Alex.";
+const REINVITE_APPROVAL = "Please invite Alex again.";
+const PARTNER_SETUP_QUESTION = "What is this setup for?";
+const PARTNER_SETUP_REFUSAL = "I don’t want to join this.";
+const PARTNER_SETUP_EXPLANATION =
+  "That link sets up your own private side of Florence. Use the setup link just above when you’re ready.";
+const PARTNER_SETUP_EXPIRED_REPLY =
+  "That Florence setup link has expired. Ask your partner to send a fresh invitation.";
+const PARTNER_SETUP_EXPIRED_NOTICE =
+  "Alex’s Florence setup link expired, so I stopped the invitation. I won’t message them again unless you ask me to send a fresh one.";
+const PARTNER_SETUP_DELIVERY_FAILURE_NOTICE =
+  "I couldn’t deliver Alex’s Florence setup link, so I stopped the invitation. I won’t message them again unless you ask me to try again.";
+const NATIVE_TEXT = "Forwarded from school: Maya’s field-trip form is due Tuesday.";
+const NATIVE_LINK = "https://school.example/fall-field-trip";
+const VOICE_TRANSCRIPT = "The teacher said the form still needs one parent signature.";
+const INTEREST_REQUEST = "Maya likes soccer. Keep an eye out for a good family match we could attend.";
+const INTEREST_RECOMMENDATION =
+  "The Bay City women’s match this Saturday fits the family calendar and looks worth considering.";
+const INTEREST_URL = "https://example.com/bay-city-family-soccer";
+const GROUP_REPAIR_NOTICE =
+  "The people in our family thread changed, so I stopped using it. I’ll make a fresh thread with just the two of you.";
+const PRIVATE_SCHOOL_FACT_SLOT = "child:maya:school";
+const INITIAL_PRIVATE_SCHOOL_FACT = "Maya attends Muir Elementary.";
+const UPDATED_PRIVATE_SCHOOL_FACT = "Maya attends Muir Academy.";
+const ORDINARY_UNUSED_GMAIL_QUERY = "ordinary-unused-family-email";
+const ORDINARY_UNUSED_GMAIL_QUESTION = "Is there anything useful in that family email?";
+const GOOGLE_CITED_REPLY_QUERY = "latest-school-office-update";
+const GOOGLE_CITED_REPLY_QUESTION = "What did the latest school office email say?";
+const GOOGLE_CITED_REPLY = "The school office says Maya’s emergency card still needs a signature.";
+const GOOGLE_MEMORY_REPLY_QUESTION = "What school did you already have saved for Maya?";
+const GOOGLE_MEMORY_REPLY = "I have Maya at Muir Academy.";
+const WEB_CALENDAR_ACCESS_REQUEST = "Can you send me a fresh link to my Florence calendar?";
+const WEB_ACCESS_FOLLOW_UP = "Thanks — is that private to me?";
+const OVERLAP_GMAIL_SUBJECT = "School bus route reminder";
+const OVERLAP_GMAIL_FACT_SLOT = "child:maya:school_bus";
+const PARTNER_PRIVATE_GOOGLE_FACT_SLOT = "child:maya:partner_school_handoff";
+const PARTNER_PRIVATE_GOOGLE_FACT = "Alex’s recurring school pickup handoff is Friday.";
+const GOOGLE_DELETION_GMAIL_SUBJECT = "Maya emergency-card reminder";
+const GOOGLE_DELETION_FACT_SLOT = "child:maya:school_office_hours";
+const GOOGLE_DELETION_FACT = "Muir Elementary’s school office closes at 4:00 p.m.";
+const GOOGLE_DELETION_PRIVATE_ALERT = "Muir says Maya’s emergency card still needs a signature.";
+
+const AUTOMATIC_FAMILY_DATE = {
+  intervalKind: "all_day" as const,
+  title: "Maya’s field-trip form deadline",
+  startDate: "2026-08-19",
+  endDate: "2026-08-20",
+  location: "Muir Elementary",
+};
+const PRE_ACTIVATION_FAMILY_DATE = {
+  intervalKind: "all_day" as const,
+  title: "Maya’s field-trip volunteer briefing",
+  startDate: "2026-08-22",
+  endDate: "2026-08-23",
+  location: "Muir Elementary",
+};
+const GOOGLE_DELETION_FAMILY_DATE = {
+  intervalKind: "all_day" as const,
+  title: "Maya’s emergency-card deadline",
+  startDate: "2026-08-24",
+  endDate: "2026-08-25",
+  location: "Muir Elementary",
+};
+const PICKUP_EVENT = {
+  intervalKind: "timed" as const,
+  title: "Maya pickup",
+  startsAt: "2026-08-18T21:45:00.000Z",
+  endsAt: "2026-08-18T22:00:00.000Z",
   timeZone: "America/Los_Angeles",
   location: "Muir Elementary",
 };
-const COMPOUND_CALENDAR_APPROVAL = "Yep, add it — and remind me that morning.";
-const CALENDAR_MORNING_REMINDER_AT = "2026-08-18T15:00:00.000Z";
-const CALENDAR_MORNING_REMINDER = "School assembly is this morning at 10:00.";
-const TRIP_WINDOW = {
-  timeMin: "2026-08-21T22:30:00.000Z",
-  timeMax: "2026-08-21T23:30:00.000Z",
+const UPDATED_PICKUP_EVENT = {
+  ...PICKUP_EVENT,
+  startsAt: "2026-08-18T22:00:00.000Z",
+  endsAt: "2026-08-18T22:15:00.000Z",
 };
-const PICKUP_CONFLICT = {
-  title: "Both parents unavailable",
-  startsAt: "2026-08-21T22:30:00.000Z",
-  endsAt: "2026-08-21T23:30:00.000Z",
-  allDay: false,
-};
-const SCHOOL_EMAIL = {
-  messageId: "gmail-school-packet",
+const JPEG_BYTES = Uint8Array.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46]);
+const PDF_BYTES = new TextEncoder().encode("%PDF-1.7\nMuir field-trip form. Return by Tuesday.\n%%EOF\n");
+const WAV_BYTES = Uint8Array.from([
+  0x52, 0x49, 0x46, 0x46, 0x25, 0x00, 0x00, 0x00, 0x57, 0x41, 0x56, 0x45, 0x66, 0x6d, 0x74, 0x20, 0x10, 0x00,
+  0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x40, 0x1f, 0x00, 0x00, 0x80, 0x3e, 0x00, 0x00, 0x02, 0x00, 0x10, 0x00,
+  0x64, 0x61, 0x74, 0x61, 0x01, 0x00, 0x00, 0x00, 0x00,
+]);
+const SCHOOL_ATTACHMENT: GmailAttachmentReference = {
+  messageId: "gmail-school-form",
   threadId: "gmail-school-thread",
-  historyId: "gmail-history-1",
-  from: "Muir Elementary <office@muir.example>",
-  subject: "Field trip permission slip",
-  sentAt: "2026-08-15T17:00:00.000Z",
-  text: "Permission slip due Tuesday. Friday's bus returns at 3:45.",
+  historyId: "101",
+  partId: "2",
+  attachmentId: "gmail-school-pdf",
+  storage: "external",
+  filename: "field-trip-form.pdf",
+  mimeType: "application/pdf",
+  sizeBytes: PDF_BYTES.byteLength,
 };
-const NATURAL_SETUP_OPT_OUT = "I don’t want Florence to message me here anymore.";
 
 type Reason = FlorenceReasoner["decide"];
-type SetupConversation = FlorenceReasoner["converseDuringSetup"];
-type InterpretCalendarApproval = FlorenceReasoner["interpretCalendarApproval"];
-type SetupConversationInput = Parameters<SetupConversation>[0];
-type CalendarApprovalInput = Parameters<InterpretCalendarApproval>[0];
+type CalendarExecutionInput = Parameters<GoogleConnection["executeCalendar"]>[0];
+type CalendarMutation = CalendarExecutionInput["mutation"];
+type FamilyCalendarProvisioningInput = Parameters<GoogleConnection["provisionFamilyCalendar"]>[0];
+type CalendarReadInput = Parameters<GoogleConnection["readCalendarWindow"]>[0];
+type TestPart =
+  | { type: "text" | "link"; value: string }
+  | {
+      type: "media";
+      id: string;
+      filename: string;
+      mimeType: string;
+      bytes: Uint8Array;
+    };
+type FakeCalendarEvent = {
+  providerEventId: string;
+  providerRevision: string;
+  providerUpdatedAt: string;
+  status: "confirmed";
+  busy: true;
+  title: string;
+  location: string | null;
+} & (
+  | {
+      intervalKind: "timed";
+      allDay: false;
+      startsAt: string;
+      endsAt: string;
+      timeZone: string;
+    }
+  | {
+      intervalKind: "all_day";
+      allDay: true;
+      startDate: string;
+      endDate: string;
+    }
+);
+type HarnessState = {
+  now: number;
+  privateReviews: Parameters<FlorenceReasoner["reviewPrivateGoogle"]>[0][];
+  googleAssessments: Parameters<FlorenceReasoner["assessGoogleChanges"]>[0][];
+  briefings: Parameters<FlorenceReasoner["synthesizeHouseholdBriefing"]>[0][];
+  provisionings: FamilyCalendarProvisioningInput[];
+  calendarRenames: Parameters<GoogleConnection["renameFamilyCalendar"]>[0][];
+  providerCalendarSummary: string | null;
+  calendarExecutions: CalendarExecutionInput[];
+  calendarReads: CalendarReadInput[];
+  calendarEvents: Map<string, FakeCalendarEvent>;
+  uncertainCalendarCreateTitle: string | null;
+  timeline: string[];
+  finiteReviews: number;
+  interestResearches: number;
+  voiceTranscriptions: number;
+  initialGoogleFailuresRemaining: number;
+  initialGoogleFailureAdultId: string | null;
+  privateFactUpdatePending: boolean;
+  privateFactUpdateDelivered: boolean;
+  overlapGmailReadsRemaining: number;
+  overlapGmailAssessments: number;
+  overlapGmailSourceId: string | null;
+  monitorEvidenceExercise: boolean;
+  monitorCancellationActive: boolean;
+  silentMonitorSourceId: string | null;
+  voicedMonitorSourceId: string | null;
+  cancelledMonitorSourceId: string | null;
+  setupConversationFailuresRemaining: number;
+  founderProductRecenterReview: boolean;
+  familyCalendarProvisioningFailuresRemaining: number;
+  invalidGrantAdultId: string | null;
+  invalidGrantTriggered: boolean;
+  googleDeletionEvidencePending: boolean;
+  googleDeletionEvidenceDelivered: boolean;
+  googleDeletionSourceId: string | null;
+  googleChangeReads: { ownerAdultId: string; kind: "gmail" | "calendar" }[];
+  interactiveGoogleReads: number;
+  providerRevocations: ("confirmed" | "unconfirmed" | "not-needed")[];
+};
 
 const release = TEST_DATABASE_URL ? describe : describe.skip;
 
-release("Florence release journeys", () => {
-  test("runs the real two-adult household journey from an interruptible document turn through Calendar proof", async () => {
-    await expectCanonicalGoogleScopeAcceptance();
-    let pdfWasRead = false;
-    let reactionWasUnderstood = false;
-    let calendarWasRead = false;
-    let gmailWasRead = false;
-    let obsoleteResultWasSuppressed = false;
-    const harness = await freshHarness(
-      async (input, reads, signal) => {
-        const sourceId = input.currentMessage.sourceId;
-        if (input.currentMessage.moveKind === "reaction") {
-          if (input.currentMessage.replyTo?.text === "I’m looking through this now.") {
-            expect(input.audience).toBe("private");
-            return decision({ policy: noMutationPolicy() });
-          }
-          reactionWasUnderstood = true;
-          expect(input.currentMessage.replyTo).toMatchObject({
-            senderName: "Florence",
-            text: "Family thread is connected.",
-          });
-          if (input.currentMessage.text === "Reacted like") {
-            return decision({
-              policy: noMutationPolicy(),
-              reaction: "laugh",
-              reply: true,
-              bubbles: [{ text: "That made me smile.", delayMs: 0 }],
-            });
-          }
-          expect(input.currentMessage.text).toBe("Reacted love");
-          return decision({
-            policy: noMutationPolicy(),
-            bubbles: [{ text: "A reaction should only be conversational.", delayMs: 0 }],
-            facts: [remember("A tapback changed family memory", sourceId)],
-            followUp: {
-              operation: "cancel",
-              followUpId: input.pendingFollowUps[0]?.followUpId ?? "missing",
-              at: null,
-              text: null,
-              sourceIds: [sourceId],
-            },
-            calendar: calendarDraft("direct", sourceId),
-          });
-        }
-        if (input.currentMessage.text.includes("Review this school packet")) {
-          const pdf = input.currentMessage.pdfs?.[0];
-          if (!pdf || !reads.readCurrentPdf) throw new Error("The attached PDF was not readable");
-          const opened = await reads.readCurrentPdf(pdf);
-          pdfWasRead = new TextDecoder().decode(opened.bytes).includes("bus returns at 3:45");
-          expect((await reads.readSource({ sourceId }))?.visibility).toBe("adult_private");
-          await waitForAbort(signal);
-          return decision({
-            bubbles: [{ text: "This obsolete answer must never be sent.", delayMs: 0 }],
-          });
-        }
-        if (
-          input.currentMessage.text.includes("Alex is unavailable too") ||
-          input.currentMessage.text.includes("Sam can cover")
-        ) {
-          expect(input.recentMessages).toEqual(
-            expect.arrayContaining([
-              expect.objectContaining({ text: expect.stringContaining("Review this school packet") }),
-            ]),
-          );
-          const pdf = input.currentMessage.pdfs?.[0];
-          if (!pdf || !reads.readCurrentPdf) throw new Error("The superseded PDF was not carried forward");
-          const opened = await reads.readCurrentPdf(pdf);
-          pdfWasRead = pdfWasRead && new TextDecoder().decode(opened.bytes).includes("Ms. Chen");
-          const calendar = await reads.readCalendarWindow({
-            connectionId: GOOGLE_CONNECTION,
-            ...TRIP_WINDOW,
-            limit: 50,
-          });
-          expect(calendar).toEqual({ status: "complete", events: [PICKUP_CONFLICT] });
-          calendarWasRead = true;
-          if (input.currentMessage.text.includes("Sam can cover")) {
-            const gmail = await reads.searchGmail({
-              connectionId: GOOGLE_CONNECTION,
-              query: 'newer_than:30d ("Muir" OR "field trip")',
-              limit: 5,
-            });
-            expect(gmail).toEqual([
-              expect.objectContaining({
-                kind: "gmail",
-                visibility: "adult_private",
-                label: SCHOOL_EMAIL.subject,
-                text: SCHOOL_EMAIL.text,
-              }),
-            ]);
-            gmailWasRead = true;
-          }
-          obsoleteResultWasSuppressed = true;
-          if (input.currentMessage.text.includes("Sam can cover")) {
-            return decision({
-              policy: noMutationPolicy(),
-              bubbles: [
-                {
-                  text: "Updated: Sam can cover the 3:45 pickup, so the pickup conflict is cleared.",
-                  delayMs: 0,
-                },
-                {
-                  text: "Tuesday’s permission-slip deadline still needs attention. Ms. Chen is a stable school contact; Friday’s trip and return are one-offs. I saved neither.",
-                  delayMs: 250,
-                },
-                {
-                  text: "Updated draft to Ms. Chen: “Sam can cover Maya’s 3:45 pickup. Please let me know if the bus returns late.”",
-                  delayMs: 400,
-                },
-              ],
-              facts: [remember("Ms. Chen is Maya’s teacher", sourceId)],
-              followUp: {
-                operation: "schedule",
-                followUpId: null,
-                at: new Date(Date.parse(input.currentMessage.occurredAt) + 60_000).toISOString(),
-                text: "This prohibited reminder must never be sent.",
-                sourceIds: [sourceId],
-              },
-              calendar: calendarDraft("direct", sourceId),
-            });
-          }
-          return decision({
-            policy: noMutationPolicy(),
-            reaction: "love",
-            reply: true,
-            bubbles: [
-              {
-                text: "The real issue is the unsupervised pickup gap after the bus returns at 3:45 — both of you are unavailable.",
-                delayMs: 0,
-              },
-              {
-                text: "Tuesday’s permission-slip deadline is actionable. Ms. Chen is a stable school contact; Friday’s trip and 3:45 return are one-offs. I saved neither.",
-                delayMs: 250,
-              },
-              {
-                text: "Draft to Ms. Chen: “Both of us are unavailable at 3:45. Can Maya stay with the bus group until 4:15?”\n\nShould I change the draft to name an alternate pickup adult?",
-                delayMs: 400,
-              },
-            ],
-            facts: [remember("Ms. Chen is Maya’s teacher", sourceId)],
-            followUp: {
-              operation: "schedule",
-              followUpId: null,
-              at: new Date(Date.parse(input.currentMessage.occurredAt) + 60_000).toISOString(),
-              text: "This prohibited reminder must never be sent.",
-              sourceIds: [sourceId],
-            },
-            calendar: calendarDraft("direct", sourceId),
-          });
-        }
-        if (input.currentMessage.text === "Hi Florence") {
-          return decision({ bubbles: [{ text: "Family thread is connected.", delayMs: 0 }] });
-        }
-        if (input.currentMessage.text.includes("remind both of us about pickup")) {
-          return decision({
-            bubbles: [{ text: "I’ll remind both of you.", delayMs: 0 }],
-            facts: [remember("School dismissal is at 2:45", sourceId)],
-            followUp: {
-              operation: "schedule",
-              followUpId: null,
-              at: new Date(Date.parse(input.currentMessage.occurredAt) + 60_000).toISOString(),
-              text: "Pickup reminder: dismissal is at 2:45.",
-              sourceIds: [sourceId],
-            },
-          });
-        }
-        if (input.currentMessage.text === "Remember that the school gate code is 2468.") {
-          return decision({
-            bubbles: [
-              { text: "I noted the gate code.", delayMs: 0 },
-              { text: "I’ll keep it with the school logistics.", delayMs: 10_000 },
-            ],
-            facts: [
-              remember("The school gate code is 2468", sourceId),
-              {
-                ...remember("The school office closes at 4", sourceId),
-                sourceIds: [sourceId, inboundSourceId("event-independent-school-hours")],
-              },
-            ],
-          });
-        }
-        if (input.currentMessage.text === "The school office closes at 4.") {
-          return decision({ facts: [remember("The school office closes at 4", sourceId)] });
-        }
-        if (input.currentMessage.text === "Actually, don’t retain that.") {
-          const gateCode = input.visibleSources.find(
-            (source) =>
-              source.kind === "memory" && source.visibility === "shared" && source.text.includes("gate code"),
-          );
-          return decision({
-            policy: noMutationPolicy(),
-            facts: [
-              {
-                operation: "forget",
-                factId: gateCode?.recordId ?? "missing",
-                statement: null,
-                sourceIds: [sourceId],
-              },
-            ],
-          });
-        }
-        if (input.currentMessage.text.startsWith("Could you add")) {
-          const calendar = await reads.readCalendarWindow({
-            connectionId: GOOGLE_CONNECTION,
-            timeMin: EVENT.startsAt,
-            timeMax: EVENT.endsAt,
-            limit: 50,
-          });
-          calendarWasRead = calendarWasRead && calendar.status === "complete";
-          expect(calendar.events).toEqual([]);
-          return decision({
-            calendar: {
-              ...calendarDraft("offer", sourceId),
-            },
-          });
-        }
-        if (input.currentMessage.text === COMPOUND_CALENDAR_APPROVAL) {
-          expect(input.pendingCalendarOffers).toEqual([expect.objectContaining({ event: EVENT })]);
-          return decision({
-            bubbles: [{ text: "I’ll remind you that morning.", delayMs: 0 }],
-            followUp: {
-              operation: "schedule",
-              followUpId: null,
-              at: CALENDAR_MORNING_REMINDER_AT,
-              text: CALENDAR_MORNING_REMINDER,
-              sourceIds: [sourceId],
-            },
-          });
-        }
-        return decision();
-      },
-      {
-        interpretCalendarApproval: async (input) => ({
-          approve: input.currentMessage.text === COMPOUND_CALENDAR_APPROVAL,
+release("Florence parent journeys", () => {
+  test("keeps private setup useful and recovers one two-parent family loop without duplicate work", async () => {
+    await assertFunctionCallContinuationIsWireSafe();
+    let accessFollowUpHistory: readonly string[] = [];
+    let accessFollowUpAuthoredText: string | null = null;
+    const harness = await createHarness(async (input) => {
+      if (input.currentMessage.text === WEB_CALENDAR_ACCESS_REQUEST) {
+        return decision({
+          bubbles: [{ text: "Here’s a fresh private link.", delayMs: 0 }],
+          webAccessPath: "/calendar",
+        });
+      }
+      if (input.currentMessage.text.startsWith(WEB_ACCESS_FOLLOW_UP)) {
+        accessFollowUpHistory = input.recentMessages.map((message) => message.text);
+        accessFollowUpAuthoredText = input.currentMessage.authoredText;
+      }
+      return decision();
+    });
+    harness.state.founderProductRecenterReview = true;
+    await harness.setupFounder();
+    await harness.accept("private", "resume-incomplete-setup", "How do I finish connecting Google?");
+    await harness.drain();
+    const setupAccessUrl = harness.accessLinkFor(PRIVATE_FOUNDER);
+    expect(setupAccessUrl.pathname).toBe("/");
+    expect(setupAccessUrl.hash).toMatch(/^#a=wa1\./);
+    expect(
+      harness.linq.messages.some(
+        (message) =>
+          message.providerConversationId === PRIVATE_FOUNDER && message.text === "https://florence.test/",
+      ),
+    ).toBe(false);
+    const setupAccessApp = await harness.webApp(false);
+    const setupAccessResponse = await setupAccessApp.inject({
+      method: "POST",
+      url: "/api/v1/session",
+      payload: { accessToken: new URLSearchParams(setupAccessUrl.hash.slice(1)).get("a") },
+    });
+    await setupAccessApp.close();
+    expect(setupAccessResponse.statusCode).toBe(200);
+    expect(setupAccessResponse.json()).toEqual({ adultId: harness.founderAdultId, accessPath: "/" });
+    const compoundSurnamePreview = await harness.florence.putMember(
+      harness.founderAdultId,
+      harness.founderAdultId,
+      { lastName: "De la Cruz" },
+    );
+    expect(compoundSurnamePreview.viewer).toMatchObject({
+      displayName: "Hari De la Cruz",
+      lastName: "De la Cruz",
+    });
+    await harness.activateFounderGoogle();
+    await expect(
+      harness.florence.completeFamilyOnboarding(harness.founderAdultId, {
+        ...familyProfileInput(),
+        familyLabel: "Client-chosen Family",
+      } as never),
+    ).rejects.toThrow();
+    await harness.completeFamilyProfile();
+    expect((await harness.florence.workspaceForAdult(harness.founderAdultId)).vault?.members).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "adult",
+          firstName: "Hari",
+          lastName: "De la Cruz",
+          displayName: "Hari De la Cruz",
+          relationship: "Parent",
         }),
-      },
-    );
-    await harness.onboard({ exerciseMessagesFirst: true });
-    await harness.activateGoogle();
-
-    expect(harness.linq.messages.map((message) => message.text)).not.toEqual(
-      expect.arrayContaining([expect.stringMatching(/^You’re in, Hari 🎉$/)]),
-    );
-    const setupTurnsBeforeFamilyPrompt = harness.setupTurns.length;
-    await harness.acceptPrivate("private-before-family-setup", "Can you check tomorrow for me?");
-    await harness.drain();
-    expect(harness.setupTurns).toHaveLength(setupTurnsBeforeFamilyPrompt + 1);
-    expect(harness.setupTurns.at(-1)).toMatchObject({
-      stage: "family_profile",
-      currentMessage: { text: "Can you check tomorrow for me?" },
-      nextStep: "finish_family_profile",
-    });
-    expect(harness.linq.messages.map((message) => message.text)).toContain("https://florence.test/");
-    await harness.completeFamilyOnboarding();
-
-    expect(harness.linq.messages.map((message) => message.text)).toEqual(
-      expect.arrayContaining([
-        expect.stringMatching(/^You’re in, Hari 🎉$/),
-        expect.stringContaining("Google account stays private to you"),
-        "What’s one thing you’d rather not deal with yourself? I’ll take a first pass.",
+        expect.objectContaining({
+          kind: "child",
+          firstName: "Maya",
+          lastName: "Anbarasu",
+          displayName: "Maya Anbarasu",
+          relationship: "Child",
+        }),
       ]),
     );
+    await harness.drain();
 
-    const signalId = inboundSourceId("event-private-school-packet");
-    const sealed = harness.vault.sealPdf({
-      documentId: "55555555-5555-4555-8555-555555555555",
-      householdId: (await harness.store.listHouseholdIdsForAdult(ADULT_ONE))[0] ?? "missing",
-      signalId,
-      filename: "school-packet.pdf",
-      declaredMimeType: "application/pdf",
-      bytes: new TextEncoder().encode(
-        "%PDF-1.7\nMuir field trip with Ms. Chen. Permission slip due Tuesday. Friday trip. The bus returns at 3:45.\n%%EOF\n",
-      ),
-      discardAfter: new Date(harness.now + 120_000).toISOString(),
-    });
-    const documentMessage = harness.inbound(
-      "private",
-      "private-school-packet",
-      "Review this school packet and draft the exact note to Ms. Chen. Don’t send it. Also don’t retain it or schedule anything.",
-      { documents: [{ ...sealed, externalKey: "linq-document-school-packet" }] },
-    );
-    expect((await harness.florence.acceptInbound(documentMessage))?.disposition).toBe("accepted");
-    await eventually(() =>
-      harness.linq.reactions.some(
-        (reaction) =>
-          reaction.targetProviderMessageId === "message-private-school-packet" &&
-          reaction.reaction === "emphasize",
-      ),
-    );
-    await eventually(
-      () => harness.linq.messages.some((message) => message.text === "I’m looking through this now."),
-      8_000,
-    );
-    const workCueIndex = harness.linq.messages.findIndex(
-      (message) => message.text === "I’m looking through this now.",
-    );
-    expect(workCueIndex).toBeGreaterThanOrEqual(0);
+    expect(harness.state.privateReviews.map((review) => review.adult.firstName)).toEqual(["Hari"]);
     expect(
-      await harness.receiveReaction("document-work-like", `sent-${workCueIndex + 1}`, "like", "private"),
-    ).toEqual({
-      disposition: "accepted",
-      sourceId: inboundSourceId("event-document-work-like"),
-    });
-    await harness.acceptPrivate(
-      "private-school-correction",
-      "Correction: Alex is unavailable too. Please keep going.",
-    );
-    await harness.drain();
-    expect((await harness.florence.acceptInbound(documentMessage))?.disposition).toBe("duplicate");
-    expect(harness.linq.messages.map((message) => message.text)).not.toContain(
-      "Tuesday’s permission-slip deadline is actionable. Ms. Chen is a stable school contact; Friday’s trip and 3:45 return are one-offs. I saved neither.",
-    );
-    await harness.acceptPrivate(
-      "private-school-late-correction",
-      "One more correction: Sam can cover the 3:45 pickup. Please keep going.",
-    );
-    await harness.drain();
-    harness.now += 1_000;
-    await harness.drain();
-
-    expect(pdfWasRead).toBe(true);
-    expect(calendarWasRead).toBe(true);
-    expect(gmailWasRead).toBe(true);
-    expect(obsoleteResultWasSuppressed).toBe(true);
-    expect(harness.googleReads).toBe(2);
-    expect(harness.gmailReads).toBe(1);
-    expect(harness.googleEffects).toBe(0);
-    const storedEmail = await harness.store.recordGmailEvidence({
-      householdId: (await harness.store.listHouseholdIdsForAdult(ADULT_ONE))[0] ?? "missing",
-      ownerAdultId: ADULT_ONE,
-      connectionId: GOOGLE_CONNECTION,
-      ...SCHOOL_EMAIL,
-      text: "A raw body must not be retained here.",
-    });
-    expect(storedEmail.visibility).toBe("private");
-    expect(storedEmail.ownerAdultId).toBe(ADULT_ONE);
-    expect(JSON.stringify(storedEmail.metadata)).not.toContain("A raw body must not be retained here.");
-    const documentWorkspace = await harness.florence.workspaceForAdult(ADULT_ONE);
-    expect(documentWorkspace.vault?.facts).not.toEqual(
-      expect.arrayContaining([expect.objectContaining({ statement: "Ms. Chen is Maya’s teacher" })]),
-    );
-    const documentReplies = harness.linq.messages.map((message) => message.text);
-    expect(documentReplies).toEqual(
+      harness.linq.messages.filter(
+        (message) =>
+          message.providerConversationId === PRIVATE_FOUNDER &&
+          message.text === "Hari, I checked your side and found one family item worth tracking.",
+      ),
+    ).toHaveLength(1);
+    const founderBeforePartner = await harness.florence.workspaceForAdult(harness.founderAdultId);
+    expect(founderBeforePartner.workspace.setup.initialBriefing).toBe("not_ready");
+    expect(founderBeforePartner.vault?.facts).toEqual(
       expect.arrayContaining([
-        "I’m looking through this now.",
-        expect.stringContaining("unsupervised pickup gap"),
-        expect.stringMatching(/stable school contact.*one-offs/),
-        expect.stringMatching(/draft to Ms\. Chen/i),
+        expect.objectContaining({
+          statement: INITIAL_PRIVATE_SCHOOL_FACT,
+          visibility: "private",
+          source: expect.objectContaining({ kind: "gmail" }),
+        }),
       ]),
     );
-    expect(documentReplies).not.toContain(
-      "Tuesday’s permission-slip deadline is actionable. Ms. Chen is a stable school contact; Friday’s trip and 3:45 return are one-offs. I saved neither.",
+    expect(founderBeforePartner.vault?.watches).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "monitor",
+          objective: "Watch for confirmation that Maya’s field-trip form is signed.",
+          status: "active",
+          visibility: "private",
+        }),
+      ]),
     );
-    expect(documentReplies.join("\n")).toContain(
-      "I didn’t retain anything in the Vault or schedule anything.",
+    await harness.assertDatabase(
+      "The founder review or its calm follow-through did not commit before partner activation",
+      `(select count(*)=1 from proactive_work where kind='initial_private_review' and status='completed')
+        and (select count(*)=1 from proactive_work where kind='personal_google_poll' and status='active')
+        and (select count(*)=1 from proactive_work where kind='finite_monitor' and status='active')
+        and not exists (select 1 from calendar_actions)`,
     );
-    expect(documentReplies.join("\n")).toContain("Tuesday’s permission-slip deadline still needs attention.");
-    expect(documentReplies).not.toContain("This obsolete answer must never be sent.");
-    harness.now += 60_000;
-    await harness.drain();
-    expect(harness.linq.messages.map((message) => message.text)).not.toContain(
-      "This prohibited reminder must never be sent.",
-    );
-
-    const groupStart = harness.inbound("group", "group-start", "Hi Florence");
-    expect((await harness.florence.bootstrapMessagesGroup(groupStart))?.disposition).toBe("accepted");
-    await harness.drain();
-    expect((await harness.florence.acceptInbound(groupStart))?.disposition).toBe("duplicate");
-    const groupReplyIndex = harness.linq.messages.findIndex(
-      (message) => message.text === "Family thread is connected.",
-    );
-    expect(groupReplyIndex).toBeGreaterThanOrEqual(0);
-    const groupReplyProviderId = `sent-${groupReplyIndex + 1}`;
-
+    expect(harness.linq.createdChats).toHaveLength(0);
+    expect(harness.state.calendarExecutions).toHaveLength(0);
     expect(
-      (
-        await harness.florence.acceptInbound(
-          harness.inbound("group", "independent-school-hours", "The school office closes at 4."),
-        )
-      )?.disposition,
-    ).toBe("accepted");
-    await harness.drain();
-    const temporaryFact = harness.inbound(
-      "group",
-      "temporary-school-code",
-      "Remember that the school gate code is 2468.",
-    );
-    expect((await harness.florence.acceptInbound(temporaryFact))?.disposition).toBe("accepted");
-    await harness.drain();
-    expect(
-      (await harness.florence.workspaceForAdult(ADULT_ONE)).vault?.facts.some((fact) =>
-        fact.statement.includes("gate code"),
+      harness.linq.messages.filter(
+        (message) =>
+          message.providerConversationId === PRIVATE_FOUNDER && message.text === "Your side is ready, Hari.",
       ),
-    ).toBe(true);
+    ).toHaveLength(1);
     expect(
-      (
-        await harness.florence.acceptInbound(
-          harness.inbound("group", "forget-temporary-school-code", "Actually, don’t retain that."),
-        )
-      )?.disposition,
-    ).toBe("accepted");
-    await harness.drain();
-    expect(
-      (await harness.florence.workspaceForAdult(ADULT_ONE)).vault?.facts.some((fact) =>
-        fact.statement.includes("gate code"),
+      harness.linq.messages.some((message) =>
+        message.text.includes("I’ll use your Gmail and calendar to catch school dates"),
       ),
     ).toBe(false);
     expect(
-      (await harness.florence.workspaceForAdult(ADULT_ONE)).vault?.facts.some((fact) =>
-        fact.statement.includes("office closes at 4"),
+      harness.linq.messages.filter(
+        (message) =>
+          message.providerConversationId === PRIVATE_FOUNDER &&
+          message.text === "Want me to text Alex at ••••0202 so they can set up their side?",
       ),
-    ).toBe(true);
-    expect(harness.linq.messages.map((message) => message.text)).not.toContain(
-      "I’ll keep it with the school logistics.",
-    );
+    ).toHaveLength(1);
 
-    expect(await harness.receiveReaction("family-love", groupReplyProviderId, "love")).toEqual({
-      disposition: "accepted",
-      sourceId: inboundSourceId("event-family-love"),
-    });
+    const founderMessagesBeforePermanentFailure = harness.linq.messages.filter(
+      (message) => message.providerConversationId === PRIVATE_FOUNDER,
+    ).length;
+    harness.linq.partnerChatFailuresRemaining = 1;
+    await harness.accept("private", "approve-partner", INVITE_APPROVAL);
     await harness.drain();
-    expect(await harness.receiveReaction("family-love", groupReplyProviderId, "love")).toEqual({
-      disposition: "duplicate",
-      sourceId: inboundSourceId("event-family-love"),
+    expect(
+      harness.linq.createdChats.filter((chat) => chat.result.authority.audience === "private"),
+    ).toHaveLength(0);
+    const permanentFailureNotices = harness.linq.messages
+      .filter((message) => message.providerConversationId === PRIVATE_FOUNDER)
+      .slice(founderMessagesBeforePermanentFailure);
+    expect(permanentFailureNotices).toHaveLength(1);
+    expect(permanentFailureNotices[0]?.text).toBe(PARTNER_SETUP_DELIVERY_FAILURE_NOTICE);
+    expect((await harness.florence.workspaceForAdult(harness.founderAdultId)).workspace.setup).toMatchObject({
+      partnerInvitation: "ready",
     });
-    expect(await harness.receiveReaction("not-florence", "message-group-start", "love")).toEqual({
-      disposition: "rejected",
-      reason: "authority_not_found",
-    });
-    expect(await harness.receiveReaction("family-like", groupReplyProviderId, "like")).toEqual({
-      disposition: "accepted",
-      sourceId: inboundSourceId("event-family-like"),
-    });
-    await harness.drain();
-
-    const pickupMessage = harness.inbound(
-      "group",
-      "group-pickup",
-      "Pickup is at 2:45; please remind both of us about pickup.",
+    const linkAttemptsAfterPermanentFailure = harness.linq.partnerSetupLinkAttempts;
+    expect(linkAttemptsAfterPermanentFailure).toBe(0);
+    await harness.assertDatabase(
+      "A pre-chat invitation failure fabricated provider history",
+      `exists (
+        select 1 from people where adult_slot=2 and status='planned'
+          and invitation_consumed_at is not null
+          and invitation_conversation_id is null and invitation_identity_digest is null
+          and invitation_message_id is null and invitation_issued_at is null
+      )`,
     );
-    expect((await harness.florence.acceptInbound(pickupMessage))?.disposition).toBe("accepted");
+    harness.state.now += 15_001;
     await harness.drain();
-    harness.now += 60_000;
-    await harness.drain();
-    const beforeCorrection = await harness.florence.workspaceForAdult(ADULT_TWO);
-    const dismissal = beforeCorrection.vault?.facts.find((fact) => fact.statement.includes("dismissal"));
-    expect(dismissal?.visibility).toBe("household");
-    await harness.florence.correctFact(ADULT_TWO, dismissal?.id ?? "missing", "School dismissal is at 3:00");
-    expect((await harness.florence.workspaceForAdult(ADULT_ONE)).vault?.facts).toEqual(
-      expect.arrayContaining([expect.objectContaining({ statement: "School dismissal is at 3:00" })]),
-    );
+    expect(harness.linq.partnerSetupLinkAttempts).toBe(linkAttemptsAfterPermanentFailure);
+    expect(
+      harness.linq.messages
+        .filter((message) => message.providerConversationId === PRIVATE_FOUNDER)
+        .slice(founderMessagesBeforePermanentFailure),
+    ).toHaveLength(1);
 
-    await harness.acceptPrivate("calendar-offer", "Could you add the school assembly to my calendar?");
+    await harness.accept("private", "reinvite-partner-after-rejection", REINVITE_APPROVAL);
     await harness.drain();
-    expect(harness.googleEffects).toBe(0);
-    await harness.acceptPrivate("calendar-approval", COMPOUND_CALENDAR_APPROVAL);
+    expect(harness.linq.createdChats[0]).toMatchObject({
+      input: { participantPhoneNumbers: [PARTNER_PHONE] },
+      result: { providerConversationId: PRIVATE_PARTNER, authority: { audience: "private" } },
+    });
+    expect((await harness.florence.workspaceForAdult(harness.founderAdultId)).workspace.setup).toMatchObject({
+      partnerInvitation: "invited",
+    });
+    const expiringPartnerSetupToken = harness.setupTokenFor(PRIVATE_PARTNER);
+    const linkAttemptsBeforeExpiry = harness.linq.partnerSetupLinkAttempts;
+    expect(linkAttemptsBeforeExpiry).toBe(1);
+    harness.state.now += 24 * 60 * 60_000 + 1_000;
+    expect(await harness.redeemPartnerSetup(expiringPartnerSetupToken)).toBeNull();
+    const founderMessagesBeforeExpiry = harness.linq.messages.filter(
+      (message) => message.providerConversationId === PRIVATE_FOUNDER,
+    ).length;
+    await harness.receiveParts(
+      "expired-partner-link-question",
+      [{ type: "text", value: PARTNER_SETUP_QUESTION }],
+      PRIVATE_PARTNER,
+      "partner",
+    );
+    expect(
+      harness.linq.messages.filter(
+        (message) =>
+          message.providerConversationId === PRIVATE_PARTNER && message.text === PARTNER_SETUP_EXPIRED_REPLY,
+      ),
+    ).toHaveLength(1);
     await harness.drain();
-    expect(harness.calendarApprovalTurns).toEqual([
-      {
-        currentMessage: {
-          text: COMPOUND_CALENDAR_APPROVAL,
-          occurredAt: expect.any(String),
-        },
-        event: EVENT,
-      },
+    const expirationNotices = harness.linq.messages
+      .filter((message) => message.providerConversationId === PRIVATE_FOUNDER)
+      .slice(founderMessagesBeforeExpiry);
+    expect(expirationNotices).toHaveLength(1);
+    expect(expirationNotices[0]?.text).toBe(PARTNER_SETUP_EXPIRED_NOTICE);
+    expect((await harness.florence.workspaceForAdult(harness.founderAdultId)).workspace.setup).toMatchObject({
+      partnerInvitation: "ready",
+    });
+    expect(harness.linq.partnerSetupLinkAttempts).toBe(linkAttemptsBeforeExpiry);
+    harness.state.now += 15_001;
+    await harness.drain();
+    expect(harness.linq.partnerSetupLinkAttempts).toBe(linkAttemptsBeforeExpiry);
+
+    await harness.accept("private", "reinvite-partner-after-expiry", REINVITE_APPROVAL);
+    await harness.drain();
+    expect(harness.linq.partnerSetupLinkAttempts).toBe(linkAttemptsBeforeExpiry + 1);
+    const finalPartnerSetupToken = harness.setupTokenFor(PRIVATE_PARTNER);
+    expect(finalPartnerSetupToken).not.toBe(expiringPartnerSetupToken);
+
+    await harness.setupPartner();
+    await harness.activatePartnerGoogle();
+    harness.state.familyCalendarProvisioningFailuresRemaining = 1;
+    await expect(harness.drain()).rejects.toBeInstanceOf(GoogleFamilyCalendarTransientError);
+
+    const householdId = (await harness.store.listHouseholdIdsForAdult(harness.founderAdultId))[0];
+    if (!householdId) throw new Error("The activated family household is missing");
+    const stalledHousehold = await harness.store.readHousehold({ householdId });
+    expect(stalledHousehold).toMatchObject({
+      familyCalendarId: FAMILY_CALENDAR,
+      familyCalendarCreatedAt: null,
+    });
+    expect(
+      stalledHousehold?.channels.filter(
+        (channel) => channel.audience === "group" && !channel.revokedAt && !channel.stoppedAt,
+      ),
+    ).toHaveLength(1);
+    expect(harness.state.provisionings).toEqual([
+      expect.not.objectContaining({ calendarId: expect.any(String) }),
     ]);
 
-    const workspace = await harness.florence.workspaceForAdult(ADULT_ONE);
-    expect(Object.values(workspace.workspace.setup)).not.toContain(false);
-    expect(pdfWasRead).toBe(true);
-    expect(reactionWasUnderstood).toBe(true);
-    expect(calendarWasRead).toBe(true);
-    expect(obsoleteResultWasSuppressed).toBe(true);
-    expect(harness.googleReads).toBe(3);
-    expect(workspace.vault?.facts).not.toEqual(
-      expect.arrayContaining([expect.objectContaining({ statement: "A tapback changed family memory" })]),
+    harness.linq.familyCalendarReadyFailuresRemaining = 1;
+    await expect(harness.drain()).rejects.toThrow(
+      "The Family Calendar announcement outcome is temporarily unknown",
     );
-    expect(harness.googleEffects).toBe(1);
-    expect(harness.linq.reactions).toHaveLength(2);
-    expect(harness.linq.reactions[1]).toMatchObject({
-      targetProviderMessageId: groupReplyProviderId,
-      reaction: "laugh",
+    const calendarReadyButUnannounced = await harness.store.readHousehold({ householdId });
+    expect(calendarReadyButUnannounced).toMatchObject({
+      familyCalendarId: FAMILY_CALENDAR,
+      familyCalendarCreatedAt: expect.any(String),
+      initialBriefingState: "not_ready",
     });
-    expect(harness.linq.messages.map((message) => message.text)).toEqual(
-      expect.arrayContaining([
-        "I’ll remind both of you.",
-        "That made me smile.",
-        "Pickup reminder: dismissal is at 2:45.",
-        "I’ll remind you that morning.",
-        "Added “School assembly” to your calendar.",
-      ]),
-    );
-    expect(harness.linq.messages.find((message) => message.text === "That made me smile.")?.replyTo).toEqual({
-      providerMessageId: groupReplyProviderId,
-    });
-    harness.now = Date.parse(CALENDAR_MORNING_REMINDER_AT);
+
     await harness.drain();
-    expect(harness.linq.messages.map((message) => message.text)).toContain(CALENDAR_MORNING_REMINDER);
+
+    const groups = harness.linq.createdChats.filter((chat) => chat.result.authority.audience === "group");
+    expect(groups).toHaveLength(1);
+    expect(groups[0]).toMatchObject({
+      input: { participantPhoneNumbers: [FOUNDER_PHONE, PARTNER_PHONE] },
+      result: {
+        providerConversationId: FAMILY_GROUP,
+        authority: {
+          audience: "group",
+          participantIdentityDigests: [FOUNDER_IDENTITY, PARTNER_IDENTITY].sort(),
+        },
+      },
+    });
+    expect(harness.state.provisionings).toEqual([
+      expect.objectContaining({
+        founderConnectionId: FOUNDER_GOOGLE,
+        partnerConnectionId: PARTNER_GOOGLE,
+        summary: "De la Cruz–Anbarasu Family",
+        timeZone: "America/Los_Angeles",
+      }),
+      expect.objectContaining({
+        calendarId: FAMILY_CALENDAR,
+        founderConnectionId: FOUNDER_GOOGLE,
+        partnerConnectionId: PARTNER_GOOGLE,
+      }),
+    ]);
+    expect(
+      harness.linq.messages.filter(
+        (message) =>
+          message.providerConversationId === FAMILY_GROUP &&
+          message.text ===
+            "I made the De la Cruz–Anbarasu Family calendar too. Either of you can ask me to add or change family plans here.",
+      ),
+    ).toHaveLength(1);
+    expect(harness.state.briefings).toHaveLength(1);
+    expect(
+      harness.linq.messages.filter(
+        (message) =>
+          message.providerConversationId === FAMILY_GROUP && message.text.startsWith("Here’s what I found:"),
+      ),
+    ).toHaveLength(1);
+    expect(
+      harness.state.calendarExecutions.filter(
+        (execution) =>
+          execution.mutation.operation === "create" &&
+          execution.mutation.event.title === PRE_ACTIVATION_FAMILY_DATE.title,
+      ),
+    ).toHaveLength(0);
+    await harness.assertDatabase(
+      "The discarded pre-activation Calendar proposal was resurrected after activation",
+      `not exists (
+        select 1 from calendar_actions
+        where payload->'event'->>'title'=${sqlLiteral(PRE_ACTIVATION_FAMILY_DATE.title)}
+      )`,
+    );
+
+    const founder = await harness.florence.workspaceForAdult(harness.founderAdultId);
+    const partner = await harness.florence.workspaceForAdult(harness.partnerAdultId);
+    expect(founder.workspace.setup).toEqual({
+      ownOnboardingComplete: true,
+      secondAdultAdded: true,
+      partnerInvitation: "connected",
+      bothAdultsMessagesConnected: true,
+      bothAdultsGoogleConnected: true,
+      familyGroupConnected: true,
+      familyCalendarConnected: true,
+      initialBriefing: "sent",
+    });
+    expect(partner.workspace.setup).toEqual(founder.workspace.setup);
+
+    const privateAccessLinksBeforeRequest = harness.accessLinksFor(PRIVATE_FOUNDER).length;
+    await harness.accept("private", "calendar-web-access", WEB_CALENDAR_ACCESS_REQUEST);
+    await harness.drain();
+    const calendarAccessUrl = harness.accessLinkFor(PRIVATE_FOUNDER);
+    expect(calendarAccessUrl.pathname).toBe("/calendar");
+    expect(harness.accessLinksFor(PRIVATE_FOUNDER)).toHaveLength(privateAccessLinksBeforeRequest + 1);
+
+    const groupAccessLinksBeforeRequest = harness.accessLinksFor(FAMILY_GROUP).length;
+    await harness.accept("group", "group-calendar-web-access", WEB_CALENDAR_ACCESS_REQUEST);
+    await harness.drain();
+    expect(harness.accessLinksFor(FAMILY_GROUP)).toHaveLength(groupAccessLinksBeforeRequest);
+
+    const privateAccessLinksBeforeVoiceEvidence = harness.accessLinksFor(PRIVATE_FOUNDER).length;
+    const voiceOnlyAccess = await harness.florence.acceptInbound({
+      ...harness.inbound("private", "voice-only-calendar-web-access", WEB_CALENDAR_ACCESS_REQUEST),
+      authoredText: null,
+      voiceTranscriptPresent: true,
+    });
+    expect(voiceOnlyAccess).not.toBeNull();
+    await harness.drain();
+    expect(harness.accessLinksFor(PRIVATE_FOUNDER)).toHaveLength(privateAccessLinksBeforeVoiceEvidence);
+
+    await harness.accept(
+      "private",
+      "calendar-web-access-follow-up",
+      `${WEB_ACCESS_FOLLOW_UP} ${calendarAccessUrl.toString()}`,
+    );
+    await harness.drain();
+    expect(accessFollowUpHistory.some((text) => text.includes("wa1."))).toBe(false);
+    expect(accessFollowUpHistory.some((text) => text.includes("[secure web link]"))).toBe(true);
+    expect(accessFollowUpAuthoredText).not.toContain("wa1.");
+    expect(accessFollowUpAuthoredText).toContain("[secure web link]");
+
+    const calendarAccessToken = new URLSearchParams(calendarAccessUrl.hash.slice(1)).get("a");
+    if (!calendarAccessToken) throw new Error("The calendar access token was not sent");
+    const originalFounderAuthority = harness.linq.authorities.get(PRIVATE_FOUNDER);
+    if (!originalFounderAuthority) throw new Error("The founder private authority is unavailable");
+    harness.linq.authorities.set(PRIVATE_FOUNDER, {
+      audience: "group",
+      participantIdentityDigests: [FOUNDER_IDENTITY],
+    });
+    const rejectedAccessApp = await harness.webApp(false);
+    const rejectedAccessResponse = await rejectedAccessApp.inject({
+      method: "POST",
+      url: "/api/v1/session",
+      payload: { accessToken: calendarAccessToken },
+    });
+    await rejectedAccessApp.close();
+    expect(rejectedAccessResponse.statusCode).toBe(401);
+    harness.linq.authorities.set(PRIVATE_FOUNDER, originalFounderAuthority);
+    const calendarAccessApp = await harness.webApp(false);
+    const calendarAccessResponse = await calendarAccessApp.inject({
+      method: "POST",
+      url: "/api/v1/session",
+      payload: { accessToken: calendarAccessToken },
+    });
+    await calendarAccessApp.close();
+    expect(calendarAccessResponse.statusCode).toBe(200);
+    expect(calendarAccessResponse.json()).toEqual({
+      adultId: harness.founderAdultId,
+      accessPath: "/calendar",
+    });
+
+    const visibleCounts = {
+      chats: harness.linq.createdChats.length,
+      messages: harness.linq.messages.length,
+      provisionings: harness.state.provisionings.length,
+      briefings: harness.state.briefings.length,
+    };
+    await harness.drain();
+    expect({
+      chats: harness.linq.createdChats.length,
+      messages: harness.linq.messages.length,
+      provisionings: harness.state.provisionings.length,
+      briefings: harness.state.briefings.length,
+    }).toEqual(visibleCounts);
   }, 20_000);
 
-  test("keeps private memory and corrections private, shares only group corrections, understands replies, and rejects mismatched group authority", async () => {
-    let understoodReply = false;
-    let understoodNaturalOptOut = false;
-    const harness = await freshHarness(async (input) => {
-      const sourceId = input.currentMessage.sourceId;
-      if (input.currentMessage.text === "Please stop messaging me in this conversation.") {
-        understoodNaturalOptOut = true;
+  test("gets ahead from both parents’ context, native inputs, a monitor, and the read-only calendar", async () => {
+    let nativeInputWasRead = false;
+    let ordinaryUnusedSourceId: string | null = null;
+    let conversationalGoogleSourceId: string | null = null;
+    let retainedGoogleMemorySourceId: string | null = null;
+    const nativeObservation: {
+      audience: string | null;
+      text: string | null;
+      imageCount: number;
+      pdfCount: number;
+      imageBytes: Uint8Array | null;
+      pdfBytes: Uint8Array | null;
+    } = {
+      audience: null,
+      text: null,
+      imageCount: 0,
+      pdfCount: 0,
+      imageBytes: null,
+      pdfBytes: null,
+    };
+    const harness = await createHarness(async (input, reads) => {
+      if (input.currentMessage.text === GOOGLE_MEMORY_REPLY_QUESTION) {
+        const retained = input.visibleSources.find(
+          (source) => source.kind === "memory" && source.text === UPDATED_PRIVATE_SCHOOL_FACT,
+        );
+        if (!retained?.recordId) {
+          throw new Error("The retained Gmail-derived school fact was not visible to the parent turn");
+        }
+        retainedGoogleMemorySourceId = retained.sourceId;
+        return decision({ bubbles: [{ text: GOOGLE_MEMORY_REPLY, delayMs: 5_000 }] });
+      }
+      if (input.currentMessage.text === GOOGLE_CITED_REPLY_QUESTION) {
+        const connection = input.googleConnections.find((candidate) => candidate.kind === "personal");
+        if (!connection) throw new Error("The private Gmail connection is missing");
+        const [source] = await reads.searchGmail({
+          connectionId: connection.connectionId,
+          query: GOOGLE_CITED_REPLY_QUERY,
+          limit: 10,
+        });
+        if (!source?.text.includes("emergency card")) {
+          throw new Error("The conversational Gmail read returned no usable evidence");
+        }
+        conversationalGoogleSourceId = source.sourceId;
+        return decision({ bubbles: [{ text: GOOGLE_CITED_REPLY, delayMs: 5_000 }] });
+      }
+      if (input.currentMessage.text === ORDINARY_UNUSED_GMAIL_QUESTION) {
+        const connection = input.googleConnections.find((candidate) => candidate.kind === "personal");
+        if (!connection) throw new Error("The private Gmail connection is missing");
+        const [source] = await reads.searchGmail({
+          connectionId: connection.connectionId,
+          query: ORDINARY_UNUSED_GMAIL_QUERY,
+          limit: 10,
+        });
+        if (!source) throw new Error("The ordinary Gmail search returned no evidence");
+        ordinaryUnusedSourceId = source.sourceId;
         return decision({
-          policy: { retain: false, schedule: false, stopMessaging: true },
+          bubbles: [{ text: "Nothing in that email needs you to do anything.", delayMs: 0 }],
         });
       }
-      if (input.currentMessage.text === "Private doctor note") {
-        throw new FlorenceReasonerError("transient", "Keep this reply target retrying");
-      }
-      if (input.currentMessage.text === "What note was I replying to?") {
-        expect(input.currentMessage.replyTo).toMatchObject({
-          sourceId: inboundSourceId("event-private-note"),
-          senderName: "Hari",
-          text: "Private doctor note",
+      if (input.currentMessage.text === INTEREST_REQUEST) {
+        return decision({
+          bubbles: [
+            { text: "I’ll keep an eye out and only bring you something genuinely useful.", delayMs: 0 },
+          ],
+          facts: [remember("Maya likes soccer", input.currentMessage.sourceId)],
+          interest: {
+            operation: "create",
+            interestWorkId: null,
+            genericTerms: ["family soccer matches"],
+            objective: "Find a worthwhile local soccer outing for the family.",
+            why: "Maya likes soccer and the family asked Florence to keep watch.",
+            sourceIds: [input.currentMessage.sourceId],
+          },
         });
-        expect(
-          input.recentMessages.some((message) => message.sourceId === input.currentMessage.replyTo?.sourceId),
-        ).toBe(false);
-        understoodReply = true;
+      }
+      if (input.currentMessage.sourceId !== inboundSourceId("event-native-school-update")) {
         return decision();
       }
-      if (input.currentMessage.text === "Pickup is at 2:45") {
-        return decision({ facts: [remember("Pickup is at 2:45", sourceId)] });
+      nativeInputWasRead = true;
+      nativeObservation.audience = input.audience;
+      nativeObservation.text = input.currentMessage.text;
+      nativeObservation.imageCount = input.currentMessage.images.length;
+      nativeObservation.pdfCount = input.currentMessage.pdfs?.length ?? 0;
+      const imageReference = input.currentMessage.images[0];
+      const pdfReference = input.currentMessage.pdfs?.[0];
+      if (!imageReference || !pdfReference || !reads.readCurrentPdf) return decision();
+      const image = await reads.readCurrentImage(imageReference);
+      const pdf = await reads.readCurrentPdf(pdfReference);
+      nativeObservation.imageBytes = image.bytes;
+      nativeObservation.pdfBytes = pdf.bytes;
+      return decision({
+        bubbles: [{ text: "I found the deadline and I’ll keep an eye on it.", delayMs: 0 }],
+        facts: [remember("Maya’s field-trip form is due Tuesday", input.currentMessage.sourceId)],
+        followUp: {
+          operation: "schedule",
+          followUpId: null,
+          objective: "Watch for confirmation that Maya’s field-trip form is signed.",
+          currentConclusion: "The form still needs a parent signature.",
+          endCondition: "A parent or the school confirms the form is signed.",
+          nextCheck: new Date(Date.parse(input.currentMessage.occurredAt) + 60 * 60_000).toISOString(),
+          why: "The forwarded school message has a live deadline.",
+          sourceIds: [input.currentMessage.sourceId],
+        },
+      });
+    });
+    harness.state.initialGoogleFailuresRemaining = 2;
+    await harness.readyHousehold();
+
+    expect(
+      (await harness.florence.workspaceForAdult(harness.founderAdultId)).vault?.watches.filter(
+        (watch) => watch.kind === "interest",
+      ),
+    ).toHaveLength(0);
+
+    expect(harness.state.briefings).toHaveLength(0);
+    expect(harness.state.initialGoogleFailuresRemaining).toBe(1);
+    const messagesAfterFirstSilentReviewFailure = harness.linq.messages.length;
+    harness.state.now += 16_000;
+    await harness.drain();
+    expect(harness.state.briefings).toHaveLength(0);
+    expect(harness.state.initialGoogleFailuresRemaining).toBe(0);
+    expect(harness.linq.messages).toHaveLength(messagesAfterFirstSilentReviewFailure);
+    harness.state.now += 16_000;
+    await harness.drain();
+
+    expect(harness.state.privateReviews.map((review) => review.adult.firstName).sort()).toEqual([
+      "Alex",
+      "Hari",
+    ]);
+    expect(harness.state.briefings).toHaveLength(1);
+    expect(JSON.stringify(harness.state.briefings[0])).not.toMatch(
+      /hari-private@example\.com|alex-private@example\.com|private calendar detail/i,
+    );
+    const briefing = harness.linq.messages.find(
+      (message) =>
+        message.providerConversationId === FAMILY_GROUP && message.text.startsWith("Here’s what I found"),
+    );
+    expect(briefing?.text).toContain("Maya’s permission-slip deadline is Tuesday");
+    expect(briefing?.text).toContain("Did I get that right?");
+    expect(briefing?.text).not.toMatch(/@example\.com|private calendar detail/i);
+
+    const founderAfterInitialReview = await harness.florence.workspaceForAdult(harness.founderAdultId);
+    const initialPrivateFact = founderAfterInitialReview.vault?.facts.find(
+      (fact) => fact.statement === INITIAL_PRIVATE_SCHOOL_FACT,
+    );
+    expect(initialPrivateFact).toMatchObject({
+      visibility: "private",
+      source: { kind: "gmail" },
+    });
+    if (!initialPrivateFact) throw new Error("The initial private Gmail fact was not retained");
+    expect(
+      (await harness.florence.workspaceForAdult(harness.partnerAdultId)).vault?.facts.some(
+        (fact) => fact.id === initialPrivateFact.id,
+      ),
+    ).toBe(false);
+
+    await harness.assertDatabase(
+      "Unused initial Gmail and Calendar evidence was retained",
+      `not exists (
+        select 1 from sources
+        where (kind='gmail' and metadata->>'messageId' in (
+          ${sqlLiteral(`gmail-${harness.founderAdultId}-false`)},
+          ${sqlLiteral(`gmail-${harness.partnerAdultId}-false`)}
+        )) or (kind='calendar' and metadata->>'providerEventId' in (
+          ${sqlLiteral(`private-event-${harness.founderAdultId}`)},
+          ${sqlLiteral(`private-event-${harness.partnerAdultId}`)}
+        ))
+      )`,
+    );
+
+    await harness.accept("private", "ordinary-unused-email", ORDINARY_UNUSED_GMAIL_QUESTION);
+    await harness.drain();
+    if (!ordinaryUnusedSourceId) throw new Error("The ordinary Gmail source was not observed");
+    await harness.assertDatabase(
+      "An uncited ordinary Gmail answer retained its source",
+      `not exists (select 1 from sources where id=${sqlLiteral(ordinaryUnusedSourceId)}::uuid)`,
+    );
+
+    harness.state.privateFactUpdatePending = true;
+    harness.state.now += 2 * 60_000;
+    await harness.drain();
+    const founderAfterFactUpdate = await harness.florence.workspaceForAdult(harness.founderAdultId);
+    const updatedPrivateFact = founderAfterFactUpdate.vault?.facts.find(
+      (fact) => fact.statement === UPDATED_PRIVATE_SCHOOL_FACT,
+    );
+    expect(updatedPrivateFact).toMatchObject({
+      id: initialPrivateFact.id,
+      visibility: "private",
+      source: { kind: "gmail" },
+    });
+    expect(updatedPrivateFact?.source.id).not.toBe(initialPrivateFact.source.id);
+    expect(
+      (await harness.florence.workspaceForAdult(harness.partnerAdultId)).vault?.facts.some(
+        (fact) => fact.id === initialPrivateFact.id,
+      ),
+    ).toBe(false);
+    expect(
+      harness.state.googleAssessments.find(
+        (assessment) => assessment.adult.adultId === harness.founderAdultId,
+      )?.currentPrivateFacts,
+    ).toEqual(
+      expect.arrayContaining([{ slot: PRIVATE_SCHOOL_FACT_SLOT, statement: INITIAL_PRIVATE_SCHOOL_FACT }]),
+    );
+    await harness.assertDatabase(
+      "The cited incremental Gmail fact was not retained exactly once",
+      `(
+        select count(*)=1 from sources
+        where kind='gmail' and metadata->>'messageId'='gmail-maya-school-enrollment-update'
+      )`,
+    );
+
+    harness.state.overlapGmailReadsRemaining = 2;
+    harness.state.now += 2 * 60_000;
+    await harness.drain();
+    expect(harness.state.overlapGmailAssessments).toBe(1);
+    if (!harness.state.overlapGmailSourceId) throw new Error("The overlap Gmail source was not observed");
+    await harness.assertDatabase(
+      "An uncited incremental Gmail overlap was retained or linked as assessed",
+      `not exists (
+        select 1 from sources where id=${sqlLiteral(harness.state.overlapGmailSourceId)}::uuid
+      ) and not exists (
+        select 1 from proactive_work_sources link
+        join proactive_work work on work.id=link.work_id
+        where work.kind='personal_google_poll'
+          and work.owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+      ) and exists (
+        select 1 from proactive_work
+        where kind='personal_google_poll'
+          and owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+          and gmail_cursor::jsonb->>'historyId'='103'
+      )`,
+    );
+
+    harness.state.now += 2 * 60_000;
+    await harness.drain();
+    expect(harness.state.overlapGmailAssessments).toBe(2);
+    await harness.assertDatabase(
+      "A reconsidered and cited Gmail overlap was not retained exactly once",
+      `(
+        select count(*)=1 from sources
+        where id=${sqlLiteral(harness.state.overlapGmailSourceId)}::uuid
+      ) and exists (
+        select 1 from fact_sources fact_source
+        join facts fact on fact.id=fact_source.fact_id
+        where fact.slot=${sqlLiteral(OVERLAP_GMAIL_FACT_SLOT)}
+          and fact_source.source_id=${sqlLiteral(harness.state.overlapGmailSourceId)}::uuid
+      )`,
+    );
+
+    const automaticExecution = harness.state.calendarExecutions.find(
+      (execution) =>
+        execution.mutation.operation === "create" &&
+        execution.mutation.event.title === AUTOMATIC_FAMILY_DATE.title,
+    );
+    expect(automaticExecution).toBeDefined();
+    const automaticConfirmation = `Added “${AUTOMATIC_FAMILY_DATE.title}” on the family calendar.`;
+    expect(
+      harness.linq.messages.filter(
+        (message) =>
+          message.providerConversationId === FAMILY_GROUP && message.text === automaticConfirmation,
+      ),
+    ).toHaveLength(1);
+    expect(harness.state.timeline.indexOf(`provider:create:${AUTOMATIC_FAMILY_DATE.title}`)).toBeLessThan(
+      harness.state.timeline.indexOf(`message:${automaticConfirmation}`),
+    );
+
+    const nativeParts: TestPart[] = [
+      { type: "text", value: NATIVE_TEXT },
+      { type: "link", value: NATIVE_LINK },
+      {
+        type: "media",
+        id: "school-photo",
+        filename: "school-message.jpg",
+        mimeType: "image/jpeg",
+        bytes: JPEG_BYTES,
+      },
+      {
+        type: "media",
+        id: "school-pdf",
+        filename: "field-trip-form.pdf",
+        mimeType: "application/pdf",
+        bytes: PDF_BYTES,
+      },
+      {
+        type: "media",
+        id: "school-voice",
+        filename: "teacher-note.wav",
+        mimeType: "audio/wav",
+        bytes: WAV_BYTES,
+      },
+    ];
+    expect(await harness.receiveParts("native-school-update", nativeParts, FAMILY_GROUP)).toEqual({
+      disposition: "accepted",
+      sourceId: inboundSourceId("event-native-school-update"),
+    });
+    await harness.drain();
+    const visibleAfterFirstDelivery = harness.linq.messages.length;
+    expect(await harness.receiveParts("native-school-update", nativeParts, FAMILY_GROUP)).toEqual({
+      disposition: "duplicate",
+      sourceId: inboundSourceId("event-native-school-update"),
+    });
+    await harness.drain();
+    expect(harness.linq.messages).toHaveLength(visibleAfterFirstDelivery);
+    expect(nativeInputWasRead).toBe(true);
+    expect(nativeObservation).toMatchObject({
+      audience: "group",
+      imageCount: 1,
+      pdfCount: 1,
+    });
+    expect(Uint8Array.from(nativeObservation.imageBytes ?? [])).toEqual(JPEG_BYTES);
+    expect(Uint8Array.from(nativeObservation.pdfBytes ?? [])).toEqual(PDF_BYTES);
+    expect(nativeObservation.text).toContain(NATIVE_TEXT);
+    expect(nativeObservation.text).toContain(NATIVE_LINK);
+    expect(nativeObservation.text).toContain(VOICE_TRANSCRIPT);
+    expect(harness.state.voiceTranscriptions).toBe(1);
+
+    const workspace = await harness.florence.workspaceForAdult(harness.founderAdultId);
+    expect(workspace.vault?.facts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          statement: "Maya’s field-trip form is due Tuesday",
+          visibility: "household",
+          source: expect.objectContaining({
+            id: inboundSourceId("event-native-school-update"),
+            kind: "message",
+          }),
+        }),
+      ]),
+    );
+    expect(workspace.vault?.watches).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "monitor",
+          objective: "Watch for confirmation that Maya’s field-trip form is signed.",
+          status: "active",
+        }),
+      ]),
+    );
+
+    await harness.accept("group", "soccer-interest", INTEREST_REQUEST, "partner");
+    await harness.drain();
+    const interests = (
+      await harness.florence.workspaceForAdult(harness.founderAdultId)
+    ).vault?.watches.filter((watch) => watch.kind === "interest");
+    expect(interests).toHaveLength(1);
+    expect(interests).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "interest",
+          objective: "Find a worthwhile local soccer outing for the family.",
+          status: "active",
+        }),
+      ]),
+    );
+    expect(
+      await harness.accept("group", "soccer-interest-repeat", INTEREST_REQUEST, "partner"),
+    ).toMatchObject({ disposition: "accepted" });
+    await harness.drain();
+    expect(
+      (await harness.florence.workspaceForAdult(harness.founderAdultId)).vault?.watches.filter(
+        (watch) => watch.kind === "interest",
+      ),
+    ).toHaveLength(1);
+    await harness.assertDatabase(
+      "The repeated interest request was not handled as one ordinary turn",
+      `exists (
+        select 1 from messages
+        where source_id=${sqlLiteral(inboundSourceId("event-soccer-interest-repeat"))}::uuid
+          and direction='inbound' and status='handled' and retry_at is null and last_error is null
+      )`,
+    );
+
+    harness.state.monitorEvidenceExercise = true;
+    harness.state.now += 2 * 60 * 60_000;
+    await harness.drain();
+    expect(harness.state.finiteReviews).toBe(1);
+    if (!harness.state.silentMonitorSourceId) {
+      throw new Error("The silent monitor did not receive current Calendar evidence");
+    }
+    expect(
+      harness.linq.messages.some(
+        (message) =>
+          message.providerConversationId === FAMILY_GROUP &&
+          message.text === "Maya’s field-trip form is signed—nothing else to do.",
+      ),
+    ).toBe(false);
+    await harness.assertDatabase(
+      "A silent monitor retained or linked the Calendar revision it read",
+      `not exists (
+        select 1 from sources where id=${sqlLiteral(harness.state.silentMonitorSourceId)}::uuid
+      ) and not exists (
+        select 1 from proactive_work_sources
+        where source_id=${sqlLiteral(harness.state.silentMonitorSourceId)}::uuid
+      )`,
+    );
+    expect(harness.state.interestResearches).toBe(1);
+    expect(
+      harness.linq.messages.filter(
+        (message) =>
+          message.providerConversationId === FAMILY_GROUP &&
+          message.text === `${INTEREST_RECOMMENDATION}\n\n${INTEREST_URL}`,
+      ),
+    ).toHaveLength(1);
+
+    harness.state.now += 2 * 60 * 60_000;
+    await harness.drain();
+    expect(harness.state.finiteReviews).toBe(2);
+    if (!harness.state.voicedMonitorSourceId) {
+      throw new Error("The voiced monitor did not cite current Calendar evidence");
+    }
+    expect(harness.state.voicedMonitorSourceId).toBe(harness.state.silentMonitorSourceId);
+    await harness.assertDatabase(
+      "A voiced monitor did not retain and link its one current Calendar source",
+      `(
+        select count(*)=1 from sources
+        where id=${sqlLiteral(harness.state.voicedMonitorSourceId)}::uuid
+      ) and (
+        select count(*)=1 from proactive_work_sources
+        where source_id=${sqlLiteral(harness.state.voicedMonitorSourceId)}::uuid
+      )`,
+    );
+
+    harness.state.monitorCancellationActive = true;
+    harness.state.now += 2 * 60 * 60_000;
+    await harness.drain();
+    expect(harness.state.finiteReviews).toBe(3);
+    if (!harness.state.cancelledMonitorSourceId) {
+      throw new Error("The completed monitor did not cite the Calendar tombstone");
+    }
+    expect(harness.state.cancelledMonitorSourceId).toBe(harness.state.voicedMonitorSourceId);
+    expect(
+      harness.linq.messages.some(
+        (message) =>
+          message.providerConversationId === FAMILY_GROUP &&
+          message.text === "Maya’s field-trip form is signed—nothing else to do.",
+      ),
+    ).toBe(true);
+    const monitoredEvent = [...harness.state.calendarEvents.values()].find(
+      (event) => event.title === AUTOMATIC_FAMILY_DATE.title,
+    );
+    if (!monitoredEvent) throw new Error("The monitored family Calendar event is missing");
+    await harness.assertDatabase(
+      "The Calendar source did not converge in place to the current cancellation",
+      `(
+        select count(*)=1 from sources current
+        where current.id=${sqlLiteral(harness.state.cancelledMonitorSourceId)}::uuid
+          and current.kind='calendar' and current.parent_source_id is null
+          and current.metadata->>'providerEventId'=${sqlLiteral(monitoredEvent.providerEventId)}
+          and current.metadata->>'providerRevision'=${sqlLiteral(`${monitoredEvent.providerRevision}-cancelled`)}
+          and current.metadata->>'status'='cancelled'
+          and current.metadata->>'title'=${sqlLiteral(AUTOMATIC_FAMILY_DATE.title)}
+          and nullif(current.metadata->>'startsAt','') is not null
+          and nullif(current.metadata->>'endsAt','') is not null
+          and current.metadata->>'allDay'='true'
+          and current.occurred_at=(current.metadata->>'startsAt')::timestamptz
+      ) and (
+        select count(*)=1 from sources
+        where kind='calendar'
+          and metadata->>'providerEventId'=${sqlLiteral(monitoredEvent.providerEventId)}
+      )`,
+    );
+    expect((await harness.florence.workspaceForAdult(harness.partnerAdultId)).vault?.watches).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "interest",
+          currentConclusion: INTEREST_RECOMMENDATION,
+          status: "active",
+        }),
+      ]),
+    );
+
+    const reconnectText =
+      "Your Google connection stopped working. Reconnect it in Florence settings so I can keep helping with family plans.";
+    const familyCalendarReconnectText =
+      "The family calendar is paused because neither Google account is connected. Either of you can reconnect in Florence settings.";
+    harness.state.googleDeletionEvidencePending = true;
+    harness.state.now += 2 * 60_000;
+    await harness.accept("private", "google-cited-conversational-reply", GOOGLE_CITED_REPLY_QUESTION);
+    expect(await harness.florence.runOnce()).toBe(true);
+    if (!conversationalGoogleSourceId) {
+      throw new Error("The ordinary conversational turn did not read Gmail evidence");
+    }
+    await harness.assertDatabase(
+      "The ordinary Gmail-grounded reply was not waiting with its Google dependency",
+      `exists (
+        select 1 from messages message join sources response on response.id=message.source_id
+        where message.direction='outbound' and message.status='pending'
+          and message.text=${sqlLiteral(GOOGLE_CITED_REPLY)}
+          and response.parent_source_id=${sqlLiteral(inboundSourceId("event-google-cited-conversational-reply"))}::uuid
+          and response.metadata->'googleConnectionIds'
+            @> ${sqlLiteral(JSON.stringify([FOUNDER_GOOGLE]))}::jsonb
+      )`,
+    );
+    for (let index = 0; index < 20 && !harness.state.googleDeletionSourceId; index += 1) {
+      expect(await harness.florence.runOnce()).toBe(true);
+    }
+    if (!harness.state.googleDeletionSourceId) {
+      throw new Error("The Google-derived deletion exercise was not staged");
+    }
+    await harness.assertDatabase(
+      "The Google-derived alert, watch, fact, and Calendar suggestion were not staged together",
+      `exists (
+        select 1 from sources
+        where id=${sqlLiteral(harness.state.googleDeletionSourceId)}::uuid
+          and kind='gmail' and visibility='private'
+          and owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+      ) and exists (
+        select 1 from facts fact join fact_sources link on link.fact_id=fact.id
+          join sources source on source.id=link.source_id
+        where fact.owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+          and fact.slot=${sqlLiteral(PRIVATE_SCHOOL_FACT_SLOT)}
+          and fact.corrected_at is not null and source.kind='gmail'
+      ) and exists (
+        select 1 from fact_sources link join facts fact on fact.id=link.fact_id
+        where link.source_id=${sqlLiteral(harness.state.googleDeletionSourceId)}::uuid
+          and fact.slot=${sqlLiteral(GOOGLE_DELETION_FACT_SLOT)}
+      ) and exists (
+        select 1 from proactive_work_sources link join proactive_work work on work.id=link.work_id
+        where link.source_id=${sqlLiteral(harness.state.googleDeletionSourceId)}::uuid
+          and work.kind='finite_monitor' and work.status='active'
+      ) and exists (
+        select 1 from calendar_actions
+        where basis_source_id=${sqlLiteral(harness.state.googleDeletionSourceId)}::uuid
+          and status='offered'
+          and payload->'event'->>'title'=${sqlLiteral(GOOGLE_DELETION_FAMILY_DATE.title)}
+      ) and exists (
+        select 1 from messages where direction='outbound' and status='pending'
+          and text=${sqlLiteral(GOOGLE_DELETION_PRIVATE_ALERT)}
+      ) and exists (
+        select 1 from messages where direction='outbound' and status='pending'
+          and idempotency_key like 'calendar-review-prompt:%'
+          and text like ${sqlLiteral(`%${GOOGLE_DELETION_FAMILY_DATE.title}%`)}
+      )`,
+    );
+    const interactiveGoogleReadsBeforeMemory = harness.state.interactiveGoogleReads;
+    harness.linq.googleDeletionDeliveryFailuresRemaining = 1;
+    await harness.accept("private", "google-memory-conversational-reply", GOOGLE_MEMORY_REPLY_QUESTION);
+    expect(await harness.florence.runOnce()).toBe(true);
+    if (!retainedGoogleMemorySourceId) {
+      throw new Error("The ordinary conversational turn did not use retained Gmail-derived memory");
+    }
+    expect(harness.state.interactiveGoogleReads).toBe(interactiveGoogleReadsBeforeMemory);
+    await harness.assertDatabase(
+      "The retained-memory reply was not waiting with its inherited Google dependency",
+      `exists (
+        select 1 from messages message join sources response on response.id=message.source_id
+        where message.direction='outbound' and message.status='pending'
+          and message.text=${sqlLiteral(GOOGLE_MEMORY_REPLY)}
+          and response.parent_source_id=${sqlLiteral(inboundSourceId("event-google-memory-conversational-reply"))}::uuid
+          and response.metadata->'googleConnectionIds'
+            @> ${sqlLiteral(JSON.stringify([FOUNDER_GOOGLE]))}::jsonb
+      )`,
+    );
+    const founderGoogleReadsBeforeDisconnect = harness.state.googleChangeReads.filter(
+      (read) => read.ownerAdultId === harness.founderAdultId,
+    ).length;
+    harness.state.providerRevocations.push("unconfirmed");
+    const disconnectApp = await harness.webApp();
+    const disconnectResponse = await disconnectApp.inject({
+      method: "DELETE",
+      url: "/api/v1/workspace/google-connections",
+      headers: { cookie: harness.sessionCookie },
+      payload: { connectionId: FOUNDER_GOOGLE },
+    });
+    await disconnectApp.close();
+    expect(disconnectResponse.statusCode).toBe(200);
+    expect(disconnectResponse.json()).toMatchObject({
+      localAccess: "disconnected",
+      providerRevocation: "unconfirmed",
+      workspace: {
+        workspace: { googleConnections: [] },
+        vault: {
+          facts: expect.arrayContaining([
+            expect.objectContaining({ statement: GOOGLE_DELETION_FACT, visibility: "private" }),
+          ]),
+          watches: expect.arrayContaining([
+            expect.objectContaining({
+              kind: "monitor",
+              objective: "Watch for confirmation that Maya’s emergency card is signed.",
+            }),
+          ]),
+        },
+      },
+    });
+    await harness.assertDatabase(
+      "Ordinary disconnect deleted retained Google-derived data",
+      `exists (
+        select 1 from sources
+        where id=${sqlLiteral(harness.state.googleDeletionSourceId)}::uuid and kind='gmail'
+      ) and exists (
+        select 1 from fact_sources where source_id=${sqlLiteral(harness.state.googleDeletionSourceId)}::uuid
+      ) and exists (
+        select 1 from proactive_work_sources link join proactive_work work on work.id=link.work_id
+        where link.source_id=${sqlLiteral(harness.state.googleDeletionSourceId)}::uuid
+          and work.kind='finite_monitor'
+      )`,
+    );
+    await harness.assertDatabase(
+      "Ordinary disconnect did not remove only noncommitted Google Calendar work",
+      `not exists (
+        select 1 from calendar_actions
+        where basis_source_id=${sqlLiteral(harness.state.googleDeletionSourceId)}::uuid
+          and status in ('offered','pending','failed')
+      ) and exists (
+        select 1 from calendar_actions
+        where status='committed'
+          and payload->'event'->>'title'=${sqlLiteral(AUTOMATIC_FAMILY_DATE.title)}
+      )`,
+    );
+    await harness.assertDatabase(
+      "Ordinary disconnect left a Google-dependent outbound deliverable",
+      `exists (
+        select 1 from messages
+        where direction='outbound' and status='failed'
+          and text=${sqlLiteral(GOOGLE_MEMORY_REPLY)}
+      ) and not exists (
+        select 1 from messages where direction='outbound' and status in ('pending','sending','sent')
+          and (
+            text=${sqlLiteral(GOOGLE_DELETION_PRIVATE_ALERT)}
+            or text=${sqlLiteral(GOOGLE_CITED_REPLY)}
+            or text=${sqlLiteral(GOOGLE_MEMORY_REPLY)}
+            or (
+              idempotency_key like 'calendar-review-prompt:%'
+              and text like ${sqlLiteral(`%${GOOGLE_DELETION_FAMILY_DATE.title}%`)}
+            )
+          )
+      )`,
+    );
+    harness.state.now += 2 * 60_000;
+    await harness.drain();
+    expect(
+      harness.state.googleChangeReads.filter((read) => read.ownerAdultId === harness.founderAdultId),
+    ).toHaveLength(founderGoogleReadsBeforeDisconnect);
+    expect(
+      harness.linq.messages.some(
+        (message) =>
+          message.text === GOOGLE_DELETION_PRIVATE_ALERT ||
+          message.text === GOOGLE_CITED_REPLY ||
+          message.text === GOOGLE_MEMORY_REPLY ||
+          message.text.includes(GOOGLE_DELETION_FAMILY_DATE.title),
+      ),
+    ).toBe(false);
+    expect(
+      harness.linq.messages.filter(
+        (message) => message.providerConversationId === PRIVATE_FOUNDER && message.text === reconnectText,
+      ),
+    ).toHaveLength(0);
+    expect(
+      harness.linq.messages.filter(
+        (message) =>
+          message.providerConversationId === FAMILY_GROUP && message.text === familyCalendarReconnectText,
+      ),
+    ).toHaveLength(0);
+    expect(
+      [...harness.state.calendarEvents.values()].some((event) => event.title === AUTOMATIC_FAMILY_DATE.title),
+    ).toBe(true);
+
+    await harness.activateGoogle(
+      harness.founderAdultId,
+      RECONNECTED_FOUNDER_GOOGLE,
+      "founder-google-reconnected-state",
+    );
+    harness.state.providerRevocations.push("confirmed");
+    const deleteApp = await harness.webApp();
+    const deleteResponse = await deleteApp.inject({
+      method: "DELETE",
+      url: "/api/v1/workspace/google-derived-data",
+      headers: { cookie: harness.sessionCookie },
+    });
+    expect(deleteResponse.statusCode).toBe(200);
+    const deleted = deleteResponse.json();
+    expect(deleted).toMatchObject({
+      providerRevocation: "confirmed",
+      workspace: { workspace: { googleConnections: [] } },
+    });
+    expect(deleted.deletion.disconnectedConnections).toBe(1);
+    expect(deleted.deletion.googleSources).toBeGreaterThan(0);
+    expect(deleted.deletion.facts).toBeGreaterThan(0);
+    expect(deleted.deletion.watches).toBeGreaterThan(0);
+    expect(deleted.deletion.calendarActions).toBe(0);
+    expect(deleted.deletion.unsentMessages).toBeGreaterThan(0);
+    expect(
+      deleted.workspace.vault.facts.some(
+        (fact: { statement: string }) => fact.statement === GOOGLE_DELETION_FACT,
+      ),
+    ).toBe(false);
+    expect(
+      deleted.workspace.vault.watches.some(
+        (watch: { objective: string }) =>
+          watch.objective === "Watch for confirmation that Maya’s emergency card is signed.",
+      ),
+    ).toBe(false);
+    await harness.assertDatabase(
+      "Deleting one adult's Google-derived data crossed its boundary or left linked data behind",
+      `not exists (
+        select 1 from sources
+        where owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+          and kind in ('gmail','calendar')
+      ) and not exists (
+        select 1 from facts
+        where owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+          and slot in (${sqlLiteral(PRIVATE_SCHOOL_FACT_SLOT)},${sqlLiteral(GOOGLE_DELETION_FACT_SLOT)})
+      ) and not exists (
+        select 1 from proactive_work
+        where owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+          and kind in ('initial_private_review','personal_google_poll','finite_monitor')
+      ) and not exists (
+        select 1 from calendar_actions
+        where payload->'event'->>'title'=${sqlLiteral(GOOGLE_DELETION_FAMILY_DATE.title)}
+      ) and not exists (
+        select 1 from messages
+        where text=${sqlLiteral(GOOGLE_DELETION_PRIVATE_ALERT)}
+          or text=${sqlLiteral(GOOGLE_CITED_REPLY)}
+          or text=${sqlLiteral(GOOGLE_MEMORY_REPLY)}
+          or (
+            idempotency_key like 'calendar-review-prompt:%'
+            and text like ${sqlLiteral(`%${GOOGLE_DELETION_FAMILY_DATE.title}%`)}
+          )
+      ) and exists (
+        select 1 from sources
+        where owner_adult_id=${sqlLiteral(harness.partnerAdultId)}::uuid and kind='gmail'
+      ) and exists (
+        select 1 from facts
+        where owner_adult_id=${sqlLiteral(harness.partnerAdultId)}::uuid
+          and slot=${sqlLiteral(PARTNER_PRIVATE_GOOGLE_FACT_SLOT)}
+      ) and exists (
+        select 1 from messages
+        where direction='outbound' and status='sent'
+          and text like 'Here’s what I found:%'
+      ) and exists (
+        select 1 from messages
+        where direction='outbound' and status='sent'
+          and text='Hari, I checked your side and found one family item worth tracking.'
+      ) and exists (
+        select 1 from messages
+        where direction='outbound' and status='sent'
+          and text=${sqlLiteral(automaticConfirmation)}
+      )`,
+    );
+    await harness.assertDatabase(
+      "Deleting Google-derived data left recoverable provider identity or credential state",
+      `exists (
+        select 1 from google_connections
+        where owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+      ) and not exists (
+        select 1 from google_connections
+        where owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+          and (
+            status<>'disconnected'
+            or refresh_token_envelope is not null
+            or email_label is not null
+            or google_subject_digest is not null
+            or session_binding_digest is not null
+            or state_consumed_at is not null
+            or last_error is not null
+            or cardinality(granted_scopes)<>0
+          )
+      )`,
+    );
+    expect((await harness.florence.workspaceForAdult(harness.partnerAdultId)).vault?.facts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ statement: PARTNER_PRIVATE_GOOGLE_FACT, visibility: "private" }),
+      ]),
+    );
+    expect(
+      [...harness.state.calendarEvents.values()].some((event) => event.title === AUTOMATIC_FAMILY_DATE.title),
+    ).toBe(true);
+
+    const duplicateDeleteResponse = await deleteApp.inject({
+      method: "DELETE",
+      url: "/api/v1/workspace/google-derived-data",
+      headers: { cookie: harness.sessionCookie },
+    });
+    await deleteApp.close();
+    expect(duplicateDeleteResponse.statusCode).toBe(200);
+    expect(duplicateDeleteResponse.json()).toMatchObject({
+      providerRevocation: "not-needed",
+      deletion: {
+        disconnectedConnections: 0,
+        googleSources: 0,
+        facts: 0,
+        watches: 0,
+        calendarActions: 0,
+        unsentMessages: 0,
+      },
+    });
+
+    const app = await harness.webApp();
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/v1/calendar?month=2026-08",
+      headers: { cookie: harness.sessionCookie },
+    });
+    await app.close();
+    expect(response.statusCode).toBe(200);
+    expect(response.headers["cache-control"]).toBe("private, no-store");
+    expect(response.json()).toMatchObject({
+      status: "ready",
+      month: "2026-08",
+      calendarName: "Anbarasu Family",
+      events: [expect.objectContaining({ title: AUTOMATIC_FAMILY_DATE.title })],
+    });
+
+    harness.state.invalidGrantAdultId = harness.partnerAdultId;
+    harness.state.invalidGrantTriggered = false;
+    harness.state.now += 2 * 60_000;
+    await harness.drain();
+    expect(harness.state.invalidGrantTriggered).toBe(true);
+    expect(
+      harness.linq.messages.filter(
+        (message) => message.providerConversationId === PRIVATE_PARTNER && message.text === reconnectText,
+      ),
+    ).toHaveLength(1);
+    expect(
+      harness.linq.messages.filter(
+        (message) =>
+          message.providerConversationId === FAMILY_GROUP && message.text === familyCalendarReconnectText,
+      ),
+    ).toHaveLength(1);
+    harness.state.now += 2 * 60_000;
+    await harness.drain();
+    expect(
+      harness.linq.messages.filter(
+        (message) =>
+          message.providerConversationId === FAMILY_GROUP && message.text === familyCalendarReconnectText,
+      ),
+    ).toHaveLength(1);
+    const unavailableApp = await harness.webApp();
+    const unavailableResponse = await unavailableApp.inject({
+      method: "GET",
+      url: "/api/v1/calendar?month=2026-08",
+      headers: { cookie: harness.sessionCookie },
+    });
+    await unavailableApp.close();
+    expect(unavailableResponse.statusCode).toBe(200);
+    expect(unavailableResponse.json()).toMatchObject({
+      status: "temporarily_unavailable",
+      month: "2026-08",
+      calendarName: "Anbarasu Family",
+    });
+
+    await harness.activateGoogle(
+      harness.founderAdultId,
+      POST_DELETION_FOUNDER_GOOGLE,
+      "founder-google-after-deletion-state",
+    );
+    await harness.assertDatabase(
+      "A verified founder reconnect did not safely rebind the existing Family Calendar",
+      `exists (
+        select 1 from households household
+          join google_connections connection
+            on connection.id=household.family_calendar_owner_connection_id
+        where household.family_calendar_id=${sqlLiteral(FAMILY_CALENDAR)}
+          and household.family_calendar_owner_connection_id=${sqlLiteral(POST_DELETION_FOUNDER_GOOGLE)}::uuid
+          and connection.owner_adult_id=${sqlLiteral(harness.founderAdultId)}::uuid
+          and connection.status='active'
+      )`,
+    );
+  }, 20_000);
+
+  test("keeps private context isolated while both parents can manage shared memory, Calendar, and group repair", async () => {
+    const harness = await createHarness(async (input, reads) => {
+      const text = input.currentMessage.text;
+      if (text === "My private backup contact is Sam.") {
+        return decision({ facts: [remember(text, input.currentMessage.sourceId)] });
       }
-      const sharedPickup = input.visibleSources.find(
-        (source) =>
-          source.kind === "memory" && source.visibility === "shared" && source.text.includes("Pickup"),
+      if (text === "Tell Alex that pickup is at 3:15.") {
+        return decision({
+          bubbles: [{ text: "I told Alex.", delayMs: 0 }],
+          householdUpdate: {
+            text: "Hari says pickup is at 3:15.",
+            sourceIds: [input.currentMessage.sourceId],
+          },
+        });
+      }
+      if (text === "Pickup is at 2:45.") {
+        return decision({ facts: [remember(text, input.currentMessage.sourceId)] });
+      }
+      const pickupMemory = input.visibleSources.find(
+        (source) => source.kind === "memory" && source.text.includes("Pickup is at"),
       );
-      if (input.currentMessage.text.includes("keep that private")) {
+      if (text === "Actually pickup is at 3:00." && pickupMemory?.recordId) {
         return decision({
           facts: [
             {
               operation: "correct",
-              factId: sharedPickup?.recordId ?? "missing",
-              statement: "Pickup is at 3:00",
-              sourceIds: [sourceId],
+              factId: pickupMemory.recordId,
+              statement: "Pickup is at 3:00.",
+              sourceIds: [input.currentMessage.sourceId],
             },
           ],
         });
       }
-      if (input.currentMessage.text === "Forget pickup privately") {
+      if (text === "We no longer need the pickup note." && pickupMemory?.recordId) {
         return decision({
           facts: [
             {
               operation: "forget",
-              factId: sharedPickup?.recordId ?? "missing",
+              factId: pickupMemory.recordId,
               statement: null,
-              sourceIds: [sourceId],
+              sourceIds: [input.currentMessage.sourceId],
             },
           ],
         });
       }
-      if (input.currentMessage.text === "Pickup is now 3:00 for everyone") {
+      if (text === "Add Maya pickup to the family calendar.") {
         return decision({
-          facts: [
-            {
-              operation: "correct",
-              factId: sharedPickup?.recordId ?? "missing",
-              statement: "Pickup is at 3:00",
-              sourceIds: [sharedPickup?.sourceId ?? "missing", sourceId],
-            },
-          ],
+          calendar: calendarDecision(input.currentMessage.sourceId, {
+            operation: "create",
+            event: PICKUP_EVENT,
+            target: null,
+          }),
+        });
+      }
+      if (text === "Move Maya pickup to 3:00.") {
+        const target = await calendarTarget(reads, input, PICKUP_EVENT);
+        return decision({
+          calendar: calendarDecision(input.currentMessage.sourceId, {
+            operation: "update",
+            event: UPDATED_PICKUP_EVENT,
+            target,
+          }),
+        });
+      }
+      if (text === "Remove Maya pickup from the family calendar.") {
+        const target = await calendarTarget(reads, input, UPDATED_PICKUP_EVENT);
+        return decision({
+          calendar: calendarDecision(input.currentMessage.sourceId, {
+            operation: "delete",
+            event: null,
+            target,
+          }),
         });
       }
       return decision();
     });
-    await harness.onboard();
-    await harness.activateGoogle();
-    await harness.completeFamilyOnboarding();
-    const privateMessage = await harness.acceptPrivate("private-note", "Private doctor note");
-    await harness.drain();
-    await harness.acceptPrivate("private-reply", "What note was I replying to?", {
-      replyToProviderMessageId: "message-private-note",
+    await harness.readyHousehold();
+
+    let shared = await harness.florence.workspaceForAdult(harness.partnerAdultId);
+    expect(shared.vault?.postalCode).toBe("94110");
+    expect(shared.vault?.members.find((member) => member.id === harness.founderAdultId)).toMatchObject({
+      postalCode: "94110",
     });
-    await harness.drain();
-    await harness.florence.bootstrapMessagesGroup(
-      harness.inbound("group", "group-start", "Pickup is at 2:45"),
-    );
-    await harness.drain();
-
-    expect(understoodReply).toBe(true);
-    expect((await harness.florence.workspaceForAdult(ADULT_TWO)).vault?.facts).not.toEqual(
-      expect.arrayContaining([expect.objectContaining({ statement: "Private doctor note" })]),
-    );
-
-    await harness.acceptPrivate("private-forget", "Forget pickup privately");
-    await harness.drain();
-    expect((await harness.florence.workspaceForAdult(ADULT_TWO)).vault?.facts).toEqual(
-      expect.arrayContaining([expect.objectContaining({ statement: "Pickup is at 2:45" })]),
-    );
-
-    await harness.acceptPrivate("private-correction", "Actually pickup is at 3:00 — keep that private");
-    await harness.drain();
-    expect((await harness.florence.workspaceForAdult(ADULT_ONE)).vault?.facts).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ statement: "Pickup is at 2:45", visibility: "household" }),
-        expect.objectContaining({ statement: "Pickup is at 3:00", visibility: "private" }),
-      ]),
-    );
-    expect((await harness.florence.workspaceForAdult(ADULT_TWO)).vault?.facts).toEqual(
-      expect.arrayContaining([expect.objectContaining({ statement: "Pickup is at 2:45" })]),
-    );
-    expect((await harness.florence.workspaceForAdult(ADULT_TWO)).vault?.facts).not.toEqual(
-      expect.arrayContaining([expect.objectContaining({ statement: "Pickup is at 3:00" })]),
-    );
-
-    await harness.florence.acceptInbound(
-      harness.inbound("group", "shared-correction", "Pickup is now 3:00 for everyone"),
-    );
-    await harness.drain();
-    expect((await harness.florence.workspaceForAdult(ADULT_TWO)).vault?.facts).toEqual(
-      expect.arrayContaining([expect.objectContaining({ statement: "Pickup is at 3:00" })]),
-    );
-
-    expect(
-      await harness.florence.resolveLinqAuthority({
-        providerConversationId: GROUP,
-        audience: "group",
-        participantIdentityDigests: [ADULT_ONE_IDENTITY, digest("outsider")].sort(),
-        senderIdentitySubjectDigest: ADULT_ONE_IDENTITY,
-        occurredAt: harness.iso(),
-      }),
-    ).toBeNull();
-
-    const attemptedLeak = await harness.store.acceptInbound(
-      harness.inbound("group", "group-leak", "Tell everyone the private note"),
-    );
+    shared = await harness.florence.putMember(harness.partnerAdultId, harness.founderAdultId, {
+      postalCode: "94117",
+    });
+    expect(shared.vault?.postalCode).toBe("94117");
     await expect(
-      harness.store.commitTurn({
-        sourceId: attemptedLeak?.sourceId ?? "missing",
-        facts: [
-          {
-            id: randomUUID(),
-            subjectPersonId: null,
-            kind: "general",
-            slot: "leak",
-            label: "Leaked note",
-            value: { statement: "Private doctor note" },
-            visibility: "household",
-            ownerAdultId: null,
-            sourceIds: [privateMessage.sourceId],
-          },
-        ],
-        handledAt: harness.iso(),
-      }),
-    ).rejects.toBeInstanceOf(FlorenceStoreUnauthorized);
-    await expect(
-      harness.store.commitTurn({
-        sourceId: attemptedLeak?.sourceId ?? "missing",
-        calendarActions: [storedCalendarAction(attemptedLeak?.sourceId ?? "missing")],
-        handledAt: harness.iso(),
-      }),
-    ).rejects.toBeInstanceOf(FlorenceStoreUnauthorized);
-
-    const sentBeforeStop = harness.linq.messages.length;
+      harness.florence.putMember(harness.partnerAdultId, randomUUID(), {
+        kind: "adult",
+        firstName: "Another",
+        lastName: "Adult",
+      } as never),
+    ).rejects.toThrow();
+    await harness.florence.disconnectGoogle(harness.partnerAdultId, PARTNER_GOOGLE);
+    await harness.drain();
     expect(
-      await harness.acceptPrivate("private-stop", "Please stop messaging me in this conversation."),
-    ).toMatchObject({
-      disposition: "accepted",
+      harness.linq.messages.filter(
+        (message) =>
+          message.providerConversationId === FAMILY_GROUP &&
+          message.text ===
+            "The family calendar is paused because neither Google account is connected. Either of you can reconnect in Florence settings.",
+      ),
+    ).toHaveLength(0);
+    shared = await harness.florence.putMember(harness.partnerAdultId, harness.founderAdultId, {
+      lastName: "Barasu",
     });
-    await harness.drain();
-    expect(understoodNaturalOptOut).toBe(true);
-    expect(harness.linq.messages).toHaveLength(sentBeforeStop);
-    expect(await harness.receiveMessagesText("private-after-stop", "Are you still there?")).toEqual({
-      disposition: "acknowledged",
-      reason: "channel_stopped",
+    expect(shared.vault?.members.find((member) => member.id === harness.founderAdultId)).toMatchObject({
+      firstName: "Hari",
+      lastName: "Barasu",
+      displayName: "Hari Barasu",
+      relationship: "Parent",
     });
-    expect((await harness.florence.workspaceForAdult(ADULT_ONE)).viewer.displayName).toBe("Hari");
-  });
-
-  test("reconciles an ambiguous Calendar write and reports one definitive failure privately", async () => {
-    const harness = await freshHarness(
-      async (input, reads) => {
-        if (input.currentMessage.text === "Review the school assembly details.") {
-          return decision();
-        }
-        expect(
-          await reads.readCalendarWindow({
-            connectionId: GOOGLE_CONNECTION,
-            timeMin: EVENT.startsAt,
-            timeMax: EVENT.endsAt,
-            limit: 50,
-          }),
-        ).toMatchObject({ status: "complete", events: [] });
-        return decision({
-          bubbles: [{ text: "Done — I added it.", delayMs: 0 }],
-          calendar: {
-            ...calendarDraft(
-              input.currentMessage.pdfs?.length ? "offer" : "direct",
-              input.currentMessage.sourceId,
-            ),
-          },
-        });
-      },
-      {
-        executeCalendar: async () => {
-          if (harness.googleEffects === 0) harness.googleEffects += 1;
-          if (harness.googleAttempts === 1) throw new Error("connection dropped after Google committed");
-          if (harness.googleAttempts === 2) return committedCalendar(harness.iso());
-          return failedCalendar(harness.iso());
-        },
-      },
-    );
-    await harness.onboard();
-    await harness.activateGoogle();
-    await harness.completeFamilyOnboarding();
-    const attachmentSourceId = inboundSourceId("event-calendar-attachment-request");
-    const attachedEvent = harness.vault.sealPdf({
-      documentId: "77777777-7777-4777-8777-777777777777",
-      householdId: (await harness.store.listHouseholdIdsForAdult(ADULT_ONE))[0] ?? "missing",
-      signalId: attachmentSourceId,
-      filename: "assembly.pdf",
-      declaredMimeType: "application/pdf",
-      bytes: new TextEncoder().encode("%PDF-1.7\nSchool assembly details\n%%EOF\n"),
-      discardAfter: new Date(harness.now + 120_000).toISOString(),
-    });
-    expect(
-      (
-        await harness.florence.acceptInbound(
-          harness.inbound(
-            "private",
-            "calendar-attachment-request",
-            "Add the school assembly in this PDF to my calendar.",
-            { documents: [{ ...attachedEvent, externalKey: "linq-calendar-attachment" }] },
-          ),
-        )
-      )?.disposition,
-    ).toBe("accepted");
-    await harness.drain();
-    expect(harness.googleAttempts).toBe(0);
-    await harness.acceptPrivate("calendar-unrequested", "Review the school assembly details.");
-    await harness.drain();
-    expect(harness.googleAttempts).toBe(0);
-    expect(harness.calendarApprovalTurns).toEqual([
-      {
-        currentMessage: {
-          text: "Review the school assembly details.",
-          occurredAt: expect.any(String),
-        },
-        event: EVENT,
-      },
+    expect(harness.state.calendarRenames).toEqual([
+      expect.objectContaining({
+        calendarId: FAMILY_CALENDAR,
+        connectionId: FOUNDER_GOOGLE,
+        ownerAdultId: harness.founderAdultId,
+        summary: "Barasu–Anbarasu Family",
+      }),
     ]);
-    expect(
-      harness.linq.messages.some((message) => message.text.startsWith("I can add this to your calendar:")),
-    ).toBe(true);
-    const inbound = harness.inbound(
-      "private",
-      "calendar-direct",
-      "Add the school assembly to my calendar exactly as written",
-    );
-    expect((await harness.florence.acceptInbound(inbound))?.disposition).toBe("accepted");
-    await harness.drain();
-    expect((await harness.florence.acceptInbound(inbound))?.disposition).toBe("duplicate");
-    expect(harness.googleAttempts).toBe(1);
-
-    harness.now += 15_000;
-    await harness.drain();
-    expect(harness.googleAttempts).toBe(2);
-    expect(harness.googleEffects).toBe(1);
-    expect(harness.linq.messages.map((message) => message.text)).not.toContain("Done — I added it.");
-    expect(
-      harness.linq.messages.filter((message) => message.text === "Added “School assembly” to your calendar."),
-    ).toHaveLength(1);
-
-    await harness.acceptPrivate(
-      "calendar-definitive-failure",
-      "Add the school assembly to my calendar exactly as written again",
-    );
-    await harness.drain();
-    expect(harness.googleAttempts).toBe(3);
-    expect(harness.googleReads).toBe(3);
-    const failures = harness.linq.messages.filter((message) =>
-      message.text.startsWith("I couldn’t confirm that “School assembly”"),
-    );
-    expect(failures).toHaveLength(1);
-    expect(failures[0]?.replyTo).toEqual({
-      providerMessageId: "message-calendar-definitive-failure",
+    expect(harness.state.providerCalendarSummary).toBe("Barasu–Anbarasu Family");
+    const householdIdAfterRename = (await harness.store.listHouseholdIdsForAdult(harness.founderAdultId))[0];
+    const renamedHousehold = householdIdAfterRename
+      ? await harness.store.readHousehold({ householdId: householdIdAfterRename })
+      : null;
+    expect(renamedHousehold).toMatchObject({
+      name: "Barasu–Anbarasu Family",
+      familyCalendarLabel: "Barasu–Anbarasu Family",
     });
+    const calendarApp = await harness.webApp();
+    const renamedCalendar = await calendarApp.inject({
+      method: "GET",
+      url: "/api/v1/calendar?month=2026-08",
+      headers: { cookie: harness.sessionCookie },
+    });
+    await calendarApp.close();
+    expect(renamedCalendar.statusCode).toBe(200);
+    expect(renamedCalendar.json()).toMatchObject({
+      status: "ready",
+      calendarName: "Barasu–Anbarasu Family",
+    });
+
+    await harness.accept("private", "private-memory", "My private backup contact is Sam.");
+    await harness.drain();
+    const founderPrivate = await harness.florence.workspaceForAdult(harness.founderAdultId);
+    const partnerPrivate = await harness.florence.workspaceForAdult(harness.partnerAdultId);
+    const privateFact = founderPrivate.vault?.facts.find(
+      (fact) => fact.statement === "My private backup contact is Sam.",
+    );
+    expect(privateFact).toMatchObject({ visibility: "private" });
+    expect(partnerPrivate.vault?.facts.some((fact) => fact.id === privateFact?.id)).toBe(false);
+
+    await harness.accept("private", "private-household-update", "Tell Alex that pickup is at 3:15.");
     await harness.drain();
     expect(
-      harness.linq.messages.filter((message) =>
-        message.text.startsWith("I couldn’t confirm that “School assembly”"),
+      harness.linq.messages.filter(
+        (message) =>
+          message.providerConversationId === FAMILY_GROUP && message.text === "Hari says pickup is at 3:15.",
+      ),
+    ).toHaveLength(1);
+    expect(
+      harness.linq.messages.filter(
+        (message) => message.providerConversationId === PRIVATE_FOUNDER && message.text === "I told Alex.",
+      ),
+    ).toHaveLength(0);
+    expect(
+      (await harness.florence.workspaceForAdult(harness.partnerAdultId)).vault?.facts.some((fact) =>
+        fact.statement.includes("pickup is at 3:15"),
+      ),
+    ).toBe(false);
+
+    await harness.accept("group", "pickup-start", "Pickup is at 2:45.");
+    await harness.drain();
+    shared = await harness.florence.workspaceForAdult(harness.partnerAdultId);
+    const pickupFactId = shared.vault?.facts.find((fact) => fact.statement === "Pickup is at 2:45.")?.id;
+    expect(pickupFactId).toBeDefined();
+    if (!pickupFactId) throw new Error("Pickup fact was not retained");
+
+    shared = await harness.florence.correctFact(harness.partnerAdultId, pickupFactId, "Pickup is at 2:50.");
+    expect(shared.vault?.facts.find((fact) => fact.id === pickupFactId)).toMatchObject({
+      statement: "Pickup is at 2:50.",
+      source: { kind: "web", label: "Corrected in Vault" },
+    });
+
+    await harness.accept("group", "pickup-correct", "Actually pickup is at 3:00.", "partner");
+    await harness.drain();
+    shared = await harness.florence.workspaceForAdult(harness.founderAdultId);
+    expect(shared.vault?.facts.find((fact) => fact.id === pickupFactId)).toMatchObject({
+      statement: "Pickup is at 3:00.",
+      visibility: "household",
+    });
+
+    await harness.accept("group", "pickup-forget", "We no longer need the pickup note.");
+    await harness.drain();
+    shared = await harness.florence.workspaceForAdult(harness.partnerAdultId);
+    expect(shared.vault?.facts.some((fact) => fact.id === pickupFactId)).toBe(false);
+
+    harness.state.uncertainCalendarCreateTitle = PICKUP_EVENT.title;
+    await harness.accept("group", "calendar-create", "Add Maya pickup to the family calendar.");
+    await harness.drain();
+    const uncertainCreateAttempts = () =>
+      harness.state.calendarExecutions.filter(
+        (execution) =>
+          execution.mutation.operation === "create" && execution.mutation.event.title === PICKUP_EVENT.title,
+      );
+    expect(uncertainCreateAttempts()).toHaveLength(1);
+    expect(
+      harness.linq.messages.filter(
+        (message) =>
+          message.providerConversationId === FAMILY_GROUP &&
+          message.text === `Added “${PICKUP_EVENT.title}” on the family calendar.`,
+      ),
+    ).toHaveLength(0);
+
+    harness.state.now += 15_001;
+    await harness.drain();
+    const reconciledCreateAttempts = uncertainCreateAttempts();
+    expect(reconciledCreateAttempts).toHaveLength(2);
+    expect(new Set(reconciledCreateAttempts.map((execution) => execution.actionId)).size).toBe(1);
+    expect(
+      [...harness.state.calendarEvents.values()].filter((event) => event.title === PICKUP_EVENT.title),
+    ).toHaveLength(1);
+    expect(
+      harness.state.timeline.filter((entry) => entry === `provider:create:${PICKUP_EVENT.title}`),
+    ).toHaveLength(1);
+    expect(
+      harness.linq.messages.filter(
+        (message) =>
+          message.providerConversationId === FAMILY_GROUP &&
+          message.text === `Added “${PICKUP_EVENT.title}” on the family calendar.`,
       ),
     ).toHaveLength(1);
 
-    const cancelledInbound = await harness.store.acceptInbound(
-      harness.inbound("private", "calendar-cancel-before-claim", "Add the school assembly to my calendar."),
+    await harness.accept("group", "calendar-update", "Move Maya pickup to 3:00.", "partner");
+    await harness.drain();
+    await harness.accept(
+      "group",
+      "calendar-delete",
+      "Remove Maya pickup from the family calendar.",
+      "partner",
     );
-    const cancelledAction = storedCalendarAction(cancelledInbound?.sourceId ?? "missing");
-    const cancellationInput = harness.inbound(
-      "private",
-      "calendar-never-mind",
-      "Actually, don’t add that yet.",
+    await harness.drain();
+    const pickupActions = new Map(
+      harness.state.calendarExecutions
+        .filter((execution) =>
+          execution.mutation.operation === "create"
+            ? execution.mutation.event.title === PICKUP_EVENT.title
+            : execution.mutation.target.observedEvent.title === PICKUP_EVENT.title,
+        )
+        .map((execution) => [execution.actionId, execution.mutation.operation]),
     );
-    harness.now += 30_000;
-    await harness.store.commitTurn({
-      sourceId: cancelledInbound?.sourceId ?? "missing",
-      calendarActions: [cancelledAction],
-      handledAt: harness.iso(),
-    });
-    const cancellation = await harness.store.acceptInbound(cancellationInput);
-    expect(cancellation?.disposition).toBe("accepted");
-    expect(await harness.store.readNextCalendarAction(harness.iso())).toBeNull();
-    await harness.store.commitTurn({
-      sourceId: cancellation?.sourceId ?? "missing",
-      handledAt: harness.iso(),
-    });
+    expect([...pickupActions.values()]).toEqual(["create", "update", "delete"]);
+    for (const confirmation of [
+      `Added “${PICKUP_EVENT.title}” on the family calendar.`,
+      `Updated “${PICKUP_EVENT.title}” on the family calendar.`,
+      `Removed “${PICKUP_EVENT.title}” from the family calendar.`,
+    ]) {
+      expect(
+        harness.linq.messages.filter(
+          (message) => message.providerConversationId === FAMILY_GROUP && message.text === confirmation,
+        ),
+      ).toHaveLength(1);
+    }
 
-    const claimInbound = await harness.store.acceptInbound(
-      harness.inbound("private", "calendar-claim", "Add one more assembly"),
-    );
-    const claimAction = storedCalendarAction(claimInbound?.sourceId ?? "missing");
-    await expect(
-      harness.store.commitTurn({
-        sourceId: claimInbound?.sourceId ?? "missing",
-        calendarActions: [{ ...claimAction, event: { ...EVENT, startsAt: "2026-08-18T17:00:00" } }],
-        handledAt: harness.iso(),
-      }),
-    ).rejects.toBeInstanceOf(FlorenceStoreConflict);
-    await harness.store.commitTurn({
-      sourceId: claimInbound?.sourceId ?? "missing",
-      calendarActions: [claimAction],
-      handledAt: harness.iso(),
+    const outsiderIdentity = digest("unexpected-participant");
+    harness.linq.authorities.set(FAMILY_GROUP, {
+      audience: "group",
+      participantIdentityDigests: [FOUNDER_IDENTITY, outsiderIdentity].sort(),
     });
-    const concurrentClaims = await Promise.all([
-      harness.store.readNextCalendarAction(harness.iso()),
-      harness.store.readNextCalendarAction(harness.iso()),
-    ]);
-    expect(concurrentClaims.filter(Boolean)).toHaveLength(1);
-    harness.now += 2 * 60_000;
-    expect((await harness.store.readNextCalendarAction(harness.iso()))?.id).toBe(claimAction.id);
-  });
+    expect(
+      await harness.receiveParts(
+        "group-participants-changed",
+        [{ type: "text", value: "Who joined this thread?" }],
+        FAMILY_GROUP,
+      ),
+    ).toEqual({ disposition: "acknowledged", reason: "family_group_repairing" });
+    await harness.drain();
+
+    expect(
+      harness.linq.messages.filter(
+        (message) =>
+          message.providerConversationId === PRIVATE_FOUNDER && message.text === GROUP_REPAIR_NOTICE,
+      ),
+    ).toHaveLength(1);
+    expect(
+      harness.linq.messages.filter(
+        (message) =>
+          message.providerConversationId === PRIVATE_PARTNER && message.text === GROUP_REPAIR_NOTICE,
+      ),
+    ).toHaveLength(1);
+    const groups = harness.linq.createdChats.filter((chat) => chat.result.authority.audience === "group");
+    expect(groups).toHaveLength(2);
+    expect(groups.at(-1)).toMatchObject({
+      result: {
+        providerConversationId: REPLACEMENT_GROUP,
+        authority: {
+          audience: "group",
+          participantIdentityDigests: [FOUNDER_IDENTITY, PARTNER_IDENTITY].sort(),
+        },
+      },
+    });
+    const householdId = (await harness.store.listHouseholdIdsForAdult(harness.founderAdultId))[0];
+    const household = householdId
+      ? await harness.store.readHousehold({ householdId, viewerAdultId: harness.founderAdultId })
+      : null;
+    expect(household?.channels).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          providerConversationId: FAMILY_GROUP,
+          revokedAt: expect.any(String),
+          stoppedAt: expect.any(String),
+        }),
+        expect.objectContaining({
+          providerConversationId: REPLACEMENT_GROUP,
+          revokedAt: null,
+          stoppedAt: null,
+        }),
+      ]),
+    );
+  }, 20_000);
 });
 
-async function expectCanonicalGoogleScopeAcceptance(): Promise<void> {
-  const pending = {
-    connectionId: GOOGLE_CONNECTION,
-    householdId: FOUNDER_IDS.householdId,
-    ownerAdultId: ADULT_ONE,
-    status: "pending" as const,
-    emailLabel: null,
-    grantedScopes: [],
-    lastError: null,
-    createdAt: new Date(NOW).toISOString(),
-    updatedAt: new Date(NOW).toISOString(),
-  };
-  const store = {
-    consumePendingState: async () => ({
-      connectionId: pending.connectionId,
-      householdId: pending.householdId,
-      ownerAdultId: pending.ownerAdultId,
-      stateDigest: digest("google-state"),
-      sessionBindingDigest: digest("browser-session"),
-    }),
-    activate: async (input: Parameters<GoogleConnectionStore["activate"]>[0]) => ({
-      ...pending,
-      status: "active" as const,
-      emailLabel: input.emailLabel,
-      grantedScopes: input.grantedScopes,
-    }),
-    markPendingFailure: async () => undefined,
-  } as unknown as GoogleConnectionStore;
-  const google = new GoogleConnection({
-    store,
-    clientId: "google-client",
-    clientSecret: "google-secret",
-    redirectUri: "https://florence.test/oauth/google/callback",
-    encryptionKey: new Uint8Array(32),
-    fetch: async (request) =>
-      String(request).endsWith("/token")
-        ? Response.json({
-            access_token: "access-token",
-            refresh_token: "refresh-token",
-            scope: [
-              "openid",
-              "https://www.googleapis.com/auth/userinfo.email",
-              "https://www.googleapis.com/auth/userinfo.profile",
-              "https://www.googleapis.com/auth/gmail.readonly",
-              "https://www.googleapis.com/auth/calendar.events.owned",
-            ].join(" "),
-            token_type: "Bearer",
-          })
-        : Response.json({ sub: "google-subject", email: "parent@example.com", email_verified: true }),
-  });
-  await expect(
-    google.finish({
-      state: "google-state",
-      code: "authorization-code",
-      sessionBindingDigest: digest("browser-session"),
-      now: new Date(NOW).toISOString(),
-    }),
-  ).resolves.toMatchObject({
-    status: "active",
-    grantedScopes: [
-      "openid",
-      "email",
-      "https://www.googleapis.com/auth/gmail.readonly",
-      "https://www.googleapis.com/auth/calendar.events.owned",
-    ],
-  });
-}
-
 class Harness {
-  now = NOW;
-  googleAttempts = 0;
-  googleEffects = 0;
-  googleReads = 0;
-  gmailReads = 0;
+  partnerId: string | null = null;
+  sessionCookieValue: string | null = null;
+  readonly #eventTimes = new Map<string, string>();
 
   constructor(
     readonly store: PostgresFlorenceStore,
@@ -1017,288 +1828,207 @@ class Harness {
     readonly linq: FakeLinq,
     readonly vault: EncryptedImageVault,
     readonly enrollmentCodes: EnrollmentCodes,
-    readonly setupTurns: SetupConversationInput[],
-    readonly calendarApprovalTurns: CalendarApprovalInput[],
+    readonly state: HarnessState,
+    readonly databaseUrl: string,
+    readonly assertionFile: string,
   ) {}
 
-  iso(): string {
-    return new Date(this.now).toISOString();
+  get founderAdultId(): string {
+    return founderSetup().adultId;
   }
 
-  async onboard(input: { exerciseMessagesFirst?: boolean } = {}): Promise<void> {
-    this.linq.authorities.set(PRIVATE_ONE, {
+  get partnerAdultId(): string {
+    if (!this.partnerId) throw new Error("Partner has not completed setup");
+    return this.partnerId;
+  }
+
+  get sessionCookie(): string {
+    if (!this.sessionCookieValue) throw new Error("Founder web session is unavailable");
+    return this.sessionCookieValue;
+  }
+
+  get participants(): string[] {
+    return [FOUNDER_IDENTITY, PARTNER_IDENTITY].sort();
+  }
+
+  iso(): string {
+    return new Date(this.state.now).toISOString();
+  }
+
+  eventTime(key: string): string {
+    const existing = this.#eventTimes.get(key);
+    if (existing) return existing;
+    this.state.now += 1;
+    const value = this.iso();
+    this.#eventTimes.set(key, value);
+    return value;
+  }
+
+  async setupFounder(): Promise<void> {
+    this.linq.authorities.set(PRIVATE_FOUNDER, {
       audience: "private",
-      participantIdentityDigests: [ADULT_ONE_IDENTITY],
+      participantIdentityDigests: [FOUNDER_IDENTITY],
     });
-    expect(await this.store.listHouseholdIdsForAdult(ADULT_ONE)).toEqual([]);
-    let setupToken: string;
-    let competingSetupToken: string | null = null;
-    if (input.exerciseMessagesFirst) {
-      const beforeIgnoredMessages = this.linq.messages.length;
-      expect(await this.receiveMessagesText("founder-whitespace", "   ")).toEqual({
-        disposition: "rejected",
-        reason: "authority_not_found",
-      });
-      expect(await this.receiveMessagesText("founder-stop", "STOP")).toEqual({
-        disposition: "acknowledged",
-        reason: "opted_out",
-      });
-      expect(await this.receiveMessagesText("founder-natural-stop", NATURAL_SETUP_OPT_OUT)).toEqual({
-        disposition: "acknowledged",
-        reason: "onboarding_offered",
-      });
-      expect(this.setupTurns.at(-1)).toMatchObject({
-        stage: "unclaimed",
-        currentMessage: { text: NATURAL_SETUP_OPT_OUT },
-      });
-      expect(this.linq.messages).toHaveLength(beforeIgnoredMessages);
-      expect(await this.store.hasPilotHousehold()).toBe(false);
-
-      const arbitraryFirstText = randomUUID();
-      expect(await this.receiveMessagesText("founder-first-message", arbitraryFirstText)).toEqual({
-        disposition: "acknowledged",
-        reason: "onboarding_offered",
-      });
-      expect(this.setupTurns).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            stage: "unclaimed",
-            currentMessage: expect.objectContaining({ text: arbitraryFirstText }),
-            nextStep: "signed_link_will_follow",
-          }),
-        ]),
-      );
-      const firstSetupLinkCount = this.linq.messages.filter(
-        (message) => message.providerConversationId === PRIVATE_ONE && message.text.includes("#s="),
-      ).length;
-      const setupTurnsBeforeSecondMessage = this.setupTurns.length;
-      this.now += 1_000;
-      expect(
-        await this.receiveMessagesText(
-          "founder-second-message",
-          `The thing I need help with changed ${randomUUID()}`,
-        ),
-      ).toEqual({ disposition: "acknowledged", reason: "onboarding_offered" });
-      expect(this.setupTurns).toHaveLength(setupTurnsBeforeSecondMessage + 1);
-      expect(
-        this.linq.messages.filter(
-          (message) => message.providerConversationId === PRIVATE_ONE && message.text.includes("#s="),
-        ),
-      ).toHaveLength(firstSetupLinkCount + 1);
-      expect(
-        await this.receiveMessagesText("competing-founder-hi", randomUUID(), {
-          providerConversationId: PRIVATE_COMPETING_FOUNDER,
-          providerHandleId: COMPETING_FOUNDER_HANDLE,
-        }),
-      ).toEqual({ disposition: "acknowledged", reason: "onboarding_offered" });
-      expect(await this.store.hasPilotHousehold()).toBe(false);
-      expect(await this.store.listHouseholdIdsForAdult(ADULT_ONE)).toEqual([]);
-      expect(await this.store.listHouseholdIdsForAdult(COMPETING_FOUNDER)).toEqual([]);
-      const setupBubble = this.linq.messages.findLast(
-        (message) => message.providerConversationId === PRIVATE_ONE && message.text.includes("#s="),
-      );
-      const setupLink = /https:\/\/\S+$/.exec(setupBubble?.text ?? "")?.[0] ?? "";
-      expect(setupLink.length).toBeLessThanOrEqual(190);
-      expect(setupBubble?.text).toBe(setupLink);
-      setupToken = this.setupTokenFor(PRIVATE_ONE);
-      competingSetupToken = this.setupTokenFor(PRIVATE_COMPETING_FOUNDER);
-    } else {
-      setupToken = this.enrollmentCodes.issueFounderSetup({
-        providerConversationId: PRIVATE_ONE,
-        identitySubjectDigest: ADULT_ONE_IDENTITY,
-        occurredAt: this.iso(),
-      }).token;
-    }
-
-    const app = await buildApp(
-      {
-        florence: this.florence,
-        callerResolver: createSessionCallerResolver({ FLORENCE_SESSION_SECRET: SESSION_SECRET }),
-        ready: () => this.store.ready(),
+    const app = await this.webApp(false);
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/session",
+      payload: {
+        setupToken: founderSetup().token,
+        profile: {
+          firstName: "Hari",
+          lastName: "Anbarasu",
+          timeZone: "America/Los_Angeles",
+          guardianAttested: true,
+          proactiveUseAccepted: true,
+          privateConflictBusySharingEnabled: true,
+        },
       },
-      { serveFrontend: false },
+    });
+    await app.close();
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ adultId: this.founderAdultId });
+    const setCookie = response.headers["set-cookie"];
+    this.sessionCookieValue = (Array.isArray(setCookie) ? setCookie[0] : setCookie)?.split(";")[0] ?? null;
+    expect(this.sessionCookieValue).toContain("florence_session=");
+  }
+
+  async activateFounderGoogle(): Promise<void> {
+    await this.activateGoogle(this.founderAdultId, FOUNDER_GOOGLE, "founder-google-state");
+  }
+
+  async completeFamilyProfile(): Promise<void> {
+    const workspace = await this.florence.completeFamilyOnboarding(this.founderAdultId, familyProfileInput());
+    const partner = workspace.vault?.members.find(
+      (member) => member.kind === "adult" && member.relationship === "Partner",
     );
-    const setupBody = {
+    if (!partner) throw new Error("Family setup did not create Alex");
+    this.partnerId = partner.id;
+    this.state.now += 1_500;
+  }
+
+  async setupPartner(): Promise<void> {
+    const result = await this.redeemPartnerSetup(this.setupTokenFor(PRIVATE_PARTNER));
+    expect(result).toMatchObject({ disposition: "accepted", adultId: this.partnerAdultId });
+  }
+
+  redeemPartnerSetup(setupToken: string) {
+    return this.florence.redeemSetupLink({
       setupToken,
       profile: {
-        displayName: "Hari",
+        firstName: "Alex",
+        lastName: "Anbarasu",
         timeZone: "America/Los_Angeles",
-        guardianAttested: true as const,
+        guardianAttested: true,
+        proactiveUseAccepted: true,
+        privateConflictBusySharingEnabled: true,
       },
-    };
-    const setup = await app.inject({ method: "POST", url: "/api/v1/session", payload: setupBody });
-    expect(setup.statusCode).toBe(200);
-    expect(setup.json()).toEqual({ adultId: ADULT_ONE });
-    expect(setup.headers["set-cookie"]).toContain("HttpOnly");
-    const replay = await app.inject({ method: "POST", url: "/api/v1/session", payload: setupBody });
-    expect(replay.statusCode).toBe(200);
-    expect(replay.headers["set-cookie"]).toContain("HttpOnly");
-    this.now += 60_001;
-    const lateReplay = await app.inject({ method: "POST", url: "/api/v1/session", payload: setupBody });
-    expect(lateReplay.statusCode).toBe(401);
-    if (competingSetupToken) {
-      const losingSetup = await app.inject({
-        method: "POST",
-        url: "/api/v1/session",
-        payload: {
-          ...setupBody,
-          setupToken: competingSetupToken,
-          profile: { ...setupBody.profile, displayName: "Other parent" },
-        },
-      });
-      expect(losingSetup.statusCode).toBe(401);
-      expect(losingSetup.json()).toEqual({ error: "invalid_or_expired_setup_link" });
-      expect(await this.store.hasPilotHousehold()).toBe(true);
-      expect(await this.store.listHouseholdIdsForAdult(COMPETING_FOUNDER)).toEqual([]);
-      const sentBeforeLateGreeting = this.linq.messages.length;
-      expect(
-        await this.receiveMessagesText("competing-founder-after-setup", "Hi", {
-          providerConversationId: PRIVATE_COMPETING_FOUNDER,
-          providerHandleId: COMPETING_FOUNDER_HANDLE,
-        }),
-      ).toEqual({ disposition: "rejected", reason: "authority_not_found" });
-      expect(this.linq.messages).toHaveLength(sentBeforeLateGreeting);
-    }
-    await app.close();
+    });
   }
 
-  async completeFamilyOnboarding(): Promise<void> {
-    const workspace = await this.florence.completeFamilyOnboarding(ADULT_ONE, {
-      partner: { id: ADULT_TWO, displayName: "Alex" },
-      children: [
-        {
-          id: "33333333-3333-4333-8333-333333333333",
-          displayName: "Maya",
-          school: "Muir Elementary",
-          activities: ["Soccer"],
-        },
-      ],
-    });
-    expect(workspace.workspace.setup.onboardingComplete).toBe(true);
-    expect(workspace.vault?.members).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ id: ADULT_TWO, displayName: "Alex", messagesIdentity: "not_invited" }),
-        expect.objectContaining({
-          id: "33333333-3333-4333-8333-333333333333",
-          displayName: "Maya",
-          school: "Muir Elementary",
-          activities: ["Soccer"],
-        }),
-      ]),
-    );
-    this.now += 1_400;
+  async activatePartnerGoogle(): Promise<void> {
+    await this.activateGoogle(this.partnerAdultId, PARTNER_GOOGLE, "partner-google-state");
+  }
+
+  async readyHousehold(): Promise<void> {
+    await this.setupFounder();
+    await this.activateFounderGoogle();
+    await this.completeFamilyProfile();
     await this.drain();
-
-    const householdId = (await this.store.listHouseholdIdsForAdult(ADULT_ONE))[0] ?? "missing";
-    const partnerChallenge = digest("release-partner-enrollment");
-    await this.store.issueMessagesEnrollment({
-      householdId,
-      actorAdultId: ADULT_ONE,
-      adultId: ADULT_TWO,
-      challengeDigest: partnerChallenge,
-      issuedAt: this.iso(),
-      expiresAt: new Date(this.now + 60_000).toISOString(),
-    });
-    expect(
-      await this.store.redeemMessagesEnrollment({
-        challengeDigest: partnerChallenge,
-        identitySubjectDigest: ADULT_TWO_IDENTITY,
-        consentVersion: "release-fixture-v1",
-        consentedAt: this.iso(),
-        providerConversationId: "linq-private-two",
-        occurredAt: this.iso(),
-      }),
-    ).toMatchObject({ disposition: "accepted", adultId: ADULT_TWO });
-    this.linq.authorities.set("linq-private-two", {
-      audience: "private",
-      participantIdentityDigests: [ADULT_TWO_IDENTITY],
-    });
-    this.linq.authorities.set(GROUP, { audience: "group", participantIdentityDigests: PARTICIPANTS });
+    await this.accept("private", "approve-partner", INVITE_APPROVAL);
+    await this.drain();
+    await this.setupPartner();
+    await this.activatePartnerGoogle();
+    await this.drain();
   }
 
-  async activateGoogle(): Promise<void> {
-    const state = "google-state";
-    const stateDigest = digest(state);
-    const sessionBindingDigest = digest("google-session");
+  async activateGoogle(adultId: string, connectionId: string, state: string): Promise<void> {
+    const householdId = (await this.store.listHouseholdIdsForAdult(adultId))[0];
+    if (!householdId) throw new Error("Google activation needs a household");
+    const sessionBindingDigest = digest(`${state}-session`);
     await this.store.createPending({
-      connectionId: GOOGLE_CONNECTION,
-      householdId: (await this.store.listHouseholdIdsForAdult(ADULT_ONE))[0] ?? "missing",
-      ownerAdultId: ADULT_ONE,
-      stateDigest,
+      connectionId,
+      householdId,
+      ownerAdultId: adultId,
+      stateDigest: digest(state),
       sessionBindingDigest,
-      stateExpiresAt: new Date(this.now + 60_000).toISOString(),
+      stateExpiresAt: new Date(this.state.now + 60_000).toISOString(),
       now: this.iso(),
     });
     await this.florence.finishGoogle({
-      adultId: ADULT_ONE,
+      adultId,
       state,
       code: "google-authorization-code",
       sessionBindingDigest,
     });
-    this.now += 1_400;
-    await this.drain();
+    this.state.now += 1_000;
   }
 
-  inbound<Audience extends "private" | "group">(
-    audience: Audience,
+  inbound(
+    audience: "private" | "group",
     key: string,
     text: string,
-    extra: Record<string, unknown> = {},
+    sender: "founder" | "partner" = "founder",
   ) {
     const isGroup = audience === "group";
+    const partner = sender === "partner";
     return {
-      providerConversationId: isGroup ? GROUP : PRIVATE_ONE,
+      providerConversationId: isGroup ? FAMILY_GROUP : partner ? PRIVATE_PARTNER : PRIVATE_FOUNDER,
       audience,
-      participantIdentityDigests: isGroup ? PARTICIPANTS : [ADULT_ONE_IDENTITY],
-      senderIdentitySubjectDigest: ADULT_ONE_IDENTITY,
+      participantIdentityDigests: isGroup
+        ? this.participants
+        : [partner ? PARTNER_IDENTITY : FOUNDER_IDENTITY],
+      senderIdentitySubjectDigest: partner ? PARTNER_IDENTITY : FOUNDER_IDENTITY,
       providerEventId: `event-${key}`,
       providerMessageId: `message-${key}`,
       text,
-      occurredAt: this.iso(),
-      ...extra,
+      occurredAt: this.eventTime(key),
     };
   }
 
-  async acceptPrivate(key: string, text: string, extra: Record<string, unknown> = {}) {
-    const result = await this.florence.acceptInbound(this.inbound("private", key, text, extra));
-    if (!result) throw new Error("Private inbound was rejected");
+  async accept(
+    audience: "private" | "group",
+    key: string,
+    text: string,
+    sender: "founder" | "partner" = "founder",
+  ) {
+    const result = await this.florence.acceptInbound(this.inbound(audience, key, text, sender));
+    if (!result) throw new Error(`Inbound ${key} was rejected`);
     return result;
   }
 
-  setupTokenFor(providerConversationId: string): string {
-    const setupMessage = this.linq.messages.findLast(
-      (message) =>
-        message.providerConversationId === providerConversationId &&
-        (message.text.includes("#s=") || message.text.includes("#setup=")),
-    );
-    if (!setupMessage) throw new Error("Florence did not send the founder setup link");
-    const fragment = new URL(setupMessage.text).hash.slice(1);
-    const token = new URLSearchParams(fragment).get("s") ?? new URLSearchParams(fragment).get("setup");
-    if (!token) throw new Error("Florence did not send the founder setup token");
-    return token;
-  }
-
-  async receiveMessagesText(
+  async receiveParts(
     key: string,
-    text: string,
-    input: { providerConversationId?: string; providerHandleId?: string } = {},
+    parts: readonly TestPart[],
+    providerConversationId: string,
+    sender: "founder" | "partner" = "founder",
   ) {
-    const providerConversationId = input.providerConversationId ?? PRIVATE_ONE;
-    const providerHandleId = input.providerHandleId ?? ADULT_ONE_HANDLE;
-    const identitySubjectDigest = linqIdentitySubjectDigest(providerHandleId);
-    this.linq.authorities.set(providerConversationId, {
-      audience: "private",
-      participantIdentityDigests: [identitySubjectDigest],
-    });
+    const senderHandle = sender === "partner" ? PARTNER_HANDLE : FOUNDER_HANDLE;
+    const senderPhone = sender === "partner" ? PARTNER_PHONE : FOUNDER_PHONE;
+    const authority = this.linq.authorities.get(providerConversationId);
+    if (!authority) throw new Error(`Unknown provider conversation ${providerConversationId}`);
+    for (const part of parts) {
+      if (part.type !== "media") continue;
+      this.linq.registerMedia(
+        {
+          providerAttachmentId: part.id,
+          filename: part.filename,
+          mimeType: part.mimeType,
+          sizeBytes: part.bytes.byteLength,
+        },
+        part.bytes,
+      );
+    }
     const providerEventId = `event-${key}`;
-    const timestamp = Math.floor(this.now / 1_000).toString();
+    const occurredAt = this.eventTime(key);
+    const timestamp = Math.floor(this.state.now / 1_000).toString();
     const rawBody = new TextEncoder().encode(
       JSON.stringify({
         api_version: "v3",
         webhook_version: "2026-02-03",
         event_type: "message.received",
         event_id: providerEventId,
-        created_at: this.iso(),
+        created_at: occurredAt,
         trace_id: `trace-${key}`,
         partner_id: LINQ_PARTNER,
         data: {
@@ -1306,22 +2036,24 @@ class Harness {
           direction: "inbound",
           chat: {
             id: providerConversationId,
-            is_group: false,
-            owner_handle: {
-              id: "messages-florence-owner",
-              handle: "+15555550000",
-              is_me: true,
-            },
+            is_group: authority.audience === "group",
+            owner_handle: { id: "florence-owner", handle: FLORENCE_PHONE, is_me: true },
           },
-          sender_handle: {
-            id: providerHandleId,
-            handle: "+15555550101",
-            is_me: false,
-          },
+          sender_handle: { id: senderHandle, handle: senderPhone, is_me: false },
           service: "iMessage",
-          parts: [{ type: "text", value: text }],
+          parts: parts.map((part) =>
+            part.type === "media"
+              ? {
+                  type: "media",
+                  id: part.id,
+                  filename: part.filename,
+                  mime_type: part.mimeType,
+                  size_bytes: part.bytes.byteLength,
+                }
+              : part,
+          ),
           reply_to: null,
-          sent_at: this.iso(),
+          sent_at: occurredAt,
           reconciled_at: null,
         },
       }),
@@ -1336,7 +2068,7 @@ class Harness {
       linq: this.linq as unknown as LinqClient,
       imageVault: this.vault,
       florence: this.florence,
-      now: () => new Date(this.now),
+      now: () => new Date(this.state.now),
     }).receive({
       rawBody,
       headers: {
@@ -1348,77 +2080,166 @@ class Harness {
     });
   }
 
-  async receiveReaction(
-    key: string,
-    targetProviderMessageId: string,
-    reaction: "love" | "like" | "dislike" | "laugh" | "emphasize" | "question",
-    audience: "private" | "group" = "group",
-  ) {
-    const providerEventId = `event-${key}`;
-    const timestamp = Math.floor(this.now / 1_000).toString();
-    const rawBody = new TextEncoder().encode(
-      JSON.stringify({
-        api_version: "v3",
-        webhook_version: "2026-02-03",
-        event_type: "reaction.added",
-        event_id: providerEventId,
-        created_at: this.iso(),
-        trace_id: `trace-${key}`,
-        partner_id: LINQ_PARTNER,
-        data: {
-          chat_id: audience === "group" ? GROUP : PRIVATE_ONE,
-          message_id: targetProviderMessageId,
-          part_index: 0,
-          reaction_type: reaction,
-          custom_emoji: null,
-          is_from_me: false,
-          from_handle: {
-            id: ADULT_ONE_HANDLE,
-            handle: "+15555550101",
-            is_me: false,
-          },
-          service: "iMessage",
-          reacted_at: this.iso(),
-        },
-      }),
+  setupTokenFor(providerConversationId: string): string {
+    const message = this.linq.messages.findLast(
+      (candidate) =>
+        candidate.providerConversationId === providerConversationId && candidate.text.includes("#s="),
     );
-    const signature = createHmac("sha256", LINQ_SIGNING_KEY)
-      .update(`${providerEventId}.${timestamp}.`, "utf8")
-      .update(rawBody)
-      .digest("base64");
-    const ingress = createLinqIngress({
-      signingSecret: LINQ_SIGNING_SECRET,
-      expectedPartnerId: LINQ_PARTNER,
-      linq: this.linq as unknown as LinqClient,
-      imageVault: this.vault,
-      florence: this.florence,
-      now: () => new Date(this.now),
-    });
-    return ingress.receive({
-      rawBody,
-      headers: {
-        "webhook-id": providerEventId,
-        "webhook-timestamp": timestamp,
-        "webhook-signature": `v1,${signature}`,
-      },
-      version: "2026-02-03",
+    const setupUrl = /https:\/\/\S+/.exec(message?.text ?? "")?.[0];
+    const token = setupUrl ? new URLSearchParams(new URL(setupUrl).hash.slice(1)).get("s") : null;
+    if (!token) throw new Error("Partner setup link was not sent");
+    return token;
+  }
+
+  accessLinksFor(providerConversationId: string): URL[] {
+    return this.linq.messages.flatMap((candidate) => {
+      if (candidate.providerConversationId !== providerConversationId || !candidate.text.includes("#a=")) {
+        return [];
+      }
+      const link = /https:\/\/\S+/.exec(candidate.text)?.[0];
+      return link ? [new URL(link)] : [];
     });
   }
 
+  accessLinkFor(providerConversationId: string): URL {
+    const link = this.accessLinksFor(providerConversationId).at(-1);
+    if (!link) throw new Error("A private Florence access link was not sent");
+    return link;
+  }
+
+  async webApp(requireSession = true) {
+    if (requireSession && !this.sessionCookieValue) throw new Error("Founder session has not been created");
+    return buildApp(
+      {
+        florence: this.florence,
+        callerResolver: createSessionCallerResolver({ FLORENCE_SESSION_SECRET: SESSION_SECRET }),
+        ready: () => this.store.ready(),
+      },
+      { serveFrontend: false },
+    );
+  }
+
   async drain(): Promise<void> {
-    for (let index = 0; index < 20 && (await this.florence.runOnce()); index += 1);
+    let idle = 0;
+    for (let index = 0; index < 50 && idle < 2; index += 1) {
+      const worked = await this.florence.runOnce();
+      idle = worked ? 0 : idle + 1;
+      if (!worked) await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+  }
+
+  async assertDatabase(message: string, conditionSql: string): Promise<void> {
+    await writeFile(
+      this.assertionFile,
+      `do $florence_assert$
+      begin
+        if not (${conditionSql}) then
+          raise exception using message=${sqlLiteral(message)};
+        end if;
+      end
+      $florence_assert$;`,
+    );
+    await migrateDatabase(this.databaseUrl, this.assertionFile);
   }
 }
 
 class FakeLinq {
   readonly authorities = new Map<string, LinqConversationAuthority>();
+  readonly createdChats: { input: LinqCreateChat; result: LinqCreatedChat }[] = [];
   readonly messages: LinqSendMessage[] = [];
   readonly reactions: LinqSendReaction[] = [];
+  readonly media = new Map<string, { reference: LinqMediaReference; bytes: Uint8Array }>();
+  partnerSetupLinkState: "accepted" | "sent" = "sent";
+  partnerSetupLinkAttempts = 0;
+  partnerChatFailuresRemaining = 0;
+  familyCalendarReadyFailuresRemaining = 0;
+  googleDeletionDeliveryFailuresRemaining = 0;
+  readonly #created = new Map<string, LinqCreatedChat>();
+  readonly #sent = new Map<string, Awaited<ReturnType<LinqClient["sendMessage"]>>>();
+
+  constructor(readonly state: HarnessState) {}
+
+  async createChat(input: LinqCreateChat): Promise<LinqCreatedChat> {
+    const prior = this.#created.get(input.idempotencyKey);
+    if (prior) return prior;
+    const privateChat = input.participantPhoneNumbers.length === 1;
+    if (privateChat && this.partnerChatFailuresRemaining > 0) {
+      this.partnerChatFailuresRemaining -= 1;
+      throw new LinqError(
+        "provider_rejected",
+        "The destination permanently rejected the partner conversation",
+        false,
+      );
+    }
+    const groupCount = this.createdChats.filter((chat) => chat.result.authority.audience === "group").length;
+    const providerConversationId = privateChat
+      ? PRIVATE_PARTNER
+      : groupCount === 0
+        ? FAMILY_GROUP
+        : REPLACEMENT_GROUP;
+    const participantIdentityDigests = privateChat
+      ? [PARTNER_IDENTITY]
+      : [FOUNDER_IDENTITY, PARTNER_IDENTITY].sort();
+    const participants = participantIdentityDigests.map((identitySubjectDigest) => ({
+      identitySubjectDigest,
+      phoneNumber: identitySubjectDigest === FOUNDER_IDENTITY ? FOUNDER_PHONE : PARTNER_PHONE,
+    }));
+    const authority = {
+      audience: privateChat ? ("private" as const) : ("group" as const),
+      ownerPhoneNumber: FLORENCE_PHONE,
+      participantIdentityDigests,
+      participants,
+    };
+    const result: LinqCreatedChat = {
+      providerConversationId,
+      authority,
+      initialMessage: {
+        idempotencyKey: input.idempotencyKey,
+        providerMessageId: `created-chat-message-${this.createdChats.length + 1}`,
+        occurredAt: new Date(this.state.now).toISOString(),
+      },
+    };
+    this.authorities.set(providerConversationId, authority);
+    this.createdChats.push({ input, result });
+    this.messages.push({
+      idempotencyKey: input.idempotencyKey,
+      providerConversationId,
+      expectedAuthority: authority,
+      text: input.initialText,
+    });
+    this.state.timeline.push(`message:${input.initialText}`);
+    this.#created.set(input.idempotencyKey, result);
+    return result;
+  }
 
   async observeChat(providerConversationId: string) {
     const authority = this.authorities.get(providerConversationId);
     if (!authority) throw new Error(`Unknown fake Linq conversation ${providerConversationId}`);
-    return authority;
+    return {
+      ...authority,
+      ownerPhoneNumber: FLORENCE_PHONE,
+      participants: authority.participantIdentityDigests.map((identitySubjectDigest) => ({
+        identitySubjectDigest,
+        phoneNumber:
+          identitySubjectDigest === FOUNDER_IDENTITY
+            ? FOUNDER_PHONE
+            : identitySubjectDigest === PARTNER_IDENTITY
+              ? PARTNER_PHONE
+              : OUTSIDER_PHONE,
+      })),
+    };
+  }
+
+  registerMedia(reference: LinqMediaReference, bytes: Uint8Array): void {
+    if (!this.media.has(reference.providerAttachmentId)) {
+      this.media.set(reference.providerAttachmentId, { reference, bytes });
+    }
+  }
+
+  async fetchMedia(reference: LinqMediaReference) {
+    const media = this.media.get(reference.providerAttachmentId);
+    if (!media) throw new Error(`Unknown fake Linq media ${reference.providerAttachmentId}`);
+    return { ...media.reference, bytes: media.bytes };
   }
 
   async setTyping(): Promise<boolean> {
@@ -1426,146 +2247,132 @@ class FakeLinq {
   }
 
   async sendMessage(input: LinqSendMessage) {
-    expect(await this.observeChat(input.providerConversationId)).toEqual(input.expectedAuthority);
+    const partnerSetupLink = input.text.includes("#s=");
+    if (partnerSetupLink) this.partnerSetupLinkAttempts += 1;
+    const prior = this.#sent.get(input.idempotencyKey);
+    if (prior) {
+      if (
+        partnerSetupLink &&
+        prior.status === "committed" &&
+        prior.providerState === "accepted" &&
+        this.partnerSetupLinkState === "sent"
+      ) {
+        const sent = {
+          ...prior,
+          providerState: "sent" as const,
+          occurredAt: new Date(this.state.now).toISOString(),
+        };
+        this.#sent.set(input.idempotencyKey, sent);
+        return sent;
+      }
+      return prior;
+    }
+    expect(await this.observeChat(input.providerConversationId)).toMatchObject(input.expectedAuthority);
+    if (
+      input.idempotencyKey.startsWith("family-calendar-ready:") &&
+      this.familyCalendarReadyFailuresRemaining > 0
+    ) {
+      this.familyCalendarReadyFailuresRemaining -= 1;
+      return {
+        status: "unknown" as const,
+        idempotencyKey: input.idempotencyKey,
+        providerReceiptId: null,
+        detail: "The Family Calendar announcement outcome is temporarily unknown",
+        occurredAt: new Date(this.state.now).toISOString(),
+      };
+    }
+    if (
+      this.googleDeletionDeliveryFailuresRemaining > 0 &&
+      (input.text === GOOGLE_DELETION_PRIVATE_ALERT || input.text.includes(GOOGLE_DELETION_FAMILY_DATE.title))
+    ) {
+      this.googleDeletionDeliveryFailuresRemaining -= 1;
+      throw new LinqError("provider_retryable", "The staged Google alert is still pending", true);
+    }
     this.messages.push(input);
-    return {
+    this.state.timeline.push(`message:${input.text}`);
+    const result: Awaited<ReturnType<LinqClient["sendMessage"]>> = {
       status: "committed" as const,
+      providerState: partnerSetupLink && this.partnerSetupLinkState === "sent" ? "sent" : "accepted",
       idempotencyKey: input.idempotencyKey,
       providerReceiptId: `sent-${this.messages.length}`,
       detail: null,
-      occurredAt: new Date(NOW).toISOString(),
+      occurredAt: new Date(this.state.now).toISOString(),
     };
+    this.#sent.set(input.idempotencyKey, result);
+    return result;
   }
 
   async sendReaction(input: LinqSendReaction) {
-    expect(await this.observeChat(input.providerConversationId)).toEqual(input.expectedAuthority);
     this.reactions.push(input);
     return {
       status: "committed" as const,
+      providerState: "reaction_added" as const,
       idempotencyKey: input.idempotencyKey,
       providerReceiptId: `reaction-${this.reactions.length}`,
       detail: null,
-      occurredAt: new Date(NOW).toISOString(),
+      occurredAt: new Date(this.state.now).toISOString(),
     };
   }
 }
 
-async function freshHarness(
-  reason: Reason,
-  options: {
-    executeCalendar?: () => Promise<GoogleCalendarExecutionResult>;
-    interpretCalendarApproval?: InterpretCalendarApproval;
-  } = {},
-): Promise<Harness> {
+async function createHarness(reason: Reason = async () => decision()): Promise<Harness> {
   if (!TEST_DATABASE_URL) throw new Error("TEST_DATABASE_URL is required");
-  const directory = await mkdtemp(join(tmpdir(), "florence-release-"));
+  const directory = await mkdtemp(join(tmpdir(), "florence-parent-journeys-"));
   const schema = `florence_${randomUUID().replaceAll("-", "")}`;
-  const setupFile = join(directory, "setup.sql");
-  await writeFile(
-    setupFile,
-    `CREATE SCHEMA "${schema}"; SET search_path TO "${schema}";\n${await readFile(baselineFile, "utf8")}`,
-  );
+  const setupFile = join(directory, "schema.sql");
+  const migrations = (await Promise.all(migrationFiles.map((file) => readFile(file, "utf8")))).join("\n");
+  await writeFile(setupFile, `CREATE SCHEMA "${schema}"; SET search_path TO "${schema}";\n${migrations}`);
   const databaseUrl = withSchema(TEST_DATABASE_URL, schema);
   await migrateDatabase(databaseUrl, setupFile);
   const store = new PostgresFlorenceStore(databaseUrl);
-  const linq = new FakeLinq();
+  const state: HarnessState = {
+    now: NOW,
+    privateReviews: [],
+    googleAssessments: [],
+    briefings: [],
+    provisionings: [],
+    calendarRenames: [],
+    providerCalendarSummary: null,
+    calendarExecutions: [],
+    calendarReads: [],
+    calendarEvents: new Map(),
+    uncertainCalendarCreateTitle: null,
+    timeline: [],
+    finiteReviews: 0,
+    interestResearches: 0,
+    voiceTranscriptions: 0,
+    initialGoogleFailuresRemaining: 0,
+    initialGoogleFailureAdultId: null,
+    privateFactUpdatePending: false,
+    privateFactUpdateDelivered: false,
+    overlapGmailReadsRemaining: 0,
+    overlapGmailAssessments: 0,
+    overlapGmailSourceId: null,
+    monitorEvidenceExercise: false,
+    monitorCancellationActive: false,
+    silentMonitorSourceId: null,
+    voicedMonitorSourceId: null,
+    cancelledMonitorSourceId: null,
+    setupConversationFailuresRemaining: 0,
+    founderProductRecenterReview: false,
+    familyCalendarProvisioningFailuresRemaining: 0,
+    invalidGrantAdultId: null,
+    invalidGrantTriggered: false,
+    googleDeletionEvidencePending: false,
+    googleDeletionEvidenceDelivered: false,
+    googleDeletionSourceId: null,
+    googleChangeReads: [],
+    interactiveGoogleReads: 0,
+    providerRevocations: [],
+  };
+  const linq = new FakeLinq(state);
   const vault = new EncryptedImageVault({
     rootDirectory: join(directory, "vault"),
     encryptionKey: new Uint8Array(32).fill(7),
   });
-  const setupTurns: SetupConversationInput[] = [];
-  const calendarApprovalTurns: CalendarApprovalInput[] = [];
-  const converseDuringSetup: SetupConversation = async (input) => {
-    setupTurns.push(input);
-    if (input.currentMessage.text === NATURAL_SETUP_OPT_OUT) {
-      return { stopMessaging: true, bubbles: [] };
-    }
-    return {
-      stopMessaging: false,
-      bubbles: [
-        {
-          text:
-            input.stage === "unclaimed"
-              ? "I can help with that. Let’s finish your private setup, then we can keep going here."
-              : input.stage === "connect_google"
-                ? "Connect your Google account on the private setup page, then we’ll keep going here."
-                : "Add your partner and the useful family basics on the setup page, then we’ll keep going here.",
-          delayMs: 0,
-        },
-      ],
-    };
-  };
-  const interpretCalendarApproval: InterpretCalendarApproval = async (input) => {
-    calendarApprovalTurns.push(input);
-    return options.interpretCalendarApproval?.(input) ?? { approve: false };
-  };
-  const reasoner = {
-    decide: reason,
-    converseDuringSetup,
-    interpretCalendarApproval,
-  } as unknown as FlorenceReasoner;
   const enrollmentCodes = new EnrollmentCodes(ENROLLMENT_SECRET);
-  let harness: Harness;
-  const google = {
-    status: (input: { householdId: string; ownerAdultId: string }) => store.listActive(input),
-    finish: async (input: { state: string; sessionBindingDigest: string; now: string }) => {
-      const stateDigest = digest(input.state);
-      await store.consumePendingState({
-        stateDigest,
-        sessionBindingDigest: input.sessionBindingDigest,
-        now: input.now,
-      });
-      return store.activate({
-        connectionId: GOOGLE_CONNECTION,
-        stateDigest,
-        googleSubjectDigest: digest("google-subject"),
-        emailLabel: "hari@example.com",
-        grantedScopes: [
-          "openid",
-          "email",
-          "https://www.googleapis.com/auth/gmail.readonly",
-          "https://www.googleapis.com/auth/calendar.events.owned",
-        ],
-        refreshTokenEnvelope: "encrypted-refresh-token",
-        now: input.now,
-      });
-    },
-    readCalendarWindow: async (input: {
-      householdId: string;
-      ownerAdultId: string;
-      connectionId: string;
-      timeMin: string;
-      timeMax: string;
-    }) => {
-      harness.googleReads += 1;
-      const credential = await store.readActiveGoogleCredential(input);
-      return credential
-        ? {
-            status: "complete" as const,
-            events: input.timeMin === TRIP_WINDOW.timeMin ? [PICKUP_CONFLICT] : [],
-          }
-        : { status: "unavailable" as const, events: [] };
-    },
-    searchGmail: async (input: {
-      householdId: string;
-      ownerAdultId: string;
-      connectionId: string;
-      query: string;
-      limit: number;
-    }) => {
-      harness.gmailReads += 1;
-      expect(input.query).toBe('newer_than:30d ("Muir" OR "field trip")');
-      expect(input.limit).toBe(5);
-      const credential = await store.readActiveGoogleCredential(input);
-      return credential ? [SCHOOL_EMAIL] : [];
-    },
-    executeCalendar: async () => {
-      harness.googleAttempts += 1;
-      if (options.executeCalendar) return options.executeCalendar();
-      harness.googleEffects += 1;
-      return committedCalendar(harness.iso());
-    },
-  } as unknown as GoogleConnection;
+  const reasoner = createReasoner(reason, state);
+  const google = createGoogle(store, state);
   const florence = new Florence({
     store,
     linq: linq as unknown as LinqClient,
@@ -1575,9 +2382,10 @@ async function freshHarness(
     imageVault: vault,
     messagesUrl: "https://florence.test/messages",
     setupOrigin: "https://florence.test",
-    now: () => new Date(harness.now),
+    linqSenderPhoneNumber: FLORENCE_PHONE,
+    now: () => new Date(state.now),
   });
-  harness = new Harness(store, florence, linq, vault, enrollmentCodes, setupTurns, calendarApprovalTurns);
+  const harness = new Harness(store, florence, linq, vault, enrollmentCodes, state, databaseUrl, setupFile);
   onTestFinished(async () => {
     florence.stop();
     await store.close();
@@ -1588,70 +2396,769 @@ async function freshHarness(
   return harness;
 }
 
+function createReasoner(reason: Reason, state: HarnessState): FlorenceReasoner {
+  return {
+    decide: reason,
+    transcribeVoiceNote: async (input: Parameters<FlorenceReasoner["transcribeVoiceNote"]>[0]) => {
+      state.voiceTranscriptions += 1;
+      expect(input).toMatchObject({ filename: "teacher-note.wav", mimeType: "audio/wav" });
+      expect(input.bytes).toEqual(WAV_BYTES);
+      return VOICE_TRANSCRIPT;
+    },
+    converseDuringSetup: async (input: Parameters<FlorenceReasoner["converseDuringSetup"]>[0]) => {
+      if (input.stage === "partner_invited" && state.setupConversationFailuresRemaining > 0) {
+        state.setupConversationFailuresRemaining -= 1;
+        throw new Error("Fake setup interpreter is temporarily unavailable");
+      }
+      const declineInvitation =
+        input.stage === "partner_invited" && input.currentMessage.text === PARTNER_SETUP_REFUSAL;
+      return {
+        stopMessaging: false,
+        declineInvitation,
+        bubbles: declineInvitation
+          ? []
+          : [
+              {
+                text:
+                  input.stage === "partner_invited"
+                    ? PARTNER_SETUP_EXPLANATION
+                    : "Finish the short setup page and I’ll keep going here.",
+                delayMs: 0,
+              },
+            ],
+      };
+    },
+    interpretCalendarApproval: async () => ({ approve: false }),
+    interpretPartnerInvitationApproval: async (
+      input: Parameters<FlorenceReasoner["interpretPartnerInvitationApproval"]>[0],
+    ) => ({
+      sendInvitation:
+        input.currentMessage.text === INVITE_APPROVAL || input.currentMessage.text === REINVITE_APPROVAL,
+    }),
+    reviewPrivateGoogle: async (
+      input: Parameters<FlorenceReasoner["reviewPrivateGoogle"]>[0],
+      reads: Parameters<FlorenceReasoner["reviewPrivateGoogle"]>[1],
+    ) => {
+      state.privateReviews.push(input);
+      const current = Date.parse(input.currentTime);
+      const recent = await reads.searchGmail({
+        connectionId: input.googleConnection.connectionId,
+        query: "(school OR activity OR form) -category:promotions -category:social",
+        after: new Date(current - 14 * 24 * 60 * 60_000).toISOString(),
+        before: input.currentTime,
+        limit: 10,
+      });
+      await reads.searchGmail({
+        connectionId: input.googleConnection.connectionId,
+        query: "(school OR activity OR family) -category:promotions -category:social",
+        after: new Date(current - 90 * 24 * 60 * 60_000).toISOString(),
+        before: new Date(current - 14 * 24 * 60 * 60_000).toISOString(),
+        limit: 10,
+      });
+      await reads.readPersonalCalendarWindow({
+        connectionId: input.googleConnection.connectionId,
+        timeMin: input.currentTime,
+        timeMax: new Date(current + 21 * 24 * 60 * 60_000).toISOString(),
+        limit: 50,
+      });
+      const source = recent[0];
+      if (!source) throw new Error("Initial review did not receive Gmail evidence");
+      const attachment = source.attachments[0];
+      if (attachment) {
+        const opened = await reads.readGmailAttachment({
+          connectionId: input.googleConnection.connectionId,
+          sourceId: source.sourceId,
+          attachment,
+        });
+        expect(opened.bytes).toEqual(PDF_BYTES);
+      }
+      const founder = input.adult.firstName === "Hari";
+      return {
+        bubbles: [
+          {
+            text: `${input.adult.firstName}, I checked your side and found one family item worth tracking.`,
+            delayMs: 0,
+          },
+        ],
+        findings: [
+          {
+            privateSummary: founder
+              ? "Hari’s private school email has the original form."
+              : "Alex’s private calendar detail stays private.",
+            sourceIds: [source.sourceId],
+            candidate: {
+              category: founder ? ("loose_end" as const) : ("deadline" as const),
+              summary: founder
+                ? "Maya’s field-trip form still needs a signature."
+                : "Maya’s permission-slip deadline is Tuesday.",
+              urgency: "soon" as const,
+              dueAt: "2026-08-19T16:00:00.000Z",
+              needsAnswer: true,
+            },
+            monitor:
+              founder && state.founderProductRecenterReview
+                ? {
+                    objective: "Watch for confirmation that Maya’s field-trip form is signed.",
+                    currentConclusion: "The form still needs a parent signature.",
+                    endCondition: "A parent or the school confirms the form is signed.",
+                    nextCheck: "2026-08-23T18:00:00.000Z",
+                    why: "The school form has a live deadline.",
+                  }
+                : null,
+            familyCalendar: founder
+              ? state.founderProductRecenterReview
+                ? {
+                    disposition: "automatic" as const,
+                    sourceIds: [source.sourceId],
+                    event: PRE_ACTIVATION_FAMILY_DATE,
+                  }
+                : null
+              : {
+                  disposition: "automatic" as const,
+                  sourceIds: [source.sourceId],
+                  event: AUTOMATIC_FAMILY_DATE,
+                },
+          },
+        ],
+        facts: [
+          {
+            slot: founder ? PRIVATE_SCHOOL_FACT_SLOT : PARTNER_PRIVATE_GOOGLE_FACT_SLOT,
+            statement: founder ? INITIAL_PRIVATE_SCHOOL_FACT : PARTNER_PRIVATE_GOOGLE_FACT,
+            sourceIds: [source.sourceId],
+          },
+        ],
+      };
+    },
+    synthesizeHouseholdBriefing: async (
+      input: Parameters<FlorenceReasoner["synthesizeHouseholdBriefing"]>[0],
+    ) => {
+      state.briefings.push(input);
+      return {
+        selectedCandidateIds: input.candidates.map((candidate) => candidate.candidateId).slice(0, 3),
+        bubbles: [
+          {
+            text: `Here’s what I found:\n${input.candidates
+              .map((candidate) => `– ${candidate.summary}`)
+              .join("\n")}\n\nDid I get that right?`,
+            delayMs: 0,
+          },
+        ],
+      };
+    },
+    assessGoogleChanges: async (input: Parameters<FlorenceReasoner["assessGoogleChanges"]>[0]) => {
+      state.googleAssessments.push(input);
+      const source = input.evidence.gmail.sources.find(
+        (candidate) => candidate.subject === "Maya school enrollment update",
+      );
+      const overlap = input.evidence.gmail.sources.find(
+        (candidate) => candidate.subject === OVERLAP_GMAIL_SUBJECT,
+      );
+      const deletionSource = input.evidence.gmail.sources.find(
+        (candidate) => candidate.subject === GOOGLE_DELETION_GMAIL_SUBJECT,
+      );
+      if (deletionSource) state.googleDeletionSourceId = deletionSource.sourceId;
+      if (overlap) {
+        state.overlapGmailAssessments += 1;
+        state.overlapGmailSourceId = overlap.sourceId;
+      }
+      return {
+        findings: deletionSource
+          ? [
+              {
+                privateDetail: GOOGLE_DELETION_PRIVATE_ALERT,
+                householdConclusion: null,
+                sourceIds: [deletionSource.sourceId],
+                urgency: "soon" as const,
+                materialChange: true,
+                monitor: {
+                  operation: "create" as const,
+                  monitorId: null,
+                  objective: "Watch for confirmation that Maya’s emergency card is signed.",
+                  currentConclusion: "The emergency card still needs a signature.",
+                  endCondition: "A parent or the school confirms the emergency card is signed.",
+                  nextCheck: new Date(Date.parse(input.currentTime) + 60 * 60_000).toISOString(),
+                  why: "The school reminder has a live deadline.",
+                },
+                familyCalendar: {
+                  disposition: "suggest" as const,
+                  sourceIds: [deletionSource.sourceId],
+                  event: GOOGLE_DELETION_FAMILY_DATE,
+                },
+              },
+            ]
+          : [],
+        facts: deletionSource
+          ? [
+              {
+                slot: GOOGLE_DELETION_FACT_SLOT,
+                statement: GOOGLE_DELETION_FACT,
+                sourceIds: [deletionSource.sourceId],
+              },
+            ]
+          : source
+            ? [
+                {
+                  slot: PRIVATE_SCHOOL_FACT_SLOT,
+                  statement: UPDATED_PRIVATE_SCHOOL_FACT,
+                  sourceIds: [source.sourceId],
+                },
+              ]
+            : overlap && state.overlapGmailAssessments === 2
+              ? [
+                  {
+                    slot: OVERLAP_GMAIL_FACT_SLOT,
+                    statement: "Maya’s school bus route reminder is current.",
+                    sourceIds: [overlap.sourceId],
+                  },
+                ]
+              : [],
+      };
+    },
+    reviewFiniteMonitor: async (input: Parameters<FlorenceReasoner["reviewFiniteMonitor"]>[0]) => {
+      state.finiteReviews += 1;
+      const source = input.evidence.calendar.events[0] ?? input.evidence.gmail.sources[0];
+      if (!source) throw new Error("Monitor review did not receive current evidence");
+      if (state.finiteReviews === 1) {
+        state.silentMonitorSourceId = source.sourceId;
+        return {
+          outcome: "silent" as const,
+          urgency: "watch" as const,
+          privateDetail: null,
+          householdConclusion: null,
+          sourceIds: [],
+          currentConclusion: input.monitor.currentConclusion,
+          nextCheck: new Date(Date.parse(input.currentTime) + 60 * 60_000).toISOString(),
+          why: input.monitor.why,
+        };
+      }
+      if (state.finiteReviews === 2) {
+        state.voicedMonitorSourceId = source.sourceId;
+        const summary = "The school has the form and is checking the signature.";
+        return {
+          outcome: "update" as const,
+          urgency: "soon" as const,
+          privateDetail: input.scope === "private" ? summary : null,
+          householdConclusion: {
+            category: "loose_end" as const,
+            summary,
+            urgency: "soon" as const,
+            dueAt: input.currentTime,
+            needsAnswer: false,
+          },
+          sourceIds: [source.sourceId],
+          currentConclusion: summary,
+          nextCheck: new Date(Date.parse(input.currentTime) + 60 * 60_000).toISOString(),
+          why: input.monitor.why,
+        };
+      }
+      state.cancelledMonitorSourceId = source.sourceId;
+      return {
+        outcome: "complete" as const,
+        urgency: "now" as const,
+        privateDetail: input.scope === "private" ? "The school confirmed the form is signed." : null,
+        householdConclusion: {
+          category: "loose_end" as const,
+          summary: "Maya’s field-trip form is signed—nothing else to do.",
+          urgency: "now" as const,
+          dueAt: input.currentTime,
+          needsAnswer: false,
+        },
+        sourceIds: [source.sourceId],
+        currentConclusion: "The form is signed.",
+        nextCheck: null,
+        why: input.monitor.why,
+      };
+    },
+    researchInterest: async () => {
+      state.interestResearches += 1;
+      return {
+        judgment: "recommend" as const,
+        summary: INTEREST_RECOMMENDATION,
+        urls: [INTEREST_URL],
+      };
+    },
+  } as unknown as FlorenceReasoner;
+}
+
+function createGoogle(store: PostgresFlorenceStore, state: HarnessState): GoogleConnection {
+  const activeCredential = async (input: {
+    householdId: string;
+    ownerAdultId: string;
+    connectionId: string;
+  }) => {
+    const credential = await store.readActiveGoogleCredential(input);
+    if (!credential) throw new Error("Fake Google connection is not active");
+    if (state.invalidGrantAdultId === input.ownerAdultId && !state.invalidGrantTriggered) {
+      state.invalidGrantTriggered = true;
+      await store.disconnect({
+        connectionId: input.connectionId,
+        householdId: input.householdId,
+        ownerAdultId: input.ownerAdultId,
+        now: new Date(state.now).toISOString(),
+      });
+      throw new GoogleConnectionError(
+        "The active Google credential is no longer valid",
+        "credential_invalid_grant",
+      );
+    }
+    return credential;
+  };
+  const baseline = (input: {
+    householdId: string;
+    ownerAdultId: string;
+    connectionId: string;
+    calendarId?: string;
+    currentTime: string;
+  }) => {
+    const familyEvents = [...state.calendarEvents.values()];
+    const events = input.calendarId
+      ? state.monitorCancellationActive
+        ? familyEvents.slice(0, 1).map((event) => ({
+            providerEventId: event.providerEventId,
+            providerRevision: `${event.providerRevision}-cancelled`,
+            providerUpdatedAt: new Date(state.now).toISOString(),
+            status: "cancelled" as const,
+            busy: false,
+            title: null,
+            startsAt: null,
+            endsAt: null,
+            allDay: null,
+            timeZone: null,
+            startDate: null,
+            endDate: null,
+          }))
+        : state.monitorEvidenceExercise && state.finiteReviews === 0
+          ? familyEvents.map((event) => ({
+              ...event,
+              providerRevision: `${event.providerRevision}-silent-observation`,
+              providerUpdatedAt: new Date(state.now).toISOString(),
+            }))
+          : familyEvents
+      : [
+          {
+            providerEventId: `private-event-${input.ownerAdultId}`,
+            providerRevision: `private-revision-${input.ownerAdultId}`,
+            providerUpdatedAt: new Date(state.now).toISOString(),
+            status: "confirmed" as const,
+            busy: true,
+            title: "Private calendar detail",
+            intervalKind: "timed" as const,
+            startsAt: "2026-08-18T17:00:00.000Z",
+            endsAt: "2026-08-18T18:00:00.000Z",
+            allDay: false,
+            timeZone: "America/Los_Angeles",
+            location: null,
+          },
+        ];
+    return {
+      status: "complete" as const,
+      events,
+      cursor: {
+        kind: "calendar_updated_min_v1" as const,
+        calendarId: input.calendarId ?? "primary",
+        updatedMin: input.currentTime,
+        windowTimeMin: input.currentTime,
+        windowTimeMax: new Date(Date.parse(input.currentTime) + 21 * 24 * 60 * 60_000).toISOString(),
+        overlapMs: 300_000 as const,
+      },
+    };
+  };
+  return {
+    status: (input: { householdId: string; ownerAdultId: string }) => store.listActive(input),
+    disconnect: async (input: {
+      connectionId: string;
+      householdId: string;
+      ownerAdultId: string;
+      now: string;
+    }) => {
+      const disconnected = await store.disconnect(input);
+      if (!disconnected) throw new Error("Fake Google connection was not found");
+      return {
+        connection: disconnected.view,
+        providerRevocation: state.providerRevocations.shift() ?? ("not-needed" as const),
+      };
+    },
+    finish: async (input: { state: string; sessionBindingDigest: string; now: string }) => {
+      const stateDigest = digest(input.state);
+      const pending = await store.consumePendingState({
+        stateDigest,
+        sessionBindingDigest: input.sessionBindingDigest,
+        now: input.now,
+      });
+      if (!pending) throw new Error("Fake Google state was not pending");
+      const founder = pending.ownerAdultId === founderSetup().adultId;
+      return store.activate({
+        connectionId: pending.connectionId,
+        stateDigest,
+        googleSubjectDigest: digest(founder ? "google-founder" : "google-partner"),
+        emailLabel: founder ? "hari@example.com" : "alex@example.com",
+        grantedScopes: GOOGLE_SCOPES,
+        refreshTokenEnvelope: founder ? "encrypted-founder-token" : "encrypted-partner-token",
+        now: input.now,
+      });
+    },
+    provisionFamilyCalendar: async (
+      input: FamilyCalendarProvisioningInput,
+    ): Promise<GoogleFamilyCalendarProvisioningResult> => {
+      state.provisionings.push(input);
+      if (input.calendarId) {
+        expect(input.calendarId).toBe(FAMILY_CALENDAR);
+      } else {
+        const creation = await store.beginFamilyCalendarCreation({
+          householdId: input.householdId,
+          now: new Date(state.now).toISOString(),
+        });
+        expect(creation).toEqual({ createAllowed: true, calendarId: null });
+      }
+      state.providerCalendarSummary = input.summary;
+      if (state.familyCalendarProvisioningFailuresRemaining > 0) {
+        state.familyCalendarProvisioningFailuresRemaining -= 1;
+        throw new GoogleFamilyCalendarTransientError(
+          "Fake Calendar sharing is temporarily unavailable",
+          FAMILY_CALENDAR,
+        );
+      }
+      return {
+        calendarId: FAMILY_CALENDAR,
+        summary: input.summary,
+        founderConnectionId: input.founderConnectionId,
+        partnerConnectionId: input.partnerConnectionId,
+        occurredAt: new Date(state.now).toISOString(),
+      };
+    },
+    renameFamilyCalendar: async (
+      input: Parameters<GoogleConnection["renameFamilyCalendar"]>[0],
+    ): Promise<GoogleFamilyCalendarRenameResult> => {
+      await activeCredential(input);
+      expect(input.calendarId).toBe(FAMILY_CALENDAR);
+      state.calendarRenames.push(input);
+      state.providerCalendarSummary = input.summary;
+      return { summary: input.summary, occurredAt: new Date(state.now).toISOString() };
+    },
+    captureGmailCursor: async (input: {
+      householdId: string;
+      ownerAdultId: string;
+      connectionId: string;
+    }) => {
+      await activeCredential(input);
+      if (
+        state.initialGoogleFailuresRemaining > 0 &&
+        (state.initialGoogleFailureAdultId === null ||
+          state.initialGoogleFailureAdultId === input.ownerAdultId)
+      ) {
+        state.initialGoogleFailureAdultId = input.ownerAdultId;
+        state.initialGoogleFailuresRemaining -= 1;
+        throw new Error("Fake Gmail baseline is temporarily unavailable");
+      }
+      return {
+        kind: "gmail_history_v1" as const,
+        historyId: input.ownerAdultId === founderSetup().adultId ? "101" : "201",
+        capturedAt: new Date(state.now).toISOString(),
+      };
+    },
+    searchGmail: async (input: {
+      householdId: string;
+      ownerAdultId: string;
+      connectionId: string;
+      query: string;
+      after?: string;
+      before?: string;
+      limit?: number;
+    }) => {
+      await activeCredential(input);
+      state.interactiveGoogleReads += 1;
+      const founder = input.ownerAdultId === founderSetup().adultId;
+      const recent =
+        input.after && input.before
+          ? Date.parse(input.before) - Date.parse(input.after) <= 15 * 24 * 60 * 60_000
+          : true;
+      const ordinaryUnused = input.query === ORDINARY_UNUSED_GMAIL_QUERY;
+      const citedReply = input.query === GOOGLE_CITED_REPLY_QUERY;
+      const messageId = citedReply
+        ? "gmail-school-office-conversation"
+        : ordinaryUnused
+          ? "gmail-ordinary-unused"
+          : founder && recent
+            ? SCHOOL_ATTACHMENT.messageId
+            : `gmail-${input.ownerAdultId}-${recent}`;
+      return {
+        status: "complete" as const,
+        messages: [
+          {
+            messageId,
+            threadId: `thread-${messageId}`,
+            historyId: citedReply ? "106" : founder ? "101" : "201",
+            from: citedReply
+              ? "office@muir.example"
+              : founder
+                ? "hari-private@example.com"
+                : "alex-private@example.com",
+            subject: citedReply
+              ? "Emergency card status"
+              : ordinaryUnused
+                ? "Ordinary family newsletter"
+                : founder
+                  ? "Private school form"
+                  : "Private family schedule",
+            sentAt: input.before ?? new Date(state.now).toISOString(),
+            text: citedReply
+              ? "Maya’s emergency card still needs a signature."
+              : ordinaryUnused
+                ? "This newsletter has no family action Florence should keep."
+                : founder
+                  ? "Hari private email: Maya attends Muir Elementary and her form needs a signature."
+                  : "Alex private email: a personal appointment moved.",
+            textStatus: "complete" as const,
+            attachmentsStatus: "complete" as const,
+            attachments: !citedReply && !ordinaryUnused && founder && recent ? [SCHOOL_ATTACHMENT] : [],
+          },
+        ],
+      };
+    },
+    readGmailAttachment: async (input: {
+      householdId: string;
+      ownerAdultId: string;
+      connectionId: string;
+      attachment: GmailAttachmentReference;
+    }) => {
+      await activeCredential(input);
+      expect(input.attachment).toEqual(SCHOOL_ATTACHMENT);
+      return { ...input.attachment, bytes: PDF_BYTES };
+    },
+    readInitialCalendarReview: async (input: {
+      householdId: string;
+      ownerAdultId: string;
+      connectionId: string;
+      calendarId?: string;
+      currentTime: string;
+      limit: number;
+    }) => {
+      await activeCredential(input);
+      return baseline(input);
+    },
+    readGmailChanges: async (input: {
+      householdId: string;
+      ownerAdultId: string;
+      connectionId: string;
+      cursor: { kind: "gmail_history_v1"; historyId: string; capturedAt: string };
+    }) => {
+      await activeCredential(input);
+      state.googleChangeReads.push({ ownerAdultId: input.ownerAdultId, kind: "gmail" });
+      const hasPrivateFactUpdate =
+        input.ownerAdultId === founderSetup().adultId &&
+        state.privateFactUpdatePending &&
+        !state.privateFactUpdateDelivered;
+      if (hasPrivateFactUpdate) state.privateFactUpdateDelivered = true;
+      const hasGoogleDeletionEvidence =
+        !hasPrivateFactUpdate &&
+        input.ownerAdultId === founderSetup().adultId &&
+        state.googleDeletionEvidencePending &&
+        !state.googleDeletionEvidenceDelivered;
+      if (hasGoogleDeletionEvidence) state.googleDeletionEvidenceDelivered = true;
+      const hasOverlap =
+        !hasPrivateFactUpdate &&
+        !hasGoogleDeletionEvidence &&
+        input.ownerAdultId === founderSetup().adultId &&
+        state.overlapGmailReadsRemaining > 0;
+      const overlapHistoryId = state.overlapGmailReadsRemaining === 2 ? "103" : "104";
+      if (hasOverlap) state.overlapGmailReadsRemaining -= 1;
+      return {
+        status: "complete" as const,
+        resyncRequired: false as const,
+        messages: hasPrivateFactUpdate
+          ? [
+              {
+                messageId: "gmail-maya-school-enrollment-update",
+                threadId: "gmail-maya-school-enrollment-thread",
+                historyId: "102",
+                from: "registrar@muir.example",
+                subject: "Maya school enrollment update",
+                sentAt: new Date(state.now).toISOString(),
+                text: UPDATED_PRIVATE_SCHOOL_FACT,
+                textStatus: "complete" as const,
+                attachmentsStatus: "complete" as const,
+                attachments: [],
+              },
+            ]
+          : hasGoogleDeletionEvidence
+            ? [
+                {
+                  messageId: "gmail-maya-emergency-card-reminder",
+                  threadId: "gmail-maya-emergency-card-thread",
+                  historyId: "105",
+                  from: "office@muir.example",
+                  subject: GOOGLE_DELETION_GMAIL_SUBJECT,
+                  sentAt: new Date(state.now).toISOString(),
+                  text: `${GOOGLE_DELETION_FACT} Maya’s emergency card still needs a signature.`,
+                  textStatus: "complete" as const,
+                  attachmentsStatus: "complete" as const,
+                  attachments: [],
+                },
+              ]
+            : hasOverlap
+              ? [
+                  {
+                    messageId: "gmail-school-bus-overlap",
+                    threadId: "gmail-school-bus-overlap-thread",
+                    historyId: overlapHistoryId,
+                    from: "transport@muir.example",
+                    subject: OVERLAP_GMAIL_SUBJECT,
+                    sentAt: new Date(state.now).toISOString(),
+                    text: "Maya’s school bus route reminder is current.",
+                    textStatus: "complete" as const,
+                    attachmentsStatus: "complete" as const,
+                    attachments: [],
+                  },
+                ]
+              : [],
+        cursor: hasPrivateFactUpdate
+          ? { ...input.cursor, historyId: "102", capturedAt: new Date(state.now).toISOString() }
+          : hasGoogleDeletionEvidence
+            ? { ...input.cursor, historyId: "105", capturedAt: new Date(state.now).toISOString() }
+            : hasOverlap
+              ? {
+                  ...input.cursor,
+                  historyId: overlapHistoryId,
+                  capturedAt: new Date(state.now).toISOString(),
+                }
+              : input.cursor,
+      };
+    },
+    readCalendarChanges: async (input: {
+      householdId: string;
+      ownerAdultId: string;
+      connectionId: string;
+      calendarId: string;
+      cursor: {
+        kind: "calendar_updated_min_v1";
+        calendarId: string;
+        updatedMin: string;
+        windowTimeMin: string;
+        windowTimeMax: string;
+        overlapMs: 300_000;
+      };
+      currentTime: string;
+    }) => {
+      await activeCredential(input);
+      state.googleChangeReads.push({ ownerAdultId: input.ownerAdultId, kind: "calendar" });
+      return {
+        status: "complete" as const,
+        resyncRequired: false as const,
+        events: [],
+        cursor: {
+          ...input.cursor,
+          updatedMin: input.currentTime,
+          windowTimeMin: input.currentTime,
+          windowTimeMax: new Date(Date.parse(input.currentTime) + 21 * 24 * 60 * 60_000).toISOString(),
+        },
+      };
+    },
+    readCalendarWindow: async (input: CalendarReadInput) => {
+      await activeCredential(input);
+      state.interactiveGoogleReads += 1;
+      state.calendarReads.push(input);
+      return {
+        status: "complete" as const,
+        events: [...state.calendarEvents.values()].filter((event) => overlaps(event, input)),
+        cursor: {
+          kind: "calendar_updated_min_v1" as const,
+          calendarId: input.calendarId ?? "primary",
+          updatedMin: new Date(state.now).toISOString(),
+          windowTimeMin: input.timeMin,
+          windowTimeMax: input.timeMax,
+          overlapMs: 300_000 as const,
+        },
+      };
+    },
+    executeCalendar: async (input: CalendarExecutionInput): Promise<GoogleCalendarExecutionResult> => {
+      state.calendarExecutions.push(input);
+      const providerEventId =
+        input.mutation.operation === "create"
+          ? `google-event-${input.actionId}`
+          : input.mutation.target.providerEventId;
+      const existing = state.calendarEvents.get(providerEventId);
+      if (input.mutation.operation === "create" && existing) {
+        expect(existing).toMatchObject(input.mutation.event);
+        return {
+          status: "committed" as const,
+          providerEventId,
+          providerRevision: existing.providerRevision,
+          occurredAt: new Date(state.now).toISOString(),
+        };
+      }
+      if (input.mutation.operation !== "create") {
+        expect(existing).toMatchObject({
+          providerRevision: input.mutation.target.providerRevision,
+          title: input.mutation.target.observedEvent.title,
+        });
+      }
+      const title =
+        input.mutation.operation === "delete"
+          ? input.mutation.target.observedEvent.title
+          : input.mutation.event.title;
+      state.timeline.push(`provider:${input.mutation.operation}:${title}`);
+      if (input.mutation.operation === "delete") {
+        state.calendarEvents.delete(providerEventId);
+        return {
+          status: "committed" as const,
+          providerEventId,
+          providerRevision: null,
+          occurredAt: new Date(state.now).toISOString(),
+        };
+      }
+      const revision = `provider-revision-${state.calendarExecutions.length}`;
+      const event = input.mutation.event;
+      const common = {
+        providerEventId,
+        providerRevision: revision,
+        providerUpdatedAt: new Date(state.now).toISOString(),
+        status: "confirmed" as const,
+        busy: true as const,
+      };
+      state.calendarEvents.set(
+        providerEventId,
+        event.intervalKind === "timed"
+          ? { ...common, ...event, allDay: false }
+          : { ...common, ...event, allDay: true },
+      );
+      if (input.mutation.operation === "create" && state.uncertainCalendarCreateTitle === title) {
+        state.uncertainCalendarCreateTitle = null;
+        throw new GoogleCalendarTransientError("The Calendar write committed but its response was lost");
+      }
+      return {
+        status: "committed" as const,
+        providerEventId,
+        providerRevision: revision,
+        occurredAt: new Date(state.now).toISOString(),
+      };
+    },
+  } as unknown as GoogleConnection;
+}
+
 function decision(
   input: {
-    policy?: FlorenceDecision["policy"];
-    reaction?: FlorenceDecision["conversation"]["reaction"];
-    reply?: boolean;
     bubbles?: FlorenceDecision["conversation"]["bubbles"];
     facts?: FlorenceDecision["facts"];
     followUp?: FlorenceDecision["followUp"];
+    interest?: FlorenceDecision["interest"];
     calendar?: FlorenceDecision["calendar"];
+    householdUpdate?: FlorenceDecision["householdUpdate"];
+    webAccessPath?: FlorenceDecision["webAccessPath"];
   } = {},
 ): FlorenceDecision {
   return {
-    policy: input.policy ?? { retain: true, schedule: true, stopMessaging: false },
+    policy: { retain: true, schedule: true, stopMessaging: false },
     conversation: {
-      replyToCurrentMessage: input.reply ?? false,
-      reaction: input.reaction ?? null,
+      replyToCurrentMessage: false,
+      reaction: null,
       bubbles: input.bubbles ?? [],
     },
     facts: input.facts ?? [],
     followUp: input.followUp ?? null,
+    interest: input.interest ?? null,
     calendar: input.calendar ?? null,
-  };
-}
-
-function noMutationPolicy(): FlorenceDecision["policy"] {
-  return { retain: false, schedule: false, stopMessaging: false };
-}
-
-async function waitForAbort(signal?: AbortSignal): Promise<never> {
-  if (!signal) throw new Error("The reasoner was not given an abort signal");
-  if (signal.aborted) throw signal.reason;
-  return new Promise((_, reject) => {
-    signal.addEventListener("abort", () => reject(signal.reason), { once: true });
-  });
-}
-
-async function eventually(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (!predicate()) {
-    if (Date.now() >= deadline) throw new Error(`Condition was not met within ${timeoutMs}ms`);
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-}
-
-function committedCalendar(occurredAt: string) {
-  return {
-    status: "committed" as const,
-    providerReceiptId: "google-event-school-assembly",
-    detail: JSON.stringify({
-      provider: "google-calendar",
-      eventId: "google-event-school-assembly",
-      etag: '"assembly-etag"',
-      digest: digest("google-calendar-proof"),
-    }),
-    occurredAt,
-  };
-}
-
-function failedCalendar(occurredAt: string): GoogleCalendarExecutionResult {
-  return {
-    status: "failed",
-    providerReceiptId: null,
-    detail: "Google Calendar rejected the approved write",
-    occurredAt,
+    householdUpdate: input.householdUpdate ?? null,
+    webAccessPath: input.webAccessPath ?? null,
   };
 }
 
@@ -1659,28 +3166,152 @@ function remember(statement: string, sourceId: string): FlorenceDecision["facts"
   return { operation: "remember", factId: null, statement, sourceIds: [sourceId] };
 }
 
-function calendarDraft(mode: "offer" | "direct", sourceId: string) {
-  return { mode, proposalId: null, connectionId: GOOGLE_CONNECTION, event: EVENT, sourceIds: [sourceId] };
+function calendarDecision(
+  sourceId: string,
+  mutation: CalendarMutation,
+): NonNullable<FlorenceDecision["calendar"]> {
+  return {
+    mode: "direct",
+    proposalId: null,
+    mutation,
+    sourceIds: [sourceId],
+  };
 }
 
-function storedCalendarAction(sourceId: string) {
+async function calendarTarget(
+  reads: Parameters<Reason>[1],
+  input: Parameters<Reason>[0],
+  expected: typeof PICKUP_EVENT,
+) {
+  const connection = input.googleConnections.find((candidate) => candidate.kind === "family");
+  if (!connection) throw new Error("Family Calendar connection is missing");
+  const result = await reads.readCalendarWindow({
+    connectionId: connection.connectionId,
+    timeMin: "2026-08-18T21:30:00.000Z",
+    timeMax: "2026-08-18T22:30:00.000Z",
+    limit: 50,
+  });
+  const event = result.events.find((candidate) => candidate.title === expected.title);
+  if (event?.intervalKind !== "timed") throw new Error("Maya pickup was not found");
   return {
-    id: randomUUID(),
-    actionId: randomUUID(),
-    connectionId: GOOGLE_CONNECTION,
-    ownerAdultId: ADULT_ONE,
-    basisSourceId: sourceId,
-    approvalMessageId: sourceId,
-    approvalDigest: digest(`approval:${sourceId}`),
-    proposalDigest: digest(`proposal:${sourceId}`),
-    event: EVENT,
+    providerEventId: event.providerEventId,
+    providerRevision: event.providerRevision,
+    observedEvent: {
+      intervalKind: "timed" as const,
+      title: event.title ?? expected.title,
+      startsAt: event.startsAt,
+      endsAt: event.endsAt,
+      timeZone: event.timeZone,
+      location: event.location,
+    },
   };
+}
+
+function overlaps(event: FakeCalendarEvent, window: { timeMin: string; timeMax: string }): boolean {
+  const startsAt = event.intervalKind === "timed" ? event.startsAt : `${event.startDate}T00:00:00.000Z`;
+  const endsAt = event.intervalKind === "timed" ? event.endsAt : `${event.endDate}T00:00:00.000Z`;
+  return endsAt > window.timeMin && startsAt < window.timeMax;
+}
+
+function founderSetup() {
+  return new EnrollmentCodes(ENROLLMENT_SECRET).issueFounderSetup({
+    providerConversationId: PRIVATE_FOUNDER,
+    identitySubjectDigest: FOUNDER_IDENTITY,
+    occurredAt: new Date(NOW).toISOString(),
+  });
+}
+
+function familyProfileInput(): Parameters<Florence["completeFamilyOnboarding"]>[1] {
+  return {
+    mode: "two_adult",
+    postalCode: "94110",
+    partner: { firstName: "Alex", lastName: "Anbarasu", phoneNumber: PARTNER_PHONE.slice(2) },
+    children: [
+      {
+        firstName: "Maya",
+        lastName: "Anbarasu",
+        school: "Muir Elementary",
+        activities: ["Soccer", "Piano"],
+      },
+    ],
+  };
+}
+
+async function assertFunctionCallContinuationIsWireSafe(): Promise<void> {
+  const functionCall = {
+    type: "function_call" as const,
+    id: "fc_1",
+    call_id: "call_1",
+    name: "search_private_gmail",
+    arguments: '{"query":"school","range":"recent_14_days","limit":10}',
+    status: "completed" as const,
+    parsed_arguments: { query: "school", range: "recent_14_days", limit: 10 },
+  };
+  let parseCalls = 0;
+  let continuedInput: unknown = null;
+  const fakeClient = {
+    responses: {
+      parse: async (params: { input?: unknown }) => {
+        parseCalls += 1;
+        if (parseCalls === 1) return { output: [functionCall], output_parsed: null };
+        continuedInput = params.input;
+        throw new Error("Stop after capturing the continued OpenAI input");
+      },
+    },
+  };
+  const reasoner = new FlorenceReasoner(
+    { apiKey: "fake-openai-key", model: "fake-openai-model" },
+    fakeClient as unknown as OpenAI,
+  );
+  await expect(
+    reasoner.reviewPrivateGoogle(
+      {
+        familyProfile: {
+          familyLabel: "Anbarasu Family",
+          timeZone: "America/Los_Angeles",
+          adultFirstNames: ["Hari"],
+          children: [],
+          postalCode: "94110",
+        },
+        adult: { adultId: "adult-1", firstName: "Hari" },
+        googleConnection: { connectionId: "google-1", status: "active", kind: "personal" },
+        currentTime: new Date(NOW).toISOString(),
+        currentPrivateFacts: [],
+      },
+      {
+        searchGmail: async () => [],
+        readPersonalCalendarWindow: async () => ({ status: "complete", events: [] }),
+        readGmailAttachment: async () => {
+          throw new Error("The continuation regression does not request an attachment");
+        },
+      },
+    ),
+  ).rejects.toMatchObject({ code: "rejected" });
+  expect(parseCalls).toBe(2);
+  if (!Array.isArray(continuedInput)) throw new Error("OpenAI continuation input was not captured");
+  const replayed = (continuedInput as unknown[]).find(
+    (item): item is Record<string, unknown> =>
+      typeof item === "object" && item !== null && "id" in item && item.id === functionCall.id,
+  );
+  expect(replayed).toEqual({
+    type: functionCall.type,
+    id: functionCall.id,
+    call_id: functionCall.call_id,
+    name: functionCall.name,
+    arguments: functionCall.arguments,
+    status: functionCall.status,
+  });
+  expect(Object.hasOwn(replayed ?? {}, "parsed_arguments")).toBe(false);
 }
 
 function withSchema(connectionString: string, schema: string): string {
   const url = new URL(connectionString);
-  url.searchParams.set("options", `-csearch_path=${schema}`);
+  url.searchParams.set("options", `-c search_path=${schema}`);
   return url.toString();
+}
+
+function sqlLiteral(value: string): string {
+  return `'${value.replaceAll("'", "''")}'`;
 }
 
 function digest(value: string): string {
@@ -1688,6 +3319,7 @@ function digest(value: string): string {
 }
 
 function inboundSourceId(providerEventId: string): string {
-  const value = digest(`linq-v3\0signal\0${providerEventId}`);
-  return `${value.slice(0, 8)}-${value.slice(8, 12)}-5${value.slice(13, 16)}-${((Number.parseInt(value[16] ?? "0", 16) & 3) | 8).toString(16)}${value.slice(17, 20)}-${value.slice(20, 32)}`;
+  const hex = digest(`linq-v3\0signal\0${providerEventId}`);
+  const variant = ((Number.parseInt(hex[16] ?? "0", 16) & 3) | 8).toString(16);
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-5${hex.slice(13, 16)}-${variant}${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
 }

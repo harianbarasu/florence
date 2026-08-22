@@ -1,4 +1,9 @@
-import type { FamilyMemberInput, FamilyMemberProfile } from "@florence/contracts";
+import type {
+  FamilyMemberInput,
+  FamilyMemberMutationInput,
+  FamilyMemberProfile,
+  PatchFamilyMemberInput,
+} from "@florence/contracts";
 import { Check, Plus, X } from "lucide-react";
 import { type FormEvent, useRef, useState } from "react";
 
@@ -6,11 +11,10 @@ type MemberEditorProps = {
   member?: FamilyMemberProfile;
   isSaving: boolean;
   onCancel: () => void;
-  onSave: (memberId: string, input: FamilyMemberInput) => Promise<unknown>;
+  onSave: (memberId: string, input: FamilyMemberMutationInput) => Promise<unknown>;
 };
 
 export function MemberEditor({ member, isSaving, onCancel, onSave }: MemberEditorProps) {
-  const [kind, setKind] = useState<"adult" | "child">(member?.kind ?? "child");
   const [error, setError] = useState<string | null>(null);
   const memberId = useRef(member?.id ?? crypto.randomUUID());
 
@@ -18,31 +22,11 @@ export function MemberEditor({ member, isSaving, onCancel, onSave }: MemberEdito
     event.preventDefault();
     setError(null);
     const data = new FormData(event.currentTarget);
-    const currentGrade = optional(data, "currentGrade");
-    const academicYear = optional(data, "academicYear");
-    const gradeEffectiveFrom = optional(data, "gradeEffectiveFrom");
-    if (
-      [currentGrade, academicYear, gradeEffectiveFrom].some(Boolean) &&
-      ![currentGrade, academicYear, gradeEffectiveFrom].every(Boolean)
-    ) {
-      setError("Grade, academic year, and effective date belong together.");
+    const input = member ? memberPatch(data, member) : newChildInput(data);
+    if (input === null) {
+      onCancel();
       return;
     }
-
-    const birthYearText = optional(data, "birthYear");
-    const input: FamilyMemberInput = {
-      kind,
-      role: kind === "child" ? "dependent" : (data.get("role") as "steward" | "caregiver"),
-      displayName: required(data, "displayName"),
-      relationship: required(data, "relationship"),
-      ...arrayField(data, "aliases"),
-      ...(birthYearText ? { birthYear: Number(birthYearText) } : {}),
-      ...optionalField(data, "school"),
-      ...optionalField(data, "currentGrade"),
-      ...optionalField(data, "academicYear"),
-      ...optionalField(data, "gradeEffectiveFrom"),
-      ...arrayField(data, "activities"),
-    };
     try {
       await onSave(memberId.current, input);
     } catch (cause) {
@@ -54,7 +38,7 @@ export function MemberEditor({ member, isSaving, onCancel, onSave }: MemberEdito
     <form className="member-editor" onSubmit={(event) => void submit(event)}>
       <div className="editor-heading">
         <div>
-          <p className="eyebrow">{member ? "Edit family member" : "Add to your family"}</p>
+          <p className="eyebrow">{member ? "Edit family member" : "Add child"}</p>
           <h2>{member?.displayName ?? "Who should Florence know?"}</h2>
         </div>
         <button
@@ -67,92 +51,39 @@ export function MemberEditor({ member, isSaving, onCancel, onSave }: MemberEdito
         </button>
       </div>
 
-      {!member && (
-        <fieldset className="segmented-control">
-          <legend>Person type</legend>
-          <button className={kind === "child" ? "active" : ""} type="button" onClick={() => setKind("child")}>
-            Child
-          </button>
-          <button className={kind === "adult" ? "active" : ""} type="button" onClick={() => setKind("adult")}>
-            Adult
-          </button>
-        </fieldset>
-      )}
-
       <div className="form-grid">
-        <Field label="Name" name="displayName" defaultValue={member?.displayName} required />
         <Field
-          label="Relationship"
-          name="relationship"
-          defaultValue={member?.relationship}
-          placeholder="Child, co-parent, caregiver…"
+          label="First name"
+          name="firstName"
+          defaultValue={member?.firstName}
+          autoComplete="given-name"
           required
         />
-        {kind === "adult" ? (
-          <label className="field">
-            <span>Household role</span>
-            <select name="role" defaultValue={member?.role === "caregiver" ? "caregiver" : "steward"}>
-              <option value="steward">Steward</option>
-              <option value="caregiver">Caregiver</option>
-            </select>
-          </label>
-        ) : (
+        <Field
+          label="Last name"
+          name="lastName"
+          defaultValue={member?.lastName ?? undefined}
+          autoComplete="family-name"
+          required={member?.kind === "adult"}
+        />
+        {(member?.kind ?? "child") === "child" && (
           <Field
-            label="Birth year"
-            name="birthYear"
-            type="number"
-            min="1900"
-            max="2100"
-            defaultValue={member?.birthYear?.toString()}
+            label="School or daycare"
+            name="school"
+            defaultValue={member?.school}
+            placeholder="School or daycare"
           />
         )}
         <Field
-          label="Nicknames"
-          name="aliases"
-          defaultValue={member?.aliases?.join(", ")}
-          placeholder="Comma separated"
+          label="Activities"
+          name="activities"
+          defaultValue={member?.activities?.join(", ")}
+          placeholder="Soccer, piano, robotics…"
         />
       </div>
-
-      {kind === "child" && (
-        <section className="editor-section">
-          <div>
-            <p className="eyebrow">School</p>
-            <p className="section-note">Grade facts stay dated so Florence can correct them next year.</p>
-          </div>
-          <div className="form-grid grade-grid">
-            <Field label="School or daycare" name="school" defaultValue={member?.school} />
-            <Field
-              label="Grade"
-              name="currentGrade"
-              defaultValue={member?.currentGrade}
-              placeholder="3rd grade"
-            />
-            <Field
-              label="Academic year"
-              name="academicYear"
-              defaultValue={member?.academicYear}
-              placeholder="2026–27"
-            />
-            <Field
-              label="Effective from"
-              name="gradeEffectiveFrom"
-              type="date"
-              defaultValue={member?.gradeEffectiveFrom}
-            />
-          </div>
-        </section>
-      )}
-
-      <Field
-        label="Activities"
-        name="activities"
-        defaultValue={member?.activities?.join(", ")}
-        placeholder="Soccer, piano, robotics…"
-      />
       {member?.status === "verified" && (
         <p className="authority-note">
-          This edits their household profile only. Their verified identity and consent remain independent.
+          This changes how they appear in your family. They still control their own Florence settings.
         </p>
       )}
       {error && (
@@ -166,7 +97,7 @@ export function MemberEditor({ member, isSaving, onCancel, onSave }: MemberEdito
         </button>
         <button className="primary-button" type="submit" disabled={isSaving}>
           {member ? <Check size={17} /> : <Plus size={17} />}
-          {isSaving ? "Saving…" : member ? "Save changes" : "Add family member"}
+          {isSaving ? "Saving…" : member ? "Save changes" : "Add child"}
         </button>
       </div>
     </form>
@@ -197,15 +128,46 @@ function optional(data: FormData, key: string): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
-function optionalField(data: FormData, key: string): Record<string, string> {
+function newChildInput(data: FormData): FamilyMemberInput {
+  const activities = list(data, "activities");
+  return {
+    kind: "child",
+    firstName: required(data, "firstName"),
+    lastName: optional(data, "lastName") ?? null,
+    ...optionalString(data, "school"),
+    ...(activities.length ? { activities } : {}),
+  };
+}
+
+function memberPatch(data: FormData, member: FamilyMemberProfile): PatchFamilyMemberInput | null {
+  const patch: PatchFamilyMemberInput = {};
+  const firstName = required(data, "firstName");
+  const lastName = optional(data, "lastName") ?? null;
+  const activities = list(data, "activities");
+  const school = optional(data, "school") ?? null;
+
+  if (member.kind === "adult" && lastName === null) throw new Error("lastName is required");
+  if (firstName !== member.firstName) patch.firstName = firstName;
+  if (lastName !== member.lastName) patch.lastName = lastName;
+  if (member.kind === "child" && school !== (member.school ?? null)) patch.school = school;
+  if (!sameList(activities, member.activities ?? [])) patch.activities = activities;
+  return Object.keys(patch).length ? patch : null;
+}
+
+function optionalString(data: FormData, key: string): Record<string, string> {
   const value = optional(data, key);
   return value ? { [key]: value } : {};
 }
 
-function arrayField(data: FormData, key: string): Record<string, string[]> {
-  const values = optional(data, key)
-    ?.split(",")
-    .map((value) => value.trim())
-    .filter(Boolean);
-  return values?.length ? { [key]: values } : {};
+function list(data: FormData, key: string): string[] {
+  return (
+    optional(data, key)
+      ?.split(",")
+      .map((value) => value.trim())
+      .filter(Boolean) ?? []
+  );
+}
+
+function sameList(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }

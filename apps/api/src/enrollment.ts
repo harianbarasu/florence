@@ -1,6 +1,8 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 
 const FOUNDER_SETUP_LIFETIME_MS = 15 * 60_000;
+const PARTNER_SETUP_LIFETIME_MS = 24 * 60 * 60_000;
+const WEB_ACCESS_LIFETIME_MS = 15 * 60_000;
 const MAX_PROVIDER_ID_BYTES = 500;
 const COMPACT_SIGNATURE_BYTES = 24;
 const COMPACT_HEADER_BYTES = 6;
@@ -17,6 +19,29 @@ export type FounderSetupClaims = {
 export type FounderSetupIssue = FounderSetupClaims & {
   token: string;
 };
+
+export type PartnerSetupClaims = {
+  providerConversationId: string;
+  identitySubjectDigest: string;
+  expiresAt: string;
+  householdId: string;
+  adultId: string;
+};
+
+export type PartnerSetupIssue = PartnerSetupClaims & { token: string };
+
+export type WebAccessPath = "/" | "/calendar" | "/vault" | "/preferences";
+
+export type WebAccessClaims = {
+  providerConversationId: string;
+  identitySubjectDigest: string;
+  expiresAt: string;
+  householdId: string;
+  adultId: string;
+  accessPath: WebAccessPath;
+};
+
+export type WebAccessIssue = WebAccessClaims & { token: string };
 
 export class EnrollmentCodes {
   readonly #secret: string;
@@ -71,9 +96,8 @@ export class EnrollmentCodes {
     if (Buffer.byteLength(token, "utf8") > 4_000) return null;
     const [version, payload, signature, extra] = token.split(".");
     if (!payload || !signature || extra) return null;
-    if (version === "fs2") return this.#verifyCompactFounderSetup(payload, signature, now);
-    if (version !== "fs1") return null;
-    return this.#verifyLegacyFounderSetup(payload, signature, now);
+    if (version !== "fs2") return null;
+    return this.#verifyCompactFounderSetup(payload, signature, now);
   }
 
   #verifyCompactFounderSetup(payload: string, signature: string, now: Date): FounderSetupClaims | null {
@@ -114,51 +138,208 @@ export class EnrollmentCodes {
     };
   }
 
-  #verifyLegacyFounderSetup(payload: string, signature: string, now: Date): FounderSetupClaims | null {
-    const expected = this.#macText(`florence-founder-setup-signature-v1\0${payload}`, "base64url");
-    if (!safeEqual(signature, expected)) return null;
-    let untrusted: unknown;
+  digestFounderSetup(token: string): string {
+    return this.#macText(`florence-founder-setup-digest-v1\0${token}`, "hex");
+  }
+
+  issuePartnerSetup(input: {
+    providerConversationId: string;
+    identitySubjectDigest: string;
+    householdId: string;
+    adultId: string;
+    occurredAt: string;
+  }): PartnerSetupIssue {
+    const providerConversationId = boundedProviderId(
+      input.providerConversationId,
+      "Provider conversation ID",
+    );
+    const identitySubjectDigest = digest(input.identitySubjectDigest, "Messages identity");
+    const householdId = uuid(input.householdId, "Household ID");
+    const adultId = uuid(input.adultId, "Adult ID");
+    const occurredAt = instant(input.occurredAt, "Partner setup issue time");
+    const expiresAtSeconds = Math.floor((occurredAt.getTime() + PARTNER_SETUP_LIFETIME_MS) / 1_000);
+    if (expiresAtSeconds < 0 || expiresAtSeconds > 0xffff_ffff) {
+      throw new Error("Partner setup expiry is outside the compact token range");
+    }
+    const conversation = Buffer.from(providerConversationId, "utf8");
+    const payload = Buffer.alloc(COMPACT_HEADER_BYTES + conversation.length + 16 + 16 + 32);
+    payload.writeUInt32BE(expiresAtSeconds, 0);
+    payload.writeUInt16BE(conversation.length, 4);
+    conversation.copy(payload, COMPACT_HEADER_BYTES);
+    uuidBytes(householdId).copy(payload, COMPACT_HEADER_BYTES + conversation.length);
+    uuidBytes(adultId).copy(payload, COMPACT_HEADER_BYTES + conversation.length + 16);
+    Buffer.from(identitySubjectDigest, "hex").copy(payload, COMPACT_HEADER_BYTES + conversation.length + 32);
+    const tag = createHmac("sha256", this.#secret)
+      .update("florence-partner-setup-signature-v1\0")
+      .update(payload)
+      .digest()
+      .subarray(0, COMPACT_SIGNATURE_BYTES);
+    return {
+      token: `ps1.${Buffer.concat([payload, tag]).toString("base64url")}`,
+      providerConversationId,
+      identitySubjectDigest,
+      expiresAt: new Date(expiresAtSeconds * 1_000).toISOString(),
+      householdId,
+      adultId,
+    };
+  }
+
+  verifyPartnerSetup(token: string, now = new Date()): PartnerSetupClaims | null {
+    if (!Number.isFinite(now.getTime()) || Buffer.byteLength(token, "utf8") > 4_000) return null;
+    const [version, encoded, extra] = token.split(".");
+    if (version !== "ps1" || !encoded || extra) return null;
+    let bytes: Buffer;
     try {
-      untrusted = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+      bytes = Buffer.from(encoded, "base64url");
     } catch {
       return null;
     }
-    if (!Array.isArray(untrusted) || untrusted.length !== 7) return null;
-    const [payloadVersion, conversation, identity, nonce, expiresAtSeconds, householdId, adultId] = untrusted;
+    if (bytes.toString("base64url") !== encoded || bytes.length < COMPACT_HEADER_BYTES + 65 + 24) {
+      return null;
+    }
+    const payload = bytes.subarray(0, -COMPACT_SIGNATURE_BYTES);
+    const tag = bytes.subarray(-COMPACT_SIGNATURE_BYTES);
+    const expected = createHmac("sha256", this.#secret)
+      .update("florence-partner-setup-signature-v1\0")
+      .update(payload)
+      .digest()
+      .subarray(0, COMPACT_SIGNATURE_BYTES);
+    if (!timingSafeEqual(tag, expected)) return null;
+    const expiresAtSeconds = payload.readUInt32BE(0);
+    const conversationLength = payload.readUInt16BE(4);
+    if (payload.length !== COMPACT_HEADER_BYTES + conversationLength + 16 + 16 + 32) return null;
+    const conversationBytes = payload.subarray(
+      COMPACT_HEADER_BYTES,
+      COMPACT_HEADER_BYTES + conversationLength,
+    );
+    const providerConversationId = conversationBytes.toString("utf8");
     if (
-      payloadVersion !== 1 ||
-      typeof conversation !== "string" ||
-      typeof identity !== "string" ||
-      typeof nonce !== "string" ||
-      typeof expiresAtSeconds !== "number" ||
-      typeof householdId !== "string" ||
-      typeof adultId !== "string"
+      !Buffer.from(providerConversationId, "utf8").equals(conversationBytes) ||
+      !isBoundedProviderId(providerConversationId)
     ) {
       return null;
     }
-    if (
-      !isBoundedProviderId(conversation) ||
-      !isDigest(identity) ||
-      !/^[A-Za-z0-9_-]{43}$/.test(nonce) ||
-      !isUuid(householdId) ||
-      !isUuid(adultId) ||
-      !Number.isSafeInteger(expiresAtSeconds)
-    ) {
-      return null;
-    }
+    const offset = COMPACT_HEADER_BYTES + conversationLength;
+    const householdId = uuidFromBytes(payload.subarray(offset, offset + 16));
+    const adultId = uuidFromBytes(payload.subarray(offset + 16, offset + 32));
+    const identitySubjectDigest = payload.subarray(offset + 32).toString("hex");
     const expiresAt = new Date(expiresAtSeconds * 1_000);
-    if (expiresAt.getTime() <= now.getTime()) return null;
+    if (expiresAt.getTime() <= now.getTime() || !isDigest(identitySubjectDigest)) return null;
     return {
-      providerConversationId: conversation,
-      identitySubjectDigest: identity,
+      providerConversationId,
+      identitySubjectDigest,
       expiresAt: expiresAt.toISOString(),
       householdId,
       adultId,
     };
   }
 
-  digestFounderSetup(token: string): string {
-    return this.#macText(`florence-founder-setup-digest-v1\0${token}`, "hex");
+  digestPartnerSetup(token: string): string {
+    return this.#macText(`florence-partner-setup-digest-v1\0${token}`, "hex");
+  }
+
+  issueWebAccess(input: {
+    providerConversationId: string;
+    identitySubjectDigest: string;
+    householdId: string;
+    adultId: string;
+    accessPath: WebAccessPath;
+    occurredAt: string;
+  }): WebAccessIssue {
+    const providerConversationId = boundedProviderId(
+      input.providerConversationId,
+      "Provider conversation ID",
+    );
+    const identitySubjectDigest = digest(input.identitySubjectDigest, "Messages identity");
+    const householdId = uuid(input.householdId, "Household ID");
+    const adultId = uuid(input.adultId, "Adult ID");
+    const accessPath = webAccessPath(input.accessPath);
+    const occurredAt = instant(input.occurredAt, "Web access issue time");
+    const expiresAtSeconds = Math.floor((occurredAt.getTime() + WEB_ACCESS_LIFETIME_MS) / 1_000);
+    if (expiresAtSeconds < 0 || expiresAtSeconds > 0xffff_ffff) {
+      throw new Error("Web access expiry is outside the compact token range");
+    }
+    const conversation = Buffer.from(providerConversationId, "utf8");
+    const payload = Buffer.alloc(COMPACT_HEADER_BYTES + conversation.length + 16 + 16 + 32 + 1);
+    payload.writeUInt32BE(expiresAtSeconds, 0);
+    payload.writeUInt16BE(conversation.length, 4);
+    conversation.copy(payload, COMPACT_HEADER_BYTES);
+    const offset = COMPACT_HEADER_BYTES + conversation.length;
+    uuidBytes(householdId).copy(payload, offset);
+    uuidBytes(adultId).copy(payload, offset + 16);
+    Buffer.from(identitySubjectDigest, "hex").copy(payload, offset + 32);
+    payload.writeUInt8(webAccessPathCode(accessPath), offset + 64);
+    const tag = createHmac("sha256", this.#secret)
+      .update("florence-web-access-signature-v1\0")
+      .update(payload)
+      .digest()
+      .subarray(0, COMPACT_SIGNATURE_BYTES);
+    return {
+      token: `wa1.${Buffer.concat([payload, tag]).toString("base64url")}`,
+      providerConversationId,
+      identitySubjectDigest,
+      expiresAt: new Date(expiresAtSeconds * 1_000).toISOString(),
+      householdId,
+      adultId,
+      accessPath,
+    };
+  }
+
+  verifyWebAccess(token: string, now = new Date()): WebAccessClaims | null {
+    if (!Number.isFinite(now.getTime()) || Buffer.byteLength(token, "utf8") > 4_000) return null;
+    const [version, encoded, extra] = token.split(".");
+    if (version !== "wa1" || !encoded || extra) return null;
+    let bytes: Buffer;
+    try {
+      bytes = Buffer.from(encoded, "base64url");
+    } catch {
+      return null;
+    }
+    if (
+      bytes.toString("base64url") !== encoded ||
+      bytes.length < COMPACT_HEADER_BYTES + 66 + COMPACT_SIGNATURE_BYTES
+    ) {
+      return null;
+    }
+    const payload = bytes.subarray(0, -COMPACT_SIGNATURE_BYTES);
+    const tag = bytes.subarray(-COMPACT_SIGNATURE_BYTES);
+    const expected = createHmac("sha256", this.#secret)
+      .update("florence-web-access-signature-v1\0")
+      .update(payload)
+      .digest()
+      .subarray(0, COMPACT_SIGNATURE_BYTES);
+    if (!timingSafeEqual(tag, expected)) return null;
+    const expiresAtSeconds = payload.readUInt32BE(0);
+    const conversationLength = payload.readUInt16BE(4);
+    if (payload.length !== COMPACT_HEADER_BYTES + conversationLength + 16 + 16 + 32 + 1) return null;
+    const conversationBytes = payload.subarray(
+      COMPACT_HEADER_BYTES,
+      COMPACT_HEADER_BYTES + conversationLength,
+    );
+    const providerConversationId = conversationBytes.toString("utf8");
+    if (
+      !Buffer.from(providerConversationId, "utf8").equals(conversationBytes) ||
+      !isBoundedProviderId(providerConversationId)
+    ) {
+      return null;
+    }
+    const offset = COMPACT_HEADER_BYTES + conversationLength;
+    const householdId = uuidFromBytes(payload.subarray(offset, offset + 16));
+    const adultId = uuidFromBytes(payload.subarray(offset + 16, offset + 32));
+    const identitySubjectDigest = payload.subarray(offset + 32, offset + 64).toString("hex");
+    const accessPath = webAccessPathFromCode(payload.readUInt8(offset + 64));
+    const expiresAt = new Date(expiresAtSeconds * 1_000);
+    if (expiresAt.getTime() <= now.getTime() || !isDigest(identitySubjectDigest) || accessPath === null) {
+      return null;
+    }
+    return {
+      providerConversationId,
+      identitySubjectDigest,
+      expiresAt: expiresAt.toISOString(),
+      householdId,
+      adultId,
+      accessPath,
+    };
   }
 
   #deterministicUuid(material: string): string {
@@ -215,8 +396,39 @@ function isUuid(value: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
 }
 
-function safeEqual(left: string, right: string): boolean {
-  const leftBytes = Buffer.from(left);
-  const rightBytes = Buffer.from(right);
-  return leftBytes.length === rightBytes.length && timingSafeEqual(leftBytes, rightBytes);
+function webAccessPath(value: WebAccessPath): WebAccessPath {
+  if (value === "/" || value === "/calendar" || value === "/vault" || value === "/preferences") {
+    return value;
+  }
+  throw new Error("Web access path must be a controlled Florence path");
+}
+
+function webAccessPathCode(value: WebAccessPath): number {
+  return value === "/" ? 0 : value === "/calendar" ? 1 : value === "/vault" ? 2 : 3;
+}
+
+function webAccessPathFromCode(value: number): WebAccessPath | null {
+  return value === 0
+    ? "/"
+    : value === 1
+      ? "/calendar"
+      : value === 2
+        ? "/vault"
+        : value === 3
+          ? "/preferences"
+          : null;
+}
+
+function uuid(value: string, label: string): string {
+  if (!isUuid(value)) throw new Error(`${label} must be a UUID`);
+  return value;
+}
+
+function uuidBytes(value: string): Buffer {
+  return Buffer.from(value.replaceAll("-", ""), "hex");
+}
+
+function uuidFromBytes(value: Buffer): string {
+  const hex = value.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }

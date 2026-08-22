@@ -1,5 +1,6 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from "node:crypto";
 import { chmod, link, mkdir, readdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import path from "node:path";
 import type { ImageReference } from "@florence/contracts";
 
@@ -31,6 +32,16 @@ export type SealedPdf = {
 };
 
 export type HeicNormalizer = (bytes: Uint8Array) => Promise<Uint8Array>;
+
+type HeicConverter = (input: { buffer: Uint8Array; format: "JPEG"; quality: number }) => Promise<Uint8Array>;
+
+const requireFromHere = createRequire(import.meta.url);
+let heicConverter: HeicConverter | undefined;
+
+export async function normalizeHeicToJpeg(bytes: Uint8Array): Promise<Uint8Array> {
+  heicConverter ??= requireFromHere("heic-convert") as HeicConverter;
+  return heicConverter({ buffer: bytes, format: "JPEG", quality: 0.92 });
+}
 
 export type EncryptedImageVaultOptions = {
   rootDirectory: string;
@@ -157,7 +168,11 @@ export class EncryptedImageVault {
       if (!this.#normalizeHeic) {
         throw new ImageVaultError("unsupported_image", "HEIC normalization is not configured");
       }
-      bytes = Buffer.from(await this.#normalizeHeic(bytes));
+      try {
+        bytes = Buffer.from(await this.#normalizeHeic(bytes));
+      } catch (error) {
+        throw new ImageVaultError("invalid_image", "HEIC image could not be decoded", { cause: error });
+      }
       if (detectMimeType(bytes) !== "image/jpeg") {
         throw new ImageVaultError("invalid_image", "HEIC normalizer did not return a JPEG");
       }

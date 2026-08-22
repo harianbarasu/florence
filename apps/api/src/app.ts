@@ -3,15 +3,22 @@ import { basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import helmet from "@fastify/helmet";
 import fastifyStatic from "@fastify/static";
-import { decodeImageVaultKey, EncryptedImageVault, ImageVaultError } from "@florence/artifacts";
+import {
+  decodeImageVaultKey,
+  EncryptedImageVault,
+  ImageVaultError,
+  normalizeHeicToJpeg,
+} from "@florence/artifacts";
 import {
   completeFamilyOnboardingInputSchema,
   disconnectGoogleConnectionInputSchema,
-  familyMemberInputSchema,
+  familyCalendarMonthQuerySchema,
+  familyMemberMutationInputSchema,
   idSchema,
   patchFactInputSchema,
+  patchWatchInputSchema,
   preferencesInputSchema,
-  setupSessionInputSchema,
+  sessionInputSchema,
 } from "@florence/contracts";
 import { FlorenceStoreConflict, FlorenceStoreUnauthorized, PostgresFlorenceStore } from "@florence/database";
 import { GoogleConnection, GoogleConnectionError } from "@florence/google";
@@ -48,6 +55,7 @@ const sessionCookieName = "florence_session";
 const sessionLifetimeSeconds = 7 * 24 * 60 * 60;
 const memberParamsSchema = z.object({ memberId: idSchema }).strict();
 const factParamsSchema = z.object({ factId: idSchema }).strict();
+const watchParamsSchema = z.object({ workId: idSchema }).strict();
 
 export function createDefaultDependencies(env: NodeJS.ProcessEnv = process.env): AppDependencies {
   const databaseUrl = requiredEnv(env, "FLORENCE_DATABASE_URL");
@@ -58,9 +66,10 @@ export function createDefaultDependencies(env: NodeJS.ProcessEnv = process.env):
   const imageVault = new EncryptedImageVault({
     rootDirectory: requiredEnv(env, "FLORENCE_IMAGE_VAULT_DIRECTORY"),
     encryptionKey: decodeImageVaultKey(requiredEnv(env, "FLORENCE_IMAGE_VAULT_KEY")),
+    normalizeHeic: normalizeHeicToJpeg,
   });
   const google = createDefaultGoogleConnection(env, store);
-  const setupOrigin = google ? new URL(requiredEnv(env, "GOOGLE_OAUTH_REDIRECT_URI")).origin : null;
+  const setupOrigin = new URL(requiredEnv(env, "GOOGLE_OAUTH_REDIRECT_URI")).origin;
   const florence = new Florence({
     store,
     linq,
@@ -68,7 +77,8 @@ export function createDefaultDependencies(env: NodeJS.ProcessEnv = process.env):
     reasoner: createFlorenceReasonerFromEnv(env),
     enrollmentCodes,
     imageVault,
-    messagesUrl: env.FLORENCE_MESSAGES_URL ?? null,
+    messagesUrl: requiredEnv(env, "FLORENCE_MESSAGES_URL"),
+    linqSenderPhoneNumber: requiredEnv(env, "LINQ_FROM_PHONE"),
     setupOrigin,
   });
   const linqIngress = createLinqIngress({
@@ -78,11 +88,12 @@ export function createDefaultDependencies(env: NodeJS.ProcessEnv = process.env):
     imageVault,
     florence,
   });
+  const callerResolver = createSessionCallerResolver(env);
   florence.start();
   return {
     florence,
     linqIngress,
-    callerResolver: createSessionCallerResolver(env),
+    callerResolver,
     ready: () => store.ready(),
     close: async () => {
       florence.stop();
@@ -150,8 +161,15 @@ export async function buildApp(
 
   app.post("/api/v1/session", async (request, reply) => {
     reply.header("Cache-Control", "no-store");
-    const body = setupSessionInputSchema.safeParse(request.body);
+    const body = sessionInputSchema.safeParse(request.body);
     if (!body.success) return invalidRequest(reply);
+    if ("accessToken" in body.data) {
+      const access = await dependencies.florence.redeemAccessLink(body.data.accessToken);
+      if (!access) return reply.status(401).send({ error: "invalid_or_expired_access_link" });
+      const session = dependencies.callerResolver.issueSession(access.adultId);
+      reply.header("Set-Cookie", sessionCookie(session.token, process.env.NODE_ENV === "production"));
+      return { adultId: session.caller.adultId, accessPath: access.accessPath };
+    }
     const enrollment = await dependencies.florence.redeemSetupLink(body.data).catch((error: unknown) => {
       if (error instanceof FlorenceStoreConflict) return null;
       throw error;
@@ -172,6 +190,15 @@ export async function buildApp(
     return caller ? { workspace: await dependencies.florence.workspaceForAdult(caller.adultId) } : undefined;
   });
 
+  app.get<{ Querystring: { month?: string } }>("/api/v1/calendar", async (request, reply) => {
+    reply.header("Cache-Control", "private, no-store");
+    const caller = await requireAdult(request, reply, dependencies.callerResolver);
+    if (!caller) return;
+    const query = familyCalendarMonthQuerySchema.safeParse(request.query);
+    if (!query.success) return invalidRequest(reply);
+    return dependencies.florence.familyCalendarMonthForAdult(caller.adultId, query.data.month);
+  });
+
   app.put("/api/v1/vault/household", async (request, reply) => {
     const caller = await requireAdult(request, reply, dependencies.callerResolver);
     if (!caller) return;
@@ -186,7 +213,7 @@ export async function buildApp(
     const caller = await requireAdult(request, reply, dependencies.callerResolver);
     if (!caller) return;
     const params = memberParamsSchema.safeParse(request.params);
-    const body = familyMemberInputSchema.safeParse(request.body);
+    const body = familyMemberMutationInputSchema.safeParse(request.body);
     if (!params.success || !body.success) return invalidRequest(reply);
     return {
       workspace: await dependencies.florence.putMember(caller.adultId, params.data.memberId, body.data),
@@ -212,8 +239,31 @@ export async function buildApp(
     const caller = await requireAdult(request, reply, dependencies.callerResolver);
     if (!caller) return;
     const params = factParamsSchema.safeParse(request.params);
+    if (!params.success || request.body !== undefined) return invalidRequest(reply);
+    return {
+      workspace: await dependencies.florence.deleteFact(caller.adultId, params.data.factId),
+    };
+  });
+
+  app.patch("/api/v1/vault/watches/:workId", async (request, reply) => {
+    const caller = await requireAdult(request, reply, dependencies.callerResolver);
+    if (!caller) return;
+    const params = watchParamsSchema.safeParse(request.params);
+    const body = patchWatchInputSchema.safeParse(request.body);
+    if (!params.success || !body.success) return invalidRequest(reply);
+    return {
+      workspace: await dependencies.florence.patchWatch(caller.adultId, params.data.workId, body.data),
+    };
+  });
+
+  app.delete("/api/v1/vault/watches/:workId", async (request, reply) => {
+    const caller = await requireAdult(request, reply, dependencies.callerResolver);
+    if (!caller) return;
+    const params = watchParamsSchema.safeParse(request.params);
     if (!params.success) return invalidRequest(reply);
-    return { workspace: await dependencies.florence.deleteFact(caller.adultId, params.data.factId) };
+    return {
+      workspace: await dependencies.florence.stopWatch(caller.adultId, params.data.workId),
+    };
   });
 
   app.put("/api/v1/preferences", async (request, reply) => {
@@ -239,9 +289,16 @@ export async function buildApp(
     if (!caller) return;
     const body = disconnectGoogleConnectionInputSchema.safeParse(request.body);
     if (!body.success) return invalidRequest(reply);
-    return {
-      workspace: await dependencies.florence.disconnectGoogle(caller.adultId, body.data.connectionId),
-    };
+    reply.header("Cache-Control", "private, no-store");
+    return dependencies.florence.disconnectGoogle(caller.adultId, body.data.connectionId);
+  });
+
+  app.delete("/api/v1/workspace/google-derived-data", async (request, reply) => {
+    const caller = await requireAdult(request, reply, dependencies.callerResolver);
+    if (!caller) return;
+    if (request.body !== undefined) return invalidRequest(reply);
+    reply.header("Cache-Control", "private, no-store");
+    return dependencies.florence.deleteGoogleDerivedData(caller.adultId);
   });
 
   app.get<{ Querystring: { state?: string; code?: string; error?: string } }>(
@@ -280,19 +337,11 @@ export async function buildApp(
 function createDefaultGoogleConnection(
   env: NodeJS.ProcessEnv,
   store: PostgresFlorenceStore,
-): GoogleConnection | null {
-  const values = [
-    env.GOOGLE_OAUTH_CLIENT_ID,
-    env.GOOGLE_OAUTH_CLIENT_SECRET,
-    env.GOOGLE_OAUTH_REDIRECT_URI,
-    env.GOOGLE_CREDENTIAL_KEY,
-  ];
-  const configured = values.filter((value) => value?.trim()).length;
-  if (configured === 0) return null;
-  if (configured !== values.length) {
-    throw new Error("Google OAuth credentials and GOOGLE_CREDENTIAL_KEY must be configured together");
-  }
-  const [clientId, clientSecret, redirectUri, encodedKey] = values as [string, string, string, string];
+): GoogleConnection {
+  const clientId = requiredEnv(env, "GOOGLE_OAUTH_CLIENT_ID");
+  const clientSecret = requiredEnv(env, "GOOGLE_OAUTH_CLIENT_SECRET");
+  const redirectUri = requiredEnv(env, "GOOGLE_OAUTH_REDIRECT_URI");
+  const encodedKey = requiredEnv(env, "GOOGLE_CREDENTIAL_KEY");
   const encryptionKey = Buffer.from(encodedKey, "base64");
   if (encryptionKey.byteLength !== 32 || encryptionKey.toString("base64") !== encodedKey) {
     throw new Error("GOOGLE_CREDENTIAL_KEY must be a canonical base64-encoded 32-byte key");

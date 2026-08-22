@@ -1,20 +1,25 @@
 import type {
   CompleteFamilyOnboardingInput,
-  FamilyMemberInput,
+  FamilyMemberMutationInput,
   PatchFactInput,
+  PatchWatchInput,
   PreferencesInput,
-  SetupSessionInput,
+  SessionInput,
 } from "@florence/contracts";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   completeFamilyOnboarding,
   createSession,
+  deleteGoogleDerivedData,
   deleteSession,
   deleteVaultFact,
+  deleteVaultWatch,
   disconnectGoogleConnection,
+  getFamilyCalendarMonth,
   getSession,
   getWorkspace,
   patchVaultFact,
+  patchVaultWatch,
   putFamilyMember,
   putPreferences,
   startGoogleConnection,
@@ -23,6 +28,7 @@ import {
 export const queryKeys = {
   session: ["session"] as const,
   workspace: ["workspace"] as const,
+  calendar: (month: string) => ["calendar", month] as const,
 };
 
 export function useSession(enabled = true) {
@@ -32,7 +38,7 @@ export function useSession(enabled = true) {
 export function useCreateSession() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (input: SetupSessionInput) => createSession(input),
+    mutationFn: (input: SessionInput) => createSession(input),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: queryKeys.session });
       await queryClient.invalidateQueries({ queryKey: queryKeys.workspace });
@@ -52,6 +58,14 @@ export function useWorkspace(enabled = true) {
   return useQuery({ queryKey: queryKeys.workspace, queryFn: getWorkspace, enabled });
 }
 
+export function useFamilyCalendarMonth(month: string) {
+  return useQuery({
+    queryKey: queryKeys.calendar(month),
+    queryFn: () => getFamilyCalendarMonth(month),
+    retry: false,
+  });
+}
+
 export function useCompleteFamilyOnboarding() {
   return useMutation({
     mutationFn: (input: CompleteFamilyOnboardingInput) => completeFamilyOnboarding(input),
@@ -61,7 +75,7 @@ export function useCompleteFamilyOnboarding() {
 export function usePutMember() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: ({ memberId, input }: { memberId: string; input: FamilyMemberInput }) =>
+    mutationFn: ({ memberId, input }: { memberId: string; input: FamilyMemberMutationInput }) =>
       putFamilyMember(memberId, input),
     onSuccess: (workspace) => queryClient.setQueryData(queryKeys.workspace, workspace),
   });
@@ -84,6 +98,23 @@ export function useDeleteFact() {
   });
 }
 
+export function usePatchWatch() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ workId, input }: { workId: string; input: PatchWatchInput }) =>
+      patchVaultWatch(workId, input),
+    onSuccess: (workspace) => queryClient.setQueryData(queryKeys.workspace, workspace),
+  });
+}
+
+export function useDeleteWatch() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (workId: string) => deleteVaultWatch(workId),
+    onSuccess: (workspace) => queryClient.setQueryData(queryKeys.workspace, workspace),
+  });
+}
+
 export function usePutPreferences() {
   const queryClient = useQueryClient();
   return useMutation({
@@ -100,6 +131,14 @@ export function useDisconnectGoogleConnection() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (connectionId: string) => disconnectGoogleConnection(connectionId),
-    onSuccess: (workspace) => queryClient.setQueryData(queryKeys.workspace, workspace),
+    onSuccess: (result) => queryClient.setQueryData(queryKeys.workspace, result.workspace),
+  });
+}
+
+export function useDeleteGoogleDerivedData() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: deleteGoogleDerivedData,
+    onSuccess: (result) => queryClient.setQueryData(queryKeys.workspace, result.workspace),
   });
 }

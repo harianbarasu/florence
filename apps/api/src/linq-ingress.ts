@@ -13,20 +13,49 @@ import {
   unwrapLinqWebhook,
 } from "@florence/linq";
 import type { Florence } from "./florence.js";
+import type { FlorenceVoiceNoteInput } from "./reasoner.js";
 
 const webhookVersion = "2026-02-03";
-const supportedImageTypes = new Set<ImageReference["mimeType"]>(["image/jpeg", "image/png", "image/webp"]);
+const supportedImageTypes = new Set<ImageReference["mimeType"]>([
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/heic",
+]);
+const supportedAudioTypes = new Set<FlorenceVoiceNoteInput["mimeType"]>([
+  "audio/flac",
+  "audio/x-flac",
+  "audio/aac",
+  "audio/aiff",
+  "audio/x-aiff",
+  "audio/amr",
+  "audio/x-caf",
+  "audio/m4a",
+  "audio/x-m4a",
+  "audio/mp4",
+  "audio/mp3",
+  "audio/mpeg",
+  "audio/ogg",
+  "audio/wav",
+  "audio/x-wav",
+  "audio/webm",
+]);
 const PDF_MIME_TYPE = "application/pdf";
 const PDF_DISCARD_MS = 24 * 60 * 60_000;
+const MAX_MEDIA_BYTES = 20 * 1024 * 1024;
+const MAX_INBOUND_TEXT_CHARS = 20_000;
+const noSupportedInboundContent = Symbol("no-supported-inbound-content");
 
 type FlorenceIngress = Pick<
   Florence,
   | "resolveLinqAuthority"
   | "respondBeforeEnrollment"
-  | "bootstrapMessagesGroup"
+  | "reconcileObservedFamilyGroup"
   | "acceptInbound"
+  | "acceptInboundWithPreparation"
   | "acceptInboundReaction"
   | "recordLinqObservation"
+  | "transcribeVoiceNote"
 >;
 
 export type LinqIngressResult =
@@ -40,6 +69,8 @@ export type LinqIngressResult =
         | "onboarding_offered"
         | "opted_out"
         | "provider_observation"
+        | "family_group_repairing"
+        | "retired_group"
         | "reconciled_history";
     }
   | {
@@ -98,7 +129,7 @@ export function createLinqIngress(options: {
           if (proposal.operation === "removed") {
             return { disposition: "acknowledged", reason: "provider_observation" };
           }
-          return acceptReaction(proposal, options);
+          return await acceptReaction(proposal, options);
         }
         if (proposal.kind === "message_status") {
           await options.florence.recordLinqObservation(proposal);
@@ -113,7 +144,7 @@ export function createLinqIngress(options: {
         if (proposal.service !== "iMessage") {
           return { disposition: "rejected", reason: "unsupported_service" };
         }
-        return acceptMessage(proposal, options);
+        return await acceptMessage(proposal, options);
       } catch (error) {
         if (error instanceof LinqIngressError) throw error;
         if (error instanceof LinqError) {
@@ -139,6 +170,13 @@ async function acceptReaction(
     return { disposition: "rejected", reason: "authority_evidence_mismatch" };
   }
   const observed = await options.linq.observeChat(proposal.providerConversationId);
+  const groupDisposition = await reconcileObservedGroup(
+    proposal.providerConversationId,
+    proposal.occurredAt,
+    observed,
+    options.florence,
+  );
+  if (groupDisposition) return groupDisposition;
   const senderIdentitySubjectDigest = linqIdentitySubjectDigest(proposal.sender.providerHandleId);
   const authority = await options.florence.resolveLinqAuthority({
     providerConversationId: proposal.providerConversationId,
@@ -177,6 +215,13 @@ async function acceptMessage(
   },
 ): Promise<LinqIngressResult> {
   const observed = await options.linq.observeChat(proposal.providerConversationId);
+  const groupDisposition = await reconcileObservedGroup(
+    proposal.providerConversationId,
+    proposal.occurredAt,
+    observed,
+    options.florence,
+  );
+  if (groupDisposition) return groupDisposition;
   if (proposal.isGroup !== null && observed.audience !== (proposal.isGroup ? "group" : "private")) {
     return { disposition: "rejected", reason: "authority_evidence_mismatch" };
   }
@@ -194,34 +239,7 @@ async function acceptMessage(
     return handleUnboundMessage(proposal, observed, options);
   }
 
-  const sourceId = inboundSourceId(proposal.providerEventId);
-  if (authority.stopped) {
-    return { disposition: "acknowledged", reason: "channel_stopped" };
-  }
-  if (isCarrierMessagesOptOut(proposal.text)) {
-    const receipt = await options.florence.acceptInbound({
-      providerConversationId: proposal.providerConversationId,
-      audience,
-      participantIdentityDigests: observed.participantIdentityDigests,
-      senderIdentitySubjectDigest,
-      providerEventId: proposal.providerEventId,
-      providerMessageId: proposal.providerMessageId,
-      replyToProviderMessageId: proposal.replyTo?.providerMessageId ?? null,
-      text: proposal.text,
-      images: [],
-      documents: [],
-      occurredAt: proposal.occurredAt,
-    });
-    if (!receipt) return { disposition: "rejected", reason: "authority_not_found" };
-    return receipt.disposition === "duplicate"
-      ? { disposition: "duplicate", sourceId: receipt.sourceId }
-      : { disposition: "acknowledged", reason: "opted_out" };
-  }
-  const media = await storeMedia(proposal, authority.householdId, sourceId, options);
-  if (proposal.text === null && media.images.length === 0 && media.documents.length === 0) {
-    return { disposition: "acknowledged", reason: "message_has_no_supported_content" };
-  }
-  const receipt = await options.florence.acceptInbound({
+  const envelope = {
     providerConversationId: proposal.providerConversationId,
     audience,
     participantIdentityDigests: observed.participantIdentityDigests,
@@ -229,13 +247,54 @@ async function acceptMessage(
     providerEventId: proposal.providerEventId,
     providerMessageId: proposal.providerMessageId,
     replyToProviderMessageId: proposal.replyTo?.providerMessageId ?? null,
-    text: proposal.text,
-    images: media.images,
-    documents: media.documents,
     occurredAt: proposal.occurredAt,
-  });
-  if (!receipt || receipt.disposition === "stopped") {
+    providerPayloadDigest: canonicalProviderPayloadDigest(
+      proposal,
+      audience,
+      observed.participantIdentityDigests,
+      senderIdentitySubjectDigest,
+    ),
+  };
+  if (isCarrierMessagesOptOut(proposal.text)) {
+    const receipt = await options.florence.acceptInboundWithPreparation(envelope, async () => ({
+      text: proposal.text,
+      authoredText: proposal.text?.trim() || null,
+      voiceTranscriptPresent: false,
+      images: [],
+      documents: [],
+    }));
+    if (!receipt) return { disposition: "rejected", reason: "authority_not_found" };
+    return receipt.disposition === "duplicate"
+      ? { disposition: "duplicate", sourceId: receipt.sourceId }
+      : { disposition: "acknowledged", reason: "opted_out" };
+  }
+  let receipt: Awaited<ReturnType<FlorenceIngress["acceptInboundWithPreparation"]>>;
+  try {
+    receipt = await options.florence.acceptInboundWithPreparation(
+      envelope,
+      async ({ householdId, sourceId }) => {
+        if (!hasSupportedContent(proposal)) throw noSupportedInboundContent;
+        const media = await storeMedia(proposal, householdId, sourceId, options);
+        return {
+          text: inboundTextWithVoiceTranscripts(proposal.text, media.voiceTranscripts),
+          authoredText: proposal.text?.trim() || null,
+          voiceTranscriptPresent: media.voiceTranscripts.length > 0,
+          images: media.images,
+          documents: media.documents,
+        };
+      },
+    );
+  } catch (error) {
+    if (error === noSupportedInboundContent) {
+      return { disposition: "acknowledged", reason: "message_has_no_supported_content" };
+    }
+    throw error;
+  }
+  if (!receipt) {
     return { disposition: "rejected", reason: "authority_not_found" };
+  }
+  if (receipt.disposition === "stopped") {
+    return { disposition: "acknowledged", reason: "channel_stopped" };
   }
   return { disposition: receipt.disposition, sourceId: receipt.sourceId };
 }
@@ -256,9 +315,7 @@ async function handleUnboundMessage(
     if (participantIdentityDigests[0] !== senderIdentitySubjectDigest) {
       return { disposition: "rejected", reason: "authority_evidence_mismatch" };
     }
-    if (isCarrierMessagesOptOut(proposal.text)) {
-      return { disposition: "acknowledged", reason: "opted_out" };
-    }
+    const carrierOptOut = isCarrierMessagesOptOut(proposal.text);
     if (!proposal.text?.trim() && proposal.media.length === 0) {
       return { disposition: "rejected", reason: "authority_not_found" };
     }
@@ -268,40 +325,47 @@ async function handleUnboundMessage(
       identitySubjectDigest: senderIdentitySubjectDigest,
       text: proposal.text?.trim() || "Shared an attachment.",
       occurredAt: proposal.occurredAt,
+      carrierOptOut,
     });
     return offered
-      ? { disposition: "acknowledged", reason: "onboarding_offered" }
+      ? { disposition: "acknowledged", reason: carrierOptOut ? "opted_out" : "onboarding_offered" }
       : { disposition: "rejected", reason: "authority_not_found" };
   }
 
-  if (proposal.media.length > 0 || proposal.text === null || participantIdentityDigests.length !== 2) {
-    return { disposition: "rejected", reason: "authority_not_found" };
-  }
-  if (!participantIdentityDigests.includes(senderIdentitySubjectDigest)) {
-    return { disposition: "rejected", reason: "authority_evidence_mismatch" };
-  }
-  const receipt = await options.florence.bootstrapMessagesGroup({
-    providerConversationId: proposal.providerConversationId,
-    audience: "group",
-    participantIdentityDigests,
-    senderIdentitySubjectDigest,
-    providerEventId: proposal.providerEventId,
-    providerMessageId: proposal.providerMessageId,
-    replyToProviderMessageId: proposal.replyTo?.providerMessageId ?? null,
-    text: proposal.text,
-    occurredAt: proposal.occurredAt,
+  return { disposition: "rejected", reason: "authority_not_found" };
+}
+
+async function reconcileObservedGroup(
+  providerConversationId: string,
+  occurredAt: string,
+  observed: { audience: "private" | "group"; participantIdentityDigests: readonly string[] },
+  florence: FlorenceIngress,
+): Promise<LinqIngressResult | null> {
+  const result = await florence.reconcileObservedFamilyGroup({
+    providerConversationId,
+    audience: observed.audience,
+    participantIdentityDigests: observed.participantIdentityDigests,
+    occurredAt,
   });
-  return receipt && receipt.disposition !== "stopped"
-    ? { disposition: receipt.disposition, sourceId: receipt.sourceId }
-    : { disposition: "rejected", reason: "authority_not_found" };
+  if (result === "mismatch") {
+    return { disposition: "acknowledged", reason: "family_group_repairing" };
+  }
+  if (result === "retired") {
+    return { disposition: "acknowledged", reason: "retired_group" };
+  }
+  return null;
 }
 
 async function storeMedia(
   proposal: LinqInboundMessageProposal,
   householdId: string,
   sourceId: string,
-  options: { linq: LinqClient; imageVault: EncryptedImageVault },
-): Promise<{ images: ImageReference[]; documents: InboundDocumentInput[] }> {
+  options: { linq: LinqClient; imageVault: EncryptedImageVault; florence: FlorenceIngress },
+): Promise<{
+  images: ImageReference[];
+  documents: InboundDocumentInput[];
+  voiceTranscripts: string[];
+}> {
   const imageMedia = proposal.media.filter(
     (item): item is LinqMediaReference & { mimeType: ImageReference["mimeType"] } =>
       supportedImageTypes.has(item.mimeType as ImageReference["mimeType"]),
@@ -310,7 +374,11 @@ async function storeMedia(
     (item): item is LinqMediaReference & { mimeType: typeof PDF_MIME_TYPE } =>
       item.mimeType === PDF_MIME_TYPE,
   );
-  if (imageMedia.length > 10 || pdfMedia.length > 3) {
+  const audioMedia = proposal.media.filter(
+    (item): item is LinqMediaReference & { mimeType: FlorenceVoiceNoteInput["mimeType"] } =>
+      supportedAudioTypes.has(item.mimeType as FlorenceVoiceNoteInput["mimeType"]),
+  );
+  if (imageMedia.length > 10 || pdfMedia.length > 3 || audioMedia.length > 3) {
     throw new LinqIngressError("invalid_payload", false);
   }
   const images: ImageReference[] = [];
@@ -352,11 +420,79 @@ async function storeMedia(
       discardAfter: sealed.discardAfter,
     });
   }
-  return { images, documents };
+  const voiceTranscripts: string[] = [];
+  for (const item of audioMedia) {
+    if (item.sizeBytes > MAX_MEDIA_BYTES) throw new LinqIngressError("invalid_payload", false);
+    const fetched = await options.linq.fetchMedia(item);
+    if (
+      fetched.mimeType !== item.mimeType ||
+      fetched.bytes.byteLength < 1 ||
+      fetched.bytes.byteLength > MAX_MEDIA_BYTES
+    ) {
+      throw new LinqIngressError("unsafe_media", false);
+    }
+    voiceTranscripts.push(
+      await options.florence.transcribeVoiceNote({
+        filename: item.filename,
+        mimeType: item.mimeType,
+        bytes: fetched.bytes,
+      }),
+    );
+  }
+  return { images, documents, voiceTranscripts };
 }
 
-function inboundSourceId(providerEventId: string): string {
-  return deterministicUuid(`linq-v3\0signal\0${providerEventId}`);
+function hasSupportedContent(proposal: LinqInboundMessageProposal): boolean {
+  return (
+    proposal.text !== null ||
+    proposal.media.some(
+      (item) =>
+        supportedImageTypes.has(item.mimeType as ImageReference["mimeType"]) ||
+        item.mimeType === PDF_MIME_TYPE ||
+        supportedAudioTypes.has(item.mimeType as FlorenceVoiceNoteInput["mimeType"]),
+    )
+  );
+}
+
+function canonicalProviderPayloadDigest(
+  proposal: LinqInboundMessageProposal,
+  audience: "private" | "group",
+  participantIdentityDigests: readonly string[],
+  senderIdentitySubjectDigest: string,
+): string {
+  const semanticPayload = [
+    "linq-inbound-v1",
+    proposal.providerEventId,
+    proposal.providerConversationId,
+    proposal.providerMessageId,
+    senderIdentitySubjectDigest,
+    audience,
+    [...participantIdentityDigests].sort(),
+    proposal.replyTo ? [proposal.replyTo.providerMessageId, proposal.replyTo.partIndex] : null,
+    proposal.occurredAt,
+    proposal.text,
+    proposal.media.map((item) => [item.providerAttachmentId, item.filename, item.mimeType, item.sizeBytes]),
+  ];
+  return createHash("sha256").update(JSON.stringify(semanticPayload), "utf8").digest("hex");
+}
+
+function inboundTextWithVoiceTranscripts(
+  text: string | null,
+  voiceTranscripts: readonly string[],
+): string | null {
+  const parentText = text?.trim() ?? "";
+  if (voiceTranscripts.length === 0) return text;
+  const label =
+    voiceTranscripts.length === 1
+      ? "[Automatic voice-note transcript]"
+      : `[Automatic transcripts of ${voiceTranscripts.length} voice notes]`;
+  const body = voiceTranscripts.join("\n\n---\n\n");
+  const prefix = `${parentText ? `${parentText}\n\n` : ""}${label}\n`;
+  const shortenedMarker = "\n[Transcript shortened]";
+  const available = MAX_INBOUND_TEXT_CHARS - prefix.length;
+  if (available < 200) throw new LinqIngressError("invalid_payload", false);
+  if (body.length <= available) return `${prefix}${body}`;
+  return `${prefix}${body.slice(0, available - shortenedMarker.length).trimEnd()}${shortenedMarker}`;
 }
 
 function inboundReaction(proposal: LinqReactionProposal): string {

@@ -1,12 +1,19 @@
 import {
   type CompleteFamilyOnboardingInput,
+  type DeleteGoogleDerivedDataResponse,
   type DisconnectGoogleConnectionInput,
-  type FamilyMemberInput,
+  type DisconnectGoogleConnectionResponse,
+  deleteGoogleDerivedDataResponseSchema,
+  disconnectGoogleConnectionResponseSchema,
+  type FamilyCalendarMonthView,
+  type FamilyMemberMutationInput,
+  familyCalendarMonthViewSchema,
   googleStartResponseSchema,
   type PatchFactInput,
+  type PatchWatchInput,
   type PreferencesInput,
+  type SessionInput,
   type SessionResponse,
-  type SetupSessionInput,
   sessionResponseSchema,
   type WorkspaceView,
   workspaceResponseSchema,
@@ -50,7 +57,7 @@ export async function getSession(): Promise<SessionResponse> {
   return sessionResponseSchema.parse(await requestJson("/api/v1/session"));
 }
 
-export async function createSession(input: SetupSessionInput): Promise<SessionResponse> {
+export async function createSession(input: SessionInput): Promise<SessionResponse> {
   return sessionResponseSchema.parse(
     await requestJson("/api/v1/session", {
       method: "POST",
@@ -67,6 +74,12 @@ export function getWorkspace(): Promise<WorkspaceView> {
   return requestWorkspace("/api/v1/workspace");
 }
 
+export async function getFamilyCalendarMonth(month: string): Promise<FamilyCalendarMonthView> {
+  return familyCalendarMonthViewSchema.parse(
+    await requestJson(`/api/v1/calendar?month=${encodeURIComponent(month)}`),
+  );
+}
+
 export function completeFamilyOnboarding(input: CompleteFamilyOnboardingInput): Promise<WorkspaceView> {
   return requestWorkspace("/api/v1/vault/household", {
     method: "PUT",
@@ -74,7 +87,7 @@ export function completeFamilyOnboarding(input: CompleteFamilyOnboardingInput): 
   });
 }
 
-export function putFamilyMember(memberId: string, input: FamilyMemberInput): Promise<WorkspaceView> {
+export function putFamilyMember(memberId: string, input: FamilyMemberMutationInput): Promise<WorkspaceView> {
   return requestWorkspace(`/api/v1/vault/members/${encodeURIComponent(memberId)}`, {
     method: "PUT",
     body: JSON.stringify(input),
@@ -89,7 +102,22 @@ export function patchVaultFact(factId: string, input: PatchFactInput): Promise<W
 }
 
 export function deleteVaultFact(factId: string): Promise<WorkspaceView> {
-  return requestWorkspace(`/api/v1/vault/facts/${encodeURIComponent(factId)}`, { method: "DELETE" });
+  return requestWorkspace(`/api/v1/vault/facts/${encodeURIComponent(factId)}`, {
+    method: "DELETE",
+  });
+}
+
+export function patchVaultWatch(workId: string, input: PatchWatchInput): Promise<WorkspaceView> {
+  return requestWorkspace(`/api/v1/vault/watches/${encodeURIComponent(workId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(input),
+  });
+}
+
+export function deleteVaultWatch(workId: string): Promise<WorkspaceView> {
+  return requestWorkspace(`/api/v1/vault/watches/${encodeURIComponent(workId)}`, {
+    method: "DELETE",
+  });
 }
 
 export function putPreferences(input: PreferencesInput): Promise<WorkspaceView> {
@@ -105,12 +133,22 @@ export async function startGoogleConnection(): Promise<{ authorizationUrl: strin
   );
 }
 
-export function disconnectGoogleConnection(connectionId: string): Promise<WorkspaceView> {
+export async function disconnectGoogleConnection(
+  connectionId: string,
+): Promise<DisconnectGoogleConnectionResponse> {
   const input: DisconnectGoogleConnectionInput = { connectionId };
-  return requestWorkspace("/api/v1/workspace/google-connections", {
-    method: "DELETE",
-    body: JSON.stringify(input),
-  });
+  return disconnectGoogleConnectionResponseSchema.parse(
+    await requestJson("/api/v1/workspace/google-connections", {
+      method: "DELETE",
+      body: JSON.stringify(input),
+    }),
+  );
+}
+
+export async function deleteGoogleDerivedData(): Promise<DeleteGoogleDerivedDataResponse> {
+  return deleteGoogleDerivedDataResponseSchema.parse(
+    await requestJson("/api/v1/workspace/google-derived-data", { method: "DELETE" }),
+  );
 }
 
 function readError(payload: unknown): string | null {

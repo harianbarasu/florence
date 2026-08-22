@@ -4,6 +4,7 @@ const LINQ_API_BASE_URL = "https://api.linqapp.com/api/partner/v3";
 const LINQ_WEBHOOK_VERSION = "2026-02-03";
 const MAX_WEBHOOK_BYTES = 1024 * 1024;
 const DEFAULT_MAX_MEDIA_BYTES = 20 * 1024 * 1024;
+const MAX_OBSERVED_CHAT_HANDLES = 32;
 
 type HeaderValue = string | readonly string[] | undefined;
 export type LinqWebhookHeaders = Headers | Readonly<Record<string, HeaderValue>>;
@@ -190,6 +191,23 @@ export type LinqSendMessage = {
   replyTo?: LinqMessageReplyTarget | null;
 };
 
+export type LinqCreateChat = {
+  idempotencyKey: string;
+  senderPhoneNumber: string;
+  participantPhoneNumbers: readonly string[];
+  initialText: string;
+};
+
+export type LinqCreatedChat = {
+  providerConversationId: string;
+  authority: LinqObservedChat;
+  initialMessage: {
+    idempotencyKey: string;
+    providerMessageId: string;
+    occurredAt: string;
+  };
+};
+
 export type LinqReaction = "love" | "like" | "dislike" | "laugh" | "emphasize" | "question";
 
 export type LinqSendReaction = {
@@ -202,12 +220,19 @@ export type LinqSendReaction = {
   reaction: LinqReaction;
 };
 
-export type LinqObservedChat = LinqConversationAuthority;
+/** Raw, bounded provider membership. Unlike expected authority, drift may contain any participant count. */
+export type LinqObservedChat = LinqConversationAuthority & {
+  ownerPhoneNumber: string;
+  participants: readonly {
+    identitySubjectDigest: string;
+    phoneNumber: string;
+  }[];
+};
 
 export type LinqDeliveryResult =
   | {
       status: "committed";
-      providerState: "accepted" | "reaction_added";
+      providerState: "accepted" | "sent" | "delivered" | "read" | "reaction_added";
       idempotencyKey: string;
       providerReceiptId: string;
       detail: null;
@@ -255,6 +280,78 @@ export class LinqClient {
       options.maximumMediaBytes ?? DEFAULT_MAX_MEDIA_BYTES,
       "Maximum media bytes",
     );
+  }
+
+  async createChat(input: LinqCreateChat): Promise<LinqCreatedChat> {
+    const idempotencyKey = bounded(input.idempotencyKey, "Chat creation idempotency key", 255);
+    const senderPhoneNumber = e164PhoneNumber(input.senderPhoneNumber, "Sender phone number");
+    const participantPhoneNumbers = normalizedParticipants(input.participantPhoneNumbers);
+    if (participantPhoneNumbers.includes(senderPhoneNumber)) {
+      fail("configuration", "A Linq chat participant cannot be the sender phone number");
+    }
+    const initialText = bounded(input.initialText, "Initial message text", 10_000);
+    if (containsUrl(initialText)) {
+      fail("configuration", "A Linq chat's initial message cannot contain a URL");
+    }
+
+    const response = await this.request(
+      this.endpoint("chats"),
+      {
+        method: "POST",
+        headers: this.headers(),
+        redirect: "error",
+        body: JSON.stringify({
+          from: senderPhoneNumber,
+          to: participantPhoneNumbers,
+          message: {
+            parts: [{ type: "text", value: initialText }],
+            idempotency_key: idempotencyKey,
+            preferred_service: "iMessage",
+          },
+        }),
+      },
+      "creating a chat",
+    );
+
+    try {
+      const payload = object(await response.json(), "create chat response");
+      const chat = object(payload.chat, "create chat response chat");
+      const providerConversationId = string(chat.id, "create chat response chat id");
+      const authority = createdChatAuthority(chat, senderPhoneNumber, participantPhoneNumbers);
+      const message = object(chat.message, "create chat response message");
+      const providerMessageId = string(message.id, "create chat response message id");
+      const occurredAt = timestamp(message.created_at, "create chat response message created_at");
+      const parts = array(message.parts, "create chat response message parts");
+      if (parts.length !== 1) {
+        fail("invalid_payload", "Linq created chat returned the wrong initial message parts");
+      }
+      const part = object(parts[0], "create chat response initial message part");
+      literal(part.type, "text", "create chat response initial message part type");
+      if (part.value !== initialText) {
+        fail("invalid_payload", "Linq created chat returned different initial message text");
+      }
+      if (message.chat_id !== null && message.chat_id !== undefined) {
+        literal(message.chat_id, providerConversationId, "create chat response message chat_id");
+      }
+      if (message.idempotency_key !== null && message.idempotency_key !== undefined) {
+        literal(message.idempotency_key, idempotencyKey, "create chat response message idempotency_key");
+      }
+      if (message.preferred_service !== null && message.preferred_service !== undefined) {
+        literal(message.preferred_service, "iMessage", "create chat response message preferred_service");
+      }
+      if (message.service !== null && message.service !== undefined) {
+        literal(message.service, "iMessage", "create chat response message service");
+      }
+      outboundMessageState(message.delivery_status, "create chat response message delivery_status");
+      return {
+        providerConversationId,
+        authority,
+        initialMessage: { idempotencyKey, providerMessageId, occurredAt },
+      };
+    } catch (error) {
+      if (error instanceof LinqError && error.retryable) throw error;
+      throw retryable("Linq accepted chat creation but returned an invalid receipt", error);
+    }
   }
 
   async observeChat(providerConversationId: string): Promise<LinqObservedChat> {
@@ -356,9 +453,13 @@ export class LinqClient {
       const message = object(payload.message, "send response message");
       const receiptId = string(message.id, "send response message id");
       const occurredAt = timestamp(message.created_at, "send response created_at");
+      const providerState = outboundMessageState(
+        message.delivery_status,
+        "send response message delivery_status",
+      );
       return {
         status: "committed",
-        providerState: "accepted",
+        providerState,
         idempotencyKey,
         providerReceiptId: receiptId,
         detail: null,
@@ -629,15 +730,96 @@ export class LinqClient {
   }
 }
 
+function createdChatAuthority(
+  chat: Record<string, unknown>,
+  senderPhoneNumber: string,
+  participantPhoneNumbers: readonly string[],
+): LinqObservedChat {
+  const audience = participantPhoneNumbers.length === 1 ? "private" : "group";
+  if (boolean(chat.is_group, "create chat response chat is_group") !== (audience === "group")) {
+    fail("invalid_payload", "Linq created a chat with the wrong audience");
+  }
+  if (chat.service !== null && chat.service !== undefined && serviceType(chat.service) !== "iMessage") {
+    fail("invalid_payload", "Linq created chat must use iMessage");
+  }
+
+  const handles = array(chat.handles, "create chat response chat handles");
+  if (handles.length !== participantPhoneNumbers.length + 1) {
+    fail("invalid_payload", "Linq created chat contains the wrong number of handles");
+  }
+  const expectedAddresses = new Set([senderPhoneNumber, ...participantPhoneNumbers]);
+  const seenAddresses = new Set<string>();
+  const seenHandleIds = new Set<string>();
+  const participants: LinqObservedChat["participants"][number][] = [];
+  let ownerCount = 0;
+  let ownerPhoneNumber: string | null = null;
+
+  for (const value of handles) {
+    const handle = object(value, "create chat response handle");
+    const id = string(handle.id, "create chat response handle id");
+    const address = providerE164PhoneNumber(handle.handle, "create chat response handle address");
+    if (seenHandleIds.has(id) || seenAddresses.has(address)) {
+      fail("invalid_payload", "Linq created chat contains a duplicate handle");
+    }
+    if (!expectedAddresses.has(address)) {
+      fail("invalid_payload", "Linq created chat contains an unexpected handle");
+    }
+    seenHandleIds.add(id);
+    seenAddresses.add(address);
+    timestamp(handle.joined_at, "create chat response handle joined_at");
+    if (serviceType(handle.service) !== "iMessage") {
+      fail("invalid_payload", "Linq created chat handles must use iMessage");
+    }
+    if (handle.status !== null && handle.status !== undefined) {
+      if (participantStatus(handle.status) !== "active") {
+        fail("invalid_payload", "Linq created chat contains an inactive handle");
+      }
+    }
+    if (handle.left_at !== null && handle.left_at !== undefined) {
+      timestamp(handle.left_at, "create chat response handle left_at");
+      fail("invalid_payload", "Linq created chat contains a departed handle");
+    }
+
+    const isOwner = address === senderPhoneNumber;
+    if (handle.is_me !== null && handle.is_me !== undefined) {
+      if (boolean(handle.is_me, "create chat response handle is_me") !== isOwner) {
+        fail("invalid_payload", "Linq created chat handle has the wrong owner marker");
+      }
+    }
+    if (isOwner) {
+      ownerCount += 1;
+      ownerPhoneNumber = address;
+    } else {
+      participants.push({ identitySubjectDigest: linqIdentitySubjectDigest(id), phoneNumber: address });
+    }
+  }
+
+  if (ownerCount !== 1 || ownerPhoneNumber === null || seenAddresses.size !== expectedAddresses.size) {
+    fail("invalid_payload", "Linq created chat does not match the requested participant set");
+  }
+  participants.sort((left, right) => left.identitySubjectDigest.localeCompare(right.identitySubjectDigest));
+  return {
+    audience,
+    ownerPhoneNumber,
+    participants,
+    participantIdentityDigests: participants.map((participant) => participant.identitySubjectDigest),
+  };
+}
+
 function observeChatAuthority(chat: Record<string, unknown>): LinqObservedChat {
   const audience = boolean(chat.is_group, "chat is_group") ? "group" : "private";
   if (chat.service !== null && chat.service !== undefined && serviceType(chat.service) !== "iMessage") {
     fail("invalid_payload", "Linq chat must use iMessage");
   }
   const handles = array(chat.handles, "chat handles");
+  if (handles.length > MAX_OBSERVED_CHAT_HANDLES) {
+    fail("invalid_payload", "Linq chat contains too many handles to reconcile safely");
+  }
   const seenHandleIds = new Set<string>();
-  const activeParticipants: string[] = [];
+  const seenActivePhoneNumbers = new Set<string>();
+  const activeParticipants: LinqObservedChat["participants"][number][] = [];
   let activeSelfCount = 0;
+  let ownerPhoneNumber: string | null = null;
 
   for (const value of handles) {
     const participant = object(value, "chat handle");
@@ -658,25 +840,37 @@ function observeChatAuthority(chat: Record<string, unknown>): LinqObservedChat {
     if (service !== "iMessage") {
       fail("invalid_payload", "Linq chat active handles must use iMessage");
     }
+    const phoneNumber = providerE164PhoneNumber(participant.handle, "chat active handle address");
+    if (seenActivePhoneNumbers.has(phoneNumber)) {
+      fail("invalid_payload", "Linq chat contains a duplicate active phone number");
+    }
+    seenActivePhoneNumbers.add(phoneNumber);
     if (isMe) {
       activeSelfCount += 1;
+      ownerPhoneNumber = phoneNumber;
     } else {
-      activeParticipants.push(linqIdentitySubjectDigest(id));
+      activeParticipants.push({
+        identitySubjectDigest: linqIdentitySubjectDigest(id),
+        phoneNumber,
+      });
     }
   }
 
   if (activeSelfCount !== 1) {
     fail("invalid_payload", "Linq chat must have exactly one active owner handle");
   }
-  const requiredParticipants = audience === "private" ? 1 : 2;
-  if (activeParticipants.length !== requiredParticipants) {
-    fail(
-      "invalid_payload",
-      `Linq ${audience} chat must have exactly ${requiredParticipants} active non-owner participant${requiredParticipants === 1 ? "" : "s"}`,
-    );
+  if (ownerPhoneNumber === null) {
+    fail("invalid_payload", "Linq chat has no active owner phone number");
   }
-  activeParticipants.sort();
-  return { audience, participantIdentityDigests: activeParticipants };
+  activeParticipants.sort((left, right) =>
+    left.identitySubjectDigest.localeCompare(right.identitySubjectDigest),
+  );
+  return {
+    audience,
+    ownerPhoneNumber,
+    participants: activeParticipants,
+    participantIdentityDigests: activeParticipants.map((participant) => participant.identitySubjectDigest),
+  };
 }
 
 function participantStatus(value: unknown): "active" | "left" | "removed" {
@@ -684,7 +878,48 @@ function participantStatus(value: unknown): "active" | "left" | "removed" {
   fail("invalid_payload", "Linq chat handle status must be active, left, or removed");
 }
 
-function expectedChatAuthority(authority: LinqConversationAuthority): LinqObservedChat | null {
+function normalizedParticipants(value: readonly string[]): string[] {
+  if (!Array.isArray(value) || (value.length !== 1 && value.length !== 2)) {
+    fail("configuration", "A Florence Linq chat requires one or two participant phone numbers");
+  }
+  const participants = value.map((candidate, index) =>
+    e164PhoneNumber(candidate, `Participant phone number ${index + 1}`),
+  );
+  if (new Set(participants).size !== participants.length) {
+    fail("configuration", "Linq chat participant phone numbers must be unique");
+  }
+  return participants.sort();
+}
+
+function e164PhoneNumber(value: unknown, name: string): string {
+  const phoneNumber = nonempty(value, name).trim();
+  if (!/^\+[1-9]\d{1,14}$/.test(phoneNumber)) {
+    fail("configuration", `${name} must use E.164 format`);
+  }
+  return phoneNumber;
+}
+
+function providerE164PhoneNumber(value: unknown, name: string): string {
+  const phoneNumber = string(value, name);
+  if (!/^\+[1-9]\d{1,14}$/.test(phoneNumber)) {
+    fail("invalid_payload", `Linq ${name} must use E.164 format`);
+  }
+  return phoneNumber;
+}
+
+function containsUrl(value: string): boolean {
+  return /(?:https?:\/\/|www\.)|(?:^|[\s(])(?:[a-z\d](?:[a-z\d-]*[a-z\d])?\.)+[a-z]{2,}(?=$|[\s/:?#),.!])/iu.test(
+    value,
+  );
+}
+
+function outboundMessageState(value: unknown, name: string): "accepted" | "sent" | "delivered" | "read" {
+  if (value === "pending" || value === "queued") return "accepted";
+  if (value === "sent" || value === "delivered" || value === "read") return value;
+  fail("invalid_payload", `Linq ${name} must describe an accepted outbound message`);
+}
+
+function expectedChatAuthority(authority: LinqConversationAuthority): LinqConversationAuthority | null {
   const audience = authority.audience;
   const digests = authority.participantIdentityDigests;
   if ((audience !== "private" && audience !== "group") || !Array.isArray(digests)) return null;
@@ -733,7 +968,10 @@ function reactionStateReceipt(targetMessageId: string, partIndex: number, reacti
     .digest("hex")}`;
 }
 
-function sameChatAuthority(expected: LinqObservedChat, observed: LinqObservedChat): boolean {
+function sameChatAuthority(
+  expected: LinqConversationAuthority,
+  observed: LinqConversationAuthority,
+): boolean {
   return (
     expected.audience === observed.audience &&
     expected.participantIdentityDigests.length === observed.participantIdentityDigests.length &&

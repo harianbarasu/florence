@@ -46,6 +46,7 @@ Required:
 | `LINQ_API_KEY` | Linq partner API key |
 | `LINQ_WEBHOOK_SECRET` | Current Standard Webhooks signing secret |
 | `LINQ_PARTNER_ID` | Exact expected Linq partner UUID |
+| `LINQ_FROM_PHONE` | Florence's exact E.164 iMessage sender number |
 | `OPENAI_API_KEY` | Model credential |
 | `FLORENCE_OPENAI_MODEL` | Pinned supported model ID |
 | `GOOGLE_OAUTH_CLIENT_ID` | Google OAuth web client ID |
@@ -70,7 +71,11 @@ Register exactly:
 
 The Linq API key and webhook signing secret are different credentials. Florence verifies the raw webhook signature, pins the payload version, re-reads the live chat, and requires iMessage plus the exact current participant set before retaining content.
 
-Google currently uses `openid email gmail.readonly calendar.events.owned`. Gmail remains private to its owning adult. Calendar writes require a current exact instruction or approval and provider reread proof.
+Google currently uses `openid`, `email`, `gmail.readonly`,
+`calendar.events.owned`, `calendar.app.created`, `calendar.acls`, and
+`calendar.calendarlist`. Gmail remains private to its owning adult. Calendar
+writes require a current exact instruction or approval and provider readback
+before Florence confirms the change.
 
 ## Build gates
 
@@ -101,15 +106,19 @@ On a disposable empty database, run `pnpm db:migrate` twice. Both runs must pass
 8. Deploy the exact release commit through `/railway.json`.
 9. Wait for `/api/health`, then run `pnpm smoke:production -- https://<canonical-host>`.
 10. Before sharing the number more broadly, have the intended founding adult
-    text Florence, complete the fragment-link mobile setup first, connect
-    Google, add the optional partner and child/school/activity basics one screen
-    at a time, and return to the exact private thread. No identity is configured
-    ahead of that message, no household name is requested, and the first valid
-    setup redemption wins. Then
-    rehearse the signed PDF conversation through the Phase 1 stop. After that
-    experience is approved, rehearse the second adult's independent onboarding,
-    exact family group, sourced memory, useful follow-up, one approved Calendar
-    write, provider proof, correction, and Vault deletion.
+    text Florence, complete the fragment-link mobile setup, connect Google, add
+    the partner and child/school/activity basics one screen at a time, and
+    return to the exact private thread. No identity is configured ahead of that
+    message, no household name is requested, and the first valid redemption for
+    that Messages identity creates its household. Rehearse Florence asking once
+    before texting the partner, the second adult's independent onboarding and
+    Google connection, automatic exact family group and shared Calendar, the
+    combined briefing, a real forwarded message/image/PDF/voice note, sourced
+    memory, one finite monitor, one relevant interest recommendation, one
+    family-Calendar create/update/delete, correction, Vault deletion, the
+    read-only web Calendar, and a Google disconnect/delete/reconnect that
+    suppresses queued Google-derived output while preserving sent Messages and
+    provider-created family Calendar events.
 11. Enable autodeploy only after the full synthetic journey and the two-phone experience pass.
 
 ## Recovery

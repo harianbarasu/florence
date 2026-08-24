@@ -530,7 +530,21 @@ export class Florence {
       now: checkedAt,
     });
     let bubbles: readonly { text: string; delayMs: number }[];
-    let idempotencyPrefix: "founder-setup" | "partner-setup-expired" | "partner-setup-reply";
+    let idempotencyPrefix:
+      | "founder-setup"
+      | "partner-setup-expired"
+      | "partner-setup-link"
+      | "partner-setup-reply";
+    let pendingPartnerEnrollment: {
+      adultId: string;
+      householdId: string;
+      founderAdultId: string;
+      messagesAddress: string;
+      initialProviderMessageId: string;
+      challengeDigest: string;
+      expiresAt: string;
+      linkBubbleIndex: number;
+    } | null = null;
 
     if (invitation) {
       if (invitation.state === "declined") return true;
@@ -547,12 +561,20 @@ export class Florence {
         await this.#store.expirePartnerInvitations({ now: checkedAt });
         bubbles = [
           {
-            text: "That Florence setup link has expired. Ask your partner to send a fresh invitation.",
+            text: invitation.linkIssued
+              ? "That Florence setup link has expired. Ask your partner to send a fresh invitation."
+              : "That Florence invitation expired before you replied. Ask your partner to send a fresh one.",
             delayMs: 0,
           },
         ];
         idempotencyPrefix = "partner-setup-expired";
       } else {
+        if (
+          invitation.state === "issued" &&
+          Date.parse(input.occurredAt) <= Date.parse(invitation.handshakeAt)
+        ) {
+          return true;
+        }
         if (!this.#reasoner) {
           throw new LinqError(
             "provider_retryable",
@@ -562,12 +584,13 @@ export class Florence {
         }
         let conversation: Awaited<ReturnType<FlorenceReasoner["converseDuringSetup"]>>;
         try {
+          const willIssueSetupLink = invitation.state === "awaiting_reply";
           conversation = await this.#reasoner.converseDuringSetup({
             stage: "partner_invited",
             parentName: null,
             currentMessage: { text: input.text, occurredAt: input.occurredAt },
             recentMessages: [],
-            nextStep: "use_existing_partner_setup_link",
+            nextStep: willIssueSetupLink ? "signed_link_will_follow" : "use_existing_partner_setup_link",
           });
         } catch (error) {
           throw new LinqError(
@@ -585,8 +608,41 @@ export class Florence {
           });
           return true;
         }
-        bubbles = conversation.bubbles;
-        idempotencyPrefix = "partner-setup-reply";
+        if (invitation.state === "awaiting_reply") {
+          if (!this.#setupOrigin || !this.#google) {
+            throw new LinqError(
+              "provider_retryable",
+              "Florence partner setup is temporarily unavailable",
+              true,
+            );
+          }
+          const setup = this.#enrollmentCodes.issuePartnerSetup({
+            providerConversationId: invitation.providerConversationId,
+            identitySubjectDigest: invitation.identitySubjectDigest,
+            householdId: invitation.householdId,
+            adultId: invitation.adultId,
+            occurredAt: invitation.handshakeAt,
+          });
+          const setupUrl = `${this.#setupOrigin}/#s=${encodeURIComponent(setup.token)}`;
+          bubbles = [
+            { text: "Thanks—here’s your private setup link.", delayMs: 0 },
+            { text: setupUrl, delayMs: 0 },
+          ];
+          pendingPartnerEnrollment = {
+            adultId: invitation.adultId,
+            householdId: invitation.householdId,
+            founderAdultId: invitation.founderAdultId,
+            messagesAddress: invitation.messagesAddress,
+            initialProviderMessageId: invitation.initialProviderMessageId,
+            challengeDigest: this.#enrollmentCodes.digestPartnerSetup(setup.token),
+            expiresAt: setup.expiresAt,
+            linkBubbleIndex: bubbles.length - 1,
+          };
+          idempotencyPrefix = "partner-setup-link";
+        } else {
+          bubbles = conversation.bubbles;
+          idempotencyPrefix = "partner-setup-reply";
+        }
       }
     } else {
       if (input.carrierOptOut) return true;
@@ -642,19 +698,66 @@ export class Florence {
     try {
       for (const [index, bubble] of bubbles.entries()) {
         if (index > 0) await pause(Math.max(650, bubble.delayMs));
+        const idempotencyBasis = pendingPartnerEnrollment
+          ? `${pendingPartnerEnrollment.initialProviderMessageId}\0${
+              index === pendingPartnerEnrollment.linkBubbleIndex ? "link" : "ack"
+            }`
+          : `${input.providerEventId}\0${index}`;
+        const baseIdempotencyKey = `${idempotencyPrefix}:${deterministicUuid(idempotencyBasis)}`;
+        const idempotencyKey = pendingPartnerEnrollment
+          ? await this.#store.scopeHouseholdLinqIdempotencyKey({
+              householdId: pendingPartnerEnrollment.householdId,
+              idempotencyKey: baseIdempotencyKey,
+            })
+          : baseIdempotencyKey;
         const result = await this.#linq.sendMessage({
-          idempotencyKey: `${idempotencyPrefix}:${deterministicUuid(`${input.providerEventId}\0${index}`)}`,
+          idempotencyKey,
           providerConversationId: input.providerConversationId,
           expectedAuthority,
           text: bubble.text,
         });
-        if (result.status === "unknown") {
-          throw new LinqError("provider_retryable", result.detail, true);
+        if (result.status !== "committed") {
+          throw new LinqError(
+            result.status === "unknown" ? "provider_retryable" : "provider_rejected",
+            result.detail,
+            result.status === "unknown",
+          );
         }
-        if (result.status === "failed") {
-          throw new LinqError("provider_rejected", result.detail, false);
+        if (pendingPartnerEnrollment && index === pendingPartnerEnrollment.linkBubbleIndex) {
+          if (
+            result.providerState !== "sent" &&
+            result.providerState !== "delivered" &&
+            result.providerState !== "read"
+          ) {
+            throw new LinqError(
+              "provider_retryable",
+              "Linq has not confirmed sending the partner setup link",
+              true,
+            );
+          }
+          await this.#store.issueMessagesEnrollment({
+            householdId: pendingPartnerEnrollment.householdId,
+            actorAdultId: pendingPartnerEnrollment.founderAdultId,
+            adultId: pendingPartnerEnrollment.adultId,
+            challengeDigest: pendingPartnerEnrollment.challengeDigest,
+            providerConversationId: input.providerConversationId,
+            identitySubjectDigest: input.identitySubjectDigest,
+            messagesAddress: pendingPartnerEnrollment.messagesAddress,
+            providerMessageId: result.providerReceiptId,
+            expiresAt: pendingPartnerEnrollment.expiresAt,
+            issuedAt: input.occurredAt,
+          });
         }
       }
+    } catch (error) {
+      if (pendingPartnerEnrollment && error instanceof LinqError && !error.retryable) {
+        await this.#store.failPartnerInvitationPermanently({
+          adultId: pendingPartnerEnrollment.adultId,
+          occurredAt: this.#now().toISOString(),
+        });
+        return true;
+      }
+      throw error;
     } finally {
       await this.#setTyping({
         providerConversationId: input.providerConversationId,
@@ -1246,10 +1349,10 @@ export class Florence {
         if (approvedCalendarOffer || approvedPartnerInvitation) {
           const actionText =
             approvedCalendarOffer && approvedPartnerInvitation
-              ? `I’ll add the calendar item and text ${approvedPartnerInvitation.firstName} now. I couldn’t finish the rest reliably.`
+              ? `Got it—I’ll add that calendar item and text ${approvedPartnerInvitation.firstName} now.`
               : approvedCalendarOffer
-                ? "I’ll handle the calendar item you approved. I couldn’t finish the rest reliably."
-                : `I’ll text ${approvedPartnerInvitation?.firstName ?? "your partner"} now. I couldn’t finish the rest reliably.`;
+                ? "Got it—I’ll add that calendar item now."
+                : `Got it—I’ll text ${approvedPartnerInvitation?.firstName ?? "your partner"} now.`;
           await this.#store.commitTurn(
             decisionCommit(
               turn,
@@ -1946,9 +2049,21 @@ export class Florence {
       if (!calendarCursor) {
         throw new Error("The private Google review did not establish Calendar coverage");
       }
+      const findings = decision.findings.filter((finding) => finding.familyRelevance !== "adult_only");
+      const facts = decision.facts
+        .filter((fact) => fact.familyRelevance !== "adult_only")
+        .map(({ slot, statement, sourceIds }) => ({ slot, statement, sourceIds }));
       const bubbles = privateInitialReviewBubbles({
-        fallback: decision.bubbles,
-        findings: decision.findings,
+        fallback:
+          findings.length === decision.findings.length && facts.length === decision.facts.length
+            ? decision.bubbles
+            : [
+                {
+                  text: "I checked your Gmail and the next three weeks of Calendar. Nothing needs your attention right now.",
+                  delayMs: decision.bubbles[0]?.delayMs ?? 0,
+                },
+              ],
+        findings,
         calendarSources,
         timeZone: work.household.timeZone,
       });
@@ -1957,13 +2072,13 @@ export class Florence {
         gmailCursor: JSON.stringify(gmailCursor),
         calendarCursor,
         bubbles,
-        findings: decision.findings.map((finding) => ({
+        findings: findings.map((finding) => ({
           sourceIds: finding.sourceIds,
           householdCandidate: finding.candidate,
           monitor: finding.monitor ?? null,
           familyCalendar: finding.familyCalendar ?? null,
         })),
-        facts: decision.facts,
+        facts,
         googleEvidence: [...googleEvidence.values()],
         occurredAt: this.#now().toISOString(),
       });
@@ -2433,7 +2548,19 @@ export class Florence {
           },
         },
       );
-      const materialFindings = decision.findings.filter((finding) => finding.materialChange);
+      const activeMonitorIds = new Set(work.activeMonitors.map((monitor) => monitor.monitorId));
+      const materialFindings = decision.findings.filter((finding) => {
+        if (!finding.materialChange) return false;
+        if (work.kind !== "personal_google_poll") return true;
+        const existingMonitorChange =
+          finding.monitor !== null &&
+          finding.monitor.operation !== "create" &&
+          activeMonitorIds.has(finding.monitor.monitorId);
+        return finding.familyRelevance !== "adult_only" || existingMonitorChange;
+      });
+      const retainedFacts = decision.facts
+        .filter((fact) => fact.familyRelevance !== "adult_only")
+        .map(({ slot, statement, sourceIds }) => ({ slot, statement, sourceIds }));
       const deliveries = materialFindings
         .filter(
           (finding) =>
@@ -2473,7 +2600,7 @@ export class Florence {
         googleEvidence: [...googleEvidence.values()],
         deliverNotBefore: proactiveDeliveryAt(decidedAt, work.household.timeZone, urgent).toISOString(),
         deliveries,
-        facts: decision.facts,
+        facts: retainedFacts,
         occurredAt: decidedAt.toISOString(),
       });
     } catch (error) {
@@ -2494,14 +2621,6 @@ export class Florence {
       });
       return;
     }
-    let terminalDelivery:
-      | {
-          providerConversationId: string;
-          identitySubjectDigest: string;
-          providerMessageId: string;
-          issuedAt: string;
-        }
-      | undefined;
     try {
       const household = await this.#store.readHousehold({ householdId: invitation.householdId });
       const founder = household?.members.find(
@@ -2517,7 +2636,7 @@ export class Florence {
         idempotencyKey: createChatIdempotencyKey,
         senderPhoneNumber: this.#linqSenderPhoneNumber,
         participantPhoneNumbers: [invitation.partnerPhoneNumber],
-        initialText: `Hi ${invitation.partnerFirstName} — I’m Florence. ${founderFirstName} asked me to help the two of you stay ahead of school, schedules, and family loose ends. I’ll send your private setup link next.`,
+        initialText: `Hi ${invitation.partnerFirstName} — I’m Florence. ${founderFirstName} asked me to help with family schedules and loose ends. Reply here when you’re ready, and I’ll send your private setup link.`,
       });
       const participant = created.authority.participants[0];
       if (
@@ -2532,53 +2651,26 @@ export class Florence {
           false,
         );
       }
-      terminalDelivery = {
-        providerConversationId: created.providerConversationId,
-        identitySubjectDigest: participant.identitySubjectDigest,
-        providerMessageId: created.initialMessage.providerMessageId,
-        issuedAt: created.initialMessage.occurredAt,
-      };
-      const setup = this.#enrollmentCodes.issuePartnerSetup({
-        providerConversationId: created.providerConversationId,
-        identitySubjectDigest: participant.identitySubjectDigest,
-        householdId: invitation.householdId,
-        adultId: invitation.partnerAdultId,
-        occurredAt: invitation.approvedAt,
-      });
-      const setupLinkIdempotencyKey = await this.#store.scopeHouseholdLinqIdempotencyKey({
-        householdId: invitation.householdId,
-        idempotencyKey: `partner-invite-link:${invitation.householdId}:${invitation.partnerAdultId}:${invitation.approvalSourceId}`,
-      });
-      const result = await this.#linq.sendMessage({
-        idempotencyKey: setupLinkIdempotencyKey,
-        providerConversationId: created.providerConversationId,
-        expectedAuthority: created.authority,
-        text: `Set up your side here:\n${this.#setupOrigin}/#s=${encodeURIComponent(setup.token)}`,
-      });
-      const dispatchConfirmed =
-        result.status === "committed" &&
-        (result.providerState === "sent" ||
-          result.providerState === "delivered" ||
-          result.providerState === "read");
-      if (!dispatchConfirmed || !result.providerReceiptId) {
-        const retryable = result.status === "unknown" || result.status === "committed";
+      if (created.initialMessage.providerState === "accepted") {
         throw new LinqError(
-          retryable ? "provider_retryable" : "provider_rejected",
-          result.detail ?? "Linq has not confirmed sending the partner setup link",
-          retryable,
+          "provider_retryable",
+          "Linq has not confirmed sending the partner reply prompt",
+          true,
         );
       }
-      await this.#store.issueMessagesEnrollment({
+      if (created.initialMessage.providerState === "failed") {
+        throw new LinqError("provider_rejected", "Linq could not deliver the partner reply prompt", false);
+      }
+      await this.#store.bindPartnerInvitationHandshake({
         householdId: invitation.householdId,
         actorAdultId: invitation.founderAdultId,
         adultId: invitation.partnerAdultId,
-        challengeDigest: this.#enrollmentCodes.digestPartnerSetup(setup.token),
+        approvalSourceId: invitation.approvalSourceId,
+        messagesAddress: participant.phoneNumber,
         providerConversationId: created.providerConversationId,
         identitySubjectDigest: participant.identitySubjectDigest,
-        messagesAddress: participant.phoneNumber,
-        providerMessageId: result.providerReceiptId,
-        expiresAt: setup.expiresAt,
-        issuedAt: invitation.approvedAt,
+        providerMessageId: created.initialMessage.providerMessageId,
+        occurredAt: created.initialMessage.occurredAt,
       });
     } catch (error) {
       if (!(error instanceof LinqError)) throw error;
@@ -2593,7 +2685,6 @@ export class Florence {
       await this.#store.failPartnerInvitationPermanently({
         adultId: invitation.partnerAdultId,
         occurredAt: this.#now().toISOString(),
-        ...(terminalDelivery ? { delivery: terminalDelivery } : {}),
       });
     }
   }
@@ -2608,14 +2699,23 @@ export class Florence {
     });
     if (
       created.authority.audience !== "group" ||
-      !sameStrings(created.authority.participantIdentityDigests, work.participantIdentityDigests)
+      created.authority.participants.length !== 2 ||
+      !sameStrings(
+        created.authority.participants.map((participant) => participant.phoneNumber).sort(),
+        [...work.participantPhoneNumbers].sort(),
+      )
     ) {
       throw new Error("Linq created a different family group");
     }
+    requireConfirmedLinqMessage({
+      providerState: created.initialMessage.providerState,
+      pendingMessage: "Linq has not confirmed sending the family group introduction",
+      failedMessage: "Linq could not deliver the family group introduction",
+    });
     await this.#store.bindCreatedMessagesGroup({
       householdId: work.householdId,
       providerConversationId: created.providerConversationId,
-      participantIdentityDigests: created.authority.participantIdentityDigests,
+      participants: created.authority.participants,
       occurredAt: created.initialMessage.occurredAt,
     });
   }
@@ -2754,6 +2854,11 @@ export class Florence {
         result.status === "unknown",
       );
     }
+    requireConfirmedLinqMessage({
+      providerState: result.providerState,
+      pendingMessage: "Linq has not confirmed sending the Family Calendar announcement",
+      failedMessage: "Linq could not deliver the Family Calendar announcement",
+    });
   }
 
   async #stageFounderHandoff(connection: GoogleConnectionView): Promise<void> {
@@ -3627,23 +3732,45 @@ function privateCalendarEvidence(
   };
 }
 
+function requireConfirmedLinqMessage(input: {
+  providerState: string;
+  pendingMessage: string;
+  failedMessage: string;
+}): void {
+  if (
+    input.providerState === "sent" ||
+    input.providerState === "delivered" ||
+    input.providerState === "read"
+  ) {
+    return;
+  }
+  if (input.providerState === "failed") {
+    throw new LinqError("provider_rejected", input.failedMessage, false);
+  }
+  throw new LinqError("provider_retryable", input.pendingMessage, true);
+}
+
 function privateGoogleFindingDetail(input: {
   fallback: string;
   sourceIds: readonly string[];
   calendarSources: readonly FlorencePrivateCalendarEvent[];
   timeZone: string;
 }): string {
-  if (input.sourceIds.length !== 1) return input.fallback;
-  const event = input.calendarSources.find((candidate) => candidate.sourceId === input.sourceIds[0]);
-  if (!event) return input.fallback;
-
-  const title = event.title?.trim() ? `“${event.title.trim()}”` : "A private calendar commitment";
-  const interval = privateCalendarIntervalText(event, input.timeZone);
-  if (!interval) return input.fallback;
-  if (event.status === "cancelled") return `${title} was canceled for ${interval}.`;
-  if (!event.busy) return `${title} no longer blocks your calendar on ${interval}.`;
-  if (event.status === "tentative") return `${title} is tentatively on your calendar ${interval}.`;
-  return `${title} is on your calendar ${interval}.`;
+  const seen = new Set<string>();
+  const calendarDetails = input.sourceIds.flatMap((sourceId) => {
+    if (seen.has(sourceId)) return [];
+    seen.add(sourceId);
+    const event = input.calendarSources.find((candidate) => candidate.sourceId === sourceId);
+    if (!event) return [];
+    const interval = privateCalendarIntervalText(event, input.timeZone);
+    if (!interval) return [];
+    const title = event.title?.trim() ? `“${event.title.trim()}”` : "A private calendar commitment";
+    if (event.status === "cancelled") return [`${title} was canceled for ${interval}.`];
+    if (!event.busy) return [`${title} no longer blocks your calendar on ${interval}.`];
+    if (event.status === "tentative") return [`${title} is tentatively on your calendar ${interval}.`];
+    return [`${title} is on your calendar ${interval}.`];
+  });
+  return calendarDetails.length > 0 ? calendarDetails.join("\n") : input.fallback;
 }
 
 function privateInitialReviewBubbles(input: {
@@ -3652,16 +3779,13 @@ function privateInitialReviewBubbles(input: {
   calendarSources: readonly FlorencePrivateCalendarEvent[];
   timeZone: string;
 }): readonly { text: string; delayMs: number }[] {
-  if (
-    input.findings.length === 0 ||
-    input.findings.some(
-      (finding) =>
-        finding.sourceIds.length !== 1 ||
-        !input.calendarSources.some((source) => source.sourceId === finding.sourceIds[0]),
-    )
-  ) {
-    return input.fallback;
-  }
+  if (input.findings.length === 0) return input.fallback;
+  const hasCalendarFinding = input.findings.some((finding) =>
+    finding.sourceIds.some((sourceId) =>
+      input.calendarSources.some((source) => source.sourceId === sourceId),
+    ),
+  );
+  if (!hasCalendarFinding) return input.fallback;
   return input.findings.map((finding, index) => ({
     text: privateGoogleFindingDetail({
       fallback: finding.privateSummary,

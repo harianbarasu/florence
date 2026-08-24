@@ -346,6 +346,7 @@ export class GoogleConnectionError extends Error {
       | "invalid_state"
       | "provider_rejected"
       | "invalid_grant"
+      | "missing_permissions"
       | "credential_invalid_grant"
       | "identity_conflict"
       | "not_found",
@@ -2581,7 +2582,7 @@ function exactScopes(value: string): readonly GoogleScope[] {
       .map((scope) => (scope === "https://www.googleapis.com/auth/userinfo.email" ? "email" : scope)),
   );
   if (GOOGLE_SCOPES.some((scope) => !actual.has(scope))) {
-    throw new GoogleConnectionError("Google did not grant all required permissions", "invalid_grant");
+    throw new GoogleConnectionError("Google did not grant all required permissions", "missing_permissions");
   }
   return [...GOOGLE_SCOPES];
 }

@@ -124,7 +124,18 @@ export async function buildApp(
   dependencies: AppDependencies = createDefaultDependencies(),
   options: AppOptions = {},
 ): Promise<FastifyInstance> {
-  const app = Fastify({ logger: process.env.NODE_ENV === "production" });
+  const app = Fastify({
+    logger:
+      process.env.NODE_ENV === "production"
+        ? {
+            serializers: {
+              req(request) {
+                return { method: request.method, path: safeRequestPath(request.url) };
+              },
+            },
+          }
+        : false,
+  });
   await app.register(helmet, { referrerPolicy: { policy: "no-referrer" } });
   if (dependencies.close) app.addHook("onClose", dependencies.close);
   app.setErrorHandler((error, request, reply) => {
@@ -144,7 +155,11 @@ export async function buildApp(
     if (error instanceof z.ZodError) {
       return reply.status(400).send({ error: "invalid_request" });
     }
-    request.log.error({ code: "florence_request_failed", method: request.method, url: request.url });
+    request.log.error({
+      code: "florence_request_failed",
+      method: request.method,
+      path: safeRequestPath(request.url),
+    });
     return reply.status(500).send({ error: "internal_error" });
   });
   await registerLinqWebhook(app, dependencies.linqIngress);
@@ -474,6 +489,10 @@ function safeTokenEqual(left: string, right: string): boolean {
   return leftBytes.length === rightBytes.length && timingSafeEqual(leftBytes, rightBytes);
 }
 
+function safeRequestPath(url: string): string {
+  return url.split("?", 1)[0] ?? url;
+}
+
 async function registerFrontend(app: FastifyInstance, frontendRoot?: string): Promise<void> {
   await app.register(fastifyStatic, {
     root: frontendRoot ?? defaultFrontendRoot,
@@ -487,7 +506,7 @@ async function registerFrontend(app: FastifyInstance, frontendRoot?: string): Pr
     },
   });
   app.setNotFoundHandler((request, reply) => {
-    const pathname = request.url.split("?", 1)[0] ?? request.url;
+    const pathname = safeRequestPath(request.url);
     if (pathname === "/api" || pathname.startsWith("/api/") || !["GET", "HEAD"].includes(request.method)) {
       return reply.status(404).send({ error: "not_found" });
     }

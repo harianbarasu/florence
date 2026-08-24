@@ -204,6 +204,7 @@ export type LinqCreatedChat = {
   initialMessage: {
     idempotencyKey: string;
     providerMessageId: string;
+    providerState: "accepted" | "sent" | "delivered" | "read" | "failed";
     occurredAt: string;
   };
 };
@@ -342,11 +343,14 @@ export class LinqClient {
       if (message.service !== null && message.service !== undefined) {
         literal(message.service, "iMessage", "create chat response message service");
       }
-      outboundMessageState(message.delivery_status, "create chat response message delivery_status");
+      const providerState = createdChatMessageState(
+        message.delivery_status,
+        "create chat response message delivery_status",
+      );
       return {
         providerConversationId,
         authority,
-        initialMessage: { idempotencyKey, providerMessageId, occurredAt },
+        initialMessage: { idempotencyKey, providerMessageId, providerState, occurredAt },
       };
     } catch (error) {
       if (error instanceof LinqError && error.retryable) throw error;
@@ -917,6 +921,14 @@ function outboundMessageState(value: unknown, name: string): "accepted" | "sent"
   if (value === "pending" || value === "queued") return "accepted";
   if (value === "sent" || value === "delivered" || value === "read") return value;
   fail("invalid_payload", `Linq ${name} must describe an accepted outbound message`);
+}
+
+function createdChatMessageState(
+  value: unknown,
+  name: string,
+): "accepted" | "sent" | "delivered" | "read" | "failed" {
+  if (value === "failed") return value;
+  return outboundMessageState(value, name);
 }
 
 function expectedChatAuthority(authority: LinqConversationAuthority): LinqConversationAuthority | null {

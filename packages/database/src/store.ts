@@ -14,6 +14,7 @@ const MAX_PDF_ENVELOPE_BYTES = 20 * 1024 * 1024 + 16 * 1024;
 const GOOGLE_POLL_INTERVAL_MS = 2 * 60_000;
 const INTEREST_CHECK_INTERVAL_MS = 7 * 24 * 60 * 60_000;
 const LINQ_RECEIPT_CLOCK_SKEW_MS = 5 * 60_000;
+const PARTNER_HANDSHAKE_LIFETIME_MS = 24 * 60 * 60_000;
 const PROACTIVE_CONSENT_PAUSE_REASON = "Paused because proactive Google use is disabled";
 const HOUSEHOLD_SAFE_MONITOR_WHY = "Florence is watching this family coordination item.";
 export type GoogleScope =
@@ -559,7 +560,6 @@ export type FamilyGroupCreationWork = {
   householdId: string;
   createChatIdempotencyKey: string;
   participantPhoneNumbers: readonly [string, string];
-  participantIdentityDigests: readonly [string, string];
   adultFirstNames: readonly [string, string];
 };
 
@@ -617,10 +617,27 @@ export type PendingPartnerInvitation = {
   phoneNumber: string;
 };
 
-export type UnboundPartnerInvitation = {
-  adultId: string;
-  state: "issued" | "expired" | "declined";
-};
+export type UnboundPartnerInvitation =
+  | {
+      adultId: string;
+      state: "declined";
+    }
+  | {
+      adultId: string;
+      state: "expired";
+      linkIssued: boolean;
+    }
+  | {
+      adultId: string;
+      state: "awaiting_reply" | "issued";
+      householdId: string;
+      founderAdultId: string;
+      messagesAddress: string;
+      providerConversationId: string;
+      identitySubjectDigest: string;
+      initialProviderMessageId: string;
+      handshakeAt: string;
+    };
 
 export type InboundTurn = {
   message: ConversationTurn & { speaker: string };
@@ -906,6 +923,7 @@ type IssuedPartnerInvitationRow = {
   household_id: string;
   first_name: string;
   invitation_message_id: string;
+  link_issued: boolean;
   founder_adult_id: string;
   founder_channel_id: string;
 };
@@ -2912,30 +2930,61 @@ export class PostgresFlorenceStore {
     const [row] = await this.#sql<
       {
         adult_id: string;
+        household_id: string;
+        founder_adult_id: string | null;
+        messages_address: string | null;
+        invitation_conversation_id: string;
+        invitation_identity_digest: string;
         invitation_message_id: string;
-        state: "issued" | "expired" | "declined";
+        invitation_issued_at: Date;
+        link_issued: boolean;
+        state: "awaiting_reply" | "issued" | "expired" | "declined";
       }[]
     >`
-      select id as adult_id,invitation_message_id,
+      select partner.id as adult_id,partner.household_id,
+        approval.sender_adult_id as founder_adult_id,partner.messages_address,
+        partner.invitation_conversation_id,partner.invitation_identity_digest,
+        partner.invitation_message_id,partner.invitation_issued_at,
+        (partner.invitation_digest is not null) as link_issued,
         case
-          when invitation_digest is null then 'declined'
-          when invitation_expires_at<=${checkedAt} then 'expired'
+          when partner.invitation_consumed_at is not null then 'declined'
+          when partner.invitation_expires_at<=${checkedAt} then 'expired'
+          when partner.invitation_digest is null then 'awaiting_reply'
           else 'issued'
         end as state
-      from people where kind='adult' and role='steward' and adult_slot=2 and status='planned'
-        and identity_subject_digest is null
-        and invitation_conversation_id=${providerConversationId}
-        and invitation_identity_digest=${input.identitySubjectDigest}
-        and invitation_message_id is not null and invitation_issued_at is not null
+      from people partner
+      left join messages approval on approval.source_id=partner.invitation_approval_source_id
+      left join linq_channels channel on channel.id=approval.channel_id
+      left join people founder on founder.id=approval.sender_adult_id
+        and founder.household_id=partner.household_id
+      where partner.kind='adult' and partner.role='steward' and partner.adult_slot=2
+        and partner.status='planned' and partner.identity_subject_digest is null
+        and partner.invitation_conversation_id=${providerConversationId}
+        and partner.invitation_identity_digest=${input.identitySubjectDigest}
+        and partner.invitation_message_id is not null and partner.invitation_issued_at is not null
         and (
-          (invitation_digest is not null and invitation_expires_at is not null
-            and invitation_consumed_at is null and messages_address is not null
-            and invitation_approval_source_id is not null and invitation_approved_at is not null)
+          (
+            partner.invitation_expires_at is not null and partner.invitation_consumed_at is null
+            and partner.messages_address is not null
+            and partner.invitation_approval_source_id is not null
+            and partner.invitation_approved_at is not null
+            and founder.kind='adult' and founder.role='steward' and founder.adult_slot=1
+            and founder.status='verified' and founder.identity_subject_digest is not null
+            and channel.household_id=partner.household_id and channel.audience='private'
+            and channel.adult_one_id=founder.id and channel.adult_two_id is null
+            and channel.identity_one_digest=founder.identity_subject_digest
+            and channel.revoked_at is null and channel.stopped_at is null
+            and approval.direction='inbound' and approval.sender_adult_id=founder.id
+            and approval.status='handled'
+          )
           or
-          (invitation_digest is null and invitation_expires_at is null
-            and invitation_consumed_at is not null and messages_address is null
-            and invitation_approval_source_id is null and invitation_approved_at is null
-            and invitation_retry_at is null and invitation_last_error is null)
+          (
+            partner.invitation_digest is null and partner.invitation_expires_at is null
+            and partner.invitation_consumed_at is not null and partner.messages_address is null
+            and partner.invitation_approval_source_id is null
+            and partner.invitation_approved_at is null
+            and partner.invitation_retry_at is null and partner.invitation_last_error is null
+          )
         )
       limit 1
     `;
@@ -2944,14 +2993,37 @@ export class PostgresFlorenceStore {
       const expiryNoticeSourceId = deterministicUuid(
         `partner-invitation-expired\0${row.adult_id}\0${row.invitation_message_id}`,
       );
-      const [expiryNotice] = await this.#sql<{ source_id: string }[]>`
-        select source_id from messages where source_id=${expiryNoticeSourceId}
+      const [expiryNotice] = await this.#sql<{ source_id: string; link_issued: boolean }[]>`
+        select source_id,(text like '%setup link expired%') as link_issued
+        from messages where source_id=${expiryNoticeSourceId}
           and direction='outbound'
           and idempotency_key like ${`partner-invitation-expired:${expiryNoticeSourceId}:h:%`}
       `;
-      if (expiryNotice) return { adultId: row.adult_id, state: "expired" };
+      if (expiryNotice) {
+        return {
+          adultId: row.adult_id,
+          state: "expired",
+          linkIssued: expiryNotice.link_issued,
+        };
+      }
     }
-    return { adultId: row.adult_id, state: row.state };
+    if (row.state === "expired") {
+      return { adultId: row.adult_id, state: row.state, linkIssued: row.link_issued };
+    }
+    if (row.state === "declined") {
+      return { adultId: row.adult_id, state: row.state };
+    }
+    return {
+      adultId: row.adult_id,
+      state: row.state,
+      householdId: row.household_id,
+      founderAdultId: required(row.founder_adult_id ?? "", "Partner invitation founder"),
+      messagesAddress: required(row.messages_address ?? "", "Partner invitation address"),
+      providerConversationId: row.invitation_conversation_id,
+      identitySubjectDigest: row.invitation_identity_digest,
+      initialProviderMessageId: row.invitation_message_id,
+      handshakeAt: row.invitation_issued_at.toISOString(),
+    };
   }
 
   async declinePartnerInvitation(input: {
@@ -2971,7 +3043,8 @@ export class PostgresFlorenceStore {
       const [invitation] = await sql<IssuedPartnerInvitationRow[]>`
         select partner.id as adult_id,partner.household_id,
           partner.profile->>'firstName' as first_name,
-          partner.invitation_message_id,founder.id as founder_adult_id,
+          partner.invitation_message_id,(partner.invitation_digest is not null) as link_issued,
+          founder.id as founder_adult_id,
           channel.id as founder_channel_id
         from people partner
         join messages approval on approval.source_id=partner.invitation_approval_source_id
@@ -2983,7 +3056,7 @@ export class PostgresFlorenceStore {
           and partner.identity_subject_digest is null
           and partner.invitation_conversation_id=${providerConversationId}
           and partner.invitation_identity_digest=${input.identitySubjectDigest}
-          and partner.invitation_digest is not null and partner.invitation_expires_at is not null
+          and partner.invitation_expires_at is not null
           and partner.invitation_consumed_at is null and partner.messages_address is not null
           and partner.invitation_message_id is not null and partner.invitation_issued_at is not null
           and partner.invitation_approval_source_id is not null
@@ -3009,7 +3082,8 @@ export class PostgresFlorenceStore {
       const invitations = await sql<IssuedPartnerInvitationRow[]>`
         select partner.id as adult_id,partner.household_id,
           partner.profile->>'firstName' as first_name,
-          partner.invitation_message_id,founder.id as founder_adult_id,
+          partner.invitation_message_id,(partner.invitation_digest is not null) as link_issued,
+          founder.id as founder_adult_id,
           channel.id as founder_channel_id
         from people partner
         join messages approval on approval.source_id=partner.invitation_approval_source_id
@@ -3018,7 +3092,6 @@ export class PostgresFlorenceStore {
           and founder.household_id=partner.household_id
         where partner.kind='adult' and partner.role='steward' and partner.adult_slot=2
           and partner.status='planned' and partner.identity_subject_digest is null
-          and partner.invitation_digest is not null
           and partner.invitation_expires_at is not null
           and partner.invitation_expires_at<=${expiredAt}
           and partner.invitation_consumed_at is null and partner.messages_address is not null
@@ -3089,12 +3162,20 @@ export class PostgresFlorenceStore {
           approval_source_id: string;
           founder_adult_id: string;
           founder_channel_id: string;
+          messages_address: string | null;
+          invitation_conversation_id: string | null;
+          invitation_identity_digest: string | null;
+          invitation_message_id: string | null;
+          invitation_issued_at: Date | null;
         }[]
       >`
         select partner.id as adult_id,partner.household_id,
           partner.profile->>'firstName' as first_name,
           partner.invitation_approval_source_id as approval_source_id,
-          founder.id as founder_adult_id,channel.id as founder_channel_id
+          founder.id as founder_adult_id,channel.id as founder_channel_id,
+          partner.messages_address,partner.invitation_conversation_id,
+          partner.invitation_identity_digest,partner.invitation_message_id,
+          partner.invitation_issued_at
         from people partner
         join messages approval on approval.source_id=partner.invitation_approval_source_id
         join linq_channels channel on channel.id=approval.channel_id
@@ -3103,11 +3184,18 @@ export class PostgresFlorenceStore {
         where partner.id=${input.adultId} and partner.kind='adult' and partner.role='steward'
           and partner.adult_slot=2 and partner.status='planned'
           and partner.identity_subject_digest is null
-          and partner.invitation_digest is null and partner.invitation_expires_at is null
-          and partner.invitation_consumed_at is null and partner.messages_address is null
-          and partner.invitation_conversation_id is null
-          and partner.invitation_identity_digest is null
-          and partner.invitation_message_id is null and partner.invitation_issued_at is null
+          and partner.invitation_digest is null and partner.invitation_consumed_at is null
+          and (
+            (partner.invitation_expires_at is null and partner.messages_address is null
+              and partner.invitation_conversation_id is null
+              and partner.invitation_identity_digest is null
+              and partner.invitation_message_id is null and partner.invitation_issued_at is null)
+            or
+            (partner.invitation_expires_at is not null and partner.messages_address is not null
+              and partner.invitation_conversation_id is not null
+              and partner.invitation_identity_digest is not null
+              and partner.invitation_message_id is not null and partner.invitation_issued_at is not null)
+          )
           and partner.invitation_approval_source_id is not null
           and partner.invitation_approved_at is not null
           and founder.kind='adult' and founder.role='steward' and founder.adult_slot=1
@@ -3124,6 +3212,16 @@ export class PostgresFlorenceStore {
         throw new FlorenceStoreConflict("The partner invitation is no longer pending");
       }
       if (suppliedDelivery) {
+        if (
+          invitation.invitation_issued_at !== null &&
+          (invitation.messages_address === null ||
+            invitation.invitation_conversation_id !== suppliedDelivery.providerConversationId ||
+            invitation.invitation_identity_digest !== suppliedDelivery.identitySubjectDigest ||
+            invitation.invitation_message_id !== suppliedDelivery.providerMessageId ||
+            invitation.invitation_issued_at.getTime() !== suppliedDelivery.issuedAt.getTime())
+        ) {
+          throw new FlorenceStoreConflict("The failed partner conversation does not match its handshake");
+        }
         const [collision] = await sql<{ id: string }[]>`
           select id from people where id<>${invitation.adult_id}
             and invitation_conversation_id=${suppliedDelivery.providerConversationId}
@@ -3140,14 +3238,14 @@ export class PostgresFlorenceStore {
       const terminalized = await sql`
         update people set invitation_digest=null,invitation_expires_at=null,
           invitation_consumed_at=${occurredAt},messages_address=null,
-          invitation_conversation_id=${suppliedDelivery?.providerConversationId ?? null},
-          invitation_identity_digest=${suppliedDelivery?.identitySubjectDigest ?? null},
-          invitation_message_id=${suppliedDelivery?.providerMessageId ?? null},
-          invitation_issued_at=${suppliedDelivery?.issuedAt ?? null},
+          invitation_conversation_id=${suppliedDelivery?.providerConversationId ?? invitation.invitation_conversation_id},
+          invitation_identity_digest=${suppliedDelivery?.identitySubjectDigest ?? invitation.invitation_identity_digest},
+          invitation_message_id=${suppliedDelivery?.providerMessageId ?? invitation.invitation_message_id},
+          invitation_issued_at=${suppliedDelivery?.issuedAt ?? invitation.invitation_issued_at},
           invitation_approval_source_id=null,invitation_approved_at=null,
           invitation_retry_at=null,invitation_last_error=null,updated_at=${occurredAt}
         where id=${invitation.adult_id} and invitation_approval_source_id=${invitation.approval_source_id}
-          and invitation_issued_at is null returning id
+          and invitation_digest is null and invitation_consumed_at is null returning id
       `;
       if (terminalized.length !== 1) {
         throw new FlorenceStoreConflict("The partner invitation changed before it could be stopped");
@@ -3155,10 +3253,144 @@ export class PostgresFlorenceStore {
       await stagePartnerInvitationTerminalNotice(sql, {
         invitation,
         reason: "delivery_failed",
+        linkIssued: false,
         occurredAt,
         stableKey: invitation.approval_source_id,
       });
     });
+  }
+
+  async bindPartnerInvitationHandshake(input: {
+    householdId: string;
+    actorAdultId: string;
+    adultId: string;
+    approvalSourceId: string;
+    messagesAddress: string;
+    providerConversationId: string;
+    identitySubjectDigest: string;
+    providerMessageId: string;
+    occurredAt: string;
+  }): Promise<FamilyMemberRecord> {
+    assertUuid(input.householdId, "Partner invitation household ID");
+    assertUuid(input.actorAdultId, "Partner invitation founder ID");
+    assertUuid(input.adultId, "Invited partner adult ID");
+    assertUuid(input.approvalSourceId, "Partner invitation approval source");
+    assertDigest(input.identitySubjectDigest, "Invited Messages identity");
+    const messagesAddress = required(input.messagesAddress, "Invited Messages address");
+    if (!/^\+[1-9]\d{7,14}$/.test(messagesAddress)) {
+      throw new FlorenceStoreConflict("Invited Messages address must be E.164");
+    }
+    const providerConversationId = required(input.providerConversationId, "Invited Linq conversation ID");
+    const providerMessageId = required(input.providerMessageId, "Partner handshake message ID");
+    const occurredAt = instant(input.occurredAt);
+    const expiresAt = new Date(occurredAt.getTime() + PARTNER_HANDSHAKE_LIFETIME_MS);
+    const partner = await this.#sql.begin(async (sql) => {
+      const [row] = await sql<PersonRow[]>`
+        select * from people where household_id=${input.householdId} and id=${input.adultId}
+          and kind='adult' and role='steward' and adult_slot=2 for update
+      `;
+      if (row?.status !== "planned" || row.identity_subject_digest !== null) {
+        throw new FlorenceStoreConflict("The invited partner is not waiting for Messages setup");
+      }
+      if (jsonRecord(row.profile).phoneNumber !== messagesAddress) {
+        throw new FlorenceStoreConflict("The invitation address does not match the planned partner");
+      }
+      const [approval] = await sql<
+        {
+          source_id: string;
+          sender_adult_id: string;
+          status: "received" | "handled";
+        }[]
+      >`
+        select approval.source_id,approval.sender_adult_id,approval.status
+        from messages approval
+        join linq_channels channel on channel.id=approval.channel_id
+        join people founder on founder.id=approval.sender_adult_id
+          and founder.household_id=${input.householdId}
+        where approval.source_id=${input.approvalSourceId}
+          and approval.direction='inbound' and approval.move_kind in ('message','reply')
+          and founder.id=${input.actorAdultId} and founder.kind='adult'
+          and founder.role='steward' and founder.adult_slot=1 and founder.status='verified'
+          and founder.identity_subject_digest is not null
+          and channel.household_id=${input.householdId} and channel.audience='private'
+          and channel.adult_one_id=founder.id and channel.adult_two_id is null
+          and channel.identity_one_digest=founder.identity_subject_digest
+          and channel.revoked_at is null and channel.stopped_at is null
+        for share of approval,channel,founder
+      `;
+      if (
+        !approval ||
+        approval.sender_adult_id !== input.actorAdultId ||
+        approval.status !== "handled" ||
+        row.invitation_approval_source_id !== input.approvalSourceId ||
+        row.invitation_approved_at === null
+      ) {
+        throw new FlorenceStoreUnauthorized(
+          "The founding adult has not approved this exact partner invitation",
+        );
+      }
+      if (occurredAt.getTime() < row.invitation_approved_at.getTime() - LINQ_RECEIPT_CLOCK_SKEW_MS) {
+        throw new FlorenceStoreConflict("The partner handshake cannot predate its approval");
+      }
+      if (row.invitation_issued_at !== null) {
+        if (
+          row.invitation_digest !== null ||
+          row.invitation_expires_at?.getTime() !== expiresAt.getTime() ||
+          row.invitation_consumed_at !== null ||
+          row.messages_address !== messagesAddress ||
+          row.invitation_conversation_id !== providerConversationId ||
+          row.invitation_identity_digest !== input.identitySubjectDigest ||
+          row.invitation_message_id !== providerMessageId ||
+          row.invitation_issued_at.getTime() !== occurredAt.getTime()
+        ) {
+          throw new FlorenceStoreConflict("The partner handshake was already bound differently");
+        }
+        return row;
+      }
+      if (
+        row.invitation_digest !== null ||
+        row.invitation_expires_at !== null ||
+        row.invitation_consumed_at !== null ||
+        row.messages_address !== null ||
+        row.invitation_conversation_id !== null ||
+        row.invitation_identity_digest !== null ||
+        row.invitation_message_id !== null ||
+        row.invitation_retry_at === null
+      ) {
+        throw new FlorenceStoreConflict("The planned partner has incomplete invitation state");
+      }
+      const [collision] = await sql<{ id: string }[]>`
+        select p.id from people p where p.id<>${row.id} and (
+          p.messages_address=${messagesAddress}
+          or p.invitation_conversation_id=${providerConversationId}
+          or p.invitation_message_id=${providerMessageId}
+          or p.identity_subject_digest=${input.identitySubjectDigest}
+          or p.invitation_identity_digest=${input.identitySubjectDigest}
+        )
+        union all
+        select c.id from linq_channels c where c.provider_conversation_id=${providerConversationId}
+          and c.revoked_at is null
+        limit 1
+      `;
+      if (collision) {
+        throw new FlorenceStoreConflict("The partner handshake is already bound elsewhere");
+      }
+      const [updated] = await sql<PersonRow[]>`
+        update people set invitation_digest=null,invitation_expires_at=${expiresAt},
+          invitation_consumed_at=null,messages_address=${messagesAddress},
+          invitation_conversation_id=${providerConversationId},
+          invitation_identity_digest=${input.identitySubjectDigest},
+          invitation_message_id=${providerMessageId},invitation_issued_at=${occurredAt},
+          invitation_retry_at=null,invitation_last_error=null,updated_at=${occurredAt}
+        where id=${row.id} and invitation_approval_source_id=${input.approvalSourceId}
+          and invitation_issued_at is null returning *
+      `;
+      if (!updated) {
+        throw new FlorenceStoreConflict("The partner invitation changed before its chat was bound");
+      }
+      return updated;
+    });
+    return personRecord(partner);
   }
 
   async issueMessagesEnrollment(input: IssueMessagesEnrollmentInput): Promise<FamilyMemberRecord> {
@@ -3194,7 +3426,7 @@ export class PostgresFlorenceStore {
       if (plannedPhone !== messagesAddress) {
         throw new FlorenceStoreConflict("The invitation address does not match the planned partner");
       }
-      if (row.invitation_issued_at) {
+      if (row.invitation_digest !== null) {
         if (
           row.invitation_digest !== input.challengeDigest ||
           row.invitation_expires_at?.getTime() !== expiresAt.getTime() ||
@@ -3202,8 +3434,7 @@ export class PostgresFlorenceStore {
           row.messages_address !== messagesAddress ||
           row.invitation_conversation_id !== providerConversationId ||
           row.invitation_identity_digest !== input.identitySubjectDigest ||
-          row.invitation_message_id !== providerMessageId ||
-          row.invitation_issued_at.getTime() !== issuedAt.getTime()
+          row.invitation_message_id !== providerMessageId
         ) {
           throw new FlorenceStoreConflict("The partner invitation was already issued differently");
         }
@@ -3232,8 +3463,7 @@ export class PostgresFlorenceStore {
         !approval ||
         approval.sender_adult_id !== input.actorAdultId ||
         approval.status !== "handled" ||
-        row.invitation_approved_at === null ||
-        row.invitation_retry_at === null
+        row.invitation_approved_at === null
       ) {
         throw new FlorenceStoreUnauthorized(
           "The founding adult has not approved this exact partner invitation",
@@ -3241,14 +3471,18 @@ export class PostgresFlorenceStore {
       }
       if (
         row.invitation_digest !== null ||
-        row.invitation_expires_at !== null ||
+        row.invitation_expires_at === null ||
         row.invitation_consumed_at !== null ||
-        row.messages_address !== null ||
-        row.invitation_conversation_id !== null ||
-        row.invitation_identity_digest !== null ||
-        row.invitation_message_id !== null
+        row.messages_address !== messagesAddress ||
+        row.invitation_conversation_id !== providerConversationId ||
+        row.invitation_identity_digest !== input.identitySubjectDigest ||
+        row.invitation_message_id === null ||
+        row.invitation_issued_at === null ||
+        row.invitation_retry_at !== null ||
+        issuedAt < row.invitation_issued_at ||
+        issuedAt > row.invitation_expires_at
       ) {
-        throw new FlorenceStoreConflict("The planned partner has incomplete invitation state");
+        throw new FlorenceStoreConflict("The planned partner is not awaiting a reply in this chat");
       }
       const [collision] = await sql<{ id: string }[]>`
         select p.id from people p where p.id<>${row.id} and (
@@ -3275,7 +3509,13 @@ export class PostgresFlorenceStore {
           invitation_message_id=${providerMessageId},invitation_issued_at=${issuedAt},
           invitation_retry_at=null,invitation_last_error=null,
           updated_at=${issuedAt}
-        where id=${row.id} returning *
+        where id=${row.id} and invitation_digest is null and invitation_consumed_at is null
+          and messages_address=${messagesAddress}
+          and invitation_conversation_id=${providerConversationId}
+          and invitation_identity_digest=${input.identitySubjectDigest}
+          and invitation_message_id=${row.invitation_message_id}
+          and invitation_issued_at=${row.invitation_issued_at}
+        returning *
       `;
       return updated;
     });
@@ -3616,10 +3856,6 @@ export class PostgresFlorenceStore {
         householdId: household.id,
         createChatIdempotencyKey,
         participantPhoneNumbers: [first.messages_address, second.messages_address],
-        participantIdentityDigests: [
-          first.identity_subject_digest,
-          second.identity_subject_digest,
-        ].sort() as [string, string],
         adultFirstNames: [
           jsonString(first.profile, "firstName") ?? first.display_name,
           jsonString(second.profile, "firstName") ?? second.display_name,
@@ -3634,9 +3870,7 @@ export class PostgresFlorenceStore {
       {
         household_id: string;
         founder_adult_id: string;
-        founder_identity_digest: string;
         partner_adult_id: string;
-        partner_identity_digest: string;
         group_adult_one_id: string;
         group_identity_one_digest: string;
         group_adult_two_id: string;
@@ -3646,9 +3880,7 @@ export class PostgresFlorenceStore {
     >`
       select h.id as household_id,
         founder.id as founder_adult_id,
-        founder.identity_subject_digest as founder_identity_digest,
         partner.id as partner_adult_id,
-        partner.identity_subject_digest as partner_identity_digest,
         family_group.adult_one_id as group_adult_one_id,
         family_group.identity_one_digest as group_identity_one_digest,
         family_group.adult_two_id as group_adult_two_id,
@@ -3693,12 +3925,10 @@ export class PostgresFlorenceStore {
     for (const row of rows) {
       const adultIds = [row.founder_adult_id, row.partner_adult_id].sort();
       const groupAdultIds = [row.group_adult_one_id, row.group_adult_two_id].sort();
-      const identityDigests = [row.founder_identity_digest, row.partner_identity_digest].sort();
       const groupIdentityDigests = [row.group_identity_one_digest, row.group_identity_two_digest].sort();
       if (
         sameStrings(adultIds, groupAdultIds) &&
-        sameStrings(identityDigests, groupIdentityDigests) &&
-        row.group_authority_digest === digestStrings([...adultIds, ...identityDigests])
+        row.group_authority_digest === digestStrings([...adultIds, ...groupIdentityDigests])
       ) {
         return row.household_id;
       }
@@ -3709,16 +3939,27 @@ export class PostgresFlorenceStore {
   async bindCreatedMessagesGroup(input: {
     householdId: string;
     providerConversationId: string;
-    participantIdentityDigests: readonly string[];
+    participants: readonly {
+      identitySubjectDigest: string;
+      phoneNumber: string;
+    }[];
     occurredAt: string;
   }): Promise<LinqChannelRecord> {
     const providerConversationId = required(
       input.providerConversationId,
       "Family group Linq conversation ID",
     );
-    const observed = sortedDigests(input.participantIdentityDigests);
+    const observed = sortedDigests(
+      input.participants.map((participant) => participant.identitySubjectDigest),
+    );
     if (observed.length !== 2 || new Set(observed).size !== 2) {
       throw new FlorenceStoreConflict("The family group requires both distinct adult identities");
+    }
+    const observedPhoneNumbers = input.participants.map((participant) =>
+      required(participant.phoneNumber, "Family group participant phone number"),
+    );
+    if (new Set(observedPhoneNumbers).size !== 2) {
+      throw new FlorenceStoreConflict("The family group requires both distinct adult phone numbers");
     }
     const occurredAt = instant(input.occurredAt);
     const channel = await this.#sql.begin(async (sql) => {
@@ -3740,10 +3981,22 @@ export class PostgresFlorenceStore {
         ) ||
         !adults.some((adult) => adult.adult_slot === 1) ||
         !adults.some((adult) => adult.adult_slot === 2) ||
-        !sameStrings(adults.flatMap((adult) => adult.identity_subject_digest ?? []).sort(), observed)
+        !sameStrings(
+          adults.flatMap((adult) => adult.messages_address ?? []).sort(),
+          [...observedPhoneNumbers].sort(),
+        )
       ) {
         throw new FlorenceStoreConflict("The family group requires exactly both verified adults");
       }
+      const mapped = adults.map((adult) => {
+        const participant = input.participants.find(
+          (candidate) => candidate.phoneNumber === adult.messages_address,
+        );
+        if (!participant) {
+          throw new FlorenceStoreConflict("The family group participant mapping is incomplete");
+        }
+        return { adult, identitySubjectDigest: participant.identitySubjectDigest };
+      });
       const [currentGroup] = await sql<ChannelRow[]>`
         select * from linq_channels where household_id=${input.householdId}
           and audience='group' and revoked_at is null for update
@@ -3751,7 +4004,18 @@ export class PostgresFlorenceStore {
       if (currentGroup) {
         if (
           currentGroup.provider_conversation_id !== providerConversationId ||
-          !sameStrings(channelIdentityDigests(currentGroup), observed)
+          !sameStrings(channelIdentityDigests(currentGroup), observed) ||
+          mapped.some(
+            ({ adult, identitySubjectDigest }) =>
+              !(
+                (currentGroup.adult_one_id === adult.id &&
+                  currentGroup.identity_one_digest === identitySubjectDigest) ||
+                (currentGroup.adult_two_id === adult.id &&
+                  currentGroup.identity_two_digest === identitySubjectDigest)
+              ),
+          ) ||
+          currentGroup.authority_digest !==
+            digestStrings([...mapped.map(({ adult }) => adult.id), ...observed])
         ) {
           throw new FlorenceStoreConflict("A different family group is already connected");
         }
@@ -3766,9 +4030,9 @@ export class PostgresFlorenceStore {
       if (providerOwner) {
         throw new FlorenceStoreConflict("That Linq conversation is already bound to another channel");
       }
-      const first = adults[0];
-      const second = adults[1];
-      if (!first?.identity_subject_digest || !second?.identity_subject_digest) {
+      const first = mapped[0];
+      const second = mapped[1];
+      if (!first || !second) {
         throw new FlorenceStoreConflict("The verified family identities are incomplete");
       }
       const [inserted] = await sql<ChannelRow[]>`
@@ -3776,8 +4040,9 @@ export class PostgresFlorenceStore {
           id,household_id,audience,provider_conversation_id,adult_one_id,identity_one_digest,
           adult_two_id,identity_two_digest,authority_digest,bound_at
         ) values (${deterministicUuid(`linq-group\0${providerConversationId}`)},${input.householdId},
-          'group',${providerConversationId},${first.id},${first.identity_subject_digest},${second.id},
-          ${second.identity_subject_digest},${digestStrings([first.id, second.id, ...observed])},${occurredAt})
+          'group',${providerConversationId},${first.adult.id},${first.identitySubjectDigest},
+          ${second.adult.id},${second.identitySubjectDigest},
+          ${digestStrings([first.adult.id, second.adult.id, ...observed])},${occurredAt})
         returning *
       `;
       return inserted;
@@ -6607,8 +6872,8 @@ async function terminalizeIssuedPartnerInvitation(
       invitation_consumed_at=${occurredAt},messages_address=null,
       invitation_approval_source_id=null,invitation_approved_at=null,
       invitation_retry_at=null,invitation_last_error=null,updated_at=${occurredAt}
-    where id=${invitation.adult_id} and invitation_digest is not null
-      and invitation_consumed_at is null
+    where id=${invitation.adult_id} and invitation_expires_at is not null
+      and invitation_consumed_at is null and messages_address is not null
       and invitation_message_id=${invitation.invitation_message_id}
     returning id
   `;
@@ -6616,6 +6881,7 @@ async function terminalizeIssuedPartnerInvitation(
   await stagePartnerInvitationTerminalNotice(sql, {
     invitation,
     reason,
+    linkIssued: invitation.link_issued,
     occurredAt,
     stableKey: invitation.invitation_message_id,
   });
@@ -6633,6 +6899,7 @@ async function stagePartnerInvitationTerminalNotice(
       founder_channel_id: string;
     };
     reason: "declined" | "expired" | "delivery_failed";
+    linkIssued?: boolean;
     occurredAt: Date;
     stableKey: string;
   },
@@ -6642,10 +6909,14 @@ async function stagePartnerInvitationTerminalNotice(
   );
   const text =
     input.reason === "expired"
-      ? `${input.invitation.first_name}’s Florence setup link expired, so I stopped the invitation. I won’t message them again unless you ask me to send a fresh one.`
+      ? input.linkIssued === false
+        ? `${input.invitation.first_name} didn’t reply before the Florence invitation expired, so I stopped it. I won’t message them again unless you ask me to try again.`
+        : `${input.invitation.first_name}’s Florence setup link expired, so I stopped the invitation. I won’t message them again unless you ask me to send a fresh one.`
       : input.reason === "delivery_failed"
         ? `I couldn’t deliver ${input.invitation.first_name}’s Florence setup link, so I stopped the invitation. I won’t message them again unless you ask me to try again.`
-        : `${input.invitation.first_name} didn’t complete Florence setup, so I stopped the invitation. I won’t message them again unless you ask me to.`;
+        : input.linkIssued === false
+          ? `${input.invitation.first_name} didn’t want to continue with Florence, so I stopped the invitation. I won’t message them again unless you ask me to.`
+          : `${input.invitation.first_name} didn’t complete Florence setup, so I stopped the invitation. I won’t message them again unless you ask me to.`;
   await insertOutbound(sql, {
     sourceId,
     idempotencyKey: `partner-invitation-${input.reason}:${sourceId}`,
@@ -6869,13 +7140,11 @@ function isMatchingFamilyGroupAuthority(
   }
   const adults = [authority.founder_adult_id, authority.partner_adult_id].sort();
   const channelAdults = [channel.adult_one_id, channel.adult_two_id].sort();
-  const identities = [authority.founder_identity_digest, authority.partner_identity_digest].sort();
   const channelIdentities = channelIdentityDigests(channel);
   return (
     adults.includes(senderAdultId) &&
     sameStrings(adults, channelAdults) &&
-    sameStrings(identities, channelIdentities) &&
-    channel.authority_digest === digestStrings([...adults, ...identities])
+    channel.authority_digest === digestStrings([...adults, ...channelIdentities])
   );
 }
 

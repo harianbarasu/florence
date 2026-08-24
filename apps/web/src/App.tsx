@@ -788,8 +788,9 @@ function GoogleSetupStep({
         </div>
       </div>
       <p className="setup-trust">
-        Florence keeps your personal email private. With your permission, she may add a clear official family
-        date to the shared calendar. If something is uncertain, she’ll ask first.
+        When Google asks, leave both Gmail and Calendar enabled—Florence can’t connect if either is turned
+        off. Florence keeps your personal email private. With your permission, she may add a clear official
+        family date to the shared calendar. If something is uncertain, she’ll ask first.
       </p>
       {error && (
         <p className="form-error" role="alert">
@@ -2423,6 +2424,9 @@ function setupError(cause: unknown): string {
 }
 
 function googleSetupError(status: string): string {
+  if (status === "missing_permissions") {
+    return "Google gave Florence only some of the access she needs, so Florence did not save this connection. Google may still list the partial grant: open your Google Account’s third-party connections, select Florence, and remove access there. Then try again and allow both Gmail and Calendar, or choose another account where both are available.";
+  }
   if (status === "authorization_cancelled" || status === "provider_rejected") {
     return "Google wasn’t connected. Nothing changed—try again when you’re ready.";
   }

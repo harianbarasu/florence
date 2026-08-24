@@ -134,10 +134,10 @@ CREATE TABLE linq_channels (
   bound_at timestamptz NOT NULL,
   revoked_at timestamptz,
   stopped_at timestamptz,
-  FOREIGN KEY (household_id,adult_one_id,identity_one_digest)
-    REFERENCES people(household_id,id,identity_subject_digest),
-  FOREIGN KEY (household_id,adult_two_id,identity_two_digest)
-    REFERENCES people(household_id,id,identity_subject_digest),
+  FOREIGN KEY (household_id,adult_one_id)
+    REFERENCES people(household_id,id),
+  FOREIGN KEY (household_id,adult_two_id)
+    REFERENCES people(household_id,id),
   CHECK (
     (audience='private' AND adult_two_id IS NULL AND identity_two_digest IS NULL)
     OR

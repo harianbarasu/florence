@@ -517,6 +517,7 @@ export class Florence {
     providerEventId: string;
     providerConversationId: string;
     identitySubjectDigest: string;
+    messagesAddress: string;
     text: string;
     occurredAt: string;
     carrierOptOut: boolean;
@@ -647,7 +648,45 @@ export class Florence {
         }
       }
     } else {
-      if (input.carrierOptOut) return true;
+      const reservation = await this.#store.classifyUnboundMessagesReservation({
+        messagesAddress: input.messagesAddress,
+        providerConversationId: input.providerConversationId,
+        identitySubjectDigest: input.identitySubjectDigest,
+      });
+      if (input.carrierOptOut) {
+        if (reservation === "pending_partner") {
+          const declined = await this.#store.declinePendingPartnerReservation({
+            messagesAddress: input.messagesAddress,
+            providerConversationId: input.providerConversationId,
+            identitySubjectDigest: input.identitySubjectDigest,
+            occurredAt: input.occurredAt,
+          });
+          if (!declined) {
+            const rebound = await this.#store.readUnboundPartnerInvitation({
+              providerConversationId: input.providerConversationId,
+              identitySubjectDigest: input.identitySubjectDigest,
+              now: checkedAt,
+            });
+            if (rebound && rebound.state !== "declined") {
+              await this.#store.declinePartnerInvitation({
+                adultId: rebound.adultId,
+                providerConversationId: input.providerConversationId,
+                identitySubjectDigest: input.identitySubjectDigest,
+                occurredAt: input.occurredAt,
+              });
+            }
+          }
+        }
+        return true;
+      }
+      if (reservation === "pending_partner") {
+        throw new LinqError(
+          "provider_retryable",
+          "The invited partner conversation is still being bound",
+          true,
+        );
+      }
+      if (reservation === "claimed") return true;
       if (!this.#setupOrigin || !this.#google) {
         throw new Error("Google Workspace onboarding is not configured");
       }
@@ -690,6 +729,21 @@ export class Florence {
         { text: setupUrl, delayMs: 0 },
       ];
       idempotencyPrefix = "founder-setup";
+    }
+
+    if (pendingPartnerEnrollment) {
+      await this.#store.issueMessagesEnrollment({
+        householdId: pendingPartnerEnrollment.householdId,
+        actorAdultId: pendingPartnerEnrollment.founderAdultId,
+        adultId: pendingPartnerEnrollment.adultId,
+        challengeDigest: pendingPartnerEnrollment.challengeDigest,
+        providerConversationId: input.providerConversationId,
+        identitySubjectDigest: input.identitySubjectDigest,
+        messagesAddress: pendingPartnerEnrollment.messagesAddress,
+        providerMessageId: pendingPartnerEnrollment.initialProviderMessageId,
+        expiresAt: pendingPartnerEnrollment.expiresAt,
+        issuedAt: input.occurredAt,
+      });
     }
 
     await this.#setTyping({
@@ -737,17 +791,15 @@ export class Florence {
               true,
             );
           }
-          await this.#store.issueMessagesEnrollment({
+          await this.#store.confirmMessagesEnrollmentDelivery({
             householdId: pendingPartnerEnrollment.householdId,
-            actorAdultId: pendingPartnerEnrollment.founderAdultId,
             adultId: pendingPartnerEnrollment.adultId,
             challengeDigest: pendingPartnerEnrollment.challengeDigest,
             providerConversationId: input.providerConversationId,
             identitySubjectDigest: input.identitySubjectDigest,
             messagesAddress: pendingPartnerEnrollment.messagesAddress,
             providerMessageId: result.providerReceiptId,
-            expiresAt: pendingPartnerEnrollment.expiresAt,
-            issuedAt: input.occurredAt,
+            deliveredAt: result.occurredAt,
           });
         }
       }
@@ -2653,16 +2705,10 @@ export class Florence {
           false,
         );
       }
-      if (created.initialMessage.providerState === "accepted") {
-        throw new LinqError(
-          "provider_retryable",
-          "Linq has not confirmed sending the partner reply prompt",
-          true,
-        );
-      }
       if (created.initialMessage.providerState === "failed") {
         throw new LinqError("provider_rejected", "Linq could not deliver the partner reply prompt", false);
       }
+      const deliveryPending = created.initialMessage.providerState === "accepted";
       await this.#store.bindPartnerInvitationHandshake({
         householdId: invitation.householdId,
         actorAdultId: invitation.founderAdultId,
@@ -2673,6 +2719,8 @@ export class Florence {
         identitySubjectDigest: participant.identitySubjectDigest,
         providerMessageId: created.initialMessage.providerMessageId,
         occurredAt: created.initialMessage.occurredAt,
+        retryAt: deliveryPending ? later(this.#now(), RETRY_MS) : null,
+        retryError: deliveryPending ? "Linq has not confirmed sending the partner reply prompt" : null,
       });
     } catch (error) {
       if (!(error instanceof LinqError)) throw error;

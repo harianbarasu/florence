@@ -540,16 +540,53 @@ release("Florence parent journeys", () => {
     const founderMessagesBeforeReinvite = harness.linq.messages.filter(
       (message) => message.providerConversationId === PRIVATE_FOUNDER,
     ).length;
+    harness.linq.partnerInitialPromptAcceptedRemaining = 1;
+    const stoppedPartnerPromptVisible = harness.linq.pauseNextPartnerInitialPrompt();
     await harness.accept("private", "reinvite-partner-after-rejection", REINVITE_APPROVAL);
+    const stoppedInvitationDrain = harness.drain();
+    await stoppedPartnerPromptVisible;
+    try {
+      expect(
+        await harness.receiveParts(
+          "partner-handshake-stop-before-binding",
+          [{ type: "text", value: "STOP" }],
+          PRIVATE_PARTNER,
+          "partner",
+        ),
+      ).toEqual({ disposition: "acknowledged", reason: "opted_out" });
+    } finally {
+      harness.linq.releasePartnerInitialPrompt();
+    }
+    await stoppedInvitationDrain;
+    expect(harness.linq.partnerSetupLinkAttempts).toBe(0);
+    expect(
+      harness.linq.messages.some(
+        (message) => message.providerConversationId === PRIVATE_PARTNER && message.text.includes("#s="),
+      ),
+    ).toBe(false);
+    await harness.assertDatabase(
+      "A STOP received before partner binding was forgotten",
+      `exists (
+        select 1 from people where adult_slot=2 and status='planned'
+          and invitation_consumed_at is not null and invitation_approval_source_id is null
+          and invitation_digest is null and invitation_expires_at is null
+          and messages_address is null and invitation_conversation_id is null
+          and invitation_identity_digest is null and invitation_message_id is null
+          and invitation_issued_at is null and invitation_retry_at is null
+      )`,
+    );
+
+    await harness.accept("private", "reinvite-partner-after-fast-stop", REINVITE_APPROVAL);
     await harness.drain();
-    expect(harness.linq.createdChats[0]).toMatchObject({
+    const reboundPartnerPrompt = harness.linq.createdChats.at(-1);
+    expect(reboundPartnerPrompt).toMatchObject({
       input: {
         participantPhoneNumbers: [PARTNER_PHONE],
         initialText: expect.stringMatching(/Reply here.*private setup link/i),
       },
       result: { providerConversationId: PRIVATE_PARTNER, authority: { audience: "private" } },
     });
-    expect(harness.linq.createdChats[0]?.input.initialText).not.toContain("#s=");
+    expect(reboundPartnerPrompt?.input.initialText).not.toContain("#s=");
     const reinviteFounderMessages = harness.linq.messages
       .filter((message) => message.providerConversationId === PRIVATE_FOUNDER)
       .slice(founderMessagesBeforeReinvite);
@@ -584,7 +621,14 @@ release("Florence parent journeys", () => {
       currentMessage: { text: PARTNER_SETUP_HANDSHAKE_REPLY },
       nextStep: "signed_link_will_follow",
     });
+    const firstPartnerSetupLinks = harness.linq.messages.filter(
+      (message) => message.providerConversationId === PRIVATE_PARTNER && message.text.includes("#s="),
+    );
+    expect(firstPartnerSetupLinks).toHaveLength(1);
+    expect(firstPartnerSetupLinks[0]?.text).toContain("#s=ps1.");
+    expect(firstPartnerSetupLinks[0]?.text).not.toContain("#s=fs2.");
     const expiringPartnerSetupToken = harness.setupTokenFor(PRIVATE_PARTNER);
+    expect(expiringPartnerSetupToken).toMatch(/^ps1\./);
     const linkAttemptsBeforeExpiry = harness.linq.partnerSetupLinkAttempts;
     expect(linkAttemptsBeforeExpiry).toBe(1);
     const partnerMessagesBeforeReplyReplay = harness.linq.messages.filter(
@@ -631,11 +675,55 @@ release("Florence parent journeys", () => {
     await harness.drain();
     expect(harness.linq.partnerSetupLinkAttempts).toBe(linkAttemptsBeforeExpiry);
 
+    harness.linq.partnerInitialPromptAcceptedRemaining = 1;
+    const partnerPromptVisible = harness.linq.pauseNextPartnerInitialPrompt();
     await harness.accept("private", "reinvite-partner-after-expiry", REINVITE_APPROVAL);
-    await harness.drain();
-    expect(harness.linq.partnerSetupLinkAttempts).toBe(linkAttemptsBeforeExpiry);
+    const invitationDrain = harness.drain();
+    await partnerPromptVisible;
+    try {
+      const acceptedPartnerPrompt = harness.linq.createdChats.at(-1);
+      expect(acceptedPartnerPrompt).toMatchObject({
+        input: {
+          participantPhoneNumbers: [PARTNER_PHONE],
+          initialText: expect.stringMatching(/Reply here.*private setup link/i),
+        },
+        result: {
+          providerConversationId: PRIVATE_PARTNER,
+          authority: { audience: "private" },
+          initialMessage: { providerState: "accepted" },
+        },
+      });
+      expect(
+        harness.linq.messages.filter(
+          (message) => message.idempotencyKey === acceptedPartnerPrompt?.input.idempotencyKey,
+        ),
+      ).toHaveLength(1);
+      await expect(
+        harness.receiveParts(
+          "partner-handshake-fast-reply-before-binding",
+          [{ type: "text", value: PARTNER_SETUP_HANDSHAKE_REPLY }],
+          PRIVATE_PARTNER,
+          "partner",
+        ),
+      ).rejects.toMatchObject({ code: "provider_retryable", retryable: true });
+      expect(
+        harness.linq.messages.some(
+          (message) => message.providerConversationId === PRIVATE_PARTNER && message.text.includes("#s=fs2."),
+        ),
+      ).toBe(false);
+      expect(harness.linq.partnerSetupLinkAttempts).toBe(linkAttemptsBeforeExpiry);
+    } finally {
+      harness.linq.releasePartnerInitialPrompt();
+    }
+    await invitationDrain;
+    expect((await harness.florence.workspaceForAdult(harness.founderAdultId)).workspace.setup).toMatchObject({
+      partnerInvitation: "invited",
+    });
+    const partnerSetupLinksBeforeFastReply = harness.linq.messages.filter(
+      (message) => message.providerConversationId === PRIVATE_PARTNER && message.text.includes("#s="),
+    ).length;
     await harness.receiveParts(
-      "partner-handshake-reply-after-expiry",
+      "partner-handshake-fast-reply-before-binding",
       [{ type: "text", value: PARTNER_SETUP_HANDSHAKE_REPLY }],
       PRIVATE_PARTNER,
       "partner",
@@ -643,9 +731,72 @@ release("Florence parent journeys", () => {
     expect(harness.linq.partnerSetupLinkAttempts).toBe(linkAttemptsBeforeExpiry + 1);
     const finalPartnerSetupToken = harness.setupTokenFor(PRIVATE_PARTNER);
     expect(finalPartnerSetupToken).not.toBe(expiringPartnerSetupToken);
+    expect(finalPartnerSetupToken).toMatch(/^ps1\./);
+    const fastReplySetupLinks = harness.linq.messages
+      .filter((message) => message.providerConversationId === PRIVATE_PARTNER && message.text.includes("#s="))
+      .slice(partnerSetupLinksBeforeFastReply);
+    expect(fastReplySetupLinks).toHaveLength(1);
+    expect(fastReplySetupLinks[0]?.text).toContain("#s=ps1.");
+    expect(
+      harness.linq.messages.some(
+        (message) => message.providerConversationId === PRIVATE_PARTNER && message.text.includes("#s=fs2."),
+      ),
+    ).toBe(false);
 
     harness.linq.familyGroupPromptAcceptedRemaining = 1;
-    await harness.setupPartner();
+    const partnerSetupApp = await harness.webApp(false);
+    const partnerProfile = {
+      firstName: "Alex",
+      lastName: "Anbarasu",
+      timeZone: "America/Los_Angeles",
+      guardianAttested: true,
+      proactiveUseAccepted: true,
+      privateConflictBusySharingEnabled: true,
+    };
+    const collidingFounderSetup = harness.enrollmentCodes.issueFounderSetup({
+      providerConversationId: PRIVATE_PARTNER,
+      identitySubjectDigest: PARTNER_IDENTITY,
+      occurredAt: harness.iso(),
+    });
+    const collidingFounderResponse = await partnerSetupApp.inject({
+      method: "POST",
+      url: "/api/v1/session",
+      payload: { setupToken: collidingFounderSetup.token, profile: partnerProfile },
+    });
+    expect(collidingFounderResponse.statusCode).toBe(401);
+    expect(collidingFounderResponse.json()).toEqual({ error: "invalid_or_expired_setup_link" });
+    expect(collidingFounderResponse.body).not.toContain("internal_error");
+    await harness.assertDatabase(
+      "A founder token for the reserved partner identity mutated the family",
+      `(select count(*)=1 from households)
+        and (select count(*)=2 from people where kind='adult')
+        and (select count(*)=1 from people where kind='adult' and adult_slot=2 and status='planned')`,
+    );
+    const firstPartnerSetupResponse = await partnerSetupApp.inject({
+      method: "POST",
+      url: "/api/v1/session",
+      payload: { setupToken: finalPartnerSetupToken, profile: partnerProfile },
+    });
+    const repeatedPartnerSetupResponse = await partnerSetupApp.inject({
+      method: "POST",
+      url: "/api/v1/session",
+      payload: { setupToken: finalPartnerSetupToken, profile: partnerProfile },
+    });
+    await partnerSetupApp.close();
+    for (const response of [firstPartnerSetupResponse, repeatedPartnerSetupResponse]) {
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({ adultId: harness.partnerAdultId });
+      expect(response.body).not.toContain("internal_error");
+    }
+    const founderHouseholds = await harness.store.listHouseholdIdsForAdult(harness.founderAdultId);
+    expect(founderHouseholds).toHaveLength(1);
+    expect(await harness.store.listHouseholdIdsForAdult(harness.partnerAdultId)).toEqual(founderHouseholds);
+    await harness.assertDatabase(
+      "The accepted partner prompt reply created a duplicate family or partner",
+      `(select count(*)=1 from households)
+        and (select count(*)=2 from people where kind='adult')
+        and (select count(*)=1 from people where kind='adult' and adult_slot=2 and status='verified')`,
+    );
     await harness.activatePartnerGoogle();
     harness.state.familyCalendarProvisioningFailuresRemaining = 1;
     await expect(harness.drain()).rejects.toThrow(
@@ -2612,6 +2763,13 @@ class FakeLinq {
   readonly sendMessageAttempts: LinqSendMessage[] = [];
   readonly reactions: LinqSendReaction[] = [];
   readonly media = new Map<string, { reference: LinqMediaReference; bytes: Uint8Array }>();
+  #partnerInitialPromptBarrier: {
+    reached: Promise<void>;
+    markReached: () => void;
+    release: Promise<void>;
+    resume: () => void;
+  } | null = null;
+  partnerInitialPromptAcceptedRemaining = 0;
   partnerSetupLinkState: "accepted" | "sent" = "sent";
   partnerSetupLinkAttempts = 0;
   partnerChatFailuresRemaining = 0;
@@ -2626,12 +2784,33 @@ class FakeLinq {
     readonly ledger: FakeLinqLedger = createFakeLinqLedger(),
   ) {}
 
+  pauseNextPartnerInitialPrompt(): Promise<void> {
+    if (this.#partnerInitialPromptBarrier) throw new Error("A partner prompt barrier is already active");
+    let markReached: () => void = () => undefined;
+    let resume: () => void = () => undefined;
+    const reached = new Promise<void>((resolve) => {
+      markReached = resolve;
+    });
+    const release = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    this.#partnerInitialPromptBarrier = { reached, markReached, release, resume };
+    return reached;
+  }
+
+  releasePartnerInitialPrompt(): void {
+    const barrier = this.#partnerInitialPromptBarrier;
+    if (!barrier) throw new Error("No partner prompt barrier is active");
+    this.#partnerInitialPromptBarrier = null;
+    barrier.resume();
+  }
+
   async createChat(input: LinqCreateChat): Promise<LinqCreatedChat> {
     this.createChatAttempts.push(input);
     const prior = this.ledger.created.get(input.idempotencyKey);
     if (prior) {
       this.authorities.set(prior.providerConversationId, prior.authority);
-      if (prior.authority.audience === "group" && prior.initialMessage.providerState === "accepted") {
+      if (prior.initialMessage.providerState === "accepted") {
         const confirmed = {
           ...prior,
           initialMessage: {
@@ -2678,6 +2857,8 @@ class FakeLinq {
       participants,
     };
     this.ledger.nextCreatedChatReceipt += 1;
+    const acceptedPartnerPrompt = privateChat && this.partnerInitialPromptAcceptedRemaining > 0;
+    if (acceptedPartnerPrompt) this.partnerInitialPromptAcceptedRemaining -= 1;
     const acceptedFamilyGroupPrompt = !privateChat && this.familyGroupPromptAcceptedRemaining > 0;
     if (acceptedFamilyGroupPrompt) this.familyGroupPromptAcceptedRemaining -= 1;
     const result: LinqCreatedChat = {
@@ -2686,7 +2867,7 @@ class FakeLinq {
       initialMessage: {
         idempotencyKey: input.idempotencyKey,
         providerMessageId: `created-chat-message-${this.ledger.nextCreatedChatReceipt}`,
-        providerState: acceptedFamilyGroupPrompt ? "accepted" : "sent",
+        providerState: acceptedPartnerPrompt || acceptedFamilyGroupPrompt ? "accepted" : "sent",
         occurredAt: new Date(this.state.now).toISOString(),
       },
     };
@@ -2700,6 +2881,11 @@ class FakeLinq {
     });
     this.state.timeline.push(`message:${input.initialText}`);
     this.ledger.created.set(input.idempotencyKey, result);
+    const promptBarrier = privateChat ? this.#partnerInitialPromptBarrier : null;
+    if (promptBarrier) {
+      promptBarrier.markReached();
+      await promptBarrier.release;
+    }
     return result;
   }
 

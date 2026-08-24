@@ -301,7 +301,11 @@ async function acceptMessage(
 
 async function handleUnboundMessage(
   proposal: LinqInboundMessageProposal,
-  observed: { audience: "private" | "group"; participantIdentityDigests: readonly string[] },
+  observed: {
+    audience: "private" | "group";
+    participantIdentityDigests: readonly string[];
+    participants: readonly { identitySubjectDigest: string; phoneNumber: string }[];
+  },
   options: {
     florence: FlorenceIngress;
   },
@@ -309,10 +313,15 @@ async function handleUnboundMessage(
   const { participantIdentityDigests } = observed;
   const senderIdentitySubjectDigest = linqIdentitySubjectDigest(proposal.sender.providerHandleId);
   if (observed.audience === "private") {
-    if (participantIdentityDigests.length !== 1) {
+    const participant = observed.participants[0];
+    if (participantIdentityDigests.length !== 1 || observed.participants.length !== 1 || !participant) {
       return { disposition: "rejected", reason: "authority_not_found" };
     }
-    if (participantIdentityDigests[0] !== senderIdentitySubjectDigest) {
+    if (
+      participantIdentityDigests[0] !== senderIdentitySubjectDigest ||
+      participant.identitySubjectDigest !== senderIdentitySubjectDigest ||
+      participant.phoneNumber !== proposal.sender.address
+    ) {
       return { disposition: "rejected", reason: "authority_evidence_mismatch" };
     }
     const carrierOptOut = isCarrierMessagesOptOut(proposal.text);
@@ -323,6 +332,7 @@ async function handleUnboundMessage(
       providerEventId: proposal.providerEventId,
       providerConversationId: proposal.providerConversationId,
       identitySubjectDigest: senderIdentitySubjectDigest,
+      messagesAddress: participant.phoneNumber,
       text: proposal.text?.trim() || "Shared an attachment.",
       occurredAt: proposal.occurredAt,
       carrierOptOut,

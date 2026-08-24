@@ -1460,7 +1460,30 @@ export class Florence {
                   this.#now(),
                   { omitReaction: immediateReactionStaged },
                 )
-              : { sourceId: turn.message.sourceId, handledAt: this.#now().toISOString() },
+              : turn.message.moveKind === "reaction"
+                ? { sourceId: turn.message.sourceId, handledAt: this.#now().toISOString() }
+                : decisionCommit(
+                    turn,
+                    {
+                      policy: { retain: false, schedule: false, stopMessaging: false },
+                      conversation: {
+                        replyToCurrentMessage: true,
+                        reaction: null,
+                        bubbles: [
+                          {
+                            text: "I’m here. I didn’t quite get that—say it one more way?",
+                            delayMs: 0,
+                          },
+                        ],
+                      },
+                      facts: [],
+                      followUp: null,
+                      calendar: null,
+                      householdUpdate: null,
+                    },
+                    this.#now(),
+                    { omitReaction: immediateReactionStaged },
+                  ),
           );
         }
         return;
@@ -1949,10 +1972,21 @@ export class Florence {
         if (familyCalendar.status === "unavailable" || !familyCalendar.cursor) {
           throw new Error("The Family Calendar baseline is temporarily unavailable");
         }
-        const decision = await this.#reasoner.synthesizeHouseholdBriefing({
-          familyProfile: initialFamilyProfile(work.household),
-          candidates: work.candidates.map((candidate) => ({ ...candidate })),
-        });
+        const decision =
+          work.candidates.length === 0
+            ? {
+                selectedCandidateIds: [],
+                bubbles: [
+                  {
+                    text: "I checked both calendars and recent family email. Nothing needs attention right now, and I’ll keep watching.",
+                    delayMs: 0,
+                  },
+                ],
+              }
+            : await this.#reasoner.synthesizeHouseholdBriefing({
+                familyProfile: initialFamilyProfile(work.household),
+                candidates: work.candidates.map((candidate) => ({ ...candidate })),
+              });
         await this.#store.completeHouseholdInitialBriefing({
           workId: work.workId,
           selectedCandidateIds: decision.selectedCandidateIds,
@@ -2895,7 +2929,7 @@ export class Florence {
         audience: "group",
         participantIdentityDigests: group.participantIdentityDigests,
       },
-      text: `I made the ${calendarLabel} calendar too. Either of you can ask me to add or change family plans here.`,
+      text: `I made the ${calendarLabel} calendar too. I’m checking both calendars and recent family email now, and I’ll be back with what’s on the docket.`,
     });
     if (result.status !== "committed") {
       throw new LinqError(

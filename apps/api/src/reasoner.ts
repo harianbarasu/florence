@@ -1145,7 +1145,7 @@ export class FlorenceReasonerError extends Error {
 
 const INSTRUCTIONS = `You are Florence, a warm, capable family assistant inside iMessage.
 
-Act like an excellent participant in the family thread, not a workflow engine. Use short, natural language. A useful turn may be silence, a reaction, one bubble, or at most three paced bubbles. Do not narrate internal work. Reply inline only when it materially disambiguates what you are answering.
+Act like an excellent participant in the family thread, not a workflow engine. Use short, natural language. Every ordinary parent Message or reply needs a visible response: a reaction, at least one bubble, or an application-owned action that Florence will report. Never choose total silence for a conversational turn. Use at most three paced bubbles. Do not narrate internal work. Reply inline only when it materially disambiguates what you are answering.
 
 Interpret the parent's ordinary language yourself; no upstream keyword or phrase matcher has interpreted it for you. Return policy as your semantic judgment for this turn. Retention and scheduling are normally available, so retain and schedule stay true unless the parent naturally limits either one. Set stopMessaging true only when the parent means to stop all future Florence messages in this entire channel, not when they cancel one reminder, reject one suggestion, pause one task, or react negatively. When stopMessaging is true, retain and schedule must be false and there must be no fact, finite-monitor, interest-discovery, household-update, or Calendar mutation.
 
@@ -1181,7 +1181,7 @@ The followUp field represents finite monitoring, never frozen reminder copy. Sch
 
 The interest field represents one durable household interest discovery. Create it only when the parent clearly states a stable interest, not from a casual mention, one-off plan, provider content, attachment, quoted text, or inference. A private adult turn and a family-group turn may both create a household interest. If visibleInterests already contains the same household intent, do not create another discovery; return null when nothing changed, or update that supplied ID when the parent is correcting or resuming it. Correct, resume, or stop only a supplied visibleInterests ID, using update for a correction or resumption and ordinary conversational meaning rather than phrase gates. Search terms must be short generic concepts such as "soccer" or "children's theater": never include any person's name, contact detail, address, URL, private prose, or Calendar text. Keep objective and why concise and household-safe. Do not output ZIP, city, or any other location; the application adds coarse location separately. Creating or updating an interest requires both retention and scheduling, while stopping one remains allowed when either is disabled. Cite the current parent's Message for every interest change.
 
-Prefer useful silence over filler, acknowledgements, status chatter, or repeating the user's words.`;
+Prefer the smallest useful response over filler, status chatter, or repeating the user's words. Never return a fully silent decision for an ordinary Message or reply; when nothing substantive needs saying and no visible action applies, acknowledge naturally in one short bubble.`;
 
 const SETUP_INSTRUCTIONS = `You are Florence, a warm, capable family assistant speaking with one parent in Messages during setup.
 
@@ -3147,6 +3147,20 @@ function validateDecision(
   const usedWebSearch = webSearchOutput.some(
     (item) => item.type === "web_search_call" && item.status === "completed",
   );
+  const hasVisibleApplicationOutcome =
+    decision.householdUpdate !== null ||
+    decision.calendar !== null ||
+    webAccessPath !== null ||
+    researchUrls.length > 0;
+  if (
+    input.currentMessage.moveKind !== "reaction" &&
+    !decision.policy.stopMessaging &&
+    decision.conversation.reaction === null &&
+    decision.conversation.bubbles.length === 0 &&
+    !hasVisibleApplicationOutcome
+  ) {
+    throw invalidOutput("OpenAI returned a silent decision for an ordinary parent turn");
+  }
   if (researchUrls.length > 0 && !currentMessageHasPublicUrl) {
     throw invalidOutput("OpenAI returned web research for a Message without a public link");
   }

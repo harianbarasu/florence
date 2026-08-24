@@ -105,6 +105,11 @@ const INCOMPLETE_SETUP_FRESH_LINK_REQUEST = "Can you send me a new link?";
 const INCOMPLETE_SETUP_FALSE_DENIAL =
   "I can’t resend a setup link from here. If you’re already on the setup page, keep going there.";
 const INCOMPLETE_SETUP_FRESH_LINK_ACKNOWLEDGEMENT = "Of course—here’s a fresh link to finish setup.";
+const PRIVATE_INITIAL_ALL_CLEAR =
+  "I checked your recent family email and the next three weeks of Calendar. Nothing needs attention right now.";
+const HOUSEHOLD_INITIAL_ALL_CLEAR =
+  "I checked both calendars and recent family email. Nothing needs attention right now, and I’ll keep watching.";
+const CONVERSATION_RECOVERY_REPLY = "I’m here. I didn’t quite get that—say it one more way?";
 const STALE_RECEIPT_QUESTION = "Can you confirm this delivery is current?";
 const STALE_RECEIPT_REPLY = "This reply must have a current provider receipt.";
 const PRIVATE_CALENDAR_ONLY_TITLE = "Maya’s soccer clinic";
@@ -294,6 +299,7 @@ type HarnessState = {
   interactiveGoogleReads: number;
   providerRevocations: ("confirmed" | "unconfirmed" | "not-needed")[];
   setupConversations: Parameters<FlorenceReasoner["converseDuringSetup"]>[0][];
+  initialNoAttentionReview: boolean;
   initialCalendarOnlyReview: boolean;
   initialUnrelatedAccountReview: boolean;
   initialUnrelatedAccountFactOnlyReview: boolean;
@@ -308,10 +314,23 @@ const release = TEST_DATABASE_URL ? describe : describe.skip;
 release("Florence parent journeys", () => {
   test("keeps private setup useful and recovers one two-parent family loop without duplicate work", async () => {
     await assertFunctionCallContinuationIsWireSafe();
+    await assertNormalParentTurnsCannotDisappear();
     let accessFollowUpHistory: readonly string[] = [];
     let accessFollowUpAuthoredText: string | null = null;
     let failNextReinviteConversation = false;
+    let failNextGroupGreeting = false;
     const harness = await createHarness(async (input) => {
+      if (
+        failNextGroupGreeting &&
+        input.audience === "group" &&
+        input.currentMessage.text === "Hi Florence"
+      ) {
+        failNextGroupGreeting = false;
+        throw new FlorenceReasonerError(
+          "invalid_output",
+          "Fake normal family-thread greeting returned no usable decision",
+        );
+      }
       if (failNextReinviteConversation && input.currentMessage.text === REINVITE_APPROVAL) {
         failNextReinviteConversation = false;
         throw new FlorenceReasonerError(
@@ -883,7 +902,7 @@ release("Florence parent journeys", () => {
         (message) =>
           message.providerConversationId === FAMILY_GROUP &&
           message.text ===
-            "I made the De la Cruz–Anbarasu Family calendar too. Either of you can ask me to add or change family plans here.",
+            "I made the De la Cruz–Anbarasu Family calendar too. I’m checking both calendars and recent family email now, and I’ll be back with what’s on the docket.",
       ),
     ).toHaveLength(1);
     expect(harness.state.briefings).toHaveLength(1);
@@ -921,6 +940,26 @@ release("Florence parent journeys", () => {
       initialBriefing: "sent",
     });
     expect(partner.workspace.setup).toEqual(founder.workspace.setup);
+
+    failNextGroupGreeting = true;
+    expect(await harness.accept("group", "group-greeting-invalid-output", "Hi Florence")).toMatchObject({
+      disposition: "accepted",
+    });
+    await harness.drain();
+    expect(
+      harness.linq.messages.filter(
+        (message) =>
+          message.providerConversationId === FAMILY_GROUP && message.text === CONVERSATION_RECOVERY_REPLY,
+      ),
+    ).toHaveLength(1);
+    await harness.assertDatabase(
+      "A recovered ordinary group turn was not handled exactly once",
+      `exists (
+        select 1 from messages
+        where source_id=${sqlLiteral(inboundSourceId("event-group-greeting-invalid-output"))}::uuid
+          and direction='inbound' and status='handled' and retry_at is null and last_error is null
+      )`,
+    );
 
     const privateAccessLinksBeforeRequest = harness.accessLinksFor(PRIVATE_FOUNDER).length;
     await harness.accept("private", "calendar-web-access", WEB_CALENDAR_ACCESS_REQUEST);
@@ -1007,7 +1046,52 @@ release("Florence parent journeys", () => {
           : decision(),
       { now: NOW + 10 * 60_000, linqLedger: harness.linq.ledger },
     );
+    resetHarness.state.initialNoAttentionReview = true;
     await resetHarness.readyHousehold();
+    expect(resetHarness.state.privateReviews.map((review) => review.adult.firstName).sort()).toEqual([
+      "Alex",
+      "Hari",
+    ]);
+    const quietPrivateReviews = resetHarness.linq.messages.filter((message) =>
+      message.idempotencyKey.startsWith("initial-private-review:"),
+    );
+    expect(quietPrivateReviews).toHaveLength(2);
+    expect(quietPrivateReviews.map((message) => message.text)).toEqual([
+      PRIVATE_INITIAL_ALL_CLEAR,
+      PRIVATE_INITIAL_ALL_CLEAR,
+    ]);
+    expect(new Set(quietPrivateReviews.map((message) => message.providerConversationId))).toEqual(
+      new Set([PRIVATE_FOUNDER, PRIVATE_PARTNER]),
+    );
+    expect(resetHarness.state.briefings).toHaveLength(0);
+    await resetHarness.assertDatabase(
+      "A quiet private review retained a finding or family fact",
+      `(select count(*)=2 from proactive_work
+          where kind='initial_private_review' and status='completed'
+            and briefing_candidates='[]'::jsonb)
+        and not exists (
+          select 1 from proactive_work_sources source
+          join proactive_work work on work.id=source.work_id
+          where work.kind='initial_private_review'
+        )
+        and not exists (select 1 from facts)`,
+    );
+    const quietActivationMessages = resetHarness.linq.messages.filter(
+      (message) => message.expectedAuthority.audience === "group",
+    );
+    const quietIntroductionIndex = quietActivationMessages.findIndex((message) =>
+      message.idempotencyKey.startsWith("family-group:"),
+    );
+    const quietCalendarIndex = quietActivationMessages.findIndex((message) =>
+      message.idempotencyKey.startsWith("family-calendar-ready:"),
+    );
+    const quietDocketIndex = quietActivationMessages.findIndex((message) =>
+      message.idempotencyKey.startsWith("initial-household-briefing:"),
+    );
+    expect(quietIntroductionIndex).toBeGreaterThanOrEqual(0);
+    expect(quietCalendarIndex).toBeGreaterThan(quietIntroductionIndex);
+    expect(quietDocketIndex).toBeGreaterThan(quietCalendarIndex);
+    expect(quietActivationMessages[quietDocketIndex]?.text).toBe(HOUSEHOLD_INITIAL_ALL_CLEAR);
     const resetIncarnation = linqIncarnationSnapshot(resetHarness.linq);
     expectFreshLinqIncarnation(firstIncarnation, resetIncarnation);
 
@@ -3134,6 +3218,7 @@ async function createHarness(
     interactiveGoogleReads: 0,
     providerRevocations: [],
     setupConversations: [],
+    initialNoAttentionReview: false,
     initialCalendarOnlyReview: false,
     initialUnrelatedAccountReview: false,
     initialUnrelatedAccountFactOnlyReview: false,
@@ -3262,6 +3347,13 @@ function createReasoner(reason: Reason, state: HarnessState): FlorenceReasoner {
         expect(opened.bytes).toEqual(PDF_BYTES);
       }
       const founder = input.adult.firstName === "Hari";
+      if (state.initialNoAttentionReview) {
+        return {
+          bubbles: [{ text: PRIVATE_INITIAL_ALL_CLEAR, delayMs: 0 }],
+          findings: [],
+          facts: [],
+        };
+      }
       if (founder && source.subject === UNRELATED_ACCOUNT_EMAIL_SUBJECT) {
         if (state.initialUnrelatedAccountFactOnlyReview) {
           return {
@@ -4280,6 +4372,100 @@ async function assertFunctionCallContinuationIsWireSafe(): Promise<void> {
     status: functionCall.status,
   });
   expect(Object.hasOwn(replayed ?? {}, "parsed_arguments")).toBe(false);
+}
+
+async function assertNormalParentTurnsCannotDisappear(): Promise<void> {
+  const silentDecision = decision();
+  const visibleDecision = decision({
+    bubbles: [{ text: "Nothing needs your attention right now.", delayMs: 0 }],
+  });
+  const applicationOwnedDecision = decision({
+    householdUpdate: {
+      text: "Pickup moved to 4:00 p.m.",
+      sourceIds: ["source-current-parent-message"],
+    },
+  });
+  const outputs = [silentDecision, silentDecision, visibleDecision, applicationOwnedDecision];
+  let parseCalls = 0;
+  const fakeClient = {
+    responses: {
+      parse: async () => {
+        const outputParsed = outputs[parseCalls];
+        parseCalls += 1;
+        if (!outputParsed) throw new Error("The silence regression exhausted its fake OpenAI output");
+        return { output: [], output_parsed: outputParsed };
+      },
+    },
+  };
+  const reasoner = new FlorenceReasoner(
+    { apiKey: "fake-openai-key", model: "fake-openai-model" },
+    fakeClient as unknown as OpenAI,
+  );
+  const normalMessage: Parameters<FlorenceReasoner["decide"]>[0] = {
+    household: {
+      householdId: "household-1",
+      name: "Anbarasu Family",
+      timeZone: "America/Los_Angeles",
+      adultNames: ["Hari", "Alex"],
+      familyProfile: "{}",
+    },
+    audience: "private",
+    currentAdultId: "adult-1",
+    currentMessage: {
+      sourceId: "source-current-parent-message",
+      senderName: "Hari",
+      moveKind: "message",
+      text: "Anything we should know about?",
+      authoredText: "Anything we should know about?",
+      voiceTranscriptPresent: false,
+      occurredAt: new Date(NOW).toISOString(),
+      images: [],
+      pdfs: [],
+      replyTo: null,
+    },
+    recentMessages: [],
+    visibleSources: [],
+    pendingFollowUps: [],
+    visibleInterests: [],
+    pendingCalendarOffers: [],
+    googleConnections: [],
+  };
+  const reads: Parameters<FlorenceReasoner["decide"]>[1] = {
+    searchGmail: async () => [],
+    searchFamilyMemory: async () => [],
+    readCalendarWindow: async () => ({ status: "complete", events: [] }),
+    readSource: async () => null,
+    readCurrentImage: async () => {
+      throw new Error("The silence regression has no image");
+    },
+    readCurrentPdf: async () => {
+      throw new Error("The silence regression has no PDF");
+    },
+  };
+  await expect(reasoner.decide(normalMessage, reads)).rejects.toMatchObject({ code: "invalid_output" });
+  await expect(
+    reasoner.decide(
+      {
+        ...normalMessage,
+        currentMessage: {
+          ...normalMessage.currentMessage,
+          moveKind: "reply",
+          text: "Yes, that one.",
+          authoredText: "Yes, that one.",
+          replyTo: {
+            sourceId: "source-prior-florence-message",
+            senderName: "Florence",
+            text: "Did you mean Tuesday?",
+            occurredAt: new Date(NOW - 1_000).toISOString(),
+          },
+        },
+      },
+      reads,
+    ),
+  ).rejects.toMatchObject({ code: "invalid_output" });
+  await expect(reasoner.decide(normalMessage, reads)).resolves.toEqual(visibleDecision);
+  await expect(reasoner.decide(normalMessage, reads)).resolves.toEqual(applicationOwnedDecision);
+  expect(parseCalls).toBe(4);
 }
 
 function withSchema(connectionString: string, schema: string): string {

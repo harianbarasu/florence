@@ -1689,7 +1689,7 @@ export class GoogleConnection {
     let pageToken: string | null = null;
     for (let page = 0; page < 25; page += 1) {
       const query = new URLSearchParams({
-        fields: "nextPageToken,items(deleted,id,role,scope(type,value))",
+        fields: "nextPageToken,items(id,role,scope(type,value))",
         maxResults: "250",
         showDeleted: "false",
       });

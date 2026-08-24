@@ -349,6 +349,8 @@ type ChildDraft = {
   id: string;
   firstName: string;
   lastName: string;
+  age: string;
+  grade: string;
   school: string;
   activities: string;
 };
@@ -357,6 +359,7 @@ type FamilySetupScreen =
   | { kind: "partner" }
   | { kind: "partner-phone" }
   | { kind: "child-name"; childId: string; returnToReview?: boolean }
+  | { kind: "child-age-grade"; childId: string; returnToReview?: boolean }
   | { kind: "child-school"; childId: string; returnToReview?: boolean }
   | { kind: "child-activities"; childId: string; returnToReview?: boolean }
   | { kind: "more-children" }
@@ -399,9 +402,25 @@ function FamilySetupPage({ view }: { view: WorkspaceView }) {
     }
     updateChild(child.id, { firstName: child.firstName.trim(), lastName: child.lastName.trim() });
     showScreen({
-      kind: "child-school",
+      kind: "child-age-grade",
       childId: child.id,
       ...(screen.kind === "child-name" && screen.returnToReview ? { returnToReview: true } : {}),
+    });
+  }
+
+  function continueFromChildAgeGrade(event: FormEvent<HTMLFormElement>, child: ChildDraft) {
+    event.preventDefault();
+    try {
+      parseChildAge(child.age);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Add a valid age or leave it blank.");
+      return;
+    }
+    updateChild(child.id, { age: child.age.trim(), grade: child.grade.trim() });
+    showScreen({
+      kind: "child-school",
+      childId: child.id,
+      ...(screen.kind === "child-age-grade" && screen.returnToReview ? { returnToReview: true } : {}),
     });
   }
 
@@ -438,32 +457,35 @@ function FamilySetupPage({ view }: { view: WorkspaceView }) {
 
   async function submit() {
     setError(null);
-    const family = {
-      postalCode: postalCode.trim(),
-      children: children.map((child) => {
-        const activities = listValues(child.activities);
-        return {
-          firstName: child.firstName.trim(),
-          ...(child.lastName.trim() ? { lastName: child.lastName.trim() } : {}),
-          ...(child.school.trim() ? { school: child.school.trim() } : {}),
-          ...(activities.length ? { activities } : {}),
-        };
-      }),
-    };
-    const input: CompleteFamilyOnboardingInput = {
-      ...family,
-      mode: "two_adult",
-      partner: {
-        firstName: partnerFirstName.trim(),
-        lastName: partnerLastName.trim(),
-        phoneNumber: partnerPhone,
-      },
-    };
-    if (input.children.some((child) => !child.firstName)) {
-      setError("Add each child’s first name.");
-      return;
-    }
     try {
+      const family = {
+        postalCode: postalCode.trim(),
+        children: children.map((child) => {
+          const age = parseChildAge(child.age);
+          const activities = listValues(child.activities);
+          return {
+            firstName: child.firstName.trim(),
+            ...(child.lastName.trim() ? { lastName: child.lastName.trim() } : {}),
+            ...(age !== undefined ? { age } : {}),
+            ...(child.grade.trim() ? { grade: child.grade.trim() } : {}),
+            ...(child.school.trim() ? { school: child.school.trim() } : {}),
+            ...(activities.length ? { activities } : {}),
+          };
+        }),
+      };
+      const input: CompleteFamilyOnboardingInput = {
+        ...family,
+        mode: "two_adult",
+        partner: {
+          firstName: partnerFirstName.trim(),
+          lastName: partnerLastName.trim(),
+          phoneNumber: partnerPhone,
+        },
+      };
+      if (input.children.some((child) => !child.firstName)) {
+        setError("Add each child’s first name.");
+        return;
+      }
       await complete.mutateAsync(input);
       window.location.replace("/?setup=complete");
     } catch (cause) {
@@ -585,6 +607,46 @@ function FamilySetupPage({ view }: { view: WorkspaceView }) {
               Never mind
             </button>
           )}
+        </form>
+      </SetupFrame>
+    );
+  }
+
+  if (screen.kind === "child-age-grade" && activeChild) {
+    return (
+      <SetupFrame>
+        <form className="setup-form" onSubmit={(event) => continueFromChildAgeGrade(event, activeChild)}>
+          <SetupHeading
+            title={`How old is ${firstName(activeChild.firstName)}?`}
+            detail="Age and grade help Florence match the right school and activity details. Both are optional."
+          />
+          <label className="field">
+            <span>Current age (optional)</span>
+            <input
+              type="number"
+              min={0}
+              max={120}
+              step={1}
+              inputMode="numeric"
+              value={activeChild.age}
+              onChange={(event) => updateChild(activeChild.id, { age: event.target.value })}
+              placeholder="Age"
+            />
+          </label>
+          <label className="field">
+            <span>Grade or year (optional)</span>
+            <input
+              value={activeChild.grade}
+              onChange={(event) => updateChild(activeChild.id, { grade: event.target.value })}
+              maxLength={80}
+              autoComplete="off"
+              placeholder="3rd grade, Kindergarten, Year 4"
+            />
+          </label>
+          {error && <SetupError>{error}</SetupError>}
+          <button className="button primary wide" type="submit">
+            {activeChild.age.trim() || activeChild.grade.trim() ? "Continue" : "Skip for now"}
+          </button>
         </form>
       </SetupFrame>
     );
@@ -726,7 +788,14 @@ function FamilySetupPage({ view }: { view: WorkspaceView }) {
               >
                 <span>{`${child.firstName} ${child.lastName}`.trim()}</span>
                 <strong>
-                  {[child.school, child.activities].filter(Boolean).join(" · ") || "No details added"}
+                  {[
+                    child.age.trim() ? `Age ${child.age.trim()}` : "",
+                    child.grade,
+                    child.school,
+                    child.activities,
+                  ]
+                    .filter(Boolean)
+                    .join(" · ") || "No details added"}
                 </strong>
               </button>
             ))}
@@ -2342,8 +2411,14 @@ function calendarEventTime(event: FamilyCalendarEvent, timeZone: string): string
 
 function memberSummary(member: FamilyMemberProfile) {
   return (
-    [member.relationship, member.school].filter(Boolean).join(" · ") ||
-    (member.kind === "adult" ? "Adult" : "Child")
+    [
+      member.relationship,
+      member.kind === "child" && member.age !== undefined ? `Age ${member.age}` : null,
+      member.kind === "child" ? member.grade : null,
+      member.school,
+    ]
+      .filter(Boolean)
+      .join(" · ") || (member.kind === "adult" ? "Adult" : "Child")
   );
 }
 
@@ -2369,7 +2444,25 @@ function initials(name: string) {
 }
 
 function newChildDraft(): ChildDraft {
-  return { id: crypto.randomUUID(), firstName: "", lastName: "", school: "", activities: "" };
+  return {
+    id: crypto.randomUUID(),
+    firstName: "",
+    lastName: "",
+    age: "",
+    grade: "",
+    school: "",
+    activities: "",
+  };
+}
+
+function parseChildAge(value: string): number | undefined {
+  const text = value.trim();
+  if (!text) return undefined;
+  const age = Number(text);
+  if (!Number.isInteger(age) || age < 0 || age > 120) {
+    throw new Error("Age must be a whole number from 0 to 120.");
+  }
+  return age;
 }
 
 function listValues(value: string): string[] {

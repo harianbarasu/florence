@@ -22,12 +22,12 @@ export function MemberEditor({ member, isSaving, onCancel, onSave }: MemberEdito
     event.preventDefault();
     setError(null);
     const data = new FormData(event.currentTarget);
-    const input = member ? memberPatch(data, member) : newChildInput(data);
-    if (input === null) {
-      onCancel();
-      return;
-    }
     try {
+      const input = member ? memberPatch(data, member) : newChildInput(data);
+      if (input === null) {
+        onCancel();
+        return;
+      }
       await onSave(memberId.current, input);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Florence could not save this person.");
@@ -67,12 +67,32 @@ export function MemberEditor({ member, isSaving, onCancel, onSave }: MemberEdito
           required={member?.kind === "adult"}
         />
         {(member?.kind ?? "child") === "child" && (
-          <Field
-            label="School or daycare"
-            name="school"
-            defaultValue={member?.school}
-            placeholder="School or daycare"
-          />
+          <>
+            <Field
+              label="Age"
+              name="age"
+              type="number"
+              min={0}
+              max={120}
+              step={1}
+              inputMode="numeric"
+              defaultValue={member?.age}
+              placeholder="Age"
+            />
+            <Field
+              label="Grade or year"
+              name="grade"
+              defaultValue={member?.grade}
+              maxLength={80}
+              placeholder="3rd grade, Kindergarten, Year 4…"
+            />
+            <Field
+              label="School or daycare"
+              name="school"
+              defaultValue={member?.school}
+              placeholder="School or daycare"
+            />
+          </>
         )}
         <Field
           label="Activities"
@@ -130,10 +150,13 @@ function optional(data: FormData, key: string): string | undefined {
 
 function newChildInput(data: FormData): FamilyMemberInput {
   const activities = list(data, "activities");
+  const age = optionalAge(data);
   return {
     kind: "child",
     firstName: required(data, "firstName"),
     lastName: optional(data, "lastName") ?? null,
+    ...(age !== undefined ? { age } : {}),
+    ...optionalString(data, "grade"),
     ...optionalString(data, "school"),
     ...(activities.length ? { activities } : {}),
   };
@@ -144,12 +167,18 @@ function memberPatch(data: FormData, member: FamilyMemberProfile): PatchFamilyMe
   const firstName = required(data, "firstName");
   const lastName = optional(data, "lastName") ?? null;
   const activities = list(data, "activities");
-  const school = optional(data, "school") ?? null;
 
   if (member.kind === "adult" && lastName === null) throw new Error("lastName is required");
   if (firstName !== member.firstName) patch.firstName = firstName;
   if (lastName !== member.lastName) patch.lastName = lastName;
-  if (member.kind === "child" && school !== (member.school ?? null)) patch.school = school;
+  if (member.kind === "child") {
+    const age = optionalAge(data) ?? null;
+    const grade = optional(data, "grade") ?? null;
+    const school = optional(data, "school") ?? null;
+    if (age !== (member.age ?? null)) patch.age = age;
+    if (grade !== (member.grade ?? null)) patch.grade = grade;
+    if (school !== (member.school ?? null)) patch.school = school;
+  }
   if (!sameList(activities, member.activities ?? [])) patch.activities = activities;
   return Object.keys(patch).length ? patch : null;
 }
@@ -157,6 +186,16 @@ function memberPatch(data: FormData, member: FamilyMemberProfile): PatchFamilyMe
 function optionalString(data: FormData, key: string): Record<string, string> {
   const value = optional(data, key);
   return value ? { [key]: value } : {};
+}
+
+function optionalAge(data: FormData): number | undefined {
+  const text = optional(data, "age");
+  if (text === undefined) return undefined;
+  const age = Number(text);
+  if (!Number.isInteger(age) || age < 0 || age > 120) {
+    throw new Error("Age must be a whole number from 0 to 120.");
+  }
+  return age;
 }
 
 function list(data: FormData, key: string): string[] {

@@ -5,6 +5,8 @@ export const timestampSchema = z.iso.datetime();
 
 const nonempty = (maximum: number) => z.string().trim().min(1).max(maximum);
 const postalCodeSchema = z.string().regex(/^\d{5}(?:-\d{4})?$/);
+const childAgeSchema = z.number().int().min(0).max(120);
+const childGradeSchema = nonempty(80);
 const familyOnboardingUsPhoneNumberSchema = z
   .string()
   .trim()
@@ -21,6 +23,8 @@ const familyMemberFields = {
   lastName: nonempty(160).nullable(),
   displayName: nonempty(160),
   relationship: nonempty(160),
+  age: childAgeSchema.optional(),
+  grade: childGradeSchema.optional(),
   school: nonempty(300).optional(),
   activities: z.array(nonempty(300)).max(50).optional(),
 };
@@ -30,6 +34,8 @@ export const familyMemberInputSchema = z
     kind: z.literal("child"),
     firstName: nonempty(160),
     lastName: nonempty(160).nullable().optional(),
+    age: childAgeSchema.optional(),
+    grade: childGradeSchema.optional(),
     school: nonempty(300).optional(),
     activities: z.array(nonempty(300)).max(50).optional(),
   })
@@ -39,6 +45,8 @@ export type FamilyMemberInput = z.infer<typeof familyMemberInputSchema>;
 const familyMemberPatchFields = {
   firstName: nonempty(160).optional(),
   lastName: nonempty(160).nullable().optional(),
+  age: childAgeSchema.nullable().optional(),
+  grade: childGradeSchema.nullable().optional(),
   school: nonempty(300).nullable().optional(),
   activities: z.array(nonempty(300)).max(50).optional(),
   postalCode: postalCodeSchema.optional(),
@@ -79,6 +87,20 @@ export const familyMemberProfileSchema = z
         code: "custom",
         path: ["lastName"],
         message: "An adult needs a last name.",
+      });
+    }
+    if (member.kind === "adult" && member.age !== undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["age"],
+        message: "Age is only recorded for children.",
+      });
+    }
+    if (member.kind === "adult" && member.grade !== undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["grade"],
+        message: "Grade is only recorded for children.",
       });
     }
     if (member.kind === "child" && member.messagesIdentity !== null) {
@@ -304,6 +326,8 @@ const familyOnboardingChildSchema = z
     lastName: nonempty(160).optional(),
   })
   .extend({
+    age: childAgeSchema.optional(),
+    grade: childGradeSchema.optional(),
     school: nonempty(300).optional(),
     activities: z.array(nonempty(300)).max(50).optional(),
   })

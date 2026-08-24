@@ -388,7 +388,8 @@ release("Florence parent journeys", () => {
       } as never),
     ).rejects.toThrow();
     await harness.completeFamilyProfile();
-    expect((await harness.florence.workspaceForAdult(harness.founderAdultId)).vault?.members).toEqual(
+    const founderAfterFamilyProfile = await harness.florence.workspaceForAdult(harness.founderAdultId);
+    expect(founderAfterFamilyProfile.vault?.members).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
           kind: "adult",
@@ -403,12 +404,45 @@ release("Florence parent journeys", () => {
           lastName: "Anbarasu",
           displayName: "Maya Anbarasu",
           relationship: "Child",
+          age: 8,
+          grade: "3rd grade",
         }),
       ]),
     );
+    const mayaId = founderAfterFamilyProfile.vault?.members.find(
+      (member) => member.kind === "child" && member.firstName === "Maya",
+    )?.id;
+    if (!mayaId) throw new Error("Family setup did not create Maya");
     await harness.drain();
 
     expect(harness.state.privateReviews.map((review) => review.adult.firstName)).toEqual(["Hari"]);
+    expect(harness.state.privateReviews[0]?.familyProfile.children).toEqual(
+      expect.arrayContaining([expect.objectContaining({ firstName: "Maya", age: 8, grade: "3rd grade" })]),
+    );
+    await expect(harness.florence.putMember(harness.founderAdultId, mayaId, { age: 121 })).rejects.toThrow();
+    let founderAfterChildEdit = await harness.florence.putMember(harness.founderAdultId, mayaId, {
+      age: 9,
+      grade: "4th grade",
+    });
+    expect(founderAfterChildEdit.vault?.members.find((member) => member.id === mayaId)).toMatchObject({
+      age: 9,
+      grade: "4th grade",
+    });
+    founderAfterChildEdit = await harness.florence.putMember(harness.founderAdultId, mayaId, {
+      age: null,
+      grade: null,
+    });
+    const mayaAfterClear = founderAfterChildEdit.vault?.members.find((member) => member.id === mayaId);
+    expect(mayaAfterClear).not.toHaveProperty("age");
+    expect(mayaAfterClear).not.toHaveProperty("grade");
+    founderAfterChildEdit = await harness.florence.putMember(harness.founderAdultId, mayaId, {
+      age: 9,
+      grade: "4th grade",
+    });
+    expect(founderAfterChildEdit.vault?.members.find((member) => member.id === mayaId)).toMatchObject({
+      age: 9,
+      grade: "4th grade",
+    });
     expect(
       harness.linq.messages.filter(
         (message) =>
@@ -3986,6 +4020,8 @@ function familyProfileInput(): Parameters<Florence["completeFamilyOnboarding"]>[
       {
         firstName: "Maya",
         lastName: "Anbarasu",
+        age: 8,
+        grade: "3rd grade",
         school: "Muir Elementary",
         activities: ["Soccer", "Piano"],
       },

@@ -220,6 +220,8 @@ export type SharedFamilyProfile = {
     childId: string;
     firstName: string;
     displayName: string;
+    age: number | null;
+    grade: string | null;
     school: string | null;
     activities: readonly string[];
   }[];
@@ -422,6 +424,8 @@ export type CompleteFamilyOnboardingInput = {
   children: readonly {
     firstName: string;
     lastName?: string;
+    age?: number;
+    grade?: string;
     school?: string;
     activities?: readonly string[];
   }[];
@@ -2595,11 +2599,16 @@ export class PostgresFlorenceStore {
       }
       const firstName = required(child.firstName, `Child ${childIndex + 1} first name`);
       const lastName = child.lastName ? required(child.lastName, `Child ${childIndex + 1} last name`) : null;
+      const age = child.age === undefined ? null : validChildAge(child.age, `Child ${childIndex + 1} age`);
+      const grade =
+        child.grade === undefined ? null : validChildGrade(child.grade, `Child ${childIndex + 1} grade`);
       return {
         id: deterministicUuid(`family-child\0${input.householdId}\0${childIndex}`),
         firstName,
         lastName,
         displayName: memberDisplayName(firstName, lastName),
+        ...(age !== null ? { age } : {}),
+        ...(grade !== null ? { grade } : {}),
         ...(child.school ? { school: required(child.school, `Child ${childIndex + 1} school`) } : {}),
         ...(child.activities
           ? {
@@ -2691,6 +2700,8 @@ export class PostgresFlorenceStore {
           relationship: "Child",
           firstName: child.firstName,
           ...(child.lastName ? { lastName: child.lastName } : {}),
+          ...(child.age !== undefined ? { age: child.age } : {}),
+          ...(child.grade !== undefined ? { grade: child.grade } : {}),
           ...(child.school ? { school: child.school } : {}),
           ...(child.activities ? { activities: child.activities } : {}),
         };
@@ -2760,6 +2771,12 @@ export class PostgresFlorenceStore {
           (existing.kind !== "adult" || existing.adult_slot !== 1)
         ) {
           throw new FlorenceStoreUnauthorized("Home ZIP belongs to the founding parent profile");
+        }
+        if (
+          existing.kind !== "child" &&
+          (Object.hasOwn(profilePatch, "age") || Object.hasOwn(profilePatch, "grade"))
+        ) {
+          throw new FlorenceStoreUnauthorized("Age and grade can only be edited for children");
         }
         const currentProfile = jsonRecord(existing.profile);
         const firstName = required(
@@ -7664,6 +7681,8 @@ async function sharedFamilyProfile(
       if (person.kind !== "child") return [];
       const profile = jsonRecord(person.profile);
       const firstName = profile.firstName;
+      const age = profile.age;
+      const grade = profile.grade;
       const school = profile.school;
       const activities = profile.activities;
       return [
@@ -7674,6 +7693,8 @@ async function sharedFamilyProfile(
               ? firstName.trim()
               : person.display_name.split(/\s+/u)[0] || person.display_name,
           displayName: person.display_name,
+          age: typeof age === "number" && Number.isInteger(age) && age >= 0 && age <= 120 ? age : null,
+          grade: typeof grade === "string" && grade.trim() && grade.trim().length <= 80 ? grade.trim() : null,
           school: typeof school === "string" && school.trim() ? school.trim() : null,
           activities: Array.isArray(activities)
             ? activities.filter(
@@ -9390,7 +9411,7 @@ function linqTruthError(truth: LinqProviderTruth): string | null {
   return typeof code === "number" ? `Linq delivery failed (${code})` : "Linq delivery failed";
 }
 
-const EDITABLE_MEMBER_PROFILE_KEYS = new Set(["school", "activities", "postalCode"]);
+const EDITABLE_MEMBER_PROFILE_KEYS = new Set(["age", "grade", "school", "activities", "postalCode"]);
 
 function defaultStoredRelationship(member: PersonRow): string {
   if (member.kind === "child") return "Child";
@@ -9456,10 +9477,33 @@ function applyEditableMemberProfilePatch(current: JsonObject, patch: JsonObject)
     if (key === "postalCode" && (typeof value !== "string" || !/^\d{5}(?:-\d{4})?$/.test(value))) {
       throw new FlorenceStoreConflict("Home ZIP must be five digits, with an optional four-digit suffix");
     }
-    if (value === null) delete next[key];
+    if (value === null) {
+      delete next[key];
+      continue;
+    }
+    if (key === "age") next[key] = validChildAge(value, "Child age");
+    else if (key === "grade") next[key] = validChildGrade(value, "Child grade");
     else next[key] = value;
   }
   return next;
+}
+
+function validChildAge(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0 || value > 120) {
+    throw new FlorenceStoreConflict(`${label} must be a whole number from zero to 120`);
+  }
+  return value;
+}
+
+function validChildGrade(value: unknown, label: string): string {
+  if (typeof value !== "string") {
+    throw new FlorenceStoreConflict(`${label} must be text`);
+  }
+  const grade = value.trim();
+  if (!grade || grade.length > 80) {
+    throw new FlorenceStoreConflict(`${label} must be between one and eighty characters`);
+  }
+  return grade;
 }
 
 function validatedPublicPreferencePatch(preferences: JsonObject): JsonObject {

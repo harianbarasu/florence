@@ -281,6 +281,8 @@ export class Florence {
       children: input.children.map((child) => ({
         firstName: child.firstName,
         ...(child.lastName ? { lastName: child.lastName } : {}),
+        ...(child.age !== undefined ? { age: child.age } : {}),
+        ...(child.grade !== undefined ? { grade: child.grade } : {}),
         ...(child.school ? { school: child.school } : {}),
         ...(child.activities ? { activities: child.activities } : {}),
       })),
@@ -3117,6 +3119,8 @@ function initialFamilyProfile(household: InitialIntelligenceWork["household"]): 
     adultFirstNames: household.adults.map((adult) => adult.firstName),
     children: household.children.map((child) => ({
       firstName: child.firstName,
+      age: child.age,
+      grade: child.grade,
       school: child.school,
       activities: [...child.activities],
     })),
@@ -3127,6 +3131,8 @@ function initialFamilyProfile(household: InitialIntelligenceWork["household"]): 
 function memberView(member: FamilyMemberRecord) {
   const firstName = profileString(member.profile, "firstName");
   const lastName = profileString(member.profile, "lastName");
+  const age = member.kind === "child" ? profileChildAge(member.profile) : null;
+  const grade = member.kind === "child" ? profileString(member.profile, "grade") : null;
   const candidate = {
     id: member.id,
     kind: member.kind,
@@ -3135,6 +3141,8 @@ function memberView(member: FamilyMemberRecord) {
     displayName: member.displayName,
     relationship: profileString(member.profile, "relationship") ?? defaultRelationship(member),
     ...(member.adultSlot === 1 ? { postalCode: profileString(member.profile, "postalCode") } : {}),
+    ...(age !== null ? { age } : {}),
+    ...(grade ? { grade } : {}),
     ...(profileString(member.profile, "school") ? { school: profileString(member.profile, "school") } : {}),
     ...(profileStrings(member.profile, "activities")
       ? { activities: profileStrings(member.profile, "activities") }
@@ -3150,6 +3158,8 @@ function memberProfile(member: FamilyMemberInput): JsonObject {
     firstName: member.firstName,
     ...(member.lastName ? { lastName: member.lastName } : {}),
     relationship: "Child",
+    ...(member.age !== undefined ? { age: member.age } : {}),
+    ...(member.grade !== undefined ? { grade: member.grade } : {}),
     ...(member.school ? { school: member.school } : {}),
     ...(member.activities ? { activities: member.activities } : {}),
   };
@@ -3157,6 +3167,8 @@ function memberProfile(member: FamilyMemberInput): JsonObject {
 
 function memberPatch(member: PatchFamilyMemberInput) {
   const profile: JsonObject = {
+    ...(member.age !== undefined ? { age: member.age } : {}),
+    ...(member.grade !== undefined ? { grade: member.grade } : {}),
     ...(member.school !== undefined ? { school: member.school } : {}),
     ...(member.activities !== undefined ? { activities: member.activities } : {}),
     ...(member.postalCode !== undefined ? { postalCode: member.postalCode } : {}),
@@ -4092,12 +4104,16 @@ function familyProfileForReasoning(member: FamilyMemberRecord): JsonObject {
         : {}),
     };
   }
+  const age = profileChildAge(member.profile);
+  const grade = profileString(member.profile, "grade");
   const school = profileString(member.profile, "school");
   const activities = profileStrings(member.profile, "activities");
   return {
     relationship,
     ...(firstName ? { firstName } : {}),
     ...(lastName ? { lastName } : {}),
+    ...(age !== null ? { age } : {}),
+    ...(grade ? { grade } : {}),
     ...(school ? { school } : {}),
     ...(activities ? { activities } : {}),
   };
@@ -4106,6 +4122,11 @@ function familyProfileForReasoning(member: FamilyMemberRecord): JsonObject {
 function profileString(profile: JsonObject, key: string): string | null {
   const value = profile[key];
   return typeof value === "string" && value.trim() ? value : null;
+}
+
+function profileChildAge(profile: JsonObject): number | null {
+  const value = profile.age;
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 120 ? value : null;
 }
 
 function profileStrings(profile: JsonObject, key: string): string[] | null {

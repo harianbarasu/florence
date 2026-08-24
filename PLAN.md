@@ -123,7 +123,9 @@ The mobile flow is one calm task per screen:
    permission;
 3. partner first and last name plus a 10-digit US mobile number, entered without
    a country code and normalized to `+1` at the API boundary;
-4. each child's first name, optional last name, school, and activities;
+4. each child's first name, optional last name, current age, grade or school
+   year, school, and activities; age and grade are parent-maintained snapshots,
+   not inferred academic-year records;
 5. home ZIP for coarse local discovery, with no street address requirement;
 6. a surname-derived family label shown as “Anbarasu Family” for one surname or
    “Anbarasu–Smith Family” for two surnames;

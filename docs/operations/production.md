@@ -107,7 +107,7 @@ On a disposable empty database, run `pnpm db:migrate` twice. Both runs must pass
 9. Wait for `/api/health`, then run `pnpm smoke:production -- https://<canonical-host>`.
 10. Before sharing the number more broadly, have the intended founding adult
     text Florence, complete the fragment-link mobile setup, connect Google, add
-    the partner and child/school/activity basics one screen at a time, and
+    the partner and child age/grade/school/activity basics one screen at a time, and
     return to the exact private thread. No identity is configured ahead of that
     message, no household name is requested, and the first valid redemption for
     that Messages identity creates its household. Rehearse Florence asking once

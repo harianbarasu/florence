@@ -3171,9 +3171,6 @@ function validateDecision(
     researchUrls.length > 0
       ? validateVerifiedWebUrls(researchUrls, webSearchOutput, "Message-link research")
       : undefined;
-  if (decision.conversation.replyToCurrentMessage && decision.conversation.bubbles.length === 0) {
-    throw invalidOutput("OpenAI requested an inline reply without a message");
-  }
   if (!decision.policy.retain && decision.facts.some((fact) => fact.operation !== "forget")) {
     throw invalidOutput("OpenAI retained family memory after declining retention authority");
   }
@@ -3321,7 +3318,16 @@ function validateDecision(
       }
     }
   }
-  return verifiedResearchUrls ? { ...decision, researchUrls: verifiedResearchUrls } : decision;
+  const normalizedDecision =
+    decision.conversation.bubbles.length === 0 && decision.conversation.replyToCurrentMessage
+      ? {
+          ...decision,
+          conversation: { ...decision.conversation, replyToCurrentMessage: false },
+        }
+      : decision;
+  return verifiedResearchUrls
+    ? { ...normalizedDecision, researchUrls: verifiedResearchUrls }
+    : normalizedDecision;
 }
 
 function sameCalendarInterval(

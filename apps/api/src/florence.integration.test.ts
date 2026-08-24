@@ -4385,7 +4385,20 @@ async function assertNormalParentTurnsCannotDisappear(): Promise<void> {
       sourceIds: ["source-current-parent-message"],
     },
   });
-  const outputs = [silentDecision, silentDecision, visibleDecision, applicationOwnedDecision];
+  const reactionDecision = decision();
+  reactionDecision.conversation.reaction = "love";
+  reactionDecision.conversation.replyToCurrentMessage = true;
+  const normalizedReactionDecision = {
+    ...reactionDecision,
+    conversation: { ...reactionDecision.conversation, replyToCurrentMessage: false },
+  };
+  const outputs = [
+    silentDecision,
+    silentDecision,
+    visibleDecision,
+    applicationOwnedDecision,
+    reactionDecision,
+  ];
   let parseCalls = 0;
   const fakeClient = {
     responses: {
@@ -4468,7 +4481,8 @@ async function assertNormalParentTurnsCannotDisappear(): Promise<void> {
   ).rejects.toMatchObject({ code: "invalid_output" });
   await expect(reasoner.decide(normalMessage, reads)).resolves.toEqual(visibleDecision);
   await expect(reasoner.decide(normalMessage, reads)).resolves.toEqual(applicationOwnedDecision);
-  expect(parseCalls).toBe(4);
+  await expect(reasoner.decide(normalMessage, reads)).resolves.toEqual(normalizedReactionDecision);
+  expect(parseCalls).toBe(5);
 }
 
 function withSchema(connectionString: string, schema: string): string {

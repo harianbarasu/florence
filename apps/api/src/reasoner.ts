@@ -70,7 +70,7 @@ const voiceNoteInputSchema = z
     bytes: z.custom<Uint8Array<ArrayBufferLike>>((value) => value instanceof Uint8Array),
   })
   .strict();
-const verifiedResearchUrlsSchema = z.array(z.string().url().max(2_000)).min(1).max(3);
+const verifiedResearchUrlsSchema = z.array(z.string().trim().min(1).max(2_000)).min(1).max(3);
 const currentImageSchema = z
   .object({
     assetId: opaqueId,
@@ -981,7 +981,7 @@ export const florenceInterestResearchDecisionSchema = z
   .object({
     judgment: z.enum(["recommend", "consider", "skip"]),
     summary: shortText,
-    urls: z.array(z.string().url().max(2_000)).min(1).max(3),
+    urls: z.array(z.string().trim().min(1).max(2_000)).min(1).max(3),
   })
   .strict();
 

@@ -4392,6 +4392,7 @@ async function assertNormalParentTurnsCannotDisappear(): Promise<void> {
       parse: async (params: { text?: { format?: unknown } }) => {
         expect(JSON.stringify(params.text?.format)).not.toContain("\\\\p{L}");
         expect(JSON.stringify(params.text?.format)).not.toContain("\\\\p{N}");
+        expect(JSON.stringify(params.text?.format)).not.toContain('"format":"uri"');
         const outputParsed = outputs[parseCalls];
         parseCalls += 1;
         if (!outputParsed) throw new Error("The silence regression exhausted its fake OpenAI output");

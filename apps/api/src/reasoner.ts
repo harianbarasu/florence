@@ -43,12 +43,8 @@ const calendarInstant = z
   )
   .refine((value) => Number.isFinite(Date.parse(value)), "Invalid Calendar time");
 const sourceIds = z.array(opaqueId).min(1);
-const genericInterestTermSchema = z
-  .string()
-  .trim()
-  .min(1)
-  .max(100)
-  .regex(/^[\p{L}\p{N}][\p{L}\p{N} &'’()+,./-]*$/u, "Interest terms must be generic search phrases");
+const genericInterestTermSchema = z.string().trim().min(1).max(100);
+const genericInterestTermPattern = /^[\p{L}\p{N}][\p{L}\p{N} &'’()+,./-]*$/u;
 const voiceNoteMimeTypeSchema = z.enum([
   "audio/flac",
   "audio/x-flac",
@@ -3078,6 +3074,7 @@ function validateGenericInterestTerms(terms: readonly string[], input: FlorenceR
   const privateNameTokens = familyNameTokens(input);
   for (const term of terms) {
     if (
+      !genericInterestTermPattern.test(term) ||
       term.trim().split(/\s+/u).length > 6 ||
       /(?:https?:\/\/|www\.|[\p{L}\p{N}._%+-]+@[\p{L}\p{N}.-]+\.[\p{L}]{2,})/iu.test(term) ||
       /\b[\p{L}\p{N}-]+\.[\p{L}]{2,24}(?:\/|\b)/iu.test(term) ||

@@ -602,6 +602,7 @@ export class Florence {
       const fallback = {
         stopMessaging: false,
         declineInvitation: false,
+        requestsFreshLink: false,
         bubbles: [
           {
             text: "Hey—I’m Florence. I help parents keep school, schedules, and family loose ends from becoming another job. Here’s your private setup link.",
@@ -624,7 +625,12 @@ export class Florence {
         }
       }
       if (conversation.stopMessaging || conversation.declineInvitation) return true;
-      bubbles = [...conversation.bubbles, { text: setupUrl, delayMs: 0 }];
+      bubbles = [
+        ...(conversation.requestsFreshLink
+          ? [{ text: "Of course—here’s your private setup link.", delayMs: 0 }]
+          : conversation.bubbles),
+        { text: setupUrl, delayMs: 0 },
+      ];
       idempotencyPrefix = "founder-setup";
     }
 
@@ -1046,7 +1052,9 @@ export class Florence {
             })),
             nextStep: googleActive ? "finish_family_profile" : "connect_google",
           });
-          bubbles = [...setup.bubbles];
+          bubbles = setup.requestsFreshLink
+            ? [{ text: "Of course—here’s a fresh link to finish setup.", delayMs: 0 }]
+            : [...setup.bubbles];
           stopMessaging = setup.stopMessaging;
         } catch {
           bubbles = [{ text: fallbackText, delayMs: 0 }];
@@ -1806,6 +1814,7 @@ export class Florence {
       });
       const attachmentIndex = new Map<string, GmailAttachmentReference>();
       const googleEvidence = new Map<string, GoogleEvidenceDraft>();
+      const calendarSources: FlorencePrivateCalendarEvent[] = [];
       let calendarCursor: string | null = null;
       const decision = await this.#reasoner.reviewPrivateGoogle(
         {
@@ -1905,7 +1914,9 @@ export class Florence {
                   ...interval,
                 });
                 googleEvidence.set(source.id, source);
-                return privateCalendarEvidence(source, event, "adult_private");
+                const calendarSource = privateCalendarEvidence(source, event, "adult_private");
+                calendarSources.push(calendarSource);
+                return calendarSource;
               }),
             };
           },
@@ -1935,11 +1946,17 @@ export class Florence {
       if (!calendarCursor) {
         throw new Error("The private Google review did not establish Calendar coverage");
       }
+      const bubbles = privateInitialReviewBubbles({
+        fallback: decision.bubbles,
+        findings: decision.findings,
+        calendarSources,
+        timeZone: work.household.timeZone,
+      });
       await this.#store.completePrivateInitialReview({
         workId: work.workId,
         gmailCursor: JSON.stringify(gmailCursor),
         calendarCursor,
-        bubbles: decision.bubbles,
+        bubbles,
         findings: decision.findings.map((finding) => ({
           sourceIds: finding.sourceIds,
           householdCandidate: finding.candidate,
@@ -2427,7 +2444,15 @@ export class Florence {
         )
         .map(
           (finding): ProactiveDelivery => ({
-            privateDetail: work.visibility === "private" ? finding.privateDetail : null,
+            privateDetail:
+              work.visibility === "private"
+                ? privateGoogleFindingDetail({
+                    fallback: finding.privateDetail,
+                    sourceIds: finding.sourceIds,
+                    calendarSources,
+                    timeZone: work.household.timeZone,
+                  })
+                : null,
             householdConclusion: finding.householdConclusion?.summary ?? null,
             householdCategory: finding.householdConclusion?.category ?? null,
             sourceIds: finding.sourceIds,
@@ -2484,8 +2509,12 @@ export class Florence {
       );
       if (!founder) throw new Error("The partner invitation founder is no longer in the household");
       const founderFirstName = profileString(founder.profile, "firstName") ?? founder.displayName;
-      const created = await this.#linq.createChat({
+      const createChatIdempotencyKey = await this.#store.scopeHouseholdLinqIdempotencyKey({
+        householdId: invitation.householdId,
         idempotencyKey: `partner-invite-chat:${invitation.householdId}:${invitation.partnerAdultId}:${invitation.approvalSourceId}`,
+      });
+      const created = await this.#linq.createChat({
+        idempotencyKey: createChatIdempotencyKey,
         senderPhoneNumber: this.#linqSenderPhoneNumber,
         participantPhoneNumbers: [invitation.partnerPhoneNumber],
         initialText: `Hi ${invitation.partnerFirstName} — I’m Florence. ${founderFirstName} asked me to help the two of you stay ahead of school, schedules, and family loose ends. I’ll send your private setup link next.`,
@@ -2516,8 +2545,12 @@ export class Florence {
         adultId: invitation.partnerAdultId,
         occurredAt: invitation.approvedAt,
       });
-      const result = await this.#linq.sendMessage({
+      const setupLinkIdempotencyKey = await this.#store.scopeHouseholdLinqIdempotencyKey({
+        householdId: invitation.householdId,
         idempotencyKey: `partner-invite-link:${invitation.householdId}:${invitation.partnerAdultId}:${invitation.approvalSourceId}`,
+      });
+      const result = await this.#linq.sendMessage({
+        idempotencyKey: setupLinkIdempotencyKey,
         providerConversationId: created.providerConversationId,
         expectedAuthority: created.authority,
         text: `Set up your side here:\n${this.#setupOrigin}/#s=${encodeURIComponent(setup.token)}`,
@@ -2701,8 +2734,12 @@ export class Florence {
       return;
     }
     const calendarLabel = household.familyCalendarLabel ?? household.name;
-    const result = await this.#linq.sendMessage({
+    const calendarReadyIdempotencyKey = await this.#store.scopeHouseholdLinqIdempotencyKey({
+      householdId: household.id,
       idempotencyKey: `family-calendar-ready:${household.id}:${group.id}`,
+    });
+    const result = await this.#linq.sendMessage({
+      idempotencyKey: calendarReadyIdempotencyKey,
       providerConversationId: group.providerConversationId,
       expectedAuthority: {
         audience: "group",
@@ -3588,6 +3625,74 @@ function privateCalendarEvidence(
     startDate: null,
     endDate: null,
   };
+}
+
+function privateGoogleFindingDetail(input: {
+  fallback: string;
+  sourceIds: readonly string[];
+  calendarSources: readonly FlorencePrivateCalendarEvent[];
+  timeZone: string;
+}): string {
+  if (input.sourceIds.length !== 1) return input.fallback;
+  const event = input.calendarSources.find((candidate) => candidate.sourceId === input.sourceIds[0]);
+  if (!event) return input.fallback;
+
+  const title = event.title?.trim() ? `“${event.title.trim()}”` : "A private calendar commitment";
+  const interval = privateCalendarIntervalText(event, input.timeZone);
+  if (!interval) return input.fallback;
+  if (event.status === "cancelled") return `${title} was canceled for ${interval}.`;
+  if (!event.busy) return `${title} no longer blocks your calendar on ${interval}.`;
+  if (event.status === "tentative") return `${title} is tentatively on your calendar ${interval}.`;
+  return `${title} is on your calendar ${interval}.`;
+}
+
+function privateInitialReviewBubbles(input: {
+  fallback: readonly { text: string; delayMs: number }[];
+  findings: readonly { privateSummary: string; sourceIds: readonly string[] }[];
+  calendarSources: readonly FlorencePrivateCalendarEvent[];
+  timeZone: string;
+}): readonly { text: string; delayMs: number }[] {
+  if (
+    input.findings.length === 0 ||
+    input.findings.some(
+      (finding) =>
+        finding.sourceIds.length !== 1 ||
+        !input.calendarSources.some((source) => source.sourceId === finding.sourceIds[0]),
+    )
+  ) {
+    return input.fallback;
+  }
+  return input.findings.map((finding, index) => ({
+    text: privateGoogleFindingDetail({
+      fallback: finding.privateSummary,
+      sourceIds: finding.sourceIds,
+      calendarSources: input.calendarSources,
+      timeZone: input.timeZone,
+    }),
+    delayMs: input.fallback[index]?.delayMs ?? 0,
+  }));
+}
+
+function privateCalendarIntervalText(event: FlorencePrivateCalendarEvent, timeZone: string): string | null {
+  if (event.intervalKind === "all_day" && event.startDate && event.endDate) {
+    return formatAllDayCalendarInterval(event.startDate, event.endDate);
+  }
+  if (!event.startsAt || !event.endsAt) return null;
+  const startsAt = new Date(event.startsAt);
+  const endsAt = new Date(event.endsAt);
+  const date = new Intl.DateTimeFormat("en-US", {
+    weekday: "long",
+    month: "short",
+    day: "numeric",
+    timeZone,
+  }).format(startsAt);
+  const time = new Intl.DateTimeFormat("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+    timeZone,
+    timeZoneName: "short",
+  }).formatRange(startsAt, endsAt);
+  return `${date}, ${time}`;
 }
 
 function calendarWindowBounds(

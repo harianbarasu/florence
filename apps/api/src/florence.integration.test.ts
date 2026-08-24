@@ -91,6 +91,14 @@ const GOOGLE_MEMORY_REPLY_QUESTION = "What school did you already have saved for
 const GOOGLE_MEMORY_REPLY = "I have Maya at Muir Academy.";
 const WEB_CALENDAR_ACCESS_REQUEST = "Can you send me a fresh link to my Florence calendar?";
 const WEB_ACCESS_FOLLOW_UP = "Thanks — is that private to me?";
+const INCOMPLETE_SETUP_FRESH_LINK_REQUEST = "Can you send me a new link?";
+const INCOMPLETE_SETUP_FALSE_DENIAL =
+  "I can’t resend a setup link from here. If you’re already on the setup page, keep going there.";
+const INCOMPLETE_SETUP_FRESH_LINK_ACKNOWLEDGEMENT = "Of course—here’s a fresh link to finish setup.";
+const STALE_RECEIPT_QUESTION = "Can you confirm this delivery is current?";
+const STALE_RECEIPT_REPLY = "This reply must have a current provider receipt.";
+const PRIVATE_CALENDAR_ONLY_TITLE = "Maya’s soccer clinic";
+const PRIVATE_CALENDAR_GENERIC_TODAY_REPLY = "I confirmed a private calendar commitment today.";
 const OVERLAP_GMAIL_SUBJECT = "School bus route reminder";
 const OVERLAP_GMAIL_FACT_SLOT = "child:maya:school_bus";
 const PARTNER_PRIVATE_GOOGLE_FACT_SLOT = "child:maya:partner_school_handoff";
@@ -120,6 +128,28 @@ const GOOGLE_DELETION_FAMILY_DATE = {
   startDate: "2026-08-24",
   endDate: "2026-08-25",
   location: "Muir Elementary",
+};
+const PRIVATE_CALENDAR_ONLY_EVENT = {
+  providerEventId: "private-calendar-only-soccer-clinic",
+  providerRevision: "private-calendar-only-revision-1",
+  providerUpdatedAt: "2026-08-23T18:00:00.000Z",
+  status: "confirmed" as const,
+  busy: true,
+  title: PRIVATE_CALENDAR_ONLY_TITLE,
+  intervalKind: "timed" as const,
+  startsAt: "2026-08-24T14:30:00.000Z",
+  endsAt: "2026-08-24T16:00:00.000Z",
+  allDay: false,
+  timeZone: "America/Los_Angeles",
+  location: "Muir Elementary",
+};
+const PRIVATE_INITIAL_CALENDAR_ONLY_EVENT = {
+  ...PRIVATE_CALENDAR_ONLY_EVENT,
+  providerEventId: "private-initial-calendar-only-soccer-clinic",
+  providerRevision: "private-initial-calendar-only-revision-1",
+  providerUpdatedAt: "2026-08-16T18:00:00.000Z",
+  startsAt: "2026-08-17T14:30:00.000Z",
+  endsAt: "2026-08-17T16:00:00.000Z",
 };
 const PICKUP_EVENT = {
   intervalKind: "timed" as const,
@@ -229,6 +259,10 @@ type HarnessState = {
   googleChangeReads: { ownerAdultId: string; kind: "gmail" | "calendar" }[];
   interactiveGoogleReads: number;
   providerRevocations: ("confirmed" | "unconfirmed" | "not-needed")[];
+  setupConversations: Parameters<FlorenceReasoner["converseDuringSetup"]>[0][];
+  initialCalendarOnlyReview: boolean;
+  calendarOnlyChangePending: boolean;
+  calendarOnlyChangeDelivered: boolean;
 };
 
 const release = TEST_DATABASE_URL ? describe : describe.skip;
@@ -283,6 +317,24 @@ release("Florence parent journeys", () => {
       lastName: "De la Cruz",
     });
     await harness.activateFounderGoogle();
+    const setupMessagesBeforeFreshLinkRequest = harness.linq.messages.length;
+    const setupLinksBeforeFreshLinkRequest = harness.accessLinksFor(PRIVATE_FOUNDER).length;
+    const priorSetupAccessUrl = harness.accessLinkFor(PRIVATE_FOUNDER).toString();
+    await harness.accept("private", "fresh-incomplete-setup-link", INCOMPLETE_SETUP_FRESH_LINK_REQUEST);
+    await harness.drain();
+    const freshSetupMessages = harness.linq.messages.slice(setupMessagesBeforeFreshLinkRequest);
+    expect(harness.state.setupConversations.at(-1)).toMatchObject({
+      stage: "family_profile",
+      currentMessage: { text: INCOMPLETE_SETUP_FRESH_LINK_REQUEST },
+      nextStep: "finish_family_profile",
+    });
+    expect(freshSetupMessages.map((message) => message.text)).toContain(
+      INCOMPLETE_SETUP_FRESH_LINK_ACKNOWLEDGEMENT,
+    );
+    expect(freshSetupMessages.some((message) => message.text === INCOMPLETE_SETUP_FALSE_DENIAL)).toBe(false);
+    expect(harness.accessLinksFor(PRIVATE_FOUNDER)).toHaveLength(setupLinksBeforeFreshLinkRequest + 1);
+    expect(harness.accessLinkFor(PRIVATE_FOUNDER)).toMatchObject({ pathname: "/" });
+    expect(harness.accessLinkFor(PRIVATE_FOUNDER).toString()).not.toBe(priorSetupAccessUrl);
     await expect(
       harness.florence.completeFamilyOnboarding(harness.founderAdultId, {
         ...familyProfileInput(),
@@ -486,6 +538,14 @@ release("Florence parent journeys", () => {
     });
 
     await harness.drain();
+    const calendarReadyAttempts = harness.linq.sendMessageAttempts.filter((message) =>
+      message.idempotencyKey.startsWith("family-calendar-ready:"),
+    );
+    expect(calendarReadyAttempts).toHaveLength(2);
+    expect(new Set(calendarReadyAttempts.map((message) => message.idempotencyKey)).size).toBe(1);
+    expect(
+      harness.linq.messages.filter((message) => message.idempotencyKey.startsWith("family-calendar-ready:")),
+    ).toHaveLength(1);
 
     const groups = harness.linq.createdChats.filter((chat) => chat.result.authority.audience === "group");
     expect(groups).toHaveLength(1);
@@ -632,6 +692,31 @@ release("Florence parent journeys", () => {
       provisionings: harness.state.provisionings.length,
       briefings: harness.state.briefings.length,
     }).toEqual(visibleCounts);
+
+    const firstIncarnation = linqIncarnationSnapshot(harness.linq);
+    const resetHarness = await createHarness(
+      async (input) =>
+        input.currentMessage.text === STALE_RECEIPT_QUESTION
+          ? decision({ bubbles: [{ text: STALE_RECEIPT_REPLY, delayMs: 0 }] })
+          : decision(),
+      { now: NOW + 10 * 60_000, linqLedger: harness.linq.ledger },
+    );
+    await resetHarness.readyHousehold();
+    const resetIncarnation = linqIncarnationSnapshot(resetHarness.linq);
+    expectFreshLinqIncarnation(firstIncarnation, resetIncarnation);
+
+    resetHarness.linq.staleReceiptForNextMessage = true;
+    await resetHarness.accept("private", "stale-provider-receipt", STALE_RECEIPT_QUESTION);
+    await resetHarness.drain();
+    expect(resetHarness.linq.messages.some((message) => message.text === STALE_RECEIPT_REPLY)).toBe(false);
+    await resetHarness.assertDatabase(
+      "A stale provider receipt was allowed to mark the current outbound message sent",
+      `exists (
+        select 1 from messages
+        where direction='outbound' and text=${sqlLiteral(STALE_RECEIPT_REPLY)}
+          and status='failed' and provider_message_id is null and sent_at is null
+      )`,
+    );
   }, 20_000);
 
   test("gets ahead from both parents’ context, native inputs, a monitor, and the read-only calendar", async () => {
@@ -1492,6 +1577,46 @@ release("Florence parent journeys", () => {
           and connection.status='active'
       )`,
     );
+
+    const calendarOnlyHarness = await createHarness();
+    calendarOnlyHarness.state.initialCalendarOnlyReview = true;
+    await calendarOnlyHarness.readyHousehold();
+    const initialCalendarOnlyBubble = calendarOnlyHarness.linq.messages.find(
+      (message) =>
+        message.providerConversationId === PRIVATE_FOUNDER &&
+        message.text.includes(PRIVATE_CALENDAR_ONLY_TITLE),
+    )?.text;
+    expect(initialCalendarOnlyBubble).toContain(PRIVATE_CALENDAR_ONLY_TITLE);
+    expect(initialCalendarOnlyBubble).toContain("Monday, Aug 17");
+    expect(initialCalendarOnlyBubble).toContain("7:30");
+    expect(initialCalendarOnlyBubble).toContain("9:00");
+    expect(initialCalendarOnlyBubble).toContain("PDT");
+    expect(initialCalendarOnlyBubble).not.toMatch(/today|confirmed private calendar commitment/i);
+    calendarOnlyHarness.state.now = Date.parse("2026-08-23T18:00:00.000Z");
+    calendarOnlyHarness.state.calendarOnlyChangePending = true;
+    const calendarOnlyMessagesBeforePoll = calendarOnlyHarness.linq.messages.length;
+    await calendarOnlyHarness.drain();
+    expect(calendarOnlyHarness.state.calendarOnlyChangeDelivered).toBe(true);
+    const calendarOnlyAssessment = calendarOnlyHarness.state.googleAssessments.find((assessment) =>
+      assessment.evidence.calendar.events.some((event) => event.title === PRIVATE_CALENDAR_ONLY_TITLE),
+    );
+    expect(calendarOnlyAssessment?.evidence.gmail.sources).toEqual([]);
+    expect(calendarOnlyAssessment?.evidence.calendar.events).toEqual([
+      expect.objectContaining({
+        title: PRIVATE_CALENDAR_ONLY_TITLE,
+        startsAt: PRIVATE_CALENDAR_ONLY_EVENT.startsAt,
+        endsAt: PRIVATE_CALENDAR_ONLY_EVENT.endsAt,
+      }),
+    ]);
+    const calendarOnlyBubble = calendarOnlyHarness.linq.messages
+      .slice(calendarOnlyMessagesBeforePoll)
+      .find((message) => message.providerConversationId === PRIVATE_FOUNDER)?.text;
+    expect(calendarOnlyBubble).toContain(PRIVATE_CALENDAR_ONLY_TITLE);
+    expect(calendarOnlyBubble).toContain("Monday, Aug 24");
+    expect(calendarOnlyBubble).toContain("7:30");
+    expect(calendarOnlyBubble).toContain("9:00");
+    expect(calendarOnlyBubble).toContain("PDT");
+    expect(calendarOnlyBubble).not.toMatch(/today|confirmed private calendar commitment/i);
   }, 20_000);
 
   test("keeps private context isolated while both parents can manage shared memory, Calendar, and group repair", async () => {
@@ -2143,10 +2268,28 @@ class Harness {
   }
 }
 
+type FakeLinqLedger = {
+  created: Map<string, LinqCreatedChat>;
+  sent: Map<string, Awaited<ReturnType<LinqClient["sendMessage"]>>>;
+  nextCreatedChatReceipt: number;
+  nextMessageReceipt: number;
+};
+
+function createFakeLinqLedger(): FakeLinqLedger {
+  return {
+    created: new Map(),
+    sent: new Map(),
+    nextCreatedChatReceipt: 0,
+    nextMessageReceipt: 0,
+  };
+}
+
 class FakeLinq {
   readonly authorities = new Map<string, LinqConversationAuthority>();
   readonly createdChats: { input: LinqCreateChat; result: LinqCreatedChat }[] = [];
+  readonly createChatAttempts: LinqCreateChat[] = [];
   readonly messages: LinqSendMessage[] = [];
+  readonly sendMessageAttempts: LinqSendMessage[] = [];
   readonly reactions: LinqSendReaction[] = [];
   readonly media = new Map<string, { reference: LinqMediaReference; bytes: Uint8Array }>();
   partnerSetupLinkState: "accepted" | "sent" = "sent";
@@ -2154,14 +2297,20 @@ class FakeLinq {
   partnerChatFailuresRemaining = 0;
   familyCalendarReadyFailuresRemaining = 0;
   googleDeletionDeliveryFailuresRemaining = 0;
-  readonly #created = new Map<string, LinqCreatedChat>();
-  readonly #sent = new Map<string, Awaited<ReturnType<LinqClient["sendMessage"]>>>();
+  staleReceiptForNextMessage = false;
 
-  constructor(readonly state: HarnessState) {}
+  constructor(
+    readonly state: HarnessState,
+    readonly ledger: FakeLinqLedger = createFakeLinqLedger(),
+  ) {}
 
   async createChat(input: LinqCreateChat): Promise<LinqCreatedChat> {
-    const prior = this.#created.get(input.idempotencyKey);
-    if (prior) return prior;
+    this.createChatAttempts.push(input);
+    const prior = this.ledger.created.get(input.idempotencyKey);
+    if (prior) {
+      this.authorities.set(prior.providerConversationId, prior.authority);
+      return prior;
+    }
     const privateChat = input.participantPhoneNumbers.length === 1;
     if (privateChat && this.partnerChatFailuresRemaining > 0) {
       this.partnerChatFailuresRemaining -= 1;
@@ -2171,7 +2320,9 @@ class FakeLinq {
         false,
       );
     }
-    const groupCount = this.createdChats.filter((chat) => chat.result.authority.audience === "group").length;
+    const groupCount = [...this.ledger.created.values()].filter(
+      (chat) => chat.authority.audience === "group",
+    ).length;
     const providerConversationId = privateChat
       ? PRIVATE_PARTNER
       : groupCount === 0
@@ -2190,12 +2341,13 @@ class FakeLinq {
       participantIdentityDigests,
       participants,
     };
+    this.ledger.nextCreatedChatReceipt += 1;
     const result: LinqCreatedChat = {
       providerConversationId,
       authority,
       initialMessage: {
         idempotencyKey: input.idempotencyKey,
-        providerMessageId: `created-chat-message-${this.createdChats.length + 1}`,
+        providerMessageId: `created-chat-message-${this.ledger.nextCreatedChatReceipt}`,
         occurredAt: new Date(this.state.now).toISOString(),
       },
     };
@@ -2208,7 +2360,7 @@ class FakeLinq {
       text: input.initialText,
     });
     this.state.timeline.push(`message:${input.initialText}`);
-    this.#created.set(input.idempotencyKey, result);
+    this.ledger.created.set(input.idempotencyKey, result);
     return result;
   }
 
@@ -2247,9 +2399,10 @@ class FakeLinq {
   }
 
   async sendMessage(input: LinqSendMessage) {
+    this.sendMessageAttempts.push(input);
     const partnerSetupLink = input.text.includes("#s=");
     if (partnerSetupLink) this.partnerSetupLinkAttempts += 1;
-    const prior = this.#sent.get(input.idempotencyKey);
+    const prior = this.ledger.sent.get(input.idempotencyKey);
     if (prior) {
       if (
         partnerSetupLink &&
@@ -2262,24 +2415,28 @@ class FakeLinq {
           providerState: "sent" as const,
           occurredAt: new Date(this.state.now).toISOString(),
         };
-        this.#sent.set(input.idempotencyKey, sent);
+        this.ledger.sent.set(input.idempotencyKey, sent);
         return sent;
       }
       return prior;
     }
-    expect(await this.observeChat(input.providerConversationId)).toMatchObject(input.expectedAuthority);
-    if (
-      input.idempotencyKey.startsWith("family-calendar-ready:") &&
-      this.familyCalendarReadyFailuresRemaining > 0
-    ) {
-      this.familyCalendarReadyFailuresRemaining -= 1;
+    if (this.staleReceiptForNextMessage) {
+      this.staleReceiptForNextMessage = false;
       return {
-        status: "unknown" as const,
+        status: "committed" as const,
+        providerState: "accepted" as const,
         idempotencyKey: input.idempotencyKey,
-        providerReceiptId: null,
-        detail: "The Family Calendar announcement outcome is temporarily unknown",
-        occurredAt: new Date(this.state.now).toISOString(),
+        providerReceiptId: "stale-provider-receipt",
+        detail: null,
+        occurredAt: new Date(this.state.now - 10 * 60_000).toISOString(),
       };
+    }
+    expect(await this.observeChat(input.providerConversationId)).toMatchObject(input.expectedAuthority);
+    const familyCalendarReadyOutcomeUnknown =
+      input.idempotencyKey.startsWith("family-calendar-ready:") &&
+      this.familyCalendarReadyFailuresRemaining > 0;
+    if (familyCalendarReadyOutcomeUnknown) {
+      this.familyCalendarReadyFailuresRemaining -= 1;
     }
     if (
       this.googleDeletionDeliveryFailuresRemaining > 0 &&
@@ -2290,15 +2447,25 @@ class FakeLinq {
     }
     this.messages.push(input);
     this.state.timeline.push(`message:${input.text}`);
+    this.ledger.nextMessageReceipt += 1;
     const result: Awaited<ReturnType<LinqClient["sendMessage"]>> = {
       status: "committed" as const,
       providerState: partnerSetupLink && this.partnerSetupLinkState === "sent" ? "sent" : "accepted",
       idempotencyKey: input.idempotencyKey,
-      providerReceiptId: `sent-${this.messages.length}`,
+      providerReceiptId: `sent-${this.ledger.nextMessageReceipt}`,
       detail: null,
       occurredAt: new Date(this.state.now).toISOString(),
     };
-    this.#sent.set(input.idempotencyKey, result);
+    this.ledger.sent.set(input.idempotencyKey, result);
+    if (familyCalendarReadyOutcomeUnknown) {
+      return {
+        status: "unknown" as const,
+        idempotencyKey: input.idempotencyKey,
+        providerReceiptId: null,
+        detail: "The Family Calendar announcement outcome is temporarily unknown",
+        occurredAt: result.occurredAt,
+      };
+    }
     return result;
   }
 
@@ -2315,7 +2482,70 @@ class FakeLinq {
   }
 }
 
-async function createHarness(reason: Reason = async () => decision()): Promise<Harness> {
+type ExternalDelivery = { key: string; receipt: string };
+type LinqIncarnationSnapshot = {
+  founderHandoff: ExternalDelivery[];
+  initialPrivateReview: ExternalDelivery[];
+  familyGroupCreate: ExternalDelivery[];
+  familyCalendarReady: ExternalDelivery[];
+  initialHouseholdBriefing: ExternalDelivery[];
+};
+
+function linqIncarnationSnapshot(linq: FakeLinq): LinqIncarnationSnapshot {
+  const sent = (prefix: string): ExternalDelivery[] =>
+    linq.messages
+      .filter((message) => message.idempotencyKey.startsWith(prefix))
+      .map((message) => {
+        const receipt = linq.ledger.sent.get(message.idempotencyKey);
+        if (receipt?.status !== "committed") {
+          throw new Error(`A committed FakeLinq receipt is missing for ${message.idempotencyKey}`);
+        }
+        return { key: message.idempotencyKey, receipt: receipt.providerReceiptId };
+      });
+  return {
+    founderHandoff: sent("founder-handoff:"),
+    initialPrivateReview: sent("initial-private-review:"),
+    familyGroupCreate: linq.createdChats
+      .filter((chat) => chat.input.idempotencyKey.startsWith("family-group:"))
+      .map((chat) => ({
+        key: chat.input.idempotencyKey,
+        receipt: chat.result.initialMessage.providerMessageId,
+      })),
+    familyCalendarReady: sent("family-calendar-ready:"),
+    initialHouseholdBriefing: sent("initial-household-briefing:"),
+  };
+}
+
+function expectFreshLinqIncarnation(
+  earlier: LinqIncarnationSnapshot,
+  current: LinqIncarnationSnapshot,
+): void {
+  const expectedCounts = {
+    founderHandoff: 2,
+    initialPrivateReview: 2,
+    familyGroupCreate: 1,
+    familyCalendarReady: 1,
+    initialHouseholdBriefing: 1,
+  } as const;
+  for (const category of Object.keys(expectedCounts) as (keyof LinqIncarnationSnapshot)[]) {
+    const earlierDeliveries = earlier[category];
+    const currentDeliveries = current[category];
+    expect(earlierDeliveries).toHaveLength(expectedCounts[category]);
+    expect(currentDeliveries).toHaveLength(expectedCounts[category]);
+    for (const delivery of [...earlierDeliveries, ...currentDeliveries]) {
+      expect(delivery.key).toMatch(/:h:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    }
+    const earlierKeys = new Set(earlierDeliveries.map((delivery) => delivery.key));
+    const earlierReceipts = new Set(earlierDeliveries.map((delivery) => delivery.receipt));
+    expect(currentDeliveries.every((delivery) => !earlierKeys.has(delivery.key))).toBe(true);
+    expect(currentDeliveries.every((delivery) => !earlierReceipts.has(delivery.receipt))).toBe(true);
+  }
+}
+
+async function createHarness(
+  reason: Reason = async () => decision(),
+  options: { now?: number; linqLedger?: FakeLinqLedger } = {},
+): Promise<Harness> {
   if (!TEST_DATABASE_URL) throw new Error("TEST_DATABASE_URL is required");
   const directory = await mkdtemp(join(tmpdir(), "florence-parent-journeys-"));
   const schema = `florence_${randomUUID().replaceAll("-", "")}`;
@@ -2326,7 +2556,7 @@ async function createHarness(reason: Reason = async () => decision()): Promise<H
   await migrateDatabase(databaseUrl, setupFile);
   const store = new PostgresFlorenceStore(databaseUrl);
   const state: HarnessState = {
-    now: NOW,
+    now: options.now ?? NOW,
     privateReviews: [],
     googleAssessments: [],
     briefings: [],
@@ -2364,8 +2594,12 @@ async function createHarness(reason: Reason = async () => decision()): Promise<H
     googleChangeReads: [],
     interactiveGoogleReads: 0,
     providerRevocations: [],
+    setupConversations: [],
+    initialCalendarOnlyReview: false,
+    calendarOnlyChangePending: false,
+    calendarOnlyChangeDelivered: false,
   };
-  const linq = new FakeLinq(state);
+  const linq = new FakeLinq(state, options.linqLedger);
   const vault = new EncryptedImageVault({
     rootDirectory: join(directory, "vault"),
     encryptionKey: new Uint8Array(32).fill(7),
@@ -2406,15 +2640,25 @@ function createReasoner(reason: Reason, state: HarnessState): FlorenceReasoner {
       return VOICE_TRANSCRIPT;
     },
     converseDuringSetup: async (input: Parameters<FlorenceReasoner["converseDuringSetup"]>[0]) => {
+      state.setupConversations.push(input);
       if (input.stage === "partner_invited" && state.setupConversationFailuresRemaining > 0) {
         state.setupConversationFailuresRemaining -= 1;
         throw new Error("Fake setup interpreter is temporarily unavailable");
+      }
+      if (input.currentMessage.text === INCOMPLETE_SETUP_FRESH_LINK_REQUEST) {
+        return {
+          stopMessaging: false,
+          declineInvitation: false,
+          requestsFreshLink: true,
+          bubbles: [{ text: INCOMPLETE_SETUP_FALSE_DENIAL, delayMs: 0 }],
+        };
       }
       const declineInvitation =
         input.stage === "partner_invited" && input.currentMessage.text === PARTNER_SETUP_REFUSAL;
       return {
         stopMessaging: false,
         declineInvitation,
+        requestsFreshLink: false,
         bubbles: declineInvitation
           ? []
           : [
@@ -2455,7 +2699,7 @@ function createReasoner(reason: Reason, state: HarnessState): FlorenceReasoner {
         before: new Date(current - 14 * 24 * 60 * 60_000).toISOString(),
         limit: 10,
       });
-      await reads.readPersonalCalendarWindow({
+      const calendar = await reads.readPersonalCalendarWindow({
         connectionId: input.googleConnection.connectionId,
         timeMin: input.currentTime,
         timeMax: new Date(current + 21 * 24 * 60 * 60_000).toISOString(),
@@ -2473,6 +2717,25 @@ function createReasoner(reason: Reason, state: HarnessState): FlorenceReasoner {
         expect(opened.bytes).toEqual(PDF_BYTES);
       }
       const founder = input.adult.firstName === "Hari";
+      if (founder && state.initialCalendarOnlyReview) {
+        const calendarSource = calendar.events.find(
+          (event) => event.title === PRIVATE_INITIAL_CALENDAR_ONLY_EVENT.title,
+        );
+        if (!calendarSource) throw new Error("Initial review did not receive the titled Calendar event");
+        return {
+          bubbles: [{ text: PRIVATE_CALENDAR_GENERIC_TODAY_REPLY, delayMs: 0 }],
+          findings: [
+            {
+              privateSummary: PRIVATE_CALENDAR_GENERIC_TODAY_REPLY,
+              sourceIds: [calendarSource.sourceId],
+              candidate: null,
+              monitor: null,
+              familyCalendar: null,
+            },
+          ],
+          facts: [],
+        };
+      }
       return {
         bubbles: [
           {
@@ -2556,62 +2819,79 @@ function createReasoner(reason: Reason, state: HarnessState): FlorenceReasoner {
       const deletionSource = input.evidence.gmail.sources.find(
         (candidate) => candidate.subject === GOOGLE_DELETION_GMAIL_SUBJECT,
       );
+      const calendarOnlySource = input.evidence.calendar.events.find(
+        (candidate) => candidate.title === PRIVATE_CALENDAR_ONLY_TITLE,
+      );
       if (deletionSource) state.googleDeletionSourceId = deletionSource.sourceId;
       if (overlap) {
         state.overlapGmailAssessments += 1;
         state.overlapGmailSourceId = overlap.sourceId;
       }
       return {
-        findings: deletionSource
+        findings: calendarOnlySource
           ? [
               {
-                privateDetail: GOOGLE_DELETION_PRIVATE_ALERT,
+                privateDetail: PRIVATE_CALENDAR_GENERIC_TODAY_REPLY,
                 householdConclusion: null,
-                sourceIds: [deletionSource.sourceId],
-                urgency: "soon" as const,
+                sourceIds: [calendarOnlySource.sourceId],
+                urgency: "now" as const,
                 materialChange: true,
-                monitor: {
-                  operation: "create" as const,
-                  monitorId: null,
-                  objective: "Watch for confirmation that Maya’s emergency card is signed.",
-                  currentConclusion: "The emergency card still needs a signature.",
-                  endCondition: "A parent or the school confirms the emergency card is signed.",
-                  nextCheck: new Date(Date.parse(input.currentTime) + 60 * 60_000).toISOString(),
-                  why: "The school reminder has a live deadline.",
-                },
-                familyCalendar: {
-                  disposition: "suggest" as const,
-                  sourceIds: [deletionSource.sourceId],
-                  event: GOOGLE_DELETION_FAMILY_DATE,
-                },
+                monitor: null,
+                familyCalendar: null,
               },
             ]
-          : [],
-        facts: deletionSource
-          ? [
-              {
-                slot: GOOGLE_DELETION_FACT_SLOT,
-                statement: GOOGLE_DELETION_FACT,
-                sourceIds: [deletionSource.sourceId],
-              },
-            ]
-          : source
+          : deletionSource
             ? [
                 {
-                  slot: PRIVATE_SCHOOL_FACT_SLOT,
-                  statement: UPDATED_PRIVATE_SCHOOL_FACT,
-                  sourceIds: [source.sourceId],
+                  privateDetail: GOOGLE_DELETION_PRIVATE_ALERT,
+                  householdConclusion: null,
+                  sourceIds: [deletionSource.sourceId],
+                  urgency: "soon" as const,
+                  materialChange: true,
+                  monitor: {
+                    operation: "create" as const,
+                    monitorId: null,
+                    objective: "Watch for confirmation that Maya’s emergency card is signed.",
+                    currentConclusion: "The emergency card still needs a signature.",
+                    endCondition: "A parent or the school confirms the emergency card is signed.",
+                    nextCheck: new Date(Date.parse(input.currentTime) + 60 * 60_000).toISOString(),
+                    why: "The school reminder has a live deadline.",
+                  },
+                  familyCalendar: {
+                    disposition: "suggest" as const,
+                    sourceIds: [deletionSource.sourceId],
+                    event: GOOGLE_DELETION_FAMILY_DATE,
+                  },
                 },
               ]
-            : overlap && state.overlapGmailAssessments === 2
+            : [],
+        facts: calendarOnlySource
+          ? []
+          : deletionSource
+            ? [
+                {
+                  slot: GOOGLE_DELETION_FACT_SLOT,
+                  statement: GOOGLE_DELETION_FACT,
+                  sourceIds: [deletionSource.sourceId],
+                },
+              ]
+            : source
               ? [
                   {
-                    slot: OVERLAP_GMAIL_FACT_SLOT,
-                    statement: "Maya’s school bus route reminder is current.",
-                    sourceIds: [overlap.sourceId],
+                    slot: PRIVATE_SCHOOL_FACT_SLOT,
+                    statement: UPDATED_PRIVATE_SCHOOL_FACT,
+                    sourceIds: [source.sourceId],
                   },
                 ]
-              : [],
+              : overlap && state.overlapGmailAssessments === 2
+                ? [
+                    {
+                      slot: OVERLAP_GMAIL_FACT_SLOT,
+                      statement: "Maya’s school bus route reminder is current.",
+                      sourceIds: [overlap.sourceId],
+                    },
+                  ]
+                : [],
       };
     },
     reviewFiniteMonitor: async (input: Parameters<FlorenceReasoner["reviewFiniteMonitor"]>[0]) => {
@@ -2734,22 +3014,24 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
               providerUpdatedAt: new Date(state.now).toISOString(),
             }))
           : familyEvents
-      : [
-          {
-            providerEventId: `private-event-${input.ownerAdultId}`,
-            providerRevision: `private-revision-${input.ownerAdultId}`,
-            providerUpdatedAt: new Date(state.now).toISOString(),
-            status: "confirmed" as const,
-            busy: true,
-            title: "Private calendar detail",
-            intervalKind: "timed" as const,
-            startsAt: "2026-08-18T17:00:00.000Z",
-            endsAt: "2026-08-18T18:00:00.000Z",
-            allDay: false,
-            timeZone: "America/Los_Angeles",
-            location: null,
-          },
-        ];
+      : state.initialCalendarOnlyReview && input.ownerAdultId === founderSetup().adultId
+        ? [PRIVATE_INITIAL_CALENDAR_ONLY_EVENT]
+        : [
+            {
+              providerEventId: `private-event-${input.ownerAdultId}`,
+              providerRevision: `private-revision-${input.ownerAdultId}`,
+              providerUpdatedAt: new Date(state.now).toISOString(),
+              status: "confirmed" as const,
+              busy: true,
+              title: "Private calendar detail",
+              intervalKind: "timed" as const,
+              startsAt: "2026-08-18T17:00:00.000Z",
+              endsAt: "2026-08-18T18:00:00.000Z",
+              allDay: false,
+              timeZone: "America/Los_Angeles",
+              location: null,
+            },
+          ];
     return {
       status: "complete" as const,
       events,
@@ -3041,10 +3323,18 @@ function createGoogle(store: PostgresFlorenceStore, state: HarnessState): Google
     }) => {
       await activeCredential(input);
       state.googleChangeReads.push({ ownerAdultId: input.ownerAdultId, kind: "calendar" });
+      const hasCalendarOnlyChange =
+        input.ownerAdultId === founderSetup().adultId &&
+        input.calendarId === "primary" &&
+        state.calendarOnlyChangePending &&
+        !state.calendarOnlyChangeDelivered;
+      if (hasCalendarOnlyChange) state.calendarOnlyChangeDelivered = true;
       return {
         status: "complete" as const,
         resyncRequired: false as const,
-        events: [],
+        events: hasCalendarOnlyChange
+          ? [{ ...PRIVATE_CALENDAR_ONLY_EVENT, providerUpdatedAt: input.currentTime }]
+          : [],
         cursor: {
           ...input.cursor,
           updatedMin: input.currentTime,

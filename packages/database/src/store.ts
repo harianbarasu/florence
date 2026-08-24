@@ -13,6 +13,7 @@ const MAX_CURRENT_PDFS = 3;
 const MAX_PDF_ENVELOPE_BYTES = 20 * 1024 * 1024 + 16 * 1024;
 const GOOGLE_POLL_INTERVAL_MS = 2 * 60_000;
 const INTEREST_CHECK_INTERVAL_MS = 7 * 24 * 60 * 60_000;
+const LINQ_RECEIPT_CLOCK_SKEW_MS = 5 * 60_000;
 const PROACTIVE_CONSENT_PAUSE_REASON = "Paused because proactive Google use is disabled";
 const HOUSEHOLD_SAFE_MONITOR_WHY = "Florence is watching this family coordination item.";
 export type GoogleScope =
@@ -985,6 +986,8 @@ type LinqObservationRow = {
   provider_message_id: string | null;
   sent_at: Date | null;
   receipt_detail: JsonValue | null;
+  not_before: Date;
+  source_occurred_at: Date;
 };
 
 type FamilyCalendarAuthorityRow = {
@@ -1065,6 +1068,14 @@ export class PostgresFlorenceStore {
     if (this.#closed) return;
     this.#closed = true;
     await this.#sql.end({ timeout: 5 });
+  }
+
+  async scopeHouseholdLinqIdempotencyKey(input: {
+    householdId: string;
+    idempotencyKey: string;
+  }): Promise<string> {
+    assertUuid(input.householdId, "Household ID");
+    return householdLinqIdempotencyKey(this.#sql, input.householdId, input.idempotencyKey);
   }
 
   async listHouseholdIdsForAdult(adultId: string): Promise<readonly string[]> {
@@ -2935,7 +2946,8 @@ export class PostgresFlorenceStore {
       );
       const [expiryNotice] = await this.#sql<{ source_id: string }[]>`
         select source_id from messages where source_id=${expiryNoticeSourceId}
-          and direction='outbound' and idempotency_key=${`partner-invitation-expired:${expiryNoticeSourceId}`}
+          and direction='outbound'
+          and idempotency_key like ${`partner-invitation-expired:${expiryNoticeSourceId}:h:%`}
       `;
       if (expiryNotice) return { adultId: row.adult_id, state: "expired" };
     }
@@ -3593,11 +3605,16 @@ export class PostgresFlorenceStore {
       ) {
         continue;
       }
-      return {
-        householdId: household.id,
-        createChatIdempotencyKey: previous
+      const createChatIdempotencyKey = await householdLinqIdempotencyKey(
+        this.#sql,
+        household.id,
+        previous
           ? `family-group:${household.id}:replace:${previous.id}`
           : `family-group:${household.id}:initial`,
+      );
+      return {
+        householdId: household.id,
+        createChatIdempotencyKey,
         participantPhoneNumbers: [first.messages_address, second.messages_address],
         participantIdentityDigests: [
           first.identity_subject_digest,
@@ -4398,7 +4415,11 @@ export class PostgresFlorenceStore {
       channel.adult_one_id === founder.id &&
       channel.adult_two_id === null
     ) {
-      const handoffTurnId = deterministicUuid(`founder-handoff-turn\0${row.household_id}\0${founder.id}`);
+      const handoff = founderHandoffIdentity(
+        row.household_id,
+        founder.id,
+        await householdLinqIncarnationScope(this.#sql, row.household_id),
+      );
       const handoffRows = await this.#sql<
         {
           source_id: string;
@@ -4410,20 +4431,21 @@ export class PostgresFlorenceStore {
         }[]
       >`
         select source_id,channel_id,status,move_kind,turn_part,idempotency_key
-        from messages where turn_id=${handoffTurnId} order by turn_part
+        from messages where turn_id=${handoff.turnId} order by turn_part
       `;
       const handoffSent =
         handoffRows.length === 2 &&
-        handoffRows.every(
-          (message, index) =>
-            message.source_id ===
-              deterministicUuid(`founder-handoff\0${row.household_id}\0${founder.id}\0${index}`) &&
+        handoffRows.every((message, index) => {
+          const part = handoff.part(index);
+          return (
+            message.source_id === part.sourceId &&
             message.channel_id === channel.id &&
             message.status === "sent" &&
             message.move_kind === "message" &&
             message.turn_part === index &&
-            message.idempotency_key === `founder-handoff:${row.household_id}:${founder.id}:${index}`,
-        );
+            message.idempotency_key === part.idempotencyKey
+          );
+        });
       if (handoffSent) {
         const [partner] = await this.#sql<{ id: string; first_name: string; phone_number: string }[]>`
           select id,profile->>'firstName' as first_name,profile->>'phoneNumber' as phone_number
@@ -4792,7 +4814,11 @@ export class PostgresFlorenceStore {
         if (!founder || !partner || !awaitingPartnerInvitationApproval(partner)) {
           throw new FlorenceStoreConflict("The exact planned partner is no longer awaiting an invitation");
         }
-        const handoffTurnId = deterministicUuid(`founder-handoff-turn\0${turn.household_id}\0${founder.id}`);
+        const handoff = founderHandoffIdentity(
+          turn.household_id,
+          founder.id,
+          await householdLinqIncarnationScope(sql, turn.household_id),
+        );
         const handoffRows = await sql<
           {
             source_id: string;
@@ -4804,20 +4830,21 @@ export class PostgresFlorenceStore {
           }[]
         >`
           select source_id,channel_id,status,move_kind,turn_part,idempotency_key
-          from messages where turn_id=${handoffTurnId} order by turn_part for share
+          from messages where turn_id=${handoff.turnId} order by turn_part for share
         `;
         if (
           handoffRows.length !== 2 ||
-          handoffRows.some(
-            (message, index) =>
-              message.source_id !==
-                deterministicUuid(`founder-handoff\0${turn.household_id}\0${founder.id}\0${index}`) ||
+          handoffRows.some((message, index) => {
+            const part = handoff.part(index);
+            return (
+              message.source_id !== part.sourceId ||
               message.channel_id !== turn.channel_id ||
               message.status !== "sent" ||
               message.move_kind !== "message" ||
               message.turn_part !== index ||
-              message.idempotency_key !== `founder-handoff:${turn.household_id}:${founder.id}:${index}`,
-          )
+              message.idempotency_key !== part.idempotencyKey
+            );
+          })
         ) {
           throw new FlorenceStoreUnauthorized(
             "The founder must approve the exact partner after Florence's handoff question was sent",
@@ -5245,12 +5272,20 @@ export class PostgresFlorenceStore {
           move_kind: "message" | "reply" | "reaction";
           provider_message_id: string | null;
           receipt_detail: JsonValue | null;
+          not_before: Date;
+          source_occurred_at: Date;
         }[]
       >`
-        select status,move_kind,provider_message_id,receipt_detail from messages where source_id=${input.sourceId}
-          and direction='outbound' for update
+        select m.status,m.move_kind,m.provider_message_id,m.receipt_detail,m.not_before,
+          s.occurred_at as source_occurred_at
+        from messages m join sources s on s.id=m.source_id
+        where m.source_id=${input.sourceId} and m.direction='outbound' for update of m
       `;
       if (!current) throw new FlorenceStoreConflict("The outbound message does not exist");
+      const stagedAt = Math.max(current.source_occurred_at.getTime(), current.not_before.getTime());
+      if (sentAt.getTime() < stagedAt - LINQ_RECEIPT_CLOCK_SKEW_MS) {
+        throw new FlorenceStoreConflict("The Linq receipt predates this staged outbound message");
+      }
       if (
         current.move_kind !== "reaction" &&
         current.provider_message_id !== null &&
@@ -5321,8 +5356,10 @@ export class PostgresFlorenceStore {
       const rows =
         input.kind === "message_status"
           ? await sql<LinqObservationRow[]>`
-              select m.source_id,m.status,m.move_kind,m.provider_message_id,m.sent_at,m.receipt_detail
+              select m.source_id,m.status,m.move_kind,m.provider_message_id,m.sent_at,m.receipt_detail,
+                m.not_before,s.occurred_at as source_occurred_at
               from messages m join linq_channels c on c.id=m.channel_id
+              join sources s on s.id=m.source_id
               where m.direction='outbound' and m.move_kind in ('message','reply')
                 and c.provider_conversation_id=${input.providerConversationId}
                 and (m.provider_message_id=${input.providerMessageId}
@@ -5331,8 +5368,10 @@ export class PostgresFlorenceStore {
             `
           : await sql<LinqObservationRow[]>`
               select reaction.source_id,reaction.status,reaction.move_kind,reaction.provider_message_id,
-                reaction.sent_at,reaction.receipt_detail
+                reaction.sent_at,reaction.receipt_detail,reaction.not_before,
+                source.occurred_at as source_occurred_at
               from messages reaction join linq_channels c on c.id=reaction.channel_id
+              join sources source on source.id=reaction.source_id
               join messages target on target.source_id=reaction.reply_to_source_id
                 and target.channel_id=reaction.channel_id
               where reaction.direction='outbound' and reaction.move_kind='reaction'
@@ -5344,6 +5383,8 @@ export class PostgresFlorenceStore {
       if (rows.length !== 1) return "unmatched";
       const current = rows[0];
       if (!current) return "unmatched";
+      const stagedAt = Math.max(current.source_occurred_at.getTime(), current.not_before.getTime());
+      if (occurredAt.getTime() < stagedAt - LINQ_RECEIPT_CLOCK_SKEW_MS) return "unmatched";
       if (
         input.kind === "message_status" &&
         current.provider_message_id !== null &&
@@ -5781,12 +5822,14 @@ export class PostgresFlorenceStore {
     const texts = input.texts.map((text, index) => required(text, `Founder handoff bubble ${index + 1}`));
     const providerConversationId = required(input.providerConversationId, "Linq conversation ID");
     const occurredAt = instant(input.occurredAt);
-    const turnId = deterministicUuid(`founder-handoff-turn\0${input.householdId}\0${input.adultId}`);
-    const sourceIds = texts.map((_, index) =>
-      deterministicUuid(`founder-handoff\0${input.householdId}\0${input.adultId}\0${index}`),
-    );
 
     return this.#sql.begin(async (sql) => {
+      const handoff = founderHandoffIdentity(
+        input.householdId,
+        input.adultId,
+        await householdLinqIncarnationScope(sql, input.householdId),
+      );
+      const sourceIds = texts.map((_, index) => handoff.part(index).sourceId);
       const [channel] = await sql<ChannelRow[]>`
         select c.* from linq_channels c
         join people p on p.household_id=c.household_id and p.id=c.adult_one_id
@@ -5826,22 +5869,23 @@ export class PostgresFlorenceStore {
         }[]
       >`
         select source_id,channel_id,move_kind,text,reply_to_source_id,turn_part,idempotency_key
-        from messages where turn_id=${turnId} order by turn_part for update
+        from messages where turn_id=${handoff.turnId} order by turn_part for update
       `;
       if (existing.length > 0) {
         if (
           existing.length > 3 ||
-          existing.some(
-            (message, index) =>
-              message.source_id !==
-                deterministicUuid(`founder-handoff\0${input.householdId}\0${input.adultId}\0${index}`) ||
+          existing.some((message, index) => {
+            const part = handoff.part(index);
+            return (
+              message.source_id !== part.sourceId ||
               message.channel_id !== channel.id ||
               message.move_kind !== "message" ||
               message.text !== texts[index] ||
               message.reply_to_source_id !== null ||
               message.turn_part !== index ||
-              message.idempotency_key !== `founder-handoff:${input.householdId}:${input.adultId}:${index}`,
-          )
+              message.idempotency_key !== part.idempotencyKey
+            );
+          })
         ) {
           throw new FlorenceStoreConflict("The founder handoff was already staged with different content");
         }
@@ -5849,12 +5893,13 @@ export class PostgresFlorenceStore {
       }
 
       for (const [index, text] of texts.entries()) {
+        const part = handoff.part(index);
         await insertOutbound(sql, {
-          sourceId: sourceIds[index] as string,
-          idempotencyKey: `founder-handoff:${input.householdId}:${input.adultId}:${index}`,
+          sourceId: part.sourceId,
+          idempotencyKey: part.rawIdempotencyKey,
           moveKind: "message",
           text,
-          turnId,
+          turnId: handoff.turnId,
           turnPart: index as 0 | 1 | 2,
           notBefore: new Date(occurredAt.getTime() + index * 700).toISOString(),
           householdId: input.householdId,
@@ -6472,6 +6517,59 @@ type OutboundInsert = OutboundDraft & {
   metadata?: JsonObject;
   occurredAt: Date;
 };
+
+type HouseholdLinqSql = postgres.Sql | postgres.TransactionSql;
+
+async function householdLinqIncarnationScope(sql: HouseholdLinqSql, householdId: string): Promise<string> {
+  const [household] = await sql<{ created_at_exact: string }[]>`
+    select to_char(created_at at time zone 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as created_at_exact
+    from households where id=${householdId}
+  `;
+  if (!household) throw new FlorenceStoreConflict("The household no longer exists");
+  return deterministicUuid(`household-linq-incarnation\0${householdId}\0${household.created_at_exact}`);
+}
+
+function scopeLinqIdempotencyKey(idempotencyKey: string, incarnationScope: string): string {
+  const key = required(idempotencyKey, "Linq idempotency key");
+  const scoped = `${key}:h:${incarnationScope}`;
+  if (scoped.length > 255) {
+    throw new FlorenceStoreConflict("A household Linq idempotency key is too long");
+  }
+  return scoped;
+}
+
+async function householdLinqIdempotencyKey(
+  sql: HouseholdLinqSql,
+  householdId: string,
+  idempotencyKey: string,
+): Promise<string> {
+  return scopeLinqIdempotencyKey(idempotencyKey, await householdLinqIncarnationScope(sql, householdId));
+}
+
+function founderHandoffIdentity(
+  householdId: string,
+  adultId: string,
+  incarnationScope: string,
+): {
+  turnId: string;
+  part(index: number): {
+    sourceId: string;
+    rawIdempotencyKey: string;
+    idempotencyKey: string;
+  };
+} {
+  return {
+    turnId: deterministicUuid(`founder-handoff-turn\0${householdId}\0${adultId}`),
+    part: (index) => {
+      const rawIdempotencyKey = `founder-handoff:${householdId}:${adultId}:${index}`;
+      return {
+        sourceId: deterministicUuid(`founder-handoff\0${householdId}\0${adultId}\0${index}`),
+        rawIdempotencyKey,
+        idempotencyKey: scopeLinqIdempotencyKey(rawIdempotencyKey, incarnationScope),
+      };
+    },
+  };
+}
 
 function personRecord(row: PersonRow): FamilyMemberRecord {
   const messagesIdentity =
@@ -8695,8 +8793,9 @@ async function insertOutbound(sql: postgres.TransactionSql, input: OutboundInser
   } else if (input.turnPart < 0 || !input.text?.trim()) {
     throw new FlorenceStoreConflict("A message bubble needs text and turn part 0 through 2");
   }
+  const idempotencyKey = await householdLinqIdempotencyKey(sql, input.householdId, input.idempotencyKey);
   const [existing] = await sql<{ source_id: string }[]>`
-    select source_id from messages where idempotency_key=${input.idempotencyKey}
+    select source_id from messages where idempotency_key=${idempotencyKey}
   `;
   if (existing) {
     if (existing.source_id !== input.sourceId) {
@@ -8709,7 +8808,7 @@ async function insertOutbound(sql: postgres.TransactionSql, input: OutboundInser
       id,household_id,kind,visibility,owner_adult_id,external_key,parent_source_id,label,metadata,occurred_at
     )
     values (${input.sourceId},${input.householdId},'linq_message',${input.visibility},${input.ownerAdultId},
-      ${`outbound:${input.idempotencyKey}`},${input.parentSourceId ?? null},
+      ${`outbound:${idempotencyKey}`},${input.parentSourceId ?? null},
       ${bounded(input.text ?? input.reaction ?? "Florence response", 500)},
       ${sql.json({
         ...(input.metadata ?? {}),
@@ -8723,7 +8822,7 @@ async function insertOutbound(sql: postgres.TransactionSql, input: OutboundInser
       idempotency_key,not_before,status
     ) values (${input.sourceId},${input.channelId},'outbound',${input.moveKind},${input.text ?? null},
       ${input.reaction ?? null},${input.replyToSourceId ?? null},${input.turnId},${input.turnPart},
-      ${input.idempotencyKey},${instant(input.notBefore)},'pending')
+      ${idempotencyKey},${instant(input.notBefore)},'pending')
   `;
 }
 
@@ -9279,7 +9378,8 @@ async function googleDerivedUnsentMessageSourceIds(
         )
         or exists (
           select 1 from scoped_connections connection
-          where message.idempotency_key=('google-reconnect:' || connection.id::text)
+          where message.idempotency_key like
+            ('google-reconnect:' || connection.id::text || ':h:%')
         )
         or exists (
           select 1 from sources outbound_source
@@ -9293,7 +9393,8 @@ async function googleDerivedUnsentMessageSourceIds(
           join google_sources evidence on evidence.id=action.basis_source_id
           where action.approval_prompt_source_id=message.source_id
             or (action.status='failed'
-              and message.idempotency_key=('calendar-failure:' || action.id::text))
+              and message.idempotency_key like
+                ('calendar-failure:' || action.id::text || ':h:%'))
         )
       )
     order by message.source_id for update of message

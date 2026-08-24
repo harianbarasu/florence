@@ -329,7 +329,7 @@ function GoogleSetupSuccess({ view }: { view: WorkspaceView }) {
       </div>
       <SetupHeading
         title="Your side is ready"
-        detail="Florence just texted you. Head back to Messages to keep going."
+        detail="Head back to Messages—Florence will follow up there shortly."
       />
       {view.workspace.messagesUrl ? (
         <a className="button primary wide" href={view.workspace.messagesUrl}>

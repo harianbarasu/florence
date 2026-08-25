@@ -1181,6 +1181,18 @@ export class GoogleConnection {
       );
     }
     const listEntry = await this.#readProductionResetCalendarListEntry(accessToken, calendarId);
+    if (listEntry === null) {
+      if (normalizedGoogleEmail(productionResetDataOwner(calendar), "Calendar data owner") !== creatorEmail) {
+        throw new GoogleProductionResetError(
+          "The Florence Calendar creator credential is not the Calendar data owner",
+          "creator_not_data_owner",
+        );
+      }
+      // Calendars.delete can disappear from CalendarList before the Calendar metadata cache expires.
+      // Google does not allow a data owner to remove an active owned Calendar from CalendarList, so
+      // exact marker + exact data owner + CalendarList absence is a confirmed deletion state.
+      return Object.freeze({ state: "absent", calendarId });
+    }
     if (listEntry.id !== calendarId) {
       throw new GoogleProductionResetError(
         "Google returned a different Calendar-list entry during reset verification",
@@ -2773,7 +2785,7 @@ export class GoogleConnection {
   async #readProductionResetCalendarListEntry(
     accessToken: string,
     calendarId: string,
-  ): Promise<Record<string, unknown>> {
+  ): Promise<Record<string, unknown> | null> {
     let response: Response;
     try {
       response = await this.#fetch(
@@ -2789,6 +2801,7 @@ export class GoogleConnection {
         "provider_unavailable",
       );
     }
+    if (response.status === 404 || response.status === 410) return null;
     if (!response.ok) {
       const code =
         response.status === 401 || response.status === 403

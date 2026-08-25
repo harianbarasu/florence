@@ -211,7 +211,10 @@ ambiguous Calendar, it locks and rechecks the complete inspected database snapsh
 durably records that provider ID. That makes a partially completed reset safe to rerun.
 It then permanently removes each marked Calendar with Google `Calendars.delete`,
 accepts `404`/`410` as an idempotent already-absent result, and confirms every Calendar
-is absent. It rechecks the inspected image inventory and unlinks only those canonical
+is absent. If Google's Calendar metadata cache temporarily survives the deletion, the
+exact Florence marker and current data-owner identity plus absence from the data owner's
+CalendarList is also conclusive because Google does not allow a data owner to remove an
+active owned Calendar from that list. It rechecks the inspected image inventory and unlinks only those canonical
 `.fiv` files and exact Florence atomic-write temporary envelopes, then confirms neither
 kind of canonical image artifact remains. The completion event reports separate
 `encryptedImageArtifactsDeleted` and `encryptedImageTemporaryArtifactsDeleted` counts.

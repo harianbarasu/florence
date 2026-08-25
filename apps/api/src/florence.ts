@@ -1398,20 +1398,31 @@ export class Florence {
       );
       const approval = approvedCalendarOffer;
       const partnerApproval = guarded.policy.stopMessaging ? null : approvedPartnerInvitation;
-      const committedDecision = approval
-        ? {
-            ...guarded,
-            policy: { ...guarded.policy, schedule: true, stopMessaging: false },
-            conversation: {
-              replyToCurrentMessage: true,
-              reaction: null,
-              bubbles: [{ text: "Got it—I’ll add that calendar item now.", delayMs: 0 }],
-            },
-            calendar: null,
-            householdUpdate: null,
-            webAccessPath: null,
-          }
-        : guarded;
+      const committedDecision =
+        approval || partnerApproval
+          ? {
+              ...guarded,
+              policy: { ...guarded.policy, schedule: true, stopMessaging: false },
+              conversation: {
+                replyToCurrentMessage: true,
+                reaction: null,
+                bubbles: [
+                  {
+                    text:
+                      approval && partnerApproval
+                        ? `Got it—I’ll add that calendar item and text ${partnerApproval.firstName} now.`
+                        : approval
+                          ? "Got it—I’ll add that calendar item now."
+                          : `Got it—I’ll text ${partnerApproval?.firstName ?? "your partner"} now.`,
+                    delayMs: 0,
+                  },
+                ],
+              },
+              calendar: null,
+              householdUpdate: null,
+              webAccessPath: null,
+            }
+          : guarded;
       await this.#store.commitTurn(
         decisionCommit(turn, committedDecision, this.#now(), {
           omitReaction: immediateReactionStaged,

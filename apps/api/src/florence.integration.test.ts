@@ -394,6 +394,7 @@ release("Florence parent journeys", () => {
     let accessFollowUpHistory: readonly string[] = [];
     let accessFollowUpAuthoredText: string | null = null;
     let failNextReinviteConversation = false;
+    let contradictNextSuccessfulPartnerInvitation = false;
     let failNextGroupGreeting = false;
     const harness = await createHarness(async (input) => {
       if (
@@ -413,6 +414,17 @@ release("Florence parent journeys", () => {
           "invalid_output",
           "Fake normal conversation output failed after isolated invitation approval",
         );
+      }
+      if (contradictNextSuccessfulPartnerInvitation && input.currentMessage.text === REINVITE_APPROVAL) {
+        contradictNextSuccessfulPartnerInvitation = false;
+        return decision({
+          bubbles: [
+            {
+              text: "I can’t send a setup text myself, but Alex can open Florence from their own phone to get started.",
+              delayMs: 0,
+            },
+          ],
+        });
       }
       if (input.currentMessage.text === WEB_CALENDAR_ACCESS_REQUEST) {
         return decision({
@@ -628,8 +640,10 @@ release("Florence parent journeys", () => {
     const permanentFailureNotices = harness.linq.messages
       .filter((message) => message.providerConversationId === PRIVATE_FOUNDER)
       .slice(founderMessagesBeforePermanentFailure);
-    expect(permanentFailureNotices).toHaveLength(1);
-    expect(permanentFailureNotices[0]?.text).toBe(PARTNER_SETUP_DELIVERY_FAILURE_NOTICE);
+    expect(permanentFailureNotices.map((message) => message.text)).toEqual([
+      "Got it—I’ll text Alex now.",
+      PARTNER_SETUP_DELIVERY_FAILURE_NOTICE,
+    ]);
     expect((await harness.florence.workspaceForAdult(harness.founderAdultId)).workspace.setup).toMatchObject({
       partnerInvitation: "ready",
     });
@@ -651,7 +665,7 @@ release("Florence parent journeys", () => {
       harness.linq.messages
         .filter((message) => message.providerConversationId === PRIVATE_FOUNDER)
         .slice(founderMessagesBeforePermanentFailure),
-    ).toHaveLength(1);
+    ).toHaveLength(2);
 
     failNextReinviteConversation = true;
     const founderMessagesBeforeReinvite = harness.linq.messages.filter(
@@ -693,6 +707,10 @@ release("Florence parent journeys", () => {
       )`,
     );
 
+    contradictNextSuccessfulPartnerInvitation = true;
+    const founderMessagesBeforeSuccessfulReinvite = harness.linq.messages.filter(
+      (message) => message.providerConversationId === PRIVATE_FOUNDER,
+    ).length;
     await harness.accept("private", "reinvite-partner-after-fast-stop", REINVITE_APPROVAL);
     await harness.drain();
     const reboundPartnerPrompt = harness.linq.createdChats.at(-1);
@@ -704,6 +722,12 @@ release("Florence parent journeys", () => {
       result: { providerConversationId: PRIVATE_PARTNER, authority: { audience: "private" } },
     });
     expect(reboundPartnerPrompt?.input.initialText).not.toContain("#s=");
+    const successfulReinviteFounderMessages = harness.linq.messages
+      .filter((message) => message.providerConversationId === PRIVATE_FOUNDER)
+      .slice(founderMessagesBeforeSuccessfulReinvite);
+    expect(successfulReinviteFounderMessages.map((message) => message.text)).toEqual([
+      "Got it—I’ll text Alex now.",
+    ]);
     const reinviteFounderMessages = harness.linq.messages
       .filter((message) => message.providerConversationId === PRIVATE_FOUNDER)
       .slice(founderMessagesBeforeReinvite);
